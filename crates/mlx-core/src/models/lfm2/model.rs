@@ -27,6 +27,7 @@ use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::transformer::paged_kv_cache_adapter::{
     PagedKVCacheAdapter, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission, SeqId,
 };
+use crate::transformer::paged_policy::record_decode_wave;
 
 use super::config::Lfm2Config;
 use super::conv_sidecar;
@@ -139,6 +140,16 @@ pub(crate) struct Lfm2Inner {
     /// directly from this table for batched decode.
     scheduled_caches: HashMap<SeqId, Vec<Lfm2LayerCache>>,
     active_scheduled_seq: Option<SeqId>,
+    /// Sequences whose recurrent (conv) row currently holds REAL
+    /// forward-produced state — whether the row is live in `caches`
+    /// (the active sequence) or parked in `scheduled_caches`. Membership
+    /// is what makes [`Lfm2Inner::scheduled_recurrent_state_live`] honest:
+    /// a released or reset row is removed, a fresh-zero row was never
+    /// inserted, and the marker is added only where conv state is actually
+    /// written (prefill/decode forwards, checkpoint and sidecar seats) —
+    /// never at admission time, where the Waiting restore lane could read
+    /// the claim before any forward has run.
+    scheduled_recurrent_survived: HashSet<SeqId>,
     /// Sampling + stop-token defaults parsed from the checkpoint's
     /// `generation_config.json` at load time. Empty for checkpoints that
     /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
@@ -380,6 +391,7 @@ impl Lfm2Inner {
             paged_adapter,
             scheduled_caches: HashMap::new(),
             active_scheduled_seq: None,
+            scheduled_recurrent_survived: HashSet::new(),
             // Empty until the load path parses `generation_config.json`
             // (set via `set_gen_defaults` in `persistence.rs`).
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
@@ -650,6 +662,7 @@ impl Lfm2Inner {
         } else {
             self.scheduled_caches.insert(seq_id, caches);
         }
+        self.scheduled_recurrent_survived.insert(seq_id);
         Ok(true)
     }
 
@@ -685,7 +698,12 @@ impl Lfm2Inner {
                 Ok(Some(()))
             },
         )
-        .map(|installed| installed.is_some())
+        .map(|installed| {
+            if installed.is_some() {
+                self.scheduled_recurrent_survived.insert(seq_id);
+            }
+            installed.is_some()
+        })
     }
 
     fn capture_lfm2_conv_cold_sidecar(&self, cache_salt: u64) {
@@ -902,6 +920,7 @@ impl Lfm2Inner {
         self.caches = init_caches(&self.config);
         self.scheduled_caches.clear();
         self.active_scheduled_seq = None;
+        self.scheduled_recurrent_survived.clear();
         self.conv_cold_checkpoints.clear();
         self.conv_state_pool.clear();
         self.conv_cold_capture_boundaries.clear();
@@ -1166,6 +1185,9 @@ impl Lfm2Inner {
         let last = logits
             .slice_axis(1, seq_len - 1, seq_len)?
             .squeeze(Some(&[0, 1]))?;
+        if let Some(seq_id) = self.active_scheduled_seq {
+            self.scheduled_recurrent_survived.insert(seq_id);
+        }
         self.remember_conv_cold_checkpoint();
         Ok(last)
     }
@@ -1186,6 +1208,10 @@ impl Lfm2Inner {
             .activate_request(seq_id)
             .map_err(Error::from_reason)?;
         if self.active_scheduled_seq == Some(seq_id) {
+            // Already live: the scheduler activates a sequence and then
+            // activates it AGAIN through `prepare_scheduled_prefix`.
+            // `scheduled_recurrent_survived` membership already describes
+            // this row — leave it alone.
             return Ok(());
         }
         self.park_active_scheduled_caches();
@@ -1204,6 +1230,7 @@ impl Lfm2Inner {
             self.scheduled_caches
                 .insert(seq_id, init_caches(&self.config));
         }
+        self.scheduled_recurrent_survived.remove(&seq_id);
     }
 
     fn release_scheduled_caches_for(&mut self, seq_id: SeqId) {
@@ -1212,6 +1239,7 @@ impl Lfm2Inner {
             self.caches = init_caches(&self.config);
         }
         self.scheduled_caches.remove(&seq_id);
+        self.scheduled_recurrent_survived.remove(&seq_id);
         self.conv_cold_checkpoints.remove(&seq_id);
         self.conv_cold_capture_boundaries.remove(&seq_id);
     }
@@ -1230,6 +1258,23 @@ impl Lfm2Inner {
 
     fn has_scheduled_caches_for(&self, seq_id: SeqId) -> bool {
         self.active_scheduled_seq == Some(seq_id) || self.scheduled_caches.contains_key(&seq_id)
+    }
+
+    /// Whether `seq_id`'s conv row currently holds REAL forward-produced
+    /// state — as opposed to fresh zero-state caches installed after a
+    /// memory-reclaim release, a `reuse_cache=false` reset, or a row that
+    /// was parked before its first forward ran. Read at admission/poll
+    /// time; the [`scheduled_recurrent_survived`] set is only ever armed
+    /// where conv state is actually written.
+    fn scheduled_recurrent_state_live(&self, seq_id: SeqId) -> bool {
+        self.scheduled_recurrent_survived.contains(&seq_id)
+    }
+
+    /// Live recurrent rows resident in `caches` + `scheduled_caches`.
+    /// `activate_paged_seq` removes from the map before setting the active
+    /// slot, so no sequence is counted twice.
+    fn scheduled_recurrent_units(&self) -> usize {
+        self.scheduled_caches.len() + usize::from(self.active_scheduled_seq.is_some())
     }
 
     fn scheduled_recurrent_bytes(&self) -> u64 {
@@ -1297,6 +1342,10 @@ impl Lfm2Inner {
                 })?;
             cache.set(0, row_state)?;
         }
+        // Every scattered row now holds forward-produced conv state for
+        // this layer — mark all of them as survived.
+        self.scheduled_recurrent_survived
+            .extend(seq_ids.iter().copied());
         Ok(())
     }
 
@@ -1406,54 +1455,14 @@ impl Lfm2Inner {
             ));
         }
         self.park_active_scheduled_caches();
-        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-            Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
-        })?;
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut planned_rows = Vec::with_capacity(rows.len());
-        for &(seq_id, _) in rows {
-            if !seen.insert(seq_id) {
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
-                )));
-            }
-            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
-                Error::from_reason(format!(
-                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
-                ))
-            })?;
-            planned_rows.push((seq_id, position));
-        }
-
-        let mut recorded = Vec::with_capacity(rows.len());
-        for &(seq_id, token_id) in rows {
-            let result = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::from_reason("run_paged_decode_step_batched: paged adapter disappeared")
-                })?
-                .record_token_for(seq_id, token_id);
-            if let Err(error) = result {
-                for &recorded_seq in recorded.iter().rev() {
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_decode_step_batched: paged adapter disappeared during rollback",
-                        )
-                    })?;
-                    adapter
-                        .activate_request(recorded_seq)
-                        .map_err(Error::from_reason)?;
-                    adapter
-                        .rollback_last_tokens(1)
-                        .map_err(Error::from_reason)?;
-                }
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched failed to record sequence {seq_id}: {error}"
-                )));
-            }
-            recorded.push(seq_id);
-        }
+        let planned_rows = record_decode_wave(
+            self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
+            })?,
+            rows,
+            "lfm2",
+        )
+        .map_err(Error::from_reason)?;
 
         let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
@@ -1596,6 +1605,11 @@ impl Lfm2Inner {
             // change values), so parity is unaffected.
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
+        // Pass 1 brought the active sequence's conv rows to the
+        // `cached_prefix_len` boundary — real forward-produced state.
+        if let Some(seq_id) = self.active_scheduled_seq {
+            self.scheduled_recurrent_survived.insert(seq_id);
+        }
         Ok(())
     }
 }
@@ -1632,6 +1646,19 @@ impl HybridSchedulerBackend for Lfm2Inner {
 
     fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
         self.has_scheduled_caches_for(seq_id)
+    }
+
+    /// Residency cap on parked recurrent rows. Without this override the trait
+    /// default (`true`) makes `ensure_recurrent_slot`'s idle-victim body dead
+    /// code and `scheduled_caches` grows one ~147KB conv row per owner
+    /// forever. The cap matches `max_concurrent_sequences()`, not
+    /// `HYBRID_LIVE_STATE_UNITS = 2`, which would cut batching from 8 rows to
+    /// 2. Deliberately not a hard error inside `activate_scheduled_recurrent`:
+    /// `finish_completed` reaches the same function with no
+    /// `ensure_recurrent_slot` gate, so erroring there would fail live turns.
+    fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.has_scheduled_recurrent(seq_id)
+            || self.scheduled_recurrent_units() < scheduler_max_num_seqs_for(32)
     }
 
     fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
@@ -1721,8 +1748,15 @@ impl HybridSchedulerBackend for Lfm2Inner {
         } else {
             false
         };
+        // The `owner_history` oracle is only honest when the parked conv row
+        // survived: `release_scheduled_caches_for` (memory reclaim or a
+        // `reuse_cache=false` turn) drops it while the request's history and
+        // K/V prefix blocks persist, which would seat zeroed conv state
+        // against a full K/V prefix. The sidecar and checkpoint-pool seats
+        // verify content byte-for-byte, so they stay valid on a dropped row.
         let conv_state_reusable = installed
-            || conv_state_reusable(tokens, owner_history, plan.cached_prefix_len as usize)
+            || (self.scheduled_recurrent_state_live(seq_id)
+                && conv_state_reusable(tokens, owner_history, plan.cached_prefix_len as usize))
             || self.seat_conv_state_checkpoint(seq_id, tokens, plan.cached_prefix_len)?;
         if restore.is_none() && !conv_state_reusable {
             self.reset_scheduled_caches_for(seq_id);
@@ -1766,11 +1800,12 @@ impl HybridSchedulerBackend for Lfm2Inner {
         };
         let installed = self.install_lfm2_conv_cold_sidecar(seq_id, plan.cached_prefix_len)?;
         let conv_state_reusable = installed
-            || conv_state_reusable(
-                prompt_tokens,
-                owner_history,
-                plan.cached_prefix_len as usize,
-            )
+            || (self.scheduled_recurrent_state_live(seq_id)
+                && conv_state_reusable(
+                    prompt_tokens,
+                    owner_history,
+                    plan.cached_prefix_len as usize,
+                ))
             || self.seat_conv_state_checkpoint(seq_id, prompt_tokens, plan.cached_prefix_len)?;
         if !conv_state_reusable {
             self.reset_scheduled_caches_for(seq_id);
@@ -2256,6 +2291,9 @@ impl PagedBackend for Lfm2Inner {
             || self.seat_conv_state_checkpoint(seq_id, plan, turn_plan.cached_prefix_len)?;
         if !reused_conv_state {
             self.caches = init_caches(&self.config);
+            if let Some(seq_id) = self.active_scheduled_seq {
+                self.scheduled_recurrent_survived.remove(&seq_id);
+            }
             self.cached_token_history.clear();
             self.cached_image_key = None;
         }

@@ -4,7 +4,7 @@ use crate::vision::qwen::prompt::{
     inject_image_placeholders,
 };
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
@@ -75,6 +75,7 @@ use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_policy::record_decode_wave;
 
 mod chat_backend;
 mod commands;

@@ -8,6 +8,9 @@ use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_policy::{
+    gather_kv_for_decode_with_fallback, warn_once_on_sync_fallback, write_kv_chunk,
+};
 use napi::bindgen_prelude::*;
 
 /// When enabled (opt-in; default OFF), cache-hit prefill (`cached_prefix_len > 0`,
@@ -44,44 +47,6 @@ fn paged_prefill_paged_attention_enabled() -> bool {
             false,
         )
     })
-}
-
-/// Report a graph-native paged path falling back to its synchronous host
-/// variant exactly once per call site per process.
-///
-/// The fallbacks below (`update_keys_values`, `gather_kv_for_decode`,
-/// `read_kv_range`) each force `eval_pending_pool_write_for_layer` plus a
-/// blocking Metal `wait_until_completed` — up to ~3 GPU pipeline drains per
-/// attention layer per token. They are required escape hatches for inputs
-/// the graph-native kernels cannot serve, but a persistent config edge
-/// (unsupported head size, dtype mismatch) would otherwise degrade every
-/// decode step invisibly. One bit per site in `WARNED_SITES` so a
-/// permanently-failing site cannot mute another's report.
-fn warn_once_on_sync_fallback(site: &'static str, layer_idx: u32, err: &str) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static WARNED_SITES: AtomicU32 = AtomicU32::new(0);
-    const SITES: &[&str] = &[
-        "kv_write",
-        "decode_gather",
-        "prefill_paged_attention",
-        "prefill_sdpa_gather",
-    ];
-    let Some(bit) = SITES.iter().position(|s| *s == site) else {
-        return;
-    };
-    let mask = 1u32 << bit;
-    if WARNED_SITES.fetch_or(mask, Ordering::Relaxed) & mask != 0 {
-        return;
-    }
-    tracing::warn!(
-        target: "mlx_core::inference",
-        event = "lfm2_paged_fallback",
-        site = site,
-        layer = layer_idx,
-        error = %err,
-        "graph-native paged path failed; synchronous fallback serializes \
-         this layer's attention on every step until the cause is resolved"
-    );
 }
 
 /// LFM2 multi-head attention with QK RMSNorm and RoPE.
@@ -318,29 +283,15 @@ impl Lfm2Attention {
         // back to the synchronous write if it is disabled or the native
         // kernel could not place the K/V (a failed native write leaves the
         // pool untouched, so the sync write below is not a double-write).
-        let native_written = native_kv_write_enabled()
-            && match adapter.update_keys_values_native(
-                attn_layer_idx,
-                &keys_paged,
-                &values_paged,
-                first_logical_position,
-            ) {
-                Ok(()) => true,
-                Err(err) => {
-                    warn_once_on_sync_fallback("kv_write", attn_layer_idx, &err);
-                    false
-                }
-            };
-        if !native_written {
-            adapter
-                .update_keys_values(
-                    attn_layer_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .map_err(napi::Error::from_reason)?;
-        }
+        write_kv_chunk(
+            adapter,
+            attn_layer_idx,
+            &keys_paged,
+            &values_paged,
+            first_logical_position,
+            "lfm2",
+        )
+        .map_err(napi::Error::from_reason)?;
 
         // 5. Compute attention output.
         let attn_bhtd = if is_prefill {
@@ -385,6 +336,7 @@ impl Lfm2Attention {
                     ) {
                         Err(err) => {
                             warn_once_on_sync_fallback(
+                                "lfm2",
                                 "prefill_paged_attention",
                                 attn_layer_idx,
                                 &err,
@@ -423,6 +375,7 @@ impl Lfm2Attention {
                             .gather_kv_for_prefill_sdpa(attn_layer_idx, total_ctx)
                             .or_else(|err| {
                                 warn_once_on_sync_fallback(
+                                    "lfm2",
                                     "prefill_sdpa_gather",
                                     attn_layer_idx,
                                     &err,
@@ -464,36 +417,15 @@ impl Lfm2Attention {
             // through graph dependencies — no per-layer host eval). Fall back
             // to the synchronous gather when it is disabled or unavailable for
             // these inputs (e.g. a query/cache dtype it cannot serve).
-            let attn_3d = if graph_decode_gather_enabled() {
-                match adapter.gather_kv_for_decode_graph(
-                    attn_layer_idx,
-                    &queries_3d,
-                    self.scale as f32,
-                    /* softcap */ 1.0,
-                ) {
-                    Ok(attn_3d) => attn_3d,
-                    Err(err) => {
-                        warn_once_on_sync_fallback("decode_gather", attn_layer_idx, &err);
-                        adapter
-                            .gather_kv_for_decode(
-                                attn_layer_idx,
-                                &queries_3d,
-                                self.scale as f32,
-                                /* softcap */ 1.0,
-                            )
-                            .map_err(napi::Error::from_reason)?
-                    }
-                }
-            } else {
-                adapter
-                    .gather_kv_for_decode(
-                        attn_layer_idx,
-                        &queries_3d,
-                        self.scale as f32,
-                        /* softcap */ 1.0,
-                    )
-                    .map_err(napi::Error::from_reason)?
-            };
+            let attn_3d = gather_kv_for_decode_with_fallback(
+                adapter,
+                attn_layer_idx,
+                &queries_3d,
+                self.scale as f32,
+                /* softcap */ 1.0,
+                "lfm2",
+            )
+            .map_err(napi::Error::from_reason)?;
             // Cast back to x's dtype so the residual stays homogeneous.
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;

@@ -355,7 +355,7 @@ mod tests {
     ) -> Vec<f32> {
         let gw = gate_w();
         // logits
-        let mut logits = vec![0.0f32; N_EXP];
+        let mut logits = [0.0f32; N_EXP];
         for e in 0..N_EXP {
             let mut s = 0.0;
             for c in 0..HIDDEN {

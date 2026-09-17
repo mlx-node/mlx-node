@@ -26,10 +26,10 @@ import type {
   Usage,
 } from '@earendil-works/pi-ai';
 import type { ChatStreamDelta, ChatStreamFinal, PerformanceMetrics, ToolCallResult } from '@mlx-node/lm';
+import { ToolCallTagBuffer } from '@mlx-node/lm';
 
 import { coerceErrorMessage } from './error-coercion.js';
 import { ReasoningTagBuffer } from './reasoning-tag-buffer.js';
-import { ToolCallTagBuffer } from './tool-call-buffer.js';
 
 /**
  * All-zero usage. Shared with the stream adapter's TurnEmitter-independent

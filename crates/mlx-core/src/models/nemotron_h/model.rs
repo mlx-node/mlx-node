@@ -4,7 +4,7 @@
 //! slots owned by the model thread; the speculative MTP head runs the engine's
 //! flat run_mtp_turn loop with a depth-1 drafter that owns its own KV.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +33,7 @@ use crate::nn::{Embedding, RMSNorm};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedTurnPlanReason, SeqId};
+use crate::transformer::paged_policy::record_decode_wave;
 
 use super::config::NemotronHConfig;
 use super::decoder_layer::{NemotronHDecoderLayer, NemotronHMixer};
@@ -1112,26 +1113,6 @@ impl NemotronHInner {
         }
     }
 
-    /// Roll back one recorded decode token per sequence, newest first, so an allocator
-    /// squeeze leaves the wave where it started. Blocks the successful records
-    /// allocated stay owned by their request — the retry writes into them.
-    fn unwind_recorded_decode_rows(&mut self, recorded: &[SeqId]) -> Result<()> {
-        for &recorded_seq in recorded.iter().rev() {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(
-                    "run_paged_decode_step_batched: paged adapter disappeared during rollback",
-                )
-            })?;
-            adapter
-                .activate_request(recorded_seq)
-                .map_err(Error::from_reason)?;
-            adapter
-                .rollback_last_tokens(1)
-                .map_err(Error::from_reason)?;
-        }
-        Ok(())
-    }
-
     /// Row-exact batched decode: N single-row decodes stacked into `[N, 1, vocab]`,
     /// bit-identical to N scalar decodes, committed ALL-OR-NOTHING.
     ///
@@ -1141,55 +1122,23 @@ impl NemotronHInner {
     /// non-invertible mamba state. Row-by-row instead lets the scheduler's
     /// blocked-wave retry re-feed a token a survivor already folded in.
     fn run_row_exact_decode_wave(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
-        // Pre-pass BEFORE any mutation: reject a duplicated sequence (two rows of one
-        // wave would record two tokens against one cursor) and resolve every row's
-        // write position while the cursors are still untouched.
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut positions = Vec::with_capacity(rows.len());
-        {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+        // Phase 1: dedup, snapshot positions, reserve every row's blocks
+        // all-or-nothing.
+        let positions = record_decode_wave(
+            self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
-            })?;
-            for &(seq_id, _) in rows {
-                if !seen.insert(seq_id) {
-                    return Err(Error::from_reason(format!(
-                        "run_paged_decode_step_batched received duplicate sequence {seq_id}"
-                    )));
-                }
-                let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "run_paged_decode_step_batched: unknown sequence {seq_id}"
-                    ))
-                })?;
-                positions.push(position);
-            }
-        }
-
-        // Phase 1: reserve every row's blocks, all or nothing.
-        let mut recorded: Vec<SeqId> = Vec::with_capacity(rows.len());
-        for &(seq_id, token_id) in rows {
-            if let Err(error) = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::from_reason("run_paged_decode_step_batched: paged adapter disappeared")
-                })?
-                .record_token_for(seq_id, token_id)
-            {
-                self.unwind_recorded_decode_rows(&recorded)?;
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched failed to record sequence {seq_id}: {error}"
-                )));
-            }
-            recorded.push(seq_id);
-        }
+            })?,
+            rows,
+            "nemotron_h",
+        )
+        .map_err(Error::from_reason)?;
 
         // Phase 2: per-row scalar forwards. `activate_paged_seq` re-points the adapter
         // at each row and swaps in that row's per-request caches.
         let mut logits = Vec::with_capacity(rows.len());
         for (index, &(seq_id, token_id)) in rows.iter().enumerate() {
             self.activate_paged_seq(seq_id)?;
-            logits.push(self.run_paged_decode_forward(token_id, positions[index])?);
+            logits.push(self.run_paged_decode_forward(token_id, positions[index].1)?);
         }
         MxArray::concatenate_many(logits.iter().collect(), Some(0))
     }
@@ -1217,42 +1166,14 @@ impl NemotronHInner {
             return self.run_row_exact_decode_wave(rows);
         }
         self.park_active_scheduled_caches();
-        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-            Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
-        })?;
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut planned_rows = Vec::with_capacity(rows.len());
-        for &(seq_id, _) in rows {
-            if !seen.insert(seq_id) {
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
-                )));
-            }
-            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
-                Error::from_reason(format!(
-                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
-                ))
-            })?;
-            planned_rows.push((seq_id, position));
-        }
-
-        let mut recorded = Vec::with_capacity(rows.len());
-        for &(seq_id, token_id) in rows {
-            if let Err(error) = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::from_reason("run_paged_decode_step_batched: paged adapter disappeared")
-                })?
-                .record_token_for(seq_id, token_id)
-            {
-                self.unwind_recorded_decode_rows(&recorded)?;
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched failed to record sequence {seq_id}: {error}"
-                )));
-            }
-            recorded.push(seq_id);
-        }
+        let planned_rows = record_decode_wave(
+            self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
+            })?,
+            rows,
+            "nemotron_h",
+        )
+        .map_err(Error::from_reason)?;
 
         let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();

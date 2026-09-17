@@ -13,10 +13,17 @@ use crate::models::paddleocr_vl::language::{
 };
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
-use crate::transformer::paged_flags::native_kv_write_enabled;
-use crate::transformer::paged_kv_cache_adapter::{
-    PagedAttentionV2Layout, PagedKVCacheAdapter, PagedPrefillMemorySnapshot, SeqId,
-    paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
+use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
+#[cfg(test)]
+use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_policy::{
+    LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes, estimate_varlen_paged_attention_bytes,
+    live_prefill_headroom, prefill_sdpa_effective_dtype,
+};
+#[cfg(test)]
+use crate::transformer::paged_policy::{
+    PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES, mlx_sdpa_uses_fused_kernel, select_live_prefill_headroom,
 };
 use napi::bindgen_prelude::*;
 
@@ -95,21 +102,6 @@ struct CacheHitPrefillPlan {
     live_headroom_bytes: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct LivePrefillHeadroom {
-    selected_bytes: Option<u64>,
-    allocator_available_bytes: Option<u64>,
-    metal_available_bytes: Option<u64>,
-    allocator_active_bytes: Option<u64>,
-    allocator_cached_bytes: Option<u64>,
-    allocator_limit_bytes: Option<u64>,
-    allocator_ceiling_bytes: Option<u64>,
-    metal_recommended_working_set_bytes: Option<u64>,
-    metal_current_allocated_bytes: Option<u64>,
-    paged_pool_allocated_bytes: Option<u64>,
-}
-
-const FAST_SDPA_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 const FAST_SDPA_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 static NATIVE_KV_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 static DECODE_GATHER_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -147,19 +139,6 @@ fn should_try_varlen_after_sdpa(mode: CacheHitPrefillMode, sdpa_constructed: boo
     !sdpa_constructed && mode != CacheHitPrefillMode::ForceSdpa
 }
 
-fn prefill_sdpa_effective_dtype(query: DType, cache: Option<DType>) -> Option<DType> {
-    let cache = cache?;
-    match (query, cache) {
-        (DType::Float16, DType::Float16) => Some(DType::Float16),
-        (DType::BFloat16, DType::BFloat16) => Some(DType::BFloat16),
-        (DType::Float32, DType::Float16 | DType::BFloat16 | DType::Float32)
-        | (DType::Float16 | DType::BFloat16, DType::Float32)
-        | (DType::Float16, DType::BFloat16)
-        | (DType::BFloat16, DType::Float16) => Some(DType::Float32),
-        _ => None,
-    }
-}
-
 fn d256_full_sdpa_available(effective_dtype_is_float32: bool) -> bool {
     static LOW_PRECISION_AVAILABLE: OnceLock<bool> = OnceLock::new();
     static FLOAT32_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -175,170 +154,6 @@ fn d256_full_sdpa_available(effective_dtype_is_float32: bool) -> bool {
         };
         status == 0 && supported
     })
-}
-
-fn mlx_sdpa_uses_fused_kernel(
-    query_tokens: u64,
-    num_query_heads: u64,
-    num_kv_heads: u64,
-    head_dim: u64,
-    d256_full_sdpa_available: bool,
-) -> bool {
-    if num_kv_heads == 0 || !num_query_heads.is_multiple_of(num_kv_heads) {
-        return false;
-    }
-    if query_tokens <= 8 {
-        let supported = matches!(head_dim, 64 | 96 | 128 | 256);
-        return supported && query_tokens.saturating_mul(num_query_heads / num_kv_heads) <= 32;
-    }
-    matches!(head_dim, 64 | 80 | 128)
-        || (head_dim == 256 && query_tokens >= 1_024 && d256_full_sdpa_available)
-}
-
-/// Conservative peak for gathering one paged layer into contiguous K/V and
-/// running MLX causal SDPA. The gather can transiently hold both the selected
-/// block tensors and their unpacked contiguous copies, hence four K/V-sized
-/// tensors. When MLX cannot use its fused kernel (including Qwen3.6-27B
-/// D=256 residual chunks below 1,024 tokens, non-NAX hosts, or an explicit
-/// rollback), include the materialized score matrix and fp32 output using the
-/// same shape gate as MLX's Metal dispatcher.
-fn estimate_paged_pool_sdpa_bytes(
-    query_tokens: u64,
-    total_context: u64,
-    num_query_heads: u64,
-    num_kv_heads: u64,
-    head_dim: u64,
-    dtype_bytes: u64,
-    d256_full_sdpa_available: bool,
-) -> u64 {
-    let one_kv = total_context
-        .saturating_mul(num_kv_heads)
-        .saturating_mul(head_dim)
-        .saturating_mul(dtype_bytes);
-    let one_query = query_tokens
-        .saturating_mul(num_query_heads)
-        .saturating_mul(head_dim)
-        .saturating_mul(dtype_bytes);
-    let gathered = one_kv
-        .saturating_mul(4)
-        .saturating_add(one_query.saturating_mul(2))
-        .saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES);
-    if mlx_sdpa_uses_fused_kernel(
-        query_tokens,
-        num_query_heads,
-        num_kv_heads,
-        head_dim,
-        d256_full_sdpa_available,
-    ) {
-        // The D=256 NAX kernel deliberately pads ragged sequence dimensions
-        // so every block can use its aligned pipeline. Those buffers coexist
-        // with the original gathered K/V and Q/output until the command
-        // encoder completes, so include them in the live-headroom estimate.
-        if head_dim == 256 {
-            let kv_padding = if total_context.is_multiple_of(32) {
-                0
-            } else {
-                total_context
-                    .div_ceil(32)
-                    .saturating_mul(32)
-                    .saturating_mul(num_kv_heads)
-                    .saturating_mul(head_dim)
-                    .saturating_mul(dtype_bytes)
-                    .saturating_mul(2)
-            };
-            let query_padding = if query_tokens.is_multiple_of(64) {
-                0
-            } else {
-                query_tokens
-                    .div_ceil(64)
-                    .saturating_mul(64)
-                    .saturating_mul(num_query_heads)
-                    .saturating_mul(head_dim)
-                    .saturating_mul(dtype_bytes)
-                    .saturating_mul(2)
-            };
-            return gathered
-                .saturating_add(kv_padding)
-                .saturating_add(query_padding);
-        }
-        return gathered;
-    }
-    let scores = num_query_heads
-        .saturating_mul(query_tokens)
-        .saturating_mul(total_context)
-        .saturating_mul(dtype_bytes);
-    let fp32_output = num_query_heads
-        .saturating_mul(query_tokens)
-        .saturating_mul(head_dim)
-        .saturating_mul(4);
-    gathered.saturating_add(scores).saturating_add(fp32_output)
-}
-
-/// Peak auxiliary storage used by the varlen paged kernel. Above one 512-token
-/// partition, V2 keeps per-query/head/partition softmax state and a partial
-/// head-sized output. For long multi-token chunks this can be larger than the
-/// contiguous K/V needed by fused SDPA. For unfused head_dim=256 SDPA it is
-/// still the O(L) safety path when the faster score-matrix route will not fit.
-fn estimate_varlen_paged_attention_bytes(
-    query_tokens: u64,
-    total_context: u64,
-    num_query_heads: u64,
-    num_kv_heads: u64,
-    head_dim: u64,
-    dtype_bytes: u64,
-) -> u64 {
-    let output = query_tokens
-        .saturating_mul(num_query_heads)
-        .saturating_mul(head_dim)
-        .saturating_mul(dtype_bytes);
-    if total_context <= 512 {
-        return output.saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES);
-    }
-    let Ok(query_tokens_u32) = u32::try_from(query_tokens) else {
-        return u64::MAX;
-    };
-    let Ok(total_context_u32) = u32::try_from(total_context) else {
-        return u64::MAX;
-    };
-    let Ok(num_query_heads_u32) = u32::try_from(num_query_heads) else {
-        return u64::MAX;
-    };
-    let Ok(num_kv_heads_u32) = u32::try_from(num_kv_heads) else {
-        return u64::MAX;
-    };
-    let Ok(head_dim_u32) = u32::try_from(head_dim) else {
-        return u64::MAX;
-    };
-    // Share the layout-aware conservative partition upper bound and
-    // signed-32-bit auxiliary-buffer guard with the runtime adapter.
-    if !paged_attention_v2_aux_fits(
-        PagedAttentionV2Layout::Varlen,
-        query_tokens_u32,
-        num_query_heads_u32,
-        num_kv_heads_u32,
-        total_context_u32,
-        head_dim_u32,
-    ) {
-        return u64::MAX;
-    }
-    let partitions = paged_attention_v2_partition_upper_bound(
-        PagedAttentionV2Layout::Varlen,
-        query_tokens_u32,
-        num_query_heads_u32,
-        num_kv_heads_u32,
-        total_context_u32,
-        head_dim_u32,
-    );
-    let rows = query_tokens
-        .saturating_mul(num_query_heads)
-        .saturating_mul(partitions);
-    let partial_output_elements = rows.saturating_mul(head_dim);
-    let softmax_state = rows.saturating_mul(2).saturating_mul(4);
-    let partial_output = partial_output_elements.saturating_mul(dtype_bytes);
-    output
-        .saturating_add(softmax_state)
-        .saturating_add(partial_output)
-        .saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES)
 }
 
 fn select_cache_hit_prefill_plan(
@@ -389,72 +204,6 @@ fn select_cache_hit_prefill_plan(
         estimated_sdpa_bytes,
         estimated_varlen_bytes,
         live_headroom_bytes,
-    }
-}
-
-/// Return the tightest live allocation allowance reported by Metal/MLX.
-///
-/// `MTLDevice.currentAllocatedSize` is process-local and includes the private
-/// paged-pool buffers that bypass MLX's allocator. MLX's active/cache counters
-/// distinguish live graph allocations from reclaimable cache, while its
-/// effective GC ceiling is bounded by 95% of Metal's recommended working set.
-/// Use the tighter of those independently useful allowances.
-fn select_live_prefill_headroom(
-    allocator_available_bytes: Option<u64>,
-    metal_available_bytes: Option<u64>,
-) -> Option<u64> {
-    match (allocator_available_bytes, metal_available_bytes) {
-        (Some(allocator), Some(metal)) => Some(allocator.min(metal)),
-        (Some(allocator), None) => Some(allocator),
-        (None, Some(metal)) => Some(metal),
-        (None, None) => None,
-    }
-}
-
-fn live_prefill_headroom(snapshot: PagedPrefillMemorySnapshot) -> LivePrefillHeadroom {
-    let allocator_ceiling_bytes = snapshot.allocator_limit_bytes.map(|limit| {
-        snapshot
-            .metal_recommended_working_set_bytes
-            .map(|recommended| limit.min(recommended.saturating_mul(95) / 100))
-            .unwrap_or(limit)
-    });
-    let mut allocator_available_bytes = allocator_ceiling_bytes
-        .zip(snapshot.allocator_active_bytes)
-        .map(|(ceiling, active)| ceiling.saturating_sub(active));
-
-    let metal_available_bytes = snapshot
-        .metal_recommended_working_set_bytes
-        .zip(snapshot.metal_current_allocated_bytes)
-        .map(|(recommended, current)| {
-            // MLX's cache is reclaimable at its GC threshold. Add back only
-            // bytes known to be part of the device's current allocation.
-            let reclaimable_cache = snapshot.allocator_cached_bytes.unwrap_or(0).min(current);
-            recommended.saturating_sub(current.saturating_sub(reclaimable_cache))
-        });
-
-    if metal_available_bytes.is_none() {
-        // A missing Metal snapshot should be rare once a paged adapter exists.
-        // Keep the allocator fallback conservative by subtracting the known
-        // external K/V pool that MLX active-memory accounting omits.
-        allocator_available_bytes = allocator_available_bytes.map(|available| {
-            available.saturating_sub(snapshot.paged_pool_allocated_bytes.unwrap_or(0))
-        });
-    }
-
-    LivePrefillHeadroom {
-        selected_bytes: select_live_prefill_headroom(
-            allocator_available_bytes,
-            metal_available_bytes,
-        ),
-        allocator_available_bytes,
-        metal_available_bytes,
-        allocator_active_bytes: snapshot.allocator_active_bytes,
-        allocator_cached_bytes: snapshot.allocator_cached_bytes,
-        allocator_limit_bytes: snapshot.allocator_limit_bytes,
-        allocator_ceiling_bytes,
-        metal_recommended_working_set_bytes: snapshot.metal_recommended_working_set_bytes,
-        metal_current_allocated_bytes: snapshot.metal_current_allocated_bytes,
-        paged_pool_allocated_bytes: snapshot.paged_pool_allocated_bytes,
     }
 }
 
@@ -1361,82 +1110,103 @@ impl Qwen3_5Attention {
                 self.head_dim as i64,
             ])?;
             let gather_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
-            let attn_3d = match adapter.gather_kv_for_decode_graph(
-                attn_layer_idx,
-                &queries_3d,
-                self.scale,
-                /* softcap */ 1.0,
-            ) {
-                Ok(attn_3d) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                             layer={} path=graph total_ctx={} elapsed_ms={:.1}",
-                            attn_layer_idx,
-                            adapter.current_token_count(),
-                            gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                        ));
-                    }
-                    if inference_debug_enabled {
-                        tracing::debug!(
-                            target: "mlx_core::inference",
-                            event = "paged_attention_gather_done",
-                            layer = attn_layer_idx,
-                            path = "graph",
-                            context_tokens = adapter.current_token_count(),
-                            elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                            "paged attention layer gather completed"
-                        );
-                    }
-                    attn_3d
+            let attn_3d = if !graph_decode_gather_enabled() {
+                let attn_3d = adapter
+                    .gather_kv_for_decode(
+                        attn_layer_idx,
+                        &queries_3d,
+                        self.scale,
+                        /* softcap */ 1.0,
+                    )
+                    .map_err(napi::Error::from_reason)?;
+                if trace_enabled {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-attn decode_gather_done \
+                         layer={} path=legacy total_ctx={} elapsed_ms={:.1}",
+                        attn_layer_idx,
+                        adapter.current_token_count(),
+                        gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                    ));
                 }
-                Err(err) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3.5-attn decode_gather_fallback \
-                             layer={} path=raw total_ctx={} error={}",
-                            attn_layer_idx,
-                            adapter.current_token_count(),
-                            err
-                        ));
-                    }
-                    if inference_info_enabled && attn_layer_idx == 0 {
-                        let context_tokens = adapter.current_token_count();
-                        let first_report =
-                            !DECODE_GATHER_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
-                        if first_report || context_tokens.is_multiple_of(32) {
-                            tracing::warn!(
+                attn_3d
+            } else {
+                match adapter.gather_kv_for_decode_graph(
+                    attn_layer_idx,
+                    &queries_3d,
+                    self.scale,
+                    /* softcap */ 1.0,
+                ) {
+                    Ok(attn_3d) => {
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] qwen3.5-attn decode_gather_done \
+                             layer={} path=graph total_ctx={} elapsed_ms={:.1}",
+                                attn_layer_idx,
+                                adapter.current_token_count(),
+                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                            ));
+                        }
+                        if inference_debug_enabled {
+                            tracing::debug!(
                                 target: "mlx_core::inference",
-                                event = "paged_attention_gather_fallback",
+                                event = "paged_attention_gather_done",
                                 layer = attn_layer_idx,
-                                context_tokens,
-                                failed_path = "graph",
-                                fallback_path = "raw",
-                                error = %err,
-                                "graph paged-attention gather failed; using raw gather"
+                                path = "graph",
+                                context_tokens = adapter.current_token_count(),
+                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                                "paged attention layer gather completed"
                             );
                         }
+                        attn_3d
                     }
-                    let attn_3d = adapter
-                        .gather_kv_for_decode(
-                            attn_layer_idx,
-                            &queries_3d,
-                            self.scale,
-                            /* softcap */ 1.0,
-                        )
-                        .map_err(napi::Error::from_reason)?;
-                    if inference_debug_enabled {
-                        tracing::debug!(
-                            target: "mlx_core::inference",
-                            event = "paged_attention_gather_done",
-                            layer = attn_layer_idx,
-                            path = "raw_fallback",
-                            context_tokens = adapter.current_token_count(),
-                            elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                            "paged attention layer gather completed"
-                        );
+                    Err(err) => {
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] qwen3.5-attn decode_gather_fallback \
+                             layer={} path=raw total_ctx={} error={}",
+                                attn_layer_idx,
+                                adapter.current_token_count(),
+                                err
+                            ));
+                        }
+                        if inference_info_enabled && attn_layer_idx == 0 {
+                            let context_tokens = adapter.current_token_count();
+                            let first_report =
+                                !DECODE_GATHER_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
+                            if first_report || context_tokens.is_multiple_of(32) {
+                                tracing::warn!(
+                                    target: "mlx_core::inference",
+                                    event = "paged_attention_gather_fallback",
+                                    layer = attn_layer_idx,
+                                    context_tokens,
+                                    failed_path = "graph",
+                                    fallback_path = "raw",
+                                    error = %err,
+                                    "graph paged-attention gather failed; using raw gather"
+                                );
+                            }
+                        }
+                        let attn_3d = adapter
+                            .gather_kv_for_decode(
+                                attn_layer_idx,
+                                &queries_3d,
+                                self.scale,
+                                /* softcap */ 1.0,
+                            )
+                            .map_err(napi::Error::from_reason)?;
+                        if inference_debug_enabled {
+                            tracing::debug!(
+                                target: "mlx_core::inference",
+                                event = "paged_attention_gather_done",
+                                layer = attn_layer_idx,
+                                path = "raw_fallback",
+                                context_tokens = adapter.current_token_count(),
+                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                                "paged attention layer gather completed"
+                            );
+                        }
+                        attn_3d
                     }
-                    attn_3d
                 }
             };
             let target_dtype = x.dtype()?;
@@ -1903,7 +1673,7 @@ mod tests {
         let padded_kv = 64_768_u64 * 4 * 256 * 2;
         assert_eq!(
             fused,
-            one_kv * 4 + one_query * 2 + FAST_SDPA_FIXED_OVERHEAD_BYTES + padded_kv * 2,
+            one_kv * 4 + one_query * 2 + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES + padded_kv * 2,
             "ragged K/V padding must remain in the fused peak estimate"
         );
 
@@ -1916,7 +1686,7 @@ mod tests {
             ragged_query,
             ragged_one_kv * 4
                 + ragged_one_query * 2
-                + FAST_SDPA_FIXED_OVERHEAD_BYTES
+                + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES
                 + ragged_padded_kv * 2
                 + ragged_padded_query * 2,
             "ragged Q and K/V padding must both remain in the fused peak estimate"

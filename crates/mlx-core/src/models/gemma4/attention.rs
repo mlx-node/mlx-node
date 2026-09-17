@@ -6,11 +6,16 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::nn::{Linear, RMSNorm, RoPE};
-use crate::transformer::paged_flags::native_kv_write_enabled;
+use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{
     DenseAttentionWindow, PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter,
-    PagedPrefillMemorySnapshot, PagedRaggedRow, SeqId, paged_attention_v2_aux_fits,
-    paged_attention_v2_partition_upper_bound,
+    PagedRaggedRow, SeqId,
+};
+#[cfg(test)]
+use crate::transformer::paged_policy::mlx_sdpa_uses_fused_kernel;
+use crate::transformer::paged_policy::{
+    LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes, estimate_varlen_paged_attention_bytes,
+    live_prefill_headroom, prefill_sdpa_effective_dtype,
 };
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -71,14 +76,6 @@ struct CacheHitPrefillPlan {
     live_headroom_bytes: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct LivePrefillHeadroom {
-    selected_bytes: Option<u64>,
-    allocator_available_bytes: Option<u64>,
-    metal_available_bytes: Option<u64>,
-}
-
-const PREFILL_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 const PREFILL_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 const DECODE_CONTEXT_BUCKET_TOKENS: u32 = 4 * 1024;
@@ -598,6 +595,7 @@ pub(crate) fn gemma4_paged_prefill_v2_layout_for_chunk(
                 num_kv_heads as u64,
                 head_dim as u64,
                 2,
+                false,
             );
             let estimated_varlen_bytes = estimate_varlen_paged_attention_bytes(
                 query_tokens as u64,
@@ -625,175 +623,6 @@ pub(crate) fn gemma4_paged_prefill_v2_layout_for_chunk(
                 CacheHitPrefillPath::PagedPoolSdpa | CacheHitPrefillPath::HostRead => None,
             }
         }
-    }
-}
-
-fn prefill_sdpa_effective_dtype(query: DType, cache: Option<DType>) -> Option<DType> {
-    let cache = cache?;
-    match (query, cache) {
-        (DType::Float16, DType::Float16) => Some(DType::Float16),
-        (DType::BFloat16, DType::BFloat16) => Some(DType::BFloat16),
-        (DType::Float32, DType::Float16 | DType::BFloat16 | DType::Float32)
-        | (DType::Float16 | DType::BFloat16, DType::Float32)
-        | (DType::Float16, DType::BFloat16)
-        | (DType::BFloat16, DType::Float16) => Some(DType::Float32),
-        _ => None,
-    }
-}
-
-fn mlx_sdpa_uses_fused_kernel(
-    query_tokens: u64,
-    num_query_heads: u64,
-    num_kv_heads: u64,
-    head_dim: u64,
-) -> bool {
-    if num_kv_heads == 0 || !num_query_heads.is_multiple_of(num_kv_heads) {
-        return false;
-    }
-    if query_tokens <= 8 {
-        let supported = matches!(head_dim, 64 | 96 | 128 | 256);
-        return supported && query_tokens.saturating_mul(num_query_heads / num_kv_heads) <= 32;
-    }
-    // The pinned MLX dispatcher has fused full-attention kernels for these
-    // widths. Gemma4's D=512 global attention deliberately stays on the
-    // conservative score-matrix estimate below.
-    matches!(head_dim, 64 | 80 | 128)
-}
-
-fn estimate_paged_pool_sdpa_bytes(
-    query_tokens: u64,
-    total_context: u64,
-    num_query_heads: u64,
-    num_kv_heads: u64,
-    head_dim: u64,
-    dtype_bytes: u64,
-) -> u64 {
-    let one_kv = total_context
-        .saturating_mul(num_kv_heads)
-        .saturating_mul(head_dim)
-        .saturating_mul(dtype_bytes);
-    let one_query = query_tokens
-        .saturating_mul(num_query_heads)
-        .saturating_mul(head_dim)
-        .saturating_mul(dtype_bytes);
-    let gathered = one_kv
-        .saturating_mul(4)
-        .saturating_add(one_query.saturating_mul(2))
-        .saturating_add(PREFILL_FIXED_OVERHEAD_BYTES);
-    if mlx_sdpa_uses_fused_kernel(query_tokens, num_query_heads, num_kv_heads, head_dim) {
-        return gathered;
-    }
-    let scores = num_query_heads
-        .saturating_mul(query_tokens)
-        .saturating_mul(total_context)
-        .saturating_mul(dtype_bytes);
-    let fp32_output = num_query_heads
-        .saturating_mul(query_tokens)
-        .saturating_mul(head_dim)
-        .saturating_mul(4);
-    gathered.saturating_add(scores).saturating_add(fp32_output)
-}
-
-fn estimate_varlen_paged_attention_bytes(
-    query_tokens: u64,
-    total_context: u64,
-    num_query_heads: u64,
-    num_kv_heads: u64,
-    head_dim: u64,
-    dtype_bytes: u64,
-) -> u64 {
-    let output = query_tokens
-        .saturating_mul(num_query_heads)
-        .saturating_mul(head_dim)
-        .saturating_mul(dtype_bytes);
-    if total_context <= 512 {
-        return output.saturating_add(PREFILL_FIXED_OVERHEAD_BYTES);
-    }
-    let Ok(query_tokens_u32) = u32::try_from(query_tokens) else {
-        return u64::MAX;
-    };
-    let Ok(total_context_u32) = u32::try_from(total_context) else {
-        return u64::MAX;
-    };
-    let Ok(num_query_heads_u32) = u32::try_from(num_query_heads) else {
-        return u64::MAX;
-    };
-    let Ok(num_kv_heads_u32) = u32::try_from(num_kv_heads) else {
-        return u64::MAX;
-    };
-    let Ok(head_dim_u32) = u32::try_from(head_dim) else {
-        return u64::MAX;
-    };
-    if !paged_attention_v2_aux_fits(
-        PagedAttentionV2Layout::Varlen,
-        query_tokens_u32,
-        num_query_heads_u32,
-        num_kv_heads_u32,
-        total_context_u32,
-        head_dim_u32,
-    ) {
-        return u64::MAX;
-    }
-    let partitions = paged_attention_v2_partition_upper_bound(
-        PagedAttentionV2Layout::Varlen,
-        query_tokens_u32,
-        num_query_heads_u32,
-        num_kv_heads_u32,
-        total_context_u32,
-        head_dim_u32,
-    );
-    let rows = query_tokens
-        .saturating_mul(num_query_heads)
-        .saturating_mul(partitions);
-    let partial_output = rows.saturating_mul(head_dim).saturating_mul(dtype_bytes);
-    let softmax_state = rows.saturating_mul(2).saturating_mul(4);
-    output
-        .saturating_add(partial_output)
-        .saturating_add(softmax_state)
-        .saturating_add(PREFILL_FIXED_OVERHEAD_BYTES)
-}
-
-fn select_live_prefill_headroom(
-    allocator_available_bytes: Option<u64>,
-    metal_available_bytes: Option<u64>,
-) -> Option<u64> {
-    match (allocator_available_bytes, metal_available_bytes) {
-        (Some(allocator), Some(metal)) => Some(allocator.min(metal)),
-        (Some(allocator), None) => Some(allocator),
-        (None, Some(metal)) => Some(metal),
-        (None, None) => None,
-    }
-}
-
-fn live_prefill_headroom(snapshot: PagedPrefillMemorySnapshot) -> LivePrefillHeadroom {
-    let allocator_ceiling_bytes = snapshot.allocator_limit_bytes.map(|limit| {
-        snapshot
-            .metal_recommended_working_set_bytes
-            .map(|recommended| limit.min(recommended.saturating_mul(95) / 100))
-            .unwrap_or(limit)
-    });
-    let mut allocator_available_bytes = allocator_ceiling_bytes
-        .zip(snapshot.allocator_active_bytes)
-        .map(|(ceiling, active)| ceiling.saturating_sub(active));
-    let metal_available_bytes = snapshot
-        .metal_recommended_working_set_bytes
-        .zip(snapshot.metal_current_allocated_bytes)
-        .map(|(recommended, current)| {
-            let reclaimable_cache = snapshot.allocator_cached_bytes.unwrap_or(0).min(current);
-            recommended.saturating_sub(current.saturating_sub(reclaimable_cache))
-        });
-    if metal_available_bytes.is_none() {
-        allocator_available_bytes = allocator_available_bytes.map(|available| {
-            available.saturating_sub(snapshot.paged_pool_allocated_bytes.unwrap_or(0))
-        });
-    }
-    LivePrefillHeadroom {
-        selected_bytes: select_live_prefill_headroom(
-            allocator_available_bytes,
-            metal_available_bytes,
-        ),
-        allocator_available_bytes,
-        metal_available_bytes,
     }
 }
 
@@ -1521,42 +1350,46 @@ impl Gemma4Attention {
         let paged_route_hint = paged_decode_route_hint(requested_paged_kernel);
         let mut graph_native_route = true;
         let mut raw_used_grouped_d512 = false;
-        let attn_3d = match adapter.gather_kv_for_decode_graph_with_plan(
-            paged_idx,
-            &queries_3d,
-            1.0,
-            1.0,
-            paged_route_hint,
-            requested_grouped_stripes.unwrap_or(0),
-        ) {
-            Ok(output) => output,
-            Err(err) => {
-                graph_native_route = false;
-                if adapter.should_report_decode_fallback(context_bucket_end) {
-                    tracing::warn!(
-                        target: "mlx_core::inference",
-                        event = "gemma4_paged_decode_fallback",
-                        layer = paged_idx,
-                        configured_mode,
-                        failed_path = "paged_attention_graph",
-                        stage = "graph_construction",
-                        context_bucket_end_tokens = context_bucket_end,
-                        physical_pool_authoritative = true,
-                        error = %err,
-                        "Gemma4 graph-native paged decode attention failed"
-                    );
+        let raw_route = |adapter: &mut PagedKVCacheAdapter| {
+            adapter
+                .gather_kv_for_decode_with_route(paged_idx, &queries_3d, 1.0, 1.0, paged_route_hint)
+                .map_err(napi::Error::from_reason)
+        };
+        let attn_3d = if !graph_decode_gather_enabled() {
+            graph_native_route = false;
+            let (output, used_grouped) = raw_route(adapter)?;
+            raw_used_grouped_d512 = used_grouped;
+            output
+        } else {
+            match adapter.gather_kv_for_decode_graph_with_plan(
+                paged_idx,
+                &queries_3d,
+                1.0,
+                1.0,
+                paged_route_hint,
+                requested_grouped_stripes.unwrap_or(0),
+            ) {
+                Ok(output) => output,
+                Err(err) => {
+                    graph_native_route = false;
+                    if adapter.should_report_decode_fallback(context_bucket_end) {
+                        tracing::warn!(
+                            target: "mlx_core::inference",
+                            event = "gemma4_paged_decode_fallback",
+                            layer = paged_idx,
+                            configured_mode,
+                            failed_path = "paged_attention_graph",
+                            stage = "graph_construction",
+                            context_bucket_end_tokens = context_bucket_end,
+                            physical_pool_authoritative = true,
+                            error = %err,
+                            "Gemma4 graph-native paged decode attention failed"
+                        );
+                    }
+                    let (output, used_grouped) = raw_route(adapter)?;
+                    raw_used_grouped_d512 = used_grouped;
+                    output
                 }
-                let (output, used_grouped) = adapter
-                    .gather_kv_for_decode_with_route(
-                        paged_idx,
-                        &queries_3d,
-                        1.0,
-                        1.0,
-                        paged_route_hint,
-                    )
-                    .map_err(napi::Error::from_reason)?;
-                raw_used_grouped_d512 = used_grouped;
-                output
             }
         };
         let effective_paged_reason = if sdpa_fell_back {
@@ -1695,6 +1528,7 @@ impl Gemma4Attention {
             self.num_kv_heads as u64,
             self.head_dim as u64,
             dtype_bytes,
+            false,
         )
         // A windowed group's dense route now also materializes a
         // `[1, 1, seq_len, total_ctx]` bool keep-mask. Charge it to the SDPA
@@ -3049,10 +2883,11 @@ mod tests {
                 2048,
                 query_heads,
                 kv_heads,
-                512
+                512,
+                false
             ));
             assert_eq!(
-                estimate_paged_pool_sdpa_bytes(2048, 4478, query_heads, kv_heads, 512, 2),
+                estimate_paged_pool_sdpa_bytes(2048, 4478, query_heads, kv_heads, 512, 2, false),
                 expected_sdpa
             );
             assert_eq!(
@@ -3060,7 +2895,7 @@ mod tests {
                 expected_varlen
             );
         }
-        let sdpa = estimate_paged_pool_sdpa_bytes(2048, 4478, 16, 1, 512, 2);
+        let sdpa = estimate_paged_pool_sdpa_bytes(2048, 4478, 16, 1, 512, 2, false);
         let varlen = estimate_varlen_paged_attention_bytes(2048, 4478, 16, 1, 512, 2);
         assert_eq!(sdpa, 513_138_688);
         assert_eq!(varlen, 405_012_480);

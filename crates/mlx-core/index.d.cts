@@ -3235,7 +3235,10 @@ export interface ColdSidecarStats {
  * Contains pre-parsed tool calls, thinking, and clean text.
  */
 export interface CompletionInfo {
-  /** Clean text with <tool_call> and <think> tags removed */
+  /**
+   * Clean text with tool-call markup (`<tool_call>` and the LFM2
+   * `<|tool_call_start|>…<|tool_call_end|>` pair) and <think> tags removed
+   */
   text: string;
   /** Raw output before tag stripping (for debugging/XML parsing) */
   rawText: string;
@@ -5741,7 +5744,9 @@ export interface ToolCallResult {
   /** Error message if status != "ok" */
   error?: string;
   /**
-   * Raw content from <tool_call> tag (preserved for debugging/persistence)
+   * Raw content from the tool-call markup (preserved for debugging/persistence):
+   * the `<tool_call>…</tool_call>` block, or for LFM2 the whole
+   * `<|tool_call_start|>…<|tool_call_end|>` sentinel block.
    * Defaults to empty string for backward compatibility with older JSON
    */
   rawContent: string;

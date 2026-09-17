@@ -487,50 +487,15 @@ impl Qwen35MoeInner {
         self.park_active_scheduled_recurrent()?;
         self.validate_scheduled_decode_residency(rows)?;
 
-        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-            Error::from_reason("Qwen3.5 MoE batched decode requires a paged adapter")
-        })?;
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut planned_rows = Vec::with_capacity(rows.len());
-        for &(seq_id, _) in rows {
-            if !seen.insert(seq_id) {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 MoE batched decode received duplicate sequence {seq_id}"
-                )));
-            }
-            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
-                Error::from_reason(format!(
-                    "Qwen3.5 MoE batched decode received unknown sequence {seq_id}"
-                ))
-            })?;
-            planned_rows.push((seq_id, position));
-        }
         let recurrent_snapshots = self.scheduled_decode_recurrent_snapshots(rows)?;
-
-        let mut recorded = Vec::with_capacity(rows.len());
-        for &(seq_id, token_id) in rows {
-            if let Err(error) = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Qwen3.5 MoE paged adapter disappeared"))?
-                .record_token_for(seq_id, token_id)
-            {
-                for &recorded_seq in recorded.iter().rev() {
-                    if let Some(adapter) = self.paged_adapter.as_mut() {
-                        adapter
-                            .activate_request(recorded_seq)
-                            .map_err(Error::from_reason)?;
-                        adapter
-                            .rollback_last_tokens(1)
-                            .map_err(Error::from_reason)?;
-                    }
-                }
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 MoE batched decode failed to record sequence {seq_id}: {error}"
-                )));
-            }
-            recorded.push(seq_id);
-        }
+        let planned_rows = record_decode_wave(
+            self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 MoE batched decode requires a paged adapter")
+            })?,
+            rows,
+            "qwen3_5_moe",
+        )
+        .map_err(Error::from_reason)?;
 
         let result = (|| {
             let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
@@ -584,10 +549,15 @@ impl Qwen35MoeInner {
             }
         })();
         if result.is_err() {
-            for &recorded_seq in recorded.iter().rev() {
-                if let Some(adapter) = self.paged_adapter.as_mut()
-                    && adapter.activate_request(recorded_seq).is_ok()
-                {
+            // `record_decode_wave` committed every row (or the call already
+            // returned), so the recorded set is the wave itself.
+            for &(recorded_seq, _) in rows.iter().rev() {
+                let Some(adapter) = self.paged_adapter.as_mut() else {
+                    return Err(Error::from_reason(
+                        "Qwen3.5-MoE paged adapter disappeared while rolling back a failed batched decode",
+                    ));
+                };
+                if adapter.activate_request(recorded_seq).is_ok() {
                     let _ = adapter.rollback_last_tokens(1);
                 }
             }

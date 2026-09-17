@@ -645,60 +645,19 @@ impl Qwen35Inner {
         self.park_active_scheduled_recurrent()?;
         self.validate_scheduled_decode_residency(rows)?;
 
-        let adapter = self
-            .paged_adapter
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 batched decode requires a paged adapter"))?;
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut planned_rows = Vec::with_capacity(rows.len());
-        for &(seq_id, _) in rows {
-            if !seen.insert(seq_id) {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 batched decode received duplicate sequence {seq_id}"
-                )));
-            }
-            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
-                Error::from_reason(format!(
-                    "Qwen3.5 batched decode received unknown sequence {seq_id}"
-                ))
-            })?;
-            planned_rows.push((seq_id, position));
-        }
         // The table is a residency cache, not the current batch. It may also
         // contain warm completed rows or a newly admitted prefill row. Only
         // the rows selected for this decode must be present and materialized;
         // stack_rows below reads exactly this filtered set.
         let recurrent_snapshots = self.scheduled_decode_recurrent_snapshots(rows)?;
-
-        let mut recorded = Vec::with_capacity(rows.len());
-        for &(seq_id, token_id) in rows {
-            let record_result = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::from_reason("Qwen3.5 paged adapter disappeared before token recording")
-                })?
-                .record_token_for(seq_id, token_id);
-            if let Err(error) = record_result {
-                for &recorded_seq in recorded.iter().rev() {
-                    let Some(adapter) = self.paged_adapter.as_mut() else {
-                        return Err(Error::from_reason(format!(
-                            "Qwen3.5 paged adapter disappeared while rolling back a failed token record for sequence {seq_id}: {error}"
-                        )));
-                    };
-                    adapter
-                        .activate_request(recorded_seq)
-                        .map_err(Error::from_reason)?;
-                    adapter
-                        .rollback_last_tokens(1)
-                        .map_err(Error::from_reason)?;
-                }
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 batched decode failed to record sequence {seq_id}: {error}"
-                )));
-            }
-            recorded.push(seq_id);
-        }
+        let planned_rows = record_decode_wave(
+            self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 batched decode requires a paged adapter")
+            })?,
+            rows,
+            "qwen3_5",
+        )
+        .map_err(Error::from_reason)?;
 
         let result = (|| {
             let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
@@ -742,7 +701,9 @@ impl Qwen35Inner {
             }
         })();
         if result.is_err() {
-            for &recorded_seq in recorded.iter().rev() {
+            // `record_decode_wave` committed every row (or the call already
+            // returned), so the recorded set is the wave itself.
+            for &(recorded_seq, _) in rows.iter().rev() {
                 let Some(adapter) = self.paged_adapter.as_mut() else {
                     return Err(Error::from_reason(
                         "Qwen3.5 paged adapter disappeared while rolling back a failed batched decode",

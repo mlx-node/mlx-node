@@ -7,7 +7,7 @@ use crate::nn::RMSNorm;
 use crate::transformer::attention::Attention;
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
-use crate::transformer::paged_flags::native_kv_write_enabled;
+use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -454,7 +454,7 @@ impl TransformerBlock {
             let scale = self.self_attn.get_scale();
 
             let gather_trace_start = trace_enabled.then(Instant::now);
-            let attn_3d = if write_path == "native" {
+            let attn_3d = if write_path == "native" && graph_decode_gather_enabled() {
                 match adapter.gather_kv_for_decode_graph(
                     layer_idx,
                     &qkv.queries,

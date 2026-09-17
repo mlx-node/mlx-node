@@ -1,6 +1,5 @@
+import { ToolCallTagBuffer } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
-
-import { ToolCallTagBuffer } from '../src/provider/tool-call-buffer.js';
 
 describe('ToolCallTagBuffer', () => {
   it('passes plain text through unchanged', () => {
@@ -116,8 +115,8 @@ describe('ToolCallTagBuffer', () => {
     expect(buffer.flush()).toBe('');
   });
 
-  // LFM2 cases mirror __test__/server/tool-call-buffer.test.ts — the two
-  // ToolCallTagBuffer copies must behave identically.
+  // LFM2 cases mirror __test__/server/tool-call-buffer.test.ts — both
+  // exercise the shared ToolCallTagBuffer (now in @mlx-node/lm).
   it('suppresses LFM2 sentinel-wrapped calls and releases post-call prose', () => {
     const buffer = new ToolCallTagBuffer();
 

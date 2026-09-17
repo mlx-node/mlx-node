@@ -1,7 +1,7 @@
+import { ToolCallTagBuffer } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { recoverSuppressedToolCallText } from '../../packages/server/src/mappers/anthropic-response.js';
-import { ToolCallTagBuffer } from '../../packages/server/src/tool-call-buffer.js';
 
 describe('ToolCallTagBuffer', () => {
   it('suppresses Gemma4 structural tool-call tags split across chunks', () => {

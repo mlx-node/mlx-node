@@ -5,6 +5,7 @@ use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Activations, RoPE};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_policy::{gather_kv_for_decode_with_fallback, write_kv_chunk};
 use napi::bindgen_prelude::*;
 
 use super::config::{LayerKind, MuseGlimmerTextConfig};
@@ -200,17 +201,15 @@ impl MuseGlimmerAttention {
             self.num_kv_heads,
             self.head_dim,
         ])?;
-        if let Err(error) =
-            adapter.update_keys_values_native(paged_idx, &k_paged, &v_paged, first_logical_position)
-        {
-            adapter
-                .update_keys_values(paged_idx, &k_paged, &v_paged, first_logical_position)
-                .map_err(|fallback| {
-                    Error::from_reason(format!(
-                        "Muse-Glimmer paged K/V write failed: {error}; fallback failed: {fallback}"
-                    ))
-                })?;
-        }
+        write_kv_chunk(
+            adapter,
+            paged_idx,
+            &k_paged,
+            &v_paged,
+            first_logical_position,
+            "muse_glimmer",
+        )
+        .map_err(Error::from_reason)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let attended = if is_prefill {
@@ -265,15 +264,17 @@ impl MuseGlimmerAttention {
                 ));
             }
             let query = q.squeeze(Some(&[2]))?;
-            adapter
-                .gather_kv_for_decode_graph(paged_idx, &query, scale as f32, 1.0)
-                .or_else(|_| {
-                    adapter
-                        .gather_kv_for_decode(paged_idx, &query, scale as f32, 1.0)
-                        .map_err(Error::from_reason)
-                })?
-                .astype(x.dtype()?)?
-                .reshape(&[1, self.num_heads, 1, self.head_dim])?
+            gather_kv_for_decode_with_fallback(
+                adapter,
+                paged_idx,
+                &query,
+                scale as f32,
+                1.0,
+                "muse_glimmer",
+            )
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?
+            .reshape(&[1, self.num_heads, 1, self.head_dim])?
         };
         let attended = attended.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
             1,
@@ -364,6 +365,17 @@ impl MuseGlimmerAttention {
         let q = q.squeeze(Some(&[2]))?;
         let k = k.squeeze(Some(&[2]))?;
         let v = v.squeeze(Some(&[2]))?;
+        // Same contract as every other family's batched decode: no legacy
+        // fallback exists for the [N,1] multi-row path, so disabling either
+        // fast path refuses continuous batching rather than silently
+        // diverging from the flags' documented kill-switch semantics.
+        if !crate::transformer::paged_flags::native_kv_write_enabled()
+            || !crate::transformer::paged_flags::graph_decode_gather_enabled()
+        {
+            return Err(Error::from_reason(
+                "muse-glimmer batched decode requires MLX_PAGED_NATIVE_KV_WRITE=1 and MLX_PAGED_GRAPH_DECODE_GATHER=1",
+            ));
+        }
         adapter
             .update_keys_values_native_batched(paged_idx, &k, &v, rows)
             .map_err(Error::from_reason)?;
@@ -470,6 +482,13 @@ impl MuseGlimmerAttention {
         let q = q.squeeze(Some(&[2]))?;
         let k = k.squeeze(Some(&[2]))?;
         let v = v.squeeze(Some(&[2]))?;
+        if !crate::transformer::paged_flags::native_kv_write_enabled()
+            || !crate::transformer::paged_flags::graph_decode_gather_enabled()
+        {
+            return Err(Error::from_reason(
+                "muse-glimmer ragged decode requires MLX_PAGED_NATIVE_KV_WRITE=1 and MLX_PAGED_GRAPH_DECODE_GATHER=1",
+            ));
+        }
         adapter
             .update_keys_values_native_ragged(paged_idx, &k, &v, rows)
             .map_err(Error::from_reason)?;

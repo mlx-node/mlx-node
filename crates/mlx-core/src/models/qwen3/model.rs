@@ -41,6 +41,7 @@ use crate::transformer::paged_kv_cache_adapter::{
     PagedKVCacheAdapter, PagedRaggedRow, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission,
     SeqId,
 };
+use crate::transformer::paged_policy::{record_decode_wave, unwind_recorded_rows};
 use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
@@ -1741,58 +1742,14 @@ impl Qwen3Inner {
                 "run_paged_decode_step_batched requires at least one row",
             ));
         }
-        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-            Error::from_reason("run_paged_decode_step_batched: paged_adapter is None")
-        })?;
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut planned_rows = Vec::with_capacity(rows.len());
-        for &(seq_id, _) in rows {
-            if !seen.insert(seq_id) {
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
-                )));
-            }
-            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
-                Error::from_reason(format!(
-                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
-                ))
-            })?;
-            planned_rows.push((seq_id, position));
-        }
-
-        let mut recorded: Vec<SeqId> = Vec::with_capacity(rows.len());
-        for &(seq_id, token) in rows {
-            let result = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::from_reason("run_paged_decode_step_batched: paged adapter disappeared")
-                })?
-                .record_token_for(seq_id, token);
-            if let Err(error) = result {
-                for &recorded_seq in recorded.iter().rev() {
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_decode_step_batched: paged adapter disappeared during rollback",
-                        )
-                    })?;
-                    adapter.activate_request(recorded_seq).map_err(|rollback| {
-                        Error::from_reason(format!(
-                            "run_paged_decode_step_batched: record failed for sequence {seq_id}: {error}; rollback activation for sequence {recorded_seq} also failed: {rollback}"
-                        ))
-                    })?;
-                    adapter.rollback_last_tokens(1).map_err(|rollback| {
-                        Error::from_reason(format!(
-                            "run_paged_decode_step_batched: record failed for sequence {seq_id}: {error}; rollback for sequence {recorded_seq} also failed: {rollback}"
-                        ))
-                    })?;
-                }
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched: failed to record sequence {seq_id}: {error}"
-                )));
-            }
-            recorded.push(seq_id);
-        }
+        let planned_rows = record_decode_wave(
+            self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged_adapter is None")
+            })?,
+            rows,
+            "qwen3",
+        )
+        .map_err(Error::from_reason)?;
 
         let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
@@ -1881,28 +1838,23 @@ impl Qwen3Inner {
                 })?
                 .record_tokens_for(*seq_id, tokens);
             if let Err(error) = result {
-                for &recorded_index in recorded.iter().rev() {
-                    let recorded_row = planned_rows[recorded_index];
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_ragged_step: paged adapter disappeared during rollback",
-                        )
-                    })?;
-                    adapter.activate_request(recorded_row.seq_id).map_err(|rollback| {
-                        Error::from_reason(format!(
-                            "run_paged_ragged_step: record failed for sequence {seq_id}: {error}; rollback activation for sequence {} also failed: {rollback}",
-                            recorded_row.seq_id
-                        ))
-                    })?;
-                    adapter
-                        .rollback_last_tokens(recorded_row.query_len)
-                        .map_err(|rollback| {
-                            Error::from_reason(format!(
-                                "run_paged_ragged_step: record failed for sequence {seq_id}: {error}; rollback for sequence {} also failed: {rollback}",
-                                recorded_row.seq_id
-                            ))
-                        })?;
-                }
+                let recorded_rows: Vec<(SeqId, u32)> = recorded
+                    .iter()
+                    .map(|&index| {
+                        let row = planned_rows[index];
+                        (row.seq_id, row.query_len)
+                    })
+                    .collect();
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "run_paged_ragged_step: paged adapter disappeared during rollback",
+                    )
+                })?;
+                unwind_recorded_rows(adapter, &recorded_rows).map_err(|rollback| {
+                    Error::from_reason(format!(
+                        "run_paged_ragged_step: failed to record sequence {seq_id}: {error}; {rollback}"
+                    ))
+                })?;
                 return Err(Error::from_reason(format!(
                     "run_paged_ragged_step: failed to record sequence {seq_id}: {error}"
                 )));

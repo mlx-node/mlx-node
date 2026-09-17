@@ -15,6 +15,7 @@ use crate::nn::Linear;
 use crate::transformer::KVCache;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_policy::{gather_kv_for_decode_with_fallback, write_kv_chunk};
 use napi::bindgen_prelude::*;
 
 use super::config::NemotronHConfig;
@@ -187,25 +188,15 @@ impl NemotronHAttention {
         // f32 one (unit-test fixtures) is accepted.
         let keys_paged = keys_paged.astype(PAGED_KV_IO_DTYPE)?;
         let values_paged = values_paged.astype(PAGED_KV_IO_DTYPE)?;
-        let native_written = native_kv_write_enabled()
-            && adapter
-                .update_keys_values_native(
-                    attn_layer_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .is_ok();
-        if !native_written {
-            adapter
-                .update_keys_values(
-                    attn_layer_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .map_err(napi::Error::from_reason)?;
-        }
+        write_kv_chunk(
+            adapter,
+            attn_layer_idx,
+            &keys_paged,
+            &values_paged,
+            first_logical_position,
+            "nemotron_h",
+        )
+        .map_err(napi::Error::from_reason)?;
 
         let attn_bhtd = if is_prefill {
             if cached_prefix_len == 0 {
@@ -278,33 +269,15 @@ impl NemotronHAttention {
                 .squeeze(Some(&[2]))?
                 .reshape(&[1, self.num_heads as i64, self.head_dim as i64])?
                 .astype(PAGED_KV_IO_DTYPE)?;
-            let attn_3d = if graph_decode_gather_enabled() {
-                match adapter.gather_kv_for_decode_graph(
-                    attn_layer_idx,
-                    &queries_3d,
-                    self.scale as f32,
-                    /* softcap */ 1.0,
-                ) {
-                    Ok(attn_3d) => attn_3d,
-                    Err(_) => adapter
-                        .gather_kv_for_decode(
-                            attn_layer_idx,
-                            &queries_3d,
-                            self.scale as f32,
-                            /* softcap */ 1.0,
-                        )
-                        .map_err(napi::Error::from_reason)?,
-                }
-            } else {
-                adapter
-                    .gather_kv_for_decode(
-                        attn_layer_idx,
-                        &queries_3d,
-                        self.scale as f32,
-                        /* softcap */ 1.0,
-                    )
-                    .map_err(napi::Error::from_reason)?
-            };
+            let attn_3d = gather_kv_for_decode_with_fallback(
+                adapter,
+                attn_layer_idx,
+                &queries_3d,
+                self.scale as f32,
+                /* softcap */ 1.0,
+                "nemotron_h",
+            )
+            .map_err(napi::Error::from_reason)?;
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;
             attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
