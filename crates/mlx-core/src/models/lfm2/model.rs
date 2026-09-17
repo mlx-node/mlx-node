@@ -48,6 +48,25 @@ fn last_token_slice_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
 }
 
+/// Whether a multi-row decode wave runs one fused `[N,1,H]` forward.
+///
+/// Default OFF: a fused wave's M=N GEMMs tile differently than the M=1 graph
+/// the serial lane runs per request, so rows pick up a few bf16 ULP per layer
+/// that the carried ShortConv state then amplifies into occasional greedy
+/// near-tie flips — `lfm2_concurrent_batched_parity` (which asserts
+/// token-identity against the serial oracle) flakes on roughly every other
+/// run. The default row-exact wave replays each row through that same N=1
+/// graph inside the shared scheduler step, trading the fused weight stream
+/// for bit-identical output — the same tradeoff `nemotron_h` makes for its
+/// quantized checkpoints. `MLX_LFM2_FUSED_BATCH_DECODE=1` opts back into the
+/// fused path for A/B benchmarking.
+fn lfm2_fused_batch_decode_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_FUSED_BATCH_DECODE", false)
+    })
+}
+
 /// Deepest full block a future identical prompt can restore while still
 /// recomputing its final prompt token to produce logits.
 fn lfm2_cold_restore_boundary(prompt_tokens: u32, block_size: u32) -> u32 {
@@ -143,6 +162,17 @@ pub(crate) struct Lfm2Inner {
     /// scheduler sequence (`0` for the whole-turn path). The SSD writer picks
     /// the deepest checkpoint its K/V chain has actually reached.
     conv_cold_checkpoints: HashMap<SeqId, VecDeque<Lfm2ConvColdCheckpoint>>,
+    /// Content-keyed conv-state pool that survives per-sequence release:
+    /// every snapshot `remember_conv_cold_checkpoint_for` captures is also
+    /// published here so a FOREIGN paged prefix hit (another session's
+    /// blocks, or this session's own after release) can seat conv state
+    /// directly instead of paying `run_conv_only_prefill`'s full-model
+    /// replay. Same correctness invariant as [`conv_state_reusable`]: conv
+    /// state is a pure function of the token prefix, so a seat is only
+    /// honored when the checkpoint's recorded tokens match
+    /// `tokens[..boundary]` byte-for-byte — the producer's identity is
+    /// irrelevant. Bounded by [`CONV_STATE_POOL_CAP`].
+    conv_state_pool: VecDeque<Lfm2ConvColdCheckpoint>,
     /// Deepest boundary from the current PROMPT that a future request can
     /// actually name. Decode extends the K/V chain past the prompt; allowing
     /// those generated-token checkpoints to win would persist a sidecar no
@@ -156,6 +186,11 @@ struct Lfm2ConvColdCheckpoint {
     tokens: Vec<u32>,
     states: Vec<MxArray>,
 }
+
+/// Global bound on [`Lfm2Inner::conv_state_pool`]. Each entry holds one
+/// `[1, conv_L_cache - 1, hidden_size]` handle per conv layer (≈147KB on
+/// lfm2.5-8b-a1b, less on dense 1.2b), so 64 entries stay under ~10MB.
+const CONV_STATE_POOL_CAP: usize = 64;
 
 /// Decide whether `self.caches`'s conv-layer state ALREADY reflects the
 /// token prefix `plan[..cached_prefix_len]` byte-for-byte, so
@@ -254,12 +289,12 @@ impl Lfm2Inner {
         // (greedy byte-equal + prefix-reuse byte-equal at BF16 against
         // real LFM2.5-1.2B weights). Callers can opt out with
         // `use_block_paged_cache: Some(false)`.
-        // The block-paged KV cache and its compiled decode path rely on
-        // Metal-only kernels; on a non-Metal backend (the CUDA/Linux build) the
-        // paged writes/gathers hit throwing stubs. Force flat eager there by
-        // never building the adapter, mirroring how Qwen3.5 gates its compiled
-        // paths. macOS is unaffected — the backend probe is always true, so the
-        // `unwrap_or(true)` default still wins.
+        // The block-paged KV cache relies on Metal-only paged-attention
+        // kernels; on a non-Metal backend (the CUDA/Linux build) the paged
+        // writes/gathers hit throwing stubs. Force flat eager there by never
+        // building the adapter, mirroring how Qwen3.5 gates its Metal-only
+        // paths. macOS is unaffected — the backend probe is always true, so
+        // the `unwrap_or(true)` default still wins.
         let want_paged = config.use_block_paged_cache.unwrap_or(true)
             && crate::engine::persistence::compiled_forward_backend_available();
         let paged_adapter = if want_paged {
@@ -350,6 +385,7 @@ impl Lfm2Inner {
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             last_paged_prefill_reused_conv_state: false,
             conv_cold_checkpoints: HashMap::new(),
+            conv_state_pool: VecDeque::new(),
             conv_cold_capture_boundaries: HashMap::new(),
         })
     }
@@ -538,15 +574,83 @@ impl Lfm2Inner {
         checkpoints.push_back(Lfm2ConvColdCheckpoint {
             boundary,
             tokens: tokens.to_vec(),
-            states,
+            states: states.clone(),
         });
         while checkpoints.len() > 16 {
             checkpoints.pop_front();
+        }
+        // Publish into the content-keyed pool so foreign prefix hits can
+        // seat this state even after the producing sequence releases.
+        if !self
+            .conv_state_pool
+            .iter()
+            .any(|entry| entry.boundary == boundary && entry.tokens.as_slice() == tokens)
+        {
+            self.conv_state_pool.push_back(Lfm2ConvColdCheckpoint {
+                boundary,
+                tokens: tokens.to_vec(),
+                states,
+            });
+            while self.conv_state_pool.len() > CONV_STATE_POOL_CAP {
+                self.conv_state_pool.pop_front();
+            }
         }
     }
 
     fn remember_conv_cold_checkpoint(&mut self) {
         self.remember_conv_cold_checkpoint_for(self.active_scheduled_seq.unwrap_or(0));
+    }
+
+    /// Seat conv-layer state from the content-keyed [`Self::conv_state_pool`]
+    /// when the paged prefix hit lands exactly on a captured boundary.
+    ///
+    /// A seat is honored only when `checkpoint.boundary == cached_prefix_len`
+    /// AND `checkpoint.tokens == tokens[..boundary]` byte-for-byte — conv
+    /// state is a pure function of the prefix, so a full token match makes
+    /// the snapshot equivalent to the state `run_conv_only_prefill` would
+    /// have rebuilt, regardless of which sequence produced it. Returns
+    /// `true` when state was installed (same cache routing as
+    /// [`Self::install_lfm2_conv_cold_sidecar`]).
+    fn seat_conv_state_checkpoint(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+    ) -> Result<bool> {
+        if cached_prefix_len == 0 || tokens.len() < cached_prefix_len as usize {
+            return Ok(false);
+        }
+        let prefix = &tokens[..cached_prefix_len as usize];
+        let Some(checkpoint) = self
+            .conv_state_pool
+            .iter()
+            .find(|entry| entry.boundary == cached_prefix_len && entry.tokens.as_slice() == prefix)
+        else {
+            return Ok(false);
+        };
+        let conv_layers = conv_sidecar::conv_layers(&self.config);
+        if conv_layers.len() != checkpoint.states.len() {
+            return Ok(false);
+        }
+        let mut caches = init_caches(&self.config);
+        for (ordinal, layer) in conv_layers.into_iter().enumerate() {
+            let Some(cache) = caches
+                .get_mut(layer)
+                .and_then(Lfm2LayerCache::as_conv_cache_mut)
+            else {
+                return Ok(false);
+            };
+            cache.set(0, checkpoint.states[ordinal].clone())?;
+        }
+        if seq_id == 0 || self.active_scheduled_seq == Some(seq_id) {
+            self.caches = caches;
+            // The seat makes `self.caches` provably reflect `prefix`; keep
+            // the warm-continuation oracle honest for the next prime.
+            self.cached_token_history = prefix.to_vec();
+        } else {
+            self.scheduled_caches.insert(seq_id, caches);
+        }
+        Ok(true)
     }
 
     fn install_lfm2_conv_cold_sidecar(
@@ -799,6 +903,7 @@ impl Lfm2Inner {
         self.scheduled_caches.clear();
         self.active_scheduled_seq = None;
         self.conv_cold_checkpoints.clear();
+        self.conv_state_pool.clear();
         self.conv_cold_capture_boundaries.clear();
         self.cached_token_history.clear();
         self.cached_image_key = None;
@@ -885,9 +990,10 @@ impl Lfm2Inner {
         }
 
         let suffix_len = suffix_tokens.len() as u32;
-        // Build per-layer kind list once. paged_idx counts only
-        // full_attention layers in their original layer order.
-        let layer_kinds = self.compute_layer_kinds();
+        // Per-layer kind list — clone of the construction-cached field (the
+        // decode paths borrow it; here a `&self` borrow would conflict with
+        // `run_conv_only_prefill(&mut self)` in Pass 1 below).
+        let layer_kinds = self.layer_kinds.clone();
 
         // Forward the FULL prompt through conv layers and the SUFFIX
         // through attention layers in the same per-layer loop. Because
@@ -946,6 +1052,19 @@ impl Lfm2Inner {
         let num_layers = self.layers.len();
         let first_logical_position = cached_prefix_len;
 
+        // Cache-hit prefill: every full-attention layer consumes the SAME
+        // `[suffix_len, total_ctx]` causal mask for its dense-gather SDPA —
+        // build it once per chunk instead of once per layer.
+        let shared_prefill_mask = if cached_prefix_len > 0 {
+            Some(crate::array::mask::create_causal_mask(
+                suffix_len as i32,
+                Some(cached_prefix_len as i32),
+                None,
+            )?)
+        } else {
+            None
+        };
+
         // The index-based loop is required here: we use raw-pointer
         // split-borrows on `self.layers` and `self.caches` to access
         // disjoint indices simultaneously while the paged_adapter is
@@ -977,6 +1096,7 @@ impl Lfm2Inner {
                         cached_prefix_len,
                         /* is_prefill */ true,
                         /* conv_cache */ None,
+                        shared_prefill_mask.as_ref(),
                     )?;
                 }
                 Lfm2LayerKind::Conv => {
@@ -1001,6 +1121,7 @@ impl Lfm2Inner {
                         cached_prefix_len,
                         /* is_prefill */ true,
                         Some(conv_cache),
+                        None,
                     )?;
                 }
             }
@@ -1144,6 +1265,12 @@ impl Lfm2Inner {
                 })?;
             states.push(state);
         }
+        if states.len() == 1 {
+            // Single-row call (the default row-exact decode wave): skip the
+            // identity concat — a one-element `concatenate_many` still
+            // enqueues a copy kernel per conv layer per row per step.
+            return Ok(states.into_iter().next().unwrap());
+        }
         MxArray::concatenate_many(states.iter().collect(), Some(0))
     }
 
@@ -1226,6 +1353,7 @@ impl Lfm2Inner {
                         /* cached_prefix_len */ 0,
                         /* is_prefill */ false,
                         /* conv_cache */ None,
+                        /* prefill_mask */ None,
                     )?;
                 }
                 Lfm2LayerKind::Conv => {
@@ -1246,6 +1374,7 @@ impl Lfm2Inner {
                         /* cached_prefix_len */ 0,
                         /* is_prefill */ false,
                         Some(conv_cache),
+                        /* prefill_mask */ None,
                     )?;
                 }
             }
@@ -1264,9 +1393,12 @@ impl Lfm2Inner {
         Ok(logits)
     }
 
-    /// Run one uniform paged decode step for multiple LFM2 requests.
-    /// Attention and ShortConv layers both execute once over `[N,1,H]`; the
-    /// convolution state is stacked/scattered around each conv layer.
+    /// Run one paged decode step for multiple LFM2 requests. Default is a
+    /// row-exact wave — one N=1 forward per row via
+    /// [`Self::forward_paged_decode_rows`], bit-identical to serial decode.
+    /// `MLX_LFM2_FUSED_BATCH_DECODE=1` instead executes all rows in one
+    /// `[N,1,H]` forward (attention and ShortConv once each, conv state
+    /// stacked/scattered around each conv layer).
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
         if rows.is_empty() {
             return Err(Error::from_reason(
@@ -1325,13 +1457,44 @@ impl Lfm2Inner {
 
         let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
-        let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+        if rows.len() > 1 && !lfm2_fused_batch_decode_enabled() {
+            // Row-exact wave (the nemotron_h quantized-checkpoint tradeoff):
+            // each row replays through the same N=1 graph the serial lane
+            // uses, so a batched wave is bit-identical to serial decode while
+            // still sharing one scheduler step. The fused [N,1,H] path keeps
+            // one weight stream but its M=N GEMM tiles round differently from
+            // M=1 — a few bf16 ULP per layer that the recurrent conv state
+            // then amplifies into occasional greedy near-tie flips.
+            let mut logits = Vec::with_capacity(rows.len());
+            for index in 0..rows.len() {
+                logits.push(self.forward_paged_decode_rows(
+                    &token_ids[index..index + 1],
+                    &seq_ids[index..index + 1],
+                    &planned_rows[index..index + 1],
+                )?);
+            }
+            return MxArray::concatenate_many(logits.iter().collect(), Some(0));
+        }
+        self.forward_paged_decode_rows(&token_ids, &seq_ids, &planned_rows)
+    }
+
+    /// Forward body of `run_paged_decode_step_batched` after every row's
+    /// token has been recorded: embed the `[N,1]` token matrix, run all
+    /// decoder layers over `[N,1,H]`, and project logits `[N,1,V]`.
+    /// `planned_rows` carries each row's pre-record position.
+    fn forward_paged_decode_rows(
+        &mut self,
+        token_ids: &[u32],
+        seq_ids: &[SeqId],
+        planned_rows: &[(SeqId, u32)],
+    ) -> Result<MxArray> {
+        let input_ids = MxArray::from_uint32(token_ids, &[token_ids.len() as i64, 1])?;
         let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
         for layer_idx in 0..self.layers.len() {
             let kind = self.layer_kinds[layer_idx];
             let layer: &Lfm2DecoderLayer = unsafe { &*self.layers.as_ptr().add(layer_idx) };
             let conv_state = if kind == Lfm2LayerKind::Conv {
-                Some(self.stacked_conv_state(&seq_ids, layer_idx, hidden_states.dtype()?)?)
+                Some(self.stacked_conv_state(seq_ids, layer_idx, hidden_states.dtype()?)?)
             } else {
                 None
             };
@@ -1342,15 +1505,15 @@ impl Lfm2Inner {
                 &hidden_states,
                 kind,
                 adapter,
-                &planned_rows,
+                planned_rows,
                 conv_state.as_ref(),
             )?;
             hidden_states = next_hidden;
             if let Some(state) = next_conv_state {
-                self.scatter_conv_state(&seq_ids, layer_idx, &state)?;
+                self.scatter_conv_state(seq_ids, layer_idx, &state)?;
             }
         }
-        for &seq_id in &seq_ids {
+        for &seq_id in seq_ids {
             self.remember_conv_cold_checkpoint_for(seq_id);
         }
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
@@ -1434,13 +1597,6 @@ impl Lfm2Inner {
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
         Ok(())
-    }
-
-    /// Build the per-layer routing list. `FullAttention { paged_idx }`
-    /// for full-attention layers (paged_idx counts only those layers in
-    /// their original order) and `Conv` for conv layers.
-    fn compute_layer_kinds(&self) -> Vec<Lfm2LayerKind> {
-        compute_layer_kinds_for(&self.config, self.layers.len())
     }
 }
 
@@ -1566,7 +1722,8 @@ impl HybridSchedulerBackend for Lfm2Inner {
             false
         };
         let conv_state_reusable = installed
-            || conv_state_reusable(tokens, owner_history, plan.cached_prefix_len as usize);
+            || conv_state_reusable(tokens, owner_history, plan.cached_prefix_len as usize)
+            || self.seat_conv_state_checkpoint(seq_id, tokens, plan.cached_prefix_len)?;
         if restore.is_none() && !conv_state_reusable {
             self.reset_scheduled_caches_for(seq_id);
         }
@@ -1613,7 +1770,8 @@ impl HybridSchedulerBackend for Lfm2Inner {
                 prompt_tokens,
                 owner_history,
                 plan.cached_prefix_len as usize,
-            );
+            )
+            || self.seat_conv_state_checkpoint(seq_id, prompt_tokens, plan.cached_prefix_len)?;
         if !conv_state_reusable {
             self.reset_scheduled_caches_for(seq_id);
         }
@@ -1965,14 +2123,14 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
         // loop-top `y.eval()` then no-ops on the already-materialized token.
         //
         // NOT `async_eval_arrays([next_token, logits])` (the qwen3-style
-        // schedule): lfm2's compiled forward has negligible per-step CPU work
+        // schedule): lfm2's eager forward has negligible per-step CPU work
         // (~110us issue vs ~5.4ms GPU/token, bandwidth-bound), so the async
         // two-wait (bottom `async_eval` + loop-top `y.eval`) buys ZERO overlap
         // and costs ~5% vs the single sync wait.
         //
         // `_budget_forced` is unused: a forced final token does NOT leave its
-        // compiled K/V co-output lazy (the single sync eval above pulls the
-        // K/V writes through the dependency chain regardless). Cross-turn
+        // paged K/V writes lazy (the single sync eval above pulls them
+        // through the dependency chain regardless). Cross-turn
         // parity on a budget-forced length exit instead depends on the conv
         // Pass-1 running attention in `run_conv_only_prefill`. See
         // tests/lfm2_paged_vs_flat_parity.rs
@@ -2094,7 +2252,8 @@ impl PagedBackend for Lfm2Inner {
         // NOT do this for us; skip it and conv state goes stale across
         // turns. Carried incremental state is the sole oracle.
         let reused_conv_state = installed_conv_sidecar
-            || conv_state_reusable(plan, &self.cached_token_history, cached_prefix_len);
+            || conv_state_reusable(plan, &self.cached_token_history, cached_prefix_len)
+            || self.seat_conv_state_checkpoint(seq_id, plan, turn_plan.cached_prefix_len)?;
         if !reused_conv_state {
             self.caches = init_caches(&self.config);
             self.cached_token_history.clear();
@@ -2230,8 +2389,8 @@ impl PagedBackend for Lfm2Inner {
     }
 
     fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
-        // Run the compiled-paged DECODE on the canonical DEFAULT stream, NOT
-        // the per-turn `generation_stream`. lfm2's compiled forward holds
+        // Run the eager-paged DECODE on the canonical DEFAULT stream, NOT
+        // the per-turn `generation_stream`. lfm2's eager forward holds
         // persistent per-layer K/V pools; running it on a queue separate from
         // the shared loop's top-of-iteration `y.eval()` (always on the default
         // stream) forces a cross-queue completion-wait every token (~5% on
@@ -2322,10 +2481,9 @@ impl PagedBackend for Lfm2Inner {
     }
 }
 
-/// Free-function form of [`Lfm2Inner::compute_layer_kinds`] usable without a
-/// `self` borrow. Identical mapping: `FullAttention { paged_idx }` for
-/// attention layers (paged_idx counts only those, in original order) and
-/// `Conv` otherwise.
+/// Builds the per-layer routing list cached in [`Lfm2Inner::layer_kinds`]:
+/// `FullAttention { paged_idx }` for attention layers (paged_idx counts only
+/// those, in original order) and `Conv` otherwise.
 fn compute_layer_kinds_for(config: &Lfm2Config, num_layers: usize) -> Vec<Lfm2LayerKind> {
     let mut kinds = Vec::with_capacity(num_layers);
     let mut paged_idx: u32 = 0;
@@ -2661,9 +2819,12 @@ mod paged_adapter_construction_tests {
     //! "default = no allocation" invariant and verify that flipping the
     //! flag wires up a real adapter without churning forward-path code.
 
-    use super::{Lfm2Inner, Lfm2SchedulerState, compute_layer_kinds_for};
+    use super::{
+        Lfm2Inner, Lfm2SchedulerState, compute_layer_kinds_for, lfm2_fused_batch_decode_enabled,
+    };
     use crate::array::DType;
     use crate::models::lfm2::Lfm2Config;
+    use crate::transformer::paged_kv_cache_adapter::SeqId;
 
     #[test]
     fn cold_restore_boundary_keeps_one_prompt_token_uncached() {
@@ -2723,6 +2884,7 @@ mod paged_adapter_construction_tests {
             num_dense_layers: None,
             norm_topk_prob: Some(true),
             use_expert_bias: Some(true),
+            routed_scaling_factor: None,
         }
     }
 
@@ -2836,54 +2998,23 @@ mod paged_adapter_construction_tests {
     /// Weights are random, so output values are arbitrary. Numerical
     /// validation is deferred to an end-to-end test with loaded weights.
     ///
-    /// Skips on no-Metal hosts.
-    #[test]
-    fn test_lfm2_paged_turn_sync_core_smoke_via_helpers() {
-        // Block-paged needs the Metal backend; on a non-Metal build the
-        // adapter is gated off (None) and there is nothing to exercise.
-        if !crate::engine::persistence::compiled_forward_backend_available() {
-            eprintln!("skipping (paged backend unavailable without Metal)");
-            return;
-        }
+    /// Cast every random-init Float32 weight on `inner` to BFloat16 so the
+    /// layers match the paged pool dtype — `update_keys_values` rejects
+    /// F32-typed K/V against a BF16 pool. Mirrors Qwen3's smoke-test cast.
+    fn cast_lfm2_inner_weights_bf16(inner: &mut Lfm2Inner) {
         use crate::array::{DType, MxArray};
+        use crate::models::lfm2::decoder_layer::OperatorType;
 
-        let cfg = paged_tiny_config(Some(true));
-        let mut inner = match Lfm2Inner::new(cfg.clone()) {
-            Ok(i) => i,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("No Metal device found") {
-                    eprintln!(
-                        "skipping test_lfm2_paged_turn_sync_core_smoke_via_helpers (no Metal): {msg}"
-                    );
-                    return;
-                }
-                panic!("unexpected Lfm2Inner::new failure: {msg}");
-            }
-        };
-        assert!(
-            inner.paged_adapter.is_some(),
-            "paged_tiny_config(Some(true)) must construct paged_adapter"
-        );
-
-        // Cast all weights to BF16 to match the pool dtype. Random-init
-        // weights from `Lfm2Inner::new` are Float32, but the paged pool
-        // was built BFloat16, so `update_keys_values` would reject
-        // F32-typed K/V from the layers. Mirror Qwen3's smoke-test cast.
         let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
 
-        // Embedding.
         let w = inner.embed_tokens.get_weight();
         inner.embed_tokens.set_weight(&cast(&w)).expect("set embed");
-        // Embedding norm.
         let w = inner.embedding_norm.get_weight();
         inner
             .embedding_norm
             .set_weight(&cast(&w))
             .expect("set embedding_norm");
 
-        // Per-layer weights. Use the now-`pub(crate)` inner fields.
-        use crate::models::lfm2::decoder_layer::OperatorType;
         for layer in inner.layers.iter_mut() {
             let w = layer.operator_norm.get_weight();
             layer
@@ -2934,6 +3065,64 @@ mod paged_adapter_construction_tests {
             let w = mlp.get_down_proj_weight();
             mlp.set_down_proj_weight(&cast(&w)).expect("set down");
         }
+    }
+
+    /// Prime `seq_id` for paged decode the way `prepare_scheduled_prefix`
+    /// leaves a fully-recomputed request: adapter request active, suffix
+    /// blocks allocated, conv state parked/installed by
+    /// `activate_paged_seq`, full prompt forwarded. `skip_lookup` keeps the
+    /// prefill a full recompute — blocks released by an earlier request on
+    /// this adapter stay content-addressed in the shared allocator and a
+    /// lookup would serve them back as a cached prefix instead.
+    fn prime_paged_seq_for_decode(inner: &mut Lfm2Inner, seq_id: SeqId, prompt: &[u32]) {
+        inner
+            .activate_paged_seq(seq_id)
+            .expect("activate_paged_seq");
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            let prefix = adapter
+                .find_cached_prefix(prompt, &[], 0, true)
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32 + 1)
+                .expect("allocate_suffix_blocks");
+        }
+        inner
+            .run_paged_prefill_chunk(prompt, prompt, 0, false)
+            .expect("run_paged_prefill_chunk");
+    }
+
+    /// Skips on no-Metal hosts.
+    #[test]
+    fn test_lfm2_paged_turn_sync_core_smoke_via_helpers() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        use crate::array::DType;
+
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match Lfm2Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_lfm2_paged_turn_sync_core_smoke_via_helpers (no Metal): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Lfm2Inner::new failure: {msg}");
+            }
+        };
+        assert!(
+            inner.paged_adapter.is_some(),
+            "paged_tiny_config(Some(true)) must construct paged_adapter"
+        );
+        cast_lfm2_inner_weights_bf16(&mut inner);
 
         // Drive the adapter lifecycle the same way `paged_turn_sync_core`
         // does. seq_id is arbitrary (per-request scoping).
@@ -3031,6 +3220,114 @@ mod paged_adapter_construction_tests {
         }
     }
 
+    /// Regression: the DEFAULT multi-row decode wave must be bit-identical
+    /// to running each row through the N=1 path — the same path the serial
+    /// lane in `tests/lfm2_concurrent_batched_parity.rs` oracles against.
+    ///
+    /// The fused `[N,1,H]` forward's M=N GEMM tiles round differently from
+    /// M=1 (a few bf16 ULPs per layer), and LFM2's carried conv state
+    /// amplifies that into occasional greedy near-tie flips on real
+    /// checkpoints — the flaky batched-vs-serial host failure. The wave
+    /// therefore defaults to replaying each row through
+    /// `forward_paged_decode_rows` at N=1 unless
+    /// `MLX_LFM2_FUSED_BATCH_DECODE=1` opts back in.
+    ///
+    /// Two seqs are primed identically in two phases (released and
+    /// re-primed between them) so the wave output can be compared
+    /// element-for-element against the N=1 serial result.
+    #[test]
+    fn test_lfm2_row_exact_decode_wave_matches_serial_rows() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        // The flag is read once and cached for the process; if the harness
+        // opted into the fused path this test would assert the wrong
+        // contract, so refuse to run rather than compare fused-vs-serial.
+        assert!(
+            !lfm2_fused_batch_decode_enabled(),
+            "row-exact regression test requires the default decode path"
+        );
+        use crate::array::DType;
+
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match Lfm2Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping row-exact decode wave test (no Metal): {msg}");
+                    return;
+                }
+                panic!("unexpected Lfm2Inner::new failure: {msg}");
+            }
+        };
+        cast_lfm2_inner_weights_bf16(&mut inner);
+
+        const SEQ_A: SeqId = 0;
+        const SEQ_B: SeqId = 1;
+        let prompt_a: Vec<u32> = vec![10, 20, 30, 40];
+        let prompt_b: Vec<u32> = vec![15, 25, 35, 45, 55];
+        let decode_a: u32 = 60;
+        let decode_b: u32 = 70;
+
+        // Phase 1: prime both seqs, run one two-row decode wave.
+        prime_paged_seq_for_decode(&mut inner, SEQ_A, &prompt_a);
+        prime_paged_seq_for_decode(&mut inner, SEQ_B, &prompt_b);
+        let wave = inner
+            .run_paged_decode_step_batched(&[(SEQ_A, decode_a), (SEQ_B, decode_b)])
+            .expect("wave decode");
+        assert_eq!(wave.ndim().expect("ndim"), 3, "wave logits must be [N,1,V]");
+        assert_eq!(wave.shape_at(0).expect("shape_at(0)"), 2);
+        assert_eq!(wave.shape_at(1).expect("shape_at(1)"), 1);
+        assert_eq!(
+            wave.shape_at(2).expect("shape_at(2)"),
+            cfg.vocab_size as i64
+        );
+
+        // Release both rows' KV blocks and recurrent state so phase 2
+        // re-primes from a cold adapter (identical post-prefill state).
+        for seq in [SEQ_A, SEQ_B] {
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged_adapter")
+                .release_request_for(seq)
+                .expect("release_request_for");
+            inner.release_scheduled_caches_for(seq);
+        }
+
+        // Phase 2: same prompts, one single-row step per seq.
+        prime_paged_seq_for_decode(&mut inner, SEQ_A, &prompt_a);
+        prime_paged_seq_for_decode(&mut inner, SEQ_B, &prompt_b);
+        let serial_a = inner
+            .run_paged_decode_step_batched(&[(SEQ_A, decode_a)])
+            .expect("serial decode A");
+        let serial_b = inner
+            .run_paged_decode_step_batched(&[(SEQ_B, decode_b)])
+            .expect("serial decode B");
+
+        let row_f32 = |logits: &crate::array::MxArray, row: i64| -> Vec<f32> {
+            let slice = logits
+                .slice_axis(0, row, row + 1)
+                .expect("slice row")
+                .astype(DType::Float32)
+                .expect("astype f32");
+            slice.eval();
+            slice.to_float32().expect("to_float32").as_ref().to_vec()
+        };
+        assert_eq!(
+            row_f32(&wave, 0),
+            row_f32(&serial_a, 0),
+            "wave row 0 must be bit-identical to the serial N=1 decode of seq A"
+        );
+        assert_eq!(
+            row_f32(&wave, 1),
+            row_f32(&serial_b, 0),
+            "wave row 1 must be bit-identical to the serial N=1 decode of seq B"
+        );
+    }
+
     /// All-conv config (zero attention layers) with the flag enabled must
     /// fail with a clear error — paged KV cache is meaningless without
     /// attention layers, and silently constructing a pool with
@@ -3100,5 +3397,69 @@ mod paged_adapter_construction_tests {
             Err(error) => error,
         };
         assert!(error.reason.contains("99"));
+    }
+
+    /// The content-keyed conv-state pool must seat ONLY on an exact
+    /// `boundary + tokens[..boundary]` match — the property that lets a
+    /// foreign prefix hit skip `run_conv_only_prefill` safely.
+    #[test]
+    fn conv_state_pool_seats_only_on_exact_prefix_match() {
+        use super::Lfm2ConvColdCheckpoint;
+        use crate::array::MxArray;
+
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = Lfm2Inner::new(cfg).expect("construct");
+
+        // One conv layer (layer_types[0] == "conv"), conv_l_cache=3 →
+        // state shape [1, 2, 64]. Publish a checkpoint at boundary 16.
+        let state = MxArray::from_float32(&vec![0.5f32; 2 * 64], &[1, 2, 64]).expect("state");
+        inner.conv_state_pool.push_back(Lfm2ConvColdCheckpoint {
+            boundary: 16,
+            tokens: (0..16).collect(),
+            states: vec![state],
+        });
+        let plan: Vec<u32> = (0..20).collect();
+
+        // Exact match → seats into the live caches.
+        assert!(
+            inner
+                .seat_conv_state_checkpoint(0, &plan, 16)
+                .expect("seat")
+        );
+        let seated = inner.caches[0]
+            .as_conv_cache_mut()
+            .and_then(|cache| cache.get(0).cloned())
+            .expect("seated conv state");
+        assert_eq!(
+            seated.to_float32().expect("to_f32").to_vec(),
+            vec![0.5f32; 2 * 64]
+        );
+        // The warm-continuation oracle must now describe the seated prefix.
+        assert_eq!(inner.cached_token_history, (0..16).collect::<Vec<u32>>());
+
+        // Token-content divergence fails closed.
+        let mut divergent = plan.clone();
+        divergent[3] = 999;
+        assert!(
+            !inner
+                .seat_conv_state_checkpoint(0, &divergent, 16)
+                .expect("seat")
+        );
+        // A hit shorter than the captured boundary fails closed.
+        assert!(!inner.seat_conv_state_checkpoint(0, &plan, 8).expect("seat"));
+        // Zero-length hits never seat.
+        assert!(!inner.seat_conv_state_checkpoint(0, &plan, 0).expect("seat"));
+        // Geometry drift (wrong state count) fails closed.
+        let mut drifted = Lfm2Inner::new(paged_tiny_config(Some(false))).expect("construct");
+        drifted.conv_state_pool.push_back(Lfm2ConvColdCheckpoint {
+            boundary: 16,
+            tokens: (0..16).collect(),
+            states: vec![],
+        });
+        assert!(
+            !drifted
+                .seat_conv_state_checkpoint(0, &plan, 16)
+                .expect("seat")
+        );
     }
 }

@@ -57,6 +57,7 @@ export const LFM2_CONFIGS: { [key: string]: Lfm2Config } = {
     numDenseLayers: 2,
     normTopkProb: true,
     useExpertBias: true,
+    routedScalingFactor: 1.0,
   },
   'lfm2.5-1.2b-thinking': {
     vocabSize: 65536,

@@ -1,25 +1,31 @@
 //! LFM2.5 sparse Mixture-of-Experts feed-forward block.
 //!
-//! Mirrors `mlx-lm/mlx_lm/models/lfm2_moe.py::Lfm2MoeSparseMoeBlock`
-//! (lines 189-226) EXACTLY:
+//! Mirrors HF `transformers/models/lfm2_moe/modeling_lfm2_moe.py::
+//! Lfm2MoeTopKRouter.forward` and post-fix `mlx-lm/mlx_lm/models/lfm2_moe.py`
+//! (mlx-lm PR #1354, "Fix LFM2 MoE routing to match the HF reference —
+//! sigmoid gating") EXACTLY:
 //!
 //! ```text
-//! gates = softmax(gate(x).astype(f32), axis=-1)
-//! if use_expert_bias: gates += expert_bias            # post-softmax, pre-topk
-//! inds = argpartition(gates, kth=-k, axis=-1)[..., -k:]
-//! scores = take_along_axis(gates, inds, axis=-1)       # from POST-BIAS gates
-//! if norm_topk_prob: scores /= sum(scores, -1, keepdims) + 1e-20
+//! gates  = sigmoid(gate(x))                          # NOT softmax
+//! if use_expert_bias:
+//!     inds = topk(gates + expert_bias)               # bias selects only
+//!     scores = gather(gates, inds)                   # UNBIASED weights
+//! else:
+//!     scores, inds = topk(gates)
+//! if norm_topk_prob: scores /= sum(scores, -1) + 1e-6
+//! scores *= routed_scaling_factor
 //! scores = scores.astype(x.dtype)
 //! y = switch_mlp(x, inds)
 //! y = (y * scores[..., None]).sum(axis=-2)
 //! ```
 //!
 //! Differences from `qwen3_5_moe::SparseMoeBlock`:
-//! - NO shared expert / shared_expert_gate / routed_scaling_factor.
-//! - The learned `expert_bias` is added to the post-softmax gates BEFORE
-//!   top-k selection, and the routing scores are gathered from those
-//!   biased gates. This cannot reuse `moe::topk_from_logits` (which has no
-//!   bias step), so the gate math is inlined here.
+//! - NO shared expert / shared_expert_gate.
+//! - The learned `expert_bias` is a selection-only correction
+//!   (DeepSeek-V3-style `e_score_correction_bias`): it perturbs top-k
+//!   selection but is never gathered into the combination weights.
+//!   This cannot reuse `moe::topk_from_logits` (no bias step), so the
+//!   gate math is inlined here.
 //! - `expert_bias` stays f32 (matches Python `cast_predicate`).
 
 use crate::array::{DType, MxArray};
@@ -44,6 +50,13 @@ pub struct Lfm2SparseMoeBlock {
     num_experts: i32,
     top_k: i32,
     norm_topk_prob: bool,
+    /// Pre-built f32 `1e-6` renorm epsilon, allocated once so the forward
+    /// hot path does not create a scalar array per layer per token.
+    /// `None` when `norm_topk_prob` is false.
+    renorm_eps: Option<MxArray>,
+    /// Pre-built f32 `routed_scaling_factor` (HF applies it after renorm;
+    /// default 1.0). `None` when the factor is 1.0.
+    routed_scale: Option<MxArray>,
 }
 
 impl Lfm2SparseMoeBlock {
@@ -75,13 +88,26 @@ impl Lfm2SparseMoeBlock {
             None
         };
 
+        let norm_topk_prob = config.norm_topk_prob.unwrap_or(true);
+        let routed_scaling_factor = config.routed_scaling_factor.unwrap_or(1.0);
+        let renorm_eps = norm_topk_prob
+            .then(|| MxArray::scalar_float(1e-6).and_then(|a| a.astype(DType::Float32)))
+            .transpose()?;
+        let routed_scale = (routed_scaling_factor != 1.0)
+            .then(|| {
+                MxArray::scalar_float(routed_scaling_factor).and_then(|a| a.astype(DType::Float32))
+            })
+            .transpose()?;
+
         Ok(Self {
             gate: LinearProj::Standard(gate),
             switch_mlp,
             expert_bias,
             num_experts,
             top_k,
-            norm_topk_prob: config.norm_topk_prob.unwrap_or(true),
+            norm_topk_prob,
+            renorm_eps,
+            routed_scale,
         })
     }
 
@@ -146,30 +172,40 @@ impl Lfm2SparseMoeBlock {
         let x_flat = x.reshape(&[ne, hidden])?;
         let x_dtype = x.dtype()?;
 
-        // gates = softmax(gate(x).astype(f32), axis=-1)
-        let logits = self.gate.forward(&x_flat)?; // [ne, num_experts]
-        let logits = logits.astype(DType::Float32)?;
-        let mut gates = Activations::softmax(&logits, Some(-1))?;
+        // gates = sigmoid(gate(x).astype(f32)) — HF Lfm2MoeTopKRouter uses
+        // sigmoid (NOT softmax); f32 keeps selection ties/renorm precise and
+        // avoids the degraded bf16 sigmoid kernel.
+        let logits = self.gate.forward(&x_flat)?.astype(DType::Float32)?; // [ne, num_experts]
+        let gates = Activations::sigmoid(&logits)?;
 
-        // if use_expert_bias: gates += expert_bias  (f32 + f32 stays f32;
-        // broadcasts [ne, E] + [E])
-        if let Some(bias) = &self.expert_bias {
-            gates = gates.add(bias)?;
-        }
-
-        // inds = argpartition(gates, kth=-k)[..., -k:]  (UNSORTED top-k)
-        let inds_full = gates.argpartition(-self.top_k, Some(-1))?;
+        // inds = topk(gates + expert_bias) — the bias is SELECTION-ONLY
+        // (HF: topk over `routing_weights + expert_bias`); it must never
+        // contaminate the gathered combination weights.
+        let selection = if let Some(bias) = &self.expert_bias {
+            gates.add(bias)? // f32 + f32; broadcasts [ne, E] + [E]
+        } else {
+            gates.clone()
+        };
+        let inds_full = selection.argpartition(-self.top_k, Some(-1))?;
         let inds = inds_full.slice_axis(1, ne_e - k, ne_e)?; // [ne, k]
 
-        // scores = take_along_axis(gates, inds, -1)  — from POST-BIAS gates
+        // scores = gather(gates, inds) — from the UNBIASED sigmoid weights
+        // (HF: `gather(routing_weights, selected_experts)`).
         let mut scores = gates.take_along_axis(&inds, -1)?; // [ne, k]
 
-        // if norm_topk_prob: scores /= sum(scores, -1, keepdims) + 1e-20
+        // if norm_topk_prob: scores /= sum(scores, -1, keepdims) + 1e-6
         if self.norm_topk_prob {
             let denom = scores.sum(Some(&[-1]), Some(true))?; // [ne, 1]
-            let eps = MxArray::scalar_float(1e-20)?.astype(DType::Float32)?;
-            let denom = denom.add(&eps)?;
+            let eps = self
+                .renorm_eps
+                .as_ref()
+                .expect("renorm_eps is built when norm_topk_prob is true");
+            let denom = denom.add(eps)?;
             scores = scores.div(&denom)?;
+        }
+        // scores *= routed_scaling_factor (HF applies it after renorm).
+        if let Some(scale) = &self.routed_scale {
+            scores = scores.mul(scale)?;
         }
         let scores = scores.astype(x_dtype)?;
 
@@ -225,6 +261,7 @@ mod tests {
             num_dense_layers: Some(num_dense_layers),
             norm_topk_prob: Some(norm_topk_prob),
             use_expert_bias: Some(use_expert_bias),
+            routed_scaling_factor: None,
         }
     }
 
@@ -266,11 +303,8 @@ mod tests {
             .collect()
     }
 
-    fn softmax(v: &[f32]) -> Vec<f32> {
-        let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = v.iter().map(|&z| (z - m).exp()).collect();
-        let s: f32 = exps.iter().sum();
-        exps.iter().map(|&e| e / s).collect()
+    fn sigmoid(z: f32) -> f32 {
+        1.0 / (1.0 + (-z).exp())
     }
 
     fn silu(z: f32) -> f32 {
@@ -309,8 +343,16 @@ mod tests {
         out
     }
 
-    /// Full reference MoE forward for a single token.
-    fn reference_forward(x: &[f32], bias: &[f32; N_EXP], norm_topk_prob: bool) -> Vec<f32> {
+    /// Full reference MoE forward for a single token — mirrors HF
+    /// `Lfm2MoeTopKRouter.forward`: sigmoid gates, `expert_bias` selects
+    /// top-k only, gathered weights are the UNBIASED sigmoid values,
+    /// renorm eps 1e-6, then `routed_scaling_factor`.
+    fn reference_forward(
+        x: &[f32],
+        bias: Option<&[f32; N_EXP]>,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+    ) -> Vec<f32> {
         let gw = gate_w();
         // logits
         let mut logits = vec![0.0f32; N_EXP];
@@ -321,27 +363,27 @@ mod tests {
             }
             logits[e] = s;
         }
-        // softmax then + bias
-        let mut gates = softmax(&logits);
-        for e in 0..N_EXP {
-            gates[e] += bias[e];
-        }
-        // top-k (by biased gate value); ties broken by lower index for
+        let gates: Vec<f32> = logits.iter().map(|&z| sigmoid(z)).collect();
+        // top-k over (gates + bias); ties broken by lower index for
         // determinism (won't occur with our weights).
         let mut idx: Vec<usize> = (0..N_EXP).collect();
         idx.sort_by(|&a, &b| {
-            gates[b]
-                .partial_cmp(&gates[a])
+            let sa = gates[a] + bias.map_or(0.0, |b_| b_[a]);
+            let sb = gates[b] + bias.map_or(0.0, |b_| b_[b]);
+            sb.partial_cmp(&sa)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.cmp(&b))
         });
         let top: Vec<usize> = idx[..TOP_K].to_vec();
         let mut scores: Vec<f32> = top.iter().map(|&e| gates[e]).collect();
         if norm_topk_prob {
-            let s: f32 = scores.iter().sum::<f32>() + 1e-20;
+            let s: f32 = scores.iter().sum::<f32>() + 1e-6;
             for v in scores.iter_mut() {
                 *v /= s;
             }
+        }
+        for v in scores.iter_mut() {
+            *v *= routed_scaling_factor;
         }
         // weighted sum of expert outputs
         let mut out = vec![0.0f32; HIDDEN];
@@ -358,8 +400,10 @@ mod tests {
         norm_topk_prob: bool,
         use_expert_bias: bool,
         bias: Option<&[f32; N_EXP]>,
+        routed_scaling_factor: f64,
     ) -> Lfm2SparseMoeBlock {
-        let cfg = tiny_moe_config(0, norm_topk_prob, use_expert_bias);
+        let mut cfg = tiny_moe_config(0, norm_topk_prob, use_expert_bias);
+        cfg.routed_scaling_factor = Some(routed_scaling_factor);
         let mut block = Lfm2SparseMoeBlock::new(&cfg).expect("new block");
 
         // gate weight (num_experts, hidden)
@@ -401,9 +445,9 @@ mod tests {
     fn forward_zero_bias_matches_reference() {
         let x = [0.5f32, -1.0, 2.0, 0.25];
         let bias = [0.0f32; N_EXP];
-        let block = build_block(true, true, Some(&bias));
+        let block = build_block(true, true, Some(&bias), 1.0);
         let got = run_single(&block, &x);
-        let want = reference_forward(&x, &bias, true);
+        let want = reference_forward(&x, Some(&bias), true, 1.0);
         assert_eq!(got.len(), HIDDEN);
         for (g, w) in got.iter().zip(want.iter()) {
             assert!(
@@ -415,19 +459,20 @@ mod tests {
 
     #[test]
     fn forward_bias_flips_top_k() {
-        // With x, the un-biased top-2 are experts {1, 0} (largest softmax).
+        // With x, the un-biased top-2 are experts {1, 0} (largest sigmoid).
         // A large positive bias on experts {2,3} flips the top-2 to {2,3},
-        // proving the bias is applied BEFORE argpartition and scores are
-        // gathered from the biased gates.
+        // proving the bias is applied BEFORE argpartition. The gathered
+        // weights must still be the UNBIASED sigmoid values — under the old
+        // post-softmax/biased-gather semantics this reference would not
+        // match (scores would carry the +5 bias into the weighted sum).
         let x = [0.5f32, -1.0, 2.0, 0.25];
 
-        let no_bias = [0.0f32; N_EXP];
-        let unbiased_ref = reference_forward(&x, &no_bias, true);
+        let unbiased_ref = reference_forward(&x, None, true, 1.0);
 
         let bias = [0.0f32, 0.0, 5.0, 5.0];
-        let block = build_block(true, true, Some(&bias));
+        let block = build_block(true, true, Some(&bias), 1.0);
         let got = run_single(&block, &x);
-        let want = reference_forward(&x, &bias, true);
+        let want = reference_forward(&x, Some(&bias), true, 1.0);
 
         for (g, w) in got.iter().zip(want.iter()) {
             assert!(
@@ -448,17 +493,57 @@ mod tests {
     }
 
     #[test]
+    fn forward_no_bias_path_matches_reference() {
+        // use_expert_bias=false → selection runs over raw sigmoid gates.
+        let x = [0.5f32, -1.0, 2.0, 0.25];
+        let block = build_block(true, false, None, 1.0);
+        let got = run_single(&block, &x);
+        let want = reference_forward(&x, None, true, 1.0);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!(
+                (g - w).abs() < 2e-3,
+                "no-bias mismatch got={got:?} want={want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_routed_scaling_factor_scales_output() {
+        // The factor multiplies the renormed weights AFTER renorm, so the
+        // MoE output scales linearly by it.
+        let x = [0.5f32, -1.0, 2.0, 0.25];
+        let bias = [0.0f32; N_EXP];
+        let block = build_block(true, true, Some(&bias), 2.0);
+        let got = run_single(&block, &x);
+        let want = reference_forward(&x, Some(&bias), true, 2.0);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!(
+                (g - w).abs() < 3e-3,
+                "scaled mismatch got={got:?} want={want:?}"
+            );
+        }
+        let base = reference_forward(&x, Some(&bias), true, 1.0);
+        let differs = got
+            .iter()
+            .zip(base.iter())
+            .any(|(g, b)| (g - 2.0 * b).abs() > 2e-3);
+        assert!(
+            !differs,
+            "routed_scaling_factor=2 must double the MoE output (got={got:?} base={base:?})"
+        );
+    }
+
+    #[test]
     fn forward_no_renorm_differs_from_renorm() {
         let x = [0.5f32, -1.0, 2.0, 0.25];
         let bias = [0.0f32; N_EXP];
 
-        let block_renorm = build_block(true, true, Some(&bias));
+        let block_renorm = build_block(true, true, Some(&bias), 1.0);
         let got_renorm = run_single(&block_renorm, &x);
-        let want_renorm = reference_forward(&x, &bias, true);
 
-        let block_no = build_block(false, true, Some(&bias));
+        let block_no = build_block(false, true, Some(&bias), 1.0);
         let got_no = run_single(&block_no, &x);
-        let want_no = reference_forward(&x, &bias, false);
+        let want_no = reference_forward(&x, Some(&bias), false, 1.0);
 
         for (g, w) in got_no.iter().zip(want_no.iter()) {
             assert!(
@@ -466,15 +551,15 @@ mod tests {
                 "no-renorm mismatch got={got_no:?} want={want_no:?}"
             );
         }
-        // Un-renormalized scores sum to < 1 here, so the weighted output must
-        // differ from the renormalized output.
+        // Un-renormalized sigmoid scores sum to < 1 here, so the weighted
+        // output must differ from the renormalized output.
         let differs = got_no
             .iter()
             .zip(got_renorm.iter())
             .any(|(a, b)| (a - b).abs() > 1e-3);
         assert!(
             differs,
-            "norm_topk_prob=false produced same output as true (no-renorm={got_no:?} renorm={got_renorm:?} want_renorm={want_renorm:?})"
+            "norm_topk_prob=false produced same output as true (no-renorm={got_no:?} renorm={got_renorm:?})"
         );
     }
 
@@ -514,7 +599,7 @@ mod tests {
         // 32 tokens x top_k=2 = 64 indices >= 64 → exercises the gather-sort
         // path in SwitchGLU::forward. Must equal the per-token reference.
         let bias = [0.0f32; N_EXP];
-        let block = build_block(true, true, Some(&bias));
+        let block = build_block(true, true, Some(&bias), 1.0);
 
         let n_tok = 32usize;
         let mut xs = Vec::with_capacity(n_tok * HIDDEN);
@@ -535,7 +620,7 @@ mod tests {
 
         for t in 0..n_tok {
             let x = &xs[t * HIDDEN..(t + 1) * HIDDEN];
-            let want = reference_forward(x, &bias, true);
+            let want = reference_forward(x, Some(&bias), true, 1.0);
             for h in 0..HIDDEN {
                 let g = got[t * HIDDEN + h];
                 assert!(

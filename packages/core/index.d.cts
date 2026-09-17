@@ -4356,7 +4356,7 @@ export interface Lfm2Config {
   /** Number of leading DENSE layers before MoE layers begin. */
   numDenseLayers?: number | undefined;
   /**
-   * Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
+   * Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-6)`).
    *
    * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
    * required). Absent (None) is read as `true` everywhere via
@@ -4364,13 +4364,22 @@ export interface Lfm2Config {
    */
   normTopkProb?: boolean | undefined;
   /**
-   * Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
+   * Add the learned per-expert bias to the routing scores BEFORE top-k
+   * (selection-only; the bias is NOT folded into the gathered weights).
    *
    * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
    * required). Absent (None) is read as `true` everywhere via
-   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+   * `.unwrap_or(true)`, matching HF `configuration_lfm2_moe.py`.
    */
   useExpertBias?: boolean | undefined;
+  /**
+   * Post-renormalization scale applied to the gathered routing weights
+   * (HF `Lfm2MoeTopKRouter`: `routing_weights * routed_scaling_factor`).
+   * HF default is 1.0; absent on every checkpoint shipped so far but kept
+   * as a first-class field so a future checkpoint that sets it is not
+   * silently dropped.
+   */
+  routedScalingFactor?: number | undefined;
 }
 
 export interface MemorySnapshot {

@@ -549,16 +549,19 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
 
     // Fix 1: Accept canonical HF config keys — block_dim defaults to hidden_size,
     // block_ff_dim falls back to intermediate_size then hidden_size.
-    // HF's `intermediate_size` is the already-resolved MLP width, so when we take
-    // that fallback we must disable auto-adjust to avoid a second 2/3 shrink in
-    // `computed_ff_dim()`.
+    // HF aliases `block_ff_dim` INTO `intermediate_size` at config load
+    // (`configuration_lfm2.py`: `intermediate_size = kwargs.pop("block_ff_dim",
+    // intermediate_size)`), so both names carry the SAME pre-shrink width and
+    // `block_auto_adjust_ff_dim` still applies on top
+    // (`modeling_lfm2.py`: `if block_auto_adjust_ff_dim: ff = 2*ff/3 ...`).
+    // The fallback must therefore NOT disable auto-adjust — vLLM applies the
+    // identical rule (`lfm2.py` Lfm2MLP).
     if config.block_dim == 0 {
         config.block_dim = config.hidden_size;
     }
     if config.block_ff_dim == 0 {
         if let Some(intermediate_size) = raw.get("intermediate_size").and_then(|v| v.as_i64()) {
             config.block_ff_dim = intermediate_size as i32;
-            config.block_auto_adjust_ff_dim = false;
         } else {
             config.block_ff_dim = config.hidden_size;
         }
@@ -574,7 +577,7 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
     // dense checkpoints (serde already defaulted them).
     //
     // NOTE: the `block_ff_dim` fallback above sets `block_ff_dim =
-    // intermediate_size` (with auto-adjust disabled) for MoE checkpoints too.
+    // intermediate_size` (auto-adjust stays enabled) for MoE checkpoints too.
     // That is harmless: dense-in-MoE layers read `intermediate_size` directly
     // (see `Lfm2DecoderLayer::new`) and MoE layers ignore `block_ff_dim`
     // entirely. We re-read `intermediate_size` here as a first-class field.
@@ -604,6 +607,7 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
     if let Some(b) = raw.get("use_expert_bias").and_then(|v| v.as_bool()) {
         config.use_expert_bias = Some(b);
     }
+    config.routed_scaling_factor = raw.get("routed_scaling_factor").and_then(|v| v.as_f64());
 
     // Parse eos_token_id from generation_config.json if available
     let gen_config_path = model_path.join("generation_config.json");
@@ -733,7 +737,7 @@ fn sanitize_weights(
     // `switch_mlp.{proj}.{weight,scales}`.
     if config.is_moe() {
         let num_experts = config.num_experts.unwrap_or(0) as usize;
-        let num_dense = config.num_dense_layers.unwrap_or(0) as usize;
+        let num_dense = config.num_dense_layers_effective() as usize;
         for l in num_dense..(config.num_hidden_layers as usize) {
             for proj in ["gate_proj", "up_proj", "down_proj"] {
                 let key0 = format!("layers.{l}.feed_forward.experts.0.{proj}.weight");
@@ -1725,6 +1729,7 @@ mod tests {
             num_dense_layers: Some(0),
             norm_topk_prob: Some(true),
             use_expert_bias: Some(use_expert_bias),
+            routed_scaling_factor: None,
         }
     }
 

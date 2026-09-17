@@ -1,7 +1,9 @@
 //! Tool call parsing utilities
 //!
 //! Extracts structured tool calls from model-generated text.
-//! Supports JSON format (Qwen3), function/parameter format (Qwen3.5), and XML format (legacy).
+//! Supports JSON format (Qwen3), function/parameter format (Qwen3.5), XML format (legacy),
+//! and the pythonic sentinel format (LFM2/LFM2.5):
+//! `<|tool_call_start|>[func(arg='v')]<|tool_call_end|>`.
 //!
 //! Uses simple string-based parsers instead of regex for clarity and debuggability.
 
@@ -33,7 +35,9 @@ pub struct ToolCallResult {
     pub status: String,
     /// Error message if status != "ok"
     pub error: Option<String>,
-    /// Raw content from <tool_call> tag (preserved for debugging/persistence)
+    /// Raw content from the tool-call markup (preserved for debugging/persistence):
+    /// the `<tool_call>…</tool_call>` block, or for LFM2 the whole
+    /// `<|tool_call_start|>…<|tool_call_end|>` sentinel block.
     /// Defaults to empty string for backward compatibility with older JSON
     #[serde(default)]
     pub raw_content: String,
@@ -406,23 +410,1012 @@ fn classify_and_parse_tool_call(inner: &str, raw_content: &str) -> Option<ToolCa
 }
 
 // ---------------------------------------------------------------------------
+// LFM2 pythonic tool calls — <|tool_call_start|>[fn(kw=literal)]<|tool_call_end|>
+// ---------------------------------------------------------------------------
+//
+// Mirrors vLLM `tool_parsers/lfm2_tool_parser.py::Lfm2ToolParser`
+// (`extract_tool_calls`, non-streaming) semantics:
+//   - Only the FIRST sentinel block is parsed; LFM2 frequently re-emits the
+//     call body after the first `<|tool_call_end|>` capped by a second end
+//     sentinel, so everything through the LAST orphan end is dropped
+//     (`_strip_echo`). A second real sentinel block is indistinguishable
+//     from that echo and is dropped the same way — LFM2 packs parallel
+//     calls into ONE bracket list, so nothing real is lost.
+//   - The call body must be a non-empty bracketed list whose every element
+//     is a function call `name(kw=literal, ...)`. Dotted names
+//     (`a.b.c(...)`) are preserved verbatim.
+//   - Keyword args only: positionals are ignored, `**kwargs` rejects the
+//     block (vLLM `handle_single_tool` iterates `call.keywords` only and
+//     `arguments[None]` fails `json.dumps`).
+//   - Argument values are Python literals: strings (single/double/triple
+//     quotes, `r`/`u`/`f` prefixes, escapes; `f` rejected when it carries a
+//     `{...}` placeholder), numbers (dec/hex/oct/bin ints, floats, unary
+//     +/-), True/False/None plus the JSON spellings true/false/null, lists,
+//     tuples and sets (→ arrays), dicts with literal keys (non-string keys
+//     are stringified like `json.dumps`). Anything else rejects the block.
+//   - On ANY parse failure the raw text is returned verbatim as content
+//     (vLLM returns `content=model_output`, `tools_called=False`) — a
+//     malformed call is model output the user should see, not markup to
+//     silently delete.
+//
+// The sentinels are non-special added tokens in the LFM2 tokenizers, so
+// `skip_special_tokens=true` does NOT strip them — this parser sees them
+// in the default decode with no flag changes needed.
+
+const LFM2_TOOL_CALL_START: &str = "<|tool_call_start|>";
+const LFM2_TOOL_CALL_END: &str = "<|tool_call_end|>";
+
+/// vLLM `_strip_echo`: drop everything through the last orphan
+/// `<|tool_call_end|>` in the post-call text — the echoed body is capped by
+/// a second end sentinel, so the last end marks where real content resumes.
+fn strip_lfm2_echo(raw_after: &str) -> &str {
+    match raw_after.rfind(LFM2_TOOL_CALL_END) {
+        Some(idx) => &raw_after[idx + LFM2_TOOL_CALL_END.len()..],
+        None => raw_after,
+    }
+}
+
+/// Recursive-descent parser for the pythonic call list. Byte-indexed
+/// scanner: every syntax character we look for is ASCII, so UTF-8 string
+/// contents pass through safely.
+struct PyLiteralParser<'a> {
+    s: &'a [u8],
+    pos: usize,
+    /// `parse_literal` nesting depth — containers and unary ops recurse, so
+    /// pathological input (`[[[[…`, `x=----…1`) must fail closed instead of
+    /// overflowing the stack (vLLM's `ast.parse` raises `RecursionError`,
+    /// which its caller catches → raw text).
+    depth: u32,
+}
+
+/// Hard cap on literal nesting — far beyond any real tool argument.
+const MAX_PY_LITERAL_DEPTH: u32 = 64;
+
+impl<'a> PyLiteralParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            s: text.as_bytes(),
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, b: u8) -> Result<(), ()> {
+        self.skip_ws();
+        if self.peek() == Some(b) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn eof(&mut self) -> bool {
+        self.skip_ws();
+        self.pos >= self.s.len()
+    }
+
+    fn ident(&mut self) -> Result<&'a str, ()> {
+        self.skip_ws();
+        let start = self.pos;
+        while let Some(&b) = self.s.get(self.pos) {
+            if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if start == self.pos
+            || !matches!(self.s[start], b'A'..=b'Z' | b'a'..=b'z' | b'_') && self.s[start] < 0x80
+        {
+            return Err(());
+        }
+        std::str::from_utf8(&self.s[start..self.pos]).map_err(|_| ())
+    }
+
+    /// `name` or `a.b.c` — dotted attribute chains are preserved.
+    fn dotted_name(&mut self) -> Result<String, ()> {
+        let mut name = self.ident()?.to_string();
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'.') {
+                break;
+            }
+            self.pos += 1;
+            name.push('.');
+            name.push_str(self.ident()?);
+        }
+        Ok(name)
+    }
+
+    /// Skip a quoted string starting at `pos` (single or triple quoted);
+    /// backslash escapes the next byte. Unterminated → Err.
+    fn skip_quoted(&mut self) -> Result<(), ()> {
+        let quote = self.s[self.pos];
+        self.pos += 1;
+        let triple = self.peek() == Some(quote) && self.s.get(self.pos + 1) == Some(&quote);
+        if triple {
+            self.pos += 2;
+        }
+        while let Some(&b) = self.s.get(self.pos) {
+            if b == b'\\' {
+                self.pos += 2;
+                continue;
+            }
+            if b == quote {
+                if triple {
+                    if self.s.get(self.pos + 1) == Some(&quote)
+                        && self.s.get(self.pos + 2) == Some(&quote)
+                    {
+                        self.pos += 3;
+                        return Ok(());
+                    }
+                    self.pos += 1;
+                    continue;
+                }
+                self.pos += 1;
+                return Ok(());
+            }
+            self.pos += 1;
+        }
+        Err(())
+    }
+
+    /// Skip one positional argument's expression text. vLLM ignores
+    /// `call.args` entirely, so the content is dropped — but the argument
+    /// boundary must still be found correctly: a top-level `,` or `)` with
+    /// `()[]{}` nesting and quoted strings respected. Empty positionals
+    /// (`f(,x)`), unbalanced closers (`f(a +]`), and a bare `=` outside a
+    /// comparison spelling (`f(5=3)`) reject the call, matching the
+    /// `SyntaxError` `ast.parse` would raise.
+    fn skip_expression(&mut self) -> Result<(), ()> {
+        let start = self.pos;
+        let mut depth = 0usize;
+        while let Some(&b) = self.s.get(self.pos) {
+            match b {
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                b')' | b',' if depth == 0 => {
+                    return if self.pos > start { Ok(()) } else { Err(()) };
+                }
+                b']' | b'}' if depth == 0 => return Err(()), // unbalanced closer
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    self.pos += 1;
+                }
+                b'\'' | b'"' => self.skip_quoted()?,
+                b'=' => {
+                    // A bare `=` can't appear inside an expression (kwargs
+                    // take the `ident =` path): allow only the comparison
+                    // spellings `==`, `<=`, `>=`, `!=`.
+                    let mut p = self.pos;
+                    while p > start && self.s[p - 1] == b' ' {
+                        p -= 1;
+                    }
+                    let prev = (p > start).then(|| self.s[p - 1]);
+                    if self.s.get(self.pos + 1) != Some(&b'=')
+                        && !matches!(prev, Some(b'=' | b'<' | b'>' | b'!'))
+                    {
+                        return Err(());
+                    }
+                    self.pos += 1;
+                }
+                _ => self.pos += 1,
+            }
+        }
+        Err(()) // ran out of text — unterminated
+    }
+
+    /// Parse a string literal: `'…'` `"…"` `'''…'''` `"""…"""` with
+    /// optional `r`/`u`/`f`/`R`/`U`/`F` prefix. `f` is accepted only when
+    /// the body has no `{`/`}` placeholder (vLLM admits JoinedStr made of
+    /// pure constants). Raw control chars inside strings are accepted —
+    /// our parser is lenient where `ast.parse` needed the escape rewrite.
+    fn parse_string(&mut self) -> Result<String, ()> {
+        let mut raw_mode = false;
+        let mut f_mode = false;
+        // Optional letter prefix (r/u/f and combinations like fr/rf). The
+        // dispatch guard guarantees a quote within the two-byte lookahead,
+        // so this loop always lands on one — a non-quote after the letters
+        // is unreachable here.
+        if matches!(
+            self.peek(),
+            Some(b'r' | b'R' | b'u' | b'U' | b'f' | b'F' | b'b' | b'B')
+        ) {
+            while matches!(
+                self.peek(),
+                Some(b'r' | b'R' | b'u' | b'U' | b'f' | b'F' | b'b' | b'B')
+            ) {
+                match self.s[self.pos].to_ascii_lowercase() {
+                    b'r' => raw_mode = true,
+                    b'f' => f_mode = true,
+                    b'b' => return Err(()), // bytes are not JSON-representable
+                    _ => {}
+                }
+                self.pos += 1;
+            }
+        }
+        let quote = match self.peek() {
+            Some(b'\'' | b'"') => self.s[self.pos],
+            _ => return Err(()),
+        };
+        self.pos += 1;
+        // Triple-quoted?
+        let triple = self.peek() == Some(quote) && self.s.get(self.pos + 1) == Some(&quote);
+        if triple {
+            self.pos += 2;
+        }
+        let mut out = String::new();
+        loop {
+            let Some(&b) = self.s.get(self.pos) else {
+                return Err(()); // unterminated
+            };
+            if b == quote {
+                if triple {
+                    if self.s.get(self.pos + 1) == Some(&quote)
+                        && self.s.get(self.pos + 2) == Some(&quote)
+                    {
+                        self.pos += 3;
+                        break;
+                    }
+                    out.push(quote as char);
+                    self.pos += 1;
+                    continue;
+                }
+                self.pos += 1;
+                break;
+            }
+            if !triple && (b == b'\n' || b == b'\r') {
+                // Single-quoted strings cannot span lines in Python — but
+                // raw newlines inside args are the most common model slip
+                // (vLLM fixes via escape_ctrl_chars_in_strings). Accept.
+                out.push(b as char);
+                self.pos += 1;
+                continue;
+            }
+            if !raw_mode && b == b'\\' {
+                self.pos += 1;
+                let Some(&e) = self.s.get(self.pos) else {
+                    return Err(());
+                };
+                self.pos += 1;
+                match e {
+                    b'n' => out.push('\n'),
+                    b't' => out.push('\t'),
+                    b'r' => out.push('\r'),
+                    b'b' => out.push('\x08'),
+                    b'f' => out.push('\x0C'),
+                    b'a' => out.push('\x07'),
+                    b'v' => out.push('\x0B'),
+                    b'0'..=b'7' => {
+                        // Octal escape: up to 3 digits total.
+                        let mut val = (e - b'0') as u32;
+                        let mut n = 1;
+                        while n < 3 {
+                            match self.s.get(self.pos) {
+                                Some(&d @ b'0'..=b'7') => {
+                                    val = val * 8 + (d - b'0') as u32;
+                                    self.pos += 1;
+                                    n += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        out.push(char::from_u32(val).ok_or(())?);
+                    }
+                    b'x' => {
+                        let h = self.hex_digits(2)?;
+                        out.push(char::from_u32(h).ok_or(())?);
+                    }
+                    b'u' => {
+                        let h = self.hex_digits(4)?;
+                        out.push(char::from_u32(h).ok_or(())?);
+                    }
+                    b'U' => {
+                        let h = self.hex_digits(8)?;
+                        out.push(char::from_u32(h).ok_or(())?);
+                    }
+                    b'\n' => {} // line continuation
+                    _ => {
+                        // `\'` `\"` `\\` collapse to the literal char; every
+                        // OTHER unrecognized escape keeps the backslash —
+                        // Python `'\d'` evaluates to `"\\d"` (backslash
+                        // preserved), so `pattern='\d+'` must not lose it.
+                        let e = self.s[self.pos - 1];
+                        if !matches!(e, b'\'' | b'"' | b'\\') {
+                            out.push('\\');
+                        }
+                        let rest = &self.s[self.pos - 1..];
+                        let ch_len = utf8_len(rest[0]);
+                        if rest.len() < ch_len {
+                            return Err(());
+                        }
+                        out.push_str(std::str::from_utf8(&rest[..ch_len]).map_err(|_| ())?);
+                        self.pos += ch_len - 1;
+                    }
+                }
+                continue;
+            }
+            if f_mode && (b == b'{' || b == b'}') {
+                // `{{`/`}}` are escaped literal braces — a pure-constant
+                // f-string like f'{{x}}' evaluates to "{x}" (vLLM accepts;
+                // JoinedStr of constants). A single brace is a real
+                // placeholder → reject.
+                if self.s.get(self.pos + 1) == Some(&b) {
+                    out.push(b as char);
+                    self.pos += 2;
+                    continue;
+                }
+                return Err(());
+            }
+            // Copy one UTF-8 char verbatim.
+            let rest = &self.s[self.pos..];
+            let ch_len = utf8_len(rest[0]);
+            if rest.len() < ch_len {
+                return Err(());
+            }
+            out.push_str(std::str::from_utf8(&rest[..ch_len]).map_err(|_| ())?);
+            self.pos += ch_len;
+        }
+        Ok(out)
+    }
+
+    fn hex_digits(&mut self, n: usize) -> Result<u32, ()> {
+        let mut val = 0u32;
+        for _ in 0..n {
+            let Some(&d) = self.s.get(self.pos) else {
+                return Err(());
+            };
+            let Some(v) = (d as char).to_digit(16) else {
+                return Err(());
+            };
+            val = val * 16 + v;
+            self.pos += 1;
+        }
+        Ok(val)
+    }
+
+    /// Number: dec/hex/oct/bin int or float, optional leading `+`/`-` is
+    /// handled by the caller (unary op). Leading zeros are tolerated
+    /// (vLLM `normalize_leading_zero_ints`).
+    fn parse_number(&mut self) -> Result<Value, ()> {
+        let start = self.pos;
+        if self.peek() == Some(b'0')
+            && matches!(
+                self.s.get(self.pos + 1),
+                Some(b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+            )
+        {
+            let radix = match self.s[self.pos + 1].to_ascii_lowercase() {
+                b'x' => 16,
+                b'o' => 8,
+                _ => 2,
+            };
+            self.pos += 2;
+            let dstart = self.pos;
+            while let Some(&d) = self.s.get(self.pos) {
+                if (d as char).is_digit(radix) || d == b'_' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let digits: String = std::str::from_utf8(&self.s[dstart..self.pos])
+                .map_err(|_| ())?
+                .chars()
+                .filter(|&c| c != '_')
+                .collect();
+            if digits.is_empty() {
+                return Err(());
+            }
+            let v = i128::from_str_radix(&digits, radix).map_err(|_| ())?;
+            return Ok(i128_to_value(v));
+        }
+        let mut is_float = false;
+        while let Some(&d) = self.s.get(self.pos) {
+            match d {
+                b'0'..=b'9' | b'_' => self.pos += 1,
+                b'.' | b'e' | b'E' | b'+' | b'-' => {
+                    // +/- only legal right after e/E.
+                    if d == b'+' || d == b'-' {
+                        let prev = self.s.get(self.pos.wrapping_sub(1)).copied();
+                        if !matches!(prev, Some(b'e' | b'E')) {
+                            break;
+                        }
+                    }
+                    is_float = true;
+                    self.pos += 1;
+                }
+                b'j' | b'J' => return Err(()), // complex: not JSON
+                _ => break,
+            }
+        }
+        let text: String = std::str::from_utf8(&self.s[start..self.pos])
+            .map_err(|_| ())?
+            .chars()
+            .filter(|&c| c != '_')
+            .collect();
+        // Dispatch guarantees the first char is a digit or `.`, so `text`
+        // can only start with those; a `.`-led scan already set `is_float`.
+        if text.is_empty() || !text.bytes().any(|b| b.is_ascii_digit()) {
+            return Err(());
+        }
+        if is_float {
+            // Tolerate the Python forms Rust f64 rejects: leading-dot
+            // `.5` → `0.5`, trailing-dot `1.` → `1.0`.
+            let normalized = if let Some(rest) = text.strip_prefix('.') {
+                format!("0.{rest}")
+            } else if text.ends_with('.') {
+                format!("{text}0")
+            } else {
+                text
+            };
+            normalized.parse::<f64>().map(Value::from).map_err(|_| ())
+        } else {
+            text.parse::<i128>().map(i128_to_value).map_err(|_| ())
+        }
+    }
+
+    /// Parse one literal value: string, number, name constant, or
+    /// container. Unary +/- over a numeric operand is folded here
+    /// (vLLM `get_parameter_value` UnaryOp branch).
+    fn parse_literal(&mut self) -> Result<Value, ()> {
+        self.depth += 1;
+        if self.depth > MAX_PY_LITERAL_DEPTH {
+            self.depth -= 1;
+            return Err(());
+        }
+        let v = self.parse_literal_inner();
+        self.depth -= 1;
+        v
+    }
+
+    fn parse_literal_inner(&mut self) -> Result<Value, ()> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'-' | b'+') => {
+                let neg = self.s[self.pos] == b'-';
+                self.pos += 1;
+                let v = self.parse_literal()?;
+                match v {
+                    Value::Number(n) => {
+                        if neg {
+                            if let Some(i) = n.as_i64() {
+                                Ok(Value::from(-i))
+                            } else if let Some(u) = n.as_u64() {
+                                // Negating a u64 that fits in i64
+                                let i = i64::try_from(u).map_err(|_| ())?;
+                                Ok(Value::from(-i))
+                            } else {
+                                n.as_f64().map(|f| Value::from(-f)).ok_or(())
+                            }
+                        } else {
+                            Ok(Value::Number(n))
+                        }
+                    }
+                    _ => Err(()), // unary on non-number → reject
+                }
+            }
+            Some(b'\'' | b'"') => Ok(Value::String(self.parse_string()?)),
+            Some(b'r' | b'R' | b'u' | b'U' | b'f' | b'F' | b'b' | b'B')
+                if matches!(
+                    self.s.get(self.pos + 1..self.pos + 3).unwrap_or(&[]),
+                    [b'\'' | b'"', ..] | [b'r' | b'R' | b'u' | b'U' | b'f' | b'F', b'\'' | b'"']
+                ) =>
+            {
+                Ok(Value::String(self.parse_string()?))
+            }
+            Some(b'0'..=b'9') | Some(b'.') => self.parse_number(),
+            Some(b'[') => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                self.skip_ws();
+                if self.peek() == Some(b']') {
+                    self.pos += 1;
+                    return Ok(Value::Array(items));
+                }
+                loop {
+                    items.push(self.parse_literal()?);
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.peek() == Some(b']') {
+                                self.pos += 1;
+                                return Ok(Value::Array(items));
+                            }
+                        }
+                        Some(b']') => {
+                            self.pos += 1;
+                            return Ok(Value::Array(items));
+                        }
+                        _ => return Err(()),
+                    }
+                }
+            }
+            Some(b'(') => {
+                // Tuple → JSON array. `(x)` is just x; `(x,)` is a tuple.
+                self.pos += 1;
+                self.skip_ws();
+                if self.peek() == Some(b')') {
+                    self.pos += 1;
+                    return Ok(Value::Array(vec![]));
+                }
+                let first = self.parse_literal()?;
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => {
+                        let mut items = vec![first];
+                        while self.peek() == Some(b',') {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.peek() == Some(b')') {
+                                break;
+                            }
+                            items.push(self.parse_literal()?);
+                            self.skip_ws();
+                        }
+                        self.expect(b')')?;
+                        Ok(Value::Array(items))
+                    }
+                    Some(b')') => {
+                        self.pos += 1;
+                        Ok(first) // parenthesized value
+                    }
+                    _ => Err(()),
+                }
+            }
+            Some(b'{') => {
+                self.pos += 1;
+                self.skip_ws();
+                if self.peek() == Some(b'}') {
+                    self.pos += 1;
+                    return Ok(Value::Object(serde_json::Map::new()));
+                }
+                let first = self.parse_literal()?;
+                self.skip_ws();
+                if self.peek() == Some(b':') {
+                    // dict — keys must be literal (already parsed); Python
+                    // allows any hashable; JSON needs strings.
+                    self.pos += 1;
+                    let mut map = serde_json::Map::new();
+                    let key = literal_key_to_string(&first)?;
+                    map.insert(key, self.parse_literal()?);
+                    loop {
+                        self.skip_ws();
+                        match self.peek() {
+                            Some(b',') => {
+                                self.pos += 1;
+                                self.skip_ws();
+                                if self.peek() == Some(b'}') {
+                                    self.pos += 1;
+                                    return Ok(Value::Object(map));
+                                }
+                                let k = self.parse_literal()?;
+                                self.skip_ws();
+                                self.expect(b':')?;
+                                map.insert(literal_key_to_string(&k)?, self.parse_literal()?);
+                            }
+                            Some(b'}') => {
+                                self.pos += 1;
+                                return Ok(Value::Object(map));
+                            }
+                            _ => return Err(()),
+                        }
+                    }
+                } else {
+                    // set literal `{v, v}` → array (vLLM maps sets to lists)
+                    let mut items = vec![first];
+                    loop {
+                        self.skip_ws();
+                        match self.peek() {
+                            Some(b',') => {
+                                self.pos += 1;
+                                self.skip_ws();
+                                if self.peek() == Some(b'}') {
+                                    self.pos += 1;
+                                    return Ok(Value::Array(items));
+                                }
+                                items.push(self.parse_literal()?);
+                            }
+                            Some(b'}') => {
+                                self.pos += 1;
+                                return Ok(Value::Array(items));
+                            }
+                            _ => return Err(()),
+                        }
+                    }
+                }
+            }
+            _ => {
+                let name = self.ident()?;
+                match name {
+                    "True" | "true" => Ok(Value::Bool(true)),
+                    "False" | "false" => Ok(Value::Bool(false)),
+                    "None" | "null" => Ok(Value::Null),
+                    _ => Err(()), // bare name → not a literal
+                }
+            }
+        }
+    }
+
+    /// One call element: `name(kw=literal, ...)`. Positional arguments are
+    /// skipped then dropped (vLLM iterates `call.keywords` only); `**kw`
+    /// rejects the call outright (vLLM fails on `arguments[None]`). Two
+    /// `ast.parse`-level `SyntaxError`s are mirrored: a positional AFTER a
+    /// keyword (`f(x=1, 5)`) and a repeated keyword (`f(x=1, x=2)`).
+    fn parse_call(&mut self) -> Result<(String, Value), ()> {
+        let name = self.dotted_name()?;
+        self.expect(b'(')?;
+        let mut args = serde_json::Map::new();
+        let mut seen_kwarg = false;
+        self.skip_ws();
+        if self.peek() == Some(b')') {
+            self.pos += 1;
+            return Ok((name, Value::Object(args)));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(b'*') {
+                // `*x` spread: ignored like other positionals (legal even
+                // after keywords); `**x` → reject (vLLM's
+                // `arguments[None]` failure).
+                self.pos += 1;
+                if self.peek() == Some(b'*') {
+                    return Err(());
+                }
+                self.skip_expression()?;
+            } else {
+                // `kw=literal` or a positional expression. Try the
+                // `ident =` lookahead first (excluding `==`); on no match
+                // rewind and skip the positional, which vLLM drops.
+                // Reserved-word kwargs (`from=1`) parse natively here —
+                // vLLM needs its rename/restore dance, we don't.
+                let save = self.pos;
+                let kw: Option<String> = match self.ident() {
+                    Ok(id) => {
+                        let id = id.to_string();
+                        self.skip_ws();
+                        if self.peek() == Some(b'=') && self.s.get(self.pos + 1) != Some(&b'=') {
+                            self.pos += 1;
+                            Some(id)
+                        } else {
+                            self.pos = save;
+                            None
+                        }
+                    }
+                    // `ident` consumes leading digits before rejecting a
+                    // digit start — REWIND so a numeric positional
+                    // (`f(5)`, `f(0x10)`) still scans as an expression.
+                    Err(()) => {
+                        self.pos = save;
+                        None
+                    }
+                };
+                match kw {
+                    Some(k) => {
+                        seen_kwarg = true;
+                        let v = self.parse_literal()?;
+                        // `f(x=1, x=2)` → `SyntaxError: keyword argument
+                        // repeated` — vLLM rejects the whole block.
+                        if args.insert(k, v).is_some() {
+                            return Err(());
+                        }
+                    }
+                    None => {
+                        // `f(x=1, 5)` → `SyntaxError: positional argument
+                        // follows keyword argument`.
+                        if seen_kwarg {
+                            return Err(());
+                        }
+                        self.skip_expression()?;
+                    }
+                }
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                        return Ok((name, Value::Object(args)));
+                    }
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    return Ok((name, Value::Object(args)));
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+}
+
+fn utf8_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first < 0xE0 {
+        2
+    } else if first < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+fn i128_to_value(v: i128) -> Value {
+    if let Ok(i) = i64::try_from(v) {
+        Value::from(i)
+    } else if let Ok(u) = u64::try_from(v) {
+        Value::from(u)
+    } else {
+        Value::from(v as f64)
+    }
+}
+
+/// Python dict keys are any hashable; JSON keys are strings — stringify
+/// non-string literal keys the way `json.dumps` does (`{True: 1}` →
+/// `{"true": 1}`, `{None: 1}` → `{"null": 1}`).
+fn literal_key_to_string(v: &Value) -> Result<String, ()> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(if *b { "true".into() } else { "false".into() }),
+        Value::Null => Ok("null".into()),
+        _ => Err(()), // list/dict keys are unhashable in Python too
+    }
+}
+
+/// Parse the bracket-list body (`f(x=1), g(y='a')` — without the outer
+/// `[]`) into `(name, args)` pairs. `None` on any parse failure, a trailing
+/// element, or leftover input. A trailing comma (`[f(),]`) is legal Python
+/// and accepted.
+fn parse_lfm2_call_list(body: &str) -> Option<Vec<(String, Value)>> {
+    let mut p = PyLiteralParser::new(body);
+    let mut calls = Vec::new();
+    p.skip_ws();
+    p.peek()?; // `[]` — vLLM requires non-empty elts
+    loop {
+        let (name, args) = p.parse_call().ok()?;
+        calls.push((name, args));
+        p.skip_ws();
+        match p.peek() {
+            Some(b',') => {
+                p.pos += 1;
+                p.skip_ws();
+                if p.peek().is_none() {
+                    break; // trailing comma at end of list
+                }
+            }
+            None => break,
+            _ => return None,
+        }
+    }
+    (p.eof() && !calls.is_empty()).then_some(calls)
+}
+
+/// vLLM `escape_nested_quotes_in_strings` (`tool_parsers/utils.py`): close a
+/// broken string literal at the only closing quote that works. Models
+/// emitting shell commands nest unescaped same-style quotes inside a string
+/// argument (`command='sed -n '1,9p' f.py'`). A string is broken when its
+/// first unescaped quote cannot syntactically close it (the next non-space
+/// char is none of `,)]}:`); then every plausible closing quote is tried —
+/// interior quotes escaped — and the candidate kept only when it is the
+/// UNIQUE candidate that re-parses as a call list. Returns `None` on zero
+/// or ambiguous candidates.
+///
+/// vLLM validates each candidate with `ast.parse` (any expression) and only
+/// afterwards requires all-`Call` elements — so a second candidate that
+/// parses as a non-call expression still counts as ambiguity there. Our
+/// validator is `parse_lfm2_call_list` (all-calls up front), which makes
+/// the recovery strictly more permissive on that corner: accepted here,
+/// declared ambiguous upstream.
+fn escape_lfm2_nested_quotes(text: &str) -> Option<String> {
+    fn unescaped_quote_positions(text: &str, start: usize, quote: u8) -> Vec<usize> {
+        let s = text.as_bytes();
+        let mut out = Vec::new();
+        let mut j = start;
+        while j < s.len() {
+            if s[j] == b'\\' {
+                j += 2;
+                continue;
+            }
+            if s[j] == quote {
+                out.push(j);
+            }
+            j += 1;
+        }
+        out
+    }
+    // vLLM `_QUOTE_FOLLOWERS` — a quote closes the string only when the
+    // next non-space byte is a container/argument delimiter.
+    fn is_closer(text: &str, pos: usize) -> bool {
+        let s = text.as_bytes();
+        let mut k = pos + 1;
+        while k < s.len() && s[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        k < s.len() && matches!(s[k], b',' | b')' | b']' | b'}' | b':')
+    }
+    // vLLM `_is_escaped`: escaped iff preceded by an ODD backslash run.
+    fn is_escaped(s: &[u8], index: usize) -> bool {
+        let mut n = 0usize;
+        let mut j = index;
+        while j > 0 && s[j - 1] == b'\\' {
+            n += 1;
+            j -= 1;
+        }
+        n % 2 == 1
+    }
+
+    let s = text.as_bytes();
+    let mut index = 0usize;
+    while index < s.len() {
+        let quote = s[index];
+        if quote != b'\'' && quote != b'"' {
+            index += 1;
+            continue;
+        }
+        let quotes = unescaped_quote_positions(text, index + 1, quote);
+        let Some(&first) = quotes.first() else {
+            return None; // unterminated — nothing to requote
+        };
+        if is_closer(text, first) {
+            index = first + 1; // normal string; skip past it
+            continue;
+        }
+        // Broken string: try each plausible close, escaping interior
+        // same-quotes; keep the candidate only when exactly one parses.
+        let mut winner: Option<String> = None;
+        for &close in quotes.iter().filter(|&&j| is_closer(text, j)) {
+            let mut candidate = String::with_capacity(text.len() + 8);
+            candidate.push_str(&text[..index + 1]); // through opening quote
+            for (off, ch) in text[index + 1..close].char_indices() {
+                if ch == quote as char && !is_escaped(s, index + 1 + off) {
+                    candidate.push('\\');
+                }
+                candidate.push(ch);
+            }
+            candidate.push(quote as char);
+            candidate.push_str(&text[close + 1..]);
+            // The candidate is the full bracketed list; validate by parsing
+            // the bracket-free body.
+            let valid = {
+                let c = candidate.trim();
+                c.starts_with('[')
+                    && c.ends_with(']')
+                    && parse_lfm2_call_list(&c[1..c.len() - 1]).is_some()
+            };
+            if valid {
+                if winner.is_some() {
+                    return None; // ambiguous — don't guess
+                }
+                winner = Some(candidate);
+            }
+        }
+        return winner;
+    }
+    None
+}
+
+/// Parse the LFM2 sentinel block: first `<|tool_call_start|>` … first
+/// `<|tool_call_end|>` (or end of text when the stream cut mid-call).
+/// Returns (cleaned_text, calls). Parse failure returns the ORIGINAL text
+/// verbatim with no calls (vLLM `content=model_output` semantics).
+fn parse_lfm2_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
+    // A sentinel inside a `<tool_call>` block is literal argument text
+    // (e.g. `{"a": "<|tool_call_start|>…"}`) — not LFM2 markup. Exclude
+    // every `<tool_call>` open's span (through its close, or EOF when
+    // unclosed) from the sentinel search so a sentinel can never be
+    // promoted to a real call out of another family's argument string.
+    let protected: Vec<(usize, usize)> = all_positions(text, "<tool_call>")
+        .into_iter()
+        .map(|open| {
+            let end = text[open..]
+                .find("</tool_call>")
+                .map(|c| open + c + "</tool_call>".len())
+                .unwrap_or(text.len());
+            (open, end)
+        })
+        .collect();
+    let mut search_from = 0;
+    let start_idx = loop {
+        let Some(rel) = text[search_from..].find(LFM2_TOOL_CALL_START) else {
+            return (text.to_string(), Vec::new());
+        };
+        let idx = search_from + rel;
+        if !protected.iter().any(|&(s, e)| idx >= s && idx < e) {
+            break idx;
+        }
+        search_from = idx + LFM2_TOOL_CALL_START.len();
+    };
+    let inner_start = start_idx + LFM2_TOOL_CALL_START.len();
+    let (inner, block_end, raw_after) = match text[inner_start..].find(LFM2_TOOL_CALL_END) {
+        Some(e) => {
+            let end = inner_start + e + LFM2_TOOL_CALL_END.len();
+            (&text[inner_start..inner_start + e], end, &text[end..])
+        }
+        None => (&text[inner_start..], text.len(), ""),
+    };
+    let tool_text = inner.trim();
+    // vLLM `TOOL_CALL_REGEX`: bracketed list only.
+    if !(tool_text.starts_with('[') && tool_text.ends_with(']')) {
+        return (text.to_string(), Vec::new());
+    }
+    let inner_body = &tool_text[1..tool_text.len() - 1];
+    // Direct parse first; on failure, the nested-quote recovery rewrites
+    // `command='sed -n '1,9p' f.py'` shapes and re-parses (vLLM runs
+    // `escape_nested_quotes_in_strings` over the ast.parse failure). The
+    // recovery sees the BRACKETED text — the trailing `)]` is what makes the
+    // outer quote a syntactically plausible close.
+    let Some(parsed_calls) = parse_lfm2_call_list(inner_body).or_else(|| {
+        escape_lfm2_nested_quotes(tool_text).and_then(|fixed| {
+            let f = fixed.trim();
+            if f.starts_with('[') && f.ends_with(']') {
+                parse_lfm2_call_list(&f[1..f.len() - 1])
+            } else {
+                None
+            }
+        })
+    }) else {
+        return (text.to_string(), Vec::new());
+    };
+    let raw = &text[start_idx..block_end];
+    let calls: Vec<ToolCallResult> = parsed_calls
+        .into_iter()
+        .map(|(name, args)| ToolCallResult::ok(name, args, raw.to_string()))
+        .collect();
+
+    // Success: content is the text BEFORE the sentinel joined with the
+    // echo-stripped trailing text (vLLM joins non-empty parts with "\n").
+    let before = text[..start_idx].trim();
+    let after = strip_lfm2_echo(raw_after).trim();
+    let content = match (before.is_empty(), after.is_empty()) {
+        (false, false) => format!("{before}\n{after}"),
+        (false, true) => before.to_string(),
+        (true, false) => after.to_string(),
+        (true, true) => String::new(),
+    };
+    (content, calls)
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Parse tool calls from generated text
 ///
 /// Returns (cleaned_text, tool_calls) where:
-/// - `cleaned_text` has all `<tool_call>...</tool_call>` tags removed
+/// - `cleaned_text` has all tool-call markup removed
 /// - `tool_calls` contains all parsed tool calls with status info
 ///
-/// Supports three formats:
+/// Supports four formats:
 /// - JSON (Qwen3): `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
 /// - Function (Qwen3.5): `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`
 /// - XML (legacy): `<tool_call><name>func</name><arguments>{...}</arguments></tool_call>`
+/// - Pythonic (LFM2/LFM2.5): `<|tool_call_start|>[func(arg='v')]<|tool_call_end|>`
+///
+/// The LFM2 sentinel block is extracted first because its echo suppression
+/// owns the tail after the first `<|tool_call_end|>`; a mixed-format output
+/// orders LFM2 calls before `<tool_call>` calls.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
-    let blocks = extract_tag_blocks(text, "<tool_call>", "</tool_call>");
+    let (text, mut tool_calls) = parse_lfm2_tool_calls(text);
 
-    let mut tool_calls = Vec::new();
+    let blocks = extract_tag_blocks(&text, "<tool_call>", "</tool_call>");
     for (start, end, inner) in &blocks {
         let raw_content = &text[*start..*end];
         if let Some(result) = classify_and_parse_tool_call(inner, raw_content) {
@@ -430,13 +1423,13 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
         }
     }
 
-    let cleaned_text = strip_tag_blocks(text, "<tool_call>", "</tool_call>");
+    let cleaned_text = strip_tag_blocks(&text, "<tool_call>", "</tool_call>");
     (cleaned_text, tool_calls)
 }
 
 /// Check if text contains any tool call tags
 pub fn has_tool_calls(text: &str) -> bool {
-    text.contains("<tool_call>")
+    text.contains("<tool_call>") || text.contains(LFM2_TOOL_CALL_START)
 }
 
 /// Parse thinking content from generated text
@@ -511,8 +1504,9 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 }
 
 /// Strip reasoning (`<think>`/`<longcat_think>` blocks, both families) from `text`
-/// while preserving `<tool_call>…</tool_call>` spans that are NOT themselves part of a
-/// reasoning block.
+/// while preserving tool-call spans that are NOT themselves part of a
+/// reasoning block — both `<tool_call>…</tool_call>` and LFM2
+/// `<|tool_call_start|>…<|tool_call_end|>` spans.
 ///
 /// Used to scrub reasoning from `raw_text` on the no-`</think>`-token fallback path.
 /// Three requirements: reasoning-looking tags *inside* a tool-call argument (a literal
@@ -581,10 +1575,19 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
 
 /// One pass of the range-based reasoning scrub (see `strip_reasoning_preserving_tools`).
 fn strip_reasoning_once(text: &str) -> String {
-    let tool_ranges: Vec<(usize, usize)> = extract_tag_blocks(text, "<tool_call>", "</tool_call>")
-        .into_iter()
-        .map(|(s, e, _)| (s, e))
-        .collect();
+    let mut tool_ranges: Vec<(usize, usize)> =
+        extract_tag_blocks(text, "<tool_call>", "</tool_call>")
+            .into_iter()
+            .map(|(s, e, _)| (s, e))
+            .collect();
+    // LFM2's pythonic sentinel blocks get the same protection: a call nested
+    // inside reasoning is scrubbed with it; a top-level call is preserved
+    // verbatim so `parse_lfm2_tool_calls` still sees it.
+    tool_ranges.extend(
+        extract_tag_blocks(text, LFM2_TOOL_CALL_START, LFM2_TOOL_CALL_END)
+            .into_iter()
+            .map(|(s, e, _)| (s, e)),
+    );
     // The logic below handles the no-tool case for free (empty `tool_ranges` ⇒ every tag is
     // top-level and no spans are dropped), so there is NO separate `parse_thinking` fast path:
     // the scrubber owns its missing-open scanner (`missing_open_close`) and never delegates to
@@ -725,17 +1728,28 @@ fn applied_missing_open(
 /// argument carries a `</think>`, with no top-level close past it) must NOT drive another pass —
 /// re-running would drop the valid call.
 fn has_top_level_missing_open_terminator(text: &str) -> bool {
-    let tool_ranges: Vec<(usize, usize)> = extract_tag_blocks(text, "<tool_call>", "</tool_call>")
-        .into_iter()
-        .map(|(s, e, _)| (s, e))
-        .collect();
+    let mut tool_ranges: Vec<(usize, usize)> =
+        extract_tag_blocks(text, "<tool_call>", "</tool_call>")
+            .into_iter()
+            .map(|(s, e, _)| (s, e))
+            .collect();
+    // LFM2 sentinel spans count too: a `</think>` inside a preserved LFM2
+    // call's string arg is an in-tool straddle, NOT a top-level close —
+    // misclassifying it would run a second pass that drops the call.
+    tool_ranges.extend(
+        extract_tag_blocks(text, LFM2_TOOL_CALL_START, LFM2_TOOL_CALL_END)
+            .into_iter()
+            .map(|(s, e, _)| (s, e)),
+    );
     matches!(applied_missing_open(text, &tool_ranges), Some((_, _, true)))
 }
 
-/// Keep only the `<tool_call>…</tool_call>` spans in `out` whose byte range is one of `genuine`
-/// (the PRESERVED tool spans mapped to output coordinates). Every other tool span is a
-/// removal-seam artifact — fragments fused into a `<tool_call>` span that never existed as a
-/// preserved call — and `parse_tool_calls` would treat it as executable, so it is dropped.
+/// Keep only the tool spans in `out` whose byte range is one of `genuine`
+/// (the PRESERVED tool spans mapped to output coordinates) — across both
+/// families (`<tool_call>…</tool_call>` and the LFM2 sentinel pair). Every
+/// other tool span is a removal-seam artifact — fragments fused into a
+/// tool span that never existed as a preserved call — and
+/// `parse_tool_calls` would treat it as executable, so it is dropped.
 ///
 /// Provenance is by RANGE, not bytes: a fabricated span can be byte-identical to a genuine call
 /// (e.g. a duplicate), so a multiset of strings cannot disambiguate them (an earlier fabricated
@@ -745,8 +1759,23 @@ fn has_top_level_missing_open_terminator(text: &str) -> bool {
 /// `out`, so it terminates.
 fn keep_only_genuine_tool_spans(mut out: String, mut genuine: Vec<(usize, usize)>) -> String {
     loop {
-        let spans = extract_tag_blocks(&out, "<tool_call>", "</tool_call>");
-        let Some(&(s, e, _)) = spans.iter().find(|(s, e, _)| !genuine.contains(&(*s, *e))) else {
+        // Rescan BOTH families: a removal seam can fuse LFM2 sentinel
+        // fragments (`<|tool_call_start` + `|>[f()]<|tool_call_end|>`) into a
+        // fabricated block just like `<tool_call>` ones.
+        let mut spans = extract_tag_blocks(&out, "<tool_call>", "</tool_call>");
+        spans.extend(extract_tag_blocks(
+            &out,
+            LFM2_TOOL_CALL_START,
+            LFM2_TOOL_CALL_END,
+        ));
+        // A span nested INSIDE a genuine one (`f(x='<tool_call>{}</tool_call>')`)
+        // is preserved argument text, not markup — and needs no special case
+        // here: the initial `tool_ranges` scan already extracted it and it was
+        // disjoint from reasoning, so it sits in `genuine` alongside its
+        // container. (No removal seam can form inside a genuine span — kept
+        // spans are copied verbatim, so no new nested span can appear either.)
+        let suspect = spans.iter().find(|(s, e, _)| !genuine.contains(&(*s, *e)));
+        let Some(&(s, e, _)) = suspect else {
             return out; // every surviving tool span maps to a preserved range
         };
         let mut result = String::with_capacity(out.len() - (e - s));
@@ -892,7 +1921,8 @@ pub struct ParseToolCallsResult {
 #[napi(object)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletionInfo {
-    /// Clean text with <tool_call> and <think> tags removed
+    /// Clean text with tool-call markup (`<tool_call>` and the LFM2
+    /// `<|tool_call_start|>…<|tool_call_end|>` pair) and <think> tags removed
     pub text: String,
     /// Raw output before tag stripping (for debugging/XML parsing)
     pub raw_text: String,
@@ -931,7 +1961,8 @@ pub fn parse_tool_calls_from_text(text: String) -> ParseToolCallsResult {
 ///
 /// Convenience function that extracts both structured components.
 /// Returns (cleaned_text, tool_calls, thinking) where cleaned_text has
-/// both `<tool_call>` and `<think>` tags removed.
+/// tool-call markup (`<tool_call>` and the LFM2 sentinel pair) and
+/// `<think>` tags removed.
 pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Option<String>) {
     let (text_without_tools, tool_calls) = parse_tool_calls(text);
     let (cleaned_text, thinking) = parse_thinking(&text_without_tools);
@@ -2590,6 +3621,297 @@ The weather in Tokyo is sunny."#;
         assert!(
             path_idx < edits_idx,
             "`path` must appear before `edits` in serialized args; got {serialized}",
+        );
+    }
+
+    // ----- LFM2 pythonic sentinel format -----
+
+    #[test]
+    fn test_lfm2_tool_call_basic() {
+        let input = "Let me check.<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, "Let me check.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "ok");
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "Paris");
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_literal_types() {
+        let input = "<|tool_call_start|>[wx.forecast(city='Paris', days=-3, opts={\"deep\": [1, 2]}, unit=\"C\", rain=True, snow=false, none=None, tup=(1, 'x'), st={1, 2}, hx=0x1f, fl=1.5e-3)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        let a = &calls[0].arguments;
+        assert_eq!(a["city"], "Paris");
+        assert_eq!(a["days"], -3);
+        assert_eq!(a["opts"], serde_json::json!({"deep": [1, 2]}));
+        assert_eq!(a["unit"], "C");
+        assert_eq!(a["rain"], true);
+        assert_eq!(a["snow"], false);
+        assert_eq!(a["none"], Value::Null);
+        assert_eq!(a["tup"], serde_json::json!([1, "x"]));
+        assert_eq!(a["st"], serde_json::json!([1, 2]));
+        assert_eq!(a["hx"], 31);
+        assert!((a["fl"].as_f64().unwrap() - 0.0015).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_multiple_calls_one_block() {
+        // Parallel calls live inside ONE bracket list (vLLM parity).
+        let input = "<|tool_call_start|>[a.f(x=1), b.g(y='z', w=[True])]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a.f"); // dotted name preserved
+        assert_eq!(calls[1].name, "b.g");
+        assert_eq!(calls[1].arguments["w"], serde_json::json!([true]));
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_echo_suppression() {
+        // LFM2 re-emits the call body after the first end sentinel, capped
+        // by a second end sentinel — everything through the last orphan end
+        // is dropped, then real post-call prose resumes.
+        let input =
+            "Check: <|tool_call_start|>[f(x=1)]<|tool_call_end|>[f(x=1)]<|tool_call_end|>Done.";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(text, "Check:\nDone.");
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_echo_no_second_end() {
+        // Echo body without a closing sentinel still holds (rfind finds
+        // nothing to strip through) — trailing starts with '[' and stays
+        // part of content per vLLM `_strip_echo` on the non-streaming path:
+        // with no orphan end there is nothing to strip, so it IS content.
+        let input = "<|tool_call_start|>[f(x=1)]<|tool_call_end|>[f(x=1)]";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(text, "[f(x=1)]");
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_reserved_kwarg_and_positional() {
+        // `from` is a Python keyword — vLLM renames it to parse; we accept
+        // it natively.
+        let input = "<|tool_call_start|>[mem.get(from=1)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, serde_json::json!({"from": 1}));
+
+        // A positional AFTER a keyword is a Python SyntaxError — vLLM's
+        // ast.parse rejects, so the whole block stays raw with no calls.
+        let input = "<|tool_call_start|>[mem.get(from=1, 'dropped')]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, input);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_failures_keep_raw_text() {
+        // vLLM: parse failure → tools_called=False, content=model_output
+        // verbatim (sentinels included). Each of these rejects the whole
+        // block: bare name, constant element, `**` spread, f-string
+        // placeholder, empty list, missing bracket.
+        for input in [
+            "<|tool_call_start|>[foo]<|tool_call_end|>",
+            "<|tool_call_start|>[f(), 42]<|tool_call_end|>",
+            "<|tool_call_start|>[f(**cfg)]<|tool_call_end|>",
+            "<|tool_call_start|>[f(x=f'{y}')]<|tool_call_end|>",
+            "<|tool_call_start|>[]<|tool_call_end|>",
+            "<|tool_call_start|>f(x=1)<|tool_call_end|>",
+            "<|tool_call_start|>[f(x=undefined)]<|tool_call_end|>",
+        ] {
+            let (text, calls) = parse_tool_calls(input);
+            assert_eq!(text, input, "failure must keep raw text: {input}");
+            assert!(calls.is_empty(), "failure must yield no calls: {input}");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_unclosed_start() {
+        // Stream ended mid-call (max_tokens): vLLM treats text after the
+        // start sentinel as the call body; parse still attempted.
+        let input = "Intro.<|tool_call_start|>[f(x=1)]";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(text, "Intro.");
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_string_escapes_and_newline() {
+        let input = "<|tool_call_start|>[run(cmd='a\\nb', raw=r'c\\d', lit='line1\nline2')]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        let a = &calls[0].arguments;
+        assert_eq!(a["cmd"], "a\nb");
+        assert_eq!(a["raw"], "c\\d");
+        assert_eq!(a["lit"], "line1\nline2"); // raw newline tolerated
+    }
+
+    /// Trailing/leading-dot floats (`1.`, `.5`) keep their value — a
+    /// botched normalization must not turn `1.` into `10`.
+    #[test]
+    fn test_lfm2_tool_call_dot_floats() {
+        let input = "<|tool_call_start|>[f(a=1., b=.5, c=2.5)]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["a"], 1.0);
+        assert_eq!(calls[0].arguments["b"], 0.5);
+        assert_eq!(calls[0].arguments["c"], 2.5);
+    }
+
+    /// Positional EXPRESSIONS (`f(x)`, `f(a+b)`, `f(len(a))`, `f(*args)`)
+    /// parse fine under ast.parse — vLLM accepts the call and keeps only
+    /// keywords. They must be skipped, not reject the call.
+    #[test]
+    fn test_lfm2_tool_call_expression_positionals_dropped() {
+        let input = "<|tool_call_start|>[f(x, len(a), *args, k=1), g(a+b, 'lit')]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments, serde_json::json!({"k": 1}));
+        assert_eq!(calls[1].name, "g");
+        assert_eq!(calls[1].arguments, serde_json::json!({}));
+    }
+
+    /// `f(x=1, x=2)` is a Python SyntaxError ("keyword argument repeated") —
+    /// vLLM's ast.parse rejects it, so the block stays raw with no calls.
+    #[test]
+    fn test_lfm2_tool_call_duplicate_kwarg_rejected() {
+        let input = "<|tool_call_start|>[f(x=1, x=2)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, input);
+        assert!(calls.is_empty());
+    }
+
+    /// An LFM2 sentinel inside a `<tool_call>` argument is literal text,
+    /// not a real call — it must not be promoted.
+    #[test]
+    fn test_lfm2_sentinel_inside_tool_call_arg_not_promoted() {
+        let input = "<tool_call>{\"name\":\"g\",\"arguments\":{\"a\":\"<|tool_call_start|>[f()]<|tool_call_end|>\"}}</tool_call>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "g");
+        assert_eq!(
+            calls[0].arguments["a"],
+            "<|tool_call_start|>[f()]<|tool_call_end|>"
+        );
+        assert_eq!(text, "");
+    }
+
+    /// Numeric positionals (`f(5)`, `f(0x10)`) are dropped like any other
+    /// positional — they must not kill the whole call.
+    #[test]
+    fn test_lfm2_tool_call_numeric_positional_dropped() {
+        let input = "<|tool_call_start|>[f(5, x=1), g(0x10)]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments["x"], 1);
+        assert_eq!(calls[0].arguments.as_object().unwrap().len(), 1);
+        assert_eq!(calls[1].name, "g");
+    }
+
+    /// A trailing comma in the call list (`[f(),]`) is legal Python.
+    #[test]
+    fn test_lfm2_tool_call_trailing_comma() {
+        let input = "<|tool_call_start|>[f(x=1),]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["x"], 1);
+    }
+
+    /// Unknown escapes keep the backslash (Python `'\d'` → `"\\d"`), while
+    /// `\'`/`\"`/`\\` collapse to the literal char.
+    #[test]
+    fn test_lfm2_tool_call_unknown_escape_keeps_backslash() {
+        let input = r"<|tool_call_start|>[f(pattern='\d+', q='it\'s', bs='a\\b')]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["pattern"], "\\d+");
+        assert_eq!(calls[0].arguments["q"], "it's");
+        assert_eq!(calls[0].arguments["bs"], "a\\b");
+    }
+
+    /// Dict keys stringify like `json.dumps` (`{True:1}` → `{"true":1}`).
+    #[test]
+    fn test_lfm2_tool_call_nonstring_dict_keys() {
+        let input = "<|tool_call_start|>[f(m={True:1, None:2, 3:4})]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        let m = &calls[0].arguments["m"];
+        assert_eq!(m["true"], 1);
+        assert_eq!(m["null"], 2);
+        assert_eq!(m["3"], 4);
+    }
+
+    /// `{{`/`}}` in an f-string are literal braces — a pure-constant
+    /// f-string parses; a real `{placeholder}` still rejects the block.
+    #[test]
+    fn test_lfm2_tool_call_fstring_escaped_braces() {
+        let input = r"<|tool_call_start|>[f(s=f'{{x}}')]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["s"], "{x}");
+
+        let bad = r"<|tool_call_start|>[f(s=f'{x}')]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(bad);
+        assert!(calls.is_empty());
+        assert_eq!(text, bad);
+    }
+
+    /// Pathological nesting must fail closed (raw text back), never
+    /// overflow the stack.
+    #[test]
+    fn test_lfm2_tool_call_depth_cap_fails_closed() {
+        let deep = "[".repeat(200) + &"]".repeat(200);
+        let input = format!("<|tool_call_start|>[f(x={deep})]<|tool_call_end|>");
+        let (text, calls) = parse_tool_calls(&input);
+        assert!(calls.is_empty());
+        assert_eq!(text, input);
+    }
+
+    /// vLLM `escape_nested_quotes_in_strings`: `command='sed -n '1,9p'
+    /// f.py'` recovers when exactly one closing quote parses.
+    #[test]
+    fn test_lfm2_tool_call_nested_quote_recovery() {
+        let input = "<|tool_call_start|>[run(command='sed -n '1,9p' f.py')]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "sed -n '1,9p' f.py");
+    }
+
+    /// A `</think>` inside a preserved LFM2 call's string arg must not be
+    /// misread as a top-level missing-open terminator (would run a second
+    /// scrub pass that drops the call).
+    #[test]
+    fn test_strip_reasoning_lfm2_call_with_inner_think_close() {
+        let input = "R</think>\n<|tool_call_start|>[f(x='</think>\ny')]<|tool_call_end|>";
+        let out = strip_reasoning_preserving_tools(input);
+        let (_, calls) = parse_tool_calls(&out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["x"], "</think>\ny");
+    }
+
+    /// The synthesis defense applies to LFM2 sentinels too: a removal seam
+    /// must not fuse sentinel fragments into a fabricated call.
+    #[test]
+    fn test_strip_reasoning_cannot_fuse_lfm2_sentinel_fragments() {
+        // `<|tool_call_start` before reasoning + `|>[f()]<|tool_call_end|>`
+        // after — deleting the reasoning would fuse a fake call without the
+        // LFM2-aware rescan.
+        let input = "<|tool_call_start<think>secret</think>|>[f()]<|tool_call_end|>";
+        let out = strip_reasoning_preserving_tools(input);
+        let (_, calls) = parse_tool_calls(&out);
+        assert!(
+            calls.is_empty(),
+            "fused sentinel must not yield a call: {out}"
         );
     }
 }

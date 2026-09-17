@@ -72,6 +72,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`        | Weight-loading chunk size                                                                                                                                                                                                                                                                              |
 | `MLX_GDN_KERNEL=perstep\|chunked`        | Force GDN recurrence kernel (default per-step on all archs; `chunked` is A/B-only and changes generated tokens by 1–2 bf16 ULP → different greedy continuation on some long prompts)                                                                                                                   |
 | `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION` | Opt-in (default off): multi-turn LFM2 cache-hit prefill tries the graph-native paged-attention bridge (gather_kv_for_prefill_chunk) before read_kv_range, skipping the forced per-layer pool sync. Held opt-in pending a stable-checkpoint paged-vs-flat gate (fused-vs-masked-SDPA ~1-ULP divergence) |
+| `MLX_LFM2_FUSED_BATCH_DECODE`            | Opt-in (default off): LFM2 multi-row decode waves run one fused `[N,1]` forward instead of the default row-exact wave (per-row N=1 forwards, bit-identical to serial). Fused M=N GEMM tiles round differently than M=1 and the carried ShortConv state amplifies the ULP diff into occasional greedy near-tie flips |
 
 ### Paged-attention
 

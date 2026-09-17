@@ -211,6 +211,7 @@ impl Lfm2DecoderLayer {
         cached_prefix_len: u32,
         is_prefill: bool,
         conv_cache: Option<&mut Lfm2LayerCache>,
+        prefill_mask: Option<&MxArray>,
     ) -> Result<MxArray> {
         // Pre-norm
         let normed = self.operator_norm.forward(x)?;
@@ -225,6 +226,7 @@ impl Lfm2DecoderLayer {
                     first_logical_position,
                     cached_prefix_len,
                     is_prefill,
+                    prefill_mask,
                 )?,
             (Lfm2LayerKind::Conv, OperatorType::Conv(conv)) => {
                 let conv_cache_slot = conv_cache.and_then(|c| c.as_conv_cache_mut());

@@ -1175,9 +1175,9 @@ pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
     let p_draft_f32 = p_draft.astype(DType::Float32)?;
     // `item_at_*` reads `arr.data<T>()[index]` directly, which requires the
     // underlying buffer to be materialized. Force evaluation before any
-    // scalar extraction.
-    p_target_f32.eval();
-    p_draft_f32.eval();
+    // scalar extraction — one grouped eval so both arrays complete in a
+    // single wait.
+    MxArray::eval_arrays(&[&p_target_f32, &p_draft_f32])?;
 
     let idx = draft_id as usize;
     let p_t = p_target_f32.item_at_float32(idx)?;

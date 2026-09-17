@@ -1359,7 +1359,7 @@ pub(crate) mod recipe {
             let num_dense_layers = config
                 .get("num_dense_layers")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+                .unwrap_or(2) as usize;
 
             info!(
                 "  lfm2 sanitize: num_hidden_layers={}, num_dense_layers={}, num_experts={:?}, target_dtype={:?}",

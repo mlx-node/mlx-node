@@ -479,9 +479,13 @@ async function handleStreamingNativeWithAbort(
         sawDone = true;
         // Final event -- close open items and emit completed
 
-        // Flush any remaining pending text (no tool call tag was found)
+        // Flush any remaining pending text (no tool call tag was found).
+        // flush() resolves the LFM2 paired-sentinel state machine first, so
+        // a same-chunk `<|tool_call_end|>prose` tail still releases its
+        // prose — whatever it returns is safe to emit regardless of the
+        // still-suppressed post-call echo watch.
         const remainingText = tagBuffer.flush();
-        if (!tagBuffer.suppressed && remainingText) {
+        if (remainingText) {
           if (!hasEmittedMessage) {
             hasEmittedMessage = true;
             messageItemId = genId('msg_');

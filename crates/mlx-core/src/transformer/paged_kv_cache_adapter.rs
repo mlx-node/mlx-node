@@ -1870,6 +1870,15 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     scale_manager: Option<Arc<Mutex<KvScaleManager>>>,
 
+    /// Memoized `[1]` fp32 scale arrays handed to `paged_kv_write` /
+    /// `paged_attention`, keyed by `(layer_idx, is_key, scale.to_bits())`.
+    /// `k_scale_array`/`v_scale_array` run twice per layer per token on the
+    /// eager paged path; keying on the scale BITS keeps the cache honest
+    /// under a live `KvScaleManager` (EMA updates produce a new key rather
+    /// than a stale array). With no manager (all production wiring) the
+    /// map holds exactly one `1.0` entry per layer per kind.
+    scale_arrays: std::collections::HashMap<(u32, bool, u32), MxArray>,
+
     /// Cached per-prefill-chunk metadata for the MLX `paged_attention`
     /// bridge. The metadata is identical for every full-attention layer in a
     /// chunk, so rebuilding a duplicated block table per layer would make the
@@ -2251,6 +2260,7 @@ impl PagedKVCacheAdapter {
             cold_capture_budget: ColdCaptureBudget::default(),
             #[cfg(target_os = "macos")]
             scale_manager: None,
+            scale_arrays: std::collections::HashMap::new(),
             #[cfg(target_os = "macos")]
             prefill_attention_inputs_cache: None,
             #[cfg(target_os = "macos")]
@@ -9030,18 +9040,37 @@ impl PagedKVCacheAdapter {
     /// FP8-uncalibrated path a no-op for the kernel template
     /// (`fp8_value = fp32_value * 1.0`) while leaving the production wiring
     /// point in place for future FP8 enablement.
-    pub fn k_scale_array(&self, layer_idx: u32) -> Result<MxArray, String> {
+    pub fn k_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
         let scale = self.lookup_k_scale(layer_idx)?;
-        MxArray::from_float32(&[scale], &[1])
-            .map_err(|e| format!("k_scale_array: failed to build scale array: {e}"))
+        self.cached_scale_array(layer_idx, true, scale)
     }
 
     /// Return a `[1]` fp32 V scale MxArray for `layer_idx`. See
     /// [`Self::k_scale_array`] for the FP8 contract.
-    pub fn v_scale_array(&self, layer_idx: u32) -> Result<MxArray, String> {
+    pub fn v_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
         let scale = self.lookup_v_scale(layer_idx)?;
-        MxArray::from_float32(&[scale], &[1])
-            .map_err(|e| format!("v_scale_array: failed to build scale array: {e}"))
+        self.cached_scale_array(layer_idx, false, scale)
+    }
+
+    /// Memoizes a `[1]` fp32 array for `scale` under
+    /// `(layer_idx, is_key, scale.to_bits())`. The eager paged path calls
+    /// `k_scale_array`/`v_scale_array` twice per layer per token; keying on
+    /// the scale BITS keeps the cache honest under a live `KvScaleManager`
+    /// (an EMA update produces a new key rather than a stale array).
+    fn cached_scale_array(
+        &mut self,
+        layer_idx: u32,
+        is_key: bool,
+        scale: f32,
+    ) -> Result<MxArray, String> {
+        let key = (layer_idx, is_key, scale.to_bits());
+        if let Some(cached) = self.scale_arrays.get(&key) {
+            return Ok(cached.clone());
+        }
+        let array = MxArray::from_float32(&[scale], &[1])
+            .map_err(|e| format!("scale_array: failed to build scale array: {e}"))?;
+        self.scale_arrays.insert(key, array.clone());
+        Ok(array)
     }
 
     /// Install a shared `KvScaleManager` for FP8 K/V calibration.
@@ -18775,7 +18804,7 @@ mod tests {
     #[test]
     fn k_v_scale_arrays_default_to_one_when_no_manager() {
         let allocator = new_allocator(8, 16);
-        let Some(adapter) = maybe_adapter(allocator, 16) else {
+        let Some(mut adapter) = maybe_adapter(allocator, 16) else {
             // No-Metal host: the accessor body itself would fail at
             // `MxArray::from_float32` because allocator::malloc routes
             // through metal::allocator(). Skip cleanly.

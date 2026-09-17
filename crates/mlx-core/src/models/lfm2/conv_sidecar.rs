@@ -331,6 +331,7 @@ mod tests {
             num_dense_layers: None,
             norm_topk_prob: None,
             use_expert_bias: None,
+            routed_scaling_factor: None,
         }
     }
 

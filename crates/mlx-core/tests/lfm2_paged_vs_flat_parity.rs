@@ -79,8 +79,8 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
         }
     }
 
-    // Always write `use_block_paged_cache` explicitly (in BOTH branches),
-    // mirroring `lfm2_compiled_e2e.rs`. Without this the flat clone
+    // Always write `use_block_paged_cache` explicitly (in BOTH branches).
+    // Without this the flat clone
     // (`use_block_paged == false`) would leave the bf16 source config — which
     // OMITS the key — untouched, and `Lfm2Inner::new`'s `unwrap_or(true)`
     // would silently load the PAGED path. That made the parity tests compare

@@ -91,9 +91,13 @@ impl MLP {
 
         // E39: fast path — pre-stacked + pre-transposed weights.
         // Env-toggle MLX_DISABLE_E39_STACKED_MLP=1 reverts to the legacy
-        // two-matmul path for A/B testing.
+        // two-matmul path for A/B testing. Read once — this runs per layer
+        // per decode token.
+        static E39_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let e39_enabled =
+            *E39_ENABLED.get_or_init(|| std::env::var("MLX_DISABLE_E39_STACKED_MLP").is_err());
         if let (Some(wgu_t), Some(wd_t)) = (&self.gate_up_proj_wt, &self.down_proj_wt)
-            && std::env::var("MLX_DISABLE_E39_STACKED_MLP").is_err()
+            && e39_enabled
         {
             let handle = unsafe {
                 sys::mlx_swiglu_mlp_forward_stacked(x.handle.0, wgu_t.handle.0, wd_t.handle.0)

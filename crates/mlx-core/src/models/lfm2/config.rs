@@ -129,7 +129,7 @@ pub struct Lfm2Config {
     #[napi(ts_type = "number | undefined")]
     pub num_dense_layers: Option<i32>,
 
-    /// Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
+    /// Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-6)`).
     ///
     /// `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
     /// required). Absent (None) is read as `true` everywhere via
@@ -138,14 +138,24 @@ pub struct Lfm2Config {
     #[napi(ts_type = "boolean | undefined")]
     pub norm_topk_prob: Option<bool>,
 
-    /// Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
+    /// Add the learned per-expert bias to the routing scores BEFORE top-k
+    /// (selection-only; the bias is NOT folded into the gathered weights).
     ///
     /// `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
     /// required). Absent (None) is read as `true` everywhere via
-    /// `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+    /// `.unwrap_or(true)`, matching HF `configuration_lfm2_moe.py`.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_expert_bias: Option<bool>,
+
+    /// Post-renormalization scale applied to the gathered routing weights
+    /// (HF `Lfm2MoeTopKRouter`: `routing_weights * routed_scaling_factor`).
+    /// HF default is 1.0; absent on every checkpoint shipped so far but kept
+    /// as a first-class field so a future checkpoint that sets it is not
+    /// silently dropped.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub routed_scaling_factor: Option<f64>,
 }
 
 impl Lfm2Config {
@@ -216,13 +226,20 @@ impl Lfm2Config {
         Some(explicit.unwrap_or(true))
     }
 
+    /// Effective `num_dense_layers`: HF `configuration_lfm2_moe.py` defaults
+    /// the field to `2` when a MoE checkpoint omits it — match that default
+    /// rather than silently treating every layer as MoE.
+    pub fn num_dense_layers_effective(&self) -> i32 {
+        self.num_dense_layers.unwrap_or(2)
+    }
+
     /// Whether the layer at `idx` uses a sparse MoE feed-forward block.
     ///
     /// MoE layers are those at or after `num_dense_layers` in a MoE
     /// checkpoint (`mlx-lm` `lfm2_moe.py:238-245`). Dense checkpoints always
     /// return false.
     pub fn is_moe_layer(&self, idx: usize) -> bool {
-        self.is_moe() && (idx as i32) >= self.num_dense_layers.unwrap_or(0)
+        self.is_moe() && (idx as i32) >= self.num_dense_layers_effective()
     }
 }
 
@@ -280,6 +297,7 @@ mod tests {
             num_dense_layers: None,
             norm_topk_prob: Some(true),
             use_expert_bias: Some(true),
+            routed_scaling_factor: None,
         }
     }
 
@@ -533,5 +551,39 @@ mod tests {
         // num_dense_layers=0 → every layer is MoE
         assert!(cfg.is_moe_layer(0));
         assert!(cfg.is_moe_layer(1));
+    }
+
+    /// A MoE checkpoint that omits `num_dense_layers` resolves to the HF
+    /// default of 2 (`configuration_lfm2_moe.py`), NOT 0 — guarding against
+    /// an all-MoE mis-parse. `routed_scaling_factor` deserializes when set.
+    #[test]
+    fn test_moe_missing_num_dense_layers_defaults_to_hf_two() {
+        let json = r#"{
+            "vocab_size": 100,
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "norm_eps": 1e-5,
+            "conv_bias": false,
+            "conv_L_cache": 3,
+            "block_dim": 64,
+            "block_ff_dim": 64,
+            "layer_types": ["conv", "conv", "full_attention", "conv"],
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "intermediate_size": 64,
+            "routed_scaling_factor": 2.5
+        }"#;
+        let cfg: Lfm2Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.is_moe());
+        assert_eq!(cfg.num_dense_layers_effective(), 2);
+        assert!(!cfg.is_moe_layer(0));
+        assert!(!cfg.is_moe_layer(1));
+        assert!(cfg.is_moe_layer(2));
+        assert!(cfg.is_moe_layer(3));
+        assert_eq!(cfg.routed_scaling_factor, Some(2.5));
     }
 }
