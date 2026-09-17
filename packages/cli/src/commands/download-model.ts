@@ -657,39 +657,44 @@ export function pickAssetSidecars(allFiles: ListFileEntry[]): ListFileEntry[] {
   });
 }
 
+/** Does `file` name a weight artifact a loader can open (companions/projectors do not count)? */
+function isLoadableWeightFile(file: string): boolean {
+  return (
+    file.endsWith('.safetensors') ||
+    file.endsWith('.pdiparams') ||
+    (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)))
+  );
+}
+
+/** The assets-repo sidecar selection, resolved before anything is written. */
+interface AssetSidecarPlan {
+  /** Root-level candidates the primary selection does not already ship. */
+  candidates: ListFileEntry[];
+  /** The commit the candidates were listed at; `null` only when unresolvable AND optional (repair runs). */
+  revision: string | null;
+}
+
 /**
- * Top up the tokenizer/config sidecars a GGUF repo lacks, from `--assets-repo`.
- *
- * Runs after the primary download, is idempotent (a sidecar already on disk
- * with the manifest size — content hash when the run is in verify mode — is
- * skipped), and never overwrites a file the PRIMARY repo itself shipped:
- * `config.json` from a GGUF repo describes its own quantization and wins over
- * the base repo's. Files the primary repo did not ship (tokenizer.json,
- * tokenizer_config.json, chat_template.jinja, …) are written from the assets
- * repo at its resolved revision.
+ * Work out which tokenizer/config sidecars `--assets-repo` would supply —
+ * WITHOUT touching `outputDir`. The result feeds the preflight guards: the
+ * prune/certify computation needs the sidecar set before the download loop
+ * runs, because both the loop and {@link fetchAssetSidecars} write IN PLACE
+ * and any refusal that claims "the installed directory is unchanged" must
+ * precede the first byte written.
  *
  * The primary repo's own manifest (`primaryPaths`) is authoritative for
  * everything it ships: a path it lists is never fetched from the assets repo,
  * regardless of content differences — the same precedence the dashboard
  * downloader applies. Without that rule a `--force` run would overwrite a
  * GGUF repo's customized config or template with the base model's copy.
- *
- * Deliberately NOT recorded in the completion marker: marker entries are
- * judged for pruning against the primary repo's remote tree only
- * (`computePruneList`), so listing sidecars there would delete them on a
- * later full sync. The top-up re-verifies them on every downloading run
- * instead. (The dashboard records them because its prune judges the staging
- * manifest, where an unlisted sidecar would be quarantined instead.)
  */
-async function fetchAssetSidecars(opts: {
+async function planAssetSidecars(opts: {
   assetsRepo: string;
-  outputDir: string;
-  cacheDir: string;
   accessToken: string | undefined;
   primaryPaths: ReadonlySet<string>;
   /** Fail instead of installing against mutable `main` when the revision cannot be pinned. */
   requireRevision: boolean;
-}): Promise<{ ensured: string[]; repo: string; revision: string | null }> {
+}): Promise<AssetSidecarPlan> {
   const resolved = await resolveRemoteRevision(opts.assetsRepo, opts.accessToken);
   if (resolved === null && opts.requireRevision) {
     // Installing against mutable `main` would publish sidecars with no
@@ -706,7 +711,45 @@ async function fetchAssetSidecars(opts: {
   const candidates = pickAssetSidecars(allFiles).filter((file) => !opts.primaryPaths.has(file.path));
   if (candidates.length === 0) {
     console.warn(`  No tokenizer/config sidecars found in ${opts.assetsRepo}\n`);
-    return { ensured: [], repo: opts.assetsRepo, revision: revision ?? null };
+  }
+  return { candidates, revision: revision ?? null };
+}
+
+/**
+ * Top up the tokenizer/config sidecars a GGUF repo lacks, applying a
+ * {@link planAssetSidecars} plan.
+ *
+ * Runs after the primary download, is idempotent (a sidecar already on disk
+ * with the manifest size — content hash when the run is in verify mode — is
+ * skipped), and never overwrites a file the PRIMARY repo itself shipped (the
+ * plan already excluded those): `config.json` from a GGUF repo describes its
+ * own quantization and wins over the base repo's. Files the primary repo did
+ * not ship (tokenizer.json, tokenizer_config.json, chat_template.jinja, …)
+ * are written from the assets repo at the plan's resolved revision.
+ *
+ * `ensured` is ALWAYS the full plan — every candidate is either verified on
+ * disk or (re)written — which is what lets the preflight treat the planned
+ * names as the installed sidecar set. A fetch that throws never reaches the
+ * marker write, same as a failed primary download.
+ *
+ * Deliberately NOT recorded in the completion marker: marker entries are
+ * judged for pruning against the primary repo's remote tree only
+ * (`computePruneList`), so listing sidecars there would delete them on a
+ * later full sync. The top-up re-verifies them on every downloading run
+ * instead. (The dashboard records them because its prune judges the staging
+ * manifest, where an unlisted sidecar would be quarantined instead.)
+ */
+async function fetchAssetSidecars(opts: {
+  assetsRepo: string;
+  outputDir: string;
+  cacheDir: string;
+  accessToken: string | undefined;
+  plan: AssetSidecarPlan;
+}): Promise<{ ensured: string[]; repo: string; revision: string | null }> {
+  const { candidates } = opts.plan;
+  const revision = opts.plan.revision ?? undefined;
+  if (candidates.length === 0) {
+    return { ensured: [], repo: opts.assetsRepo, revision: opts.plan.revision };
   }
 
   console.log(`Fetching ${candidates.length} tokenizer/config sidecar(s) from ${opts.assetsRepo}...\n`);
@@ -738,7 +781,7 @@ async function fetchAssetSidecars(opts: {
     fetched.push(file.path);
   }
   console.log('');
-  return { ensured: fetched, repo: opts.assetsRepo, revision: revision ?? null };
+  return { ensured: fetched, repo: opts.assetsRepo, revision: opts.plan.revision };
 }
 
 export async function run(argv: string[]) {
@@ -856,18 +899,53 @@ export async function run(argv: string[]) {
   const repairSidecarsBeforeReturn = async (): Promise<void> => {
     if (assetsRepo === undefined) return;
     cachedManifest ??= await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+    // Only the paths this run's selection ACTUALLY stages count as primary
+    // supplied: a file the repo lists but the globs/CORE_FILES do not select
+    // is not on disk, so excluding it would lose the sidecar entirely.
+    const primaryNames = new Set(cachedManifest.filesToDownload.map((file) => file.path));
+    // Repairing an EXISTING install: a transient resolution failure must not
+    // fail the run — the marker keeps the provenance it already recorded.
+    const plan = await planAssetSidecars({
+      assetsRepo,
+      accessToken: HUGGINGFACE_TOKEN,
+      primaryPaths: primaryNames,
+      requireRevision: false,
+    });
+    const planned = plan.candidates.map((file) => file.path);
+    // The refusal below claims the install is unchanged, so it must run on
+    // the plan BEFORE any sidecar is fetched — `ensured` is always the full
+    // plan, making the planned names exactly the set the fetch would leave
+    // on disk (a failed fetch throws before the marker write anyway).
+    let stale: string[] = [];
+    let surviving: string[] = [];
+    if (completion !== null && (planned.length > 0 || plan.revision !== null)) {
+      const plannedSet = new Set(planned);
+      // Obsolete candidates go too: initializing from every old entry would
+      // keep a file the assets repo REMOVED on disk and listed while the new
+      // revision is recorded — discovery reports current and the runtime keeps
+      // consuming it.
+      stale = completion.files.filter(
+        (file) => ASSET_SIDECAR_CANDIDATES.includes(file) && !primaryNames.has(file) && !plannedSet.has(file),
+      );
+      const listed = new Set(completion.files);
+      // Planned candidates count as present without an existsSync gate: the
+      // fetch below ensures every one of them, or the run throws first.
+      for (const path of planned) listed.add(path);
+      for (const file of stale) listed.delete(file);
+      surviving = [...listed].sort();
+      if (stale.length > 0 && (!surviving.includes('config.json') || !surviving.some(isLoadableWeightFile))) {
+        throw new Error(
+          `Refusing to apply "${assetsRepo}" sidecar removals: they would leave no loadable checkpoint. ` +
+            `The installed directory is unchanged.`,
+        );
+      }
+    }
     const topUp = await fetchAssetSidecars({
       assetsRepo,
       outputDir,
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
-      // Only the paths this run's selection ACTUALLY stages count as primary
-      // supplied: a file the repo lists but the globs/CORE_FILES do not select
-      // is not on disk, so excluding it would lose the sidecar entirely.
-      primaryPaths: new Set(cachedManifest.filesToDownload.map((file) => file.path)),
-      // Repairing an EXISTING install: a transient resolution failure must not
-      // fail the run — the marker keeps the provenance it already recorded.
-      requireRevision: false,
+      plan,
     });
     sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
     sidecarPaths = topUp.ensured;
@@ -876,33 +954,9 @@ export async function run(argv: string[]) {
     // files stay UNLISTED — a deletion would not invalidate the marker — and an
     // advanced assets revision stays unpinned, which is the update badge that
     // can never clear. Only ever touches an existing marker (this is a repair,
-    // not a first install).
+    // not a first install). `ensured` === the plan, so this gate is the same
+    // predicate the preflight above computed `stale`/`surviving` under.
     if (completion !== null && (sidecarPaths.length > 0 || sidecarSource !== null)) {
-      const primaryNames = new Set(cachedManifest.filesToDownload.map((file) => file.path));
-      const planned = new Set(sidecarPaths);
-      // Obsolete candidates go too: initializing from every old entry would
-      // keep a file the assets repo REMOVED on disk and listed while the new
-      // revision is recorded — discovery reports current and the runtime keeps
-      // consuming it.
-      const stale = completion.files.filter(
-        (file) => ASSET_SIDECAR_CANDIDATES.includes(file) && !primaryNames.has(file) && !planned.has(file),
-      );
-      const listed = new Set(completion.files);
-      for (const path of sidecarPaths) {
-        if (existsSync(join(outputDir, path))) listed.add(path);
-      }
-      for (const file of stale) listed.delete(file);
-      const surviving = [...listed].sort();
-      const loadableWeight = (file: string): boolean =>
-        file.endsWith('.safetensors') ||
-        file.endsWith('.pdiparams') ||
-        (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)));
-      if (stale.length > 0 && (!surviving.includes('config.json') || !surviving.some(loadableWeight))) {
-        throw new Error(
-          `Refusing to apply "${assetsRepo}" sidecar removals: they would leave no loadable checkpoint. ` +
-            `The installed directory is unchanged.`,
-        );
-      }
       // Delete BEFORE publishing the updated marker, same rule as the
       // dashboard: a failure must leave the marker able to derive the same set
       // again.
@@ -1058,15 +1112,25 @@ export async function run(argv: string[]) {
   if (cachedManifest === null) {
     console.log('Fetching file list from HuggingFace...\n');
   }
-  const { totalSize, filesToDownload, allFiles } =
-    cachedManifest ??
-    (await getModelFiles(
-      modelName,
-      HUGGINGFACE_TOKEN,
-      globPatterns,
-      remoteSha ?? undefined,
-      previousCompletion?.files,
-    ));
+  let manifest: { totalSize: number; filesToDownload: ListFileEntry[]; allFiles: ListFileEntry[] };
+  try {
+    manifest =
+      cachedManifest ??
+      (await getModelFiles(
+        modelName,
+        HUGGINGFACE_TOKEN,
+        globPatterns,
+        remoteSha ?? undefined,
+        previousCompletion?.files,
+      ));
+  } catch (error) {
+    // A listing failure certifies nothing and — preflight below having moved
+    // every guard input ahead of the writes — cannot have written a byte:
+    // restore the found marker rather than stranding the install partial.
+    await restoreCompletionMarker();
+    throw error;
+  }
+  const { totalSize, filesToDownload, allFiles } = manifest;
 
   if (filesToDownload.length === 0) {
     console.error('No files matched the given criteria.\n');
@@ -1084,6 +1148,139 @@ export async function run(argv: string[]) {
     // don't leave its marker downgraded (see restoreCompletionMarker).
     await restoreCompletionMarker();
     process.exit(1);
+  }
+
+  // ── Preflight: resolve every prune/certify guard input BEFORE the first
+  // write. The download loop and the sidecar fetch write IN PLACE into
+  // outputDir, so a refusal that claims "the installed directory is
+  // unchanged" must fire here — afterwards it would be a lie, and the
+  // restored marker would label a mixed-revision directory with the old
+  // snapshot's name. Every input is manifest-derived (the only disk reads
+  // are the pre-run `existingTopLevelFiles` listing and previous-marker
+  // entries, which the loop can only rewrite via paths already inside the
+  // selection), so `pruneList`/`certified` are identical to what finalizeSync
+  // used to compute post-download.
+  let sidecarPlan: AssetSidecarPlan | null = null;
+  if (assetsRepo !== undefined) {
+    try {
+      sidecarPlan = await planAssetSidecars({
+        assetsRepo,
+        accessToken: HUGGINGFACE_TOKEN,
+        primaryPaths: new Set(filesToDownload.map((file) => file.path)),
+        requireRevision: true,
+      });
+    } catch (error) {
+      // Same rule as the manifest fetch above: nothing has been written, so a
+      // resolution/listing failure must not strand the found marker partial.
+      await restoreCompletionMarker();
+      throw error;
+    }
+  }
+  // `ensured` is always the full plan (see fetchAssetSidecars), so the planned
+  // names ARE the post-fetch sidecar set on every path that reaches
+  // finalization — the post-download `existsSync` filter this replaces was
+  // already a no-op there.
+  const plannedSidecars = sidecarPlan?.candidates.map((file) => file.path) ?? [];
+
+  const isGlobRun = Boolean(globPatterns?.length);
+  // A --complete run's selection IS the prescribed model, so it carries
+  // FULL-run semantics: the new revision is claimed (a glob run deliberately
+  // under-claims, which for a catalog install left the dashboard offering an
+  // update the CLI had already applied, forever) and the directory is pruned
+  // to the prescription like the dashboard's own publish swap.
+  const fullSemantics = !isGlobRun || args.complete === true;
+  // Legacy runs (no resolvable revision) never prune or certify — finalizeSync
+  // returns early on them — so their guard inputs stay empty and no refusal
+  // below can fire.
+  let pruneList: string[] = [];
+  let certified: string[] = [];
+  if (remoteSha !== null) {
+    // Files the old marker recorded that the remote repo no longer has are
+    // stale garbage (e.g. shards of a superseded sharding layout) — a loader
+    // globbing the dir would read them. Only ever deletes old-marker entries
+    // of THIS repo's marker.
+    const remotePaths = allFiles.map((f) => f.path);
+    // Files the marker attributes to the assetsRepo are exempt: the primary
+    // tree cannot prove anything about them (they were never in it), so
+    // pruning them here would delete the tool-calling sidecars this very run
+    // just verified — and an install that HAS such provenance must keep its
+    // candidate names exempt even when this run passed no --assets-repo.
+    const exemptFromPrune = new Set<string>(plannedSidecars);
+    if (assetsRepo === undefined && previousCompletion?.assetsRepo !== undefined) {
+      // No assets manifest was consulted this run, so the sidecars' state is
+      // unknown: every candidate name stays exempt (and recorded). When the
+      // manifest WAS consulted, only the names it still supplies are exempt —
+      // a candidate it dropped is pruned and dropped from the marker, instead
+      // of lingering while the revision advances past it.
+      for (const name of ASSET_SIDECAR_CANDIDATES) exemptFromPrune.add(name);
+    }
+    // A --complete run prunes and carries against the PRESCRIPTION, not the
+    // whole remote tree: `allFiles` would let an unselected variant (another
+    // quant the user once downloaded here) survive as "proven on remote" while
+    // the marker claims the new revision — an unverified file riding along that
+    // discovery can then expose as a loadable model.
+    const scopedPaths =
+      args.complete === true ? [...filesToDownload.map((f) => f.path), ...plannedSidecars] : remotePaths;
+    pruneList =
+      previousCompletion !== null
+        ? computePruneList(previousCompletion.files, scopedPaths, outputDir, !fullSemantics, exemptFromPrune)
+        : computeLegacyWeightPruneList(existingTopLevelFiles, scopedPaths, outputDir, !fullSemantics);
+    // The exact file list this run will certify — computed BEFORE the prune so
+    // the guard and the marker agree on one set.
+    certified = buildMarkerFiles(
+      previousCompletion,
+      scopedPaths,
+      [...filesToDownload.map((f) => f.path), ...plannedSidecars],
+      outputDir,
+      !fullSemantics,
+      exemptFromPrune,
+    );
+    // A FRESH install that claims a loadable model — a catalog prescription, or
+    // one that pulled sidecars — must certify a config: isModelInstalled
+    // requires one, so a marker without it can never read as installed while
+    // the wizard calls the run a success. Updates are covered by the prune
+    // guard below, whose message names the removals that would break the
+    // install; this gate exists for the case with nothing to prune.
+    if (previousCompletion === null && (args.complete === true || assetsRepo !== undefined)) {
+      if (!certified.includes('config.json') || !certified.some(isLoadableWeightFile)) {
+        // The refusal cannot leave what it downloaded: a markerless directory
+        // of loadable weights reads as a PRESENT but foreign install — the
+        // dashboard renders a disabled card it is not allowed to repair. When
+        // nothing predates this run (the directory is new, or was empty), the
+        // honest "nothing was published" is removing it; a pre-existing
+        // markerless directory keeps its files, which are the user's to mix.
+        await restoreCompletionMarker();
+        if (existingTopLevelFiles.length === 0) {
+          await rm(outputDir, { recursive: true, force: true });
+        }
+        throw new Error(
+          `Refusing to certify "${modelName}": the selection has no ` +
+            `${certified.includes('config.json') ? 'model weights' : 'config.json'}` +
+            `${assetsRepo !== undefined ? ` (the repository provides none and "${assetsRepo}" provides none)` : ''}. ` +
+            `Nothing was published.`,
+        );
+      }
+    }
+    if (pruneList.length > 0) {
+      // Pruning must never destroy the install: the surviving manifest has to
+      // keep a config and a weight. Upstream dropping the LAST config.json (a
+      // weight-only GGUF repo relies on the assets repo for it) is exactly
+      // that case — fail with everything unchanged, which running here makes
+      // literally true.
+      const remaining = certified.filter((file) => !pruneList.includes(file));
+      if (!remaining.includes('config.json') || !remaining.some(isLoadableWeightFile)) {
+        // "Unchanged" is only honest if the marker goes back too: this run
+        // already downgraded it to `partial` before downloading, so refusing
+        // here would strand the install as present-but-uncertified with no
+        // update affordance (see restoreCompletionMarker).
+        await restoreCompletionMarker();
+        throw new Error(
+          `Refusing to sync "${modelName}": removing ${pruneList.join(', ')} would leave no loadable checkpoint ` +
+            `(missing ${remaining.includes('config.json') ? 'model weights' : 'config.json'}). ` +
+            `The installed directory is unchanged.`,
+        );
+      }
+    }
   }
 
   // Show what will be downloaded
@@ -1141,20 +1338,21 @@ export async function run(argv: string[]) {
 
   // Sidecars land before the prune/marker step so the certified directory is
   // exactly what the loader will open: GGUF weights plus the base-model
-  // tokenizer files the runtime needs (see ASSET_SIDECAR_CANDIDATES).
-  if (assetsRepo !== undefined) {
+  // tokenizer files the runtime needs (see ASSET_SIDECAR_CANDIDATES). The
+  // selection was already resolved in the preflight — this only applies it.
+  if (assetsRepo !== undefined && sidecarPlan !== null) {
     const topUp = await fetchAssetSidecars({
       assetsRepo,
       outputDir,
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
-      primaryPaths: new Set(filesToDownload.map((file) => file.path)),
-      requireRevision: true,
+      plan: sidecarPlan,
     });
     // Record the pair only when the revision resolved: an unresolved source is
     // unknown provenance, and an empty string would compare unequal forever.
+    // (`topUp.ensured` needs no variable here: it is always the full plan —
+    // `plannedSidecars` — and finalization consumed that set in the preflight.)
     sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
-    sidecarPaths = topUp.ensured;
   }
 
   // Prune + marker write, invoked ONLY from a SUCCESS path. Pruning any
@@ -1163,70 +1361,15 @@ export async function run(argv: string[]) {
   // removed.
   const finalizeSync = async (): Promise<void> => {
     if (remoteSha === null) return; // nothing trustworthy to pin — legacy run
-    // Files the old marker recorded that the remote repo no longer has are
-    // stale garbage (e.g. shards of a superseded sharding layout) — a loader
-    // globbing the dir would read them. Only ever deletes old-marker entries
-    // of THIS repo's marker.
-    const remotePaths = allFiles.map((f) => f.path);
-    const isGlobRun = Boolean(globPatterns?.length);
-    // A --complete run's selection IS the prescribed model, so it carries
-    // FULL-run semantics: the new revision is claimed (a glob run deliberately
-    // under-claims, which for a catalog install left the dashboard offering an
-    // update the CLI had already applied, forever) and the directory is pruned
-    // to the prescription like the dashboard's own publish swap.
-    const fullSemantics = !isGlobRun || args.complete === true;
-    // Files the marker attributes to the assetsRepo are exempt: the primary
-    // tree cannot prove anything about them (they were never in it), so
-    // pruning them here would delete the tool-calling sidecars this very run
-    // just verified — and an install that HAS such provenance must keep its
-    // candidate names exempt even when this run passed no --assets-repo.
-    const exemptFromPrune = new Set<string>(sidecarPaths);
-    if (assetsRepo === undefined && previousCompletion?.assetsRepo !== undefined) {
-      // No assets manifest was consulted this run, so the sidecars' state is
-      // unknown: every candidate name stays exempt (and recorded). When the
-      // manifest WAS consulted, only the names it still supplies are exempt —
-      // a candidate it dropped is pruned and dropped from the marker, instead
-      // of lingering while the revision advances past it.
-      for (const name of ASSET_SIDECAR_CANDIDATES) exemptFromPrune.add(name);
-    }
-    // A --complete run prunes and carries against the PRESCRIPTION, not the
-    // whole remote tree: `allFiles` would let an unselected variant (another
-    // quant the user once downloaded here) survive as "proven on remote" while
-    // the marker claims the new revision — an unverified file riding along that
-    // discovery can then expose as a loadable model.
-    const scopedPaths = args.complete === true ? [...filesToDownload.map((f) => f.path), ...sidecarPaths] : remotePaths;
-    const pruneList =
-      previousCompletion !== null
-        ? computePruneList(previousCompletion.files, scopedPaths, outputDir, !fullSemantics, exemptFromPrune)
-        : computeLegacyWeightPruneList(existingTopLevelFiles, scopedPaths, outputDir, !fullSemantics);
-    // The exact file list this run will certify — computed BEFORE the prune so
-    // the guard and the marker agree on one set.
-    const certified = buildMarkerFiles(
-      previousCompletion,
-      scopedPaths,
-      [...filesToDownload.map((f) => f.path), ...sidecarPaths.filter((path) => existsSync(join(outputDir, path)))],
-      outputDir,
-      !fullSemantics,
-      exemptFromPrune,
-    );
-    const loadableWeight = (file: string): boolean =>
-      file.endsWith('.safetensors') ||
-      file.endsWith('.pdiparams') ||
-      (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)));
-    // A FRESH install that claims a loadable model — a catalog prescription, or
-    // one that pulled sidecars — must certify a config: isModelInstalled
-    // requires one, so a marker without it can never read as installed while
-    // the wizard calls the run a success. Updates are covered by the prune
-    // guard below, whose message names the removals that would break the
-    // install; this gate exists for the case with nothing to prune.
+    // `pruneList`/`certified` were computed in the preflight, BEFORE the
+    // download loop and the sidecar fetch wrote anything — so the two
+    // refusals below are FAIL-CLOSED backstops over the same values. The
+    // preflight already refused every case that could fire; these are kept
+    // so a future change that reorders a write still cannot certify a
+    // broken directory.
     if (previousCompletion === null && (args.complete === true || assetsRepo !== undefined)) {
-      if (!certified.includes('config.json') || !certified.some(loadableWeight)) {
-        // The refusal cannot leave what it downloaded: a markerless directory
-        // of loadable weights reads as a PRESENT but foreign install — the
-        // dashboard renders a disabled card it is not allowed to repair. When
-        // nothing predates this run (the directory is new, or was empty), the
-        // honest "nothing was published" is removing it; a pre-existing
-        // markerless directory keeps its files, which are the user's to mix.
+      if (!certified.includes('config.json') || !certified.some(isLoadableWeightFile)) {
+        await restoreCompletionMarker();
         if (existingTopLevelFiles.length === 0) {
           await rm(outputDir, { recursive: true, force: true });
         }
@@ -1239,16 +1382,8 @@ export async function run(argv: string[]) {
       }
     }
     if (pruneList.length > 0) {
-      // Pruning must never destroy the install: the surviving manifest has to
-      // keep a config and a weight. Upstream dropping the LAST config.json (a
-      // weight-only GGUF repo relies on the assets repo for it) is exactly
-      // that case — fail with everything unchanged.
       const remaining = certified.filter((file) => !pruneList.includes(file));
-      if (!remaining.includes('config.json') || !remaining.some(loadableWeight)) {
-        // "Unchanged" is only honest if the marker goes back too: this run
-        // already downgraded it to `partial` before downloading, so refusing
-        // here would strand the install as present-but-uncertified with no
-        // update affordance (see restoreCompletionMarker).
+      if (!remaining.includes('config.json') || !remaining.some(isLoadableWeightFile)) {
         await restoreCompletionMarker();
         throw new Error(
           `Refusing to sync "${modelName}": removing ${pruneList.join(', ')} would leave no loadable checkpoint ` +

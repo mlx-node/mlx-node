@@ -563,4 +563,80 @@ describe('download model --assets-repo', () => {
     expect(hub.downloaded).toEqual([]);
     expect(readdirSync(outputDir)).toEqual([GGUF]);
   });
+
+  it('refuses an update BEFORE any bytes land when the prune would break the install', async () => {
+    // Regression: the prune guard ran AFTER the in-place download loop, so its
+    // "The installed directory is unchanged" refusal was a lie — the new
+    // weight had already been copied in next to the old one, and the restored
+    // marker then labeled a mixed-revision directory with the old snapshot's
+    // name. Every guard input is manifest-derived, so the refusal must fire
+    // before the first write.
+    const NEW = 'Tiny-UD-Q5_K_XL.gguf';
+    hub.shas[PRIMARY] = 'c'.repeat(40);
+    hub.shas[ASSETS] = 'b'.repeat(40);
+    hub.manifests[PRIMARY] = [{ type: 'file', path: NEW, size: 900 }]; // renamed weight, old one gone upstream
+    hub.manifests[ASSETS] = [{ type: 'file', path: 'tokenizer.json', size: 20 }]; // config.json gone upstream
+    const seeded = {
+      repo: PRIMARY,
+      revision: 'a'.repeat(40),
+      files: [GGUF, 'config.json', 'tokenizer.json'],
+      scope: 'full',
+      assetsRepo: ASSETS,
+      assetsRevision: 'b'.repeat(40),
+      completedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
+    writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
+    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
+
+    await expect(
+      run(['-m', PRIMARY, '-o', outputDir, '--assets-repo', ASSETS, '--cache-dir', cacheDir]),
+    ).rejects.toThrow(/no loadable checkpoint/);
+
+    // "Unchanged" is now literal: the new weight never landed, nothing was
+    // fetched at all, the old files keep their bytes, and the marker the run
+    // found is the marker it left.
+    expect(existsSync(join(outputDir, NEW))).toBe(false);
+    expect(hub.downloaded).toEqual([]);
+    expect(readFileSync(join(outputDir, GGUF), 'utf8')).toBe('x'.repeat(300));
+    expect(existsSync(join(outputDir, 'config.json'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8'))).toEqual(seeded);
+  });
+
+  it('refuses a repair-path sidecar removal BEFORE fetching anything', async () => {
+    // Same ordering bug on the early-return path: the repair fetched sidecars
+    // into the install before checking whether the removals it was about to
+    // apply would leave the directory unloadable. The plan is computable
+    // without a single write, so the refusal must come first.
+    hub.shas[ASSETS] = 'b'.repeat(40); // PRIMARY unresolved -> legacy repair path
+    // config.json and chat_template.jinja dropped upstream; only the tokenizer remains.
+    hub.manifests[ASSETS] = [{ type: 'file', path: 'tokenizer.json', size: 20 }];
+    const seeded = {
+      repo: PRIMARY,
+      revision: 'a'.repeat(40),
+      files: [GGUF, 'config.json', 'chat_template.jinja'],
+      scope: 'full',
+      assetsRepo: ASSETS,
+      assetsRevision: 'a'.repeat(40),
+      completedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
+    writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
+    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'chat_template.jinja'), 'x'.repeat(9));
+
+    await expect(
+      run(['-m', PRIMARY, '-o', outputDir, '-g', '*UD-Q4_K_XL*', '--assets-repo', ASSETS, '--cache-dir', cacheDir]),
+    ).rejects.toThrow(/no loadable checkpoint/);
+
+    // The refusal precedes the fetch: tokenizer.json was planned but never
+    // downloaded or written, and the stale candidates it would have replaced
+    // are still on disk.
+    expect(hub.downloaded).toEqual([]);
+    expect(existsSync(join(outputDir, 'tokenizer.json'))).toBe(false);
+    expect(existsSync(join(outputDir, 'config.json'))).toBe(true);
+    expect(existsSync(join(outputDir, 'chat_template.jinja'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8'))).toEqual(seeded);
+  });
 });
