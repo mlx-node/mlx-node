@@ -687,8 +687,21 @@ async function fetchAssetSidecars(opts: {
   cacheDir: string;
   accessToken: string | undefined;
   primaryPaths: ReadonlySet<string>;
+  /** Fail instead of installing against mutable `main` when the revision cannot be pinned. */
+  requireRevision: boolean;
 }): Promise<{ ensured: string[]; repo: string; revision: string | null }> {
-  const revision = (await resolveRemoteRevision(opts.assetsRepo, opts.accessToken)) ?? undefined;
+  const resolved = await resolveRemoteRevision(opts.assetsRepo, opts.accessToken);
+  if (resolved === null && opts.requireRevision) {
+    // Installing against mutable `main` would publish sidecars with no
+    // provenance at all: the dashboard would report the model installed and
+    // could never surface a later tokenizer or template fix. A clear,
+    // retryable failure beats a permanently untracked install.
+    throw new Error(
+      `Could not resolve the latest revision of "${opts.assetsRepo}"; refusing to install sidecar files that could never receive updates. ` +
+        `Re-run when the network is reachable.`,
+    );
+  }
+  const revision = resolved ?? undefined;
   const { allFiles } = await getModelFiles(opts.assetsRepo, opts.accessToken, undefined, revision);
   const candidates = pickAssetSidecars(allFiles).filter(
     (file) => !opts.primaryPaths.has(file.path),
@@ -854,6 +867,9 @@ export async function run(argv: string[]) {
       // supplied: a file the repo lists but the globs/CORE_FILES do not select
       // is not on disk, so excluding it would lose the sidecar entirely.
       primaryPaths: new Set(cachedManifest.filesToDownload.map((file) => file.path)),
+      // Repairing an EXISTING install: a transient resolution failure must not
+      // fail the run — the marker keeps the provenance it already recorded.
+      requireRevision: false,
     });
     sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
     sidecarPaths = topUp.ensured;
@@ -1114,6 +1130,7 @@ export async function run(argv: string[]) {
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
       primaryPaths: new Set(filesToDownload.map((file) => file.path)),
+      requireRevision: true,
     });
     // Record the pair only when the revision resolved: an unresolved source is
     // unknown provenance, and an empty string would compare unequal forever.
@@ -1177,16 +1194,32 @@ export async function run(argv: string[]) {
       !fullSemantics,
       exemptFromPrune,
     );
+    const loadableWeight = (file: string): boolean =>
+      file.endsWith('.safetensors') ||
+      file.endsWith('.pdiparams') ||
+      (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)));
+    // A FRESH install that claims a loadable model — a catalog prescription, or
+    // one that pulled sidecars — must certify a config: isModelInstalled
+    // requires one, so a marker without it can never read as installed while
+    // the wizard calls the run a success. Updates are covered by the prune
+    // guard below, whose message names the removals that would break the
+    // install; this gate exists for the case with nothing to prune.
+    if (previousCompletion === null && (args.complete === true || assetsRepo !== undefined)) {
+      if (!certified.includes('config.json') || !certified.some(loadableWeight)) {
+        throw new Error(
+          `Refusing to certify "${modelName}": the selection has no ` +
+            `${certified.includes('config.json') ? 'model weights' : 'config.json'}` +
+            `${assetsRepo !== undefined ? ` (the repository provides none and "${assetsRepo}" provides none)` : ''}. ` +
+            `Nothing was published.`,
+        );
+      }
+    }
     if (pruneList.length > 0) {
       // Pruning must never destroy the install: the surviving manifest has to
       // keep a config and a weight. Upstream dropping the LAST config.json (a
       // weight-only GGUF repo relies on the assets repo for it) is exactly
       // that case — fail with everything unchanged.
       const remaining = certified.filter((file) => !pruneList.includes(file));
-      const loadableWeight = (file: string): boolean =>
-        file.endsWith('.safetensors') ||
-        file.endsWith('.pdiparams') ||
-        (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)));
       if (!remaining.includes('config.json') || !remaining.some(loadableWeight)) {
         throw new Error(
           `Refusing to sync "${modelName}": removing ${pruneList.join(', ')} would leave no loadable checkpoint ` +

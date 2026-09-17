@@ -142,31 +142,6 @@ describe('download model --assets-repo', () => {
     expect(marker.assetsRevision).toBe('b'.repeat(40));
   });
 
-  it('records no assets provenance when the sidecar revision is unresolved', async () => {
-    // Unknown provenance must stay unknown: recording an empty revision would
-    // compare unequal to every upstream sha and raise a permanent update badge.
-    hub.shas[PRIMARY] = 'a'.repeat(40); // primary resolved, assets NOT
-    await run([
-      '-m',
-      PRIMARY,
-      '-o',
-      outputDir,
-      '-g',
-      '*UD-Q4_K_XL*',
-      '--assets-repo',
-      ASSETS,
-      '--complete',
-      '--cache-dir',
-      cacheDir,
-    ]);
-    const marker = JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8')) as {
-      assetsRepo?: string;
-      assetsRevision?: string;
-    };
-    expect(marker.assetsRepo).toBeUndefined();
-    expect(marker.assetsRevision).toBeUndefined();
-  });
-
   it('records partial scope without --complete', async () => {
     hub.shas[PRIMARY] = 'a'.repeat(40);
     await run(['-m', PRIMARY, '-o', outputDir, '-g', '*UD-Q4_K_XL*', '--cache-dir', cacheDir]);
@@ -258,6 +233,7 @@ describe('download model --assets-repo', () => {
       writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
     };
     hub.shas[PRIMARY] = 'c'.repeat(40);
+    hub.shas[ASSETS] = 'b'.repeat(40);
     seed('a'.repeat(40));
 
     await run([
@@ -294,6 +270,7 @@ describe('download model --assets-repo', () => {
     // otherwise the marker advances past a file that is still on disk and the
     // runtime keeps consuming a sidecar upstream removed.
     hub.shas[PRIMARY] = 'a'.repeat(40);
+    hub.shas[ASSETS] = 'b'.repeat(40);
     hub.manifests[ASSETS] = [{ type: 'file', path: 'config.json', size: 12 }]; // tokenizer.json dropped upstream
     writeFileSync(
       join(outputDir, '.mlx-download-complete.json'),
@@ -375,6 +352,7 @@ describe('download model --assets-repo', () => {
     // must fail with everything unchanged — the alternative is certifying a
     // directory nothing can load.
     hub.shas[PRIMARY] = 'c'.repeat(40);
+    hub.shas[ASSETS] = 'b'.repeat(40);
     hub.manifests[ASSETS] = [{ type: 'file', path: 'tokenizer.json', size: 20 }]; // config.json gone upstream
     writeFileSync(
       join(outputDir, '.mlx-download-complete.json'),
@@ -424,6 +402,7 @@ describe('download model --assets-repo', () => {
     // run neither selected nor verified, which discovery can expose as a
     // loadable model.
     hub.shas[PRIMARY] = 'c'.repeat(40);
+    hub.shas[ASSETS] = 'b'.repeat(40);
     hub.manifests[PRIMARY] = [
       { type: 'file', path: GGUF, size: 300 },
       { type: 'file', path: 'Tiny-UD-Q8_K_XL.gguf', size: 900 }, // published, NOT in the glob prescription
@@ -525,6 +504,58 @@ describe('download model --assets-repo', () => {
     await run(['-m', PRIMARY, '-o', outputDir, '-g', 'mtp-*.gguf', '--cache-dir', cacheDir]);
 
     expect(existsSync(join(outputDir, 'mtp-Qwen3.8-27B-Q4_0.gguf'))).toBe(true);
+    expect(existsSync(join(outputDir, '.mlx-download-complete.json'))).toBe(false);
+  });
+
+  it('refuses to certify a fresh install whose selection has no config.json', async () => {
+    // Weight-only primary repo + an assets manifest that omits config.json:
+    // there is no previous marker and nothing to prune, so the only thing that
+    // can catch this is the fresh-install gate. Without it the wizard reports
+    // success for a directory nothing can load.
+    hub.shas[PRIMARY] = 'a'.repeat(40);
+    hub.shas[ASSETS] = 'b'.repeat(40);
+    hub.manifests[ASSETS] = [{ type: 'file', path: 'tokenizer.json', size: 20 }]; // no config.json anywhere
+
+    await expect(
+      run([
+        '-m',
+        PRIMARY,
+        '-o',
+        outputDir,
+        '-g',
+        '*UD-Q4_K_XL*',
+        '--assets-repo',
+        ASSETS,
+        '--complete',
+        '--cache-dir',
+        cacheDir,
+      ]),
+    ).rejects.toThrow(/no config[.]json/);
+
+    expect(existsSync(join(outputDir, '.mlx-download-complete.json'))).toBe(false);
+  });
+
+  it('refuses to install sidecars when their revision cannot be pinned', async () => {
+    // Installing against mutable `main` publishes sidecars with no provenance:
+    // installed, and never updatable. A retryable failure is the honest answer.
+    hub.shas[PRIMARY] = 'a'.repeat(40); // ASSETS deliberately unresolved
+
+    await expect(
+      run([
+        '-m',
+        PRIMARY,
+        '-o',
+        outputDir,
+        '-g',
+        '*UD-Q4_K_XL*',
+        '--assets-repo',
+        ASSETS,
+        '--complete',
+        '--cache-dir',
+        cacheDir,
+      ]),
+    ).rejects.toThrow(/Could not resolve the latest revision/);
+
     expect(existsSync(join(outputDir, '.mlx-download-complete.json'))).toBe(false);
   });
 
