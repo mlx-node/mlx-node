@@ -22,6 +22,7 @@ pub mod embeddings;
 pub mod encoder;
 pub mod interpolate;
 pub mod projector;
+pub mod qwen;
 pub mod rope_vision;
 
 // Re-export for Rust internal use

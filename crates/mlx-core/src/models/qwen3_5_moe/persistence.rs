@@ -1,3 +1,4 @@
+use crate::vision::qwen::weights::{load_vision_weights, parse_vision_config};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -23,14 +24,13 @@ use crate::models::quant_dispatch::{
     resolve_default_mode, select_quantization_block,
 };
 use crate::models::qwen3_5::persistence::{
-    MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
-    parse_vision_config,
+    MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes,
 };
-use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
-use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::nn::Linear;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::vision::qwen::encoder::QwenVisionEncoder;
+use crate::vision::qwen::processing::QwenImageProcessor;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
@@ -1474,7 +1474,7 @@ fn load_vision_encoder_moe(
             vision_config.patch_size,
         );
 
-        let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+        let mut vision_encoder = QwenVisionEncoder::new(vision_config.clone())?;
         load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
 
         inner.init_mrope_layers(
@@ -1484,7 +1484,7 @@ fn load_vision_encoder_moe(
         )?;
 
         inner.set_vision_encoder(vision_encoder)?;
-        inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+        inner.set_image_processor(QwenImageProcessor::new(None));
         inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
         info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");

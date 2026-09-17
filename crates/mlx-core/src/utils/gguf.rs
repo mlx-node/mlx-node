@@ -4749,6 +4749,58 @@ fn qwen35_native_cache_is_current(
     })
 }
 
+/// Resolve every split by its declared ordinal, accepting any GGUF extension
+/// casing while rejecting ambiguous sibling names. Payload validation remains
+/// the caller's responsibility; this reads directory entries only.
+pub(crate) fn resolve_gguf_shards(first: &Path, count: u32) -> Result<Vec<PathBuf>> {
+    if !(1..=1024).contains(&count) {
+        return Err(Error::from_reason("Invalid GGUF split count"));
+    }
+    if count == 1 {
+        return Ok(vec![first.to_path_buf()]);
+    }
+    let stem = first
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| Error::from_reason("Invalid GGUF split filename"))?;
+    let prefix = stem
+        .strip_suffix(&format!("-00001-of-{count:05}"))
+        .ok_or_else(|| Error::from_reason("Open the first GGUF split (-00001-of-...)"))?;
+    let directory = first
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut siblings: std::collections::HashMap<String, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            siblings.entry(stem.to_owned()).or_default().push(path);
+        }
+    }
+    let mut paths = vec![first.to_path_buf()];
+    for ordinal in 2..=count {
+        let stem = format!("{prefix}-{ordinal:05}-of-{count:05}");
+        let candidates = siblings.remove(&stem).unwrap_or_default();
+        if candidates.len() != 1 {
+            return Err(Error::from_reason(format!(
+                "Expected one GGUF split {stem}, found {}",
+                candidates.len()
+            )));
+        }
+        paths.push(candidates.into_iter().next().unwrap());
+    }
+    Ok(paths)
+}
+
 /// Resolve a Gemma GGUF directory without overriding an existing SafeTensors
 /// checkpoint. Multiple targets require an explicit filename.
 pub(crate) fn resolve_gemma4_gguf_source(path: &Path) -> Result<Option<PathBuf>> {

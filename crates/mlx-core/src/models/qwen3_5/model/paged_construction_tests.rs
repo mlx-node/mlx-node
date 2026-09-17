@@ -1484,15 +1484,15 @@ fn test_vlm_loads_when_paged_enabled() {
     if std::env::var_os("MLX_TEST_PAGED").is_none() {
         return;
     }
-    use crate::models::qwen3_5::vision::Qwen3_5VisionConfig;
-    use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
+    use crate::vision::qwen::encoder::QwenVisionConfig;
+    use crate::vision::qwen::encoder::QwenVisionEncoder;
 
     let cfg = tiny_cfg(true);
     let mut inner = Qwen35Inner::new(cfg).unwrap();
     inner
         .initialize_paged_adapter()
         .expect("post-load paged adapter initialization");
-    let vision_cfg = Qwen3_5VisionConfig {
+    let vision_cfg = QwenVisionConfig {
         hidden_size: 64,
         intermediate_size: 256,
         num_heads: 4,
@@ -1502,7 +1502,7 @@ fn test_vlm_loads_when_paged_enabled() {
         image_size: 256,
         out_hidden_size: 64,
     };
-    let vision_enc = Qwen3_5VisionEncoder::new(vision_cfg).expect("vision encoder construction");
+    let vision_enc = QwenVisionEncoder::new(vision_cfg).expect("vision encoder construction");
     let result = inner.set_vision_encoder(vision_enc);
     assert!(
         result.is_ok(),
@@ -1517,7 +1517,7 @@ fn test_vlm_loads_when_paged_enabled() {
     assert_eq!(incomplete.available, MediaCapabilities::NONE);
     assert_eq!(incomplete.backend_validated, MediaCapabilities::IMAGES);
 
-    inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+    inner.set_image_processor(QwenImageProcessor::new(None));
     let complete = inner.execution_plan().media;
     assert_eq!(complete.available, MediaCapabilities::IMAGES);
     assert_eq!(complete.backend_validated, MediaCapabilities::NONE);

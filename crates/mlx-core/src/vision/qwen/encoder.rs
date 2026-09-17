@@ -1,8 +1,8 @@
-/// Qwen3.5 Vision Encoder
+/// Qwen Vision Encoder
 ///
 /// Assembles existing shared vision components (VisionAttention, VisionMLP,
 /// VisionEncoderLayer, SpatialProjector, VisionRotaryEmbedding) into a full
-/// vision encoder for Qwen3.5-VL.
+/// vision encoder for Qwen VLMs.
 ///
 /// Architecture: patch_embed → + pos_embed → 27 blocks with 2D RoPE → merger
 use crate::array::MxArray;
@@ -16,9 +16,9 @@ use napi::bindgen_prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Qwen3.5 Vision Encoder configuration
+/// Qwen Vision Encoder configuration
 #[derive(Debug, Clone)]
-pub struct Qwen3_5VisionConfig {
+pub struct QwenVisionConfig {
     pub hidden_size: i32,        // 1152
     pub intermediate_size: i32,  // 4304
     pub num_heads: i32,          // 16
@@ -29,7 +29,7 @@ pub struct Qwen3_5VisionConfig {
     pub out_hidden_size: i32,    // 4096 (matches text hidden_size)
 }
 
-impl Default for Qwen3_5VisionConfig {
+impl Default for QwenVisionConfig {
     fn default() -> Self {
         Self {
             hidden_size: 1152,
@@ -44,16 +44,16 @@ impl Default for Qwen3_5VisionConfig {
     }
 }
 
-/// Qwen3.5 Vision Encoder
+/// Qwen Vision Encoder
 ///
 /// Processes images into vision features compatible with the text model.
-pub struct Qwen3_5VisionEncoder {
-    config: Qwen3_5VisionConfig,
+pub struct QwenVisionEncoder {
+    config: QwenVisionConfig,
     /// Patch embedding: Conv2d extracting patches from images
     patch_embed: Arc<PatchEmbedding>,
     /// Learned position embeddings [num_pos, hidden_size]
     pos_embed: Option<Arc<MxArray>>,
-    /// 27 transformer encoder layers
+    /// Transformer encoder layers
     layers: Vec<Arc<VisionEncoderLayer>>,
     /// 2D rotary position embeddings
     rotary_pos_emb: Arc<VisionRotaryEmbedding>,
@@ -61,9 +61,9 @@ pub struct Qwen3_5VisionEncoder {
     merger: Option<Arc<SpatialProjector>>,
 }
 
-impl Qwen3_5VisionEncoder {
+impl QwenVisionEncoder {
     /// Create a new vision encoder (layers and weights added separately).
-    pub fn new(config: Qwen3_5VisionConfig) -> Result<Self> {
+    pub fn new(config: QwenVisionConfig) -> Result<Self> {
         let head_dim = config.hidden_size / config.num_heads;
         let rotary_pos_emb = VisionRotaryEmbedding::new((head_dim / 2) as u32, None);
 
@@ -357,18 +357,18 @@ impl Qwen3_5VisionEncoder {
             let w_dim = i64::from(grid_data[img_idx * 3 + 2]);
             let segment_len = h_dim
                 .checked_mul(w_dim)
-                .ok_or_else(|| Error::from_reason("Qwen3.5 vision segment length overflow"))?;
+                .ok_or_else(|| Error::from_reason("Qwen vision segment length overflow"))?;
             for _ in 0..t {
                 let prev = *segment_boundaries.last().unwrap_or(&0);
                 segment_boundaries.push(prev.checked_add(segment_len).ok_or_else(|| {
-                    Error::from_reason("Qwen3.5 vision cumulative segment length overflow")
+                    Error::from_reason("Qwen vision cumulative segment length overflow")
                 })?);
             }
         }
         let total_seq_len = h.shape()?[0];
         if segment_boundaries.last().copied() != Some(total_seq_len) {
             return Err(Error::from_reason(format!(
-                "Qwen3.5 vision grid covers {} patches but patch embedding produced {total_seq_len}",
+                "Qwen vision grid covers {} patches but patch embedding produced {total_seq_len}",
                 segment_boundaries.last().copied().unwrap_or(0),
             )));
         }
@@ -387,7 +387,7 @@ impl Qwen3_5VisionEncoder {
             let context = format!("qwen3_5_vision_layer_{layer_idx}");
             MxArray::eval_arrays_with_context(&[&h], &context).map_err(|error| {
                 Error::from_reason(format!(
-                    "Qwen3.5 vision layer {layer_idx} materialization failed: {error}"
+                    "Qwen vision layer {layer_idx} materialization failed: {error}"
                 ))
             })?;
             crate::array::clear_cache();
@@ -396,7 +396,7 @@ impl Qwen3_5VisionEncoder {
                 event = "vision_layer_materialized",
                 layer = layer_idx,
                 patch_count = total_seq_len,
-                "Qwen3.5 vision layer residual materialized"
+                "Qwen vision layer residual materialized"
             );
         }
 
@@ -440,7 +440,7 @@ impl Qwen3_5VisionEncoder {
     }
 }
 
-impl Clone for Qwen3_5VisionEncoder {
+impl Clone for QwenVisionEncoder {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -469,13 +469,13 @@ mod tests {
 
     /// Build a tiny encoder (small dims, `num_layers` transformer blocks, no
     /// spatial merge) sufficient to exercise a full `forward()` call.
-    fn tiny_encoder(num_layers: usize) -> Qwen3_5VisionEncoder {
+    fn tiny_encoder(num_layers: usize) -> QwenVisionEncoder {
         let hidden = 8i64;
         let heads = 2u32;
         let patch = 2i64;
         let intermediate = 16i64;
 
-        let config = Qwen3_5VisionConfig {
+        let config = QwenVisionConfig {
             hidden_size: hidden as i32,
             intermediate_size: intermediate as i32,
             num_heads: heads as i32,
@@ -486,7 +486,7 @@ mod tests {
             out_hidden_size: hidden as i32,
         };
 
-        let mut encoder = Qwen3_5VisionEncoder::new(config).unwrap();
+        let mut encoder = QwenVisionEncoder::new(config).unwrap();
 
         let patch_weight = random_array(&[hidden, patch, patch, 3]);
         encoder.set_patch_embed(&patch_weight, None).unwrap();

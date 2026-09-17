@@ -545,10 +545,22 @@ impl HybridSchedulerBackend for Inner {
             return;
         }
         handle_chat_cmd(self, command);
-        owners
-            .owner_states
-            .insert(owner, self.saved_history.clone());
-        self.park_row();
+        if self.saved_history.is_empty() {
+            // Admission/media failures can return before run_paged_turn's abort
+            // hook. Empty rows have no reusable frontier and must not occupy an
+            // owner slot (including successful requests with reuse disabled).
+            if let Some(adapter) = &mut self.decoder.paged {
+                let _ = adapter.release_request_for(seq);
+            }
+            self.release_scheduled_recurrent_for(seq);
+            owners.owner_sequences.remove(&owner);
+            owners.owner_states.remove(&owner);
+        } else {
+            owners
+                .owner_states
+                .insert(owner, self.saved_history.clone());
+            self.park_row();
+        }
     }
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {
         HybridStepExecutor::new(self)

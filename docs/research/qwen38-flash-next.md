@@ -5,6 +5,72 @@ Research: 15–17 September 2026. Starting revision:
 initial performance record, mlx.fast investigation, prefill port log, and
 macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
+## Architecture review, 17 September
+
+The shared Qwen vision implementation now lives in
+`crates/mlx-core/src/vision/qwen/`: processor geometry, encoder, normalized
+weight loading, prompt expansion, M-RoPE positions, and the dense/MoE image-feature
+cache with its live memory planner. Qwen3.5 dense,
+Qwen3.5 MoE, and Qwen4 import that module directly. The previous family-owned
+modules and compatibility aliases are removed; numerical and image-layout
+regressions move with their implementation. Generic message image extraction
+lives in `engine/vision.rs`, also used by Qianfan OCR.
+
+Qwen4 exposes the validated image-capability snapshot and the exact expanded
+prompt planner to ChatSession. Planning and prefill share its processor
+configuration and input limits (four images, 16 megapixels and 32 MiB per
+image), so context budgeting does not use the unexpanded template length.
+No vision tensors or inference caches are allocated by the planner.
+
+The existing TypeScript family registry also owns discovery's vision markers
+and GGUF policy. A single file/directory path applies that policy, preserves
+Qwen3.5's XL restriction and Gemma/Muse's sidecar requirements, prefers converted
+target weights, and publishes only Qwen4's first split. Header-only GGUF
+checkpoints no longer need an unrelated config file to appear in discovery.
+
+Split filename resolution is a shared GGUF metadata utility and accepts
+mixed extension casing across siblings. Missing/ambiguous parts still fail.
+Failed exclusive requests release empty owner and page state; a rejected turn
+with an existing usable frontier preserves that owner's history.
+
+The Qwen4 decoder, routed-expert residency, hashed PLE and HC/GDN kernel
+contracts remain family-owned: other models do not share their tensor layout,
+precision boundaries, or SSD ownership policy. Existing generic scheduler,
+paged-cache, stream-limit and Metal library-cache modules remain the reuse
+boundaries. Experimental kernel switches with independent parity coverage
+are retained; the previously rejected MoE replay prototype remains archived
+outside the PR. This refactor makes no new performance claim.
+
+Architecture validation:
+
+- The release core suite passed **3576 tests**, with **122 ignored** and three
+  existing debug-assertion-only cases excluded in release mode. This includes
+  the moved vision/cache regressions, mixed-case split payload reads, exact
+  Qwen4 image token planning, repeated sync/stream media failures, and
+  cancellation that preserves a usable owner.
+- Canonical native build and both packaged Metal library checks passed.
+  The addon SHA-256 is
+  `5a8f30626b7975d58b293222949970e78d39a7d1e04521045e2a53b51e00df0f`;
+  both Metal libraries match the preceding attention-gate build.
+- Strict all-target Clippy passed for `mlx-core` and `mlx-sys`. Workspace
+  TypeScript checking and formatting/type-aware lint on the four changed
+  TypeScript sources passed. Both generated declaration copies match.
+- The six affected TypeScript suites passed **95 tests**, including the
+  Qwen4 discovery cases in the existing agent suite. No new standalone
+  TypeScript test harness is committed.
+- The exact-arithmetic full-checkpoint smoke passed **11 requests** with the
+  matching auxiliary checkpoint, plus public image capability/count checks
+  and **eight rejected malformed-image owners** followed by successful red,
+  continued-red and changed-blue image turns. The 64-by-64 image planned 64
+  image tokens; a five-image conversation was rejected before inference.
+- Live headroom admitted **60 GiB / 345 slots** under the unchanged 63 GiB
+  cap. Peak physical footprint was **61,956,784,896 bytes**; all **1365 pages**
+  were free after reset and reserved state was zero. The memory guard passed.
+  Compilation overlapped this correctness-only smoke; its timings are not
+  performance results.
+- Raw evidence and immutable native artifacts remain outside the repository
+  under `~/Library/Caches/mlx-node/qwen4-reference-gap-20260917/architecture-*`.
+
 ## 95% follow-up: refreshed reference
 
 The 17 September follow-up inspected the new promoted tree

@@ -3,18 +3,42 @@
 use super::{Inner, config::Config, weights::Store};
 use crate::array::MxArray;
 use crate::engine::backend::{PagedBackend, TurnOutput, WholeTurnArgs};
-use crate::models::qwen3_5::model::vision_turn::{
+use crate::vision::qwen::prompt::{
     compute_image_token_counts_per_image, get_rope_index, inject_image_placeholders,
 };
-use crate::models::qwen3_5::{
-    processing::Qwen35VLImageProcessor, vision::Qwen3_5VisionConfig, vision::Qwen3_5VisionEncoder,
+use crate::vision::qwen::{
+    encoder::{QwenVisionConfig, QwenVisionEncoder},
+    processing::QwenImageProcessor,
 };
 use napi::{Error, Result};
 use std::collections::HashMap;
 
+pub(super) const IMAGE_LIMITS: crate::vision::qwen::prompt::ImageLimits =
+    crate::vision::qwen::prompt::ImageLimits {
+        max_images: 4,
+        max_pixels: 16_777_216,
+        max_encoded_bytes: 32 << 20,
+    };
+
+pub(super) fn image_processor() -> QwenImageProcessor {
+    QwenImageProcessor::new(Some(
+        crate::models::paddleocr_vl::processing::ImageProcessorConfig {
+            min_pixels: 65536,
+            max_pixels: 262144,
+            patch_size: 16,
+            temporal_patch_size: 2,
+            merge_size: 2,
+            image_mean: vec![0.5; 3],
+            image_std: vec![0.5; 3],
+            do_rescale: true,
+            do_normalize: true,
+        },
+    ))
+}
+
 pub struct Vision {
-    config: Option<Qwen3_5VisionConfig>,
-    encoder: Option<Qwen3_5VisionEncoder>,
+    config: Option<QwenVisionConfig>,
+    encoder: Option<QwenVisionEncoder>,
 }
 pub struct Prepared {
     pub embeddings: MxArray,
@@ -66,7 +90,7 @@ impl Vision {
             });
         }
         let v = &raw["vision_config"];
-        let cfg = crate::models::qwen3_5::persistence::parse_vision_config(raw);
+        let cfg = crate::vision::qwen::weights::parse_vision_config(raw);
         if cfg.hidden_size <= 0
             || cfg.hidden_size > 2048
             || cfg.intermediate_size <= 0
@@ -137,48 +161,22 @@ impl Vision {
             MxArray::eval_arrays_with_context(&[&value], "qwen4::media::value")?;
             params.insert(key.trim_start_matches("visual.").to_string(), value);
         }
-        let mut encoder = Qwen3_5VisionEncoder::new(cfg.clone())?;
-        crate::models::qwen3_5::persistence::load_vision_weights(&mut encoder, &params, &cfg)?;
+        let mut encoder = QwenVisionEncoder::new(cfg.clone())?;
+        crate::vision::qwen::weights::load_vision_weights(&mut encoder, &params, &cfg)?;
         self.encoder = Some(encoder);
         Ok(())
     }
 }
 impl Inner {
     pub fn run_media(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        if args.media.images.is_empty()
-            || !args.media.audio.is_empty()
-            || args.media.images.len() > 4
-        {
+        if args.media.images.is_empty() || !args.media.audio.is_empty() {
             return Err(Error::from_reason(
                 "Qwen4 accepts 1-4 images per rendered conversation; audio is not part of this checkpoint",
             ));
         }
         self.decoder.check_cancelled()?;
-        // Probe encoded dimensions before allocating a decoded image buffer.
-        for bytes in args.media.images {
-            let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
-                .with_guessed_format()?
-                .into_dimensions()
-                .map_err(|e| Error::from_reason(e.to_string()))?;
-            if u64::from(w) * u64::from(h) > 16_777_216 || bytes.len() > 32 << 20 {
-                return Err(Error::from_reason(
-                    "Qwen4 image exceeds the 16 megapixel / 32 MiB input budget",
-                ));
-            }
-        }
-        let processor = Qwen35VLImageProcessor::new(Some(
-            crate::models::paddleocr_vl::processing::ImageProcessorConfig {
-                min_pixels: 65536,
-                max_pixels: 262144,
-                patch_size: 16,
-                temporal_patch_size: 2,
-                merge_size: 2,
-                image_mean: vec![0.5; 3],
-                image_std: vec![0.5; 3],
-                do_rescale: true,
-                do_normalize: true,
-            },
-        ));
+        IMAGE_LIMITS.validate(args.media.images)?;
+        let processor = image_processor();
         let refs: Vec<_> = args.media.images.iter().map(Vec::as_slice).collect();
         let counts = processor.plan_merged_token_counts(&refs, 2)?;
         let tokens = inject_image_placeholders(args.tokens, &counts)?;

@@ -1,3 +1,8 @@
+use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_vision_features};
+use crate::vision::qwen::prompt::{
+    IMAGE_TOKEN_ID, compute_image_token_counts_per_image, expanded_prompt_token_count,
+    inject_image_placeholders,
+};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,13 +45,12 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
     replay_gdn_cache_and_commit,
 };
 use crate::models::qwen3_5::model::{
-    IMAGE_TOKEN_ID, Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
-    compute_image_token_counts_per_image, constrain_paged_context_params, eval_layer_caches,
-    inject_image_placeholders, qwen35_expanded_prompt_token_count, vlm_prepare_vision_features,
+    Qwen3_5ContextLimits, async_eval_layer_caches, constrain_paged_context_params,
+    eval_layer_caches,
 };
-use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
-use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
+use crate::vision::qwen::encoder::QwenVisionEncoder;
+use crate::vision::qwen::processing::QwenImageProcessor;
 
 pub(crate) type Qwen35MoeSchedulerState =
     crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35MoeInner>;
@@ -134,8 +138,8 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) fa_idx: usize,
-    pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
-    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,
+    pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
     pub(crate) spatial_merge_size: Option<i32>,
     pub(crate) vision_cache: VisionCache,
     pub(crate) cached_token_history: Vec<u32>,
@@ -321,7 +325,7 @@ pub struct Qwen3_5MoeModel {
     pub(crate) vision_active: bool,
     /// Same loaded processor and merge-size snapshots used by the model thread,
     /// retained for exact CPU-only image-token planning before SSE.
-    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
     pub(crate) spatial_merge_size: i32,
     pub(crate) context_limits: Qwen3_5ContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
@@ -428,11 +432,12 @@ impl Qwen3_5MoeModel {
         prompt_tokens: Uint32Array,
         messages: Vec<ChatMessage>,
     ) -> Result<u32> {
-        qwen35_expanded_prompt_token_count(
+        expanded_prompt_token_count(
             self.image_processor.clone(),
             self.spatial_merge_size,
             prompt_tokens,
             messages,
+            None,
         )
         .await
     }

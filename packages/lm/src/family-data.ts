@@ -186,6 +186,14 @@ interface ModelFamilyDataBase {
    * not direct files, so it carries none.
    */
   readonly ggufArchitectures?: readonly string[];
+  /** Config markers for optimistic discovery; the loaded model is authoritative. */
+  readonly visionConfigKeys?: readonly string[];
+  /** Native GGUF discovery policy, shared by file and directory scans. */
+  readonly ggufDiscovery?: {
+    readonly variants: 'all' | 'qwen35-xl';
+    readonly requiresAssets?: true;
+    readonly split?: true;
+  };
 }
 
 /**
@@ -233,8 +241,10 @@ export type ModelFamilyData = ChatFamilyData | NonGenerativeFamilyData;
 export const MODEL_FAMILY_DATA = [
   {
     id: 'gemma4',
+    visionConfigKeys: ['vision_config', 'unified_vision_config'],
     kind: 'loadable',
     ggufArchitectures: ['gemma4'],
+    ggufDiscovery: { variants: 'all', requiresAssets: true },
     match: {
       rawModelTypes: ['gemma4', 'gemma4_text', 'gemma4_unified'],
       architectureProbe: ({ architectures }) => architectures.has('Gemma4UnifiedForConditionalGeneration'),
@@ -259,6 +269,7 @@ export const MODEL_FAMILY_DATA = [
     id: 'muse_glimmer',
     kind: 'loadable',
     ggufArchitectures: ['muse-glimmer'],
+    ggufDiscovery: { variants: 'all', requiresAssets: true },
     match: {
       rawModelTypes: ['muse_glimmer', 'muse_glimmer_text'],
       architectureProbe: ({ architectures }) => architectures.has('MuseGlimmerForConditionalGeneration'),
@@ -294,10 +305,12 @@ export const MODEL_FAMILY_DATA = [
   },
   {
     id: 'qwen3_5',
+    visionConfigKeys: ['vision_config'],
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3_5'] },
     acceptsDraftModel: true,
     ggufArchitectures: ['qwen35'],
+    ggufDiscovery: { variants: 'qwen35-xl' },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
@@ -306,6 +319,7 @@ export const MODEL_FAMILY_DATA = [
   },
   {
     id: 'qwen3_5_moe',
+    visionConfigKeys: ['vision_config'],
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3_5_moe'] },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
@@ -316,9 +330,11 @@ export const MODEL_FAMILY_DATA = [
   },
   {
     id: 'qwen4_exp',
+    visionConfigKeys: ['vision_config'],
     kind: 'loadable',
     match: { rawModelTypes: ['qwen4_exp', 'qwen4_exp_text'] },
     ggufArchitectures: ['qwen4exp'],
+    ggufDiscovery: { variants: 'all', split: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: { sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding, maxOutputTokens: 8192 },
   },

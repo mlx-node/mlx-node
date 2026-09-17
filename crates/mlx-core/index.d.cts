@@ -2149,6 +2149,10 @@ export declare class Qwen3Tokenizer {
  */
 export declare class Qwen4ExpModel {
   static load(modelPath: string, options?: Qwen4ExpLoadOptions | undefined | null): Promise<Qwen4ExpModel>;
+  /** Whether the validated checkpoint has a supported image tower. */
+  supportsImages(): boolean;
+  /** Plan the expanded prompt using the same processor and limits as prefill. */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
   residencyInfo(): Qwen4ExpResidencyInfo;
   modelAssetsPath(): string;
   hasMtpWeights(): boolean;

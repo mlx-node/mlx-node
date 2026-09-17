@@ -783,25 +783,10 @@ impl Store {
         {
             return Err(err("Expected qwen4exp GGUF"));
         }
-        let filename = first
-            .file_name()
-            .and_then(|v| v.to_str())
-            .ok_or_else(|| err("Invalid GGUF filename"))?;
-        let suffix = format!("-00001-of-{count:05}.gguf");
-        let prefix = if count > 1 {
-            filename
-                .strip_suffix(&suffix)
-                .ok_or_else(|| err("Invalid GGUF split filename"))?
-        } else {
-            ""
-        };
+        let paths = crate::utils::gguf::resolve_gguf_shards(first, count)?;
         self.metadata = initial.metadata.clone();
-        for i in 0..count {
-            let path = if count == 1 {
-                first.to_path_buf()
-            } else {
-                first.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", i + 1))
-            };
+        for (i, path) in paths.into_iter().enumerate() {
+            let i = i as u32;
             let g = if i == 0 {
                 None
             } else {

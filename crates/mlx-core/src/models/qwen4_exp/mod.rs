@@ -21,7 +21,9 @@ use crate::engine::model_command::ModelCommand;
 use crate::engine::params::{ModelGenerationDefaults, ThinkingPolicy};
 use crate::model_thread::ModelThread;
 use crate::stream::{Stream, StreamContext};
+use crate::tokenizer::ChatMessage;
 use crate::tokenizer::Qwen3Tokenizer;
+use napi::bindgen_prelude::Uint32Array;
 use napi::{Error, Result};
 use napi_derive::napi;
 use std::path::{Path, PathBuf};
@@ -279,6 +281,7 @@ pub struct Qwen4ExpModel {
     paged_capacity: u32,
     residency: memory::Plan,
     prefill_chunk_size: usize,
+    supports_images: bool,
 }
 #[napi]
 impl Qwen4ExpModel {
@@ -308,6 +311,7 @@ impl Qwen4ExpModel {
                 };
                 let has_mtp = auxiliary::validate_mtp(&weights, &config)?;
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
+                let supports_images = vision.available();
                 let tokenizer = Arc::new(Qwen3Tokenizer::load_from_file_sync(
                     assets
                         .join("tokenizer.json")
@@ -359,12 +363,21 @@ impl Qwen4ExpModel {
                         paged_capacity,
                         residency,
                         prefill_chunk_size,
+                        supports_images,
                     ),
                 ))
             },
             |state, receiver| state.drive(receiver),
         );
-        let (config, assets_path, has_mtp, paged_capacity, residency, prefill_chunk_size) = ready
+        let (
+            config,
+            assets_path,
+            has_mtp,
+            paged_capacity,
+            residency,
+            prefill_chunk_size,
+            supports_images,
+        ) = ready
             .await
             .map_err(|e| Error::from_reason(e.to_string()))??;
         Ok(Self {
@@ -375,7 +388,30 @@ impl Qwen4ExpModel {
             paged_capacity,
             residency,
             prefill_chunk_size,
+            supports_images,
         })
+    }
+    /// Whether the validated checkpoint has a supported image tower.
+    #[napi]
+    pub fn supports_images(&self) -> bool {
+        self.supports_images
+    }
+    /// Plan the expanded prompt using the same processor and limits as prefill.
+    #[napi]
+    pub async fn expanded_prompt_token_count(
+        &self,
+        prompt_tokens: Uint32Array,
+        messages: Vec<ChatMessage>,
+    ) -> Result<u32> {
+        crate::vision::qwen::prompt::expanded_prompt_token_count(
+            self.supports_images
+                .then(|| Arc::new(media::image_processor())),
+            2,
+            prompt_tokens,
+            messages,
+            Some(media::IMAGE_LIMITS),
+        )
+        .await
     }
     #[napi]
     pub fn residency_info(&self) -> Qwen4ExpResidencyInfo {

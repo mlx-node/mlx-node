@@ -4,6 +4,188 @@ fn fixture() -> PathBuf {
 }
 
 #[test]
+fn split_gguf_extension_case_preserves_index_and_payloads() {
+    for extensions in [["GGUF", "GGUF"], ["GgUf", "gGuF"]] {
+        let dir = Temp::new();
+        let paths: Vec<_> = extensions
+            .iter()
+            .enumerate()
+            .map(|(i, ext)| dir.0.join(format!("model-{:05}-of-00002.{ext}", i + 1)))
+            .collect();
+        for (i, path) in paths.iter().enumerate() {
+            let mut b = b"GGUF".to_vec();
+            b.extend_from_slice(&3u32.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&4u64.to_le_bytes());
+            gguf_string(&mut b, "general.architecture");
+            b.extend_from_slice(&8u32.to_le_bytes());
+            gguf_string(&mut b, "qwen4exp");
+            for (key, value) in [
+                ("split.no", i as u32),
+                ("split.count", 2),
+                ("split.tensors.count", 2),
+            ] {
+                gguf_string(&mut b, key);
+                b.extend_from_slice(&4u32.to_le_bytes());
+                b.extend_from_slice(&value.to_le_bytes());
+            }
+            gguf_string(&mut b, &format!("part{i}.weight"));
+            b.extend_from_slice(&2u32.to_le_bytes());
+            b.extend_from_slice(&4u64.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            while !b.len().is_multiple_of(32) {
+                b.push(0);
+            }
+            for _ in 0..4 {
+                b.extend_from_slice(&(i as f32 + 1.).to_le_bytes());
+            }
+            std::fs::write(path, b).unwrap();
+        }
+        let mut store = weights::Store::open_fixture(&paths[0], None).unwrap();
+        assert_eq!(store.bytes_read, 0, "indexing must stay metadata-only");
+        for i in 0..2 {
+            assert_eq!(
+                store
+                    .read(&format!("part{i}.weight"), 0, 1)
+                    .unwrap()
+                    .dense()
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .as_ref(),
+                &[i as f32 + 1.; 4]
+            );
+        }
+        assert!(weights::Store::open_fixture(&paths[1], None).is_err());
+        std::fs::remove_file(&paths[1]).unwrap();
+        assert!(weights::Store::open_fixture(&paths[0], None).is_err());
+    }
+}
+
+#[test]
+fn failed_exclusive_turns_release_empty_owners_and_preserve_live_history() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, SchedulerOwnerContext};
+    let mut inner = tiny_inner();
+    let mut sequences = std::collections::HashMap::new();
+    let mut states = std::collections::HashMap::new();
+    let mut next = 1;
+    for i in 0..8 {
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        let mut message: crate::tokenizer::ChatMessage =
+            serde_json::from_value(serde_json::json!({"role":"user","content":"a"})).unwrap();
+        message.images = Some(vec![napi::bindgen_prelude::Uint8Array::from(vec![0, 1, 2])]);
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(16);
+        let config = crate::engine::types::ChatConfig {
+            cache_owner_id: Some(format!("bad-{i}")),
+            ..Default::default()
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cmd = if i % 2 == 0 {
+            ChatCmd::SessionStart {
+                messages: vec![message],
+                config,
+                cancelled,
+                reply,
+            }
+        } else {
+            ChatCmd::StreamSessionStart {
+                messages: vec![message],
+                config,
+                cancelled,
+                stream_tx,
+            }
+        };
+        inner.execute_chat_barrier(
+            cmd,
+            SchedulerOwnerContext {
+                owner_sequences: &mut sequences,
+                owner_states: &mut states,
+                next_seq_id: &mut next,
+            },
+        );
+        let reason = if i % 2 == 0 {
+            rx.try_recv().unwrap().err().unwrap().reason
+        } else {
+            stream_rx.try_recv().unwrap().err().unwrap().reason
+        };
+        assert!(reason.to_lowercase().contains("image"), "{reason}");
+        assert!(sequences.is_empty() && states.is_empty() && inner.rows.is_empty());
+        assert!(inner.active_seq.is_none());
+        assert!(
+            inner
+                .decoder
+                .paged
+                .as_ref()
+                .unwrap()
+                .live_seq_ids()
+                .is_empty()
+        );
+    }
+    // Cancellation before prefill must not discard a previously usable owner.
+    inner.activate_exclusive_seq(next).unwrap();
+    inner.decoder.prefill_chunk(&[3, 4], None, false).unwrap();
+    sequences.insert("live".into(), next);
+    let (reply, mut rx) = tokio::sync::oneshot::channel();
+    inner.execute_chat_barrier(
+        ChatCmd::SessionContinue {
+            messages: vec![],
+            config: crate::engine::types::ChatConfig {
+                cache_owner_id: Some("live".into()),
+                ..Default::default()
+            },
+            cancelled: Arc::new(AtomicBool::new(true)),
+            reply,
+        },
+        SchedulerOwnerContext {
+            owner_sequences: &mut sequences,
+            owner_states: &mut states,
+            next_seq_id: &mut next,
+        },
+    );
+    assert_eq!(
+        rx.try_recv().unwrap().err().unwrap().reason,
+        "chat session cancelled"
+    );
+    assert_eq!(states["live"], vec![3, 4]);
+    assert_eq!(sequences.len(), 1);
+}
+
+#[test]
+fn media_prompt_planning_matches_bounded_processor_grids() {
+    use crate::vision::qwen::prompt::{
+        IMAGE_TOKEN_ID, compute_image_token_counts_per_image, inject_image_placeholders,
+        plan_expanded_image_prompt_len,
+    };
+    let processor = media::image_processor();
+    let images: Vec<Vec<u8>> = [(32, 64), (768, 1024)]
+        .into_iter()
+        .map(|(w, h)| {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(w, h)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        })
+        .collect();
+    media::IMAGE_LIMITS.validate(&images).unwrap();
+    let tokens = [1, IMAGE_TOKEN_ID as u32, 2, IMAGE_TOKEN_ID as u32, 3];
+    let planned = plan_expanded_image_prompt_len(&processor, 2, &tokens, &images).unwrap();
+    let processed = processor
+        .process_many(&images.iter().map(Vec::as_slice).collect::<Vec<_>>())
+        .unwrap();
+    let counts = compute_image_token_counts_per_image(&processed.grid_thw(), 2).unwrap();
+    assert_eq!(
+        planned,
+        inject_image_placeholders(&tokens, &counts).unwrap().len()
+    );
+    assert!(planned > tokens.len());
+    assert!(counts.iter().all(|&count| count <= 256));
+}
+
+#[test]
 fn gguf_extension_case_preserves_checkpoint_loading() {
     let expected = weights::Store::open_fixture(&fixture().join("model.gguf"), None).unwrap();
     let mut expected = decoder::Decoder::new(gguf::config(&expected).unwrap(), expected).unwrap();
@@ -1242,12 +1424,16 @@ fn tiny_inner() -> Inner {
     let c = config::Config::parse(&raw).unwrap();
     let store = weights::Store::open_fixture(&path, None).unwrap();
     let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
-    let tokenizer_path =
-        std::env::temp_dir().join(format!("qwen4-test-tokenizer-{}.json", std::process::id()));
+    let tokenizer_dir = Temp::new();
+    let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
+    std::fs::write(
+        tokenizer_dir.0.join("tokenizer_config.json"),
+        r#"{"chat_template":"a"}"#,
+    )
+    .unwrap();
     std::fs::write(&tokenizer_path,r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"a":0,"b":1,"<unk>":2},"unk_token":"<unk>"}}"#).unwrap();
     let tokenizer =
         Arc::new(Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap()).unwrap());
-    std::fs::remove_file(tokenizer_path).unwrap();
     let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
     decoder.paged = Some(super::paged::create(&c).unwrap());
     Inner {

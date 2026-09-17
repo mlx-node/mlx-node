@@ -8,7 +8,7 @@ import {
   launchPresetFor,
   familyTraitsFor,
   NON_GENERATIVE_FAMILY_IDS,
-  MODEL_FAMILY_DATA,
+  familyDataFor,
   type FamilyTraits,
   type LaunchPreset,
   type ModelType,
@@ -33,7 +33,7 @@ interface DiscoveryMetadata {
 }
 
 /**
- * The Qwen3.5/Qwen3.8 discovery filter retains its XL policy. Gemma4 and Muse
+ * The Qwen3.5 discovery filter retains its XL policy. Gemma4 and Muse
  * accept all supported tensor formats, including Q4_0 QAT checkpoints.
  * Match the Unsloth Dynamic XL target names users download, while excluding
  * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
@@ -52,18 +52,15 @@ function ggufModelName(name: string): string {
   return name.slice(0, -'.gguf'.length);
 }
 
-function requiresGgufAssets(modelType: ModelType): boolean {
-  return modelType === 'gemma4' || modelType === 'muse_glimmer';
-}
-
-function matchesGgufFamily(path: string, modelType: ModelType): boolean {
-  const architecture = readGgufArchitecture(path);
-  return MODEL_FAMILY_DATA.some(
-    (family) =>
-      family.id === modelType &&
-      'ggufArchitectures' in family &&
-      family.ggufArchitectures.some((supported) => supported === architecture),
-  );
+function supportedGgufName(name: string, modelType: ModelType): boolean {
+  const policy = familyDataFor(modelType)?.ggufDiscovery;
+  if (!policy || GGUF_COMPANION_NAME.test(name)) return false;
+  const split = /-(\d{5})-of-(\d{5})\.gguf$/i.exec(name);
+  if (split) {
+    const total = Number(split[2]);
+    if (Number(split[1]) !== 1 || total < 1 || total > 1024 || (total > 1 && !policy.split)) return false;
+  }
+  return policy.variants === 'all' || isQwen35XlGguf(name);
 }
 
 async function hasGgufAssets(modelDir: string): Promise<boolean> {
@@ -76,10 +73,8 @@ async function hasGgufAssets(modelDir: string): Promise<boolean> {
 }
 
 interface ModelFileInventory {
-  xlGgufs: string[];
   targetGgufs: string[];
   hasGguf: boolean;
-  hasSafetensors: boolean;
   hasPrimarySafetensors: boolean;
 }
 
@@ -89,16 +84,14 @@ async function modelFileInventory(modelDir: string): Promise<ModelFileInventory>
       .filter((entry) => entry.isFile())
       .map((entry) => entry.name);
     return {
-      xlGgufs: files.filter(isQwen35XlGguf).sort(),
       targetGgufs: files
         .filter((name) => name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(name))
         .sort(),
       hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
-      hasSafetensors: files.some((name) => name.toLowerCase().endsWith('.safetensors')),
       hasPrimarySafetensors: files.some((name) => PRIMARY_SAFETENSORS.test(name)),
     };
   } catch {
-    return { xlGgufs: [], targetGgufs: [], hasGguf: false, hasSafetensors: false, hasPrimarySafetensors: false };
+    return { targetGgufs: [], hasGguf: false, hasPrimarySafetensors: false };
   }
 }
 
@@ -141,11 +134,8 @@ async function readDiscoveryMetadata(
     const root = positiveInteger(config.max_position_embeddings);
     const textConfig = config.text_config;
     const nested = nonEmptyRecord(textConfig) ? positiveInteger(textConfig.max_position_embeddings) : undefined;
-    const hasVisionConfig = nonEmptyRecord(config.vision_config);
     const supportsImages =
-      modelType === 'gemma4'
-        ? hasVisionConfig || nonEmptyRecord(config.unified_vision_config)
-        : (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe') && hasVisionConfig;
+      familyDataFor(modelType)?.visionConfigKeys?.some((key) => nonEmptyRecord(config[key])) ?? false;
     const draftOnly = Array.isArray(config.architectures) && config.architectures.includes('DFlash2DraftModel');
 
     return {
@@ -235,93 +225,46 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
     });
   };
 
+  const appendGguf = async (name: string, metadataRoot: string, scopeName: string): Promise<void> => {
+    const path = join(metadataRoot, name);
+    try {
+      const modelType = await detectModelType(path);
+      const family = familyDataFor(modelType);
+      if (!supportedGgufName(name, modelType)) return;
+      // A sibling config must agree with the target header, never a projector.
+      if (!family?.ggufArchitectures?.includes(readGgufArchitecture(path))) return;
+      if (family.ggufDiscovery?.requiresAssets && !(await hasGgufAssets(metadataRoot))) {
+        if (debug)
+          console.warn(`[mlx] skip ${path}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
+        return;
+      }
+      await append(ggufModelName(name), path, metadataRoot, modelType, scopeName);
+    } catch (err) {
+      if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
+    }
+  };
+
   for (const entry of entries) {
     if (entry.isFile() && entry.name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(entry.name)) {
-      const full = join(modelsDir, entry.name);
-      try {
-        const modelType = await detectModelType(full);
-        // A shared sibling config can describe another target or a projector.
-        // Never advertise a file under a loader that disagrees with its header.
-        if (!matchesGgufFamily(full, modelType)) continue;
-        if (requiresGgufAssets(modelType) && !(await hasGgufAssets(modelsDir))) {
-          if (debug)
-            console.warn(
-              `[mlx] skip ${full}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`,
-            );
-          continue;
-        }
-        if (
-          modelType === 'gemma4' ||
-          modelType === 'muse_glimmer' ||
-          (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))
-        ) {
-          await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
-        } else if (debug) {
-          console.warn(`[mlx] skip ${full}: no supported direct GGUF target for ${modelType}`);
-        }
-      } catch (err) {
-        if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
-      }
+      await appendGguf(entry.name, modelsDir, basename(modelsDir));
       continue;
     }
     if (!entry.isDirectory()) continue;
     const full = join(modelsDir, entry.name);
-
-    let modelType: ModelType;
+    const inventory = await modelFileInventory(full);
+    // Prefer converted targets over retained source files or companion weights.
+    // Each native GGUF variant is otherwise a separate entry. Header detection
+    // also handles Qwen4 split directories with no config/tokenizer sidecars.
+    if (inventory.hasGguf && !inventory.hasPrimarySafetensors) {
+      for (const name of inventory.targetGgufs) await appendGguf(name, full, entry.name);
+      continue;
+    }
     try {
-      modelType = await detectModelType(full);
+      const modelType = await detectModelType(full);
+      await append(entry.name, full, full, modelType, entry.name);
     } catch (err) {
       if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
-      continue;
     }
-
-    const inventory = await modelFileInventory(full);
-    const hasModelWeights = requiresGgufAssets(modelType) ? inventory.hasPrimarySafetensors : inventory.hasSafetensors;
-    if (requiresGgufAssets(modelType) && !hasModelWeights && inventory.targetGgufs.length > 0) {
-      if (!(await hasGgufAssets(full))) {
-        if (debug)
-          console.warn(`[mlx] skip ${full}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
-        continue;
-      }
-      for (const gguf of inventory.targetGgufs) {
-        const path = join(full, gguf);
-        try {
-          if (!matchesGgufFamily(path, modelType)) continue;
-          await append(ggufModelName(gguf), path, full, modelType, entry.name);
-        } catch (err) {
-          if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
-        }
-      }
-      continue;
-    }
-    const { xlGgufs } = inventory;
-    if (xlGgufs.length > 0 && !inventory.hasPrimarySafetensors) {
-      if (modelType !== 'qwen3_5') {
-        if (debug) {
-          console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
-        }
-        continue;
-      }
-      for (const gguf of xlGgufs) {
-        const path = join(full, gguf);
-        try {
-          if (matchesGgufFamily(path, modelType)) await append(ggufModelName(gguf), path, full, modelType, entry.name);
-        } catch (err) {
-          if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
-        }
-      }
-      continue;
-    }
-
-    // Present each supported GGUF variant separately in the picker. Keep
-    // converted model directories discoverable when they retain
-    // an imatrix/source GGUF beside their actual SafeTensors weights.
-    if (inventory.hasGguf && !hasModelWeights) {
-      if (debug) console.warn(`[mlx] skip ${full}: no supported direct GGUF target`);
-      continue;
-    }
-
-    await append(basename(full), full, full, modelType, entry.name);
   }
 
   out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));

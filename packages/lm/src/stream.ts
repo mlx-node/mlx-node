@@ -780,6 +780,11 @@ export class Qwen35MoeModel extends makeStreamingModel(Qwen35MoeModelNative, {
   recordModelPath: true,
 }) {}
 
+/** Qwen3.8-Flash-Next with SSD-streamed experts and PLE embeddings. */
+export class Qwen4ExpModel extends makeStreamingModel(Qwen4ExpModelNative, {
+  recordModelPath: true,
+}) {}
+
 /** LFM2 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
 export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, {
   recordModelPath: true,
@@ -825,6 +830,7 @@ export class Qwen3Model extends makeStreamingModel(Qwen3ModelNative, {
 function _assertSessionCapable(): void {
   const _qwen35: SessionCapableModel = null as unknown as Qwen35Model;
   const _moe: SessionCapableModel = null as unknown as Qwen35MoeModel;
+  const _qwen4: SessionCapableModel = null as unknown as Qwen4ExpModel;
   const _lfm2: SessionCapableModel = null as unknown as Lfm2Model;
   const _gemma4: SessionCapableModel = null as unknown as Gemma4Model;
   const _museGlimmer: SessionCapableModel = null as unknown as MuseGlimmerModel;
@@ -832,6 +838,7 @@ function _assertSessionCapable(): void {
   const _nemotronH: SessionCapableModel = null as unknown as NemotronHModel;
   void _qwen35;
   void _moe;
+  void _qwen4;
   void _lfm2;
   void _gemma4;
   void _museGlimmer;
@@ -840,20 +847,24 @@ function _assertSessionCapable(): void {
 }
 void _assertSessionCapable;
 
-type ExpandedPromptPlanner = Required<Pick<SessionCapableModel, 'expandedPromptTokenCount'>>;
+type QwenVisionSurface = Required<Pick<SessionCapableModel, 'supportsImages' | 'expandedPromptTokenCount'>>;
 
-/** Compile-time guard that both Qwen3.5 native classes and wrappers retain the exact media planner. */
-function _assertExpandedPromptPlannerSurfaces(): void {
-  const _nativeDense: ExpandedPromptPlanner = null as unknown as InstanceType<typeof Qwen35ModelNative>;
-  const _nativeMoe: ExpandedPromptPlanner = null as unknown as InstanceType<typeof Qwen35MoeModelNative>;
-  const _wrappedDense: ExpandedPromptPlanner = null as unknown as Qwen35Model;
-  const _wrappedMoe: ExpandedPromptPlanner = null as unknown as Qwen35MoeModel;
+/** Compile-time guard that all Qwen vision native classes and wrappers retain image capability and the exact media planner. */
+function _assertQwenVisionSurfaces(): void {
+  const _nativeDense: QwenVisionSurface = null as unknown as InstanceType<typeof Qwen35ModelNative>;
+  const _nativeMoe: QwenVisionSurface = null as unknown as InstanceType<typeof Qwen35MoeModelNative>;
+  const _wrappedDense: QwenVisionSurface = null as unknown as Qwen35Model;
+  const _wrappedMoe: QwenVisionSurface = null as unknown as Qwen35MoeModel;
+  const _nativeQwen4: QwenVisionSurface = null as unknown as InstanceType<typeof Qwen4ExpModelNative>;
+  const _wrappedQwen4: QwenVisionSurface = null as unknown as Qwen4ExpModel;
+  void _nativeQwen4;
+  void _wrappedQwen4;
   void _nativeDense;
   void _nativeMoe;
   void _wrappedDense;
   void _wrappedMoe;
 }
-void _assertExpandedPromptPlannerSurfaces;
+void _assertQwenVisionSurfaces;
 
 type PreservedNativeSurface<C extends NativeStreamingCtor> = Omit<
   InstanceType<C>,
@@ -865,6 +876,7 @@ function _assertPreservedNativeSurfaces(): void {
   const _qwen3: PreservedNativeSurface<typeof Qwen3ModelNative> = null as unknown as Qwen3Model;
   const _qwen35: PreservedNativeSurface<typeof Qwen35ModelNative> = null as unknown as Qwen35Model;
   const _moe: PreservedNativeSurface<typeof Qwen35MoeModelNative> = null as unknown as Qwen35MoeModel;
+  const _qwen4: PreservedNativeSurface<typeof Qwen4ExpModelNative> = null as unknown as Qwen4ExpModel;
   const _lfm2: PreservedNativeSurface<typeof Lfm2ModelNative> = null as unknown as Lfm2Model;
   const _gemma4: PreservedNativeSurface<typeof Gemma4ModelNative> = null as unknown as Gemma4Model;
   const _museGlimmer: PreservedNativeSurface<typeof MuseGlimmerModelNative> = null as unknown as MuseGlimmerModel;
@@ -872,14 +884,10 @@ function _assertPreservedNativeSurfaces(): void {
   void _qwen3;
   void _qwen35;
   void _moe;
+  void _qwen4;
   void _lfm2;
   void _gemma4;
   void _museGlimmer;
   void _nemotronH;
 }
 void _assertPreservedNativeSurfaces;
-
-/** Qwen3.8-Flash-Next with SSD-streamed experts and PLE embeddings. */
-export class Qwen4ExpModel extends makeStreamingModel(Qwen4ExpModelNative, {
-  recordModelPath: true,
-}) {}

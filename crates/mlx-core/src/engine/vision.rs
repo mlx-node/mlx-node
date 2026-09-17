@@ -26,3 +26,18 @@ pub(crate) struct VisionMerge {
     /// the compressed rotation position. Text-only prefills compute 0.
     pub rope_deltas: i64,
 }
+
+/// Extract all raw image bytes from chat messages.
+pub(crate) fn extract_images_from_messages(
+    messages: &[crate::tokenizer::ChatMessage],
+) -> Vec<Vec<u8>> {
+    let mut all_images: Vec<Vec<u8>> = Vec::new();
+    for msg in messages {
+        if let Some(ref images) = msg.images {
+            for img in images {
+                all_images.push(img.to_vec());
+            }
+        }
+    }
+    all_images
+}

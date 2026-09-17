@@ -37,6 +37,7 @@ use crate::array::{MxArray, synchronize_and_clear_cache};
 use crate::engine::types::{
     ChatConfig, ChatResult, ChatSessionCall, ChatStreamChunk, ChatStreamHandle,
 };
+use crate::engine::vision::extract_images_from_messages;
 use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::qianfan_ocr::bridge::InternVLBridge;
 use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
@@ -44,7 +45,6 @@ use crate::models::qianfan_ocr::language::InternVLLanguageModel;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
 use crate::models::qianfan_ocr::processing::{ProcessedImage, QianfanImageProcessor};
 use crate::models::qianfan_ocr::vision::InternViTModel;
-use crate::models::qwen3_5::model::extract_images_from_messages;
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
     check_repetition_cutoff, sample,

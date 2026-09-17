@@ -284,6 +284,46 @@ describe('discoverMlxModels', () => {
     },
   );
 
+  it.each(['qwen4_exp', 'qwen4_exp_text'])('advertises %s images only with a vision config', async (model_type) => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-qwen4-vision-'));
+    try {
+      const model = join(root, 'model');
+      await mkdir(model);
+      for (const vision_config of [{ hidden_size: 16 }, {}, null]) {
+        await writeFile(join(model, 'config.json'), JSON.stringify({ model_type, vision_config }));
+        const [entry] = await discoverMlxModels(root);
+        expect(entry!.discovered.modelType).toBe('qwen4_exp');
+        expect(entry!.piModel.input).toEqual(vision_config?.hidden_size ? ['text', 'image'] : ['text']);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('discovers Qwen4 GGUF variants and first splits without sidecars, preferring converted targets', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-qwen4-splits-'));
+    try {
+      const direct = join(root, 'direct.GGUF');
+      const split = join(root, 'split');
+      await mkdir(split);
+      const first = join(split, 'UD-Q4_K_XL-00001-of-00002.GgUf');
+      for (const path of [direct, first, join(split, 'UD-Q4_K_XL-00002-of-00002.gguf'), join(split, 'mmproj.gguf')]) {
+        await writeFile(path, minimalGguf('qwen4exp'));
+      }
+      const entries = await discoverMlxModels(root);
+      expect(entries.map((e) => e.discovered.path).sort()).toEqual([direct, first].sort());
+      expect(entries.every((e) => e.discovered.modelType === 'qwen4_exp' && e.piModel.input.length === 1)).toBe(true);
+      await writeFile(join(split, 'config.json'), JSON.stringify({ model_type: 'qwen4_exp' }));
+      await writeFile(join(split, 'model.safetensors'), 'converted weights');
+      expect((await discoverMlxModels(root)).map((e) => e.discovered.path).sort()).toEqual([direct, split].sort());
+      await rm(join(split, 'model.safetensors'));
+      await writeFile(first, minimalGguf('qwen35'));
+      expect((await discoverMlxModels(root)).map((e) => e.discovered.path)).toEqual([direct]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('discovers every nested Q<number>_K_XL target by its direct GGUF path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-xl-gguf-'));
     try {
