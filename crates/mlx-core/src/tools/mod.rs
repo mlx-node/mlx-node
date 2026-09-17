@@ -1098,6 +1098,23 @@ impl<'a> PyLiteralParser<'a> {
                 return Err(()); // unterminated
             };
             if b == quote {
+                if raw_mode {
+                    // Even in a raw string a backslash escapes the quote
+                    // for termination (the backslash stays in the value):
+                    // `r'foo\'` is unterminated in Python. An odd run of
+                    // backslashes right before the quote means it cannot
+                    // close the literal. Non-raw mode never reaches this —
+                    // its escape arm already consumed `\'`/`\\` as pairs.
+                    let mut back = self.pos;
+                    while back > 0 && self.s[back - 1] == b'\\' {
+                        back -= 1;
+                    }
+                    if (self.pos - back) % 2 == 1 {
+                        out.push(quote as char);
+                        self.pos += 1;
+                        continue;
+                    }
+                }
                 if triple {
                     if self.s.get(self.pos + 1) == Some(&quote)
                         && self.s.get(self.pos + 2) == Some(&quote)
@@ -4550,6 +4567,40 @@ The weather in Tokyo is sunny."#;
         assert_eq!(a["cmd"], "a\nb");
         assert_eq!(a["raw"], "c\\d");
         assert_eq!(a["lit"], "line1\nline2"); // raw newline tolerated
+    }
+
+    /// A backslash escapes the closing quote even in RAW strings (the
+    /// backslash stays in the value), so `r'foo\'` is unterminated in
+    /// Python — the block must stay verbatim, not promote `foo\`.
+    #[test]
+    fn test_lfm2_tool_call_raw_string_escaped_quote() {
+        // Odd backslash run before the quote → unterminated → reject.
+        for inner in [
+            "f(value=r'foo\\')",
+            "f(value=r'foo\\\\\\')",
+            "f(value=rf'foo\\')",
+            "f(r'foo\\', x=1)", // positional — same unterminated literal
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+
+        // An even run ends the literal normally; the escaped quote inside
+        // keeps both bytes (raw strings retain the backslash).
+        for (inner, want) in [
+            ("f(value=r'foo\\\\')", "foo\\\\"),
+            ("f(value=r'foo\\'')", "foo\\'"),
+            ("f(value='foo\\\\')", "foo\\"),
+            ("f(value='foo\\\'')", "foo'"),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner} must produce one call");
+            assert_eq!(calls[0].arguments["value"], want, "{inner}");
+            assert_eq!(text, "", "{inner}");
+        }
     }
 
     /// Trailing/leading-dot floats (`1.`, `.5`) keep their value — a
