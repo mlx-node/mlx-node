@@ -6,6 +6,7 @@ use crate::engine::backend::{PagedBackend, PagedPrefix};
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket,
 };
+use crate::engine::paged_stepper::PagedStepper;
 use crate::models::qwen4_exp::runtime_flags;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
@@ -127,7 +128,7 @@ impl PagedPrefix for Prefix {
     }
 }
 impl PagedBackend for Inner {
-    type PagedDecode<'a> = Step<'a>;
+    type PagedDecode<'a> = PagedStepper<Step<'a>>;
     type PrefixState = Prefix;
     fn prime_prefix_state(
         &mut self,
@@ -214,8 +215,8 @@ impl PagedBackend for Inner {
             .ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))?
             .squeeze(Some(&[1]))
     }
-    fn begin_paged_decode(&mut self) -> Result<Step<'_>> {
-        Ok(Step(self))
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
+        Ok(PagedStepper(Step(self)))
     }
     fn admit_paged_speculative_decode(
         &mut self,

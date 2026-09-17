@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::models::forward as fwd;
+
 /// Default prefill chunk size (tokens per chunk).
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
@@ -9,14 +11,7 @@ pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
 pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<()> {
-    if let Some(caches) = caches {
-        let mut arrays: Vec<&MxArray> = Vec::new();
-        for cache in caches.iter() {
-            cache.collect_arrays(&mut arrays);
-        }
-        MxArray::eval_arrays(&arrays)?;
-    }
-    Ok(())
+    fwd::eval_layer_caches(caches)
 }
 
 /// Async variant of `eval_layer_caches`: kicks GPU on cache materialization
@@ -24,13 +19,7 @@ pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Resu
 /// start building the next chunk's graph while the previous chunk's cache
 /// writes are still in flight.
 pub(crate) fn async_eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
-    if let Some(caches) = caches {
-        let mut arrays: Vec<&MxArray> = Vec::new();
-        for cache in caches.iter() {
-            cache.collect_arrays(&mut arrays);
-        }
-        MxArray::async_eval_arrays(&arrays);
-    }
+    fwd::async_eval_layer_caches(caches);
 }
 
 /// Chunked prefill: process prompt in chunks of `PREFILL_STEP_SIZE`, evaluating
@@ -74,58 +63,35 @@ pub(super) fn chunked_prefill_with_size(
     chunk_size: i64,
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
-    let total_len = prompt.shape_at(1)?;
-    if total_len <= 0 {
-        return Err(Error::from_reason("chunked_prefill: empty prompt"));
-    }
-    let chunk_size = if chunk_size <= 0 {
-        total_len
-    } else {
-        chunk_size
-    };
-    let mut offset: i64 = 0;
-
     // `MLX_PREFILL_SYNC_BETWEEN_CHUNKS` forces synchronous `eval_layer_caches`
     // between chunks instead of the async default.
     let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
-    while total_len - offset > chunk_size {
-        // Cooperative-cancel checkpoint: abort at the chunk
-        // boundary. The Err rides the flat engine's
-        // `fail_closed_flat_turn` arm — no `save_cache_state`, the
-        // session is invalidated, so the partially-advanced caches never
-        // become a live prefix.
-        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            return Err(Error::from_reason("prefill cancelled"));
-        }
-        let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
-        {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let _hidden = forward_pre_norm_inner(&chunk, embedding, layers, caches)?;
-        }
-        if chunk_async {
-            async_eval_layer_caches(caches);
-        } else {
-            eval_layer_caches(caches)?;
-        }
-        crate::array::clear_cache();
-        offset += chunk_size;
-    }
-
-    // The final remainder is a chunk boundary too once at least one looped
-    // chunk ran: poll before forwarding it so a cancel landing during the
-    // last looped chunk aborts instead of riding through the remainder.
-    // `offset == 0` means the whole prompt fits in one forward — single-shot
-    // prefills stay uncancellable by design.
-    if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-        return Err(Error::from_reason("prefill cancelled"));
-    }
-    let remaining = prompt.slice_axis(1, offset, total_len)?;
-    let last_logits = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-        let hidden = forward_pre_norm_inner(&remaining, embedding, layers, caches)?;
-        project_last_logits_from_pre_norm_hidden(&hidden, final_norm, lm_head, embedding)?
-    };
-    Ok(last_logits)
+    let mut ctx = (embedding, layers, caches, final_norm, lm_head);
+    fwd::chunked_prefill(
+        &mut ctx,
+        prompt,
+        generation_stream,
+        chunk_size,
+        true,
+        move |_| turn_cancel,
+        |ctx, chunk, is_final| {
+            let hidden = forward_pre_norm_inner(chunk, ctx.0, ctx.1, ctx.2)?;
+            if is_final {
+                project_last_logits_from_pre_norm_hidden(&hidden, ctx.3, ctx.4, ctx.0)
+            } else {
+                Ok(hidden)
+            }
+        },
+        |ctx| {
+            if chunk_async {
+                fwd::async_eval_layer_caches(&*ctx.2);
+            } else {
+                fwd::eval_layer_caches(&*ctx.2)?;
+            }
+            crate::array::clear_cache();
+            Ok(())
+        },
+    )
 }
 
 /// `chunked_prefill` variant that ALSO returns the post-final-norm hidden
@@ -297,9 +263,17 @@ pub(super) fn forward_inner(
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
 ) -> Result<MxArray> {
-    let hidden = forward_pre_norm_inner(input_ids, embedding, layers, caches)?;
-    let hidden = final_norm.forward(&hidden)?;
-    project_logits_from_hidden(&hidden, lm_head, embedding)
+    let h = fwd::forward_body_normed(
+        input_ids,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        |layer, h, caches, i| {
+            layer.forward(h, None, caches.as_mut().map(|c| &mut c[i]), None, true)
+        },
+    )?;
+    fwd::project_logits(&h, lm_head.as_ref(), embedding)
 }
 
 pub(super) fn forward_pre_norm_inner(
@@ -308,15 +282,6 @@ pub(super) fn forward_pre_norm_inner(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
 ) -> Result<MxArray> {
-    let hidden_states = embedding.forward(input_ids)?;
-    let mut h = hidden_states.clone();
-
-    debug!(
-        "Qwen3.5 forward_inner: input_ids_shape={} post_embed_shape={}",
-        shape_dbg(input_ids),
-        shape_dbg(&h),
-    );
-
     let num_layers = layers.len();
     // Plain layer loop.
     //
@@ -329,20 +294,33 @@ pub(super) fn forward_pre_norm_inner(
     // `project_last_logits_from_pre_norm_hidden` (which slices before
     // `final_norm` + `lm_head`), so the slice deliberately does NOT
     // live in this loop.
-    for i in 0..num_layers {
-        let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, None, cache, None, true)?;
-        if i == 0 || i + 1 == num_layers {
+    fwd::forward_pre_norm_with(
+        input_ids,
+        |ids| {
+            let h = embedding.forward(ids)?;
             debug!(
-                "Qwen3.5 forward_inner: post_layer[{}/{}] shape={}",
-                i,
-                num_layers,
+                "Qwen3.5 forward_inner: input_ids_shape={} post_embed_shape={}",
+                shape_dbg(input_ids),
                 shape_dbg(&h),
             );
-        }
-    }
-
-    Ok(h)
+            Ok(h)
+        },
+        layers,
+        caches,
+        |layer, h, caches, i| {
+            let out = layer.forward(h, None, caches.as_mut().map(|c| &mut c[i]), None, true)?;
+            if i == 0 || i + 1 == num_layers {
+                debug!(
+                    "Qwen3.5 forward_inner: post_layer[{}/{}] shape={}",
+                    i,
+                    num_layers,
+                    shape_dbg(&out),
+                );
+            }
+            Ok(out)
+        },
+        None,
+    )
 }
 
 /// Tape-recording variant of [`forward_pre_norm_inner`] for the eager MTP
@@ -361,23 +339,31 @@ fn forward_pre_norm_inner_with_tape(
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     tape: &mut [Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>],
 ) -> Result<MxArray> {
-    let hidden_states = embedding.forward(input_ids)?;
-    let mut h = hidden_states.clone();
-
-    let num_layers = layers.len();
     debug_assert_eq!(
         tape.len(),
-        num_layers,
+        layers.len(),
         "forward_pre_norm_inner_with_tape: tape length must equal layer count"
     );
-    for i in 0..num_layers {
-        let cache = caches.as_mut().map(|c| &mut c[i]);
-        let mut slot: Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape> = None;
-        h = layers[i].forward_with_tape(&h, None, cache, None, true, Some(&mut slot))?;
-        tape[i] = slot;
-    }
-
-    Ok(h)
+    fwd::forward_pre_norm_with(
+        input_ids,
+        |ids| embedding.forward(ids),
+        layers,
+        caches,
+        |layer, h, caches, i| {
+            let mut slot = None;
+            let out = layer.forward_with_tape(
+                h,
+                None,
+                caches.as_mut().map(|c| &mut c[i]),
+                None,
+                true,
+                Some(&mut slot),
+            )?;
+            tape[i] = slot;
+            Ok(out)
+        },
+        None,
+    )
 }
 
 /// Target forward used by the external DFlash2 stepper. Captures post-layer
@@ -450,10 +436,7 @@ pub(super) fn project_logits_from_hidden(
     lm_head: &Option<LinearProj>,
     embedding: &Embedding,
 ) -> Result<MxArray> {
-    match lm_head {
-        Some(head) => head.forward(hidden),
-        None => embedding.as_linear(hidden),
-    }
+    fwd::project_logits(hidden, lm_head.as_ref(), embedding)
 }
 
 /// Eager (pure-Rust) MTP verify step.
@@ -501,11 +484,9 @@ fn project_last_logits_from_pre_norm_hidden(
     lm_head: &Option<LinearProj>,
     embedding: &Embedding,
 ) -> Result<MxArray> {
-    let seq_len = hidden.shape_at(1)?;
-    let last_hidden = hidden.slice_axis(1, seq_len - 1, seq_len)?;
-    let last_hidden = final_norm.forward(&last_hidden)?;
-    let logits = project_logits_from_hidden(&last_hidden, lm_head, embedding)?;
-    logits.squeeze(Some(&[1]))
+    fwd::project_last_hidden_logits(hidden, final_norm, |h| {
+        fwd::project_logits(h, lm_head.as_ref(), embedding)
+    })
 }
 
 /// Partition `total` committed tokens into chunk sizes all within the

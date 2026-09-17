@@ -21,7 +21,7 @@ use crate::models::quant_dispatch::{
     load_linear_proj_quantized_or_bf16, load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
-use crate::models::qwen3_5_moe::quantized_linear::{
+use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
     try_build_kquant_quantized_linear,
@@ -1392,7 +1392,7 @@ impl Lfm2Model {
 mod tests {
     use super::*;
     use crate::models::quant_dispatch::{build_non_moe_ql, plq_to_packed_params};
-    use crate::models::qwen3_5_moe::quantized_linear::{
+    use crate::models::quantized_linear::{
         LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, SYM8_BITS, SYM8_GROUP_SIZE, SYM8_MODE,
     };
     use crate::nn::Embedding;

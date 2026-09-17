@@ -190,7 +190,7 @@ function dispatchLoad(
   modelPath: string,
   options: LoadModelOptions | undefined,
 ): Promise<unknown> {
-  if (options?.auxiliaryModelPath !== undefined && modelType !== 'qwen4_exp') {
+  if (options?.auxiliaryModelPath !== undefined && requireFamilyData(modelType).acceptsAuxiliaryModel !== true) {
     throw new Error(
       `auxiliaryModelPath is only supported by qwen4_exp models; ${modelPath} has model_type "${modelType}"`,
     );

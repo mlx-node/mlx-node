@@ -24,12 +24,16 @@ use crate::engine::hybrid_scheduler::{
     ScheduledPrefixAdmission, pool_tokens_after_recurrent, scheduled_turn_context,
     scheduler_max_num_seqs_for, scheduler_per_seq_context_override,
 };
-use crate::engine::paged_epilogue::{abort_single_adapter_turn, finalize_single_adapter_turn};
+use crate::engine::paged_epilogue::{
+    FinalTokenPolicy, abort_single_adapter_turn, finalize_single_adapter_turn,
+};
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
 use crate::model_thread::{ResponseTx, send_and_await};
+use crate::models::forward as fwd;
 use crate::nn::{Embedding, RMSNorm};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
@@ -42,14 +46,17 @@ use super::layer_cache::{NemotronHLayerCache, NemotronHLayerSnapshot};
 use super::mamba2::Mamba2State;
 use super::mtp::NemotronHMtpModule;
 
-/// Chunk size for the chunked prefill (tokens per chunk).
-pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
+/// Chunk size for the chunked prefill (tokens per chunk) — the shared
+/// flat-family default; this alias feeds the `u32`-typed
+/// `chunk_aligned_prefill_slices` grid.
+pub(crate) const PREFILL_STEP_SIZE: i64 = fwd::PREFILL_STEP_SIZE;
 
 /// The distinguished error a chunk-boundary cancel poll aborts a prefill
-/// with. Shared by the producers (every chunked prefill in this file) and
-/// the one consumer that must tell a cancellation apart from a genuine
-/// failure (`mtp_seed_aborted`), so the two cannot drift.
-pub(crate) const PREFILL_CANCELLED: &str = "prefill cancelled";
+/// with. Shared by the producers (every chunked prefill in this file,
+/// including the shared `fwd::chunked_prefill_*` drivers) and the one
+/// consumer that must tell a cancellation apart from a genuine failure
+/// (`mtp_seed_aborted`) — one literal so the two cannot drift.
+pub(crate) const PREFILL_CANCELLED: &str = fwd::PREFILL_CANCELLED;
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) type NemotronHCmd = crate::engine::model_command::ModelCommand<NemotronHFamilyCommand>;
@@ -400,16 +407,15 @@ impl NemotronHInner {
 
     /// Full forward over input_ids [1, T]: returns [1, T, vocab] logits.
     pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
-        let mut h = self.embedding.forward(input_ids)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, Some(&mut self.caches[i]))?;
-        }
-        h = self.final_norm.forward(&h)?;
-        if let Some(ref head) = self.lm_head {
-            head.forward(&h)
-        } else {
-            self.embedding.as_linear(&h)
-        }
+        let h = fwd::forward_body_normed(
+            input_ids,
+            &self.embedding,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            |layer, h, caches, i| layer.forward(h, Some(&mut caches[i])),
+        )?;
+        fwd::project_logits(&h, self.lm_head.as_ref(), &self.embedding)
     }
 
     /// Raw forward with hidden, hidden kept as [1, T, hidden] (3D). Used by
@@ -420,16 +426,15 @@ impl NemotronHInner {
         input_ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray)> {
-        let mut h = embedding.forward(input_ids)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, Some(&mut self.caches[i]))?;
-        }
-        let hidden = self.final_norm.forward(&h)?;
-        let logits = if let Some(ref head) = self.lm_head {
-            head.forward(&hidden)?
-        } else {
-            embedding.as_linear(&hidden)?
-        };
+        let hidden = fwd::forward_body_normed(
+            input_ids,
+            embedding,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            |layer, h, caches, i| layer.forward(h, Some(&mut caches[i])),
+        )?;
+        let logits = fwd::project_logits(&hidden, self.lm_head.as_ref(), embedding)?;
         Ok((logits, hidden))
     }
 
@@ -444,11 +449,7 @@ impl NemotronHInner {
 
     /// Eval every live cache array (post-prefill sync).
     fn eval_caches_internal(&self) -> Result<()> {
-        let mut refs = Vec::new();
-        for c in self.caches.iter() {
-            c.collect_arrays(&mut refs);
-        }
-        MxArray::eval_arrays(&refs)
+        fwd::eval_layer_caches(&self.caches)
     }
 
     /// Save the session history, aligning it with the physical cache length.
@@ -461,16 +462,14 @@ impl NemotronHInner {
         generated_tokens: &[u32],
         drop_last: bool,
     ) {
-        if reuse_cache {
-            let mut full_history = tokens.to_vec();
-            let history_tokens = if drop_last && !generated_tokens.is_empty() {
-                &generated_tokens[..generated_tokens.len() - 1]
-            } else {
-                generated_tokens
-            };
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
-        } else {
+        if !fwd::save_flat_token_history(
+            tokens,
+            generated_tokens,
+            !drop_last,
+            reuse_cache,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        ) {
             self.reset_caches_internal();
         }
     }
@@ -492,28 +491,19 @@ impl NemotronHInner {
             total_len as u32,
             PREFILL_STEP_SIZE as u32,
             self.config.chunk_size as u32,
-        );
-        let last_idx = slices.len().saturating_sub(1);
-        let mut last = None;
-        for (idx, (s, e)) in slices.into_iter().enumerate() {
-            if self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-            {
-                return Err(Error::from_reason(PREFILL_CANCELLED));
-            }
-            let chunk = prompt.slice_axis(1, s as i64, e as i64)?;
-            {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                last = Some(self.forward(&chunk)?);
-            }
-            if idx != last_idx {
-                self.eval_caches_internal()?;
-                crate::array::clear_cache();
-            }
-        }
-        last.ok_or_else(|| Error::from_reason("chunked_prefill produced no chunks"))
+        )
+        .into_iter()
+        .map(|(s, e)| (s as i64, e as i64))
+        .collect::<Vec<_>>();
+        fwd::chunked_prefill_slices(
+            self,
+            prompt,
+            &slices,
+            generation_stream,
+            |inner: &NemotronHInner| inner.turn_cancel.as_deref(),
+            |inner, chunk| inner.forward(chunk),
+            |inner| fwd::eval_caches_and_clear(&inner.caches),
+        )
     }
 
     /// Chunked prefill that ALSO seeds the MTP drafter's own KV cache, feeding it the
@@ -1027,16 +1017,9 @@ impl NemotronHInner {
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden)?;
         }
 
-        hidden = self.final_norm.forward(&hidden)?;
-        let logits = if let Some(ref head) = self.lm_head {
-            head.forward(&hidden)?
-        } else {
-            self.embedding.as_linear(&hidden)?
-        };
-        let seq_len = logits.shape_at(1)?;
-        logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[0, 1]))
+        fwd::project_last_token_logits(&hidden, &self.final_norm, |normed| {
+            fwd::project_logits(normed, self.lm_head.as_ref(), &self.embedding)
+        })
     }
 
     /// Run one paged decode step (single request, exclusive/whole-turn lane).
@@ -1107,17 +1090,13 @@ impl NemotronHInner {
         }
 
         hidden = self.final_norm.forward(&hidden)?;
-        if let Some(ref head) = self.lm_head {
-            head.forward(&hidden)
-        } else {
-            self.embedding.as_linear(&hidden)
-        }
+        fwd::project_logits(&hidden, self.lm_head.as_ref(), &self.embedding)
     }
 
     /// Row-exact batched decode: N single-row decodes stacked into `[N, 1, vocab]`,
     /// bit-identical to N scalar decodes, committed ALL-OR-NOTHING.
     ///
-    /// Ordering is the whole point: `record_tokens_batched` rejects a duplicated
+    /// Ordering is the whole point: `record_decode_wave` rejects a duplicated
     /// sequence (two rows of one wave would record two tokens against one
     /// cursor), resolves every row's write position while the cursors are still
     /// untouched, then records every row (the only step that reserves blocks, so
@@ -1214,11 +1193,7 @@ impl NemotronHInner {
         }
 
         hidden = self.final_norm.forward(&hidden)?;
-        if let Some(ref head) = self.lm_head {
-            head.forward(&hidden)
-        } else {
-            self.embedding.as_linear(&hidden)
-        }
+        fwd::project_logits(&hidden, self.lm_head.as_ref(), &self.embedding)
     }
 }
 /// Per-turn decode stepper for the engine's generic flat AR flow.
@@ -1354,9 +1329,7 @@ impl ChatBackend for NemotronHInner {
         let token_arr: Vec<u32> = prompt_tokens.to_vec();
         let prompt = MxArray::from_uint32(&token_arr, &[1, prompt_tokens.len() as i64])?;
         let logits = self.chunked_prefill(&prompt, stream)?;
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        last_logits.squeeze(Some(&[1]))
+        fwd::slice_last_logits_keep_batch(&logits)
     }
 
     type Decode<'a>
@@ -1409,48 +1382,29 @@ impl ChatBackend for NemotronHInner {
 impl NemotronHInner {
     /// Async-eval every live cache array.
     fn async_eval_caches(&self) {
-        let mut refs = Vec::new();
-        for c in self.caches.iter() {
-            c.collect_arrays(&mut refs);
-        }
-        MxArray::async_eval_arrays(&refs);
+        fwd::async_eval_layer_caches(&self.caches);
     }
 }
 
-/// Paged decode stepper for the exclusive/whole-turn lane, driving the
-/// engine-owned run_paged_turn decode loop through PagedBackend.
+/// Paged decode state for the exclusive/whole-turn lane, wrapped by
+/// [`PagedStepper`] for the `DecodeStep` impl; drives the engine-owned
+/// run_paged_turn decode loop through PagedBackend.
 pub(crate) struct NemotronHPagedDecode<'a> {
     inner: &'a mut NemotronHInner,
 }
 
-impl DecodeStep for NemotronHPagedDecode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        // NOT on the hot path - the engine drives decode via
-        // forward_with_token (which hands the scalar the loop already read).
-        let token_id = input_ids.item_at_int32(0)? as u32;
-        self.forward_with_token(input_ids, token_id)
-    }
+impl PagedStepModel for NemotronHPagedDecode<'_> {
+    /// `SyncToken`: one synchronous `next_token.eval()` pulls the logits
+    /// AND the paged K/V writes through the dependency chain; the loop-top
+    /// `y.eval()` then no-ops.
+    const EVAL: EvalPolicy = EvalPolicy::SyncToken;
+    /// `AlwaysDrop` — the Mamba-2 recurrent state is non-invertible:
+    /// re-running a decode step for the final length-exit token would fold
+    /// a token the saved drop-last history never kept into the mamba state.
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::AlwaysDrop;
 
-    fn forward_with_token(
-        &mut self,
-        _input_ids: &MxArray,
-        token_id: u32,
-    ) -> Result<(MxArray, bool)> {
-        let logits = self
-            .inner
-            .run_paged_decode_step(token_id)?
-            .squeeze(Some(&[1]))?;
-        // run_paged_decode_step returns [1, 1, vocab]; the squeeze above
-        // reduces it to [1, vocab], so needs_squeeze = false.
-        Ok((logits, false))
-    }
-
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        next_token.eval();
-    }
-
-    fn maintain_cache(&mut self, step: i32) {
-        crate::array::maybe_clear_cache_for_paged_step(step);
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
+        self.inner.run_paged_decode_step(token_id)
     }
 }
 
@@ -1476,7 +1430,7 @@ impl PagedPrefix for NemotronHPrefixState {
 
 impl PagedBackend for NemotronHInner {
     type PagedDecode<'a>
-        = NemotronHPagedDecode<'a>
+        = PagedStepper<NemotronHPagedDecode<'a>>
     where
         Self: 'a;
     type PrefixState = NemotronHPrefixState;
@@ -1553,7 +1507,7 @@ impl PagedBackend for NemotronHInner {
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
-        Ok(NemotronHPagedDecode { inner: self })
+        Ok(PagedStepper(NemotronHPagedDecode { inner: self }))
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
@@ -2614,10 +2568,7 @@ impl NemotronHInner {
                 return self.mtp_seed_aborted(args, e);
             }
         };
-        let seq_len = prefill_logits.shape_at(1)?;
-        let mut last_logits = prefill_logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[1]))?;
+        let mut last_logits = fwd::slice_last_logits_keep_batch(&prefill_logits)?;
         profiler.end_prefill();
 
         last_logits = crate::engine::apply_all_penalties(last_logits, &token_history, p)?;

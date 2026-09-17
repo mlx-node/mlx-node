@@ -22,6 +22,7 @@ use crate::engine::spec_paged::SpecPagedCache;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
+use crate::models::forward as fwd;
 use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};

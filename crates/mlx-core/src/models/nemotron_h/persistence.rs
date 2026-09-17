@@ -32,12 +32,10 @@ use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, admits_static_fp8_activation, default_per_layer_quant,
     effective_plq_for, parse_quant_block, select_quantization_block,
 };
-use crate::models::qwen3_5::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_quantized_checkpoint,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear,
-};
-use crate::models::qwen3_5_moe::quantized_linear::{
-    LinearProj, QuantizedLinear, QuantizedSwitchLinear, try_build_nvfp4_quantized_switch_linear,
+use crate::models::quantized_linear::{
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, QuantizedLinear,
+    QuantizedSwitchLinear, is_quantized_checkpoint, try_build_nvfp4_quantized_linear,
+    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 

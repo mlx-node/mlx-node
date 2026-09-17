@@ -96,7 +96,7 @@ agent), one row per site with its failure mode.
 | `packages/cli/src/commands/convert-detect.ts` | one `CONVERT_DETECT` row (row order is load-bearing and deliberately differs from the runtime loader's probe order)                                                   | the convert-detect parity test (`convert-detect.test.ts`) goes red against native `convertibleModelTypes()` — without it, `mlx convert` with `-m` omitted silently converts generically and produces unloadable output |
 | `packages/lm/src/family-data.ts`              | one `MODEL_FAMILY_DATA` row: `kind`, `match` (raw aliases + optional architecture probe), `traits`, a launch preset, optional `ggufArchitectures`/`acceptsDraftModel` | a chat-kind row without `traits` or a preset **fails to compile** (the `ChatFamilyData` type requires them); `family-completeness.test.ts` backstops at runtime                                                        |
 | `packages/lm/src/models/model-loader.ts`      | one `LOADER_BINDINGS` entry (loader closure + native class)                                                                                                           | `satisfies Record<ModelType, LoaderBinding>` fails to compile — in both directions: a data row without a binding, or a binding without a row                                                                           |
-| `packages/lm/src/stream.ts`                   | one `makeStreamingModel` wrapper class + a line in each compile-time conformance block (`_assertSessionCapable`, `_assertPreservedNativeSurfaces`)                    | `ChatSession<X>` stops type-checking downstream; a drifted override signature fails the conformance block at compile time                                                                                              |
+| `packages/lm/src/stream.ts`                   | one `makeStreamingModel` wrapper class (its `opts` come from the row's `streamOpts`) + one `FAMILY_WRAPPERS` entry for the compile-time conformance check             | `ChatSession<X>` stops type-checking downstream; a drifted override signature or a missing `FAMILY_WRAPPERS` key fails `FamilyConformance` at compile time                                                               |
 | `packages/lm/src/index.ts`                    | export line(s) for the wrapper class and config types                                                                                                                 | the family is unreachable from `@mlx-node/lm`                                                                                                                                                                          |
 | `yarn build:native`                           | regenerates BOTH committed `index.d.cts` copies + the `index.cjs` export line                                                                                         | CI declaration-drift failure (`packages/core/build.ts` `assertDeclarationCopiesMatch` hard-fails before and after generation)                                                                                          |
 
@@ -165,10 +165,11 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
 
 ## Stage 3 — cold restore (SSD)
 
-- Add the family to `COLD_RESTORE_FAMILIES` (`cold_tier.rs`) AND the TS
-  mirror `COLD_TIER_RESTORE_FAMILIES` (`packages/agent/src/cold-tier.ts`);
-  `cold-tier-families.test.ts` pins the pair against the native
-  `cold_restore_families()` getter without loading the addon.
+- Add the family to `COLD_RESTORE_FAMILIES` (`cold_tier.rs`) AND set
+  `coldRestoreEligible: true` on its `MODEL_FAMILY_DATA` row — the TS mirror
+  `COLD_TIER_RESTORE_FAMILIES` (`packages/agent/src/cold-tier.ts`) derives
+  from the rows; `cold-tier-families.test.ts` pins the pair against the
+  native `cold_restore_families()` getter without loading the addon.
 - The authorization rule, quoted from `cold_tier.rs`:
 
   > Widening this list is a correctness decision, never a perf one, and it is

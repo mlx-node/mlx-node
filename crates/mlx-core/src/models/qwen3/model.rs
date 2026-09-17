@@ -28,12 +28,14 @@ use crate::engine::paged_epilogue::{
     finalize_single_adapter_turn, prime_single_adapter_prefix, reconcile_paged_surplus,
     save_paged_token_history,
 };
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::scheduler::{
     RowStepResult, StepExecutor, StepKind, StepPlan, StepResult, TurnState,
     is_paged_allocation_blocked,
 };
 use crate::model_thread::{ModelThread, ResponseTx, send_and_await};
+use crate::models::forward as fwd;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
@@ -1652,19 +1654,14 @@ impl Qwen3Inner {
     /// final-chunk return path. Hidden state shape on entry: `[1,
     /// chunk_len, hidden]`.
     fn project_last_token_logits(&self, hidden_states: &MxArray) -> Result<MxArray> {
-        let normed = self.final_norm.forward(hidden_states)?;
-        let logits = if self.config.tie_word_embeddings {
-            let embedding_weight = self.embedding.get_weight();
-            normed.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
-        } else {
-            self.lm_head.forward(&normed)?
-        };
-        // Slice last token: logits shape [1, chunk_len, vocab] -> [vocab].
-        let seq_len = logits.shape_at(1)?;
-        let last = logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[0, 1]))?;
-        Ok(last)
+        fwd::project_last_token_logits(hidden_states, &self.final_norm, |normed| {
+            if self.config.tie_word_embeddings {
+                let embedding_weight = self.embedding.get_weight();
+                normed.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)
+            } else {
+                self.lm_head.forward(normed)
+            }
+        })
     }
 
     /// Run one decode step through the paged forward path. Mirrors
@@ -2024,82 +2021,50 @@ impl Qwen3Inner {
         };
 
         // PREFILL
-        let total_seq_len = current_ids.shape_at(1)? as usize;
-        let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
-        let mut last_logits = if use_chunked_prefill {
-            let mut offset = 0usize;
-            while offset + prefill_step_size < total_seq_len {
-                let chunk_end = offset + prefill_step_size;
-                let chunk = current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
-                rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-                {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let _ = Qwen3Model::forward_fused(
-                        &chunk,
+        let mut last_logits = {
+            let mut prefill_ctx = (
+                &mut kv_keys,
+                &mut kv_values,
+                &mut cache_idx,
+                &mut rope_offsets,
+            );
+            let logits = fwd::chunked_prefill(
+                &mut prefill_ctx,
+                &current_ids,
+                generation_stream,
+                prefill_step_size as i64,
+                true,
+                |_| None,
+                |ctx, chunk, _is_final| {
+                    // `cache_idx` equals the chunk's start offset at each
+                    // boundary (forward_fused advances it by chunk length).
+                    *ctx.3 = MxArray::from_int32(&[*ctx.2], &[1])?;
+                    Qwen3Model::forward_fused(
+                        chunk,
                         &embedding_weight,
                         layers,
                         final_norm,
                         lm_head,
                         model_config,
-                        &mut kv_keys,
-                        &mut kv_values,
-                        &mut cache_idx,
-                        &rope_offsets,
+                        ctx.0,
+                        ctx.1,
+                        ctx.2,
+                        ctx.3,
                         &left_padding,
-                    )?;
-                }
-                for kv_key in kv_keys.iter().flatten() {
-                    kv_key.eval();
-                }
-                for kv_value in kv_values.iter().flatten() {
-                    kv_value.eval();
-                }
-                synchronize_and_clear_cache();
-                offset = chunk_end;
-            }
-            let final_chunk = current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
-            rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Qwen3Model::forward_fused(
-                    &final_chunk,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-            let chunk_seq_len = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
-                .squeeze(Some(&[0, 1]))?
-        } else {
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Qwen3Model::forward_fused(
-                    &current_ids,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-            let seq_len = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[0, 1]))?
+                    )
+                },
+                |ctx| {
+                    for kv_key in ctx.0.iter().flatten() {
+                        kv_key.eval();
+                    }
+                    for kv_value in ctx.1.iter().flatten() {
+                        kv_value.eval();
+                    }
+                    synchronize_and_clear_cache();
+                    Ok(())
+                },
+            )?;
+            fwd::slice_last_logits_to_vocab(&logits)?
         };
 
         rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
@@ -2740,82 +2705,50 @@ impl Qwen3Inner {
         };
 
         // PREFILL
-        let total_seq_len = current_ids.shape_at(1)? as usize;
-        let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
-        let mut last_logits = if use_chunked_prefill {
-            let mut offset = 0usize;
-            while offset + prefill_step_size < total_seq_len {
-                let chunk_end = offset + prefill_step_size;
-                let chunk = current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
-                rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-                {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let _ = Qwen3Model::forward_fused(
-                        &chunk,
+        let mut last_logits = {
+            let mut prefill_ctx = (
+                &mut kv_keys,
+                &mut kv_values,
+                &mut cache_idx,
+                &mut rope_offsets,
+            );
+            let logits = fwd::chunked_prefill(
+                &mut prefill_ctx,
+                &current_ids,
+                generation_stream,
+                prefill_step_size as i64,
+                true,
+                |_| None,
+                |ctx, chunk, _is_final| {
+                    // `cache_idx` equals the chunk's start offset at each
+                    // boundary (forward_fused advances it by chunk length).
+                    *ctx.3 = MxArray::from_int32(&[*ctx.2], &[1])?;
+                    Qwen3Model::forward_fused(
+                        chunk,
                         &embedding_weight,
                         layers,
                         final_norm,
                         lm_head,
                         model_config,
-                        &mut kv_keys,
-                        &mut kv_values,
-                        &mut cache_idx,
-                        &rope_offsets,
+                        ctx.0,
+                        ctx.1,
+                        ctx.2,
+                        ctx.3,
                         &left_padding,
-                    )?;
-                }
-                for kv_key in kv_keys.iter().flatten() {
-                    kv_key.eval();
-                }
-                for kv_value in kv_values.iter().flatten() {
-                    kv_value.eval();
-                }
-                synchronize_and_clear_cache();
-                offset = chunk_end;
-            }
-            let final_chunk = current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
-            rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Qwen3Model::forward_fused(
-                    &final_chunk,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-            let chunk_seq_len = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
-                .squeeze(Some(&[0, 1]))?
-        } else {
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Qwen3Model::forward_fused(
-                    &current_ids,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-            let seq_len = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[0, 1]))?
+                    )
+                },
+                |ctx| {
+                    for kv_key in ctx.0.iter().flatten() {
+                        kv_key.eval();
+                    }
+                    for kv_value in ctx.1.iter().flatten() {
+                        kv_value.eval();
+                    }
+                    synchronize_and_clear_cache();
+                    Ok(())
+                },
+            )?;
+            fwd::slice_last_logits_to_vocab(&logits)?
         };
 
         rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
@@ -3876,122 +3809,59 @@ impl Qwen3Inner {
         let total_len = prompt_tokens.len();
         let prefill_input = MxArray::from_uint32(prompt_tokens, &[1, total_len as i64])?;
         let prefill_step_size: usize = 2048;
-        let use_chunked_prefill = total_len > prefill_step_size;
 
         let mut rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
         let left_padding = MxArray::from_int32(&[0], &[1])?;
 
-        let last_logits = if use_chunked_prefill {
-            let mut offset = 0usize;
-            while offset + prefill_step_size < total_len {
-                // Cooperative-cancel checkpoint (H1b): abort at the chunk
-                // boundary. The Err rides the flat engine's
-                // `fail_closed_flat_turn` arm — no `save_cache_state`, the
-                // session is invalidated, so the partial turn-KV never
-                // becomes a live prefix.
-                if self
-                    .turn_cancel
-                    .as_ref()
-                    .is_some_and(|f| f.load(Ordering::Relaxed))
-                {
-                    return Err(Error::from_reason("prefill cancelled"));
-                }
-                let chunk_end = offset + prefill_step_size;
-                let chunk = prefill_input.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
-                rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
-                {
-                    let _stream_ctx = StreamContext::new(stream);
-                    let _ = Qwen3Model::forward_fused(
-                        &chunk,
-                        &embedding_weight,
-                        &self.layers,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &self.config,
-                        &mut self.turn_kv_keys,
-                        &mut self.turn_kv_values,
-                        &mut self.turn_cache_idx,
-                        &rope_offsets,
-                        &left_padding,
-                    )?;
-                }
-                for kv_key in self.turn_kv_keys.iter().flatten() {
+        let logits = fwd::chunked_prefill(
+            self,
+            &prefill_input,
+            stream,
+            prefill_step_size as i64,
+            true,
+            |inner: &Qwen3Inner| inner.turn_cancel.as_deref(),
+            |inner, chunk, _is_final| {
+                // `turn_cache_idx` equals the chunk's start offset at each
+                // boundary (forward_fused advances it by the chunk length).
+                rope_offsets = MxArray::from_int32(&[inner.turn_cache_idx], &[1])?;
+                Qwen3Model::forward_fused(
+                    chunk,
+                    &embedding_weight,
+                    &inner.layers,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    &inner.config,
+                    &mut inner.turn_kv_keys,
+                    &mut inner.turn_kv_values,
+                    &mut inner.turn_cache_idx,
+                    &rope_offsets,
+                    &left_padding,
+                )
+            },
+            |inner| {
+                for kv_key in inner.turn_kv_keys.iter().flatten() {
                     kv_key.eval();
                 }
-                for kv_value in self.turn_kv_values.iter().flatten() {
+                for kv_value in inner.turn_kv_values.iter().flatten() {
                     kv_value.eval();
                 }
                 synchronize_and_clear_cache();
-                offset = chunk_end;
-            }
-            // The final remainder is a chunk boundary too once at least one
-            // looped chunk ran (always true in this arm): poll before
-            // forwarding it so a cancel landing during the last looped chunk
-            // aborts instead of riding through the remainder. The offset-zero
-            // single-shot arm below stays uncancellable by design.
-            if offset > 0
-                && self
-                    .turn_cancel
-                    .as_ref()
-                    .is_some_and(|f| f.load(Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
-            }
-            let final_chunk = prefill_input.slice(&[0, offset as i64], &[1, total_len as i64])?;
-            rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
-            let logits = {
-                let _stream_ctx = StreamContext::new(stream);
-                Qwen3Model::forward_fused(
-                    &final_chunk,
-                    &embedding_weight,
-                    &self.layers,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &self.config,
-                    &mut self.turn_kv_keys,
-                    &mut self.turn_kv_values,
-                    &mut self.turn_cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-            let chunk_seq_len = logits.shape_at(1)?;
-            // Keep as `[1, vocab]` (squeeze only axis 1) so the shape
-            // matches dense/MoE streaming and flows cleanly through
-            // the shared penalty + sampling pipeline.
-            logits
-                .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
-                .squeeze(Some(&[1]))?
-        } else {
-            let logits = {
-                let _stream_ctx = StreamContext::new(stream);
-                Qwen3Model::forward_fused(
-                    &prefill_input,
-                    &embedding_weight,
-                    &self.layers,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &self.config,
-                    &mut self.turn_kv_keys,
-                    &mut self.turn_kv_values,
-                    &mut self.turn_cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-            let seq_len = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[1]))?
-        };
+                Ok(())
+            },
+        )?;
+        // Keep as `[1, vocab]` (squeeze only axis 1) so the shape
+        // matches dense/MoE streaming and flows cleanly through
+        // the shared penalty + sampling pipeline.
+        let last_logits = fwd::slice_last_logits_keep_batch(&logits)?;
 
         Ok(last_logits)
     }
 }
 
-/// Paged decode stepper for qwen3 (pure-eager — no compiled path, so no
-/// lifecycle/reset guard fields). The paged analog of [`Qwen3Decode`]:
-/// drives [`crate::engine::decode::run_decode_loop`] through the
+/// Paged decode state for qwen3 (pure-eager — no compiled path, so no
+/// lifecycle/reset guard fields); wrapped by [`PagedStepper`] for the
+/// `DecodeStep` impl. The paged analog of [`Qwen3Decode`]: drives
+/// [`crate::engine::decode::run_decode_loop`] through the
 /// `forward_paged_adapter` path via [`Qwen3Inner::run_paged_decode_step`].
 pub(crate) struct Qwen3PagedDecode<'a> {
     inner: &'a mut Qwen3Inner,
@@ -4002,39 +3872,25 @@ pub(crate) struct Qwen3PagedDecode<'a> {
     positions_dummy: MxArray,
 }
 
-impl DecodeStep for Qwen3PagedDecode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+impl PagedStepModel for Qwen3PagedDecode<'_> {
+    /// `AsyncTokenAndLogits`: schedule next_token (+ logits, matching the
+    /// flat `Qwen3Decode`) for async eval; the loop-top `y.eval()` forces
+    /// materialization next iteration.
+    const EVAL: EvalPolicy = EvalPolicy::AsyncTokenAndLogits;
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::KeepAllOnLength;
+
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
         // The paged forward needs the concrete token id (record_tokens +
-        // re-embed as [1, 1]); recover it from the [1, 1] input the loop
-        // reshaped. `item_at_int32` forces the eval of `y` — idempotent
-        // with the loop-top `y.eval()`.
-        let token_value = input_ids.item_at_int32(0)? as u32;
-        let logits = self.inner.run_paged_decode_step(
-            token_value,
+        // re-embed as [1, 1]) — handed by the engine, so the absorbed
+        // per-step `item_at_int32` the old `forward` paid is gone.
+        self.inner.run_paged_decode_step(
+            token_id,
             self.num_layers,
             &self.positions_dummy,
-        )?;
-        // `run_paged_decode_step` returns `[1, 1, vocab]`; `true` requests
-        // the engine's squeeze of axis 1 → `[1, vocab]` (the FLAT
-        // contract — `sample` / `apply_all_penalties` accept the leading
-        // batch axis).
-        Ok((logits, true))
+        )
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, _budget_forced: bool) {
-        // Schedule next_token (+ logits, matching the flat `Qwen3Decode`)
-        // for async eval; the loop-top `y.eval()` forces materialization
-        // next iteration.
-        MxArray::async_eval_arrays(&[next_token, logits]);
-    }
-
-    fn maintain_cache(&mut self, step: i32) {
-        // Paged cadence — the per-step
-        // `maybe_clear_cache_for_paged_step(step)`.
-        crate::array::maybe_clear_cache_for_paged_step(step);
-    }
-
-    fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+    fn materialize_final_token(&mut self, token_id: u32) -> Result<()> {
         // LENGTH-exit only (the engine gates the call): run ONE more
         // `run_paged_decode_step` for the final committed token so its
         // K/V lands in the paged adapter, then DISCARD the logits. This
@@ -4088,7 +3944,7 @@ impl Qwen3Inner {
 
 impl PagedBackend for Qwen3Inner {
     type PagedDecode<'a>
-        = Qwen3PagedDecode<'a>
+        = PagedStepper<Qwen3PagedDecode<'a>>
     where
         Self: 'a;
     type PrefixState = Qwen3PrefixState;
@@ -4122,11 +3978,11 @@ impl PagedBackend for Qwen3Inner {
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
         let positions_dummy = MxArray::from_int32(&[0], &[1])?;
         let num_layers = self.layers.len();
-        Ok(Qwen3PagedDecode {
+        Ok(PagedStepper(Qwen3PagedDecode {
             inner: self,
             num_layers,
             positions_dummy,
-        })
+        }))
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
@@ -4412,15 +4268,14 @@ impl ChatBackend for Qwen3Inner {
             // non-length case the final token IS the boundary marker
             // (`<|im_end|>` or the cutoff token) the next delta re-renders
             // itself.
-            let history_tokens =
-                if args.finish_reason != "length" && !args.generated_tokens.is_empty() {
-                    &args.generated_tokens[..args.generated_tokens.len() - 1]
-                } else {
-                    args.generated_tokens
-                };
-            let mut full_history = args.save_tokens.to_vec();
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
+            fwd::save_flat_token_history(
+                args.save_tokens,
+                args.generated_tokens,
+                args.finish_reason == "length",
+                true,
+                FinalTokenPolicy::KeepAllOnLength,
+                &mut self.cached_token_history,
+            );
             // Qwen3 has no vision path — the image cache key is
             // structurally always None, but we reset it here for clarity
             // and uniformity with VLM-capable siblings.

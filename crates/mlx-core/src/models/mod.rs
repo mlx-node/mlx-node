@@ -4,8 +4,10 @@
  * Contains all model implementations.
  */
 pub(crate) mod chat_napi;
+pub(crate) mod forward;
 pub mod gemma4;
 pub mod harrier;
+pub mod int8_gemm;
 pub mod k2_horizon;
 pub mod lfm2;
 pub mod mtp_drafter;
@@ -20,6 +22,7 @@ pub mod pp_text_rec;
 pub mod privacy_filter;
 pub mod qianfan_ocr;
 pub mod quant_dispatch;
+pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod qwen3_5_moe;

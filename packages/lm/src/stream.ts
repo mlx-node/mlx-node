@@ -24,6 +24,7 @@ import type {
 } from '@mlx-node/core';
 
 import type { SessionCapableModel } from './chat-session.js';
+import { FAMILY_ROWS, type ChatFamilyId, type FamilyStreamOpts } from './family-data.js';
 
 interface NativeChatSessionCall {
   cancel(): void;
@@ -766,6 +767,13 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
   };
 }
 
+// Each wrapper's options literal lives on its `MODEL_FAMILY_DATA` row
+// (`streamOpts` in `family-data.ts`): the row is the single source of truth
+// for the per-family knobs, and its `as const` literal type is what makes
+// `ResolvedApplyTemplate` resolve `true`/`false` rather than `boolean`.
+// `lfm2_moe` has no wrapper of its own — it shares `Lfm2Model` and therefore
+// `lfm2`'s row.
+
 /**
  * Qwen3.5 dense model with AsyncGenerator-based session streaming.
  *
@@ -774,45 +782,37 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
  * `.name === 'Qwen35Model'` and a working `instanceof`. Records its
  * model path so `applyChatTemplate` can serve a lazily built tokenizer.
  */
-export class Qwen35Model extends makeStreamingModel(Qwen35ModelNative, {
-  recordModelPath: true,
-}) {}
+export class Qwen35Model extends makeStreamingModel(Qwen35ModelNative, FAMILY_ROWS.qwen3_5.streamOpts) {}
 
 /** Qwen3.5 MoE model — see {@link Qwen35Model} for the wrapper shape. */
-export class Qwen35MoeModel extends makeStreamingModel(Qwen35MoeModelNative, {
-  recordModelPath: true,
-}) {}
+export class Qwen35MoeModel extends makeStreamingModel(Qwen35MoeModelNative, FAMILY_ROWS.qwen3_5_moe.streamOpts) {}
 
 /** Qwen3.8-Flash-Next with SSD-streamed experts and PLE embeddings. */
-export class Qwen4ExpModel extends makeStreamingModel(Qwen4ExpModelNative, {
-  recordModelPath: true,
-}) {}
+export class Qwen4ExpModel extends makeStreamingModel(Qwen4ExpModelNative, FAMILY_ROWS.qwen4_exp.streamOpts) {}
 
 /** LFM2 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
-export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, {
-  recordModelPath: true,
-  replayAssistantRawText: true,
-}) {}
+export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, FAMILY_ROWS.lfm2.streamOpts) {}
 
 /** Nemotron 3.5 Lightning (text-only) — see {@link Qwen35Model} for the wrapper shape. */
-export class NemotronHModel extends makeStreamingModel(NemotronHModelNative, {
-  recordModelPath: true,
-}) {}
+export class NemotronHModel extends makeStreamingModel(
+  NemotronHModelNative,
+  FAMILY_ROWS.nemotron_h.streamOpts,
+) {}
 
 /** K2-Horizon model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
-export class K2HorizonModel extends makeStreamingModel(K2HorizonModelNative, {
-  recordModelPath: true,
-}) {}
+export class K2HorizonModel extends makeStreamingModel(
+  K2HorizonModelNative,
+  FAMILY_ROWS.k2_horizon.streamOpts,
+) {}
 
 /** Gemma4 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
-export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, {
-  recordModelPath: true,
-}) {}
+export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, FAMILY_ROWS.gemma4.streamOpts) {}
 
 /** Muse-Glimmer text model with embedded DFlash speculative decoding. */
-export class MuseGlimmerModel extends makeStreamingModel(MuseGlimmerModelNative, {
-  recordModelPath: true,
-}) {}
+export class MuseGlimmerModel extends makeStreamingModel(
+  MuseGlimmerModelNative,
+  FAMILY_ROWS.muse_glimmer.streamOpts,
+) {}
 
 /**
  * Qwen3 (first-gen, text-only) model.
@@ -821,85 +821,114 @@ export class MuseGlimmerModel extends makeStreamingModel(MuseGlimmerModelNative,
  * other families) but does not install the factory's path-backed
  * `applyChatTemplate`; it retains the native tokenizer-backed method.
  */
-export class Qwen3Model extends makeStreamingModel(Qwen3ModelNative, {
-  recordModelPath: true,
-  applyTemplate: false,
-}) {}
+export class Qwen3Model extends makeStreamingModel(Qwen3ModelNative, FAMILY_ROWS.qwen3.streamOpts) {}
 
 // -------------------------------------------------------------------
 // Compile-time conformance check
 // -------------------------------------------------------------------
 //
-// Ensures each family class structurally satisfies
-// `SessionCapableModel` so `ChatSession<XxxModel>` type-checks in
-// downstream code. Compile-only — the `null as unknown as T`
-// placeholder never runs. If a factory override signature drifts away
-// from the interface, this block fails to compile.
-function _assertSessionCapable(): void {
-  const _qwen35: SessionCapableModel = null as unknown as Qwen35Model;
-  const _moe: SessionCapableModel = null as unknown as Qwen35MoeModel;
-  const _qwen4: SessionCapableModel = null as unknown as Qwen4ExpModel;
-  const _lfm2: SessionCapableModel = null as unknown as Lfm2Model;
-  const _gemma4: SessionCapableModel = null as unknown as Gemma4Model;
-  const _museGlimmer: SessionCapableModel = null as unknown as MuseGlimmerModel;
-  const _qwen3: SessionCapableModel = null as unknown as Qwen3Model;
-  const _nemotronH: SessionCapableModel = null as unknown as NemotronHModel;
-  const _k2: SessionCapableModel = null as unknown as K2HorizonModel;
-  void _qwen35;
-  void _moe;
-  void _qwen4;
-  void _lfm2;
-  void _gemma4;
-  void _museGlimmer;
-  void _qwen3;
-  void _nemotronH;
-  void _k2;
+// One mapped-type pass over {@link FAMILY_WRAPPERS}, keyed by `ChatFamilyId`,
+// replacing the retired per-family assert blocks. Exhaustiveness comes from
+// the key set: a new chat family without a table entry fails the table's
+// `satisfies` (and the `FAMILY_WRAPPERS[K]` index in `FamilyCheck`), so the
+// registry row type and this table enumerate the complete fan-out. Each
+// entry pins the three things the old assert lines pinned:
+//
+//   - the wrapper instance structurally satisfies `SessionCapableModel`,
+//     so `ChatSession<XxxModel>` keeps type-checking downstream
+//     (was `_assertSessionCapable`);
+//   - it preserves every native member the factory does not replace,
+//     `PreservedNativeSurface` (was `_assertPreservedNativeSurfaces`);
+//   - `vision` entries keep `supportsImages` + `expandedPromptTokenCount`
+//     on BOTH the native class and the wrapper (was
+//     `_assertQwenVisionSurfaces`).
+//
+// Compile-only — the `null as unknown as T` placeholders never run.
+
+interface FamilyWrapperEntry {
+  /**
+   * The exported per-family class. Its `.name` and `instanceof` are
+   * load-bearing (`MTP_AUTO_DEFAULT_SUPPRESSED_MODELS` walks the prototype
+   * chain for it, trainers log it), so the table stores the real named
+   * class, not a `makeStreamingModel` rebuild.
+   */
+  readonly wrapper: abstract new (...args: never[]) => unknown;
+  /** The native `@mlx-node/core` class the wrapper extends. */
+  readonly native: NativeStreamingCtor;
+  /** Pins the Qwen media-planner surface on both sides of the wrapper. */
+  readonly vision?: true;
 }
-void _assertSessionCapable;
+
+const FAMILY_WRAPPERS = {
+  gemma4: { wrapper: Gemma4Model, native: Gemma4ModelNative },
+  muse_glimmer: { wrapper: MuseGlimmerModel, native: MuseGlimmerModelNative },
+  qwen3: { wrapper: Qwen3Model, native: Qwen3ModelNative },
+  qwen3_5: { wrapper: Qwen35Model, native: Qwen35ModelNative, vision: true },
+  qwen3_5_moe: { wrapper: Qwen35MoeModel, native: Qwen35MoeModelNative, vision: true },
+  qwen4_exp: { wrapper: Qwen4ExpModel, native: Qwen4ExpModelNative, vision: true },
+  lfm2: { wrapper: Lfm2Model, native: Lfm2ModelNative },
+  // `lfm2_moe` loads through `lfm2`'s wrapper — there is no `Lfm2MoeModel`
+  // class — and `lfm2`'s registry row owns its `streamOpts`.
+  lfm2_moe: { wrapper: Lfm2Model, native: Lfm2ModelNative },
+  nemotron_h: { wrapper: NemotronHModel, native: NemotronHModelNative },
+  k2_horizon: { wrapper: K2HorizonModel, native: K2HorizonModelNative },
+} as const satisfies Record<ChatFamilyId, FamilyWrapperEntry>;
 
 type QwenVisionSurface = Required<Pick<SessionCapableModel, 'supportsImages' | 'expandedPromptTokenCount'>>;
-
-/** Compile-time guard that all Qwen vision native classes and wrappers retain image capability and the exact media planner. */
-function _assertQwenVisionSurfaces(): void {
-  const _nativeDense: QwenVisionSurface = null as unknown as InstanceType<typeof Qwen35ModelNative>;
-  const _nativeMoe: QwenVisionSurface = null as unknown as InstanceType<typeof Qwen35MoeModelNative>;
-  const _wrappedDense: QwenVisionSurface = null as unknown as Qwen35Model;
-  const _wrappedMoe: QwenVisionSurface = null as unknown as Qwen35MoeModel;
-  const _nativeQwen4: QwenVisionSurface = null as unknown as InstanceType<typeof Qwen4ExpModelNative>;
-  const _wrappedQwen4: QwenVisionSurface = null as unknown as Qwen4ExpModel;
-  void _nativeQwen4;
-  void _wrappedQwen4;
-  void _nativeDense;
-  void _nativeMoe;
-  void _wrappedDense;
-  void _wrappedMoe;
-}
-void _assertQwenVisionSurfaces;
 
 type PreservedNativeSurface<C extends NativeStreamingCtor> = Omit<
   InstanceType<C>,
   NativeStreamingMethod | NativeSessionReplacementMethod
 >;
 
-/** Compile-time guard for every native member the factory does not replace. */
-function _assertPreservedNativeSurfaces(): void {
-  const _qwen3: PreservedNativeSurface<typeof Qwen3ModelNative> = null as unknown as Qwen3Model;
-  const _qwen35: PreservedNativeSurface<typeof Qwen35ModelNative> = null as unknown as Qwen35Model;
-  const _moe: PreservedNativeSurface<typeof Qwen35MoeModelNative> = null as unknown as Qwen35MoeModel;
-  const _qwen4: PreservedNativeSurface<typeof Qwen4ExpModelNative> = null as unknown as Qwen4ExpModel;
-  const _lfm2: PreservedNativeSurface<typeof Lfm2ModelNative> = null as unknown as Lfm2Model;
-  const _gemma4: PreservedNativeSurface<typeof Gemma4ModelNative> = null as unknown as Gemma4Model;
-  const _museGlimmer: PreservedNativeSurface<typeof MuseGlimmerModelNative> = null as unknown as MuseGlimmerModel;
-  const _nemotronH: PreservedNativeSurface<typeof NemotronHModelNative> = null as unknown as NemotronHModel;
-  const _k2: PreservedNativeSurface<typeof K2HorizonModelNative> = null as unknown as K2HorizonModel;
-  void _qwen3;
-  void _qwen35;
-  void _moe;
-  void _qwen4;
-  void _lfm2;
-  void _gemma4;
-  void _museGlimmer;
-  void _nemotronH;
-  void _k2;
-}
-void _assertPreservedNativeSurfaces;
+/**
+ * `true` for a conforming family; a string literal naming the failure
+ * otherwise, so a compile error reads e.g.
+ * `Type '"vision surface drift (native): qwen3_5"' is not assignable`.
+ */
+type FamilyCheck<K extends ChatFamilyId> =
+  InstanceType<(typeof FAMILY_WRAPPERS)[K]['wrapper']> extends SessionCapableModel
+    ? InstanceType<(typeof FAMILY_WRAPPERS)[K]['wrapper']> extends PreservedNativeSurface<
+          (typeof FAMILY_WRAPPERS)[K]['native']
+        >
+      ? (typeof FAMILY_WRAPPERS)[K] extends { readonly vision: true }
+        ? InstanceType<(typeof FAMILY_WRAPPERS)[K]['native']> extends QwenVisionSurface
+          ? InstanceType<(typeof FAMILY_WRAPPERS)[K]['wrapper']> extends QwenVisionSurface
+            ? true
+            : `vision surface drift (wrapped): ${K}`
+          : `vision surface drift (native): ${K}`
+        : true
+      : `preserved-surface drift: ${K}`
+    : `not session capable: ${K}`;
+
+type FamilyConformance = { [K in ChatFamilyId]: FamilyCheck<K> };
+
+/**
+ * The value half of {@link FamilyConformance}: assigning the resolved record
+ * to an all-`true` shape fails to compile on the first drifted key. If a
+ * factory override signature drifts away from `SessionCapableModel`, or a
+ * native member the factory does not replace disappears, this line errors.
+ */
+const _familyConformance: { [K in ChatFamilyId]: true } = null as unknown as FamilyConformance;
+void _familyConformance;
+
+/**
+ * `FamilyStreamOpts` (`family-data.ts`) is the row-side structural mirror of
+ * {@link StreamingModelOptions} — the same mirror pattern
+ * `FamilyThinkingLevelMap` uses for pi's map. A key-set drift or a widened
+ * field type resolves to a failure string, which is not assignable to
+ * `true`.
+ */
+type StreamOptsShapeCheck =
+  keyof FamilyStreamOpts extends keyof StreamingModelOptions
+    ? keyof StreamingModelOptions extends keyof FamilyStreamOpts
+      ? FamilyStreamOpts extends StreamingModelOptions
+        ? StreamingModelOptions extends FamilyStreamOpts
+          ? true
+          : 'streamOpts drift: StreamingModelOptions widened past FamilyStreamOpts'
+        : 'streamOpts drift: FamilyStreamOpts widened past StreamingModelOptions'
+      : 'streamOpts drift: StreamingModelOptions has keys FamilyStreamOpts lacks'
+    : 'streamOpts drift: FamilyStreamOpts has keys StreamingModelOptions lacks';
+
+const _streamOptsShape: true = null as unknown as StreamOptsShapeCheck;
+void _streamOptsShape;

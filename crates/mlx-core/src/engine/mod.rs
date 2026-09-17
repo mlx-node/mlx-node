@@ -20,6 +20,7 @@ pub(crate) mod model_command;
 pub(crate) mod mtp_turn;
 pub(crate) mod napi_glue;
 pub(crate) mod paged_epilogue;
+pub(crate) mod paged_stepper;
 pub(crate) mod paged_turn;
 pub(crate) mod params;
 pub(crate) mod penalties;

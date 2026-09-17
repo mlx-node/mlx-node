@@ -78,8 +78,6 @@
 //! sequential decode flip the argmax → token streams diverge from the
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
-#[cfg(target_os = "macos")]
-use std::cell::Cell;
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
@@ -90,6 +88,12 @@ use std::time::{Duration, Instant};
 use mlx_paged_attn::metal::KvScaleManager;
 use mlx_paged_attn::{
     BlockAllocator, LayerKVPool, PagedAttentionConfig, PhysicalBlock, SequenceBlockTable,
+};
+
+#[cfg(target_os = "macos")]
+use super::paged_metadata_cache::{
+    MetadataClear, PagedMetadataCache, RaggedPagedInputsCache, RaggedRowIdentity,
+    RequestMetadataCaches,
 };
 
 use crate::array::{DType, MxArray};
@@ -517,7 +521,7 @@ pub(crate) fn build_decode_block_ids(table: &SequenceBlockTable) -> Vec<i32> {
 /// table. Normal suffix prefill records exactly through the current chunk; a
 /// cached-prefix replay can have `block_table.num_tokens()` already advanced to
 /// the full cached prefix while each replay chunk attends over a subrange.
-fn build_prefill_block_ids_for_total(
+pub(crate) fn build_prefill_block_ids_for_total(
     table: &SequenceBlockTable,
     required_tokens: u32,
     block_size: u32,
@@ -1657,20 +1661,12 @@ pub struct PagedRequestState {
     restored_sidecar: Option<mlx_paged_attn::ColdSidecar>,
     aux_prefix_unbacked: bool,
     cold_capture: ColdCaptureOutcome,
+    /// The attention-metadata caches parked with this request's workspace.
+    /// Swapped wholesale into `PagedMetadataCache::request` on
+    /// re-activation, so a parked request resumes with exactly the
+    /// metadata wave it left.
     #[cfg(target_os = "macos")]
-    prefill_attention_inputs_cache: Option<PrefillPagedAttentionInputsCache>,
-    #[cfg(target_os = "macos")]
-    compact_prefill_inputs_cache: Option<CompactPrefillInputsCache>,
-    #[cfg(target_os = "macos")]
-    varlen_prefill_inputs_cache: Option<VarlenPrefillInputsCache>,
-    #[cfg(target_os = "macos")]
-    decode_attention_inputs_cache: Option<DecodePagedAttentionInputsCache>,
-    #[cfg(target_os = "macos")]
-    write_slot_mapping_cache: Option<WriteSlotMappingCache>,
-    #[cfg(target_os = "macos")]
-    prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
-    #[cfg(target_os = "macos")]
-    decode_planning_cache: Option<DecodePlanningCache>,
+    meta: RequestMetadataCaches,
 }
 
 impl PagedRequestState {
@@ -1686,19 +1682,7 @@ impl PagedRequestState {
             aux_prefix_unbacked: false,
             cold_capture: ColdCaptureOutcome::default(),
             #[cfg(target_os = "macos")]
-            prefill_attention_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            compact_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            varlen_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_attention_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            write_slot_mapping_cache: None,
-            #[cfg(target_os = "macos")]
-            prefill_memory_snapshot_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_planning_cache: None,
+            meta: RequestMetadataCaches::default(),
         }
     }
 }
@@ -1887,41 +1871,21 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     unit_kv_scale_array: MxArray,
 
-    /// Last `(max_context_len, stripes)` resolved by
-    /// [`Self::resolve_grouped_d128_stripes`]. The FFI probes device memory
-    /// ceilings, so resolving once per token instead of once per layer
-    /// avoids ~num_layers-1 redundant probes per step.
+    /// The attention-metadata cache cluster: every array/snapshot/probe
+    /// whose payload is pure dispatch metadata (block tables, seq lens,
+    /// slot mappings, memory snapshots, capability/stripe probes).
+    /// Mutation points invalidate through the single
+    /// [`PagedMetadataCache::invalidate`] funnel; request-scoped entries
+    /// ride `meta.request` through the park/install cycle while the
+    /// packed ragged wave, the D128 stripe plan, and the D512 capability
+    /// stay model-global.
+    ///
+    /// Deliberately NOT inside: `native_pool_arrays` below carries lazy
+    /// graph outputs tied to native-write ordering (a write dependency
+    /// chain, not pure metadata), and `unit_kv_scale_array` is an eager
+    /// constant.
     #[cfg(target_os = "macos")]
-    d128_stripe_plan_cache: Cell<Option<(u32, u32)>>,
-    /// Cached per-prefill-chunk metadata for the MLX `paged_attention`
-    /// bridge. The metadata is identical for every full-attention layer in a
-    /// chunk, so rebuilding a duplicated block table per layer would make the
-    /// optimized prefill path pay avoidable host allocation/upload cost.
-    #[cfg(target_os = "macos")]
-    prefill_attention_inputs_cache: Option<PrefillPagedAttentionInputsCache>,
-
-    /// Compact one-row prefill metadata shared by the varlen attention and
-    /// graph-native SDPA gather paths. This is invalidated alongside the
-    /// legacy prefill cache whenever the request cursor changes.
-    #[cfg(target_os = "macos")]
-    compact_prefill_inputs_cache: Option<CompactPrefillInputsCache>,
-
-    /// Varlen-specific sequence metadata for the current prefill chunk.
-    #[cfg(target_os = "macos")]
-    varlen_prefill_inputs_cache: Option<VarlenPrefillInputsCache>,
-
-    /// Split-lifetime decode metadata for the MLX `paged_attention` bridge.
-    /// The materialized block table survives token-cursor changes until the
-    /// exact physical block-id sequence changes; `seq_lens` is immutable and
-    /// replaced for each new cursor so older lazy graphs retain their storage.
-    /// Same-token calls from later full-attention layers reuse both arrays.
-    #[cfg(target_os = "macos")]
-    decode_attention_inputs_cache: Option<DecodePagedAttentionInputsCache>,
-
-    /// One immutable one-token batch shared by all layers in this cache group.
-    /// Identity/revision/frontier checks survive owner workspace rotation.
-    #[cfg(target_os = "macos")]
-    ragged_inputs_cache: Option<RaggedPagedInputsCache>,
+    meta: PagedMetadataCache,
 
     /// Per-layer MLX views of the K/V pool that carry native
     /// `paged_kv_write` dependencies. When a native write returns
@@ -1930,33 +1894,6 @@ pub struct PagedKVCacheAdapter {
     /// write-before-read graph edge.
     #[cfg(target_os = "macos")]
     native_pool_arrays: Vec<Option<NativePoolArrays>>,
-
-    /// Cached exact slot mapping for the current write chunk. Gemma4 has five
-    /// global layers that write the same token positions, so this avoids
-    /// rebuilding and re-evaluating identical int64 metadata per layer.
-    #[cfg(target_os = "macos")]
-    write_slot_mapping_cache: Option<WriteSlotMappingCache>,
-
-    /// One process-memory sample per recorded prefill chunk. Every
-    /// full-attention layer in that chunk must make the same routing decision;
-    /// re-running the probes per layer is both wasteful and can produce a
-    /// mixed SDPA/varlen plan as lazy graph allocations change.
-    #[cfg(target_os = "macos")]
-    prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
-
-    /// Process-memory sample and failure/report latches for one coarse decode
-    /// context bucket. Unlike the per-token PagedAttention metadata, decode
-    /// routing must remain stable while all logical full-attention consumers
-    /// read the same physical pool. Sampling once per bucket also prevents
-    /// lazy allocations in an early layer from changing later layers' route.
-    #[cfg(target_os = "macos")]
-    decode_planning_cache: Option<DecodePlanningCache>,
-
-    /// Immutable grouped-D512 pipeline/threadgroup capability for this pool's
-    /// geometry. The Metal probe itself is process-cached, but retaining the
-    /// result here removes even the FFI call from every layer/token.
-    #[cfg(target_os = "macos")]
-    grouped_d512_capability_cache: Option<(i32, Result<bool, String>)>,
 
     /// Optional hook invoked once per successful pool grow with the pool's
     /// new total K/V bytes (all layers, both sides). The cache-limit pool
@@ -1973,68 +1910,6 @@ pub struct PagedKVCacheAdapter {
 }
 
 #[cfg(target_os = "macos")]
-struct PrefillPagedAttentionInputsCache {
-    token_count: u32,
-    cached_prefix_len: u32,
-    num_new_tokens: u32,
-    block_count: u32,
-    block_table: MxArray,
-    seq_lens: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct CompactPrefillInputsCache {
-    first_block: u32,
-    token_count: u32,
-    required_tokens: u32,
-    block_count: u32,
-    /// One-dimensional physical block IDs, suitable for `take(axis=0)`.
-    block_ids: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct VarlenPrefillInputsCache {
-    token_count: u32,
-    cached_prefix_len: u32,
-    query_len: u32,
-    block_count: u32,
-    block_table: MxArray,
-    seq_lens: MxArray,
-    cu_seqlens_q: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct DecodePagedAttentionInputsCache {
-    first_block: u32,
-    physical_revision: u64,
-    token_count: u32,
-    block_count: u32,
-    block_table: MxArray,
-    seq_lens: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct RaggedRowIdentity {
-    row: PagedRaggedRow,
-    table_identity: u64,
-    physical_revision: u64,
-    token_count: u32,
-}
-
-#[cfg(target_os = "macos")]
-struct RaggedPagedInputsCache {
-    rows: Vec<RaggedRowIdentity>,
-    pool_generation: u64,
-    slot_mapping: MxArray,
-    aliased_slot: Option<i64>,
-    block_tables: MxArray,
-    seq_lens: MxArray,
-    cu_seqlens_q: MxArray,
-    max_context_len: u32,
-    total_queries: u32,
-}
-
-#[cfg(target_os = "macos")]
 struct NativePoolArrays {
     key: MxArray,
     value: MxArray,
@@ -2045,72 +1920,16 @@ struct NativePoolArrays {
     generation: u64,
 }
 
-#[cfg(target_os = "macos")]
-struct WriteSlotMappingCache {
-    token_count: u32,
-    first_logical_position: u32,
-    num_tokens: u32,
-    physical_revision: u64,
-    first_slot: i64,
-    last_slot: i64,
-    slot_mapping: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-struct PrefillMemorySnapshotCache {
-    token_count: u32,
-    snapshot: PagedPrefillMemorySnapshot,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-struct DecodePlanningCache {
-    context_bucket_end: u32,
-    snapshot: PagedPrefillMemorySnapshot,
-    sdpa_failed: bool,
-    reported_route_signature: Option<u64>,
-    fallback_reported: bool,
-}
-
 impl PagedKVCacheAdapter {
-    #[cfg(target_os = "macos")]
-    fn clear_prefill_attention_inputs_cache(&mut self) {
-        self.prefill_attention_inputs_cache = None;
-        self.compact_prefill_inputs_cache = None;
-        self.varlen_prefill_inputs_cache = None;
-        self.prefill_memory_snapshot_cache = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_decode_attention_inputs_cache(&mut self) {
-        self.decode_attention_inputs_cache = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_decode_planning_cache(&mut self) {
-        self.decode_planning_cache = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_attention_inputs_caches(&mut self) {
-        self.clear_prefill_attention_inputs_cache();
-        self.clear_decode_attention_inputs_cache();
-    }
-
+    /// Drop every cached per-layer pool view plus the whole request-scoped
+    /// metadata wave. Pool growth swaps the underlying Metal buffers, so
+    /// both halves must rebuild before the next dispatch.
     #[cfg(target_os = "macos")]
     fn clear_native_graph_state(&mut self) {
         self.native_pool_arrays
             .iter_mut()
             .for_each(|slot| *slot = None);
-        self.clear_active_request_graph_state();
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_active_request_graph_state(&mut self) {
-        self.clear_attention_inputs_caches();
-        self.clear_decode_planning_cache();
-        self.write_slot_mapping_cache = None;
+        self.meta.invalidate(MetadataClear::ActiveRequest);
     }
 
     /// Construct a new adapter sharing the given allocator and layer
@@ -2281,27 +2100,9 @@ impl PagedKVCacheAdapter {
             #[cfg(target_os = "macos")]
             unit_kv_scale_array,
             #[cfg(target_os = "macos")]
-            d128_stripe_plan_cache: Cell::new(None),
-            #[cfg(target_os = "macos")]
-            prefill_attention_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            compact_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            varlen_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_attention_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            ragged_inputs_cache: None,
+            meta: PagedMetadataCache::default(),
             #[cfg(target_os = "macos")]
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
-            #[cfg(target_os = "macos")]
-            write_slot_mapping_cache: None,
-            #[cfg(target_os = "macos")]
-            prefill_memory_snapshot_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_planning_cache: None,
-            #[cfg(target_os = "macos")]
-            grouped_d512_capability_cache: None,
             pool_growth_notifier: None,
             #[cfg(test)]
             grow_headroom_probe_override: None,
@@ -2545,19 +2346,7 @@ impl PagedKVCacheAdapter {
             aux_prefix_unbacked: std::mem::take(&mut self.aux_prefix_unbacked),
             cold_capture: std::mem::take(&mut self.cold_capture),
             #[cfg(target_os = "macos")]
-            prefill_attention_inputs_cache: self.prefill_attention_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            compact_prefill_inputs_cache: self.compact_prefill_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            varlen_prefill_inputs_cache: self.varlen_prefill_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            decode_attention_inputs_cache: self.decode_attention_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            write_slot_mapping_cache: self.write_slot_mapping_cache.take(),
-            #[cfg(target_os = "macos")]
-            prefill_memory_snapshot_cache: self.prefill_memory_snapshot_cache.take(),
-            #[cfg(target_os = "macos")]
-            decode_planning_cache: self.decode_planning_cache.take(),
+            meta: self.meta.take_request(),
         })
     }
 
@@ -2573,15 +2362,7 @@ impl PagedKVCacheAdapter {
         self.aux_prefix_unbacked = state.aux_prefix_unbacked;
         self.cold_capture = state.cold_capture;
         #[cfg(target_os = "macos")]
-        {
-            self.prefill_attention_inputs_cache = state.prefill_attention_inputs_cache;
-            self.compact_prefill_inputs_cache = state.compact_prefill_inputs_cache;
-            self.varlen_prefill_inputs_cache = state.varlen_prefill_inputs_cache;
-            self.decode_attention_inputs_cache = state.decode_attention_inputs_cache;
-            self.write_slot_mapping_cache = state.write_slot_mapping_cache;
-            self.prefill_memory_snapshot_cache = state.prefill_memory_snapshot_cache;
-            self.decode_planning_cache = state.decode_planning_cache;
-        }
+        self.meta.install_request(state.meta);
         self.active_seq = Some(seq_id);
     }
 
@@ -4263,7 +4044,7 @@ impl PagedKVCacheAdapter {
         }
         drop(guard);
         #[cfg(target_os = "macos")]
-        self.clear_attention_inputs_caches();
+        self.meta.invalidate(MetadataClear::AttentionInputs);
         Ok(released_count)
     }
 
@@ -4446,7 +4227,7 @@ impl PagedKVCacheAdapter {
         self.request_tokens.extend_from_slice(tokens);
         block_table.set_num_tokens(new_total);
         #[cfg(target_os = "macos")]
-        self.clear_prefill_attention_inputs_cache();
+        self.meta.invalidate(MetadataClear::PrefillInputs);
         Ok(())
     }
 
@@ -4547,7 +4328,7 @@ impl PagedKVCacheAdapter {
         self.request_tokens.truncate(new_len as usize);
         block_table.set_num_tokens(new_len);
         #[cfg(target_os = "macos")]
-        self.clear_prefill_attention_inputs_cache();
+        self.meta.invalidate(MetadataClear::PrefillInputs);
         Ok(())
     }
 
@@ -4720,45 +4501,21 @@ impl PagedKVCacheAdapter {
             .as_ref()
             .map(|table| table.physical_revision())
             .unwrap_or(0);
-        if let Some(cache) = self.write_slot_mapping_cache.as_ref()
-            && cache.token_count == token_count
-            && cache.first_logical_position == first_logical_position
-            && cache.num_tokens == num_tokens
-            && cache.physical_revision == physical_revision
+        if let Some(hit) =
+            self.meta
+                .write_slot_mapping(token_count, first_logical_position, num_tokens, physical_revision)
         {
-            return Ok((
-                cache.slot_mapping.clone(),
-                cache.first_slot,
-                cache.last_slot,
-            ));
+            return Ok(hit);
         }
 
         let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
-        let first_slot = slot_mapping.first().copied().unwrap_or(-1);
-        let last_slot = slot_mapping.last().copied().unwrap_or(-1);
-        let slot_mapping_arr = MxArray::from_int64(&slot_mapping, &[num_tokens as i64])
-            .map_err(|e| format!("update_keys_values_native slot_mapping: {e}"))?;
-        MxArray::eval_arrays(&[&slot_mapping_arr])
-            .map_err(|e| format!("update_keys_values_native slot_mapping eval: {e}"))?;
-
-        self.write_slot_mapping_cache = Some(WriteSlotMappingCache {
+        self.meta.store_write_slot_mapping(
             token_count,
             first_logical_position,
             num_tokens,
             physical_revision,
-            first_slot,
-            last_slot,
-            slot_mapping: slot_mapping_arr,
-        });
-        let cache = self
-            .write_slot_mapping_cache
-            .as_ref()
-            .expect("write_slot_mapping_cache was just populated");
-        Ok((
-            cache.slot_mapping.clone(),
-            cache.first_slot,
-            cache.last_slot,
-        ))
+            slot_mapping,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -5276,7 +5033,7 @@ impl PagedKVCacheAdapter {
         // preparation and command-buffer resource pattern until traced.
         let slot_mapping = if rows.iter().all(|row| row.query_len == 1) {
             self.ensure_ragged_inputs(rows)?;
-            let cache = self.ragged_inputs_cache.as_ref().unwrap();
+            let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
             if let Some(slot) = cache.aliased_slot {
                 return Err(format!(
                     "ragged KV write aliases physical slot {slot} across query rows"
@@ -5442,136 +5199,17 @@ impl PagedKVCacheAdapter {
     /// request, so the block table contains exactly that sequence and
     /// `seq_lens[0]` is the recorded count relative to the first retained block.
     /// Sliding groups omit whole blocks before their live window.
+    ///
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn decode_attention_inputs(&mut self) -> Result<(MxArray, MxArray, u32), String> {
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "gather_kv_for_decode_graph called before reset_for_new_request".to_string()
-        })?;
-        let recorded = block_table.num_tokens();
-        if recorded == 0 {
-            return Err("gather_kv_for_decode_graph called before any tokens recorded".to_string());
-        }
-        // Rebase only dispatch metadata. Cache ownership and RoPE positions
-        // stay absolute; the kernel sees at most window + block_size - 1
-        // positions and applies its existing lower mask to the partial page.
-        let first_block = if self.sliding_window == 0 {
-            0
-        } else {
-            recorded.saturating_sub(self.sliding_window) / self.block_size
-        };
-        let visible_tokens = recorded - first_block * self.block_size;
-        let recorded_i32 = i32::try_from(visible_tokens).map_err(|_| {
-            format!("gather_kv_for_decode_graph: recorded token count {recorded} exceeds i32::MAX")
-        })?;
-        let physical_revision = block_table.physical_revision();
-        let block_count = u32::try_from(
-            block_table
-                .num_blocks()
-                .saturating_sub(first_block as usize),
+        self.meta.decode_attention_inputs(
+            self.block_table.as_ref(),
+            self.sliding_window,
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
         )
-        .map_err(|_| {
-            format!(
-                "gather_kv_for_decode_graph: too many blocks for i32 shape: {}",
-                block_table.num_blocks()
-            )
-        })?;
-        if block_count == 0 {
-            return Err(
-                "gather_kv_for_decode_graph: active request has no allocated blocks".to_string(),
-            );
-        }
-
-        // Every later full-attention layer in this token observes the same
-        // cursor and exact physical table. A populated cache proves the arrays
-        // already passed content validation and synchronous materialization, so
-        // return before rebuilding/scanning the O(blocks) host vector.
-        if let Some(cache) = self.decode_attention_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.physical_revision == physical_revision
-            && cache.block_count == block_count
-            && cache.first_block == first_block
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.block_count,
-            ));
-        }
-
-        let max_seq_len = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "gather_kv_for_decode_graph: max seq len overflow".to_string())?;
-        if visible_tokens > max_seq_len {
-            return Err(format!(
-                "gather_kv_for_decode_graph: recorded token count {recorded} exceeds \
-                 block table capacity {block_count} * {} = {max_seq_len}",
-                self.block_size
-            ));
-        }
-
-        // Cursor advancement normally leaves the physical table unchanged for
-        // `block_size - 1` steps. Reuse its immutable materialized MxArray in
-        // that case; otherwise rebuild and validate the exact ID sequence.
-        let cached_block_table = self
-            .decode_attention_inputs_cache
-            .as_ref()
-            .filter(|cache| {
-                cache.physical_revision == physical_revision
-                    && cache.block_count == block_count
-                    && cache.first_block == first_block
-            })
-            .map(|cache| cache.block_table.clone());
-        let (block_table_arr, rebuilt_block_table) = match cached_block_table {
-            Some(block_table_arr) => (block_table_arr, false),
-            None => {
-                let block_ids: Vec<i32> = block_table.blocks()[first_block as usize..]
-                    .iter()
-                    .map(|block| block.block_id as i32)
-                    .collect();
-                debug_assert_eq!(block_ids.len(), block_count as usize);
-                let pool_block_count = self.layer_kv_pool.num_blocks();
-                for (idx, &block_id) in block_ids.iter().enumerate() {
-                    if block_id < 0 || block_id as u32 >= pool_block_count {
-                        return Err(format!(
-                            "gather_kv_for_decode_graph: block_table[{idx}]={block_id} out of \
-                             range for pool block count {pool_block_count}"
-                        ));
-                    }
-                }
-                let array = MxArray::from_int32(&block_ids, &[1, block_count as i64])
-                    .map_err(|e| format!("gather_kv_for_decode_graph block_table: {e}"))?;
-                (array, true)
-            }
-        };
-        let seq_lens_arr = MxArray::from_int32(&[recorded_i32], &[1])
-            .map_err(|e| format!("gather_kv_for_decode_graph seq_lens: {e}"))?;
-        if rebuilt_block_table {
-            MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
-                .map_err(|e| format!("gather_kv_for_decode_graph metadata eval: {e}"))?;
-        } else {
-            // Never mutate the old scalar array in place: already-scheduled
-            // lazy attention graphs may still retain it as their context lens.
-            MxArray::eval_arrays(&[&seq_lens_arr])
-                .map_err(|e| format!("gather_kv_for_decode_graph seq_lens eval: {e}"))?;
-        }
-
-        self.decode_attention_inputs_cache = Some(DecodePagedAttentionInputsCache {
-            first_block,
-            physical_revision,
-            token_count: recorded,
-            block_count,
-            block_table: block_table_arr,
-            seq_lens: seq_lens_arr,
-        });
-        let cache = self
-            .decode_attention_inputs_cache
-            .as_ref()
-            .expect("decode_attention_inputs_cache was just populated");
-        Ok((
-            cache.block_table.clone(),
-            cache.seq_lens.clone(),
-            cache.block_count,
-        ))
     }
 
     /// Materialize decode metadata for multiple logical requests.
@@ -5601,7 +5239,7 @@ impl PagedKVCacheAdapter {
             })
             .collect::<Result<Vec<_>, String>>()?;
         self.ensure_ragged_inputs(&rows)?;
-        let cache = self.ragged_inputs_cache.as_ref().unwrap();
+        let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
         Ok((
             cache.block_tables.clone(),
             cache.seq_lens.clone(),
@@ -5717,7 +5355,7 @@ impl PagedKVCacheAdapter {
     ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
         if rows.iter().all(|row| row.query_len == 1) {
             self.ensure_ragged_inputs(rows)?;
-            let cache = self.ragged_inputs_cache.as_ref().unwrap();
+            let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
             return Ok((
                 cache.block_tables.clone(),
                 cache.seq_lens.clone(),
@@ -5768,30 +5406,16 @@ impl PagedKVCacheAdapter {
         if rows.is_empty() {
             return Err("ragged metadata requires at least one row".into());
         }
-        if let Some(cache) = self.ragged_inputs_cache.as_ref()
-            && cache.pool_generation == self.layer_kv_pool.generation()
-            && cache.rows.len() == rows.len()
-            && cache.rows.iter().zip(rows).all(|(cached, row)| {
-                let table = if self.active_seq == Some(row.seq_id) {
-                    self.block_table.as_ref()
-                } else {
-                    self.requests
-                        .get(&row.seq_id)
-                        .map(|state| &state.block_table)
-                };
-                cached.row == *row
-                    && table.is_some_and(|table| {
-                        cached.table_identity == table.metadata_identity()
-                            && cached.physical_revision == table.physical_revision()
-                            && cached.token_count == table.num_tokens()
-                    })
+        if let Some(cache) = self.meta.ragged_inputs_cache.as_ref()
+            && cache.matches(rows, self.layer_kv_pool.generation(), |seq_id| {
+                self.block_table_for(seq_id)
             })
         {
             return Ok(());
         }
         // Invalidate before rebuilding so a failed preparation cannot leave a
         // partially matching wave available to a later dispatch.
-        self.ragged_inputs_cache = None;
+        self.meta.invalidate(MetadataClear::RaggedInputs);
         let mut seen = HashSet::with_capacity(rows.len());
         let mut identities = Vec::with_capacity(rows.len());
         let mut slots = Vec::new();
@@ -5843,7 +5467,7 @@ impl PagedKVCacheAdapter {
         let cu_seqlens_q = MxArray::from_int32(&cumulative, &[cumulative.len() as i64])
             .map_err(|error| error.to_string())?;
         MxArray::eval_arrays(&[&slot_mapping, &cu_seqlens_q]).map_err(|error| error.to_string())?;
-        self.ragged_inputs_cache = Some(RaggedPagedInputsCache {
+        self.meta.ragged_inputs_cache = Some(RaggedPagedInputsCache {
             rows: identities,
             pool_generation: self.layer_kv_pool.generation(),
             slot_mapping,
@@ -5915,20 +5539,8 @@ impl PagedKVCacheAdapter {
         max_context_len: u32,
     ) -> u32 {
         if route_hint == PagedDecodeRouteHint::ForceD128 && grouped_stripes == 0 {
-            if let Some((cached_ctx, stripes)) = self.d128_stripe_plan_cache.get()
-                && cached_ctx == max_context_len
-            {
-                return stripes;
-            }
-            let stripes = unsafe {
-                mlx_sys::mlx_paged_grouped_d128_default_stripes(
-                    max_context_len,
-                    self.layer_kv_pool.num_layers() as u32,
-                )
-            };
-            self.d128_stripe_plan_cache
-                .set(Some((max_context_len, stripes)));
-            stripes
+            self.meta
+                .resolve_d128_stripe_plan(max_context_len, self.layer_kv_pool.num_layers() as u32)
         } else {
             grouped_stripes
         }
@@ -6466,184 +6078,49 @@ impl PagedKVCacheAdapter {
     }
 
     /// Build and cache a compact one-dimensional physical block-ID array for
-    /// the first `required_tokens` logical positions of the active request.
-    /// Both graph-native prefill paths consume this representation: varlen
-    /// attention reshapes it to one block-table row, while SDPA gathering uses
-    /// it directly as the `take(axis=0)` index vector.
-    #[cfg(target_os = "macos")]
-    fn compact_prefill_block_ids(
-        &mut self,
-        required_tokens: u32,
-    ) -> Result<(MxArray, u32), String> {
-        self.compact_prefill_block_ids_from(required_tokens, 0)
-    }
-
+    /// `required_tokens` logical positions of the active request, starting at
+    /// `first_block`. Both graph-native prefill paths consume this
+    /// representation: varlen attention reshapes it to one block-table row,
+    /// while SDPA gathering uses it directly as the `take(axis=0)` index
+    /// vector.
+    ///
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn compact_prefill_block_ids_from(
         &mut self,
         required_tokens: u32,
         first_block: u32,
     ) -> Result<(MxArray, u32), String> {
-        if required_tokens == 0 {
-            return Err("compact prefill block IDs require at least one token".to_string());
-        }
-        if required_tokens > i32::MAX as u32 {
-            return Err(format!(
-                "compact prefill required token count {required_tokens} exceeds i32::MAX"
-            ));
-        }
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "compact prefill block IDs requested before reset_for_new_request".to_string()
-        })?;
-        let recorded = block_table.num_tokens();
-        if recorded < required_tokens {
-            return Err(format!(
-                "compact prefill: recorded token count {recorded} is less than required \
-                 token count {required_tokens}; call record_tokens first"
-            ));
-        }
-
-        if let Some(cache) = self.compact_prefill_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.required_tokens == required_tokens
-            && cache.first_block == first_block
-        {
-            return Ok((cache.block_ids.clone(), cache.block_count));
-        }
-
-        let end_block = required_tokens.div_ceil(self.block_size) as usize;
-        let blocks = block_table
-            .blocks()
-            .get(first_block as usize..end_block)
-            .ok_or_else(|| "compact prefill: block range exceeds recorded capacity".to_string())?;
-        let block_ids: Vec<i32> = blocks.iter().map(|block| block.block_id as i32).collect();
-        if block_ids.is_empty() {
-            return Err("compact prefill: active request has no allocated blocks".to_string());
-        }
-        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
-            format!(
-                "compact prefill: too many blocks for i32 shape: {}",
-                block_ids.len()
-            )
-        })?;
-        let pool_block_count = self.layer_kv_pool.num_blocks();
-        for (idx, &block_id) in block_ids.iter().enumerate() {
-            if block_id < 0 || block_id as u32 >= pool_block_count {
-                return Err(format!(
-                    "compact prefill: block_table[{idx}]={block_id} out of range for \
-                     pool block count {pool_block_count}"
-                ));
-            }
-        }
-        let capacity = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "compact prefill block capacity overflow".to_string())?;
-        if required_tokens.saturating_sub(first_block * self.block_size) > capacity {
-            return Err(format!(
-                "compact prefill: required token count {required_tokens} exceeds block \
-                 table capacity {block_count} * {} = {capacity}",
-                self.block_size
-            ));
-        }
-
-        let block_ids_arr = MxArray::from_int32(&block_ids, &[block_count as i64])
-            .map_err(|e| format!("compact prefill block IDs: {e}"))?;
-        MxArray::eval_arrays(&[&block_ids_arr])
-            .map_err(|e| format!("compact prefill block ID eval: {e}"))?;
-        self.compact_prefill_inputs_cache = Some(CompactPrefillInputsCache {
-            first_block,
-            token_count: recorded,
+        self.meta.compact_prefill_block_ids(
+            self.block_table.as_ref(),
             required_tokens,
-            block_count,
-            block_ids: block_ids_arr,
-        });
-        let cache = self
-            .compact_prefill_inputs_cache
-            .as_ref()
-            .expect("compact_prefill_inputs_cache was just populated");
-        Ok((cache.block_ids.clone(), cache.block_count))
+            first_block,
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
+        )
     }
 
     /// Build the compact metadata for a single continuing prefill sequence.
     /// The block table has shape `[1, block_count]`, `seq_lens` contains the
     /// complete context length after the chunk, and `cu_seqlens_q=[0,q_len]`
     /// assigns every query row to that one sequence.
+    ///
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn varlen_prefill_attention_inputs(
         &mut self,
         cached_prefix_len: u32,
         query_len: u32,
     ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
-        if query_len == 0 {
-            return Err("varlen prefill requires query_len > 0".to_string());
-        }
-        let total_context = cached_prefix_len
-            .checked_add(query_len)
-            .ok_or_else(|| "varlen prefill total context overflow".to_string())?;
-        if total_context > i32::MAX as u32 || query_len > i32::MAX as u32 {
-            return Err(format!(
-                "varlen prefill metadata exceeds int32 range \
-                 (query_len={query_len}, total_context={total_context})"
-            ));
-        }
-        let recorded = self
-            .block_table
-            .as_ref()
-            .ok_or_else(|| "varlen prefill requested before reset_for_new_request".to_string())?
-            .num_tokens();
-        if recorded < total_context {
-            return Err(format!(
-                "varlen prefill: recorded token count {recorded} is less than \
-                 cached_prefix_len + query_len ({cached_prefix_len} + {query_len} = \
-                 {total_context}); call record_tokens for the whole chunk first"
-            ));
-        }
-
-        if let Some(cache) = self.varlen_prefill_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.cached_prefix_len == cached_prefix_len
-            && cache.query_len == query_len
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.cu_seqlens_q.clone(),
-                cache.block_count,
-                total_context,
-            ));
-        }
-
-        let (block_ids, block_count) = self.compact_prefill_block_ids(total_context)?;
-        let block_table = block_ids
-            .reshape(&[1, block_count as i64])
-            .map_err(|e| format!("varlen prefill block_table reshape: {e}"))?;
-        let seq_lens = MxArray::from_int32(&[total_context as i32], &[1])
-            .map_err(|e| format!("varlen prefill seq_lens: {e}"))?;
-        let cu_seqlens_q = MxArray::from_int32(&[0, query_len as i32], &[2])
-            .map_err(|e| format!("varlen prefill cu_seqlens_q: {e}"))?;
-        MxArray::eval_arrays(&[&block_table, &seq_lens, &cu_seqlens_q])
-            .map_err(|e| format!("varlen prefill metadata eval: {e}"))?;
-
-        self.varlen_prefill_inputs_cache = Some(VarlenPrefillInputsCache {
-            token_count: recorded,
+        self.meta.varlen_prefill_attention_inputs(
+            self.block_table.as_ref(),
             cached_prefix_len,
             query_len,
-            block_count,
-            block_table,
-            seq_lens,
-            cu_seqlens_q,
-        });
-        let cache = self
-            .varlen_prefill_inputs_cache
-            .as_ref()
-            .expect("varlen_prefill_inputs_cache was just populated");
-        Ok((
-            cache.block_table.clone(),
-            cache.seq_lens.clone(),
-            cache.cu_seqlens_q.clone(),
-            cache.block_count,
-            total_context,
-        ))
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
+        )
     }
 
     /// Graph-native compact paged attention for a multi-token prefill suffix.
@@ -7171,125 +6648,21 @@ impl PagedKVCacheAdapter {
             .map_err(|e| format!("gather_kv_for_prefill_chunk: failed to wrap output array: {e}"))
     }
 
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn prefill_attention_inputs(
         &mut self,
         cached_prefix_len: u32,
         num_new_tokens: u32,
     ) -> Result<(MxArray, MxArray, u32), String> {
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "gather_kv_for_prefill_chunk called before reset_for_new_request".to_string()
-        })?;
-        let recorded = block_table.num_tokens();
-        let expected_total = cached_prefix_len
-            .checked_add(num_new_tokens)
-            .ok_or_else(|| "gather_kv_for_prefill_chunk: token count overflow".to_string())?;
-        if recorded < expected_total {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk: recorded token count {recorded} is less than \
-                 cached_prefix_len + num_new_tokens ({cached_prefix_len} + {num_new_tokens} = \
-                 {expected_total}); call record_tokens for the whole chunk first"
-            ));
-        }
-
-        if let Some(cache) = self.prefill_attention_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.cached_prefix_len == cached_prefix_len
-            && cache.num_new_tokens == num_new_tokens
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.block_count,
-            ));
-        }
-
-        let block_ids =
-            build_prefill_block_ids_for_total(block_table, expected_total, self.block_size)
-                .map_err(|e| format!("gather_kv_for_prefill_chunk: {e}"))?;
-        if block_ids.is_empty() {
-            return Err(
-                "gather_kv_for_prefill_chunk: active request has no allocated blocks".to_string(),
-            );
-        }
-        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
-            format!(
-                "gather_kv_for_prefill_chunk: too many blocks for i32 shape: {}",
-                block_ids.len()
-            )
-        })?;
-        let pool_block_count = self.layer_kv_pool.num_blocks();
-        for (idx, &block_id) in block_ids.iter().enumerate() {
-            if block_id < 0 || block_id as u32 >= pool_block_count {
-                return Err(format!(
-                    "gather_kv_for_prefill_chunk: block_table[{idx}]={block_id} out of \
-                     range for pool block count {pool_block_count}"
-                ));
-            }
-        }
-        let max_seq_len = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "gather_kv_for_prefill_chunk: max seq len overflow".to_string())?;
-        if expected_total > max_seq_len {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk: expected total tokens {expected_total} exceeds \
-                 block table capacity {block_count} * {} = {max_seq_len}",
-                self.block_size
-            ));
-        }
-        if recorded > expected_total && inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] paged_kv prefill_attention_inputs_prefix_replay recorded_tokens={} required_tokens={} cached_prefix={} num_new_tokens={} block_count={}",
-                recorded, expected_total, cached_prefix_len, num_new_tokens, block_count
-            ));
-        }
-
-        let num_new_usize = num_new_tokens as usize;
-        let block_count_usize = block_count as usize;
-        let mut duplicated_blocks = Vec::with_capacity(num_new_usize * block_count_usize);
-        for _ in 0..num_new_tokens {
-            duplicated_blocks.extend_from_slice(&block_ids);
-        }
-
-        let mut seq_lens = Vec::with_capacity(num_new_usize);
-        for i in 0..num_new_tokens {
-            let seq_len = cached_prefix_len
-                .checked_add(i + 1)
-                .ok_or_else(|| "gather_kv_for_prefill_chunk: seq_len overflow".to_string())?;
-            seq_lens.push(seq_len as i32);
-        }
-
-        let block_table_arr = MxArray::from_int32(
-            &duplicated_blocks,
-            &[num_new_tokens as i64, block_count as i64],
-        )
-        .map_err(|e| format!("gather_kv_for_prefill_chunk block_table: {e}"))?;
-        let seq_lens_arr = MxArray::from_int32(&seq_lens, &[num_new_tokens as i64])
-            .map_err(|e| format!("gather_kv_for_prefill_chunk seq_lens: {e}"))?;
-        // Keep the metadata MxArrays cached for the whole prefill chunk. The
-        // FFI bridge consumes these exact arrays; it must not wrap them in lazy
-        // metadata copies before `PagedAttention::eval_gpu` performs host-side
-        // bounds checks.
-        MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
-            .map_err(|e| format!("gather_kv_for_prefill_chunk metadata eval: {e}"))?;
-
-        self.prefill_attention_inputs_cache = Some(PrefillPagedAttentionInputsCache {
-            token_count: recorded,
+        self.meta.prefill_attention_inputs(
+            self.block_table.as_ref(),
             cached_prefix_len,
             num_new_tokens,
-            block_count,
-            block_table: block_table_arr,
-            seq_lens: seq_lens_arr,
-        });
-        let cache = self
-            .prefill_attention_inputs_cache
-            .as_ref()
-            .expect("prefill_attention_inputs_cache was just populated");
-        Ok((
-            cache.block_table.clone(),
-            cache.seq_lens.clone(),
-            cache.block_count,
-        ))
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
+        )
     }
 
     /// Non-macOS stub.
@@ -8118,7 +7491,7 @@ impl PagedKVCacheAdapter {
             // partially failed lifecycle transition. Never let graph arrays or
             // request-shaped metadata outlive the request table they describe.
             #[cfg(target_os = "macos")]
-            self.clear_active_request_graph_state();
+            self.meta.invalidate(MetadataClear::ActiveRequest);
             return Ok(0);
         };
 
@@ -8140,7 +7513,7 @@ impl PagedKVCacheAdapter {
             Ok(guard) => guard,
             Err(error) => {
                 #[cfg(target_os = "macos")]
-                self.clear_active_request_graph_state();
+                self.meta.invalidate(MetadataClear::ActiveRequest);
                 return Err(format!("BlockAllocator mutex poisoned: {error}"));
             }
         };
@@ -8162,8 +7535,8 @@ impl PagedKVCacheAdapter {
         self.cold_capture = ColdCaptureOutcome::default();
         #[cfg(target_os = "macos")]
         {
-            self.prefill_attention_inputs_cache = None;
-            self.clear_active_request_graph_state();
+            self.meta.request.prefill_attention_inputs_cache = None;
+            self.meta.invalidate(MetadataClear::ActiveRequest);
         }
         // Defense-in-depth: clear the registration flag so a subsequent
         // reset_for_new_request → register flow on this adapter works
@@ -8186,7 +7559,7 @@ impl PagedKVCacheAdapter {
     pub fn release_all_requests(&mut self) -> Result<u32, String> {
         #[cfg(target_os = "macos")]
         {
-            self.ragged_inputs_cache = None;
+            self.meta.invalidate(MetadataClear::RaggedInputs);
         }
         let mut released = 0u32;
         if self.active_seq.is_some() {
@@ -8316,7 +7689,7 @@ impl PagedKVCacheAdapter {
         // a duplicate finalize after an error path doesn't double-register).
         if self.already_registered {
             #[cfg(target_os = "macos")]
-            self.clear_attention_inputs_caches();
+            self.meta.invalidate(MetadataClear::AttentionInputs);
             return Ok(0);
         }
         // Reuse `register_full_blocks_for_reuse`'s implementation for the
@@ -8324,7 +7697,7 @@ impl PagedKVCacheAdapter {
         // `release_request` after it.
         let result = self.register_full_blocks_for_reuse(extra_keys, cache_salt);
         #[cfg(target_os = "macos")]
-        self.clear_attention_inputs_caches();
+        self.meta.invalidate(MetadataClear::AttentionInputs);
         result
     }
 
@@ -8358,13 +7731,13 @@ impl PagedKVCacheAdapter {
         self.ensure_aux_prefix_primed("finalize_turn_keep_live_per_block")?;
         if self.already_registered {
             #[cfg(target_os = "macos")]
-            self.clear_attention_inputs_caches();
+            self.meta.invalidate(MetadataClear::AttentionInputs);
             return Ok(0);
         }
         let result =
             self.register_full_blocks_for_reuse_per_block(extra_keys_per_block, cache_salt);
         #[cfg(target_os = "macos")]
-        self.clear_attention_inputs_caches();
+        self.meta.invalidate(MetadataClear::AttentionInputs);
         result
     }
 
@@ -8461,7 +7834,7 @@ impl PagedKVCacheAdapter {
             self.aux_prefix_unbacked = false;
             self.restored_sidecar = None;
             #[cfg(target_os = "macos")]
-            self.clear_active_request_graph_state();
+            self.meta.invalidate(MetadataClear::ActiveRequest);
             return Ok((prior_token_count, 0));
         }
 
@@ -8529,8 +7902,8 @@ impl PagedKVCacheAdapter {
         self.restored_sidecar = None;
         #[cfg(target_os = "macos")]
         {
-            self.clear_attention_inputs_caches();
-            self.clear_decode_planning_cache();
+            self.meta.invalidate(MetadataClear::AttentionInputs);
+            self.meta.invalidate(MetadataClear::DecodePlanning);
         }
 
         Ok((prior_token_count, newly_allocated))
@@ -8563,7 +7936,7 @@ impl PagedKVCacheAdapter {
         self.already_registered = true;
         self.prefix_lookup_done = true;
         #[cfg(target_os = "macos")]
-        self.clear_active_request_graph_state();
+        self.meta.invalidate(MetadataClear::ActiveRequest);
         Ok(())
     }
 
@@ -8665,26 +8038,10 @@ impl PagedKVCacheAdapter {
 
         #[cfg(target_os = "macos")]
         {
-            if let Some((cached_heads, cached_result)) = self.grouped_d512_capability_cache.as_ref()
-                && *cached_heads == num_query_heads
-            {
-                return cached_result.clone();
-            }
-            let result = unsafe {
-                mlx_sys::mlx_paged_grouped_d512_capability(
-                    num_query_heads,
-                    self.layer_kv_pool.config().num_kv_heads as i32,
-                )
-            };
-            let result = match result {
-                1 => Ok(true),
-                0 => Ok(false),
-                other => Err(format!(
-                    "grouped D512 capability probe failed with status {other}"
-                )),
-            };
-            self.grouped_d512_capability_cache = Some((num_query_heads, result.clone()));
-            result
+            self.meta.grouped_d512_capability(
+                num_query_heads,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+            )
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8724,19 +8081,11 @@ impl PagedKVCacheAdapter {
     ) -> PagedPrefillMemorySnapshot {
         #[cfg(target_os = "macos")]
         {
-            if let Some(cached) = self.decode_planning_cache
-                && cached.context_bucket_end == context_bucket_end
-            {
-                return cached.snapshot;
+            if let Some(snapshot) = self.meta.decode_planning_snapshot(context_bucket_end) {
+                return snapshot;
             }
             let snapshot = Self::probe_prefill_memory_snapshot(self);
-            self.decode_planning_cache = Some(DecodePlanningCache {
-                context_bucket_end,
-                snapshot,
-                sdpa_failed: false,
-                reported_route_signature: None,
-                fallback_reported: false,
-            });
+            self.meta.init_decode_planning(context_bucket_end, snapshot);
             snapshot
         }
 
@@ -8751,9 +8100,7 @@ impl PagedKVCacheAdapter {
     pub fn decode_sdpa_failed(&self, context_bucket_end: u32) -> bool {
         #[cfg(target_os = "macos")]
         {
-            self.decode_planning_cache.is_some_and(|cached| {
-                cached.context_bucket_end == context_bucket_end && cached.sdpa_failed
-            })
+            self.meta.decode_sdpa_failed(context_bucket_end)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8766,12 +8113,7 @@ impl PagedKVCacheAdapter {
     /// Latch an SDPA construction/gather failure for the rest of this bucket.
     pub fn mark_decode_sdpa_failed(&mut self, context_bucket_end: u32) {
         #[cfg(target_os = "macos")]
-        if let Some(cached) = self.decode_planning_cache.as_mut()
-            && cached.context_bucket_end == context_bucket_end
-        {
-            cached.sdpa_failed = true;
-            cached.reported_route_signature = None;
-        }
+        self.meta.mark_decode_sdpa_failed(context_bucket_end);
 
         #[cfg(not(target_os = "macos"))]
         let _ = context_bucket_end;
@@ -8781,17 +8123,8 @@ impl PagedKVCacheAdapter {
     pub fn should_report_decode_route(&mut self, context_bucket_end: u32, signature: u64) -> bool {
         #[cfg(target_os = "macos")]
         {
-            let Some(cached) = self.decode_planning_cache.as_mut() else {
-                return true;
-            };
-            if cached.context_bucket_end != context_bucket_end {
-                return true;
-            }
-            if cached.reported_route_signature == Some(signature) {
-                return false;
-            }
-            cached.reported_route_signature = Some(signature);
-            true
+            self.meta
+                .should_report_decode_route(context_bucket_end, signature)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8805,14 +8138,7 @@ impl PagedKVCacheAdapter {
     pub fn should_report_decode_fallback(&mut self, context_bucket_end: u32) -> bool {
         #[cfg(target_os = "macos")]
         {
-            let Some(cached) = self.decode_planning_cache.as_mut() else {
-                return true;
-            };
-            if cached.context_bucket_end != context_bucket_end || cached.fallback_reported {
-                return false;
-            }
-            cached.fallback_reported = true;
-            true
+            self.meta.should_report_decode_fallback(context_bucket_end)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8828,62 +8154,18 @@ impl PagedKVCacheAdapter {
         probe: impl FnOnce(&Self) -> PagedPrefillMemorySnapshot,
     ) -> PagedPrefillMemorySnapshot {
         let token_count = self.current_token_count();
-        if let Some(cached) = self.prefill_memory_snapshot_cache
-            && cached.token_count == token_count
-        {
-            return cached.snapshot;
+        if let Some(snapshot) = self.meta.prefill_memory_snapshot(token_count) {
+            return snapshot;
         }
 
         let snapshot = probe(self);
-        self.prefill_memory_snapshot_cache = Some(PrefillMemorySnapshotCache {
-            token_count,
-            snapshot,
-        });
+        self.meta.store_prefill_memory_snapshot(token_count, snapshot);
         snapshot
     }
 
     #[cfg(target_os = "macos")]
     fn probe_prefill_memory_snapshot(&self) -> PagedPrefillMemorySnapshot {
-        let mut active = 0u64;
-        let mut cached = 0u64;
-        let mut limit = 0u64;
-        let allocator_ok = unsafe {
-            mlx_sys::mlx_get_active_memory(&mut active) == 0
-                && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
-                && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
-                && limit > 0
-        };
-
-        let metal = mlx_paged_attn::metal::MetalState::get()
-            .ok()
-            .map(|state| {
-                (
-                    state.device.recommended_max_working_set_size(),
-                    state.device.current_allocated_size(),
-                )
-            })
-            .filter(|(recommended, _)| *recommended > 0);
-        let pool_cfg = self.layer_kv_pool.config();
-        let paged_pool_allocated_bytes = mlx_paged_attn::profile::bytes_per_block(
-            self.layer_kv_pool.num_layers() as u32,
-            pool_cfg.num_kv_heads,
-            pool_cfg.head_size,
-            pool_cfg.block_size,
-            self.layer_kv_pool.cache_dtype(),
-        )
-        .ok()
-        .map(|bytes_per_block| {
-            bytes_per_block.saturating_mul(self.layer_kv_pool.num_blocks() as u64)
-        });
-
-        PagedPrefillMemorySnapshot {
-            allocator_active_bytes: allocator_ok.then_some(active),
-            allocator_cached_bytes: allocator_ok.then_some(cached),
-            allocator_limit_bytes: allocator_ok.then_some(limit),
-            metal_recommended_working_set_bytes: metal.map(|(recommended, _)| recommended),
-            metal_current_allocated_bytes: metal.map(|(_, current)| current),
-            paged_pool_allocated_bytes,
-        }
+        super::paged_metadata_cache::probe_prefill_memory_snapshot(&self.layer_kv_pool)
     }
 
     pub fn cached_token_count(&self) -> u32 {
@@ -12613,6 +11895,8 @@ mod tests {
             .decode_attention_inputs()
             .expect("populate decode metadata");
         let stale = adapter
+            .meta
+            .request
             .decode_attention_inputs_cache
             .take()
             .expect("decode cache populated");
@@ -12620,10 +11904,10 @@ mod tests {
         assert_eq!(adapter.release_request().unwrap(), 1);
         // Recreate the historical bad state: no request table, but a stale
         // graph metadata cache survived a prior failed cleanup.
-        adapter.decode_attention_inputs_cache = Some(stale);
+        adapter.meta.request.decode_attention_inputs_cache = Some(stale);
         assert_eq!(adapter.release_request().unwrap(), 0);
         assert!(
-            adapter.decode_attention_inputs_cache.is_none(),
+            adapter.meta.request.decode_attention_inputs_cache.is_none(),
             "idempotent release must repair stale request-shaped metadata"
         );
     }
@@ -12664,7 +11948,7 @@ mod tests {
         );
         assert_eq!(adapter.request_tokens(), &[1, 2, 3, 4]);
         assert!(
-            adapter.decode_attention_inputs_cache.is_none(),
+            adapter.meta.request.decode_attention_inputs_cache.is_none(),
             "failed release must still clear graph-native metadata"
         );
     }
@@ -13067,7 +12351,7 @@ mod tests {
             let started = Instant::now();
             for _ in 0..1000 {
                 if rebuild {
-                    adapter.ragged_inputs_cache = None;
+                    adapter.meta.ragged_inputs_cache = None;
                 }
                 black_box(adapter.ragged_attention_inputs(&rows).unwrap());
             }
@@ -13096,6 +12380,7 @@ mod tests {
             .update_keys_values_native_batched(0, &values, &values, &[(1, 3), (2, 3)])
             .unwrap();
         let slots = adapter
+            .meta
             .ragged_inputs_cache
             .as_ref()
             .unwrap()
@@ -13108,6 +12393,7 @@ mod tests {
         assert_eq!(
             slots.as_raw_ptr(),
             adapter
+                .meta
                 .ragged_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13165,6 +12451,7 @@ mod tests {
         ];
         let (tables, lens, cumulative, _, _) = adapter.ragged_attention_inputs(&rows).unwrap();
         let slots = adapter
+            .meta
             .ragged_inputs_cache
             .as_ref()
             .unwrap()
@@ -13179,6 +12466,7 @@ mod tests {
         assert_eq!(
             slots.as_raw_ptr(),
             adapter
+                .meta
                 .ragged_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13201,6 +12489,7 @@ mod tests {
         assert_eq!(replaced.item_at_int32(1).unwrap(), replacement_id as i32);
         assert_eq!(
             adapter
+                .meta
                 .ragged_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13341,6 +12630,8 @@ mod tests {
         let a_revision = adapter.block_table().unwrap().physical_revision();
         assert_eq!(
             adapter
+                .meta
+                .request
                 .decode_attention_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13360,6 +12651,8 @@ mod tests {
         adapter.decode_attention_inputs().unwrap();
         assert_eq!(
             adapter
+                .meta
+                .request
                 .decode_attention_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13390,7 +12683,12 @@ mod tests {
         // newer token cursor or materialized block table.
         adapter.activate_request(1).unwrap();
         let (_, _, a_block_count) = adapter.decode_attention_inputs().unwrap();
-        let a_cache = adapter.decode_attention_inputs_cache.as_ref().unwrap();
+        let a_cache = adapter
+            .meta
+            .request
+            .decode_attention_inputs_cache
+            .as_ref()
+            .unwrap();
         assert_eq!(a_cache.token_count, 4);
         assert_eq!(a_cache.physical_revision, a_revision);
         assert_eq!(a_cache.block_count, a_block_count);
@@ -14698,7 +13996,7 @@ mod tests {
         let (first_request_table, _, _) = adapter.decode_attention_inputs().unwrap();
         adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         adapter.release_request().unwrap();
-        assert!(adapter.decode_attention_inputs_cache.is_none());
+        assert!(adapter.meta.request.decode_attention_inputs_cache.is_none());
 
         adapter.reset_for_new_request(1).unwrap();
         let prefix = adapter

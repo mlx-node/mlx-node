@@ -42,11 +42,13 @@ use crate::engine::paged_epilogue::{
     finalize_single_adapter_turn, prime_single_adapter_prefix, reconcile_paged_surplus,
     save_paged_token_history,
 };
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::models::forward as fwd;
 use crate::nn::{Embedding, GroupedRMSNorm, Linear};
 use crate::profiling::PerformanceMetrics;
-use crate::stream::{Stream, StreamContext};
+use crate::stream::Stream;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::{
@@ -156,22 +158,8 @@ pub(crate) fn init_caches(config: &K2HorizonConfig) -> Vec<KVCache> {
 
 /// Force-materialize every live flat-cache array (post-prefill sync).
 fn eval_kv_caches(caches: &[KVCache]) -> Result<()> {
-    let mut arrays: Vec<&MxArray> = Vec::new();
-    for cache in caches {
-        if let Some(k) = cache.keys_ref() {
-            arrays.push(k);
-        }
-        if let Some(v) = cache.values_ref() {
-            arrays.push(v);
-        }
-    }
-    if !arrays.is_empty() {
-        MxArray::eval_arrays(&arrays)?;
-    }
-    Ok(())
+    fwd::eval_layer_caches(caches)
 }
-
-const PREFILL_STEP_SIZE: i64 = 2048;
 
 impl K2Inner {
     /// Construct `K2Inner` from the parsed config. Weight tensors are
@@ -442,11 +430,14 @@ impl K2Inner {
     /// Forward pass through the full model on the flat `KVCache` stack.
     /// Returns logits `[B, T, vocab]`.
     pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
-        let mut h = self.embed_tokens.forward(input_ids)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, None, Some(&mut self.caches[i]))?;
-        }
-        h = self.norm.forward(&h)?;
+        let h = fwd::forward_body_normed(
+            input_ids,
+            &self.embed_tokens,
+            &mut self.layers,
+            &mut self.caches,
+            &self.norm,
+            |layer, h, caches, i| layer.forward(h, None, Some(&mut caches[i])),
+        )?;
         self.project_logits(&h)
     }
 
@@ -456,11 +447,11 @@ impl K2Inner {
     /// through the shared embedding table (`as_linear` covers dense and
     /// packed embeds alike), matching the qwen3/lfm2 convention.
     fn project_logits(&self, hidden_states: &MxArray) -> Result<MxArray> {
-        if self.config.tie_word_embeddings {
-            self.embed_tokens.as_linear(hidden_states)
-        } else {
-            self.lm_head.forward(hidden_states)
-        }
+        fwd::project_logits(
+            hidden_states,
+            (!self.config.tie_word_embeddings).then_some(&self.lm_head),
+            &self.embed_tokens,
+        )
     }
 
     /// Chunked flat prefill (2048-token chunks, per-chunk cache evals).
@@ -477,41 +468,16 @@ impl K2Inner {
                 cache.trim(cache.get_offset() - 1);
             }
         }
-        let total_len = prompt.shape_at(1)?;
-        let mut offset: i64 = 0;
-        while total_len - offset > PREFILL_STEP_SIZE {
-            // Cooperative-cancel checkpoint: abort at the chunk boundary;
-            // the Err rides `fail_closed_flat_turn` (cache reset + no save).
-            if self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
-            }
-            let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
-            {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                let _logits = self.forward(&chunk)?;
-            }
-            eval_kv_caches(&self.caches)?;
-            crate::array::clear_cache();
-            offset += PREFILL_STEP_SIZE;
-        }
-        if offset > 0
-            && self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-        {
-            return Err(Error::from_reason("prefill cancelled"));
-        }
-        let remaining = prompt.slice_axis(1, offset, total_len)?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            self.forward(&remaining)?
-        };
-        Ok(logits)
+        fwd::chunked_prefill(
+            self,
+            prompt,
+            generation_stream,
+            fwd::PREFILL_STEP_SIZE,
+            true,
+            |inner: &K2Inner| inner.turn_cancel.as_deref(),
+            |inner, chunk, _is_final| inner.forward(chunk),
+            |inner| fwd::eval_caches_and_clear(&inner.caches),
+        )
     }
 
     /// Reset all caches and cached token history (both reset scopes share
@@ -542,16 +508,14 @@ impl K2Inner {
         generated_tokens: &[u32],
         last_token_in_cache: bool,
     ) {
-        if reuse_cache {
-            let mut full_history = tokens.to_vec();
-            let history_tokens = if !last_token_in_cache && !generated_tokens.is_empty() {
-                &generated_tokens[..generated_tokens.len() - 1]
-            } else {
-                generated_tokens
-            };
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
-        } else {
+        if !fwd::save_flat_token_history(
+            tokens,
+            generated_tokens,
+            last_token_in_cache,
+            reuse_cache,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        ) {
             self.reset_caches_internal();
         }
     }
@@ -684,12 +648,9 @@ impl K2Inner {
     /// Final grouped norm + lm_head over the last position only.
     /// `hidden_states`: `[1, T, hidden]` → `[vocab]`.
     fn project_last_token_logits(&self, hidden_states: &MxArray) -> Result<MxArray> {
-        let normed = self.norm.forward(hidden_states)?;
-        let logits = self.project_logits(&normed)?;
-        let seq_len = logits.shape_at(1)?;
-        logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[0, 1]))
+        fwd::project_last_token_logits(hidden_states, &self.norm, |normed| {
+            self.project_logits(normed)
+        })
     }
 
     /// One paged decode step: record the token, embed, per-layer paged
@@ -975,55 +936,34 @@ impl DecodeStep for K2Decode<'_> {
     }
 }
 
-/// Paged decode stepper (the paged analog of [`K2Decode`]); each `forward`
-/// runs the eager paged step through `run_paged_decode_step`.
+/// Paged decode state (the paged analog of [`K2Decode`]); wrapped by
+/// [`PagedStepper`] for the `DecodeStep` impl. Each `paged_step` runs the
+/// eager paged step through `run_paged_decode_step`.
 pub(crate) struct K2PagedDecode<'a> {
     inner: &'a mut K2Inner,
 }
 
-impl DecodeStep for K2PagedDecode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        // Not on the hot path — the engine drives `forward_with_token`
-        // (which hands the scalar the loop already read). Kept for trait
-        // parity; extract then delegate.
-        let token_id = input_ids.item_at_int32(0)? as u32;
-        self.forward_with_token(input_ids, token_id)
+impl PagedStepModel for K2PagedDecode<'_> {
+    /// `SyncToken`: a single synchronous eval pulls logits AND the paged
+    /// K/V writes through the dependency chain (one sync wait); the
+    /// loop-top `y.eval()` then no-ops.
+    const EVAL: EvalPolicy = EvalPolicy::SyncToken;
+    /// Pure-KV paged model: the placeholder record reserves the write
+    /// slot (count-derived), the drained id patches it at commit, and a
+    /// terminal step rewinds the record — no out-of-band state
+    /// (conv/recurrent/MTP) to undo.
+    const PIPELINED: bool = true;
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::KeepAllOnLength;
+
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
+        self.inner.run_paged_decode_step(token_id)
     }
 
-    fn forward_with_token(
-        &mut self,
-        _input_ids: &MxArray,
-        token_id: u32,
-    ) -> Result<(MxArray, bool)> {
-        // `run_paged_decode_step` returns [1, 1, vocab]; squeeze([1]) here
-        // → [1, vocab], so `needs_squeeze = false` (lfm2 polarity, NOT
-        // qwen3's — the squeeze lives in this body).
-        let logits = self
-            .inner
-            .run_paged_decode_step(token_id)?
-            .squeeze(Some(&[1]))?;
-        Ok((logits, false))
+    fn paged_step_lazy(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        self.inner.run_paged_decode_step_lazy(input_ids)
     }
 
-    fn supports_token_pipeline(&self) -> bool {
-        // Pure-KV paged stepper: the placeholder record reserves the
-        // write slot (count-derived), the drained id patches it at
-        // commit, and a terminal step rewinds the record — no
-        // out-of-band state (conv/recurrent/MTP) to undo.
-        true
-    }
-
-    fn forward_with_lazy_token(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        // Same squeeze polarity as `forward_with_token`: the body
-        // collapses [1, 1, vocab] -> [1, vocab], so `needs_squeeze = false`.
-        let logits = self
-            .inner
-            .run_paged_decode_step_lazy(input_ids)?
-            .squeeze(Some(&[1]))?;
-        Ok((logits, false))
-    }
-
-    fn commit_lazy_token(&mut self, token_id: u32) -> Result<()> {
+    fn commit_placeholder(&mut self, token_id: u32) -> Result<()> {
         self.inner
             .paged_adapter
             .as_mut()
@@ -1032,7 +972,7 @@ impl DecodeStep for K2PagedDecode<'_> {
             .map_err(Error::from_reason)
     }
 
-    fn rollback_lazy_step(&mut self) -> Result<()> {
+    fn rollback_placeholder(&mut self) -> Result<()> {
         // Bookkeeping-only rewind — the same idempotent primitive the
         // batched record-failure path already uses
         // (`run_paged_decode_step_batched`). The speculatively written KV
@@ -1046,18 +986,7 @@ impl DecodeStep for K2PagedDecode<'_> {
             .map_err(Error::from_reason)
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single synchronous eval pulls logits AND the paged K/V writes
-        // through the dependency chain (one sync wait); the loop-top
-        // `y.eval()` then no-ops.
-        next_token.eval();
-    }
-
-    fn maintain_cache(&mut self, step: i32) {
-        crate::array::maybe_clear_cache_for_paged_step(step);
-    }
-
-    fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+    fn materialize_final_token(&mut self, token_id: u32) -> Result<()> {
         // PAGED + pure-KV (qwen3 convention, NOT lfm2's): record + forward
         // the final length-exit token so `request_tokens()` equals the
         // keep-all history — the pipelined decode loop never forwards the
@@ -1094,7 +1023,7 @@ impl K2Inner {
 
 impl PagedBackend for K2Inner {
     type PagedDecode<'a>
-        = K2PagedDecode<'a>
+        = PagedStepper<K2PagedDecode<'a>>
     where
         Self: 'a;
     type PrefixState = K2PrefixState;
@@ -1122,7 +1051,7 @@ impl PagedBackend for K2Inner {
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
-        Ok(K2PagedDecode { inner: self })
+        Ok(PagedStepper(K2PagedDecode { inner: self }))
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
@@ -1392,9 +1321,7 @@ impl ChatBackend for K2Inner {
         let token_arr: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         let prompt = MxArray::from_int32(&token_arr, &[1, prompt_tokens.len() as i64])?;
         let logits = self.chunked_prefill(&prompt, stream)?;
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        last_logits.squeeze(Some(&[1]))
+        fwd::slice_last_logits_keep_batch(&logits)
     }
 
     type Decode<'a>

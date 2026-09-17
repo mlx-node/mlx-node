@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::models::forward as fwd;
+
 /// Run the MoE eager layer stack over `[1, T]` ids and return the
 /// pre-final-norm hidden `[1, T, hidden]`.
 ///
@@ -20,15 +22,16 @@ pub(super) fn forward_pre_norm_inner(
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     _fa_idx: usize,
 ) -> Result<MxArray> {
-    let hidden_states = embedding.forward(input_ids)?;
-    let mut h = hidden_states.clone();
-
-    let num_layers = layers.len();
-    for i in 0..num_layers {
-        let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, None, cache, None, true)?;
-    }
-    Ok(h)
+    fwd::forward_pre_norm_with(
+        input_ids,
+        |ids| embedding.forward(ids),
+        layers,
+        caches,
+        |layer, h, caches, i| {
+            layer.forward(h, None, caches.as_mut().map(|c| &mut c[i]), None, true)
+        },
+        None,
+    )
 }
 
 /// Like [`forward_pre_norm_inner`], but records a per-layer GDN tape for the
@@ -46,22 +49,31 @@ fn forward_pre_norm_inner_with_tape(
     _fa_idx: usize,
     tape: &mut [Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape>],
 ) -> Result<MxArray> {
-    let hidden_states = embedding.forward(input_ids)?;
-    let mut h = hidden_states.clone();
-
-    let num_layers = layers.len();
     debug_assert_eq!(
         tape.len(),
-        num_layers,
+        layers.len(),
         "forward_pre_norm_inner_with_tape: tape length must equal layer count"
     );
-    for i in 0..num_layers {
-        let cache = caches.as_mut().map(|c| &mut c[i]);
-        let mut slot: Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape> = None;
-        h = layers[i].forward_with_tape(&h, None, cache, None, true, Some(&mut slot))?;
-        tape[i] = slot;
-    }
-    Ok(h)
+    fwd::forward_pre_norm_with(
+        input_ids,
+        |ids| embedding.forward(ids),
+        layers,
+        caches,
+        |layer, h, caches, i| {
+            let mut slot = None;
+            let out = layer.forward_with_tape(
+                h,
+                None,
+                caches.as_mut().map(|c| &mut c[i]),
+                None,
+                true,
+                Some(&mut slot),
+            )?;
+            tape[i] = slot;
+            Ok(out)
+        },
+        None,
+    )
 }
 
 /// Project a pre-/post-final-norm hidden to logits, preserving the leading
@@ -73,10 +85,7 @@ pub(super) fn project_logits_from_hidden(
     lm_head: &Option<LinearProj>,
     embedding: &Embedding,
 ) -> Result<MxArray> {
-    match lm_head {
-        Some(head) => head.forward(hidden),
-        None => embedding.as_linear(hidden),
-    }
+    fwd::project_logits(hidden, lm_head.as_ref(), embedding)
 }
 
 /// Batched eager verify: run the `[1, K+1]` verify ids through the MoE main
@@ -120,9 +129,6 @@ pub(super) fn forward_inner(
     lm_head: &Option<LinearProj>,
     _fa_idx: usize,
 ) -> Result<MxArray> {
-    let hidden_states = embedding.forward(input_ids)?;
-    let mut h = hidden_states.clone();
-
     // No explicit mask is ever built. Full-attention layers pass `mask:
     // None`, so `Qwen3_5Attention::forward` picks its fused "causal" SDPA
     // kernel whenever `seq_len > 1` (prefill and the `[1, K+1]` eager-MTP
@@ -131,14 +137,17 @@ pub(super) fn forward_inner(
     // for `ArraysCache`, and an all-ones mask would just be a no-op that
     // adds graph nodes and Metal overhead. Mirrors the dense
     // `forward_pre_norm_inner`.
-    let num_layers = layers.len();
-    for i in 0..num_layers {
-        let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, None, cache, None, true)?;
-    }
-
-    let h = final_norm.forward(&h)?;
-    project_logits_from_hidden(&h, lm_head, embedding)
+    let h = fwd::forward_body_normed(
+        input_ids,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        |layer, h, caches, i| {
+            layer.forward(h, None, caches.as_mut().map(|c| &mut c[i]), None, true)
+        },
+    )?;
+    fwd::project_logits(&h, lm_head.as_ref(), embedding)
 }
 
 /// Default prefill chunk size (tokens per chunk).
@@ -221,51 +230,23 @@ fn chunked_prefill_with_size(
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
     debug_assert!(chunk_size > 0, "chunk_size must be positive");
-    let total_len = prompt.shape_at(1)?;
-    let mut offset: i64 = 0;
-
-    // All-but-last chunks: run forward, eval caches, clear compute cache.
-    // The returned logits from these chunks are thrown away because only
-    // the final chunk's logits are consumed by the sampler.
-    while total_len - offset > chunk_size {
-        // Cooperative-cancel checkpoint: abort at the chunk
-        // boundary. The Err rides the flat engine's
-        // `fail_closed_flat_turn` arm — no `save_cache_state`, the
-        // session is invalidated, so the partially-advanced caches never
-        // become a live prefix.
-        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            return Err(Error::from_reason("prefill cancelled"));
-        }
-        let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
-        {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let _logits = forward_inner(
-                &chunk, embedding, layers, caches, final_norm, lm_head, fa_idx,
-            )?;
-        }
-        // Materialize all cache arrays on GPU so the next chunk doesn't
-        // extend a giant lazy graph rooted at the prior chunk's inputs.
-        eval_layer_caches(caches)?;
-        crate::array::clear_cache();
-        offset += chunk_size;
-    }
-
-    // The final remainder is a chunk boundary too once at least one looped
-    // chunk ran: poll before forwarding it so a cancel landing during the
-    // last looped chunk aborts instead of riding through the remainder.
-    // `offset == 0` (single-shot) stays uncancellable by design.
-    if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-        return Err(Error::from_reason("prefill cancelled"));
-    }
-    // Final chunk: return logits to caller. No eval/clear here — the
-    // caller's next step (sampling / slicing last_logits) triggers eval
-    // naturally, and the outer decode loop clears cache on its own rhythm.
-    let remaining = prompt.slice_axis(1, offset, total_len)?;
-    let logits = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-        forward_inner(
-            &remaining, embedding, layers, caches, final_norm, lm_head, fa_idx,
-        )?
-    };
-    Ok(logits)
+    let mut ctx = (embedding, layers, caches, final_norm, lm_head, fa_idx);
+    fwd::chunked_prefill(
+        &mut ctx,
+        prompt,
+        generation_stream,
+        chunk_size,
+        true,
+        move |_| turn_cancel,
+        |ctx, chunk, _is_final| {
+            // Every chunk (looped and final) runs the full forward_inner —
+            // the looped logits are discarded by the driver.
+            forward_inner(chunk, ctx.0, ctx.1, ctx.2, ctx.3, ctx.4, ctx.5)
+        },
+        |ctx| {
+            // Materialize all cache arrays on GPU so the next chunk doesn't
+            // extend a giant lazy graph rooted at the prior chunk's inputs.
+            fwd::eval_caches_and_clear(&*ctx.2)
+        },
+    )
 }

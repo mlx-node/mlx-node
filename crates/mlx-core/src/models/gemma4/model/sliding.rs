@@ -1884,68 +1884,44 @@ pub(super) fn prefill_body_gemma4(
         None
     };
 
-    let mut offset: i64 = 0;
-
-    // Process in chunks
-    while prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
-        // Cooperative-cancel checkpoint (H1b): abort at the chunk
-        // boundary. The Err rides the flat engine's
-        // `fail_closed_flat_turn` arm — no `save_cache_state`, the
-        // session is invalidated, so the partially-advanced caches never
-        // become a live prefix.
-        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            return Err(Error::from_reason("prefill cancelled"));
-        }
-        let chunk_embeds = all_embeds.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE)?;
-        let chunk_ple = all_ple
-            .as_ref()
-            .map(|p| p.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE))
-            .transpose()?;
-
-        let _hidden = forward_body(
-            None,
-            Some(chunk_embeds),
-            embedding,
-            layers,
-            caches,
-            final_norm,
-            ple,
-            chunk_ple.as_ref(),
-            config,
-        )?;
-        eval_gemma4_caches(caches)?;
-        crate::array::clear_cache();
-        offset += GEMMA4_PREFILL_STEP_SIZE;
-    }
-
-    // Final chunk (still body only — no lm_head needed)
-    if offset < prefill_len {
-        // The final remainder is a chunk boundary too once at least one
-        // looped chunk ran: poll before forwarding it so a cancel landing
-        // during the last looped chunk aborts instead of riding through the
-        // remainder. `offset == 0` (single-shot) stays uncancellable by
-        // design.
-        if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            return Err(Error::from_reason("prefill cancelled"));
-        }
-        let remaining_embeds = all_embeds.slice_axis(1, offset, prefill_len)?;
-        let remaining_ple = all_ple
-            .as_ref()
-            .map(|p| p.slice_axis(1, offset, prefill_len))
-            .transpose()?;
-
-        let _hidden = forward_body(
-            None,
-            Some(remaining_embeds),
-            embedding,
-            layers,
-            caches,
-            final_norm,
-            ple,
-            remaining_ple.as_ref(),
-            config,
-        )?;
-    }
+    // Process in chunks (body only — no lm_head needed). The driver
+    // owns the cooperative-cancel checkpoints: abort at each chunk
+    // boundary (the Err rides the flat engine's `fail_closed_flat_turn`
+    // arm — no `save_cache_state`, the session is invalidated, so the
+    // partially-advanced caches never become a live prefix) plus a
+    // final-remainder poll once at least one looped chunk ran.
+    let mut ctx = (&all_embeds, &all_ple, &mut *caches);
+    fwd::chunked_prefill_ranges(
+        &mut ctx,
+        prefill_len,
+        GEMMA4_PREFILL_STEP_SIZE,
+        true,
+        |_| turn_cancel,
+        |ctx, start, end, _is_final| {
+            let chunk_embeds = ctx.0.slice_axis(1, start, end)?;
+            let chunk_ple = ctx
+                .1
+                .as_ref()
+                .map(|p| p.slice_axis(1, start, end))
+                .transpose()?;
+            forward_body(
+                None,
+                Some(chunk_embeds),
+                embedding,
+                layers,
+                ctx.2,
+                final_norm,
+                ple,
+                chunk_ple.as_ref(),
+                config,
+            )
+        },
+        |ctx| {
+            eval_gemma4_caches(ctx.2)?;
+            crate::array::clear_cache();
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }

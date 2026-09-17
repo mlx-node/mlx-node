@@ -1,6 +1,8 @@
 //! `PagedBackend` for `Qwen35Inner` plus the paged decode/prefix adapters.
 
 use super::*;
+use crate::engine::paged_epilogue::FinalTokenPolicy;
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 
 /// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
 /// `decode_loop!` macro and the engine's `run_mtp_turn` loop (and the
@@ -22,86 +24,59 @@ impl StreamSender<'_> {
     }
 }
 
-/// Paged decode stepper for qwen3_5 dense (the paged analog of the FLAT
-/// [`Qwen35Decode`]). Drives
-/// [`crate::engine::decode::run_decode_loop`] through the generic
-/// [`crate::engine::paged_turn::run_paged_turn`]: each `forward` runs the
-/// pure-Rust eager paged step against the live post-prefill adapter pools +
-/// GDN caches. Created by `<Qwen35Inner as PagedBackend>::begin_paged_decode`,
-/// consumed across the whole decode loop.
+/// Paged decode state for qwen3_5 dense (the paged analog of the FLAT
+/// [`Qwen35Decode`]); wrapped by [`PagedStepper`] for the `DecodeStep`
+/// impl. Drives [`crate::engine::decode::run_decode_loop`] through the
+/// generic [`crate::engine::paged_turn::run_paged_turn`]: each
+/// `paged_step` runs the pure-Rust eager paged step against the live
+/// post-prefill adapter pools + GDN caches. Created by
+/// `<Qwen35Inner as PagedBackend>::begin_paged_decode`, consumed across
+/// the whole decode loop.
 pub(crate) struct Qwen35PagedDecode<'a> {
     inner: &'a mut Qwen35Inner,
 }
 
-impl DecodeStep for Qwen35PagedDecode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        // NOT on the hot path — the engine drives decode via
-        // `forward_with_token` (which hands the scalar the loop already read).
-        // Kept only to satisfy the trait; extract then delegate.
-        let token_id = input_ids.item_at_int32(0)? as u32;
-        self.forward_with_token(input_ids, token_id)
-    }
+impl PagedStepModel for Qwen35PagedDecode<'_> {
+    /// `SyncTokenAndForcedLogits`: isolated sync/stream comparisons did
+    /// not resolve a benefit from async scheduling here — retain one
+    /// completion boundary per token. The forced path also evals the
+    /// logits: a forced host token does not depend on the target/cache
+    /// writes.
+    const EVAL: EvalPolicy = EvalPolicy::SyncTokenAndForcedLogits;
+    /// `AlwaysDrop` — CRITICAL: dense paged drops the last token
+    /// UNCONDITIONALLY (see `save_paged_history`). The adapter only
+    /// advanced for the tokens the loop actually forwarded; re-running a
+    /// decode step for the final length-exit token would record a token
+    /// the GDN/adapter state never advanced → recurrent-state desync vs
+    /// the saved drop-last history.
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::AlwaysDrop;
 
-    fn forward_with_token(
-        &mut self,
-        _input_ids: &MxArray,
-        token_id: u32,
-    ) -> Result<(MxArray, bool)> {
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
         // Pure-Rust eager paged decode step.
         //
-        // PERF: `token_id` is HANDED by the engine (already read once at the
-        // loop top via `y.item_at_int32`), so we do NOT re-`item_at_int32` the
-        // fresh `_input_ids` reshape — that redundant second per-step eval/sync
-        // measurably regressed decode. `_input_ids` is unused (kept for
-        // signature parity).
-        let logits = {
-            let embed = self.inner.embedding.clone();
-            let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen35PagedDecode::forward: caches dropped mid-decode")
-            })?;
-            let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen35PagedDecode::forward: paged_adapter dropped mid-decode")
-            })?;
-            crate::models::qwen3_5::paged_forward::run_paged_decode_step(
-                token_id,
-                &embed,
-                &mut self.inner.layers,
-                caches_ref,
-                &self.inner.final_norm,
-                &self.inner.lm_head,
-                &self.inner.layer_kinds,
-                adapter,
-                self.inner.cached_rope_deltas.unwrap_or(0),
-            )?
-            .squeeze(Some(&[1]))?
-        };
-
-        // `run_paged_decode_step` returns [1, 1, vocab]; the `squeeze([1])`
-        // above already collapses to [1, vocab], so `needs_squeeze = FALSE`.
-        Ok((logits, false))
+        // PERF: `token_id` is HANDED by the engine (already read once at
+        // the loop top via `y.item_at_int32`), so we do NOT
+        // re-`item_at_int32` the fresh `input_ids` reshape — that
+        // redundant second per-step eval/sync measurably regressed decode.
+        let embed = self.inner.embedding.clone();
+        let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
+            Error::from_reason("Qwen35PagedDecode::paged_step: caches dropped mid-decode")
+        })?;
+        let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
+            Error::from_reason("Qwen35PagedDecode::paged_step: paged_adapter dropped mid-decode")
+        })?;
+        crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+            token_id,
+            &embed,
+            &mut self.inner.layers,
+            caches_ref,
+            &self.inner.final_norm,
+            &self.inner.lm_head,
+            &self.inner.layer_kinds,
+            adapter,
+            self.inner.cached_rope_deltas.unwrap_or(0),
+        )
     }
-
-    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
-        // Isolated sync/stream comparisons did not resolve a benefit from
-        // async scheduling here. Retain one completion boundary per token.
-        next_token.eval();
-        if budget_forced {
-            // A forced host token does not depend on the target/cache writes.
-            logits.eval();
-        }
-    }
-
-    fn maintain_cache(&mut self, step: i32) {
-        // Per-step paged cache-clear cadence.
-        crate::array::maybe_clear_cache_for_paged_step(step);
-    }
-
-    // `materialize_final` — DO NOT override (default no-op). CRITICAL: dense
-    // paged drops the last token UNCONDITIONALLY (see `save_paged_history`).
-    // The adapter only advanced for the tokens the loop actually forwarded;
-    // re-running a decode step here for the final length-exit token would
-    // record a token the GDN/adapter state never advanced → recurrent-state
-    // desync vs the saved drop-last history.
 }
 
 /// qwen3_5 dense paged prefix state — the effective prefix/suffix split from
@@ -134,7 +109,7 @@ impl PagedPrefix for Qwen35PrefixState {
 
 impl PagedBackend for Qwen35Inner {
     type PagedDecode<'a>
-        = Qwen35PagedDecode<'a>
+        = PagedStepper<Qwen35PagedDecode<'a>>
     where
         Self: 'a;
     type PrefixState = Qwen35PrefixState;
@@ -396,7 +371,7 @@ impl PagedBackend for Qwen35Inner {
         // Pure-Rust eager paged decode: the stepper drives
         // `run_paged_decode_step` against the live post-prefill adapter pools +
         // GDN caches. No compiled-graph seeding / lifecycle locks needed.
-        Ok(Qwen35PagedDecode { inner: self })
+        Ok(PagedStepper(Qwen35PagedDecode { inner: self }))
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {

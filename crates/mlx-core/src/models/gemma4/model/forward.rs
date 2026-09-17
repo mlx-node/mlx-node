@@ -487,15 +487,13 @@ pub(crate) fn project_paged_hidden_rows(
     config: &Gemma4Config,
     last_only: bool,
 ) -> Result<MxArray> {
-    let hidden = final_norm.forward(hidden_states)?;
-    let logits = lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config)?;
     if !last_only {
-        return Ok(logits);
+        let hidden = final_norm.forward(hidden_states)?;
+        return lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config);
     }
-    let last_seq_len = logits.shape_at(1)?;
-    logits
-        .slice_axis(1, last_seq_len - 1, last_seq_len)?
-        .squeeze(Some(&[0, 1]))
+    fwd::project_last_token_logits(hidden_states, final_norm, |normed| {
+        lm_head_logits(normed, embedding, lm_head, embed_weight_t, config)
+    })
 }
 
 /// The paged layer loops' twin of `forward_body`'s tap validation: capture

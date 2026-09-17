@@ -28,7 +28,7 @@ use crate::transformer::paged_policy::{
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
-use super::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///

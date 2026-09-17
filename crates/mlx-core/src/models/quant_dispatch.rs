@@ -18,10 +18,11 @@
 //! [`load_dense_mlp_variant`], [`load_embedding_affine_or_bf16`]) that the
 //! `k2_horizon` and `lfm2` persistence layers used to carry as verbatim
 //! copies differing only in the `family` tag inside error strings. The
-//! helpers reach back into `qwen3_5::quantized_linear` for the concrete
-//! `try_build_*` builders / `LinearProj` / `MLPVariant` — the same module
-//! both families already imported them from (through the
-//! `qwen3_5_moe::quantized_linear` re-export shim).
+//! helpers reach into `crate::models::quantized_linear` (the canonical
+//! family-neutral module hoisted out of `qwen3_5`) for the concrete
+//! `try_build_*` builders / `LinearProj` / `MLPVariant` — the same items both
+//! families already imported through the `qwen3_5_moe::quantized_linear`
+//! re-export shim.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,7 +32,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::array::{DType, MxArray};
-use crate::models::qwen3_5::quantized_linear::{
+use crate::models::quantized_linear::{
     LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
     NVFP4_GROUP_SIZE, QuantizedLinear, try_build_kquant_quantized_linear,
     try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
@@ -759,7 +760,7 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
 /// Fail-closed: everything else with an `input_amax` is a stale or hand-edited
 /// config. Shared by the config parser below, the modelopt-schema parser in
 /// `nemotron_h::persistence`, and the forward-time fake-quant gate in
-/// `qwen3_5::quantized_linear` — the three must not drift.
+/// `crate::models::quantized_linear` — the three must not drift.
 pub fn admits_static_fp8_activation(mode: PerLayerMode, bits: i32, group_size: i32) -> bool {
     matches!(mode, PerLayerMode::Mxfp8 | PerLayerMode::Affine) && bits == 8 && group_size == 32
 }

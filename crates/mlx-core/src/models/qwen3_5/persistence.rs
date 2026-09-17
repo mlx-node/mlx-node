@@ -33,7 +33,7 @@ use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
 use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState};
-use super::quantized_linear::{
+use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
     PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
     try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,

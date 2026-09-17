@@ -21,14 +21,16 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import type { ModelType } from '@mlx-node/lm';
+import { MODEL_FAMILY_DATA } from '@mlx-node/lm/family-data';
 
 /**
  * Model families whose paged prefix blocks can be restored from the SSD cold
- * tier soundly. The single source of truth on the TypeScript side, mirroring
- * `COLD_RESTORE_FAMILIES` in `crates/mlx-core/src/cold_tier.rs`; the two gate
- * the same decision from opposite ends, and
- * `packages/agent/__test__/cold-tier-families.test.ts` asserts they never
- * drift.
+ * tier soundly. Derived from the `coldRestoreEligible` flags on the
+ * `MODEL_FAMILY_DATA` rows — the registry is the single source of truth on
+ * the TypeScript side — mirroring `COLD_RESTORE_FAMILIES` in
+ * `crates/mlx-core/src/cold_tier.rs`; the two gate the same decision from
+ * opposite ends, and `packages/agent/__test__/cold-tier-families.test.ts`
+ * asserts they never drift.
  *
  * A family belongs here only when EVERY piece of per-token state its forward
  * pass carries between turns is reconstructible from the tier — either because
@@ -72,15 +74,9 @@ import type { ModelType } from '@mlx-node/lm';
  * {@link coldTierRestoreFamilyList} in `packages/cli/src/commands/agent/index.ts`
  * and asserted by `packages/cli/__test__/agent-cmd.test.ts`.
  */
-export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>([
-  'qwen3',
-  'qwen3_5',
-  'qwen3_5_moe',
-  'gemma4',
-  'muse_glimmer',
-  'lfm2',
-  'lfm2_moe',
-]);
+export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(
+  MODEL_FAMILY_DATA.filter((row) => 'coldRestoreEligible' in row).map((row) => row.id),
+);
 
 /** Allowlisted families in a stable, human-facing order (help text, API payload). */
 export function coldTierRestoreFamilyList(): string[] {

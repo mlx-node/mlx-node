@@ -31,7 +31,7 @@ use crate::models::quant_dispatch::{
     load_embedding_affine_or_bf16, load_linear_proj_quantized_or_bf16,
     load_quant_settings_from_disk, resolve_default_mode,
 };
-use crate::models::qwen3_5_moe::quantized_linear::{
+use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_mxfp8_checkpoint,
 };
 use crate::tokenizer::Qwen3Tokenizer;

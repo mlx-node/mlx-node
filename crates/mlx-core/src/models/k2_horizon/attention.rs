@@ -13,7 +13,7 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::mask::create_causal_mask;
-use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Linear, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};

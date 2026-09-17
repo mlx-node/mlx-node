@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -21,11 +21,13 @@ use crate::engine::hybrid_scheduler::{
 use crate::engine::paged_epilogue::{
     FinalTokenPolicy, abort_single_adapter_turn, reconcile_paged_surplus,
 };
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
+use crate::models::forward as fwd;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
-use crate::stream::{Stream, StreamContext};
+use crate::stream::Stream;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::transformer::paged_kv_cache_adapter::{
     PagedKVCacheAdapter, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission, SeqId,
@@ -248,10 +250,11 @@ fn conv_state_reusable(
         && plan[..cached_prefix_len] == cached_token_history[..]
 }
 
-/// Paged decode stepper for lfm2 / lfm2_moe (the paged analog of the FLAT
-/// [`Lfm2Decode`]). Drives [`crate::engine::decode::run_decode_loop`] through
-/// the generic [`crate::engine::paged_turn::run_paged_turn`]: each `forward`
-/// runs the pure-Rust eager paged step. Created by
+/// Paged decode state for lfm2 / lfm2_moe (the paged analog of the FLAT
+/// [`Lfm2Decode`]); wrapped by [`PagedStepper`] for the `DecodeStep` impl.
+/// Drives [`crate::engine::decode::run_decode_loop`] through the generic
+/// [`crate::engine::paged_turn::run_paged_turn`]: each `paged_step` runs the
+/// pure-Rust eager paged step. Created by
 /// `<Lfm2Inner as PagedBackend>::begin_paged_decode`.
 pub(crate) struct Lfm2PagedDecode<'a> {
     inner: &'a mut Lfm2Inner,
@@ -834,81 +837,40 @@ impl Lfm2Inner {
     ///
     /// Returns logits [B, T, vocab_size].
     pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
-        // 1. Token embeddings (no scaling)
-        let mut h = self.embed_tokens.forward(input_ids)?;
-
-        // 2. Iterate through layers
-        // No explicit causal mask — attention layers use the fused
-        // `scaled_dot_product_attention_causal()` path when mask is None and
-        // seq_len > 1 (prefill). This avoids O(T^2) mask memory.
-        // Conv layers always get None mask.
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, None, Some(&mut self.caches[i]))?;
-        }
-
-        // 3. Output norm
-        h = self.embedding_norm.forward(&h)?;
+        // 1. Token embeddings (no scaling) → 2. layer loop (no explicit
+        // causal mask — attention layers use the fused
+        // `scaled_dot_product_attention_causal()` path when mask is None
+        // and seq_len > 1, conv layers always get None) → 3. output norm.
+        let h = fwd::forward_body_normed(
+            input_ids,
+            &self.embed_tokens,
+            &mut self.layers,
+            &mut self.caches,
+            &self.embedding_norm,
+            |layer, h, caches, i| layer.forward(h, None, Some(&mut caches[i])),
+        )?;
 
         // 4. LM head or tied embeddings. The tied path routes through
         // `Embedding::as_linear`, which handles BOTH a packed-quantized
         // embedding (`mlx_quantized_matmul` on the packed tensors — no dense
         // table) AND a dense bf16 embedding (`h @ get_weight()^T`, numerically
         // identical to the prior matmul).
-        let logits = if let Some(ref head) = self.lm_head {
-            head.forward(&h)?
-        } else {
-            self.embed_tokens.as_linear(&h)?
-        };
-
-        Ok(logits)
+        fwd::project_logits(&h, self.lm_head.as_ref(), &self.embed_tokens)
     }
 
     /// Chunked prefill: process prompt in chunks of PREFILL_STEP_SIZE tokens,
     /// evaluating caches after each chunk to avoid OOM on long prompts.
     fn chunked_prefill(&mut self, prompt: &MxArray, generation_stream: Stream) -> Result<MxArray> {
-        let total_len = prompt.shape_at(1)?;
-        let mut offset: i64 = 0;
-        while total_len - offset > PREFILL_STEP_SIZE {
-            // Cooperative-cancel checkpoint (H1b): abort at the chunk
-            // boundary. The Err rides the flat engine's
-            // `fail_closed_flat_turn` arm — no `save_cache_state`, the
-            // session is invalidated, so the partially-advanced
-            // conv/attention caches never become a live prefix.
-            if self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
-            }
-            let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
-            {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                let _logits = self.forward(&chunk)?;
-            }
-            eval_lfm2_caches(&self.caches)?;
-            crate::array::clear_cache();
-            offset += PREFILL_STEP_SIZE;
-        }
-        // The final remainder is a chunk boundary too once at least one
-        // looped chunk ran: poll before forwarding it so a cancel landing
-        // during the last looped chunk aborts instead of riding through the
-        // remainder. `offset == 0` (single-shot) stays uncancellable by
-        // design.
-        if offset > 0
-            && self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-        {
-            return Err(Error::from_reason("prefill cancelled"));
-        }
-        let remaining = prompt.slice_axis(1, offset, total_len)?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            self.forward(&remaining)?
-        };
-        Ok(logits)
+        fwd::chunked_prefill(
+            self,
+            prompt,
+            generation_stream,
+            fwd::PREFILL_STEP_SIZE,
+            true,
+            |inner: &Lfm2Inner| inner.turn_cancel.as_deref(),
+            |inner, chunk, _is_final| inner.forward(chunk),
+            |inner| fwd::eval_caches_and_clear(&inner.caches),
+        )
     }
 
     /// Reset all caches and cached token history.
@@ -965,16 +927,14 @@ impl Lfm2Inner {
         generated_tokens: &[u32],
         last_token_in_cache: bool,
     ) {
-        if reuse_cache {
-            let mut full_history = tokens.to_vec();
-            let history_tokens = if !last_token_in_cache && !generated_tokens.is_empty() {
-                &generated_tokens[..generated_tokens.len() - 1]
-            } else {
-                generated_tokens
-            };
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
-        } else {
+        if !fwd::save_flat_token_history(
+            tokens,
+            generated_tokens,
+            last_token_in_cache,
+            reuse_cache,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        ) {
             self.reset_caches_internal();
         }
     }
@@ -1168,26 +1128,20 @@ impl Lfm2Inner {
         // in the per-layer loop above, and the discarded rows are never read.
         // Setting the toggle reproduces the old "project full T, then slice"
         // behavior for same-binary A/B baselining.
-        let proj_input = if last_token_slice_enabled() {
-            let seq_len_h = hidden_states.shape_at(1)?;
-            hidden_states.slice_axis(1, seq_len_h - 1, seq_len_h)?
+        let last = if last_token_slice_enabled() {
+            // Slice to the last row BEFORE norm + projection so the largest
+            // matmul does ~T× less work.
+            fwd::project_last_hidden_logits(&hidden_states, &self.embedding_norm, |h| {
+                fwd::project_logits(h, self.lm_head.as_ref(), &self.embed_tokens)
+            })?
+            .squeeze(Some(&[0]))?
         } else {
-            hidden_states
+            // The pre-opt order: project the full `[1, T]` residual, then pick
+            // the final row.
+            fwd::project_last_token_logits(&hidden_states, &self.embedding_norm, |h| {
+                fwd::project_logits(h, self.lm_head.as_ref(), &self.embed_tokens)
+            })?
         };
-        let hidden_states = self.embedding_norm.forward(&proj_input)?;
-        let logits = if let Some(ref head) = self.lm_head {
-            head.forward(&hidden_states)?
-        } else {
-            self.embed_tokens.as_linear(&hidden_states)?
-        };
-
-        // Slice the last token's logits. When the opt is ON `logits` already has
-        // T=1, so this is a no-op slice; when OFF it picks the final row as
-        // before. Either way the returned shape is unchanged.
-        let seq_len = logits.shape_at(1)?;
-        let last = logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[0, 1]))?;
         if let Some(seq_id) = self.active_scheduled_seq {
             self.scheduled_recurrent_survived.insert(seq_id);
         }
@@ -1437,12 +1391,7 @@ impl Lfm2Inner {
         // Tied path → `Embedding::as_linear` (packed quantized matmul or dense
         // `h @ weight^T`).
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
-        let logits = if let Some(ref head) = self.lm_head {
-            head.forward(&hidden_states)?
-        } else {
-            self.embed_tokens.as_linear(&hidden_states)?
-        };
-        Ok(logits)
+        fwd::project_logits(&hidden_states, self.lm_head.as_ref(), &self.embed_tokens)
     }
 
     /// Run one paged decode step for multiple LFM2 requests. Default is a
@@ -1529,11 +1478,7 @@ impl Lfm2Inner {
             self.remember_conv_cold_checkpoint_for(seq_id);
         }
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
-        if let Some(ref head) = self.lm_head {
-            head.forward(&hidden_states)
-        } else {
-            self.embed_tokens.as_linear(&hidden_states)
-        }
+        fwd::project_logits(&hidden_states, self.lm_head.as_ref(), &self.embed_tokens)
     }
 
     /// Forward the cached prefix tokens through ALL layers (conv state
@@ -2019,9 +1964,7 @@ impl ChatBackend for Lfm2Inner {
         let token_arr: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         let prompt = MxArray::from_int32(&token_arr, &[1, prompt_tokens.len() as i64])?;
         let logits = self.chunked_prefill(&prompt, stream)?;
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        last_logits.squeeze(Some(&[1]))
+        fwd::slice_last_logits_keep_batch(&logits)
     }
 
     type Decode<'a>
@@ -2123,71 +2066,41 @@ impl ChatBackend for Lfm2Inner {
     }
 }
 
-impl DecodeStep for Lfm2PagedDecode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        // NOT on the hot path — the engine drives decode via
-        // `forward_with_token` (which hands the scalar the loop already
-        // read). Kept only to satisfy the trait; extract then delegate.
-        let token_id = input_ids.item_at_int32(0)? as u32;
-        self.forward_with_token(input_ids, token_id)
-    }
+impl PagedStepModel for Lfm2PagedDecode<'_> {
+    /// `SyncToken`: a single SYNCHRONOUS eval of `next_token` pulls the
+    /// logits AND the paged K/V writes through the dependency chain (one
+    /// sync wait); the loop-top `y.eval()` then no-ops on the
+    /// already-materialized token.
+    ///
+    /// NOT `async_eval_arrays([next_token, logits])` (the qwen3-style
+    /// schedule): lfm2's eager forward has negligible per-step CPU work
+    /// (~110us issue vs ~5.4ms GPU/token, bandwidth-bound), so the async
+    /// two-wait (bottom `async_eval` + loop-top `y.eval`) buys ZERO overlap
+    /// and costs ~5% vs the single sync wait.
+    ///
+    /// A forced final token does NOT leave its paged K/V writes lazy
+    /// (the single sync eval pulls the K/V writes through the dependency
+    /// chain regardless). Cross-turn parity on a budget-forced length exit
+    /// instead depends on the conv Pass-1 running attention in
+    /// `run_conv_only_prefill`. See tests/lfm2_paged_vs_flat_parity.rs
+    /// `lfm2_paged_budget_forced_warm_continue_parity`.
+    const EVAL: EvalPolicy = EvalPolicy::SyncToken;
+    /// `AlwaysDrop` — lfm2 PAGED must NOT re-run a decode step for the
+    /// final length-exit token (re-forwarding would corrupt the
+    /// non-invertible ShortConv state). The drop-on-length
+    /// `save_paged_history` already keeps history aligned with the adapter
+    /// (see the token-accounting proof on
+    /// `<Lfm2Inner as PagedBackend>::save_paged_history`), so no extra
+    /// forward is needed.
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::AlwaysDrop;
 
-    fn forward_with_token(
-        &mut self,
-        _input_ids: &MxArray,
-        token_id: u32,
-    ) -> Result<(MxArray, bool)> {
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
         // `token_id` is HANDED by the engine (already read once at the loop
-        // top via `y.item_at_int32`), so `_input_ids` is unused (kept for
-        // signature parity); `run_paged_decode_step` re-records the token
-        // from the scalar.
-        let logits = self
-            .inner
-            .run_paged_decode_step(token_id)?
-            .squeeze(Some(&[1]))?;
-
-        // `run_paged_decode_step` returns [1, 1, vocab] and the `squeeze([1])`
-        // above already reduces it to [1, vocab], so `needs_squeeze = FALSE`.
-        // ⚠ POLARITY IS INVERTED vs qwen3 (whose `Qwen3PagedDecode::forward`
-        // returns `true` from a direct `run_paged_decode_step`) — lfm2's
-        // squeeze lives in this body, so returning `true` here would
-        // double-squeeze and break the sampler.
-        Ok((logits, false))
+        // top via `y.item_at_int32`); `run_paged_decode_step` re-records
+        // the token from the scalar.
+        self.inner.run_paged_decode_step(token_id)
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token` pulls the logits AND the
-        // paged K/V writes through the dependency chain (one sync wait); the
-        // loop-top `y.eval()` then no-ops on the already-materialized token.
-        //
-        // NOT `async_eval_arrays([next_token, logits])` (the qwen3-style
-        // schedule): lfm2's eager forward has negligible per-step CPU work
-        // (~110us issue vs ~5.4ms GPU/token, bandwidth-bound), so the async
-        // two-wait (bottom `async_eval` + loop-top `y.eval`) buys ZERO overlap
-        // and costs ~5% vs the single sync wait.
-        //
-        // `_budget_forced` is unused: a forced final token does NOT leave its
-        // paged K/V writes lazy (the single sync eval above pulls them
-        // through the dependency chain regardless). Cross-turn
-        // parity on a budget-forced length exit instead depends on the conv
-        // Pass-1 running attention in `run_conv_only_prefill`. See
-        // tests/lfm2_paged_vs_flat_parity.rs
-        // `lfm2_paged_budget_forced_warm_continue_parity`.
-        next_token.eval();
-    }
-
-    fn maintain_cache(&mut self, step: i32) {
-        // Paged cadence — per-step cache clear.
-        crate::array::maybe_clear_cache_for_paged_step(step);
-    }
-
-    // `materialize_final` — DO NOT override (default no-op). lfm2 PAGED must
-    // NOT re-run a decode step for the final length-exit token. The
-    // drop-on-length `save_paged_history` already keeps history aligned with
-    // the adapter (see the token-accounting proof on
-    // `<Lfm2Inner as PagedBackend>::save_paged_history`), so no extra forward
-    // is needed.
-    //
     // `end_decode` — DO NOT override (default Ok(())). The decode loop updates
     // the active request's convolution state in place. The scheduler parks that
     // state in its sequence-keyed table after finalization; the legacy lane
@@ -2225,7 +2138,7 @@ impl PagedPrefix for Lfm2PrefixState {
 
 impl PagedBackend for Lfm2Inner {
     type PagedDecode<'a>
-        = Lfm2PagedDecode<'a>
+        = PagedStepper<Lfm2PagedDecode<'a>>
     where
         Self: 'a;
     type PrefixState = Lfm2PrefixState;
@@ -2354,7 +2267,7 @@ impl PagedBackend for Lfm2Inner {
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
-        Ok(Lfm2PagedDecode { inner: self })
+        Ok(PagedStepper(Lfm2PagedDecode { inner: self }))
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
@@ -2550,18 +2463,9 @@ pub(crate) fn init_caches(config: &Lfm2Config) -> Vec<Lfm2LayerCache> {
     caches
 }
 
-const PREFILL_STEP_SIZE: i64 = 2048;
-
 /// Evaluate all cache arrays (after prefill).
 fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) -> Result<()> {
-    let mut arrays: Vec<&MxArray> = Vec::new();
-    for cache in caches {
-        cache.collect_arrays(&mut arrays);
-    }
-    if !arrays.is_empty() {
-        MxArray::eval_arrays(&arrays)?;
-    }
-    Ok(())
+    fwd::eval_layer_caches(caches)
 }
 
 /// LFM2 language model (LFM2.5-1.2B-Thinking).

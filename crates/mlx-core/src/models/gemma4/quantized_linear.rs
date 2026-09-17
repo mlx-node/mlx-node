@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 use crate::array::{DType, MxArray};
-// The int8 W8A8/W8A16 kernels are family-agnostic; importing them from
-// qwen3_5 follows the existing cross-family precedent
-// (`gemma4::persistence` imports the shared `engine::persistence` helpers).
-use crate::models::qwen3_5::int8_gemm;
+// The int8 W8A8/W8A16 kernels are family-agnostic; they live in the shared
+// family-neutral `models::int8_gemm` module next to the canonical
+// `models::quantized_linear` implementation.
+use crate::models::int8_gemm;
 use crate::nn::{Activations, Linear};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -500,7 +500,7 @@ pub const SYM8_MODE: &str = "sym8";
 /// The checkpoint-native `[N,K]` tensor is the only resident weight.
 ///
 /// gemma4-local copy of the dense Qwen3.5 reference
-/// (`crate::models::qwen3_5::quantized_linear::try_build_sym8_quantized_linear`)
+/// (`crate::models::quantized_linear::try_build_sym8_quantized_linear`)
 /// — the validation chains must not drift.
 pub fn try_build_sym8_quantized_linear(
     params: &HashMap<String, MxArray>,
@@ -612,7 +612,7 @@ pub fn try_build_kquant_quantized_linear(
 ///
 /// The sym8 surface (`s_w`, `new_sym8`, `forward_sym8`, the
 /// `mode == "sym8"` dispatch) is a gemma4-local copy of the dense Qwen3.5
-/// reference (`crate::models::qwen3_5::quantized_linear::QuantizedLinear`)
+/// reference (`crate::models::quantized_linear::QuantizedLinear`)
 /// calling the same family-agnostic `int8_gemm` kernels. The two copies MUST
 /// NOT drift: same M-boundary (M <= 2 -> W8A16 qmv, M >= 3 -> W8A8 gemm),
 /// linear bias added AFTER the kernel, result narrowed to bf16 inside C++.

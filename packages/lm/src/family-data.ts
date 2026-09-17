@@ -185,6 +185,47 @@ export interface LaunchPreset {
   maxOutputTokens: number;
 }
 
+/**
+ * Structural mirror of `StreamingModelOptions` in `stream.ts` — the options
+ * literal a family's `makeStreamingModel` wrapper passes. Declared here so
+ * the registry row owns the value; `stream.ts` pins field-for-field
+ * assignability against the factory's own interface in its compile-time
+ * conformance block (the same pattern {@link FamilyThinkingLevelMap} uses
+ * for pi's thinking-level map).
+ */
+export interface FamilyStreamOpts {
+  /**
+   * `static load` records the on-disk model path so the wrapper can serve
+   * `applyChatTemplate` from a lazily constructed tokenizer.
+   */
+  readonly recordModelPath: boolean;
+  /**
+   * Attach the factory's path-backed `applyChatTemplate`; defaults to
+   * `recordModelPath`. Qwen3 records its path but keeps the native
+   * tokenizer-backed implementation, hence `applyTemplate: false`.
+   */
+  readonly applyTemplate?: boolean;
+  /**
+   * Model-specific ordering for structured multimodal content parts. The
+   * tokenizer applies this policy after sanitization while the checkpoint
+   * Jinja template continues to own all role and wire-format tokens.
+   */
+  readonly templateContentPolicy?: {
+    readonly order: 'textThenMedia' | 'imagesThenText';
+    /**
+     * When sanitized text already contains this model-owned placeholder, keep
+     * the message structured but do not synthesize additional image parts.
+     */
+    readonly existingImagePlaceholder?: string;
+  };
+  /**
+   * Preserve the native raw assistant bytes in session history. LFM2's
+   * checkpoint template consumes reasoning inside `message.content` and does
+   * not read the structured `reasoning_content` field used by Qwen/Gemma.
+   */
+  readonly replayAssistantRawText?: boolean;
+}
+
 interface ModelFamilyDataBase {
   /** Canonical `ModelType` id. */
   readonly id: string;
@@ -192,6 +233,14 @@ interface ModelFamilyDataBase {
   /** Backward-compatible fallback when config.json omits model_type or sets it to null. */
   readonly defaultForNullishModelType?: true;
   readonly acceptsDraftModel?: true;
+  /**
+   * Native `load` accepts a matching auxiliary HF checkpoint directory — the
+   * original checkpoint supplying qwen4_exp's MTP and vision weights that a
+   * GGUF omits. Gates `LoadModelOptions.auxiliaryModelPath` in
+   * `models/model-loader.ts` the same way `acceptsDraftModel` gates
+   * `draftModelPath`.
+   */
+  readonly acceptsAuxiliaryModel?: true;
   /**
    * GGUF `general.architecture` values whose native `load(path)` accepts a
    * direct GGUF file.
@@ -205,6 +254,24 @@ interface ModelFamilyDataBase {
     readonly requiresAssets?: true;
     readonly split?: true;
   };
+  /**
+   * The options literal this family's `makeStreamingModel` wrapper passes —
+   * `stream.ts` builds each chat family's class from `FAMILY_ROWS[id].streamOpts`
+   * and `@mlx-node/vlm` reads the `qianfan-ocr` row the same way. Optional:
+   * families without a streaming wrapper carry none (`harrier` is
+   * embedding-only; `internvl_chat` loads the unwrapped native class), and
+   * `lfm2_moe` shares `lfm2`'s wrapper, so the literal lives once, on `lfm2`.
+   */
+  readonly streamOpts?: FamilyStreamOpts;
+  /**
+   * This family's paged prefix blocks restore soundly from the SSD cold
+   * tier. `COLD_TIER_RESTORE_FAMILIES` (`packages/agent/src/cold-tier.ts`)
+   * derives its set from these flags; the native `COLD_RESTORE_FAMILIES`
+   * (`crates/mlx-core/src/cold_tier.rs`) remains the authority —
+   * `cold-tier-families.test.ts` pins parity. Widening is authorized by the
+   * family's native restart-parity gate alone; see cold-tier.ts.
+   */
+  readonly coldRestoreEligible?: true;
 }
 
 /**
@@ -261,6 +328,8 @@ export const MODEL_FAMILY_DATA = [
       architectureProbe: ({ architectures }) => architectures.has('Gemma4UnifiedForConditionalGeneration'),
     },
     acceptsDraftModel: true,
+    coldRestoreEligible: true,
+    streamOpts: { recordModelPath: true },
     traits: {
       reasoning: true,
       thinkingLevelMap: {
@@ -285,6 +354,8 @@ export const MODEL_FAMILY_DATA = [
       rawModelTypes: ['muse_glimmer', 'muse_glimmer_text'],
       architectureProbe: ({ architectures }) => architectures.has('MuseGlimmerForConditionalGeneration'),
     },
+    coldRestoreEligible: true,
+    streamOpts: { recordModelPath: true },
     traits: {
       reasoning: true,
       fallbackContextWindow: 131072,
@@ -308,6 +379,13 @@ export const MODEL_FAMILY_DATA = [
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3'] },
     defaultForNullishModelType: true,
+    coldRestoreEligible: true,
+    /**
+     * Records its model path (so prototype-set + path-recording match the
+     * other families) but does not install the factory's path-backed
+     * `applyChatTemplate`; it retains the native tokenizer-backed method.
+     */
+    streamOpts: { recordModelPath: true, applyTemplate: false },
     traits: { reasoning: true, fallbackContextWindow: 40960 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
@@ -320,6 +398,8 @@ export const MODEL_FAMILY_DATA = [
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3_5'] },
     acceptsDraftModel: true,
+    coldRestoreEligible: true,
+    streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
     ggufDiscovery: { variants: 'qwen35-xl' },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
@@ -335,6 +415,8 @@ export const MODEL_FAMILY_DATA = [
     ggufArchitectures: ['qwen35moe'],
     ggufDiscovery: { variants: 'qwen35-xl' },
     match: { rawModelTypes: ['qwen3_5_moe'] },
+    coldRestoreEligible: true,
+    streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
@@ -346,6 +428,8 @@ export const MODEL_FAMILY_DATA = [
     visionConfigKeys: ['vision_config'],
     kind: 'loadable',
     match: { rawModelTypes: ['qwen4_exp', 'qwen4_exp_text'] },
+    acceptsAuxiliaryModel: true,
+    streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen4exp'],
     ggufDiscovery: { variants: 'all', split: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
@@ -355,6 +439,12 @@ export const MODEL_FAMILY_DATA = [
     id: 'lfm2',
     kind: 'loadable',
     match: { rawModelTypes: ['lfm2'] },
+    coldRestoreEligible: true,
+    /**
+     * `replayAssistantRawText` also serves `lfm2_moe`: both families load
+     * through the shared `Lfm2Model` wrapper, so the flag lives once, here.
+     */
+    streamOpts: { recordModelPath: true, replayAssistantRawText: true },
     traits: { reasoning: true, fallbackContextWindow: 128000 },
     launchPreset: {
       sampling: LFM2_SAMPLING_DEFAULTS,
@@ -365,6 +455,7 @@ export const MODEL_FAMILY_DATA = [
     id: 'lfm2_moe',
     kind: 'loadable',
     match: { rawModelTypes: ['lfm2_moe'] },
+    coldRestoreEligible: true,
     traits: { reasoning: true, fallbackContextWindow: 128000 },
     /**
      * LFM2.5-8B-A1B: LiquidAI's MoE card recommends temperature 0.2 / top_k 80
@@ -389,6 +480,7 @@ export const MODEL_FAMILY_DATA = [
       rawModelTypes: ['nemotron_h'],
       architectureProbe: ({ architectures }) => architectures.has('NemotronHForCausalLM'),
     },
+    streamOpts: { recordModelPath: true },
     traits: {
       reasoning: true,
       fallbackContextWindow: 1048576,
@@ -405,6 +497,7 @@ export const MODEL_FAMILY_DATA = [
       rawModelTypes: ['k2_horizon'],
       architectureProbe: ({ architectures }) => architectures.has('K2HorizonForCausalLM'),
     },
+    streamOpts: { recordModelPath: true },
     traits: {
       reasoning: true,
       /**
@@ -439,6 +532,14 @@ export const MODEL_FAMILY_DATA = [
     id: 'qianfan-ocr',
     kind: 'vlm',
     match: { rawModelTypes: ['qianfan-ocr'] },
+    /** Consumed by the `QianfanOCRModel` wrapper in `@mlx-node/vlm`. */
+    streamOpts: {
+      recordModelPath: true,
+      templateContentPolicy: {
+        order: 'imagesThenText',
+        existingImagePlaceholder: '<image>',
+      },
+    },
   },
 ] as const satisfies readonly ModelFamilyData[];
 
@@ -451,6 +552,19 @@ type ChatFamilyRow = Extract<FamilyDataRow, { readonly kind: 'trainable' | 'load
 export type ChatFamilyId = ChatFamilyRow['id'];
 
 export type TrainableFamilyId = Extract<FamilyDataRow, { readonly kind: 'trainable' }>['id'];
+
+/**
+ * The registry rows keyed by canonical id, with each row's literal type
+ * preserved — `FAMILY_ROWS.qwen3_5.streamOpts` still knows `recordModelPath`
+ * is `true`, which `makeStreamingModel`'s `ResolvedApplyTemplate` needs (a
+ * `ModelFamilyData`-typed lookup such as {@link familyDataFor} would widen
+ * the literals to `boolean` and break the per-family instance surface).
+ */
+type FamilyRowById = { [R in FamilyDataRow as R['id']]: R };
+
+export const FAMILY_ROWS = Object.fromEntries(
+  MODEL_FAMILY_DATA.map((row) => [row.id, row] as const),
+) as FamilyRowById;
 
 /**
  * Every chat-capable family (kind trainable | loadable), in registry order —

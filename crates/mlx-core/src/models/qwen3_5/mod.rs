@@ -9,7 +9,7 @@ pub mod gated_delta;
 pub mod gated_delta_net;
 pub(crate) mod gdn_checkpoint_store;
 pub(crate) mod gdn_sidecar;
-pub mod int8_gemm;
+pub use crate::models::int8_gemm;
 pub mod layer_cache;
 pub mod model;
 pub mod mtp;

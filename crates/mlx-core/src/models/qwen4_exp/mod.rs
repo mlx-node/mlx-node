@@ -20,6 +20,8 @@ const MAX_PREFILL_CHUNK: usize = 1024;
 use crate::array::MxArray;
 use crate::engine::backend::{ChatBackend, DecodeStep, ResetScope, SaveStateArgs, TurnSetup};
 use crate::engine::model_command::ModelCommand;
+use crate::engine::paged_epilogue::FinalTokenPolicy;
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel};
 use crate::engine::params::{ModelGenerationDefaults, ThinkingPolicy};
 use crate::model_thread::ModelThread;
 use crate::stream::{Stream, StreamContext};
@@ -54,6 +56,35 @@ impl DecodeStep for Step<'_> {
     }
     fn forward_with_token(&mut self, _ids: &MxArray, token: u32) -> Result<(MxArray, bool)> {
         Ok((self.0.decoder.step(token)?, true))
+    }
+}
+/// Paged lane: [`crate::engine::paged_stepper::PagedStepper`] wraps the
+/// same `Step` state (`PagedBackend::PagedDecode` aliases
+/// `PagedStepper<Step>`); the FLAT lane keeps the `DecodeStep` impl
+/// above. `decoder.step` returns the raw `[1, 1, vocab]` logits the
+/// stepper squeezes itself.
+impl PagedStepModel for Step<'_> {
+    /// `AsyncTokenAndForcedLogits` — the `DecodeStep::eval_step` default
+    /// the bare paged impl inherited.
+    const EVAL: EvalPolicy = EvalPolicy::AsyncTokenAndForcedLogits;
+    /// `AlwaysDrop` — DO NOT re-forward the final token: `decoder.step`
+    /// advances the GDN/conv/indexer/PLE recurrent state and
+    /// `decoder.history`, so a replayed step would desync the frontier
+    /// `save_paged_history` publishes (the exact forwarded-token set,
+    /// never an unconsumed sample).
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::AlwaysDrop;
+
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
+        self.0.decoder.step(token_id)
+    }
+
+    fn maintain_cache(&mut self, step: i32) {
+        // The bare paged impl inherited the FLAT every-256-step
+        // `clear_cache` default — preserve that cadence exactly (NOT the
+        // paged helper's 1024-step cadence).
+        if (step + 1) % 256 == 0 {
+            crate::array::clear_cache();
+        }
     }
 }
 impl ChatBackend for Inner {

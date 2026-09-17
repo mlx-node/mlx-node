@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::engine::paged_epilogue::{FinalTokenPolicy, reconcile_paged_surplus};
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 
 /// Eager flat decode stepper for one gemma4 turn
 /// ([`ChatBackend::begin_decode`]). Runs the flat decode-loop step body:
@@ -76,8 +77,9 @@ impl DecodeStep for Gemma4Decode<'_> {
     }
 }
 
-/// Paged decode stepper for gemma4 (pure-eager — no compiled path, so no
-/// lifecycle/reset guard fields). Drives
+/// Paged decode state for gemma4 (pure-eager — no compiled path, so no
+/// lifecycle/reset guard fields); wrapped by [`PagedStepper`] for the
+/// `DecodeStep` impl. Drives
 /// [`crate::engine::decode::run_decode_loop`] through
 /// [`Gemma4Inner::run_paged_decode_step`], advancing every grouped adapter and
 /// pruning physical sliding blocks after their lazy writes materialize.
@@ -93,25 +95,20 @@ pub(crate) struct Gemma4PagedDecode<'a> {
     inner: &'a mut Gemma4Inner,
 }
 
-impl DecodeStep for Gemma4PagedDecode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        // The loop hands the already-extracted token via
-        // `forward_with_token`; recover it here from the `[1, 1]` input for
-        // the bare `forward` contract (idempotent eval with the loop-top
-        // `y.eval()`).
-        let token_id = input_ids.item_at_int32(0)? as u32;
-        self.forward_with_token(input_ids, token_id)
-    }
+impl PagedStepModel for Gemma4PagedDecode<'_> {
+    /// Base policy is `AsyncToken` (gemma4 never async-evals the logits);
+    /// `eval_step` below is overridden verbatim because it ALSO carries
+    /// the `pending_timing` reset on the forced path — the const alone
+    /// cannot express that.
+    const EVAL: EvalPolicy = EvalPolicy::AsyncToken;
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::KeepAllOnLength;
 
-    fn forward_with_token(
-        &mut self,
-        _input_ids: &MxArray,
-        token_id: u32,
-    ) -> Result<(MxArray, bool)> {
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
         crate::models::gemma4::diagnostic::set_step(self.step);
         self.step += 1;
         // `run_paged_decode_step` records the token in the adapter at its
-        // top (BEFORE the forward), then returns `[1, 1, vocab]`.
+        // top (BEFORE the forward), then returns `[1, 1, vocab]` (the
+        // stepper squeezes axis 1 itself).
         let context = self
             .inner
             .kv_cache_coordinator
@@ -126,10 +123,7 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         );
         let _scope = super::super::decode_tuning::PlanScope::enter(plan);
         self.pending_timing = Some(std::time::Instant::now());
-        let logits = self.inner.run_paged_decode_step(token_id)?;
-        // `run_paged_decode_step` returns `[1, 1, vocab]`; `true` requests
-        // the engine's squeeze of axis 1 (the eager convention).
-        Ok((logits, true))
+        self.inner.run_paged_decode_step(token_id)
     }
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, budget_forced: bool) {
@@ -177,7 +171,7 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
             .map_or(Ok(()), |error| Err(Error::from_reason(error)))
     }
 
-    fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+    fn materialize_final_token(&mut self, token_id: u32) -> Result<()> {
         // LENGTH-exit only (the engine gates the call): run ONE more
         // `run_paged_decode_step` for the final committed token so its K/V
         // lands in the paged adapter, then DISCARD the logits. The adapter's
@@ -212,7 +206,7 @@ impl PagedPrefix for Gemma4PrefixState {
 
 impl PagedBackend for Gemma4Inner {
     type PagedDecode<'a>
-        = Gemma4PagedDecode<'a>
+        = PagedStepper<Gemma4PagedDecode<'a>>
     where
         Self: 'a;
     type PrefixState = Gemma4PrefixState;
@@ -305,14 +299,14 @@ impl PagedBackend for Gemma4Inner {
                             )
                             .unwrap_or(false)
                 });
-        Ok(Gemma4PagedDecode {
+        Ok(PagedStepper(Gemma4PagedDecode {
             step: 0,
             pending_cache_error: None,
             pending_timing: None,
             tune_grouped,
             tune_submission,
             inner: self,
-        })
+        }))
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
@@ -719,16 +713,14 @@ impl ChatBackend for Gemma4Inner {
         // paged core has one, and paged turns never reach this hook), and
         // the engine's session_start guard rejects `reuse_cache=Some(false)`
         // anyway.
-        let history_tokens: &[u32] =
-            if args.finish_reason != "length" && !args.generated_tokens.is_empty() {
-                &args.generated_tokens[..args.generated_tokens.len() - 1]
-            } else {
-                args.generated_tokens
-            };
-        let mut new_history = Vec::with_capacity(args.save_tokens.len() + history_tokens.len());
-        new_history.extend_from_slice(args.save_tokens);
-        new_history.extend_from_slice(history_tokens);
-        self.cached_token_history = new_history;
+        fwd::save_flat_token_history(
+            args.save_tokens,
+            args.generated_tokens,
+            args.finish_reason == "length",
+            true,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        );
         if !args.is_delta {
             // Fresh text-only turn: clear any stale image/audio key (a
             // text-only turn has no multimodal key to set). Delta turns leave
