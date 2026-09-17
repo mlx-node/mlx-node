@@ -248,12 +248,7 @@ impl Decoder {
             &keys,
             &values,
             (c.head_dim as f64).powf(-0.5),
-        )?
-        .transpose(Some(&[0, 2, 1, 3]))?
-        .reshape(&[1, t as i64, nh * hd])?;
-        let gate = qg
-            .slice_axis(3, hd, 2 * hd)?
-            .reshape(&[1, t as i64, nh * hd])?;
-        Ok(Some(math::sigmoid_mul(&gate, &out)?))
+        )?;
+        Ok(Some(math::attention_output(&out, &qg)?))
     }
 }

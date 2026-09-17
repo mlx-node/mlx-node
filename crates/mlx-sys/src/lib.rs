@@ -2067,6 +2067,10 @@ unsafe extern "C" {
         cosine: *mut mlx_array,
         sine: *mut mlx_array,
     ) -> *mut mlx_array;
+    pub fn mlx_qwen4_attention_gate(
+        attention: *mut mlx_array,
+        projection: *mut mlx_array,
+    ) -> *mut mlx_array;
     pub fn mlx_qwen4_attention_norm_rotary(
         x: *mut mlx_array,
         weight: *mut mlx_array,

@@ -1104,7 +1104,6 @@ impl Decoder {
         let kh = c.num_key_value_heads as i64;
         let qg = projections.qg.reshape(&[1, 1, nh, 2 * hd])?;
         let q = qg.slice_axis(3, 0, hd)?;
-        let gate = qg.slice_axis(3, hd, 2 * hd)?.reshape(&[1, 1, nh * hd])?;
         let q = self.attention_norm_rotary(
             &q.transpose(Some(&[0, 2, 1, 3]))?,
             &format!("{p}.q_norm.weight"),
@@ -1225,10 +1224,8 @@ impl Decoder {
             (keys.take(&selected, 2)?, values.take(&selected, 2)?)
         };
         let out =
-            scaled_dot_product_attention(&q, &keys, &values, (c.head_dim as f64).powf(-0.5), None)?
-                .transpose(Some(&[0, 2, 1, 3]))?
-                .reshape(&[1, 1, nh * hd])?;
-        let out = math::sigmoid_mul(&gate, &out)?;
+            scaled_dot_product_attention(&q, &keys, &values, (c.head_dim as f64).powf(-0.5), None)?;
+        let out = math::attention_output(&out, &qg)?;
         if project_output {
             self.linear(
                 &out,

@@ -153,6 +153,117 @@ the optional BF16 prefill/PLE configuration, with its existing numerical limits.
 The earlier 90% result remains a separately dated result, not a substitute for
 these contemporaneous measurements.
 
+### Cached MoE replay experiment (archived)
+
+An external prototype, `MLX_QWEN4_MOE_REPLAY=1`, tested a narrower adaptation of
+`TrackFastMLPReplay`'s cached-graph pattern. Router projection, probability-first
+route/shared-gate selection, logical-to-slot lookup and routed/shared expert
+kernels become one retained MLX graph. Each call supplies the current input,
+router/shared-gate weights, slot map, six weight banks and native sigmoid table.
+It captures no mutable weight bank or route map as a constant. Existing kernel
+arithmetic is unchanged; this experiment targets host graph construction.
+
+The prototype required the matching router-row, route/shared-gate, register,
+expert-lane and two-row switches, and stays inside tentative singleton routing.
+Its selected IDs join the existing route tape; the output joins existing slot
+readers. The same commit, miss rollback/replay and cancellation handling remain
+in force. No bank capacity, system reserve or completion guard is increased or
+removed. The ordinary path remains available for unsupported inputs/settings.
+
+In the prototype tree, all **109 Qwen native tests passed** (47.02 seconds). The added replay regression
+compares independent BF16 router/shared-gate projections and the already checked
+separate expert operations across Q4_K/Q5_K gate/up and affine5/8 down banks,
+changing inputs/weights, replacement slot maps, and missing slots. IDs and every
+output match exactly; unsupported multi-token input falls back. The canonical
+addon build and strict all-target Clippy also passed. The immutable addon is
+`target95-replay-build`, SHA-256
+`3c9c2eeb7a8071d656d3e2036671c97dbfc1746963b356df85d9e710abd3f03b`.
+A full-checkpoint diagnostic forced rollback for every tentative token across
+two 1024/128 requests: **254 replays**, comprising 126 actual misses and 128
+hits, all with the expected standard output hash. The trace explicitly confirmed
+the compiled MoE path executed. The 63 GiB/393-slot memory/pressure guard passed
+at 69,366,627,080 bytes peak physical footprint. These forced-replay timings are
+excluded from performance comparisons.
+The replay-enabled complete-checkpoint smoke also passed all 11 requests and
+released every page/state reservation, with an actual auxiliary-model plan of
+63 GiB / 366 slots and 65,159,760,056 bytes peak physical footprint. Its trace
+confirmed graph execution. These are correctness checks, not throughput samples.
+
+The first fresh pair before the user closed applications gave prototype/control
+medians of 1499.895/51.441 and 1473.065/51.033 tokens/s. These rates and all
+output hashes/guards are retained as `target95-replay-candidate-a` and
+`target95-replay-control-a`; they are not pooled with the next series.
+
+After the user offered a five-minute closed-application window, a separate
+control/prototype/prototype/control series used the same immutable replay addon,
+1024/128 tokens, two warmups plus three measurements per process and 63 GiB /
+393 slots. Every output hash and all four comparison guards passed.
+
+| Process      | Prefill median | Decode median | Busy GPU MHz median |
+| ------------ | -------------: | ------------: | ------------------: |
+| Replay off A |       2278.178 |        54.467 |                1618 |
+| Replay on A  |       2261.055 |        54.807 |                1618 |
+| Replay on B  |       2237.141 |        54.516 |                1612 |
+| Replay off B |        999.411 |        47.458 |                1125 |
+
+The requested window began at 03:23:39 UTC. The first pair ended at 03:27:57;
+the second prototype ended at 03:28:45 and the final control at 03:29:24, beyond
+that five-minute window. The full sequence cannot be described as a controlled
+closed-application comparison. The first pair supplies no convincing replay
+benefit, and pooling the slow final control would exaggerate it. GPU-clock
+variation remains an observation with no established cause. The prototype's
+six-sample median was 2252.210/54.693 tokens/s, below the 95% targets; its ranges
+were 2156.429–2280.691 and 54.439–55.049. Full data and telemetry are retained in
+`target95-closed-abba.json`.
+
+The replay source patch, regression and immutable addon are archived outside
+the PR (`target95-replay-final.patch`, `target95-replay-build`). With no
+repeatable benefit, the replay runtime branch and its flag were removed from
+the shipping source. The forced-rollback and smoke results above describe that
+archived prototype, not a newer runtime configuration.
+
+### Attention output gate follow-up
+
+The reference's
+[`attnGateSource`](https://github.com/Layr-Labs/mlxfast-qwen38-125b-a6b-engine/blob/05944553c77666f74651f5c20d6cb4b8b132b7d9/Runner/FastModel/TrackFastKernels2.swift#L455)
+reads the attention and projected gate directly in one operation. Our Q/K
+normalization already handles strides without materializing the input views;
+there is no missing copy removal there. The output path still reshaped the
+head-major attention and interleaved gate into token-major buffers before its
+pointwise multiply. `MLX_QWEN4_ATTENTION_GATE=1` ports direct addressing for
+that output, preserving the local interleaved head layout and using the existing
+native BF16 sigmoid table. All changing arrays and strides remain graph inputs;
+unsupported shapes/dtypes and disabled fused pointwise operations retain the
+original path. No additional weight copies or admission changes are introduced.
+
+All **109 Qwen native tests passed** (53.05 seconds). The new gate regression
+compares the independent native compiled sigmoid/multiply across changing
+inputs, offset/transposed views, singleton and 7/64/1024-token windows, and
+1/8/24 heads. It covers every finite BF16 gate value, signed zeros, infinities
+and native exponential halfway cases, with bitwise output comparison. F32
+inputs are rejected by the custom path. An initial broader Cargo invocation
+also began building unrelated integration binaries; those task-owned compiler
+jobs were stopped and the completed Qwen unit-test binary was run directly.
+The stopped compilation supplies no integration-test result.
+
+The canonical addon build, packaged metallib checks and strict all-target Clippy
+passed. `target95-gate-build` identifies the immutable addon, SHA-256
+`f2659ffa435bde3ec767d242f00498a2d02e45a48c631f502da658786b3f77bc`.
+Its gate-enabled exact-arithmetic complete-checkpoint smoke passed all **11
+requests**, including AR, streaming continuation, native/adaptive MTP,
+concurrent owners, cancellation recovery and image continuation/replacement.
+All 1365 pages were free afterward and all state/block reservations were zero.
+With live headroom, the auxiliary-model plan admitted **62 GiB / 359 slots**
+under the unchanged 63 GiB cap; peak physical footprint was 64,151,749,760 bytes.
+Memory/pressure guards passed. This is correctness evidence only, not a
+fixed-63-GiB performance comparison.
+
+The first alternating gate-off/on comparison (`target95-gate-paired-a`) stopped
+before loading: its comparison guard detected Metal compilation in the
+`lfm2-vllm-align` / `k2-horizon` worktrees. The guard was not relaxed and those
+processes were not stopped. It supplies no throughput sample for this port.
+The gate remains opt-in; the 95% objective is still unachieved.
+
 ## Previous 90% result and limits
 
 **The previous optional configuration exceeded 90% of both then-published rates.**

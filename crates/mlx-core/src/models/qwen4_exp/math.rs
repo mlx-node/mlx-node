@@ -1642,6 +1642,38 @@ pub(super) fn swiglu(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
         Activations::swiglu_compiled(gate, up)
     }
 }
+fn fused_attention_gate(attention: &MxArray, projection: &MxArray) -> Result<Option<MxArray>> {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return Ok(None);
+    }
+    let raw = unsafe {
+        mlx_sys::mlx_qwen4_attention_gate(attention.as_raw_ptr(), projection.as_raw_ptr())
+    };
+    if raw.is_null() {
+        Ok(None)
+    } else {
+        MxArray::from_handle(raw, "Qwen4 attention output gate").map(Some)
+    }
+}
+
+pub(super) fn attention_output(attention: &MxArray, projection: &MxArray) -> Result<MxArray> {
+    if runtime_flags::is_one(c"MLX_QWEN4_ATTENTION_GATE")
+        && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
+        && let Some(output) = fused_attention_gate(attention, projection)?
+    {
+        return Ok(output);
+    }
+    let shape = attention.shape()?;
+    let (tokens, heads, width) = (shape[2], shape[1], shape[3]);
+    let gate = projection
+        .slice_axis(3, width, 2 * width)?
+        .reshape(&[1, tokens, heads * width])?;
+    let value = attention
+        .transpose(Some(&[0, 2, 1, 3]))?
+        .reshape(&[1, tokens, heads * width])?;
+    sigmoid_mul(&gate, &value)
+}
+
 pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
     if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE") {
         value.mul(&Activations::sigmoid(gate)?)
@@ -1653,6 +1685,71 @@ pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
 #[cfg(test)]
 mod window_conv_tests {
     use super::*;
+
+    #[test]
+    fn attention_gate_preserves_layouts_native_sigmoid_and_changing_inputs() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        for seed in [0_u32, 197] {
+            for (tokens, heads) in [(1_i64, 1_i64), (7, 8), (64, 8), (1024, 24)] {
+                let attention = values(
+                    (tokens + 1) * heads * 256,
+                    &[1, tokens + 1, heads, 256],
+                    seed as f32,
+                )
+                .astype(DType::BFloat16)
+                .unwrap()
+                .slice_axis(1, 1, tokens + 1)
+                .unwrap()
+                .transpose(Some(&[0, 2, 1, 3]))
+                .unwrap();
+                let data: Vec<_> = (0..(tokens + 1) * heads * 512)
+                    .map(|i| {
+                        // All finite BF16 inputs, signed zeros and infinities;
+                        // includes native sigmoid exponential halfway cases.
+                        let bits = ((i / 512 * 256 + i % 256) as u32 + seed) & 65535;
+                        let x = f32::from_bits(bits << 16);
+                        if x.is_nan() { -6.84375 } else { x }
+                    })
+                    .collect();
+                let projection = MxArray::from_float32(&data, &[1, tokens + 1, heads, 512])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap()
+                    .slice_axis(1, 1, tokens + 1)
+                    .unwrap();
+                let gate = projection
+                    .slice_axis(3, 256, 512)
+                    .unwrap()
+                    .reshape(&[1, tokens, heads * 256])
+                    .unwrap();
+                let value = attention
+                    .transpose(Some(&[0, 2, 1, 3]))
+                    .unwrap()
+                    .reshape(&[1, tokens, heads * 256])
+                    .unwrap();
+                let expected = Activations::sigmoid_mul_compiled(&gate, &value).unwrap();
+                let actual = fused_attention_gate(&attention, &projection)
+                    .unwrap()
+                    .expect("eligible direct-address attention gate");
+                let actual = actual.to_float32().unwrap();
+                let expected = expected.to_float32().unwrap();
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "seed={seed} tokens={tokens} heads={heads}",
+                );
+                assert!(
+                    fused_attention_gate(&attention.astype(DType::Float32).unwrap(), &projection)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
 
     fn values(n: i64, shape: &[i64], phase: f32) -> MxArray {
         MxArray::from_float32(

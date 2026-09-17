@@ -683,6 +683,41 @@ extern "C" mlx_array *mlx_qwen4_routed_experts(mlx_array *x, mlx_array *ids,
   return nullptr;
 }
 
+// Read SDPA's head-major result and the interleaved Q/gate projection without
+// materializing the two token-major reshape buffers before the pointwise op.
+extern "C" mlx_array *mlx_qwen4_attention_gate(mlx_array *attention,
+                                              mlx_array *projection) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!attention || !projection) return nullptr;
+    const auto &att = *reinterpret_cast<array *>(attention);
+    const auto &qg = *reinterpret_cast<array *>(projection);
+    if (att.ndim() != 4 || att.shape(0) != 1 || att.shape(1) < 1 ||
+        att.shape(1) > 128 || att.shape(2) < 1 || att.shape(2) > 1024 ||
+        att.shape(3) != 256 || att.dtype() != mlx::core::bfloat16 ||
+        qg.shape() != Shape{1, att.shape(2), att.shape(1), 512} ||
+        qg.dtype() != att.dtype()) return nullptr;
+    static auto graph = [](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_attention_gate", {"att", "qg", "sigmoid_table"}, {"out"},
+#include "metal/qwen4_attention_gate.metal.inc"
+          , "", false);
+      const int heads = a[0].shape(1), tokens = a[0].shape(2);
+      return kernel(a, {{1, tokens, heads * 256}}, {a[0].dtype()},
+                    {heads * 256, tokens, 1}, {256, 1, 1},
+                    {{"T", a[0].dtype()}, {"H", heads}, {"D", 256}},
+                    std::nullopt, false, mlx::core::Device::gpu);
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto result = compiled({att, qg, native_bf16_sigmoid_table()});
+    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 attention output gate: " << e.what() << std::endl;
+  }
+#endif
+  return nullptr;
+}
+
 // 0..11 are the existing routed-expert inputs, 12..20 the shared banks,
 // and 21 the BF16 shared gate. All arrays remain graph inputs on replay.
 extern "C" mlx_array *mlx_qwen4_routed_shared_experts(mlx_array *const *inputs,
