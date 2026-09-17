@@ -63,6 +63,12 @@ export interface CatalogItem {
    */
   localAssetsRepo: string | null;
   localAssetsRevision: string | null;
+  /**
+   * Base-model repo the catalog entry CURRENTLY sources its tokenizer
+   * sidecars from — compared against `localAssetsRepo` so a switched source
+   * is itself an update (the marker's repo is what the probe map lacks).
+   */
+  assetsRepo?: string;
   /** Separate optional draft weights, never a standalone chat-model entry. */
   draft?: CatalogDraftItem;
 }

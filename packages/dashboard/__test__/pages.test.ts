@@ -1447,6 +1447,84 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).not.toContain('Update available');
   });
 
+  it('offers Update when the catalog switched the sidecar source repo', async () => {
+    // The marker names the OLD assets repo, which the sweep never probes —
+    // it lists only the catalog's current one — so comparing the marker's
+    // repo alone can never see the change and the migration job never runs.
+    await mount(
+      createElement(Models),
+      catalogRoutes(
+        {
+          present: true,
+          installed: true,
+          localRevision: 'a'.repeat(40),
+          assetsRepo: 'base/new-model', // the entry's CURRENT source
+          localAssetsRepo: 'base/model', // the marker's recorded one
+          localAssetsRevision: 'c'.repeat(40),
+        },
+        [],
+        {
+          items: [
+            { hfRepo: REPO, remoteRevision: 'a'.repeat(40) },
+            { hfRepo: 'base/new-model', remoteRevision: 'e'.repeat(40) },
+          ],
+        },
+      ),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Update available');
+  });
+
+  it('offers Update when the install predates sidecar provenance the entry prescribes', async () => {
+    // localAssetsRepo null + a prescribed assetsRepo means the install lacks
+    // the tokenizer sidecars entirely — a repairable gap, not "unknown".
+    await mount(
+      createElement(Models),
+      catalogRoutes(
+        {
+          present: true,
+          installed: true,
+          localRevision: 'a'.repeat(40),
+          assetsRepo: 'base/model',
+          localAssetsRepo: null,
+          localAssetsRevision: null,
+        },
+        [],
+        {
+          items: [
+            { hfRepo: REPO, remoteRevision: 'a'.repeat(40) },
+            { hfRepo: 'base/model', remoteRevision: 'e'.repeat(40) },
+          ],
+        },
+      ),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Update available');
+  });
+
+  it('stays Installed when the catalog dropped its sidecar source', async () => {
+    // The reverse direction is deliberately quiet: the marker records an
+    // assetsRepo the entry no longer prescribes, no job could clear that
+    // badge, and the old repo is unprobed — Installed, no update.
+    await mount(
+      createElement(Models),
+      catalogRoutes(
+        {
+          present: true,
+          installed: true,
+          localRevision: 'a'.repeat(40),
+          localAssetsRepo: 'base/model',
+          localAssetsRevision: 'c'.repeat(40),
+        },
+        [],
+        { items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }] },
+      ),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+  });
+
   it('never offers Update for a checkpoint the dashboard does not own', async () => {
     // The join is the page's now, so the ownership gate is too: an Update is a
     // re-install, and the runner's preflight refuses every final dir it does not

@@ -1298,6 +1298,52 @@ describe('DownloadManager', () => {
     expect(marker.assetsRevision).toBe(SHA_NEW);
   });
 
+  it('records the new sidecar source when the assets repo moved at the same sha', async () => {
+    // An HF repo TRANSFER keeps history: the new repo's HEAD is the sha the
+    // marker already records. The verified-clean path must still rewrite the
+    // marker's assetsRepo — the page compares THAT name against the entry's,
+    // so a stale name means an update badge no job can ever clear.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+    const first = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = first.start(REPO);
+    first.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'done'));
+
+    // Same bytes, same pinned sha — but the marker names the repo the entry
+    // used to point at (the transfer's old name).
+    const markerPath = join(finalDir(), DOWNLOAD_COMPLETE_MARKER);
+    const marker = JSON.parse(readFileSync(markerPath, 'utf-8')) as { assetsRepo?: string };
+    marker.assetsRepo = 'base/old-model';
+    writeFileSync(markerPath, JSON.stringify(marker));
+    hub.downloaded = [];
+
+    const second = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events2: DownloadEvent[] = [];
+    const id2 = second.start(REPO);
+    second.subscribe(id2, (event) => events2.push(event));
+    await waitFor(() => events2.some((event) => event.type === 'done'));
+
+    // Everything verified clean — nothing re-downloaded — but the marker now
+    // names the CURRENT source, so the badge clears.
+    expect(hub.downloaded).toEqual([]);
+    const next = JSON.parse(readFileSync(markerPath, 'utf-8')) as { assetsRepo?: string };
+    expect(next.assetsRepo).toBe(ASSETS_REPO);
+  });
+
   it('drops and deletes a sidecar the assets repo no longer supplies', async () => {
     // A repo that deleted a tokenizer file must not leave it installed (and
     // listed) forever: the verified-done path prunes what the assets listing

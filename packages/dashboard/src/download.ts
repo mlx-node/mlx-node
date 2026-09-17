@@ -1454,7 +1454,12 @@ export class DownloadManager {
     const stale = installed.files.filter(
       (file) => ASSET_SIDECAR_CANDIDATE_SET.has(file) && !primaryNames.has(file) && !plannedNames.has(file),
     );
-    if (stale.length === 0 && installed.assetsRevision === plan.revision) return true;
+    // Repo identity participates in "verified clean" too: an upstream repo
+    // TRANSFER keeps history, so the new source's HEAD is the sha the marker
+    // already records. Returning here would leave `assetsRepo` naming the old
+    // repo forever — a badge update discovery can never clear.
+    if (stale.length === 0 && installed.assetsRepo === plan.repo.name && installed.assetsRevision === plan.revision)
+      return true;
     if (stale.length > 0) {
       // Pruning must never destroy the install. The resulting manifest has to
       // stay loadable — a config and a weight — and the case that matters is

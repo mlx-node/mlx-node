@@ -9,7 +9,7 @@
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { type CatalogEntry, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { type CatalogEntry, catalogRepo, catalogSelectionForRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { findDFlash2Draft, isDFlash2Companion } from '@mlx-node/lm/draft-companion';
 
 import { isDownloaderOwned, isModelInstalled, isModelPresent, isPathOccupied, readCompletion } from './models.js';
@@ -192,6 +192,11 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
       ...entry,
       draft,
       hfRepo,
+      // Selection fields describe the GGUF repo only, so serve the SAME gated
+      // value the job plans sidecars from: a platform-override build resolves
+      // to a repo that plans none, and serving the raw field would pin an
+      // update badge its marker could never record.
+      assetsRepo: catalogSelectionForRepo(entry, hfRepo).assetsRepo,
       slug,
       installed,
       present,
