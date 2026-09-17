@@ -123,7 +123,7 @@ describe('buildChatConfig', () => {
     // construction must never reorder it.
     expect(() => buildChatConfig('harrier', undefined, undefined)).toThrow(
       'buildChatConfig: no launch preset for model type "harrier" ' +
-        '(known types: qwen3, qwen3_5, qwen3_5_moe, gemma4, muse_glimmer, lfm2, lfm2_moe, nemotron_h)',
+        '(known types: qwen3, qwen3_5, qwen3_5_moe, gemma4, muse_glimmer, qwen4_exp, lfm2, lfm2_moe, nemotron_h)',
     );
   });
 

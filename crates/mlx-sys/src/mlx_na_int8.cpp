@@ -11,7 +11,7 @@
 // Int8 DType, so int8 lives entirely C++-side: Stage-1 callers pass bf16/f32
 // arrays holding integer values in [-127,127] which are cast to int8 here.
 //
-// Layout contract (see metal/na_int8_gemm.metal.inc):
+// Layout contract (see metal/common/na_int8_gemm.metal.inc):
 //   kernel math (host view): C[m,n] = sum_k A[m,k] * B[k,n]
 //   with A = [M,K] row-major, B = [K,N] row-major.
 //   We want y = x @ w^T where w is [N,K] row-major (weight rows = output chans).
@@ -30,7 +30,7 @@
 namespace {
 
 const char* kNaInt8GemmBody =
-#include "metal/na_int8_gemm.metal.inc"
+#include "metal/common/na_int8_gemm.metal.inc"
     ;
 
 const char* kNaInt8GemmHeader =
@@ -41,31 +41,31 @@ const char* kNaInt8GemmHeader =
 // (2) Per-token dynamic symmetric int8 activation quant (one kernel, two strided
 //     global passes over x). Replaces the ~5-7-op lazy quant chain.
 const char* kNaInt8QuantBody =
-#include "metal/na_int8_quant.metal.inc"
+#include "metal/common/na_int8_quant.metal.inc"
     ;
 // (3) int32 -> bf16 accumulator rescale (one elementwise pass). Replaces the
 //     multi-pass lazy rescale (astype/f32-mul/mul/astype-bf16).
 const char* kNaInt8RescaleBody =
-#include "metal/na_int8_rescale.metal.inc"
+#include "metal/common/na_int8_rescale.metal.inc"
     ;
 // sym8 DECODE matvec (QMV). Memory-BW-bound matvec for small M (decode): the
 // prefill 128x64 GEMM wastes 127/128 rows at M=1, so decode needs a dedicated
 // matvec that streams each int8 weight byte once + applies s_x[m]*s_w[n] inline.
 // Reuses the shared na_int8_quant kernel for the activation int8 quant.
 const char* kNaInt8QmvBody =
-#include "metal/na_int8_qmv.metal.inc"
+#include "metal/common/na_int8_qmv.metal.inc"
     ;
 // FUSED sym8 DECODE matvec: takes bf16 x directly, folds the per-token int8
 // activation quant INTO the matvec kernel (single kernel, like affine qmv).
 const char* kNaInt8QmvFusedBody =
-#include "metal/na_int8_qmv_fused.metal.inc"
+#include "metal/common/na_int8_qmv_fused.metal.inc"
     ;
 // W8A16 sym8 DECODE matvec: bf16 x read directly, NO activation quant at all —
 // single-pass f32-accumulate mixed-precision matvec. The act-quant passes of
 // the fused W8A8 qmv are pure overhead at M=1 (e2e -0.50x vs affine-Q8); this
 // kernel removes them AND makes decode activation-exact.
 const char* kNaInt8QmvW8a16Body =
-#include "metal/na_int8_qmv_w8a16.metal.inc"
+#include "metal/common/na_int8_qmv_w8a16.metal.inc"
     ;
 // W8A16 sym8 DECODE matvec, MLX-affine-qmv style (the PRODUCTION decode
 // kernel): simdgroup-per-rows on the [N,K] checkpoint orientation, wide
@@ -73,7 +73,7 @@ const char* kNaInt8QmvW8a16Body =
 // memory/barriers. Fixes the 2D-block kernel's DRAM streaming deficit
 // (54.7us -> ~affine-parity in the in-stream decode chain).
 const char* kNaInt8QmvW8a16SgBody =
-#include "metal/na_int8_qmv_w8a16_sg.metal.inc"
+#include "metal/common/na_int8_qmv_w8a16_sg.metal.inc"
     ;
 
 // MEASUREMENT ONLY (diagnostic). Identical to kNaInt8GemmBody but uses
@@ -317,7 +317,7 @@ mlx::core::fast::CustomKernelFunction& get_int8_qmv_w8a16_kernel() {
 }
 
 // W8A16 sym8 DECODE matvec kernel, simd_sum style ([N,K] checkpoint
-// orientation — see metal/na_int8_qmv_w8a16_sg.metal.inc).
+// orientation — see metal/common/na_int8_qmv_w8a16_sg.metal.inc).
 mlx::core::fast::CustomKernelFunction& get_int8_qmv_w8a16_sg_kernel() {
   static std::mutex mtx;
   static std::optional<mlx::core::fast::CustomKernelFunction> kernel;
@@ -405,7 +405,7 @@ mlx::core::array int8_rescale(const mlx::core::array& acc,
 // to bf16. x[m,:] is staged into threadgroup memory in chunks so it is read once
 // per group; the [K,N] weight read is coalesced (consecutive threads = consecutive
 // n = contiguous bytes). Output is LAZY (composes into the forward graph). See
-// metal/na_int8_qmv.metal.inc for the kernel + dispatch contract.
+// metal/common/na_int8_qmv.metal.inc for the kernel + dispatch contract.
 mlx::core::array int8_qmv_core(const mlx::core::array& x_i8,
                                const mlx::core::array& w_kn,
                                const mlx::core::array& s_x,

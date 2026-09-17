@@ -1,4 +1,37 @@
 #include "mlx_common.h"
+#include "mlx/primitives.h"
+#include "mlx/backend/cpu/copy.h"
+#ifdef MLX_NODE_GPU_ENABLED
+#include "mlx/backend/gpu/copy.h"
+#endif
+
+namespace {
+// AsType(copy=true) can donate its last input buffer and preserve the offset
+// and oversized allocation of a slice. General copies always allocate tightly
+// packed output storage, while retaining normal lazy stream ordering.
+class IndependentCopy final : public mlx::core::Copy {
+ public:
+  explicit IndependentCopy(mlx::core::Stream stream) : Copy(stream) {}
+  void eval_cpu(const std::vector<array>& inputs, array& out) override {
+    mlx::core::copy_cpu(inputs[0], out, mlx::core::CopyType::General, stream());
+  }
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+#ifdef MLX_NODE_GPU_ENABLED
+    mlx::core::copy_gpu(inputs[0], out, mlx::core::CopyType::General, stream());
+#else
+    throw std::runtime_error("IndependentCopy requires a GPU backend on a GPU stream");
+#endif
+  }
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>& inputs, const std::vector<int>& axes) override {
+    return {{array(inputs[0].shape(), inputs[0].dtype(),
+        std::make_shared<IndependentCopy>(stream()), {inputs[0]})}, axes};
+  }
+  DEFINE_NAME(IndependentCopy)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+};
+}
+
 
 extern "C" {
 
@@ -195,12 +228,8 @@ mlx_array* mlx_array_copy(mlx_array* handle) {
 
 mlx_array* mlx_array_deep_copy(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
-  // `copy()` creates a distinct MLX array handle but its Copy primitive shares
-  // the input buffer after evaluation. Force an AsType primitive even though
-  // the dtype is unchanged: both the CPU and GPU implementations allocate and
-  // populate independent storage. This is required when retaining a slice
-  // without pinning the much larger source allocation.
-  array result = astype(*arr, arr->dtype(), /* copy = */ true);
+  array result(arr->shape(), arr->dtype(),
+      std::make_shared<IndependentCopy>(mlx::core::to_stream({})), {*arr});
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 

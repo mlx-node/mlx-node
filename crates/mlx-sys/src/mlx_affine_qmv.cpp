@@ -3,7 +3,7 @@
 
 namespace {
 const char* kAffineQmvBf16 =
-#include "metal/affine_qmv_bf16.metal.inc"
+#include "metal/common/affine_qmv_bf16.metal.inc"
 ;
 
 const mlx::core::fast::CustomKernelFunction& affine_qmv_kernel() {

@@ -8410,12 +8410,11 @@ impl PagedKVCacheAdapter {
         self.block_table.is_some() && self.already_registered
     }
 
-    /// Finalize a sliding group without publishing null-containing logical
-    /// blocks into the content-addressed full-prefix cache.
+    /// Retain a completed request without publishing content-addressed blocks.
+    /// Sliding groups use this because their logical blocks contain holes.
+    /// Hybrid families also use it when their auxiliary state is live-only:
+    /// those K/V pages must not advertise a restorable standalone prefix.
     pub fn finalize_turn_keep_live_no_prefix(&mut self) -> Result<(), String> {
-        if self.sliding_window == 0 {
-            return Err("finalize_turn_keep_live_no_prefix requires a sliding adapter".to_string());
-        }
         if self.block_table.is_none() {
             return Err(
                 "finalize_turn_keep_live_no_prefix called before begin_request".to_string(),
@@ -9600,6 +9599,13 @@ mod tests {
         )))
     }
 
+    fn open_test_cold_cache(
+        root: std::path::PathBuf,
+    ) -> Result<mlx_paged_attn::ColdCacheManager, String> {
+        // Persistence fixtures must not depend on the host disk's free-space reserve.
+        mlx_paged_attn::ColdCacheManager::open_at(root, 16 * 1024 * 1024, 0, 8)
+    }
+
     /// Build a placeholder `LayerKVPool` matching the allocator's capacity.
     /// Uses `LayerKVPool::new_for_test` so the lifecycle-only tests below
     /// don't pay GPU-allocation costs and aren't constrained to the
@@ -9888,8 +9894,7 @@ mod tests {
 
         let root =
             std::env::temp_dir().join(format!("mlx-adapter-cold-tier-{}", std::process::id()));
-        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-            .expect("temp-dir cold cache must open");
+        let manager = open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open");
         let fingerprint =
             mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-test".as_slice()]);
         adapter.set_cold_tier(ColdTierContext {
@@ -9922,8 +9927,7 @@ mod tests {
 
         let root =
             std::env::temp_dir().join(format!("mlx-adapter-cold-suppress-{}", std::process::id()));
-        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-            .expect("temp-dir cold cache must open");
+        let manager = open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open");
         let fingerprint =
             mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-suppress".as_slice()]);
         adapter.set_cold_tier(ColdTierContext {
@@ -9995,10 +9999,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("mlx-adapter-cold-capture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let manager = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         let fingerprint =
             mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-test".as_slice()]);
         adapter.set_cold_tier(ColdTierContext {
@@ -10099,10 +10101,8 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let manager = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         let fingerprint =
             mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-per-block".as_slice()]);
         adapter.set_cold_tier(ColdTierContext {
@@ -10500,8 +10500,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-            .expect("temp-dir cold cache must open");
+        let manager = open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open");
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::new(manager),
             fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
@@ -10614,10 +10613,8 @@ mod tests {
         let alloc_src = new_allocator(8, 8);
         let mut adapter_src = PagedKVCacheAdapter::new(alloc_src, Arc::clone(&pool_src), 8)
             .expect("capture adapter ctor");
-        let manager_src = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager_src =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         adapter_src.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager_src),
             fingerprint,
@@ -10686,10 +10683,7 @@ mod tests {
         let alloc_dst = new_allocator(8, 8);
         let mut adapter_dst = PagedKVCacheAdapter::new(alloc_dst, Arc::clone(&pool_dst), 8)
             .expect("restore adapter ctor");
-        let manager_dst = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("reopen cold cache"),
-        );
+        let manager_dst = Arc::new(open_test_cold_cache(root.clone()).expect("reopen cold cache"));
         adapter_dst.set_cold_tier(ColdTierContext {
             manager: manager_dst,
             fingerprint,
@@ -10795,10 +10789,8 @@ mod tests {
         let alloc_src = new_allocator(8, 8);
         let mut adapter_src = PagedKVCacheAdapter::new(alloc_src, Arc::clone(&pool_src), 8)
             .expect("capture adapter ctor");
-        let manager_src = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager_src =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         adapter_src.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager_src),
             fingerprint,
@@ -10871,10 +10863,7 @@ mod tests {
             let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool), 8)
                 .expect("restore adapter ctor");
             adapter.set_cold_tier(ColdTierContext {
-                manager: Arc::new(
-                    mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                        .expect("reopen cold cache"),
-                ),
+                manager: Arc::new(open_test_cold_cache(root.clone()).expect("reopen cold cache")),
                 fingerprint,
                 sidecar_policy: None,
             });
@@ -11042,10 +11031,8 @@ mod tests {
         let mut adapter_src =
             PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool_src), 8)
                 .expect("capture adapter ctor");
-        let manager_src = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager_src =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         adapter_src.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager_src),
             fingerprint,
@@ -11107,10 +11094,7 @@ mod tests {
         let fresh = |policy: Option<mlx_paged_attn::ColdSidecarPolicy>, per_block: bool| {
             let pool =
                 Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
-            let manager = Arc::new(
-                mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                    .expect("reopen cold cache"),
-            );
+            let manager = Arc::new(open_test_cold_cache(root.clone()).expect("reopen cold cache"));
             let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool), 8)
                 .expect("restore adapter ctor");
             adapter.set_cold_tier(ColdTierContext {
@@ -11224,8 +11208,8 @@ mod tests {
                 .collect(),
         };
         {
-            let writer = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("reopen cold cache to write state");
+            let writer =
+                open_test_cold_cache(root.clone()).expect("reopen cold cache to write state");
             assert!(writer.enqueue_sidecar(state.clone()).unwrap());
             assert!(writer.drain(std::time::Duration::from_secs(10)));
         }
@@ -11353,10 +11337,8 @@ mod tests {
         let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 8) else {
             return;
         };
-        let manager = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         let per_block: Vec<Vec<u64>> = vec![Vec::new(); 4];
 
         // No policy: a salt is none of the cold tier's business.
@@ -11448,10 +11430,8 @@ mod tests {
         assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 4);
         adapter.release_request().unwrap();
 
-        let manager = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         let policy = mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
             .expect("policy geometry must validate");
 
@@ -11587,10 +11567,8 @@ mod tests {
         );
         adapter.release_request().unwrap();
 
-        let manager = Arc::new(
-            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
-                .expect("temp-dir cold cache must open"),
-        );
+        let manager =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,

@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 /**
  * MLX Stream Support
  *
@@ -109,18 +111,19 @@ impl Drop for StreamContext {
 
 /// Wired Limit Context Manager (RAII pattern)
 ///
-/// Matches mlx-lm's `wired_limit` context manager (generate.py lines 219-256).
-/// Temporarily sets the wired memory limit for Metal GPU operations.
+/// Temporarily requests wired memory for Metal GPU operations, following
+/// mlx-lm's `wired_limit` policy or an independently admitted working-set bound.
 ///
 /// When created:
 /// - Checks if Metal is available
 /// - Calculates model size and compares to max_recommended_working_set_size
-/// - Sets wired limit to max_recommended_working_set_size
+/// - Requests the selected limit, capped at max_recommended_working_set_size
+/// - Keeps the largest request while overlapping contexts are active
 /// - Stores streams to synchronize on exit
 ///
 /// When dropped:
 /// - Synchronizes all provided streams (waits for GPU operations to complete)
-/// - Restores the original wired limit
+/// - Restores the original wired limit after the last overlapping context exits
 ///
 /// # Why this matters
 /// - Metal GPU has finite "wired" memory (cannot be paged out)
@@ -140,24 +143,8 @@ impl Drop for StreamContext {
 /// // Streams synchronized, original limit restored
 /// ```
 pub struct WiredLimitContext {
-    /// Captured prior wired limit, populated only when the constructor
-    /// successfully called `mlx_set_wired_limit`.
-    ///
-    /// - `None`        — constructor failed (Metal unavailable, FFI -1, or
-    ///   model_size_bytes was 0): no wired limit was set, so `Drop` MUST
-    ///   NOT attempt to restore anything. `streams` is also empty in this
-    ///   state so the sync loop is a no-op.
-    /// - `Some(prev)`  — constructor succeeded: `Drop` restores `prev`.
-    ///   `Some(0)` is a legitimate value here (the prior wired limit was
-    ///   genuinely zero, e.g. before `mlx-lm` ever called the API on this
-    ///   process); restoring zero on drop matches the captured state.
-    ///
-    /// This split removes the prior `usize`-only design where `0` was
-    /// overloaded to mean BOTH "constructor failed" AND "prior limit was
-    /// zero", which silently turned a legitimate prior-zero into a
-    /// no-op-restore that left the process-wide wired limit pinned to
-    /// `max_recommended_working_set_size` after the context dropped.
-    old_limit: Option<usize>,
+    /// Process-wide lease. Overlapping turns may finish in any order.
+    lease: Option<u64>,
     streams: Vec<Stream>,
 }
 
@@ -168,12 +155,22 @@ impl WiredLimitContext {
     /// * `model_size_bytes` - Total size of model parameters in bytes
     /// * `streams` - Streams to synchronize before restoring limit (usually `vec![generation_stream]`)
     pub fn new(model_size_bytes: usize, streams: Vec<Stream>) -> Self {
+        Self::with_limit(model_size_bytes, usize::MAX, streams)
+    }
+
+    /// Request residency only up to an independently admitted working set.
+    /// This changes pinning, not the allocator's allocation or cache limits.
+    pub(crate) fn bounded(bytes: usize, streams: Vec<Stream>) -> Self {
+        Self::with_limit(bytes, bytes, streams)
+    }
+
+    fn with_limit(model_size_bytes: usize, limit: usize, streams: Vec<Stream>) -> Self {
         let max_rec_size = Self::get_max_working_set_size();
         if max_rec_size == 0 {
             // Metal unavailable or device_info missing the entry —
             // never set a wired limit, so Drop has nothing to restore.
             return Self {
-                old_limit: None,
+                lease: None,
                 streams: Vec::new(),
             };
         }
@@ -191,28 +188,14 @@ impl WiredLimitContext {
             );
         }
 
-        // Set wired limit to max_recommended_working_set_size. The fallible
-        // shim returns -1 on degraded-Metal hosts (allocator init throws);
-        // we treat that the same as the unavailable-Metal short-circuit
-        // above and return a no-op context so `Drop` doesn't try to
-        // restore a never-set limit.
-        let mut prev: u64 = 0;
-        let rc = unsafe { sys::mlx_set_wired_limit(max_rec_size as u64, &mut prev) };
-        if rc != 0 {
-            return Self {
-                old_limit: None,
-                streams: Vec::new(),
-            };
-        }
-
-        // Constructor succeeded — capture the prior limit verbatim. If
-        // `prev == 0` that means the wired limit was genuinely zero
-        // before this call; Drop restores 0 (which matches mlx-lm's
-        // documented behaviour: `set_wired_limit(0)` returns to the
-        // OS-default unlimited state).
+        let requested = limit.min(max_rec_size);
+        let lease = wired_leases()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acquire(requested, set_wired_limit);
         Self {
-            old_limit: Some(prev as usize),
-            streams,
+            lease,
+            streams: if lease.is_some() { streams } else { Vec::new() },
         }
     }
 
@@ -232,31 +215,133 @@ impl WiredLimitContext {
     }
 }
 
+/// MLX's wired limit is process-global. Keep the largest admitted request
+/// until the last overlapping lease finishes; lowering it between active
+/// turns would churn residency while their GPU streams are still running.
+/// Failed final restores retain the baseline so a later lease can retry it.
+#[derive(Default)]
+struct WiredLeases {
+    baseline: Option<usize>,
+    current: usize,
+    next_id: u64,
+    active: std::collections::HashSet<u64>,
+}
+
+impl WiredLeases {
+    fn acquire(
+        &mut self,
+        requested: usize,
+        mut set: impl FnMut(usize) -> Option<usize>,
+    ) -> Option<u64> {
+        let id = self.next_id.checked_add(1)?;
+        if self.baseline.is_none() || requested > self.current {
+            let previous = set(requested)?;
+            self.baseline.get_or_insert(previous);
+            self.current = requested;
+        }
+        self.next_id = id;
+        self.active.insert(id);
+        Some(id)
+    }
+
+    fn release(&mut self, id: u64, mut set: impl FnMut(usize) -> Option<usize>) {
+        if !self.active.remove(&id) || !self.active.is_empty() {
+            return;
+        }
+        if let Some(baseline) = self.baseline
+            && set(baseline).is_some()
+        {
+            self.current = baseline;
+            self.baseline = None;
+        }
+    }
+}
+
+fn wired_leases() -> &'static std::sync::Mutex<WiredLeases> {
+    static LEASES: std::sync::OnceLock<std::sync::Mutex<WiredLeases>> = std::sync::OnceLock::new();
+    LEASES.get_or_init(Default::default)
+}
+
+fn set_wired_limit(requested: usize) -> Option<usize> {
+    let mut previous = 0u64;
+    if unsafe { sys::mlx_set_wired_limit(requested as u64, &mut previous) } != 0 {
+        return None;
+    }
+    tracing::debug!(previous, requested, "Updated Metal wired memory limit");
+    Some(previous as usize)
+}
+
 impl Drop for WiredLimitContext {
     fn drop(&mut self) {
-        // `None` means the constructor never successfully set a wired
-        // limit (Metal unavailable, FFI returned -1, or max_rec_size
-        // was 0). Skip both the sync and the restore — there is
-        // nothing to undo.
-        let Some(prev_limit) = self.old_limit else {
-            return;
-        };
-
-        // CRITICAL: Synchronize all streams before changing wired limit
-        // This prevents race conditions where wired limit changes while GPU ops are pending
+        let Some(lease) = self.lease else { return };
+        // Synchronize without holding the process-wide lock. Only the final
+        // lease restores the baseline, after every owner's stream has drained.
         for stream in &self.streams {
             stream.synchronize();
         }
+        wired_leases()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(lease, set_wired_limit);
+    }
+}
 
-        // Restore original wired limit (which may legitimately be 0 —
-        // see `old_limit`'s docs: a captured `Some(0)` means the prior
-        // limit really was zero and the OS-default unlimited state
-        // should be restored). Best-effort: ignore the fallible shim's
-        // -1 return — there is no usable error channel from `Drop`,
-        // and the only consumer that can act on the failure (the
-        // model wrapper that owned this context) is already going
-        // away.
-        let mut _prev: u64 = 0;
-        let _rc = unsafe { sys::mlx_set_wired_limit(prev_limit as u64, &mut _prev) };
+#[cfg(test)]
+mod wired_tests {
+    use super::WiredLeases;
+    use std::cell::Cell;
+
+    #[test]
+    fn overlapping_leases_restore_zero_or_nonzero_only_after_last_owner() {
+        for baseline in [0, 23] {
+            for reverse in [false, true] {
+                let current = Cell::new(baseline);
+                let mut set = |next| Some(current.replace(next));
+                let mut leases = WiredLeases::default();
+                let a = leases.acquire(50, &mut set).unwrap();
+                let b = leases.acquire(80, &mut set).unwrap();
+                let c = leases.acquire(40, &mut set).unwrap();
+                assert_eq!(current.get(), 80);
+                let order = if reverse { [c, b, a] } else { [a, b, c] };
+                for id in &order[..2] {
+                    leases.release(*id, &mut set);
+                    assert_eq!(current.get(), 80);
+                }
+                leases.release(order[2], &mut set);
+                assert_eq!(current.get(), baseline);
+                assert!(leases.baseline.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_acquisition_does_not_create_a_lease_or_replace_baseline() {
+        let mut leases = WiredLeases::default();
+        assert!(leases.acquire(50, |_| None).is_none());
+        assert!(leases.baseline.is_none() && leases.active.is_empty());
+        let a = leases.acquire(50, |_| Some(7)).unwrap();
+        assert!(leases.acquire(80, |_| None).is_none());
+        assert_eq!(leases.current, 50);
+        assert_eq!(leases.active.len(), 1);
+        leases.release(a, |next| {
+            assert_eq!(next, 7);
+            Some(50)
+        });
+        assert!(leases.baseline.is_none());
+    }
+
+    #[test]
+    fn failed_restore_retries_original_baseline_after_next_lease() {
+        let mut leases = WiredLeases::default();
+        let a = leases.acquire(50, |_| Some(0)).unwrap();
+        leases.release(a, |_| None);
+        assert_eq!(leases.baseline, Some(0));
+        let b = leases.acquire(80, |_| Some(50)).unwrap();
+        leases.release(a, |_| panic!("released lease must be ignored"));
+        leases.release(b, |next| {
+            assert_eq!(next, 0);
+            Some(80)
+        });
+        assert!(leases.baseline.is_none());
     }
 }

@@ -9,9 +9,7 @@ const IMG: i32 = IMAGE_TOKEN_ID;
 const TEXT_A: i32 = 100;
 const TEXT_B: i32 = 200;
 
-/// MLX's MPS backend is not re-entrant — every test that touches an
-/// `MxArray` must hold this mutex so only one such test runs at a
-/// time across the test binary.
+/// Serialize the GPU cases in this module.
 fn mlx_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

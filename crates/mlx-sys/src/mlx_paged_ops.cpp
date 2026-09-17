@@ -129,34 +129,25 @@ mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
   return mlx::core::fast::paged::KvDtype::Bf16;
 }
 
-// Reject non-row-contiguous or nonzero-offset views at the factory.
+// Kernels use dense row-major indexing, so strided inputs need compaction.
+// CommandEncoder::set_input_array binds the array's byte offset. Read-only
+// new K/V may therefore be contiguous offset views. Keep the stricter
+// zero-offset contract for mutable pools and CPU-inspected metadata.
 //
-// Rationale: the Metal kernels read each input as a dense row-major
-// buffer starting at the raw `MTLBuffer` pointer. The dispatch carries
-// the BUFFER ONLY — no offset / strides — so a sliced or transposed
-// view would silently alias to offset 0 in the backing allocation and
-// either:
-//   - clobber unrelated regions of the pool (writes), or
-//   - read from the wrong start of a non-zero-offset slice (reads).
-//
-// The contract is therefore: refuse non-row-contiguous / nonzero-offset
-// views and let the caller materialize a `mlx::core::contiguous(...)`
-// copy explicitly.
-//
-// This check passes on:
+// The stricter zero-offset check passes on:
 //   - tracer arrays from `mlx::core::compile()` (default flags
 //     `{true, true, true}`, default offset 0; see `array.h:495`)
 //   - shape-only arrays from negative-test helpers
 //     (`array(Shape{...}, dtype, nullptr, {})`)
 //   - normal `eval()`-ed arrays before any slice/transpose op
 //
-// It fails on:
+// The stricter zero-offset check rejects:
 //   - results of `mlx::core::slice(...)` with nonzero start (offset != 0
 //     and/or row_contiguous == false)
 //   - results of `mlx::core::transpose(...)` (row_contiguous == false)
 //   - any view returned by `array::copy_shared_buffer(...)` that
 //     adjusted strides or set a non-default offset
-void require_row_contiguous_zero_offset(
+void require_row_contiguous(
     const array& arr,
     const char* op_name,
     const char* input_name) {
@@ -169,6 +160,13 @@ void require_row_contiguous_zero_offset(
         << "`mlx::core::contiguous(arr)` before passing to the primitive.";
     throw std::invalid_argument(msg.str());
   }
+}
+
+void require_row_contiguous_zero_offset(
+    const array& arr,
+    const char* op_name,
+    const char* input_name) {
+  require_row_contiguous(arr, op_name, input_name);
   if (arr.offset() != 0) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] " << input_name
@@ -216,11 +214,11 @@ void validate_paged_kv_write_inputs(
     int x_pack,
     KvDtype kv_dtype,
     const char* op_name) {
-  // 1. Contiguity + zero offset on every input.
+  // 1. Dense layout on every input; only read-only new K/V accept offsets.
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
   require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
-  require_row_contiguous_zero_offset(new_k, op_name, "new_k");
-  require_row_contiguous_zero_offset(new_v, op_name, "new_v");
+  require_row_contiguous(new_k, op_name, "new_k");
+  require_row_contiguous(new_v, op_name, "new_v");
   require_row_contiguous_zero_offset(slot_mapping, op_name, "slot_mapping");
   require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
   require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
@@ -4848,6 +4846,13 @@ std::vector<mlx::core::array> paged_kv_write_non_contig_trace_fn(
   return {out.first, out.second};
 }
 
+std::atomic<int> paged_kv_offset_trace_count{0};
+std::vector<mlx::core::array> paged_kv_offset_trace_fn(
+    const std::vector<mlx::core::array>& inputs) {
+  ++paged_kv_offset_trace_count;
+  return paged_kv_write_non_contig_trace_fn(inputs);
+}
+
 /// Trace function for the compile-cached non-contiguous
 /// `paged_attention` test. Independent of
 /// `paged_attention_oob_trace_fn` to keep the per-test compile cache
@@ -4883,12 +4888,78 @@ std::vector<mlx::core::array> paged_attention_non_contig_trace_fn(
 
 extern "C" {
 
+// Exercise both the factory and a cached graph with read-only offset K/V.
+// Drop the views and their parents before evaluation; graph ownership must
+// keep the backing storage alive. Mutable pools remain zero-offset.
+int mlx_paged_kv_write_compile_offset_views_check() {
+  using namespace mlx::core;
+  if (!metal::is_available()) return -3;
+  try {
+    constexpr int blocks = 4, heads = 4, dim = 64, block_size = 16;
+    auto k_pool = zeros({blocks, heads, dim / 8, block_size, 8}, bfloat16);
+    auto v_pool = zeros({blocks, heads, dim, block_size}, bfloat16);
+    eval(k_pool, v_pool);
+    std::vector<float> expected_k(k_pool.size(), 0), expected_v(v_pool.size(), 0);
+    paged_kv_offset_trace_count.store(0);
+    auto compiled = compile(&paged_kv_offset_trace_fn);
+    for (int pass = 0; pass < 3; ++pass) {
+      std::vector<array> outputs;
+      {
+        int start = pass == 0 ? 0 : pass + 1;
+        std::vector<float> k_host((start + 2) * heads * dim, -7.0f);
+        std::vector<float> v_host(k_host.size(), -9.0f);
+        std::vector<int64_t> slots{pass * 16 + 1, pass * 16 + 15};
+        for (int row = 0; row < 2; ++row) {
+          for (int h = 0; h < heads; ++h) {
+            for (int d = 0; d < dim; ++d) {
+              auto source = ((start + row) * heads + h) * dim + d;
+              float k = (pass + 1) + ((row + h + d) % 8) * 0.125f;
+              float v = -k;
+              k_host[source] = k;
+              v_host[source] = v;
+              int block = slots[row] / block_size;
+              int token = slots[row] % block_size;
+              expected_k[(((block * heads + h) * (dim / 8) + d / 8)
+                  * block_size + token) * 8 + d % 8] = k;
+              expected_v[((block * heads + h) * dim + d) * block_size + token] = v;
+            }
+          }
+        }
+        auto kp = astype(array(k_host.data(), {start + 2, heads, dim}, float32), bfloat16);
+        auto vp = astype(array(v_host.data(), {start + 2, heads, dim}, float32), bfloat16);
+        eval(kp, vp);
+        auto k = slice(kp, {start, 0, 0}, {start + 2, heads, dim});
+        auto v = slice(vp, {start, 0, 0}, {start + 2, heads, dim});
+        eval(k, v);
+        if (!k.flags().row_contiguous || !v.flags().row_contiguous ||
+            (pass > 0 && (k.offset() == 0 || v.offset() == 0))) return -1;
+        outputs = compiled({k_pool, v_pool, k, v,
+            array(slots.data(), {2}, int64), array(1.0f), array(1.0f)});
+      }
+      if (outputs.size() != 2) return -1;
+      eval(outputs);
+      k_pool = outputs[0];
+      v_pool = outputs[1];
+      auto k = astype(k_pool, float32), v = astype(v_pool, float32);
+      eval(k, v);
+      for (size_t i = 0; i < expected_k.size(); ++i) {
+        if (k.data<float>()[i] != expected_k[i] ||
+            v.data<float>()[i] != expected_v[i]) return 0;
+      }
+    }
+    return paged_kv_offset_trace_count.load() == 1 ? 1 : -1;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[paged_kv_write_compile_offset_views] %s\n", e.what());
+    return -1;
+  }
+}
+
 /// Compile a `paged_kv_write`-emitting function, call it once with
 /// contiguous inputs (cache miss → factory + eval_gpu both pass), then
 /// call it again with the SAME shapes / dtypes but with `new_k`
 /// substituted by a non-row-contiguous transposed view. Cache HIT
 /// bypasses the factory; `PagedKVWrite::eval_gpu`'s mirrored
-/// `require_row_contiguous_zero_offset` check MUST throw on the second
+/// `require_row_contiguous` check MUST throw on the second
 /// eval.
 ///
 /// Layout matches `mlx_paged_kv_write_compile_cached_oob_throws`:

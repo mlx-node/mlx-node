@@ -33,6 +33,8 @@ export { LFM2_CONFIGS, getLfm2Config } from './models/lfm2-configs.js';
 
 // MoE variant
 export { Qwen35MoeModel } from './stream.js';
+export { Qwen4ExpModel } from './stream.js';
+export type { Qwen4ExpContextLimits, Qwen4ExpLoadOptions, Qwen4ExpResidencyInfo } from '@mlx-node/core';
 export type { Qwen35MoeConfig } from '@mlx-node/core';
 
 // Nemotron H models

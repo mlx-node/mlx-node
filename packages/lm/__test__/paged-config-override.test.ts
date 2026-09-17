@@ -212,7 +212,17 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
   // else.
   it('derives the default paged policy set from the chat families', () => {
     expect([...CHAT_FAMILY_IDS].sort()).toEqual(
-      ['qwen3', 'qwen3_5', 'qwen3_5_moe', 'gemma4', 'muse_glimmer', 'lfm2', 'lfm2_moe', 'nemotron_h'].sort(),
+      [
+        'qwen3',
+        'qwen3_5',
+        'qwen3_5_moe',
+        'qwen4_exp',
+        'gemma4',
+        'muse_glimmer',
+        'lfm2',
+        'lfm2_moe',
+        'nemotron_h',
+      ].sort(),
     );
   });
 });

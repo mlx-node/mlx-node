@@ -77,6 +77,11 @@ mlx_array* mlx_array_transpose(mlx_array* handle,
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+bool mlx_array_is_available(mlx_array* handle) {
+  const auto* arr = reinterpret_cast<const array*>(handle);
+  return arr && arr->is_available();
+}
+
 void mlx_array_eval(mlx_array* handle) {
   try {
     auto arr = reinterpret_cast<array*>(handle);

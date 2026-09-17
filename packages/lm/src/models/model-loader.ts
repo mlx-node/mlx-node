@@ -14,6 +14,7 @@ import {
   Qwen3Model as NativeQwen3Model,
   Qwen35Model as NativeQwen35Model,
   Qwen35MoeModel as NativeQwen35MoeModel,
+  Qwen4ExpModel as NativeQwen4ExpModel,
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
@@ -28,10 +29,13 @@ import {
   Qwen3Model,
   Qwen35Model,
   Qwen35MoeModel,
+  Qwen4ExpModel,
 } from '../stream.js';
 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
+  /** Matching original HF checkpoint supplying Qwen4 MTP and vision omitted by GGUF. */
+  auxiliaryModelPath?: string;
   /** Discover a Qwen DFlash2 companion on disk (default true). Explicit draftModelPath wins. */
   autoLoadDraft?: boolean;
   /**
@@ -112,6 +116,14 @@ const LOADER_BINDINGS = {
     load: (modelPath: string) => Qwen35MoeModel.load(modelPath),
     nativeModelClass: NativeQwen35MoeModel,
   },
+  qwen4_exp: {
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      Qwen4ExpModel.load(
+        modelPath,
+        options?.auxiliaryModelPath === undefined ? null : { auxiliaryModelPath: options.auxiliaryModelPath },
+      ),
+    nativeModelClass: NativeQwen4ExpModel,
+  },
   lfm2: {
     load: (modelPath: string) => Lfm2Model.load(modelPath),
     nativeModelClass: NativeLfm2Model,
@@ -172,6 +184,11 @@ function dispatchLoad(
   modelPath: string,
   options: LoadModelOptions | undefined,
 ): Promise<unknown> {
+  if (options?.auxiliaryModelPath !== undefined && modelType !== 'qwen4_exp') {
+    throw new Error(
+      `auxiliaryModelPath is only supported by qwen4_exp models; ${modelPath} has model_type "${modelType}"`,
+    );
+  }
   if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
     throw new Error(
       `draftModelPath (speculative-decoding draft) is only supported by gemma4 and qwen3_5 models; ` +

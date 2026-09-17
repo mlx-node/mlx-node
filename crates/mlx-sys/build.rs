@@ -1,6 +1,127 @@
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Port the reference's Metal residency and custom-kernel cache without changing
+/// the MLX gitlink. Derived host files live in OUT_DIR; the narrow replacements fail
+/// loudly if a future MLX update changes their integration points.
+#[deny(clippy::unwrap_used, clippy::expect_used)]
+fn metal_residency_overlay(manifest: &Path, mlx: &Path, out_dir: &Path) -> io::Result<PathBuf> {
+    let write_changed = |path: PathBuf, bytes: &[u8]| -> io::Result<()> {
+        match std::fs::read(&path) {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(build_file_error("read overlay", &path, error)),
+        }
+        std::fs::write(&path, bytes)
+            .map_err(|error| build_file_error("write overlay", &path, error))
+    };
+    let root = out_dir.join("metal-residency");
+    let output = root.join("mlx/backend/metal");
+    std::fs::create_dir_all(&output)
+        .map_err(|error| build_file_error("create overlay directory", &output, error))?;
+    let source = mlx.join("mlx/backend/metal");
+    let port = manifest.join("metal-residency");
+    let replace = |text: &mut String, from: &str, to: &str| -> io::Result<()> {
+        if text.matches(from).count() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("MLX residency integration drift: {from}"),
+            ));
+        }
+        *text = text.replacen(from, to, 1);
+        Ok(())
+    };
+    for name in ["resident.h", "resident.cpp", "overlay.cmake"] {
+        println!("cargo:rerun-if-changed={}", port.join(name).display());
+    }
+    for name in ["resident.h", "resident.cpp"] {
+        let path = port.join(name);
+        let bytes = std::fs::read(&path)
+            .map_err(|error| build_file_error("read residency source", &path, error))?;
+        write_changed(output.join(name), &bytes)?;
+    }
+    for name in ["device.h", "device.cpp"] {
+        println!("cargo:rerun-if-changed={}", source.join(name).display());
+        let mut text = read_build_source(&source.join(name))?;
+        if name == "device.h" {
+            replace(
+                &mut text,
+                "  Device& device_;",
+                "  Device& device_;\n  ResidencySet& residency_set_;\n  uint64_t sets_attached_{0};",
+            )?;
+        } else {
+            replace(
+                &mut text,
+                "    : device_(d) {",
+                "    : device_(d), residency_set_(residency_set) {",
+            )?;
+            replace(
+                &mut text,
+                "  if (residency_set.mtl_residency_set()) {\n    queue_->addResidencySet(residency_set.mtl_residency_set());\n  }",
+                "  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
+            )?;
+            replace(
+                &mut text,
+                "void CommandEncoder::commit(std::function<void()> completion) {",
+                "void CommandEncoder::commit(std::function<void()> completion) {\n  // Metal fixes residency at commit, including sets created after this queue.\n  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
+            )?;
+        }
+        write_changed(output.join(name), text.as_bytes())?;
+    }
+    // The reference keys custom libraries by name, source and compile options.
+    // Compute that immutable key with the primitive, so cached graphs do not
+    // rescan the complete Metal source on every dispatch. Every CMake/bridge
+    // translation unit must see this same generated class layout.
+    let header = mlx.join("mlx/fast_primitives.h");
+    println!("cargo:rerun-if-changed={}", header.display());
+    let mut text = read_build_source(&header)?;
+    replace(
+        &mut text,
+        "#include <optional>",
+        "#include <cstdlib>\n#include <functional>\n#include <optional>",
+    )?;
+    replace(
+        &mut text,
+        "        compile_options_(compile_options) {}",
+        "        compile_options_(compile_options),\n        library_name_(hash_cache_enabled() ? name_ + \"_mlx_node_\" +\n            std::to_string(std::hash<std::string>{}(source_)) + \"_\" +\n            std::to_string(compile_options_) : std::string{}) {}",
+    )?;
+    replace(
+        &mut text,
+        "  CompileOptions::Data compile_options_;",
+        "  CompileOptions::Data compile_options_;\n  std::string library_name_;\n  static bool hash_cache_enabled() {\n    static const bool enabled = [] {\n      const char* value = std::getenv(\"MLX_METAL_HASH_KERNEL_CACHE\");\n      return value && std::string(value) == \"1\";\n    }();\n    return enabled;\n  }",
+    )?;
+    write_changed(root.join("mlx/fast_primitives.h"), text.as_bytes())?;
+    let kernel = source.join("custom_kernel.cpp");
+    println!("cargo:rerun-if-changed={}", kernel.display());
+    let mut text = read_build_source(&kernel)?;
+    replace(
+        &mut text,
+        "  {\n    // Clear kernels from the device library cache if needed",
+        "  // Process-start experiment; an empty key retains the original cache.\n  const bool hashed = !library_name_.empty();\n  if (!hashed) {\n    // Clear kernels from the device library cache if needed",
+    )?;
+    replace(
+        &mut text,
+        "      name_, compile_options_, [this] { return metal::utils() + source_; });",
+        "      hashed ? library_name_ : name_, compile_options_,\n      [this] { return metal::utils() + source_; });",
+    )?;
+    write_changed(output.join("custom_kernel.cpp"), text.as_bytes())?;
+    Ok(root)
+}
+
+fn build_file_error(action: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("Failed to {action} {}: {error}", path.display()),
+    )
+}
+
+fn read_build_source(path: &Path) -> io::Result<String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| build_file_error("read build source", path, error))
+}
 
 fn metal_toolchain_available() -> bool {
     Command::new("xcrun")
@@ -208,7 +329,7 @@ fn xcrun_find(tool: &str) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
-fn main() {
+fn main() -> io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=mlx");
     // The deployment-target floor participates in both the CMake configure
@@ -219,31 +340,10 @@ fn main() {
     // exported C ABI. Re-run even when Cargo otherwise considers the inputs
     // unchanged so toggling CPU-only mode cannot reuse Metal artifacts.
     println!("cargo:rerun-if-env-changed=MLX_DISABLE_METAL");
-    // Watch all C++ source files, headers, and Metal kernel includes
+    // Cargo recursively watches directories, including added/removed bridge
+    // files and shader includes nested under metal/common or a model family.
     let src_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
-    // Track added bridge translation units as well as edits to existing files.
     println!("cargo:rerun-if-changed={}", src_dir.display());
-    if let Ok(entries) = std::fs::read_dir(&src_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension()
-                && (ext == "cpp" || ext == "h")
-            {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
-        }
-    }
-    let metal_dir = src_dir.join("metal");
-    if let Ok(entries) = std::fs::read_dir(&metal_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension()
-                && ext == "inc"
-            {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
-        }
-    }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let mlx_dir = manifest_dir.join("mlx");
@@ -285,6 +385,19 @@ fn main() {
     };
 
     let mut cfg = cmake::Config::new(&mlx_dir);
+    let residency_overlay = build_metal
+        .then(|| metal_residency_overlay(&manifest_dir, &mlx_dir, &out_dir_path))
+        .transpose()?;
+    if let Some(overlay) = &residency_overlay {
+        cfg.define("MLX_NODE_RESIDENCY_OVERLAY", overlay);
+        cfg.define(
+            "CMAKE_PROJECT_INCLUDE",
+            manifest_dir.join("metal-residency/overlay.cmake"),
+        );
+    } else {
+        // Clear a cached include if this build directory switches to CPU-only.
+        cfg.define("CMAKE_PROJECT_INCLUDE", "");
+    }
     cfg.define("MLX_BUILD_TESTS", "OFF")
         .define("MLX_BUILD_EXAMPLES", "OFF")
         .define("MLX_BUILD_BENCHMARKS", "OFF")
@@ -356,6 +469,24 @@ fn main() {
             "CXX",
             &[default_cxx_compiler.as_str(), "/usr/bin/clang++", "clang++"],
         );
+        // Rust links with -nodefaultlibs. Clang 21's availability checks use
+        // __isPlatformVersionAtLeast from compiler-rt, which the C++ driver
+        // normally supplies automatically. Carry that runtime explicitly so
+        // native tests and addons targeting older macOS versions both link.
+        if let Ok(runtime) = Command::new(&cxx_compiler)
+            .arg("-print-file-name=libclang_rt.osx.a")
+            .output()
+            && runtime.status.success()
+        {
+            let path = PathBuf::from(String::from_utf8_lossy(&runtime.stdout).trim());
+            if path.is_absolute()
+                && path.is_file()
+                && let Some(parent) = path.parent()
+            {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
+            }
+        }
         let ar = resolve_build_tool("AR", &[default_ar.as_str(), "/usr/bin/ar", "ar"]);
         let ranlib = resolve_build_tool(
             "RANLIB",
@@ -546,6 +677,11 @@ fn main() {
     let include_generated = dst.join("include");
 
     let mut bridge = cc::Build::new();
+    if let Some(overlay) = &residency_overlay {
+        // Device contains ResidencySet by value: all bridge code must see the
+        // same class layout as libmlx, before the original vendor headers.
+        bridge.include(overlay);
+    }
     bridge
         .cpp(true)
         .warnings(false)
@@ -553,12 +689,58 @@ fn main() {
         .include(&include_source)
         .include(&mlx_dir);
 
+    if build_metal || target_os == "linux" {
+        bridge.define("MLX_NODE_GPU_ENABLED", None);
+    }
+
     // `__APPLE__` alone does not mean this build contains MLX's Metal backend:
     // `MLX_DISABLE_METAL=1` is a supported CPU-only macOS configuration.  Keep
     // bridge translation units from including/calling Metal-only APIs unless
     // the CMake build above actually enabled them.
     if build_metal {
         bridge.define("MLX_NODE_METAL_ENABLED", None);
+        // Custom quantized kernels reuse the vendored K-quant arithmetic even
+        // in the normal precompiled-metallib build, where MLX does not export
+        // its optional JIT preambles. Generate private copies from source so
+        // the helper kernels cannot drift from the linked quantization code.
+        let preambles = out_dir_path.join("quantized-preambles");
+        let script = mlx_dir.join("mlx/backend/metal/make_compiled_preamble.sh");
+        for (source_name, name) in [
+            ("steel/gemm/gemm", "gemm"),
+            ("quantized_utils", "quantized_utils"),
+            ("kquant", "kquant"),
+            ("steel/gemm/nax", "nax"),
+            ("kquant_nax", "kquant_nax"),
+        ] {
+            let status = Command::new("bash")
+                .arg(&script)
+                .arg(&preambles)
+                .arg("clang")
+                .arg(&mlx_dir)
+                .arg(source_name)
+                .status()
+                .map_err(|error| build_file_error("run preamble generator", &script, error))?;
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "Quantized {name} Metal preamble failed: {status}"
+                )));
+            }
+            let path = preambles.join(format!("{name}.cpp"));
+            let source = read_build_source(&path)?.replace(
+                "namespace mlx::core::metal",
+                "namespace mlx::core::quantized_preamble",
+            );
+            std::fs::write(&path, source).map_err(|error| {
+                build_file_error("write private quantized preamble", &path, error)
+            })?;
+            bridge.file(path);
+            println!(
+                "cargo:rerun-if-changed={}",
+                mlx_dir
+                    .join(format!("mlx/backend/metal/kernels/{source_name}.h"))
+                    .display()
+            );
+        }
     }
 
     if is_macos {
@@ -592,7 +774,7 @@ fn main() {
             }
         }
     }
-    // Add src/ as include path for metal/*.metal.inc includes
+    // Add src/ as include path for metal/{common,<family>}/*.metal.inc includes
     bridge.include(&src_dir);
 
     // Translation units that depend on Metal *by header* (raw `MTL::` types
@@ -627,4 +809,5 @@ fn main() {
     bridge.compile("mlx_ffi");
 
     println!("cargo:rustc-link-lib=static=mlx_ffi");
+    Ok(())
 }

@@ -18,15 +18,15 @@ npm install @mlx-node/lm
 Multi-turn chat runs through `ChatSession`, which owns the server-side KV cache and hides the session bookkeeping behind `send()` / `sendStream()`. The `loadSession()` convenience wrapper loads the model and constructs the session in one step:
 
 ```typescript
-import { loadSession } from "@mlx-node/lm";
+import { loadSession } from '@mlx-node/lm';
 
-const session = await loadSession("./models/Qwen3-0.6B");
+const session = await loadSession('./models/Qwen3-0.6B');
 
-const result = await session.send("What is the capital of France?");
+const result = await session.send('What is the capital of France?');
 console.log(result.text);
 
 // Follow-ups reuse KV when the template-rendered transcript is an exact prefix extension.
-const followUp = await session.send("And its population?");
+const followUp = await session.send('And its population?');
 console.log(followUp.text);
 ```
 
@@ -35,13 +35,11 @@ console.log(followUp.text);
 Every generative model wrapper supports token-by-token streaming via `session.sendStream()`, which yields an `AsyncGenerator<ChatStreamEvent>`:
 
 ```typescript
-import { loadSession } from "@mlx-node/lm";
+import { loadSession } from '@mlx-node/lm';
 
-const session = await loadSession("./models/Qwen3.5-0.8B");
+const session = await loadSession('./models/Qwen3.5-0.8B');
 
-for await (const event of session.sendStream(
-  "Write a haiku about TypeScript.",
-)) {
+for await (const event of session.sendStream('Write a haiku about TypeScript.')) {
   if (!event.done) {
     process.stdout.write(event.text);
   } else {
@@ -57,22 +55,22 @@ Breaking out of the loop automatically cancels generation. The session tracks it
 OpenAI-compatible function calling with `createToolDefinition`. Tool-result turns feed back through the same session via `sendToolResult()`. The complete structured transcript is rendered by the checkpoint-provided template, while native code reuses KV only on an exact token-prefix match:
 
 ```typescript
-import { loadSession, createToolDefinition } from "@mlx-node/lm";
+import { loadSession, createToolDefinition } from '@mlx-node/lm';
 
-const session = await loadSession("./models/Qwen3-0.6B");
+const session = await loadSession('./models/Qwen3-0.6B');
 
 const tools = [
   createToolDefinition(
-    "get_weather",
-    "Get weather for a city",
+    'get_weather',
+    'Get weather for a city',
     {
-      city: { type: "string", description: "City name" },
+      city: { type: 'string', description: 'City name' },
     },
-    ["city"],
+    ['city'],
   ),
 ];
 
-const result = await session.send("What is the weather in Tokyo?", {
+const result = await session.send('What is the weather in Tokyo?', {
   config: { tools },
 });
 
@@ -83,7 +81,7 @@ const result = await session.send("What is the weather in Tokyo?", {
 // subsequent `sendToolResult*` after a multi-call turn throws with a clear
 // error — and the caller must refuse multi-call turns up front. Tighten the
 // prompt or tool spec so the model emits at most one call per turn.
-const okCalls = result.toolCalls?.filter((tc) => tc.status === "ok") ?? [];
+const okCalls = result.toolCalls?.filter((tc) => tc.status === 'ok') ?? [];
 if (okCalls.length > 1) {
   throw new Error(
     `ChatSession only supports one tool call per assistant turn; ` +
@@ -105,22 +103,17 @@ if (call) {
 `loadModel()` auto-detects the model architecture from `config.json`. Use `loadSession()` when you want an ergonomic `ChatSession` handle in one step, or load a concrete model class and construct `new ChatSession(model)` when you need a reference to both the model and the session (e.g. for `generate()` calls, training, or model metadata):
 
 ```typescript
-import {
-  loadSession,
-  ChatSession,
-  Qwen35Model,
-  Qwen35MoeModel,
-} from "@mlx-node/lm";
+import { loadSession, ChatSession, Qwen35Model, Qwen35MoeModel } from '@mlx-node/lm';
 
 // Convenience: auto-detect architecture and wrap in a ChatSession.
-const session = await loadSession("./models/Qwen3-0.6B", {
-  system: "Be concise.",
+const session = await loadSession('./models/Qwen3-0.6B', {
+  system: 'Be concise.',
 });
 
 // Or load a specific architecture directly — every generative model wrapper
 // structurally satisfies ChatSession's SessionCapableModel bound.
-const dense = await Qwen35Model.load("./models/Qwen3.5-0.8B");
-const moe = await Qwen35MoeModel.load("./models/Qwen3.5-35B-A3B");
+const dense = await Qwen35Model.load('./models/Qwen3.5-0.8B');
+const moe = await Qwen35MoeModel.load('./models/Qwen3.5-35B-A3B');
 const denseSession = new ChatSession(dense);
 const moeSession = new ChatSession(moe);
 ```
@@ -132,18 +125,13 @@ const moeSession = new ChatSession(moe);
 ### Pre-defined Configs
 
 ```typescript
-import {
-  QWEN3_CONFIGS,
-  QWEN35_CONFIGS,
-  getQwen3Config,
-  getQwen35Config,
-} from "@mlx-node/lm";
+import { QWEN3_CONFIGS, QWEN35_CONFIGS, getQwen3Config, getQwen35Config } from '@mlx-node/lm';
 
 // Available Qwen3 configs: 'qwen3-0.6b', 'qwen3-1.7b', 'qwen3-7b'
-const config = getQwen3Config("qwen3-0.6b");
+const config = getQwen3Config('qwen3-0.6b');
 
 // Available Qwen3.5 configs: 'qwen3.5-0.6b'
-const config35 = getQwen35Config("qwen3.5-0.6b");
+const config35 = getQwen35Config('qwen3.5-0.6b');
 ```
 
 ## Profiling
@@ -151,7 +139,7 @@ const config35 = getQwen35Config("qwen3.5-0.6b");
 Track per-generation timing, memory usage, and TTFT:
 
 ```typescript
-import { enableProfiling, disableProfiling } from "@mlx-node/lm";
+import { enableProfiling, disableProfiling } from '@mlx-node/lm';
 
 enableProfiling();
 
@@ -174,6 +162,7 @@ Or set `MLX_PROFILE_DECODE=1` to auto-enable and write a report on exit.
 | `Qwen3Model`     | Qwen3 inference — `generate()` and paged attention                                |
 | `Qwen35Model`    | Qwen3.5 Dense — compiled forward, VLM, paged attention, native MTP                |
 | `Qwen35MoeModel` | Qwen3.5 MoE — compiled forward, expert routing, paged attention, native MTP       |
+| `Qwen4ExpModel`  | Qwen3.8-Flash-Next — bounded SSD loading, images, native MTP and paged sessions   |
 | `Gemma4Model`    | Gemma4 inference — multimodal generation and optional external-draft speculation  |
 | `Lfm2Model`      | LFM2.5 hybrid conv+attention inference — `generate()`                             |
 
@@ -205,7 +194,7 @@ type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 
 ```typescript
 interface ToolDefinition {
-  type: "function";
+  type: 'function';
   function: FunctionDefinition;
 }
 
@@ -236,13 +225,14 @@ function createToolDefinition(
 
 Every generative model wrapper exposes the same `ChatSession<M>` surface — `send()`, `sendStream()`, and `sendToolResult()` all work against any of the models below.
 
-| Model         | `generate()` | `ChatSession` | Training | Notes                                |
-| ------------- | :----------: | :-----------: | :------: | ------------------------------------ |
-| Qwen3         |     Yes      |      Yes      | GRPO/SFT | Paged attention                      |
-| Qwen3.5 Dense |     Yes      |      Yes      | GRPO/SFT | Compiled forward, VLM, native MTP    |
-| Qwen3.5 MoE   |     Yes      |      Yes      | GRPO/SFT | Expert routing, paged cache, MTP     |
-| Gemma4        |     Yes      |      Yes      |    No    | Multimodal, optional external draft  |
-| LFM2.5        |     Yes      |      Yes      |    No    | Hybrid conv + attention architecture |
+| Model              | `generate()` | `ChatSession` | Training | Notes                                                                             |
+| ------------------ | :----------: | :-----------: | :------: | --------------------------------------------------------------------------------- |
+| Qwen3              |     Yes      |      Yes      | GRPO/SFT | Paged attention                                                                   |
+| Qwen3.5 Dense      |     Yes      |      Yes      | GRPO/SFT | Compiled forward, VLM, native MTP                                                 |
+| Qwen3.5 MoE        |     Yes      |      Yes      | GRPO/SFT | Expert routing, paged cache, MTP                                                  |
+| Qwen3.8-Flash-Next |      No      |      Yes      |    No    | Images, MTP, paged QSA; see [memory and loading](../../docs/qwen38-flash-next.md) |
+| Gemma4             |     Yes      |      Yes      |    No    | Multimodal, optional external draft                                               |
+| LFM2.5             |     Yes      |      Yes      |    No    | Hybrid conv + attention architecture                                              |
 
 ## Performance
 

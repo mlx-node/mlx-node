@@ -1,8 +1,8 @@
-/// Image Processing for Qwen3.5-VL
+/// Image processing shared by Qwen VLMs
 ///
 /// Handles image preprocessing including smart resizing, normalization,
 /// and patch extraction. Adapted from PaddleOCR-VL processing module
-/// with Qwen3.5-VL specific parameters.
+/// with model-specific resize budgets.
 use crate::array::MxArray;
 use crate::models::paddleocr_vl::processing::{
     ImageProcessorConfig, ProcessedImage, ProcessedImages, aggregate_processed_images, smart_resize,
@@ -14,7 +14,7 @@ use napi::bindgen_prelude::*;
 use std::io::Cursor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Qwen35VLImageGeometry {
+struct QwenImageGeometry {
     resized_height: usize,
     resized_width: usize,
     grid_t: i32,
@@ -22,7 +22,7 @@ struct Qwen35VLImageGeometry {
     grid_w: i32,
 }
 
-/// Compute the merged language-token count for one Qwen3.5 vision grid.
+/// Compute the merged language-token count for one Qwen vision grid.
 ///
 /// Both the non-mutating capacity planner and the real image-processing path
 /// use this helper so pre-SSE prompt sizing cannot drift from the number of
@@ -71,16 +71,16 @@ fn qwen35_vl_processor_config() -> ImageProcessorConfig {
     }
 }
 
-/// Image processor for Qwen3.5-VL
+/// Image processor for Qwen VLMs
 ///
 /// Processes images into patches suitable for the vision encoder.
 /// For images (not video), the temporal dimension is handled by
 /// duplicating the frame (temporal_patch_size=2).
-pub struct Qwen35VLImageProcessor {
+pub struct QwenImageProcessor {
     config: ImageProcessorConfig,
 }
 
-impl Qwen35VLImageProcessor {
+impl QwenImageProcessor {
     pub fn new(config: Option<ImageProcessorConfig>) -> Self {
         Self {
             config: config.unwrap_or_else(qwen35_vl_processor_config),
@@ -153,7 +153,7 @@ impl Qwen35VLImageProcessor {
             .collect()
     }
 
-    fn plan_geometry(&self, orig_width: u32, orig_height: u32) -> Result<Qwen35VLImageGeometry> {
+    fn plan_geometry(&self, orig_width: u32, orig_height: u32) -> Result<QwenImageGeometry> {
         // Smart resize to maintain aspect ratio within pixel bounds. This is
         // the single geometry source used by both planning and processing.
         let (new_height, new_width) = smart_resize(
@@ -164,7 +164,7 @@ impl Qwen35VLImageProcessor {
             self.config.max_pixels,
         )?;
         let patch_size = self.config.patch_size;
-        Ok(Qwen35VLImageGeometry {
+        Ok(QwenImageGeometry {
             resized_height: new_height as usize,
             resized_width: new_width as usize,
             grid_t: 1,
@@ -255,7 +255,7 @@ impl Qwen35VLImageProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageProcessorConfig, Qwen35VLImageProcessor};
+    use super::{ImageProcessorConfig, QwenImageProcessor};
     use crate::models::gemma4::image_processor::Gemma4ImageProcessor;
     use image::{DynamicImage, ImageFormat, RgbImage};
     use std::io::Cursor;
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn qwen35_and_gemma4_processors_accept_gif_bytes() {
-        let qwen = Qwen35VLImageProcessor::new(Some(ImageProcessorConfig {
+        let qwen = QwenImageProcessor::new(Some(ImageProcessorConfig {
             min_pixels: 16 * 16,
             max_pixels: 16 * 16,
             patch_size: 16,
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn cpu_geometry_plan_matches_real_processing_grids() {
-        let processor = Qwen35VLImageProcessor::new(Some(ImageProcessorConfig {
+        let processor = QwenImageProcessor::new(Some(ImageProcessorConfig {
             min_pixels: 32 * 32,
             max_pixels: 64 * 64,
             patch_size: 16,

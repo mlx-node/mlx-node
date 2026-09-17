@@ -99,3 +99,48 @@ fn non_allocating_length_plan_matches_placeholder_injection() {
         );
     }
 }
+
+#[test]
+fn zero_sized_image_does_not_shift_later_placeholders() {
+    assert_eq!(
+        inject_image_placeholders(&[BOS, IMG, TEXT, IMG], &[0, 2]).unwrap(),
+        vec![BOS, TEXT, IMG, IMG]
+    );
+}
+
+#[test]
+fn image_limits_check_headers_without_decoding_pixels() {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(32, 64)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let bytes = png.into_inner();
+    let limits = ImageLimits {
+        max_images: 2,
+        max_pixels: 2048,
+        max_encoded_bytes: bytes.len(),
+    };
+    limits.validate(&[bytes.clone(), bytes.clone()]).unwrap();
+    assert!(
+        limits
+            .validate(&[bytes.clone(), bytes.clone(), bytes.clone()])
+            .is_err()
+    );
+    assert!(
+        ImageLimits {
+            max_pixels: 2047,
+            ..limits
+        }
+        .validate(std::slice::from_ref(&bytes))
+        .is_err()
+    );
+    assert!(
+        ImageLimits {
+            max_encoded_bytes: bytes.len() - 1,
+            ..limits
+        }
+        .validate(&[bytes])
+        .is_err()
+    );
+    assert!(limits.validate(&[vec![0, 1, 2]]).is_err());
+}

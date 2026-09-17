@@ -288,6 +288,8 @@ unsafe extern "C-unwind" {
         has_axis: bool,
     ) -> *mut mlx_array;
     pub fn mlx_array_eval(handle: *mut mlx_array);
+    /// Read readiness without evaluating or scheduling the array.
+    pub fn mlx_array_is_available(handle: *mut mlx_array) -> bool;
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
     pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
     pub fn mlx_eval_with_error(
@@ -1219,9 +1221,13 @@ unsafe extern "C-unwind" {
     ///                   skipped (trace-count check still ran).
     pub fn mlx_paged_kv_write_compile_trace_smoke(num_tokens: i32) -> i32;
 
+    /// Cached paged writes must bind offset K/V and retain their backing arrays.
+    /// Returns 1 on exact pool parity, -3 without Metal, and <=0 on failure.
+    pub fn mlx_paged_kv_write_compile_offset_views_check() -> i32;
+
     // =============================================================================
     // Factory must reject non-row-contiguous or nonzero-offset views for
-    // ALL inputs.
+    // Mutable pools and metadata; read-only new K/V may have an offset.
     //
     // Each helper builds a real data-backed array, applies `slice` /
     // `transpose` to produce a non-row-contiguous or nonzero-offset
@@ -1968,3 +1974,325 @@ pub type LayerFunctionPtr = extern "C-unwind" fn(
     max_outputs: usize,
     context: *mut std::os::raw::c_void,
 ) -> usize;
+
+unsafe extern "C" {
+    /// Forward-local runtime settings. Begin/end must run on the same thread.
+    pub fn mlx_qwen4_flags_begin();
+    pub fn mlx_qwen4_flags_end();
+    pub fn mlx_qwen4_flag_equals(
+        name: *const std::os::raw::c_char,
+        value: *const std::os::raw::c_char,
+    ) -> bool;
+    /// Exclusive mutable expert-slot transaction. The caller must evaluate all
+    /// lazy readers of destination banks before recycling slots.
+    pub fn mlx_qwen4_copy_weight_rows(
+        destinations: *mut *mut mlx_array,
+        sources: *mut *mut mlx_array,
+        slots: *const u32,
+        arrays: usize,
+        updates: usize,
+    ) -> bool;
+    pub fn mlx_qwen4_gather_pages(
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        slots: *mut mlx_array,
+        heads: i32,
+        dim: i32,
+        block_size: i32,
+        out_keys: *mut *mut mlx_array,
+        out_values: *mut *mut mlx_array,
+    ) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_routes_shared_gate(
+        logits: *mut mlx_array,
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        ids: *mut *mut mlx_array,
+        scores: *mut *mut mlx_array,
+        gate: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_singleton_routes(
+        logits: *mut mlx_array,
+        ids: *mut *mut mlx_array,
+        scores: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_prefill_ple_conv(
+        full: *mut mlx_array,
+        weight: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_routes(
+        logits: *mut mlx_array,
+        ids: *mut *mut mlx_array,
+        scores: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_route_sort(
+        ids: *mut mlx_array,
+        experts: i32,
+        order: *mut *mut mlx_array,
+        inverse: *mut *mut mlx_array,
+        sorted_ids: *mut *mut mlx_array,
+    ) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_gdn_prepare(
+        qkv: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_window_conv(
+        x: *mut mlx_array,
+        history: *mut mlx_array,
+        weight: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        next_history: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_gdn_epilogue(
+        out: *mut mlx_array,
+        z: *mut mlx_array,
+        norm: *mut mlx_array,
+        eps: f64,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64)
+    -> *mut mlx_array;
+    pub fn mlx_qwen4_rotary_window(
+        x: *mut mlx_array,
+        cosine: *mut mlx_array,
+        sine: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_attention_gate(
+        attention: *mut mlx_array,
+        projection: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_attention_norm_rotary(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        cosine: *mut mlx_array,
+        sine: *mut mlx_array,
+        eps: f64,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_decode_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64) -> *mut mlx_array;
+    pub fn mlx_qwen4_inject_norm(
+        x: *mut mlx_array,
+        branch: *mut mlx_array,
+        gate: *mut mlx_array,
+        weight: *mut mlx_array,
+        eps: f64,
+        stream: *mut *mut mlx_array,
+        normed: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_mixer_down_inject(
+        input: *mut mlx_array,
+        down: *mut mlx_array,
+        down_scales: *mut mlx_array,
+        down_biases: *mut mlx_array,
+        inject: *mut mlx_array,
+        inject_scales: *mut mlx_array,
+        inject_biases: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_inject: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_decode_mixer_act(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_norm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        group: i32,
+        eps: f64,
+        centered: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_gdn_gates(
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        decay: *mut *mut mlx_array,
+        beta: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_inject(
+        x: *mut mlx_array,
+        y: *mut mlx_array,
+        g: *mut mlx_array,
+    ) -> *mut mlx_array;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_gather_window(
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        table: *mut mlx_array,
+        tokens: *mut mlx_array,
+        fresh_k: *mut mlx_array,
+        fresh_v: *mut mlx_array,
+        base: i32,
+        block_size: i32,
+        out_k: *mut *mut mlx_array,
+        out_v: *mut *mut mlx_array,
+    ) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_prefill_indirect(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        token_rows: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        experts: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_expert_tiles(ids: *mut mlx_array, experts: i32) -> *mut mlx_array;
+    pub fn mlx_qwen4_sorted_combine(
+        values: *mut mlx_array,
+        scores: *mut mlx_array,
+        inverse: *mut mlx_array,
+        top: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_dense_prefill(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_router_decode(input: *mut mlx_array, weight: *mut mlx_array)
+    -> *mut mlx_array;
+
+    pub fn mlx_qwen4_dense_decode(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_mixer_act(
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_hc_mix(up: *mut mlx_array, normed: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_qwen4_hyper_up(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        normed: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_hyper_up_inject(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        normed: *mut mlx_array,
+        injection: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_gate: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_sorted_shared_combine(
+        values: *mut mlx_array,
+        scores: *mut mlx_array,
+        inverse: *mut mlx_array,
+        shared: *mut mlx_array,
+        gate: *mut mlx_array,
+        top: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_expert_prefill(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        tiles: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        experts: i32,
+        group: i32,
+        bits: i32,
+        mode: *const std::ffi::c_char,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_affine_expert_gemv(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        experts: i32,
+        group: i32,
+        bits: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_routed_shared_experts(
+        inputs: *const *mut mlx_array,
+        count: usize,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_routed_experts(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        scores: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_expert_gemv(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        experts: i32,
+        group: i32,
+        bits: i32,
+        mode: *const std::ffi::c_char,
+    ) -> *mut mlx_array;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_complete_gdn(
+        qkv: *mut mlx_array,
+        z: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        state: *mut mlx_array,
+        norm: *mut mlx_array,
+        eps: f64,
+        out: *mut *mut mlx_array,
+        next: *mut *mut mlx_array,
+        next_history: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_gated_delta_kernel(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        mask: *mut mlx_array,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+}

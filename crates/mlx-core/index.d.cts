@@ -2156,6 +2156,108 @@ export declare class Qwen3Tokenizer {
 }
 
 /**
+ * Qwen3.8-Flash-Next with bounded SSD weights, native MTP, image input and
+ * paged scheduling. Inference and cache mutations run on one owned thread.
+ */
+export declare class Qwen4ExpModel {
+  static load(modelPath: string, options?: Qwen4ExpLoadOptions | undefined | null): Promise<Qwen4ExpModel>;
+  /** Whether the validated checkpoint has a supported image tower. */
+  supportsImages(): boolean;
+  /** Plan the expanded prompt using the same processor and limits as prefill. */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  residencyInfo(): Qwen4ExpResidencyInfo;
+  modelAssetsPath(): string;
+  hasMtpWeights(): boolean;
+  /**
+   * SSD-backed draft and verification work is opt-in; head availability
+   * alone does not establish a latency benefit for the current workload.
+   */
+  mtpAutoEnabled(): boolean;
+  hasBlockPagedCache(): boolean;
+  maxConcurrentSequences(): number;
+  contextLimits(): Qwen4ExpContextLimits;
+  getConfig(): any;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
+/**
  * Response store for OpenAI Responses API persistence.
  *
  * Stores responses in SQLite to support `previous_response_id`
@@ -5217,6 +5319,36 @@ export interface Qwen3LmConfig {
   ropeTheta: number;
   useQkNorm: boolean;
   tieWordEmbeddings: boolean;
+}
+
+export interface Qwen4ExpContextLimits {
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
+  trainedWindowTokens: number;
+}
+
+export interface Qwen4ExpLoadOptions {
+  /** Original matching HF checkpoint containing MTP/vision omitted by GGUF. */
+  auxiliaryModelPath?: string;
+}
+
+/** Load-time residency decision; full residency is admitted before payload reads. */
+export interface Qwen4ExpResidencyInfo {
+  policy: string;
+  weightBudgetBytes: number;
+  hotWeightBytes: number;
+  fullHotResidency: boolean;
+  prefillChunkTokens: number;
+  /** Free plus reclaimable file-backed memory observed at bootstrap. */
+  availableMemoryBytes?: number;
+  physicalMemoryBytes?: number;
+  /** Assembled matrices actually pinned, including partial projection banks. */
+  residentBankBytes: number;
+  /** Complete routed layers whose expert IDs stay on the GPU. */
+  residentExpertLayers: number;
+  /** Shared slot capacity for the remaining partial layers at bootstrap. */
+  partialExpertSlots: number;
 }
 
 /** Result of text recognition. */

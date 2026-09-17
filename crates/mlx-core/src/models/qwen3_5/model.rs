@@ -39,12 +39,10 @@ use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
 use crate::engine;
-use crate::engine::vision::VisionMerge;
 use crate::engine::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
 };
-use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::config::Qwen3_5Config;
 use crate::models::qwen3_5::decoder_layer::DecoderLayer;
 #[cfg(test)]
@@ -61,8 +59,12 @@ use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5::mtp::Qwen3_5MTPModule;
 use crate::models::qwen3_5::mtp_decode;
 use crate::models::qwen3_5::persistence;
-use crate::models::qwen3_5::processing::{Qwen35VLImageProcessor, merged_image_token_count};
-use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
+use crate::vision::qwen::encoder::QwenVisionEncoder;
+use crate::vision::qwen::processing::QwenImageProcessor;
+use crate::vision::qwen::prompt::{
+    IMAGE_TOKEN_ID, compute_image_token_counts_per_image, expanded_prompt_token_count,
+    inject_image_placeholders,
+};
 
 // This stays a FILE, not `model/mod.rs`: promoting it re-roots every
 // `#[path]`-declared child in the family. The seams live in `model/`.
@@ -78,7 +80,6 @@ mod paged_turn;
 pub(crate) mod scheduled_mtp;
 mod state;
 mod training;
-mod vision_turn;
 
 // Facade: the names the seams publish back into this hub, so the hub, the
 // cousin seams and the `#[cfg(test)]` children keep resolving them unqualified.
@@ -112,18 +113,7 @@ use self::state::{
 pub(crate) use self::state::{
     arrays_bits_equal_for_test, constrain_paged_context_params, qwen35_dense_vision_active,
 };
-pub(crate) use self::vision_turn::{
-    IMAGE_TOKEN_ID, VisionCache, VisionCacheInner, compute_image_token_counts_per_image,
-    extract_images_from_messages, inject_image_placeholders, plan_expanded_image_prompt_len,
-    vlm_prepare_vision_features,
-};
-#[cfg(test)]
-use self::vision_turn::{
-    VISION_CACHE_MAX_BYTES, VISION_GIB, VisionCacheMiss, VisionFeatureCacheKey, VisionImageRequest,
-    VisionMemoryCapSource, VisionMemorySnapshot, expanded_image_prompt_len, get_rope_index,
-    lookup_vision_feature_cache, partition_vision_cache_misses, plan_vision_image_requests,
-    projected_vision_feature_bytes, resolve_vision_memory_budget,
-};
+use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_vision_features};
 
 pub(crate) type Qwen35SchedulerState =
     crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35Inner>;
@@ -176,8 +166,8 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_decode::DFlash2TurnState>,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
-    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,
+    pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
     pub(crate) spatial_merge_size: Option<i32>,
     pub(crate) vision_cache: VisionCache,
     pub(crate) cached_token_history: Vec<u32>,
@@ -452,7 +442,7 @@ pub struct Qwen3_5Model {
     /// Loaded image processor retained by the public wrapper for CPU-only
     /// expanded-token planning before a streaming response commits headers.
     /// This is the same `Arc` used by the model thread's real vision prefill.
-    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
     /// Actual merge size installed on the loaded inner model, paired with
     /// `image_processor` for exact preflight geometry.
     pub(crate) spatial_merge_size: i32,
@@ -556,11 +546,12 @@ impl Qwen3_5Model {
         prompt_tokens: Uint32Array,
         messages: Vec<ChatMessage>,
     ) -> Result<u32> {
-        qwen35_expanded_prompt_token_count(
+        expanded_prompt_token_count(
             self.image_processor.clone(),
             self.spatial_merge_size,
             prompt_tokens,
             messages,
+            None,
         )
         .await
     }
@@ -814,42 +805,6 @@ impl Qwen3_5Model {
     }
 }
 
-/// Shared dense/MoE NAPI implementation for exact, non-mutating image prompt
-/// planning. Inputs are copied before entering the blocking worker so no JS
-/// backing-store references cross threads.
-pub(crate) async fn qwen35_expanded_prompt_token_count(
-    image_processor: Option<Arc<Qwen35VLImageProcessor>>,
-    spatial_merge_size: i32,
-    prompt_tokens: Uint32Array,
-    messages: Vec<ChatMessage>,
-) -> Result<u32> {
-    let tokens = prompt_tokens.to_vec();
-    let images = extract_images_from_messages(&messages);
-    if images.is_empty() {
-        return u32::try_from(tokens.len())
-            .map_err(|_| Error::from_reason("rendered prompt token count exceeds u32"));
-    }
-    let image_processor = image_processor.ok_or_else(|| {
-        Error::from_reason(
-            "cannot plan expanded image tokens: Qwen3.5 image processor is not loaded",
-        )
-    })?;
-
-    napi::bindgen_prelude::spawn_blocking(move || {
-        let prompt_len =
-            plan_expanded_image_prompt_len(&image_processor, spatial_merge_size, &tokens, &images)?;
-        u32::try_from(prompt_len)
-            .map_err(|_| Error::from_reason("expanded prompt token count exceeds u32"))
-    })
-    .await
-    .map_err(|join_error| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Expanded prompt planning worker failed: {join_error}"),
-        )
-    })?
-}
-
 impl Qwen3_5Model {
     /// Test-only deterministic teardown for memory-constrained real-weight
     /// integration tests. Requires exclusive command-sender ownership and
@@ -869,15 +824,6 @@ crate::models::chat_napi::chat_napi_surface! {
     ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
 }
-
-#[cfg(test)]
-mod vision_feature_cache_tests;
-
-#[cfg(test)]
-mod image_placeholder_tests;
-
-#[cfg(test)]
-mod rope_index_tests;
 
 #[cfg(test)]
 mod paged_construction_tests;

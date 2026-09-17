@@ -9,12 +9,16 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Qwen3**                  |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                                            |
 | **Qwen3.5 Dense**          |     yes      |     yes     | GRPO + SFT | Hybrid GDN/attention; native MTP; Qwen3.8 DFlash2; VLM variant                   |
 | **Qwen3.5 MoE**            |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant                            |
+| **Qwen3.8-Flash-Next**     |      —       |     yes     |     —      | Bounded SSD loading; native MTP, images, paged QSA and shared scheduling         |
 | **Gemma4**                 |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
 | **Muse-Glimmer**           |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                               |
 | **LFM2.5**                 |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |
 | **Nemotron 3.5 Lightning** |     yes      |     yes     |     —      | Hybrid Mamba-2 + MoE + attention; native MTP; inference-only                     |
 
-`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Gemma4, Muse-Glimmer, LFM2.5, and Nemotron 3.5 Lightning are inference-only.
+`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Qwen3.8-Flash-Next, Gemma4, Muse-Glimmer, LFM2.5, and Nemotron 3.5 Lightning are inference-only.
+
+See [Qwen3.8-Flash-Next](qwen38-flash-next.md) for SSD loading, memory budgets,
+the first-split GGUF path, auxiliary MTP/vision weights, and supported media.
 
 **Nemotron 3.5 Lightning reasoning note.** Earlier revisions of this branch documented greedy (`T=0`) thinking turns looping inside the `<think>` block for hundreds of tokens and attributed it to 4-bit expert noise on the NVFP4 checkpoint. **That diagnosis was wrong and is retracted.** The cause was ours: the runtime applied a rotary embedding in all four attention paths, but this model is **NoPE** — HF (`modeling_nemotron_h.py`), vLLM (`nemotron_h.py`) and mlx-lm all run its six GQA layers with no positional encoding, and Mamba-2 carries the sequence modelling. Rotation is identity at offset 0 and grows with position, so short prompts stayed fluent and hid the corruption. `b4b7f58c` removed it and the loops are **gone**: the same prompts now close `<think>` and answer correctly (833 tokens, `finishReason: 'stop'`, verified on the real NVFP4 checkpoint). No sampling workaround is needed — `reasoningEffort` is a free choice again. One runtime behaviour is unchanged and by design: an unclosed `<think>` at the token budget is redacted to `text=""` by `finalize.rs`, so give reasoning turns a generous `maxNewTokens`, or set `thinkingTokenBudget` to force the block closed. `NemotronHConfig` no longer exposes `ropeTheta`, `numLogitsToKeep` or `tieWordEmbeddings` — nothing read any of them, and a NoPE family advertising a RoPE base only invites someone to wire it back in. A tied head is still rejected at parse time.
 
@@ -88,7 +92,7 @@ const result = await pipeline.analyze(imageBuffer);
 
 Every role-aware turn sends the full structured history to native code. The checkpoint-provided chat template renders that history, and native KV reuse is allowed only when the rendered token sequence exactly extends the committed cache. A template mismatch safely falls back to full prefill; Rust never manufactures user/tool wire-format strings.
 
-All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Gemma4,
+All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Qwen3.8-Flash-Next, Gemma4,
 Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, and the VLM
 `QianfanOCRModel`) structurally satisfy `SessionCapableModel` — any of
 them can be passed to `new ChatSession(model)`.

@@ -6,36 +6,36 @@ The bridge between MLX (C++) and the NAPI/Rust layer lives in `crates/mlx-sys/`.
 
 `crates/mlx-sys/src/`:
 
-| File                     | Purpose                                                                                                                                               |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mlx_array_ops.cpp`      | Array construction, arithmetic, indexing, dtype-safe scalar ops                                                                                       |
-| `mlx_advanced_ops.cpp`   | quantized_matmul, gather_qmm, conv2d, FP8 dequant, PaddleOCR forward                                                                                  |
-| `mlx_nn_ops.cpp`         | NN ops, data extraction, random, math                                                                                                                 |
-| `mlx_fused_ops.cpp`      | Fused SwiGLU MLP and supporting ops                                                                                                                   |
-| `mlx_misc_ops.cpp`       | Synchronization, compiled sampling helpers                                                                                                            |
-| `mlx_stream.cpp`         | Stream/device management, memory limits                                                                                                               |
-| `mlx_autograd.cpp`       | `value_and_grad` integration                                                                                                                          |
-| `mlx_gated_delta.cpp`    | Metal GDN kernel opaque handles and shader indexing                                                                                                   |
-| ~~`mlx_qwen35.cpp`~~     | **DELETED** in the chat-engine refactor (`ee88b92b`). Was the compiled Qwen3.5 dense forward (`mlx::core::compile`); decode is now pure-Rust eager (`paged_forward::run_paged_decode_step` / `forward_inner`). |
-| ~~`mlx_qwen35_moe.cpp`~~ | **DELETED** (same refactor). Was the compiled MoE forward with expert routing. |
-| ~~`mlx_qwen35_vlm.cpp`~~ | **DELETED** (same refactor). VLM prefill now runs in Rust (`models/qwen3_5/vision.rs` + `chunked_prefill`). |
-| `mlx_qwen35_common.h`    | Shared compiled-forward helpers — only the compiled SwiGLU helper survives the deletion |
-| `mlx_common.h`           | FFI macros, error handling, array conversion                                                                                                          |
-| ~~`mlx_common_weights.cpp`~~ | **DELETED** (same refactor) — was the common weight storage for the compiled forward passes. |
-| `mlx_paged_dispatch.cpp` | C++ paged-attention kernel dispatch                                                                                                                   |
-| `mlx_paged_ops.cpp`      | `PagedKVWrite` / `PagedAttention` custom MLX ops (largest file in the bridge)                                                                         |
-| `mlx_paged_profile.cpp`  | Profile-run helpers for auto-sizing the block pool                                                                                                    |
+| File                         | Purpose                                                                                                                                                                                                        |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mlx_array_ops.cpp`          | Array construction, arithmetic, indexing, dtype-safe scalar ops                                                                                                                                                |
+| `mlx_advanced_ops.cpp`       | quantized_matmul, gather_qmm, conv2d, FP8 dequant, PaddleOCR forward                                                                                                                                           |
+| `mlx_nn_ops.cpp`             | NN ops, data extraction, random, math                                                                                                                                                                          |
+| `mlx_fused_ops.cpp`          | Fused SwiGLU MLP and supporting ops                                                                                                                                                                            |
+| `mlx_misc_ops.cpp`           | Synchronization, compiled sampling helpers                                                                                                                                                                     |
+| `mlx_stream.cpp`             | Stream/device management, memory limits                                                                                                                                                                        |
+| `mlx_autograd.cpp`           | `value_and_grad` integration                                                                                                                                                                                   |
+| `mlx_gated_delta.cpp`        | Metal GDN kernel opaque handles and shader indexing                                                                                                                                                            |
+| ~~`mlx_qwen35.cpp`~~         | **DELETED** in the chat-engine refactor (`ee88b92b`). Was the compiled Qwen3.5 dense forward (`mlx::core::compile`); decode is now pure-Rust eager (`paged_forward::run_paged_decode_step` / `forward_inner`). |
+| ~~`mlx_qwen35_moe.cpp`~~     | **DELETED** (same refactor). Was the compiled MoE forward with expert routing.                                                                                                                                 |
+| ~~`mlx_qwen35_vlm.cpp`~~     | **DELETED** (same refactor). VLM prefill now runs in Rust (`vision/qwen/encoder.rs` + `chunked_prefill`).                                                                                                      |
+| `mlx_qwen35_common.h`        | Shared compiled-forward helpers — only the compiled SwiGLU helper survives the deletion                                                                                                                        |
+| `mlx_common.h`               | FFI macros, error handling, array conversion                                                                                                                                                                   |
+| ~~`mlx_common_weights.cpp`~~ | **DELETED** (same refactor) — was the common weight storage for the compiled forward passes.                                                                                                                   |
+| `mlx_paged_dispatch.cpp`     | C++ paged-attention kernel dispatch                                                                                                                                                                            |
+| `mlx_paged_ops.cpp`          | `PagedKVWrite` / `PagedAttention` custom MLX ops (largest file in the bridge)                                                                                                                                  |
+| `mlx_paged_profile.cpp`      | Profile-run helpers for auto-sizing the block pool                                                                                                                                                             |
 
 `crates/mlx-sys/src/lib.rs` is the FFI declaration root (~300 `pub fn` wrappers around `unsafe extern "C-unwind"` blocks).
 
-Because the wrappers are `extern "C-unwind"`, a C++ function that lets an exception escape **aborts the process** rather than returning an `Err` — every `.cpp` here catches and returns `nullptr`, and the Rust side turns a null handle into an error. A panic on a load path is therefore not recoverable; guards that want to name a bad tensor must run *before* the FFI call, not rely on MLX rejecting it.
+Because the wrappers are `extern "C-unwind"`, a C++ function that lets an exception escape **aborts the process** rather than returning an `Err` — every `.cpp` here catches and returns `nullptr`, and the Rust side turns a null handle into an error. A panic on a load path is therefore not recoverable; guards that want to name a bad tensor must run _before_ the FFI call, not rely on MLX rejecting it.
 
 ### Two build-side inputs that are not `.cpp` files
 
-| Path | Purpose |
-| ---- | ------- |
-| `crates/mlx-sys/cmake/switch-exhaustiveness.cmake` | Injected into the vendored MLX build via `CMAKE_PROJECT_TOP_LEVEL_INCLUDES` from `crates/mlx-sys/build.rs` — **macOS only** |
-| `crates/mlx-core/vendor/ggml/ggml_kquant_ref.{c,h}` | ggml's own Q4_K/Q5_K/Q6_K decoders, vendored verbatim, compiled by `crates/mlx-core/build.rs` as the K-quant parity oracle |
+| Path                                                | Purpose                                                                                                                     |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `crates/mlx-sys/cmake/switch-exhaustiveness.cmake`  | Injected into the vendored MLX build via `CMAKE_PROJECT_TOP_LEVEL_INCLUDES` from `crates/mlx-sys/build.rs` — **macOS only** |
+| `crates/mlx-core/vendor/ggml/ggml_kquant_ref.{c,h}` | ggml's own Q4_K/Q5_K/Q6_K decoders, vendored verbatim, compiled by `crates/mlx-core/build.rs` as the K-quant parity oracle  |
 
 **`switch-exhaustiveness.cmake` exists because `-w` is absolute in clang.** The `cmake` crate composes `CMAKE_CXX_FLAGS` through `cc` with warnings off, which appends `-w`; clang then drops every non-error diagnostic and keeps dropping it however late a `-W`/`-Werror=` flag appears. The file rewrites `-w` to `-Wno-everything` (same silence, but later flags can re-enable individual diagnostics) and then sets `-Werror=switch`. That makes a `switch` over `QuantizationMode` with no `default:` label a **compile error** when an enumerator is missing — which is the point: `QuantizationMode` is append-only and serialized by ordinal through `export.cpp`, so adding a mode must break the build rather than fall through silently. (`primitives.h` states the same contract: reordering or removing a mode reinterprets every previously exported graph as a different quantization format.)
 
@@ -76,13 +76,13 @@ Current state:
 
 - `mlx::core::array` has **no default constructor** — initialize via `mlx_array_from_scalar(...)` or other helpers.
 - `int32` is not in scope inside inner namespaces — use `mlx::core::int32`.
-- Adding a **new** `.cpp` file requires `rm -rf target/release/build/mlx-sys-*` once; the `cc` crate caches its source-file list across builds and won't pick up new files otherwise.
+- Cargo watches `mlx-sys/src/` recursively. Adding a bridge `.cpp` or a nested Metal include is picked up by the next canonical native build.
 
 ### Env vars
 
-| Var                     | Effect                                                                  |
-| ----------------------- | ----------------------------------------------------------------------- |
-| ~~`MLX_NO_COMPILE=1`~~  | **REMOVED (dead)** — gated the deleted compiled forward; unread today.  |
+| Var                         | Effect                                                                   |
+| --------------------------- | ------------------------------------------------------------------------ |
+| ~~`MLX_NO_COMPILE=1`~~      | **REMOVED (dead)** — gated the deleted compiled forward; unread today.   |
 | ~~`MLX_EVAL_ALL_CACHES=1`~~ | **REMOVED (dead)** — token-only eval is the only strategy; unread today. |
 
 ## Process-wide globals
@@ -95,6 +95,14 @@ locks per step. `crates/mlx-core/src/engine/compiled_lock.rs` is now only an
 `AtomicU64` model-id counter.
 
 ## Metal shaders
+
+`crates/mlx-sys/src/metal/` holds the JIT shader includes. Reusable quantized
+projections, routing helpers, normalization, rotary, convolution and Gated
+DeltaNet kernels live in `common/`; Qwen4's fixed routing/head geometry and
+hyper-connection fusions live in `qwen4/`. The
+[kernel guide](../crates/mlx-sys/src/metal/README.md) records the layout and
+arithmetic contracts for new model callers. Family-specific dispatch and
+fallbacks remain in the C++ adapters.
 
 `crates/mlx-paged-attn/metal/`:
 

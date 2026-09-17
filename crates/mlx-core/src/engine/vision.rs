@@ -7,6 +7,8 @@
 //! product of that pipeline is [`VisionMerge`] — the embeddings + positions
 //! that feed the language-model paged prefill.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use crate::array::MxArray;
 
 /// The output of the vision encode + image-feature merge + M-RoPE position
@@ -25,4 +27,19 @@ pub(crate) struct VisionMerge {
     /// decode/warm-continuation steps add to the physical KV slot to recover
     /// the compressed rotation position. Text-only prefills compute 0.
     pub rope_deltas: i64,
+}
+
+/// Extract all raw image bytes from chat messages.
+pub(crate) fn extract_images_from_messages(
+    messages: &[crate::tokenizer::ChatMessage],
+) -> Vec<Vec<u8>> {
+    let mut all_images: Vec<Vec<u8>> = Vec::new();
+    for msg in messages {
+        if let Some(ref images) = msg.images {
+            for img in images {
+                all_images.push(img.to_vec());
+            }
+        }
+    }
+    all_images
 }

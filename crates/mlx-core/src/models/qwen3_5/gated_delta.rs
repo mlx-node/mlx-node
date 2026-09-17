@@ -480,7 +480,7 @@ fn invert_i_plus_strict_lower(a: &MxArray, l: i64) -> Result<MxArray> {
 /// Chunk-parallel port of the per-step recurrence (`gated_delta_ops`) for the CUDA
 /// prefill path. Collapses the O(T) token-serial recurrence into O(T/BT) chunk-serial
 /// steps of dense batched matmuls (cuBLAS / tensor cores), matching the in-tree Metal
-/// chunked kernel's math (`crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc`).
+/// chunked kernel's math (`crates/mlx-sys/src/metal/common/gated_delta_chunked.metal.inc`).
 ///
 /// Device-agnostic (portable MxArray ops) so it also runs on Metal, where the unit-test
 /// parity check against `gated_delta_ops` lives. `g_log` is the LOG-space decay gate

@@ -47,18 +47,18 @@ npm install @mlx-node/lm
 ```
 
 ```typescript
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
-import { loadSession } from "@mlx-node/lm";
+import { loadSession } from '@mlx-node/lm';
 
-const modelPath = join(homedir(), ".mlx-node", "models", "qwen3-0.6b");
+const modelPath = join(homedir(), '.mlx-node', 'models', 'qwen3-0.6b');
 const session = await loadSession(modelPath);
 
-const first = await session.send("Write a haiku about TypeScript.");
+const first = await session.send('Write a haiku about TypeScript.');
 console.log(first.text);
 
-const followUp = await session.send("Make it shorter.");
+const followUp = await session.send('Make it shorter.');
 console.log(followUp.text);
 ```
 
@@ -73,12 +73,13 @@ See [docs/models.md](docs/models.md) for loading options and model-specific beha
 
 ## Models
 
-| Type      | Models                                                                 | Notes                                                   |
-| --------- | ---------------------------------------------------------------------- | ------------------------------------------------------- |
+| Type      | Models                                                                         | Notes                                                   |
+| --------- | ------------------------------------------------------------------------------ | ------------------------------------------------------- |
 | General   | Qwen3, Qwen3.5/3.6 Dense and MoE, Gemma4, LFM2, LFM2.5, Nemotron 3.5 Lightning | Qwen models support GRPO and SFT; others inference-only |
-| Vision    | Qwen3.5/3.6 VLM, Gemma4 VLM, PaddleOCR-VL, Qianfan OCR, PP-StructureV3 | General vision, OCR, and document processing            |
-| Audio     | Qwen3-ASR                                                              | Offline, streaming, and meeting transcription           |
-| Embedding | Harrier                                                                | Embedding inference                                     |
+| SSD       | [Qwen3.8-Flash-Next](docs/qwen38-flash-next.md)                                | Text, images, native MTP, paged cache; inference-only   |
+| Vision    | Qwen3.5/3.6 VLM, Gemma4 VLM, PaddleOCR-VL, Qianfan OCR, PP-StructureV3         | General vision, OCR, and document processing            |
+| Audio     | Qwen3-ASR                                                                      | Offline, streaming, and meeting transcription           |
+| Embedding | Harrier                                                                        | Embedding inference                                     |
 
 The detailed support matrix is in [docs/models.md](docs/models.md).
 
@@ -107,23 +108,20 @@ Paged text models use continuous batching when the model supports it. Media turn
 The training package contains GRPO and SFT trainers. This is a small GRPO example using the GSM8K dataset downloaded by `mlx download dataset`:
 
 ```typescript
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
-import { GRPOTrainer, loadLocalGsm8kDataset } from "@mlx-node/trl";
+import { GRPOTrainer, loadLocalGsm8kDataset } from '@mlx-node/trl';
 
 const trainer = await GRPOTrainer.create({
-  modelPath: join(homedir(), ".mlx-node", "models", "qwen3-0.6b"),
-  outputDir: "outputs/grpo",
+  modelPath: join(homedir(), '.mlx-node', 'models', 'qwen3-0.6b'),
+  outputDir: 'outputs/grpo',
   groupSize: 4,
-  lossType: "grpo",
-  rewardFunction: async (outputs) =>
-    outputs.map(({ completion }) =>
-      completion.text.includes("correct") ? 1 : 0,
-    ),
+  lossType: 'grpo',
+  rewardFunction: async (outputs) => outputs.map(({ completion }) => (completion.text.includes('correct') ? 1 : 0)),
 });
 
-const dataset = await loadLocalGsm8kDataset("train", { limit: 100 });
+const dataset = await loadLocalGsm8kDataset('train', { limit: 100 });
 await trainer.train(dataset);
 ```
 

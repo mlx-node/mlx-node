@@ -1,6 +1,6 @@
 # GDN chunked-ops (CUDA prefill) — derived spec
 
-Port of the in-tree Metal chunked kernel (`crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc`)
+Port of the in-tree Metal chunked kernel (`crates/mlx-sys/src/metal/common/gated_delta_chunked.metal.inc`)
 to **pure device-agnostic MxArray ops**, so the CUDA prefill path stops running the O(T) per-step
 recurrence and instead runs O(T/BT) chunk-serial steps of dense batched matmuls (cuBLAS / tensor
 cores). `BT = 64`. Oracle = `gated_delta_ops` (per-step). Decode (T<64) and masked calls keep per-step.

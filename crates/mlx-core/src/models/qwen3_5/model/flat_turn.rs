@@ -272,14 +272,14 @@ impl Qwen35Inner {
     /// also goes through `self.rope` unconditionally. Both paths share
     /// the same RoPE on text-only inputs, so byte-equal parity holds
     /// on VLM checkpoints provided no images are passed.
-    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
+    pub(crate) fn set_vision_encoder(&mut self, enc: QwenVisionEncoder) -> Result<()> {
         self.vision_encoder = Some(Arc::new(enc));
         self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
         Ok(())
     }
 
     /// Set the image processor.
-    pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
+    pub(crate) fn set_image_processor(&mut self, proc: QwenImageProcessor) {
         self.image_processor = Some(Arc::new(proc));
         self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
     }
