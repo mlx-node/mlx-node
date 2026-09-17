@@ -1153,9 +1153,7 @@ describe('DownloadManager', () => {
     // Every sidecar is published AND came off the assets repo, not the primary one.
     for (const name of sidecars) {
       expect(existsSync(join(finalDir(), name)), `${name} missing from the published dir`).toBe(true);
-      expect(hub.downloadedFrom, `${name} was not fetched from the assets repo`).toContain(
-        `${ASSETS_REPO}/${name}`,
-      );
+      expect(hub.downloadedFrom, `${name} was not fetched from the assets repo`).toContain(`${ASSETS_REPO}/${name}`);
       expect(hub.downloadedFrom, `${name} was fetched from the primary repo`).not.toContain(`${REPO}/${name}`);
     }
     expect(hub.downloaded, 'a non-candidate assets-repo file was fetched').not.toContain('README.md');
@@ -1348,60 +1346,63 @@ describe('DownloadManager', () => {
   // macOS-only: the immutable flag is the one way to keep a file regular (so
   // the install still reads as installed and the refresh path really runs)
   // while making `rm` refuse it.
-  it.skipIf(process.platform !== 'darwin')('leaves the marker untouched when a stale sidecar cannot be deleted', async () => {
-    // The stale set is derived FROM the marker, so dropping an entry before its
-    // file is actually gone would make an interrupted refresh unrecoverable:
-    // the file stays, nothing derives it again, and it is reported current
-    // forever. Deletion must fail with the marker still listing it, so the
-    // next run retries.
-    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
-    hub.manifests[ASSETS_REPO] = [
-      { type: 'file', path: 'config.json', size: 12 },
-      { type: 'file', path: 'tokenizer.json', size: 20 },
-    ];
-    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
-    const first = new DownloadManager({
-      modelsDir,
-      cacheDir,
-      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
-    });
-    const idOne = first.start(REPO);
-    const eventsOne: DownloadEvent[] = [];
-    first.subscribe(idOne, (event) => eventsOne.push(event));
-    await waitFor(() => eventsOne.some((event) => event.type === 'done'));
-
-    // Upstream drops tokenizer.json; locally the file becomes immutable.
-    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
-    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
-    const tokenizerPath = join(finalDir(), 'tokenizer.json');
-    execFileSync('/usr/bin/chflags', ['uchg', tokenizerPath]);
-    try {
-      const second = new DownloadManager({
+  it.skipIf(process.platform !== 'darwin')(
+    'leaves the marker untouched when a stale sidecar cannot be deleted',
+    async () => {
+      // The stale set is derived FROM the marker, so dropping an entry before its
+      // file is actually gone would make an interrupted refresh unrecoverable:
+      // the file stays, nothing derives it again, and it is reported current
+      // forever. Deletion must fail with the marker still listing it, so the
+      // next run retries.
+      hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+      hub.manifests[ASSETS_REPO] = [
+        { type: 'file', path: 'config.json', size: 12 },
+        { type: 'file', path: 'tokenizer.json', size: 20 },
+      ];
+      hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+      const first = new DownloadManager({
         modelsDir,
         cacheDir,
-        fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
+        fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
       });
-      const idTwo = second.start(REPO);
-      const eventsTwo: DownloadEvent[] = [];
-      second.subscribe(idTwo, (event) => eventsTwo.push(event));
-      await waitFor(() => eventsTwo.some((event) => event.type === 'error' || event.type === 'done'));
+      const idOne = first.start(REPO);
+      const eventsOne: DownloadEvent[] = [];
+      first.subscribe(idOne, (event) => eventsOne.push(event));
+      await waitFor(() => eventsOne.some((event) => event.type === 'done'));
 
-      // The install still reads as installed (the file IS a regular file), so
-      // this really exercised the refresh path — not the full re-stage one.
-      expect(isModelInstalled(finalDir())).toBe(true);
-      expect(eventsTwo.some((event) => event.type === 'error')).toBe(true);
-      const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
-        files: string[];
-        assetsRevision?: string;
-      };
-      // Untouched: still listed, still pinned to the old revision — the next run
-      // derives the same stale set and tries again.
-      expect(marker.files).toContain('tokenizer.json');
-      expect(marker.assetsRevision).toBe(SHA_OLD);
-    } finally {
-      execFileSync('/usr/bin/chflags', ['nouchg', tokenizerPath]);
-    }
-  });
+      // Upstream drops tokenizer.json; locally the file becomes immutable.
+      hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+      hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+      const tokenizerPath = join(finalDir(), 'tokenizer.json');
+      execFileSync('/usr/bin/chflags', ['uchg', tokenizerPath]);
+      try {
+        const second = new DownloadManager({
+          modelsDir,
+          cacheDir,
+          fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
+        });
+        const idTwo = second.start(REPO);
+        const eventsTwo: DownloadEvent[] = [];
+        second.subscribe(idTwo, (event) => eventsTwo.push(event));
+        await waitFor(() => eventsTwo.some((event) => event.type === 'error' || event.type === 'done'));
+
+        // The install still reads as installed (the file IS a regular file), so
+        // this really exercised the refresh path — not the full re-stage one.
+        expect(isModelInstalled(finalDir())).toBe(true);
+        expect(eventsTwo.some((event) => event.type === 'error')).toBe(true);
+        const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+          files: string[];
+          assetsRevision?: string;
+        };
+        // Untouched: still listed, still pinned to the old revision — the next run
+        // derives the same stale set and tries again.
+        expect(marker.files).toContain('tokenizer.json');
+        expect(marker.assetsRevision).toBe(SHA_OLD);
+      } finally {
+        execFileSync('/usr/bin/chflags', ['nouchg', tokenizerPath]);
+      }
+    },
+  );
 
   it('refuses to prune away the last config, leaving the install intact', async () => {
     // The primary GGUF repo ships no config.json (AgentWorld's doesn't): the
@@ -1446,7 +1447,9 @@ describe('DownloadManager', () => {
     expect(marker.files).toContain('config.json');
     expect(marker.assetsRevision).toBe(SHA_OLD);
     // And no temp marker residue from the atomic writer.
-    expect(readdirSync(finalDir()).filter((name) => name.includes(DOWNLOAD_COMPLETE_MARKER) && name.endsWith('.tmp'))).toEqual([]);
+    expect(
+      readdirSync(finalDir()).filter((name) => name.includes(DOWNLOAD_COMPLETE_MARKER) && name.endsWith('.tmp')),
+    ).toEqual([]);
   });
 
   it('does not re-download verified sidecars on a second job over the same revision', async () => {
@@ -1691,9 +1694,7 @@ describe('DownloadManager', () => {
     const id = manager.start(REPO);
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
-    expect(hub.downloaded, 'a same-length corrupt Xet blob was accepted without a re-fetch').toContain(
-      WEIGHT,
-    );
+    expect(hub.downloaded, 'a same-length corrupt Xet blob was accepted without a re-fetch').toContain(WEIGHT);
     expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300));
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
   });
@@ -2843,7 +2844,11 @@ describe('DownloadManager', () => {
     expect(events.some((event) => event.type === 'error')).toBe(false);
     expect(manager.jobs().find((j) => j.id === id)!.state).toBe('cancelled');
 
-    // Staging cleaned; nothing published.
+    // Staging cleaned; nothing published. The `cancelled` event is emitted in
+    // `catch` before `finally` awaits the staging `rm`, so wait for the
+    // directory to disappear rather than asserting on the event (same race as
+    // the error-path tests above).
+    await waitFor(() => jobStagingDirs().length === 0);
     expect(jobStagingDirs()).toEqual([]);
     expect(existsSync(finalDir())).toBe(false);
     // Shared HF cache UNTOUCHED — config.json's cached pointer + blob survive.
