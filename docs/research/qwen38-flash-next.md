@@ -5,6 +5,28 @@ Research: 15–17 September 2026. Starting revision:
 initial performance record, mlx.fast investigation, prefill port log, and
 macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
+## Reviewer follow-up, 17 September
+
+The read-only GGUF asset-directory finding was reproduced through the packaged
+addon: a tiny checkpoint with mode `0444` in a directory with mode `0555` failed
+with `Permission denied (os error 13)` before loading tokenizer assets. Qwen4 now
+uses the shared writable native GGUF cache, including `MLX_NATIVE_GGUF_CACHE_DIR`,
+XDG/OS user-cache selection and temporary-directory fallback. The source identity
+and atomic directory publication remain unchanged. The existing cache helpers now
+have family-neutral names and serve Qwen4 alongside the other native GGUF loaders.
+
+The regression checks that generated tokenizer/config files are complete and
+reusable, the read-only checkpoint stays byte-identical, and no sibling files or
+temporary cache directories remain. The source-replacement regression continues
+to use the same generated-asset path with an isolated cache directory.
+
+Validation passed: canonical native build and both packaged Metal-library checks;
+**3584 core unit tests** (122 ignored; the same three debug-only release
+exclusions); strict all-target Clippy; and **197 selected TypeScript tests**. The
+shared cache-selection and Qwen3.5 read-only-source regressions also passed.
+Generated declaration copies match. Evidence is outside the repository under
+`~/Library/Caches/mlx-node/pr154-review-followup-20260917/`.
+
 ## Production error-handling audit, 17 September
 
 The production `unwrap`/`expect` audit covers the new Qwen4 runtime,

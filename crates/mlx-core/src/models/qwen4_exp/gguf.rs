@@ -1,6 +1,7 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
-    GgufMetaValue, source_file_identity_digest, write_embedded_gpt2_tokenizer,
+    GgufMetaValue, native_gguf_cache_root, source_file_identity_digest,
+    write_embedded_gpt2_tokenizer,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -151,23 +152,24 @@ pub fn config(store: &Store) -> Result<Config> {
     Config::parse(&json!({"model_type":"qwen4_exp","text_config":Value::Object(text)}))
 }
 
-/// Tokenizer-only assets; weight payloads stay in the source checkpoint.
+/// Tokenizer-only assets in the application cache; the checkpoint stays read-only.
 pub fn assets(first: &Path, store: &Store, c: &Config) -> Result<PathBuf> {
+    assets_in(first, store, c, &native_gguf_cache_root()?)
+}
+
+fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<PathBuf> {
     let source = first
         .canonicalize()
         .map_err(|e| Error::from_reason(e.to_string()))?;
     let metadata = std::fs::metadata(&source).map_err(|e| Error::from_reason(e.to_string()))?;
     let identity = source_file_identity_digest(&source, &metadata);
-    let parent = first
-        .parent()
-        .ok_or_else(|| Error::from_reason("Qwen4 GGUF source has no parent directory"))?;
-    let dir = parent.join(format!(".mlx-qwen4-assets-v2-{identity}"));
+    let dir = root.join(format!(".mlx-qwen4-assets-v2-{identity}"));
     if dir.join("complete").exists() {
         return Ok(dir);
     }
     // Publish a complete directory in one rename. Simultaneous loads may race,
     // but neither reader can observe another load's partly written tokenizer.
-    let temp = parent.join(format!(".mlx-qwen4-assets-tmp-{}", uuid::Uuid::new_v4()));
+    let temp = root.join(format!(".mlx-qwen4-assets-tmp-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&temp).map_err(|e| Error::from_reason(e.to_string()))?;
     let result = (|| -> Result<PathBuf> {
         if !write_embedded_gpt2_tokenizer(&store.metadata, &temp)? {
@@ -198,18 +200,9 @@ pub fn assets(first: &Path, store: &Store, c: &Config) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::fs::{self, FileTimes, OpenOptions};
+    use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn asset_cache_rebuilds_after_same_size_same_mtime_source_replacement() {
-        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        let source = root.join("model.gguf");
-        let replacement = root.join("replacement.gguf");
-        fs::write(&source, b"old").unwrap();
-        fs::write(&replacement, b"new").unwrap();
-        let original_metadata = fs::metadata(&source).unwrap();
-        let original_modified = original_metadata.modified().unwrap();
-
+    fn tokenizer_fixture() -> (Store, Config) {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
         let mut store = Store::open_metadata(&fixture, None).unwrap();
         let raw = serde_json::from_slice(&fs::read(fixture.join("config.json")).unwrap()).unwrap();
@@ -232,8 +225,26 @@ mod tests {
                 GgufMetaValue::ArrayString(Vec::new()),
             ),
         ]);
-        let original = assets(&source, &store, &config).unwrap();
-        assert_eq!(assets(&source, &store, &config).unwrap(), original);
+        (store, config)
+    }
+
+    #[test]
+    fn asset_cache_rebuilds_after_same_size_same_mtime_source_replacement() {
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        let replacement = root.join("replacement.gguf");
+        fs::write(&source, b"old").unwrap();
+        fs::write(&replacement, b"new").unwrap();
+        let original_metadata = fs::metadata(&source).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        let (mut store, config) = tokenizer_fixture();
+        let original = assets_in(&source, &store, &config, &cache).unwrap();
+        assert_eq!(
+            assets_in(&source, &store, &config, &cache).unwrap(),
+            original
+        );
 
         OpenOptions::new()
             .write(true)
@@ -250,13 +261,51 @@ mod tests {
             GgufMetaValue::ArrayString(vec!["new".into()]),
         );
 
-        let rebuilt = assets(&source, &store, &config).unwrap();
+        let rebuilt = assets_in(&source, &store, &config, &cache).unwrap();
         assert_ne!(original, rebuilt);
         let tokenizer: Value =
             serde_json::from_slice(&fs::read(rebuilt.join("tokenizer.json")).unwrap()).unwrap();
         assert_eq!(tokenizer["model"]["vocab"]["new"], 0);
         assert!(tokenizer["model"]["vocab"].get("old").is_none());
         assert!(rebuilt.join("complete").is_file());
+        assert_eq!(store.bytes_read, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asset_cache_never_writes_beside_read_only_source() {
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let cache = root.join("cache");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&cache).unwrap();
+        let input = source.join("model.gguf");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/model.gguf");
+        fs::copy(&fixture, &input).unwrap();
+        let (store, config) = tokenizer_fixture();
+
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        let prepared = assets_in(&input, &store, &config, &cache);
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = prepared.unwrap();
+
+        assert!(output.starts_with(&cache));
+        assert_eq!(assets_in(&input, &store, &config, &cache).unwrap(), output);
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 1);
+        assert_eq!(fs::read(&input).unwrap(), fs::read(&fixture).unwrap());
+        let tokenizer: Value =
+            serde_json::from_slice(&fs::read(output.join("tokenizer.json")).unwrap()).unwrap();
+        assert_eq!(tokenizer["model"]["vocab"]["old"], 0);
+        let generated: Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            generated["text_config"],
+            serde_json::to_value(&config).unwrap()
+        );
+        assert!(output.join("complete").is_file());
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
         assert_eq!(store.bytes_read, 0);
         fs::remove_dir_all(root).unwrap();
     }

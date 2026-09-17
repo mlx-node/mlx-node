@@ -24,7 +24,10 @@ never loaded as one dense model.
 For [Unsloth UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q4_K_XL),
 place all four splits together and pass the first `.gguf` file. The loader
 validates the split descriptors before inference. It extracts embedded tokenizer
-assets into a small `.mlx-qwen4-assets-v2-*` directory beside the first split.
+assets into a small `.mlx-qwen4-assets-v2-*` directory in the writable native
+GGUF application cache. `MLX_NATIVE_GGUF_CACHE_DIR` overrides that cache;
+otherwise the loader uses the XDG/OS user cache, with a temporary-directory
+fallback. The source checkpoint directory only needs read access.
 Quantized weight codes and scale/minimum values are preserved during import;
 loading does not require a whole-checkpoint conversion or requantization.
 

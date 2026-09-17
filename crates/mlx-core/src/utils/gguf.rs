@@ -4558,9 +4558,9 @@ pub async fn convert_gguf_to_safetensors(
 /// F32 norms/biases are narrowed to BF16 so they do not promote inference
 /// activations away from the model's BF16 execution/cache dtype.
 const QWEN35_NATIVE_CACHE_FORMAT: u32 = 5;
-const QWEN35_NATIVE_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
+const NATIVE_GGUF_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
 
-fn qwen35_native_cache_candidates_from(
+fn native_gguf_cache_candidates_from(
     override_root: Option<PathBuf>,
     xdg_cache_home: Option<PathBuf>,
     home: Option<PathBuf>,
@@ -4584,7 +4584,7 @@ fn qwen35_native_cache_candidates_from(
     candidates
 }
 
-fn initialize_qwen35_native_cache_root(root: &Path) -> std::io::Result<PathBuf> {
+fn initialize_native_gguf_cache_root(root: &Path) -> std::io::Result<PathBuf> {
     fs::create_dir_all(root)?;
     let probe = root.join(format!(
         ".write-probe-{}-{}",
@@ -4599,9 +4599,10 @@ fn initialize_qwen35_native_cache_root(root: &Path) -> std::io::Result<PathBuf> 
     root.canonicalize()
 }
 
-fn qwen35_native_cache_root() -> Result<PathBuf> {
-    let override_root = std::env::var_os(QWEN35_NATIVE_CACHE_DIR_ENV).map(PathBuf::from);
-    let candidates = qwen35_native_cache_candidates_from(
+/// Writable application cache shared by native GGUF weights and runtime assets.
+pub(crate) fn native_gguf_cache_root() -> Result<PathBuf> {
+    let override_root = std::env::var_os(NATIVE_GGUF_CACHE_DIR_ENV).map(PathBuf::from);
+    let candidates = native_gguf_cache_candidates_from(
         override_root.clone(),
         std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
@@ -4609,13 +4610,13 @@ fn qwen35_native_cache_root() -> Result<PathBuf> {
     );
     let mut failures = Vec::new();
     for candidate in candidates {
-        match initialize_qwen35_native_cache_root(&candidate) {
+        match initialize_native_gguf_cache_root(&candidate) {
             Ok(root) => return Ok(root),
             Err(error) => failures.push(format!("{}: {error}", candidate.display())),
         }
     }
     let authority = if override_root.is_some() {
-        format!(" from {QWEN35_NATIVE_CACHE_DIR_ENV}")
+        format!(" from {NATIVE_GGUF_CACHE_DIR_ENV}")
     } else {
         String::new()
     };
@@ -4923,7 +4924,7 @@ fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
 /// cache. The source directory remains read-only; the matching unified media
 /// projector is converted in the same transaction as the text model.
 pub(crate) async fn prepare_gemma4_native_gguf(input: &Path) -> Result<PathBuf> {
-    let root = qwen35_native_cache_root()?;
+    let root = native_gguf_cache_root()?;
     prepare_gemma4_native_gguf_in(input, &root).await
 }
 
@@ -4956,7 +4957,7 @@ async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<Path
             input.display()
         )));
     }
-    let root = initialize_qwen35_native_cache_root(root)?;
+    let root = initialize_native_gguf_cache_root(root)?;
     prepare_native_gguf_inner(
         &input,
         &root,
@@ -5010,7 +5011,7 @@ fn muse_glimmer_native_draft(input: &Path) -> Result<Option<PathBuf>> {
 }
 
 pub(crate) async fn prepare_muse_glimmer_native_gguf(input: &Path) -> Result<PathBuf> {
-    let root = qwen35_native_cache_root()?;
+    let root = native_gguf_cache_root()?;
     prepare_muse_glimmer_native_gguf_in(input, &root).await
 }
 
@@ -5038,7 +5039,7 @@ async fn prepare_muse_glimmer_native_gguf_in(input: &Path, root: &Path) -> Resul
             parent.to_string_lossy().into_owned(),
         )?;
     }
-    let root = initialize_qwen35_native_cache_root(root)?;
+    let root = initialize_native_gguf_cache_root(root)?;
     prepare_native_gguf_inner(
         &input,
         &root,
@@ -5092,13 +5093,13 @@ fn native_gguf_companion_digest(companion: Option<&Path>) -> Result<String> {
 }
 
 pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
-    let cache_root = qwen35_native_cache_root()?;
+    let cache_root = native_gguf_cache_root()?;
     prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
 }
 
 #[cfg(test)]
 async fn prepare_qwen35_native_gguf_in(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
-    let cache_root = initialize_qwen35_native_cache_root(cache_root).map_err(|error| {
+    let cache_root = initialize_native_gguf_cache_root(cache_root).map_err(|error| {
         Error::from_reason(format!(
             "Failed to create native GGUF cache root '{}': {error}",
             cache_root.display()
@@ -6440,13 +6441,13 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_native_cache_root_prefers_override_then_application_cache() {
+    fn native_gguf_cache_root_prefers_override_then_application_cache() {
         let override_root = PathBuf::from("/override");
         let xdg = PathBuf::from("/xdg");
         let home = PathBuf::from("/home/tester");
         let temp = PathBuf::from("/tmp/tester");
         assert_eq!(
-            qwen35_native_cache_candidates_from(
+            native_gguf_cache_candidates_from(
                 Some(override_root.clone()),
                 Some(xdg.clone()),
                 Some(home.clone()),
@@ -6455,11 +6456,10 @@ mod tests {
             vec![override_root]
         );
         assert_eq!(
-            qwen35_native_cache_candidates_from(None, Some(xdg), Some(home.clone()), temp.clone())
-                [0],
+            native_gguf_cache_candidates_from(None, Some(xdg), Some(home.clone()), temp.clone())[0],
             PathBuf::from("/xdg/mlx-node/native-gguf")
         );
-        let without_xdg = qwen35_native_cache_candidates_from(None, None, Some(home), temp.clone());
+        let without_xdg = native_gguf_cache_candidates_from(None, None, Some(home), temp.clone());
         #[cfg(target_os = "macos")]
         assert_eq!(
             without_xdg[0],
