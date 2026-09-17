@@ -261,7 +261,7 @@ Examples:
 
   # One Unsloth Dynamic variant plus the base-model tokenizer sidecars that
   # every GGUF quantization repo lacks (required for correct tool calling):
-  mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" -g "MTP/*" \\
+  mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" \\
     --assets-repo Qwen/Qwen3.8-27B
 `);
 }

@@ -82,7 +82,8 @@ describe('MODEL_CATALOG', () => {
   });
 
   it('Qwen3.8-27B keeps its optional DFlash2 companion beside the MTP weights', () => {
-    // MTP ships inside the unsloth repo (`MTP/*` glob, auto-detected at load)
+    // MTP is inline in the UD-Q4_K_XL file itself (auto-detected at load);
+    // the repo's separate MTP/*.gguf is deliberately not downloaded
     // and covers the default path; the DFlash2 draft stays offered as an
     // optional, never-auto-installed companion for checkpoints that pair
     // with it, so the dashboard companion card and its download allowlist
