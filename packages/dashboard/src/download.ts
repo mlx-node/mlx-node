@@ -1016,13 +1016,19 @@ export class DownloadManager {
         for (const file of sidecarPlan.files) if (file.size > 0) totalBytes += file.size;
       }
 
+      // One aggregate for every frame of this job: the UI reducer replaces
+      // `fileCount` with each progress event's value, so a primary-loop frame
+      // reporting the primary-only count would shrink the displayed total and
+      // then jump when the sidecars start.
+      const aggregateFileCount = files.length + (sidecarPlan?.files.length ?? 0);
+
       job.totalBytes = totalBytes;
       this.emit({
         type: 'start',
         id: job.id,
         repo: job.repo,
         totalBytes,
-        fileCount: files.length + (sidecarPlan?.files.length ?? 0),
+        fileCount: aggregateFileCount,
       });
 
       // Already published, complete, AND pinned to THIS repo+revision (marker
@@ -1083,14 +1089,14 @@ export class DownloadManager {
         if (await isStagedCopyComplete(destPath, file)) {
           const fileBytes = file.size > 0 ? file.size : 0;
           job.receivedBytes = jobBaseBytes + fileBytes;
-          this.emitFileProgress(job, file.path, fileBytes, file.size, index, files.length);
+          this.emitFileProgress(job, file.path, fileBytes, file.size, index, aggregateFileCount);
           continue;
         }
 
         const context = await this.downloadVerifiedFile(repo, revision, file, destPath, {
           jobBaseBytes,
           fileIndex: index,
-          fileCount: files.length,
+          fileCount: aggregateFileCount,
         });
 
         // Settle the file at its manifest size (or the counted bytes when the
@@ -1098,7 +1104,7 @@ export class DownloadManager {
         // cache hit or a metadata-only response streamed nothing.
         const fileBytes = file.size > 0 ? file.size : context.received;
         job.receivedBytes = jobBaseBytes + fileBytes;
-        this.emitFileProgress(job, file.path, fileBytes, file.size, index, files.length);
+        this.emitFileProgress(job, file.path, fileBytes, file.size, index, aggregateFileCount);
       }
 
       // A cancel issued after the fetch loop must still unwind here — before the

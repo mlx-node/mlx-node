@@ -1090,6 +1090,13 @@ describe('DownloadManager', () => {
       totalBytes: 312,
       fileCount: 2,
     });
+    // EVERY frame must report the aggregate (1 primary + 1 sidecar): the UI
+    // reducer replaces its count with each progress event's, so a primary-only
+    // count here would shrink the displayed total and then jump when the
+    // sidecar starts.
+    const progressCounts = events.filter((event) => event.type === 'progress').map((event) => event.fileCount);
+    expect(progressCounts.length).toBeGreaterThan(0);
+    expect(new Set(progressCounts)).toEqual(new Set([2]));
     expect([...hub.downloaded].sort()).toEqual([WEIGHT, 'config.json'].sort());
 
     // The unmatched variants were never fetched and never published…
