@@ -584,7 +584,7 @@ impl<'a> PyLiteralParser<'a> {
     /// binary operator, a postfix (`(` `[` `.`), or the top-level `,`/`)`
     /// argument boundary. `Lambda` covers `lambda …:` parameter lists.
     /// Deliberate residuals (rare invalid forms still accepted, e.g.
-    /// `a.5`, `a ~ b`): skipping is a boundary check, not codegen — the
+    /// `a ~ b`, `0xg`): skipping is a boundary check, not codegen — the
     /// goal is keeping obviously-malformed text from promoting a call.
     fn skip_expression(&mut self) -> Result<(), ()> {
         #[derive(Clone, Copy, PartialEq)]
@@ -713,13 +713,50 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos += 3;
                                 st = St::Have;
                             } else if self.s.get(self.pos + 1).is_some_and(|c| c.is_ascii_digit()) {
+                                let num_start = self.pos;
                                 self.pos += 2;
                                 while self
                                     .s
                                     .get(self.pos)
-                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
+                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
                                 {
                                     self.pos += 1;
+                                }
+                                if matches!(
+                                    self.s.get(self.pos),
+                                    Some(c) if matches!(c, b'e' | b'E')
+                                ) {
+                                    self.pos += 1;
+                                    if matches!(
+                                        self.s.get(self.pos),
+                                        Some(c) if matches!(c, b'+' | b'-')
+                                    ) {
+                                        self.pos += 1;
+                                    }
+                                    let exp_start = self.pos;
+                                    while self
+                                        .s
+                                        .get(self.pos)
+                                        .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
+                                    {
+                                        self.pos += 1;
+                                    }
+                                    if self.pos == exp_start {
+                                        return Err(());
+                                    }
+                                }
+                                if matches!(
+                                    self.s.get(self.pos),
+                                    Some(c) if matches!(c, b'j' | b'J')
+                                ) {
+                                    self.pos += 1;
+                                }
+                                if !Self::valid_numeric_underscores(
+                                    &self.s[num_start..self.pos],
+                                    |c| c.is_ascii_digit(),
+                                    false,
+                                ) {
+                                    return Err(());
                                 }
                                 st = St::Have;
                             } else {
@@ -822,12 +859,18 @@ impl<'a> PyLiteralParser<'a> {
                                     ) {
                                         self.pos += 1;
                                     }
+                                    let exp_start = self.pos;
                                     while self
                                         .s
                                         .get(self.pos)
                                         .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
                                     {
                                         self.pos += 1;
+                                    }
+                                    // `1e`, `1e+`, `.5e-` — an exponent
+                                    // marker with no digits is a SyntaxError.
+                                    if self.pos == exp_start {
+                                        return Err(());
                                     }
                                 }
                                 if matches!(
@@ -884,29 +927,16 @@ impl<'a> PyLiteralParser<'a> {
                             st = St::Need;
                         }
                         b'.' => match self.s.get(self.pos + 1) {
-                            // `5.`/`5.5` float continuation (also admits
-                            // `a.5` — a residual, see the doc).
-                            Some(c) if c.is_ascii_digit() => {
-                                self.pos += 2;
-                                while self
-                                    .s
-                                    .get(self.pos)
-                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
-                                {
-                                    self.pos += 1;
-                                }
-                            }
-                            // Attribute access `a.b`.
+                            // Attribute access `a.b` — the only legal `.`
+                            // after an operand: digit-led numbers already
+                            // consumed their fraction/exponent, so `.5`,
+                            // `x.`, `.5.5`, `1.5.5` here are SyntaxErrors.
                             Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80 => {
                                 let id_start = self.pos + 1;
                                 self.pos = ident_end(self.s, id_start);
                                 if reject_keyword(&self.s[id_start..self.pos]) {
                                     return Err(());
                                 }
-                            }
-                            // Trailing-dot float `5.` before a boundary.
-                            Some(b')' | b']' | b'}' | b',' | b' ' | b'\t' | b'\n' | b'\r') => {
-                                self.pos += 1;
                             }
                             _ => return Err(()),
                         },
@@ -4169,12 +4199,25 @@ The weather in Tokyo is sunny."#;
             "f(b 'x')",   // spaced string prefix is a name, not a literal
             "f(x not)",   // `not` with no operand
             "f(a > b <)", // trailing operator
+            "f(1e+)",     // exponent marker with no digits
+            "f(1e)",      // bare `e` after digits
+            "f(1e-)",     // signed exponent with no digits
+            "f(.5e)",     // same hole on the `.`-led float path
+            "f(5.e)",     // `5.` then `e` — juxtaposed name, SyntaxError
+            "f(.5.5)",    // second `.` in a `.`-led float
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
             assert_eq!(text, input, "{inner} must stay verbatim");
             assert!(calls.is_empty(), "{inner} must not promote a call");
         }
+
+        // The exact reviewer case: the surviving kwarg must not promote
+        // the call once the positional is proven malformed.
+        let input = "<|tool_call_start|>[dangerous_action(1e+, confirmed=True)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, input);
+        assert!(calls.is_empty());
     }
 
     #[test]
@@ -4202,6 +4245,10 @@ The weather in Tokyo is sunny."#;
             ("f(a[1:], x=1)", "{\"x\":1}"),
             ("f({1: 2}, x=1)", "{\"x\":1}"),
             ("f(5. + .5, x=1)", "{\"x\":1}"),
+            ("f(.5e3, x=1)", "{\"x\":1}"),
+            ("f(5.e3, x=1)", "{\"x\":1}"),
+            ("f(1_0e1_0, x=1)", "{\"x\":1}"),
+            ("f(.5_0e1, x=1)", "{\"x\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
