@@ -6,23 +6,12 @@ const tokenizerMocks = vi.hoisted(() => ({
   fromPretrained: vi.fn(),
 }));
 
-vi.mock('@mlx-node/core', () => {
-  class UnusedNativeModel {}
-  return {
-    Gemma4Model: UnusedNativeModel,
-    K2HorizonModel: UnusedNativeModel,
-    Lfm2Model: UnusedNativeModel,
-    MuseGlimmerModel: UnusedNativeModel,
-    NemotronHModel: UnusedNativeModel,
-    Qwen3Model: UnusedNativeModel,
-    Qwen35Model: UnusedNativeModel,
-    Qwen35MoeModel: UnusedNativeModel,
-    Qwen4ExpModel: UnusedNativeModel,
-    Qwen3Tokenizer: {
-      fromPretrained: tokenizerMocks.fromPretrained,
-    },
-  };
-});
+vi.mock('@mlx-node/core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@mlx-node/core')>()),
+  Qwen3Tokenizer: {
+    fromPretrained: tokenizerMocks.fromPretrained,
+  },
+}));
 
 import { makeStreamingModel } from '../src/stream.js';
 

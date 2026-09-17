@@ -658,16 +658,14 @@ impl PagedBackend for Qwen35MoeInner {
         let Some(adapter) = self.paged_adapter.as_mut() else {
             return true;
         };
-        let history_len = if generated.is_empty() {
-            0
-        } else {
-            generated.len() - 1
-        };
-        let target_len = prompt_len + history_len;
-        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
-        if surplus > 0
-            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
-        {
+        if let Err((surplus, e)) = crate::engine::paged_epilogue::reconcile_paged_surplus(
+            adapter.request_tokens().len(),
+            prompt_len,
+            generated.len(),
+            _keep_all,
+            crate::engine::paged_epilogue::FinalTokenPolicy::AlwaysDrop,
+            |n| adapter.rollback_last_tokens(n),
+        ) {
             tracing::warn!(
                 target: "mlx_core::qwen3_5_moe::paged",
                 "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \

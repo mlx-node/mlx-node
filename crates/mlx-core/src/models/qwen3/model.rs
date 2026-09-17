@@ -15,13 +15,18 @@ use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TrainBackend,
-    TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, DecodeStep, PagedBackend, ResetScope, SaveStateArgs, TrainBackend, TurnOutput,
+    TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_train_cmd};
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefixAdmission,
     ScheduledRestoreResult, ScheduledTurn, scheduler_max_num_seqs_for, scheduler_per_seq_context,
+};
+use crate::engine::paged_epilogue::{
+    FinalTokenPolicy, SimplePagedPrefix, abort_single_adapter_turn,
+    finalize_single_adapter_turn, prime_single_adapter_prefix, reconcile_paged_surplus,
+    save_paged_token_history,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::scheduler::{
@@ -4050,20 +4055,8 @@ impl DecodeStep for Qwen3PagedDecode<'_> {
 /// qwen3 paged prefix state — the effective prefix/suffix split from
 /// `prepare_turn_with_max_cache_hit_tokens`. Identity-style (no held
 /// cache handles); the adapter mutated its own internal state during the
-/// prime.
-pub(crate) struct Qwen3PrefixState {
-    effective_cached_prefix_len: usize,
-    suffix_len: usize,
-}
-
-impl PagedPrefix for Qwen3PrefixState {
-    fn effective_cached_prefix_len(&self) -> usize {
-        self.effective_cached_prefix_len
-    }
-    fn suffix_len(&self) -> usize {
-        self.suffix_len
-    }
-}
+/// prime. Shared two-usize shape (`engine::paged_epilogue`).
+pub(crate) type Qwen3PrefixState = SimplePagedPrefix;
 
 impl Qwen3Inner {
     fn prime_prefix_state_for(
@@ -4074,32 +4067,14 @@ impl Qwen3Inner {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Qwen3PrefixState> {
-        let total_budget = plan.len() as u32;
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "prime_prefix_state: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                plan,
-                total_budget,
-                reuse_cache,
-                extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
+        let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+            Error::from_reason(
+                "prime_prefix_state: paged_adapter is None — caller must check \
+                 use_block_paged_cache before dispatch",
             )
-            .map_err(Error::from_reason)?;
-        Ok(Qwen3PrefixState {
-            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
-            suffix_len: turn_plan.suffix_len as usize,
-        })
+        })?;
+        prime_single_adapter_prefix(adapter, seq_id, plan, reuse_cache, extra_keys, cache_salt)
+            .map_err(Error::from_reason)
     }
 
     fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
@@ -4162,12 +4137,7 @@ impl PagedBackend for Qwen3Inner {
         // (`let _ =` every call — a teardown failure must not mask the turn
         // result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            if reuse_cache {
-                let _ = adapter.finalize_turn_keep_live(&[], cache_salt);
-            } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
-                let _ = adapter.release_request();
-            }
+            let _ = finalize_single_adapter_turn(adapter, reuse_cache, &[], cache_salt);
         }
     }
 
@@ -4177,7 +4147,7 @@ impl PagedBackend for Qwen3Inner {
         // register / keep live. Infallible (`let _ =` — must not mask the
         // turn's error).
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+            let _ = abort_single_adapter_turn(adapter);
         }
     }
 
@@ -4196,22 +4166,17 @@ impl PagedBackend for Qwen3Inner {
         // boundary token). The engine reconciles `request_tokens()` to this
         // same trimmed history via `reconcile_paged_request_tokens` before
         // finalize.
-        if reuse_cache {
-            let mut full_history = save_tokens.to_vec();
-            let history_tokens = if keep_all || generated.is_empty() {
-                generated
-            } else {
-                &generated[..generated.len() - 1]
-            };
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
-            // Qwen3 has no vision path — keep the image cache key None
-            // for uniformity with the VLM-capable siblings' branch.
-            self.cached_image_key = None;
-        } else {
-            self.cached_token_history.clear();
-            self.cached_image_key = None;
-        }
+        save_paged_token_history(
+            save_tokens,
+            generated,
+            keep_all,
+            reuse_cache,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        );
+        // Qwen3 has no vision path — keep the image cache key None
+        // for uniformity with the VLM-capable siblings' branch.
+        self.cached_image_key = None;
         // Standard-KV: token-history only, never fails (no GDN/recurrent
         // checkpoint). `Ok` satisfies the fallible trait contract.
         Ok(())
@@ -4249,16 +4214,14 @@ impl PagedBackend for Qwen3Inner {
         let Some(adapter) = self.paged_adapter.as_mut() else {
             return true;
         };
-        let history_len = if keep_all || generated.is_empty() {
-            generated.len()
-        } else {
-            generated.len() - 1
-        };
-        let target_len = prompt_len + history_len;
-        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
-        if surplus > 0
-            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
-        {
+        if let Err((surplus, e)) = reconcile_paged_surplus(
+            adapter.request_tokens().len(),
+            prompt_len,
+            generated.len(),
+            keep_all,
+            FinalTokenPolicy::KeepAllOnLength,
+            |n| adapter.rollback_last_tokens(n),
+        ) {
             tracing::warn!(
                 target: "mlx_core::qwen3::paged",
                 "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \

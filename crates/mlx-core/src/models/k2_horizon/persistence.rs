@@ -27,16 +27,12 @@ use crate::engine::persistence::{
     dequant_fp8_block_scale, dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
-    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
+    PerLayerMode, PerLayerQuant, default_per_layer_quant, load_dense_mlp_variant,
+    load_embedding_affine_or_bf16, load_linear_proj_quantized_or_bf16,
     load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::qwen3_5_moe::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, QuantizedLinear,
-    is_mxfp8_checkpoint, try_build_kquant_quantized_linear, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
-    try_build_quantized_linear, try_build_sym8_quantized_linear,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_mxfp8_checkpoint,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -101,186 +97,10 @@ fn sanitize_weights(params: &mut HashMap<String, MxArray>) -> Result<HashMap<Str
     Ok(sanitized)
 }
 
-/// Build a quantized `QuantizedLinear` for `base`, dispatching on the
-/// resolved per-layer mode. `Ok(None)` = incomplete `.weight`/`.scales`
-/// group (caller fails loud); `Err` = a mode/storage skew this builder
-/// must never silently skip.
-fn build_k2_non_moe_ql(
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<Option<QuantizedLinear>> {
-    let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-    ensure_int8_storage_resolves_sym8(params, base, plq.mode, "k2_horizon")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, base, plq.mode, "k2_horizon")?;
-    ensure_kquant_storage_resolves_kquant(params, base, plq.mode, "k2_horizon")?;
-    ensure_affine_biases_present(params, base, plq.mode, "k2_horizon")?;
-    Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
-        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, base),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "k2_horizon: projection '{base}' resolved to fp8_e4m3, but plain per-output \
-                 E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
-        PerLayerMode::Affine => {
-            try_build_quantized_linear(params, base, plq.group_size, plq.bits)
-        }
-        PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
-        PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K
-        | PerLayerMode::Q3K
-        | PerLayerMode::IQ4NL
-        | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
-            try_build_kquant_quantized_linear(params, base, plq.mode, "k2_horizon")?
-        }
-    })
-}
-
-/// Load one `LinearProj` either quantized (ANY mode) or plain bf16, keyed
-/// off `{base}.scales`.
-fn load_linear_proj_quantized_or_bf16(
-    proj: &mut LinearProj,
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<()> {
-    if params.contains_key(&format!("{base}.scales")) {
-        let ql = build_k2_non_moe_ql(params, base, per_layer_quant, default_plq)?.ok_or_else(
-            || {
-                Error::from_reason(format!(
-                    "k2_horizon: quantized tensor '{base}' has '.scales' but its packed \
-                     '.weight' could not be resolved (missing weight/scales) — refusing to load \
-                     with random init"
-                ))
-            },
-        )?;
-        proj.set_quantized(ql);
-    } else if let Some(w) = params.get(&format!("{base}.weight")) {
-        ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
-        proj.set_weight(w, base)?;
-    }
-    Ok(())
-}
-
-/// Whether any of a dense MLP's three projections carries `.scales`.
-fn dense_mlp_is_quantized(params: &HashMap<String, MxArray>, prefix: &str) -> bool {
-    ["gate_proj", "up_proj", "down_proj"]
-        .iter()
-        .any(|p| params.contains_key(&format!("{prefix}.{p}.scales")))
-}
-
-/// Load a dense `MLPVariant` (gate/up/down) quantized (ANY mode) or bf16.
-fn load_dense_mlp_variant(
-    ff: &mut MLPVariant,
-    params: &HashMap<String, MxArray>,
-    prefix: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<()> {
-    let gate_base = format!("{prefix}.gate_proj");
-    let up_base = format!("{prefix}.up_proj");
-    let down_base = format!("{prefix}.down_proj");
-
-    if dense_mlp_is_quantized(params, prefix) {
-        let gate_proj = build_k2_non_moe_ql(params, &gate_base, per_layer_quant, default_plq)?
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "k2_horizon: quantized dense-MLP projection '{gate_base}' could not be built \
-                     (missing weight/scales)"
-                ))
-            })?;
-        let up_proj = build_k2_non_moe_ql(params, &up_base, per_layer_quant, default_plq)?
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "k2_horizon: quantized dense-MLP projection '{up_base}' could not be built \
-                     (missing weight/scales)"
-                ))
-            })?;
-        let down_proj = build_k2_non_moe_ql(params, &down_base, per_layer_quant, default_plq)?
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "k2_horizon: quantized dense-MLP projection '{down_base}' could not be built \
-                     (missing weight/scales)"
-                ))
-            })?;
-        *ff = MLPVariant::Quantized {
-            gate_proj,
-            up_proj,
-            down_proj,
-        };
-    } else {
-        for (base, set) in [
-            (gate_base.as_str(), MLPVariant::set_gate_proj_weight as fn(&mut MLPVariant, &MxArray) -> Result<()>),
-            (up_base.as_str(), MLPVariant::set_up_proj_weight as fn(&mut MLPVariant, &MxArray) -> Result<()>),
-            (down_base.as_str(), MLPVariant::set_down_proj_weight as fn(&mut MLPVariant, &MxArray) -> Result<()>),
-        ] {
-            if let Some(w) = params.get(&format!("{base}.weight")) {
-                ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
-                set(ff, w)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Load `embed_tokens` PACKED-quantized (ANY mode) or bf16, keyed off
-/// `embed_tokens.scales`. Packed stays resident — `forward` gather-then-
-/// dequantizes per row, so the dense `vocab × hidden` table never
-/// materializes.
-fn load_embedding_affine_or_bf16(
-    embedding: &mut crate::nn::Embedding,
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<()> {
-    if let Some(scales) = params.get(&format!("{base}.scales")) {
-        let weight = params.get(&format!("{base}.weight")).ok_or_else(|| {
-            Error::from_reason(format!(
-                "k2_horizon: quantized embedding '{base}' has '.scales' but is missing its \
-                 packed '.weight'"
-            ))
-        })?;
-        let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-        let (group_size, bits, mode) = match plq.mode {
-            PerLayerMode::Affine => (plq.group_size, plq.bits, "affine"),
-            PerLayerMode::Mxfp8 => (
-                crate::models::qwen3_5_moe::quantized_linear::MXFP8_GROUP_SIZE,
-                crate::models::qwen3_5_moe::quantized_linear::MXFP8_BITS,
-                "mxfp8",
-            ),
-            PerLayerMode::Mxfp4 => (
-                crate::models::qwen3_5_moe::quantized_linear::MXFP4_GROUP_SIZE,
-                crate::models::qwen3_5_moe::quantized_linear::MXFP4_BITS,
-                "mxfp4",
-            ),
-            PerLayerMode::Nvfp4 => (
-                crate::models::qwen3_5_moe::quantized_linear::NVFP4_GROUP_SIZE,
-                crate::models::qwen3_5_moe::quantized_linear::NVFP4_BITS,
-                "nvfp4",
-            ),
-            other => {
-                return Err(Error::from_reason(format!(
-                    "k2_horizon: embedding '{base}' resolved to mode {other:?}, but the packed \
-                     embedding path supports only affine/mxfp4/mxfp8/nvfp4"
-                )));
-            }
-        };
-        let biases = params.get(&format!("{base}.biases"));
-        embedding.load_quantized_packed(weight, scales, biases, group_size, bits, mode)?;
-    } else if let Some(w) = params.get(&format!("{base}.weight")) {
-        ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
-        embedding.load_weight(w)?;
-    }
-    Ok(())
-}
+/// K2 family tag for the shared non-MoE loader helpers in
+/// [`crate::models::quant_dispatch`] — keeps error strings naming this
+/// family after the verbatim helper copies were deduplicated.
+const FAMILY: &str = "k2_horizon";
 
 /// Validate all mandatory K2 tensors are present in the sanitized param
 /// map — load-time failure beats silent random-init garbage.
@@ -372,6 +192,7 @@ fn apply_weights(
         "embed_tokens",
         per_layer_quant,
         default_plq,
+        FAMILY,
     )?;
 
     if let Some(w) = params.get("norm.weight") {
@@ -390,6 +211,7 @@ fn apply_weights(
             "lm_head",
             per_layer_quant,
             default_plq,
+            FAMILY,
         )?;
     }
 
@@ -410,6 +232,7 @@ fn apply_weights(
             &format!("{attn_prefix}.q_proj"),
             per_layer_quant,
             default_plq,
+            FAMILY,
         )?;
         load_linear_proj_quantized_or_bf16(
             layer.attention.k_proj_mut(),
@@ -417,6 +240,7 @@ fn apply_weights(
             &format!("{attn_prefix}.k_proj"),
             per_layer_quant,
             default_plq,
+            FAMILY,
         )?;
         load_linear_proj_quantized_or_bf16(
             layer.attention.v_proj_mut(),
@@ -424,6 +248,7 @@ fn apply_weights(
             &format!("{attn_prefix}.v_proj"),
             per_layer_quant,
             default_plq,
+            FAMILY,
         )?;
         load_linear_proj_quantized_or_bf16(
             layer.attention.o_proj_mut(),
@@ -431,6 +256,7 @@ fn apply_weights(
             &format!("{attn_prefix}.o_proj"),
             per_layer_quant,
             default_plq,
+            FAMILY,
         )?;
 
         load_dense_mlp_variant(
@@ -439,6 +265,7 @@ fn apply_weights(
             &format!("{prefix}.mlp"),
             per_layer_quant,
             default_plq,
+            FAMILY,
         )?;
     }
 

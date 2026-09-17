@@ -1,12 +1,11 @@
 use crate::array::MxArray;
-use crate::nn::{Activations, Conv1d, Linear};
+use crate::nn::{Activations, Conv1d, Linear, RMSNormGated, rms_norm_unscaled};
 use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::{GdnKernelTape, gated_delta_update, gated_delta_update_with_tape};
 use super::quantized_linear::{LinearProj, QuantizedLinear};
-use super::rms_norm_gated::RMSNormGated;
 
 /// Per-GDN-layer tape recorded during the eager MTP verify forward.
 ///
@@ -462,8 +461,8 @@ impl GatedDeltaNet {
         //   q = (inv_scale^2) * rms_norm(q, None, 1e-6)
         //   k = inv_scale * rms_norm(k, None, 1e-6)
         let inv_scale = (self.key_head_dim as f64).powf(-0.5);
-        let q_normed = rms_norm_no_weight(&q, 1e-6)?;
-        let k_normed = rms_norm_no_weight(&k, 1e-6)?;
+        let q_normed = rms_norm_unscaled(&q, 1e-6)?;
+        let k_normed = rms_norm_unscaled(&k, 1e-6)?;
         let q = q_normed.mul_scalar(inv_scale * inv_scale)?;
         let k = k_normed.mul_scalar(inv_scale)?;
         if self.tiled_gguf_layout
@@ -672,11 +671,4 @@ impl GatedDeltaNet {
     pub fn get_a_log(&self) -> MxArray {
         self.a_log.clone()
     }
-}
-
-/// RMS normalization without learnable weight (weight=None in Python).
-/// Uses mlx_fast_rms_norm with nullptr weight (C++ handles nullptr → std::nullopt).
-fn rms_norm_no_weight(x: &MxArray, eps: f32) -> Result<MxArray> {
-    let handle = unsafe { mlx_sys::mlx_fast_rms_norm(x.handle.0, std::ptr::null_mut(), eps) };
-    MxArray::from_handle(handle, "rms_norm_no_weight")
 }

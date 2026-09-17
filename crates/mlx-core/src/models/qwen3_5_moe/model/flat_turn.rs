@@ -191,8 +191,15 @@ impl Qwen35MoeInner {
         let eos_id = eos_token_id;
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
-        let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
-        let mut streamed_text_len: usize = 0;
+        // One streaming bundle — detokenizer + cursors + emitter (MoE does
+        // not override `stream_emitter`, so it is the default ChatML
+        // emitter — byte-identical to the former inline emit).
+        let mut turn_streaming = crate::engine::decode::TurnStreaming::new(
+            self,
+            tokenizer_for_decode.inner(),
+            thinking.enabled,
+            true,
+        );
 
         let generation_stream = Stream::new(DeviceType::Gpu);
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
@@ -252,7 +259,6 @@ impl Qwen35MoeInner {
         MxArray::async_eval_arrays(&[&y]);
 
         let starts_in_thinking = thinking.enabled;
-        let mut last_is_reasoning = starts_in_thinking;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         // Whether the final committed token reached the physical KV/GDN cache;
@@ -269,16 +275,7 @@ impl Qwen35MoeInner {
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut emitter = crate::engine::backend::DefaultStreamEmitter;
-            let streaming = crate::engine::decode::StreamingCtx {
-                callback: cb.0,
-                cancelled,
-                decode_stream: &mut decode_stream,
-                tokenizer: tokenizer_for_decode.inner(),
-                streamed_text_len: &mut streamed_text_len,
-                last_is_reasoning: &mut last_is_reasoning,
-                emitter: &mut emitter,
-            };
+            let streaming = turn_streaming.ctx(Some(cb.0), Some(cancelled));
 
             let outcome = crate::engine::mtp_turn::run_mtp_turn(
                 self,
@@ -303,7 +300,7 @@ impl Qwen35MoeInner {
                     // the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
                 },
-                Some(streaming),
+                streaming,
             )?;
 
             last_in_cache = outcome.last_in_cache;
@@ -349,10 +346,10 @@ impl Qwen35MoeInner {
                 streaming: {
                     callback: cb,
                     cancelled: cancelled,
-                    decode_stream: decode_stream,
+                    decode_stream: turn_streaming.decode_stream,
                     tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
+                    streamed_text_len: turn_streaming.streamed_text_len,
+                    last_is_reasoning: turn_streaming.last_is_reasoning
                 }
             );
         }
@@ -381,34 +378,11 @@ impl Qwen35MoeInner {
                 String::new()
             });
 
-        // Flush residual bytes
-        if text.len() > streamed_text_len {
-            let residual = text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if p.include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        thinking_enabled: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        public_raw_text: None,
-                        text_authoritative: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-        }
+        // Flush residual bytes through the bundle's emitter — the default
+        // ChatML `on_residual` suppresses reasoning text when
+        // include_reasoning == false and emits the same chunk shape the
+        // inline flush built.
+        turn_streaming.flush_residual(&text, p.include_reasoning, cb.0);
 
         let num_tokens = generated_tokens.len() as u32;
         let prompt_token_count = if has_images {
@@ -950,8 +924,15 @@ impl Qwen35MoeInner {
         // Decode setup
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
-        let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
-        let mut streamed_text_len: usize = 0;
+        // One streaming bundle — detokenizer + cursors + emitter (MoE does
+        // not override `stream_emitter`, so it is the default ChatML
+        // emitter — byte-identical to the former inline emit).
+        let mut turn_streaming = crate::engine::decode::TurnStreaming::new(
+            self,
+            tokenizer_for_decode.inner(),
+            thinking.enabled,
+            true,
+        );
 
         let mut token_history: Vec<u32> = full_token_history;
         last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
@@ -959,7 +940,6 @@ impl Qwen35MoeInner {
         MxArray::async_eval_arrays(&[&y]);
 
         let starts_in_thinking = thinking.enabled;
-        let mut last_is_reasoning = starts_in_thinking;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         // Whether the final committed token reached the physical KV/GDN cache;
@@ -975,16 +955,7 @@ impl Qwen35MoeInner {
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut emitter = crate::engine::backend::DefaultStreamEmitter;
-            let streaming = crate::engine::decode::StreamingCtx {
-                callback: cb.0,
-                cancelled,
-                decode_stream: &mut decode_stream,
-                tokenizer: tokenizer_for_decode.inner(),
-                streamed_text_len: &mut streamed_text_len,
-                last_is_reasoning: &mut last_is_reasoning,
-                emitter: &mut emitter,
-            };
+            let streaming = turn_streaming.ctx(Some(cb.0), Some(cancelled));
 
             let outcome = crate::engine::mtp_turn::run_mtp_turn(
                 self,
@@ -1009,7 +980,7 @@ impl Qwen35MoeInner {
                     // the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
                 },
-                Some(streaming),
+                streaming,
             )?;
 
             last_in_cache = outcome.last_in_cache;
@@ -1055,10 +1026,10 @@ impl Qwen35MoeInner {
                 streaming: {
                     callback: cb,
                     cancelled: cancelled,
-                    decode_stream: decode_stream,
+                    decode_stream: turn_streaming.decode_stream,
                     tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
+                    streamed_text_len: turn_streaming.streamed_text_len,
+                    last_is_reasoning: turn_streaming.last_is_reasoning
                 }
             );
         }
@@ -1087,33 +1058,11 @@ impl Qwen35MoeInner {
                 String::new()
             });
 
-        if text.len() > streamed_text_len {
-            let residual = text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if p.include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        thinking_enabled: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        public_raw_text: None,
-                        text_authoritative: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-        }
+        // Flush residual bytes through the bundle's emitter — the default
+        // ChatML `on_residual` suppresses reasoning text when
+        // include_reasoning == false and emits the same chunk shape the
+        // inline flush built.
+        turn_streaming.flush_residual(&text, p.include_reasoning, cb.0);
 
         let num_tokens = generated_tokens.len() as u32;
         let prompt_token_count = delta_tokens.len() as u32;

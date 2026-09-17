@@ -826,6 +826,12 @@ fn get_layer_params<'a>(
 // ============================================
 
 /// RMS normalization without learnable weight (functional version).
+///
+/// Intentionally NOT `nn::rms_norm_unscaled`: the inference paths use the
+/// fused `mlx_fast_rms_norm` kernel, while this functional forward composes
+/// primitive ops (matching `rms_norm_functional` above) so the autograd graph
+/// sees the same primitive sequence the training path was built with —
+/// including the explicit f32 upcast for the variance computation.
 fn rms_norm_no_weight_functional(x: &MxArray, eps: f64) -> Result<MxArray> {
     let original_dtype = x.dtype()?;
     let x_f32 = x.astype(crate::array::DType::Float32)?;

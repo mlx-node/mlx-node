@@ -470,9 +470,16 @@ impl Qwen35MoeInner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking_enabled;
+        // Streaming decode state — one bundle: detokenizer + cursors +
+        // emitter (MoE does not override `stream_emitter`, so it is the
+        // default ChatML emitter — byte-identical to the former inline
+        // emit).
+        let mut turn_streaming = crate::engine::decode::TurnStreaming::new(
+            self,
+            tokenizer.inner(),
+            thinking_enabled,
+            true,
+        );
 
         let seq_id = self.active_scheduled_seq.unwrap_or(0);
         // Lazy decode allocation: pass the prompt length only.
@@ -647,10 +654,7 @@ impl Qwen35MoeInner {
             &mut reasoning_tracker,
             report_perf,
             &mut first_token_instant,
-            &tokenizer,
-            &mut decode_stream,
-            &mut streamed_text_len,
-            &mut last_is_reasoning,
+            &mut turn_streaming,
             cb,
             cancelled,
             gdn_prefix_already_primed,
@@ -724,39 +728,17 @@ impl Qwen35MoeInner {
             ));
         }
 
+        // Flush residual buffered bytes through the bundle's emitter —
+        // the default ChatML `on_residual` suppresses reasoning text when
+        // include_reasoning == false and emits the same chunk shape the
+        // inline flush built.
         let full_text = tokenizer
             .decode_sync(&generated_tokens, true)
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to decode generated tokens: {}", e);
                 String::new()
             });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        thinking_enabled: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        public_raw_text: None,
-                        text_authoritative: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-        }
+        turn_streaming.flush_residual(&full_text, include_reasoning, cb.0);
 
         let performance = if report_perf {
             compute_performance_metrics(
@@ -810,7 +792,7 @@ impl Qwen35MoeInner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paged_turn_stream_core_inner<'a>(
+    fn paged_turn_stream_core_inner(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
@@ -821,17 +803,7 @@ impl Qwen35MoeInner {
         reasoning_tracker: &mut engine::ReasoningTracker,
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
-        tokenizer: &'a Arc<Qwen3Tokenizer>,
-        decode_stream: &mut tokenizers::DecodeStream<
-            'a,
-            tokenizers::ModelWrapper,
-            tokenizers::NormalizerWrapper,
-            tokenizers::PreTokenizerWrapper,
-            tokenizers::PostProcessorWrapper,
-            tokenizers::DecoderWrapper,
-        >,
-        streamed_text_len: &mut usize,
-        last_is_reasoning: &mut bool,
+        turn_streaming: &mut crate::engine::decode::TurnStreaming<'_>,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
         gdn_prefix_already_primed: bool,
@@ -918,7 +890,7 @@ impl Qwen35MoeInner {
             generated_tokens.push(token_id);
             token_history.push(token_id);
             let is_reasoning = reasoning_tracker.observe_token(token_id);
-            *last_is_reasoning = is_reasoning;
+            turn_streaming.last_is_reasoning = is_reasoning;
 
             if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
@@ -930,13 +902,13 @@ impl Qwen35MoeInner {
             }
 
             let token_text = Qwen3Tokenizer::step_decode_stream(
-                decode_stream,
-                tokenizer.inner(),
+                &mut turn_streaming.decode_stream,
+                turn_streaming.tokenizer,
                 token_id,
                 &generated_tokens,
-                *streamed_text_len,
+                turn_streaming.streamed_text_len,
             );
-            *streamed_text_len += token_text.len();
+            turn_streaming.streamed_text_len += token_text.len();
             // Suppress reasoning deltas when include_reasoning == false.
             // Detokenize + length-advance above stay OUTSIDE this gate.
             if p.include_reasoning || !is_reasoning {

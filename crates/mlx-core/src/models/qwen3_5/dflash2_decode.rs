@@ -8,9 +8,9 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, SpecFrontier, StreamEmitter, TurnOutput, WholeTurnArgs,
+    ResetScope, SpecFrontier, TurnOutput, WholeTurnArgs,
 };
-use crate::engine::decode::StreamingCtx;
+use crate::engine::decode::TurnStreaming;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::generated_capacity_hint;
@@ -554,11 +554,12 @@ impl Qwen35Inner {
         let mut finish_reason = String::from("length");
         let mut reasoning = ReasoningTracker::from_setup(&args.thinking, tokenizer.think_end_id());
         let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
-        let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = args.thinking.enabled;
-        let mut emitter: Option<Box<dyn StreamEmitter>> =
-            args.sink.map(|_| ChatBackend::stream_emitter(self));
+        // One streaming bundle — detokenizer + cursors + emitter — built
+        // only when a sink exists so the sync path never runs the emitter
+        // hook.
+        let mut turn_streaming = args.sink.map(|_| {
+            TurnStreaming::new(self, tokenizer.inner(), args.thinking.enabled, stream_skip_special)
+        });
         let turn_token_observer = ChatBackend::turn_token_observer(self);
         let block_size = self
             .dflash2
@@ -568,18 +569,9 @@ impl Qwen35Inner {
             .block_size;
         let mut rng = rand::rng();
         let outcome = {
-            let streaming = match (args.sink, args.cancelled, emitter.as_mut()) {
-                (Some(callback), Some(cancelled), Some(emitter)) => Some(StreamingCtx {
-                    callback,
-                    cancelled,
-                    decode_stream: &mut decode_stream,
-                    tokenizer: tokenizer.inner(),
-                    streamed_text_len: &mut streamed_text_len,
-                    last_is_reasoning: &mut last_is_reasoning,
-                    emitter: emitter.as_mut(),
-                }),
-                _ => None,
-            };
+            let streaming = turn_streaming
+                .as_mut()
+                .and_then(|ts| ts.ctx(args.sink, args.cancelled));
             run_dspark_turn(
                 self,
                 &mut rng,
@@ -643,18 +635,11 @@ impl Qwen35Inner {
         } else {
             None
         };
-        if let (Some(sink), Some(emitter)) = (args.sink, emitter.as_mut()) {
+        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
             let decoded = tokenizer
                 .decode_sync(&generated, stream_skip_special)
                 .unwrap_or_default();
-            if decoded.len() > streamed_text_len {
-                emitter.on_residual(
-                    &decoded[streamed_text_len..],
-                    last_is_reasoning,
-                    params.include_reasoning,
-                    sink,
-                );
-            }
+            ts.flush_residual(&decoded, params.include_reasoning, sink);
         }
         let prompt_tokens = if is_delta && is_streaming {
             ChatBackend::stream_delta_prompt_tokens(self, tokens.len(), tokens.len() - prior_cached)
@@ -678,8 +663,8 @@ impl Qwen35Inner {
             },
         )?;
         result.cached_tokens = cached_prefix as u32;
-        if let (Some(sink), Some(emitter)) = (args.sink, emitter.as_mut()) {
-            emitter.finish(&result, sink);
+        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+            ts.emitter.finish(&result, sink);
             Ok(TurnOutput::Streamed)
         } else {
             Ok(TurnOutput::Complete(Box::new(result)))

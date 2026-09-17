@@ -1,10 +1,24 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
+use super::activations::Activations;
 
 // ============================================
 // Normalization Layers
 // ============================================
+
+/// RMS normalization without a learnable weight (`weight=None` in Python).
+///
+/// Uses the fused `mlx_fast_rms_norm` kernel with a nullptr weight (the C++
+/// side maps nullptr → `std::nullopt`), computing in f32 accumulators and
+/// returning the input dtype. This is the canonical inference-path version of
+/// the per-model `rms_norm_no_weight` / `scaleless_rms_norm` copies it
+/// replaces; the autograd functional code keeps its own elementwise spell-out
+/// so gradients flow through ordinary VJP nodes.
+pub fn rms_norm_unscaled(x: &MxArray, eps: f32) -> Result<MxArray> {
+    let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, std::ptr::null_mut(), eps) };
+    MxArray::from_handle(handle, "rms_norm_unscaled")
+}
 
 pub struct RMSNorm {
     weight: MxArray,
@@ -171,6 +185,57 @@ impl LayerNorm {
             bias: bias_arr,
             eps: eps.unwrap_or(1e-5),
         })
+    }
+}
+
+/// RMSNorm with optional SwiGLU gating.
+///
+/// When `gate` is provided: `swiglu(gate, rms_norm(x))`
+/// When `gate` is None: `rms_norm(x)`
+///
+/// Lives beside `RMSNorm`/`LayerNorm`/`GroupedRMSNorm` — it has no model-
+/// family dependencies (moved out of `models::qwen3_5`, which re-exports it
+/// via `qwen3_5::rms_norm_gated`).
+pub struct RMSNormGated {
+    weight: MxArray,
+    eps: f32,
+}
+
+impl RMSNormGated {
+    pub fn new(dims: u32, eps: Option<f64>) -> Result<Self> {
+        let weight = MxArray::ones(&[dims as i64], None)?;
+        Ok(Self {
+            weight,
+            eps: eps.unwrap_or(1e-6) as f32,
+        })
+    }
+
+    /// Forward pass with optional gating.
+    pub fn forward(&self, x: &MxArray, gate: Option<&MxArray>) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, self.weight.handle.0, self.eps) };
+        let normed = MxArray::from_handle(handle, "rms_norm_gated")?;
+        match gate {
+            Some(g) => Activations::swiglu(g, &normed),
+            None => Ok(normed),
+        }
+    }
+
+    pub fn get_weight(&self) -> MxArray {
+        self.weight.clone()
+    }
+
+    pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
+        self.weight = weight.clone();
+        Ok(())
+    }
+}
+
+impl Clone for RMSNormGated {
+    fn clone(&self) -> Self {
+        Self {
+            weight: self.weight.clone(),
+            eps: self.eps,
+        }
     }
 }
 

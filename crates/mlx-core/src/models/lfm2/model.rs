@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,6 +17,9 @@ use crate::engine::cmd::ChatCmd;
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefixAdmission,
     ScheduledRestoreResult, scheduler_max_num_seqs_for, scheduler_per_seq_context,
+};
+use crate::engine::paged_epilogue::{
+    FinalTokenPolicy, abort_single_adapter_turn, reconcile_paged_surplus,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
@@ -2386,7 +2389,7 @@ impl PagedBackend for Lfm2Inner {
         // unsafe to keep around. Release ONLY — never register / keep live.
         // Infallible (`let _ =` — must not mask the turn's error).
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+            let _ = abort_single_adapter_turn(adapter);
         }
         self.conv_cold_checkpoints
             .remove(&self.active_scheduled_seq.unwrap_or(0));
@@ -2498,16 +2501,14 @@ impl PagedBackend for Lfm2Inner {
         let Some(adapter) = self.paged_adapter.as_mut() else {
             return true;
         };
-        let history_len = if generated.is_empty() {
-            0
-        } else {
-            generated.len() - 1
-        };
-        let target_len = prompt_len + history_len;
-        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
-        if surplus > 0
-            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
-        {
+        if let Err((surplus, e)) = reconcile_paged_surplus(
+            adapter.request_tokens().len(),
+            prompt_len,
+            generated.len(),
+            _keep_all,
+            FinalTokenPolicy::AlwaysDrop,
+            |n| adapter.rollback_last_tokens(n),
+        ) {
             tracing::warn!(
                 target: "mlx_core::lfm2::paged",
                 "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \

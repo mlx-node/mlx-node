@@ -9,11 +9,14 @@ use napi_derive::napi;
 use crate::array::MxArray;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
-    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, ResetScope, SaveStateArgs,
+    StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
 };
 #[cfg(test)]
 use crate::engine::cmd::ChatCmd;
+use crate::engine::paged_epilogue::{
+    FinalTokenPolicy, SimplePagedPrefix, reconcile_paged_surplus, save_paged_token_history,
+};
 use crate::engine::params::ChatParams;
 use crate::engine::plan::{
     ExecutionPlan, MediaPlan, PagedAttentionPlan, SpeculativeKind, SpeculativePlan,
@@ -24,7 +27,7 @@ use crate::models::gemma4::dspark::DsparkTap;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::model::Gemma4KVCacheCoordinator;
 use crate::models::gemma4::quantized_linear::LinearProj;
-use crate::nn::{Embedding, RMSNorm};
+use crate::nn::{Embedding, RMSNorm, rms_norm_unscaled};
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::tools::ToolCallResult;
@@ -763,17 +766,6 @@ impl MuseGlimmerInner {
             .map_or(Ok(0), |paged| paged.coordinator.release_request_all(seq_id))
     }
 
-    fn scaleless_rms_norm(&self, x: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            mlx_sys::mlx_fast_rms_norm(
-                x.as_raw_ptr(),
-                std::ptr::null_mut(),
-                self.config.text_config.rms_norm_eps,
-            )
-        };
-        MxArray::from_handle(handle, "muse_glimmer_embedding_norm")
-    }
-
     fn project_logits(&self, hidden: &MxArray, last_only: bool) -> Result<MxArray> {
         let hidden = if last_only {
             let seq_len = hidden.shape_at(1)?;
@@ -798,7 +790,10 @@ impl MuseGlimmerInner {
         tap_layers: &[usize],
         last_only: bool,
     ) -> Result<(MxArray, Vec<MxArray>)> {
-        let mut h = self.scaleless_rms_norm(&self.embed_tokens.forward(input_ids)?)?;
+        let mut h = rms_norm_unscaled(
+            &self.embed_tokens.forward(input_ids)?,
+            self.config.text_config.rms_norm_eps,
+        )?;
         let mut taps = Vec::with_capacity(tap_layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut self.caches[index])?;
@@ -890,7 +885,10 @@ impl MuseGlimmerInner {
             .record_tokens_all(self.active_paged_seq, tokens)
             .map_err(Error::from_reason)?;
         let ids = MxArray::from_uint32(tokens, &[1, tokens.len() as i64])?;
-        let mut hidden = self.scaleless_rms_norm(&self.embed_tokens.forward(&ids)?)?;
+        let mut hidden = rms_norm_unscaled(
+            &self.embed_tokens.forward(&ids)?,
+            self.config.text_config.rms_norm_eps,
+        )?;
         for index in 0..self.layers.len() {
             let layer: &MuseGlimmerDecoderLayer = unsafe { &*self.layers.as_ptr().add(index) };
             let (route, window) = {
@@ -1054,7 +1052,10 @@ impl MuseGlimmerInner {
         self.decode_timing = None;
         let ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let input = MxArray::from_uint32(&ids, &[rows.len() as i64, 1])?;
-        let mut hidden = self.scaleless_rms_norm(&self.embed_tokens.forward(&input)?)?;
+        let mut hidden = rms_norm_unscaled(
+            &self.embed_tokens.forward(&input)?,
+            self.config.text_config.rms_norm_eps,
+        )?;
         let text = &self.config.text_config;
         let eligible = rows.len() == 1
             && text.head_dim == 128
@@ -1192,20 +1193,9 @@ impl DecodeStep for MusePagedDecode<'_> {
     }
 }
 
-pub(crate) struct MusePrefixState {
-    effective_cached_prefix_len: usize,
-    suffix_len: usize,
-}
-
-impl PagedPrefix for MusePrefixState {
-    fn effective_cached_prefix_len(&self) -> usize {
-        self.effective_cached_prefix_len
-    }
-
-    fn suffix_len(&self) -> usize {
-        self.suffix_len
-    }
-}
+/// Muse paged prefix state — the shared two-usize shape
+/// (`engine::paged_epilogue`); the coordinator resolves the split.
+pub(crate) type MusePrefixState = SimplePagedPrefix;
 
 pub(crate) struct MuseGlimmerDecode<'a> {
     inner: &'a mut MuseGlimmerInner,
@@ -1437,18 +1427,14 @@ impl PagedBackend for MuseGlimmerInner {
         keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
-        if reuse_cache {
-            let mut history = save_tokens.to_vec();
-            let generated = if keep_all || generated.is_empty() {
-                generated
-            } else {
-                &generated[..generated.len() - 1]
-            };
-            history.extend_from_slice(generated);
-            self.cached_token_history = history;
-        } else {
-            self.cached_token_history.clear();
-        }
+        save_paged_token_history(
+            save_tokens,
+            generated,
+            keep_all,
+            reuse_cache,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        );
         Ok(())
     }
 
@@ -1458,12 +1444,6 @@ impl PagedBackend for MuseGlimmerInner {
         generated: &[u32],
         keep_all: bool,
     ) -> bool {
-        let generated_len = if keep_all || generated.is_empty() {
-            generated.len()
-        } else {
-            generated.len() - 1
-        };
-        let target = prompt_len.saturating_add(generated_len);
         let Some(paged) = self.paged.as_mut() else {
             return false;
         };
@@ -1473,12 +1453,16 @@ impl PagedBackend for MuseGlimmerInner {
         else {
             return false;
         };
-        let surplus = (current as usize).saturating_sub(target);
-        surplus == 0
-            || paged
-                .coordinator
-                .rollback_last_tokens_all(self.active_paged_seq, surplus as u32)
-                .is_ok()
+        let seq_id = self.active_paged_seq;
+        reconcile_paged_surplus(
+            current as usize,
+            prompt_len,
+            generated.len(),
+            keep_all,
+            FinalTokenPolicy::KeepAllOnLength,
+            |n| paged.coordinator.rollback_last_tokens_all(seq_id, n),
+        )
+        .is_ok()
     }
 }
 

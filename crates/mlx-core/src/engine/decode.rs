@@ -20,7 +20,9 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{ChunkSink, DecodeStep, StreamEmitter, TurnTokenObserver};
+use crate::engine::backend::{
+    ChatBackend, ChunkSink, DecodeStep, StreamEmitter, TurnTokenObserver,
+};
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::stream::{Stream, StreamContext};
@@ -177,6 +179,105 @@ pub(crate) struct StreamingCtx<'s, 't> {
     /// [`crate::engine::backend::ChatBackend::stream_emitter`], created
     /// once per turn by the session core.
     pub emitter: &'s mut dyn StreamEmitter,
+}
+
+/// Owned per-turn streaming state: the raw tokenizer, the incremental
+/// decode stream it backs, the streamed-text / reasoning cursors a
+/// [`StreamingCtx`] borrows and mutates, and the per-family emitter.
+///
+/// Bundling the five pieces keeps the ctx's writes and the post-loop
+/// residual flush on ONE pair of cursors — the coupling the hand-rolled
+/// per-site locals enforced by proximity. Callers gate construction on
+/// the sink (`Option<TurnStreaming>` on the engine cores, unconditional
+/// on the legacy always-streaming cores): the decode stream and emitter
+/// are built only when a sink exists (the emitter hook must not run on
+/// sync turns), so the sync path pays nothing.
+pub(crate) struct TurnStreaming<'t> {
+    /// Raw tokenizer backing `decode_stream` — the same `inner()` the
+    /// ctx hands [`Qwen3Tokenizer::step_decode_stream`] for its
+    /// error-recovery re-stream. Exposed for the hand-rolled legacy
+    /// loops that call `step_decode_stream` outside a `StreamingCtx`.
+    pub tokenizer: &'t tokenizers::Tokenizer,
+    /// Incremental detokenizer the loop steps per committed token. Its
+    /// skip-special flag came from
+    /// [`ChatBackend::stream_skip_special_tokens`] (or the legacy cores'
+    /// hardcoded `true`) at construction.
+    pub decode_stream: TokDecodeStream<'t>,
+    /// Bytes of generated text already emitted — the residual flush
+    /// re-decodes and emits `full_text[streamed_text_len..]`.
+    pub streamed_text_len: usize,
+    /// Reasoning tag of the LAST token the ctx observed — the residual
+    /// flush emits with it.
+    pub last_is_reasoning: bool,
+    /// Per-family chunk emitter ([`ChatBackend::stream_emitter`]).
+    pub emitter: Box<dyn StreamEmitter>,
+}
+
+impl<'t> TurnStreaming<'t> {
+    /// Build the turn's streaming state. `tokenizer` is the raw
+    /// `tokenizers::Tokenizer` (`qwen3_tokenizer.inner()`);
+    /// `skip_special` is the family's
+    /// [`ChatBackend::stream_skip_special_tokens`] (or the legacy cores'
+    /// `true`); `last_is_reasoning` seeds at `thinking_enabled`,
+    /// matching the per-site locals. The emitter is built HERE, so
+    /// sink-gated callers construct the bundle under their existing gate
+    /// and `stream_emitter` still never runs on sync turns.
+    pub fn new<B: ChatBackend>(
+        backend: &B,
+        tokenizer: &'t tokenizers::Tokenizer,
+        thinking_enabled: bool,
+        skip_special: bool,
+    ) -> Self {
+        Self {
+            tokenizer,
+            decode_stream: tokenizer.decode_stream(skip_special),
+            streamed_text_len: 0,
+            last_is_reasoning: thinking_enabled,
+            emitter: backend.stream_emitter(),
+        }
+    }
+
+    /// Produce the [`StreamingCtx`] the decode loop writes through —
+    /// `None` unless BOTH `callback` and `cancelled` are `Some`, the same
+    /// `_ => None` arm the per-site 3-way matches had.
+    pub fn ctx<'s>(
+        &'s mut self,
+        callback: Option<&'s dyn ChunkSink>,
+        cancelled: Option<&'s AtomicBool>,
+    ) -> Option<StreamingCtx<'s, 't>> {
+        Some(StreamingCtx {
+            callback: callback?,
+            cancelled: cancelled?,
+            decode_stream: &mut self.decode_stream,
+            tokenizer: self.tokenizer,
+            streamed_text_len: &mut self.streamed_text_len,
+            last_is_reasoning: &mut self.last_is_reasoning,
+            emitter: self.emitter.as_mut(),
+        })
+    }
+
+    /// Post-loop residual flush: emit
+    /// `full_text[self.streamed_text_len..]` through the emitter with the
+    /// final reasoning tag — the multi-token grapheme tail the
+    /// incremental stream held back. `full_text` is the caller's
+    /// `decode_sync` of the generated tokens, so each site keeps its own
+    /// decode error handling (the session/paged cores warn, the DFlash
+    /// cores default silently) and its own skip-special flag.
+    pub fn flush_residual(
+        &mut self,
+        full_text: &str,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        if full_text.len() > self.streamed_text_len {
+            self.emitter.on_residual(
+                &full_text[self.streamed_text_len..],
+                self.last_is_reasoning,
+                include_reasoning,
+                sink,
+            );
+        }
+    }
 }
 
 /// Keep submitted target work alive and completed before an error path can

@@ -32,9 +32,9 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, SpecFrontier, StreamEmitter, TurnOutput, WholeTurnArgs,
+    ResetScope, SpecFrontier, TurnOutput, WholeTurnArgs,
 };
-use crate::engine::decode::StreamingCtx;
+use crate::engine::decode::TurnStreaming;
 use crate::engine::dspark_turn::{DsparkTurnArgs, PagedDsparkBackend, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
@@ -872,14 +872,13 @@ impl Gemma4Inner {
 
         let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
 
-        // Streaming decode state (mirrors the generic core; only the
-        // streaming branch reads it).
+        // Streaming decode state (mirrors the generic core) — one bundle:
+        // detokenizer + cursors + emitter, built only when a sink exists
+        // so the sync path never runs the emitter hook.
         let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
-        let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking.enabled;
-        let mut emitter: Option<Box<dyn StreamEmitter>> =
-            args.sink.map(|_| ChatBackend::stream_emitter(self));
+        let mut turn_streaming = args.sink.map(|_| {
+            TurnStreaming::new(self, tokenizer.inner(), thinking.enabled, stream_skip_special)
+        });
 
         // --- variant prefill: target K/V + the draft's per-turn state ---
         // From here until the save runs, every error FAILS CLOSED
@@ -933,18 +932,9 @@ impl Gemma4Inner {
         let mut rng = rand::rng();
         let mut last_in_cache;
         {
-            let streaming_ctx = match (args.sink, args.cancelled, emitter.as_mut()) {
-                (Some(sink), Some(cancelled), Some(em)) => Some(StreamingCtx {
-                    callback: sink,
-                    cancelled,
-                    decode_stream: &mut decode_stream,
-                    tokenizer: tokenizer.inner(),
-                    streamed_text_len: &mut streamed_text_len,
-                    last_is_reasoning: &mut last_is_reasoning,
-                    emitter: em.as_mut(),
-                }),
-                _ => None,
-            };
+            let streaming_ctx = turn_streaming
+                .as_mut()
+                .and_then(|ts| ts.ctx(args.sink, args.cancelled));
             let outcome = run_dspark_turn(
                 self,
                 &mut rng,
@@ -1040,7 +1030,7 @@ impl Gemma4Inner {
         };
         let reasoning_tokens = reasoning_tracker.reasoning_token_count();
 
-        if let (Some(sink), Some(em)) = (args.sink, emitter.as_mut()) {
+        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
             // Residual flush through the emitter (same skip-special flag as
             // the in-loop DecodeStream so `streamed_text_len` accounting
             // stays consistent).
@@ -1065,10 +1055,7 @@ impl Gemma4Inner {
                     tracing::warn!("Failed to decode generated tokens: {}", e);
                     String::new()
                 });
-            if full_text.len() > streamed_text_len {
-                let residual = &full_text[streamed_text_len..];
-                em.on_residual(residual, last_is_reasoning, p.include_reasoning, sink);
-            }
+            ts.flush_residual(&full_text, p.include_reasoning, sink);
         }
 
         let reported_prompt_tokens: u32 = if is_delta && is_streaming {
@@ -1108,8 +1095,8 @@ impl Gemma4Inner {
             cached_prefix_len as u32
         };
 
-        if let (Some(sink), Some(em)) = (args.sink, emitter.as_mut()) {
-            em.finish(&result, sink);
+        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+            ts.emitter.finish(&result, sink);
             return Ok(TurnOutput::Streamed);
         }
         Ok(TurnOutput::Complete(Box::new(result)))

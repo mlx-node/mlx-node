@@ -20,10 +20,10 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix,
-    StreamEmitter, TurnOutput, TurnTokenObserver, WholeTurnArgs,
+    DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix, TurnOutput,
+    TurnTokenObserver, WholeTurnArgs,
 };
-use crate::engine::decode::StreamingCtx;
+use crate::engine::decode::{StreamingCtx, TurnStreaming};
 use crate::engine::paged_turn::FinishPagedTurnArgs;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
@@ -1218,10 +1218,11 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
 
     let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
     let stream_skip_special = backend.stream_skip_special_tokens();
-    let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
-    let mut streamed_text_len = 0usize;
-    let mut last_is_reasoning = thinking.enabled;
-    let mut emitter: Option<Box<dyn StreamEmitter>> = args.sink.map(|_| backend.stream_emitter());
+    // One streaming bundle — detokenizer + cursors + emitter — built only
+    // when a sink exists so the sync path never runs the emitter hook.
+    let mut turn_streaming = args.sink.map(|_| {
+        TurnStreaming::new(backend, tokenizer.inner(), thinking.enabled, stream_skip_special)
+    });
     let turn_token_observer = backend.turn_token_observer();
 
     profiler.begin_prefill();
@@ -1257,18 +1258,9 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
 
     let mut rng = rand::rng();
     let outcome = {
-        let streaming_ctx = match (args.sink, args.cancelled, emitter.as_mut()) {
-            (Some(sink), Some(cancelled), Some(em)) => Some(StreamingCtx {
-                callback: sink,
-                cancelled,
-                decode_stream: &mut decode_stream,
-                tokenizer: tokenizer.inner(),
-                streamed_text_len: &mut streamed_text_len,
-                last_is_reasoning: &mut last_is_reasoning,
-                emitter: em.as_mut(),
-            }),
-            _ => None,
-        };
+        let streaming_ctx = turn_streaming
+            .as_mut()
+            .and_then(|ts| ts.ctx(args.sink, args.cancelled));
         run_dspark_turn(
             backend,
             &mut rng,
@@ -1342,10 +1334,17 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
             reasoning_tokens: reasoning_tracker.reasoning_token_count(),
             profiler: &profiler,
             stream_skip_special,
-            streamed_text_len,
-            last_is_reasoning,
+            // The epilogue takes scalar copies — the same defaults the
+            // locals had when the (sink-less) sync path never created a
+            // streaming bundle.
+            streamed_text_len: turn_streaming
+                .as_ref()
+                .map_or(0, |ts| ts.streamed_text_len),
+            last_is_reasoning: turn_streaming
+                .as_ref()
+                .map_or(thinking.enabled, |ts| ts.last_is_reasoning),
             sink: args.sink,
-            emitter,
+            emitter: turn_streaming.map(|ts| ts.emitter),
         },
     )
 }

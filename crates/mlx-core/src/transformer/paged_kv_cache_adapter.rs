@@ -4561,6 +4561,26 @@ impl PagedKVCacheAdapter {
         self.rollback_last_tokens(n)
     }
 
+    /// Atomically record one decode token for each scheduled row.
+    ///
+    /// Snapshots each row's logical position BEFORE recording (the value
+    /// families use as `planned_rows`), then records every row's token.
+    /// On any failure, rolls back the already-recorded rows in reverse
+    /// order and returns the original error — callers see all-or-nothing.
+    /// Rejects duplicate seq_ids: each row must be a distinct sequence.
+    pub fn record_tokens_batched(
+        &mut self,
+        rows: &[(SeqId, u32)],
+    ) -> Result<Vec<(SeqId, u32)>, String> {
+        // Record every row's token BEFORE the forward (record-first
+        // contract); roll back recorded rows on failure so a partial
+        // record set never skews the pool. Rollback failures compose with
+        // the original error: the scheduler's allocation-blocked probe
+        // reads the original "could not reserve" text, which a bare
+        // rollback error would drop.
+        crate::transformer::paged_policy::record_decode_wave(self, rows, "record_tokens_batched")
+    }
+
     /// Build the slot mapping for a contiguous chunk of tokens starting
     /// at `first_logical_position` in this request. Each entry is the
     /// kernel-encoded slot index `block_id * block_size + position_in_block`
@@ -12851,6 +12871,93 @@ mod tests {
         assert_eq!(adapter.block_table_for(1).unwrap().block_ids(), a_ids);
         assert_eq!(adapter.current_token_count_for(2), Some(4));
         assert_eq!(adapter.block_table_for(2).unwrap().block_ids(), b_ids);
+    }
+
+    /// `record_tokens_batched` snapshots every row's pre-record cursor, then
+    /// advances each request exactly one token — the batched-decode
+    /// `planned_rows` contract the model families consume.
+    #[test]
+    fn record_tokens_batched_returns_prerecord_positions_and_advances() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
+            eprintln!(
+                "skipping record_tokens_batched_returns_prerecord_positions_and_advances: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 8).unwrap();
+        adapter.record_tokens(&[5, 6, 7, 8, 9, 10, 11, 12]).unwrap();
+
+        let planned = adapter.record_tokens_batched(&[(1, 100), (2, 200)]).unwrap();
+        assert_eq!(planned, vec![(1, 4), (2, 8)]);
+        assert_eq!(adapter.current_token_count_for(1), Some(5));
+        assert_eq!(adapter.current_token_count_for(2), Some(9));
+        assert_eq!(
+            adapter.request_tokens_for(1).unwrap().last(),
+            Some(&100)
+        );
+        assert_eq!(
+            adapter.request_tokens_for(2).unwrap().last(),
+            Some(&200)
+        );
+    }
+
+    /// A duplicated seq_id is rejected during the snapshot pass, before ANY
+    /// row's token is recorded.
+    #[test]
+    fn record_tokens_batched_rejects_duplicate_sequence() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
+            eprintln!(
+                "skipping record_tokens_batched_rejects_duplicate_sequence: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+
+        let error = adapter
+            .record_tokens_batched(&[(1, 100), (1, 200)])
+            .expect_err("a duplicated seq_id must be rejected");
+        assert!(error.contains("duplicate sequence 1"), "got: {error}");
+        assert_eq!(adapter.current_token_count_for(1), Some(4));
+        assert_eq!(adapter.request_tokens_for(1).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    /// A mid-batch record failure unwinds the already-recorded rows
+    /// newest-first, leaving every request exactly where the wave started.
+    /// Five-block pool: three 1-block rows leave two free blocks, so rows 1
+    /// and 2 cross a block boundary successfully and row 3 exhausts the
+    /// allocator — exercising the reverse-order rollback of both rows.
+    #[test]
+    fn record_tokens_batched_rolls_back_prior_rows_on_failure() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(5, 4), 4) else {
+            eprintln!(
+                "skipping record_tokens_batched_rolls_back_prior_rows_on_failure: Metal unavailable"
+            );
+            return;
+        };
+        for seq_id in [1, 2, 3] {
+            adapter.begin_request(seq_id).unwrap();
+            adapter.allocate_suffix_blocks_for(seq_id, 4).unwrap();
+            adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        }
+
+        let error = adapter
+            .record_tokens_batched(&[(1, 100), (2, 200), (3, 300)])
+            .expect_err("row 3's record must fail on allocator exhaustion");
+        assert!(
+            error.contains("failed to record sequence 3"),
+            "got: {error}"
+        );
+        for seq_id in [1, 2, 3] {
+            assert_eq!(adapter.current_token_count_for(seq_id), Some(4));
+            assert_eq!(adapter.request_tokens_for(seq_id).unwrap(), &[1, 2, 3, 4]);
+            assert_eq!(adapter.block_table_for(seq_id).unwrap().num_tokens(), 4);
+        }
     }
 
     #[test]

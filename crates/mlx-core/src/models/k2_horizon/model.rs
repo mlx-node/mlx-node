@@ -29,13 +29,18 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs,
+    ChatBackend, DecodeStep, FinalizeArgs, PagedBackend, ResetScope, SaveStateArgs,
     ThinkEndResolution, ThinkingSetup, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefixAdmission,
     ScheduledRestoreResult, scheduler_max_num_seqs_for, scheduler_per_seq_context,
+};
+use crate::engine::paged_epilogue::{
+    FinalTokenPolicy, SimplePagedPrefix, abort_single_adapter_turn,
+    finalize_single_adapter_turn, prime_single_adapter_prefix, reconcile_paged_surplus,
+    save_paged_token_history,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
@@ -820,57 +825,18 @@ impl K2Inner {
                 "run_paged_decode_step_batched requires at least one row",
             ));
         }
-        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-            Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
-        })?;
-        let mut seen = std::collections::HashSet::with_capacity(rows.len());
-        let mut planned_rows = Vec::with_capacity(rows.len());
-        for &(seq_id, _) in rows {
-            if !seen.insert(seq_id) {
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
-                )));
-            }
-            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
-                Error::from_reason(format!(
-                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
-                ))
-            })?;
-            planned_rows.push((seq_id, position));
-        }
-
         // Record every row's token BEFORE the forward (record-first
-        // contract); roll back recorded rows on failure so a partial
-        // record set never skews the pool.
-        let mut recorded = Vec::with_capacity(rows.len());
-        for &(seq_id, token_id) in rows {
-            let result = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::from_reason("run_paged_decode_step_batched: paged adapter disappeared")
-                })?
-                .record_token_for(seq_id, token_id);
-            if let Err(error) = result {
-                for &recorded_seq in recorded.iter().rev() {
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_decode_step_batched: paged adapter disappeared during rollback",
-                        )
-                    })?;
-                    adapter
-                        .activate_request(recorded_seq)
-                        .map_err(Error::from_reason)?;
-                    adapter
-                        .rollback_last_tokens(1)
-                        .map_err(Error::from_reason)?;
-                }
-                return Err(Error::from_reason(format!(
-                    "run_paged_decode_step_batched failed to record sequence {seq_id}: {error}"
-                )));
-            }
-            recorded.push(seq_id);
-        }
+        // contract); `record_tokens_batched` rolls back recorded rows on
+        // failure so a partial record set never skews the pool, and returns
+        // each row's pre-record write position as `planned_rows`.
+        let planned_rows = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
+            })?
+            .record_tokens_batched(rows)
+            .map_err(Error::from_reason)?;
 
         let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
@@ -1102,21 +1068,9 @@ impl DecodeStep for K2PagedDecode<'_> {
     }
 }
 
-/// K2 paged prefix state — the qwen3 two-usize shape (no sidecar fields;
+/// K2 paged prefix state — the shared two-usize shape (no sidecar fields;
 /// K2 has no out-of-band state to reconcile).
-pub(crate) struct K2PrefixState {
-    effective_cached_prefix_len: usize,
-    suffix_len: usize,
-}
-
-impl PagedPrefix for K2PrefixState {
-    fn effective_cached_prefix_len(&self) -> usize {
-        self.effective_cached_prefix_len
-    }
-    fn suffix_len(&self) -> usize {
-        self.suffix_len
-    }
-}
+pub(crate) type K2PrefixState = SimplePagedPrefix;
 
 impl K2Inner {
     fn prime_prefix_state_for(
@@ -1127,34 +1081,14 @@ impl K2Inner {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<K2PrefixState> {
-        let total_budget = plan.len() as u32;
-        // vLLM-style exact-prefix cap: leave at least one prompt token to
-        // prefill so the decoder always has something to consume.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "prime_prefix_state: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                plan,
-                total_budget,
-                reuse_cache,
-                extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
+        let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+            Error::from_reason(
+                "prime_prefix_state: paged_adapter is None — caller must check \
+                 use_block_paged_cache before dispatch",
             )
-            .map_err(Error::from_reason)?;
-        Ok(K2PrefixState {
-            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
-            suffix_len: turn_plan.suffix_len as usize,
-        })
+        })?;
+        prime_single_adapter_prefix(adapter, seq_id, plan, reuse_cache, extra_keys, cache_salt)
+            .map_err(Error::from_reason)
     }
 }
 
@@ -1198,12 +1132,7 @@ impl PagedBackend for K2Inner {
         // register full blocks for reuse + release. Infallible — a
         // teardown failure must not mask the turn result.
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            if reuse_cache {
-                let _ = adapter.finalize_turn_keep_live(&[], cache_salt);
-            } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
-                let _ = adapter.release_request();
-            }
+            let _ = finalize_single_adapter_turn(adapter, reuse_cache, &[], cache_salt);
         }
     }
 
@@ -1211,7 +1140,7 @@ impl PagedBackend for K2Inner {
         // Error-path teardown: release fully — partial block_table state is
         // unsafe to keep. Release ONLY, never register / keep live.
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+            let _ = abort_single_adapter_turn(adapter);
         }
     }
 
@@ -1227,18 +1156,14 @@ impl PagedBackend for K2Inner {
         // `materialize_final` forwarded the last token — K2's paged
         // stepper overrides `materialize_final`, so the last token IS in
         // the adapter on length exits).
-        if reuse_cache {
-            let mut full_history = save_tokens.to_vec();
-            let history_tokens = if keep_all || generated.is_empty() {
-                generated
-            } else {
-                &generated[..generated.len() - 1]
-            };
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
-        } else {
-            self.cached_token_history.clear();
-        }
+        save_paged_token_history(
+            save_tokens,
+            generated,
+            keep_all,
+            reuse_cache,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        );
         Ok(())
     }
 
@@ -1256,16 +1181,14 @@ impl PagedBackend for K2Inner {
         let Some(adapter) = self.paged_adapter.as_mut() else {
             return true;
         };
-        let history_len = if keep_all || generated.is_empty() {
-            generated.len()
-        } else {
-            generated.len() - 1
-        };
-        let target_len = prompt_len + history_len;
-        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
-        if surplus > 0
-            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
-        {
+        if let Err((surplus, e)) = reconcile_paged_surplus(
+            adapter.request_tokens().len(),
+            prompt_len,
+            generated.len(),
+            keep_all,
+            FinalTokenPolicy::KeepAllOnLength,
+            |n| adapter.rollback_last_tokens(n),
+        ) {
             tracing::warn!(
                 target: "mlx_core::k2_horizon::paged",
                 "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \

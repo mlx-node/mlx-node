@@ -18,7 +18,7 @@ import { dirname, join, resolve } from 'node:path';
 import type { MlxModelInfo } from '@mlx-node/agent';
 // Native-free subpath: the help path must print without loading the addon, and
 // the family list must have exactly ONE definition (the drift guard's).
-import { coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
+import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { expandPiAgentDir } from '@mlx-node/agent/paths';
 
 export { expandPiAgentDir } from '@mlx-node/agent/paths';
@@ -774,7 +774,7 @@ export async function run(
     models = await discoverMlxModels(modelsDir);
     if (models.length === 0) {
       console.error(`No usable model found in ${modelsDir} after the download.`);
-      console.error('Expected a subdirectory with a config.json for a supported family (qwen3/qwen3.5/gemma4/lfm2).');
+      console.error(`Expected a subdirectory with a config.json for a supported family (${CHAT_FAMILY_IDS.join('/')}).`);
       console.error('Check the download output above, or point --models-dir at an existing models directory.');
       process.exitCode = 1;
       return;

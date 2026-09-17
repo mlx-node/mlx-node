@@ -1,6 +1,7 @@
 //! The engine trait surface: the flat and paged decode steppers, the paged prefix state, and the PagedBackend / ChatBackend implementations for Gemma4Inner.
 
 use super::*;
+use crate::engine::paged_epilogue::{FinalTokenPolicy, reconcile_paged_surplus};
 
 /// Eager flat decode stepper for one gemma4 turn
 /// ([`ChatBackend::begin_decode`]). Runs the flat decode-loop step body:
@@ -408,11 +409,8 @@ impl PagedBackend for Gemma4Inner {
         // the next turn's warm-continue.
         if reuse_cache {
             let mut full_history = save_tokens.to_vec();
-            let history_tokens = if keep_all || generated.is_empty() {
-                generated
-            } else {
-                &generated[..generated.len() - 1]
-            };
+            let history_tokens =
+                FinalTokenPolicy::KeepAllOnLength.history_tokens(generated, keep_all);
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
             if continued_media_context.is_empty() {
@@ -476,21 +474,16 @@ impl PagedBackend for Gemma4Inner {
             );
             return false;
         }
-        let history_len = if keep_all || generated.is_empty() {
-            generated.len()
-        } else {
-            generated.len() - 1
-        };
-        let target_len = prompt_len + history_len;
-        let surplus = coordinator
-            .full_adapter()
-            .request_tokens()
-            .len()
-            .saturating_sub(target_len);
-        if surplus > 0
-            && let Err(e) =
-                coordinator.rollback_last_tokens_all(self.active_paged_seq, surplus as u32)
-        {
+        let recorded_len = coordinator.full_adapter().request_tokens().len();
+        let seq_id = self.active_paged_seq;
+        if let Err((surplus, e)) = reconcile_paged_surplus(
+            recorded_len,
+            prompt_len,
+            generated.len(),
+            keep_all,
+            FinalTokenPolicy::KeepAllOnLength,
+            |n| coordinator.rollback_last_tokens_all(seq_id, n),
+        ) {
             tracing::warn!(
                 target: "mlx_core::gemma4::paged",
                 "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \

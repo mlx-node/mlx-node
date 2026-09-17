@@ -9,6 +9,7 @@ use crate::engine::spec_paged::SpecPagedCache;
 use crate::models::gemma4::dspark::DsparkTap;
 use crate::models::muse_glimmer::dflash::DFlashContextCache;
 use crate::models::muse_glimmer::kv_cache::PagedWindowSlot;
+use crate::nn::rms_norm_unscaled;
 use crate::transformer::paged_kv_cache_adapter::PagedRaggedRow;
 use napi::bindgen_prelude::{Error, Result};
 
@@ -246,7 +247,10 @@ impl ScheduledDraftVerify for MuseGlimmerInner {
         }
         let input = MxArray::from_uint32(&tokens, &[tokens.len() as i64, 1])?;
         let offsets = MxArray::from_int32(&positions, &[positions.len() as i64])?;
-        let mut hidden = self.scaleless_rms_norm(&self.embed_tokens.forward(&input)?)?;
+        let mut hidden = rms_norm_unscaled(
+            &self.embed_tokens.forward(&input)?,
+            self.config.text_config.rms_norm_eps,
+        )?;
         let mut taps = Vec::with_capacity(tap_layers.len());
         for index in 0..self.layers.len() {
             let paged = self
