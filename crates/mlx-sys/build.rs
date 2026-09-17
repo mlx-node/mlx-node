@@ -152,7 +152,10 @@ fn host_macos_version() -> Option<(u64, u64)> {
     // The absolute path survives build environments with a stripped PATH —
     // a PATH lookup that fails here would silently drop the floor back to
     // the toolchain default (the air64_v29 problem above).
-    let output = Command::new("/usr/bin/sw_vers").arg("-productVersion").output().ok()?;
+    let output = Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
