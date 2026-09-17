@@ -69,6 +69,20 @@ export interface DownloadCompletion {
    * compatibility with markers written before selection scope was recorded.
    */
   scope?: 'full' | 'partial';
+  /**
+   * Base-model repo that supplied this install's tokenizer/config sidecars,
+   * and the exact commit they were pinned to — the provenance update
+   * discovery compares in addition to `repo`/`revision`.
+   *
+   * Sidecar files carry no other source identity (they are folded into
+   * `files` like primary files), so without these two a base-repo tokenizer
+   * fix is invisible: the primary revision matches, no badge is raised, and
+   * no job exists to run the repair. Absent on installs that used no
+   * assetsRepo and on markers written before this field existed — unknown
+   * provenance compares as "no update known", never as "up to date".
+   */
+  assetsRepo?: string;
+  assetsRevision?: string;
   /** ISO timestamp of the atomic publish. */
   completedAt: string;
 }
@@ -218,7 +232,11 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     typeof marker.completedAt !== 'string' ||
     !Array.isArray(marker.files) ||
     !marker.files.every((file) => typeof file === 'string') ||
-    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial')
+    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial') ||
+    // Sidecar provenance is optional (pre-provenance markers lack it) but must
+    // be a string when present — a numeric/object value is a malformed marker.
+    (marker.assetsRepo !== undefined && typeof marker.assetsRepo !== 'string') ||
+    (marker.assetsRevision !== undefined && typeof marker.assetsRevision !== 'string')
   ) {
     return undefined;
   }
@@ -227,6 +245,11 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     revision: marker.revision,
     files: marker.files,
     scope: marker.scope as DownloadCompletion['scope'],
+    // The fields every consumer actually reads — a marker parsed here drops
+    // anything not named, so new provenance MUST be threaded through or it
+    // never reaches update discovery.
+    ...(typeof marker.assetsRepo === 'string' ? { assetsRepo: marker.assetsRepo } : {}),
+    ...(typeof marker.assetsRevision === 'string' ? { assetsRevision: marker.assetsRevision } : {}),
     completedAt: marker.completedAt,
   };
 }

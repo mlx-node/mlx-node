@@ -65,6 +65,19 @@ export interface CatalogItem extends CatalogEntry {
    * A `null` here means "no update badge", never "up to date".
    */
   localRevision: string | null;
+  /**
+   * The base-model repo the install's tokenizer sidecars came from, and the
+   * commit they were pinned to (marker `assetsRepo`/`assetsRevision`) — or
+   * `null` when the install used none, or predates the field.
+   *
+   * Update discovery compares this pair in addition to `repo`/`revision`: a
+   * sidecar-only upstream change moves nothing in the primary repo, so
+   * without it the badge never appears and the repair job — which verifies
+   * planned sidecars before reading an install as done — can never run.
+   * `null` means "no assets-side update known", never "up to date".
+   */
+  localAssetsRepo: string | null;
+  localAssetsRevision: string | null;
 }
 
 export interface CatalogDraftItem {
@@ -184,6 +197,8 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
       present,
       blockedByForeignDir,
       localRevision: completion?.revision ?? null,
+      localAssetsRepo: completion?.assetsRepo ?? null,
+      localAssetsRevision: completion?.assetsRevision ?? null,
     };
   });
 }

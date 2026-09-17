@@ -231,6 +231,11 @@ Options:
                           repos ship weights only; without an official
                           tokenizer the runtime extracts the embedded one,
                           which strips the tool-call wrapper on decode.
+  --complete              The selection IS the complete prescribed model (a
+                          catalog install): write the completion marker as a
+                          full-model record. Without it a --glob run is
+                          recorded as partial, which the dashboard never
+                          treats as installed and never offers updates for.
   --force                 Re-sync against upstream even if the local copy
                           looks up to date (changed files re-download,
                           unchanged files are skipped by content hash)
@@ -681,7 +686,7 @@ async function fetchAssetSidecars(opts: {
   cacheDir: string;
   accessToken: string | undefined;
   primaryPaths: ReadonlySet<string>;
-}): Promise<string[]> {
+}): Promise<{ fetched: string[]; repo: string; revision: string | null }> {
   const revision = (await resolveRemoteRevision(opts.assetsRepo, opts.accessToken)) ?? undefined;
   const { allFiles } = await getModelFiles(opts.assetsRepo, opts.accessToken, undefined, revision);
   const candidates = pickAssetSidecars(allFiles).filter(
@@ -689,7 +694,7 @@ async function fetchAssetSidecars(opts: {
   );
   if (candidates.length === 0) {
     console.warn(`  No tokenizer/config sidecars found in ${opts.assetsRepo}\n`);
-    return [];
+    return { fetched: [], repo: opts.assetsRepo, revision: revision ?? null };
   }
 
   console.log(`Fetching ${candidates.length} tokenizer/config sidecar(s) from ${opts.assetsRepo}...\n`);
@@ -718,7 +723,7 @@ async function fetchAssetSidecars(opts: {
     fetched.push(file.path);
   }
   console.log('');
-  return fetched;
+  return { fetched, repo: opts.assetsRepo, revision: revision ?? null };
 }
 
 export async function run(argv: string[]) {
@@ -741,6 +746,9 @@ export async function run(argv: string[]) {
       },
       'assets-repo': {
         type: 'string',
+      },
+      complete: {
+        type: 'boolean',
       },
       force: {
         type: 'boolean',
@@ -814,6 +822,8 @@ export async function run(argv: string[]) {
   // matches `remoteSha`, or the user forced a re-verify. A fresh dir or a
   // current-marker dir only ever needs the cheap size check.
   let verifyContent = false;
+  /** Resolved sidecar source, recorded in the completion marker when present. */
+  let sidecarSource: { repo: string; revision: string } | null = null;
   const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
 
   /**
@@ -829,7 +839,7 @@ export async function run(argv: string[]) {
   const repairSidecarsBeforeReturn = async (): Promise<void> => {
     if (assetsRepo === undefined) return;
     cachedManifest ??= await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
-    await fetchAssetSidecars({
+    const topUp = await fetchAssetSidecars({
       assetsRepo,
       outputDir,
       cacheDir,
@@ -839,6 +849,7 @@ export async function run(argv: string[]) {
       // is not on disk, so excluding it would lose the sidecar entirely.
       primaryPaths: new Set(cachedManifest.filesToDownload.map((file) => file.path)),
     });
+    sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
   };
 
   if (existsSync(outputDir)) {
@@ -1043,13 +1054,16 @@ export async function run(argv: string[]) {
   // exactly what the loader will open: GGUF weights plus the base-model
   // tokenizer files the runtime needs (see ASSET_SIDECAR_CANDIDATES).
   if (assetsRepo !== undefined) {
-    await fetchAssetSidecars({
+    const topUp = await fetchAssetSidecars({
       assetsRepo,
       outputDir,
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
       primaryPaths: new Set(filesToDownload.map((file) => file.path)),
     });
+    // Record the pair only when the revision resolved: an unresolved source is
+    // unknown provenance, and an empty string would compare unequal forever.
+    sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
   }
 
   // Prune + marker write, invoked ONLY from a SUCCESS path. Pruning any
@@ -1084,7 +1098,10 @@ export async function run(argv: string[]) {
         outputDir,
         isGlobRun,
       ),
-      scope: isGlobRun ? 'partial' : 'full',
+      scope: isGlobRun && !args.complete ? 'partial' : 'full',
+      // Provenance for update discovery, same as the dashboard's marker: a
+      // tokenizer fix in the base repo moves nothing in the primary repo.
+      ...(sidecarSource !== null ? { assetsRepo: sidecarSource.repo, assetsRevision: sidecarSource.revision } : {}),
       completedAt: new Date().toISOString(),
     });
   };

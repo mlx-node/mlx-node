@@ -616,12 +616,23 @@ function catalogItem(label: string): CatalogItem {
 }
 
 /** Write a download completion marker naming `repo` into `<modelsDir>/<name>`. */
-function writeCompletion(name: string, repo: string, files = ['config.json', 'model.safetensors']): void {
+function writeCompletion(
+  name: string,
+  repo: string,
+  files = ['config.json', 'model.safetensors'],
+  assets?: { repo: string; revision: string },
+): void {
   const dir = join(modelsDir, name);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, DOWNLOAD_COMPLETE_MARKER),
-    JSON.stringify({ repo, revision: 'a'.repeat(40), files, completedAt: new Date().toISOString() }),
+    JSON.stringify({
+      repo,
+      revision: 'a'.repeat(40),
+      files,
+      ...(assets === undefined ? {} : { assetsRepo: assets.repo, assetsRevision: assets.revision }),
+      completedAt: new Date().toISOString(),
+    }),
   );
 }
 
@@ -731,6 +742,32 @@ describe('catalogWithState — a recommended model is identified by download pro
     // down to its marker is not a loadable checkpoint.
     writeCompletion('gutted', RECOMMENDED_REPO);
     expect(catalogItem(RECOMMENDED.label).present).toBe(false);
+  });
+});
+
+describe('catalogWithState — sidecar provenance reaches update discovery', () => {
+  it('surfaces the marker assetsRepo/assetsRevision, or null when absent', () => {
+    // Update discovery compares BOTH repo/revision pairs: a tokenizer fix in
+    // the base model moves nothing in the primary repo, so without this
+    // provenance the badge never appears and the repair job cannot run.
+    const entry = MODEL_CATALOG.find((item) => item.assetsRepo !== undefined && !item.hidden)!;
+    const slug = catalogSlug(entry);
+    writeModel(modelsDir, slug, CONFIG_A, 2048);
+    writeCompletion(slug, catalogRepo(entry), ['config.json', 'model.safetensors'], {
+      repo: entry.assetsRepo!,
+      revision: 'b'.repeat(40),
+    });
+
+    const item = catalogWithState(modelsDir).find((candidate) => candidate.hfRepo === catalogRepo(entry))!;
+    expect(item.localAssetsRepo).toBe(entry.assetsRepo);
+    expect(item.localAssetsRevision).toBe('b'.repeat(40));
+
+    // A marker without the fields (pre-provenance install) reports null, never
+    // a value that could compare as "up to date".
+    writeModel(modelsDir, 'plain-install', CONFIG_A, 2048);
+    writeCompletion('plain-install', 'owner/plain');
+    const plain = catalogWithState(modelsDir).find((candidate) => candidate.slug === 'plain-install');
+    expect(plain).toBeUndefined();
   });
 });
 

@@ -43,7 +43,12 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
-import { catalogDownloadRepos, catalogEntryForRepo, catalogSelectionForRepo } from '@mlx-node/agent/catalog';
+import {
+  catalogDownloadRepos,
+  catalogEntryForRepo,
+  catalogSelectionForRepo,
+  catalogUpdateRepos,
+} from '@mlx-node/agent/catalog';
 import { isDFlash2Companion, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
@@ -817,7 +822,7 @@ export class DownloadManager {
     const shas = new Map<string, string | null>();
     const reads = new Map<string, number>();
     await Promise.all(
-      catalogDownloadRepos().map(async (repo) => {
+      catalogUpdateRepos().map(async (repo) => {
         const at = ++this.resolveSeq;
         try {
           // RAW fetch, never `wrappedFetch`. That wrapper attributes every
@@ -1159,7 +1164,7 @@ export class DownloadManager {
       }
       job.state = 'committing';
 
-      await this.publish(stagingDir, finalDir, job.repo, revision, files, job.overwrite);
+      await this.publish(stagingDir, finalDir, job.repo, revision, files, job.overwrite, sidecarPlan);
 
       job.state = 'done';
       this.emit({ type: 'done', id: job.id, outputDir: finalDir });
@@ -1526,6 +1531,7 @@ export class DownloadManager {
     revision: string,
     files: ListFileEntry[],
     overwrite: boolean,
+    sidecarPlan: { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] } | null,
   ): Promise<void> {
     await mkdir(dirname(finalDir), { recursive: true });
 
@@ -1541,6 +1547,10 @@ export class DownloadManager {
       revision,
       files: files.map((file) => file.path),
       scope: 'full',
+      // Record the sidecar source when this install had one: update discovery
+      // compares BOTH revisions, so a base-repo tokenizer fix raises the
+      // badge that lets the repair job run at all.
+      ...(sidecarPlan !== null ? { assetsRepo: sidecarPlan.repo.name, assetsRevision: sidecarPlan.revision } : {}),
       completedAt: new Date().toISOString(),
     };
     await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`);

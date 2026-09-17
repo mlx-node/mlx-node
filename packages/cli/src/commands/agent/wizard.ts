@@ -60,6 +60,10 @@ function downloadModelArgv(entry: CatalogEntry, modelsDir: string | undefined): 
   if (selection.assetsRepo !== undefined) {
     argv.push('--assets-repo', selection.assetsRepo);
   }
+  // The catalog's prescribed selection is the COMPLETE model, so the marker
+  // must not read as a partial (arbitrary-subset) glob run: the dashboard
+  // only treats full markers as installed and only offers updates for them.
+  argv.push('--complete');
   if (modelsDir) {
     argv.push('-o', join(modelsDir, repoSlug(hfRepo)));
   }

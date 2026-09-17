@@ -13,7 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { catalogDownloadRepos, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { catalogUpdateRepos, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { findDFlash2Draft, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -404,15 +404,23 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     return new DownloadManager({ modelsDir, cacheDir });
   }
 
-  it('resolves a sha for every VISIBLE catalog repo, and skips the hidden ones', async () => {
+  it('resolves a sha for every VISIBLE catalog repo and its assetsRepo, and skips hidden ones', async () => {
     // `hidden` entries are unpublished repos: Hugging Face answers 401 for them,
-    // so dialling would spend a request to learn nothing.
+    // so dialling would spend a request to learn nothing. The assetsRepos ARE
+    // probed: a sidecar-only upstream change moves nothing in the primary repo,
+    // and without a probed sha the badge — and the repair job behind it — would
+    // be unreachable.
     const shas = await manager().checkCatalogUpdates();
-    const visible = catalogDownloadRepos();
-    expect([...shas.keys()].sort()).toEqual([...visible].sort());
+    const expected = catalogUpdateRepos();
+    expect([...shas.keys()].sort()).toEqual([...expected].sort());
     expect(shas.get(REPO)).toBe(hub.sha);
+    for (const entry of MODEL_CATALOG.filter((e) => !e.hidden && e.assetsRepo !== undefined)) {
+      expect(shas.has(entry.assetsRepo!)).toBe(true);
+      expect(hub.modelInfoRepos).toContain(entry.assetsRepo);
+    }
     for (const entry of MODEL_CATALOG.filter((e) => e.hidden)) {
       expect(hub.modelInfoRepos).not.toContain(catalogRepo(entry));
+      if (entry.assetsRepo !== undefined) expect(hub.modelInfoRepos).not.toContain(entry.assetsRepo);
     }
   });
 
@@ -616,7 +624,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // OLDER sha it captured for the full six-hour TTL, with no job in the
     // interleaving for `jobResolvedShas` to repair it from. Each overlap also
     // pays a second full fan-out, the very cost the cache exists to avoid.
-    const visible = catalogDownloadRepos().length;
+    const visible = catalogUpdateRepos().length;
     let releaseSweep: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       releaseSweep = resolve;

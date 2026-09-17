@@ -9,6 +9,30 @@ import {
   visibleCatalog,
 } from '../src/catalog.js';
 
+describe('catalogUpdateRepos — update discovery covers the sidecar sources', () => {
+  it('adds every visible entry assetsRepo to the download repo set', async () => {
+    const { catalogDownloadRepos, catalogUpdateRepos, MODEL_CATALOG } = await import('../src/catalog.js');
+    const downloads = catalogDownloadRepos();
+    const updates = catalogUpdateRepos();
+    // Superset, deduped.
+    for (const repo of downloads) expect(updates).toContain(repo);
+    expect(new Set(updates).size).toBe(updates.length);
+    // The assets sources are the point: a sidecar-only upstream change moves
+    // nothing in the primary repo, so without these it raises no badge and the
+    // repair job is unreachable.
+    const assets = MODEL_CATALOG.filter((entry) => !entry.hidden && entry.assetsRepo !== undefined).map(
+      (entry) => entry.assetsRepo!,
+    );
+    expect(assets.length).toBeGreaterThan(0);
+    for (const repo of assets) expect(updates).toContain(repo);
+    // Hidden entries stay out of both (their repos 401).
+    for (const entry of MODEL_CATALOG.filter((item) => item.hidden)) {
+      expect(updates).not.toContain(entry.hfRepo);
+      if (entry.assetsRepo !== undefined) expect(updates).not.toContain(entry.assetsRepo);
+    }
+  });
+});
+
 describe('MODEL_CATALOG', () => {
   it('is non-empty', () => {
     expect(MODEL_CATALOG.length).toBeGreaterThan(0);

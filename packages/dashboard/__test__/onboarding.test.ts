@@ -21,6 +21,8 @@ const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
   present: false,
   blockedByForeignDir: false,
   localRevision: null,
+  localAssetsRepo: null,
+  localAssetsRevision: null,
 }));
 const visible = items.filter((item) => !item.hidden);
 let page: RenderedPage | undefined;

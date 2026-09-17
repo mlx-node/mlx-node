@@ -30,6 +30,8 @@ function expectedArgv(entry: CatalogEntry, modelsDir?: string): string[] {
   const argv = ['-m', repo];
   for (const glob of entry.globs ?? []) argv.push('-g', glob);
   if (entry.assetsRepo !== undefined) argv.push('--assets-repo', entry.assetsRepo);
+  // The prescribed selection is the complete model, never a partial glob run.
+  argv.push('--complete');
   if (modelsDir !== undefined) argv.push('-o', join(modelsDir, repo.split('/').pop()!.toLowerCase()));
   return argv;
 }

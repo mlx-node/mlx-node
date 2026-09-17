@@ -1127,6 +1127,8 @@ describe('Models page — the Install affordance', () => {
           present: false,
           blockedByForeignDir: false,
           localRevision: null,
+          localAssetsRepo: null,
+          localAssetsRevision: null,
           ...item,
         },
       ],
@@ -1360,6 +1362,85 @@ describe('Models page — the Install affordance', () => {
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
         items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }],
       }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+  });
+
+  it('offers Update when only the tokenizer sidecars advanced', async () => {
+    // A base-model tokenizer/template fix moves nothing in the primary repo, and
+    // the Installed button is otherwise disabled — so without comparing the
+    // sidecar source too, the repair path is unreachable by design.
+    await mount(
+      createElement(Models),
+      catalogRoutes(
+        {
+          present: true,
+          installed: true,
+          localRevision: 'a'.repeat(40),
+          localAssetsRepo: 'base/model',
+          localAssetsRevision: 'c'.repeat(40),
+        },
+        [],
+        {
+          items: [
+            { hfRepo: REPO, remoteRevision: 'a'.repeat(40) },
+            { hfRepo: 'base/model', remoteRevision: 'd'.repeat(40) },
+          ],
+        },
+      ),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Update available');
+  });
+
+  it('stays Installed when the sidecar revision matches', async () => {
+    await mount(
+      createElement(Models),
+      catalogRoutes(
+        {
+          present: true,
+          installed: true,
+          localRevision: 'a'.repeat(40),
+          localAssetsRepo: 'base/model',
+          localAssetsRevision: 'c'.repeat(40),
+        },
+        [],
+        {
+          items: [
+            { hfRepo: REPO, remoteRevision: 'a'.repeat(40) },
+            { hfRepo: 'base/model', remoteRevision: 'c'.repeat(40) },
+          ],
+        },
+      ),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+  });
+
+  it('stays Installed when the sidecar repo did not answer', async () => {
+    // An unprobed sidecar repo (`null`) is "unknown", never "up to date" — and
+    // it must not invent a badge either: no comparison, no update.
+    await mount(
+      createElement(Models),
+      catalogRoutes(
+        {
+          present: true,
+          installed: true,
+          localRevision: 'a'.repeat(40),
+          localAssetsRepo: 'base/model',
+          localAssetsRevision: 'c'.repeat(40),
+        },
+        [],
+        {
+          items: [
+            { hfRepo: REPO, remoteRevision: 'a'.repeat(40) },
+            { hfRepo: 'base/model', remoteRevision: null },
+          ],
+        },
+      ),
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');

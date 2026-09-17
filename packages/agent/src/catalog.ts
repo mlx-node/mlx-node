@@ -160,6 +160,26 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
   },
 ];
 
+/**
+ * Every repo whose upstream revision participates in update discovery: the
+ * visible target repos and their companions, plus the `assetsRepo` each entry
+ * sources its tokenizer sidecars from.
+ *
+ * The download allowlist ({@link catalogDownloadRepos}) is deliberately
+ * narrower — sidecars are fetched INSIDE a job, never started as one — but a
+ * tokenizer or chat-template fix in the base model is an update a user must be
+ * able to see. Without these, a sidecar-only upstream change raises no badge,
+ * the update endpoint never reports it, and the UI's Installed button stays
+ * disabled: the repair path is unreachable by design.
+ */
+export function catalogUpdateRepos(): string[] {
+  const repos = new Set(catalogDownloadRepos());
+  for (const entry of MODEL_CATALOG) {
+    if (!entry.hidden && entry.assetsRepo !== undefined) repos.add(entry.assetsRepo);
+  }
+  return [...repos];
+}
+
 /** Visible target repos plus their optional companion downloads. */
 export function catalogDownloadRepos(): string[] {
   return [

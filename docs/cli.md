@@ -53,12 +53,16 @@ replace the contents wholesale.
 | `-m`, `--model`  | `Qwen/Qwen3-0.6B`      | HuggingFace model id                                   |
 | `-g`, `--glob`   | —                      | Filename pattern filter (download only matching files) |
 | `--assets-repo`  | —                      | Base-model repo to fetch tokenizer/config sidecars from |
+| `--complete`     | `false`                | Marker records a full-model (catalog) install, not a partial `-g` subset |
 | `--force`        | `false`                | Re-verify every file against upstream by content hash  |
 | `--cache-dir`    | `~/.cache/huggingface` | HuggingFace cache directory                            |
 | `--set-token`    | —                      | Store HuggingFace credentials                          |
 | `-o`, `--output` | —                      | Output directory                                       |
 
-`--assets-repo` exists because GGUF quantization repos ship weights only. When
+`--complete` marks the selection as the COMPLETE prescribed model — the wizard
+passes it, because a catalog install must read as installed (and update-able)
+downstream while an arbitrary `-g` subset must not. `--assets-repo` exists
+because GGUF quantization repos ship weights only. When
 no sidecar `tokenizer.json` sits next to a `.gguf`, the native runtime extracts
 the tokenizer embedded in the GGUF, and that extraction marks
 `<tool_call>`/`</tool_call>` as special tokens — every decode path then skips
