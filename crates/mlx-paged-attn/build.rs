@@ -5,6 +5,9 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=metal/");
     println!("cargo:rerun-if-env-changed=MLX_DISABLE_METAL");
+    // The metallib's min-OS flag reads this too — same declaration mlx-sys
+    // makes, so a changed target recompiles the standalone library as well.
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     println!("cargo:rustc-check-cfg=cfg(mlx_node_metal_enabled)");
 
     // A build script runs for the host, so compile-time `cfg(target_os)` would
@@ -33,11 +36,42 @@ fn main() {
 /// `-mmacosx-version-min=26.0` = `air64_v28-apple-macosx26.0.0`.
 const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.0";
 
-fn macos_deployment_target() -> String {
+/// The build host's macOS version as `(major, minor)`, via `sw_vers`.
+fn host_macos_version() -> Option<(u64, u64)> {
+    // The absolute path survives build environments with a stripped PATH —
+    // a PATH lookup that fails here would silently drop the floor back to
+    // the toolchain default (the air64_v29 problem above).
+    let output = Command::new("/usr/bin/sw_vers").arg("-productVersion").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// The floor applied when `MACOSX_DEPLOYMENT_TARGET` is unset: the project
+/// floor, never ABOVE the build host's own version — pinning 26.0 on macOS
+/// 14 or 15 (where a local source build is documented to work) would emit a
+/// metallib the host cannot load and an older SDK can reject. The floor only
+/// matters on hosts newer than it, so the unset fallback caps at the host
+/// version — the same rule `crates/mlx-sys/build.rs` applies.
+fn default_macos_deployment_target() -> Option<String> {
+    let (major, minor) = host_macos_version()?;
+    if (major, minor) > (26, 0) {
+        Some(MACOS_DEPLOYMENT_TARGET_FLOOR.to_string())
+    } else {
+        Some(format!("{major}.{minor}"))
+    }
+}
+
+fn macos_deployment_target() -> Option<String> {
     env::var("MACOSX_DEPLOYMENT_TARGET")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| MACOS_DEPLOYMENT_TARGET_FLOOR.to_string())
+        .or_else(default_macos_deployment_target)
 }
 
 fn compile_metal_shaders() {
@@ -65,26 +99,26 @@ fn compile_metal_shaders() {
 
         // Compile Metal to AIR. The min-OS flag pins the AIR language
         // version to the deployment floor — see MACOS_DEPLOYMENT_TARGET_FLOOR.
-        let min_os_flag = format!("-mmacosx-version-min={deployment_target}");
-        let status = Command::new("xcrun")
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                "-c",
-                src_path.to_str().unwrap(),
-                "-o",
-                air_path.to_str().unwrap(),
-                // Include path for header files
-                "-I",
-                metal_dir.to_str().unwrap(),
-                // Optimization flags
-                "-O3",
-                "-ffast-math",
-                &min_os_flag,
-            ])
-            .status()
-            .expect("Failed to execute xcrun metal");
+        let mut compile_cmd = Command::new("xcrun");
+        compile_cmd.args([
+            "-sdk",
+            "macosx",
+            "metal",
+            "-c",
+            src_path.to_str().unwrap(),
+            "-o",
+            air_path.to_str().unwrap(),
+            // Include path for header files
+            "-I",
+            metal_dir.to_str().unwrap(),
+            // Optimization flags
+            "-O3",
+            "-ffast-math",
+        ]);
+        if let Some(target) = &deployment_target {
+            compile_cmd.arg(format!("-mmacosx-version-min={target}"));
+        }
+        let status = compile_cmd.status().expect("Failed to execute xcrun metal");
 
         if !status.success() {
             panic!(
