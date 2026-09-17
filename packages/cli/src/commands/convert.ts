@@ -106,7 +106,7 @@ Optional Arguments:
   --model-type, -m      Model type (auto-detected if not specified)
                         Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_asr,
                         qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr,
-                        privacy-filter, muse_glimmer, nemotron_h
+                        privacy-filter, muse_glimmer, nemotron_h, k2_horizon
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -122,7 +122,8 @@ Quantization Arguments:
   --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16; not applicable to sym8)
   --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or "sym8".
                         sym8 = per-output-channel symmetric int8 (SafeTensors
-                        input only; dense qwen3_5, lfm2/lfm2_moe, gemma4 in v1):
+                        input only; qwen3_5/qwen3_5_moe, lfm2/lfm2_moe,
+                        gemma4/gemma4_unified, k2_horizon):
                         int8 [N,K] .weight + f32 [N] .scales, no .biases,
                         no group_size.
                         Routers/gates, 3D stacked experts, embeddings, and
@@ -282,6 +283,12 @@ Model Types:
                         lossless one. --quantize/--q-recipe/--q-mxfp/
                         --imatrix-path/--q-mtp are rejected — ingest is the
                         only mode.
+  k2_horizon            IFM K2-Horizon dense model. Compressed-tensors
+                        block-FP8 Linear weights (.weight F8_E4M3 + BF16
+                        .weight_scale [N/128,K/128]) are dequantized to the
+                        target dtype, then re-quantized by the requested
+                        --q-mode (mxfp8 recommended — matches the source
+                        precision class).
 
 GGUF Support:
   When --input points to a .gguf file, the converter automatically parses the
@@ -648,7 +655,7 @@ export async function run(argv: string[]) {
     // late native error.
     if (args.quantize && quantMode === 'sym8') {
       console.error(
-        'Error: --q-mode sym8 is not supported for GGUF input; sym8 is available for SafeTensors models (dense qwen3_5, lfm2/lfm2_moe, gemma4 in v1)',
+        'Error: --q-mode sym8 is not supported for GGUF input; sym8 is available for SafeTensors models (qwen3_5/qwen3_5_moe, lfm2/lfm2_moe, gemma4/gemma4_unified, k2_horizon)',
       );
       process.exit(1);
     }

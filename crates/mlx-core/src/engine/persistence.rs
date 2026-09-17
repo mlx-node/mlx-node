@@ -863,6 +863,56 @@ pub(crate) fn dequant_fp8_weights(
     Ok(())
 }
 
+/// Dequantize compressed-tensors block-FP8 pairs in-place (`*.weight` in
+/// F8E4M3 storage + `*.weight_scale` `[N/128, K/128]` block scales).
+///
+/// Sibling of [`dequant_fp8_weights`] under the compressed-tensors naming
+/// (`weight_scale`, not DeepSeek's `weight_scale_inv`) — K2-Horizon and any
+/// Neural Magic-style FP8 export use this convention. Two deliberate
+/// differences: an orphaned scale key is an *error* (a truncated
+/// compressed-tensors group would otherwise load a still-FP8 weight
+/// silently), and the scale upcasts to f32 before the block multiply so
+/// BF16 scale storage never double-rounds the product — HF's
+/// compressed-tensors dequant runs in f32 for the same reason.
+///
+/// Runs BEFORE key sanitization: the suffix scan is prefix-agnostic.
+pub(crate) fn dequant_fp8_block_scale(
+    params: &mut HashMap<String, MxArray>,
+    target_dtype: DType,
+) -> Result<()> {
+    let scale_keys: Vec<String> = params
+        .keys()
+        .filter(|k| k.ends_with(".weight_scale"))
+        .cloned()
+        .collect();
+    if scale_keys.is_empty() {
+        return Ok(());
+    }
+    info!(
+        "Dequantizing {} compressed-tensors FP8 weight pairs to {:?}",
+        scale_keys.len(),
+        target_dtype
+    );
+    for scale_key in scale_keys {
+        let weight_key = scale_key.replace(".weight_scale", ".weight");
+        let scale = params
+            .remove(&scale_key)
+            .expect("scale_key must exist in params");
+        let Some(weight) = params.remove(&weight_key) else {
+            return Err(Error::from_reason(format!(
+                "'{scale_key}' has no matching '{weight_key}' — \
+                 truncated compressed-tensors group, refusing to load"
+            )));
+        };
+        let scale = scale.astype(DType::Float32)?;
+        let dequantized = dequant_fp8(&weight, &scale, target_dtype)?;
+        // Eval immediately to prevent lazy chain accumulation over ~400 pairs.
+        dequantized.eval();
+        params.insert(weight_key, dequantized);
+    }
+    Ok(())
+}
+
 /// Helper to read an i32 config value, checking `text_config` first, then root.
 /// Tries each key in order, returning the first match or the default.
 pub(crate) fn get_config_i32(

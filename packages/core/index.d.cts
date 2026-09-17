@@ -529,6 +529,113 @@ export declare class HarrierModel {
 }
 
 /**
+ * K2-Horizon language model (IFM K2-Horizon-7B).
+ *
+ * Dense decoder-only transformer — GQA, SwiGLU, grouped RMSNorm, full
+ * RoPE, untied lm_head. Pure standard-KV: flat KV caches, block-paged
+ * adapter (default on), and the continuous-batching scheduler all share
+ * this inner state on the dedicated model thread.
+ */
+export declare class K2HorizonModel {
+  /**
+   * Load a K2-Horizon model from a directory containing safetensors and
+   * config.json.
+   */
+  static load(modelPath: string): Promise<K2HorizonModel>;
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance (`true` iff the adapter was constructed at load time —
+   * `use_block_paged_cache` defaults to true; a non-Metal build leaves
+   * it off).
+   */
+  hasBlockPagedCache(): boolean;
+  /** Get the model configuration. */
+  getConfig(): K2HorizonConfig;
+  /** Native admission capacity for the server's per-model semaphore. */
+  maxConcurrentSequences(): number;
+  /** Estimated number of model parameters. */
+  numParameters(): number;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
+/**
  * LFM2 language model (LFM2.5-1.2B-Thinking).
  *
  * Hybrid conv+attention architecture from Liquid AI. 16 layers total:
@@ -4263,6 +4370,100 @@ export interface InternVisionConfig {
 
 /** Check whether profiling is currently enabled. */
 export declare function isProfilingEnabled(): boolean;
+
+/**
+ * K2-Horizon model configuration (`model_type: "k2_horizon"`).
+ *
+ * Dense decoder-only transformer (IFM K2-Horizon-7B): GQA attention,
+ * SwiGLU MLP, grouped RMSNorm (`layernorm_num_groups`), full RoPE,
+ * untied embeddings. No MoE, no conv/recurrent state, no MTP head —
+ * a pure standard-KV transformer.
+ */
+export interface K2HorizonConfig {
+  vocabSize: number;
+  hiddenSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  intermediateSize: number;
+  maxPositionEmbeddings: number;
+  /**
+   * Per-head dimension. K2 ships `head_dim` explicitly; fall back to
+   * `hidden_size / num_attention_heads` when absent.
+   */
+  headDim?: number;
+  /** RMSNorm epsilon (`rms_norm_eps` in config.json). */
+  normEps: number;
+  /**
+   * Number of groups the grouped RMSNorm partitions `hidden_size` into
+   * (variance computed per `hidden_size / layernorm_num_groups` group,
+   * not over the whole row). K2 ships `layernorm_num_groups: 4`.
+   * `1` degenerates to plain RMSNorm.
+   */
+  layernormNumGroups: number;
+  /**
+   * Flat `rope_theta` key (other families' convention). K2 nests it
+   * under `rope_parameters`; both are accepted, nested wins.
+   */
+  ropeTheta?: number;
+  /** Nested RoPE block; `rope_theta` resolved via [`Self::rope_theta`]. */
+  ropeParameters?: K2RopeParameters;
+  /**
+   * Whether `lm_head` shares `embed_tokens` weights. K2 ships `false`
+   * (a separate `lm_head.weight` tensor). Defaults false rather than
+   * the HF `PretrainedConfig` convention of true: an omitted flag on
+   * a checkpoint that still ships `lm_head.weight` must stay untied,
+   * and one that omits BOTH flag and tensor fails the mandatory-weight
+   * check loudly instead of silently binding random-init logits.
+   */
+  tieWordEmbeddings: boolean;
+  eosTokenId: any;
+  bosTokenId: number;
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: adaptive (weights-aware) sizing.
+   */
+  pagedCacheMemoryMb?: number | undefined;
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined;
+  /**
+   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`).
+   *
+   * Default: `true` — K2 is a pure standard-KV transformer, so every
+   * layer routes through the adapter. Opt out with
+   * `use_block_paged_cache: Some(false)` for the flat `KVCache` path.
+   */
+  useBlockPagedCache?: boolean | undefined;
+  /**
+   * Persist block-paged attention state to the SSD cold tier. Explicit
+   * config overrides the process-wide `MLX_PERSIST_PAGED_CACHE` default.
+   * Currently inert: `k2_horizon` is not in `COLD_RESTORE_FAMILIES`, so
+   * `resolve_persist_cold` fails closed and no state is written until the
+   * family is allowlisted (parity-gated — see `cold_tier.rs`).
+   */
+  persistPagedCache?: boolean | undefined;
+}
+
+/**
+ * Nested RoPE parameter block (`config.json["rope_parameters"]`).
+ *
+ * K2-Horizon nests `rope_theta` under `rope_parameters` instead of the
+ * flat `rope_theta` key the other families use:
+ * `"rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}`.
+ */
+export interface K2RopeParameters {
+  ropeTheta: number;
+  /**
+   * `default` (full RoPE) is the only supported type; anything else is
+   * ignored here and rejected by `K2HorizonConfig::validate`.
+   */
+  ropeType?: string;
+}
 
 /** A single detected layout element. */
 export interface LayoutElement {

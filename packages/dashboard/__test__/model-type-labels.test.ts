@@ -32,6 +32,7 @@ const LABEL_CASES = [
   ['alias-lfm2', { model_type: 'lfm2' }, 'lfm2'],
   ['alias-lfm2-moe', { model_type: 'lfm2_moe' }, 'lfm2_moe'],
   ['alias-nemotron-h', { model_type: 'nemotron_h' }, 'nemotron_h'],
+  ['alias-k2-horizon', { model_type: 'k2_horizon' }, 'k2_horizon'],
   ['alias-internvl-chat', { model_type: 'internvl_chat' }, 'internvl_chat'],
   ['alias-qianfan-ocr', { model_type: 'qianfan-ocr' }, 'qianfan-ocr'],
 
@@ -56,6 +57,7 @@ const LABEL_CASES = [
   ['probe-harrier-default-base', { architectures: ['Qwen3Model'] }, 'harrier'],
   ['probe-harrier-non-string-entries', { model_type: 'qwen3', architectures: ['Qwen3Model', 42] }, 'harrier'],
   ['probe-nemotron-arch', { model_type: 'nemotron', architectures: ['NemotronHForCausalLM'] }, 'nemotron_h'],
+  ['probe-k2-arch', { model_type: 'unknown', architectures: ['K2HorizonForCausalLM'] }, 'k2_horizon'],
 
   // Loader defaults and the dashboard's raw-string fallback for shapes the
   // loader fails closed on (a viewer must label, never throw).

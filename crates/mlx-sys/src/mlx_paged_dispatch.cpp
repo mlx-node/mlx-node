@@ -611,8 +611,15 @@ GroupedPagedAttentionKind select_grouped_paged_attention(
         : GroupedPagedAttentionKind::None;
   }
   if (route_hint == PagedAttentionRouteHint::ForceD128) {
+    // Validated geometries: 32q/2kv (Muse-Glimmer, GQA 16) and 32q/8kv
+    // (K2-Horizon, GQA 4). The kernel derives the GQA fan-out from the
+    // threadgroup shape; `grouped_pipelines_supported` still gates the
+    // required stage width downstream.
+    const bool supported_heads =
+        (num_q_heads == 32 && num_kv_heads == 2) ||
+        (num_q_heads == 32 && num_kv_heads == 8);
     return io_dtype == KvDtype::Bf16 && cache_dtype == KvDtype::Bf16 &&
-        num_seqs == 1 && num_q_heads == 32 && num_kv_heads == 2 &&
+        num_seqs == 1 && supported_heads &&
         head_size == 128 && block_size == 16 && query_rows == 1 &&
         max_context_len > static_cast<int>(kPartitionSize)
         ? GroupedPagedAttentionKind::D128Direct
@@ -859,12 +866,28 @@ bool grouped_d512_test_probe_enabled() {
   return enabled;
 }
 
+std::atomic<uint64_t>& grouped_d128_test_probe_counter() {
+  static std::atomic<uint64_t> counter{0};
+  return counter;
+}
+
+bool grouped_d128_test_probe_enabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("MLX_PAGED_GROUPED_D128_TEST_PROBE");
+    return value != nullptr && std::string(value) == "1";
+  }();
+  return enabled;
+}
+
 void record_grouped_route_for_test(GroupedPagedAttentionKind kind) {
   if (kind == GroupedPagedAttentionKind::Qwen35D256) {
     record_grouped_qwen35_route_for_test();
   } else if (kind == GroupedPagedAttentionKind::D512Direct &&
              grouped_d512_test_probe_enabled()) {
     grouped_d512_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
+  } else if (kind == GroupedPagedAttentionKind::D128Direct &&
+             grouped_d128_test_probe_enabled()) {
+    grouped_d128_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -892,6 +915,14 @@ extern "C" void mlx_paged_grouped_gemma4_test_probe_reset() {
 
 extern "C" uint64_t mlx_paged_grouped_gemma4_test_probe_count() {
   return mlx_paged_grouped_d512_test_probe_count();
+}
+
+extern "C" void mlx_paged_grouped_d128_test_probe_reset() {
+  grouped_d128_test_probe_counter().store(0, std::memory_order_relaxed);
+}
+
+extern "C" uint64_t mlx_paged_grouped_d128_test_probe_count() {
+  return grouped_d128_test_probe_counter().load(std::memory_order_relaxed);
 }
 
 extern "C" uint32_t mlx_paged_grouped_d128_max_stripes(
@@ -922,6 +953,25 @@ extern "C" uint32_t mlx_paged_grouped_d128_max_stripes(
   } catch (...) {
     return 0;
   }
+}
+
+// Default stripe plan for callers that opt into ForceD128 without their own
+// measured sweep: the shared context-length table clamped by the
+// memory/device ceiling. Returns 0 when the grouped route is unavailable —
+// dispatch then falls back to generic V2 because D128 requires nonzero
+// planned stripes.
+extern "C" uint32_t mlx_paged_grouped_d128_default_stripes(
+    uint32_t context, uint32_t attention_layers) {
+  const uint32_t maximum =
+      mlx_paged_grouped_d128_max_stripes(context, attention_layers);
+  if (maximum == 0) return 0;
+  return std::min(
+      grouped_stripe_count(
+          GroupedPagedAttentionKind::D128Direct,
+          static_cast<int>(context),
+          /*num_q_heads=*/32,
+          /*num_kv_heads=*/8),
+      maximum);
 }
 
 extern "C" int mlx_paged_grouped_d512_capability(

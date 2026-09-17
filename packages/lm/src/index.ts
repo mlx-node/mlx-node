@@ -47,6 +47,10 @@ export type { Qwen35MoeConfig } from '@mlx-node/core';
 export { NemotronHModel } from './stream.js';
 export type { NemotronHConfig, NemotronHContextLimits } from '@mlx-node/core';
 
+// K2-Horizon models (IFM; compressed-tensors FP8 → mxfp8 via `mlx convert`)
+export { K2HorizonModel } from './stream.js';
+export type { K2HorizonConfig, K2RopeParameters } from '@mlx-node/core';
+
 // Memory hygiene: most management is automatic — the decode loop
 // inside `@mlx-node/core` calls `mlx_clear_cache()` every 256 generated
 // tokens to prevent unbounded free-pool growth during long
@@ -120,6 +124,7 @@ export {
   familyDataFor,
   familyTraitsFor,
   GEMMA4_SAMPLING_DEFAULTS,
+  K2_SAMPLING_DEFAULTS,
   launchPresetFor,
   LFM2_SAMPLING_DEFAULTS,
   matchFamily,

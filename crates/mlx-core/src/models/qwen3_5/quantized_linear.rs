@@ -136,7 +136,7 @@ impl MLPVariant {
             } => {
                 let gate = gate_proj.forward(x)?;
                 let up = up_proj.forward(x)?;
-                let activated = Activations::swiglu(&gate, &up)?;
+                let activated = Activations::swiglu_compiled(&gate, &up)?;
                 down_proj.forward(&activated)
             }
         }

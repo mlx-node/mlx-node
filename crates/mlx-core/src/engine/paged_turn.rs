@@ -9,7 +9,7 @@ use napi::bindgen_prelude::*;
 
 use crate::engine::backend::{
     ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedSpeculativeArgs,
-    StreamEmitter, ThinkingSetup, TurnOutput, WholeTurnArgs,
+    StreamEmitter, ThinkEndResolution, ThinkingSetup, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
@@ -123,12 +123,21 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
     } else {
         args.prompt_tokens.len() as u32
     };
+    // Per-turn reasoning close token (see `admit_paged_turn`): K2's
+    // effort-dependent `</ifm|think*>` tag resolves through the backend
+    // hook; other families get the tokenizer-global `</think>`.
+    let ThinkEndResolution {
+        think_end_id,
+        think_end_str: think_end_str_owned,
+        think_end_extra_ids,
+    } = backend.think_end_for_turn(args.config, args.tokenizer);
     let mut result = match backend.finalize_turn(FinalizeArgs {
         tokenizer: args.tokenizer,
         generated_tokens: args.generated_tokens,
         finish_reason: args.finish_reason,
-        think_end_id: args.tokenizer.think_end_id(),
-        think_end_str: args.tokenizer.think_end_str(),
+        think_end_id,
+        think_end_str: think_end_str_owned.as_deref(),
+        think_end_extra_ids: &think_end_extra_ids,
         performance,
         include_reasoning: args.params.include_reasoning,
         thinking_enabled: args.thinking.enabled,
@@ -173,7 +182,11 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let thinking = args.thinking;
     let is_delta = args.plan.is_delta;
     let is_streaming = args.sink.is_some();
-    let think_end_id = tokenizer.think_end_id();
+    let ThinkEndResolution {
+        think_end_id,
+        think_end_extra_ids,
+        ..
+    } = backend.think_end_for_turn(args.config, &tokenizer);
 
     // Delta turns force `reuse_cache = true` (the engine's delta guards
     // already rejected an explicit `Some(false)`); fresh turns resolve
@@ -246,7 +259,8 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     profiler.set_prompt_tokens(suffix_len as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
+    let mut reasoning_tracker =
+        ReasoningTracker::from_setup_multi(&thinking, think_end_id, think_end_extra_ids);
     let extra_eos_ids = backend.extra_eos_ids();
     let eos_before_emit = backend.eos_before_emit();
 

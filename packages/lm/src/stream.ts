@@ -2,6 +2,7 @@ import { join } from 'node:path';
 
 import {
   Gemma4Model as Gemma4ModelNative,
+  K2HorizonModel as K2HorizonModelNative,
   Lfm2Model as Lfm2ModelNative,
   MuseGlimmerModel as MuseGlimmerModelNative,
   NemotronHModel as NemotronHModelNative,
@@ -76,7 +77,8 @@ export interface ChatStreamFinal {
    *
    * The native `ChatStreamChunk` surfaces `cachedTokens` on the
    * terminal (`done == true`) chunk for every streaming entry point
-   * (Qwen3, Qwen3.5 Dense / MoE, LFM2, Gemma4, QianfanOCR) — start-path
+   * (Qwen3, Qwen3.5 Dense / MoE, LFM2, Gemma4, Muse-Glimmer,
+   * Nemotron-H, K2-Horizon, QianfanOCR) — start-path
    * chunks carry the matched prefix length from
    * `verify_cache_prefix_direct`, delta-path chunks carry the reused
    * prior-history length. Non-terminal deltas carry `None` /
@@ -419,7 +421,8 @@ async function runChatSessionCall(
 // -------------------------------------------------------------------
 //
 // Every generative family (Qwen3, Qwen3.5 dense / MoE, LFM2, Gemma4,
-// and the QianfanOCR VLM in `@mlx-node/vlm`) wraps its native class
+// Muse-Glimmer, Nemotron-H, K2-Horizon, and the QianfanOCR VLM in
+// `@mlx-node/vlm`) wraps its native class
 // identically: capture the three callback-based session-streaming
 // methods, re-expose them as `AsyncGenerator<ChatStreamEvent>`, set the
 // subclass prototype in `static load`, and (for path-recording families)
@@ -796,6 +799,11 @@ export class NemotronHModel extends makeStreamingModel(NemotronHModelNative, {
   recordModelPath: true,
 }) {}
 
+/** K2-Horizon model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
+export class K2HorizonModel extends makeStreamingModel(K2HorizonModelNative, {
+  recordModelPath: true,
+}) {}
+
 /** Gemma4 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
 export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, {
   recordModelPath: true,
@@ -836,6 +844,7 @@ function _assertSessionCapable(): void {
   const _museGlimmer: SessionCapableModel = null as unknown as MuseGlimmerModel;
   const _qwen3: SessionCapableModel = null as unknown as Qwen3Model;
   const _nemotronH: SessionCapableModel = null as unknown as NemotronHModel;
+  const _k2: SessionCapableModel = null as unknown as K2HorizonModel;
   void _qwen35;
   void _moe;
   void _qwen4;
@@ -844,6 +853,7 @@ function _assertSessionCapable(): void {
   void _museGlimmer;
   void _qwen3;
   void _nemotronH;
+  void _k2;
 }
 void _assertSessionCapable;
 
@@ -881,6 +891,7 @@ function _assertPreservedNativeSurfaces(): void {
   const _gemma4: PreservedNativeSurface<typeof Gemma4ModelNative> = null as unknown as Gemma4Model;
   const _museGlimmer: PreservedNativeSurface<typeof MuseGlimmerModelNative> = null as unknown as MuseGlimmerModel;
   const _nemotronH: PreservedNativeSurface<typeof NemotronHModelNative> = null as unknown as NemotronHModel;
+  const _k2: PreservedNativeSurface<typeof K2HorizonModelNative> = null as unknown as K2HorizonModel;
   void _qwen3;
   void _qwen35;
   void _moe;
@@ -889,5 +900,6 @@ function _assertPreservedNativeSurfaces(): void {
   void _gemma4;
   void _museGlimmer;
   void _nemotronH;
+  void _k2;
 }
 void _assertPreservedNativeSurfaces;

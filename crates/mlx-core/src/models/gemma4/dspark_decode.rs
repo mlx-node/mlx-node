@@ -1086,6 +1086,7 @@ impl Gemma4Inner {
                 finish_reason,
                 think_end_id,
                 think_end_str: think_end_str.as_deref(),
+                think_end_extra_ids: &[],
                 performance,
                 include_reasoning: p.include_reasoning,
                 thinking_enabled: thinking.enabled,

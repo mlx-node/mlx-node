@@ -6,6 +6,7 @@
 pub(crate) mod chat_napi;
 pub mod gemma4;
 pub mod harrier;
+pub mod k2_horizon;
 pub mod lfm2;
 pub mod mtp_drafter;
 pub mod muse_glimmer;

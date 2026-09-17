@@ -112,9 +112,32 @@ fn generate_tool_call_id() -> String {
 // Tag extraction helpers — replace all regex with simple string scanning
 // ---------------------------------------------------------------------------
 
+/// Tag set a family's reasoning/tool markup uses.
+///
+/// The ChatML default (`<think>` + `<tool_call>`) is what every existing
+/// family ships; K2-Horizon substitutes `<ifm|think*>` / `<ifm|tool_call>`
+/// pairs through the `*_with` spec-parameterized variants below. Behavior
+/// for existing callers is byte-identical — the same constants flow
+/// through the same code.
+#[derive(Clone, Copy)]
+pub(crate) struct MarkupSpec {
+    /// Reasoning `(open, close)` pairs, scanned in order.
+    pub reasoning: &'static [(&'static str, &'static str)],
+    /// Tool-call block delimiters.
+    pub tool_open: &'static str,
+    pub tool_close: &'static str,
+}
+
+/// The default ChatML markup spec.
+pub(crate) const CHATML_MARKUP: MarkupSpec = MarkupSpec {
+    reasoning: &[("<think>", "</think>"), ("<longcat_think>", "</longcat_think>")],
+    tool_open: "<tool_call>",
+    tool_close: "</tool_call>",
+};
+
 /// Extract all blocks between `<open_tag>` and `</close_tag>`.
 /// Returns Vec of (start_of_open_tag, end_of_close_tag, inner_content).
-fn extract_tag_blocks<'a>(
+pub(crate) fn extract_tag_blocks<'a>(
     text: &'a str,
     open_tag: &str,
     close_tag: &str,
@@ -145,7 +168,7 @@ fn extract_tag_blocks<'a>(
 }
 
 /// Remove all occurrences of `<open_tag>...</close_tag>` from text.
-fn strip_tag_blocks(text: &str, open_tag: &str, close_tag: &str) -> String {
+pub(crate) fn strip_tag_blocks(text: &str, open_tag: &str, close_tag: &str) -> String {
     let blocks = extract_tag_blocks(text, open_tag, close_tag);
     if blocks.is_empty() {
         return text.to_string();
@@ -223,7 +246,7 @@ fn sanitize_json_string(input: &str) -> String {
 /// Parse a JSON format tool call (Qwen3)
 ///
 /// Format: `{"name": "func", "arguments": {...}}`
-fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
+pub(crate) fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
     let sanitized = sanitize_json_string(json_str);
     match serde_json::from_str::<Value>(&sanitized) {
         Ok(parsed) => {
@@ -3441,22 +3464,41 @@ fn parse_lfm2_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
 /// orders LFM2 calls before `<tool_call>` calls.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
     let (text, mut tool_calls) = parse_lfm2_tool_calls(text);
+    let (cleaned_text, chatml_calls) =
+        parse_tool_calls_with(&text, CHATML_MARKUP, classify_and_parse_tool_call);
+    tool_calls.extend(chatml_calls);
+    (cleaned_text, tool_calls)
+}
 
-    let blocks = extract_tag_blocks(&text, "<tool_call>", "</tool_call>");
+/// [`parse_tool_calls`] parameterized by the family's tool-tag pair and
+/// inner-block classifier. K2-Horizon routes its `<ifm|tool_call>` blocks
+/// through this with its own classifier; every existing caller keeps the
+/// ChatML default.
+pub(crate) fn parse_tool_calls_with(
+    text: &str,
+    spec: MarkupSpec,
+    classify: fn(&str, &str) -> Option<ToolCallResult>,
+) -> (String, Vec<ToolCallResult>) {
+    let blocks = extract_tag_blocks(text, spec.tool_open, spec.tool_close);
+    let mut tool_calls = Vec::new();
     for (start, end, inner) in &blocks {
         let raw_content = &text[*start..*end];
-        if let Some(result) = classify_and_parse_tool_call(inner, raw_content) {
+        if let Some(result) = classify(inner, raw_content) {
             tool_calls.push(result);
         }
     }
-
-    let cleaned_text = strip_tag_blocks(&text, "<tool_call>", "</tool_call>");
+    let cleaned_text = strip_tag_blocks(text, spec.tool_open, spec.tool_close);
     (cleaned_text, tool_calls)
 }
 
 /// Check if text contains any tool call tags
 pub fn has_tool_calls(text: &str) -> bool {
-    text.contains("<tool_call>") || text.contains(LFM2_TOOL_CALL_START)
+    has_tool_calls_with(text, CHATML_MARKUP) || text.contains(LFM2_TOOL_CALL_START)
+}
+
+/// [`has_tool_calls`] parameterized by the family's tool-tag pair.
+pub(crate) fn has_tool_calls_with(text: &str, spec: MarkupSpec) -> bool {
+    text.contains(spec.tool_open)
 }
 
 /// Parse thinking content from generated text
@@ -3589,9 +3631,15 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 /// iteration halts and preserves the call). Multiple in-tool straddle candidates within one
 /// pass are resolved by last-wins in `missing_open_close`.
 pub fn strip_reasoning_preserving_tools(text: &str) -> String {
-    let mut current = strip_reasoning_once(text);
-    while has_top_level_missing_open_terminator(&current) {
-        let next = strip_reasoning_once(&current);
+    strip_reasoning_preserving_tools_with(text, CHATML_MARKUP)
+}
+
+/// [`strip_reasoning_preserving_tools`] parameterized by the family's
+/// markup spec — same fixpoint scrub, family's own reasoning/tool tags.
+pub(crate) fn strip_reasoning_preserving_tools_with(text: &str, spec: MarkupSpec) -> String {
+    let mut current = strip_reasoning_once(text, spec);
+    while has_top_level_missing_open_terminator(&current, spec) {
+        let next = strip_reasoning_once(&current, spec);
         if next == current {
             break;
         }
@@ -3601,20 +3649,22 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
 }
 
 /// One pass of the range-based reasoning scrub (see `strip_reasoning_preserving_tools`).
-fn strip_reasoning_once(text: &str) -> String {
+fn strip_reasoning_once(text: &str, spec: MarkupSpec) -> String {
     let mut tool_ranges: Vec<(usize, usize)> =
-        extract_tag_blocks(text, "<tool_call>", "</tool_call>")
+        extract_tag_blocks(text, spec.tool_open, spec.tool_close)
             .into_iter()
             .map(|(s, e, _)| (s, e))
             .collect();
     // LFM2's pythonic sentinel blocks get the same protection: a call nested
     // inside reasoning is scrubbed with it; a top-level call is preserved
     // verbatim so `parse_lfm2_tool_calls` still sees it.
-    tool_ranges.extend(
-        extract_tag_blocks(text, LFM2_TOOL_CALL_START, LFM2_TOOL_CALL_END)
-            .into_iter()
-            .map(|(s, e, _)| (s, e)),
-    );
+    if spec.tool_open == CHATML_MARKUP.tool_open && spec.tool_close == CHATML_MARKUP.tool_close {
+        tool_ranges.extend(
+            extract_tag_blocks(text, LFM2_TOOL_CALL_START, LFM2_TOOL_CALL_END)
+                .into_iter()
+                .map(|(s, e, _)| (s, e)),
+        );
+    }
     // The logic below handles the no-tool case for free (empty `tool_ranges` ⇒ every tag is
     // top-level and no spans are dropped), so there is NO separate `parse_thinking` fast path:
     // the scrubber owns its missing-open scanner (`missing_open_close`) and never delegates to
@@ -3624,10 +3674,7 @@ fn strip_reasoning_once(text: &str) -> String {
     // Paired reasoning ranges on the original text, excluding any block that is literal
     // argument text inside a tool span.
     let mut reasoning: Vec<(usize, usize)> = Vec::new();
-    for (open, close) in [
-        ("<think>", "</think>"),
-        ("<longcat_think>", "</longcat_think>"),
-    ] {
+    for (open, close) in spec.reasoning {
         for (start, end, _inner) in extract_tag_blocks(text, open, close) {
             let in_arg = tool_ranges.iter().any(|(s, e)| start >= *s && end <= *e);
             if !in_arg {
@@ -3640,7 +3687,7 @@ fn strip_reasoning_once(text: &str) -> String {
     // the opener into the prompt) and emits a bare close. The leading prefix up to the applied
     // terminator (earliest qualifying close across families — see `applied_missing_open` /
     // `missing_open_close`) is reasoning. It composes with the paired set above.
-    if let Some((_, close_end, _)) = applied_missing_open(text, &tool_ranges) {
+    if let Some((_, close_end, _)) = applied_missing_open(text, &tool_ranges, spec) {
         reasoning.push((0, close_end));
     }
 
@@ -3703,7 +3750,7 @@ fn strip_reasoning_once(text: &str) -> String {
             })
         })
         .collect();
-    let out = keep_only_genuine_tool_spans(out, genuine);
+    let out = keep_only_genuine_tool_spans(out, genuine, spec);
     out.trim().to_string()
 }
 
@@ -3725,13 +3772,11 @@ fn strip_reasoning_once(text: &str) -> String {
 fn applied_missing_open(
     text: &str,
     tool_ranges: &[(usize, usize)],
+    spec: MarkupSpec,
 ) -> Option<(usize, usize, bool)> {
     let mut top_level: Option<(usize, usize)> = None; // earliest top-level close
     let mut straddle: Option<(usize, usize)> = None; // latest in-tool straddle
-    for (open, close) in [
-        ("<think>", "</think>"),
-        ("<longcat_think>", "</longcat_think>"),
-    ] {
+    for (open, close) in spec.reasoning {
         if let Some((pos, end)) = missing_open_close(text, open, close, tool_ranges) {
             let is_top = !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
             if is_top {
@@ -3754,21 +3799,26 @@ fn applied_missing_open(
 /// genuine leading reasoning remains, whereas an in-tool straddle (a preserved call whose
 /// argument carries a `</think>`, with no top-level close past it) must NOT drive another pass —
 /// re-running would drop the valid call.
-fn has_top_level_missing_open_terminator(text: &str) -> bool {
+fn has_top_level_missing_open_terminator(text: &str, spec: MarkupSpec) -> bool {
     let mut tool_ranges: Vec<(usize, usize)> =
-        extract_tag_blocks(text, "<tool_call>", "</tool_call>")
+        extract_tag_blocks(text, spec.tool_open, spec.tool_close)
             .into_iter()
             .map(|(s, e, _)| (s, e))
             .collect();
     // LFM2 sentinel spans count too: a `</think>` inside a preserved LFM2
     // call's string arg is an in-tool straddle, NOT a top-level close —
     // misclassifying it would run a second pass that drops the call.
-    tool_ranges.extend(
-        extract_tag_blocks(text, LFM2_TOOL_CALL_START, LFM2_TOOL_CALL_END)
-            .into_iter()
-            .map(|(s, e, _)| (s, e)),
-    );
-    matches!(applied_missing_open(text, &tool_ranges), Some((_, _, true)))
+    if spec.tool_open == CHATML_MARKUP.tool_open && spec.tool_close == CHATML_MARKUP.tool_close {
+        tool_ranges.extend(
+            extract_tag_blocks(text, LFM2_TOOL_CALL_START, LFM2_TOOL_CALL_END)
+                .into_iter()
+                .map(|(s, e, _)| (s, e)),
+        );
+    }
+    matches!(
+        applied_missing_open(text, &tool_ranges, spec),
+        Some((_, _, true))
+    )
 }
 
 /// Keep only the tool spans in `out` whose byte range is one of `genuine`
@@ -3784,17 +3834,23 @@ fn has_top_level_missing_open_terminator(text: &str) -> bool {
 /// the output ranges can. Dropped one span at a time, re-extracting and shifting `genuine` after
 /// each drop so a fusion newly formed at a drop seam is itself caught. Each drop strictly shrinks
 /// `out`, so it terminates.
-fn keep_only_genuine_tool_spans(mut out: String, mut genuine: Vec<(usize, usize)>) -> String {
+fn keep_only_genuine_tool_spans(
+    mut out: String,
+    mut genuine: Vec<(usize, usize)>,
+    spec: MarkupSpec,
+) -> String {
     loop {
         // Rescan BOTH families: a removal seam can fuse LFM2 sentinel
         // fragments (`<|tool_call_start` + `|>[f()]<|tool_call_end|>`) into a
         // fabricated block just like `<tool_call>` ones.
-        let mut spans = extract_tag_blocks(&out, "<tool_call>", "</tool_call>");
-        spans.extend(extract_tag_blocks(
-            &out,
-            LFM2_TOOL_CALL_START,
-            LFM2_TOOL_CALL_END,
-        ));
+        let mut spans = extract_tag_blocks(&out, spec.tool_open, spec.tool_close);
+        if spec.tool_open == CHATML_MARKUP.tool_open && spec.tool_close == CHATML_MARKUP.tool_close {
+            spans.extend(extract_tag_blocks(
+                &out,
+                LFM2_TOOL_CALL_START,
+                LFM2_TOOL_CALL_END,
+            ));
+        }
         // A span nested INSIDE a genuine one (`f(x='<tool_call>{}</tool_call>')`)
         // is preserved argument text, not markup — and needs no special case
         // here: the initial `tool_ranges` scan already extracted it and it was
@@ -4042,21 +4098,40 @@ pub fn split_at_think_end(
     raw_text: &str,
     think_end_tag: Option<&str>,
 ) -> (String, Vec<ToolCallResult>, Option<String>) {
+    split_at_think_end_with(
+        raw_text,
+        think_end_tag,
+        &["<think>", "<longcat_think>"],
+        parse_tool_calls,
+        parse_generation_output,
+    )
+}
+
+/// [`split_at_think_end`] parameterized by the family's open-tag prefixes
+/// and tool/generation parsers. K2-Horizon passes its `<ifm|think*>`
+/// opens and `<ifm|tool_call>` parser; ChatML callers keep the default.
+pub(crate) fn split_at_think_end_with(
+    raw_text: &str,
+    think_end_tag: Option<&str>,
+    open_prefixes: &[&str],
+    parse_tools: fn(&str) -> (String, Vec<ToolCallResult>),
+    parse_fallback: fn(&str) -> (String, Vec<ToolCallResult>, Option<String>),
+) -> (String, Vec<ToolCallResult>, Option<String>) {
     // Token-level split: authoritative when think_end_tag is confirmed.
-    // Always takes priority — even when <think> appears in the text (old templates).
-    // Tool calls are parsed only from content after the boundary.
-    // Uses find (first occurrence): </think> is a special token, so the first
-    // text match is the real boundary. Content after the boundary may mention
-    // </think> literally; rfind would incorrectly split at that later occurrence.
+    // Always takes priority — even when an open tag appears in the text
+    // (old templates). Tool calls are parsed only from content after the
+    // boundary. Uses find (first occurrence): the close tag is a single
+    // emitted token, so the first text match is the real boundary.
     if let Some(tag) = think_end_tag
         && let Some(close_pos) = raw_text.find(tag)
     {
         let thinking_text = raw_text[..close_pos].trim();
-        // Strip opening think tag from old-style templates that emit it
-        // in generated text (newer templates inject it in the prompt).
-        let thinking_text = thinking_text
-            .strip_prefix("<think>")
-            .or_else(|| thinking_text.strip_prefix("<longcat_think>"))
+        // Strip an opening reasoning tag from old-style templates that
+        // emit it in generated text (newer templates inject it in the
+        // prompt).
+        let thinking_text = open_prefixes
+            .iter()
+            .find_map(|p| thinking_text.strip_prefix(p))
             .unwrap_or(thinking_text)
             .trim();
         let after_tag = &raw_text[close_pos + tag.len()..];
@@ -4066,12 +4141,12 @@ pub fn split_at_think_end(
         } else {
             Some(thinking_text.to_string())
         };
-        let (clean_text, tool_calls) = parse_tool_calls(response_text);
+        let (clean_text, tool_calls) = parse_tools(response_text);
         return (clean_text.trim().to_string(), tool_calls, thinking);
     }
     // No token-level confirmation: fall back to generic text-level parsing.
     // This path is used by callers without token-level info (e.g. build_reward_outputs).
-    parse_generation_output(raw_text)
+    parse_fallback(raw_text)
 }
 
 /// Build RewardOutput array from generation results.

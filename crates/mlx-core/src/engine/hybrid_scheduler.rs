@@ -2388,9 +2388,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             response,
             generated_tokens: Vec::new(),
             finish_reason: String::from("length"),
-            reasoning_tracker: engine::penalties::ReasoningTracker::from_setup(
+            reasoning_tracker: engine::penalties::ReasoningTracker::from_setup_multi(
                 &admitted.thinking,
                 admitted.think_end_id,
+                admitted.think_end_extra_ids,
             ),
             extra_eos_ids: self.inner.extra_eos_ids(),
             generation_start,

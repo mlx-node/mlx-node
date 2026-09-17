@@ -358,7 +358,8 @@ function publicStreamEvent(event: ChatStreamEvent, config: ChatConfig): ChatStre
 /**
  * Structural interface matched by every generative model wrapper
  * (`Qwen35Model`, `Qwen35MoeModel`, `Lfm2Model`, `Gemma4Model`,
- * `Qwen3Model`, and the Qianfan-OCR VLM wrapper). `ChatSession<M>` is
+ * `MuseGlimmerModel`, `NemotronHModel`, `K2HorizonModel`, `Qwen3Model`,
+ * and the Qianfan-OCR VLM wrapper). `ChatSession<M>` is
  * generic over `M extends SessionCapableModel` so each session
  * instance statically binds to a specific model's concrete type
  * (handy for IDE autocomplete) while the implementation remains

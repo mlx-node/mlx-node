@@ -257,6 +257,77 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
     let mut pending_evaluation = PendingDecodeEvaluation::default();
     for step_idx in 0..max_new_tokens {
         reasoning_tracker.enforce_next_token(&mut y)?;
+
+        // Per-iteration submit-ahead (lazy-token pipelined) gate —
+        // evaluated EVERY step so a capable stepper falls back to the
+        // serial arm per step: the last iteration has no next token to
+        // sample; a non-default penalty would read a `token_history` that
+        // here still lacks the not-yet-drained token (a 1-token lag that
+        // changes sampling — at the defaults `apply_all_penalties` is
+        // identity, so gating on them loses nothing); a pending think-end
+        // force must ride the forced-token path rather than a sampled
+        // speculative one; and non-capable steppers (conv / GDN recurrent /
+        // MTP — non-rewindable state) never take this arm at all.
+        let pipelined = step.supports_token_pipeline()
+            && step_idx + 1 < max_new_tokens
+            && p.repetition_penalty == 1.0
+            && p.presence_penalty == 0.0
+            && p.frequency_penalty == 0.0
+            && !reasoning_tracker.force_think_end_pending();
+
+        // Speculative build BEFORE the drain: the stepper records a
+        // placeholder (the KV write slot derives from the recorded token
+        // COUNT, never the id — record-first contract), builds this
+        // step's forward from the LAZY `y`, samples the next token, and
+        // submits it — so the GPU stays busy through the host bookkeeping
+        // below instead of draining at `y.eval()` (mlx-lm `generate.py`
+        // ordering). The placeholder patches to the real id at
+        // `commit_lazy_token` once the drain lands; a terminal drain rolls
+        // the record back via `rollback_lazy_step` (net zero).
+        let mut speculative: Option<(MxArray, MxArray)> = None;
+        // A build/sample failure is CAPTURED, not propagated: the
+        // stepper's `forward_with_lazy_token` error contract is that an
+        // `Err` leaves no pending speculative state (the placeholder
+        // record self-rolled-back), so a terminal current token below can
+        // treat the speculative step as never-attempted — matching the
+        // serial arm's terminal-before-forward ordering, where a fallible
+        // forward is never attempted on a stopping step. A NON-terminal
+        // failure re-raises after the drain, same as the serial arm's
+        // real forward erroring.
+        let mut spec_err: Option<Error> = None;
+        if pipelined {
+            let _stream_ctx = StreamContext::new(generation_stream);
+
+            let built = (|| -> Result<(MxArray, MxArray)> {
+                profiler.begin("forward");
+                let next_ids = y.reshape(&[1, 1])?;
+                let (mut logits, needs_squeeze) = step.forward_with_lazy_token(&next_ids)?;
+                if needs_squeeze {
+                    logits = logits.squeeze(Some(&[1]))?;
+                }
+                profiler.end();
+
+                profiler.begin("sample");
+                let next_token = crate::sampling::sample(&logits, p.sampling_config)?;
+                profiler.end();
+                Ok((next_token, logits))
+            })();
+
+            match built {
+                Ok((next_token, logits)) => {
+                    profiler.begin("schedule_eval");
+                    // Async submit, NOT `step.eval_step`: the paged
+                    // stepper's `eval_step` is deliberately synchronous,
+                    // while this arm needs the host free to drain token t
+                    // as the GPU runs.
+                    MxArray::async_eval_arrays(&[&next_token]);
+                    profiler.end();
+                    speculative = Some((next_token, logits));
+                }
+                Err(error) => spec_err = Some(error),
+            }
+        }
+
         // vLLM-aligned penalty context. Materialize and extract the
         // CURRENT token, then push it to `token_history` HERE — at the
         // loop TOP, BEFORE the next_y block samples the next token. vLLM
@@ -284,6 +355,17 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         profiler.begin("extract");
         let token_id = y.item_at_int32(0)? as u32;
         profiler.end();
+        if speculative.is_some() {
+            // Patch THIS iteration's placeholder — recorded by
+            // `forward_with_lazy_token` for the token's own forward —
+            // with the real drained id. Commit BEFORE the terminal check:
+            // on a terminal token `rollback_lazy_step` below removes the
+            // record again, so commit+rollback net zero. A `spec_err`
+            // iteration skips this entirely — the stepper's error
+            // contract already rolled the placeholder back, so there is
+            // nothing to patch.
+            step.commit_lazy_token(token_id)?;
+        }
         token_history.push(token_id);
         // `generated_tokens` (the OUTPUT stream) is pushed HERE too — at
         // the loop TOP, before the terminal checks — so the
@@ -365,7 +447,42 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // before the next sample) and the cancel-snapshot parity (the
         // pre-forward `cancelled` read reused by the emit break) — see the
         // emit block's one-token-divergence proof.
-        let next_y = if step_idx + 1 < max_new_tokens && !is_terminal {
+        let next_y = if let Some((next_token, logits)) = speculative {
+            // Keep the submitted speculative graph anchored in
+            // `pending_evaluation` exactly like the serial arm's
+            // `schedule_eval` phase — its Drop drains the write chain
+            // before an exit path can release the paged slots it touches.
+            // `forced` is never set in this arm (a pending force gated it
+            // out above).
+            pending_evaluation.logits = Some(logits);
+            pending_evaluation.forced = false;
+            if is_terminal {
+                // Net zero with the commit above: the placeholder record
+                // is rewound (bookkeeping only — the block stays
+                // allocated and its speculatively written slot is dead
+                // space until the next recorded token overwrites it).
+                // The sampled `next_token` is dropped un-drained: it is
+                // never committed into `generated_tokens`.
+                step.rollback_lazy_step()?;
+                None
+            } else {
+                Some(next_token)
+            }
+        } else if let Some(error) = spec_err {
+            // The speculative build failed AFTER the stepper already
+            // self-rolled-back its placeholder — there is no pending
+            // record and nothing was submitted. On a TERMINAL step the
+            // serial arm never attempts the forward at all, so this
+            // token still stops cleanly: resolve `next_y` to `None` and
+            // let the normal finish_reason flow below break. On a
+            // NON-terminal step re-raise — the serial arm's real forward
+            // would have failed identically.
+            if is_terminal {
+                None
+            } else {
+                return Err(error);
+            }
+        } else if step_idx + 1 < max_new_tokens && !is_terminal {
             let _stream_ctx = StreamContext::new(generation_stream);
 
             profiler.begin("forward");
@@ -697,8 +814,8 @@ mod run_decode_loop_tests {
 
     /// Drive `run_decode_loop` non-streaming with a fresh profiler /
     /// stream and return the committed tokens + finish reason.
-    fn drive(
-        step: &mut MockStep,
+    fn drive<S: DecodeStep>(
+        step: &mut S,
         first_token: u32,
         params: &ChatParams,
         tracker: &mut ReasoningTracker,
@@ -719,8 +836,8 @@ mod run_decode_loop_tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn drive_with_observer(
-        step: &mut MockStep,
+    fn drive_with_observer<S: DecodeStep>(
+        step: &mut S,
         first_token: u32,
         params: &ChatParams,
         tracker: &mut ReasoningTracker,
@@ -1369,8 +1486,8 @@ mod run_decode_loop_tests {
     /// emitter / ordering knob / pre-set cancellation, returning the
     /// committed tokens, finish reason, and emitted chunks.
     #[allow(clippy::too_many_arguments)]
-    fn drive_streaming(
-        step: &mut MockStep,
+    fn drive_streaming<S: DecodeStep>(
+        step: &mut S,
         first_token: u32,
         params: &ChatParams,
         tracker: &mut ReasoningTracker,
@@ -1774,5 +1891,297 @@ mod run_decode_loop_tests {
         );
         // token_history stays in lockstep with the output stream.
         assert_eq!(token_history, generated_tokens);
+    }
+
+    // ---- submit-ahead (lazy-token pipelined) arm ----
+
+    /// Pipelined-capable stepper: same scripted argmax as [`MockStep`],
+    /// but opts into the submit-ahead arm. Each `forward_with_lazy_token`
+    /// pushes a `None` placeholder onto `records`; `commit_lazy_token`
+    /// patches the tail; `rollback_lazy_step` pops it — the K2 adapter
+    /// contract (`record_placeholder_token` / `patch_last_recorded_token`
+    /// / `rollback_last_tokens`). `ledger` captures the per-iteration
+    /// call order for the assertions.
+    struct PipelinedMockStep {
+        inner: MockStep,
+        records: Vec<Option<u32>>,
+        ledger: Vec<&'static str>,
+        /// When `Some(n)`, the Nth `forward_with_lazy_token` call (0-based)
+        /// rolls its placeholder back and returns `Err` — modeling the
+        /// stepper error contract ("an `Err` return leaves no pending
+        /// speculative state") that the loop's `spec_err` recovery leans on.
+        fail_lazy_forward_at: Option<usize>,
+    }
+
+    impl PipelinedMockStep {
+        fn new(script: Vec<u32>, vocab: i64) -> Self {
+            Self {
+                inner: MockStep::new(script, vocab),
+                records: Vec::new(),
+                ledger: Vec::new(),
+                fail_lazy_forward_at: None,
+            }
+        }
+    }
+
+    impl DecodeStep for PipelinedMockStep {
+        fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            self.ledger.push("forward");
+            self.inner.forward(input_ids)
+        }
+
+        fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+            self.inner.eval_step(next_token, logits, budget_forced);
+        }
+
+        fn supports_token_pipeline(&self) -> bool {
+            true
+        }
+
+        fn forward_with_lazy_token(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            self.ledger.push("lazy_forward");
+            self.records.push(None);
+            if self.fail_lazy_forward_at == Some(self.records.len() - 1) {
+                // Contract: self-rollback the placeholder, then Err.
+                self.records.pop();
+                return Err(Error::from_reason("injected speculative forward failure"));
+            }
+            self.inner.forward(input_ids)
+        }
+
+        fn commit_lazy_token(&mut self, token_id: u32) -> Result<()> {
+            self.ledger.push("commit");
+            match self.records.last_mut() {
+                Some(slot) if slot.is_none() => {
+                    *slot = Some(token_id);
+                    Ok(())
+                }
+                _ => Err(Error::from_reason(
+                    "commit_lazy_token without a pending placeholder",
+                )),
+            }
+        }
+
+        fn rollback_lazy_step(&mut self) -> Result<()> {
+            self.ledger.push("rollback");
+            self.records
+                .pop()
+                .map(|_| ())
+                .ok_or_else(|| Error::from_reason("rollback_lazy_step with no recorded step"))
+        }
+    }
+
+    /// Pipelined-arm parity on an EOS exit: the submit-ahead drive
+    /// commits the SAME token stream + finish reason as the serial arm,
+    /// runs `lazy_forward -> commit` per forwarded step, and rolls the
+    /// terminal step's record back — the surviving record set is exactly
+    /// the forwarded tokens the serial arm would have recorded (the stop
+    /// token's placeholder is committed then rewound: net zero).
+    #[test]
+    fn pipelined_arm_matches_serial_stream_and_rolls_back_terminal_record() {
+        let params = greedy_params(|_| {});
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut baseline = MockStep::new(vec![7], 16);
+        let serial = drive(&mut baseline, 3, &params, &mut tracker, 10, 7, &[])
+            .unwrap_or_else(|e| panic!("serial loop failed: {}", e.reason));
+
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = PipelinedMockStep::new(vec![7], 16);
+        let out = drive(&mut step, 3, &params, &mut tracker, 10, 7, &[])
+            .unwrap_or_else(|e| panic!("pipelined loop failed: {}", e.reason));
+
+        assert_eq!(serial.generated, vec![3, 7]);
+        assert_eq!(out.generated, serial.generated);
+        assert_eq!(out.finish_reason, serial.finish_reason);
+        // iter 0: lazy_forward -> commit; iter 1 (EOS drain):
+        // lazy_forward -> commit -> rollback. The serial `forward` never
+        // ran in the pipelined drive.
+        assert_eq!(
+            step.ledger,
+            vec![
+                "lazy_forward",
+                "commit",
+                "lazy_forward",
+                "commit",
+                "rollback"
+            ]
+        );
+        // Token 3's patched record survives; token 7's was rewound — the
+        // record count matches the serial arm's accounting on an EOS exit
+        // (the stop token's forward is dropped either way).
+        assert_eq!(step.records, vec![Some(3)]);
+    }
+
+    /// Length exit: the LAST iteration is gated out of both arms
+    /// (`step_idx + 1 < max_new_tokens`), so the pipelined arm runs
+    /// `lazy_forward -> commit` on steps 0..max-2 and the final commit
+    /// takes the shared no-forward fall-out — no rollback fires because
+    /// nothing speculative is in flight at the length break.
+    #[test]
+    fn pipelined_arm_length_exit_runs_serial_tail() {
+        let params = greedy_params(|cfg| {
+            cfg.max_consecutive_tokens = Some(0);
+            cfg.max_ngram_repeats = Some(0);
+        });
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = PipelinedMockStep::new(vec![9], 16);
+        let out = drive(&mut step, 1, &params, &mut tracker, 4, 15, &[])
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(out.generated, vec![1, 9, 9, 9]);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            step.ledger,
+            vec![
+                "lazy_forward",
+                "commit",
+                "lazy_forward",
+                "commit",
+                "lazy_forward",
+                "commit",
+            ]
+        );
+        // Three forwarded steps recorded + patched; the last committed
+        // token (9 at index 3) was never forwarded — the same slot the
+        // real paged stepper closes via `materialize_final`.
+        assert_eq!(step.records, vec![Some(1), Some(9), Some(9)]);
+    }
+
+    /// Per-iteration fallback: a non-default penalty keeps EVERY step of
+    /// a capable stepper on the serial arm — `forward` serves each step
+    /// (via the `forward_with_token` default) and the lazy
+    /// placeholder/commit/rollback seam never fires.
+    #[test]
+    fn pipelined_gate_falls_back_to_serial_arm_under_penalties() {
+        let params = greedy_params(|cfg| {
+            cfg.repetition_penalty = Some(2.0);
+            cfg.max_consecutive_tokens = Some(0);
+            cfg.max_ngram_repeats = Some(0);
+        });
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = PipelinedMockStep::new(vec![3, 4], 16);
+        let out = drive(&mut step, 1, &params, &mut tracker, 4, 15, &[])
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(out.generated.len(), 4);
+        assert_eq!(
+            step.ledger,
+            vec!["forward", "forward", "forward"],
+            "every step must take the serial arm under a non-default penalty"
+        );
+        assert!(step.records.is_empty());
+
+        // The serial `MockStep` drive under identical params produces the
+        // identical stream — fallback changes mechanics, not results.
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut baseline = MockStep::new(vec![3, 4], 16);
+        let serial = drive(&mut baseline, 1, &params, &mut tracker, 4, 15, &[])
+            .unwrap_or_else(|e| panic!("serial loop failed: {}", e.reason));
+        assert_eq!(out.generated, serial.generated);
+    }
+
+    /// Forced token THROUGH the pipeline: a budget=1 tracker arms the
+    /// think-end force at iteration 0's `observe_token`; iteration 1's
+    /// `enforce_next_token` consumes it and swaps the in-flight sample
+    /// for the forced id BEFORE the gate runs, so the pipelined arm
+    /// still builds that step's forward — and `commit_lazy_token`
+    /// patches the placeholder to the FORCED id, not the discarded
+    /// sample. Stream + records must equal the serial baseline.
+    #[test]
+    fn pipelined_arm_commits_forced_token_through_placeholder() {
+        const THINK_END: u32 = 9;
+        let params = greedy_params(|cfg| {
+            cfg.max_consecutive_tokens = Some(0);
+            cfg.max_ngram_repeats = Some(0);
+        });
+        let mut tracker = ReasoningTracker::new(true, Some(1), Some(THINK_END));
+        let mut step = PipelinedMockStep::new(vec![5], 16);
+        let out = drive(&mut step, 4, &params, &mut tracker, 6, 7, &[])
+            .unwrap_or_else(|e| panic!("pipelined loop failed: {}", e.reason));
+
+        // Serial baseline under an identical tracker.
+        let mut tracker = ReasoningTracker::new(true, Some(1), Some(THINK_END));
+        let mut baseline = MockStep::new(vec![5], 16);
+        let serial = drive(&mut baseline, 4, &params, &mut tracker, 6, 7, &[])
+            .unwrap_or_else(|e| panic!("serial loop failed: {}", e.reason));
+
+        // The forced THINK_END lands at position 1 (budget=0 trips on the
+        // first observed token) in BOTH drives; the discarded speculative
+        // sample never reaches the output.
+        assert_eq!(serial.generated, vec![4, THINK_END, 5, 5, 5, 5]);
+        assert_eq!(out.generated, serial.generated);
+        assert_eq!(out.finish_reason, serial.finish_reason);
+        // Iteration 1 — the enforced step — still runs
+        // lazy_forward -> commit, and its record patches to the FORCED
+        // id (9), proving the placeholder picked up the enforced token.
+        assert_eq!(
+            step.ledger,
+            vec![
+                "lazy_forward",
+                "commit",
+                "lazy_forward",
+                "commit",
+                "lazy_forward",
+                "commit",
+                "lazy_forward",
+                "commit",
+                "lazy_forward",
+                "commit",
+            ]
+        );
+        assert_eq!(
+            step.records,
+            vec![Some(4), Some(THINK_END), Some(5), Some(5), Some(5)]
+        );
+    }
+
+    /// Speculative-build failure on a TERMINAL step must not abort a
+    /// cleanly-stopping turn: the serial arm never attempts a fallible
+    /// forward when the drained token is EOS, so the pipelined arm treats
+    /// the failure as never-attempted — `commit` is skipped (the stepper
+    /// already self-rolled-back), no `rollback` fires, and the turn still
+    /// breaks with finish_reason "stop".
+    #[test]
+    fn pipelined_spec_err_on_terminal_step_still_stops_cleanly() {
+        let params = greedy_params(|_| {});
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        // first_token = EOS: iteration 0 drains a terminal token while its
+        // speculative forward fails.
+        let mut step = PipelinedMockStep::new(vec![9], 16);
+        step.fail_lazy_forward_at = Some(0);
+        let out = drive(&mut step, 7, &params, &mut tracker, 5, 7, &[])
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(out.generated, vec![7]);
+        assert_eq!(out.finish_reason, "stop");
+        // lazy_forward ran once and self-rolled-back; no commit/rollback.
+        assert_eq!(step.ledger, vec!["lazy_forward"]);
+        assert!(step.records.is_empty());
+    }
+
+    /// The same failure on a NON-terminal step propagates — the serial
+    /// arm's real forward would have errored identically.
+    #[test]
+    fn pipelined_spec_err_on_nonterminal_step_propagates() {
+        let params = greedy_params(|_| {});
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = PipelinedMockStep::new(vec![9], 16);
+        step.fail_lazy_forward_at = Some(0);
+        let result = drive(&mut step, 3, &params, &mut tracker, 5, 7, &[]);
+
+        let error = match result {
+            Ok(_) => panic!("non-terminal speculative failure must propagate"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .reason
+                .contains("injected speculative forward failure"),
+            "unexpected error: {}",
+            error.reason
+        );
+        assert_eq!(step.ledger, vec!["lazy_forward"]);
+        assert!(step.records.is_empty());
     }
 }

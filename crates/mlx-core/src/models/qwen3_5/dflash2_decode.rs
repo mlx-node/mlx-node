@@ -669,6 +669,7 @@ impl Qwen35Inner {
                 finish_reason,
                 think_end_id: tokenizer.think_end_id(),
                 think_end_str: tokenizer.think_end_str(),
+                think_end_extra_ids: &[],
                 performance,
                 include_reasoning: params.include_reasoning,
                 thinking_enabled: args.thinking.enabled,

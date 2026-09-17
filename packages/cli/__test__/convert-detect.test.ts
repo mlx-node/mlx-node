@@ -85,6 +85,7 @@ describe('CONVERT_DETECT row semantics', () => {
     ['openai_privacy_filter', 'privacy-filter'],
     ['muse_glimmer', 'muse_glimmer'],
     ['nemotron_h', 'nemotron_h'],
+    ['k2_horizon', 'k2_horizon'],
   ])("maps raw model_type '%s' to '%s'", (raw, out) => {
     expect(detectConvertModelType({ model_type: raw })).toBe(out);
   });
@@ -92,6 +93,7 @@ describe('CONVERT_DETECT row semantics', () => {
   it.each([
     ['Gemma4UnifiedForConditionalGeneration', 'gemma4_unified'],
     ['NemotronHForCausalLM', 'nemotron_h'],
+    ['K2HorizonForCausalLM', 'k2_horizon'],
   ])("detects an architecture-only config with '%s' as '%s'", (architecture, out) => {
     expect(detectConvertModelType({ architectures: [architecture] })).toBe(out);
   });

@@ -51,6 +51,12 @@ pub(crate) struct ReasoningTracker {
     thinking_token_count: i32,
     budget: Option<i32>,
     think_end_id: Option<u32>,
+    /// Additional token ids that also END reasoning without being the
+    /// forced/budget tag. K2-Horizon opens one of three `<ifm|think*>`
+    /// blocks per turn but the model may close with a different member
+    /// of the family — the primary `think_end_id` remains the tag the
+    /// budget forces, while these alternates still flip the boundary.
+    extra_think_end_ids: Vec<u32>,
     force_think_end: bool,
     /// Set after `should_force_think_end` is consumed, prevents re-triggering
     /// from subsequent `observe_token` calls before the forced token is extracted.
@@ -61,8 +67,9 @@ impl ReasoningTracker {
     /// Create a new tracker.
     ///
     /// `starts_in_thinking`: true when the template injected `<think>\n` (thinking enabled).
-    /// `budget`: maximum thinking tokens before forcing `</think>`. None = unlimited.
-    /// `think_end_id`: token ID for `</think>` from the tokenizer vocabulary.
+    /// `budget`: maximum thinking tokens before forcing the close tag. None = unlimited.
+    /// `think_end_id`: the turn's primary reasoning-close token id — `</think>`
+    /// for ChatML families, the effort-matched `</ifm|think*>` for K2-Horizon.
     pub fn new(starts_in_thinking: bool, budget: Option<i32>, think_end_id: Option<u32>) -> Self {
         // Budget=0 means "no thinking tokens at all" — force </think> immediately
         // on the first decode step, before any thinking token is generated.
@@ -72,6 +79,7 @@ impl ReasoningTracker {
             thinking_token_count: 0,
             budget,
             think_end_id,
+            extra_think_end_ids: Vec::new(),
             force_think_end: force_immediately,
             end_scheduled: false,
         }
@@ -89,6 +97,19 @@ impl ReasoningTracker {
         Self::new(setup.enabled, setup.budget, think_end_id)
     }
 
+    /// [`from_setup`] plus alternate close-token ids (K2-Horizon's
+    /// `</ifm|think*>` family): any of them ends reasoning, but only the
+    /// primary `think_end_id` is the budget-forced token.
+    pub fn from_setup_multi(
+        setup: &crate::engine::backend::ThinkingSetup,
+        think_end_id: Option<u32>,
+        extra_think_end_ids: Vec<u32>,
+    ) -> Self {
+        let mut tracker = Self::new(setup.enabled, setup.budget, think_end_id);
+        tracker.extra_think_end_ids = extra_think_end_ids;
+        tracker
+    }
+
     /// Process a generated token. Returns whether this token is reasoning content.
     ///
     /// Call AFTER extracting the token ID from the GPU each decode step.
@@ -97,7 +118,7 @@ impl ReasoningTracker {
             return false;
         }
 
-        if self.think_end_id == Some(token_id) {
+        if self.think_end_id == Some(token_id) || self.extra_think_end_ids.contains(&token_id) {
             self.in_thinking = false;
             self.force_think_end = false;
             self.end_scheduled = false;

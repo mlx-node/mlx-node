@@ -22,6 +22,11 @@ export const CONVERT_DETECT: readonly ConvertDetectRow[] = [
   // stale-but-recognized model_type (e.g. qwen3_5) cannot route a Nemotron
   // checkpoint to another family's sanitizer.
   { architecture: 'NemotronHForCausalLM', out: 'nemotron_h' },
+  // Same authoritative-architecture guard as Nemotron: K2's recipe runs a
+  // load-bearing FP8 block dequant, so a checkpoint with a missing or
+  // foreign model_type must not fall through to the generic pass (which
+  // would copy the F8_E4M3 tensors raw and emit an unloadable model).
+  { architecture: 'K2HorizonForCausalLM', out: 'k2_horizon' },
   { rawModelTypes: ['paddleocr_vl'], out: 'paddleocr-vl' },
   // Qianfan-OCR checkpoints use InternVL's historical raw model_type.
   // The runtime registry maps exactly both strings to QianfanOCRModel;
@@ -52,6 +57,7 @@ export const CONVERT_DETECT: readonly ConvertDetectRow[] = [
   // authoritative); this row covers checkpoints that declare the plain
   // model_type.
   { rawModelTypes: ['nemotron_h'] },
+  { rawModelTypes: ['k2_horizon'] },
 ];
 
 /**

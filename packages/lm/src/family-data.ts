@@ -164,6 +164,18 @@ export const LFM2_SAMPLING_DEFAULTS: ChatConfig = {
 };
 
 /**
+ * Sampling defaults from IFM's K2-Horizon model card
+ * (temperature 1.0 / top_p 0.95; the card publishes no top_k).
+ */
+export const K2_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 1.0,
+  topP: 0.95,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.0,
+};
+
+/**
  * Sampling defaults + per-model output cap. A per-request client value still
  * wins: `ChatSession.mergeConfig` treats per-call config as an overlay on top
  * of `defaultConfig`.
@@ -383,6 +395,38 @@ export const MODEL_FAMILY_DATA = [
     },
     launchPreset: {
       sampling: NEMOTRON_SAMPLING_DEFAULTS,
+      maxOutputTokens: 32768,
+    },
+  },
+  {
+    id: 'k2_horizon',
+    kind: 'loadable',
+    match: {
+      rawModelTypes: ['k2_horizon'],
+      architectureProbe: ({ architectures }) => architectures.has('K2HorizonForCausalLM'),
+    },
+    traits: {
+      reasoning: true,
+      /**
+       * K2 always thinks — its template raises on `reasoning_effort="none"`
+       * and offers exactly three levels (high/medium/low, rendered as
+       * `<ifm|think>` / `<ifm|think_fast>` / `<ifm|think_faster>`). The map
+       * below hides xhigh/max from pi (null) and projects minimal→low; the
+       * native side applies the same projection for direct API callers
+       * (none/minimal→low, xhigh/max→high — `normalize_k2_effort`).
+       */
+      thinkingLevelMap: {
+        minimal: 'low',
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+        xhigh: null,
+        max: null,
+      },
+      fallbackContextWindow: 524288,
+    },
+    launchPreset: {
+      sampling: K2_SAMPLING_DEFAULTS,
       maxOutputTokens: 32768,
     },
   },

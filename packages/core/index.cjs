@@ -858,6 +858,7 @@ module.exports.GenerationResult = nativeBinding.GenerationResult;
 module.exports.GrpoTrainingEngine = nativeBinding.GrpoTrainingEngine;
 module.exports.GRPOTrainingEngine = nativeBinding.GRPOTrainingEngine;
 module.exports.HarrierModel = nativeBinding.HarrierModel;
+module.exports.K2HorizonModel = nativeBinding.K2HorizonModel;
 module.exports.Lfm2Model = nativeBinding.Lfm2Model;
 module.exports.MuseGlimmerModel = nativeBinding.MuseGlimmerModel;
 module.exports.MxArray = nativeBinding.MxArray;

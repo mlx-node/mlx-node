@@ -2641,6 +2641,155 @@ pub(crate) mod recipe {
         }
     }
 
+    /// K2-Horizon (IFM `K2HorizonForCausalLM`): compressed-tensors block-FP8
+    /// → dense target dtype → the generic quantizer re-packs (mxfp8 intended).
+    ///
+    /// The shipped checkpoint stores every linear `.weight` as F8_E4M3 bytes
+    /// (loaded as `Uint8`) plus a BF16 `.weight_scale` `[N/128, K/128]`
+    /// block-scale companion; `embed_tokens`, `lm_head`, and the grouped-norm
+    /// weights ship dense BF16. `owns_dtype_cast` keeps the raw U8 storage and
+    /// BF16 scales untouched until this sanitize dequantizes each pair via
+    /// `dequant_fp8` — the same 128×128 block broadcast as the
+    /// `weight_scale_inv` path (compressed-tensors' `weight_scale` differs
+    /// only in name). A direct E4M3→mxfp8 repack is intentionally NOT done:
+    /// the BF16 block scale cannot express mxfp8's per-32-element E8M0 scales
+    /// losslessly, so dequantize→requantize is the only correct path.
+    pub(crate) struct K2HorizonRecipe;
+
+    impl ConversionRecipe for K2HorizonRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["k2_horizon"]
+        }
+
+        fn owns_dtype_cast(&self) -> bool {
+            true
+        }
+
+        fn embed_quantizable(&self) -> bool {
+            // The loader's `load_embedding_affine_or_bf16` packs the token
+            // embedding (gather-then-dequantize on lookup).
+            true
+        }
+
+        fn sym8_supported(&self) -> bool {
+            // Every `LinearProj` dispatches sym8.
+            true
+        }
+
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            _config: &serde_json::Value,
+            target_dtype_str: &str,
+            _tie_word_embeddings: bool,
+            verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let target_dtype = match target_dtype_str {
+                "float32" | "f32" => DType::Float32,
+                "float16" | "f16" => DType::Float16,
+                "bfloat16" | "bf16" => DType::BFloat16,
+                other => {
+                    warn!("Unknown target dtype '{other}', defaulting to bfloat16");
+                    DType::BFloat16
+                }
+            };
+
+            let mut out = weights;
+
+            // Step 1 — dequantize every compressed-tensors block-FP8 pair:
+            // `*.weight` (Uint8 E4M3) + `*.weight_scale` (BF16 [N/128, K/128])
+            // via the shared helper (f32 scale upcast + orphan-scale error).
+            crate::engine::persistence::dequant_fp8_block_scale(&mut out, target_dtype)?;
+
+            // Step 2 — cast every remaining floating-point tensor to the
+            // target dtype. Quant sidecars (`.scales`, `.biases`) and packed
+            // `.weight`s that carry a `.scales` companion pass through
+            // untouched (an already-affine-quantized source stays loadable);
+            // sym8 `.scales` follow the shared normalize/preserve rule.
+            let quantized_bases: HashSet<String> = out
+                .keys()
+                .filter(|k| k.ends_with(".scales"))
+                .map(|k| k.strip_suffix(".scales").unwrap_or(k.as_str()).to_string())
+                .collect();
+            let keys: Vec<String> = out.keys().cloned().collect();
+            for k in keys {
+                if k.ends_with(".biases") {
+                    continue;
+                }
+                if k.ends_with(".scales") {
+                    if let Sym8ScalesCastAction::NormalizeToF32 =
+                        sym8_scales_cast_action(&k, &out)?
+                        && let Some(v) = out.get(&k)
+                    {
+                        let normalized = v.astype(DType::Float32)?;
+                        out.insert(k, normalized);
+                    }
+                    continue;
+                }
+                if let Some(base) = k.strip_suffix(".weight")
+                    && quantized_bases.contains(base)
+                {
+                    continue;
+                }
+                let Some(v) = out.get(&k) else {
+                    continue;
+                };
+                let dt = v.dtype()?;
+                if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16)
+                    && dt != target_dtype
+                {
+                    let converted = v.astype(target_dtype)?;
+                    out.insert(k, converted);
+                }
+            }
+
+            // Step 3 — root-cause backstop: the converter must never emit a
+            // non-float `.weight` the loader misreads as dense. K2's
+            // always-dense tensor classes are the norms (`*layernorm.weight`
+            // and `norm.weight` — both covered by the `norm.weight` suffix)
+            // plus the rotary buffers (dropped by the loader, never loaded).
+            // Every other non-float weight must carry a quant sidecar.
+            let weight_keys: Vec<String> = out
+                .keys()
+                .filter(|k| k.ends_with(".weight"))
+                .cloned()
+                .collect();
+            for k in &weight_keys {
+                let base = k.strip_suffix(".weight").unwrap_or(k);
+                let Some(v) = out.get(k) else {
+                    continue;
+                };
+                let dt = v.dtype()?;
+                if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) {
+                    continue;
+                }
+                if k.ends_with("norm.weight") {
+                    return Err(Error::from_reason(format!(
+                        "k2_horizon convert: non-float weight '{k}' ({dt:?}) on an \
+                         always-dense tensor class (grouped RMSNorm) — these are \
+                         never quantized; convert from an unquantized checkpoint instead"
+                    )));
+                }
+                if !out.contains_key(&format!("{base}.scales"))
+                    && !out.contains_key(&format!("{base}.weight_scale_inv"))
+                    && !out.contains_key(&format!("{base}.weight_scale"))
+                {
+                    return Err(Error::from_reason(format!(
+                        "k2_horizon convert: non-float weight '{k}' ({dt:?}) has no quant \
+                         sidecar (.scales / .weight_scale_inv / .weight_scale) — \
+                         pre-quantized source is unsupported; convert from an \
+                         unquantized checkpoint instead"
+                    )));
+                }
+            }
+
+            if verbose {
+                info!("  After k2_horizon sanitization: {} tensors", out.len());
+            }
+            Ok(out)
+        }
+    }
+
     type RecipeFactory = fn() -> Box<dyn ConversionRecipe>;
 
     /// One row per convertible family: the exact HuggingFace `model_type`
@@ -2658,6 +2807,7 @@ pub(crate) mod recipe {
         (&["muse_glimmer"], || Box::new(MuseGlimmerRecipe)),
         (&["gemma4", "gemma4_unified"], || Box::new(Gemma4Recipe)),
         (&["nemotron_h"], || Box::new(NemotronHRecipe)),
+        (&["k2_horizon"], || Box::new(K2HorizonRecipe)),
     ];
 
     /// Every convertible `model_type` the registry accepts, in dispatch order
@@ -11555,6 +11705,7 @@ mod tests {
                 "gemma4",
                 "gemma4_unified",
                 "nemotron_h",
+                "k2_horizon",
             ],
             "registry key order feeds the unknown-model-type error text"
         );
@@ -11574,7 +11725,7 @@ mod tests {
                 r.owns_dtype_cast(),
                 matches!(
                     mt,
-                    "qwen3_5_moe" | "qwen3_5" | "lfm2_moe" | "lfm2" | "nemotron_h"
+                    "qwen3_5_moe" | "qwen3_5" | "lfm2_moe" | "lfm2" | "nemotron_h" | "k2_horizon"
                 ),
                 "{mt}: owns_dtype_cast mismatch vs inline has_custom_sanitizer"
             );
@@ -11582,7 +11733,7 @@ mod tests {
             // embed_quantizable must match the packed-embedding allowlist.
             assert_eq!(
                 r.embed_quantizable(),
-                matches!(mt, "qwen3_asr" | "lfm2" | "lfm2_moe"),
+                matches!(mt, "qwen3_asr" | "lfm2" | "lfm2_moe" | "k2_horizon"),
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 
@@ -11592,7 +11743,7 @@ mod tests {
                 r.sym8_supported(),
                 matches!(
                     mt,
-                    "qwen3_5" | "qwen3_5_moe" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
+                    "qwen3_5" | "qwen3_5_moe" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified" | "k2_horizon"
                 ),
                 "{mt}: sym8_supported mismatch vs inline sym8 allowlist"
             );

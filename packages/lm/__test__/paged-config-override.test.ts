@@ -222,6 +222,7 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
         'lfm2',
         'lfm2_moe',
         'nemotron_h',
+        'k2_horizon',
       ].sort(),
     );
   });

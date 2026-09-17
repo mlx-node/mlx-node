@@ -78,6 +78,8 @@
 //! sequential decode flip the argmax → token streams diverge from the
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
+#[cfg(target_os = "macos")]
+use std::cell::Cell;
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
@@ -244,20 +246,18 @@ impl KvTensorMeta {
     /// production `update_keys_values` path; tests construct `KvTensorMeta`
     /// directly so they don't need the MLX runtime.
     pub(crate) fn from_array(array: &MxArray, label: &str) -> Result<Self, String> {
-        let ndim = array
-            .ndim()
-            .map_err(|e| format!("{label}.ndim() failed: {e}"))?;
-        let mut shape = Vec::with_capacity(ndim as usize);
-        for axis in 0..ndim {
-            let dim = array
-                .shape_at(axis)
-                .map_err(|e| format!("{label}.shape_at({axis}) failed: {e}"))?;
-            shape.push(dim);
-        }
+        let shape = array
+            .shape()
+            .map_err(|e| format!("{label}.shape() failed: {e}"))?
+            .to_vec();
         let dtype = array
             .dtype()
             .map_err(|e| format!("{label}.dtype() failed: {e}"))?;
-        Ok(Self { ndim, shape, dtype })
+        Ok(Self {
+            ndim: shape.len() as u32,
+            shape,
+            dtype,
+        })
     }
 }
 
@@ -1879,6 +1879,20 @@ pub struct PagedKVCacheAdapter {
     /// map holds exactly one `1.0` entry per layer per kind.
     scale_arrays: std::collections::HashMap<(u32, bool, u32), MxArray>,
 
+    /// Shared `[1]` fp32 `1.0` scale array returned by
+    /// [`Self::k_scale_array`] / [`Self::v_scale_array`] when no scale
+    /// manager is installed. The decode write path requests a K and a V
+    /// scale per layer per token, so allocating a fresh constant array at
+    /// each call produced ~2×num_layers node creations per step.
+    #[cfg(target_os = "macos")]
+    unit_kv_scale_array: MxArray,
+
+    /// Last `(max_context_len, stripes)` resolved by
+    /// [`Self::resolve_grouped_d128_stripes`]. The FFI probes device memory
+    /// ceilings, so resolving once per token instead of once per layer
+    /// avoids ~num_layers-1 redundant probes per step.
+    #[cfg(target_os = "macos")]
+    d128_stripe_plan_cache: Cell<Option<(u32, u32)>>,
     /// Cached per-prefill-chunk metadata for the MLX `paged_attention`
     /// bridge. The metadata is identical for every full-attention layer in a
     /// chunk, so rebuilding a duplicated block table per layer would make the
@@ -2036,7 +2050,7 @@ struct WriteSlotMappingCache {
     token_count: u32,
     first_logical_position: u32,
     num_tokens: u32,
-    block_count: usize,
+    physical_revision: u64,
     first_slot: i64,
     last_slot: i64,
     slot_mapping: MxArray,
@@ -2237,6 +2251,9 @@ impl PagedKVCacheAdapter {
         };
         #[cfg(target_os = "macos")]
         let num_layers = layer_kv_pool.num_layers();
+        #[cfg(target_os = "macos")]
+        let unit_kv_scale_array = MxArray::from_float32(&[1.0], &[1])
+            .map_err(|e| format!("unit K/V scale array: {e}"))?;
         Ok(Self {
             allocator,
             layer_kv_pool,
@@ -2261,6 +2278,10 @@ impl PagedKVCacheAdapter {
             #[cfg(target_os = "macos")]
             scale_manager: None,
             scale_arrays: std::collections::HashMap::new(),
+            #[cfg(target_os = "macos")]
+            unit_kv_scale_array,
+            #[cfg(target_os = "macos")]
+            d128_stripe_plan_cache: Cell::new(None),
             #[cfg(target_os = "macos")]
             prefill_attention_inputs_cache: None,
             #[cfg(target_os = "macos")]
@@ -4450,6 +4471,48 @@ impl PagedKVCacheAdapter {
         self.record_tokens(tokens)
     }
 
+    /// Record a not-yet-drained decode token as a placeholder so the
+    /// submit-ahead decode arm can build this step's forward BEFORE the
+    /// sampled id reaches the host. Routes through
+    /// [`Self::record_tokens`] so lazy block growth, the aux-prefix prime
+    /// check, and block-table accounting all run identically — only the
+    /// stored id differs. `u32::MAX` is the sentinel: it can never be a
+    /// valid token id, and the record-first contract means the KV write
+    /// slot derives from the recorded token COUNT, never the id value.
+    ///
+    /// The placeholder must be resolved before any reader consumes
+    /// `request_tokens` VALUES: [`Self::patch_last_recorded_token`] writes
+    /// the real id once the drain lands, [`Self::rollback_last_tokens`]
+    /// drops the record on a terminal step. Mid-decode readers (write-slot
+    /// derivation, `seq_lens`) consult `len()` only.
+    pub fn record_placeholder_token(&mut self) -> Result<(), String> {
+        self.record_tokens(&[u32::MAX])
+    }
+
+    /// Patch the most recently recorded token in place. Pair for
+    /// [`Self::record_placeholder_token`]: the submit-ahead decode arm
+    /// records `u32::MAX` before the sampled id is drained, then writes
+    /// the real id here once the host read lands. Callers MUST patch (or
+    /// roll back) before any prefix-hash / finalize path reads
+    /// `request_tokens` values — mid-decode readers use `len()` only.
+    ///
+    /// Errors if the active request has no recorded tokens, or if the
+    /// tail record is NOT the placeholder sentinel — a mispaired call
+    /// (double-commit, patch after a real `record_tokens`) must fail
+    /// loud rather than clobber a real id that feeds `continue_turn`'s
+    /// `starts_with` and prefix hashing.
+    pub fn patch_last_recorded_token(&mut self, token: u32) -> Result<(), String> {
+        let last = self
+            .request_tokens
+            .last_mut()
+            .ok_or_else(|| "patch_last_recorded_token: no recorded tokens to patch".to_string())?;
+        if *last != u32::MAX {
+            return Err("patch_last_recorded_token: tail is not a placeholder record".to_string());
+        }
+        *last = token;
+        Ok(())
+    }
+
     /// Roll back the most recent `n` tokens from `request_tokens` and
     /// `block_table.num_tokens`. Used by the C++ compiled-paged dispatcher
     /// when a forward step fails after `record_tokens` has already advanced
@@ -4629,12 +4692,19 @@ impl PagedKVCacheAdapter {
         num_tokens: u32,
     ) -> Result<(MxArray, i64, i64), String> {
         let token_count = self.request_tokens.len() as u32;
-        let block_count = self.num_allocated_blocks();
+        // Revision is O(1) and tracks every physical mutation of the
+        // block table; a raw block-count scan was O(blocks) per call and
+        // could alias across same-size relayouts.
+        let physical_revision = self
+            .block_table
+            .as_ref()
+            .map(|table| table.physical_revision())
+            .unwrap_or(0);
         if let Some(cache) = self.write_slot_mapping_cache.as_ref()
             && cache.token_count == token_count
             && cache.first_logical_position == first_logical_position
             && cache.num_tokens == num_tokens
-            && cache.block_count == block_count
+            && cache.physical_revision == physical_revision
         {
             return Ok((
                 cache.slot_mapping.clone(),
@@ -4655,7 +4725,7 @@ impl PagedKVCacheAdapter {
             token_count,
             first_logical_position,
             num_tokens,
-            block_count,
+            physical_revision,
             first_slot,
             last_slot,
             slot_mapping: slot_mapping_arr,
@@ -5813,6 +5883,37 @@ impl PagedKVCacheAdapter {
         )
     }
 
+    /// Resolve the grouped-D128 stripe plan for a `ForceD128` decode that
+    /// carried no explicit count: the shared context table clamped by the
+    /// live device/memory ceiling. 0 means "unavailable" — the C++ dispatch
+    /// requires nonzero planned stripes for D128, so it keeps generic V2.
+    #[cfg(target_os = "macos")]
+    fn resolve_grouped_d128_stripes(
+        &self,
+        route_hint: PagedDecodeRouteHint,
+        grouped_stripes: u32,
+        max_context_len: u32,
+    ) -> u32 {
+        if route_hint == PagedDecodeRouteHint::ForceD128 && grouped_stripes == 0 {
+            if let Some((cached_ctx, stripes)) = self.d128_stripe_plan_cache.get()
+                && cached_ctx == max_context_len
+            {
+                return stripes;
+            }
+            let stripes = unsafe {
+                mlx_sys::mlx_paged_grouped_d128_default_stripes(
+                    max_context_len,
+                    self.layer_kv_pool.num_layers() as u32,
+                )
+            };
+            self.d128_stripe_plan_cache
+                .set(Some((max_context_len, stripes)));
+            stripes
+        } else {
+            grouped_stripes
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gather_kv_for_decode_graph_batched_with_plan(
@@ -5880,6 +5981,8 @@ impl PagedKVCacheAdapter {
 
         let (block_tables, seq_lens, max_context_len) =
             self.decode_attention_inputs_batched(seq_ids)?;
+        let grouped_stripes =
+            self.resolve_grouped_d128_stripes(route_hint, grouped_stripes, max_context_len);
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -6128,6 +6231,11 @@ impl PagedKVCacheAdapter {
         }
 
         let (block_table, seq_lens, block_count) = self.decode_attention_inputs()?;
+        let grouped_stripes = self.resolve_grouped_d128_stripes(
+            route_hint,
+            grouped_stripes,
+            self.current_token_count(),
+        );
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -9041,6 +9149,10 @@ impl PagedKVCacheAdapter {
     /// (`fp8_value = fp32_value * 1.0`) while leaving the production wiring
     /// point in place for future FP8 enablement.
     pub fn k_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
+        #[cfg(target_os = "macos")]
+        if self.scale_manager.is_none() {
+            return Ok(self.unit_kv_scale_array.clone());
+        }
         let scale = self.lookup_k_scale(layer_idx)?;
         self.cached_scale_array(layer_idx, true, scale)
     }
@@ -9048,6 +9160,10 @@ impl PagedKVCacheAdapter {
     /// Return a `[1]` fp32 V scale MxArray for `layer_idx`. See
     /// [`Self::k_scale_array`] for the FP8 contract.
     pub fn v_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
+        #[cfg(target_os = "macos")]
+        if self.scale_manager.is_none() {
+            return Ok(self.unit_kv_scale_array.clone());
+        }
         let scale = self.lookup_v_scale(layer_idx)?;
         self.cached_scale_array(layer_idx, false, scale)
     }
@@ -9727,6 +9843,56 @@ mod tests {
             )
             .expect("sliding adapter ctor must succeed"),
         )
+    }
+
+    /// Submit-ahead decode primitives: `record_placeholder_token` grows
+    /// the cursor/block table exactly like a real record (the write slot
+    /// is count-derived, the sentinel value is never consulted),
+    /// `patch_last_recorded_token` commits the real id in place, and a
+    /// terminal `rollback_last_tokens(1)` removes the placeholder
+    /// wholesale — net zero logical state.
+    #[test]
+    fn placeholder_token_record_patch_and_rollback() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 8), 8) else {
+            return;
+        };
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.record_tokens(&[10, 11, 12]).unwrap();
+        let block_ids_before = adapter.block_table().unwrap().block_ids();
+
+        // Placeholder advances the cursor + table like a real record.
+        adapter.record_placeholder_token().unwrap();
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.request_tokens(), &[10, 11, 12, u32::MAX]);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+
+        // Commit patches the sentinel in place; the cursor does not move.
+        adapter.patch_last_recorded_token(42).unwrap();
+        assert_eq!(adapter.request_tokens(), &[10, 11, 12, 42]);
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+
+        // A terminal-step rollback drops a fresh placeholder wholesale —
+        // the loop's ordering is commit-then-rollback: net zero.
+        adapter.record_placeholder_token().unwrap();
+        assert_eq!(adapter.current_token_count(), 5);
+        adapter.patch_last_recorded_token(99).unwrap();
+        adapter.rollback_last_tokens(1).unwrap();
+        assert_eq!(adapter.request_tokens(), &[10, 11, 12, 42]);
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+        assert_eq!(adapter.block_table().unwrap().block_ids(), block_ids_before);
+
+        // Patching with nothing recorded is an error, not a panic.
+        adapter.reset_for_new_request(2).unwrap();
+        assert!(adapter.patch_last_recorded_token(7).is_err());
+
+        // A mispaired commit — patching on top of a REAL record — must
+        // also error rather than clobber an id that feeds
+        // `continue_turn`'s `starts_with` and prefix hashing.
+        adapter.record_tokens(&[5, 6]).unwrap();
+        assert!(adapter.patch_last_recorded_token(7).is_err());
+        assert_eq!(adapter.request_tokens(), &[5, 6]);
     }
 
     #[test]
@@ -15982,6 +16148,136 @@ mod tests {
                 assert_eq!(adapter.current_token_count(), N);
             }
         }
+    }
+
+    /// K2-Horizon geometry (32q/8kv, head_size 128, GQA 4) opts into the
+    /// grouped striped kernel via `ForceD128`. Both the generic V2 route and
+    /// the grouped route (adapter-resolved stripes) must match an
+    /// independent FP64 softmax reference; the grouped output must also
+    /// differ bitwise from generic, proving the dispatch actually left the
+    /// generic path (stripe partitioning changes accumulation order).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn k2_geometry_grouped_d128_matches_dense_reference() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        const N: u32 = 2579;
+        const HQ: usize = 32;
+        const HKV: usize = 8;
+        const D: usize = 128;
+        let data = |len: usize, stride: usize, period: usize| {
+            (0..len)
+                .map(|i| ((i * stride % period) as f32 - (period / 2) as f32) / 64.0)
+                .collect::<Vec<_>>()
+        };
+        // These binary fractions are exactly representable in BF16.
+        let k_data = data(N as usize * HKV * D, 13, 113);
+        let v_data = data(N as usize * HKV * D, 17, 127);
+        let k = MxArray::from_float32(&k_data, &[N as i64, HKV as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let v = MxArray::from_float32(&v_data, &[N as i64, HKV as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let scale = 1.0 / (D as f32).sqrt();
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: HKV as u32,
+            head_size: D as u32,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(8192),
+            max_batch_size: Some(1),
+        };
+        let pool = Arc::new(
+            mlx_paged_attn::LayerKVPool::new(
+                config,
+                512,
+                512,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            )
+            .unwrap(),
+        );
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(512, 512, 16)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).unwrap();
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
+        adapter.update_keys_values(0, &k, &v, 0).unwrap();
+
+        let q_data = data(HQ * D, 19, 109);
+        let q = MxArray::from_float32(&q_data, &[1, HQ as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Generic route (Auto cannot select grouped for K2's shape) and the
+        // opt-in grouped route with adapter-resolved stripes.
+        let generic = adapter
+            .gather_kv_for_decode_graph_batched(0, &q, &[7], scale, 0.0)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let grouped = adapter
+            .gather_kv_for_decode_graph_batched_with_plan(
+                0,
+                &q,
+                &[7],
+                scale,
+                0.0,
+                PagedDecodeRouteHint::ForceD128,
+                0,
+            )
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        // FP64 softmax reference over the full [0, N) window.
+        for head in 0..HQ {
+            let kv_head = head / (HQ / HKV);
+            let q_base = head * D;
+            let scores: Vec<f64> = (0..N as usize)
+                .map(|pos| {
+                    let k_base = (pos * HKV + kv_head) * D;
+                    (0..D)
+                        .map(|d| f64::from(q_data[q_base + d]) * f64::from(k_data[k_base + d]))
+                        .sum::<f64>()
+                        * f64::from(scale)
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let probs: Vec<f64> = scores.iter().map(|x| (x - max).exp()).collect();
+            let total: f64 = probs.iter().sum();
+            for d in 0..D {
+                let expected = probs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| p * f64::from(v_data[(i * HKV + kv_head) * D + d]))
+                    .sum::<f64>()
+                    / total;
+                for (route, output) in [("generic", &generic), ("grouped", &grouped)] {
+                    let got = f64::from(output[q_base + d]);
+                    assert!(
+                        got.is_finite() && (got - expected).abs() < 0.003,
+                        "route={route} head={head} d={d}: {got} != {expected}"
+                    );
+                }
+            }
+        }
+
+        // Route evidence: grouped stripe partitioning rounds differently.
+        let identical = generic.iter().zip(&grouped).all(|(a, b)| a == b);
+        assert!(
+            !identical,
+            "ForceD128 output is bit-identical to generic V2; the grouped \
+             kernel did not run"
+        );
+        assert_eq!(adapter.current_token_count(), N);
     }
 
     /// The first verifier query must retain its whole window, even when a

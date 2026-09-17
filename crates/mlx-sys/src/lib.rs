@@ -1454,8 +1454,20 @@ unsafe extern "C-unwind" {
     pub fn mlx_paged_grouped_d512_test_probe_reset();
     pub fn mlx_paged_grouped_d512_test_probe_count() -> u64;
 
+    /// Reset/read the route-hint grouped D128 probe (requires
+    /// `MLX_PAGED_GROUPED_D128_TEST_PROBE=1` in the environment).
+    pub fn mlx_paged_grouped_d128_test_probe_reset();
+    pub fn mlx_paged_grouped_d128_test_probe_count() -> u64;
+
     /// Maximum legal D128 partitions under live pipeline, storage and context limits.
     pub fn mlx_paged_grouped_d128_max_stripes(context: u32, attention_layers: u32) -> u32;
+
+    /// Context-table D128 stripe count clamped by `mlx_paged_grouped_d128_max_stripes`.
+    /// Returns 0 when the grouped route is unavailable (dispatch then keeps generic V2).
+    pub fn mlx_paged_grouped_d128_default_stripes(
+        context: u32,
+        attention_layers: u32,
+    ) -> u32;
 
     /// Return 1 when the canonical direct-read D512 Metal pipeline, reducer,
     /// and threadgroup limits

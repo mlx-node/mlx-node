@@ -72,6 +72,37 @@ pub(crate) trait DecodeStep {
         self.forward(input_ids)
     }
 
+    /// Whether this stepper supports the submit-ahead pipelined arm of
+    /// [`crate::engine::decode::run_decode_loop`]: it tolerates a
+    /// placeholder record before the token id is known and provides
+    /// commit/rollback for the speculative step. Pure-KV families only —
+    /// steppers with non-rewindable state (conv, GDN recurrent, MTP) must
+    /// keep the default.
+    fn supports_token_pipeline(&self) -> bool {
+        false
+    }
+
+    /// Record the not-yet-known input token (placeholder) and build this
+    /// step's forward. Semantics equal [`DecodeStep::forward_with_token`]
+    /// except the real token id arrives later via
+    /// [`DecodeStep::commit_lazy_token`] / [`DecodeStep::rollback_lazy_step`].
+    /// `input_ids` is the caller's lazy `[1, 1]` sample reshape — the
+    /// stepper must consume it as graph input, never drain it.
+    fn forward_with_lazy_token(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        Err(Error::from_reason("forward_with_lazy_token: not supported"))
+    }
+
+    /// Commit the pending placeholder record with the real sampled id.
+    fn commit_lazy_token(&mut self, _token_id: u32) -> Result<()> {
+        Err(Error::from_reason("commit_lazy_token: not supported"))
+    }
+
+    /// Roll back the pending placeholder record (terminal/cancel path).
+    /// Must leave adapter + stepper state exactly as if the step never ran.
+    fn rollback_lazy_step(&mut self) -> Result<()> {
+        Err(Error::from_reason("rollback_lazy_step: not supported"))
+    }
+
     /// Schedule async evaluation for this step's sampled token (and, on
     /// the budget-forced path, the untouched logits so the lazy graph
     /// stays bounded).
@@ -357,6 +388,15 @@ pub(crate) struct FinalizeArgs<'a> {
     pub finish_reason: String,
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<&'a str>,
+    /// Alternate close ids that count as the reasoning boundary (see
+    /// [`ChatBackend::think_end_for_turn`]). Empty unless the family has
+    /// more than one close tag. These are honored by
+    /// `ReasoningTracker`'s token-level boundary detection — the
+    /// DEFAULT `finalize_turn` still checks `think_end_id` only, so a
+    /// family with non-empty extras must override `finalize_turn` (as
+    /// K2-Horizon does: its split also needs the extra close-tag
+    /// STRINGS, which these args do not carry).
+    pub think_end_extra_ids: &'a [u32],
     pub performance: Option<PerformanceMetrics>,
     pub include_reasoning: bool,
     pub thinking_enabled: bool,
@@ -367,8 +407,8 @@ pub(crate) struct FinalizeArgs<'a> {
 /// Resolved thinking-mode state for one turn.
 ///
 /// Produced by [`ChatBackend::thinking_setup`]; feeds
-/// `ReasoningTracker::from_setup(&setup, think_end_id)` at the call
-/// sites that currently inline the per-family resolution. `Copy` so it
+/// `ReasoningTracker::from_setup_multi(&setup, think_end_id, extra_ids)`
+/// at the tracker construction sites. `Copy` so it
 /// threads by value into [`WholeTurnArgs`] and the per-family
 /// whole-turn cores without clone churn.
 #[derive(Clone, Copy)]
@@ -383,6 +423,22 @@ pub(crate) struct ThinkingSetup {
     /// budget, else derived via
     /// [`crate::engine::params::default_thinking_budget_for_effort`].
     pub budget: Option<i32>,
+}
+
+/// Per-turn reasoning-close resolution from
+/// [`ChatBackend::think_end_for_turn`].
+pub(crate) struct ThinkEndResolution {
+    /// Primary close token id — the one the thinking budget forces and
+    /// the default finalization path's boundary check uses.
+    pub think_end_id: Option<u32>,
+    /// Its tag string, used for the text-level split at finalize.
+    pub think_end_str: Option<String>,
+    /// ADDITIONAL token ids that also end reasoning without being the
+    /// budget-forced tag: K2's model may close a `<ifm|think_faster>`
+    /// block with a literal `</ifm|think>`, so the tracker must accept
+    /// the whole family while the forced token stays the rendered one.
+    /// Empty for every other family.
+    pub think_end_extra_ids: Vec<u32>,
 }
 
 /// Arguments for [`ChatBackend::save_cache_state`].
@@ -526,7 +582,7 @@ pub(crate) struct WholeTurnArgs<'a> {
     /// Turn's resolved thinking-mode state:
     /// `backend.thinking_setup(&config)` computed ONCE at turn entry. The
     /// specialized executors (paged/speculative/multimodal) build their
-    /// `ReasoningTracker` from this via `ReasoningTracker::from_setup`
+    /// `ReasoningTracker` from this via `ReasoningTracker::from_setup_multi`
     /// instead of recomputing `resolve_enable_thinking` inline.
     pub thinking: ThinkingSetup,
     /// Request-time feature plan resolved once from the model's immutable
@@ -625,6 +681,35 @@ pub(crate) trait ChatBackend {
     /// [`ThinkingSetup`] field docs for the family-specific rules).
     fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup {
         crate::engine::params::resolve(self.policy(), config)
+    }
+
+    /// Resolve the turn's reasoning-close resolution.
+    ///
+    /// Default = the tokenizer-global values (`tok.think_end_id()` /
+    /// `tok.think_end_str()`): every ChatML-family turn closes reasoning
+    /// on the same `</think>` token, so a per-tokenizer answer suffices.
+    /// Families whose close tag is a FUNCTION of the request (K2-Horizon
+    /// picks `</ifm|think>` / `</ifm|think_fast>` / `</ifm|think_faster>`
+    /// by `reasoning_effort`) override this to answer per-turn. The
+    /// resolution feeds `ReasoningTracker` (token-level boundary
+    /// detection + budget forcing) and `FinalizeArgs` (text-level split)
+    /// via `admit_paged_turn` / the paged executor, so both always agree
+    /// on THIS turn's tag.
+    ///
+    /// Called more than once per turn (at admission and again where the
+    /// tracker is built), so it must be a pure function of
+    /// `(config, tokenizer)`: same inputs ⇒ same resolution, no side
+    /// effects.
+    fn think_end_for_turn(
+        &self,
+        _config: &ChatConfig,
+        tok: &Qwen3Tokenizer,
+    ) -> ThinkEndResolution {
+        ThinkEndResolution {
+            think_end_id: tok.think_end_id(),
+            think_end_str: tok.think_end_str().map(str::to_string),
+            think_end_extra_ids: Vec::new(),
+        }
     }
 
     /// Resolve the turn's [`ChatParams`] — sampling configuration,
