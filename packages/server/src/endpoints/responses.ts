@@ -639,7 +639,19 @@ async function handleStreamingNativeWithAbort(
         // duplicate-trim case where finalText is a substring of the
         // streamed text (e.g. native `.trim()` shrinkage). See the
         // companion comment above for the case-distinction rationale.
-        if (hasEmittedMessage && finalText && !tagBuffer.suppressed && !messageText.includes(finalText)) {
+        //
+        // `suppressed` alone is not disqualifying: LFM2's start sentinel
+        // suppresses to stream end (the interior could still fail parsing),
+        // so a successful call leaves post-call prose held in the buffer.
+        // When the final event DID parse calls, emit the held tail so the
+        // delta stream still sums to `output_text.done` — as the Messages
+        // and agent terminal-recovery paths already do.
+        if (
+          hasEmittedMessage &&
+          finalText &&
+          (!tagBuffer.suppressed || hasToolCalls) &&
+          !messageText.includes(finalText)
+        ) {
           const overlap = longestSuffixPrefixOverlap(messageText, finalText);
           const unsent = finalText.slice(overlap);
           if (unsent) {

@@ -759,7 +759,9 @@ impl<'a> PyLiteralParser<'a> {
                         }
                         // Number operand: digits with optional `0x`/`0o`/`0b`
                         // radix, fraction, exponent, `_` separators, `j`. A
-                        // letter glued straight on (`5x`) is a SyntaxError.
+                        // letter glued straight on (`5x`) is a SyntaxError,
+                        // and `_` placement follows PEP 515 (between digits,
+                        // or right after the base prefix).
                         _ if b.is_ascii_digit() => {
                             if b == b'0'
                                 && matches!(
@@ -767,7 +769,13 @@ impl<'a> PyLiteralParser<'a> {
                                     Some(c) if matches!(c, b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
                                 )
                             {
+                                let radix = match self.s[self.pos + 1].to_ascii_lowercase() {
+                                    b'x' => 16,
+                                    b'o' => 8,
+                                    _ => 2,
+                                };
                                 self.pos += 2;
+                                let dstart = self.pos;
                                 while self
                                     .s
                                     .get(self.pos)
@@ -775,7 +783,17 @@ impl<'a> PyLiteralParser<'a> {
                                 {
                                     self.pos += 1;
                                 }
+                                if self.pos == dstart
+                                    || !Self::valid_numeric_underscores(
+                                        &self.s[dstart..self.pos],
+                                        |c| (c as char).is_digit(radix),
+                                        true,
+                                    )
+                                {
+                                    return Err(());
+                                }
                             } else {
+                                let num_start = self.pos;
                                 while self
                                     .s
                                     .get(self.pos)
@@ -817,6 +835,13 @@ impl<'a> PyLiteralParser<'a> {
                                     Some(c) if matches!(c, b'j' | b'J')
                                 ) {
                                     self.pos += 1;
+                                }
+                                if !Self::valid_numeric_underscores(
+                                    &self.s[num_start..self.pos],
+                                    |c| c.is_ascii_digit(),
+                                    false,
+                                ) {
+                                    return Err(());
                                 }
                             }
                             if self.s.get(self.pos).is_some_and(|c| {
@@ -1144,6 +1169,28 @@ impl<'a> PyLiteralParser<'a> {
         Ok(val)
     }
 
+    /// `_` separator placement per PEP 515: a separator must sit between
+    /// two digits (radix digits for base-prefixed literals), except the
+    /// single `_` allowed right after `0x`/`0o`/`0b` (`0x_ff` is legal).
+    /// `after_prefix` marks `s[0]` as the position following a base prefix.
+    fn valid_numeric_underscores(
+        s: &[u8],
+        is_digit: impl Fn(u8) -> bool,
+        after_prefix: bool,
+    ) -> bool {
+        for (i, &c) in s.iter().enumerate() {
+            if c != b'_' {
+                continue;
+            }
+            let next_ok = s.get(i + 1).is_some_and(|&n| is_digit(n));
+            let prev_ok = i > 0 && is_digit(s[i - 1]);
+            if !next_ok || !(prev_ok || (after_prefix && i == 0)) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Number: dec/hex/oct/bin int or float, optional leading `+`/`-` is
     /// handled by the caller (unary op). Leading zeros are tolerated
     /// (vLLM `normalize_leading_zero_ints`).
@@ -1168,6 +1215,13 @@ impl<'a> PyLiteralParser<'a> {
                 } else {
                     break;
                 }
+            }
+            if !Self::valid_numeric_underscores(
+                &self.s[dstart..self.pos],
+                |c| (c as char).is_digit(radix),
+                true,
+            ) {
+                return Err(());
             }
             let digits: String = std::str::from_utf8(&self.s[dstart..self.pos])
                 .map_err(|_| ())?
@@ -1198,6 +1252,10 @@ impl<'a> PyLiteralParser<'a> {
                 b'j' | b'J' => return Err(()), // complex: not JSON
                 _ => break,
             }
+        }
+        if !Self::valid_numeric_underscores(&self.s[start..self.pos], |c| c.is_ascii_digit(), false)
+        {
+            return Err(());
         }
         let text: String = std::str::from_utf8(&self.s[start..self.pos])
             .map_err(|_| ())?
@@ -4149,6 +4207,57 @@ The weather in Tokyo is sunny."#;
             let (text, calls) = parse_tool_calls(&input);
             assert_eq!(calls.len(), 1, "{inner} must produce one call");
             assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(calls[0].arguments.to_string(), want_args, "{inner}");
+            assert_eq!(text, "", "{inner}");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_bad_numeric_separators_rejected() {
+        // Misplaced `_` is a SyntaxError to ast.parse (PEP 515: separators
+        // sit between digits, or directly after a `0x`/`0o`/`0b` prefix).
+        // The whole block must stay verbatim — both as a kwarg value and
+        // as a skipped positional.
+        for inner in [
+            "f(count=1__0)",  // consecutive separators
+            "f(count=1_)",    // trailing separator
+            "f(count=1_.5)",  // separator before `.`
+            "f(count=1._5)",  // separator after `.`
+            "f(count=1e_5)",  // separator before exponent digits
+            "f(count=1_e5)",  // separator after `e`
+            "f(count=0x__f)", // consecutive separators after prefix
+            "f(count=0x_f_)", // trailing separator in radix digits
+            "f(count=0b1_2)", // separator next to a non-radix digit
+            "f(count=0x)",    // radix prefix with no digits
+            "f(1__0, x=1)",   // malformed positional must not promote kwargs
+            "f(1_, x=1)",
+            "f(0x_f_, x=1)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_numeric_separators() {
+        // PEP 515-legal separators still parse — kwarg values normalize by
+        // stripping the `_`s, valid positionals still drop.
+        for (inner, want_args) in [
+            ("f(count=1_000)", "{\"count\":1000}"),
+            ("f(count=1_0.5_0)", "{\"count\":10.5}"),
+            ("f(count=1_0e1)", "{\"count\":100.0}"),
+            ("f(count=0x_ff)", "{\"count\":255}"),
+            ("f(count=0xff_ff)", "{\"count\":65535}"),
+            ("f(count=0b1_0)", "{\"count\":2}"),
+            ("f(count=0o7_7)", "{\"count\":63}"),
+            ("f(1_000, x=1)", "{\"x\":1}"),
+            ("f(0x_ff, x=1)", "{\"x\":1}"),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner} must produce one call");
             assert_eq!(calls[0].arguments.to_string(), want_args, "{inner}");
             assert_eq!(text, "", "{inner}");
         }

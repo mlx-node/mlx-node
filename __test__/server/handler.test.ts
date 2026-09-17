@@ -10351,6 +10351,70 @@ describe('createHandler', () => {
       expect(msgContent.text).toBe('Let me look that up.');
     });
 
+    it('recovers the post-call text tail for a successful suppressed LFM2 call', async () => {
+      // LFM2's <|tool_call_start|> suppresses to stream end (call validity is
+      // only known at the final event), so post-call prose never reaches a
+      // delta mid-stream. The terminal recovery must still emit it so the
+      // accumulated deltas equal `response.output_text.done`.
+      const streamEvents = [
+        { done: false, text: 'before ', isReasoning: false },
+        { done: false, text: '<|tool_call_start|>[get_weather(city=', isReasoning: false },
+        { done: false, text: '"SF")]<|tool_call_end|>after', isReasoning: false },
+        {
+          done: true,
+          text: 'before after',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_lfm2',
+              name: 'get_weather',
+              arguments: '{"city":"SF"}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: 'before <|tool_call_start|>[get_weather(city="SF")]<|tool_call_end|>after',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('before after');
+      // The held post-call prose is emitted as a terminal delta — deltas
+      // sum to the advertised done text.
+      expect(allDeltaText).toBe('before after');
+      expect(allDeltaText).not.toContain('<|tool_call_start|>');
+    });
+
     it('skips message item when final text is empty and tool calls are present', async () => {
       // Model immediately produces tool-call markup, no visible text
       const streamEvents = [
