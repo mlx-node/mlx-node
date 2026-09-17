@@ -21,10 +21,30 @@ fn main() {
     compile_metal_shaders();
 }
 
+/// Deployment-target floor for the metallib when `MACOSX_DEPLOYMENT_TARGET`
+/// is unset — kept equal to `crates/mlx-sys/build.rs`'s constant.
+///
+/// Without a floor the metal compiler targets the BUILD HOST: a build on
+/// macOS 27 emits `air64_v29` ("language version 4.1") shaders that a macOS
+/// 26 host cannot load — the paged-attn library is loaded lazily (first KV
+/// pool construction), so the failure surfaces as an HTTP 500 from the
+/// server long after the app itself started. Measured: default
+/// `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
+/// `-mmacosx-version-min=26.0` = `air64_v28-apple-macosx26.0.0`.
+const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.0";
+
+fn macos_deployment_target() -> String {
+    env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| MACOS_DEPLOYMENT_TARGET_FLOOR.to_string())
+}
+
 fn compile_metal_shaders() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
     let metal_dir = PathBuf::from(&manifest_dir).join("metal");
+    let deployment_target = macos_deployment_target();
 
     // Metal source files to compile
     let metal_files = [
@@ -43,7 +63,9 @@ fn compile_metal_shaders() {
 
         println!("cargo:rerun-if-changed={}", src_path.display());
 
-        // Compile Metal to AIR
+        // Compile Metal to AIR. The min-OS flag pins the AIR language
+        // version to the deployment floor — see MACOS_DEPLOYMENT_TARGET_FLOOR.
+        let min_os_flag = format!("-mmacosx-version-min={deployment_target}");
         let status = Command::new("xcrun")
             .args([
                 "-sdk",
@@ -59,6 +81,7 @@ fn compile_metal_shaders() {
                 // Optimization flags
                 "-O3",
                 "-ffast-math",
+                &min_os_flag,
             ])
             .status()
             .expect("Failed to execute xcrun metal");

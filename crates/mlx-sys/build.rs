@@ -10,17 +10,32 @@ fn metal_toolchain_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Explicit deployment-target floor for the macOS build products. When unset,
-/// every toolchain stamps its own default and the artifact floor silently
-/// tracks the build machine: the metal compiler uses the SDK's default min-OS
-/// and MLX's CMake defaults `CMAKE_OSX_DEPLOYMENT_TARGET` to the build host's
-/// macOS version. Setting `MACOSX_DEPLOYMENT_TARGET` (already honored by
-/// rustc and cc for the Rust side) makes the floor deliberate for the CMake
-/// and metallib products too.
+/// Deployment-target floor for the macOS build products when
+/// `MACOSX_DEPLOYMENT_TARGET` is unset.
+///
+/// The project's floor is macOS 26.0: one published artifact carries the NAX
+/// kernels behind a runtime gate while the metallib links at the floor (see
+/// the `MLX_METAL_FORCE_NAX` block below). Leaving the default to the
+/// toolchains breaks that promise silently — MLX's CMake and `xcrun metal`
+/// both target the BUILD HOST, so a build on macOS 27 emits `air64_v29`
+/// shaders ("language version 4.1") that a macOS 26 host refuses to load at
+/// runtime while the rest of the app launches fine (measured: default
+/// `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
+/// `-mmacosx-version-min=26.0` = `air64_v28-apple-macosx26.0.0`). This MLX
+/// revision's kernels also fail to COMPILE against the newer default
+/// language version, so the floor is a build requirement, not a preference.
+const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.0";
+
+/// Explicit deployment-target floor for the macOS build products. Setting
+/// `MACOSX_DEPLOYMENT_TARGET` (already honored by rustc and cc for the Rust
+/// side) overrides it for the CMake and metallib products too.
 fn macos_deployment_target() -> Option<String> {
-    env::var("MACOSX_DEPLOYMENT_TARGET")
-        .ok()
-        .filter(|v| !v.is_empty())
+    Some(
+        env::var("MACOSX_DEPLOYMENT_TARGET")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| MACOS_DEPLOYMENT_TARGET_FLOOR.to_string()),
+    )
 }
 
 /// Compile the paged-attention `.metal` sources into
