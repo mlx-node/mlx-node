@@ -1,5 +1,7 @@
 use napi_derive::napi;
 
+use crate::models::paged_config::PagedCacheConfig;
+
 /// Name of the env var that overrides `paged_cache_initial_memory_mb` at
 /// load time (u32 MiB). Env wins over config; unset both keeps the
 /// historical fixed pool (initial == max).
@@ -99,7 +101,7 @@ pub(crate) fn resolve_qwen35_paged_default(
     match env_override {
         Some("1") | Some("true") | Some("TRUE") => Some(true),
         Some("0") | Some("false") | Some("FALSE") => Some(false),
-        _ => Some(explicit.unwrap_or(true)),
+        _ => PagedCacheConfig::resolve_use_paged_default(explicit, true),
     }
 }
 
@@ -331,6 +333,25 @@ impl Qwen3_5Config {
 
         // 2 bytes per param (bf16)
         total_params * 2
+    }
+
+    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`]
+    /// (all five fields — qwen3_5 is the family that owns
+    /// `paged_cache_initial_memory_mb`).
+    ///
+    /// The fields stay declared inline on the struct: `Qwen3_5Config` is a
+    /// `#[napi(object)]` bridge type whose generated TS interface is flat
+    /// camelCase, and `Qwen3_5Config { .. }` literals exist outside this
+    /// file (persistence's raw-value parse, test helpers) —
+    /// `#[serde(flatten)]` would break both contracts.
+    pub fn paged_cache_config(&self) -> PagedCacheConfig {
+        PagedCacheConfig {
+            paged_cache_memory_mb: self.paged_cache_memory_mb,
+            paged_cache_initial_memory_mb: self.paged_cache_initial_memory_mb,
+            paged_block_size: self.paged_block_size,
+            use_block_paged_cache: self.use_block_paged_cache,
+            persist_paged_cache: self.persist_paged_cache,
+        }
     }
 }
 

@@ -2,14 +2,14 @@ use std::sync::OnceLock;
 
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
-use crate::array::mask::create_causal_mask;
+use crate::models::attention_core::{
+    BatchedDecodeLabels, CacheHitPrefillRoute, PagedAttentionCore,
+};
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
-use crate::transformer::paged_policy::{
-    gather_kv_for_decode_with_fallback, warn_once_on_sync_fallback, write_kv_chunk,
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedDecodeRouteHint, PagedKVCacheAdapter, SeqId,
 };
 use napi::bindgen_prelude::*;
 
@@ -195,6 +195,34 @@ impl Lfm2Attention {
         self.out_proj.forward(&output)
     }
 
+    /// The shared paged skeleton with LFM2's parameterization: per-head
+    /// Q/K RMSNorm on `[B,T,H,D]` before the transpose (V has no norm),
+    /// scalar-offset RoPE, `Auto` decode route, and the opt-in
+    /// `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION` bridge for cache-hit
+    /// prefill (`gather_kv_for_prefill_chunk`, batch-1 only, falling back
+    /// to the `gather_kv_for_prefill_sdpa` graph-SDPA gather then
+    /// `read_kv_range` + explicit-mask SDPA).
+    fn paged_core(&self) -> PagedAttentionCore<'_> {
+        PagedAttentionCore {
+            q_proj: &self.q_proj,
+            k_proj: &self.k_proj,
+            v_proj: &self.v_proj,
+            o_proj: &self.out_proj,
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+            qk_norm: Some((&self.q_layernorm, &self.k_layernorm)),
+            rope: Some(&self.rope),
+            kv_io_dtype: None,
+            decode_route_hint: PagedDecodeRouteHint::Auto,
+            cache_hit_prefill: CacheHitPrefillRoute::BridgeIfBatch1ThenGraphSdpa {
+                gate: paged_prefill_paged_attention_enabled,
+            },
+            family: "lfm2",
+        }
+    }
+
     /// Forward pass driven by `PagedKVCacheAdapter` for full-attention
     /// LFM2 layers.
     ///
@@ -226,218 +254,15 @@ impl Lfm2Attention {
         is_prefill: bool,
         prefill_mask: Option<&MxArray>,
     ) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
-
-        // 1. Q/K/V projections
-        let queries = self.q_proj.forward(x)?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
-
-        // 2. Reshape to [B, T, H, D] and apply per-head layernorm to Q/K
-        let queries =
-            queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
-        let queries = self.q_layernorm.forward(&queries)?;
-        let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
-
-        let keys = keys.reshape(&[
-            batch,
-            seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let keys = self.k_layernorm.forward(&keys)?;
-        let keys_bhtd = keys.transpose(Some(&[0, 2, 1, 3]))?;
-
-        let values = values.reshape(&[
-            batch,
-            seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
-
-        // 3. Apply RoPE using `first_logical_position` (the adapter's
-        //    pre-record offset).
-        let rope_offset = first_logical_position as i32;
-        let queries_bhtd = self.rope.forward(&queries_bhtd, Some(rope_offset))?;
-        let keys_bhtd = self.rope.forward(&keys_bhtd, Some(rope_offset))?;
-
-        // 4. Convert K/V to the paged layout `[num_tokens, n_kv_heads,
-        //    head_dim]` expected by `update_keys_values`. Currently
-        //    batch=1 so `num_tokens = batch * seq_len = seq_len`.
-        //    [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D]
-        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-
-        // Prefer the graph-native lazy write so the same-step attention read
-        // depends on it through MLX's graph (no per-layer host sync). Fall
-        // back to the synchronous write if it is disabled or the native
-        // kernel could not place the K/V (a failed native write leaves the
-        // pool untouched, so the sync write below is not a double-write).
-        write_kv_chunk(
+        self.paged_core().forward_paged(
+            x,
             adapter,
             attn_layer_idx,
-            &keys_paged,
-            &values_paged,
             first_logical_position,
-            "lfm2",
+            cached_prefix_len,
+            is_prefill,
+            prefill_mask,
         )
-        .map_err(napi::Error::from_reason)?;
-
-        // 5. Compute attention output.
-        let attn_bhtd = if is_prefill {
-            if cached_prefix_len == 0 {
-                // Fresh prefill: SDPA over in-flight Q/K/V with internal
-                // causal mask.
-                if seq_len > 1 {
-                    scaled_dot_product_attention_causal(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale,
-                    )?
-                } else {
-                    scaled_dot_product_attention(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale,
-                        None,
-                    )?
-                }
-            } else {
-                // Cache-hit prefill: the suffix was just written above.
-                // Prefer the MLX graph-native paged-attention bridge (reads
-                // the pool through graph dependencies, no per-layer host
-                // sync) over `read_kv_range`, which forces
-                // `eval_pending_pool_write_for_layer` on every call. Mirrors
-                // the qwen3_5 / gemma4 `forward_paged` cache-hit branch.
-                let total_ctx = cached_prefix_len + (seq_len as u32);
-                let maybe_paged_attn = if batch == 1 && paged_prefill_paged_attention_enabled() {
-                    // [B, H, T, D] -> [H, T, D] -> [T, H, D], matching
-                    // `PagedKVCacheAdapter::gather_kv_for_prefill_chunk`.
-                    let queries_paged = queries_bhtd
-                        .squeeze(Some(&[0]))?
-                        .transpose(Some(&[1, 0, 2]))?;
-                    match adapter.gather_kv_for_prefill_chunk(
-                        attn_layer_idx,
-                        &queries_paged,
-                        cached_prefix_len,
-                        self.scale as f32,
-                    ) {
-                        Err(err) => {
-                            warn_once_on_sync_fallback(
-                                "lfm2",
-                                "prefill_paged_attention",
-                                attn_layer_idx,
-                                &err,
-                            );
-                            None
-                        }
-                        Ok(attn_t_h_d) => {
-                            let target_dtype = x.dtype()?;
-                            let attn_t_h_d = attn_t_h_d.astype(target_dtype)?;
-                            // [T, H, D] -> [H, T, D] -> [B, H, T, D]
-                            let attn = attn_t_h_d.transpose(Some(&[1, 0, 2]))?.reshape(&[
-                                batch,
-                                self.num_heads as i64,
-                                seq_len,
-                                self.head_dim as i64,
-                            ])?;
-                            Some(attn)
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                match maybe_paged_attn {
-                    Some(attn) => attn,
-                    None => {
-                        // Cache-hit prefill: gather the dense [1, Hkv, T, D]
-                        // K/V IN-GRAPH (take+transpose over the pool arrays,
-                        // retaining the pending write's lazy dependency) and
-                        // run the same explicit-mask SDPA — bit-identical to
-                        // the `read_kv_range` host path but without its
-                        // blocking blit + per-element CPU repack + re-upload.
-                        // `read_kv_range` remains the last resort for cache
-                        // dtypes the dense gather cannot serve (FP8).
-                        let (k_full, v_full) = adapter
-                            .gather_kv_for_prefill_sdpa(attn_layer_idx, total_ctx)
-                            .or_else(|err| {
-                                warn_once_on_sync_fallback(
-                                    "lfm2",
-                                    "prefill_sdpa_gather",
-                                    attn_layer_idx,
-                                    &err,
-                                );
-                                adapter.read_kv_range(attn_layer_idx, 0, total_ctx)
-                            })
-                            .map_err(napi::Error::from_reason)?;
-                        // The mask is a pure function of (seq_len,
-                        // cached_prefix_len) — identical across attention
-                        // layers — so the caller builds it once per chunk.
-                        let mask = match prefill_mask {
-                            Some(mask) => mask.clone(),
-                            None => create_causal_mask(
-                                seq_len as i32,
-                                Some(cached_prefix_len as i32),
-                                None,
-                            )?,
-                        };
-                        scaled_dot_product_attention(
-                            &queries_bhtd,
-                            &k_full,
-                            &v_full,
-                            self.scale,
-                            Some(&mask),
-                        )?
-                    }
-                }
-            }
-        } else {
-            // Decode: gather full historical K/V via the paged kernel. Both
-            // gather variants expect `[1, num_query_heads, head_size]`
-            // queries, so reshape from [1, H, 1, D].
-            let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
-                1,
-                self.num_heads as i64,
-                self.head_dim as i64,
-            ])?;
-            // Prefer the graph-native gather (reads the lazy pool arrays
-            // through graph dependencies — no per-layer host eval). Fall back
-            // to the synchronous gather when it is disabled or unavailable for
-            // these inputs (e.g. a query/cache dtype it cannot serve).
-            let attn_3d = gather_kv_for_decode_with_fallback(
-                adapter,
-                attn_layer_idx,
-                &queries_3d,
-                self.scale as f32,
-                /* softcap */ 1.0,
-                "lfm2",
-            )
-            .map_err(napi::Error::from_reason)?;
-            // Cast back to x's dtype so the residual stays homogeneous.
-            let target_dtype = x.dtype()?;
-            let attn_3d = attn_3d.astype(target_dtype)?;
-            // Reshape [1, H, D] -> [1, H, 1, D] for the standard
-            // [B,H,T,D] tail.
-            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
-        };
-
-        // 6. Output: [B, H, T, D] -> [B, T, H*D] -> projection.
-        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-        self.out_proj.forward(&output)
     }
 
     /// Uniform batched paged decode with one request-specific RoPE offset and
@@ -453,85 +278,16 @@ impl Lfm2Attention {
         attn_layer_idx: u32,
         rows: &[(SeqId, u32)],
     ) -> Result<MxArray> {
-        let shape = x.shape()?;
-        if rows.is_empty()
-            || shape.as_ref().len() != 3
-            || shape[0] != rows.len() as i64
-            || shape[1] != 1
-        {
-            return Err(Error::from_reason(format!(
-                "Lfm2Attention::forward_paged_batched expects [N,1,H] for {} rows, got {:?}",
-                rows.len(),
-                shape.as_ref()
-            )));
-        }
-        if !native_kv_write_enabled() || !graph_decode_gather_enabled() {
-            return Err(Error::from_reason(
-                "LFM2 batched decode requires native K/V writes and graph decode gather",
-            ));
-        }
-
-        let batch = rows.len() as i64;
-        let offsets = rows
-            .iter()
-            .map(|&(seq_id, position)| {
-                i32::try_from(position).map_err(|_| {
-                    Error::from_reason(format!(
-                        "LFM2 batched decode sequence {seq_id} position {position} exceeds i32::MAX"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let offsets = MxArray::from_int32(&offsets, &[batch])?;
-        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
-
-        let queries = self.q_proj.forward(x)?.reshape(&[
-            batch,
-            1,
-            self.num_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let queries = self
-            .q_layernorm
-            .forward(&queries)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let queries = self.rope.forward_with_offsets(&queries, &offsets)?;
-
-        let keys = self.k_proj.forward(x)?.reshape(&[
-            batch,
-            1,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let keys = self
-            .k_layernorm
-            .forward(&keys)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
-        let values = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-
-        let queries = queries.squeeze(Some(&[2]))?;
-        let keys = keys.squeeze(Some(&[2]))?;
-        let values = values.squeeze(Some(&[2]))?;
-        adapter
-            .update_keys_values_native_batched(attn_layer_idx, &keys, &values, rows)
-            .map_err(Error::from_reason)?;
-        let attended = adapter
-            .gather_kv_for_decode_graph_batched(
-                attn_layer_idx,
-                &queries,
-                &seq_ids,
-                self.scale as f32,
-                1.0,
-            )
-            .map_err(Error::from_reason)?
-            .astype(x.dtype()?)?
-            .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
-        self.out_proj.forward(&attended)
+        self.paged_core().forward_paged_batched(
+            x,
+            adapter,
+            attn_layer_idx,
+            rows,
+            &BatchedDecodeLabels {
+                type_name: "Lfm2Attention",
+                family: "LFM2",
+            },
+        )
     }
 
     // ========== Weight setters ==========

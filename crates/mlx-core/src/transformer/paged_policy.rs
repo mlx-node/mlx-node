@@ -13,8 +13,9 @@ use std::sync::{Mutex, OnceLock};
 use crate::array::{DType, MxArray};
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{
-    PagedAttentionV2Layout, PagedKVCacheAdapter, PagedPrefillMemorySnapshot, SeqId,
-    paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
+    PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter,
+    PagedPrefillMemorySnapshot, SeqId, paged_attention_v2_aux_fits,
+    paged_attention_v2_partition_upper_bound,
 };
 
 /// Report a synchronous paged-KV fallback once per `(family, site)` per
@@ -95,10 +96,34 @@ pub(crate) fn gather_kv_for_decode_with_fallback(
     softcap: f32,
     family: &'static str,
 ) -> Result<MxArray, String> {
+    gather_kv_for_decode_with_route_and_fallback(
+        adapter,
+        layer_idx,
+        queries,
+        scale,
+        softcap,
+        PagedDecodeRouteHint::Auto,
+        family,
+    )
+}
+
+pub(crate) fn gather_kv_for_decode_with_route_and_fallback(
+    adapter: &mut PagedKVCacheAdapter,
+    layer_idx: u32,
+    queries: &MxArray,
+    scale: f32,
+    softcap: f32,
+    route: PagedDecodeRouteHint,
+    family: &'static str,
+) -> Result<MxArray, String> {
     if graph_decode_gather_enabled() {
-        match adapter.gather_kv_for_decode_graph(layer_idx, queries, scale, softcap) {
+        match adapter.gather_kv_for_decode_graph_with_route(
+            layer_idx, queries, scale, softcap, route,
+        ) {
             Ok(attn) => return Ok(attn),
-            Err(err) => warn_once_on_sync_fallback(family, "decode_gather", layer_idx, &err),
+            Err(err) => {
+                warn_once_on_sync_fallback(family, "decode_gather", layer_idx, &err)
+            }
         }
     }
     adapter.gather_kv_for_decode(layer_idx, queries, scale, softcap)

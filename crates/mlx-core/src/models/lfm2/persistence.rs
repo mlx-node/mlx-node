@@ -10,7 +10,8 @@ use tracing::info;
 use crate::array::{DType, MxArray};
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::engine::persistence::{
-    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+    KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_weights,
+    load_all_safetensors, prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, dense_mlp_is_quantized,
@@ -361,6 +362,139 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
     Ok(config)
 }
 
+/// MLP weight rename: w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj.
+/// Scoped to `feed_forward.*` keys so the rename ALSO catches MoE expert
+/// keys (`feed_forward.experts.{e}.w1.weight` etc.) without touching any
+/// unrelated `w1`/`w2`/`w3` tensors. Mirrors `lfm2_moe.py::sanitize`.
+///
+/// The rename covers ALL affine-quant group suffixes — `.weight`,
+/// `.scales`, AND `.biases` — not just `.weight`. A quantized DENSE
+/// `lfm2.py` checkpoint (whose MLP modules ARE `w1`/`w2`/`w3`, see
+/// `mlx-lm/mlx_lm/models/lfm2.py:189-191`) ships the companions under the
+/// same `w{1,2,3}` names. Renaming only `.weight` would orphan
+/// `feed_forward.w1.{scales,biases}`, leaving the loader unable to find
+/// `gate_proj.scales` and wrongly taking the bf16 path for a packed
+/// weight. The full-suffix rename keeps the whole group together so
+/// `load_dense_mlp_variant` resolves it as quantized.
+///
+/// N/A — per-layer quant OVERRIDE keys never arrive under `w{1,2,3}`:
+/// dense `lfm2.py` has no `quant_predicate` (uniform top-level default),
+/// and `lfm2_moe.py::quant_predicate` only specializes
+/// `feed_forward.gate`. So `per_layer_quant` is keyed by
+/// `feed_forward.gate` / standard proj / embedding names — never
+/// `w{1,2,3}` — and needs no alias normalization.
+static LFM2_FEED_FORWARD_RENAMES: &[KeyRule] = &[
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w1.weight",
+        to: "gate_proj.weight",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w1.scales",
+        to: "gate_proj.scales",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w1.biases",
+        to: "gate_proj.biases",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w2.weight",
+        to: "down_proj.weight",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w2.scales",
+        to: "down_proj.scales",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w2.biases",
+        to: "down_proj.biases",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w3.weight",
+        to: "up_proj.weight",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w3.scales",
+        to: "up_proj.scales",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w3.biases",
+        to: "up_proj.biases",
+    },
+];
+
+/// Value hook: conv weight transpose — `*.conv.conv.weight` where
+/// shape[-1] > shape[1] gets transposed [out, 1, kernel] -> [out, kernel, 1].
+/// Runs on the post-rename map; the `conv.conv.weight` keys are untouched by
+/// every rename rule, so this is order-equivalent to the original in-loop
+/// transpose.
+fn transpose_depthwise_conv_weights(params: &mut HashMap<String, MxArray>) {
+    for (key, value) in params.iter_mut() {
+        if !key.contains("conv.conv.weight") {
+            continue;
+        }
+        if value.ndim().unwrap_or(0) != 3 {
+            continue;
+        }
+        let dim1 = value.shape_at(1).unwrap_or(0);
+        let dim2 = value.shape_at(2).unwrap_or(0);
+        if dim2 > dim1 {
+            *value = value
+                .transpose(Some(&[0, 2, 1]))
+                .unwrap_or_else(|_| value.clone());
+        }
+    }
+}
+
+/// Value hook: MoE expert stacking — per MoE layer, stack the per-expert
+/// `feed_forward.experts.{e}.{proj}.weight` tensors into a single
+/// `feed_forward.switch_mlp.{proj}.weight` of shape (num_experts, out, in).
+/// Mirrors `lfm2_moe.py::sanitize` (mx.stack over axis 0). FP8 dequant has
+/// already run before sanitize, so experts are bf16 2D tensors here — no
+/// re-quantization. The `contains_key(experts.0)` guard makes this a no-op
+/// for pre-stacked (quantized) checkpoints whose experts already ship as
+/// `switch_mlp.{proj}.{weight,scales}`.
+fn stack_moe_expert_weights(
+    params: &mut HashMap<String, MxArray>,
+    config: &Lfm2Config,
+) -> Result<()> {
+    if !config.is_moe() {
+        return Ok(());
+    }
+    let num_experts = config.num_experts.unwrap_or(0) as usize;
+    let num_dense = config.num_dense_layers_effective() as usize;
+    for l in num_dense..(config.num_hidden_layers as usize) {
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let key0 = format!("layers.{l}.feed_forward.experts.0.{proj}.weight");
+            if params.contains_key(&key0) {
+                let mut arrs = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let kk = format!("layers.{l}.feed_forward.experts.{e}.{proj}.weight");
+                    let a = params.remove(&kk).ok_or_else(|| {
+                        Error::from_reason(format!("lfm2_moe: missing expert weight {kk}"))
+                    })?;
+                    arrs.push(a);
+                }
+                let refs: Vec<&MxArray> = arrs.iter().collect();
+                let stacked = MxArray::stack(refs, Some(0))?; // (num_experts, out, in)
+                params.insert(
+                    format!("layers.{l}.feed_forward.switch_mlp.{proj}.weight"),
+                    stacked,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sanitize HuggingFace weight keys to internal format.
 ///
 /// Handles (lfm2.py:298-306):
@@ -372,118 +506,27 @@ fn sanitize_weights(
     params: &mut HashMap<String, MxArray>,
     config: &Lfm2Config,
 ) -> Result<HashMap<String, MxArray>> {
-    let mut sanitized = HashMap::new();
-
-    let keys: Vec<String> = params.keys().cloned().collect();
-    for key in keys {
-        let value = params.remove(&key).unwrap();
-
-        // 1. Strip `model.` prefix
-        let clean_key = key.strip_prefix("model.").unwrap_or(&key).to_string();
-
-        // Skip lm_head.weight only when tie_embedding is true (weight shared with embed_tokens)
-        if clean_key == "lm_head.weight" && config.tie_embedding {
-            continue;
-        }
-
-        // Skip rotary embeddings (computed at runtime)
-        if clean_key.contains("rotary_emb") {
-            continue;
-        }
-
-        // 2. Conv weight transpose: *.conv.conv.weight where shape[-1] > shape[1]
-        let value = if clean_key.contains("conv.conv.weight") {
-            let ndim = value.ndim().unwrap_or(0);
-            if ndim == 3 {
-                let dim1 = value.shape_at(1).unwrap_or(0);
-                let dim2 = value.shape_at(2).unwrap_or(0);
-                if dim2 > dim1 {
-                    // Transpose from [out, 1, kernel] to [out, kernel, 1] format
-                    value
-                        .transpose(Some(&[0, 2, 1]))
-                        .unwrap_or_else(|_| value.clone())
-                } else {
-                    value
-                }
-            } else {
-                value
-            }
-        } else {
-            value
-        };
-
-        // 3. MLP weight rename: w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj.
-        // Scoped to `feed_forward.*` keys so the rename ALSO catches MoE expert
-        // keys (`feed_forward.experts.{e}.w1.weight` etc.) without touching any
-        // unrelated `w1`/`w2`/`w3` tensors. Mirrors `lfm2_moe.py::sanitize`.
-        //
-        // The rename covers ALL affine-quant group suffixes — `.weight`,
-        // `.scales`, AND `.biases` — not just `.weight`. A quantized DENSE
-        // `lfm2.py` checkpoint (whose MLP modules ARE `w1`/`w2`/`w3`, see
-        // `mlx-lm/mlx_lm/models/lfm2.py:189-191`) ships the companions under the
-        // same `w{1,2,3}` names. Renaming only `.weight` would orphan
-        // `feed_forward.w1.{scales,biases}`, leaving the loader unable to find
-        // `gate_proj.scales` and wrongly taking the bf16 path for a packed
-        // weight. The full-suffix rename keeps the whole group together so
-        // `load_dense_mlp_variant` resolves it as quantized.
-        //
-        // N/A — per-layer quant OVERRIDE keys never arrive under `w{1,2,3}`:
-        // dense `lfm2.py` has no `quant_predicate` (uniform top-level default),
-        // and `lfm2_moe.py::quant_predicate` only specializes
-        // `feed_forward.gate`. So `per_layer_quant` is keyed by
-        // `feed_forward.gate` / standard proj / embedding names — never
-        // `w{1,2,3}` — and needs no alias normalization.
-        let clean_key = if clean_key.contains("feed_forward") {
-            clean_key
-                .replace("w1.weight", "gate_proj.weight")
-                .replace("w1.scales", "gate_proj.scales")
-                .replace("w1.biases", "gate_proj.biases")
-                .replace("w2.weight", "down_proj.weight")
-                .replace("w2.scales", "down_proj.scales")
-                .replace("w2.biases", "down_proj.biases")
-                .replace("w3.weight", "up_proj.weight")
-                .replace("w3.scales", "up_proj.scales")
-                .replace("w3.biases", "up_proj.biases")
-        } else {
-            clean_key
-        };
-
-        sanitized.insert(clean_key, value);
+    // Declarative key rewrite: strip `model.`, drop `lm_head.weight` only
+    // when tie_embedding is true (weight shared with embed_tokens), drop
+    // rotary embeddings (computed at runtime), then the w1/w2/w3 renames —
+    // the original drop order (lm_head before rotary) is preserved.
+    let mut rules: Vec<KeyRule> = Vec::with_capacity(2 + LFM2_FEED_FORWARD_RENAMES.len());
+    if config.tie_embedding {
+        rules.push(KeyRule::DropExact("lm_head.weight"));
     }
+    rules.push(KeyRule::DropContains("rotary_emb"));
+    rules.extend_from_slice(LFM2_FEED_FORWARD_RENAMES);
+    let mut sanitized = apply_rename_spec(
+        std::mem::take(params),
+        &RenameSpec {
+            strip_prefixes: &["model."],
+            rules: &rules,
+            ..Default::default()
+        },
+    )?;
 
-    // MoE expert stacking: per MoE layer, stack the per-expert
-    // `feed_forward.experts.{e}.{proj}.weight` tensors into a single
-    // `feed_forward.switch_mlp.{proj}.weight` of shape (num_experts, out, in).
-    // Mirrors `lfm2_moe.py::sanitize` (mx.stack over axis 0). FP8 dequant has
-    // already run before sanitize, so experts are bf16 2D tensors here — no
-    // re-quantization. The `contains_key(experts.0)` guard makes this a no-op
-    // for pre-stacked (quantized) checkpoints whose experts already ship as
-    // `switch_mlp.{proj}.{weight,scales}`.
-    if config.is_moe() {
-        let num_experts = config.num_experts.unwrap_or(0) as usize;
-        let num_dense = config.num_dense_layers_effective() as usize;
-        for l in num_dense..(config.num_hidden_layers as usize) {
-            for proj in ["gate_proj", "up_proj", "down_proj"] {
-                let key0 = format!("layers.{l}.feed_forward.experts.0.{proj}.weight");
-                if sanitized.contains_key(&key0) {
-                    let mut arrs = Vec::with_capacity(num_experts);
-                    for e in 0..num_experts {
-                        let kk = format!("layers.{l}.feed_forward.experts.{e}.{proj}.weight");
-                        let a = sanitized.remove(&kk).ok_or_else(|| {
-                            Error::from_reason(format!("lfm2_moe: missing expert weight {kk}"))
-                        })?;
-                        arrs.push(a);
-                    }
-                    let refs: Vec<&MxArray> = arrs.iter().collect();
-                    let stacked = MxArray::stack(refs, Some(0))?; // (num_experts, out, in)
-                    sanitized.insert(
-                        format!("layers.{l}.feed_forward.switch_mlp.{proj}.weight"),
-                        stacked,
-                    );
-                }
-            }
-        }
-    }
+    transpose_depthwise_conv_weights(&mut sanitized);
+    stack_moe_expert_weights(&mut sanitized, config)?;
 
     // Cast f32 tensors to bf16 to avoid dtype promotion issues. EXCLUDE
     // `expert_bias` so it stays f32 (matches `lfm2_moe.py::cast_predicate`)
@@ -491,24 +534,7 @@ fn sanitize_weights(
     // bf16 scales). sym8 siblings are identified content-based (Int8 sibling
     // `.weight`) because the quant config is read AFTER sanitize; affine/mxfp
     // `.scales` (packed Uint32 weights) keep today's bf16 cast.
-    let sym8_scales: std::collections::HashSet<String> = sanitized
-        .keys()
-        .filter_map(|k| {
-            let prefix = k.strip_suffix(".scales")?;
-            let w = sanitized.get(&format!("{prefix}.weight"))?;
-            (w.dtype().ok()? == DType::Int8).then(|| k.clone())
-        })
-        .collect();
-    for (k, value) in sanitized.iter_mut() {
-        if k.ends_with(".expert_bias") || sym8_scales.contains(k) {
-            continue;
-        }
-        if value.dtype().is_ok_and(|dt| dt == DType::Float32)
-            && let Ok(casted) = value.astype(DType::BFloat16)
-        {
-            *value = casted;
-        }
-    }
+    cast_f32_tensors_to_bf16(&mut sanitized, |k| k.ends_with(".expert_bias"));
 
     Ok(sanitized)
 }

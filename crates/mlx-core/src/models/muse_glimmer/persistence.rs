@@ -6,7 +6,9 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
-use crate::engine::persistence::{load_all_safetensors, parse_generation_defaults};
+use crate::engine::persistence::{
+    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, parse_generation_defaults,
+};
 use crate::models::gemma4::quantized_linear::{
     LinearProj, try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,
     try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
@@ -451,21 +453,36 @@ fn primary_safetensor_is_mlx(path: &Path) -> Result<bool> {
         == Some("mlx"))
 }
 
-fn canonicalize_target_weights(
-    params: HashMap<String, MxArray>,
-    norms_are_direct: bool,
-) -> Result<HashMap<String, MxArray>> {
-    let mut canonical = HashMap::with_capacity(params.len());
-    for (source_key, array) in params {
-        let key = if let Some(rest) = source_key.strip_prefix("language_model.model.lm_head.") {
-            format!("lm_head.{rest}")
-        } else if let Some(rest) = source_key.strip_prefix("language_model.lm_head.") {
-            format!("lm_head.{rest}")
-        } else if let Some(rest) = source_key.strip_prefix("language_model.model.") {
-            format!("model.language_model.{rest}")
-        } else {
-            source_key.clone()
-        };
+/// Declarative half of `canonicalize_target_weights`: the first-match
+/// raw-key rewrites that map the checkpoint's `language_model.*` namespaces
+/// into the loader's `model.language_model.*` / `lm_head.*` canonical space,
+/// plus the duplicate-canonical-key rejection.
+static MUSE_CANONICAL_SPEC: RenameSpec<'static> = RenameSpec {
+    raw_rules: &[
+        KeyRule::RenamePrefix {
+            from: "language_model.model.lm_head.",
+            to: "lm_head.",
+        },
+        KeyRule::RenamePrefix {
+            from: "language_model.lm_head.",
+            to: "lm_head.",
+        },
+        KeyRule::RenamePrefix {
+            from: "language_model.model.",
+            to: "model.language_model.",
+        },
+    ],
+    strip_prefixes: &[],
+    rules_require_strip: false,
+    rules: &[],
+    reject_duplicate_keys_as: Some("Muse-Glimmer"),
+};
+
+/// Value hook: centered-sandwich norms in a raw (non-MLX) checkpoint are
+/// stored in deviation-from-1 form; shift them +1.0 so the direct-convention
+/// RMSNorm kernels see final values.
+fn shift_centered_sandwich_norms(canonical: &mut HashMap<String, MxArray>) -> Result<()> {
+    for (key, value) in canonical.iter_mut() {
         let is_centered_sandwich_norm = key
             .strip_prefix("model.language_model.layers.")
             .is_some_and(|rest| {
@@ -478,16 +495,20 @@ fn canonicalize_target_weights(
                 .iter()
                 .any(|suffix| rest.ends_with(suffix))
             });
-        let array = if !norms_are_direct && is_centered_sandwich_norm {
-            array.add_scalar(1.0)?
-        } else {
-            array
-        };
-        if canonical.insert(key.clone(), array).is_some() {
-            return Err(Error::from_reason(format!(
-                "Muse-Glimmer checkpoint contains duplicate canonical tensor '{key}'"
-            )));
+        if is_centered_sandwich_norm {
+            *value = value.add_scalar(1.0)?;
         }
+    }
+    Ok(())
+}
+
+fn canonicalize_target_weights(
+    params: HashMap<String, MxArray>,
+    norms_are_direct: bool,
+) -> Result<HashMap<String, MxArray>> {
+    let mut canonical = apply_rename_spec(params, &MUSE_CANONICAL_SPEC)?;
+    if !norms_are_direct {
+        shift_centered_sandwich_norms(&mut canonical)?;
     }
     Ok(canonical)
 }

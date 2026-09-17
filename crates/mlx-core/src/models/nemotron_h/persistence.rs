@@ -26,7 +26,8 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::engine::persistence::{
-    load_all_safetensors, parse_generation_defaults, prewarm_checkpoint_pages,
+    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, parse_generation_defaults,
+    prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, admits_static_fp8_activation, default_per_layer_quant,
@@ -48,38 +49,55 @@ fn strip_backbone(k: &str) -> &str {
     k.strip_prefix("backbone.").unwrap_or(k)
 }
 
+/// Declarative half of `sanitize_weights`: drop the safetensors
+/// `__metadata__` sidecar (RAW — `backbone.__metadata__` still strips to
+/// `__metadata__` and passes through, as before), strip `backbone.`, drop
+/// the modelopt companion keys convert consumed, and apply the two exact
+/// embedding/norm renames.
+static NEMOTRON_RENAME_SPEC: RenameSpec<'static> = RenameSpec {
+    raw_rules: &[KeyRule::DropExact("__metadata__")],
+    strip_prefixes: &["backbone."],
+    rules_require_strip: false,
+    rules: &[
+        // Modelopt companion tensors (raw HF checkpoint layout).
+        KeyRule::DropSuffix(".weight_scale"),
+        KeyRule::DropSuffix(".weight_scale_2"),
+        KeyRule::DropSuffix(".input_scale"),
+        KeyRule::RenameExact {
+            from: "embeddings.weight",
+            to: "embedding.weight",
+        },
+        KeyRule::RenameExact {
+            from: "norm_f.weight",
+            to: "final_norm.weight",
+        },
+    ],
+    reject_duplicate_keys_as: None,
+};
+
 /// Sanitize the checkpoint tensors into the loader's canonical key space:
 /// strip `backbone.`, rename, stack per-expert projections, drop the modelopt
 /// companion keys convert consumed, and transpose conv1d into MLX orientation.
 fn sanitize_weights(
-    mut params: HashMap<String, MxArray>,
+    params: HashMap<String, MxArray>,
+    config: &NemotronHConfig,
+) -> Result<HashMap<String, MxArray>> {
+    let params = apply_rename_spec(params, &NEMOTRON_RENAME_SPEC)?;
+    stack_experts_and_transpose_conv1d(params, config)
+}
+
+/// Value hook: collect `layers.{n}.mixer.experts.{e}.{proj}.weight` (and the
+/// `mtp.layers.` twin) into per-projection buckets, stack them along a new
+/// leading axis, and transpose `.mixer.conv1d.weight` from HF
+/// [out, in/groups, kernel] into MLX [out, kernel, in/groups] orientation.
+fn stack_experts_and_transpose_conv1d(
+    params: HashMap<String, MxArray>,
     config: &NemotronHConfig,
 ) -> Result<HashMap<String, MxArray>> {
     let mut result: HashMap<String, MxArray> = HashMap::new();
     let mut expert_weights: HashMap<String, Vec<(usize, MxArray)>> = HashMap::new();
 
-    for (name, array) in params.drain() {
-        if name == "__metadata__" {
-            continue;
-        }
-        let name = strip_backbone(&name).to_string();
-
-        // Drop modelopt companion tensors (raw HF checkpoint layout).
-        if name.ends_with(".weight_scale")
-            || name.ends_with(".weight_scale_2")
-            || name.ends_with(".input_scale")
-        {
-            continue;
-        }
-
-        let name = if name == "embeddings.weight" {
-            "embedding.weight".to_string()
-        } else if name == "norm_f.weight" {
-            "final_norm.weight".to_string()
-        } else {
-            name
-        };
-
+    for (name, array) in params {
         if let Some(rest) = name.strip_prefix("layers.")
             && let Some(rest) = rest.strip_suffix(".weight")
             && let Some((layer, exp)) = rest.split_once(".mixer.experts.")

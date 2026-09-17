@@ -1901,16 +1901,15 @@ impl Gemma4Attention {
         //    head_dim]` expected by `update_keys_values`. Currently
         //    batch=1 so num_tokens = batch * seq_len = seq_len.
         //    [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D]
-        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
+        let (keys_paged, values_paged) =
+            crate::models::attention_core::paged_kv_layout(
+                &keys_bhtd,
+                &values_bhtd,
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            )?;
 
         let write_trace_start = trace_enabled.then(std::time::Instant::now);
         if trace_enabled {

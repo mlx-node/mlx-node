@@ -11,6 +11,7 @@ pub mod attention;
 #[cfg(test)]
 mod attention_vjp_test;
 pub mod block;
+pub(crate) mod cold_tier;
 pub mod kv_cache;
 pub mod kv_cache_spec;
 pub mod mlp;

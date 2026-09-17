@@ -24,7 +24,8 @@ use tracing::info;
 use crate::array::{DType, MxArray};
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::engine::persistence::{
-    dequant_fp8_block_scale, dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+    KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_block_scale,
+    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, load_dense_mlp_variant,
@@ -51,6 +52,16 @@ fn parse_config(model_path: &Path) -> Result<K2HorizonConfig> {
     Ok(config)
 }
 
+/// Declarative half of `sanitize_weights` — strip the `model.` prefix and
+/// drop the rotary-embedding buffers the fused path recomputes.
+static K2_RENAME_SPEC: RenameSpec<'static> = RenameSpec {
+    raw_rules: &[],
+    strip_prefixes: &["model."],
+    rules_require_strip: false,
+    rules: &[KeyRule::DropContains("rotary_emb")],
+    reject_duplicate_keys_as: None,
+};
+
 /// Sanitize HF weight keys to internal format: strip the `model.` prefix,
 /// drop rotary buffers (computed at runtime), keep the untied `lm_head`.
 ///
@@ -60,39 +71,11 @@ fn parse_config(model_path: &Path) -> Result<K2HorizonConfig> {
 /// consumed them; a survivor is malformed but harmless, keep it f32 so the
 /// mandatory-weights validator reports it untouched).
 fn sanitize_weights(params: &mut HashMap<String, MxArray>) -> Result<HashMap<String, MxArray>> {
-    let mut sanitized = HashMap::new();
+    let mut sanitized = apply_rename_spec(std::mem::take(params), &K2_RENAME_SPEC)?;
 
-    let keys: Vec<String> = params.keys().cloned().collect();
-    for key in keys {
-        let value = params.remove(&key).unwrap();
-        let clean_key = key.strip_prefix("model.").unwrap_or(&key).to_string();
-
-        if clean_key.contains("rotary_emb") {
-            continue;
-        }
-        sanitized.insert(clean_key, value);
-    }
-
-    // Cast f32 tensors to bf16 to avoid dtype promotion issues — EXCLUDING
-    // sym8 `.scales` (f32 [N] is the sym8 storage contract).
-    let sym8_scales: std::collections::HashSet<String> = sanitized
-        .keys()
-        .filter_map(|k| {
-            let prefix = k.strip_suffix(".scales")?;
-            let w = sanitized.get(&format!("{prefix}.weight"))?;
-            (w.dtype().ok()? == DType::Int8).then(|| k.clone())
-        })
-        .collect();
-    for (k, value) in sanitized.iter_mut() {
-        if sym8_scales.contains(k) {
-            continue;
-        }
-        if value.dtype().is_ok_and(|dt| dt == DType::Float32)
-            && let Ok(casted) = value.astype(DType::BFloat16)
-        {
-            *value = casted;
-        }
-    }
+    // Value hook: cast f32 tensors to bf16 to avoid dtype promotion issues —
+    // EXCLUDING sym8 `.scales` (f32 [N] is the sym8 storage contract).
+    cast_f32_tensors_to_bf16(&mut sanitized, |_| false);
 
     Ok(sanitized)
 }

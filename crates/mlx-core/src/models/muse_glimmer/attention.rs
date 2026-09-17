@@ -180,16 +180,14 @@ impl MuseGlimmerAttention {
             ),
             None => (q, k),
         };
-        let k_paged = k.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+        let (k_paged, v_paged) = crate::models::attention_core::paged_kv_layout(
+            &k,
+            &v,
+            /* batch */ 1,
             seq_len,
             self.num_kv_heads,
             self.head_dim,
-        ])?;
-        let v_paged = v.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ])?;
+        )?;
         write_kv_chunk(
             adapter,
             paged_idx,

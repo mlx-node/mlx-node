@@ -10,6 +10,8 @@ use napi::bindgen_prelude::*;
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::models::paged_config::PagedCacheConfig;
+
 /// `qk_scale_factor` when the checkpoint omits it.
 fn default_qk_scale_factor() -> f32 {
     3.87
@@ -94,14 +96,15 @@ struct RawConfig {
     muse_glimmer_gguf_rope_layout: Option<String>,
     #[serde(default)]
     dflash_config: Option<MuseGlimmerDFlashConfig>,
-    #[serde(default)]
-    use_block_paged_cache: Option<bool>,
-    #[serde(default)]
-    paged_block_size: Option<u32>,
-    #[serde(default)]
-    paged_cache_memory_mb: Option<u32>,
-    #[serde(default)]
-    persist_paged_cache: Option<bool>,
+    /// The flat block-paged KV keys shared with every paged family
+    /// (`paged_cache_memory_mb`, `paged_block_size`, `use_block_paged_cache`,
+    /// `persist_paged_cache`). Flattened so the keys stay top-level in
+    /// `config.json`; `RawConfig` is serde-only (no `#[napi]` surface, no
+    /// struct literals outside this module), which is what makes the shared
+    /// embed safe here — the resolved `MuseGlimmerConfig` keeps its flat
+    /// fields for the literals in `kv_cache.rs` / `model.rs` tests.
+    #[serde(flatten)]
+    paged: PagedCacheConfig,
 }
 
 /// Configuration written from Meta's companion DFlash GGUF header.
@@ -875,11 +878,23 @@ impl MuseGlimmerConfig {
             vision_config: raw.vision_config,
             rope_traditional,
             dflash_config: raw.dflash_config,
-            use_block_paged_cache: raw.use_block_paged_cache,
-            paged_block_size: raw.paged_block_size,
-            paged_cache_memory_mb: raw.paged_cache_memory_mb,
-            persist_paged_cache: raw.persist_paged_cache,
+            use_block_paged_cache: raw.paged.use_block_paged_cache,
+            paged_block_size: raw.paged.paged_block_size,
+            paged_cache_memory_mb: raw.paged.paged_cache_memory_mb,
+            persist_paged_cache: raw.paged.persist_paged_cache,
         })
+    }
+
+    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`]
+    /// (`paged_cache_initial_memory_mb` is qwen3_5-only; always `None` here).
+    pub fn paged_cache_config(&self) -> PagedCacheConfig {
+        PagedCacheConfig {
+            paged_cache_memory_mb: self.paged_cache_memory_mb,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: self.paged_block_size,
+            use_block_paged_cache: self.use_block_paged_cache,
+            persist_paged_cache: self.persist_paged_cache,
+        }
     }
 }
 

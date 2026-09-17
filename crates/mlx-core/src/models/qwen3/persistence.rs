@@ -19,7 +19,9 @@ use crate::array::MxArray;
 #[cfg(test)]
 use crate::cold_tier::parse_bool_env;
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
-use crate::engine::persistence::{load_all_safetensors, prewarm_checkpoint_pages};
+use crate::engine::persistence::{
+    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, prewarm_checkpoint_pages,
+};
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::model::Qwen3FamilyCommand;
@@ -435,31 +437,39 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
     })
 }
 
+/// HF → internal key map for `model.`-prefixed tensors. Renames are gated on
+/// the `model.` strip (`rules_require_strip`) — an unprefixed
+/// `embed_tokens.weight` passes through untouched, exactly like the original
+/// `if let Some(stripped) = name.strip_prefix("model.")` arm did.
+static QWEN3_RENAME_SPEC: RenameSpec<'static> = RenameSpec {
+    raw_rules: &[],
+    strip_prefixes: &["model."],
+    rules_require_strip: true,
+    rules: &[
+        // `embed_tokens.weight` and `embed_tokens.*` — the original was a
+        // `str::replace`, so replace-all semantics are kept verbatim.
+        KeyRule::ReplaceIfPrefixed {
+            scope: "embed_tokens.",
+            from: "embed_tokens",
+            to: "embedding",
+        },
+        KeyRule::RenameExact {
+            from: "norm.weight",
+            to: "final_norm.weight",
+        },
+    ],
+    reject_duplicate_keys_as: None,
+};
+
 /// Load weights from SafeTensors, mapping HuggingFace names to our naming convention.
 fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
     // Qwen3-8B checkpoints are normally published as multiple safetensors
     // shards. Use the shared mmap loader so the dense family accepts the same
     // single-file and sharded layouts as LFM2/Qwen3.5/Gemma4.
-    let mut param_map = load_all_safetensors(path, false)?;
+    let param_map = load_all_safetensors(path, false)?;
     info!("  Loaded {} tensors", param_map.len());
 
-    let mut mapped_params: HashMap<String, MxArray> = HashMap::new();
-    for (name, array) in param_map.drain() {
-        let mapped_name = if let Some(stripped) = name.strip_prefix("model.") {
-            if stripped == "embed_tokens.weight" {
-                "embedding.weight".to_string()
-            } else if stripped.starts_with("embed_tokens.") {
-                stripped.replace("embed_tokens", "embedding")
-            } else if stripped == "norm.weight" {
-                "final_norm.weight".to_string()
-            } else {
-                stripped.to_string()
-            }
-        } else {
-            name
-        };
-        mapped_params.insert(mapped_name, array);
-    }
+    let mapped_params = apply_rename_spec(param_map, &QWEN3_RENAME_SPEC)?;
 
     info!(
         "Loaded {} parameters from SafeTensors (mapped)",

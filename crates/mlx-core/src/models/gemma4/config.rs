@@ -1,5 +1,7 @@
 use napi_derive::napi;
 
+use crate::models::paged_config::PagedCacheConfig;
+
 /// Gemma 4 model configuration (dense variant).
 ///
 /// Supports E2B (2.3B), E4B (4.5B), and 31B dense models.
@@ -339,6 +341,24 @@ impl Gemma4Config {
         // Check if this is the last non-shared layer of this type
         !(layer_idx + 1..first_shared)
             .any(|i| self.layer_types.get(i).is_some_and(|t| t == my_type))
+    }
+
+    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`]
+    /// (`paged_cache_initial_memory_mb` is qwen3_5-only; always `None` here).
+    ///
+    /// The four fields stay declared inline on the struct: `Gemma4Config` is
+    /// a `#[napi(object)]` bridge type whose generated TS interface is flat
+    /// camelCase, and `Gemma4Config { .. }` literals exist across the
+    /// family's test helpers — `#[serde(flatten)]` would break both
+    /// contracts.
+    pub fn paged_cache_config(&self) -> PagedCacheConfig {
+        PagedCacheConfig {
+            paged_cache_memory_mb: self.paged_cache_memory_mb,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: self.paged_block_size,
+            use_block_paged_cache: self.use_block_paged_cache,
+            persist_paged_cache: self.persist_paged_cache,
+        }
     }
 }
 

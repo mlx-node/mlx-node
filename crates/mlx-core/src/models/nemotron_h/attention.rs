@@ -10,12 +10,15 @@
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::{DType, MxArray};
+use crate::models::attention_core::{
+    BatchedDecodeLabels, CacheHitPrefillRoute, PagedAttentionCore,
+};
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::Linear;
 use crate::transformer::KVCache;
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
-use crate::transformer::paged_policy::{gather_kv_for_decode_with_fallback, write_kv_chunk};
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedDecodeRouteHint, PagedKVCacheAdapter, SeqId,
+};
 use napi::bindgen_prelude::*;
 
 use super::config::NemotronHConfig;
@@ -130,6 +133,31 @@ impl NemotronHAttention {
             || self.o_proj.is_quantized()
     }
 
+    /// The shared paged skeleton with Nemotron-H's parameterization: no
+    /// Q/K norm, no RoPE (NoPE — position reaches the model through the
+    /// Mamba-2 mixers), `Auto` decode route, the unconditional
+    /// `gather_kv_for_prefill_chunk` bridge for cache-hit prefill, and a
+    /// `PAGED_KV_IO_DTYPE` cast at the pool boundary (a production bf16
+    /// stream is a no-op; an f32 one — unit-test fixtures — is accepted).
+    fn paged_core(&self) -> PagedAttentionCore<'_> {
+        PagedAttentionCore {
+            q_proj: &self.q_proj,
+            k_proj: &self.k_proj,
+            v_proj: &self.v_proj,
+            o_proj: &self.o_proj,
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+            qk_norm: None,
+            rope: None,
+            kv_io_dtype: Some(PAGED_KV_IO_DTYPE),
+            decode_route_hint: PagedDecodeRouteHint::Auto,
+            cache_hit_prefill: CacheHitPrefillRoute::BridgeUnconditional,
+            family: "nemotron_h",
+        }
+    }
+
     /// Block-paged forward driven by the PagedKVCacheAdapter.
     ///
     /// Mirrors the LFM2 forward_paged contract: `x` is already pre-normalized,
@@ -147,145 +175,15 @@ impl NemotronHAttention {
         cached_prefix_len: u32,
         is_prefill: bool,
     ) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
-
-        let queries = self.q_proj.forward(x)?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
-
-        let queries =
-            queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
-        let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = keys.reshape(&[
-            batch,
-            seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let keys_bhtd = keys.transpose(Some(&[0, 2, 1, 3]))?;
-        let values = values.reshape(&[
-            batch,
-            seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
-
-        // Paged layout [num_tokens, n_kv_heads, head_dim].
-        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-
-        // Cast at the write boundary: a production bf16 stream is a no-op, an
-        // f32 one (unit-test fixtures) is accepted.
-        let keys_paged = keys_paged.astype(PAGED_KV_IO_DTYPE)?;
-        let values_paged = values_paged.astype(PAGED_KV_IO_DTYPE)?;
-        write_kv_chunk(
+        self.paged_core().forward_paged(
+            x,
             adapter,
             attn_layer_idx,
-            &keys_paged,
-            &values_paged,
             first_logical_position,
-            "nemotron_h",
+            cached_prefix_len,
+            is_prefill,
+            None,
         )
-        .map_err(napi::Error::from_reason)?;
-
-        let attn_bhtd = if is_prefill {
-            if cached_prefix_len == 0 {
-                if seq_len > 1 {
-                    scaled_dot_product_attention_causal(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale,
-                    )?
-                } else {
-                    scaled_dot_product_attention(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale,
-                        None,
-                    )?
-                }
-            } else {
-                // Cache-hit prefill: the suffix was just written above; the
-                // paged kernel attends over cached prefix + fresh suffix.
-                let total_ctx = cached_prefix_len + (seq_len as u32);
-                let queries_paged = queries_bhtd
-                    .squeeze(Some(&[0]))?
-                    .transpose(Some(&[1, 0, 2]))?;
-                let maybe_paged_attn = adapter
-                    .gather_kv_for_prefill_chunk(
-                        attn_layer_idx,
-                        &queries_paged,
-                        cached_prefix_len,
-                        self.scale as f32,
-                    )
-                    .ok()
-                    .map(|attn_t_h_d| {
-                        let target_dtype = x.dtype()?;
-                        let attn_t_h_d = attn_t_h_d.astype(target_dtype)?;
-                        attn_t_h_d.transpose(Some(&[1, 0, 2]))?.reshape(&[
-                            batch,
-                            self.num_heads as i64,
-                            seq_len,
-                            self.head_dim as i64,
-                        ])
-                    })
-                    .transpose()?;
-                match maybe_paged_attn {
-                    Some(attn) => attn,
-                    None => {
-                        let (k_full, v_full) = adapter
-                            .read_kv_range(attn_layer_idx, 0, total_ctx)
-                            .map_err(napi::Error::from_reason)?;
-                        let mask = crate::array::mask::create_causal_mask(
-                            seq_len as i32,
-                            Some(cached_prefix_len as i32),
-                            None,
-                        )?;
-                        scaled_dot_product_attention(
-                            &queries_bhtd,
-                            &k_full,
-                            &v_full,
-                            self.scale,
-                            Some(&mask),
-                        )?
-                    }
-                }
-            }
-        } else {
-            // Decode: gather full historical K/V via the paged kernel.
-            let queries_3d = queries_bhtd
-                .squeeze(Some(&[2]))?
-                .reshape(&[1, self.num_heads as i64, self.head_dim as i64])?
-                .astype(PAGED_KV_IO_DTYPE)?;
-            let attn_3d = gather_kv_for_decode_with_fallback(
-                adapter,
-                attn_layer_idx,
-                &queries_3d,
-                self.scale as f32,
-                /* softcap */ 1.0,
-                "nemotron_h",
-            )
-            .map_err(napi::Error::from_reason)?;
-            let target_dtype = x.dtype()?;
-            let attn_3d = attn_3d.astype(target_dtype)?;
-            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
-        };
-
-        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-        self.o_proj.forward(&output)
     }
 
     /// Uniform batched paged decode for the continuous-batching lane.
@@ -301,61 +199,16 @@ impl NemotronHAttention {
         attn_layer_idx: u32,
         rows: &[(SeqId, u32)],
     ) -> Result<MxArray> {
-        let shape = x.shape()?;
-        if rows.is_empty()
-            || shape.as_ref().len() != 3
-            || shape[0] != rows.len() as i64
-            || shape[1] != 1
-        {
-            return Err(Error::from_reason(format!(
-                "NemotronHAttention::forward_paged_batched expects [N,1,H] for {} rows, got {:?}",
-                rows.len(),
-                shape.as_ref()
-            )));
-        }
-        if !native_kv_write_enabled() || !graph_decode_gather_enabled() {
-            return Err(Error::from_reason(
-                "NemotronH batched decode requires native K/V writes and graph decode gather",
-            ));
-        }
-
-        let batch = rows.len() as i64;
-        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
-
-        let queries = self
-            .q_proj
-            .forward(x)?
-            .reshape(&[batch, 1, self.num_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = self
-            .k_proj
-            .forward(x)?
-            .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let values = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-
-        let queries = queries.squeeze(Some(&[2]))?.astype(PAGED_KV_IO_DTYPE)?;
-        let keys = keys.squeeze(Some(&[2]))?.astype(PAGED_KV_IO_DTYPE)?;
-        let values = values.squeeze(Some(&[2]))?.astype(PAGED_KV_IO_DTYPE)?;
-        adapter
-            .update_keys_values_native_batched(attn_layer_idx, &keys, &values, rows)
-            .map_err(Error::from_reason)?;
-        let attended = adapter
-            .gather_kv_for_decode_graph_batched(
-                attn_layer_idx,
-                &queries,
-                &seq_ids,
-                self.scale as f32,
-                /* softcap */ 1.0,
-            )
-            .map_err(Error::from_reason)?
-            .astype(x.dtype()?)?
-            .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
-        self.o_proj.forward(&attended)
+        self.paged_core().forward_paged_batched(
+            x,
+            adapter,
+            attn_layer_idx,
+            rows,
+            &BatchedDecodeLabels {
+                type_name: "NemotronHAttention",
+                family: "NemotronH",
+            },
+        )
     }
 }
 

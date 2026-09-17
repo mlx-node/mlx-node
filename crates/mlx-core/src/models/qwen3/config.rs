@@ -3,6 +3,8 @@
  */
 use napi_derive::napi;
 
+use crate::models::paged_config::PagedCacheConfig;
+
 /// Qwen3 model configuration
 #[napi(object)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -55,4 +57,24 @@ pub struct Qwen3Config {
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub persist_paged_cache: Option<bool>,
+}
+
+impl Qwen3Config {
+    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`]
+    /// (`paged_cache_initial_memory_mb` is qwen3_5-only; always `None` here).
+    ///
+    /// The four fields stay declared inline on the struct: `Qwen3Config` is a
+    /// `#[napi(object)]` bridge type whose generated TS interface is flat
+    /// camelCase (`useBlockPagedCache`, set by e.g. `TINY_TEST_CONFIG`), and
+    /// `Qwen3Config { paged_cache_memory_mb: .. }` literals exist outside this
+    /// file — `#[serde(flatten)]` would break both contracts.
+    pub fn paged_cache_config(&self) -> PagedCacheConfig {
+        PagedCacheConfig {
+            paged_cache_memory_mb: self.paged_cache_memory_mb,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: self.paged_block_size,
+            use_block_paged_cache: self.use_block_paged_cache,
+            persist_paged_cache: self.persist_paged_cache,
+        }
+    }
 }

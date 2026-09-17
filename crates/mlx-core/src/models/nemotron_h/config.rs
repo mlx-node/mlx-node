@@ -2,6 +2,8 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde_json::Value;
 
+use crate::models::paged_config::PagedCacheConfig;
+
 /// NVIDIA Nemotron 3.5 Lightning ("nemotron_h") model configuration.
 ///
 /// Hybrid MoE: every layer is one pre-RMSNorm + ONE mixer + a residual, closed
@@ -165,6 +167,19 @@ impl NemotronHConfig {
 
         // 2 bytes per param (bf16)
         total_params * 2
+    }
+
+    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`].
+    /// `persist_paged_cache` / `paged_cache_initial_memory_mb` have no fields
+    /// on this config and stay `None`.
+    pub fn paged_cache_config(&self) -> PagedCacheConfig {
+        PagedCacheConfig {
+            paged_cache_memory_mb: self.paged_cache_memory_mb,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: self.paged_block_size,
+            use_block_paged_cache: self.use_block_paged_cache,
+            persist_paged_cache: None,
+        }
     }
 }
 
@@ -445,6 +460,12 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         ));
     }
 
+    // Shared snake_case reads (`as_u64` → `as u32`, `as_bool`) identical to
+    // the fields they replace; `persist_paged_cache` /
+    // `paged_cache_initial_memory_mb` stay unconsumed — this family has no
+    // such fields.
+    let paged = PagedCacheConfig::from_raw_json(raw);
+
     Ok(NemotronHConfig {
         vocab_size: req_i32(raw, "vocab_size")?,
         hidden_size: req_i32(raw, "hidden_size")?,
@@ -485,15 +506,9 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         eos_token_ids,
         mtp_layers_block_type,
         n_mtp_layers,
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-        paged_block_size: raw
-            .get("paged_block_size")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(Value::as_bool),
+        paged_cache_memory_mb: paged.paged_cache_memory_mb,
+        paged_block_size: paged.paged_block_size,
+        use_block_paged_cache: paged.use_block_paged_cache,
     })
 }
 

@@ -913,6 +913,265 @@ pub(crate) fn dequant_fp8_block_scale(
     Ok(())
 }
 
+// ===========================================================================
+// Declarative weight-key rename specs
+// ===========================================================================
+//
+// Every family's `sanitize_weights`-style load path does the same two things
+// to each raw checkpoint key: an ordered KEY rewrite (strip a wrapper prefix,
+// rename a handful of exact keys, drop runtime-computed or unsupported
+// tensors) and a set of family-specific VALUE transforms (FP8 dequant, conv
+// transposes, norm +1.0 shifts, expert stacking) no table can express.
+// [`RenameSpec`] + [`apply_rename_spec`] are the shared declarative half; the
+// value transforms stay in each family as named hooks running before/after
+// the spec application.
+
+/// The five HF/VLM wrapper prefixes stripped longest-first by the qwen3_5,
+/// qwen3_5_moe, and gemma4 sanitize passes. The list + order mirror the
+/// authoritative `models::mtp_drafter::strip_wrapper_prefix` chain — a
+/// `rename_spec` test pins the equivalence so the two can never drift.
+pub(crate) const WRAPPER_STRIP_PREFIXES: &[&str] = &[
+    "model.language_model.model.",
+    "model.language_model.",
+    "language_model.model.",
+    "language_model.",
+    "model.",
+];
+
+/// One declarative key rule inside a [`RenameSpec`].
+///
+/// Inside [`RenameSpec::rules`] the rules run IN ORDER against the current
+/// key; every matching rule rewrites the key and evaluation continues with
+/// the NEXT rule — the same shape as the hand-written `if`/`str::replace`
+/// chains it replaces — while the `Drop*` and `KeepIfPrefix` rules terminate
+/// the chain for that key.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum KeyRule {
+    /// `key == k` → drop the tensor.
+    DropExact(&'static str),
+    /// `key.starts_with(p)` → drop the tensor.
+    DropPrefix(&'static str),
+    /// `key.contains(s)` → drop the tensor.
+    DropContains(&'static str),
+    /// `key.ends_with(s)` → drop the tensor.
+    DropSuffix(&'static str),
+    /// `key == from` → emit under `to`.
+    RenameExact {
+        from: &'static str,
+        to: &'static str,
+    },
+    /// `key.starts_with(from)` → `to` + the remainder (`to == ""` is a plain
+    /// prefix strip).
+    RenamePrefix {
+        from: &'static str,
+        to: &'static str,
+    },
+    /// `key.contains(scope)` → `key.replace(from, to)`.
+    ///
+    /// Replace-ALL, not prefix swap: the lfm2 `feed_forward` w1/w2/w3 renames
+    /// and the qwen3_5_moe `experts.down_proj` fix were `str::replace` calls,
+    /// so this preserves their every-occurrence semantics exactly.
+    ReplaceIfContains {
+        scope: &'static str,
+        from: &'static str,
+        to: &'static str,
+    },
+    /// `key.starts_with(scope)` → `key.replace(from, to)` (replace-all).
+    ReplaceIfPrefixed {
+        scope: &'static str,
+        from: &'static str,
+        to: &'static str,
+    },
+    /// `key.starts_with(p)` → keep the tensor under the CURRENT key and stop
+    /// evaluating rules — the positive form of the `!key.starts_with(p)`
+    /// guards on later drops (gemma4 keeps `vision_tower.*` clip params while
+    /// dropping the text ones).
+    KeepIfPrefix(&'static str),
+}
+
+/// Declarative key-remap table shared by the per-family `sanitize_weights`
+/// skeletons.
+///
+/// Pipeline per input key:
+///   1. [`Self::raw_rules`] are tried in order on the RAW key; the FIRST
+///      match is terminal — the tensor is dropped or emitted under the
+///      rewritten key, and neither `strip_prefixes` nor `rules` run. This is
+///      for guards gated on the pre-strip key: `__metadata__` drops,
+///      qwen3_5's `model.visual`/`visual_encoder` filters, muse_glimmer's
+///      `language_model.model.*` namespace rewrites.
+///   2. [`Self::strip_prefixes`] is an else-if chain: the FIRST matching
+///      prefix is stripped exactly once. Order is load-bearing for
+///      overlapping prefixes — longest first ([`WRAPPER_STRIP_PREFIXES`]).
+///   3. [`Self::rules`] run in order on the post-strip key — but only when
+///      `rules_require_strip` is false OR a prefix actually matched (qwen3
+///      and harrier gate every rename inside the
+///      `if let Some(stripped) = key.strip_prefix("model.")` arm, so an
+///      unprefixed `embed_tokens.weight` passes through untouched).
+///   4. Whatever key survives is inserted — or errors on collision when
+///      [`Self::reject_duplicate_keys_as`] is set.
+///
+/// Unknown-key policy: anything unmatched passes through unchanged (every
+/// load-path family is permissive). Fail-closed inventory validation stays in
+/// the family hook — it needs the full map and config anyway.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RenameSpec<'a> {
+    /// First-match-wins rules on the RAW key; a match is terminal.
+    pub raw_rules: &'a [KeyRule],
+    /// Else-if prefix strip tried in order; first match strips once.
+    pub strip_prefixes: &'a [&'a str],
+    /// Gate [`Self::rules`] on a prefix having been stripped.
+    pub rules_require_strip: bool,
+    /// Ordered rule chain on the post-strip key.
+    pub rules: &'a [KeyRule],
+    /// `Some(family)` makes a duplicate output key an error naming the family
+    /// ("{family} checkpoint contains duplicate canonical tensor '{key}'");
+    /// `None` keeps the default `HashMap::insert` last-write-wins behavior.
+    pub reject_duplicate_keys_as: Option<&'a str>,
+}
+
+/// What one [`KeyRule`] does to a key it fires on.
+enum RuleOutcome {
+    /// Drop the tensor (skip the key entirely).
+    Drop,
+    /// Keep the tensor under the current key; stop evaluating rules.
+    Keep,
+    /// Emit the tensor under the rewritten key.
+    Rename(String),
+}
+
+/// Evaluate one rule against `key`; `None` means the guard did not match.
+fn eval_key_rule(rule: &KeyRule, key: &str) -> Option<RuleOutcome> {
+    Some(match *rule {
+        KeyRule::DropExact(k) if key == k => RuleOutcome::Drop,
+        KeyRule::DropPrefix(p) if key.starts_with(p) => RuleOutcome::Drop,
+        KeyRule::DropContains(s) if key.contains(s) => RuleOutcome::Drop,
+        KeyRule::DropSuffix(s) if key.ends_with(s) => RuleOutcome::Drop,
+        KeyRule::RenameExact { from, to } if key == from => {
+            RuleOutcome::Rename(to.to_string())
+        }
+        KeyRule::RenamePrefix { from, to } if key.starts_with(from) => {
+            RuleOutcome::Rename(format!("{to}{}", &key[from.len()..]))
+        }
+        KeyRule::ReplaceIfContains { scope, from, to } if key.contains(scope) => {
+            RuleOutcome::Rename(key.replace(from, to))
+        }
+        KeyRule::ReplaceIfPrefixed { scope, from, to } if key.starts_with(scope) => {
+            RuleOutcome::Rename(key.replace(from, to))
+        }
+        KeyRule::KeepIfPrefix(p) if key.starts_with(p) => RuleOutcome::Keep,
+        _ => return None,
+    })
+}
+
+/// Insert `key`/`value` into `out`, honoring the spec's duplicate policy.
+fn emit_renamed(
+    out: &mut HashMap<String, MxArray>,
+    reject_duplicate_keys_as: Option<&str>,
+    key: String,
+    value: MxArray,
+) -> Result<()> {
+    if let Some(family) = reject_duplicate_keys_as {
+        if out.insert(key.clone(), value).is_some() {
+            return Err(Error::from_reason(format!(
+                "{family} checkpoint contains duplicate canonical tensor '{key}'"
+            )));
+        }
+    } else {
+        out.insert(key, value);
+    }
+    Ok(())
+}
+
+/// Apply a [`RenameSpec`] to `params`, returning the rewritten weight map.
+///
+/// Consumes the input map so `&mut`-style callers can hand over ownership via
+/// `std::mem::take(params)` — which also preserves the "sanitizer empties the
+/// input map" contract some family tests pin.
+pub(crate) fn apply_rename_spec(
+    params: HashMap<String, MxArray>,
+    spec: &RenameSpec<'_>,
+) -> Result<HashMap<String, MxArray>> {
+    let mut out: HashMap<String, MxArray> = HashMap::with_capacity(params.len());
+    'tensors: for (key, value) in params {
+        // Phase 1 — raw-key rules: the FIRST match is terminal.
+        if let Some(outcome) = spec
+            .raw_rules
+            .iter()
+            .find_map(|rule| eval_key_rule(rule, &key))
+        {
+            match outcome {
+                RuleOutcome::Drop => {}
+                RuleOutcome::Keep => {
+                    emit_renamed(&mut out, spec.reject_duplicate_keys_as, key, value)?
+                }
+                RuleOutcome::Rename(new_key) => {
+                    emit_renamed(&mut out, spec.reject_duplicate_keys_as, new_key, value)?
+                }
+            }
+            continue;
+        }
+
+        // Phase 2 — the else-if prefix strip (first match only).
+        let (mut key, stripped) = match spec
+            .strip_prefixes
+            .iter()
+            .find_map(|prefix| key.strip_prefix(prefix))
+        {
+            Some(rest) => (rest.to_string(), true),
+            None => (key, false),
+        };
+
+        // Phase 3 — the ordered post-strip rule chain.
+        if stripped || !spec.rules_require_strip {
+            for rule in spec.rules {
+                match eval_key_rule(rule, &key) {
+                    Some(RuleOutcome::Drop) => continue 'tensors,
+                    Some(RuleOutcome::Keep) => break,
+                    Some(RuleOutcome::Rename(new_key)) => key = new_key,
+                    None => {}
+                }
+            }
+        }
+        emit_renamed(&mut out, spec.reject_duplicate_keys_as, key, value)?;
+    }
+    Ok(out)
+}
+
+/// Cast every Float32 tensor in `params` to BFloat16 in place, exempting the
+/// mandatory-f32 sym8 `.scales` companions — an f32 `[N]` sidecar beside an
+/// Int8 `.weight` sibling, identified content-based because quant settings
+/// are read from config.json AFTER sanitize — plus any key where
+/// `also_exempt` holds (lfm2's `.expert_bias`, gemma4's `vision_tower.*` /
+/// `embed_vision.*`).
+///
+/// This is the shared tail of the k2_horizon / lfm2 / gemma4 sanitizers.
+/// Affine `.scales` (packed-Uint32 sibling) keep the bf16 cast, and an
+/// `astype` failure keeps the original f32 — the baselines' `let Ok(casted)`
+/// fallthrough, unchanged.
+pub(crate) fn cast_f32_tensors_to_bf16(
+    params: &mut HashMap<String, MxArray>,
+    also_exempt: impl Fn(&str) -> bool,
+) {
+    let sym8_scales: std::collections::HashSet<String> = params
+        .keys()
+        .filter_map(|k| {
+            let prefix = k.strip_suffix(".scales")?;
+            let w = params.get(&format!("{prefix}.weight"))?;
+            (w.dtype().ok()? == DType::Int8).then(|| k.clone())
+        })
+        .collect();
+    for (k, value) in params.iter_mut() {
+        if sym8_scales.contains(k) || also_exempt(k) {
+            continue;
+        }
+        if value.dtype().is_ok_and(|dt| dt == DType::Float32)
+            && let Ok(casted) = value.astype(DType::BFloat16)
+        {
+            *value = casted;
+        }
+    }
+}
+
 /// Helper to read an i32 config value, checking `text_config` first, then root.
 /// Tries each key in order, returning the first match or the default.
 pub(crate) fn get_config_i32(
@@ -1271,5 +1530,185 @@ mod generation_defaults_tests {
             d.eos_token_ids
         );
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod rename_spec_tests {
+    use super::*;
+
+    fn dummy() -> MxArray {
+        MxArray::from_float32(&[0.0], &[1]).expect("dummy")
+    }
+
+    /// `WRAPPER_STRIP_PREFIXES` must strip exactly the same string as the
+    /// authoritative `mtp_drafter::strip_wrapper_prefix` chain — the longest-
+    /// first ordering exists to keep `model.language_model.model.` from being
+    /// eaten by the bare `model.` arm.
+    #[test]
+    fn wrapper_strip_prefixes_match_mtp_drafter_chain() {
+        for key in [
+            "model.language_model.model.mtp.fc.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.embed_tokens.weight",
+            "language_model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "layers.0.mlp.down_proj.weight",
+            "lm_head.weight",
+        ] {
+            let expected = crate::models::mtp_drafter::strip_wrapper_prefix(key);
+            let actual = WRAPPER_STRIP_PREFIXES
+                .iter()
+                .find_map(|p| key.strip_prefix(p))
+                .unwrap_or(key);
+            assert_eq!(actual, expected, "strip mismatch for '{key}'");
+        }
+    }
+
+    #[test]
+    fn spec_strips_renames_drops_and_preserves_tensor_identity() {
+        let spec = RenameSpec {
+            raw_rules: &[],
+            strip_prefixes: &["model."],
+            rules_require_strip: false,
+            rules: &[
+                KeyRule::DropContains("rotary_emb"),
+                KeyRule::RenamePrefix {
+                    from: "embed_tokens.",
+                    to: "embedding.",
+                },
+                KeyRule::RenameExact {
+                    from: "norm.weight",
+                    to: "final_norm.weight",
+                },
+            ],
+            reject_duplicate_keys_as: None,
+        };
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        let w = dummy();
+        let w_ptr = w.as_raw_ptr();
+        params.insert("model.embed_tokens.weight".into(), w);
+        params.insert("model.norm.weight".into(), dummy());
+        params.insert("model.layers.0.self_attn.rotary_emb.inv_freq".into(), dummy());
+        params.insert("untouched.key".into(), dummy());
+
+        let out = apply_rename_spec(params, &spec).expect("apply");
+        assert_eq!(out.len(), 3);
+        // The spec moves VALUES verbatim — the same MxArray handle, not a copy.
+        assert_eq!(out["embedding.weight"].as_raw_ptr(), w_ptr);
+        assert!(out.contains_key("final_norm.weight"));
+        assert!(out.contains_key("untouched.key"));
+    }
+
+    #[test]
+    fn raw_rules_are_first_match_and_terminal() {
+        let spec = RenameSpec {
+            raw_rules: &[
+                KeyRule::DropPrefix("model.visual"),
+                KeyRule::RenamePrefix {
+                    from: "language_model.model.",
+                    to: "",
+                },
+            ],
+            strip_prefixes: &["model."],
+            rules_require_strip: false,
+            rules: &[KeyRule::DropContains("must_not_be_seen")],
+            reject_duplicate_keys_as: None,
+        };
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("model.visual.patch.weight".into(), dummy());
+        params.insert(
+            "language_model.model.layers.0.must_not_be_seen.weight".into(),
+            dummy(),
+        );
+        let out = apply_rename_spec(params, &spec).expect("apply");
+        // raw Rewrite is terminal: `rules` never saw the renamed key.
+        assert!(out.contains_key("layers.0.must_not_be_seen.weight"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn rules_require_strip_gates_renames_on_matched_prefix() {
+        let spec = RenameSpec {
+            raw_rules: &[],
+            strip_prefixes: &["model."],
+            rules_require_strip: true,
+            rules: &[KeyRule::ReplaceIfPrefixed {
+                scope: "embed_tokens.",
+                from: "embed_tokens",
+                to: "embedding",
+            }],
+            reject_duplicate_keys_as: None,
+        };
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("model.embed_tokens.weight".into(), dummy());
+        params.insert("embed_tokens.weight".into(), dummy());
+        let out = apply_rename_spec(params, &spec).expect("apply");
+        assert!(out.contains_key("embedding.weight"));
+        // The unprefixed key skipped the rule chain entirely.
+        assert!(out.contains_key("embed_tokens.weight"));
+    }
+
+    #[test]
+    fn keep_if_prefix_short_circuits_later_drops() {
+        let spec = RenameSpec {
+            raw_rules: &[],
+            strip_prefixes: &["model."],
+            rules_require_strip: false,
+            rules: &[
+                KeyRule::KeepIfPrefix("vision_tower."),
+                KeyRule::DropContains("input_min"),
+            ],
+            reject_duplicate_keys_as: None,
+        };
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("model.vision_tower.q_proj.input_min".into(), dummy());
+        params.insert("model.layers.0.q_proj.input_min".into(), dummy());
+        let out = apply_rename_spec(params, &spec).expect("apply");
+        assert!(out.contains_key("vision_tower.q_proj.input_min"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_output_key_errors_when_rejected() {
+        let spec = RenameSpec {
+            raw_rules: &[],
+            strip_prefixes: &["model."],
+            rules_require_strip: false,
+            rules: &[],
+            reject_duplicate_keys_as: Some("Test-Family"),
+        };
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("model.layers.0.weight".into(), dummy());
+        params.insert("layers.0.weight".into(), dummy());
+        let err = apply_rename_spec(params, &spec)
+            .err()
+            .expect("duplicate canonical key must error");
+        assert!(
+            format!("{err}").contains("duplicate canonical tensor 'layers.0.weight'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cast_f32_exempts_sym8_scales_and_named_extras() {
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        let f32_arr = |n: i64, shape: &[i64]| {
+            MxArray::from_float32(&vec![0.5f32; n as usize], shape).unwrap()
+        };
+        params.insert(
+            "layers.0.q_proj.weight".into(),
+            f32_arr(8, &[2, 4]).astype(DType::Int8).unwrap(),
+        );
+        params.insert("layers.0.q_proj.scales".into(), f32_arr(2, &[2]));
+        params.insert("layers.0.expert_bias".into(), f32_arr(2, &[2]));
+        params.insert("norm.weight".into(), f32_arr(4, &[4]));
+
+        cast_f32_tensors_to_bf16(&mut params, |k| k.ends_with(".expert_bias"));
+
+        let dt = |k: &str| params[k].dtype().unwrap();
+        assert_eq!(dt("layers.0.q_proj.scales"), DType::Float32);
+        assert_eq!(dt("layers.0.expert_bias"), DType::Float32);
+        assert_eq!(dt("norm.weight"), DType::BFloat16);
     }
 }

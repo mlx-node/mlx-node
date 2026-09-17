@@ -3,6 +3,7 @@
  *
  * Contains all model implementations.
  */
+pub(crate) mod attention_core;
 pub(crate) mod chat_napi;
 pub(crate) mod forward;
 pub mod gemma4;
@@ -13,6 +14,7 @@ pub mod lfm2;
 pub mod mtp_drafter;
 pub mod muse_glimmer;
 pub mod nemotron_h;
+pub mod paged_config;
 pub mod paddleocr_vl;
 pub mod pp_doc_ori;
 pub mod pp_doc_unwarp;

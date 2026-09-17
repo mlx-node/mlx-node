@@ -9,7 +9,9 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::MxArray;
-use crate::engine::persistence::load_all_safetensors;
+use crate::engine::persistence::{
+    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors,
+};
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::{HarrierConfig, HarrierModel};
@@ -70,7 +72,7 @@ fn load_impl(model_path: &str) -> Result<HarrierModel> {
     let mut param_map = load_all_safetensors(path, false)?;
     info!("Loaded {} tensors from SafeTensors", param_map.len());
 
-    let mapped_params = map_hf_names(&mut param_map);
+    let mapped_params = map_hf_names(&mut param_map)?;
     info!("Mapped {} parameters", mapped_params.len());
 
     let tokenizer_path = path.join("tokenizer.json");
@@ -206,31 +208,32 @@ fn load_prompts(model_dir: &Path) -> HashMap<String, String> {
     prompts
 }
 
+/// HF → internal key map. The `lm_head.weight` drop is RAW-scoped
+/// (`raw_rules`): the original `else if` arm only discarded a *bare*
+/// `lm_head.weight`, while a `model.`-prefixed one was stripped and kept —
+/// same for `rules_require_strip`, which keeps renames inside the `model.`
+/// branch exactly like the original `if let` chain.
+static HARRIER_RENAME_SPEC: RenameSpec<'static> = RenameSpec {
+    raw_rules: &[KeyRule::DropExact("lm_head.weight")],
+    strip_prefixes: &["model."],
+    rules_require_strip: true,
+    rules: &[
+        KeyRule::ReplaceIfPrefixed {
+            scope: "embed_tokens.",
+            from: "embed_tokens",
+            to: "embedding",
+        },
+        KeyRule::RenameExact {
+            from: "norm.weight",
+            to: "final_norm.weight",
+        },
+    ],
+    reject_duplicate_keys_as: None,
+};
+
 /// Map HuggingFace parameter names to internal names.
-fn map_hf_names(params: &mut HashMap<String, MxArray>) -> HashMap<String, MxArray> {
-    let mut mapped = HashMap::new();
-
-    for (name, array) in params.drain() {
-        let mapped_name = if let Some(stripped) = name.strip_prefix("model.") {
-            if stripped == "embed_tokens.weight" {
-                "embedding.weight".to_string()
-            } else if stripped.starts_with("embed_tokens.") {
-                stripped.replace("embed_tokens", "embedding")
-            } else if stripped == "norm.weight" {
-                "final_norm.weight".to_string()
-            } else {
-                stripped.to_string()
-            }
-        } else if name == "lm_head.weight" {
-            // Skip lm_head if present — embedding model doesn't use it
-            continue;
-        } else {
-            name
-        };
-        mapped.insert(mapped_name, array);
-    }
-
-    mapped
+fn map_hf_names(params: &mut HashMap<String, MxArray>) -> Result<HashMap<String, MxArray>> {
+    apply_rename_spec(std::mem::take(params), &HARRIER_RENAME_SPEC)
 }
 
 fn get_i32(raw: &Value, keys: &[&str]) -> Result<i32> {
