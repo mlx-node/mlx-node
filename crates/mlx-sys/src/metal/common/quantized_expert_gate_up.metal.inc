@@ -49,7 +49,7 @@ if constexpr(HOIST_ZERO) {
   }
 }
 uint wr32=tid/2,wk32=(tid%2)*32;
-QwenPackedGroup32<BITS> pg,pu;
+PackedGroup32<BITS> pg,pu;
 float gs,gb,us,ub;
 KQScales<float,BITS,8,true> gscale(sgs,bg, (wr+wr32)*(K/32)+wk32/32);
 KQScales<float,BITS,8,true> uscale(sus,bu, (wr+wr32)*(K/32)+wk32/32);

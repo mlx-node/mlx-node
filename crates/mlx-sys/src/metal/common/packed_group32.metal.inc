@@ -2,7 +2,7 @@ R"metal(
 // PackedNAXGroup32 / MLXFAST-WVEC8 from upstream 8981cef5, adapted
 // to mixed Q4_K/Q5_K codes and F32 scale/min products (MIT notice retained).
 template<int BITS>
-struct QwenPackedGroup32 {
+struct PackedGroup32 {
   uint words[BITS];
   float scale, bias;
   void prefetch(const device uint8_t* src,float s,float b) thread {

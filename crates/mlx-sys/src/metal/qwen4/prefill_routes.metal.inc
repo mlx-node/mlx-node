@@ -1,5 +1,5 @@
 // Adapted from mlxfast TrackFastMoE.route, 8981cef5.
-// MIT, copyright 2026 Layr Labs, Inc.; see MLXFAST-LICENSE.txt.
+// MIT, copyright 2026 Layr Labs, Inc.; see ../MLXFAST-LICENSE.txt.
 R"metal(
 
 // Preserve probability-first routing, including BF16 rounding before stable

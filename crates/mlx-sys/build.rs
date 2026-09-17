@@ -300,31 +300,10 @@ fn main() {
     // exported C ABI. Re-run even when Cargo otherwise considers the inputs
     // unchanged so toggling CPU-only mode cannot reuse Metal artifacts.
     println!("cargo:rerun-if-env-changed=MLX_DISABLE_METAL");
-    // Watch all C++ source files, headers, and Metal kernel includes
+    // Cargo recursively watches directories, including added/removed bridge
+    // files and shader includes nested under metal/common or a model family.
     let src_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
-    // Track added bridge translation units as well as edits to existing files.
     println!("cargo:rerun-if-changed={}", src_dir.display());
-    if let Ok(entries) = std::fs::read_dir(&src_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension()
-                && (ext == "cpp" || ext == "h")
-            {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
-        }
-    }
-    let metal_dir = src_dir.join("metal");
-    if let Ok(entries) = std::fs::read_dir(&metal_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension()
-                && ext == "inc"
-            {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
-        }
-    }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let mlx_dir = manifest_dir.join("mlx");
@@ -678,11 +657,11 @@ fn main() {
     // the CMake build above actually enabled them.
     if build_metal {
         bridge.define("MLX_NODE_METAL_ENABLED", None);
-        // Direct Qwen4 expert GEMVs reuse the vendored K-quant arithmetic even
+        // Custom quantized kernels reuse the vendored K-quant arithmetic even
         // in the normal precompiled-metallib build, where MLX does not export
         // its optional JIT preambles. Generate private copies from source so
         // the helper kernels cannot drift from the linked quantization code.
-        let preambles = PathBuf::from(env::var("OUT_DIR").unwrap()).join("qwen4-preambles");
+        let preambles = PathBuf::from(env::var("OUT_DIR").unwrap()).join("quantized-preambles");
         let script = mlx_dir.join("mlx/backend/metal/make_compiled_preamble.sh");
         for (source_name, name) in [
             ("steel/gemm/gemm", "gemm"),
@@ -698,16 +677,16 @@ fn main() {
                 .arg(&mlx_dir)
                 .arg(source_name)
                 .status()
-                .expect("generate Qwen4 Metal preamble");
-            assert!(status.success(), "Qwen4 {name} Metal preamble failed");
+                .expect("generate quantized Metal preamble");
+            assert!(status.success(), "Quantized {name} Metal preamble failed");
             let path = preambles.join(format!("{name}.cpp"));
             let source = std::fs::read_to_string(&path)
-                .expect("read Qwen4 Metal preamble")
+                .expect("read quantized Metal preamble")
                 .replace(
                     "namespace mlx::core::metal",
-                    "namespace mlx::core::qwen4_preamble",
+                    "namespace mlx::core::quantized_preamble",
                 );
-            std::fs::write(&path, source).expect("write private Qwen4 Metal preamble");
+            std::fs::write(&path, source).expect("write private quantized Metal preamble");
             bridge.file(path);
             println!(
                 "cargo:rerun-if-changed={}",
@@ -749,7 +728,7 @@ fn main() {
             }
         }
     }
-    // Add src/ as include path for metal/*.metal.inc includes
+    // Add src/ as include path for metal/{common,<family>}/*.metal.inc includes
     bridge.include(&src_dir);
 
     // Translation units that depend on Metal *by header* (raw `MTL::` types

@@ -12,12 +12,9 @@ namespace {
 
 // The precise exponential matches the compiled pointwise path's F32 sigmoid.
 // The default intrinsic differed by a few ULPs when lowered in the full kernel.
-const char *complete_gdn_header = R"(
-  template <typename T> METAL_FUNC T qwen4_sigmoid(T x) {
-    auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
-    return (x < 0) ? y : 1 - y;
-  }
-)";
+const char *complete_gdn_header =
+#include "metal/common/precise_sigmoid.metal.inc"
+    ;
 
 template <bool PREFETCH>
 std::vector<array> complete_gdn_metal(const std::vector<array> &in) {
@@ -26,7 +23,7 @@ std::vector<array> complete_gdn_metal(const std::vector<array> &in) {
                                     {"qkv", "z", "a", "b", "conv", "history",
                                      "scale", "dt", "state", "norm", "eps"},
                                     {"out", "next", "next_history"},
-#include "metal/qwen4_gdn_complete.metal.inc"
+#include "metal/qwen4/gdn_complete.metal.inc"
                                     , complete_gdn_header);
   return fn(in, {{1, 1, 6144}, in[8].shape(), in[5].shape()},
             {in[0].dtype(), mlx::core::float32, in[0].dtype()}, {32, 32, 48},
@@ -38,7 +35,7 @@ std::vector<array> complete_gdn_metal(const std::vector<array> &in) {
 std::vector<array> window_conv_metal(const std::vector<array> &in) {
   static auto fn = mlx::core::fast::metal_kernel(
       "qwen4_window_conv", {"x", "history", "weight"}, {"out", "next_history"},
-#include "metal/qwen4_window_conv.metal.inc"
+#include "metal/common/conv1d_silu_k4.metal.inc"
       , complete_gdn_header);
   const int tokens = in[0].shape(1), width = in[0].shape(2);
   return fn(in, {in[0].shape(), in[1].shape()}, {in[0].dtype(), in[0].dtype()},
@@ -142,7 +139,7 @@ extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
         "qwen4_gdn_prepare",
         {"qkv", "a", "b", "conv", "history", "scale", "dt"},
         {"q", "k", "v", "decay", "beta", "next_history"},
-#include "metal/qwen4_gdn_prepare.metal.inc"
+#include "metal/qwen4/gdn_prepare.metal.inc"
         , complete_gdn_header);
     auto result = fn(in,
                      {{1, t, 16, 128},

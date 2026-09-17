@@ -34,7 +34,7 @@
 namespace {
 
 const char* kAffineW8a8GemmBody =
-#include "metal/na_affine_w8a8_gemm.metal.inc"
+#include "metal/common/na_affine_w8a8_gemm.metal.inc"
     ;
 
 const char* kAffineW8a8GemmHeader =
@@ -44,12 +44,12 @@ const char* kAffineW8a8GemmHeader =
 // Fused per-token activation quant + per-group act-sum S (extends the symmetric
 // quant with the S output the affine bias term needs).
 const char* kAffineW8a8QuantSBody =
-#include "metal/na_affine_w8a8_quant_s.metal.inc"
+#include "metal/common/na_affine_w8a8_quant_s.metal.inc"
     ;
 
 // Load-time weight unpack: affine uint32 [N,K/4] -> signed int8 [K,N].
 const char* kAffineW8a8UnpackBody =
-#include "metal/na_affine_w8a8_unpack.metal.inc"
+#include "metal/common/na_affine_w8a8_unpack.metal.inc"
     ;
 
 // Architecture gate (cached). Mirrors na_int8_gpu_gen() in mlx_na_int8.cpp.

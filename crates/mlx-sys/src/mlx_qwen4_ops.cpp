@@ -8,11 +8,7 @@
 #include <optional>
 #include <string_view>
 #ifdef MLX_NODE_METAL_ENABLED
-namespace mlx::core::qwen4_preamble {
-const char *gemm();
-const char *quantized_utils();
-const char *kquant();
-} // namespace mlx::core::qwen4_preamble
+#include "metal/common/quantized.h"
 #include "mlx/primitives.h"
 #endif
 
@@ -81,7 +77,7 @@ mlx_array *mlx_qwen4_router_decode(mlx_array *input, mlx_array *weight) {
     static auto graph = [](const std::vector<array> &a) {
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_router_decode", {"x", "w"}, {"out"},
-#include "metal/qwen4_router_decode.metal.inc"
+#include "metal/qwen4/router_decode.metal.inc"
       );
       return kernel(a, {{1, 1, 512}}, {mlx::core::bfloat16}, {32 * 128, 1, 4},
                     {32, 1, 4}, {{"T", mlx::core::bfloat16}}, std::nullopt,
@@ -113,7 +109,7 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
         const auto &x = in[0];
         static auto kernel = mlx::core::fast::metal_kernel(
             "qwen4_singleton_routes", {"logits"}, {"ids", "scores"},
-#include "metal/qwen4_singleton_routes.metal.inc"
+#include "metal/qwen4/singleton_routes.metal.inc"
         );
         return kernel({x}, {{1, 1, 10}, {1, 1, 10}},
                       {mlx::core::uint32, x.dtype()}, {128, 1, 1}, {128, 1, 1},
@@ -169,7 +165,7 @@ bool mlx_qwen4_routes_shared_gate(mlx_array *logits, mlx_array *input,
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_routes_shared_gate", {"logits", "x", "wg"},
           {"ids", "scores", "gate"},
-#include "metal/qwen4_routes_shared_gate.metal.inc"
+#include "metal/qwen4/routes_shared_gate.metal.inc"
       );
       return kernel(a, {{1, 1, 10}, {1, 1, 10}, {1, 1, 1}},
                     {mlx::core::uint32, mlx::core::bfloat16, mlx::core::bfloat16},
@@ -216,7 +212,7 @@ bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
         const auto &x = in[0];
         static auto kernel = mlx::core::fast::metal_kernel(
             "qwen4_prefill_routes", {"logits"}, {"ids", "scores"},
-#include "metal/qwen4_prefill_routes.metal.inc"
+#include "metal/qwen4/prefill_routes.metal.inc"
         );
         int rows = x.shape(1);
         return kernel({x}, {{1, rows, 10}, {1, rows, 10}},
@@ -353,9 +349,9 @@ mlx_array *mlx_qwen4_affine_expert_gemv(mlx_array *x, mlx_array *ids,
         if (lane == 0) out[size_t(assignment)*N + first+r] = T(C(value));
       }
     )",
-        std::string(mlx::core::qwen4_preamble::gemm()) +
-            mlx::core::qwen4_preamble::quantized_utils() +
-            mlx::core::qwen4_preamble::kquant());
+        std::string(mlx::core::quantized_preamble::gemm()) +
+            mlx::core::quantized_preamble::quantized_utils() +
+            mlx::core::quantized_preamble::kquant());
     auto result = kernel(
         {astype(input, compute_type), selected, w, s, b}, {{rows, 1, n}},
         {input.dtype()}, {32, ((n + 3) / 4) * 2, rows}, {32, 2, 1},
@@ -402,9 +398,9 @@ mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
     static auto kernel = [] {
       // Reuse the vendored MLX arithmetic. Only dimension arguments change
       // from constant-buffer references to values for template specialization.
-      std::string header = std::string(mlx::core::qwen4_preamble::gemm()) +
-                           mlx::core::qwen4_preamble::quantized_utils() +
-                           mlx::core::qwen4_preamble::kquant();
+      std::string header = std::string(mlx::core::quantized_preamble::gemm()) +
+                           mlx::core::quantized_preamble::quantized_utils() +
+                           mlx::core::quantized_preamble::kquant();
       for (const char *name : {"kquant_qmv_fast_impl", "kquant_qmv_impl"}) {
         auto start = header.find(std::string("METAL_FUNC void ") + name);
         auto end = header.find('{', start);
@@ -543,7 +539,7 @@ mlx_array *mlx_qwen4_rotary_window(mlx_array *input, mlx_array *cosine,
     static auto graph = [](const std::vector<array> &a) {
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_rotary_window", {"x", "cosb", "sinb"}, {"out"},
-#include "metal/qwen4_rotary.metal.inc"
+#include "metal/common/rope_split_half.metal.inc"
       );
       const auto &x = a[0];
       return kernel(a, {x.shape()}, {x.dtype()}, {int(x.size()), 1, 1},
@@ -588,7 +584,7 @@ mlx_array *mlx_qwen4_attention_norm_rotary(mlx_array *input, mlx_array *weight,
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_attention_norm_rotary", {"x", "w", "cosb", "sinb", "eps"},
           {"out"},
-#include "metal/qwen4_attention_norm_rotary.metal.inc"
+#include "metal/common/rms_norm_rope_256.metal.inc"
           , "", false);
       const auto &x = a[0];
       return kernel(a, {x.shape()}, {x.dtype()},
@@ -627,7 +623,7 @@ static mlx_array *qwen4_hyper_norm(mlx_array *x, mlx_array *w, double eps,
     static auto graph = [](const std::vector<array> &a) {
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_prefill_norm", {"residual", "scale", "eps"}, {"normed"},
-#include "metal/qwen4_prefill_norm.metal.inc"
+#include "metal/common/group_rms_norm.metal.inc"
       );
       int rows = a[0].shape(1);
       // Reference singleton schedule: 640 threads (20 simdgroups). Wide
@@ -686,7 +682,7 @@ bool mlx_qwen4_inject_norm(mlx_array *x, mlx_array *y, mlx_array *g,
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_inject_norm", {"residual", "branch", "inject", "scale", "eps"},
           {"stream", "normed"},
-#include "metal/qwen4_inject_norm.metal.inc"
+#include "metal/qwen4/inject_norm.metal.inc"
       );
       int rows = a[0].shape(1), sg = rows <= 8 ? 20 : 4;
       return kernel(a, {{1, rows, 10240}, {1, rows, 10240}},
@@ -919,7 +915,7 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
     const int rows = input.size(), blocks = (rows + 255) / 256;
     static auto count =
         mlx::core::fast::metal_kernel("qwen4_route_counts", {"ids"}, {"counts"},
-#include "metal/qwen4_route_counts.metal.inc"
+#include "metal/common/route_counts.metal.inc"
         );
     static auto scatter =
         mlx::core::fast::metal_kernel("qwen4_route_scatter", {"ids", "counts"},

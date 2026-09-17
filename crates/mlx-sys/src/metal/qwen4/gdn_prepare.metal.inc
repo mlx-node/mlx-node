@@ -19,7 +19,7 @@ R"(
             total = product + total;
         }
         T raw = T(total);
-        T activated = raw * qwen4_sigmoid(raw);
+        T activated = raw * precise_sigmoid(raw);
         values[i] = float(activated);
         squared += values[i] * values[i];
         if (token == 0) {
@@ -47,7 +47,7 @@ R"(
         float ax = float(a[h]) + dt[vec];
         float softplus = metal::max(ax, 0.0f) + log1p(metal::precise::exp(-metal::abs(ax)));
         decay[h] = metal::precise::exp(softplus * scale[vec]);
-        beta[h] = qwen4_sigmoid(float(b[h]));
+        beta[h] = precise_sigmoid(float(b[h]));
     }
   }
 )"

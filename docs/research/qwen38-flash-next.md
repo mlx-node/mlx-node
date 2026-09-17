@@ -7,6 +7,27 @@ macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
 ## Architecture review, 17 September
 
+The Metal shader audit separates implementation provenance from model-specific
+semantics. Thirteen Qwen4-prefixed shader includes are reusable operations and
+now live under `crates/mlx-sys/src/metal/common/`, beside the existing recurrence
+and quantized kernels. The shared quantized preamble builders and precise
+sigmoid helper also live there. Fixed 512-way/top-10 routing, the packed shared
+expert, complete GDN geometry and hyper-connection fusions remain in `qwen4/`.
+The family adapters keep their existing shape checks, environment controls,
+fallbacks and arithmetic. Reuse requirements are recorded in the
+[kernel guide](../../crates/mlx-sys/src/metal/README.md).
+Two unreferenced tape shader templates were removed; accepted-prefix replay
+continues through the existing Rust `GdnKernelTape` and per-step recurrence.
+
+The shader reorganization passed the canonical native build and packaged Metal
+library checks, strict all-target Clippy, **3576 core unit tests** (122 ignored;
+the same three release-inapplicable assertion tests excluded), and **47 Metal
+library selection tests**. A source comparison checked all 45 relocated shader
+bodies for unchanged arithmetic and layouts after normalizing renamed helpers,
+comments and compile-time assertions. Logs are under
+`~/Library/Caches/mlx-node/metal-layout-20260917/`. The full-checkpoint and
+performance results below predate this reorganization.
+
 The shared Qwen vision implementation now lives in
 `crates/mlx-core/src/vision/qwen/`: processor geometry, encoder, normalized
 weight loading, prompt expansion, M-RoPE positions, and the dense/MoE image-feature

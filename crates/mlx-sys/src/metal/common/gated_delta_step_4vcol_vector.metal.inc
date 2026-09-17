@@ -1,5 +1,5 @@
-// Qwen4 wide recurrence: the vector loads and three shared address offsets from
-// mlx.fast TrackFastKernels.leanRowsSource (8981cef5). Keep this GGUF path's
+// Vector recurrence: vector loads and three shared address offsets from
+// mlx.fast TrackFastKernels.leanRowsSource (8981cef5). Keep the caller's
 // modulo head mapping, uncompensated FP32 reductions, FP32 output and state.
 // Dk=128 and contiguous inputs make each lane's four values naturally aligned.
 R"(
@@ -8,7 +8,8 @@ R"(
         auto hv_idx = n % Hv;
         auto hk_idx = hv_idx % Hk;
         constexpr int n_per_t = Dk / 32;
-        static_assert(n_per_t == 4, "four contiguous key values per lane");
+        static_assert(Dk == 128, "four contiguous key values per lane");
+        static_assert(Dv % 4 == 0, "four value rows per SIMD group");
 
         const auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
         const auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;

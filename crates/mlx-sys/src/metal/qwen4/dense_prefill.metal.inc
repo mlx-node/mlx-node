@@ -1,6 +1,6 @@
 R"metal(
 // Packed prefetch/vector stores ported from mlxfast PackedNAXGroup32,
-// 8981cef5 (MIT; see MLXFAST-LICENSE.txt). Q8 uses two uint4 packs and
+// 8981cef5 (MIT; see ../MLXFAST-LICENSE.txt). Q8 uses two uint4 packs and
 // FP16 companions; dequantization and cooperative operands stay FP32.
 
 // Affine8 prefill with stored BF16 inputs and FP16 scale/bias arrays.

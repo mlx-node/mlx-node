@@ -1,4 +1,4 @@
-// See MLXFAST-LICENSE.txt. The local BF16 rounding boundaries are unchanged.
+// See ../MLXFAST-LICENSE.txt. The local BF16 rounding boundaries are unchanged.
 R"METAL(
 // Adapted from TrackFastKernels2.attnPrepSource, 8981cef5 (MIT).
 // Preserve separate BF16 products before the split-half sum/difference.

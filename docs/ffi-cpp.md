@@ -76,7 +76,7 @@ Current state:
 
 - `mlx::core::array` has **no default constructor** — initialize via `mlx_array_from_scalar(...)` or other helpers.
 - `int32` is not in scope inside inner namespaces — use `mlx::core::int32`.
-- Adding a **new** `.cpp` file requires `rm -rf target/release/build/mlx-sys-*` once; the `cc` crate caches its source-file list across builds and won't pick up new files otherwise.
+- Cargo watches `mlx-sys/src/` recursively. Adding a bridge `.cpp` or a nested Metal include is picked up by the next canonical native build.
 
 ### Env vars
 
@@ -95,6 +95,14 @@ locks per step. `crates/mlx-core/src/engine/compiled_lock.rs` is now only an
 `AtomicU64` model-id counter.
 
 ## Metal shaders
+
+`crates/mlx-sys/src/metal/` holds the JIT shader includes. Reusable quantized
+projections, routing helpers, normalization, rotary, convolution and Gated
+DeltaNet kernels live in `common/`; Qwen4's fixed routing/head geometry and
+hyper-connection fusions live in `qwen4/`. The
+[kernel guide](../crates/mlx-sys/src/metal/README.md) records the layout and
+arithmetic contracts for new model callers. Family-specific dispatch and
+fallbacks remain in the C++ adapters.
 
 `crates/mlx-paged-attn/metal/`:
 

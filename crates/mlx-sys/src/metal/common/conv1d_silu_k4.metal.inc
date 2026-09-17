@@ -16,7 +16,7 @@ R"(
         }
     }
     T raw = T(total);
-    T sig = qwen4_sigmoid(raw);
+    T sig = precise_sigmoid(raw);
     out[token * W + ch] = raw * sig;
     // Every output history row must be written even for a one-token chunk.
     if (token == 0) {

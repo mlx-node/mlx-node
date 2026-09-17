@@ -1,13 +1,8 @@
 R"metal(
-template <typename T> METAL_FUNC T q4_sigmoid(T x) {
-  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
-  return (x < 0) ? y : 1 - y;
-}
-
 // Same lane ownership and K walk as kquant_qmv_fast_impl. Both projections
 // reuse the activation load; each retains its independent F32 accumulator.
 template <typename T, int BITS, int H, int M, int E, int TOP, bool LANES>
-METAL_FUNC void q4_gate_up(
+METAL_FUNC void quantized_expert_gate_up(
     const device T* x, const device uint* ids,
     const device uint* wg, const device uchar* sg, const device half* bg,
     const device uint* wu, const device uchar* su, const device half* bu,
@@ -46,24 +41,24 @@ METAL_FUNC void q4_gate_up(
     for (int r = 0; r < 4; ++r) { g[r] = simd_sum(g[r]); u[r] = simd_sum(u[r]); }
     if (lane < 4) {
       T gate = T(g[lane]), up = T(u[lane]);
-      T silu = T(q4_sigmoid(gate) * gate);
+      T silu = T(precise_sigmoid(gate) * gate);
       out[size_t(assignment) * M + first + lane] = float(T(silu * up));
     }
   } else {
   for (int r = 0; r < 4; ++r) {
     T gate = T(simd_sum(g[r])), up = T(simd_sum(u[r]));
     if (lane == 0) {
-      T silu = T(q4_sigmoid(gate) * gate);
+      T silu = T(precise_sigmoid(gate) * gate);
       out[size_t(assignment) * M + first + r] = float(T(silu * up));
     }
   }
   }
 }
 
-// Same affine5/8 qdot walk as qwen4_affine_expert_gemv. Experts are split
+// Affine5/8 qdot with FP16 companions and a group size of 32. Experts are split
 // across SIMD groups, then folded in the original eight-lane reduction order.
 template <typename T, typename P, int BITS, int H, int M, int E, int TOP, int RPS, int KSG, bool LANES>
-METAL_FUNC void q4_down_combine(
+METAL_FUNC void affine_expert_down_combine(
     const device float* x, const device uint* ids, const device P* scores,
     const device uint* w, const device half* scales, const device half* biases,
     device P* out, threadgroup P* products,

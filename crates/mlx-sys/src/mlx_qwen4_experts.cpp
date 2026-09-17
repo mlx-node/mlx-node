@@ -1,34 +1,14 @@
 #include "mlx_common.h"
 #include "mlx_qwen4_flags.h"
 #ifdef MLX_NODE_METAL_ENABLED
-namespace mlx::core::qwen4_preamble {
-const char *gemm();
-const char *quantized_utils();
-const char *kquant();
-} // namespace mlx::core::qwen4_preamble
+#include "metal/common/quantized.h"
 namespace {
-// TrackFastMixer.header1 / TrackFastMoE.helpersCore keep only the register
-// helpers needed by their kernels. MLX checks custom-kernel source equality
-// at every dispatch, so carrying unused GEMM bodies also costs warm CPU time.
-// Keep the vendored helper bodies verbatim to preserve their arithmetic.
-const std::string &qmv_header() {
-  static const std::string header = [] {
-    std::string source = mlx::core::qwen4_preamble::kquant();
-    const auto loader = source.find("struct QuantizedBlockLoader {");
-    const auto end = loader == std::string::npos
-                         ? std::string::npos
-                         : source.rfind("\ntemplate <", loader);
-    if (end == std::string::npos)
-      throw std::runtime_error("Qwen4 register preamble boundary changed");
-    source.resize(end);
-    return source;
-  }();
-  return header;
-}
+using mlx::core::quantized_preamble::qmv_header;
 
 const std::string &expert_header() {
   static const std::string header = qmv_header() +
-#include "metal/qwen4_expert_decode.metal.inc"
+#include "metal/common/precise_sigmoid.metal.inc"
+#include "metal/common/quantized_expert_decode.metal.inc"
       ;
   return header;
 }
@@ -103,7 +83,7 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
   static auto gu = mlx::core::fast::metal_kernel(
       "qwen4_gate_up_decode", {"x", "ids", "wg", "sg", "bg", "wu", "su", "bu"},
       {"out"}, R"(
-    q4_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
+    quantized_expert_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
       threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
       simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
@@ -120,7 +100,7 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
       "qwen4_down_combine_decode",
       {"x", "ids", "scores", "w", "scales", "biases"}, {"out"}, R"(
     threadgroup P products[10*4];
-    q4_down_combine<T,P,BITS,2560,640,E,10,4,5,LANES>(x,ids,scores,w,scales,biases,out,products,
+    affine_expert_down_combine<T,P,BITS,2560,640,E,10,4,5,LANES>(x,ids,scores,w,scales,biases,out,products,
       threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
       simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
@@ -139,7 +119,7 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
 
 const std::string &shared_expert_header() {
   static const std::string header = expert_header() +
-#include "metal/qwen4_shared_expert_decode.metal.inc"
+#include "metal/qwen4/shared_expert_decode.metal.inc"
       ;
   return header;
 }
@@ -155,7 +135,7 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
        "swu", "ssu", "sbu", "sigmoid_table"},
       {"out"}, R"(
     if (threadgroup_position_in_grid.z < 10) {
-      q4_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
+      quantized_expert_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
         threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
         simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
     } else {
@@ -276,7 +256,7 @@ extern "C" mlx_array *mlx_qwen4_dense_decode(mlx_array *input,
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_dense_decode",
           {"x", "w", "scales", "biases", "normed", "sigmoid_table"}, {"out"},
-#include "metal/qwen4_dense_decode.metal.inc"
+#include "metal/qwen4/dense_decode.metal.inc"
           , qmv_header());
       auto shape = x.shape();
       shape.back() = n;
@@ -324,7 +304,7 @@ extern "C" mlx_array *mlx_qwen4_decode_mixer_act(mlx_array *input,
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_decode_mixer_act",
           {"x", "w", "scales", "biases", "normed", "sigmoid_table"}, {"out"},
-#include "metal/qwen4_dense_decode.metal.inc"
+#include "metal/qwen4/dense_decode.metal.inc"
           , qmv_header());
       return kernel({a[0], a[1], a[2], a[3], a[0], a[4]}, {{1, 1, 320}},
                     {mlx::core::bfloat16}, {32, 320, 1}, {32, 2, 1},
@@ -383,7 +363,7 @@ extern "C" bool mlx_qwen4_mixer_down_inject(
           "qwen4_mixer_down_inject",
           {"x", "wd", "sd", "bd", "wi", "si", "bi", "silu_table"},
           {"act", "injection"},
-#include "metal/qwen4_mixer_down_inject.metal.inc"
+#include "metal/qwen4/mixer_down_inject.metal.inc"
           , qmv_header());
       return kernel(a, {{1, 1, 320}, {1, 1, 4}},
                     {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 324, 1},
@@ -395,7 +375,7 @@ extern "C" bool mlx_qwen4_mixer_down_inject(
           "qwen4_mixer_split_k",
           {"x", "wd", "sd", "bd", "wi", "si", "bi", "silu_table"},
           {"act", "injection"},
-#include "metal/qwen4_mixer_split_k.metal.inc"
+#include "metal/qwen4/mixer_split_k.metal.inc"
           , qmv_header());
       return kernel(a, {{1, 1, 320}, {1, 1, 4}},
                     {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 656, 1},
@@ -440,7 +420,7 @@ extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_hyper_up",
           {"x", "w", "scales", "biases", "normed", "sigmoid_table"}, {"out"},
-#include "metal/qwen4_dense_decode.metal.inc"
+#include "metal/qwen4/dense_decode.metal.inc"
           , qmv_header());
       return kernel({x, w, s, b, n, in[5]}, {{1, 1, 2560}}, {x.dtype()},
                     {32, 2560, 1}, {32, 2, 1},
@@ -507,10 +487,10 @@ extern "C" bool mlx_qwen4_hyper_up_inject(
         }
       )";
       static const std::string source = std::string(
-#include "metal/qwen4_dense_decode.metal.inc"
+#include "metal/qwen4/dense_decode.metal.inc"
           ) + epilogue;
       static const std::string columns_source = std::string(
-#include "metal/qwen4_mixer_up_columns.metal.inc"
+#include "metal/qwen4/mixer_up_columns.metal.inc"
           ) + epilogue;
       static auto columns_kernel = mlx::core::fast::metal_kernel(
           "qwen4_mixer_up_columns",
@@ -590,7 +570,7 @@ extern "C" mlx_array *mlx_qwen4_sorted_shared_combine(
           "qwen4_sorted_shared_combine",
           {"values", "scores", "inverse", "shared", "gate", "sigmoid_table"},
           {"out"},
-#include "metal/qwen4_sorted_shared.metal.inc"
+#include "metal/common/sorted_expert_shared_combine.metal.inc"
           );
       return kernel(a, {{1, tokens, 2560}}, {mlx::core::bfloat16},
                     {tokens * 2560, 1, 1}, {256, 1, 1},
@@ -700,7 +680,7 @@ extern "C" mlx_array *mlx_qwen4_attention_gate(mlx_array *attention,
     static auto graph = [](const std::vector<array> &a) {
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_attention_gate", {"att", "qg", "sigmoid_table"}, {"out"},
-#include "metal/qwen4_attention_gate.metal.inc"
+#include "metal/common/attention_gate_bf16.metal.inc"
           , "", false);
       const int heads = a[0].shape(1), tokens = a[0].shape(2);
       return kernel(a, {{1, tokens, heads * 256}}, {a[0].dtype()},

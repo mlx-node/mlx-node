@@ -1,6 +1,6 @@
 R"metal(
 // TrackFastKernels2.attnGateSource / TrackP12Prefill's direct-address pattern.
-// See MLXFAST-LICENSE.txt. GGUF Q and gate are interleaved by head; retain
+// See ../MLXFAST-LICENSE.txt. GGUF Q and gate are interleaved by head; retain
 // native compiled BF16 sigmoid rounding via the existing immutable table.
 const uint j = thread_position_in_grid.x;
 const uint token = thread_position_in_grid.y;

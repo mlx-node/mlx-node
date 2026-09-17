@@ -32,7 +32,7 @@ R"(
                 }
             }
             T raw = T(c);
-            T sig = qwen4_sigmoid(raw);
+            T sig = precise_sigmoid(raw);
             T activated = raw * sig;
             values[i] = float(activated);
             total += values[i] * values[i];
@@ -58,7 +58,7 @@ R"(
         float ax = float(a[hv]) + float(dt[hv]);
         float softplus = metal::max(ax, 0.0f) + log1p(metal::precise::exp(-metal::abs(ax)));
         gates[0] = metal::precise::exp(softplus * float(scale[hv]));
-        gates[1] = qwen4_sigmoid(float(b[hv]));
+        gates[1] = precise_sigmoid(float(b[hv]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // TrackFastGDNDecode: retain local FP32 arithmetic and modulo heads.
@@ -130,7 +130,7 @@ R"(
         for (uint i = 0; i < 4; ++i) {
             uint d = lane * 4 + i;
             T normalized = T((values[i] / divisor) * float(norm[d]));
-            out[hv * 128 + d] = T(float(normalized) * qwen4_sigmoid(float(z[hv * 128 + d])));
+            out[hv * 128 + d] = T(float(normalized) * precise_sigmoid(float(z[hv * 128 + d])));
         }
     }
 )"

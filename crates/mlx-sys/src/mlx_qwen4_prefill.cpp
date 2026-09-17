@@ -5,32 +5,12 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
-namespace mlx::core::qwen4_preamble {
-const char *nax();
-const char *quantized_utils();
-const char *kquant_nax();
-} // namespace mlx::core::qwen4_preamble
+#include "metal/common/quantized.h"
 #endif
 
 #ifdef MLX_NODE_METAL_ENABLED
-static const std::string &qwen4_prefill_header() {
-  static const std::string header = [] {
-    // Only the decoders/loaders are needed. Uninstantiated generic kernels
-    // also require MLX's private broadcasting helpers; omit those kernels.
-    std::string source = mlx::core::qwen4_preamble::kquant_nax();
-    auto function = source.find("METAL_FUNC void kquant_qmm_t_nax_tgp_impl(");
-    auto end = function == std::string::npos
-                   ? std::string::npos
-                   : source.rfind("\ntemplate <", function);
-    if (end == std::string::npos)
-      throw std::runtime_error("Qwen4 NAX preamble boundary changed");
-    source.resize(end);
-    return std::string(mlx::core::qwen4_preamble::nax()) + source +
-#include "metal/qwen4_packed_prefetch.metal.inc"
-        ;
-  }();
-  return header;
-}
+using mlx::core::quantized_preamble::nax_header;
+
 template <int BM, bool ACT = false, bool PREFETCH = false, bool COMPACT = false>
 static std::vector<array>
 qwen4_dense_prefill_graph(const std::vector<array> &a) {
@@ -42,8 +22,8 @@ qwen4_dense_prefill_graph(const std::vector<array> &a) {
   static auto kernel = mlx::core::fast::metal_kernel(
       "qwen4_dense_prefill", {"x", "w", "scales", "biases", "silu_table"},
       {"out"},
-#include "metal/qwen4_dense_prefill.metal.inc"
-      , qwen4_prefill_header());
+#include "metal/qwen4/dense_prefill.metal.inc"
+      , nax_header());
   auto shape = x.shape();
   shape.back() = n;
   return kernel({x, w, s, b, ACT ? a[4] : x}, {shape}, {mlx::core::bfloat16},
@@ -104,8 +84,8 @@ qwen4_indirect_prefill_graph(const std::vector<array> &a) {
       "qwen4_prefill_indirect_gate_up",
       {"x", "ids", "token_rows", "tiles", "wg", "sgs", "bg", "wu", "sus", "bu"},
       {"out"},
-#include "metal/qwen4_prefill_gate_up.metal.inc"
-      , qwen4_prefill_header());
+#include "metal/common/quantized_expert_gate_up.metal.inc"
+      , nax_header());
   auto activated = gate_up(
       {x, ids, rows, table, w[0], w[1], w[2], w[3], w[4], w[5]}, {{r, 1, m}},
       {x.dtype()}, {32 * (m / 64), 4 * table.shape(0), 1}, {32, 4, 1},
@@ -123,8 +103,8 @@ qwen4_indirect_prefill_graph(const std::vector<array> &a) {
   static auto down = mlx::core::fast::metal_kernel(
       "qwen4_prefill_indirect_down",
       {"x", "ids", "tiles", "w", "scales", "biases"}, {"out"},
-#include "metal/qwen4_prefill_down.metal.inc"
-      , qwen4_prefill_header());
+#include "metal/common/affine_expert_down.metal.inc"
+      , nax_header());
   auto out =
       down({activated, ids, table, w[6], w[7], w[8]}, {{r, 1, h}}, {x.dtype()},
            {32 * (h / 128), 4 * table.shape(0), 1}, {32, 4, 1},
@@ -436,11 +416,11 @@ mlx_array *mlx_qwen4_expert_prefill(mlx_array *x, mlx_array *ids,
     if (w.shape(1) != k * bits / 32)
       return nullptr;
     auto compute = affine ? mlx::core::float32 : input.dtype();
-    const auto &header = qwen4_prefill_header();
+    const auto &header = nax_header();
     static auto kernel = mlx::core::fast::metal_kernel(
         "qwen4_expert_prefill", {"x", "ids", "tiles", "w", "scales", "biases"},
         {"out"},
-#include "metal/qwen4_expert_prefill.metal.inc"
+#include "metal/common/quantized_expert_prefill.metal.inc"
         , header);
     auto result = kernel(
         {input, selected, tiles, w, s, b}, {{rows, 1, n}}, {input.dtype()},

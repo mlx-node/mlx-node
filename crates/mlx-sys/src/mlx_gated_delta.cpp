@@ -9,17 +9,17 @@ struct mlx_metal_kernel;
 //   [2] = vectorized, non-masked
 //   [3] = vectorized, masked
 static const char* gated_delta_sources[] = {
-    #include "metal/gated_delta_step.metal.inc"
+    #include "metal/common/gated_delta_step.metal.inc"
     ,
-    #include "metal/gated_delta_step_mask.metal.inc"
+    #include "metal/common/gated_delta_step_mask.metal.inc"
     ,
-    #include "metal/gated_delta_step_vec.metal.inc"
+    #include "metal/common/gated_delta_step_vec.metal.inc"
     ,
-    #include "metal/gated_delta_step_vec_mask.metal.inc"
+    #include "metal/common/gated_delta_step_vec_mask.metal.inc"
 };
 
 static const char* gated_delta_chunked_source =
-    #include "metal/gated_delta_chunked.metal.inc"
+    #include "metal/common/gated_delta_chunked.metal.inc"
 ;
 
 // E47 (catalog D1): per-step kernel with 2 v-columns per simdgroup.
@@ -27,28 +27,28 @@ static const char* gated_delta_chunked_source =
 // simdgroup processes dv_A=2y and dv_B=2y+1, sharing q[Dk] + k[Dk] loads.
 // Grid Y must be halved by the dispatcher.
 static const char* gated_delta_step_2vcol_source =
-    #include "metal/gated_delta_step_2vcol.metal.inc"
+    #include "metal/common/gated_delta_step_2vcol.metal.inc"
 ;
 
 // E48: per-step kernel with 4 v-columns per simdgroup.
 // Extends E47 by another factor. Grid Y must be quartered by the dispatcher.
 static const char* gated_delta_step_4vcol_source =
-    #include "metal/gated_delta_step_4vcol.metal.inc"
+    #include "metal/common/gated_delta_step_4vcol.metal.inc"
 ;
 
-static const char* qwen4_gdn_vector_rows_source =
-    #include "metal/qwen4_gdn_vector_rows.metal.inc"
+static const char* gated_delta_step_4vcol_vector_source =
+    #include "metal/common/gated_delta_step_4vcol_vector.metal.inc"
 ;
 
 static const char* gated_delta_fused_gating_source =
-    #include "metal/gated_delta_fused_gating.metal.inc"
+    #include "metal/common/gated_delta_fused_gating.metal.inc"
 ;
 
 // Cache compiled kernels to avoid recompilation
 static std::mutex kernel_cache_mutex;
 static std::unordered_map<int, mlx::core::fast::CustomKernelFunction> kernel_cache;
 
-// per_step_variant: 0=legacy, 1=2-vcol, 2=4-vcol, 3=Qwen4 vector loads.
+// per_step_variant: 0=legacy, 1=2-vcol, 2=4-vcol, 3=4-vcol vector loads with FP32 state.
 static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(
     bool has_mask, bool vectorized, int per_step_variant) {
     int key = (has_mask ? 1 : 0) | (vectorized ? 2 : 0) | (per_step_variant << 2);
@@ -73,7 +73,7 @@ static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(
 
     const char* src;
     if (per_step_variant == 3) {
-        src = qwen4_gdn_vector_rows_source;
+        src = gated_delta_step_4vcol_vector_source;
     } else if (per_step_variant == 1) {
         src = gated_delta_step_2vcol_source;
     } else if (per_step_variant == 2) {

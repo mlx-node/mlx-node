@@ -54,7 +54,7 @@ if constexpr(STAGE) {
     }
   }
 }
-QwenPackedGroup32<BITS> pw;
+PackedGroup32<BITS> pw;
 size_t initialSide=(size_t(expert)*N+col+tid)*(K/32);
 if constexpr(PREFETCH) pw.prefetch(packed+tid*(K*BP/VP),float(scales[initialSide]),float(biases[initialSide]));
 for(int base=0;base<K;base+=BK) {

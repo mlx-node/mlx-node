@@ -1,5 +1,5 @@
 // Adapted from mlxfast TrackFastKernels2.injectNorm{,Wide}Source at 8981cef5.
-// See MLXFAST-LICENSE.txt. Preserve the local GGUF F32 norm arithmetic.
+// See ../MLXFAST-LICENSE.txt. Preserve the local GGUF F32 norm arithmetic.
 R"METAL(
 
         constexpr int N_READS = 4;

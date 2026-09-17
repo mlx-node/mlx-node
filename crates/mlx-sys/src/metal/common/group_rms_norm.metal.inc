@@ -1,6 +1,8 @@
 // Adapted from mlxfast TrackFastKernels2.injectNormWideSource at 8981cef5.
-// See MLXFAST-LICENSE.txt. Keep the GGUF F32 scale and mean/sqrt boundaries.
+// See ../MLXFAST-LICENSE.txt. Keep the GGUF F32 scale and mean/sqrt boundaries.
 R"METAL(
+        static_assert(H % 128 == 0 && H <= 4096 && W % H == 0,
+                      "whole 128-element slices and at most 32 SIMD partials");
 
         constexpr int N_READS = 4;
         constexpr uint NT = H / N_READS;

@@ -1,6 +1,7 @@
 R"METAL(
+static_assert(D == 256, "eight values per lane in a single SIMD group");
 // Adapted from TrackFastKernels2.attnPrepSource at 8981cef5 (MIT).
-// See MLXFAST-LICENSE.txt. Local F32 scales and BF16 rotation boundaries
+// See ../MLXFAST-LICENSE.txt. Local F32 scales and BF16 rotation boundaries
 // are preserved. Unlike the reference RMSNorm reduction, the local compiled
 // mean uses one SIMD group with two successive four-element reads per lane
 // for a 256-element row (MLX reduce_row.h), then sqrt and division.
