@@ -832,6 +832,12 @@ impl Store {
                 return Err(err("Inconsistent GGUF split metadata"));
             }
             for t in &g.tensors {
+                if t.tensor_type == GgufTensorType::PQ2_0 {
+                    return Err(err(format!(
+                        "Qwen4 does not support PQ2_0 tensor '{}'",
+                        t.name
+                    )));
+                }
                 if t.dims.is_empty()
                     || t.dims.iter().any(|&d| d == 0 || d > i64::MAX as u64)
                     || t.dims
@@ -1360,6 +1366,100 @@ impl Store {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn pq2_gguf_is_rejected_during_store_indexing() {
+        let dir = std::env::temp_dir().join(format!("qwen4-pq2-reject-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend((value.len() as u64).to_le_bytes());
+            bytes.extend(value.bytes());
+        };
+        let write = |path: &Path, name: &str, ty: GgufTensorType, index: u32, count: u32| {
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend(3u32.to_le_bytes());
+            bytes.extend(1u64.to_le_bytes());
+            bytes.extend(3u64.to_le_bytes());
+            string(&mut bytes, "general.architecture");
+            bytes.extend(8u32.to_le_bytes());
+            string(&mut bytes, "qwen4exp");
+            for (key, value) in [("split.no", index), ("split.count", count)] {
+                string(&mut bytes, key);
+                bytes.extend(4u32.to_le_bytes());
+                bytes.extend(value.to_le_bytes());
+            }
+            string(&mut bytes, name);
+            bytes.extend(2u32.to_le_bytes());
+            bytes.extend(128u64.to_le_bytes());
+            bytes.extend(1u64.to_le_bytes());
+            bytes.extend((ty as u32).to_le_bytes());
+            bytes.extend(0u64.to_le_bytes());
+            let payload_bytes = 128 / ty.block_size() * ty.type_size();
+            bytes.resize(bytes.len().div_ceil(32) * 32 + payload_bytes, 0);
+            fs::write(path, bytes).unwrap();
+        };
+        let supported = dir.join("supported.gguf");
+        write(&supported, "supported.weight", GgufTensorType::Q4_0, 0, 1);
+        let store = Store::open_metadata(&supported, Some(&dir.join("supported-cache"))).unwrap();
+        assert_eq!(
+            store
+                .descriptor("supported.weight")
+                .unwrap()
+                .width()
+                .unwrap(),
+            128
+        );
+        assert_eq!(store.bytes_read, 0);
+        let single = dir.join("single.gguf");
+        write(&single, "test.pq2.weight", GgufTensorType::PQ2_0, 0, 1);
+        let first = dir.join("split-00001-of-00002.gguf");
+        let second = dir.join("split-00002-of-00002.gguf");
+        write(&first, "supported.weight", GgufTensorType::Q4_0, 0, 2);
+        write(&second, "test.pq2.weight", GgufTensorType::PQ2_0, 1, 2);
+        for (label, path, pq2_path) in
+            [("single", single.clone(), single), ("split", first, second)]
+        {
+            let parsed = parse_gguf(&pq2_path).unwrap();
+            assert_eq!(parsed.tensors[0].tensor_type, GgufTensorType::PQ2_0);
+            let cache = dir.join(format!("{label}-cache"));
+            let error = match Store::open_metadata(&path, Some(&cache)) {
+                Ok(_) => panic!("{label}: Qwen4 must reject PQ2 before loading payloads"),
+                Err(error) => error,
+            };
+            assert!(error.reason.contains("PQ2_0"), "{}", error.reason);
+            assert!(error.reason.contains("Qwen4"), "{}", error.reason);
+            assert!(error.reason.contains("test.pq2.weight"), "{}", error.reason);
+            assert!(
+                !cache.exists(),
+                "{label}: rejection must precede packed-cache setup"
+            );
+        }
+    }
+
+    #[test]
+    fn pq2_runtime_residency_is_rejected() {
+        let mut tensor = Tensor {
+            path: PathBuf::new(),
+            shape: vec![1, 128],
+            offset: 0,
+            bytes: 34,
+            encoding: Encoding::Gguf(GgufTensorType::PQ2_0),
+        };
+        let error = tensor
+            .runtime_bytes()
+            .expect_err("Qwen4 must not budget unsupported PQ2");
+        assert!(error.reason.contains("PQ2_0"), "{}", error.reason);
+        tensor.encoding = Encoding::Gguf(GgufTensorType::Q4_0);
+        tensor.bytes = 72;
+        assert_eq!(tensor.runtime_bytes().unwrap(), 80);
+    }
 
     #[test]
     fn descriptor_dimensions_reject_empty_zero_and_overflowing_shapes() {

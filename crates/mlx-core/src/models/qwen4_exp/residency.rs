@@ -74,7 +74,9 @@ impl Tensor {
                 GgufTensorType::IQ4NL => (19, 32),
                 GgufTensorType::IQ3S => (266, 256),
                 GgufTensorType::IQ4XS => (138, 256),
-                GgufTensorType::PQ2_0 => (34, 128),
+                GgufTensorType::PQ2_0 => {
+                    return Err(err("Qwen4 does not support PQ2_0 tensor residency"));
+                }
             },
         };
         n.checked_mul(num)
