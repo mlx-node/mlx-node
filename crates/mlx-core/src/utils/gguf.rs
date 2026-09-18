@@ -1043,7 +1043,7 @@ fn load_quantized_tensor(
         }
         GgufTensorType::PQ2_0 => {
             biases = vec![0u16; sb_elements];
-            for (i, block) in raw.chunks_exact(34).enumerate() {
+            for (i, block) in raw.as_chunks::<34>().0.iter().enumerate() {
                 let d = u16::from_le_bytes([block[0], block[1]]);
                 if !half::f16::from_bits(d).is_finite() {
                     return Err(Error::from_reason(format!(
@@ -1053,9 +1053,8 @@ fn load_quantized_tensor(
                 }
                 scales[i] = d;
                 biases[i] = d ^ 0x8000;
-                for (j, bytes) in block[2..].chunks_exact(4).enumerate() {
-                    weights_packed[i * 8 + j] =
-                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                for (j, bytes) in block[2..].as_chunks::<4>().0.iter().enumerate() {
+                    weights_packed[i * 8 + j] = u32::from_le_bytes(*bytes);
                 }
             }
         }
@@ -4669,9 +4668,7 @@ pub async fn convert_gguf_to_safetensors(
     // model-size-specific defaults can build random projections with plausible
     // but wrong shapes. An authoritative sibling config remains the stronger
     // source and intentionally bypasses this metadata completeness gate.
-    if is_primary_model
-        && native_qwen35_layout
-        && (synthesized_config || prism_contract.is_some())
+    if is_primary_model && native_qwen35_layout && (synthesized_config || prism_contract.is_some())
     {
         validate_qwen35_standalone_geometry(&gguf.metadata)?;
     }
@@ -14123,9 +14120,7 @@ mod tests {
         assert_pq2_dequant_matches_ggml(vec![1024, 1], &scales, &payload, "single-row");
 
         let row_scales: [f32; 8] = [0.75, -1.25, 2.5, 0.125, -3.0, 1.5, -0.625, 4.0];
-        let payload = pq2_blocks(&row_scales, |block, j| {
-            (block * 97 + j * 13) as u8
-        });
+        let payload = pq2_blocks(&row_scales, |block, j| (block * 97 + j * 13) as u8);
         assert_pq2_dequant_matches_ggml(vec![512, 2], &row_scales, &payload, "two-row");
     }
 
@@ -14619,8 +14614,7 @@ mod tests {
             Some(companion.as_path()),
         )
         .await
-        .err()
-        .expect("a prism.hadamard source must reject a companion GGUF");
+        .expect_err("a prism.hadamard source must reject a companion GGUF");
         assert!(err.reason.contains("text-only"), "{}", err.reason);
         fs::remove_dir_all(&root).ok();
     }

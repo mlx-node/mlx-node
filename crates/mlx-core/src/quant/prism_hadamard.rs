@@ -548,13 +548,13 @@ impl PrismHadamardConfig {
             if name.as_str() == EMBEDDING_WEIGHT_NAME {
                 continue;
             }
-            if let Some(layer) = weight_name_layer(name)? {
-                if layer >= config.num_layers {
-                    return Err(Error::from_reason(format!(
-                        "prism_hadamard: weight name '{name}' references layer {layer} but the model has {} layers",
-                        config.num_layers
-                    )));
-                }
+            if let Some(layer) = weight_name_layer(name)?
+                && layer >= config.num_layers
+            {
+                return Err(Error::from_reason(format!(
+                    "prism_hadamard: weight name '{name}' references layer {layer} but the model has {} layers",
+                    config.num_layers
+                )));
             }
         }
         for (key, value) in params {
@@ -1087,12 +1087,12 @@ mod tests {
         let x = MxArray::from_float32(&det_input(1024), &[1, 1024]).unwrap();
         let transform = transform_for(&nontrivial_signs(1024), 1024, None);
         let result = transform.apply(&x, false).unwrap();
-        let outcome: Result<()> = (|| {
+        let outcome: Result<()> = {
             let _scope = HadamardDecodeScope::with_enabled(true);
             HADAMARD_CACHE.with(|cache| cache.borrow_mut().store(&x, &transform, false, &result));
             HADAMARD_CACHE.with(|cache| assert!(cache.borrow().last.is_some()));
             Err(Error::from_reason("scope cleanup probe"))
-        })();
+        };
         assert!(outcome.is_err());
         HADAMARD_CACHE.with(|cache| {
             let cache = cache.borrow();
@@ -1352,7 +1352,7 @@ mod tests {
         packed_triplet(&mut params, "embedding", 8, 1024);
         params.insert(
             "layers.0.linear_attn.in_proj_b.weight".to_string(),
-            MxArray::from_float32(&vec![0.0f32; 16], &[4, 4]).unwrap(),
+            MxArray::from_float32(&[0.0f32; 16], &[4, 4]).unwrap(),
         );
         (config, params)
     }
@@ -1417,7 +1417,7 @@ mod tests {
         let mut wrong_bias = params.clone();
         wrong_bias.insert(
             "lm_head.biases".to_string(),
-            MxArray::from_float16(&vec![0u16; 8 * 8], &[8, 8]).unwrap(),
+            MxArray::from_float16(&[0u16; 8 * 8], &[8, 8]).unwrap(),
         );
         assert!(
             config.prepare(&wrong_bias, &qconfig, quant, &none).is_err(),
@@ -1427,7 +1427,7 @@ mod tests {
         let mut nan_scales = params.clone();
         nan_scales.insert(
             "lm_head.scales".to_string(),
-            MxArray::from_float16(&vec![half::f16::NAN.to_bits(); 8 * 8], &[8, 8]).unwrap(),
+            MxArray::from_float16(&[half::f16::NAN.to_bits(); 8 * 8], &[8, 8]).unwrap(),
         );
         assert!(
             config.prepare(&nan_scales, &qconfig, quant, &none).is_err(),
