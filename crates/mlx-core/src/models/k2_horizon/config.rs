@@ -162,6 +162,12 @@ impl K2HorizonConfig {
                 self.vocab_size,
             )));
         }
+        let head_dim = self.head_dim();
+        if head_dim <= 0 {
+            return Err(napi::Error::from_reason(format!(
+                "k2_horizon config: head_dim ({head_dim}) must be positive"
+            )));
+        }
         if self.num_attention_heads % self.num_key_value_heads != 0 {
             return Err(napi::Error::from_reason(format!(
                 "k2_horizon config: num_attention_heads ({}) must be a multiple of \
@@ -266,6 +272,77 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_non_positive_head_dim() {
+        let mut cfg: K2HorizonConfig = serde_json::from_str(
+            r#"{"vocab_size": 8, "hidden_size": 8, "num_hidden_layers": 1,
+                "num_attention_heads": 1, "num_key_value_heads": 1,
+                "intermediate_size": 8, "max_position_embeddings": 8}"#,
+        )
+        .unwrap();
+        for enabled in [None, Some(true), Some(false)] {
+            cfg.use_block_paged_cache = enabled;
+            for head_dim in [0, -1, i32::MIN] {
+                cfg.head_dim = Some(head_dim);
+                assert_eq!(
+                    cfg.validate().unwrap_err().reason,
+                    format!("k2_horizon config: head_dim ({head_dim}) must be positive")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_inferred_head_dim() {
+        let mut cfg: K2HorizonConfig = serde_json::from_str(
+            r#"{"vocab_size": 8, "hidden_size": 8, "num_hidden_layers": 1,
+                "num_attention_heads": 16, "num_key_value_heads": 1,
+                "intermediate_size": 8, "max_position_embeddings": 8}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.head_dim(), 0);
+        for enabled in [None, Some(true), Some(false)] {
+            cfg.use_block_paged_cache = enabled;
+            assert_eq!(
+                cfg.validate().unwrap_err().reason,
+                "k2_horizon config: head_dim (0) must be positive"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_preserves_head_dim_resolution_and_geometry_guard() {
+        let mut cfg: K2HorizonConfig = serde_json::from_str(
+            r#"{"vocab_size": 8, "hidden_size": 8, "num_hidden_layers": 1,
+                "num_attention_heads": 1, "num_key_value_heads": 1,
+                "intermediate_size": 8, "max_position_embeddings": 8}"#,
+        )
+        .unwrap();
+        for enabled in [None, Some(true), Some(false)] {
+            cfg.use_block_paged_cache = enabled;
+            cfg.num_attention_heads = 1;
+            cfg.head_dim = None;
+            assert_eq!(cfg.head_dim(), 8);
+            cfg.validate().unwrap();
+            cfg.num_attention_heads = 16;
+            cfg.head_dim = Some(128);
+            assert_eq!(cfg.head_dim(), 128);
+            cfg.validate().unwrap();
+            for head_dim in [None, Some(128)] {
+                cfg.head_dim = head_dim;
+                for heads in [0, -1] {
+                    cfg.num_attention_heads = heads;
+                    assert!(
+                        cfg.validate()
+                            .unwrap_err()
+                            .reason
+                            .contains("non-positive geometry")
+                    );
+                }
+            }
+        }
     }
 
     #[test]
