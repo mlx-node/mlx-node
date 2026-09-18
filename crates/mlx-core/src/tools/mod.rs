@@ -662,6 +662,7 @@ impl<'a> PyLiteralParser<'a> {
             None,
             Star,
             DoubleStar,
+            KwargsDone,
             Slash,
         }
         // Identifiers that can never appear where an operand is expected.
@@ -1589,6 +1590,13 @@ impl<'a> PyLiteralParser<'a> {
                         _ => return Err(()),
                     },
                     St::Lambda => match b {
+                        _ if lambda_marker == LambdaMarker::KwargsDone
+                            && stack.len() == lambda_depth
+                            && b != b':'
+                            && !(param_done && b == b',') =>
+                        {
+                            return Err(());
+                        }
                         b':' if stack.len() == lambda_depth
                             && (lambda_bare_star_pending
                                 || matches!(
@@ -1614,7 +1622,9 @@ impl<'a> PyLiteralParser<'a> {
                             b',' => {
                                 param_start = true;
                                 param_done = false;
-                                lambda_marker = LambdaMarker::None;
+                                if lambda_marker != LambdaMarker::KwargsDone {
+                                    lambda_marker = LambdaMarker::None;
+                                }
                                 self.pos += 1;
                             }
                             b'=' => {
@@ -1731,7 +1741,11 @@ impl<'a> PyLiteralParser<'a> {
                                     lambda_bare_star_pending = false;
                                 }
                                 param_start = false;
-                                lambda_marker = LambdaMarker::None;
+                                lambda_marker = if lambda_marker == LambdaMarker::DoubleStar {
+                                    LambdaMarker::KwargsDone
+                                } else {
+                                    LambdaMarker::None
+                                };
                                 param_done = true;
                                 param_has_default = false;
                             } else {
@@ -5233,6 +5247,53 @@ The weather in Tokyo is sunny."#;
             "f(lambda a=1,/,*,b=2: b, confirmed=True)",
             "f((lambda *,a: a) + (lambda b,/: b), confirmed=True)",
             "f(lambda a=(lambda *,b: b): a, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_lambda_kwargs_terminal_rejected() {
+        for inner in [
+            "dangerous_action(lambda **kw, extra: value, confirmed=True)",
+            "f(lambda **kw, extra=1: value, confirmed=True)",
+            "f(lambda **kw, *args: value, confirmed=True)",
+            "f(lambda **kw, **more: value, confirmed=True)",
+            "f(lambda **kw, /: value, confirmed=True)",
+            "f(lambda **kw,,: value, confirmed=True)",
+            "f(lambda **kw=1: value, confirmed=True)",
+            "f((lambda **kw, extra: value), confirmed=True)",
+            "f(lambda a=(lambda **kw, extra: value): a, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_kwargs_terminal_dropped() {
+        for inner in [
+            "f(lambda **kw: kw, confirmed=True)",
+            "f(lambda **kw,: kw, confirmed=True)",
+            "f(lambda a,**kw: a, confirmed=True)",
+            "f(lambda a=1,**kw: a, confirmed=True)",
+            "f(lambda *args,**kw: args, confirmed=True)",
+            "f(lambda *,needed,**kw: needed, confirmed=True)",
+            "f((lambda **kw: kw) + (lambda extra: extra), confirmed=True)",
+            "f(lambda a=(lambda **kw: kw): a, confirmed=True)",
+            "f(lambda **kw: lambda extra: extra, confirmed=True)",
+            "f(lambda **kw: helper(extra=1), confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
