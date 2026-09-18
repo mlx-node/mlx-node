@@ -301,8 +301,7 @@ impl GroupedRMSNorm {
         let dims = shape.as_ref();
         let hidden = *dims
             .last()
-            .ok_or_else(|| Error::from_reason("GroupedRMSNorm: input must have at least 1 dim"))?
-            as i64;
+            .ok_or_else(|| Error::from_reason("GroupedRMSNorm: input must have at least 1 dim"))?;
         let group_size = hidden / self.num_groups;
 
         // Cast to f32, reshape [..., H] → [..., G, C]. The fused kernel
@@ -310,7 +309,7 @@ impl GroupedRMSNorm {
         // weight=None keeps the per-element multiply outside since the
         // binding requires a 1-D weight of size C while ours is H-sized.
         let x32 = x.astype(crate::array::DType::Float32)?;
-        let mut grouped: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+        let mut grouped = dims.to_vec();
         let last = grouped.len() - 1;
         grouped[last] = self.num_groups;
         grouped.push(group_size);
@@ -321,11 +320,7 @@ impl GroupedRMSNorm {
         let normed = MxArray::from_handle(handle, "grouped_fast_rms_norm")?;
 
         // Back to [..., H], apply learned weight in f32, restore dtype.
-        let flat_shape: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
-        normed
-            .reshape(&flat_shape)?
-            .mul(&self.weight)?
-            .astype(in_dtype)
+        normed.reshape(dims)?.mul(&self.weight)?.astype(in_dtype)
     }
 
     /// Set the weight (scale) parameter

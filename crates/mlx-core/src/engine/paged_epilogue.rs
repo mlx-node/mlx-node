@@ -152,7 +152,7 @@ impl FinalTokenPolicy {
 
     /// The `generated` tokens that belong in the saved history — the same
     /// trim as [`Self::history_len`], as a slice.
-    pub(crate) fn history_tokens<'a>(self, generated: &'a [u32], keep_all: bool) -> &'a [u32] {
+    pub(crate) fn history_tokens(self, generated: &[u32], keep_all: bool) -> &[u32] {
         &generated[..self.history_len(generated.len(), keep_all)]
     }
 }

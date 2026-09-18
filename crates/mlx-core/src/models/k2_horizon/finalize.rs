@@ -46,12 +46,7 @@ const K2_OPEN_PREFIXES: &[&str] = &["<ifm|think>", "<ifm|think_fast>", "<ifm|thi
 fn coerce_arg_value(value: &str, arg_type: Option<&str>) -> Value {
     let trimmed = value.trim();
     match arg_type.map(str::trim) {
-        Some(t)
-            if matches!(
-                t,
-                "object" | "array" | "number" | "integer" | "boolean" | "null"
-            ) =>
-        {
+        Some("object" | "array" | "number" | "integer" | "boolean" | "null") => {
             serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(value.to_string()))
         }
         Some(_) => Value::String(value.to_string()),

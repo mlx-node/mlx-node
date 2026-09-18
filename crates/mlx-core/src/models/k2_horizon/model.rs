@@ -9,13 +9,13 @@
 //!
 //! Execution paths:
 //!   * FLAT   — `Vec<KVCache>` + `scaled_dot_product_attention(_causal)`;
-//!              qwen3's all-or-nothing prefix check with the pure-KV
-//!              exact-match rewind (`trim` + re-forward last token).
+//!     qwen3's all-or-nothing prefix check with the pure-KV
+//!     exact-match rewind (`trim` + re-forward last token).
 //!   * PAGED  — `PagedKVCacheAdapter` (block-paged prefix cache), the
-//!              qwen3 token-accounting convention (`record_tokens` before
-//!              forward, `reconcile_paged_request_tokens` drop-last).
+//!     qwen3 token-accounting convention (`record_tokens` before
+//!     forward, `reconcile_paged_request_tokens` drop-last).
 //!   * SCHED  — generic `HybridStepExecutor` batched paged decode
-//!              (pure-KV: no per-sequence out-of-band state).
+//!     (pure-KV: no per-sequence out-of-band state).
 
 use std::cell::Cell;
 use std::sync::Arc;
