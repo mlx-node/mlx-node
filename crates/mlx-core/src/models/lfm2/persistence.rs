@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_weights,
     load_all_safetensors, prewarm_checkpoint_pages,
@@ -1221,11 +1221,7 @@ impl Lfm2Inner {
         let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
         let persist_cold =
             resolve_persist_cold(family, persist_env.as_deref(), config.persist_paged_cache);
-        let shard_snapshot_before_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
         // Quantization settings (read straight from config.json's
         // `quantization` block). For dense bf16 checkpoints these are the
@@ -1236,11 +1232,7 @@ impl Lfm2Inner {
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
-        let shard_snapshot_at_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        checkpoint_load.record_mmap();
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval of any
         // mmap-backed weight (FP8 dequant in `dequant_fp8_weights`, the tensor
@@ -1319,12 +1311,7 @@ impl Lfm2Inner {
         if persist_cold
             && let Some(context) = inner.build_cold_tier_context(model_path, &weights_resident)
         {
-            let after_fingerprint = snapshot_shard_identities(path);
-            if shard_identities_stable(
-                &shard_snapshot_before_mmap,
-                &shard_snapshot_at_mmap,
-                &after_fingerprint,
-            ) {
+            if checkpoint_load.stable_after_fingerprint() {
                 inner.attach_cold_tier(context, &weights_resident);
             } else {
                 tracing::warn!(

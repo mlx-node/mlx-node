@@ -46,17 +46,14 @@ use crate::transformer::paged_policy::{
 use napi::bindgen_prelude::*;
 
 /// How a cache-hit prefill (`is_prefill && cached_prefix_len > 0`) computes
-/// attention once the suffix chunk has been written to the pool. Every arm
-/// ends at the same explicit-mask SDPA; the
-/// `BridgeIfBatch1ThenGraphSdpa` arm gathers K/V in-graph
-/// (`gather_kv_for_prefill_sdpa`) before resorting to the `read_kv_range`
-/// host read.
+/// attention once the suffix chunk has been written to the pool. Bridge routes
+/// may use paged attention; their SDPA fallback arms share the existing explicit
+/// mask.
 #[derive(Clone, Copy)]
 pub(crate) enum CacheHitPrefillRoute {
-    /// Never attempt the paged-attention bridge: straight to
-    /// `read_kv_range` + explicit causal mask + SDPA (K2-Horizon's
-    /// verified path).
-    HostReadSdpa,
+    /// Gather K/V in the MLX graph for explicit-mask SDPA, falling back to
+    /// the synchronous host read only when graph gathering fails.
+    GraphSdpa,
     /// Attempt `gather_kv_for_prefill_chunk` only when `batch == 1` and
     /// the family's runtime `gate` holds; on gate-false or bridge error,
     /// try `gather_kv_for_prefill_sdpa` for graph-SDPA before the
@@ -67,7 +64,7 @@ pub(crate) enum CacheHitPrefillRoute {
     /// Attempt the bridge unconditionally: the `[B,H,T,D]` → `[T,H,D]`
     /// squeeze is NOT batch-gated, so `batch != 1` propagates the squeeze
     /// error exactly like the hand-rolled body (Nemotron-H).
-    /// `HostReadSdpa` on bridge error only.
+    /// Host-read SDPA on bridge error only.
     BridgeUnconditional,
 }
 
@@ -484,7 +481,7 @@ impl PagedAttentionCore<'_> {
     ) -> Result<MxArray> {
         let total_ctx = cached_prefix_len + (seq_len as u32);
         let try_bridge = match self.cache_hit_prefill {
-            CacheHitPrefillRoute::HostReadSdpa => false,
+            CacheHitPrefillRoute::GraphSdpa => false,
             CacheHitPrefillRoute::BridgeIfBatch1ThenGraphSdpa { gate } => batch == 1 && gate(),
             CacheHitPrefillRoute::BridgeUnconditional => true,
         };
@@ -536,7 +533,8 @@ impl PagedAttentionCore<'_> {
             None => {
                 let (k_full, v_full) = if matches!(
                     self.cache_hit_prefill,
-                    CacheHitPrefillRoute::BridgeIfBatch1ThenGraphSdpa { .. }
+                    CacheHitPrefillRoute::GraphSdpa
+                        | CacheHitPrefillRoute::BridgeIfBatch1ThenGraphSdpa { .. }
                 ) {
                     adapter
                         .gather_kv_for_prefill_sdpa(attn_layer_idx, total_ctx)

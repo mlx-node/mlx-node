@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
 use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
@@ -2007,11 +2007,7 @@ pub async fn load_with_thread(
                     persist_env.as_deref(),
                     config.persist_paged_cache,
                 );
-                let shard_snapshot_before_mmap = if persist_cold {
-                    snapshot_shard_identities(path)
-                } else {
-                    None
-                };
+                let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
                 // Load all weights. MTPLX-compatible artifacts can store the MTP
                 // module in an external sidecar (usually `mtp.safetensors`) instead
@@ -2024,11 +2020,7 @@ pub async fn load_with_thread(
                 // with the after-fingerprint snapshot below it brackets the WHOLE
                 // load-to-fingerprint span so a mid-load model-directory swap can
                 // never bind the OLD weights to a NEW revision's fingerprint.
-                let shard_snapshot_at_mmap = if persist_cold {
-                    snapshot_shard_identities(path)
-                } else {
-                    None
-                };
+                checkpoint_load.record_mmap();
 
                 // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
                 // of any mmap-backed weight (FP8 dequant in `sanitize_weights`,
@@ -2331,12 +2323,7 @@ pub async fn load_with_thread(
                 if persist_cold
                     && let Some(ctx) = inner.build_cold_tier_context(&model_path, &weights_resident)
                 {
-                    let after_fingerprint = snapshot_shard_identities(path);
-                    if shard_identities_stable(
-                        &shard_snapshot_before_mmap,
-                        &shard_snapshot_at_mmap,
-                        &after_fingerprint,
-                    ) {
+                    if checkpoint_load.stable_after_fingerprint() {
                         inner.attach_cold_tier(ctx, &weights_resident);
                     } else {
                         warn!(

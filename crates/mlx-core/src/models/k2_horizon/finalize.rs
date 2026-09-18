@@ -16,6 +16,7 @@ use napi::bindgen_prelude::*;
 use serde_json::Value;
 
 use crate::engine::backend::FinalizeArgs;
+use crate::engine::finalize::finalize_chat_result_with;
 use crate::engine::types::ChatResult;
 use crate::tools::{self, MarkupSpec, ToolCallResult};
 
@@ -313,75 +314,169 @@ fn raw_text_with_reasoning_suppressed(
 /// decode as literal text and this function sees the full markup — exact
 /// parity with ChatML's non-special `</think>` handling.
 pub(crate) fn finalize_k2_chat_result(args: FinalizeArgs<'_>) -> Result<ChatResult> {
-    let text = args
-        .tokenizer
-        .decode_sync(args.generated_tokens, true)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to decode generated tokens: {}", e);
-            String::new()
-        });
-
-    let num_tokens = args.generated_tokens.len() as u32;
-
-    let (clean_text, tool_calls, thinking) = parse_thinking_and_tools(
-        &text,
-        args.generated_tokens,
-        args.thinking_enabled,
-        args.think_end_id,
-        args.think_end_str,
-        args.think_end_extra_ids,
-        args.include_reasoning,
-    );
-
-    // K2's template RAISES on any assistant history message without a
-    // thinking field (`reasoning_content`/`think`/…), so a suppressed or
-    // absent reasoning body must still round-trip as a DEFINED field —
-    // `Some("")` renders `<ifm|think>\n</ifm|think>` on replay where
-    // `None` would make the next continuation's render raise.
-    let thinking = Some(thinking.unwrap_or_default());
-
-    let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-        "tool_calls".to_string()
-    } else {
-        args.finish_reason
-    };
-
-    let public_raw_text = raw_text_with_reasoning_suppressed(
-        &text,
-        args.generated_tokens,
-        args.thinking_enabled,
-        args.think_end_id,
-        args.think_end_str,
-        args.think_end_extra_ids,
-        false,
-    );
-    let raw_text = if args.include_reasoning {
-        text
-    } else {
-        public_raw_text.clone()
-    };
-
-    Ok(ChatResult {
-        text: clean_text,
-        tool_calls,
-        thinking,
-        // Overwritten by the session core with the effective Jinja kwarg;
-        // the decode-time value keeps non-session callers conservative.
-        thinking_enabled: args.thinking_enabled,
-        num_tokens,
-        prompt_tokens: args.prompt_tokens,
-        reasoning_tokens: args.reasoning_tokens,
-        finish_reason,
-        raw_text,
-        public_raw_text: Some(public_raw_text),
-        cached_tokens: 0,
-        performance: args.performance,
-    })
+    finalize_chat_result_with(
+        args,
+        |text, args| {
+            let (clean_text, tool_calls, thinking) = parse_thinking_and_tools(
+                text,
+                args.generated_tokens,
+                args.thinking_enabled,
+                args.think_end_id,
+                args.think_end_str,
+                args.think_end_extra_ids,
+                args.include_reasoning,
+            );
+            // K2's template RAISES on any assistant history message without a
+            // thinking field (`reasoning_content`/`think`/…), so a suppressed or
+            // absent reasoning body must still round-trip as a DEFINED field —
+            // `Some("")` renders `<ifm|think>\n</ifm|think>` on replay where
+            // `None` would make the next continuation's render raise.
+            (clean_text, tool_calls, Some(thinking.unwrap_or_default()))
+        },
+        |text, args| {
+            raw_text_with_reasoning_suppressed(
+                text,
+                args.generated_tokens,
+                args.thinking_enabled,
+                args.think_end_id,
+                args.think_end_str,
+                args.think_end_extra_ids,
+                false,
+            )
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finalizer_tokenizer() -> crate::tokenizer::Qwen3Tokenizer {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-k2-finalize-tokenizer-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer.json");
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "secret": 0,
+                    "<unk>": 1,
+                    "answer": 2,
+                    "</ifm|think>": 3,
+                    "</ifm|think_fast>": 4,
+                    "</ifm|think_faster>": 5
+                },
+                "unk_token": "<unk>"
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let tokenizer = crate::tokenizer::Qwen3Tokenizer::from_file(&path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        tokenizer
+    }
+
+    #[test]
+    fn finalize_k2_chat_result_preserves_close_families_and_hidden_replay() {
+        let tokenizer = finalizer_tokenizer();
+        let closes = [
+            (3, "</ifm|think>"),
+            (4, "</ifm|think_fast>"),
+            (5, "</ifm|think_faster>"),
+        ];
+        for (close_id, close_tag) in closes {
+            let result = finalize_k2_chat_result(FinalizeArgs {
+                tokenizer: &tokenizer,
+                generated_tokens: &[0, close_id, 2],
+                finish_reason: "length".to_string(),
+                think_end_id: Some(close_id),
+                think_end_str: Some(close_tag),
+                think_end_extra_ids: &[],
+                performance: None,
+                include_reasoning: true,
+                thinking_enabled: true,
+                prompt_tokens: 7,
+                reasoning_tokens: 1,
+            })
+            .unwrap();
+            assert_eq!(result.text, "answer");
+            assert_eq!(result.thinking.as_deref(), Some("secret"));
+            assert_eq!(result.num_tokens, 3);
+            assert_eq!(result.prompt_tokens, 7);
+            assert_eq!(result.reasoning_tokens, 1);
+            assert_eq!(result.cached_tokens, 0);
+        }
+
+        let alternate = finalize_k2_chat_result(FinalizeArgs {
+            tokenizer: &tokenizer,
+            generated_tokens: &[0, 4, 2],
+            finish_reason: "length".to_string(),
+            think_end_id: Some(3),
+            think_end_str: Some("</ifm|think>"),
+            think_end_extra_ids: &[4, 5],
+            performance: None,
+            include_reasoning: true,
+            thinking_enabled: true,
+            prompt_tokens: 3,
+            reasoning_tokens: 1,
+        })
+        .unwrap();
+        assert_eq!(alternate.text, "answer");
+        assert_eq!(alternate.thinking.as_deref(), Some("secret"));
+
+        let hidden = finalize_k2_chat_result(FinalizeArgs {
+            tokenizer: &tokenizer,
+            generated_tokens: &[0, 3, 2],
+            finish_reason: "length".to_string(),
+            think_end_id: Some(3),
+            think_end_str: Some("</ifm|think>"),
+            think_end_extra_ids: &[4, 5],
+            performance: None,
+            include_reasoning: false,
+            thinking_enabled: true,
+            prompt_tokens: 3,
+            reasoning_tokens: 1,
+        })
+        .unwrap();
+        assert_eq!(hidden.thinking.as_deref(), Some(""));
+        assert_eq!(hidden.raw_text.trim(), "answer");
+        assert_eq!(
+            hidden.public_raw_text.as_deref().map(str::trim),
+            Some("answer")
+        );
+        assert!(!hidden.raw_text.contains("secret"));
+
+        let truncated = finalize_k2_chat_result(FinalizeArgs {
+            tokenizer: &tokenizer,
+            generated_tokens: &[0],
+            finish_reason: "length".to_string(),
+            think_end_id: Some(3),
+            think_end_str: Some("</ifm|think>"),
+            think_end_extra_ids: &[4, 5],
+            performance: None,
+            include_reasoning: false,
+            thinking_enabled: true,
+            prompt_tokens: 3,
+            reasoning_tokens: 1,
+        })
+        .unwrap();
+        assert_eq!(truncated.thinking.as_deref(), Some(""));
+        assert_eq!(truncated.raw_text, "");
+        assert_eq!(truncated.public_raw_text.as_deref(), Some(""));
+    }
 
     /// The template's default `xml` format: name line, then
     /// arg_key/arg_value pairs. Scalars stay strings (the `xml` format

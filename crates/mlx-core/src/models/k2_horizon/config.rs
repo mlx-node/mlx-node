@@ -79,7 +79,7 @@ pub struct K2HorizonConfig {
     #[serde(default)]
     pub bos_token_id: i32,
 
-    // Paged attention options (opt-in, mirror qwen3/lfm2 knobs).
+    // Paged attention options (default on; mirror qwen3/lfm2 knobs).
     /// GPU memory budget for paged KV cache in megabytes.
     /// Only used when `use_block_paged_cache` is true.
     /// Default: adaptive (weights-aware) sizing.

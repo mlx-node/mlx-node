@@ -3,6 +3,7 @@
 
 use napi::bindgen_prelude::*;
 
+use crate::engine::backend::FinalizeArgs;
 use crate::engine::types::{ChatResult, ChatStreamChunk};
 use crate::model_thread::StreamTx;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -187,6 +188,57 @@ pub(crate) fn raw_text_with_reasoning_suppressed(
     tools::strip_reasoning_preserving_tools(text)
 }
 
+pub(crate) fn finalize_chat_result_with(
+    args: FinalizeArgs<'_>,
+    parse: impl FnOnce(&str, &FinalizeArgs<'_>) -> (String, Vec<tools::ToolCallResult>, Option<String>),
+    scrub: impl FnOnce(&str, &FinalizeArgs<'_>) -> String,
+) -> Result<ChatResult> {
+    let text = args
+        .tokenizer
+        .decode_sync(args.generated_tokens, true)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to decode generated tokens: {}", e);
+            String::new()
+        });
+    let num_tokens = args.generated_tokens.len() as u32;
+    let (clean_text, tool_calls, thinking) = parse(&text, &args);
+    let public_raw_text = scrub(&text, &args);
+    // If we have valid tool calls, override finish reason
+    let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+        "tool_calls".to_string()
+    } else {
+        args.finish_reason
+    };
+    let raw_text = if args.include_reasoning {
+        text
+    } else {
+        public_raw_text.clone()
+    };
+    Ok(ChatResult {
+        text: clean_text,
+        tool_calls,
+        thinking,
+        // The session core overwrites this with the effective Jinja kwarg
+        // (`resolve_enable_thinking(config).unwrap_or(true)`) after the
+        // family finalizer returns. Keeping the decode-time value here makes
+        // direct/non-session callers conservative and fully initializes the
+        // shared result type.
+        thinking_enabled: args.thinking_enabled,
+        num_tokens,
+        prompt_tokens: args.prompt_tokens,
+        reasoning_tokens: args.reasoning_tokens,
+        finish_reason,
+        raw_text,
+        public_raw_text: Some(public_raw_text),
+        // Callers that reused a cached prefix overwrite this via their own
+        // `cached_prefix_len as u32` after this function returns. Defaulting
+        // to zero keeps the behavior of callers that do not (yet) thread
+        // the value through intact.
+        cached_tokens: 0,
+        performance: args.performance,
+    })
+}
+
 /// Decode tokens, parse thinking/tool_calls, build ChatResult.
 pub(crate) fn finalize_chat_result(
     tokenizer: &Qwen3Tokenizer,
@@ -200,68 +252,41 @@ pub(crate) fn finalize_chat_result(
     prompt_tokens: u32,
     reasoning_tokens: u32,
 ) -> Result<ChatResult> {
-    let text = tokenizer
-        .decode_sync(generated_tokens, true)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to decode generated tokens: {}", e);
-            String::new()
-        });
-
-    let num_tokens = generated_tokens.len() as u32;
-
-    let (clean_text, tool_calls, thinking) = parse_thinking_and_tools(
-        &text,
-        generated_tokens,
-        thinking_enabled,
-        think_end_id,
-        think_end_str,
-        include_reasoning,
-    );
-
-    // If we have valid tool calls, override finish reason
-    let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-        "tool_calls".to_string()
-    } else {
-        finish_reason
-    };
-
-    let public_raw_text = raw_text_with_reasoning_suppressed(
-        &text,
-        generated_tokens,
-        thinking_enabled,
-        think_end_id,
-        think_end_str,
-        false,
-    );
-    let raw_text = if include_reasoning {
-        text
-    } else {
-        public_raw_text.clone()
-    };
-
-    Ok(ChatResult {
-        text: clean_text,
-        tool_calls,
-        thinking,
-        // The session core overwrites this with the effective Jinja kwarg
-        // (`resolve_enable_thinking(config).unwrap_or(true)`) after the
-        // family finalizer returns. Keeping the decode-time value here makes
-        // direct/non-session callers conservative and fully initializes the
-        // shared result type.
-        thinking_enabled,
-        num_tokens,
-        prompt_tokens,
-        reasoning_tokens,
-        finish_reason,
-        raw_text,
-        public_raw_text: Some(public_raw_text),
-        // Callers that reused a cached prefix overwrite this via their own
-        // `cached_prefix_len as u32` after this function returns. Defaulting
-        // to zero keeps the behavior of callers that do not (yet) thread
-        // the value through intact.
-        cached_tokens: 0,
-        performance,
-    })
+    finalize_chat_result_with(
+        FinalizeArgs {
+            tokenizer,
+            generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str,
+            think_end_extra_ids: &[],
+            performance,
+            include_reasoning,
+            thinking_enabled,
+            prompt_tokens,
+            reasoning_tokens,
+        },
+        |text, args| {
+            parse_thinking_and_tools(
+                text,
+                args.generated_tokens,
+                args.thinking_enabled,
+                args.think_end_id,
+                args.think_end_str,
+                args.include_reasoning,
+            )
+        },
+        |text, args| {
+            raw_text_with_reasoning_suppressed(
+                text,
+                args.generated_tokens,
+                args.thinking_enabled,
+                args.think_end_id,
+                args.think_end_str,
+                false,
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -269,6 +294,133 @@ mod tests {
     use super::*;
 
     const THINK_END_ID: u32 = 151668; // example </think> token ID
+
+    fn finalizer_tokenizer() -> Qwen3Tokenizer {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-finalize-tokenizer-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer.json");
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "raw": 0,
+                    "<unk>": 1,
+                    "secret": 2,
+                    "</think>": 3,
+                    "answer": 4,
+                    "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>": 5,
+                    "<tool_call>{bad}</tool_call>": 6
+                },
+                "unk_token": "<unk>"
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let tokenizer = Qwen3Tokenizer::from_file(&path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        tokenizer
+    }
+
+    #[test]
+    fn finalize_chat_result_preserves_visibility_metadata_and_tool_finish() {
+        let tokenizer = finalizer_tokenizer();
+        let raw = finalize_chat_result(
+            &tokenizer,
+            &[0],
+            "length".to_string(),
+            Some(3),
+            Some("</think>"),
+            None,
+            false,
+            false,
+            9,
+            4,
+        )
+        .unwrap();
+        assert_eq!(raw.text, "raw");
+        assert_eq!(raw.raw_text, "raw");
+        assert_eq!(raw.public_raw_text.as_deref(), Some("raw"));
+        assert_eq!(raw.num_tokens, 1);
+        assert_eq!(raw.prompt_tokens, 9);
+        assert_eq!(raw.reasoning_tokens, 4);
+        assert_eq!(raw.cached_tokens, 0);
+
+        let hidden = finalize_chat_result(
+            &tokenizer,
+            &[2],
+            "length".to_string(),
+            Some(3),
+            Some("</think>"),
+            None,
+            false,
+            true,
+            1,
+            1,
+        )
+        .unwrap();
+        let visible = finalize_chat_result(
+            &tokenizer,
+            &[2],
+            "length".to_string(),
+            Some(3),
+            Some("</think>"),
+            None,
+            true,
+            true,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(hidden.thinking, None);
+        assert_eq!(hidden.raw_text, "");
+        assert_eq!(hidden.public_raw_text.as_deref(), Some(""));
+        assert_eq!(visible.thinking.as_deref(), Some("secret"));
+        assert_eq!(visible.raw_text, "secret");
+
+        let valid = finalize_chat_result(
+            &tokenizer,
+            &[5],
+            "length".to_string(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(valid.finish_reason, "tool_calls");
+        assert!(valid.tool_calls.iter().any(|call| call.status == "ok"));
+        let invalid = finalize_chat_result(
+            &tokenizer,
+            &[6],
+            "length".to_string(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(invalid.finish_reason, "length");
+        assert!(invalid.tool_calls.iter().all(|call| call.status != "ok"));
+    }
 
     #[test]
     fn test_raw_text_with_reasoning_suppressed() {

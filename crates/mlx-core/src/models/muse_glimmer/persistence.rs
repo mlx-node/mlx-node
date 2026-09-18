@@ -5,7 +5,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, parse_generation_defaults,
 };
@@ -552,17 +552,9 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         persist_env.as_deref(),
         config.persist_paged_cache,
     );
-    let shard_snapshot_before_mmap = if persist_cold {
-        snapshot_shard_identities(path)
-    } else {
-        None
-    };
+    let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
     let params = load_target_safetensors(path, config.text_config.tie_word_embeddings)?;
-    let shard_snapshot_at_mmap = if persist_cold {
-        snapshot_shard_identities(path)
-    } else {
-        None
-    };
+    checkpoint_load.record_mmap();
     if persist_cold {
         crate::engine::persistence::prewarm_checkpoint_pages(path);
     }
@@ -695,12 +687,7 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         && let Some(context) =
             inner.build_cold_tier_context(&path.to_string_lossy(), weights_resident)
     {
-        let after_fingerprint = snapshot_shard_identities(path);
-        if shard_identities_stable(
-            &shard_snapshot_before_mmap,
-            &shard_snapshot_at_mmap,
-            &after_fingerprint,
-        ) {
+        if checkpoint_load.stable_after_fingerprint() {
             inner.attach_cold_tier(context, weights_resident);
         } else {
             tracing::warn!(

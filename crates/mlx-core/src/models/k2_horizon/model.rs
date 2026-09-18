@@ -1151,8 +1151,8 @@ impl ChatBackend for K2Inner {
         // K2's template ALWAYS opens a reasoning tag (any valid effort);
         // `enable_thinking` is not consulted. Effort picks the tag variant
         // AND derives the budget via `default_thinking_budget_for_effort`
-        // (explicit thinking_token_budget wins). `"none"` raises inside the
-        // template at render, before this policy matters.
+        // (explicit thinking_token_budget wins). `normalize_k2_effort` maps
+        // none to low before render and budget resolution.
         ThinkingPolicy::AlwaysOnBudgetFromEffort
     }
 

@@ -37,9 +37,10 @@ The two planning stages have different responsibilities:
   model against one request. `ExecutionPlan` is immutable load-time data;
   `TurnPlan` is compact request-time data and is computed before cache mutation.
 
-The decode loop does not probe model capabilities. The session selects exactly
-one executor, and a declared feature without an implementation fails loudly
-instead of falling through to a different route.
+The session selects exactly one executor. Within autoregressive decoding, the
+selected stepper advertises whether greedy submit-ahead is safe; otherwise the
+same executor uses serial decoding. A declared turn-plan feature without an
+implementation fails loudly instead of falling through to a different route.
 
 ## Independent execution dimensions
 
@@ -60,7 +61,7 @@ cross-attention, and other state remains model-owned. Do not add a global
 Scheduling policy is nevertheless engine-owned. `HybridSchedulerState<B>`
 owns admission, owner/sequence mapping, block and recurrent-state reservation,
 prefill/decode planning, SSD waits, preemption, completion, and barriers for
-Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, Gemma4, Muse-Glimmer, and Nemotron 3.5 Lightning. `HybridSchedulerBackend` is the
+Qwen3, K2-Horizon, LFM2/2.5, Qwen3.5 Dense/MoE, Gemma4, Muse-Glimmer, and Nemotron 3.5 Lightning. `HybridSchedulerBackend` is the
 model-runner boundary: a family exposes its paged cache manager, auxiliary-state
 lifecycle, prefix construction/restore, and batched decode implementation.
 Environment-derived limits remain shared engine policy, not pass-through
@@ -119,7 +120,8 @@ both routes propose and verify tokens.
 | Family        | Media                                                        | Paged attention                                                                                                                 | Chat speculation                                                                                                                                                                                   | Important constraint                                                                                                                                   |
 | ------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Qwen3         | none                                                         | fresh and delta                                                                                                                 | none                                                                                                                                                                                               | all paged turns use the shared paged executor                                                                                                          |
-| LFM2          | none                                                         | fresh and delta                                                                                                                 | none                                                                                                                                                                                               | short-conv state is never paged: every paged turn (fresh or delta) rebuilds it from the full token stream via conv Pass-1                              |
+| K2-Horizon    | none                                                         | fresh and delta                                                                                                                 | none                                                                                                                                                                                               | pure-KV greedy submit-ahead decode with compatible penalties; stochastic sampling uses serial decode                                                   |
+| LFM2          | none                                                         | fresh and delta                                                                                                                 | none                                                                                                                                                                                               | reuse live, checkpointed, or restored ShortConv state when its token prefix matches; replay convolution state only when it cannot be reused            |
 | Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta                                                                                                                 | native MTP, including paged target state and supported image-context continuation; OR an external Qwen3.8 DFlash2 draft on flat target state only — a loaded draft dir shadows the native MTP plan | plain paged AR may use the two-row GDN scheduler; multimedia/MTP retain the ordered path                                                               |
 | Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta                                                                                                                 | native MTP on flat or paged target state                                                                                                                                                           | plain paged AR may use the two-row GDN/MoE scheduler; multimedia/MTP retain the ordered path                                                           |
 | Gemma4        | image/audio components that have a paged adapter             | fresh and delta                                                                                                                 | DSpark on paged text state; assistant draft on flat text state                                                                                                                                     | ordinary paged text AR and fixed-depth text DSpark share grouped full/sliding batching; media, assistant and adaptive speculation retain ordered lanes |
@@ -128,6 +130,12 @@ both routes propose and verify tokens.
 
 The table is a conformance description, not dispatch code. The source of truth
 is each model's `execution_plan()` plus its executor implementations.
+
+### Shared infrastructure and ownership
+
+Model families reuse narrow implementation seams rather than one universal tensor path: `models::forward`, `engine::paged_stepper`, `models::attention_core`, `models::quantized_linear`, `models::paged_config`, and `RenameSpec`. Final result assembly lives in `engine::finalize`; checkpoint snapshot transactions live in `cold_tier::CheckpointLoadGuard`; tool syntax, LFM2 grammar, markup ranges, and reasoning scans live in separate `tools` modules.
+
+`PrefixKeys` owns immutable uniform/per-block cache identity and hash walking. `BlockAllocator` owns mutable physical blocks, refcounts, prefix registration, and LRU eviction. `PagedKVCacheAdapter` owns request lifecycle, lookup/publication orchestration, and hot/cold integration. Sharing these seams does not imply that families share tensor math or cache topology.
 
 **nemotron_h draft head.** Unlike the earlier read-only shape, the NemotronH MTP
 head is **stateful**: it has its own `k_proj`/`v_proj` and its own causal KV

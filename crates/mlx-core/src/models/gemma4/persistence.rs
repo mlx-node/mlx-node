@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, cast_f32_tensors_to_bf16,
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
@@ -2606,19 +2606,11 @@ impl Gemma4Inner {
         // fail-closed gate before this loader attaches persistence.
         let persist_cold =
             resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
-        let shard_snapshot_before_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
         let mut params = load_all_safetensors(path, should_load_media_sidecar(&config))?;
 
-        let shard_snapshot_at_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        checkpoint_load.record_mmap();
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
         // of any mmap-backed weight (FP8 dequant in `dequant_fp8_weights`,
@@ -2855,12 +2847,7 @@ impl Gemma4Inner {
             // attaching it also arms the reconcile-down restore and the
             // auxiliary-state obligation the sliding prefill discharges.
             if let Some(ctx) = inner.build_cold_tier_context(model_path, &weights_resident) {
-                let after_fingerprint = snapshot_shard_identities(path);
-                if shard_identities_stable(
-                    &shard_snapshot_before_mmap,
-                    &shard_snapshot_at_mmap,
-                    &after_fingerprint,
-                ) {
+                if checkpoint_load.stable_after_fingerprint() {
                     inner.attach_cold_tier(ctx, &weights_resident);
                 } else {
                     tracing::warn!(

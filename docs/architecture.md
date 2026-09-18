@@ -4,27 +4,20 @@ For the model-extension boundary and composable media, paged-attention, and
 speculative-decoding plan, see [inference-architecture.md](inference-architecture.md).
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  TypeScript layer — 6 packages                           │
-│  @mlx-node/lm      Inference, ChatSession, streaming      │
-│  @mlx-node/trl     GRPO/SFT training, datasets            │
-│  @mlx-node/vlm     VLM, OCR, document pipelines           │
-│  @mlx-node/server  HTTP server (/v1/responses, /v1/messages)│
-│  @mlx-node/cli     mlx download, mlx convert, mlx launch  │
-│  @mlx-node/core    Native addon (NAPI bindings)           │
-├──────────────────────────────────────────────────────────┤
-│  Rust compute layer — 5 workspace crates                 │
-│  mlx-core        Models, training, ops, vision (all NAPI) │
-│  mlx-paged-attn  PagedAttention + Metal kernels           │
-│  mlx-sys         Low-level MLX FFI bridge (cpp + headers) │
-│  mlx-db          SQLite training persistence              │
-│  mlx-tui         mlx-train Ratatui binary (no library deps)│
-├──────────────────────────────────────────────────────────┤
-│  C++ bridge → Compiled forward paths                      │
-│  ~300 FFI declarations, compiled decode via mlx::compile  │
-├──────────────────────────────────────────────────────────┤
-│  MLX → Metal / CUDA / Accelerate GPUs                     │
-└──────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│  TypeScript layer — 12 top-level packages                  │
+│  core, lm, trl, vlm, server, cli, agent, asr, privacy,     │
+│  dashboard, desktop, internal-tools                        │
+│  plus examples and the core/npm/darwin-arm64 distribution │
+├────────────────────────────────────────────────────────────┤
+│  Rust compute layer — 6 workspace crates                  │
+│  mlx-core, mlx-sys, mlx-paged-attn, mlx-db, mlx-tui,       │
+│  mlx-metal (narrow objc2-metal adapter)                    │
+├────────────────────────────────────────────────────────────┤
+│  C++ bridge → MLX FFI and compiled decode via mlx::compile │
+├────────────────────────────────────────────────────────────┤
+│  MLX → Metal / CUDA / Accelerate GPUs                      │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ## Memory model: unified memory decides the cache hierarchy
@@ -48,7 +41,7 @@ vLLM (discrete GPU)                 mlx-node (unified memory)
 
 **A RAM tier would be a no-op.** vLLM's `CPUOffloadingManager` earns its keep because
 moving KV from VRAM to host RAM frees a genuinely separate, scarce resource. Here the
-destination *is* the source. Disk is the only place a block can go that gives memory
+destination _is_ the source. Disk is the only place a block can go that gives memory
 back, so the cold tier
 ([paged-cache.md](paged-cache.md#ssd-cold-tier-hybrid-families-and-the-auxiliary-sidecar))
 is a single hop, not the bottom of a ladder.
@@ -67,7 +60,7 @@ pool is sized to the context, not to the machine.
 (`vllm/v1/kv_offload/tiering/fs/`) is cross-process by design: filenames are stable
 content-hash chains namespaced by a config-hash directory of model NAME + geometry +
 dtype, and lookup is a stateless per-file existence probe (`manager.py`,
-`file_mapper.py`) — no index exists, the filesystem *is* the index, which is exactly
+`file_mapper.py`) — no index exists, the filesystem _is_ the index, which is exactly
 what makes it cross-process. What it does not have: no `fsync` and no payload
 checksums (a right-sized corrupted file loads silently), no quota or eviction
 (unbounded growth), no weight-byte fingerprint (it trusts the model NAME), and
@@ -111,22 +104,23 @@ Bound memory hard, bound disk by quota, and spend the per-turn write budget on d
 ## Package dependency chain
 
 ```
-@mlx-node/core (Rust/NAPI native addon)
-    ├── @mlx-node/lm        inference, models, streaming, tools, profiling
-    │     ├── @mlx-node/trl    training (GRPO, SFT, datasets, rewards)
-    │     ├── @mlx-node/vlm    vision (VLM, OCR, document pipeline)
-    │     └── @mlx-node/server HTTP server (SessionRegistry, /v1/* endpoints)
-    └── @mlx-node/cli       depends on core + lm + server
+core ── native addon boundary
+├── lm, asr, privacy
+├── trl, vlm, server ── core + lm
+├── agent ───────────── core + lm + server
+├── cli ─────────────── agent + core + lm + privacy + server
+├── dashboard ───────── agent + lm (native-free catalog boundary)
+└── desktop ─────────── dashboard + lm + server (process-isolated native)
 ```
 
-`mlx-tui` is the workspace binary crate (Ratatui-based `mlx-train` TUI) — it's a workspace member but no other crate depends on it, so it's built separately via `cargo build -p mlx-tui`. `@mlx-node/internal-tools` lives in root `devDependencies` and is not part of the runtime chain.
+`internal-tools` is development tooling, not part of the runtime chain. The dashboard dependency remains a native-free catalog boundary; dependency edges are not permission to import native code into UI processes. `mlx-tui` is the standalone Ratatui workspace binary and is built separately with `cargo build -p mlx-tui`.
 
 ## Repository layout
 
 ```
 mlx-node/
-├── Cargo.toml                  workspace manifest (5 crates)
-├── package.json                npm workspaces (6 packages + examples)
+├── Cargo.toml                  workspace manifest (6 crates)
+├── package.json                npm workspaces (12 top-level packages + examples)
 ├── vite.config.ts              Vitest + Oxlint + Oxfmt config
 ├── tsconfig.json               TypeScript project references
 │
@@ -135,7 +129,8 @@ mlx-node/
 │   ├── mlx-core/               All NAPI exports: models, training, ops, vision
 │   ├── mlx-paged-attn/         PagedAttention + Metal shaders — see paged-cache.md
 │   ├── mlx-db/                 SQLite training persistence
-│   └── mlx-tui/                mlx-train Ratatui binary (standalone)
+│   ├── mlx-tui/                mlx-train Ratatui binary (standalone)
+│   └── mlx-metal/              narrow objc2-metal adapter
 │
 ├── packages/
 │   ├── core/                   @mlx-node/core (native addon + .d.cts)
@@ -161,8 +156,15 @@ mlx-node/
 │   │                             `host/paths` is a further, dependency-free
 │   │                             subpath (~/.mlx-node layout) for callers that
 │   │                             must not dlopen the native addon.
-│   └── cli/                    @mlx-node/cli — see cli.md
+│   ├── cli/                    @mlx-node/cli — see cli.md
+│   ├── agent/                  @mlx-node/agent
+│   ├── asr/                    @mlx-node/asr
+│   ├── privacy/                @mlx-node/privacy
+│   ├── dashboard/              @mlx-node/dashboard (native-free UI/catalog)
+│   ├── desktop/                @mlx-node/desktop (process-isolated native)
+│   └── internal-tools/         development tooling
 │
+├── packages/core/npm/darwin-arm64/  platform distribution package
 ├── __test__/                   TypeScript tests
 └── examples/                   lm.ts, vlm-inference.ts, paddle-ocr-pipeline.ts, tool-use-example.ts, grpo/, sft/
 ```
@@ -171,20 +173,20 @@ mlx-node/
 
 | Command                            | Output                                                                                                                                                            |
 | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `yarn build`                       | `yarn build:native && yarn build:ts`                                                                                                                              |
-| `yarn build:native`                | macOS: `packages/core/index.cjs`, `mlx-core.darwin-arm64.node`, `mlx.metallib`, `paged_attn.metallib`. Linux/CUDA: `mlx-core.linux-arm64-gnu.node` (no metallibs) |
-| `yarn build:ts`                    | `packages/*/dist/` via `tsc -b` (project references)                                                                                                              |
-| `yarn typecheck`                   | TypeScript type-check only                                                                                                                                        |
+| `vp run build`                     | `vp run build:native && vp run build:ts`                                                                                                                          |
+| `vp run build:native`              | macOS: `packages/core/index.cjs`, `mlx-core.darwin-arm64.node`, `mlx.metallib`, `paged_attn.metallib`. Linux/CUDA: `mlx-core.linux-arm64-gnu.node` (no metallibs) |
+| `vp run build:ts`                  | `packages/*/dist/` via `tsc -b` (project references)                                                                                                              |
+| `vp run typecheck`                 | TypeScript type-check only                                                                                                                                        |
 | `cargo build --release -p mlx-tui` | `mlx-train` TUI binary                                                                                                                                            |
 
-`yarn build:native` is the **canonical native build** — runs the napi-rs pipeline through `packages/core/build.ts` (executed via `oxnode`). Running `cargo build` directly does **not** produce the `.node` addon.
+`vp run build:native` is the **canonical native build** — runs the napi-rs pipeline through `packages/core/build.ts` (executed via `oxnode`). Running `cargo build` directly does **not** produce the `.node` addon.
 
 ## Adding a new native operation
 
 1. Add FFI declaration in `crates/mlx-sys/src/lib.rs`.
 2. Add C++ bridge function in the appropriate `crates/mlx-sys/src/mlx_*.cpp` file (see [ffi-cpp.md](ffi-cpp.md) for which file owns what).
 3. Add a Rust wrapper in `crates/mlx-core/src/` with `#[napi]` exports.
-4. Run `yarn build:native` to regenerate NAPI bindings and `packages/core/index.d.cts`.
+4. Run `vp run build:native` to regenerate NAPI bindings and `packages/core/index.d.cts`.
 5. Add tests using TypedArray helpers.
 
 If you added a **new** `.cpp` file, run `rm -rf target/release/build/mlx-sys-*` once — the `cc` crate caches the source-file list across builds and won't pick up new files otherwise.
@@ -195,4 +197,4 @@ If you added a **new** `.cpp` file, run `rm -rf target/release/build/mlx-sys-*` 
 
 1. Pick the package by responsibility: `lm` (inference), `trl` (training), `vlm` (vision), `server` (HTTP), `cli` (CLI).
 2. Add to `packages/<pkg>/src/`, export from `packages/<pkg>/src/index.ts`.
-3. Run `yarn build:ts && yarn typecheck`.
+3. Run `vp run build:ts && vp run typecheck`.

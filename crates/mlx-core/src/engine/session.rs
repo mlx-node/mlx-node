@@ -1042,6 +1042,22 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
     };
     let is_delta = live_continuation.is_some();
     let tokens = live_continuation.unwrap_or(full_tokens);
+    if crate::inference_trace::enabled() {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for token in &tokens {
+            digest.update(token.to_le_bytes());
+        }
+        let digest = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        crate::inference_trace::write(format_args!(
+            "[MLX_TRACE] admitted_prompt is_delta={is_delta} tokens={} sha256={digest}",
+            tokens.len(),
+        ));
+    }
     let images = if is_delta {
         Vec::new()
     } else {

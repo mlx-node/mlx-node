@@ -259,9 +259,8 @@ impl Clone for RMSNormGated {
 /// channels, so each group's statistics are independent. With
 /// `num_groups == 1` this degenerates to ordinary RMSNorm.
 ///
-/// Implemented from primitive ops (no fused Metal kernel): for
-/// hidden_size=4096 / num_groups=4 the reshape+rms step is cheap relative
-/// to the surrounding GEMMs.
+/// Uses MLX's fused RMSNorm on a grouped f32 view, followed by the
+/// full-width learned scale and a cast back to the input dtype.
 pub struct GroupedRMSNorm {
     weight: MxArray,
     eps: f64,

@@ -2408,6 +2408,8 @@ impl Qwen3Tokenizer {
         render_ctx: RenderContextOptions,
     ) -> std::result::Result<String, String> {
         let mut env = Environment::new();
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         Self::install_template_helpers(&mut env);
 
         // Neutralize HuggingFace `{% generation %}` / `{% endgeneration %}`
@@ -5359,18 +5361,9 @@ mod tests {
     /// they are spaced the way HF spaces them, and catches every other kind of
     /// renderer drift in the same breath.
     ///
-    /// Byte-identity is asserted per family where it holds, and where it does not
-    /// the residual is NAMED in `HF_RESIDUAL_GAPS` and only the JSON regions are
-    /// asserted. A named gap is worth more than a skipped family: the skip looks
-    /// like coverage and is not.
-    ///
-    /// ## Measured
-    ///
-    /// 12 distinct `tojson` templates in the cache. **Nine render BYTE-IDENTICAL
-    /// to HuggingFace** — ornith-1.0-9b, ornith-1.0-35b, qwen3.5, qwen3.6,
-    /// agentworld, agents-a1-4b, lfm2.5-1.2b-thinking, lfm2.5-2.6b, muse-glimmer.
-    /// One diverges by whitespace only (`HF_RESIDUAL_GAPS`). Two do not render at
-    /// all (`KNOWN_UNRENDERABLE_CAUSES`).
+    /// Each renderable fixture must match HuggingFace. Whitespace uses HF
+    /// trim/lstrip defaults; known template-language gaps remain checked
+    /// separately.
     ///
     /// ## Non-vacuity, verified by mutation
     ///
@@ -5443,24 +5436,11 @@ mod tests {
                 continue;
             }
             let offset = first_difference(&ours, hf);
-            assert!(
-                HF_RESIDUAL_GAPS.iter().any(|(f, _)| f == family),
-                "{family} diverges from HuggingFace at byte {offset} and is not a recorded \
-                 residual gap.\n  ours: {:?}\n  HF:   {:?}",
+            panic!(
+                "{family} diverges from HuggingFace at byte {offset}.\n  ours: {:?}\n  HF:   {:?}",
                 &ours[offset.saturating_sub(40)..(offset + 40).min(ours.len())],
                 &hf[offset.saturating_sub(40)..(offset + 40).min(hf.len())],
             );
-            // A recorded gap still has to be spaced-JSON-correct: the gap is about
-            // whitespace and context keys OUTSIDE the JSON, never inside it.
-            for (detector, expected) in SEPARATOR_PROBES {
-                if ours.contains(detector) {
-                    assert!(
-                        ours.contains(expected),
-                        "{family} is a recorded residual gap, but its JSON regions must still \
-                         match HF exactly. Expected:\n  {expected}\nin:\n{ours}",
-                    );
-                }
-            }
         }
 
         assert_eq!(
@@ -5488,32 +5468,6 @@ mod tests {
         );
         eprintln!("{}", report.join("\n"));
     }
-
-    /// Families whose whole prompt does NOT match HF byte-for-byte, and why.
-    /// Populated from a real run; the gate refuses any divergence not listed, and
-    /// a recorded family still has to match HF inside its JSON regions.
-    ///
-    /// One entry, and it is NOT a separator defect — it is Jinja whitespace
-    /// control. HF builds its environment with `trim_blocks=True,
-    /// lstrip_blocks=True` (`chat_template_utils.py:487`) and miniJinja defaults
-    /// both to false. Nine of the ten renderable families are byte-identical
-    /// anyway, because their templates spell every trim explicitly as `{%- … -%}`;
-    /// Nemotron's does not, so we emit 1614 bytes where HF emits 1601 — 13 extra
-    /// newlines after block tags, all inside the tool-schema block.
-    ///
-    /// MEASURED CANDIDATE FIX, deliberately not taken here: adding
-    /// `env.set_trim_blocks(true); env.set_lstrip_blocks(true);` to
-    /// `render_chat_template_jinja2_with_content_order` makes ALL TEN renderable
-    /// families byte-identical to HF and regresses none of the nine that already
-    /// matched. It is still the wrong commit for it: those settings apply to every
-    /// template, and the 22 installed templates that do not use `tojson` — gemma4
-    /// among them — have no HF fixture here, so nothing in this file would notice
-    /// if it moved a gemma4 prompt. Ship it behind fixtures for the whole cache,
-    /// not behind these ten.
-    const HF_RESIDUAL_GAPS: &[(&str, &str)] = &[(
-        "nemotron-3.5-lightning",
-        "miniJinja defaults trim_blocks/lstrip_blocks to false; HF sets both true",
-    )];
 
     /// First byte at which two strings differ; `min(len)` when one is a prefix.
     fn first_difference(a: &str, b: &str) -> usize {
@@ -7266,6 +7220,26 @@ mod tests {
             images: None,
             audio: None,
         }
+    }
+
+    #[test]
+    fn generation_blocks_use_hf_whitespace_defaults() {
+        let dir = TestModelDir::new("generation-whitespace");
+        let template = "{%- for message in messages -%}\n    {{- '<|ifm|im_start|>' + message.role }}\n        {% generation %}\n        {{- '<ifm|think>\\n' + message.reasoning_content + '</ifm|think>' + message.content }}\n        {%- endgeneration -%}\n{%- endfor -%}";
+        let tokenizer = dir.load_with_template(&[], template);
+        let rendered = tokenizer
+            .render_chat_template_sync(
+                &[assistant_with_reasoning("reason")],
+                Some(false),
+                None,
+                Some(true),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|ifm|im_start|>assistant\n<ifm|think>\nreason</ifm|think>answer"
+        );
     }
 
     #[test]

@@ -15260,6 +15260,99 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn test_k2_bf16_prefill_gather_matches_host_with_lazy_suffix() {
+        const TOKENS: usize = 33;
+        const HEADS: usize = 8;
+        const DIM: usize = 128;
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: HEADS as u32,
+            head_size: DIM as u32,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            4,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => {
+                eprintln!("skipping K2 BF16 prefill gather: {error}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 16)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).unwrap();
+        adapter.reset_for_new_request(11).unwrap();
+        adapter.allocate_suffix_blocks(TOKENS as u32).unwrap();
+        let token_ids: Vec<u32> = (0..TOKENS as u32).collect();
+        let key_at = |token: usize, head: usize, dim: usize| {
+            ((token * 17 + head * 3 + dim % 7) % 64) as f32 / 8.0
+        };
+        let value_at = |token: usize, head: usize, dim: usize| {
+            ((token * 7 + head * 13 + dim) % 61) as f32 / 8.0
+        };
+        for (start, end) in [(0usize, 17usize), (17, TOKENS)] {
+            adapter.record_tokens(&token_ids[start..end]).unwrap();
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for token in start..end {
+                for head in 0..HEADS {
+                    for dim in 0..DIM {
+                        keys.push(key_at(token, head, dim));
+                        values.push(value_at(token, head, dim));
+                    }
+                }
+            }
+            let shape = [(end - start) as i64, HEADS as i64, DIM as i64];
+            let keys = MxArray::from_float32(&keys, &shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let values = MxArray::from_float32(&values, &shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            adapter
+                .update_keys_values_native(0, &keys, &values, start as u32)
+                .unwrap();
+        }
+        let (graph_k, graph_v) = adapter
+            .gather_kv_for_prefill_sdpa(0, TOKENS as u32)
+            .unwrap();
+        for array in [&graph_k, &graph_v] {
+            assert_eq!(
+                array.shape().unwrap().as_ref(),
+                &[1, HEADS as i64, TOKENS as i64, DIM as i64]
+            );
+            assert_eq!(array.dtype().unwrap(), DType::BFloat16);
+        }
+        let graph_k = graph_k.to_float32().unwrap();
+        let graph_v = graph_v.to_float32().unwrap();
+        let (host_k, host_v) = adapter.read_kv_range(0, 0, TOKENS as u32).unwrap();
+        let host_k = host_k.to_float32().unwrap();
+        let host_v = host_v.to_float32().unwrap();
+        assert_eq!(graph_k.as_ref(), host_k.as_ref());
+        assert_eq!(graph_v.as_ref(), host_v.as_ref());
+        for head in 0..HEADS {
+            for token in 0..TOKENS {
+                for dim in 0..DIM {
+                    let index = (head * TOKENS + token) * DIM + dim;
+                    assert_eq!(graph_k[index], key_at(token, head, dim));
+                    assert_eq!(graph_v[index], value_at(token, head, dim));
+                }
+            }
+        }
+        assert_eq!(adapter.current_token_count(), TOKENS as u32);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn test_gather_kv_for_prefill_sdpa_preserves_layout_and_native_dependency() {
         let cfg = mlx_paged_attn::PagedAttentionConfig {
             block_size: 8,

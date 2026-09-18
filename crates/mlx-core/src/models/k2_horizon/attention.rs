@@ -140,10 +140,10 @@ impl K2Attention {
     /// (`query_key_norm = false`), full RoPE on `head_dim`, `ForceD128`
     /// decode route (K2's 32q/8kv/hs128 geometry is eligible for the
     /// grouped striped kernel; the hint degrades to generic V2 whenever
-    /// the dispatch predicate or pipeline check fails), and the verified
-    /// `read_kv_range` + explicit-mask path for cache-hit prefill — the
-    /// graph-native `gather_kv_for_prefill_chunk` bridge stays opt-out
-    /// here because K2's parity gate is fresh.
+    /// the dispatch predicate or pipeline check fails), and cache-hit
+    /// prefill gathers K/V through the MLX graph and uses the existing
+    /// explicit-mask SDPA; a failed gather retains the synchronous host
+    /// fallback.
     fn paged_core(&self) -> PagedAttentionCore<'_> {
         PagedAttentionCore {
             q_proj: &self.q_proj,
@@ -158,7 +158,7 @@ impl K2Attention {
             rope: Some(&self.rope),
             kv_io_dtype: None,
             decode_route_hint: PagedDecodeRouteHint::ForceD128,
-            cache_hit_prefill: CacheHitPrefillRoute::HostReadSdpa,
+            cache_hit_prefill: CacheHitPrefillRoute::GraphSdpa,
             family: "k2_horizon",
         }
     }

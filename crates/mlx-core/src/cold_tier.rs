@@ -628,6 +628,45 @@ pub(crate) fn shard_identities_stable(
     }
 }
 
+pub(crate) struct CheckpointLoadGuard<'a> {
+    path: &'a Path,
+    enabled: bool,
+    before_mmap: Option<HashMap<String, ShardIdentity>>,
+    at_mmap: Option<HashMap<String, ShardIdentity>>,
+}
+
+impl<'a> CheckpointLoadGuard<'a> {
+    pub(crate) fn before_mmap(path: &'a Path, enabled: bool) -> Self {
+        Self {
+            path,
+            enabled,
+            before_mmap: if enabled {
+                snapshot_shard_identities(path)
+            } else {
+                None
+            },
+            at_mmap: None,
+        }
+    }
+
+    pub(crate) fn record_mmap(&mut self) {
+        self.at_mmap = if self.enabled {
+            snapshot_shard_identities(self.path)
+        } else {
+            None
+        };
+    }
+
+    pub(crate) fn stable_after_fingerprint(&self) -> bool {
+        self.enabled
+            && shard_identities_stable(
+                &self.before_mmap,
+                &self.at_mmap,
+                &snapshot_shard_identities(self.path),
+            )
+    }
+}
+
 /// Lenient boolean parse for the `MLX_PERSIST_PAGED_CACHE` override.
 /// `1/true/on/yes` → `Some(true)`, `0/false/off/no` → `Some(false)`
 /// (case-insensitive, surrounding whitespace ignored); anything else →
@@ -1167,6 +1206,58 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("mlx-{tag}-{}-{n}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn checkpoint_load_guard_tracks_the_full_snapshot_bracket() {
+        let stable = unique_tmp("checkpoint-guard-stable");
+        std::fs::create_dir_all(&stable).unwrap();
+        std::fs::write(stable.join("model.safetensors"), b"one").unwrap();
+        let mut guard = CheckpointLoadGuard::before_mmap(&stable, true);
+        guard.record_mmap();
+        assert!(guard.stable_after_fingerprint());
+        let _ = std::fs::remove_dir_all(&stable);
+
+        let omitted = unique_tmp("checkpoint-guard-omitted");
+        std::fs::create_dir_all(&omitted).unwrap();
+        std::fs::write(omitted.join("model.safetensors"), b"one").unwrap();
+        let guard = CheckpointLoadGuard::before_mmap(&omitted, true);
+        assert!(!guard.stable_after_fingerprint());
+        let _ = std::fs::remove_dir_all(&omitted);
+
+        let before_changed = unique_tmp("checkpoint-guard-before-changed");
+        std::fs::create_dir_all(&before_changed).unwrap();
+        let shard = before_changed.join("model.safetensors");
+        std::fs::write(&shard, b"one").unwrap();
+        let mut guard = CheckpointLoadGuard::before_mmap(&before_changed, true);
+        std::fs::write(&shard, b"different-length").unwrap();
+        guard.record_mmap();
+        assert!(!guard.stable_after_fingerprint());
+        let _ = std::fs::remove_dir_all(&before_changed);
+
+        let after_changed = unique_tmp("checkpoint-guard-after-changed");
+        std::fs::create_dir_all(&after_changed).unwrap();
+        let shard = after_changed.join("model.safetensors");
+        std::fs::write(&shard, b"one").unwrap();
+        let mut guard = CheckpointLoadGuard::before_mmap(&after_changed, true);
+        guard.record_mmap();
+        std::fs::write(&shard, b"different-length").unwrap();
+        assert!(!guard.stable_after_fingerprint());
+        let _ = std::fs::remove_dir_all(&after_changed);
+
+        let missing = unique_tmp("checkpoint-guard-missing");
+        let _ = std::fs::remove_dir_all(&missing);
+        let mut guard = CheckpointLoadGuard::before_mmap(&missing, true);
+        guard.record_mmap();
+        assert!(!guard.stable_after_fingerprint());
+
+        let disabled = unique_tmp("checkpoint-guard-disabled");
+        let mut guard = CheckpointLoadGuard::before_mmap(&disabled, false);
+        std::fs::create_dir_all(&disabled).unwrap();
+        std::fs::write(disabled.join("model.safetensors"), b"one").unwrap();
+        guard.record_mmap();
+        assert!(!guard.stable_after_fingerprint());
+        let _ = std::fs::remove_dir_all(&disabled);
     }
 
     fn geometry() -> ColdTierGeometry {
@@ -2204,5 +2295,169 @@ mod tests {
 
         drop(manager);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod cold_tier_shard_identity_tests {
+    use super::*;
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-qwen3-shard-id-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_dir_fails_safe_to_none() {
+        let dir =
+            std::env::temp_dir().join(format!("mlx-qwen3-shard-id-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            snapshot_shard_identities(&dir).is_none(),
+            "an unreadable directory must fail safe (None → cold tier stays off)"
+        );
+    }
+
+    #[test]
+    fn stable_when_unchanged() {
+        let dir = unique_tmp("stable");
+        fs::write(dir.join("model.safetensors"), b"weights-v1").unwrap();
+        let a = snapshot_shard_identities(&dir).expect("snapshot A");
+        let b = snapshot_shard_identities(&dir).expect("snapshot B");
+        assert!(a.contains_key("model.safetensors"));
+        assert!(a == b, "two snapshots of an unchanged shard must be equal");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_reinstall_swap() {
+        let dir = unique_tmp("reinstall");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir).expect("before");
+
+        // Simulate a reinstall: remove + recreate with different content, so
+        // both the inode (unix) and the byte length change even if the OS
+        // reuses the inode.
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let after = snapshot_shard_identities(&dir).expect("after");
+
+        assert!(
+            before != after,
+            "a mid-load shard swap must be detected as changed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_added_shard() {
+        let dir = unique_tmp("added");
+        fs::write(dir.join("model-00001-of-00002.safetensors"), b"a").unwrap();
+        let before = snapshot_shard_identities(&dir).expect("before");
+        fs::write(dir.join("model-00002-of-00002.safetensors"), b"b").unwrap();
+        let after = snapshot_shard_identities(&dir).expect("after");
+        assert!(
+            before != after,
+            "a shard appearing during load must be detected as changed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_non_shard_files() {
+        let dir = unique_tmp("ignore");
+        fs::write(dir.join("model.safetensors"), b"w").unwrap();
+        fs::write(dir.join("config.json"), b"{}").unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        let snap = snapshot_shard_identities(&dir).expect("snap");
+        assert_eq!(snap.len(), 1, "only .safetensors shards are tracked");
+        assert!(snap.contains_key("model.safetensors"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_stable_across_all_three_snapshots() {
+        let dir = unique_tmp("bracket-stable");
+        fs::write(dir.join("model.safetensors"), b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        let at_mmap = snapshot_shard_identities(&dir);
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            shard_identities_stable(&before, &at_mmap, &after_fp),
+            "unchanged shards across the whole bracket must stay eligible for cold tier"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_swap_straddling_mmap_disables() {
+        // Window 1: a swap between the before-mmap snapshot and the mmap makes
+        // `at_mmap` differ from `before`, even though `at_mmap == after_fp`.
+        let dir = unique_tmp("bracket-window1");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let at_mmap = snapshot_shard_identities(&dir);
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            at_mmap == after_fp,
+            "identity is stable after the straddling swap"
+        );
+        assert!(
+            !shard_identities_stable(&before, &at_mmap, &after_fp),
+            "a swap straddling the mmap must disable cold persistence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_swap_during_fingerprint_read_disables() {
+        // Window 2: `before == at_mmap`, but a swap during the fingerprint read
+        // makes the after-fingerprint snapshot differ → cold disabled.
+        let dir = unique_tmp("bracket-window2");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        let at_mmap = snapshot_shard_identities(&dir);
+        assert!(before == at_mmap, "no change before the fingerprint read");
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            !shard_identities_stable(&before, &at_mmap, &after_fp),
+            "a swap during the fingerprint read must disable cold persistence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_unreadable_at_any_checkpoint_disables() {
+        let dir = unique_tmp("bracket-none");
+        fs::write(dir.join("model.safetensors"), b"w").unwrap();
+        let snap = snapshot_shard_identities(&dir);
+        assert!(snap.is_some());
+        assert!(
+            !shard_identities_stable(&None, &snap, &snap),
+            "an unreadable before-mmap snapshot must fail safe"
+        );
+        assert!(
+            !shard_identities_stable(&snap, &None, &snap),
+            "an unreadable at-mmap snapshot must fail safe"
+        );
+        assert!(
+            !shard_identities_stable(&snap, &snap, &None),
+            "an unreadable after-fingerprint snapshot must fail safe"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

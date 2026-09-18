@@ -22,7 +22,7 @@ use napi::bindgen_prelude::*;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_block_scale,
     dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
@@ -40,8 +40,7 @@ use crate::tokenizer::Qwen3Tokenizer;
 use super::config::K2HorizonConfig;
 use super::model::{K2HorizonModel, K2Inner};
 
-/// Parse config.json into `K2HorizonConfig` (+ structural validation +
-/// `generation_config.json` EOS override).
+/// Parse config.json into `K2HorizonConfig` (+ structural validation).
 fn parse_config(model_path: &Path) -> Result<K2HorizonConfig> {
     let config_path = model_path.join("config.json");
     let raw_str = fs::read_to_string(&config_path)
@@ -297,21 +296,13 @@ impl K2Inner {
             persist_env.as_deref(),
             config.persist_paged_cache,
         );
-        let shard_snapshot_before_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
         let (quant_bits, quant_group_size, top_level_mode, per_layer_quant) =
             load_quant_settings_from_disk(path, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
 
         let mut params = load_all_safetensors(path, false)?;
-        let shard_snapshot_at_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        checkpoint_load.record_mmap();
 
         // Watchdog pre-warm before the FIRST GPU eval on mmap-backed
         // weights (FP8 dequant is the first touch on the raw checkpoint).
@@ -354,12 +345,7 @@ impl K2Inner {
         if persist_cold
             && let Some(context) = inner.build_cold_tier_context(model_path, &weights_resident)
         {
-            let after_fingerprint = snapshot_shard_identities(path);
-            if shard_identities_stable(
-                &shard_snapshot_before_mmap,
-                &shard_snapshot_at_mmap,
-                &after_fingerprint,
-            ) {
+            if checkpoint_load.stable_after_fingerprint() {
                 inner.attach_cold_tier(context, &weights_resident);
             } else {
                 tracing::warn!(
