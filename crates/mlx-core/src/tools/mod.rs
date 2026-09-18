@@ -586,7 +586,7 @@ impl<'a> PyLiteralParser<'a> {
 
     /// Skip a quoted string starting at `pos` (single or triple quoted);
     /// backslash escapes the next byte. Unterminated → Err.
-    fn skip_quoted(&mut self, f_mode: bool) -> Result<(), ()> {
+    fn skip_quoted(&mut self, f_mode: bool, bytes_mode: bool, raw_mode: bool) -> Result<(), ()> {
         let quote = self.s[self.pos];
         self.pos += 1;
         let triple = self.peek() == Some(quote) && self.s.get(self.pos + 1) == Some(&quote);
@@ -594,6 +594,9 @@ impl<'a> PyLiteralParser<'a> {
             self.pos += 2;
         }
         while let Some(&b) = self.s.get(self.pos) {
+            if bytes_mode && b >= 0x80 {
+                return Err(());
+            }
             if f_mode && b == b'{' {
                 if self.s.get(self.pos + 1) == Some(&b) {
                     self.pos += 2;
@@ -611,6 +614,19 @@ impl<'a> PyLiteralParser<'a> {
                 continue;
             }
             if b == b'\\' {
+                if !raw_mode
+                    && self.s.get(self.pos + 1) == Some(&b'x')
+                    && (!self
+                        .s
+                        .get(self.pos + 2)
+                        .is_some_and(|c| c.is_ascii_hexdigit())
+                        || !self
+                            .s
+                            .get(self.pos + 3)
+                            .is_some_and(|c| c.is_ascii_hexdigit()))
+                {
+                    return Err(());
+                }
                 self.pos += if f_mode && matches!(self.s.get(self.pos + 1), Some(b'{' | b'}')) {
                     1
                 } else {
@@ -661,7 +677,37 @@ impl<'a> PyLiteralParser<'a> {
                 return Err(());
             };
             match b {
-                b'\'' | b'"' => self.skip_quoted(false)?,
+                b'\'' | b'"' => {
+                    let prefix_end = self.pos;
+                    let mut prefix_start = prefix_end;
+                    while prefix_start > start
+                        && prefix_end - prefix_start < 2
+                        && matches!(
+                            self.s[prefix_start - 1],
+                            b'r' | b'R' | b'u' | b'U' | b'f' | b'F' | b'b' | b'B'
+                        )
+                    {
+                        prefix_start -= 1;
+                    }
+                    let prefix = &self.s[prefix_start..prefix_end];
+                    let valid_prefix = match prefix.len() {
+                        0 => true,
+                        1 => matches!(prefix[0].to_ascii_lowercase(), b'r' | b'u' | b'b' | b'f'),
+                        2 => matches!(
+                            (
+                                prefix[0].to_ascii_lowercase(),
+                                prefix[1].to_ascii_lowercase()
+                            ),
+                            (b'r', b'b') | (b'b', b'r') | (b'r', b'f') | (b'f', b'r')
+                        ),
+                        _ => false,
+                    };
+                    self.skip_quoted(
+                        valid_prefix && prefix.iter().any(|c| c.eq_ignore_ascii_case(&b'f')),
+                        valid_prefix && prefix.iter().any(|c| c.eq_ignore_ascii_case(&b'b')),
+                        valid_prefix && prefix.iter().any(|c| c.eq_ignore_ascii_case(&b'r')),
+                    )?;
+                }
                 b'(' | b'[' | b'{' => {
                     stack.push(b);
                     self.pos += 1;
@@ -919,6 +965,8 @@ impl<'a> PyLiteralParser<'a> {
         let mut last_str = false;
         let mut prefix_end = usize::MAX;
         let mut prefix_f = false;
+        let mut prefix_b = false;
+        let mut prefix_r = false;
         // `*a`/`**a` consumed at an element start inside a bracket —
         // recorded as (depth, bracket). A `for` at that depth makes it a
         // comprehension element where unpacking is a SyntaxError
@@ -1086,7 +1134,7 @@ impl<'a> PyLiteralParser<'a> {
                                 }
                             }
                             b'\'' | b'"' => {
-                                self.skip_quoted(false)?;
+                                self.skip_quoted(false, false, false)?;
                                 st = St::Have;
                                 last_str = true;
                                 prefix_end = usize::MAX;
@@ -1123,6 +1171,7 @@ impl<'a> PyLiteralParser<'a> {
                                     }
                                     Some(DICT) => return Err(()),
                                     Some(SET) if is_kw_unpack => return Err(()),
+                                    _ if is_kw_unpack => return Err(()),
                                     _ => {}
                                 }
                                 if let Some(&top) = stack.last() {
@@ -1266,6 +1315,10 @@ impl<'a> PyLiteralParser<'a> {
                                         };
                                         prefix_f = is_string_prefix
                                             && id.iter().any(|c| c.eq_ignore_ascii_case(&b'f'));
+                                        prefix_b = is_string_prefix
+                                            && id.iter().any(|c| c.eq_ignore_ascii_case(&b'b'));
+                                        prefix_r = is_string_prefix
+                                            && id.iter().any(|c| c.eq_ignore_ascii_case(&b'r'));
                                     }
                                 }
                             }
@@ -1630,8 +1683,12 @@ impl<'a> PyLiteralParser<'a> {
                             if !last_str && self.pos != prefix_end {
                                 return Err(());
                             }
-                            let f_mode = !last_str && self.pos == prefix_end && prefix_f;
-                            self.skip_quoted(f_mode)?;
+                            let has_prefix = !last_str && self.pos == prefix_end;
+                            self.skip_quoted(
+                                has_prefix && prefix_f,
+                                has_prefix && prefix_b,
+                                has_prefix && prefix_r,
+                            )?;
                             last_str = true;
                             prefix_end = usize::MAX;
                         }
@@ -1903,7 +1960,7 @@ impl<'a> PyLiteralParser<'a> {
                             if param_start && stack.len() == lambda_depth {
                                 return Err(());
                             }
-                            self.skip_quoted(false)?;
+                            self.skip_quoted(false, false, false)?;
                         }
                         b',' => {
                             if stack.len() == lambda_depth {
@@ -5752,6 +5809,8 @@ The weather in Tokyo is sunny."#;
             "f(f'{a b}', confirmed=True)",
             "f(f'{x!q}', confirmed=True)",
             "f(f'{x:{y:{z:{w}}}}', confirmed=True)",
+            "f(f\"{b'\\xGG'}\", confirmed=True)",
+            "f(f\"{'\\xGG'}\", confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -5780,6 +5839,9 @@ The weather in Tokyo is sunny."#;
             "f(f'{user = :03}', confirmed=True)",
             "f(f'{user!r }', confirmed=True)",
             "f(f'{x:{y:{z}}}', confirmed=True)",
+            "f(f\"{r'\\xGG'}\", confirmed=True)",
+            "f(f\"{br'\\xGG'}\", confirmed=True)",
+            "f(f\"{f'{x}'}\", confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -5982,6 +6044,85 @@ The weather in Tokyo is sunny."#;
             "f(x[()], confirmed=True)",
             "f(x[[]], confirmed=True)",
             "f(helper()[0], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_invalid_double_star_placements_rejected() {
+        for inner in [
+            "dangerous_action([**items], confirmed=True)",
+            "f((**items,), confirmed=True)",
+            "f((**items), confirmed=True)",
+            "f(x[**items], confirmed=True)",
+            "f({*items, **other}, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_double_star_placements_dropped() {
+        for inner in [
+            "f(helper(**items), confirmed=True)",
+            "f({**items}, confirmed=True)",
+            "f({**items, key: 1}, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_non_ascii_bytes_literals_rejected() {
+        for inner in [
+            "dangerous_action(b'é', confirmed=True)",
+            "f(B'é', confirmed=True)",
+            "f(br'é', confirmed=True)",
+            "f(rb'abcé', confirmed=True)",
+            "f(b'''é''', confirmed=True)",
+            "f(b'\\xGG', confirmed=True)",
+            "f(b'\\x', confirmed=True)",
+            "f(b'\\x0', confirmed=True)",
+            "f('\\xGG', confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_bytes_literals_dropped() {
+        for inner in [
+            "f(b'abc', confirmed=True)",
+            "f(b'\\xc3\\xa9', confirmed=True)",
+            "f(br'\\xc3', confirmed=True)",
+            "f(rb'plain', confirmed=True)",
+            "f(br'\\xGG', confirmed=True)",
+            "f(b'\\x4f', confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
