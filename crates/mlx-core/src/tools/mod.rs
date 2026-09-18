@@ -586,7 +586,7 @@ impl<'a> PyLiteralParser<'a> {
 
     /// Skip a quoted string starting at `pos` (single or triple quoted);
     /// backslash escapes the next byte. Unterminated → Err.
-    fn skip_quoted(&mut self) -> Result<(), ()> {
+    fn skip_quoted(&mut self, f_mode: bool) -> Result<(), ()> {
         let quote = self.s[self.pos];
         self.pos += 1;
         let triple = self.peek() == Some(quote) && self.s.get(self.pos + 1) == Some(&quote);
@@ -594,8 +594,19 @@ impl<'a> PyLiteralParser<'a> {
             self.pos += 2;
         }
         while let Some(&b) = self.s.get(self.pos) {
-            if b == b'\\' {
+            if f_mode && matches!(b, b'{' | b'}') {
+                if self.s.get(self.pos + 1) != Some(&b) {
+                    return Err(());
+                }
                 self.pos += 2;
+                continue;
+            }
+            if b == b'\\' {
+                self.pos += if f_mode && matches!(self.s.get(self.pos + 1), Some(b'{' | b'}')) {
+                    1
+                } else {
+                    2
+                };
                 continue;
             }
             if b == quote {
@@ -782,6 +793,7 @@ impl<'a> PyLiteralParser<'a> {
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
         let mut last_str = false;
         let mut prefix_end = usize::MAX;
+        let mut prefix_f = false;
         // `*a`/`**a` consumed at an element start inside a bracket —
         // recorded as (depth, bracket). A `for` at that depth makes it a
         // comprehension element where unpacking is a SyntaxError
@@ -943,7 +955,7 @@ impl<'a> PyLiteralParser<'a> {
                                 }
                             }
                             b'\'' | b'"' => {
-                                self.skip_quoted()?;
+                                self.skip_quoted(false)?;
                                 st = St::Have;
                                 last_str = true;
                                 prefix_end = usize::MAX;
@@ -1101,11 +1113,14 @@ impl<'a> PyLiteralParser<'a> {
                                     _ => {
                                         st = St::Have;
                                         last_str = false;
-                                        prefix_end = if string_prefix(id) {
+                                        let is_string_prefix = string_prefix(id);
+                                        prefix_end = if is_string_prefix {
                                             self.pos
                                         } else {
                                             usize::MAX
                                         };
+                                        prefix_f = is_string_prefix
+                                            && id.iter().any(|c| c.eq_ignore_ascii_case(&b'f'));
                                     }
                                 }
                             }
@@ -1458,7 +1473,8 @@ impl<'a> PyLiteralParser<'a> {
                             if !last_str && self.pos != prefix_end {
                                 return Err(());
                             }
-                            self.skip_quoted()?;
+                            let f_mode = !last_str && self.pos == prefix_end && prefix_f;
+                            self.skip_quoted(f_mode)?;
                             last_str = true;
                             prefix_end = usize::MAX;
                         }
@@ -1716,7 +1732,7 @@ impl<'a> PyLiteralParser<'a> {
                             if param_start && stack.len() == lambda_depth {
                                 return Err(());
                             }
-                            self.skip_quoted()?;
+                            self.skip_quoted(false)?;
                         }
                         b',' => {
                             if stack.len() == lambda_depth {
@@ -2337,9 +2353,9 @@ impl<'a> PyLiteralParser<'a> {
 
     /// One call element: `name(kw=literal, ...)`. Positional arguments are
     /// skipped then dropped (vLLM iterates `call.keywords` only); `**kw`
-    /// rejects the call outright (vLLM fails on `arguments[None]`). Two
-    /// `ast.parse`-level `SyntaxError`s are mirrored: a positional AFTER a
-    /// keyword (`f(x=1, 5)`) and a repeated keyword (`f(x=1, x=2)`).
+    /// rejects the call outright (vLLM fails on `arguments[None]`). A
+    /// positional AFTER a keyword (`f(x=1, 5)`) mirrors `ast.parse`'s
+    /// `SyntaxError`; duplicate keywords keep their final value like vLLM.
     fn parse_call(&mut self) -> Result<(String, Value), ()> {
         let name = self.dotted_name()?;
         self.expect(b'(')?;
@@ -2392,11 +2408,7 @@ impl<'a> PyLiteralParser<'a> {
                     Some(k) => {
                         seen_kwarg = true;
                         let v = self.parse_literal()?;
-                        // `f(x=1, x=2)` → `SyntaxError: keyword argument
-                        // repeated` — vLLM rejects the whole block.
-                        if args.insert(k, v).is_some() {
-                            return Err(());
-                        }
+                        let _ = args.insert(k, v);
                     }
                     None => {
                         // `f(x=1, 5)` → `SyntaxError: positional argument
@@ -5557,6 +5569,44 @@ The weather in Tokyo is sunny."#;
     }
 
     #[test]
+    fn test_lfm2_tool_call_malformed_positional_fstrings_rejected() {
+        for inner in [
+            "dangerous_action(f'{', confirmed=True)",
+            "f(f'}', confirmed=True)",
+            "f(f'{x', confirmed=True)",
+            "f(f'\\{', confirmed=True)",
+            "f(fr'{', confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_constant_positional_fstrings_dropped() {
+        for inner in [
+            "f(f'plain', confirmed=True)",
+            "f(f'{{{{', confirmed=True)",
+            "f(f'}}}}', confirmed=True)",
+            "f(f'{{{{x}}}}', confirmed=True)",
+            "f(rf'{{{{x}}}}', confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
     fn test_lfm2_tool_call_malformed_positionals_rejected() {
         // Each of these is a SyntaxError to ast.parse — verbatim, no call.
         for inner in [
@@ -6156,14 +6206,21 @@ The weather in Tokyo is sunny."#;
         assert_eq!(calls[1].arguments, serde_json::json!({}));
     }
 
-    /// `f(x=1, x=2)` is a Python SyntaxError ("keyword argument repeated") —
-    /// vLLM's ast.parse rejects it, so the block stays raw with no calls.
+    /// `ast.parse` preserves duplicate keywords and vLLM's argument map
+    /// keeps the final value.
     #[test]
-    fn test_lfm2_tool_call_duplicate_kwarg_rejected() {
-        let input = "<|tool_call_start|>[f(x=1, x=2)]<|tool_call_end|>";
-        let (text, calls) = parse_tool_calls(input);
-        assert_eq!(text, input);
-        assert!(calls.is_empty());
+    fn test_lfm2_tool_call_duplicate_kwarg_last_wins() {
+        for (inner, expected) in [
+            ("f(x=1, x=2)", serde_json::json!({"x": 2})),
+            ("f(x=1, y=2, x=3)", serde_json::json!({"x": 3, "y": 2})),
+            ("f(é=1, é=2)", serde_json::json!({"é": 2})),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].arguments, expected, "{inner}");
+        }
     }
 
     /// An LFM2 sentinel inside a `<tool_call>` argument is literal text,
