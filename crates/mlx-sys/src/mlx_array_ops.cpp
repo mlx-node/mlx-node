@@ -219,6 +219,16 @@ mlx_array* mlx_array_astype(mlx_array* handle, int32_t dtype) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+mlx_array* mlx_array_hadamard_transform(mlx_array* input, float scale) {
+  try {
+    auto& x = *reinterpret_cast<mlx::core::array*>(input);
+    return reinterpret_cast<mlx_array*>(new mlx::core::array(mlx::core::hadamard_transform(x, scale)));
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] Hadamard transform failed: " << e.what() << std::endl;
+    return nullptr;
+  }
+}
+
 mlx_array* mlx_array_copy(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
   array result = copy(*arr);

@@ -1,4 +1,5 @@
 use crate::array::MxArray;
+use crate::quant::prism_hadamard::HadamardTransform;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 #[cfg(test)]
@@ -74,6 +75,7 @@ pub struct Embedding {
     /// `forward` gathers across the sub-cap shards instead of reading the dense
     /// `weight`; used for tables too large to materialize as one Metal buffer.
     sharded: Option<ShardedEmbedding>,
+    hadamard: Option<HadamardTransform>,
     /// Test-only tripwire shared by clones. Production inference must never
     /// call `get_weight()` on a packed embedding because that constructs a
     /// full `[vocab, hidden]` dequantization graph.
@@ -93,6 +95,7 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            hadamard: None,
             #[cfg(test)]
             packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
         })
@@ -111,6 +114,7 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            hadamard: None,
             #[cfg(test)]
             packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
         })
@@ -134,14 +138,18 @@ impl Embedding {
                 Some(ref b) => Some(b.take(indices, 0)?),
                 None => None,
             };
-            return dequantize(
+            let gathered = dequantize(
                 &gathered_w,
                 &gathered_s,
                 gathered_b.as_ref(),
                 q.group_size,
                 q.bits,
                 &q.mode,
-            );
+            )?;
+            return match self.hadamard.as_ref() {
+                Some(t) => t.apply(&gathered, true),
+                None => Ok(gathered),
+            };
         }
         if let Some(ref sh) = self.sharded {
             return forward_sharded(sh, indices);
@@ -160,6 +168,12 @@ impl Embedding {
     /// `x @ get_weight().T` tied-head matmul, so callers can route uniformly
     /// through `as_linear`.
     pub fn as_linear(&self, x: &MxArray) -> Result<MxArray> {
+        let transformed = self
+            .hadamard
+            .as_ref()
+            .map(|t| t.apply(x, false))
+            .transpose()?;
+        let x = transformed.as_ref().unwrap_or(x);
         if let Some(ref q) = self.quantized_packed {
             let mode_c = std::ffi::CString::new(q.mode.as_str())
                 .map_err(|_| Error::from_reason("Invalid embedding quantize mode string"))?;
@@ -204,6 +218,7 @@ impl Embedding {
         self.is_quantized_flag = false;
         self.quantized_packed = None;
         self.sharded = None;
+        self.hadamard = None;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
@@ -271,6 +286,7 @@ impl Embedding {
         });
         self.is_quantized_flag = false;
         self.quantized_packed = None;
+        self.hadamard = None;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
@@ -320,6 +336,7 @@ impl Embedding {
         self.weight = dequantized;
         self.is_quantized_flag = true;
         self.quantized_packed = None;
+        self.hadamard = None;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
@@ -370,8 +387,25 @@ impl Embedding {
         // dequantizes on demand from the packed backend, so it never reads this
         // placeholder for packed embeddings.
         self.weight = MxArray::zeros(&[1, 1], Some(crate::array::DType::BFloat16))?;
+        self.hadamard = None;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn set_hadamard(&mut self, transform: HadamardTransform) -> Result<()> {
+        let Some(q) = self.quantized_packed.as_ref() else {
+            return Err(Error::from_reason(
+                "prism_hadamard: embedding rotation requires a packed-quantized embedding backend",
+            ));
+        };
+        if q.mode != "affine" || q.bits != 2 || q.group_size != 128 {
+            return Err(Error::from_reason(format!(
+                "prism_hadamard: embedding rotation requires an affine 2-bit group-size-128 table; got mode={} bits={} group_size={}",
+                q.mode, q.bits, q.group_size
+            )));
+        }
+        self.hadamard = Some(transform);
         Ok(())
     }
 
@@ -444,6 +478,11 @@ impl Embedding {
     pub(crate) fn packed_full_dequant_calls(&self) -> usize {
         self.packed_full_dequant_calls.load(Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_hadamard(&self) -> bool {
+        self.hadamard.is_some()
+    }
 }
 
 impl Clone for Embedding {
@@ -465,6 +504,7 @@ impl Clone for Embedding {
                     mode: q.mode.clone(),
                 }),
             sharded: self.sharded.clone(),
+            hadamard: self.hadamard.clone(),
             #[cfg(test)]
             packed_full_dequant_calls: Arc::clone(&self.packed_full_dequant_calls),
         }
@@ -492,6 +532,7 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            hadamard: None,
             #[cfg(test)]
             packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
         })

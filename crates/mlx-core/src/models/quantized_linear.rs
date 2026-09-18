@@ -3,6 +3,7 @@ use std::ffi::CString;
 
 use crate::array::MxArray;
 use crate::nn::{Activations, Linear};
+use crate::quant::prism_hadamard::HadamardTransform;
 use crate::transformer::MLP;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -111,6 +112,10 @@ impl LinearProj {
             LinearProj::Quantized(ql) => ql.input_amax(),
         }
     }
+
+    pub(crate) fn has_hadamard(&self) -> bool {
+        matches!(self, LinearProj::Quantized(ql) if ql.has_hadamard())
+    }
 }
 
 /// An MLP that can be either standard or quantized.
@@ -170,6 +175,22 @@ impl MLPVariant {
     /// `Qwen3_5MTPModule::has_quantized_weights`).
     pub fn is_quantized(&self) -> bool {
         matches!(self, MLPVariant::Quantized { .. })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_hadamard(&self) -> Option<(bool, bool, bool)> {
+        match self {
+            MLPVariant::Standard(_) => None,
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => Some((
+                gate_proj.has_hadamard(),
+                up_proj.has_hadamard(),
+                down_proj.has_hadamard(),
+            )),
+        }
     }
 
     pub fn set_gate_proj_weight(&mut self, w: &MxArray) -> Result<()> {
@@ -555,6 +576,7 @@ pub struct QuantizedLinear {
     // inference.
     amax_key: Option<String>,
     output_layout: QuantizedOutputLayout,
+    hadamard: Option<HadamardTransform>,
 }
 
 /// Routing observability for the sym8 forward (unit-test scope only):
@@ -601,6 +623,7 @@ impl QuantizedLinear {
             input_amax: None,
             amax_key: None,
             output_layout: QuantizedOutputLayout::Native,
+            hadamard: None,
         }
     }
 
@@ -626,6 +649,7 @@ impl QuantizedLinear {
             input_amax: None,
             amax_key: None,
             output_layout: QuantizedOutputLayout::Native,
+            hadamard: None,
         }
     }
 
@@ -656,6 +680,41 @@ impl QuantizedLinear {
         self
     }
 
+    pub(crate) fn with_hadamard(mut self, transform: Option<HadamardTransform>) -> Result<Self> {
+        if transform.is_some()
+            && (self.mode != DEFAULT_QUANT_MODE
+                || self.bits != 2
+                || self.group_size != 128
+                || self.input_amax.is_some())
+        {
+            return Err(Error::from_reason(format!(
+                "prism_hadamard rotations require an affine 2-bit group-size-128 projection without input_amax; '{}' resolved to mode={} bits={} group_size={}",
+                self.amax_key.as_deref().unwrap_or("<unnamed>"),
+                self.mode,
+                self.bits,
+                self.group_size
+            )));
+        }
+        if transform.is_some() && crate::quant::prism_hadamard::hoist_metadata_enabled() {
+            self.scales = self.scales.astype(crate::array::DType::Float32)?;
+            self.scales.eval();
+            self.biases = self
+                .biases
+                .as_ref()
+                .map(|b| b.astype(crate::array::DType::Float32))
+                .transpose()?;
+            if let Some(biases) = &self.biases {
+                biases.eval();
+            }
+        }
+        self.hadamard = transform;
+        Ok(self)
+    }
+
+    pub(crate) fn has_hadamard(&self) -> bool {
+        self.hadamard.is_some()
+    }
+
     /// Construct a sym8 linear from pre-validated operands (see
     /// [`try_build_sym8_quantized_linear`] for the load-time validation).
     ///
@@ -677,6 +736,7 @@ impl QuantizedLinear {
             input_amax: None,
             amax_key: None,
             output_layout: QuantizedOutputLayout::Native,
+            hadamard: None,
         }
     }
 
@@ -823,6 +883,20 @@ impl QuantizedLinear {
     /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        let transformed = self
+            .hadamard
+            .as_ref()
+            .map(|t| t.apply(x, false))
+            .transpose()?;
+        let x = transformed.as_ref().unwrap_or(x);
+        if self.hadamard.is_some()
+            && crate::quant::prism_hadamard::hoist_metadata_enabled()
+            && x.dtype()? != crate::array::DType::Float32
+        {
+            return Err(Error::from_reason(
+                "prism_hadamard: FP32 metadata hoisting requires FP32 projection inputs",
+            ));
+        }
         // Whether THIS thread is the calibrating model thread (thread-local, so
         // a concurrently-running inference model on another thread never trips
         // this). Read once and reused for both the tap and the fake-quant

@@ -648,6 +648,27 @@ impl GatedDeltaNet {
         (qkv_z, b_a)
     }
 
+    #[cfg(test)]
+    pub(crate) fn prism_hadamard_sites(&self) -> (bool, bool, bool, bool) {
+        let qkv = self
+            .split_in_proj_qkv_z
+            .as_ref()
+            .map(|(qkv, _)| qkv.has_hadamard())
+            .unwrap_or_else(|| self.in_proj_qkvz.has_hadamard());
+        let z = self
+            .split_in_proj_qkv_z
+            .as_ref()
+            .map(|(_, z)| z.has_hadamard())
+            .unwrap_or(false);
+        let ba = self.in_proj_ba.has_hadamard()
+            || self
+                .split_in_proj_b_a
+                .as_ref()
+                .map(|(b, a)| b.has_hadamard() || a.has_hadamard())
+                .unwrap_or(false);
+        (qkv, z, self.out_proj.has_hadamard(), ba)
+    }
+
     // ========== Weight getters (for training parameter extraction) ==========
 
     pub fn get_in_proj_qkvz_weight(&self) -> MxArray {

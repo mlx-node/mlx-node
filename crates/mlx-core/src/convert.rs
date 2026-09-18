@@ -3444,6 +3444,18 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let config_data = fs::read_to_string(&config_path)?;
     let config: serde_json::Value = serde_json::from_str(&config_data)?;
 
+    if config.get("prism_hadamard").is_some()
+        || config
+            .get("text_config")
+            .and_then(|text| text.get("prism_hadamard"))
+            .is_some()
+        || config.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35")
+    {
+        return Err(Error::from_reason(
+            "This checkpoint declares a prism_hadamard rotation contract; the standard converter is not rotation-aware and cannot rewrite its packed weights. Load the original GGUF instead.",
+        ));
+    }
+
     // A caller may omit `model_type` and rely on generic dtype conversion.
     // Fail closed from the source config before the converter mutex, MLX setup,
     // output creation, or tensor loading for families whose runtimes are dense-only.
@@ -21889,5 +21901,86 @@ mod tests {
             None,
             "no family detected and no supplied type stays None"
         );
+    }
+
+    #[tokio::test]
+    async fn prism_hadamard_marker_rejects_standard_conversion() {
+        for (label, config) in [
+            (
+                "root marker",
+                serde_json::json!({
+                    "model_type": "qwen3_5",
+                    "prism_hadamard": {
+                        "version": 1,
+                        "block_size": 1024,
+                        "transform": "normalized-sylvester-walsh-hadamard",
+                        "axis": "input-last-dimension",
+                        "sign_mode": "explicit",
+                        "weight_names": ["layers.0.mlp.gate_proj.weight"],
+                        "inverse_weight_names": ["embedding.weight"],
+                        "sign_widths": [1024],
+                        "sign_values": [1],
+                        "gdn_v_grouped": true
+                    }
+                }),
+            ),
+            (
+                "nested marker",
+                serde_json::json!({
+                    "model_type": "qwen3_5",
+                    "text_config": { "prism_hadamard": {} }
+                }),
+            ),
+            (
+                "pack alias",
+                serde_json::json!({ "model_type": "prism_hadamard_qwen35" }),
+            ),
+        ] {
+            let base = std::env::temp_dir().join(format!(
+                "prism_hadamard_convert_guard_{}_{}_{}",
+                label.replace(' ', "_"),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let input = base.join("in");
+            let output = base.join("out");
+            std::fs::create_dir_all(&input).expect("create synthetic input dir");
+            std::fs::write(
+                input.join("config.json"),
+                serde_json::to_string_pretty(&config).unwrap(),
+            )
+            .expect("write config.json");
+            let err = convert_model(ConversionOptions {
+                input_dir: input.to_string_lossy().to_string(),
+                output_dir: output.to_string_lossy().to_string(),
+                dtype: None,
+                verbose: Some(false),
+                model_type: None,
+                quantize: Some(false),
+                quant_bits: None,
+                quant_group_size: None,
+                quant_mode: None,
+                quant_recipe: None,
+                imatrix_path: None,
+                quant_mxfp: None,
+                quant_mtp: None,
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{label}: a prism_hadamard checkpoint must be rejected"));
+            assert!(
+                err.reason.contains("prism_hadamard"),
+                "{label}: the error must name the rotation contract: {}",
+                err.reason
+            );
+            assert!(
+                !output.join("model.safetensors").exists(),
+                "{label}: no output may be written for a rotation contract"
+            );
+            std::fs::remove_dir_all(&base).ok();
+        }
     }
 }

@@ -356,6 +356,7 @@ fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5Config,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
+    preserve_split_projections: bool,
 ) -> Result<HashMap<String, MxArray>> {
     let has_mtp_weights = params.keys().any(|k| k.contains("mtp."));
     let has_unsanitized_conv1d = params.iter().any(|(name, array)| {
@@ -501,7 +502,9 @@ fn sanitize_weights(
 
     apply_sanitized_value_transforms(&mut result, needs_norm_fix, mtp_norms_need_shift)?;
 
-    merge_split_projections(&mut result, per_layer_quant)?;
+    if !preserve_split_projections {
+        merge_split_projections(&mut result, per_layer_quant)?;
+    }
 
     // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
     // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error
@@ -1246,6 +1249,7 @@ fn apply_weights_inner(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
+    prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
 ) -> Result<()> {
     apply_weights_inner_with_residency(
         inner,
@@ -1256,6 +1260,7 @@ fn apply_weights_inner(
         top_level_mode,
         per_layer_quant,
         _has_vision,
+        prism,
     )
     .map(drop)
 }
@@ -1271,6 +1276,7 @@ fn apply_weights_inner_with_residency(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
+    prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
 ) -> Result<PlainFp8Residency> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -1358,6 +1364,10 @@ fn apply_weights_inner_with_residency(
         // activations, violating "activation FP8 only on attn/GDN sites".
         let input_amax = if is_site { plq.input_amax } else { None };
         let built = built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key));
+        let built = match built {
+            Some(ql) => Some(ql.with_hadamard(prism.and_then(|r| r.projection(prefix)))?),
+            None => None,
+        };
         if let Some(linear) = built.as_ref() {
             plain_fp8_residency
                 .borrow_mut()
@@ -1448,6 +1458,9 @@ fn apply_weights_inner_with_residency(
         // reach the dense lookup / tied-lm_head matmul.
         ensure_dense_weight_floating("embedding.weight", w)?;
         inner.embedding.set_weight(w)?;
+    }
+    if let Some(rt) = prism {
+        inner.embedding.set_hadamard(rt.embedding())?;
     }
 
     // Final norm
@@ -1992,6 +2005,26 @@ pub async fn load_with_thread(
 
                 let mut config = parse_config(&raw)?;
 
+                let prism_config =
+                    crate::quant::prism_hadamard::PrismHadamardConfig::from_config(&raw)?;
+                if prism_config.is_some() {
+                    if config.n_mtp_layers > 0 {
+                        return Err(Error::from_reason(
+                            "prism_hadamard checkpoints do not support MTP layers",
+                        ));
+                    }
+                    if draft_model_path.is_some() {
+                        return Err(Error::from_reason(
+                            "prism_hadamard checkpoints do not support a draft model",
+                        ));
+                    }
+                    if raw.get("vision_config").is_some_and(|v| !v.is_null()) {
+                        return Err(Error::from_reason(
+                            "prism_hadamard checkpoints are text-only (vision_config present)",
+                        ));
+                    }
+                }
+
                 info!(
                     "Qwen3.5 config: {} layers, hidden={}, heads={}, kv_heads={}",
                     config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
@@ -2078,10 +2111,25 @@ pub async fn load_with_thread(
                 }
                 info!("Loaded {} raw tensors", raw_params.len());
 
+                if prism_config.is_some()
+                    && raw_params
+                        .keys()
+                        .any(|name| normalize_mtp_weight_key(name).is_some())
+                {
+                    return Err(Error::from_reason(
+                        "prism_hadamard checkpoints do not support mtp.* weights",
+                    ));
+                }
+
                 // Split vision/text weights
                 let has_vision = raw_params
                     .keys()
                     .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
+                if prism_config.is_some() && has_vision {
+                    return Err(Error::from_reason(
+                        "prism_hadamard checkpoints are text-only (vision weights present)",
+                    ));
+                }
 
                 let (text_raw_params, vision_params) = if has_vision {
                     let mut vision_params: HashMap<String, MxArray> = HashMap::new();
@@ -2113,7 +2161,12 @@ pub async fn load_with_thread(
                     parse_quant_settings(quant_cfg, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
 
                 // Sanitize weights
-                let mut params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
+                let mut params = sanitize_weights(
+                    text_raw_params,
+                    &config,
+                    &per_layer_quant,
+                    prism_config.is_some(),
+                )?;
                 let quantized = is_quantized_checkpoint(&params);
                 info!(
                     "Sanitized to {} parameters (quantized={})",
@@ -2177,6 +2230,13 @@ pub async fn load_with_thread(
                     None
                 };
 
+                let prism_runtime = match prism_config.as_ref() {
+                    Some(pc) => {
+                        Some(pc.prepare(&params, &config, runtime_default_plq, &per_layer_quant)?)
+                    }
+                    None => None,
+                };
+
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
@@ -2191,7 +2251,9 @@ pub async fn load_with_thread(
                     top_level_mode,
                     &per_layer_quant,
                     has_vision,
+                    prism_runtime.as_ref(),
                 )?;
+                inner.prism_hadamard = prism_runtime;
 
                 // Materialize mmap-backed weights. Pages were pre-warmed above, so
                 // the chunked eval runs in the warm regime (no GPU page-fault
@@ -2200,6 +2262,9 @@ pub async fn load_with_thread(
                     let mut arrays: Vec<&MxArray> = params.values().collect();
                     if !defer_plain_fp8_materialization() {
                         arrays.extend(plain_fp8_residency.arrays());
+                    }
+                    if let Some(rt) = inner.prism_hadamard.as_ref() {
+                        arrays.extend(rt.arrays());
                     }
                     crate::array::memory::materialize_weights(&arrays)?
                 };
@@ -2354,6 +2419,9 @@ pub async fn load_with_thread(
                 // Count only the retained BF16 correctness fallback arrays.
                 weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
                 weight_bytes = weight_bytes.saturating_add(dflash2_weight_bytes);
+                if let Some(runtime) = inner.prism_hadamard.as_ref() {
+                    weight_bytes = weight_bytes.saturating_add(runtime.nbytes());
+                }
 
                 Ok((inner, weight_bytes, pool_cache_limit_guard))
             })();
@@ -2831,6 +2899,7 @@ mod tests {
             None,
             &per_layer_quant,
             false,
+            None,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -3513,6 +3582,7 @@ mod tests {
             None,
             &per_layer_quant,
             /* has_vision */ true,
+            None,
         ) {
             Ok(()) => {}
             Err(err) => {
@@ -3531,6 +3601,239 @@ mod tests {
         assert!(
             !inner.has_mtp_weights(),
             "declaring MTP in config without loading its weights must not enable runtime MTP"
+        );
+    }
+
+    #[test]
+    fn prism_hadamard_loader_attaches_transforms_to_every_projection_kind() {
+        use crate::quant::prism_hadamard::PrismHadamardConfig;
+        let label = "prism_hadamard_loader_attaches_transforms_to_every_projection_kind";
+
+        let cfg = Qwen3_5Config {
+            qwen35_gguf_gdn_layout: Some("tiled".to_string()),
+            vocab_size: 256,
+            hidden_size: 1024,
+            num_layers: 2,
+            num_heads: 8,
+            num_kv_heads: 2,
+            head_dim: 128,
+            intermediate_size: 1024,
+            linear_num_value_heads: 16,
+            linear_num_key_heads: 8,
+            linear_key_head_dim: 64,
+            linear_value_head_dim: 64,
+            full_attention_interval: 2,
+            tie_word_embeddings: false,
+            ..no_mtp_layer_cfg()
+        };
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        let hidden = cfg.hidden_size as i64;
+        let vocab = cfg.vocab_size as i64;
+        let v_rows = (cfg.linear_num_value_heads * cfg.linear_value_head_dim) as i64;
+        let qkv_rows = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim) as i64 + v_rows;
+        let q_rows = (2 * cfg.num_heads * cfg.head_dim) as i64;
+        let kv_rows = (cfg.num_kv_heads * cfg.head_dim) as i64;
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        let mut insert_packed = |name: &str, n: i64, k: i64| {
+            let prefix = name.strip_suffix(".weight").unwrap();
+            let weight = MxArray::from_uint32(&vec![0u32; (n * k / 16) as usize], &[n, k / 16])
+                .expect("uint32 packed weight");
+            let scales =
+                MxArray::from_float32(&vec![0.5f32; (n * k / 128) as usize], &[n, k / 128])
+                    .expect("scales")
+                    .astype(DType::Float16)
+                    .expect("f16 scales");
+            let biases =
+                MxArray::from_float32(&vec![-0.5f32; (n * k / 128) as usize], &[n, k / 128])
+                    .expect("biases")
+                    .astype(DType::Float16)
+                    .expect("f16 biases");
+            params.insert(name.to_string(), weight);
+            params.insert(format!("{prefix}.scales"), scales);
+            params.insert(format!("{prefix}.biases"), biases);
+        };
+
+        let rotated = [
+            ("layers.0.linear_attn.in_proj_qkv", qkv_rows),
+            ("layers.0.linear_attn.in_proj_z", v_rows),
+            ("layers.0.linear_attn.out_proj", hidden),
+            ("layers.0.mlp.gate_proj", hidden),
+            ("layers.0.mlp.up_proj", hidden),
+            ("layers.0.mlp.down_proj", hidden),
+            ("layers.1.self_attn.q_proj", q_rows),
+            ("layers.1.self_attn.k_proj", kv_rows),
+            ("layers.1.self_attn.v_proj", kv_rows),
+            ("layers.1.self_attn.o_proj", hidden),
+            ("layers.1.mlp.gate_proj", hidden),
+            ("layers.1.mlp.up_proj", hidden),
+            ("layers.1.mlp.down_proj", hidden),
+            ("lm_head", vocab),
+        ];
+        for (prefix, rows) in rotated {
+            insert_packed(&format!("{prefix}.weight"), rows, hidden);
+        }
+        insert_packed("embedding.weight", vocab, hidden);
+
+        let dense_ba = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![0.01f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+        let v_heads = cfg.linear_num_value_heads as i64;
+        params.insert(
+            "layers.0.linear_attn.in_proj_b.weight".to_string(),
+            dense_ba(&[v_heads, hidden]),
+        );
+        params.insert(
+            "layers.0.linear_attn.in_proj_a.weight".to_string(),
+            dense_ba(&[v_heads, hidden]),
+        );
+
+        let contract = PrismHadamardConfig {
+            version: 1,
+            block_size: 1024,
+            transform: "normalized-sylvester-walsh-hadamard".to_string(),
+            axis: "input-last-dimension".to_string(),
+            sign_mode: "explicit".to_string(),
+            weight_names: rotated
+                .iter()
+                .map(|(prefix, _)| format!("{prefix}.weight"))
+                .collect(),
+            inverse_weight_names: vec!["embedding.weight".to_string()],
+            sign_widths: vec![1024],
+            sign_values: (0..1024).map(|i| if i % 3 == 0 { -1 } else { 1 }).collect(),
+            gdn_v_grouped: true,
+        };
+        let plq = PerLayerQuant {
+            bits: 2,
+            group_size: 128,
+            mode: PerLayerMode::Affine,
+            input_amax: None,
+        };
+        let runtime = contract
+            .prepare(&params, &cfg, plq, &HashMap::new())
+            .expect("prism_hadamard runtime preparation must succeed");
+
+        match apply_weights_inner(
+            &mut inner,
+            &params,
+            &cfg,
+            2,
+            128,
+            None,
+            &HashMap::new(),
+            false,
+            Some(&runtime),
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = err.reason.to_string();
+                assert!(
+                    msg.contains("missing mandatory weights"),
+                    "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        inner.prism_hadamard = Some(runtime);
+        use crate::engine::backend::TrainBackend;
+        assert!(
+            inner
+                .init_training_sync(
+                    Box::default(),
+                    crate::training_model::ModelType::Qwen35Dense(cfg.clone()),
+                )
+                .unwrap_err()
+                .reason
+                .contains("prism_hadamard")
+        );
+        assert!(
+            inner
+                .train_step_sft_sync(vec![0], vec![1, 1], vec![0], vec![1, 1], Default::default())
+                .err()
+                .expect("Prism SFT must be rejected")
+                .reason
+                .contains("prism_hadamard")
+        );
+        assert!(
+            inner
+                .train_step_grpo_sync(vec![0.0], 1, Default::default(), None)
+                .err()
+                .expect("Prism GRPO must be rejected")
+                .reason
+                .contains("prism_hadamard")
+        );
+        assert!(inner.training_state.is_none());
+        assert!(inner.embedding.has_hadamard());
+        assert!(
+            inner.lm_head.as_ref().is_some_and(|h| h.has_hadamard()),
+            "lm_head must carry the forward transform"
+        );
+        match &inner.layers[0].attn {
+            AttentionType::Linear(gdn) => {
+                assert_eq!(
+                    gdn.prism_hadamard_sites(),
+                    (true, true, true, false),
+                    "split qkv/z/out projections must rotate; dense alpha/beta must not"
+                );
+            }
+            _ => panic!("layer 0 must be a GDN (linear) layer in {label}"),
+        }
+        assert_eq!(
+            inner.layers[0].mlp.has_hadamard(),
+            Some((true, true, true)),
+            "layer 0 MLP projections must rotate"
+        );
+        match &inner.layers[1].attn {
+            AttentionType::Full(attn) => {
+                assert_eq!(
+                    attn.prism_hadamard_sites(),
+                    (true, true, true, true),
+                    "full-attention q/k/v/o projections must rotate"
+                );
+            }
+            _ => panic!("layer 1 must be a full-attention layer in {label}"),
+        }
+        assert_eq!(
+            inner.layers[1].mlp.has_hadamard(),
+            Some((true, true, true)),
+            "layer 1 MLP projections must rotate"
+        );
+
+        let save_dir = std::env::temp_dir().join(format!(
+            "mlx-qwen35-prism-save-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        let save_path = save_dir.to_str().expect("temp path is UTF-8").to_string();
+        let err = inner
+            .save_model_sync(&save_path)
+            .expect_err("a prism_hadamard (quantized) checkpoint must reject dense save");
+        assert!(
+            err.reason.contains("dense/BF16-only"),
+            "save guard must cite the dense-only format: {}",
+            err.reason
+        );
+        assert!(
+            !save_dir.exists(),
+            "the quantized save guard must fire before creating the destination"
         );
     }
 
@@ -3619,6 +3922,7 @@ mod tests {
                     None,
                     plq,
                     /* has_vision */ false,
+                    None,
                 ) {
                     Ok(()) => {}
                     Err(err) => {
@@ -3769,6 +4073,7 @@ mod tests {
                 None,
                 &HashMap::new(),
                 false,
+                None,
             ) {
                 Ok(()) => {}
                 Err(err) => {
@@ -3861,6 +4166,7 @@ mod tests {
             None,
             &plq,
             /* has_vision */ false,
+            None,
         ) {
             Ok(()) => {}
             Err(err) => {
@@ -3953,6 +4259,7 @@ mod tests {
             None,
             &plq,
             /* has_vision */ false,
+            None,
         ) {
             Ok(()) => {}
             Err(err) => {

@@ -160,6 +160,7 @@ pub(crate) struct Qwen35Inner {
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
     pub(crate) lm_head: Option<LinearProj>,
+    pub(crate) prism_hadamard: Option<crate::quant::prism_hadamard::PrismHadamardRuntime>,
     /// Optional external DFlash2 companion. When installed it takes
     /// precedence over the target checkpoint's inline one-layer MTP head.
     pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,

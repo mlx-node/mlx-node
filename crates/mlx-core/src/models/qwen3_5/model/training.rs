@@ -189,6 +189,11 @@ impl Qwen35Inner {
         config: crate::grpo::engine::GRPOEngineConfig,
         _model_type: crate::training_model::ModelType,
     ) -> Result<()> {
+        if self.prism_hadamard.is_some() {
+            return Err(napi::Error::from_reason(
+                "Training is not supported for prism_hadamard (PQ2_0 rotated) checkpoints.",
+            ));
+        }
         if self.training_state.is_some() {
             return Err(napi::Error::from_reason(
                 "Training state already initialized. A single model thread can host only one active training run.",
@@ -591,6 +596,11 @@ impl Qwen35Inner {
         use crate::optimizers::GradientUtils;
         use crate::training_model::ModelType;
 
+        if self.prism_hadamard.is_some() {
+            return Err(napi::Error::from_reason(
+                "Training is not supported for prism_hadamard (PQ2_0 rotated) checkpoints.",
+            ));
+        }
         reset_peak_memory();
 
         // Get cached generation results from training_state
@@ -947,6 +957,11 @@ impl Qwen35Inner {
         use crate::array::{heavy_cleanup, synchronize_and_clear_cache};
         use crate::optimizers::GradientUtils;
 
+        if self.prism_hadamard.is_some() {
+            return Err(napi::Error::from_reason(
+                "Training is not supported for prism_hadamard (PQ2_0 rotated) checkpoints.",
+            ));
+        }
         reset_peak_memory();
 
         // Ensure training state is initialized

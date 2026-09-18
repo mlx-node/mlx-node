@@ -74,6 +74,51 @@ describe('discoverLocalChatModels', () => {
     expect(failures).toEqual([]);
   });
 
+  it.each(['direct', 'nested'] as const)(
+    'discovers the exact dense Qwen3.5 Bonsai PQ2_0 GGUF in %s layout',
+    async (layout) => {
+      const dir = join(tmp, `bonsai-pq2-${layout}`);
+      const repository = layout === 'direct' ? dir : join(dir, 'bonsai');
+      mkdirSync(repository, { recursive: true });
+      const gguf = join(repository, 'Ternary-Bonsai-2-27B-PQ2_0.gguf');
+      writeFileSync(gguf, minimalGguf('qwen35'));
+      const models = await discoverLocalChatModels(dir);
+      expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
+    },
+  );
+
+  it('matches the Bonsai PQ2_0 filename case-insensitively', async () => {
+    const dir = join(tmp, 'bonsai-case');
+    mkdirSync(dir);
+    const gguf = join(dir, 'ternary-bonsai-2-27b-pq2_0.GGUF');
+    writeFileSync(gguf, minimalGguf('qwen35'));
+    const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
+  });
+
+  it.each([
+    ['Other-Model-27B-PQ2_0.gguf', 'qwen35'],
+    ['Ternary-Bonsai-2-27B-PTQ1_0.gguf', 'qwen35'],
+    ['Ternary-Bonsai-2-27B-PQ2_0-extra.gguf', 'qwen35'],
+    ['Ternary-Bonsai-2-27B-PQ2_0.gguf', 'qwen35moe'],
+    ['Ternary-Bonsai-2-27B-PQ2_0-mmproj.gguf', 'qwen35'],
+    ['Qwen3.5-27B-Q4_K_M.gguf', 'qwen35'],
+  ] as const)('does not widen the Bonsai gate to %s [%s]', async (name, architecture) => {
+    const dir = join(tmp, `bonsai-reject-${name}`);
+    mkdirSync(dir);
+    writeFileSync(join(dir, name), minimalGguf(architecture));
+    await expect(discoverLocalChatModels(dir)).resolves.toEqual([]);
+  });
+
+  it('keeps admitting dense Qwen3.5 Q*_K_XL GGUFs alongside the Bonsai name', async () => {
+    const dir = join(tmp, 'qwen35-xl-preserved');
+    mkdirSync(dir);
+    const gguf = join(dir, 'Qwen3.5-27B-Q4_K_XL.gguf');
+    writeFileSync(gguf, minimalGguf('qwen35'));
+    const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
+  });
+
   it.skipIf(!canChmod)('reports an entry it could not evaluate via onEntryFailure', async () => {
     // config.json exists but cannot be opened (EACCES): the entry may be a
     // model missing from the result, so the scan is incomplete — exactly the

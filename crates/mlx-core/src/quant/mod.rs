@@ -12,3 +12,4 @@ pub mod fp8_weight;
 pub(crate) mod mx_common;
 pub mod mxfp4_weight;
 pub mod mxfp8_weight;
+pub(crate) mod prism_hadamard;

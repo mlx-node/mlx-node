@@ -58,6 +58,9 @@ impl PagedStepModel for Qwen35PagedDecode<'_> {
         // the loop top via `y.item_at_int32`), so we do NOT
         // re-`item_at_int32` the fresh `input_ids` reshape — that
         // redundant second per-step eval/sync measurably regressed decode.
+        let _hadamard_scope = crate::quant::prism_hadamard::HadamardDecodeScope::enter(
+            self.inner.prism_hadamard.is_some(),
+        );
         let embed = self.inner.embedding.clone();
         let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
             Error::from_reason("Qwen35PagedDecode::paged_step: caches dropped mid-decode")

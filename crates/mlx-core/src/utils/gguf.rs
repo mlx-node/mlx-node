@@ -15,7 +15,7 @@
 ///     Q6_K token embedding keeps the older dequantize-to-BF16 fallback.
 ///
 /// Reference: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
@@ -31,6 +31,7 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
+use crate::quant::prism_hadamard::PrismHadamardConfig;
 use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales};
 use crate::utils::safetensors::save_safetensors;
 
@@ -74,6 +75,7 @@ pub enum GgufTensorType {
     IQ3S = 21,
     IQ4XS = 23,
     BF16 = 30,
+    PQ2_0 = 142,
 }
 
 impl GgufTensorType {
@@ -93,6 +95,7 @@ impl GgufTensorType {
             21 => Some(Self::IQ3S),
             23 => Some(Self::IQ4XS),
             30 => Some(Self::BF16),
+            142 => Some(Self::PQ2_0),
             _ => None,
         }
     }
@@ -121,6 +124,7 @@ impl GgufTensorType {
             Self::Q6K => 210,
             Self::IQ4NL => 18,
             Self::IQ4XS => 136,
+            Self::PQ2_0 => 34,
         }
     }
 
@@ -136,6 +140,7 @@ impl GgufTensorType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 => 32,
             Self::IQ4NL => 32,
+            Self::PQ2_0 => 128,
             Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ3S | Self::IQ4XS => 256,
         }
     }
@@ -152,7 +157,10 @@ impl GgufTensorType {
     /// per-16/32-value sub-scales need the K-quant array contract in
     /// `crate::utils::gguf_kquant`, not affine's one f16 scale per block.
     fn is_mlx_affine_quantized(&self) -> bool {
-        matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0)
+        matches!(
+            self,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 | Self::PQ2_0
+        )
     }
 
     /// The repacker format for the ggml K-quants, `None` for everything else.
@@ -175,7 +183,8 @@ impl GgufTensorType {
             | Self::Q4_0
             | Self::Q4_1
             | Self::Q5_1
-            | Self::Q8_0 => None,
+            | Self::Q8_0
+            | Self::PQ2_0 => None,
         }
     }
 
@@ -195,6 +204,7 @@ impl GgufTensorType {
             Self::IQ3S => "IQ3_S",
             Self::IQ4XS => "IQ4_XS",
             Self::BF16 => "BF16",
+            Self::PQ2_0 => "PQ2_0",
         }
     }
 }
@@ -602,7 +612,7 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
             Some(t) => t,
             None => {
                 return Err(Error::from_reason(format!(
-                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q5_1(7), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30) are recognized. \
+                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q5_1(7), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30), PQ2_0(142) are recognized. \
                      Other K-quant and IQ formats require dequantization before conversion.",
                     name, type_u32
                 )));
@@ -830,6 +840,7 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
         // Q5_1 stores a real per-block minimum beside its scale, like Q4_1.
         GgufTensorType::Q5_1
         | GgufTensorType::Q4_1
+        | GgufTensorType::PQ2_0
         | GgufTensorType::F32
         | GgufTensorType::F16
         | GgufTensorType::BF16
@@ -865,20 +876,9 @@ fn load_quantized_tensor(
     gguf: &GgufFile,
     tensor: &GgufTensorInfo,
 ) -> Result<Vec<(String, MxArray)>> {
-    let abs_offset = gguf.data_offset + tensor.offset;
-    reader.seek(SeekFrom::Start(abs_offset)).map_err(|e| {
-        Error::from_reason(format!("Failed to seek to tensor '{}': {e}", tensor.name))
-    })?;
-
-    let data_size = tensor.data_size() as usize;
-    let mut raw = vec![0u8; data_size];
-    reader
-        .read_exact(&mut raw)
-        .map_err(|e| Error::from_reason(format!("Failed to read tensor '{}': {e}", tensor.name)))?;
-
     let shape = tensor.mlx_shape();
     let num_elements = tensor.num_elements() as usize;
-    let block_size: usize = 32;
+    let block_size = tensor.tensor_type.block_size();
     let n_blocks = num_elements / block_size;
 
     // Words one 32-value block occupies. 4- and 8-bit codes divide a word
@@ -889,6 +889,7 @@ fn load_quantized_tensor(
         GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 4, // 32 x 4-bit = 128 bits
         GgufTensorType::Q5_1 => 5,                        // 32 x 5-bit = 160 bits
         GgufTensorType::Q8_0 => 8,                        // 32 x 8-bit = 256 bits
+        GgufTensorType::PQ2_0 => 8,
         _ => unreachable!(),
     };
 
@@ -899,6 +900,12 @@ fn load_quantized_tensor(
             tensor.name
         ))
     })?;
+    if last <= 0 || last % block_size as i64 != 0 {
+        return Err(Error::from_reason(format!(
+            "Quantized tensor '{}' last dimension {last} must be a positive multiple of block size {block_size}",
+            tensor.name
+        )));
+    }
     let mut w_shape = leading_dims.to_vec();
     w_shape.push(last / block_size as i64 * words_per_block as i64);
 
@@ -914,6 +921,17 @@ fn load_quantized_tensor(
     // Only the asymmetric format fills this; the symmetric ones reconstruct
     // their offset from the scale at load and never allocate the array.
     let mut biases: Vec<u16> = Vec::new(); // f16
+
+    let abs_offset = gguf.data_offset + tensor.offset;
+    reader.seek(SeekFrom::Start(abs_offset)).map_err(|e| {
+        Error::from_reason(format!("Failed to seek to tensor '{}': {e}", tensor.name))
+    })?;
+
+    let data_size = tensor.data_size() as usize;
+    let mut raw = vec![0u8; data_size];
+    reader
+        .read_exact(&mut raw)
+        .map_err(|e| Error::from_reason(format!("Failed to read tensor '{}': {e}", tensor.name)))?;
 
     let type_size = tensor.tensor_type.type_size();
 
@@ -1020,6 +1038,24 @@ fn load_quantized_tensor(
                         packed |= (unsigned_val as u32) << (b * 8);
                     }
                     weights_packed[base + k] = packed;
+                }
+            }
+        }
+        GgufTensorType::PQ2_0 => {
+            biases = vec![0u16; sb_elements];
+            for (i, block) in raw.chunks_exact(34).enumerate() {
+                let d = u16::from_le_bytes([block[0], block[1]]);
+                if !half::f16::from_bits(d).is_finite() {
+                    return Err(Error::from_reason(format!(
+                        "PQ2_0 scale must be finite (tensor '{}', block {i})",
+                        tensor.name
+                    )));
+                }
+                scales[i] = d;
+                biases[i] = d ^ 0x8000;
+                for (j, bytes) in block[2..].chunks_exact(4).enumerate() {
+                    weights_packed[i * 8 + j] =
+                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                 }
             }
         }
@@ -2825,6 +2861,12 @@ impl SourceQuantProfile {
             // 5-bit codes with a stored per-block minimum, like Q4_1.
             GgufTensorType::Q5_1 => Some(Self::affine(5)),
             GgufTensorType::Q8_0 => Some(Self::affine(8).symmetric(ty)),
+            GgufTensorType::PQ2_0 => Some(Self {
+                bits: 2,
+                group_size: 128,
+                mode: "affine",
+                symmetric_zero_point: None,
+            }),
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
             // here; `k_quant_format` stays the only type -> format mapping.
@@ -2869,7 +2911,7 @@ impl SourceQuantProfile {
     /// the only shape a generic default can reproduce; the K-quant modes carry
     /// ggml geometry no default supplies.
     fn requires_explicit_entry(self) -> bool {
-        self.mode != "affine"
+        self.mode != "affine" || self.group_size != 32
     }
 
     fn to_json(self) -> serde_json::Value {
@@ -2898,6 +2940,377 @@ impl SourceQuantProfile {
             ),
         }
     }
+}
+
+const PRISM_HADAMARD_GGUF_PREFIX: &str = "prism.hadamard.";
+const PRISM_HADAMARD_GGUF_KEYS: [&str; 10] = [
+    "prism.hadamard.version",
+    "prism.hadamard.block_size",
+    "prism.hadamard.transform",
+    "prism.hadamard.axis",
+    "prism.hadamard.sign_mode",
+    "prism.hadamard.weight_names",
+    "prism.hadamard.inverse_weight_names",
+    "prism.hadamard.sign_widths",
+    "prism.hadamard.sign_values",
+    "prism.hadamard.gdn_v_grouped",
+];
+
+fn prism_meta_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
+    match gguf.metadata.get(key) {
+        Some(GgufMetaValue::Uint32(v)) => Ok(*v),
+        Some(other) => Err(Error::from_reason(format!(
+            "prism.hadamard metadata '{key}' must be a uint32, got {other:?}"
+        ))),
+        None => Err(Error::from_reason(format!(
+            "prism.hadamard metadata is missing required key '{key}'"
+        ))),
+    }
+}
+
+fn prism_meta_string(gguf: &GgufFile, key: &str) -> Result<String> {
+    match gguf.metadata.get(key) {
+        Some(GgufMetaValue::String(v)) => Ok(v.clone()),
+        Some(other) => Err(Error::from_reason(format!(
+            "prism.hadamard metadata '{key}' must be a string, got {other:?}"
+        ))),
+        None => Err(Error::from_reason(format!(
+            "prism.hadamard metadata is missing required key '{key}'"
+        ))),
+    }
+}
+
+fn prism_meta_bool(gguf: &GgufFile, key: &str) -> Result<bool> {
+    match gguf.metadata.get(key) {
+        Some(GgufMetaValue::Bool(v)) => Ok(*v),
+        Some(other) => Err(Error::from_reason(format!(
+            "prism.hadamard metadata '{key}' must be a bool, got {other:?}"
+        ))),
+        None => Err(Error::from_reason(format!(
+            "prism.hadamard metadata is missing required key '{key}'"
+        ))),
+    }
+}
+
+fn prism_meta_string_array(gguf: &GgufFile, key: &str) -> Result<Vec<String>> {
+    match gguf.metadata.get(key) {
+        Some(GgufMetaValue::ArrayString(v)) => Ok(v.clone()),
+        Some(other) => Err(Error::from_reason(format!(
+            "prism.hadamard metadata '{key}' must be a string array, got {other:?}"
+        ))),
+        None => Err(Error::from_reason(format!(
+            "prism.hadamard metadata is missing required key '{key}'"
+        ))),
+    }
+}
+
+fn prism_meta_i32_array(gguf: &GgufFile, key: &str) -> Result<Vec<i32>> {
+    match gguf.metadata.get(key) {
+        Some(GgufMetaValue::ArrayI32(v)) => Ok(v.clone()),
+        Some(other) => Err(Error::from_reason(format!(
+            "prism.hadamard metadata '{key}' must be an int32 array, got {other:?}"
+        ))),
+        None => Err(Error::from_reason(format!(
+            "prism.hadamard metadata is missing required key '{key}'"
+        ))),
+    }
+}
+
+fn prism_hadamard_runtime_name(name: &str, gguf: &GgufFile) -> Result<String> {
+    let hf = gguf_name_to_hf_for_metadata(name, &gguf.metadata).ok_or_else(|| {
+        Error::from_reason(format!(
+            "prism.hadamard weight '{name}' does not map to a runtime weight name"
+        ))
+    })?;
+    let stripped = crate::models::quant_dispatch::normalize_per_layer_key(&hf);
+    Ok(match stripped.strip_prefix("embed_tokens.") {
+        Some(suffix) => format!("embedding.{suffix}"),
+        None => stripped,
+    })
+}
+
+fn prism_hadamard_config(gguf: &GgufFile) -> Result<Option<PrismHadamardConfig>> {
+    if !gguf
+        .metadata
+        .keys()
+        .any(|key| key.starts_with(PRISM_HADAMARD_GGUF_PREFIX))
+    {
+        return Ok(None);
+    }
+    for key in gguf.metadata.keys() {
+        if key.starts_with(PRISM_HADAMARD_GGUF_PREFIX)
+            && !PRISM_HADAMARD_GGUF_KEYS.contains(&key.as_str())
+        {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard metadata carries unknown key '{key}'"
+            )));
+        }
+    }
+    let arch = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .unwrap_or("");
+    if arch != "qwen35" {
+        return Err(Error::from_reason(format!(
+            "prism.hadamard requires the dense 'qwen35' GGUF architecture, got '{arch}'"
+        )));
+    }
+    if qwen35_inline_mtp_index(gguf)?.is_some()
+        || gguf
+            .metadata
+            .get("qwen35.nextn_predict_layers")
+            .and_then(GgufMetaValue::as_u64)
+            .unwrap_or(0)
+            > 0
+    {
+        return Err(Error::from_reason(
+            "prism.hadamard sources with MTP/nextn configuration are not supported",
+        ));
+    }
+
+    let declared: HashSet<String> = prism_meta_string_array(gguf, "prism.hadamard.weight_names")?
+        .into_iter()
+        .chain(prism_meta_string_array(
+            gguf,
+            "prism.hadamard.inverse_weight_names",
+        )?)
+        .collect();
+    for name in &declared {
+        let tensor = gguf
+            .tensors
+            .iter()
+            .find(|tensor| &tensor.name == name)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "prism.hadamard weight '{name}' is not a tensor in this GGUF"
+                ))
+            })?;
+        if tensor.tensor_type != GgufTensorType::PQ2_0 {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard weight '{name}' is {}, not PQ2_0",
+                tensor.tensor_type.name()
+            )));
+        }
+    }
+    for tensor in &gguf.tensors {
+        if tensor.tensor_type.is_quantized() && tensor.tensor_type != GgufTensorType::PQ2_0 {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard sources cannot mix in '{}' tensor '{}'; only PQ2_0 is supported",
+                tensor.tensor_type.name(),
+                tensor.name
+            )));
+        }
+        if tensor.tensor_type == GgufTensorType::PQ2_0 && !declared.contains(&tensor.name) {
+            return Err(Error::from_reason(format!(
+                "PQ2_0 tensor '{}' is not covered by the prism.hadamard manifest",
+                tensor.name
+            )));
+        }
+    }
+
+    let sign_widths = prism_meta_i32_array(gguf, "prism.hadamard.sign_widths")?;
+    let sign_width_set: HashSet<i32> = sign_widths.iter().copied().collect();
+    for name in &declared {
+        let tensor = gguf
+            .tensors
+            .iter()
+            .find(|tensor| &tensor.name == name)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "prism.hadamard weight '{name}' is not a tensor in this GGUF"
+                ))
+            })?;
+        let shape = tensor.mlx_shape();
+        if shape.len() != 2 || shape.iter().any(|&axis| axis <= 0) {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard weight '{name}' must be a 2-D matrix with positive axes, got {shape:?}"
+            )));
+        }
+        let k = shape[1];
+        if k % i64::from(tensor.tensor_type.block_size() as i32) != 0 {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard weight '{name}' innermost dimension {k} is not a positive multiple of the PQ2_0 block"
+            )));
+        }
+        let k_i32 = i32::try_from(k).map_err(|_| {
+            Error::from_reason(format!(
+                "prism.hadamard weight '{name}' innermost dimension {k} is out of range"
+            ))
+        })?;
+        if !sign_width_set.contains(&k_i32) {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard weight '{name}' innermost dimension {k} matches no declared sign width {sign_widths:?}"
+            )));
+        }
+    }
+
+    let weight_names = prism_meta_string_array(gguf, "prism.hadamard.weight_names")?
+        .iter()
+        .map(|name| prism_hadamard_runtime_name(name, gguf))
+        .collect::<Result<Vec<_>>>()?;
+    let inverse_weight_names =
+        prism_meta_string_array(gguf, "prism.hadamard.inverse_weight_names")?
+            .iter()
+            .map(|name| prism_hadamard_runtime_name(name, gguf))
+            .collect::<Result<Vec<_>>>()?;
+
+    let config = PrismHadamardConfig {
+        version: prism_meta_u32(gguf, "prism.hadamard.version")?,
+        block_size: i32::try_from(prism_meta_u32(gguf, "prism.hadamard.block_size")?)
+            .map_err(|_| Error::from_reason("prism.hadamard.block_size is out of range"))?,
+        transform: prism_meta_string(gguf, "prism.hadamard.transform")?,
+        axis: prism_meta_string(gguf, "prism.hadamard.axis")?,
+        sign_mode: prism_meta_string(gguf, "prism.hadamard.sign_mode")?,
+        weight_names,
+        inverse_weight_names,
+        sign_widths,
+        sign_values: prism_meta_i32_array(gguf, "prism.hadamard.sign_values")?,
+        gdn_v_grouped: prism_meta_bool(gguf, "prism.hadamard.gdn_v_grouped")?,
+    };
+    config.validate()?;
+    Ok(Some(config))
+}
+
+fn validate_prism_supplied_config(
+    supplied: &serde_json::Value,
+    contract: &PrismHadamardConfig,
+    gguf: &GgufFile,
+) -> Result<()> {
+    let Some(obj) = supplied.as_object() else {
+        return Err(Error::from_reason(
+            "prism.hadamard conversion requires a JSON object config.json companion",
+        ));
+    };
+    for key in [
+        "vision_config",
+        "text_config",
+        "audio_config",
+        "video_config",
+        "multimodal_config",
+    ] {
+        if obj.contains_key(key) {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard sources are text-only and do not accept a nested '{key}' companion config"
+            )));
+        }
+    }
+    for key in ["num_nextn_predict_layers", "mtp_num_hidden_layers"] {
+        if supplied.get(key).and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+            return Err(Error::from_reason(format!(
+                "prism.hadamard sources do not support MTP; supplied config.json declares '{key}'"
+            )));
+        }
+    }
+    let synthesized = extract_config(&gguf.metadata);
+    if supplied
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(Error::from_reason(
+            "prism.hadamard requires an untied lm_head; supplied config.json sets tie_word_embeddings",
+        ));
+    }
+    if supplied
+        .get("attention_bias")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(Error::from_reason(
+            "prism.hadamard rotated projections carry no additive bias; supplied config.json sets attention_bias",
+        ));
+    }
+    if let Some(rope) = supplied.get("rope_parameters") {
+        let Some(rope_obj) = rope.as_object() else {
+            return Err(Error::from_reason(
+                "supplied config.json 'rope_parameters' must be an object; the loader reads it before the root rope fields",
+            ));
+        };
+        for key in ["rope_type", "type"] {
+            match rope_obj.get(key) {
+                None => {}
+                Some(value) if value.as_str() == Some("default") => {}
+                Some(value) => {
+                    return Err(Error::from_reason(format!(
+                        "supplied config.json 'rope_parameters.{key}' declares {value}; only 'default' rope is supported"
+                    )));
+                }
+            }
+        }
+        for key in ["rope_theta", "partial_rotary_factor"] {
+            if let Some(value) = rope_obj.get(key) {
+                check_prism_rope_value(value, key, &synthesized)?;
+            }
+        }
+    }
+    if let Some(layout) = supplied.get("qwen35_gguf_gdn_layout")
+        && layout.as_str() != Some("tiled")
+    {
+        return Err(Error::from_reason(format!(
+            "prism.hadamard requires qwen35_gguf_gdn_layout 'tiled'; supplied config.json declares {layout}"
+        )));
+    }
+    let expected_contract = serde_json::to_value(contract).map_err(|e| {
+        Error::from_reason(format!("Failed to serialize prism.hadamard contract: {e}"))
+    })?;
+    if let Some(marker) = supplied.get("prism_hadamard")
+        && marker != &expected_contract
+    {
+        return Err(Error::from_reason(
+            "supplied config.json declares a prism_hadamard contract that conflicts with the GGUF header",
+        ));
+    }
+    for key in ["quantization", "quantization_config"] {
+        if let Some(supplied_quant) = supplied.get(key) {
+            let expected = preserved_source_quantization(gguf, true)?;
+            if expected.as_ref() != Some(supplied_quant) {
+                return Err(Error::from_reason(format!(
+                    "supplied config.json field '{key}' conflicts with the PQ2_0 source quantization"
+                )));
+            }
+        }
+    }
+    if let Some(header_obj) = synthesized.as_object() {
+        for (key, value) in header_obj {
+            if key == "_name_or_path" || key == "rope_theta" || key == "partial_rotary_factor" {
+                continue;
+            }
+            if let Some(supplied_value) = supplied.get(key)
+                && supplied_value != value
+            {
+                return Err(Error::from_reason(format!(
+                    "supplied config.json field '{key}' conflicts with the GGUF header geometry"
+                )));
+            }
+        }
+    }
+    for key in ["rope_theta", "partial_rotary_factor"] {
+        if let Some(value) = supplied.get(key) {
+            check_prism_rope_value(value, key, &synthesized)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_prism_rope_value(
+    value: &serde_json::Value,
+    label: &str,
+    synthesized: &serde_json::Value,
+) -> Result<()> {
+    let Some(supplied_f) = value.as_f64() else {
+        return Err(Error::from_reason(format!(
+            "supplied config.json '{label}' must be a number"
+        )));
+    };
+    if let Some(header_f) = synthesized.get(label).and_then(|v| v.as_f64())
+        && (supplied_f as f32) != (header_f as f32)
+    {
+        return Err(Error::from_reason(format!(
+            "supplied config.json '{label}' conflicts with the GGUF header rope geometry"
+        )));
+    }
+    Ok(())
 }
 
 /// Describe tensors that were already quantized in the GGUF source.
@@ -4009,8 +4422,37 @@ pub async fn convert_gguf_to_safetensors(
         info!("  {ttype}: {count} tensors");
     }
 
+    let prism_contract = prism_hadamard_config(&gguf)?;
+    if prism_contract.is_some() {
+        if options.quantize.unwrap_or(false)
+            || options.quant_recipe.is_some()
+            || options.quant_mxfp.unwrap_or(false)
+            || options.imatrix_path.is_some()
+        {
+            return Err(Error::from_reason(
+                "prism.hadamard sources carry packed PQ2_0 weights that are losslessly repacked, never re-quantized; --quantize / --q-recipe / --q-mxfp / --imatrix-path cannot be combined with a prism.hadamard GGUF. Rejected from the GGUF header before tensor data was loaded.",
+            ));
+        }
+        if options.vlm_key_prefix.unwrap_or(false) {
+            return Err(Error::from_reason(
+                "prism.hadamard sources are text-only; --vlm-key-prefix remaps weights the runtime contract names cannot follow. Rejected from the GGUF header before tensor data was loaded.",
+            ));
+        }
+        if options
+            .output_filename
+            .as_deref()
+            .unwrap_or("model.safetensors")
+            != "model.safetensors"
+        {
+            return Err(Error::from_reason(
+                "prism.hadamard sources must convert as the primary 'model.safetensors' output: the rotation contract lives in config.json, which only the primary conversion writes. Rejected from the GGUF header before tensor data was loaded.",
+            ));
+        }
+    }
+
     let import_k_quants = options.import_k_quants.unwrap_or(false);
-    let native_qwen35_layout = options.native_qwen35_layout.unwrap_or(false);
+    let native_qwen35_layout =
+        options.native_qwen35_layout.unwrap_or(false) || prism_contract.is_some();
     // Validate the descriptor-level inline-MTP witness before any destination
     // file can be created or truncated. The resulting index is also the exact
     // main-decoder length to write when config.json must be synthesized.
@@ -4199,6 +4641,16 @@ pub async fn convert_gguf_to_safetensors(
     let src_config = asset_dir.join("config.json");
     let synthesized_config = !src_config.exists();
 
+    if let Some(contract) = &prism_contract
+        && src_config.exists()
+    {
+        let supplied_data = fs::read_to_string(&src_config)
+            .map_err(|e| Error::from_reason(format!("Failed to read config.json: {e}")))?;
+        let supplied: serde_json::Value = serde_json::from_str(&supplied_data)
+            .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?;
+        validate_prism_supplied_config(&supplied, contract, &gguf)?;
+    }
+
     // The text GGUF contains the decoder geometry, but the runtime contract is
     // the multimodal HF config: it also carries image/video token IDs, the
     // projector dimensions, vision layer kinds, and Muse's independent
@@ -4217,7 +4669,10 @@ pub async fn convert_gguf_to_safetensors(
     // model-size-specific defaults can build random projections with plausible
     // but wrong shapes. An authoritative sibling config remains the stronger
     // source and intentionally bypasses this metadata completeness gate.
-    if is_primary_model && native_qwen35_layout && synthesized_config {
+    if is_primary_model
+        && native_qwen35_layout
+        && (synthesized_config || prism_contract.is_some())
+    {
         validate_qwen35_standalone_geometry(&gguf.metadata)?;
     }
 
@@ -4336,26 +4791,27 @@ pub async fn convert_gguf_to_safetensors(
                 )));
             }
         };
-
-        info!("Converting to {dtype_str}...");
-        let keys: Vec<String> = weights.keys().cloned().collect();
-        for key in keys {
-            if preserve_dtype_keys.contains(&key) {
-                continue;
-            }
-            // Skip quantized weight triplets
-            if key.ends_with(".scales") || key.ends_with(".biases") {
-                continue;
-            }
-            // Skip uint32 packed quantized weights
-            if let Some(arr) = weights.get(&key)
-                && arr.dtype()? == DType::Uint32
-            {
-                continue;
-            }
-            if let Some(arr) = weights.remove(&key) {
-                let converted = convert_tensor_dtype(arr, target_dtype)?;
-                weights.insert(key, converted);
+        if prism_contract.is_none() {
+            info!("Converting to {dtype_str}...");
+            let keys: Vec<String> = weights.keys().cloned().collect();
+            for key in keys {
+                if preserve_dtype_keys.contains(&key) {
+                    continue;
+                }
+                // Skip quantized weight triplets
+                if key.ends_with(".scales") || key.ends_with(".biases") {
+                    continue;
+                }
+                // Skip uint32 packed quantized weights
+                if let Some(arr) = weights.get(&key)
+                    && arr.dtype()? == DType::Uint32
+                {
+                    continue;
+                }
+                if let Some(arr) = weights.remove(&key) {
+                    let converted = convert_tensor_dtype(arr, target_dtype)?;
+                    weights.insert(key, converted);
+                }
             }
         }
     }
@@ -4653,6 +5109,23 @@ pub async fn convert_gguf_to_safetensors(
             apply_qwen35_inline_mtp_config(&mut synthesized, qwen35_inline_mtp_index);
             synthesized
         };
+
+        if let Some(contract) = &prism_contract
+            && let Some(obj) = config_json.as_object_mut()
+        {
+            let header = extract_config(&gguf.metadata);
+            if let Some(header_obj) = header.as_object() {
+                for (key, value) in header_obj {
+                    obj.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            obj.insert(
+                "prism_hadamard".to_string(),
+                serde_json::to_value(contract).map_err(|e| {
+                    Error::from_reason(format!("Failed to serialize prism_hadamard config: {e}"))
+                })?,
+            );
+        }
 
         // Measured off the tensor list and cross-checked against the header, so
         // it also applies to a hand-supplied config.json: a config for a GGUF
@@ -5013,6 +5486,7 @@ fn qwen35_native_cache_is_current(
     output_dir: &Path,
     source_identity_digest: &str,
     asset_digest: &str,
+    expected_dtype: &str,
 ) -> bool {
     let marker = output_dir.join(".complete");
     fs::read_to_string(marker).is_ok_and(|contents| {
@@ -5021,7 +5495,7 @@ fn qwen35_native_cache_is_current(
                 "source_identity_sha256={source_identity_digest}\n"
             ))
             && contents.contains(&format!("assets_sha256={asset_digest}\n"))
-            && contents.contains("dtype=bf16\n")
+            && contents.contains(&format!("dtype={expected_dtype}\n"))
             && output_dir.join("model.safetensors").is_file()
             && output_dir.join("config.json").is_file()
     })
@@ -5567,9 +6041,34 @@ async fn prepare_native_gguf_inner(
         NativeGgufFamily::Qwen35 | NativeGgufFamily::Qwen35Moe
     );
     let layout = family.layout();
+    let prism_contract = if family == NativeGgufFamily::Qwen35 {
+        prism_hadamard_config(&parse_gguf(&input_path)?)?
+    } else {
+        None
+    };
+    if prism_contract.is_some() && companion.is_some() {
+        return Err(Error::from_reason(
+            "prism.hadamard sources are text-only and cannot be paired with a companion GGUF",
+        ));
+    }
+    let cache_dtype = if prism_contract.is_some() {
+        "source"
+    } else {
+        "bf16"
+    };
     // Bound the filename even when the main and companion both have long
     // names/identities. Keep the two source fingerprints in the marker too.
-    let preparation_digest = if family == NativeGgufFamily::Qwen35 {
+    let preparation_digest = if let Some(contract) = &prism_contract {
+        let contract_json = serde_json::to_string(contract).map_err(|e| {
+            Error::from_reason(format!("Failed to serialize prism.hadamard contract: {e}"))
+        })?;
+        Sha256::digest(format!(
+            "{asset_digest}:{layout}:prism-hadamard:{contract_json}"
+        ))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+    } else if family == NativeGgufFamily::Qwen35 {
         // Preserve existing Qwen cache keys and avoid an unrelated reimport.
         asset_digest.clone()
     } else {
@@ -5628,8 +6127,12 @@ async fn prepare_native_gguf_inner(
             "GGUF source changed while acquiring the native cache lock; retry the load".to_string(),
         ));
     }
-    if qwen35_native_cache_is_current(&output_dir, &source_identity_digest, &asset_digest)
-        && (companion.is_none() || output_dir.join(family.companion_filename()).is_file())
+    if qwen35_native_cache_is_current(
+        &output_dir,
+        &source_identity_digest,
+        &asset_digest,
+        cache_dtype,
+    ) && (companion.is_none() || output_dir.join(family.companion_filename()).is_file())
     {
         return Ok(output_dir);
     }
@@ -5734,7 +6237,7 @@ async fn prepare_native_gguf_inner(
     if let Err(error) = fs::write(
         marker,
         format!(
-            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_sha256={companion_digest}\ndtype=bf16\n",
+            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n",
             input_path.display(),
             source_identity_digest,
             metadata.len(),
@@ -6782,6 +7285,23 @@ mod tests {
                 GgufMetaValue::Float32(v) => {
                     buf.extend_from_slice(&(GgufValueType::Float32 as u32).to_le_bytes());
                     buf.extend_from_slice(&v.to_le_bytes());
+                }
+                GgufMetaValue::Int32(v) => {
+                    buf.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                GgufMetaValue::Bool(v) => {
+                    buf.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
+                    buf.push(u8::from(*v));
+                }
+                GgufMetaValue::ArrayString(values) => {
+                    buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+                    buf.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+                    buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                    for v in values {
+                        buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                        buf.extend_from_slice(v.as_bytes());
+                    }
                 }
                 GgufMetaValue::ArrayI32(values) => {
                     buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
@@ -13410,5 +13930,698 @@ mod tests {
         assert_eq!(info.mlx_shape(), vec![1024, 768]);
         assert_eq!(info.num_elements(), 786432);
         assert_eq!(info.data_size(), 786432 * 2); // BF16 = 2 bytes
+    }
+
+    fn prism_sign_values(width: usize) -> Vec<i32> {
+        (0..width)
+            .map(|i| if i % 3 == 0 { -1 } else { 1 })
+            .collect()
+    }
+
+    fn prism_metadata() -> Vec<(&'static str, GgufMetaValue)> {
+        vec![
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            ("general.quantization_version", GgufMetaValue::Uint32(2)),
+            ("qwen35.embedding_length", GgufMetaValue::Uint32(64)),
+            ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+            ("qwen35.ssm.state_size", GgufMetaValue::Uint32(128)),
+            ("qwen35.ssm.inner_size", GgufMetaValue::Uint32(6144)),
+            ("qwen35.ssm.time_step_rank", GgufMetaValue::Uint32(48)),
+            ("qwen35.ssm.group_count", GgufMetaValue::Uint32(16)),
+            ("qwen35.ssm.conv_kernel", GgufMetaValue::Uint32(4)),
+            ("qwen35.full_attention_interval", GgufMetaValue::Uint32(4)),
+            ("prism.hadamard.version", GgufMetaValue::Uint32(1)),
+            ("prism.hadamard.block_size", GgufMetaValue::Uint32(1024)),
+            (
+                "prism.hadamard.transform",
+                GgufMetaValue::String("normalized-sylvester-walsh-hadamard".to_string()),
+            ),
+            (
+                "prism.hadamard.axis",
+                GgufMetaValue::String("input-last-dimension".to_string()),
+            ),
+            (
+                "prism.hadamard.sign_mode",
+                GgufMetaValue::String("explicit".to_string()),
+            ),
+            (
+                "prism.hadamard.weight_names",
+                GgufMetaValue::ArrayString(vec!["blk.0.attn_qkv.weight".to_string()]),
+            ),
+            (
+                "prism.hadamard.inverse_weight_names",
+                GgufMetaValue::ArrayString(vec!["token_embd.weight".to_string()]),
+            ),
+            (
+                "prism.hadamard.sign_widths",
+                GgufMetaValue::ArrayI32(vec![1024]),
+            ),
+            (
+                "prism.hadamard.sign_values",
+                GgufMetaValue::ArrayI32(prism_sign_values(1024)),
+            ),
+            ("prism.hadamard.gdn_v_grouped", GgufMetaValue::Bool(true)),
+        ]
+    }
+
+    fn pq2_payload(rows: usize, k: usize, fill: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(rows * k / 128 * 34);
+        for block in 0..rows * k / 128 {
+            payload.extend_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+            for j in 0..32 {
+                payload.push(fill(block, j));
+            }
+        }
+        payload
+    }
+
+    fn prism_tensors() -> Vec<(&'static str, Vec<u64>, GgufTensorType, Vec<u8>)> {
+        vec![
+            (
+                "blk.0.attn_qkv.weight",
+                vec![1024, 2],
+                GgufTensorType::PQ2_0,
+                pq2_payload(2, 1024, |_, j| j as u8),
+            ),
+            (
+                "token_embd.weight",
+                vec![1024, 2],
+                GgufTensorType::PQ2_0,
+                pq2_payload(2, 1024, |_, j| j as u8),
+            ),
+            (
+                "output_norm.weight",
+                vec![64],
+                GgufTensorType::BF16,
+                vec![0u8; 128],
+            ),
+            (
+                "blk.0.attn_norm.weight",
+                vec![64],
+                GgufTensorType::F32,
+                vec![0u8; 256],
+            ),
+        ]
+    }
+
+    fn write_prism_gguf(
+        root: &Path,
+        metadata: &[(&str, GgufMetaValue)],
+        tensors: &[(&str, Vec<u64>, GgufTensorType, Vec<u8>)],
+    ) -> PathBuf {
+        let refs: Vec<(&str, &[u64], GgufTensorType, &[u8])> = tensors
+            .iter()
+            .map(|(name, dims, ty, data)| (*name, dims.as_slice(), *ty, data.as_slice()))
+            .collect();
+        let input = root.join("Ternary-Bonsai-2-27B-PQ2_0.gguf");
+        fs::write(&input, build_minimal_gguf(metadata, &refs)).unwrap();
+        input
+    }
+
+    fn prism_temp_dir(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-prism-hadamard-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn pq2_blocks(scales: &[f32], code_byte: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(scales.len() * 34);
+        for (block, &d) in scales.iter().enumerate() {
+            payload.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+            for j in 0..32 {
+                payload.push(code_byte(block, j));
+            }
+        }
+        payload
+    }
+
+    fn assert_pq2_dequant_matches_ggml(
+        dims: Vec<u64>,
+        scales: &[f32],
+        payload: &[u8],
+        label: &str,
+    ) {
+        let tensor = GgufTensorInfo {
+            name: "blk.0.attn_qkv.weight".to_string(),
+            n_dims: 2,
+            dims,
+            tensor_type: GgufTensorType::PQ2_0,
+            offset: 0,
+        };
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![tensor.clone()],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let mut cursor = std::io::Cursor::new(payload.to_vec());
+        let out = load_quantized_tensor(&mut cursor, &gguf, &tensor).unwrap();
+        let by_name: HashMap<String, MxArray> = out.into_iter().collect();
+        let weight = &by_name["blk.0.attn_qkv.weight"];
+        let scale_arr = &by_name["blk.0.attn_qkv.scales"];
+        let bias_arr = &by_name["blk.0.attn_qkv.biases"];
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32, "{label}");
+        assert_eq!(scale_arr.dtype().unwrap(), DType::Float16, "{label}");
+        assert_eq!(bias_arr.dtype().unwrap(), DType::Float16, "{label}");
+
+        let dequantized = dequantize_affine(weight, scale_arr, bias_arr, 2, 128);
+        assert_eq!(dequantized.len(), scales.len() * 128, "{label}");
+        for (i, &got) in dequantized.iter().enumerate() {
+            let block = i / 128;
+            let n = i % 128;
+            let d = half::f16::from_f32(scales[block]).to_f32();
+            let code = (payload[block * 34 + 2 + n / 4] >> (2 * (n % 4))) & 0x3;
+            let want = d * (f32::from(code) - 1.0);
+            assert_eq!(got, want, "{label} element {i} code {code}");
+        }
+
+        let scale_host = scale_arr.astype(DType::Float32).unwrap();
+        let bias_host = bias_arr.astype(DType::Float32).unwrap();
+        for (block, &d) in scales.iter().enumerate() {
+            let d = half::f16::from_f32(d).to_f32();
+            assert_eq!(scale_host.item_at_float32(block).unwrap(), d, "{label}");
+            assert_eq!(bias_host.item_at_float32(block).unwrap(), -d, "{label}");
+        }
+    }
+
+    #[test]
+    fn prism_hadamard_pq2_0_repacks_blocks_with_ggml_exactness() {
+        let scales: [f32; 8] = [1.0, -0.5, 0.0, 2.0, -1.5, 0.25, 3.0, -2.0];
+        let payload = pq2_blocks(&scales, |block, j| (block * 32 + j) as u8);
+        assert_pq2_dequant_matches_ggml(vec![1024, 1], &scales, &payload, "single-row");
+
+        let row_scales: [f32; 8] = [0.75, -1.25, 2.5, 0.125, -3.0, 1.5, -0.625, 4.0];
+        let payload = pq2_blocks(&row_scales, |block, j| {
+            (block * 97 + j * 13) as u8
+        });
+        assert_pq2_dequant_matches_ggml(vec![512, 2], &row_scales, &payload, "two-row");
+    }
+
+    #[test]
+    fn prism_hadamard_pq2_0_rejects_malformed_payloads() {
+        let gguf = |dims: Vec<u64>| GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![GgufTensorInfo {
+                name: "blk.0.attn_qkv.weight".to_string(),
+                n_dims: dims.len() as u32,
+                dims,
+                tensor_type: GgufTensorType::PQ2_0,
+                offset: 0,
+            }],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+
+        for bits in [0x7C00u16, 0x7E00u16] {
+            let file = gguf(vec![128, 1]);
+            let tensor = file.tensors[0].clone();
+            let mut payload = vec![0u8; 34];
+            payload[..2].copy_from_slice(&bits.to_le_bytes());
+            let mut cursor = std::io::Cursor::new(payload);
+            let err = load_quantized_tensor(&mut cursor, &file, &tensor)
+                .err()
+                .expect("a non-finite PQ2_0 scale must be rejected");
+            assert!(err.reason.contains("finite"), "{}", err.reason);
+        }
+
+        let file = gguf(vec![127, 1]);
+        let tensor = file.tensors[0].clone();
+        let mut cursor = std::io::Cursor::new(vec![0u8; 34]);
+        let err = load_quantized_tensor(&mut cursor, &file, &tensor)
+            .err()
+            .expect("a last dim of 127 is not a PQ2_0 block multiple");
+        assert!(
+            err.reason.contains("multiple of block size 128"),
+            "{}",
+            err.reason
+        );
+
+        let file = gguf(vec![256, 1]);
+        let tensor = file.tensors[0].clone();
+        let mut cursor = std::io::Cursor::new(vec![0u8; 34]);
+        let err = load_quantized_tensor(&mut cursor, &file, &tensor)
+            .err()
+            .expect("a truncated PQ2_0 payload must be rejected");
+        assert!(err.reason.contains("Failed to read"), "{}", err.reason);
+    }
+
+    #[test]
+    fn prism_hadamard_pq2_0_declares_affine_2_of_128_without_symmetric_marker() {
+        let profile = SourceQuantProfile::for_gguf_type(GgufTensorType::PQ2_0)
+            .expect("PQ2_0 must carry a source profile");
+        assert_eq!(profile.bits, 2);
+        assert_eq!(profile.group_size, 128);
+        assert_eq!(profile.mode, "affine");
+        assert_eq!(profile.symmetric_zero_point, None);
+        assert!(profile.requires_explicit_entry());
+        assert!(symmetric_zero_point(GgufTensorType::PQ2_0).is_none());
+        assert_eq!(GgufTensorType::PQ2_0.type_size(), 34);
+        assert_eq!(GgufTensorType::PQ2_0.block_size(), 128);
+        assert_eq!(GgufTensorType::PQ2_0.name(), "PQ2_0");
+        assert!(GgufTensorType::PQ2_0.is_mlx_affine_quantized());
+        assert!(GgufTensorType::PQ2_0.k_quant_format().is_none());
+        let json = profile.to_json();
+        assert_eq!(json["bits"], serde_json::json!(2));
+        assert_eq!(json["group_size"], serde_json::json!(128));
+        assert_eq!(json["mode"], serde_json::json!("affine"));
+        assert!(json.get(SYMMETRIC_ZERO_POINT_KEY).is_none());
+    }
+
+    #[test]
+    fn prism_hadamard_gguf_config_parses_normalized_contract() {
+        let root = prism_temp_dir("parse");
+        let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
+        let gguf = parse_gguf(&input).unwrap();
+        let contract = prism_hadamard_config(&gguf)
+            .unwrap()
+            .expect("a prism.hadamard fixture must produce a contract");
+        assert_eq!(contract.version, 1);
+        assert_eq!(contract.block_size, 1024);
+        assert_eq!(contract.transform, "normalized-sylvester-walsh-hadamard");
+        assert_eq!(contract.axis, "input-last-dimension");
+        assert_eq!(contract.sign_mode, "explicit");
+        assert_eq!(
+            contract.weight_names,
+            vec!["layers.0.linear_attn.in_proj_qkv.weight".to_string()]
+        );
+        assert_eq!(
+            contract.inverse_weight_names,
+            vec!["embedding.weight".to_string()]
+        );
+        assert_eq!(contract.sign_widths, vec![1024]);
+        assert_eq!(contract.sign_values.len(), 1024);
+        assert!(contract.gdn_v_grouped);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prism_hadamard_gguf_config_absent_without_marker() {
+        let root = prism_temp_dir("absent");
+        let metadata = vec![
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+        ];
+        let input = write_prism_gguf(&root, &metadata, &prism_tensors());
+        let gguf = parse_gguf(&input).unwrap();
+        assert!(prism_hadamard_config(&gguf).unwrap().is_none());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prism_hadamard_gguf_config_rejects_header_mutations() {
+        let cases: Vec<(
+            &str,
+            Vec<(&'static str, GgufMetaValue)>,
+            Vec<(&'static str, Vec<u64>, GgufTensorType, Vec<u8>)>,
+        )> = vec![
+            (
+                "unknown key",
+                prism_metadata()
+                    .into_iter()
+                    .chain([("prism.hadamard.extra", GgufMetaValue::Uint32(1))])
+                    .collect(),
+                prism_tensors(),
+            ),
+            (
+                "non-qwen35 architecture",
+                prism_metadata()
+                    .into_iter()
+                    .map(|(k, v)| {
+                        if k == "general.architecture" {
+                            (k, GgufMetaValue::String("qwen3".to_string()))
+                        } else {
+                            (k, v)
+                        }
+                    })
+                    .collect(),
+                prism_tensors(),
+            ),
+            (
+                "MTP metadata",
+                prism_metadata()
+                    .into_iter()
+                    .chain([("qwen35.nextn_predict_layers", GgufMetaValue::Uint32(1))])
+                    .collect(),
+                prism_tensors(),
+            ),
+            (
+                "absent declared weight",
+                prism_metadata()
+                    .into_iter()
+                    .map(|(k, v)| {
+                        if k == "prism.hadamard.weight_names" {
+                            (
+                                k,
+                                GgufMetaValue::ArrayString(vec![
+                                    "blk.0.attn_qkv.weight".to_string(),
+                                    "blk.0.ffn_up.weight".to_string(),
+                                ]),
+                            )
+                        } else {
+                            (k, v)
+                        }
+                    })
+                    .collect(),
+                prism_tensors(),
+            ),
+            (
+                "dense declared weight",
+                prism_metadata()
+                    .into_iter()
+                    .map(|(k, v)| {
+                        if k == "prism.hadamard.weight_names" {
+                            (
+                                k,
+                                GgufMetaValue::ArrayString(vec![
+                                    "blk.0.attn_qkv.weight".to_string(),
+                                    "output_norm.weight".to_string(),
+                                ]),
+                            )
+                        } else {
+                            (k, v)
+                        }
+                    })
+                    .collect(),
+                prism_tensors(),
+            ),
+            (
+                "uncovered PQ2_0 tensor",
+                prism_metadata(),
+                prism_tensors()
+                    .into_iter()
+                    .chain([(
+                        "blk.0.ffn_down.weight",
+                        vec![1024, 2],
+                        GgufTensorType::PQ2_0,
+                        pq2_payload(2, 1024, |_, j| j as u8),
+                    )])
+                    .collect(),
+            ),
+            (
+                "non-PQ2_0 quantized tensor",
+                prism_metadata(),
+                prism_tensors()
+                    .into_iter()
+                    .chain([(
+                        "blk.0.ffn_down.weight",
+                        vec![32, 2],
+                        GgufTensorType::Q4_0,
+                        vec![0u8; 36],
+                    )])
+                    .collect(),
+            ),
+            (
+                "nonmatching declared width",
+                prism_metadata(),
+                prism_tensors()
+                    .into_iter()
+                    .map(|(name, dims, ty, data)| {
+                        if name == "blk.0.attn_qkv.weight" {
+                            (
+                                name,
+                                vec![2048, 1],
+                                ty,
+                                pq2_payload(1, 2048, |_, j| j as u8),
+                            )
+                        } else {
+                            (name, dims, ty, data)
+                        }
+                    })
+                    .collect(),
+            ),
+            (
+                "bad version",
+                prism_metadata()
+                    .into_iter()
+                    .map(|(k, v)| {
+                        if k == "prism.hadamard.version" {
+                            (k, GgufMetaValue::Uint32(2))
+                        } else {
+                            (k, v)
+                        }
+                    })
+                    .collect(),
+                prism_tensors(),
+            ),
+        ];
+        for (label, metadata, tensors) in cases {
+            let root = prism_temp_dir(&format!("reject-{}", label.replace(' ', "-")));
+            let input = write_prism_gguf(&root, &metadata, &tensors);
+            let gguf = parse_gguf(&input).unwrap();
+            assert!(
+                prism_hadamard_config(&gguf).is_err(),
+                "mutation '{label}' must be rejected"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn prism_hadamard_conversion_rejects_requantization_before_output() {
+        for (label, mutate) in [
+            (
+                "quantize",
+                Box::new(|o: &mut GgufConversionOptions| o.quantize = Some(true))
+                    as Box<dyn Fn(&mut GgufConversionOptions)>,
+            ),
+            (
+                "q-recipe",
+                Box::new(|o: &mut GgufConversionOptions| {
+                    o.quant_recipe = Some("default".to_string())
+                }),
+            ),
+            (
+                "mxfp",
+                Box::new(|o: &mut GgufConversionOptions| o.quant_mxfp = Some(true)),
+            ),
+            (
+                "imatrix",
+                Box::new(|o: &mut GgufConversionOptions| {
+                    o.imatrix_path = Some("/tmp/imatrix.dat".to_string())
+                }),
+            ),
+            (
+                "vlm-key-prefix",
+                Box::new(|o: &mut GgufConversionOptions| o.vlm_key_prefix = Some(true)),
+            ),
+            (
+                "secondary output",
+                Box::new(|o: &mut GgufConversionOptions| {
+                    o.output_filename = Some("vision.safetensors".to_string())
+                }),
+            ),
+        ] {
+            let root = prism_temp_dir(&format!("preflight-{label}"));
+            let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
+            let output = root.join("out");
+            fs::create_dir_all(&output).unwrap();
+            let existing = output.join("model.safetensors");
+            let sentinel = b"a previously converted model that must survive a failed re-convert";
+            fs::write(&existing, sentinel).unwrap();
+            let mut options = GgufConversionOptions {
+                input_path: input.to_string_lossy().into_owned(),
+                output_dir: output.to_string_lossy().into_owned(),
+                config_source_dir: None,
+                dtype: None,
+                verbose: Some(false),
+                quantize: Some(false),
+                quant_bits: None,
+                quant_group_size: None,
+                quant_mode: None,
+                quant_recipe: None,
+                imatrix_path: None,
+                output_filename: None,
+                vlm_key_prefix: Some(false),
+                quant_mxfp: Some(false),
+                import_k_quants: Some(false),
+                native_qwen35_layout: None,
+            };
+            mutate(&mut options);
+            assert!(
+                convert_gguf_to_safetensors(options).await.is_err(),
+                "{label} must be rejected for a prism.hadamard source"
+            );
+            assert_eq!(
+                fs::read(&existing).unwrap(),
+                sentinel,
+                "{label}: the destination was written before preflight rejected"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn prism_hadamard_conversion_writes_contract_and_preserves_dtypes() {
+        let root = prism_temp_dir("convert");
+        let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
+        let output = root.join("out");
+        fs::create_dir_all(&output).unwrap();
+        convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: Some("float16".to_string()),
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(false),
+            native_qwen35_layout: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("prism.hadamard conversion must succeed: {}", e.reason));
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["model_type"], serde_json::json!("qwen3_5"));
+        assert_eq!(config["qwen35_gguf_gdn_layout"], serde_json::json!("tiled"));
+        let contract = &config["prism_hadamard"];
+        assert_eq!(contract["version"], serde_json::json!(1));
+        assert_eq!(contract["block_size"], serde_json::json!(1024));
+        assert_eq!(
+            contract["weight_names"],
+            serde_json::json!(["layers.0.linear_attn.in_proj_qkv.weight"])
+        );
+        assert_eq!(
+            contract["inverse_weight_names"],
+            serde_json::json!(["embedding.weight"])
+        );
+        assert_eq!(contract["sign_widths"], serde_json::json!([1024]));
+        assert_eq!(contract["sign_mode"], serde_json::json!("explicit"));
+        assert_eq!(contract["gdn_v_grouped"], serde_json::json!(true));
+
+        let safetensors =
+            crate::utils::safetensors::SafeTensorsFile::load(output.join("model.safetensors"))
+                .unwrap();
+        use crate::utils::safetensors::SafeTensorDType;
+        let dtype_of = |key: &str| safetensors.tensors[key].dtype.clone();
+        assert!(matches!(
+            dtype_of("model.norm.weight"),
+            SafeTensorDType::BF16
+        ));
+        assert!(matches!(
+            dtype_of("model.layers.0.input_layernorm.weight"),
+            SafeTensorDType::F32
+        ));
+        assert!(matches!(
+            dtype_of("model.layers.0.linear_attn.in_proj_qkv.weight"),
+            SafeTensorDType::U32
+        ));
+        assert!(matches!(
+            dtype_of("model.layers.0.linear_attn.in_proj_qkv.scales"),
+            SafeTensorDType::F16
+        ));
+        assert!(matches!(
+            dtype_of("model.embed_tokens.weight"),
+            SafeTensorDType::U32
+        ));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn prism_hadamard_conversion_rejects_conflicting_supplied_config() {
+        let root = prism_temp_dir("supplied");
+        let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
+        fs::write(
+            root.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "model_type": "qwen3_5",
+                "hidden_size": 4096,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = root.join("out");
+        fs::create_dir_all(&output).unwrap();
+        let existing = output.join("model.safetensors");
+        let sentinel = b"a previously converted model that must survive a failed re-convert";
+        fs::write(&existing, sentinel).unwrap();
+        let err = convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(false),
+            native_qwen35_layout: None,
+        })
+        .await
+        .err()
+        .expect("a conflicting supplied config must be rejected");
+        assert!(err.reason.contains("conflicts"), "{}", err.reason);
+        assert_eq!(fs::read(&existing).unwrap(), sentinel);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn prism_hadamard_native_cache_marks_source_dtype_and_contract() {
+        let root = prism_temp_dir("native-cache");
+        let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
+        let cache_root = root.join("native-cache");
+        let output = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap_or_else(|e| panic!("native preparation must succeed: {}", e.reason));
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(marker.contains("dtype=source\n"), "{marker}");
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert!(config.get("prism_hadamard").is_some());
+        assert_eq!(config["qwen35_gguf_gdn_layout"], serde_json::json!("tiled"));
+
+        let companion = root.join("mmproj.gguf");
+        fs::write(
+            &companion,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("clip".to_string()),
+                )],
+                &[],
+            ),
+        )
+        .unwrap();
+        let err = prepare_native_gguf_inner(
+            &input,
+            &cache_root,
+            NativeGgufFamily::Qwen35,
+            Some(companion.as_path()),
+        )
+        .await
+        .err()
+        .expect("a prism.hadamard source must reject a companion GGUF");
+        assert!(err.reason.contains("text-only"), "{}", err.reason);
+        fs::remove_dir_all(&root).ok();
     }
 }

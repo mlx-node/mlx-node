@@ -208,6 +208,19 @@ fn select_cache_hit_prefill_plan(
 }
 
 impl Qwen3_5Attention {
+    fn paged_attention_operand(&self, x: &MxArray, cache_dtype: Option<DType>) -> Result<MxArray> {
+        if self.q_proj.has_hadamard() && x.dtype()? == DType::Float32 {
+            let dtype = cache_dtype
+                .filter(|dtype| matches!(dtype, DType::Float16 | DType::BFloat16))
+                .ok_or_else(|| {
+                    Error::from_reason("prism_hadamard paged attention requires a 16-bit KV cache")
+                })?;
+            x.astype(dtype)
+        } else {
+            Ok(x.clone())
+        }
+    }
+
     pub fn new(config: &Qwen3_5Config) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_heads;
@@ -584,6 +597,11 @@ impl Qwen3_5Attention {
                 k_rot.transpose(Some(&[0, 2, 1, 3]))?,
             )
         };
+
+        let cache_dtype = adapter.prefill_sdpa_cache_dtype();
+        let queries = self.paged_attention_operand(&queries, cache_dtype)?;
+        let keys = self.paged_attention_operand(&keys, cache_dtype)?;
+        let values = self.paged_attention_operand(&values, cache_dtype)?;
 
         // Transpose to [B, H, T, D] for SDPA.
         let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
@@ -1324,6 +1342,10 @@ impl Qwen3_5Attention {
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+        let cache_dtype = adapter.prefill_sdpa_cache_dtype();
+        let queries = self.paged_attention_operand(&queries, cache_dtype)?;
+        let keys = self.paged_attention_operand(&keys, cache_dtype)?;
+        let values = self.paged_attention_operand(&values, cache_dtype)?;
 
         let output = if seq_len == 1 {
             let queries = queries.squeeze(Some(&[2]))?;
@@ -1556,6 +1578,16 @@ impl Qwen3_5Attention {
     #[cfg(test)]
     pub(crate) fn q_proj_input_amax(&self) -> Option<f32> {
         self.q_proj.input_amax()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prism_hadamard_sites(&self) -> (bool, bool, bool, bool) {
+        (
+            self.q_proj.has_hadamard(),
+            self.k_proj.has_hadamard(),
+            self.v_proj.has_hadamard(),
+            self.o_proj.has_hadamard(),
+        )
     }
 }
 
@@ -1966,6 +1998,64 @@ mod tests {
                 .path,
             CacheHitPrefillPath::PagedPoolSdpa
         );
+    }
+
+    #[test]
+    fn prism_hadamard_paged_operands_cast_only_rotated_fp32() -> Result<()> {
+        use crate::quant::prism_hadamard::HadamardTransform;
+        let cfg = Qwen3_5Config {
+            hidden_size: 1024,
+            ..tiny_cfg()
+        };
+        let mut attention = Qwen3_5Attention::new(&cfg)?;
+        let x = MxArray::from_float32(&[0.1, -0.2, 0.3, 0.4, -0.5, 0.6], &[1, 2, 3])?;
+        assert_eq!(
+            attention
+                .paged_attention_operand(&x, Some(DType::BFloat16))?
+                .dtype()?,
+            DType::Float32
+        );
+        let projection = QuantizedLinear::new(
+            MxArray::zeros(&[64, 64], Some(DType::Uint32))?,
+            MxArray::from_float16(&vec![0x3800; 64 * 8], &[64, 8])?,
+            Some(MxArray::from_float16(&vec![0xb800; 64 * 8], &[64, 8])?),
+            None,
+            128,
+            2,
+            "affine".to_string(),
+        )
+        .with_hadamard(Some(HadamardTransform {
+            signs: MxArray::from_float32(&vec![1.0; 1024], &[1024])?,
+            block_size: 1024,
+            gdn_permutation: None,
+        }))?;
+        attention.set_quantized_q_proj(projection);
+        for dtype in [DType::Float16, DType::BFloat16] {
+            let actual = attention.paged_attention_operand(&x, Some(dtype))?;
+            assert_eq!(actual.dtype()?, dtype);
+            assert_eq!(actual.shape()?.as_ref(), x.shape()?.as_ref());
+            assert_eq!(
+                actual.astype(DType::Float32)?.to_float32()?.as_ref(),
+                x.astype(dtype)?
+                    .astype(DType::Float32)?
+                    .to_float32()?
+                    .as_ref()
+            );
+        }
+        let half = x.astype(DType::Float16)?;
+        assert_eq!(
+            attention
+                .paged_attention_operand(&half, Some(DType::BFloat16))?
+                .dtype()?,
+            DType::Float16
+        );
+        assert!(attention.paged_attention_operand(&x, None).is_err());
+        assert!(
+            attention
+                .paged_attention_operand(&x, Some(DType::Float32))
+                .is_err()
+        );
+        Ok(())
     }
 
     fn tiny_cfg() -> Qwen3_5Config {

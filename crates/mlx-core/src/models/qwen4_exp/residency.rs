@@ -74,6 +74,7 @@ impl Tensor {
                 GgufTensorType::IQ4NL => (19, 32),
                 GgufTensorType::IQ3S => (266, 256),
                 GgufTensorType::IQ4XS => (138, 256),
+                GgufTensorType::PQ2_0 => (34, 128),
             },
         };
         n.checked_mul(num)

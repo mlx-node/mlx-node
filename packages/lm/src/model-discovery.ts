@@ -39,6 +39,7 @@ interface DiscoveryMetadata {
  * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
  */
 const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
+const BONSAI_PQ2_GGUF = /^ternary-bonsai-2-27b-pq2_0\.gguf$/i;
 // `mtp` joins the rule because the catalog ships MTP weights BESIDE a target
 // (Qwen3.8's `MTP/mtp-*.gguf`, Gemma's `mtp-*.gguf`) and nothing in the runtime
 // pairs a standalone GGUF MTP file: counting one as weights certifies a
@@ -75,6 +76,7 @@ function supportedGgufName(name: string, modelType: ModelType): boolean {
     const total = Number(split[2]);
     if (Number(split[1]) !== 1 || total < 1 || total > 1024 || (total > 1 && !policy.split)) return false;
   }
+  if (modelType === 'qwen3_5' && BONSAI_PQ2_GGUF.test(name)) return true;
   return policy.variants === 'all' || isQwen35XlGguf(name);
 }
 
