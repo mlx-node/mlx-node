@@ -2218,26 +2218,41 @@ fn parse_lfm2_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
         };
         let tool_text = inner.trim();
         // vLLM `TOOL_CALL_REGEX`: bracketed list only.
-        if !(tool_text.starts_with('[') && tool_text.ends_with(']')) {
-            return (text.to_string(), Vec::new());
-        }
-        let inner_body = &tool_text[1..tool_text.len() - 1];
-        // Direct parse first; on failure, the nested-quote recovery
-        // rewrites `command='sed -n '1,9p' f.py'` shapes and re-parses
-        // (vLLM runs `escape_nested_quotes_in_strings` over the ast.parse
-        // failure). The recovery sees the BRACKETED text — the trailing
-        // `)]` is what makes the outer quote a plausible close.
-        let Some(parsed_calls) = parse_lfm2_call_list(inner_body).or_else(|| {
-            escape_lfm2_nested_quotes(tool_text).and_then(|fixed| {
-                let f = fixed.trim();
-                if f.starts_with('[') && f.ends_with(']') {
-                    parse_lfm2_call_list(&f[1..f.len() - 1])
-                } else {
-                    None
-                }
+        let parsed = if tool_text.starts_with('[') && tool_text.ends_with(']') {
+            let inner_body = &tool_text[1..tool_text.len() - 1];
+            // Direct parse first; on failure, the nested-quote recovery
+            // rewrites `command='sed -n '1,9p' f.py'` shapes and re-parses
+            // (vLLM runs `escape_nested_quotes_in_strings` over the
+            // ast.parse failure). The recovery sees the BRACKETED text —
+            // the trailing `)]` is what makes the outer quote a plausible
+            // close.
+            parse_lfm2_call_list(inner_body).or_else(|| {
+                escape_lfm2_nested_quotes(tool_text).and_then(|fixed| {
+                    let f = fixed.trim();
+                    if f.starts_with('[') && f.ends_with(']') {
+                        parse_lfm2_call_list(&f[1..f.len() - 1])
+                    } else {
+                        None
+                    }
+                })
             })
-        }) else {
-            return (text.to_string(), Vec::new());
+        } else {
+            None
+        };
+        let Some(parsed_calls) = parsed else {
+            if calls.is_empty() {
+                // The FIRST block failing is vLLM's `content=model_output`:
+                // ast.parse on the only block it reads failed, so the whole
+                // output stays verbatim with no calls.
+                return (text.to_string(), Vec::new());
+            }
+            // A LATER block failing is out of vLLM's reach — it never
+            // parses past the first end sentinel, so the malformed span
+            // is echo region, not a call. Keep the calls already promoted
+            // and echo-strip from this sentinel on (an orphan END caps
+            // the echoed body).
+            cleaned.push_str(strip_lfm2_echo(&text[start_idx..]));
+            return (cleaned.trim().to_string(), calls);
         };
         let raw = &text[start_idx..block_end];
         calls.extend(
@@ -4575,11 +4590,25 @@ The weather in Tokyo is sunny."#;
     }
 
     #[test]
-    fn test_lfm2_tool_call_second_block_malformed_keeps_verbatim() {
-        // A malformed second block fails the whole output verbatim (vLLM
-        // ast.parse failure → content=model_output), discarding even the
-        // first block's call.
-        let input = "<|tool_call_start|>[f(x=1)]<|tool_call_end|> <|tool_call_start|>[f(@@@)]<|tool_call_end|>";
+    fn test_lfm2_tool_call_second_block_malformed_keeps_first_call() {
+        // A malformed SECOND block never reaches vLLM's parser — it stops
+        // at the first end sentinel, so the bad span is echo region. The
+        // first block's call survives; the bad block strips like an echo.
+        let input = "<|tool_call_start|>[f(x=1)]<|tool_call_end|> mid <|tool_call_start|>[f(@@@)]<|tool_call_end|> tail";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(text, "mid  tail");
+        // An unclosed malformed tail has no end sentinel to cap the echo —
+        // it stays verbatim as trailing content, calls still kept.
+        let input =
+            "<|tool_call_start|>[f(x=1)]<|tool_call_end|> mid <|tool_call_start|>[f(@@@)] tail";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(text, "mid <|tool_call_start|>[f(@@@)] tail");
+        // The FIRST block failing is still all-or-nothing verbatim —
+        // vLLM's `content=model_output`, second blocks are never seen.
+        let input = "<|tool_call_start|>[f(@@@)]<|tool_call_end|> <|tool_call_start|>[g(x=1)]<|tool_call_end|>";
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(text, input);
         assert!(calls.is_empty());

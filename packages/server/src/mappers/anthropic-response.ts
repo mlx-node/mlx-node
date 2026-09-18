@@ -86,7 +86,7 @@ export function recoverSuppressedToolCallText(rawText: string): string {
     .replace(/<tool_call>[\s\S]*?(?:<\/tool_call>|$)/g, '')
     .replace(/<\|tool_response>[\s\S]*?(?:<tool_response\|>|$)/g, '')
     .replace(/<\|tool>[\s\S]*?(?:<tool\|>|$)/g, '')
-    .replace(/<\|tool_call_start\|>[\s\S]*<\|tool_call_end\|>|<\|tool_call_start\|>[\s\S]*$/g, '')
+    .replace(/<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>|<\|tool_call_start\|>[\s\S]*$/g, '')
     .replace(/<\|tool_call_end\|>/g, '')
     .replace(/<\|turn>[^\n]*(?:\n|$)/g, '')
     .replace(/<turn\|>/g, '');
