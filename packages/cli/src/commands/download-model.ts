@@ -911,6 +911,20 @@ export async function run(argv: string[]) {
       primaryPaths: primaryNames,
       requireRevision: false,
     });
+    // But best-effort still requires an immutable revision. Without one,
+    // `fetchAssetSidecars` would download from MUTABLE `main`, overwrite live
+    // install files, and the marker write below would keep the OLD pinned
+    // `assetsRevision` — provenance that lies about where the bytes came
+    // from, and a branch move mid-run would mix revisions. The repair is
+    // skipped instead; the install keeps the sidecars it already has and a
+    // later run with a resolvable revision repairs it then. This also covers
+    // the `planned.length === 0 && revision === null` case: nothing to do.
+    if (plan.revision === null) {
+      console.warn(
+        `Could not resolve the latest revision of "${assetsRepo}"; skipping sidecar repair for this run.\n`,
+      );
+      return;
+    }
     const planned = plan.candidates.map((file) => file.path);
     // The refusal below claims the install is unchanged, so it must run on
     // the plan BEFORE any sidecar is fetched — `ensured` is always the full

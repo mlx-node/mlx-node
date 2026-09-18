@@ -82,7 +82,10 @@ describe('download model --assets-repo', () => {
   it('tops up the sidecars even when the glob-matched weights already look complete', async () => {
     // The weights (and nothing else) are already on disk: the run's remaining
     // work is the tokenizer pair, and the glob completeness check would
-    // otherwise return before any fetch.
+    // otherwise return before any fetch. The assets revision must be
+    // resolvable — an unpinned repair is skipped rather than fetched from
+    // mutable `main` (see the skip test below).
+    hub.shas[ASSETS] = 'b'.repeat(40);
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
 
     await run(['-m', PRIMARY, '-o', outputDir, '-g', '*UD-Q4_K_XL*', '--assets-repo', ASSETS, '--cache-dir', cacheDir]);
@@ -638,5 +641,44 @@ describe('download model --assets-repo', () => {
     expect(existsSync(join(outputDir, 'config.json'))).toBe(true);
     expect(existsSync(join(outputDir, 'chat_template.jinja'))).toBe(true);
     expect(JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8'))).toEqual(seeded);
+  });
+
+  it('skips the repair entirely when the assets revision cannot be pinned', async () => {
+    // `planAssetSidecars` runs with `requireRevision: false` on this path, so
+    // a transient resolution failure used to fall through to a fetch from
+    // MUTABLE `main` — overwriting live install files — while the marker
+    // write below kept the OLD pinned `assetsRevision`: provenance that lies
+    // about where the bytes came from (and a branch move mid-run mixes
+    // revisions). The repair must skip rather than mutate the install
+    // unpinned; the seeded marker records an older sidecar revision and has
+    // to stay byte-identical.
+    //
+    // Both revisions stay unresolved — `hub.shas` has no entry, `modelInfo`
+    // returns no sha — so the run takes the legacy "already downloaded"
+    // early-return path, the one the repair runs in front of.
+    const seeded = {
+      repo: PRIMARY,
+      revision: 'a'.repeat(40),
+      files: ['model.safetensors', 'config.json', 'tokenizer.json'],
+      scope: 'full',
+      assetsRepo: ASSETS,
+      assetsRevision: 'b'.repeat(40),
+      completedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
+    writeFileSync(join(outputDir, 'model.safetensors'), 'x'.repeat(64));
+    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    // tokenizer.json is in the marker AND still offered by the assets
+    // manifest, but missing on disk — exactly what the repair would fetch.
+
+    await run(['-m', PRIMARY, '-o', outputDir, '--assets-repo', ASSETS, '--cache-dir', cacheDir]);
+
+    // The plan was still consulted (the skip happens after planning, not
+    // instead of it), but nothing was fetched and nothing was written: the
+    // missing sidecar stays missing and the marker is byte-identical.
+    expect(hub.listedRepos).toContain(ASSETS);
+    expect(hub.downloaded).toEqual([]);
+    expect(existsSync(join(outputDir, 'tokenizer.json'))).toBe(false);
+    expect(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8')).toBe(JSON.stringify(seeded));
   });
 });
