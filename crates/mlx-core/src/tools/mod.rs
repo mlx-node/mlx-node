@@ -655,6 +655,15 @@ impl<'a> PyLiteralParser<'a> {
         let mut stack: Vec<u8> = Vec::new(); // open brackets — closers must match
         // `not` consumed as an operator (`x not in y`): `in`/`is` may follow.
         let mut after_not_op = false;
+        // Ternary `x if y else z` needs its `else`: `a if b` is a
+        // SyntaxError. Comprehension `if`s (`[x for i in y if z]`) are
+        // filters — no `else` — tracked per bracket depth so nested
+        // comprehensions and outer clauses survive inner closes.
+        let mut pending_ifs = 0usize;
+        let mut comp_depths: Vec<usize> = Vec::new();
+        // A `for` at top level is a genexpr — valid only as the sole
+        // argument, so a `,` boundary after it is a SyntaxError.
+        let mut top_genexpr = false;
         // Implicit-concat / string-prefix tracking: a quote after an
         // operand is legal only directly glued to a prefix identifier
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
@@ -669,7 +678,11 @@ impl<'a> PyLiteralParser<'a> {
                 // Top-level argument boundary — valid only after an operand
                 // (not inside `lambda` params, where `,` separates names).
                 b')' | b',' if stack.is_empty() && st != St::Lambda => {
-                    return if st == St::Have { Ok(()) } else { Err(()) };
+                    return if st == St::Have && pending_ifs == 0 && !(b == b',' && top_genexpr) {
+                        Ok(())
+                    } else {
+                        Err(())
+                    };
                 }
                 _ => match st {
                     St::Need => match b {
@@ -916,7 +929,13 @@ impl<'a> PyLiteralParser<'a> {
                             Some(o)
                                 if matches!((o, b), (b'(', b')') | (b'[', b']') | (b'{', b'}')) =>
                             {
+                                // `(a if b)` closes with the ternary's
+                                // `else` still owed — a SyntaxError.
+                                if pending_ifs > 0 {
+                                    return Err(());
+                                }
                                 self.pos += 1;
+                                comp_depths.retain(|&d| d <= stack.len());
                             }
                             _ => return Err(()),
                         },
@@ -994,7 +1013,33 @@ impl<'a> PyLiteralParser<'a> {
                             let id_start = self.pos;
                             self.pos = ident_end(self.s, self.pos);
                             match &self.s[id_start..self.pos] {
-                                b"and" | b"or" | b"in" | b"is" | b"if" | b"else" | b"for" => {
+                                b"and" | b"or" | b"in" | b"is" => {
+                                    st = St::Need;
+                                }
+                                b"if" => {
+                                    // Ternary needs `else`; a filter `if`
+                                    // inside a comprehension does not.
+                                    if !comp_depths.contains(&stack.len()) {
+                                        pending_ifs += 1;
+                                    }
+                                    st = St::Need;
+                                }
+                                b"else" => {
+                                    // `else` without an open ternary is a
+                                    // SyntaxError.
+                                    if pending_ifs == 0 {
+                                        return Err(());
+                                    }
+                                    pending_ifs -= 1;
+                                    st = St::Need;
+                                }
+                                b"for" => {
+                                    // Comprehension clauses run at the
+                                    // bracket depth they appear in; a
+                                    // top-level `for` is a genexpr, valid
+                                    // only as the call's sole argument.
+                                    comp_depths.push(stack.len());
+                                    top_genexpr |= stack.is_empty();
                                     st = St::Need;
                                 }
                                 b"not" => {
@@ -1180,6 +1225,12 @@ impl<'a> PyLiteralParser<'a> {
                         out.push(char::from_u32(h).ok_or(())?);
                     }
                     b'\n' => {} // line continuation
+                    b'N' if self.peek() == Some(b'{') => {
+                        // `\N{NAME}` resolves through a Unicode-name
+                        // table we don't carry — reject the block
+                        // verbatim rather than corrupt the argument.
+                        return Err(());
+                    }
                     _ => {
                         // `\'` `\"` `\\` collapse to the literal char; every
                         // OTHER unrecognized escape keeps the backslash —
@@ -4269,6 +4320,12 @@ The weather in Tokyo is sunny."#;
             "f(0x1g)",    // non-hex letter glued to the digit run
             "f(0b12)",    // digit outside the selected radix
             "f(0o18)",
+            "f(a if b, confirmed=True)", // incomplete ternary — `else` owed
+            "f(a else b)",               // `else` with no open `if`
+            "f((a if b), x=1)",          // bracket closes mid-ternary
+            "f([a if b], x=1)",          // `if` outside a comprehension
+            "f([a if b for c in d], x=1)", // `for` doesn't rescue the ternary
+            "f(x for x in y, k=1)",      // genexpr must be the sole argument
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4316,6 +4373,16 @@ The weather in Tokyo is sunny."#;
             ("f(0x1e5, x=1)", "{\"x\":1}"), // `e` is a hex digit here
             ("f(0o17, x=1)", "{\"x\":1}"),
             ("f(0b101, x=1)", "{\"x\":1}"),
+            ("f(a if b else c, x=1)", "{\"x\":1}"), // complete ternary
+            ("f(a if b else c if d else e, x=1)", "{\"x\":1}"),
+            ("f([x for i in y if z], k=1)", "{\"k\":1}"), // comp filter
+            ("f([x for i in y if a if b], k=1)", "{\"k\":1}"), // chained filters
+            // Nested comprehension, then an outer-clause filter.
+            ("f([x for i in [j for j in y] if q], k=1)", "{\"k\":1}"),
+            ("f([a if b else c for i in d], k=1)", "{\"k\":1}"), // ternary elem
+            ("f([x for i in (a if b else c)], k=1)", "{\"k\":1}"),
+            ("f(x for i in y)", "{}"), // sole genexpr positional
+            ("f(x for i in y if i)", "{}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4599,6 +4666,38 @@ The weather in Tokyo is sunny."#;
             let (text, calls) = parse_tool_calls(&input);
             assert_eq!(calls.len(), 1, "{inner} must produce one call");
             assert_eq!(calls[0].arguments["value"], want, "{inner}");
+            assert_eq!(text, "", "{inner}");
+        }
+    }
+
+    /// `\N{NAME}` needs a Unicode-name table we don't carry — the block
+    /// stays verbatim rather than shipping the literal escape text as
+    /// the argument. A bare `\N` without braces is not an escape in
+    /// Python either, so it keeps the backslash like `\d`.
+    #[test]
+    fn test_lfm2_tool_call_named_unicode_rejected() {
+        for inner in [
+            "f(value='\\N{SNOWMAN}')",
+            "f(value='x\\N{BAD}y')",
+            "f(value=\"\\N{X}\")",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+
+        // Bare `\N` (no brace) is not a valid escape but Python keeps
+        // it literally — same as `\d`; a positional `\N{..}` literal is
+        // still a valid skipped expression.
+        for (inner, want_args) in [
+            ("f(value='\\N')", "{\"value\":\"\\\\N\"}"),
+            ("f('\\N{SNOWMAN}', x=1)", "{\"x\":1}"),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner} must produce one call");
+            assert_eq!(calls[0].arguments.to_string(), want_args, "{inner}");
             assert_eq!(text, "", "{inner}");
         }
     }
