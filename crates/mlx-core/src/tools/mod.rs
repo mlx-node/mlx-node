@@ -653,6 +653,11 @@ impl<'a> PyLiteralParser<'a> {
         }
         let mut st = St::Need;
         let mut stack: Vec<u8> = Vec::new(); // open brackets — closers must match
+        // A postfix `x[…]` opens a subscript — the only bracket where `:`
+        // is slice syntax (`x[1:2]`, `x[:]`, `x[::]`). `:` inside a list
+        // display, tuple, or call is a SyntaxError; inside `{}` it is a
+        // dict separator that requires a value.
+        const SUBSCRIPT: u8 = 0;
         // `not` consumed as an operator (`x not in y`): `in`/`is` may follow.
         let mut after_not_op = false;
         // Ternary `x if y else z` needs its `else`: `a if b` is a
@@ -720,7 +725,14 @@ impl<'a> PyLiteralParser<'a> {
                                     p -= 1;
                                 }
                                 let trailing_ok = p > 0
-                                    && matches!(self.s[p - 1], b'(' | b'[' | b'{' | b',' | b':');
+                                    && match self.s[p - 1] {
+                                        b'(' | b'[' | b'{' | b',' => true,
+                                        // `x[1:]` — an open slice end is
+                                        // legal only in a subscript; `{k:}`
+                                        // is missing its dict value.
+                                        b':' => stack.last() == Some(&SUBSCRIPT),
+                                        _ => false,
+                                    };
                                 if !trailing_ok {
                                     return Err(());
                                 }
@@ -728,7 +740,10 @@ impl<'a> PyLiteralParser<'a> {
                                     Some(o)
                                         if matches!(
                                             (o, b),
-                                            (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                                            (b'(', b')')
+                                                | (b'[', b']')
+                                                | (b'{', b'}')
+                                                | (SUBSCRIPT, b']')
                                         ) =>
                                     {
                                         self.pos += 1;
@@ -810,7 +825,9 @@ impl<'a> PyLiteralParser<'a> {
                                 last_str = false;
                                 prefix_end = usize::MAX;
                             }
-                            b':' if !stack.is_empty() => self.pos += 1, // `a[:…]` `{…:…}`
+                            // `x[:2]` / `x[::]` — `:` where an operand is
+                            // expected is slice syntax, only in a subscript.
+                            b':' if stack.last() == Some(&SUBSCRIPT) => self.pos += 1,
                             _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
                                 let id_start = self.pos;
                                 self.pos = ident_end(self.s, self.pos);
@@ -943,14 +960,18 @@ impl<'a> PyLiteralParser<'a> {
                     }
                     St::Have => match b {
                         b'(' | b'[' => {
-                            // Postfix call / index.
-                            stack.push(b);
+                            // Postfix call / index — a subscript `[` admits
+                            // slice `:` inside; a call `(` does not.
+                            stack.push(if b == b'[' { SUBSCRIPT } else { b'(' });
                             self.pos += 1;
                             st = St::Need;
                         }
                         b')' | b']' | b'}' => match stack.pop() {
                             Some(o)
-                                if matches!((o, b), (b'(', b')') | (b'[', b']') | (b'{', b'}')) =>
+                                if matches!(
+                                    (o, b),
+                                    (b'(', b')') | (b'[', b']') | (b'{', b'}') | (SUBSCRIPT, b']')
+                                ) =>
                             {
                                 // `(a if b)` closes with the ternary's
                                 // `else` still owed — a SyntaxError.
@@ -966,11 +987,17 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos += 1;
                             st = St::Need;
                         }
-                        b':' if !stack.is_empty() => {
-                            // Slice / dict-entry separator.
-                            self.pos += 1;
-                            st = St::Need;
-                        }
+                        b':' if !stack.is_empty() => match stack.last() {
+                            // `{k:` — dict separator (a value must follow);
+                            // `x[1:` — slice continue. `:` inside `()` or a
+                            // list display is a SyntaxError (`(1:2)`,
+                            // `[1:2]`).
+                            Some(&b'{') | Some(&SUBSCRIPT) => {
+                                self.pos += 1;
+                                st = St::Need;
+                            }
+                            _ => return Err(()),
+                        },
                         b':' if self.s.get(self.pos + 1) == Some(&b'=') => {
                             self.pos += 2; // `:=` walrus
                             st = St::Need;
@@ -1093,7 +1120,10 @@ impl<'a> PyLiteralParser<'a> {
                         }
                         b')' | b']' | b'}' if !stack.is_empty() => match stack.pop() {
                             Some(o)
-                                if matches!((o, b), (b'(', b')') | (b'[', b']') | (b'{', b'}')) =>
+                                if matches!(
+                                    (o, b),
+                                    (b'(', b')') | (b'[', b']') | (b'{', b'}') | (SUBSCRIPT, b']')
+                                ) =>
                             {
                                 self.pos += 1;
                             }
@@ -4402,6 +4432,11 @@ The weather in Tokyo is sunny."#;
             "f(lambda =x: y)",       // `=` with no name
             "f(lambda (a): x)",      // `(a)` params are Python 2
             "f(lambda a,,b: x)",     // empty param between commas
+            "f({1:}, confirmed=True)", // dict entry missing its value
+            "f({:}, x=1)",           // `:` where a key belongs
+            "f([1:2], x=1)",         // `:` inside a list display
+            "f((1:2), x=1)",         // `:` inside parens
+            "f([a: b], x=1)",        // `:` inside a list via idents
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4467,6 +4502,15 @@ The weather in Tokyo is sunny."#;
             ("f(lambda a,: a, x=1)", "{\"x\":1}"), // trailing comma
             ("f(lambda *a, b=1: a, x=1)", "{\"x\":1}"),
             ("f(lambda a, /, b: a, x=1)", "{\"x\":1}"),
+            ("f(x[1:2], y=1)", "{\"y\":1}"), // subscript slice
+            ("f(x[:], y=1)", "{\"y\":1}"),   // open slice
+            ("f(x[::2], y=1)", "{\"y\":1}"),
+            ("f(x[a:b:c], y=1)", "{\"y\":1}"),
+            ("f(x[1:], y=1)", "{\"y\":1}"),     // trailing-open slice
+            ("f(x[y[1:2]], y=1)", "{\"y\":1}"), // nested subscript
+            ("f(x[1:2, 3], y=1)", "{\"y\":1}"), // tuple index
+            ("f({1:2}, y=1)", "{\"y\":1}"),     // dict literal positional
+            ("f({k: v for k in y}, y=1)", "{\"y\":1}"), // dict comprehension
             ("f(lambda x=(1, 2), y='a': x, k=1)", "{\"k\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");

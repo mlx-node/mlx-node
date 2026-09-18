@@ -10474,6 +10474,56 @@ describe('createHandler', () => {
       expect(allDeltaText).toBe('after');
     });
 
+    it('emits parked leading whitespace once when it survives into done text', async () => {
+      // A whitespace-only reply parks the "\n\n" chunk, then the final event
+      // carries the same bytes (no tool-call trimming). The terminal delta
+      // must emit the authoritative text once — not prepend the parked copy.
+      const streamEvents = [
+        { done: false, text: '\n\n', isReasoning: false },
+        {
+          done: true,
+          text: '\n\n',
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 2,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '\n\n',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('\n\n');
+      expect(allDeltaText).toBe('\n\n');
+    });
+
     it('skips message item when final text is empty and tool calls are present', async () => {
       // Model immediately produces tool-call markup, no visible text
       const streamEvents = [

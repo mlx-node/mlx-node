@@ -692,9 +692,10 @@ async function handleStreamingNativeWithAbort(
         // (possible if all text arrived in the final event only)
         if (!hasEmittedMessage && finalText && !skipMessageItem) {
           hasEmittedMessage = true;
-          // Parked leading whitespace joins the emission only when the
-          // authoritative text still carries it.
-          const head = finalText.startsWith(pendingLeadingWhitespace) ? pendingLeadingWhitespace : '';
+          // Nothing reached the wire yet — emit the authoritative text once.
+          // When it still carries the parked leading whitespace those bytes
+          // are already inside `finalText`; otherwise the parked bytes were
+          // trimmed upstream and must be dropped.
           pendingLeadingWhitespace = '';
           messageItemId = genId('msg_');
           const messageItem: MessageOutputItem = {
@@ -715,12 +716,12 @@ async function handleStreamingNativeWithAbort(
             content_index: 0,
             part: textPart,
           });
-          messageText = head + finalText;
+          messageText = finalText;
           writeSSEEvent(res, 'response.output_text.delta', {
             item_id: messageItemId,
             output_index: miIndex,
             content_index: 0,
-            delta: head + finalText,
+            delta: finalText,
           });
         }
 
