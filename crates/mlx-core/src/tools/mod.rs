@@ -1098,6 +1098,11 @@ impl<'a> PyLiteralParser<'a> {
                                         elem_start = false;
                                     } // unary — still need an operand
                                     b"lambda" => {
+                                        if comp_depths.contains(&stack.len())
+                                            || pending_ifs.contains(&stack.len())
+                                        {
+                                            return Err(());
+                                        }
                                         st = St::Lambda;
                                         lambda_depth = stack.len();
                                         param_start = true;
@@ -1301,8 +1306,12 @@ impl<'a> PyLiteralParser<'a> {
                             b'.' => {
                                 // `a.b` attribute target.
                                 self.pos += 1;
+                                let id_start = self.pos;
                                 if ident_char_at(self.s, self.pos, true) {
                                     self.pos = ident_end(self.s, self.pos);
+                                    if reserved_ident(&self.s[id_start..self.pos]) {
+                                        return Err(());
+                                    }
                                 } else {
                                     return Err(());
                                 }
@@ -5592,6 +5601,83 @@ The weather in Tokyo is sunny."#;
             "f(f'}}}}', confirmed=True)",
             "f(f'{{{{x}}}}', confirmed=True)",
             "f(rf'{{{{x}}}}', confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_reserved_target_attributes_rejected() {
+        for inner in [
+            "dangerous_action([x for a.for in source], confirmed=True)",
+            "f([x for a.lambda in source], confirmed=True)",
+            "f([x for a.None in source], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_target_attributes_dropped() {
+        for inner in [
+            "f([x for a.match in source], confirmed=True)",
+            "f([x for a.café in source], confirmed=True)",
+            "f([x for a.b[0] in source], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_unparenthesized_restricted_lambdas_rejected() {
+        for inner in [
+            "dangerous_action([x for a in source if lambda: value], confirmed=True)",
+            "f([x for a in lambda: value], confirmed=True)",
+            "f([x for a in source for b in lambda: value], confirmed=True)",
+            "f(a if lambda: value else b, confirmed=True)",
+            "f(lambda: x if lambda: y else z, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_expression_positions_dropped() {
+        for inner in [
+            "f([lambda: x for x in source], confirmed=True)",
+            "f([x for a in source if (lambda: value)], confirmed=True)",
+            "f([x for a in (lambda: value)], confirmed=True)",
+            "f([x for a in source for b in (lambda: value)], confirmed=True)",
+            "f(a if (lambda: value) else b, confirmed=True)",
+            "f([(lambda: x) for x in source], confirmed=True)",
+            "f(lambda: x, confirmed=True)",
+            "f(helper(lambda: x), confirmed=True)",
+            "f({key: lambda: value}, confirmed=True)",
+            "f(lambda x=lambda: value: x, confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
