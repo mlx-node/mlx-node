@@ -618,8 +618,8 @@ impl<'a> PyLiteralParser<'a> {
                 if !raw_mode {
                     // Mandatory escapes must be well-formed or `ast.parse`
                     // raises and vLLM keeps the whole block verbatim:
-                    // `\x` needs 2 hex digits, `\u`/`\U` need 4/8, and
-                    // `\N` needs a non-empty `{NAME}`. `\u`/`\U`/`\N` are
+                    // `\x` needs 2 hex digits, `\u`/`\U` need 4/8, and `\N`
+                    // is rejected outright (see below). `\u`/`\U`/`\N` are
                     // NOT escapes in bytes literals, so they stay literal
                     // there (only `\x` is checked).
                     let escape = self.s.get(self.pos + 1).copied();
@@ -647,30 +647,15 @@ impl<'a> PyLiteralParser<'a> {
                             return Err(());
                         }
                         // `\N` is a recognized escape introducer in str: a
-                        // bare `\N` and a malformed `{NAME}` are both hard
-                        // SyntaxErrors (`b'\N'` is only a warning, so bytes
-                        // skip this). The name itself is not validated
-                        // against the Unicode table we don't carry — the
-                        // scan only bounds its characters so it can never
-                        // run past the closing quote.
-                        Some(b'N') if !bytes_mode => {
-                            if self.s.get(self.pos + 2) != Some(&b'{') {
-                                return Err(());
-                            }
-                            let mut name_end = self.pos + 3;
-                            while matches!(
-                                self.s.get(name_end),
-                                Some(c) if c.is_ascii_alphanumeric()
-                                    || matches!(c, b' ' | b'-' | b'_')
-                            ) {
-                                name_end += 1;
-                            }
-                            if name_end == self.pos + 3 || self.s.get(name_end) != Some(&b'}') {
-                                return Err(());
-                            }
-                            self.pos = name_end + 1;
-                            continue;
-                        }
+                        // bare `\N` is a hard SyntaxError, and `\N{NAME}`
+                        // needs a Unicode-name table we don't carry, so an
+                        // unknown name cannot be told from a known one.
+                        // Reject both rather than promote a call whose
+                        // `ast.parse` failed — the same reject-on-
+                        // non-representable stance as keyword `\N` and
+                        // non-JSON literals. `b'\N'` is only a warning, so
+                        // bytes skip this.
+                        Some(b'N') if !bytes_mode => return Err(()),
                         _ => {}
                     }
                 }
@@ -6861,6 +6846,8 @@ The weather in Tokyo is sunny."#;
             "f('\\UFFFFFFFF', confirmed=True)",
             "f('\\N{BULLET', confirmed=True)",
             "f('\\N{}', confirmed=True)",
+            "f('\\N{BULLET}', confirmed=True)",
+            "f('\\N{NOT A REAL NAME}', confirmed=True)",
             "f('\\N', confirmed=True)",
             "f('C:\\New folder', confirmed=True)",
             "f(\"\\uZZZZ\", confirmed=True)",
@@ -6878,7 +6865,6 @@ The weather in Tokyo is sunny."#;
             "f('\\U0001F600', confirmed=True)",
             "f('\\U0010FFFF', confirmed=True)",
             "f('\\uD800', confirmed=True)",
-            "f('\\N{BULLET}', confirmed=True)",
             "f('\\q', confirmed=True)",
             "f('\\400', confirmed=True)",
             "f(b'\\uZZZZ', confirmed=True)",
