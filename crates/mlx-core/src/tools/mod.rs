@@ -762,6 +762,9 @@ impl<'a> PyLiteralParser<'a> {
         // `lambda a b` / `lambda a.b` / `lambda a(` are SyntaxErrors.
         let mut param_done = false;
         let mut lambda_depth = 0;
+        let mut lambda_default_seen = false;
+        let mut lambda_keyword_only = false;
+        let mut param_has_default = false;
         // Implicit-concat / string-prefix tracking: a quote after an
         // operand is legal only directly glued to a prefix identifier
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
@@ -1050,6 +1053,9 @@ impl<'a> PyLiteralParser<'a> {
                                         param_start = true;
                                         param_done = false;
                                         saw_marker = false;
+                                        lambda_default_seen = false;
+                                        lambda_keyword_only = false;
+                                        param_has_default = false;
                                     }
                                     _ => {
                                         st = St::Have;
@@ -1572,6 +1578,15 @@ impl<'a> PyLiteralParser<'a> {
                         _ => return Err(()),
                     },
                     St::Lambda => match b {
+                        _ if param_done
+                            && stack.len() == lambda_depth
+                            && matches!(b, b',' | b':')
+                            && lambda_default_seen
+                            && !lambda_keyword_only
+                            && !param_has_default =>
+                        {
+                            return Err(());
+                        }
                         // After a param name only `,`, `=`, or the ending
                         // `:` is legal — `lambda a b`, `lambda a.b`, and
                         // `lambda a(` are all SyntaxErrors.
@@ -1585,6 +1600,8 @@ impl<'a> PyLiteralParser<'a> {
                             b'=' => {
                                 self.pos += 1;
                                 self.skip_expression_until(false, true)?;
+                                lambda_default_seen = true;
+                                param_has_default = true;
                             }
                             b':' => {
                                 param_done = false;
@@ -1644,6 +1661,7 @@ impl<'a> PyLiteralParser<'a> {
                         b'*' | b'/' => {
                             if param_start && stack.len() == lambda_depth {
                                 saw_marker = true;
+                                lambda_keyword_only |= b == b'*';
                             }
                             self.pos += 1;
                         }
@@ -1663,6 +1681,7 @@ impl<'a> PyLiteralParser<'a> {
                                 param_start = false;
                                 saw_marker = false;
                                 param_done = true;
+                                param_has_default = false;
                             } else {
                                 self.pos += 1;
                             }
@@ -5065,6 +5084,52 @@ The weather in Tokyo is sunny."#;
             "f(helper(**a,) + other(*b, 2), confirmed=True)",
             "f(outer(helper(**a), 2), confirmed=True)",
             "f(lambda x=helper(**a, x=1): x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_lambda_parameter_order_rejected() {
+        for inner in [
+            "dangerous_action(lambda a=1,b: x, confirmed=True)",
+            "f(lambda a=1,b,c=2: x, confirmed=True)",
+            "f(lambda a=1,/,b: x, confirmed=True)",
+            "f(lambda a=1,b,*args: x, confirmed=True)",
+            "f((lambda a=1,b: x), confirmed=True)",
+            "f(lambda a=(lambda b=1,c: x): a, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_parameter_order_dropped() {
+        for inner in [
+            "f(lambda a=1,b=2: x, confirmed=True)",
+            "f(lambda a,b=1: x, confirmed=True)",
+            "f(lambda a=1,: x, confirmed=True)",
+            "f(lambda a=1,/: x, confirmed=True)",
+            "f(lambda a=1,/,b=2: x, confirmed=True)",
+            "f(lambda a=1,*,b: x, confirmed=True)",
+            "f(lambda a=1,*args,b: x, confirmed=True)",
+            "f(lambda a=1,**kwargs: x, confirmed=True)",
+            "f(lambda *,a=1,b: x, confirmed=True)",
+            "f(lambda a=1,/,*,b: x, confirmed=True)",
+            "f((lambda a=1: a) + (lambda b: b), confirmed=True)",
+            "f(lambda a=1,b=(lambda c:c): b, confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
