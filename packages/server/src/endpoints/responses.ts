@@ -737,6 +737,10 @@ async function handleStreamingNativeWithAbort(
           });
         }
 
+        if (hasEmittedMessage && messageText !== finalText) {
+          finalText = messageText;
+        }
+
         if (hasEmittedMessage && messageItemId && !skipMessageItem) {
           const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
           const contentIndex = 0;

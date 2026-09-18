@@ -594,7 +594,16 @@ impl<'a> PyLiteralParser<'a> {
             self.pos += 2;
         }
         while let Some(&b) = self.s.get(self.pos) {
-            if f_mode && matches!(b, b'{' | b'}') {
+            if f_mode && b == b'{' {
+                if self.s.get(self.pos + 1) == Some(&b) {
+                    self.pos += 2;
+                } else {
+                    self.pos += 1;
+                    self.skip_f_replacement(1)?;
+                }
+                continue;
+            }
+            if f_mode && b == b'}' {
                 if self.s.get(self.pos + 1) != Some(&b) {
                     return Err(());
                 }
@@ -626,6 +635,115 @@ impl<'a> PyLiteralParser<'a> {
             self.pos += 1;
         }
         Err(())
+    }
+
+    fn validate_f_expression(&self, expression: &[u8]) -> Result<(), ()> {
+        let expression = std::str::from_utf8(expression).map_err(|_| ())?.trim();
+        if expression.is_empty() {
+            return Err(());
+        }
+        let wrapped = format!("({expression}),");
+        let mut parser = PyLiteralParser::new(&wrapped);
+        parser.depth = self.depth;
+        parser.skip_expression(false)?;
+        parser.expect(b',')?;
+        if parser.eof() { Ok(()) } else { Err(()) }
+    }
+
+    fn skip_f_replacement(&mut self, nesting: u32) -> Result<(), ()> {
+        if nesting > 3 {
+            return Err(());
+        }
+        let start = self.pos;
+        let mut stack = Vec::new();
+        loop {
+            let Some(&b) = self.s.get(self.pos) else {
+                return Err(());
+            };
+            match b {
+                b'\'' | b'"' => self.skip_quoted(false)?,
+                b'(' | b'[' | b'{' => {
+                    stack.push(b);
+                    self.pos += 1;
+                }
+                b')' | b']' | b'}' => {
+                    if b == b'}' && stack.is_empty() {
+                        break;
+                    }
+                    let Some(open) = stack.pop() else {
+                        return Err(());
+                    };
+                    if !matches!((open, b), (b'(', b')') | (b'[', b']') | (b'{', b'}')) {
+                        return Err(());
+                    }
+                    self.pos += 1;
+                }
+                b'!' if stack.is_empty() && self.s.get(self.pos + 1) != Some(&b'=') => break,
+                b':' if stack.is_empty() => break,
+                b'=' if stack.is_empty()
+                    && self.s.get(self.pos + 1) != Some(&b'=')
+                    && (self.pos == start
+                        || !matches!(self.s[self.pos - 1], b'!' | b'<' | b'>' | b'=')) =>
+                {
+                    break;
+                }
+                _ => {
+                    let len = utf8_len(b);
+                    if self.pos + len > self.s.len() {
+                        return Err(());
+                    }
+                    self.pos += len;
+                }
+            }
+        }
+        let end = self.pos;
+        self.validate_f_expression(&self.s[start..end])?;
+        if self.peek() == Some(b'=') {
+            self.pos += 1;
+            while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.pos += 1;
+            }
+        }
+        if self.peek() == Some(b'!') {
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b's' | b'r' | b'a')) {
+                return Err(());
+            }
+            self.pos += 1;
+            while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.pos += 1;
+            }
+        }
+        if self.peek() == Some(b':') {
+            self.pos += 1;
+            self.skip_f_format_spec(nesting)?;
+        }
+        if self.peek() != Some(b'}') {
+            return Err(());
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn skip_f_format_spec(&mut self, nesting: u32) -> Result<(), ()> {
+        loop {
+            let Some(&b) = self.s.get(self.pos) else {
+                return Err(());
+            };
+            if b == b'}' {
+                return Ok(());
+            }
+            if b == b'{' {
+                self.pos += 1;
+                self.skip_f_replacement(nesting + 1)?;
+            } else {
+                let len = utf8_len(b);
+                if self.pos + len > self.s.len() {
+                    return Err(());
+                }
+                self.pos += len;
+            }
+        }
     }
 
     /// Skip one positional argument's expression text. vLLM ignores
@@ -929,7 +1047,11 @@ impl<'a> PyLiteralParser<'a> {
                                         b':' => stack.last() == Some(&SUBSCRIPT),
                                         _ => false,
                                     };
-                                if !trailing_ok {
+                                if !trailing_ok
+                                    || (b == b']'
+                                        && stack.last() == Some(&SUBSCRIPT)
+                                        && self.s[p - 1] == b'[')
+                                {
                                     return Err(());
                                 }
                                 match stack.pop() {
@@ -5625,6 +5747,11 @@ The weather in Tokyo is sunny."#;
             "f(f'{x', confirmed=True)",
             "f(f'\\{', confirmed=True)",
             "f(fr'{', confirmed=True)",
+            "f(f'{}', confirmed=True)",
+            "f(f'{+}', confirmed=True)",
+            "f(f'{a b}', confirmed=True)",
+            "f(f'{x!q}', confirmed=True)",
+            "f(f'{x:{y:{z:{w}}}}', confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -5634,13 +5761,25 @@ The weather in Tokyo is sunny."#;
     }
 
     #[test]
-    fn test_lfm2_tool_call_constant_positional_fstrings_dropped() {
+    fn test_lfm2_tool_call_valid_positional_fstrings_dropped() {
         for inner in [
             "f(f'plain', confirmed=True)",
             "f(f'{{{{', confirmed=True)",
             "f(f'}}}}', confirmed=True)",
             "f(f'{{{{x}}}}', confirmed=True)",
             "f(rf'{{{{x}}}}', confirmed=True)",
+            "f(f'{user}', confirmed=True)",
+            "f(f'{a + b}', confirmed=True)",
+            "f(f'{(a,b)}', confirmed=True)",
+            "f(f'{value!r}', confirmed=True)",
+            "f(f'{value:03}', confirmed=True)",
+            "f(f'{value:{width}}', confirmed=True)",
+            "f(f'{x=}', confirmed=True)",
+            "f(f'{user = }', confirmed=True)",
+            "f(f'{user = !r}', confirmed=True)",
+            "f(f'{user = :03}', confirmed=True)",
+            "f(f'{user!r }', confirmed=True)",
+            "f(f'{x:{y:{z}}}', confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -5803,6 +5942,46 @@ The weather in Tokyo is sunny."#;
             "f(helper(x=lambda: b), confirmed=True)",
             "f(a[lambda: b], confirmed=True)",
             "f(lambda x=lambda: b: x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_empty_postfix_subscripts_rejected() {
+        for inner in [
+            "dangerous_action(x[], confirmed=True)",
+            "f(x[ ], confirmed=True)",
+            "f(x.y[], confirmed=True)",
+            "f(helper(x[]), confirmed=True)",
+            "f([x for a[] in source], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_empty_displays_and_subscripts_dropped() {
+        for inner in [
+            "f([], confirmed=True)",
+            "f([ ], confirmed=True)",
+            "f(x[:], confirmed=True)",
+            "f(x[::], confirmed=True)",
+            "f(x[()], confirmed=True)",
+            "f(x[[]], confirmed=True)",
+            "f(helper()[0], confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
