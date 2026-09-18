@@ -370,6 +370,11 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // speculative one; and non-capable steppers (conv / GDN recurrent /
         // MTP — non-rewindable state) never take this arm at all.
         let pipelined = step.supports_token_pipeline()
+            && crate::sampling::is_greedy_temperature(
+                p.sampling_config
+                    .and_then(|config| config.temperature)
+                    .unwrap_or(1.0),
+            )
             && step_idx + 1 < max_new_tokens
             && p.repetition_penalty == 1.0
             && p.presence_penalty == 0.0
@@ -2070,6 +2075,109 @@ mod run_decode_loop_tests {
                 .map(|_| ())
                 .ok_or_else(|| Error::from_reason("rollback_lazy_step with no recorded step"))
         }
+    }
+
+    #[test]
+    fn stochastic_pipeline_preserves_serial_rng_after_terminal_steps() {
+        fn run<S: DecodeStep>(
+            step: &mut S,
+            stop: &str,
+            params: &ChatParams,
+        ) -> (Vec<u32>, String, Vec<i32>) {
+            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut profiler = DecodeProfiler::new("test", "rng");
+            let mut generated = Vec::new();
+            let mut history = Vec::new();
+            let mut finish = String::from("length");
+            let mut first = None;
+            let cancel = AtomicBool::new(stop == "cancelled");
+            unsafe { mlx_sys::mlx_seed(0x22_0158) };
+            run_decode_loop(
+                step,
+                DecodeLoopArgs {
+                    y: MxArray::from_int32(&[3], &[1]).unwrap(),
+                    params,
+                    reasoning_tracker: &mut tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens: 6,
+                    eos_id: if stop == "eos" { 7 } else { 15 },
+                    extra_eos_ids: if stop == "extra_eos" { &[7] } else { &[] },
+                    eos_before_emit: false,
+                    generated_tokens: &mut generated,
+                    token_history: &mut history,
+                    finish_reason: &mut finish,
+                    first_token_instant: &mut first,
+                    report_perf: false,
+                    generation_stream: Stream::new(DeviceType::Gpu),
+                    cancel_flag: Some(&cancel),
+                    turn_token_observer: None,
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(history, generated);
+            let probe = MxArray::from_float32(&[0.0; 512], &[32, 16]).unwrap();
+            let after = crate::sampling::sample(&probe, None)
+                .unwrap()
+                .to_int32()
+                .unwrap()
+                .to_vec();
+            (generated, finish, after)
+        }
+        for stop in ["eos", "extra_eos", "repetition", "cancelled", "length"] {
+            let params = greedy_params(|cfg| {
+                cfg.temperature = Some(0.7);
+                cfg.top_k = Some(1);
+                cfg.max_consecutive_tokens = Some(if stop == "repetition" { 3 } else { 0 });
+                cfg.max_ngram_repeats = Some(0);
+            });
+            let mut serial = MockStep::new(vec![7], 16);
+            let expected = run(&mut serial, stop, &params);
+            let mut capable = PipelinedMockStep::new(vec![7], 16);
+            let actual = run(&mut capable, stop, &params);
+            assert_eq!(actual, expected, "{stop}");
+            assert!(capable.records.is_empty(), "{stop}");
+            assert!(
+                capable.ledger.iter().all(|entry| *entry == "forward"),
+                "{stop}"
+            );
+            assert_eq!(
+                actual.1,
+                match stop {
+                    "eos" | "extra_eos" => "stop",
+                    other => other,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_gate_matches_sampler_temperature_defaults_and_threshold() {
+        for temperature in [
+            None,
+            Some(0.7),
+            Some(0.0),
+            Some(1e-7),
+            Some(crate::sampling::GREEDY_TEMPERATURE_EPS as f64),
+        ] {
+            let params = greedy_params(|cfg| {
+                cfg.temperature = temperature;
+                cfg.top_k = Some(1);
+                cfg.max_consecutive_tokens = Some(0);
+                cfg.max_ngram_repeats = Some(0);
+            });
+            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut step = PipelinedMockStep::new(vec![7], 16);
+            drive(&mut step, 3, &params, &mut tracker, 3, 15, &[]).unwrap();
+            let greedy = crate::sampling::is_greedy_temperature(temperature.unwrap_or(1.0));
+            assert_eq!(step.ledger.contains(&"lazy_forward"), greedy);
+        }
+        let mut params = greedy_params(|_| {});
+        params.sampling_config = None;
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = PipelinedMockStep::new(vec![7], 16);
+        drive(&mut step, 3, &params, &mut tracker, 3, 15, &[]).unwrap();
+        assert!(!step.ledger.contains(&"lazy_forward"));
     }
 
     /// Pipelined-arm parity on an EOS exit: the submit-ahead drive

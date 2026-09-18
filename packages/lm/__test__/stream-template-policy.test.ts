@@ -13,7 +13,7 @@ vi.mock('@mlx-node/core', async (importOriginal) => ({
   },
 }));
 
-import { makeStreamingModel } from '../src/stream.js';
+import { K2HorizonModel, makeStreamingModel } from '../src/stream.js';
 
 class NativeStreamingStub {
   static async load(_modelPath: string): Promise<NativeStreamingStub> {
@@ -116,6 +116,20 @@ describe('makeStreamingModel template content policy', () => {
       undefined,
       'low',
     );
+  });
+
+  it.each([
+    ['none', 'low'],
+    ['minimal', 'low'],
+    ['low', 'low'],
+    ['medium', 'medium'],
+    ['high', 'high'],
+    ['xhigh', 'high'],
+    ['max', 'high'],
+    [undefined, undefined],
+    ['bogus', undefined],
+  ] as const)('normalizes K2 reasoning effort %s to %s', (effort, expected) => {
+    expect(K2HorizonModel.prototype.normalizeReasoningEffort(effort)).toBe(expected);
   });
 
   it('uses the native asset directory after a direct GGUF load', async () => {

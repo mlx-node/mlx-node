@@ -186,6 +186,14 @@ impl K2HorizonConfig {
                 "k2_horizon config: unsupported rope_type '{rope_type}' (only 'default' is implemented)"
             )));
         }
+        if self.use_block_paged_cache.unwrap_or(true)
+            && let Some(block_size) = self.paged_block_size
+            && ![8, 16, 32].contains(&block_size)
+        {
+            return Err(napi::Error::from_reason(format!(
+                "k2_horizon config: paged_block_size ({block_size}) must be 8, 16, or 32"
+            )));
+        }
         Ok(())
     }
 }
@@ -258,6 +266,36 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_paged_block_size_before_pool_sizing() {
+        let mut cfg: K2HorizonConfig = serde_json::from_str(
+            r#"{"vocab_size": 8, "hidden_size": 8, "num_hidden_layers": 1,
+                "num_attention_heads": 1, "num_key_value_heads": 1,
+                "intermediate_size": 8, "max_position_embeddings": 8}"#,
+        )
+        .unwrap();
+        for enabled in [None, Some(true), Some(false)] {
+            cfg.use_block_paged_cache = enabled;
+            for size in [None, Some(8), Some(16), Some(32)] {
+                cfg.paged_block_size = size;
+                cfg.validate().unwrap();
+            }
+            for size in [0, 1, 7, 64] {
+                cfg.paged_block_size = Some(size);
+                if enabled == Some(false) {
+                    cfg.validate().unwrap();
+                } else {
+                    assert!(
+                        cfg.validate()
+                            .unwrap_err()
+                            .reason
+                            .contains("paged_block_size")
+                    );
+                }
+            }
+        }
     }
 
     #[test]

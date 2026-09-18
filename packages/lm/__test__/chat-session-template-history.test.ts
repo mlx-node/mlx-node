@@ -2,7 +2,7 @@ import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult, ToolDefinitio
 import { describe, expect, it } from 'vitest';
 
 import { ChatSession, type SessionCapableModel } from '../src/chat-session.js';
-import type { ChatStreamEvent } from '../src/stream.js';
+import { K2HorizonModel, type ChatStreamEvent } from '../src/stream.js';
 
 type TestChatResult = ChatResult & { publicRawText?: string };
 
@@ -96,10 +96,7 @@ class RecordingModel implements SessionCapableModel {
     return this.nextStartStream();
   }
 
-  chatStreamSessionContinue(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-  ): AsyncGenerator<ChatStreamEvent> {
+  chatStreamSessionContinue(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
     this.continueStreamCalls.push({ messages, config });
     return this.nextContinueStream();
   }
@@ -130,6 +127,12 @@ class RecordingModel implements SessionCapableModel {
     const run = this.continueStreamRuns.shift() ?? [];
     if (run instanceof Error) throw run;
     for (const event of run) yield event;
+  }
+}
+
+class K2RecordingModel extends RecordingModel {
+  normalizeReasoningEffort(effort: string | undefined): string | undefined {
+    return K2HorizonModel.prototype.normalizeReasoningEffort(effort);
   }
 }
 
@@ -252,6 +255,177 @@ describe('ChatSession template-rendered continuation history', () => {
       {
         role: 'assistant',
         content: 'first',
+        reasoningContent: 'private chain',
+        thinkingEnabled: true,
+      },
+      { role: 'user', content: 'two' },
+    ]);
+  });
+
+  it.each([undefined, 0, 4])(
+    'normalizes K2 none effort while retaining hidden sync history at budget %s',
+    async (thinkingTokenBudget) => {
+      const model = new K2RecordingModel();
+      model.results.push(
+        chatResult({
+          text: 'first',
+          thinking: 'private chain',
+          rawText: '<ifm|think_faster>private chain</ifm|think_faster>first',
+          publicRawText: 'first',
+        }),
+        chatResult({ text: 'second', thinking: 'next chain', publicRawText: 'second' }),
+      );
+      const session = new ChatSession(model);
+      const config = Object.freeze({ reasoningEffort: 'none' as const, thinkingTokenBudget });
+
+      const first = await session.send('one', { config });
+      await session.send('two', { config });
+
+      expect(model.startCalls[0]?.config).toMatchObject({
+        reasoningEffort: 'low',
+        includeReasoning: true,
+        thinkingTokenBudget,
+      });
+      expect(model.continueCalls[0]?.config).toMatchObject({
+        reasoningEffort: 'low',
+        includeReasoning: true,
+        thinkingTokenBudget,
+      });
+      expect(config.reasoningEffort).toBe('none');
+      expect('includeReasoning' in config).toBe(false);
+      expect(config.thinkingTokenBudget).toBe(thinkingTokenBudget);
+      expect(first.thinking).toBeUndefined();
+      expect(first.rawText).toBe('first');
+      expect(model.continueCalls[0]?.messages).toEqual([
+        { role: 'user', content: 'one' },
+        {
+          role: 'assistant',
+          content: 'first',
+          reasoningContent: 'private chain',
+          thinkingEnabled: true,
+        },
+        { role: 'user', content: 'two' },
+      ]);
+
+      const replayModel = new K2RecordingModel();
+      replayModel.results.push(chatResult({ text: 'replayed', thinking: 'replay chain', publicRawText: 'replayed' }));
+      const replaySession = new ChatSession(replayModel);
+      replaySession.primeHistory(model.continueCalls[0]!.messages);
+      await replaySession.startFromHistory(config);
+      expect(replayModel.startCalls[0]?.messages[1]).toEqual({
+        role: 'assistant',
+        content: 'first',
+        reasoningContent: 'private chain',
+        thinkingEnabled: true,
+      });
+      expect(replayModel.startCalls[0]?.config).toMatchObject({
+        reasoningEffort: 'low',
+        includeReasoning: true,
+        thinkingTokenBudget,
+      });
+    },
+  );
+
+  it('keeps ordinary none effort suppressed without K2 normalization', async () => {
+    const model = new RecordingModel();
+    model.results.push(
+      chatResult({
+        text: 'first',
+        thinking: 'private chain',
+        rawText: '<think>private chain</think>first',
+        publicRawText: 'first',
+      }),
+    );
+    const session = new ChatSession(model);
+    const config = Object.freeze({ reasoningEffort: 'none' as const });
+
+    const result = await session.send('one', { config });
+
+    expect(model.startCalls[0]?.config?.reasoningEffort).toBe('none');
+    expect(model.startCalls[0]?.config?.includeReasoning).toBeUndefined();
+    expect(result.thinking).toBeUndefined();
+    expect(result.rawText).toBe('first');
+  });
+
+  it('keeps explicit K2 reasoning visibility while normalizing none to low', async () => {
+    const model = new K2RecordingModel();
+    model.results.push(
+      chatResult({
+        text: 'first',
+        thinking: 'private chain',
+        rawText: '<ifm|think_faster>private chain</ifm|think_faster>first',
+      }),
+    );
+    const session = new ChatSession(model);
+
+    const result = await session.send('one', {
+      config: { reasoningEffort: 'none', includeReasoning: true },
+    });
+
+    expect(model.startCalls[0]?.config).toMatchObject({
+      reasoningEffort: 'low',
+      includeReasoning: true,
+    });
+    expect(result.thinking).toBe('private chain');
+    expect(result.rawText).toBe('<ifm|think_faster>private chain</ifm|think_faster>first');
+  });
+
+  it('filters K2 none-effort stream reasoning while retaining replay history', async () => {
+    const model = new K2RecordingModel();
+    model.startStreamRuns.push([
+      { text: 'private chain', done: false, isReasoning: true },
+      { text: 'answer', done: false, isReasoning: false },
+      {
+        text: 'answer',
+        done: true,
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: 'private chain',
+        thinkingEnabled: true,
+        numTokens: 4,
+        promptTokens: 10,
+        reasoningTokens: 2,
+        rawText: '<ifm|think_faster>private chain</ifm|think_faster>answer',
+        publicRawText: 'answer',
+        textAuthoritative: true,
+      },
+    ]);
+    model.results.push(chatResult({ text: 'next', thinking: undefined }));
+    const session = new ChatSession(model);
+    const config = Object.freeze({ reasoningEffort: 'none' as const });
+
+    const events: ChatStreamEvent[] = [];
+    for await (const event of session.sendStream('one', { config })) {
+      events.push(event);
+    }
+    await session.send('two');
+
+    expect(events).toEqual([
+      { text: 'answer', done: false, isReasoning: false },
+      {
+        text: 'answer',
+        done: true,
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: null,
+        thinkingEnabled: true,
+        numTokens: 4,
+        promptTokens: 10,
+        reasoningTokens: 2,
+        rawText: 'answer',
+        publicRawText: 'answer',
+        textAuthoritative: true,
+      },
+    ]);
+    expect(model.startStreamCalls[0]?.config).toMatchObject({
+      reasoningEffort: 'low',
+      includeReasoning: true,
+    });
+    expect(model.continueCalls[0]?.messages).toEqual([
+      { role: 'user', content: 'one' },
+      {
+        role: 'assistant',
+        content: 'answer',
         reasoningContent: 'private chain',
         thinkingEnabled: true,
       },

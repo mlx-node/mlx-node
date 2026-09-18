@@ -797,7 +797,24 @@ export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, FAMILY_ROWS.l
 export class NemotronHModel extends makeStreamingModel(NemotronHModelNative, FAMILY_ROWS.nemotron_h.streamOpts) {}
 
 /** K2-Horizon model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
-export class K2HorizonModel extends makeStreamingModel(K2HorizonModelNative, FAMILY_ROWS.k2_horizon.streamOpts) {}
+export class K2HorizonModel extends makeStreamingModel(K2HorizonModelNative, FAMILY_ROWS.k2_horizon.streamOpts) {
+  normalizeReasoningEffort(effort: string | undefined): string | undefined {
+    switch (effort) {
+      case 'none':
+      case 'minimal':
+      case 'low':
+        return 'low';
+      case 'medium':
+        return 'medium';
+      case 'high':
+      case 'xhigh':
+      case 'max':
+        return 'high';
+      default:
+        return undefined;
+    }
+  }
+}
 
 /** Gemma4 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
 export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, FAMILY_ROWS.gemma4.streamOpts) {}
