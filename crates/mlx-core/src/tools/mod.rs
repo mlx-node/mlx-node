@@ -9,6 +9,7 @@
 
 use napi_derive::napi;
 use serde_json::Value;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 /// Structured tool call with parsed arguments
@@ -567,7 +568,7 @@ impl<'a> PyLiteralParser<'a> {
         if reserved_ident(first.as_bytes()) {
             return Err(());
         }
-        let mut name = first.to_string();
+        let mut name: String = first.nfkc().collect();
         loop {
             self.skip_ws();
             if self.peek() != Some(b'.') {
@@ -579,7 +580,7 @@ impl<'a> PyLiteralParser<'a> {
                 return Err(());
             }
             name.push('.');
-            name.push_str(seg);
+            name.extend(seg.nfkc());
         }
         Ok(name)
     }
@@ -921,6 +922,36 @@ impl<'a> PyLiteralParser<'a> {
                 _ => false,
             }
         }
+        fn enter_target_receiver(
+            depth: usize,
+            island_stack: &mut Vec<usize>,
+            target_group_depths: &mut Vec<usize>,
+            target_star_depths: &mut Vec<usize>,
+            target_comma_depths: &mut Vec<usize>,
+            target_unassignable_depths: &mut Vec<usize>,
+            target_receiver_depths: &mut Vec<usize>,
+        ) {
+            target_group_depths.retain(|&d| d != depth);
+            target_star_depths.retain(|&d| d != depth);
+            target_comma_depths.retain(|&d| d != depth);
+            target_unassignable_depths.retain(|&d| d != depth);
+            island_stack.push(depth - 1);
+            target_receiver_depths.push(depth);
+        }
+        fn enter_direct_target_receiver(
+            depth: usize,
+            island_stack: &mut Vec<usize>,
+            target_star_depths: &mut Vec<usize>,
+            target_comma_depths: &mut Vec<usize>,
+            target_unassignable_depths: &mut Vec<usize>,
+            target_direct_receiver_depths: &mut Vec<usize>,
+        ) {
+            target_star_depths.retain(|&d| d != depth);
+            target_comma_depths.retain(|&d| d != depth);
+            target_unassignable_depths.retain(|&d| d != depth);
+            island_stack.push(depth);
+            target_direct_receiver_depths.push(depth);
+        }
         // `not` consumed as an operator (`x not in y`): `in`/`is` may follow.
         let mut after_not_op = false;
         // Ternary `x if y else z` needs its `else`: `a if b` is a
@@ -939,6 +970,12 @@ impl<'a> PyLiteralParser<'a> {
         // Recorded as the stack depth at which they were pushed; inside
         // them the target grammar does not apply.
         let mut island_stack: Vec<usize> = Vec::new();
+        let mut target_group_depths: Vec<usize> = Vec::new();
+        let mut target_star_depths: Vec<usize> = Vec::new();
+        let mut target_comma_depths: Vec<usize> = Vec::new();
+        let mut target_unassignable_depths: Vec<usize> = Vec::new();
+        let mut target_receiver_depths: Vec<usize> = Vec::new();
+        let mut target_direct_receiver_depths: Vec<usize> = Vec::new();
         // A `for` at top level is a genexpr — valid only as the sole
         // argument, so a `,` boundary after it is a SyntaxError.
         let mut top_genexpr = false;
@@ -986,6 +1023,9 @@ impl<'a> PyLiteralParser<'a> {
         // trailing comma.
         let mut dict_key_next: Vec<usize> = Vec::new();
         let mut slice_colons: Vec<(usize, u8)> = Vec::new();
+        let mut await_operand = false;
+        let mut yield_depths: Vec<usize> = Vec::new();
+        let mut yield_from_depths: Vec<usize> = Vec::new();
         // `*a`/`**a` unpacking is legal only at an element start — after
         // `,`, a bracket open, or the expression start. After an
         // operator, `:`, `=`, or a unary prefix it is a SyntaxError
@@ -1010,7 +1050,11 @@ impl<'a> PyLiteralParser<'a> {
             // literals, and calls are all SyntaxErrors (`[x for x + y
             // in z]`). A subscript island suspends the target grammar
             // until it closes (`for a[x + 1] in` is valid).
-            let strict_target = !for_depths.is_empty() && island_stack.is_empty();
+            let strict_target = for_depths.last().is_some_and(|target_depth| {
+                island_stack
+                    .last()
+                    .is_none_or(|island_depth| target_depth > island_depth)
+            });
             match b {
                 b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
                 // Top-level argument boundary — valid only after an operand
@@ -1043,37 +1087,161 @@ impl<'a> PyLiteralParser<'a> {
                             }
                             return Err(());
                         }
+                        if await_operand
+                            && !matches!(b, b'(' | b'[' | b'{' | b'\'' | b'"' | b'.')
+                            && !b.is_ascii_digit()
+                            && !ident_char_at(self.s, self.pos, true)
+                        {
+                            return Err(());
+                        }
                         match b {
                             // A `for` target admits only names, `*` starred
                             // items, and `(`/`[` target groups — literals,
                             // unary ops, `{}`, and every other first are
                             // SyntaxErrors.
                             _ if strict_target => match b {
+                                _ if !target_group_depths.contains(&stack.len())
+                                    && (matches!(b, b'\'' | b'"' | b'{' | b'.')
+                                        || b.is_ascii_digit()) =>
+                                {
+                                    enter_direct_target_receiver(
+                                        stack.len(),
+                                        &mut island_stack,
+                                        &mut target_star_depths,
+                                        &mut target_comma_depths,
+                                        &mut target_unassignable_depths,
+                                        &mut target_direct_receiver_depths,
+                                    );
+                                    need_ctx = NeedCtx::Expr;
+                                    continue;
+                                }
+                                _ if target_group_depths.contains(&stack.len())
+                                    && !matches!(b, b'*' | b'(' | b'[' | b')' | b']')
+                                    && !ident_char_at(self.s, self.pos, true) =>
+                                {
+                                    enter_target_receiver(
+                                        stack.len(),
+                                        &mut island_stack,
+                                        &mut target_group_depths,
+                                        &mut target_star_depths,
+                                        &mut target_comma_depths,
+                                        &mut target_unassignable_depths,
+                                        &mut target_receiver_depths,
+                                    );
+                                    need_ctx = NeedCtx::Expr;
+                                    continue;
+                                }
                                 b'*' => {
                                     if self.s.get(self.pos + 1) == Some(&b'*') {
                                         return Err(()); // `**a` is no target
                                     }
+                                    target_star_depths.push(stack.len());
                                     self.pos += 1;
                                 }
                                 b'(' | b'[' => {
                                     stack.push(b);
+                                    target_group_depths.push(stack.len());
                                     self.pos += 1;
+                                }
+                                b')' | b']' => {
+                                    let depth = stack.len();
+                                    let Some(&open) = stack.last() else {
+                                        return Err(());
+                                    };
+                                    let mut previous = self.pos;
+                                    while previous > 0
+                                        && matches!(
+                                            self.s[previous - 1],
+                                            b' ' | b'\t' | b'\n' | b'\r'
+                                        )
+                                    {
+                                        previous -= 1;
+                                    }
+                                    let empty = previous > 0
+                                        && matches!(
+                                            (open, self.s[previous - 1]),
+                                            (b'(', b'(') | (b'[', b'[')
+                                        );
+                                    if !target_group_depths.contains(&depth)
+                                        || !close_match(open, b)
+                                        || (!empty && !target_comma_depths.contains(&depth))
+                                    {
+                                        return Err(());
+                                    }
+                                    stack.pop();
+                                    self.pos += 1;
+                                    target_group_depths.retain(|&d| d != depth);
+                                    target_star_depths.retain(|&d| d != depth);
+                                    target_comma_depths.retain(|&d| d != depth);
+                                    target_unassignable_depths.retain(|&d| d != depth);
+                                    target_unassignable_depths.retain(|&d| d != stack.len());
+                                    st = St::Have;
+                                    last_str = false;
+                                    prefix_end = usize::MAX;
                                 }
                                 _ if ident_char_at(self.s, self.pos, true) => {
                                     let id_start = self.pos;
                                     self.pos = ident_end(self.s, self.pos);
-                                    if reserved_ident(&self.s[id_start..self.pos]) {
-                                        return Err(());
+                                    let id = &self.s[id_start..self.pos];
+                                    let depth = stack.len();
+                                    if id == b"in"
+                                        && for_depths.last() == Some(&depth)
+                                        && target_comma_depths.contains(&depth)
+                                    {
+                                        for_depths.pop();
+                                        target_group_depths.retain(|&d| d < depth);
+                                        target_star_depths.retain(|&d| d < depth);
+                                        target_comma_depths.retain(|&d| d < depth);
+                                        target_unassignable_depths.retain(|&d| d < depth);
+                                        st = St::Need;
+                                        need_ctx = NeedCtx::Restricted;
+                                    } else {
+                                        let direct_receiver = !target_group_depths.contains(&depth)
+                                            && (matches!(id, b"True" | b"False" | b"None")
+                                                || (string_prefix(id)
+                                                    && matches!(self.peek(), Some(b'\'' | b'"'))));
+                                        if direct_receiver {
+                                            self.pos = id_start;
+                                            enter_direct_target_receiver(
+                                                depth,
+                                                &mut island_stack,
+                                                &mut target_star_depths,
+                                                &mut target_comma_depths,
+                                                &mut target_unassignable_depths,
+                                                &mut target_direct_receiver_depths,
+                                            );
+                                            need_ctx = NeedCtx::Expr;
+                                            continue;
+                                        }
+                                        if reserved_ident(id) {
+                                            if !target_group_depths.contains(&depth) {
+                                                return Err(());
+                                            }
+                                            self.pos = id_start;
+                                            enter_target_receiver(
+                                                depth,
+                                                &mut island_stack,
+                                                &mut target_group_depths,
+                                                &mut target_star_depths,
+                                                &mut target_comma_depths,
+                                                &mut target_unassignable_depths,
+                                                &mut target_receiver_depths,
+                                            );
+                                            need_ctx = NeedCtx::Expr;
+                                            continue;
+                                        }
+                                        target_unassignable_depths.retain(|&d| d != depth);
+                                        st = St::Have;
+                                        last_str = false;
+                                        prefix_end = usize::MAX;
                                     }
-                                    st = St::Have;
-                                    last_str = false;
-                                    prefix_end = usize::MAX;
                                 }
                                 _ => return Err(()),
                             },
                             b'(' | b'[' | b'{' => {
                                 stack.push(b);
                                 self.pos += 1;
+                                await_operand = false;
                                 elem_start = true;
                                 need_ctx = NeedCtx::Expr;
                             }
@@ -1110,10 +1278,38 @@ impl<'a> PyLiteralParser<'a> {
                                         if for_depths.last() == Some(&(stack.len() + 1)) {
                                             return Err(());
                                         }
-                                        if o == SUBSCRIPT
+                                        let closed_depth = stack.len() + 1;
+                                        if target_receiver_depths.contains(&closed_depth)
                                             && island_stack.last() == Some(&stack.len())
                                         {
                                             island_stack.pop();
+                                            target_receiver_depths.retain(|&d| d != closed_depth);
+                                            if !target_unassignable_depths.contains(&stack.len()) {
+                                                target_unassignable_depths.push(stack.len());
+                                            }
+                                        } else if matches!(o, SUBSCRIPT | CALLPAREN)
+                                            && target_direct_receiver_depths.contains(&stack.len())
+                                            && island_stack.last() == Some(&stack.len())
+                                        {
+                                            if o == SUBSCRIPT {
+                                                island_stack.pop();
+                                                target_direct_receiver_depths
+                                                    .retain(|&d| d != stack.len());
+                                            }
+                                        } else if matches!(o, SUBSCRIPT | CALLPAREN)
+                                            && island_stack.last() == Some(&stack.len())
+                                        {
+                                            island_stack.pop();
+                                            if o == CALLPAREN {
+                                                if !target_unassignable_depths
+                                                    .contains(&stack.len())
+                                                {
+                                                    target_unassignable_depths.push(stack.len());
+                                                }
+                                            } else {
+                                                target_unassignable_depths
+                                                    .retain(|&d| d != stack.len());
+                                            }
                                         }
                                         self.pos += 1;
                                         st = St::Have;
@@ -1125,6 +1321,8 @@ impl<'a> PyLiteralParser<'a> {
                                         comma_depths.retain(|&d| d <= stack.len());
                                         dict_key_next.retain(|&d| d <= stack.len());
                                         slice_colons.retain(|(d, _)| *d <= stack.len());
+                                        yield_depths.retain(|&d| d <= stack.len());
+                                        yield_from_depths.retain(|&d| d <= stack.len());
                                         kwarg_seen_depths.retain(|&d| d <= stack.len());
                                         kw_unpack_depths.retain(|&d| d <= stack.len());
                                         kwarg_elem_depths.retain(|&d| d <= stack.len());
@@ -1136,6 +1334,7 @@ impl<'a> PyLiteralParser<'a> {
                             b'\'' | b'"' => {
                                 self.skip_quoted(false, false, false)?;
                                 st = St::Have;
+                                await_operand = false;
                                 last_str = true;
                                 prefix_end = usize::MAX;
                             }
@@ -1246,6 +1445,7 @@ impl<'a> PyLiteralParser<'a> {
                                 } else {
                                     return Err(());
                                 }
+                                await_operand = false;
                                 last_str = false;
                                 prefix_end = usize::MAX;
                             }
@@ -1274,18 +1474,81 @@ impl<'a> PyLiteralParser<'a> {
                                 let id_start = self.pos;
                                 self.pos = ident_end(self.s, self.pos);
                                 let id = &self.s[id_start..self.pos];
-                                if reject_keyword(id) {
+                                let mut next = self.pos;
+                                while matches!(self.s.get(next), Some(b' ' | b'\t' | b'\n' | b'\r'))
+                                {
+                                    next += 1;
+                                }
+                                let nested_kwarg = elem_start
+                                    && stack.last() == Some(&CALLPAREN)
+                                    && self.s.get(next) == Some(&b'=')
+                                    && self.s.get(next + 1) != Some(&b'=');
+                                if !nested_kwarg && id == b"await" {
+                                    if await_operand {
+                                        return Err(());
+                                    }
+                                    await_operand = true;
+                                    elem_start = false;
+                                    need_ctx = NeedCtx::Restricted;
+                                    continue;
+                                }
+                                if !nested_kwarg && id == b"yield" {
+                                    if await_operand {
+                                        return Err(());
+                                    }
+                                    let mut before = id_start;
+                                    while before > 0
+                                        && matches!(
+                                            self.s[before - 1],
+                                            b' ' | b'\t' | b'\n' | b'\r'
+                                        )
+                                    {
+                                        before -= 1;
+                                    }
+                                    if stack.last() != Some(&b'(')
+                                        || before == 0
+                                        || self.s[before - 1] != b'('
+                                    {
+                                        return Err(());
+                                    }
+                                    let mut next = self.pos;
+                                    while matches!(
+                                        self.s.get(next),
+                                        Some(b' ' | b'\t' | b'\n' | b'\r')
+                                    ) {
+                                        next += 1;
+                                    }
+                                    let next_end = ident_end(self.s, next);
+                                    let yield_from =
+                                        next_end > next && &self.s[next..next_end] == b"from";
+                                    yield_depths.push(stack.len());
+                                    if yield_from {
+                                        self.pos = next_end;
+                                        yield_from_depths.push(stack.len());
+                                    }
+                                    if !yield_from && self.s.get(next) == Some(&b')') {
+                                        st = St::Have;
+                                    } else {
+                                        st = St::Need;
+                                        elem_start = !yield_from;
+                                        need_ctx = NeedCtx::Expr;
+                                    }
+                                    last_str = false;
+                                    prefix_end = usize::MAX;
+                                    continue;
+                                }
+                                if !nested_kwarg && reject_keyword(id) {
                                     return Err(());
                                 }
                                 match id {
-                                    b"not" => {
+                                    b"not" if !nested_kwarg => {
                                         if need_ctx == NeedCtx::Restricted {
                                             return Err(());
                                         }
                                         elem_start = false;
                                         need_ctx = NeedCtx::Inversion;
                                     } // unary — still need an operand
-                                    b"lambda" => {
+                                    b"lambda" if !nested_kwarg => {
                                         if need_ctx != NeedCtx::Expr
                                             || comp_depths.contains(&stack.len())
                                             || pending_ifs.contains(&stack.len())
@@ -1306,6 +1569,7 @@ impl<'a> PyLiteralParser<'a> {
                                     }
                                     _ => {
                                         st = St::Have;
+                                        await_operand = false;
                                         last_str = false;
                                         let is_string_prefix = string_prefix(id);
                                         prefix_end = if is_string_prefix {
@@ -1421,6 +1685,7 @@ impl<'a> PyLiteralParser<'a> {
                                     return Err(());
                                 }
                                 st = St::Have;
+                                await_operand = false;
                                 last_str = false;
                                 prefix_end = usize::MAX;
                             }
@@ -1428,9 +1693,23 @@ impl<'a> PyLiteralParser<'a> {
                         }
                     }
                     St::Have => match b {
+                        _ if target_direct_receiver_depths.contains(&stack.len())
+                            && !matches!(b, b'(' | b'[' | b'.' | b'\'' | b'"') =>
+                        {
+                            return Err(());
+                        }
                         b')' | b']' | b'}' => match stack.pop() {
                             Some(o) if close_match(o, b) => {
                                 let d = stack.len() + 1; // the popped bracket's inner depth
+                                let target_group = target_group_depths.contains(&d);
+                                let target_receiver = target_receiver_depths.contains(&d);
+                                if target_group
+                                    && o == b'('
+                                    && target_star_depths.contains(&d)
+                                    && !target_comma_depths.contains(&d)
+                                {
+                                    return Err(());
+                                }
                                 // `(a if b)` closes with the ternary's
                                 // `else` still owed — a SyntaxError. So
                                 // does a `for` whose `in` never arrived
@@ -1444,6 +1723,7 @@ impl<'a> PyLiteralParser<'a> {
                                     && starred_depths
                                         .iter()
                                         .any(|&(sd, brk)| sd == d && brk == b'(')
+                                    && !yield_depths.contains(&d)
                                     && !comma_depths.contains(&d)
                                 {
                                     return Err(());
@@ -1462,8 +1742,45 @@ impl<'a> PyLiteralParser<'a> {
                                 {
                                     return Err(());
                                 }
-                                if o == SUBSCRIPT && island_stack.last() == Some(&stack.len()) {
+                                if target_receiver && island_stack.last() == Some(&stack.len()) {
                                     island_stack.pop();
+                                    target_receiver_depths.retain(|&x| x != d);
+                                    if !target_unassignable_depths.contains(&stack.len()) {
+                                        target_unassignable_depths.push(stack.len());
+                                    }
+                                } else if matches!(o, SUBSCRIPT | CALLPAREN)
+                                    && target_direct_receiver_depths.contains(&stack.len())
+                                    && island_stack.last() == Some(&stack.len())
+                                {
+                                    if o == SUBSCRIPT {
+                                        island_stack.pop();
+                                        target_direct_receiver_depths.retain(|&x| x != stack.len());
+                                    }
+                                } else if matches!(o, SUBSCRIPT | CALLPAREN)
+                                    && island_stack.last() == Some(&stack.len())
+                                {
+                                    island_stack.pop();
+                                    if o == CALLPAREN {
+                                        if !target_unassignable_depths.contains(&stack.len()) {
+                                            target_unassignable_depths.push(stack.len());
+                                        }
+                                    } else {
+                                        target_unassignable_depths.retain(|&x| x != stack.len());
+                                    }
+                                }
+                                if target_group {
+                                    let unassignable = target_unassignable_depths.contains(&d);
+                                    target_group_depths.retain(|&x| x != d);
+                                    target_star_depths.retain(|&x| x != d);
+                                    target_comma_depths.retain(|&x| x != d);
+                                    target_unassignable_depths.retain(|&x| x != d);
+                                    if unassignable {
+                                        if !target_unassignable_depths.contains(&stack.len()) {
+                                            target_unassignable_depths.push(stack.len());
+                                        }
+                                    } else {
+                                        target_unassignable_depths.retain(|&x| x != stack.len());
+                                    }
                                 }
                                 self.pos += 1;
                                 comp_depths.retain(|&x| x <= stack.len());
@@ -1472,6 +1789,8 @@ impl<'a> PyLiteralParser<'a> {
                                 comma_depths.retain(|&x| x <= stack.len());
                                 dict_key_next.retain(|&x| x <= stack.len());
                                 slice_colons.retain(|(x, _)| *x <= stack.len());
+                                yield_depths.retain(|&x| x <= stack.len());
+                                yield_from_depths.retain(|&x| x <= stack.len());
                                 kwarg_seen_depths.retain(|&x| x <= stack.len());
                                 kw_unpack_depths.retain(|&x| x <= stack.len());
                                 kwarg_elem_depths.retain(|&x| x <= stack.len());
@@ -1485,8 +1804,32 @@ impl<'a> PyLiteralParser<'a> {
                         // SyntaxErrors (`[x for x + y in z]`).
                         _ if strict_target => match b {
                             b',' => {
+                                if target_unassignable_depths.contains(&stack.len()) {
+                                    if !target_group_depths.contains(&stack.len()) {
+                                        return Err(());
+                                    }
+                                    enter_target_receiver(
+                                        stack.len(),
+                                        &mut island_stack,
+                                        &mut target_group_depths,
+                                        &mut target_star_depths,
+                                        &mut target_comma_depths,
+                                        &mut target_unassignable_depths,
+                                        &mut target_receiver_depths,
+                                    );
+                                    continue;
+                                }
+                                target_comma_depths.push(stack.len());
                                 self.pos += 1;
                                 st = St::Need;
+                            }
+                            b'(' => {
+                                island_stack.push(stack.len());
+                                stack.push(CALLPAREN);
+                                self.pos += 1;
+                                st = St::Need;
+                                elem_start = true;
+                                need_ctx = NeedCtx::Expr;
                             }
                             b'[' => {
                                 // `a[i]` — a subscript target; its value is
@@ -1506,19 +1849,40 @@ impl<'a> PyLiteralParser<'a> {
                                     if reserved_ident(&self.s[id_start..self.pos]) {
                                         return Err(());
                                     }
+                                    target_unassignable_depths.retain(|&d| d != stack.len());
                                 } else {
                                     return Err(());
                                 }
+                            }
+                            _ if target_group_depths.contains(&stack.len()) => {
+                                enter_target_receiver(
+                                    stack.len(),
+                                    &mut island_stack,
+                                    &mut target_group_depths,
+                                    &mut target_star_depths,
+                                    &mut target_comma_depths,
+                                    &mut target_unassignable_depths,
+                                    &mut target_receiver_depths,
+                                );
+                                continue;
                             }
                             _ if ident_char_at(self.s, self.pos, true) => {
                                 let id_start = self.pos;
                                 self.pos = ident_end(self.s, self.pos);
                                 // `in` completes the target at the `for`'s
                                 // own depth; anything else is a SyntaxError.
+                                let depth = stack.len();
                                 if &self.s[id_start..self.pos] == b"in"
-                                    && for_depths.last() == Some(&stack.len())
+                                    && for_depths.last() == Some(&depth)
                                 {
+                                    if target_unassignable_depths.contains(&depth) {
+                                        return Err(());
+                                    }
                                     for_depths.pop();
+                                    target_group_depths.retain(|&d| d < depth);
+                                    target_star_depths.retain(|&d| d < depth);
+                                    target_comma_depths.retain(|&d| d < depth);
+                                    target_unassignable_depths.retain(|&d| d < depth);
                                     st = St::Need;
                                     need_ctx = NeedCtx::Restricted;
                                 } else {
@@ -1538,6 +1902,9 @@ impl<'a> PyLiteralParser<'a> {
                             need_ctx = NeedCtx::Expr;
                         }
                         b',' if !stack.is_empty() => {
+                            if yield_from_depths.contains(&stack.len()) {
+                                return Err(());
+                            }
                             // A comprehension is single-element — `[x for
                             // x in y, 2]` is a SyntaxError.
                             if comp_depths.contains(&stack.len()) {
@@ -1611,6 +1978,7 @@ impl<'a> PyLiteralParser<'a> {
                             }
                             let bare_name = p < id_end
                                 && ident_char_at(self.s, p, true)
+                                && !reserved_ident(&self.s[p..id_end])
                                 && (q == 0 || matches!(self.s[q - 1], b'(' | b',' | b'[' | b'{'));
                             if !bare_name {
                                 return Err(());
@@ -1673,6 +2041,12 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos = ident_end(self.s, id_start);
                                 if reject_keyword(&self.s[id_start..self.pos]) {
                                     return Err(());
+                                }
+                                if target_direct_receiver_depths.contains(&stack.len())
+                                    && island_stack.last() == Some(&stack.len())
+                                {
+                                    island_stack.pop();
+                                    target_direct_receiver_depths.retain(|&d| d != stack.len());
                                 }
                             }
                             _ => return Err(()),
@@ -1788,12 +2162,31 @@ impl<'a> PyLiteralParser<'a> {
                             let id_start = self.pos;
                             self.pos = ident_end(self.s, self.pos);
                             match &self.s[id_start..self.pos] {
+                                b"async" => {
+                                    let mut next = self.pos;
+                                    while matches!(
+                                        self.s.get(next),
+                                        Some(b' ' | b'\t' | b'\n' | b'\r')
+                                    ) {
+                                        next += 1;
+                                    }
+                                    let next_end = ident_end(self.s, next);
+                                    if next_end == next || &self.s[next..next_end] != b"for" {
+                                        return Err(());
+                                    }
+                                    self.pos = next;
+                                }
                                 b"and" | b"or" | b"is" => {
                                     st = St::Need;
                                     elem_start = false;
                                     need_ctx = NeedCtx::Inversion;
                                 }
                                 b"in" => {
+                                    if target_direct_receiver_depths.contains(&stack.len())
+                                        && for_depths.last() == Some(&stack.len())
+                                    {
+                                        return Err(());
+                                    }
                                     // Satisfies the innermost `for` at
                                     // this bracket depth; `in` inside
                                     // deeper brackets is a membership op.
@@ -1841,6 +2234,7 @@ impl<'a> PyLiteralParser<'a> {
                                     // key can't be a comp (`{k:v, x
                                     // for}`).
                                     if stack.last() == Some(&SUBSCRIPT)
+                                        || yield_depths.contains(&d)
                                         || starred_depths.iter().any(|&(sd, _)| sd == d)
                                         || comma_depths.contains(&d)
                                         || dict_key_next.contains(&d)
@@ -2614,7 +3008,7 @@ impl<'a> PyLiteralParser<'a> {
                 let save = self.pos;
                 let kw: Option<String> = match self.ident() {
                     Ok(id) => {
-                        let id = id.to_string();
+                        let id: String = id.nfkc().collect();
                         self.skip_ws();
                         if self.peek() == Some(b'=') && self.s.get(self.pos + 1) != Some(&b'=') {
                             self.pos += 1;
@@ -6138,6 +6532,112 @@ The weather in Tokyo is sunny."#;
     }
 
     #[test]
+    fn test_lfm2_tool_call_valid_control_flow_positionals_dropped() {
+        for inner in [
+            "f(await value, confirmed=True)",
+            "f(await helper(), confirmed=True)",
+            "f(value + await other, confirmed=True)",
+            "f(not await value, confirmed=True)",
+            "f(await (lambda: value), confirmed=True)",
+            "f((yield), confirmed=True)",
+            "f((yield value), confirmed=True)",
+            "f((yield *values), confirmed=True)",
+            "f((yield lambda: value), confirmed=True)",
+            "f((yield from values), confirmed=True)",
+            "f([x async for x in values], confirmed=True)",
+            "f([await x for x in values], confirmed=True)",
+            "f((x async for x in values), confirmed=True)",
+            "f([x for x in values async for y in others], confirmed=True)",
+            "f([x async for *item in values], confirmed=True)",
+            "f([x async for *item, in values], confirmed=True)",
+            "f([x async for (*item,) in values], confirmed=True)",
+            "f([x async for factory().slot in values], confirmed=True)",
+            "f([x async for factory()[index] in values], confirmed=True)",
+            "f([x async for (factory()).slot in values], confirmed=True)",
+            "f([x async for [factory()].slot in values], confirmed=True)",
+            "f([x async for (left + right).slot in values], confirmed=True)",
+            "f([x async for (factory(),).slot in values], confirmed=True)",
+            "f([x async for [factory(), other].slot in values], confirmed=True)",
+            "f([x async for (await value)[index] in values], confirmed=True)",
+            "f([x async for (not value).slot in values], confirmed=True)",
+            "f([x async for (lambda: value).slot in values], confirmed=True)",
+            "f([x async for True.slot in values], confirmed=True)",
+            "f([x async for 1[index] in values], confirmed=True)",
+            "f([x async for {}.slot in values], confirmed=True)",
+            "f([x async for 's'.slot in values], confirmed=True)",
+            "f([x async for () in values], confirmed=True)",
+            "f([x async for [] in values], confirmed=True)",
+            "f([x async for [*item] in values], confirmed=True)",
+            "f([x async for *left, *right in values], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_malformed_control_flow_positionals_rejected() {
+        for inner in [
+            "f(await, confirmed=True)",
+            "f(await -value, confirmed=True)",
+            "f(await await value, confirmed=True)",
+            "f(yield value, confirmed=True)",
+            "f(yield from values, confirmed=True)",
+            "f((yield from values, other), confirmed=True)",
+            "f((yield value for value in values), confirmed=True)",
+            "f([x async for (*item) in values], confirmed=True)",
+            "f([x for (*item) in values], confirmed=True)",
+            "f([x async for factory() in values], confirmed=True)",
+            "f([x async for (factory()) in values], confirmed=True)",
+            "f([x async for [factory()] in values], confirmed=True)",
+            "f([q for cache[[z for factory() in values]] in rows], confirmed=True)",
+            "f([q for cache[[z for x + y in values]] in rows], confirmed=True)",
+            "f([q for cache[[z for True in values]] in rows], confirmed=True)",
+            "f([x for 1 + item.slot in values], confirmed=True)",
+            "f([x for True and item[index] in values], confirmed=True)",
+            "f(async, confirmed=True)",
+            "f([x async x in values], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_nested_reserved_kwargs_dropped() {
+        for inner in [
+            "f(helper(await=1), confirmed=True)",
+            "f(helper(from=1), confirmed=True)",
+            "f(helper(not=1), confirmed=True)",
+            "f(helper(lambda=1), confirmed=True)",
+            "f(helper(yield=1), confirmed=True)",
+            "f(helper(async=1), confirmed=True)",
+            "f(helper(True=1), confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
     fn test_lfm2_tool_call_malformed_positionals_rejected() {
         // Each of these is a SyntaxError to ast.parse — verbatim, no call.
         for inner in [
@@ -6223,18 +6723,21 @@ The weather in Tokyo is sunny."#;
             "f({k:v, k2}, x=1)",     // dict key missing its `:`
             "f(x for x in y, z=1)",  // a genexpr must be the sole arg
             "f(1:=2, confirmed=True)", // literal walrus target
-            "f(a.b:=2, x=1)",        // attribute walrus target
-            "f(x[0]:=2, x=1)",       // subscript walrus target
-            "f((x,y):=2, x=1)",      // tuple walrus target
-            "f(g():=2, x=1)",        // call walrus target
-            "f((x):=2, x=1)",        // parenthesized walrus target
-            "f(a+b:=2, x=1)",        // operator walrus target
-            "f(x=y:=2, x=1)",        // walrus after `=`
-            "f({k: v:=1}, x=1)",     // walrus as a dict value
-            "f(not x:=1, x=1)",      // walrus after `not`
+            "f(True:=2, confirmed=True)",
+            "f(False:=2, confirmed=True)",
+            "f(None:=2, confirmed=True)",
+            "f(a.b:=2, x=1)",                    // attribute walrus target
+            "f(x[0]:=2, x=1)",                   // subscript walrus target
+            "f((x,y):=2, x=1)",                  // tuple walrus target
+            "f(g():=2, x=1)",                    // call walrus target
+            "f((x):=2, x=1)",                    // parenthesized walrus target
+            "f(a+b:=2, x=1)",                    // operator walrus target
+            "f(x=y:=2, x=1)",                    // walrus after `=`
+            "f({k: v:=1}, x=1)",                 // walrus as a dict value
+            "f(not x:=1, x=1)",                  // walrus after `not`
             "f(helper(x=1, 2), confirmed=True)", // positional after kwarg
-            "f(helper(x=1, *a, b), x=1)", // positional after kwarg+star
-            "f(helper(*a, x=1, b), x=1)", // positional after kwarg, later star
+            "f(helper(x=1, *a, b), x=1)",        // positional after kwarg+star
+            "f(helper(*a, x=1, b), x=1)",        // positional after kwarg, later star
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -6296,6 +6799,23 @@ The weather in Tokyo is sunny."#;
             assert_eq!(calls.len(), 1, "{inner}");
             assert_eq!(calls[0].name, want, "{inner}");
         }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_nfkc_normalizes_identifiers() {
+        let input = "<|tool_call_start|>[K(x=1), a.K(y=2), ｆｏｒ(z=3)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].name, "K");
+        assert_eq!(calls[1].name, "a.K");
+        assert_eq!(calls[2].name, "for");
+
+        let input = "<|tool_call_start|>[f(K=1, K=2)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments.to_string(), "{\"K\":2}");
     }
 
     #[test]

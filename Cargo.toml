@@ -35,6 +35,7 @@ regex = "1.13"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 unicode-width = "0.2.2"
 unicode-ident = "1.0.24"
+unicode-normalization = "0.1.25"
 rust_xlsxwriter = "0.99.0"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
