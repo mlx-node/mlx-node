@@ -657,6 +657,13 @@ impl<'a> PyLiteralParser<'a> {
             Have,
             Lambda,
         }
+        #[derive(Clone, Copy, PartialEq)]
+        enum LambdaMarker {
+            None,
+            Star,
+            DoubleStar,
+            Slash,
+        }
         // Identifiers that can never appear where an operand is expected.
         fn reject_keyword(id: &[u8]) -> bool {
             matches!(
@@ -757,7 +764,7 @@ impl<'a> PyLiteralParser<'a> {
         // `lambda ,: x`, `lambda =x: y` are all SyntaxErrors. Default
         // expressions after `=` are scanned loosely like the rest.
         let mut param_start = false;
-        let mut saw_marker = false;
+        let mut lambda_marker = LambdaMarker::None;
         // A completed param name admits only `,` `=` or the ending `:` —
         // `lambda a b` / `lambda a.b` / `lambda a(` are SyntaxErrors.
         let mut param_done = false;
@@ -765,6 +772,8 @@ impl<'a> PyLiteralParser<'a> {
         let mut lambda_default_seen = false;
         let mut lambda_keyword_only = false;
         let mut param_has_default = false;
+        let mut lambda_positional_seen = false;
+        let mut lambda_bare_star_pending = false;
         // Implicit-concat / string-prefix tracking: a quote after an
         // operand is legal only directly glued to a prefix identifier
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
@@ -1052,10 +1061,12 @@ impl<'a> PyLiteralParser<'a> {
                                         lambda_depth = stack.len();
                                         param_start = true;
                                         param_done = false;
-                                        saw_marker = false;
+                                        lambda_marker = LambdaMarker::None;
                                         lambda_default_seen = false;
                                         lambda_keyword_only = false;
                                         param_has_default = false;
+                                        lambda_positional_seen = false;
+                                        lambda_bare_star_pending = false;
                                     }
                                     _ => {
                                         st = St::Have;
@@ -1578,6 +1589,15 @@ impl<'a> PyLiteralParser<'a> {
                         _ => return Err(()),
                     },
                     St::Lambda => match b {
+                        b':' if stack.len() == lambda_depth
+                            && (lambda_bare_star_pending
+                                || matches!(
+                                    lambda_marker,
+                                    LambdaMarker::Star | LambdaMarker::DoubleStar
+                                )) =>
+                        {
+                            return Err(());
+                        }
                         _ if param_done
                             && stack.len() == lambda_depth
                             && matches!(b, b',' | b':')
@@ -1594,7 +1614,7 @@ impl<'a> PyLiteralParser<'a> {
                             b',' => {
                                 param_start = true;
                                 param_done = false;
-                                saw_marker = false;
+                                lambda_marker = LambdaMarker::None;
                                 self.pos += 1;
                             }
                             b'=' => {
@@ -1642,11 +1662,17 @@ impl<'a> PyLiteralParser<'a> {
                             if stack.len() == lambda_depth {
                                 // `a,,b` — a `,` is only legal right after
                                 // a `*`/`/` marker or a name.
-                                if param_start && !saw_marker {
+                                if param_start
+                                    && matches!(
+                                        lambda_marker,
+                                        LambdaMarker::None | LambdaMarker::DoubleStar
+                                    )
+                                {
                                     return Err(());
                                 }
+                                lambda_bare_star_pending |= lambda_marker == LambdaMarker::Star;
                                 param_start = true;
-                                saw_marker = false;
+                                lambda_marker = LambdaMarker::None;
                             }
                             self.pos += 1;
                         }
@@ -1659,14 +1685,36 @@ impl<'a> PyLiteralParser<'a> {
                         }
                         b'=' | b'-' | b'+' | b'~' | b'.' => self.pos += 1,
                         b'*' | b'/' => {
-                            if param_start && stack.len() == lambda_depth {
-                                saw_marker = true;
-                                lambda_keyword_only |= b == b'*';
+                            if !param_start
+                                || stack.len() != lambda_depth
+                                || lambda_marker != LambdaMarker::None
+                            {
+                                return Err(());
+                            }
+                            if b == b'/' {
+                                if !lambda_positional_seen || lambda_keyword_only {
+                                    return Err(());
+                                }
+                                lambda_marker = LambdaMarker::Slash;
+                            } else {
+                                lambda_marker = if self.s.get(self.pos + 1) == Some(&b'*') {
+                                    self.pos += 1;
+                                    LambdaMarker::DoubleStar
+                                } else {
+                                    if lambda_keyword_only {
+                                        return Err(());
+                                    }
+                                    LambdaMarker::Star
+                                };
+                                lambda_keyword_only = true;
                             }
                             self.pos += 1;
                         }
                         _ if ident_char_at(self.s, self.pos, false) => {
                             if param_start && stack.len() == lambda_depth {
+                                if lambda_marker == LambdaMarker::Slash {
+                                    return Err(());
+                                }
                                 // Param names start with a letter/`_` and
                                 // can't be keywords — `lambda 1: x` and
                                 // `lambda for: x` are both SyntaxErrors.
@@ -1678,8 +1726,12 @@ impl<'a> PyLiteralParser<'a> {
                                 if reserved_ident(&self.s[id_start..self.pos]) {
                                     return Err(());
                                 }
+                                lambda_positional_seen |= !lambda_keyword_only;
+                                if lambda_marker == LambdaMarker::None {
+                                    lambda_bare_star_pending = false;
+                                }
                                 param_start = false;
-                                saw_marker = false;
+                                lambda_marker = LambdaMarker::None;
                                 param_done = true;
                                 param_has_default = false;
                             } else {
@@ -5130,6 +5182,57 @@ The weather in Tokyo is sunny."#;
             "f(lambda a=1,/,*,b: x, confirmed=True)",
             "f((lambda a=1: a) + (lambda b: b), confirmed=True)",
             "f(lambda a=1,b=(lambda c:c): b, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_incomplete_lambda_markers_rejected() {
+        for inner in [
+            "dangerous_action(lambda *: x, confirmed=True)",
+            "f(lambda /: x, confirmed=True)",
+            "f(lambda *,: x, confirmed=True)",
+            "f(lambda *,**kw: x, confirmed=True)",
+            "f(lambda **: x, confirmed=True)",
+            "f(lambda **,: x, confirmed=True)",
+            "f(lambda /,a: x, confirmed=True)",
+            "f(lambda a=1,*: x, confirmed=True)",
+            "f((lambda *: x), confirmed=True)",
+            "f(lambda a=(lambda /: x): a, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_markers_dropped() {
+        for inner in [
+            "f(lambda: x, confirmed=True)",
+            "f(lambda *,a: a, confirmed=True)",
+            "f(lambda *,a=1: a, confirmed=True)",
+            "f(lambda *,a,**kw: a, confirmed=True)",
+            "f(lambda *args: args, confirmed=True)",
+            "f(lambda **kw: kw, confirmed=True)",
+            "f(lambda *args,**kw: args, confirmed=True)",
+            "f(lambda a,/: a, confirmed=True)",
+            "f(lambda a,/,b: b, confirmed=True)",
+            "f(lambda a,/,*,b: b, confirmed=True)",
+            "f(lambda a=1,/,*,b=2: b, confirmed=True)",
+            "f((lambda *,a: a) + (lambda b,/: b), confirmed=True)",
+            "f(lambda a=(lambda *,b: b): a, confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
