@@ -731,6 +731,19 @@ describe('recoverSuppressedToolCallText', () => {
     expect(recoverSuppressedToolCallText(raw)).toBe('pre  mid  tail');
   });
 
+  it('strips echoed call bodies after an LFM2 block', () => {
+    // The model may repeat `[f()]<|tool_call_end|>` without a start
+    // sentinel — the echo body must not leak into recovered text.
+    const raw = '<|tool_call_start|>[f()]<|tool_call_end|>[f()]<|tool_call_end|>';
+    expect(recoverSuppressedToolCallText(raw)).toBe('');
+  });
+
+  it('strips multiple echoed bodies but keeps prose before a real block', () => {
+    const raw =
+      'pre <|tool_call_start|>[f()]<|tool_call_end|>[g()]<|tool_call_end|> mid <|tool_call_start|>[h()]<|tool_call_end|> tail';
+    expect(recoverSuppressedToolCallText(raw)).toBe('pre  mid  tail');
+  });
+
   it('strips an unclosed LFM2 block through end of text', () => {
     const raw = 'pre <|tool_call_start|>[f(x=1)]';
     expect(recoverSuppressedToolCallText(raw)).toBe('pre ');

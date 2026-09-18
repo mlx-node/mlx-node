@@ -31,6 +31,7 @@ mlx-paged-attn = { workspace = true }
 mlx-db = { workspace = true }
 sqlx = { workspace = true }
 unicode-width = { workspace = true }
+unicode-ident = { workspace = true }
 rust_xlsxwriter = { workspace = true }
 zip = { workspace = true }
 

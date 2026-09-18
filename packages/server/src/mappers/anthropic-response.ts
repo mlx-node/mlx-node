@@ -79,17 +79,27 @@ export function containsToolCallMarkup(rawText: string): boolean {
 }
 
 export function recoverSuppressedToolCallText(rawText: string): string {
-  return rawText
-    .replace(/<\|channel>[\s\S]*?(?:<channel\|>|$)/g, '')
-    .replace(/<channel\|>/g, '')
-    .replace(/<\|tool_call>[\s\S]*?(?:<tool_call\|>|$)/g, '')
-    .replace(/<tool_call>[\s\S]*?(?:<\/tool_call>|$)/g, '')
-    .replace(/<\|tool_response>[\s\S]*?(?:<tool_response\|>|$)/g, '')
-    .replace(/<\|tool>[\s\S]*?(?:<tool\|>|$)/g, '')
-    .replace(/<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>|<\|tool_call_start\|>[\s\S]*$/g, '')
-    .replace(/<\|tool_call_end\|>/g, '')
-    .replace(/<\|turn>[^\n]*(?:\n|$)/g, '')
-    .replace(/<turn\|>/g, '');
+  return (
+    rawText
+      .replace(/<\|channel>[\s\S]*?(?:<channel\|>|$)/g, '')
+      .replace(/<channel\|>/g, '')
+      .replace(/<\|tool_call>[\s\S]*?(?:<tool_call\|>|$)/g, '')
+      .replace(/<tool_call>[\s\S]*?(?:<\/tool_call>|$)/g, '')
+      .replace(/<\|tool_response>[\s\S]*?(?:<tool_response\|>|$)/g, '')
+      .replace(/<\|tool>[\s\S]*?(?:<tool\|>|$)/g, '')
+      // A complete LFM2 block plus any echoed call bodies that follow it —
+      // the model may repeat `[f()]<|tool_call_end|>` without a start
+      // sentinel. The optional tempered body can't cross another
+      // `<|tool_call_start|>`, so real later blocks (and prose before
+      // them) survive; a bare orphan end sentinel is still dropped below.
+      .replace(
+        /<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>(?:(?:(?!<\|tool_call_start\|>)[\s\S])*<\|tool_call_end\|>)?|<\|tool_call_start\|>[\s\S]*$/g,
+        '',
+      )
+      .replace(/<\|tool_call_end\|>/g, '')
+      .replace(/<\|turn>[^\n]*(?:\n|$)/g, '')
+      .replace(/<turn\|>/g, '')
+  );
 }
 
 export function buildAnthropicContent(

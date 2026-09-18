@@ -554,16 +554,8 @@ impl<'a> PyLiteralParser<'a> {
     fn ident(&mut self) -> Result<&'a str, ()> {
         self.skip_ws();
         let start = self.pos;
-        while let Some(&b) = self.s.get(self.pos) {
-            if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        if start == self.pos
-            || !matches!(self.s[start], b'A'..=b'Z' | b'a'..=b'z' | b'_') && self.s[start] < 0x80
-        {
+        self.pos = ident_end(self.s, self.pos);
+        if start == self.pos || !ident_char_at(self.s, start, true) {
             return Err(());
         }
         std::str::from_utf8(&self.s[start..self.pos]).map_err(|_| ())
@@ -640,7 +632,10 @@ impl<'a> PyLiteralParser<'a> {
     /// Deliberate residuals (rare invalid forms still accepted, e.g.
     /// `a ~ b`, `0xg`): skipping is a boundary check, not codegen — the
     /// goal is keeping obviously-malformed text from promoting a call.
-    fn skip_expression(&mut self) -> Result<(), ()> {
+    /// `starred` marks the expression as an already-consumed `*a`
+    /// unpacking — a `for` at the top level then makes it a comp
+    /// element (`*a for a in b` is a SyntaxError).
+    fn skip_expression(&mut self, starred: bool) -> Result<(), ()> {
         #[derive(Clone, Copy, PartialEq)]
         enum St {
             Need,
@@ -696,15 +691,6 @@ impl<'a> PyLiteralParser<'a> {
                 _ => false,
             }
         }
-        fn ident_end(s: &[u8], mut p: usize) -> usize {
-            while s
-                .get(p)
-                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c >= 0x80)
-            {
-                p += 1;
-            }
-            p
-        }
         let mut st = St::Need;
         let mut stack: Vec<u8> = Vec::new(); // open brackets — closers must match
         // A postfix `x[…]` opens a subscript — the only bracket where `:`
@@ -712,6 +698,23 @@ impl<'a> PyLiteralParser<'a> {
         // display, tuple, or call is a SyntaxError; inside `{}` it is a
         // dict separator that requires a value.
         const SUBSCRIPT: u8 = 0;
+        // A postfix `f(` opens a call — keyword `x=1` arguments are legal
+        // inside it but not inside a grouping `(`, list display, dict, or
+        // subscript.
+        const CALLPAREN: u8 = 1;
+        // `{}` resolves to a set display on its first bare element (`,` /
+        // walrus / `for`) and to a dict on a key `:` — mixing the two
+        // (`{1, 2:3}`, `{1:2, 3}`) is a SyntaxError.
+        const SET: u8 = 2;
+        const DICT: u8 = 3;
+        fn close_match(o: u8, b: u8) -> bool {
+            match b {
+                b')' => matches!(o, b'(' | CALLPAREN),
+                b']' => matches!(o, b'[' | SUBSCRIPT),
+                b'}' => matches!(o, b'{' | SET | DICT),
+                _ => false,
+            }
+        }
         // `not` consumed as an operator (`x not in y`): `in`/`is` may follow.
         let mut after_not_op = false;
         // Ternary `x if y else z` needs its `else`: `a if b` is a
@@ -748,6 +751,29 @@ impl<'a> PyLiteralParser<'a> {
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
         let mut last_str = false;
         let mut prefix_end = usize::MAX;
+        // `*a`/`**a` consumed at an element start inside a bracket —
+        // recorded as (depth, bracket). A `for` at that depth makes it a
+        // comprehension element where unpacking is a SyntaxError
+        // (`[*a for x in y]`, `f(*a for x in y)`); a `)` closing a `(`
+        // group with no `,` is `(*a)` — also a SyntaxError.
+        let mut starred_depths: Vec<(usize, u8)> = Vec::new();
+        if starred {
+            starred_depths.push((0, 0));
+        }
+        // `,` inside a bracket — a comprehension is single-element, so a
+        // `for` after any element comma is a SyntaxError (`[a, x for x
+        // in y]`).
+        let mut comma_depths: Vec<usize> = Vec::new();
+        // Depths where a dict `,` was seen — the next operand is a key
+        // that owes a `:` (`{k:v, k2}` is a SyntaxError). A `}` in Have
+        // state with a key pending rejects; in Need it's a legal
+        // trailing comma.
+        let mut dict_key_next: Vec<usize> = Vec::new();
+        // `*a`/`**a` unpacking is legal only at an element start — after
+        // `,`, a bracket open, or the expression start. After an
+        // operator, `:`, `=`, or a unary prefix it is a SyntaxError
+        // (`f(1 + *a)`).
+        let mut elem_start = true;
         loop {
             let Some(&b) = self.s.get(self.pos) else {
                 return Err(()); // ran out of text — unterminated
@@ -804,7 +830,7 @@ impl<'a> PyLiteralParser<'a> {
                                     stack.push(b);
                                     self.pos += 1;
                                 }
-                                _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                                _ if ident_char_at(self.s, self.pos, true) => {
                                     let id_start = self.pos;
                                     self.pos = ident_end(self.s, self.pos);
                                     if reserved_ident(&self.s[id_start..self.pos]) {
@@ -819,6 +845,7 @@ impl<'a> PyLiteralParser<'a> {
                             b'(' | b'[' | b'{' => {
                                 stack.push(b);
                                 self.pos += 1;
+                                elem_start = true;
                             }
                             // Empty container (`()` `[]` `{}`) or a close after
                             // `,`/`:` inside brackets (`(a,)` `a[1:]`) — never
@@ -842,15 +869,13 @@ impl<'a> PyLiteralParser<'a> {
                                     return Err(());
                                 }
                                 match stack.pop() {
-                                    Some(o)
-                                        if matches!(
-                                            (o, b),
-                                            (b'(', b')')
-                                                | (b'[', b']')
-                                                | (b'{', b'}')
-                                                | (SUBSCRIPT, b']')
-                                        ) =>
-                                    {
+                                    Some(o) if close_match(o, b) => {
+                                        // `[x for a,]` — closing the comp
+                                        // bracket while its `for` still
+                                        // owes `in` is a SyntaxError.
+                                        if for_depths.last() == Some(&(stack.len() + 1)) {
+                                            return Err(());
+                                        }
                                         if o == SUBSCRIPT
                                             && island_stack.last() == Some(&stack.len())
                                         {
@@ -860,6 +885,11 @@ impl<'a> PyLiteralParser<'a> {
                                         st = St::Have;
                                         last_str = false;
                                         prefix_end = usize::MAX;
+                                        comp_depths.retain(|&d| d <= stack.len());
+                                        for_depths.retain(|&d| d <= stack.len());
+                                        starred_depths.retain(|&(d, _)| d <= stack.len());
+                                        comma_depths.retain(|&d| d <= stack.len());
+                                        dict_key_next.retain(|&d| d <= stack.len());
                                     }
                                     _ => return Err(()),
                                 }
@@ -870,7 +900,27 @@ impl<'a> PyLiteralParser<'a> {
                                 last_str = true;
                                 prefix_end = usize::MAX;
                             }
-                            b'-' | b'+' | b'~' | b'*' => self.pos += 1, // unary / spread
+                            b'-' | b'+' | b'~' => {
+                                self.pos += 1;
+                                elem_start = false; // `-*a` is a SyntaxError
+                            }
+                            // `*a`/`**a` unpacking — legal only at an
+                            // element start (`f(*a)`, `[*a]`, `{*a}`,
+                            // `(*a,)`), never after an operator (`1 + *a`)
+                            // or inside a `:`/`=` continuation.
+                            b'*' => {
+                                if !elem_start {
+                                    return Err(());
+                                }
+                                if let Some(&top) = stack.last() {
+                                    starred_depths.push((stack.len(), top));
+                                }
+                                self.pos += 1;
+                                if self.s.get(self.pos) == Some(&b'*') {
+                                    self.pos += 1; // `**a`
+                                }
+                                elem_start = false;
+                            }
                             b'.' => {
                                 // `...` ellipsis or `.5` float — nothing else.
                                 if self.s.get(self.pos + 1) == Some(&b'.')
@@ -937,8 +987,11 @@ impl<'a> PyLiteralParser<'a> {
                             }
                             // `x[:2]` / `x[::]` — `:` where an operand is
                             // expected is slice syntax, only in a subscript.
-                            b':' if stack.last() == Some(&SUBSCRIPT) => self.pos += 1,
-                            _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                            b':' if stack.last() == Some(&SUBSCRIPT) => {
+                                self.pos += 1;
+                                elem_start = false;
+                            }
+                            _ if ident_char_at(self.s, self.pos, true) => {
                                 let id_start = self.pos;
                                 self.pos = ident_end(self.s, self.pos);
                                 let id = &self.s[id_start..self.pos];
@@ -946,7 +999,9 @@ impl<'a> PyLiteralParser<'a> {
                                     return Err(());
                                 }
                                 match id {
-                                    b"not" => {} // unary — still need an operand
+                                    b"not" => {
+                                        elem_start = false;
+                                    } // unary — still need an operand
                                     b"lambda" => {
                                         st = St::Lambda;
                                         param_start = true;
@@ -1056,9 +1111,9 @@ impl<'a> PyLiteralParser<'a> {
                                         return Err(());
                                     }
                                 }
-                                if self.s.get(self.pos).is_some_and(|c| {
-                                    c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80
-                                }) {
+                                // `5x` / `5é` — a digit-glued name is a
+                                // SyntaxError.
+                                if ident_char_at(self.s, self.pos, false) {
                                     return Err(());
                                 }
                                 st = St::Have;
@@ -1070,27 +1125,39 @@ impl<'a> PyLiteralParser<'a> {
                     }
                     St::Have => match b {
                         b')' | b']' | b'}' => match stack.pop() {
-                            Some(o)
-                                if matches!(
-                                    (o, b),
-                                    (b'(', b')') | (b'[', b']') | (b'{', b'}') | (SUBSCRIPT, b']')
-                                ) =>
-                            {
+                            Some(o) if close_match(o, b) => {
+                                let d = stack.len() + 1; // the popped bracket's inner depth
                                 // `(a if b)` closes with the ternary's
                                 // `else` still owed — a SyntaxError. So
-                                // does a `for` whose `in` never arrived:
-                                // the pop above already ran, so its depth
-                                // is `stack.len() + 1` (`[x for x]`).
-                                if pending_ifs > 0 || for_depths.last() == Some(&(stack.len() + 1))
+                                // does a `for` whose `in` never arrived
+                                // (`[x for x]`).
+                                if pending_ifs > 0 || for_depths.last() == Some(&d) {
+                                    return Err(());
+                                }
+                                // `(*a)` — a bare starred group is a
+                                // SyntaxError; `(*a,)` is a legal tuple.
+                                if o == b'('
+                                    && starred_depths
+                                        .iter()
+                                        .any(|&(sd, brk)| sd == d && brk == b'(')
+                                    && !comma_depths.contains(&d)
                                 {
+                                    return Err(());
+                                }
+                                // `{k:v, k2}` — a dict element whose key
+                                // owes `:` before the close.
+                                if o == DICT && dict_key_next.contains(&d) {
                                     return Err(());
                                 }
                                 if o == SUBSCRIPT && island_stack.last() == Some(&stack.len()) {
                                     island_stack.pop();
                                 }
                                 self.pos += 1;
-                                comp_depths.retain(|&d| d <= stack.len());
-                                for_depths.retain(|&d| d <= stack.len());
+                                comp_depths.retain(|&x| x <= stack.len());
+                                for_depths.retain(|&x| x <= stack.len());
+                                starred_depths.retain(|&(x, _)| x <= stack.len());
+                                comma_depths.retain(|&x| x <= stack.len());
+                                dict_key_next.retain(|&x| x <= stack.len());
                             }
                             _ => return Err(()),
                         },
@@ -1114,16 +1181,13 @@ impl<'a> PyLiteralParser<'a> {
                             b'.' => {
                                 // `a.b` attribute target.
                                 self.pos += 1;
-                                match self.s.get(self.pos) {
-                                    Some(&c)
-                                        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 =>
-                                    {
-                                        self.pos = ident_end(self.s, self.pos);
-                                    }
-                                    _ => return Err(()),
+                                if ident_char_at(self.s, self.pos, true) {
+                                    self.pos = ident_end(self.s, self.pos);
+                                } else {
+                                    return Err(());
                                 }
                             }
-                            _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                            _ if ident_char_at(self.s, self.pos, true) => {
                                 let id_start = self.pos;
                                 self.pos = ident_end(self.s, self.pos);
                                 // `in` completes the target at the `for`'s
@@ -1141,36 +1205,82 @@ impl<'a> PyLiteralParser<'a> {
                         },
                         b'(' | b'[' => {
                             // Postfix call / index — a subscript `[` admits
-                            // slice `:` inside; a call `(` does not.
-                            stack.push(if b == b'[' { SUBSCRIPT } else { b'(' });
+                            // slice `:` inside; a call `(` admits keyword
+                            // `x=1` arguments (`outer(helper(x=1), k=2)`).
+                            stack.push(if b == b'[' { SUBSCRIPT } else { CALLPAREN });
                             self.pos += 1;
                             st = St::Need;
+                            elem_start = true;
                         }
                         b',' if !stack.is_empty() => {
+                            // A comprehension is single-element — `[x for
+                            // x in y, 2]` is a SyntaxError.
+                            if comp_depths.contains(&stack.len()) {
+                                return Err(());
+                            }
+                            match stack.last() {
+                                // `{a,` — a bare element locks the
+                                // display to a set.
+                                Some(&b'{') => *stack.last_mut().unwrap() = SET,
+                                // `{k:v,` — the next operand is a key
+                                // that owes a `:`.
+                                Some(&DICT) => dict_key_next.push(stack.len()),
+                                _ => {}
+                            }
+                            comma_depths.push(stack.len());
                             self.pos += 1;
                             st = St::Need;
+                            elem_start = true;
+                        }
+                        // `:=` walrus — legal wherever an operand just
+                        // ended (`x:=1`, `x[a:=1]`, `{k:(v:=1)}`); inside
+                        // an undecided `{` it is a bare element, locking
+                        // the display to a set (`{x:=1}`).
+                        b':' if self.s.get(self.pos + 1) == Some(&b'=') => {
+                            if stack.last() == Some(&b'{') {
+                                *stack.last_mut().unwrap() = SET;
+                            }
+                            self.pos += 2;
+                            st = St::Need;
+                            elem_start = false;
                         }
                         b':' if !stack.is_empty() => match stack.last() {
-                            // `{k:` — dict separator (a value must follow);
-                            // `x[1:` — slice continue. `:` inside `()` or a
-                            // list display is a SyntaxError (`(1:2)`,
-                            // `[1:2]`).
-                            Some(&b'{') | Some(&SUBSCRIPT) => {
+                            // `x[1:` — slice continue; `{k:` — dict
+                            // separator locking the display to a dict (a
+                            // value must follow). `:` in a set, `()`,
+                            // list display, or call is a SyntaxError
+                            // (`[1:2]`, `{1, 2:3}`, `f(a:1)`).
+                            Some(&SUBSCRIPT) => {
                                 self.pos += 1;
                                 st = St::Need;
+                                elem_start = false;
+                            }
+                            Some(&b'{') => {
+                                // `{*a:1}` — a starred element can't be
+                                // a dict key.
+                                if starred_depths.iter().any(|&(d, _)| d == stack.len()) {
+                                    return Err(());
+                                }
+                                *stack.last_mut().unwrap() = DICT;
+                                self.pos += 1;
+                                st = St::Need;
+                                elem_start = false;
+                            }
+                            // `{k:v, k2:` — the pending key's separator.
+                            Some(&DICT) if dict_key_next.contains(&stack.len()) => {
+                                dict_key_next.retain(|&d| d != stack.len());
+                                self.pos += 1;
+                                st = St::Need;
+                                elem_start = false;
                             }
                             _ => return Err(()),
                         },
-                        b':' if self.s.get(self.pos + 1) == Some(&b'=') => {
-                            self.pos += 2; // `:=` walrus
-                            st = St::Need;
-                        }
                         b'.' => match self.s.get(self.pos + 1) {
                             // Attribute access `a.b` — the only legal `.`
                             // after an operand: digit-led numbers already
                             // consumed their fraction/exponent, so `.5`,
                             // `x.`, `.5.5`, `1.5.5` here are SyntaxErrors.
-                            Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80 => {
+                            Some(_) if ident_char_at(self.s, self.pos + 1, true) => {
                                 let id_start = self.pos + 1;
                                 self.pos = ident_end(self.s, id_start);
                                 if reject_keyword(&self.s[id_start..self.pos]) {
@@ -1194,10 +1304,55 @@ impl<'a> PyLiteralParser<'a> {
                         b'=' if self.s.get(self.pos + 1) == Some(&b'=') => {
                             self.pos += 2;
                             st = St::Need;
+                            elem_start = false;
                         }
                         b'!' if self.s.get(self.pos + 1) == Some(&b'=') => {
                             self.pos += 2;
                             st = St::Need;
+                            elem_start = false;
+                        }
+                        // `=` inside a call paren is keyword-argument
+                        // syntax — but only after a bare name (`g(x=1)`
+                        // nested in a dropped positional). `g(5=1)`,
+                        // `g(a.b=1)`, `g(*a=1)`, `g()=1` are SyntaxErrors;
+                        // so is `=` anywhere else (`x[a=1]`, `{a=1}`,
+                        // `(a=1)`).
+                        b'=' if stack.last() == Some(&CALLPAREN) => {
+                            // Walk back over whitespace + the identifier —
+                            // a kwarg name is a bare ident directly after
+                            // `(` or `,`.
+                            let mut p = self.pos;
+                            while p > 0 && matches!(self.s[p - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                                p -= 1;
+                            }
+                            let id_end = p;
+                            while p > 0 {
+                                let c = self.s[p - 1];
+                                if c.is_ascii_alphanumeric() || c == b'_' {
+                                    p -= 1;
+                                } else if c >= 0x80 && (c & 0xC0) == 0x80 {
+                                    p -= 1; // UTF-8 continuation byte
+                                } else if c >= 0x80 && ident_char_at(self.s, p - 1, false) {
+                                    p -= 1; // XID_Continue lead byte
+                                } else {
+                                    break;
+                                }
+                            }
+                            let mut q = p;
+                            while q > 0 && matches!(self.s[q - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                                q -= 1;
+                            }
+                            let bare_name = p < id_end
+                                && ident_char_at(self.s, p, true)
+                                && q > 0
+                                && matches!(self.s[q - 1], b'(' | b',');
+                            // `f(*a=1)` — a starred element can't take `=`.
+                            if !bare_name || starred_depths.iter().any(|&(d, _)| d == stack.len()) {
+                                return Err(());
+                            }
+                            self.pos += 1;
+                            st = St::Need;
+                            elem_start = false;
                         }
                         b'<' | b'>' => {
                             self.pos += 1;
@@ -1208,6 +1363,7 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos += 1;
                             }
                             st = St::Need;
+                            elem_start = false;
                         }
                         b'*' | b'/' => {
                             self.pos += 1;
@@ -1215,12 +1371,14 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos += 1; // `**` `//`
                             }
                             st = St::Need;
+                            elem_start = false;
                         }
                         b'+' | b'-' | b'%' | b'|' | b'&' | b'^' | b'@' => {
                             self.pos += 1;
                             st = St::Need;
+                            elem_start = false;
                         }
-                        _ if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => {
+                        _ if ident_char_at(self.s, self.pos, false) => {
                             // Only word operators may follow an operand —
                             // juxtaposed operands (`a b`) are a SyntaxError.
                             let id_start = self.pos;
@@ -1228,6 +1386,7 @@ impl<'a> PyLiteralParser<'a> {
                             match &self.s[id_start..self.pos] {
                                 b"and" | b"or" | b"is" => {
                                     st = St::Need;
+                                    elem_start = false;
                                 }
                                 b"in" => {
                                     // Satisfies the innermost `for` at
@@ -1237,6 +1396,7 @@ impl<'a> PyLiteralParser<'a> {
                                         for_depths.pop();
                                     }
                                     st = St::Need;
+                                    elem_start = false;
                                 }
                                 b"if" => {
                                     // Ternary needs `else`; a filter `if`
@@ -1245,6 +1405,7 @@ impl<'a> PyLiteralParser<'a> {
                                         pending_ifs += 1;
                                     }
                                     st = St::Need;
+                                    elem_start = false;
                                 }
                                 b"else" => {
                                     // `else` without an open ternary is a
@@ -1254,21 +1415,46 @@ impl<'a> PyLiteralParser<'a> {
                                     }
                                     pending_ifs -= 1;
                                     st = St::Need;
+                                    elem_start = false;
                                 }
                                 b"for" => {
+                                    let d = stack.len();
+                                    // `*` unpacking can't be a comp
+                                    // element (`[*a for x in y]`,
+                                    // `f(*a for a in b)`); a `for` can't
+                                    // live in a subscript (`x[a for a in
+                                    // y]`); a comp is single-element
+                                    // (`[a, x for x in y]`); and a dict
+                                    // key can't be a comp (`{k:v, x
+                                    // for}`).
+                                    if stack.last() == Some(&SUBSCRIPT)
+                                        || starred_depths.iter().any(|&(sd, _)| sd == d)
+                                        || comma_depths.contains(&d)
+                                        || dict_key_next.contains(&d)
+                                    {
+                                        return Err(());
+                                    }
+                                    // `for` right after `{` → set comp —
+                                    // the element was a bare value, so the
+                                    // display can never become a dict.
+                                    if stack.last() == Some(&b'{') {
+                                        *stack.last_mut().unwrap() = SET;
+                                    }
                                     // Comprehension clauses run at the
                                     // bracket depth they appear in and
                                     // each owes an `in` at that depth; a
                                     // top-level `for` is a genexpr, valid
                                     // only as the call's sole argument.
-                                    comp_depths.push(stack.len());
-                                    for_depths.push(stack.len());
+                                    comp_depths.push(d);
+                                    for_depths.push(d);
                                     top_genexpr |= stack.is_empty();
                                     st = St::Need;
+                                    elem_start = false;
                                 }
                                 b"not" => {
                                     after_not_op = true;
                                     st = St::Need;
+                                    elem_start = false;
                                 }
                                 _ => return Err(()),
                             }
@@ -1314,12 +1500,7 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos += 1;
                         }
                         b')' | b']' | b'}' if !stack.is_empty() => match stack.pop() {
-                            Some(o)
-                                if matches!(
-                                    (o, b),
-                                    (b'(', b')') | (b'[', b']') | (b'{', b'}') | (SUBSCRIPT, b']')
-                                ) =>
-                            {
+                            Some(o) if close_match(o, b) => {
                                 self.pos += 1;
                             }
                             _ => return Err(()),
@@ -1354,12 +1535,12 @@ impl<'a> PyLiteralParser<'a> {
                             }
                             self.pos += 1;
                         }
-                        _ if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => {
+                        _ if ident_char_at(self.s, self.pos, false) => {
                             if param_start && stack.is_empty() {
                                 // Param names start with a letter/`_` and
                                 // can't be keywords — `lambda 1: x` and
                                 // `lambda for: x` are both SyntaxErrors.
-                                if !(b.is_ascii_alphabetic() || b == b'_' || b >= 0x80) {
+                                if !ident_char_at(self.s, self.pos, true) {
                                     return Err(());
                                 }
                                 let id_start = self.pos;
@@ -1928,7 +2109,7 @@ impl<'a> PyLiteralParser<'a> {
                 if self.peek() == Some(b'*') {
                     return Err(());
                 }
-                self.skip_expression()?;
+                self.skip_expression(true)?;
             } else {
                 // `kw=literal` or a positional expression. Try the
                 // `ident =` lookahead first (excluding `==`); on no match
@@ -1972,7 +2153,7 @@ impl<'a> PyLiteralParser<'a> {
                         if seen_kwarg {
                             return Err(());
                         }
-                        self.skip_expression()?;
+                        self.skip_expression(false)?;
                     }
                 }
             }
@@ -2006,6 +2187,53 @@ fn utf8_len(first: u8) -> usize {
     } else {
         4
     }
+}
+
+/// Is the char at `s[p]` identifier syntax? ASCII `[A-Za-z_]` (or
+/// `[A-Za-z0-9_]` when `start == false`) plus the Unicode XID_Start /
+/// XID_Continue classes CPython uses — `café`/`变量` are names, `😀`
+/// is a SyntaxError (`ast.parse` rejects it → vLLM keeps the block
+/// verbatim; a bare `>= 0x80` byte gate would promote it).
+fn ident_char_at(s: &[u8], p: usize, start: bool) -> bool {
+    let Some(&c) = s.get(p) else {
+        return false;
+    };
+    if c < 0x80 {
+        return if start {
+            c.is_ascii_alphabetic() || c == b'_'
+        } else {
+            c.is_ascii_alphanumeric() || c == b'_'
+        };
+    }
+    let Some(t) = s
+        .get(p..p + utf8_len(c))
+        .and_then(|b| std::str::from_utf8(b).ok())
+    else {
+        return false;
+    };
+    let Some(ch) = t.chars().next() else {
+        return false;
+    };
+    if start {
+        unicode_ident::is_xid_start(ch)
+    } else {
+        unicode_ident::is_xid_continue(ch)
+    }
+}
+
+/// End of the identifier starting at `p` — ASCII ident bytes plus
+/// XID_Continue chars; everything else stops the scan.
+fn ident_end(s: &[u8], mut p: usize) -> usize {
+    while let Some(&c) = s.get(p) {
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            p += 1;
+        } else if c >= 0x80 && ident_char_at(s, p, false) {
+            p += utf8_len(c);
+        } else {
+            break;
+        }
+    }
+    p
 }
 
 fn i128_to_value(v: i128) -> Option<Value> {
@@ -4691,6 +4919,25 @@ The weather in Tokyo is sunny."#;
             "f(lambda a b: x)",      // param without `,`
             "f(lambda a.b: x)",      // dotted param name
             "f(lambda a(x): y)",     // call-shaped param
+            "f([*items for item in source], confirmed=True)", // starred comp elem
+            "f(*a for a in b, x=1)", // starred genexpr elem
+            "f((*a), x=1)",          // bare starred group
+            "f(x[a for a in y], x=1)", // genexpr in subscript
+            "f([x for a[i for j in z] in w], x=1)", // nested subscript genexpr
+            "f({1, 2:3}, confirmed=True)", // set element then `:` — mixed literal
+            "f({1:2, 3}, confirmed=True)", // dict pair then bare element
+            "f({x:=1, a:2}, x=1)",   // walrus locks set — then `:`
+            "f(1 + *a, x=1)",        // `*` after an operator
+            "f(x[1:*a], x=1)",       // `*` after a slice colon
+            "f(helper(5=1), x=1)",   // `=` after a non-name operand
+            "f(helper(a.b=1), x=1)", // `=` after an attribute
+            "f(helper(*a=1), x=1)",  // `=` after a starred element
+            "f(x[a=1], x=1)",        // `=` inside a subscript
+            "f({a=1}, x=1)",         // `=` inside a display
+            "f([a, x for x in y], x=1)", // comp after an element `,`
+            "f({k:v, x for x in y}, x=1)", // comp after a dict `,`
+            "f({k:v, k2}, x=1)",     // dict key missing its `:`
+            "f(x for x in y, z=1)",  // a genexpr must be the sole arg
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4727,6 +4974,10 @@ The weather in Tokyo is sunny."#;
             "a.None(x=1)",
             "not(x=1)", // unary-op keyword can't name a call
             "in(x=1)",
+            "😀(confirmed=True)", // emoji is no XID ident — SyntaxError
+            "a.😀(x=1)",
+            "café.😀(x=1)",
+            "5café(x=1)", // digit-led name
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4739,6 +4990,15 @@ The weather in Tokyo is sunny."#;
         let (_, calls) = parse_tool_calls(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "match");
+
+        // Unicode XID names promote exactly like ASCII — `café`/`变量`
+        // are legal Python identifiers.
+        for (inner, want) in [("café(x=1)", "café"), ("变量(x=1)", "变量")] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (_, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, want, "{inner}");
+        }
     }
 
     #[test]
@@ -4809,9 +5069,25 @@ The weather in Tokyo is sunny."#;
             ("f([x for a.b in y], y=1)", "{\"y\":1}"), // attribute target
             ("f([x for a[i + 1] in y], y=1)", "{\"y\":1}"), // subscript target
             ("f([x for a, *b in y], y=1)", "{\"y\":1}"), // starred target
-            ("f([x for a[i for j in z] in w], y=1)", "{\"y\":1}"), // nested
+            ("f([x for a[(i for i in z)] in w], y=1)", "{\"y\":1}"), // paren genexpr idx
+            ("f([x for a[b in c] in w], y=1)", "{\"y\":1}"), // membership idx
             ("f((x for x in y), y=1)", "{\"y\":1}"), // parenthesized genexpr
-            ("f(x[i for i in y], y=1)", "{\"y\":1}"), // genexpr in subscript
+            ("f(x[(i for i in y)], y=1)", "{\"y\":1}"), // paren genexpr index
+            ("f(outer(helper(x=1), z=2), y=3)", "{\"y\":3}"), // nested kwarg call
+            ("f(helper(a, x=1), y=2)", "{\"y\":2}"), // nested pos+kwarg
+            ("f(x:=1, y=2)", "{\"y\":2}"),      // walrus positional
+            ("f((x:=1), y=2)", "{\"y\":2}"),    // parens walrus
+            ("f(x[a:=1], y=2)", "{\"y\":2}"),   // walrus in subscript
+            ("f({x:=1}, y=2)", "{\"y\":2}"),    // walrus set element
+            ("f({k: (v:=1)}, y=2)", "{\"y\":2}"), // walrus dict value
+            ("f({1, 2}, y=1)", "{\"y\":1}"),    // set literal
+            ("f({*a}, y=1)", "{\"y\":1}"),      // starred set
+            ("f({'a': 1, 'b': 2}, y=1)", "{\"y\":1}"), // dict literal
+            ("f({'a': 1,}, y=1)", "{\"y\":1}"), // dict trailing comma
+            ("f({}, y=1)", "{\"y\":1}"),        // empty dict
+            ("f((*a, b), y=1)", "{\"y\":1}"),   // starred tuple
+            ("f([*a], y=1)", "{\"y\":1}"),      // starred list
+            ("f(x[*a], y=1)", "{\"y\":1}"),     // starred index
             ("f(lambda match: x, y=1)", "{\"y\":1}"), // soft-keyword param
             ("f(lambda a1: x, y=1)", "{\"y\":1}"), // digit-suffix param
             ("f(lambda a, *b: x, y=1)", "{\"y\":1}"), // starred param
