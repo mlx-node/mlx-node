@@ -10524,6 +10524,70 @@ describe('createHandler', () => {
       expect(allDeltaText).toBe('\n\n');
     });
 
+    it('keeps emitted leading whitespace in done text when tool-call trimming removes it', async () => {
+      // "\n\n" parks, then "before " flushes it into a delta before the
+      // sentinel suppresses. The native done text is outer-trimmed to
+      // "before after", but the whitespace already reached the wire —
+      // `output_text.done` must keep it so deltas sum to the advertised text.
+      const streamEvents = [
+        { done: false, text: '\n\n', isReasoning: false },
+        {
+          done: false,
+          text: 'before <|tool_call_start|>[get_weather()]<|tool_call_end|>after',
+          isReasoning: false,
+        },
+        {
+          done: true,
+          text: 'before after',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_lfm2',
+              name: 'get_weather',
+              arguments: '{}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '\n\nbefore <|tool_call_start|>[get_weather()]<|tool_call_end|>after',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('\n\nbefore after');
+      expect(allDeltaText).toBe('\n\nbefore after');
+    });
+
     it('skips message item when final text is empty and tool calls are present', async () => {
       // Model immediately produces tool-call markup, no visible text
       const streamEvents = [

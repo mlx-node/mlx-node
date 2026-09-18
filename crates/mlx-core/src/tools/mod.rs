@@ -774,6 +774,14 @@ impl<'a> PyLiteralParser<'a> {
         // operator, `:`, `=`, or a unary prefix it is a SyntaxError
         // (`f(1 + *a)`).
         let mut elem_start = true;
+        // Argument ordering inside a nested call: once a `x=1` kwarg is
+        // consumed at a CALLPAREN depth, later elements must be `*a` or
+        // kwargs — a bare positional (`helper(x=1, 2)`) is a SyntaxError.
+        // `kwarg_seen` persists per depth; `kwarg_elem`/`star_elem`
+        // describe the element currently closing and reset at `,`.
+        let mut kwarg_seen_depths: Vec<usize> = Vec::new();
+        let mut kwarg_elem_depths: Vec<usize> = Vec::new();
+        let mut star_elem_depths: Vec<usize> = Vec::new();
         loop {
             let Some(&b) = self.s.get(self.pos) else {
                 return Err(()); // ran out of text — unterminated
@@ -890,6 +898,9 @@ impl<'a> PyLiteralParser<'a> {
                                         starred_depths.retain(|&(d, _)| d <= stack.len());
                                         comma_depths.retain(|&d| d <= stack.len());
                                         dict_key_next.retain(|&d| d <= stack.len());
+                                        kwarg_seen_depths.retain(|&d| d <= stack.len());
+                                        kwarg_elem_depths.retain(|&d| d <= stack.len());
+                                        star_elem_depths.retain(|&d| d <= stack.len());
                                     }
                                     _ => return Err(()),
                                 }
@@ -914,6 +925,7 @@ impl<'a> PyLiteralParser<'a> {
                                 }
                                 if let Some(&top) = stack.last() {
                                     starred_depths.push((stack.len(), top));
+                                    star_elem_depths.push(stack.len());
                                 }
                                 self.pos += 1;
                                 if self.s.get(self.pos) == Some(&b'*') {
@@ -1149,6 +1161,15 @@ impl<'a> PyLiteralParser<'a> {
                                 if o == DICT && dict_key_next.contains(&d) {
                                     return Err(());
                                 }
+                                // `helper(x=1, 2)` — a bare positional
+                                // closing a call that saw a kwarg.
+                                if o == CALLPAREN
+                                    && kwarg_seen_depths.contains(&d)
+                                    && !kwarg_elem_depths.contains(&d)
+                                    && !star_elem_depths.contains(&d)
+                                {
+                                    return Err(());
+                                }
                                 if o == SUBSCRIPT && island_stack.last() == Some(&stack.len()) {
                                     island_stack.pop();
                                 }
@@ -1158,6 +1179,9 @@ impl<'a> PyLiteralParser<'a> {
                                 starred_depths.retain(|&(x, _)| x <= stack.len());
                                 comma_depths.retain(|&x| x <= stack.len());
                                 dict_key_next.retain(|&x| x <= stack.len());
+                                kwarg_seen_depths.retain(|&x| x <= stack.len());
+                                kwarg_elem_depths.retain(|&x| x <= stack.len());
+                                star_elem_depths.retain(|&x| x <= stack.len());
                             }
                             _ => return Err(()),
                         },
@@ -1218,6 +1242,16 @@ impl<'a> PyLiteralParser<'a> {
                             if comp_depths.contains(&stack.len()) {
                                 return Err(());
                             }
+                            // `helper(x=1, 2)` — after a kwarg only `*a`
+                            // or another kwarg may follow; a bare
+                            // positional is a SyntaxError.
+                            if stack.last() == Some(&CALLPAREN)
+                                && kwarg_seen_depths.contains(&stack.len())
+                                && !kwarg_elem_depths.contains(&stack.len())
+                                && !star_elem_depths.contains(&stack.len())
+                            {
+                                return Err(());
+                            }
                             match stack.last() {
                                 // `{a,` — a bare element locks the
                                 // display to a set.
@@ -1227,16 +1261,52 @@ impl<'a> PyLiteralParser<'a> {
                                 Some(&DICT) => dict_key_next.push(stack.len()),
                                 _ => {}
                             }
+                            // The element flags describe the element just
+                            // closed — the next one starts fresh.
+                            kwarg_elem_depths.retain(|&d| d != stack.len());
+                            star_elem_depths.retain(|&d| d != stack.len());
                             comma_depths.push(stack.len());
                             self.pos += 1;
                             st = St::Need;
                             elem_start = true;
                         }
-                        // `:=` walrus — legal wherever an operand just
-                        // ended (`x:=1`, `x[a:=1]`, `{k:(v:=1)}`); inside
+                        // `:=` walrus — the target must be a bare NAME
+                        // directly after `(`/`,`/`[`/`{` or the expression
+                        // start (`x:=1`, `x[a:=1]`, `{k:(v:=1)}`); inside
                         // an undecided `{` it is a bare element, locking
-                        // the display to a set (`{x:=1}`).
+                        // the display to a set (`{x:=1}`). Literals,
+                        // attributes, subscripts, calls, groups, and
+                        // operator results can't be targets — `1:=2`,
+                        // `a.b:=2`, `(x):=2`, `a+b:=2`, `x=y:=2`, and
+                        // `{k: v:=1}` are all SyntaxErrors.
                         b':' if self.s.get(self.pos + 1) == Some(&b'=') => {
+                            let mut p = self.pos;
+                            while p > 0 && matches!(self.s[p - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                                p -= 1;
+                            }
+                            let id_end = p;
+                            while p > 0 {
+                                let c = self.s[p - 1];
+                                if c.is_ascii_alphanumeric() || c == b'_' {
+                                    p -= 1;
+                                } else if c >= 0x80 && (c & 0xC0) == 0x80 {
+                                    p -= 1; // UTF-8 continuation byte
+                                } else if c >= 0x80 && ident_char_at(self.s, p - 1, false) {
+                                    p -= 1; // XID_Continue lead byte
+                                } else {
+                                    break;
+                                }
+                            }
+                            let mut q = p;
+                            while q > 0 && matches!(self.s[q - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                                q -= 1;
+                            }
+                            let bare_name = p < id_end
+                                && ident_char_at(self.s, p, true)
+                                && (q == 0 || matches!(self.s[q - 1], b'(' | b',' | b'[' | b'{'));
+                            if !bare_name {
+                                return Err(());
+                            }
                             if stack.last() == Some(&b'{') {
                                 *stack.last_mut().unwrap() = SET;
                             }
@@ -1346,10 +1416,15 @@ impl<'a> PyLiteralParser<'a> {
                                 && ident_char_at(self.s, p, true)
                                 && q > 0
                                 && matches!(self.s[q - 1], b'(' | b',');
-                            // `f(*a=1)` — a starred element can't take `=`.
-                            if !bare_name || starred_depths.iter().any(|&(d, _)| d == stack.len()) {
+                            // `f(*a=1)` — a starred element can't take `=`
+                            // (element-scoped: `helper(*a, x=1)` is legal).
+                            if !bare_name || star_elem_depths.contains(&stack.len()) {
                                 return Err(());
                             }
+                            // A kwarg consumed — later elements at this
+                            // depth must be `*a` or kwargs.
+                            kwarg_seen_depths.push(stack.len());
+                            kwarg_elem_depths.push(stack.len());
                             self.pos += 1;
                             st = St::Need;
                             elem_start = false;
@@ -4938,6 +5013,19 @@ The weather in Tokyo is sunny."#;
             "f({k:v, x for x in y}, x=1)", // comp after a dict `,`
             "f({k:v, k2}, x=1)",     // dict key missing its `:`
             "f(x for x in y, z=1)",  // a genexpr must be the sole arg
+            "f(1:=2, confirmed=True)", // literal walrus target
+            "f(a.b:=2, x=1)",        // attribute walrus target
+            "f(x[0]:=2, x=1)",       // subscript walrus target
+            "f((x,y):=2, x=1)",      // tuple walrus target
+            "f(g():=2, x=1)",        // call walrus target
+            "f((x):=2, x=1)",        // parenthesized walrus target
+            "f(a+b:=2, x=1)",        // operator walrus target
+            "f(x=y:=2, x=1)",        // walrus after `=`
+            "f({k: v:=1}, x=1)",     // walrus as a dict value
+            "f(not x:=1, x=1)",      // walrus after `not`
+            "f(helper(x=1, 2), confirmed=True)", // positional after kwarg
+            "f(helper(x=1, *a, b), x=1)", // positional after kwarg+star
+            "f(helper(*a, x=1, b), x=1)", // positional after kwarg, later star
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -5075,6 +5163,9 @@ The weather in Tokyo is sunny."#;
             ("f(x[(i for i in y)], y=1)", "{\"y\":1}"), // paren genexpr index
             ("f(outer(helper(x=1), z=2), y=3)", "{\"y\":3}"), // nested kwarg call
             ("f(helper(a, x=1), y=2)", "{\"y\":2}"), // nested pos+kwarg
+            ("f(helper(x=1, y=2), z=3)", "{\"z\":3}"), // nested kwarg chain
+            ("f(helper(x=1, *a), y=2)", "{\"y\":2}"), // kwarg then star
+            ("f(helper(*a, x=1), y=2)", "{\"y\":2}"), // star then kwarg
             ("f(x:=1, y=2)", "{\"y\":2}"),      // walrus positional
             ("f((x:=1), y=2)", "{\"y\":2}"),    // parens walrus
             ("f(x[a:=1], y=2)", "{\"y\":2}"),   // walrus in subscript

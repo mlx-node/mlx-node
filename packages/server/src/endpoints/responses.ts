@@ -436,6 +436,11 @@ async function handleStreamingNativeWithAbort(
   // whitespace would leave the delta stream ahead of `output_text.done`
   // whenever a suppressed tool call follows it.
   let pendingLeadingWhitespace = '';
+  // The leading-whitespace run that DID reach the wire (flushed with the
+  // first real text). When a later tool call trims it from `final.text`,
+  // the done text keeps it anyway — emitted bytes can't be un-sent, and
+  // the delta stream must sum to `output_text.done`.
+  let emittedLeadingWs = '';
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
   // Tracks whether the reasoning output item's `response.output_item.done`
@@ -558,7 +563,14 @@ async function handleStreamingNativeWithAbort(
         // Use the final event's parsed text (markup-stripped) as the authoritative content.
         // If the parsed text is empty and there are tool calls, skip the message item entirely
         // (matching the non-streaming buildOutputItems behavior).
-        const finalText = event.text;
+        let finalText = event.text;
+        // Leading whitespace that already reached the wire stays in the
+        // done text — a later tool call may have trimmed it from
+        // `final.text`, but emitted bytes can't be un-sent and the delta
+        // stream must sum to `output_text.done`.
+        if (emittedLeadingWs && !finalText.startsWith(emittedLeadingWs)) {
+          finalText = emittedLeadingWs + finalText;
+        }
         const hasToolCalls = event.toolCalls.some((t) => t.status === 'ok');
         const skipMessageItem = !finalText && hasToolCalls;
 
@@ -951,6 +963,9 @@ async function handleStreamingNativeWithAbort(
             }
             const deltaText = pendingLeadingWhitespace + cleanPrefix;
             pendingLeadingWhitespace = '';
+            if (!emittedLeadingWs && !messageText) {
+              emittedLeadingWs = deltaText.match(/^\s+/)?.[0] ?? '';
+            }
             messageText += deltaText;
             writeSSEEvent(res, 'response.output_text.delta', {
               item_id: messageItemId,
@@ -990,6 +1005,9 @@ async function handleStreamingNativeWithAbort(
                 content_index: 0,
                 part: textPart,
               });
+            }
+            if (!emittedLeadingWs && !messageText) {
+              emittedLeadingWs = combined.match(/^\s+/)?.[0] ?? '';
             }
             messageText += combined;
             writeSSEEvent(res, 'response.output_text.delta', {
