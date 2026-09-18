@@ -669,6 +669,12 @@ impl<'a> PyLiteralParser<'a> {
             Lambda,
         }
         #[derive(Clone, Copy, PartialEq)]
+        enum NeedCtx {
+            Expr,
+            Inversion,
+            Restricted,
+        }
+        #[derive(Clone, Copy, PartialEq)]
         enum LambdaMarker {
             None,
             Star,
@@ -727,6 +733,7 @@ impl<'a> PyLiteralParser<'a> {
             }
         }
         let mut st = St::Need;
+        let mut need_ctx = NeedCtx::Expr;
         let mut stack: Vec<u8> = Vec::new(); // open brackets — closers must match
         // A postfix `x[…]` opens a subscript — the only bracket where `:`
         // is slice syntax (`x[1:2]`, `x[:]`, `x[::]`). `:` inside a list
@@ -865,6 +872,7 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos = ident_end(self.s, self.pos);
                             if self.pos > id_start && &self.s[id_start..self.pos] == b"in" {
                                 after_not_op = false;
+                                need_ctx = NeedCtx::Restricted;
                                 continue; // still Need — the operand follows
                             }
                             return Err(());
@@ -901,6 +909,7 @@ impl<'a> PyLiteralParser<'a> {
                                 stack.push(b);
                                 self.pos += 1;
                                 elem_start = true;
+                                need_ctx = NeedCtx::Expr;
                             }
                             // Empty container (`()` `[]` `{}`) or a close after
                             // `,`/`:` inside brackets (`(a,)` `a[1:]`) — never
@@ -963,6 +972,7 @@ impl<'a> PyLiteralParser<'a> {
                             b'-' | b'+' | b'~' => {
                                 self.pos += 1;
                                 elem_start = false; // `-*a` is a SyntaxError
+                                need_ctx = NeedCtx::Restricted;
                             }
                             // `*a`/`**a` unpacking — legal only at an
                             // element start (`f(*a)`, `[*a]`, `{*a}`,
@@ -1002,6 +1012,7 @@ impl<'a> PyLiteralParser<'a> {
                                     self.pos += 1; // `**a`
                                 }
                                 elem_start = false;
+                                need_ctx = NeedCtx::Restricted;
                             }
                             b'.' => {
                                 // `...` ellipsis or `.5` float — nothing else.
@@ -1078,6 +1089,7 @@ impl<'a> PyLiteralParser<'a> {
                                 }
                                 self.pos += 1;
                                 elem_start = false;
+                                need_ctx = NeedCtx::Expr;
                             }
                             b',' if stack.last() == Some(&SUBSCRIPT)
                                 && slice_colons.iter().any(|(d, _)| *d == stack.len()) =>
@@ -1085,6 +1097,7 @@ impl<'a> PyLiteralParser<'a> {
                                 slice_colons.retain(|(d, _)| *d != stack.len());
                                 self.pos += 1;
                                 elem_start = true;
+                                need_ctx = NeedCtx::Expr;
                             }
                             _ if ident_char_at(self.s, self.pos, true) => {
                                 let id_start = self.pos;
@@ -1095,10 +1108,15 @@ impl<'a> PyLiteralParser<'a> {
                                 }
                                 match id {
                                     b"not" => {
+                                        if need_ctx == NeedCtx::Restricted {
+                                            return Err(());
+                                        }
                                         elem_start = false;
+                                        need_ctx = NeedCtx::Inversion;
                                     } // unary — still need an operand
                                     b"lambda" => {
-                                        if comp_depths.contains(&stack.len())
+                                        if need_ctx != NeedCtx::Expr
+                                            || comp_depths.contains(&stack.len())
                                             || pending_ifs.contains(&stack.len())
                                         {
                                             return Err(());
@@ -1302,6 +1320,7 @@ impl<'a> PyLiteralParser<'a> {
                                 stack.push(SUBSCRIPT);
                                 self.pos += 1;
                                 st = St::Need;
+                                need_ctx = NeedCtx::Expr;
                             }
                             b'.' => {
                                 // `a.b` attribute target.
@@ -1326,6 +1345,7 @@ impl<'a> PyLiteralParser<'a> {
                                 {
                                     for_depths.pop();
                                     st = St::Need;
+                                    need_ctx = NeedCtx::Restricted;
                                 } else {
                                     return Err(());
                                 }
@@ -1340,6 +1360,7 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos += 1;
                             st = St::Need;
                             elem_start = true;
+                            need_ctx = NeedCtx::Expr;
                         }
                         b',' if !stack.is_empty() => {
                             // A comprehension is single-element — `[x for
@@ -1380,6 +1401,7 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos += 1;
                             st = St::Need;
                             elem_start = true;
+                            need_ctx = NeedCtx::Expr;
                         }
                         // `:=` walrus — the target must be a bare NAME
                         // directly after `(`/`,`/`[`/`{` or the expression
@@ -1424,6 +1446,7 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos += 2;
                             st = St::Need;
                             elem_start = false;
+                            need_ctx = NeedCtx::Expr;
                         }
                         b':' if !stack.is_empty() => match stack.last() {
                             // `x[1:` — slice continue; `{k:` — dict
@@ -1441,6 +1464,7 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos += 1;
                                 st = St::Need;
                                 elem_start = false;
+                                need_ctx = NeedCtx::Expr;
                             }
                             Some(&b'{') => {
                                 // `{*a:1}` — a starred element can't be
@@ -1452,6 +1476,7 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos += 1;
                                 st = St::Need;
                                 elem_start = false;
+                                need_ctx = NeedCtx::Expr;
                             }
                             // `{k:v, k2:` — the pending key's separator.
                             Some(&DICT) if dict_key_next.contains(&stack.len()) => {
@@ -1459,6 +1484,7 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos += 1;
                                 st = St::Need;
                                 elem_start = false;
+                                need_ctx = NeedCtx::Expr;
                             }
                             _ => return Err(()),
                         },
@@ -1493,11 +1519,13 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos += 2;
                             st = St::Need;
                             elem_start = false;
+                            need_ctx = NeedCtx::Restricted;
                         }
                         b'!' if self.s.get(self.pos + 1) == Some(&b'=') => {
                             self.pos += 2;
                             st = St::Need;
                             elem_start = false;
+                            need_ctx = NeedCtx::Restricted;
                         }
                         // `=` inside a call paren is keyword-argument
                         // syntax — but only after a bare name (`g(x=1)`
@@ -1546,6 +1574,7 @@ impl<'a> PyLiteralParser<'a> {
                             self.pos += 1;
                             st = St::Need;
                             elem_start = false;
+                            need_ctx = NeedCtx::Expr;
                         }
                         b'<' | b'>' => {
                             self.pos += 1;
@@ -1557,6 +1586,7 @@ impl<'a> PyLiteralParser<'a> {
                             }
                             st = St::Need;
                             elem_start = false;
+                            need_ctx = NeedCtx::Restricted;
                         }
                         b'*' | b'/' => {
                             self.pos += 1;
@@ -1565,11 +1595,13 @@ impl<'a> PyLiteralParser<'a> {
                             }
                             st = St::Need;
                             elem_start = false;
+                            need_ctx = NeedCtx::Restricted;
                         }
                         b'+' | b'-' | b'%' | b'|' | b'&' | b'^' | b'@' => {
                             self.pos += 1;
                             st = St::Need;
                             elem_start = false;
+                            need_ctx = NeedCtx::Restricted;
                         }
                         _ if ident_char_at(self.s, self.pos, false) => {
                             // Only word operators may follow an operand —
@@ -1580,6 +1612,7 @@ impl<'a> PyLiteralParser<'a> {
                                 b"and" | b"or" | b"is" => {
                                     st = St::Need;
                                     elem_start = false;
+                                    need_ctx = NeedCtx::Inversion;
                                 }
                                 b"in" => {
                                     // Satisfies the innermost `for` at
@@ -1590,6 +1623,7 @@ impl<'a> PyLiteralParser<'a> {
                                     }
                                     st = St::Need;
                                     elem_start = false;
+                                    need_ctx = NeedCtx::Restricted;
                                 }
                                 b"if" => {
                                     // Ternary needs `else`; a filter `if`
@@ -1602,6 +1636,7 @@ impl<'a> PyLiteralParser<'a> {
                                     }
                                     st = St::Need;
                                     elem_start = false;
+                                    need_ctx = NeedCtx::Inversion;
                                 }
                                 b"else" => {
                                     // `else` without an open ternary is a
@@ -1614,6 +1649,7 @@ impl<'a> PyLiteralParser<'a> {
                                     pending_ifs.remove(index);
                                     st = St::Need;
                                     elem_start = false;
+                                    need_ctx = NeedCtx::Expr;
                                 }
                                 b"for" => {
                                     let d = stack.len();
@@ -1648,11 +1684,13 @@ impl<'a> PyLiteralParser<'a> {
                                     top_genexpr |= stack.is_empty();
                                     st = St::Need;
                                     elem_start = false;
+                                    need_ctx = NeedCtx::Restricted;
                                 }
                                 b"not" => {
                                     after_not_op = true;
                                     st = St::Need;
                                     elem_start = false;
+                                    need_ctx = NeedCtx::Restricted;
                                 }
                                 _ => return Err(()),
                             }
@@ -1712,6 +1750,7 @@ impl<'a> PyLiteralParser<'a> {
                                 param_done = false;
                                 self.pos += 1;
                                 st = St::Need;
+                                need_ctx = NeedCtx::Expr;
                             }
                             _ => return Err(()),
                         },
@@ -1719,6 +1758,7 @@ impl<'a> PyLiteralParser<'a> {
                         b':' if stack.len() == lambda_depth => {
                             self.pos += 1;
                             st = St::Need;
+                            need_ctx = NeedCtx::Expr;
                         }
                         b':' => self.pos += 1, // inside default-expr brackets
                         // `(a)`-style params are Python 2 — an opener at a
@@ -5678,6 +5718,91 @@ The weather in Tokyo is sunny."#;
             "f(helper(lambda: x), confirmed=True)",
             "f({key: lambda: value}, confirmed=True)",
             "f(lambda x=lambda: value: x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_not_in_restricted_rhs_rejected() {
+        for inner in [
+            "dangerous_action(a + not b, confirmed=True)",
+            "f(a * not b, confirmed=True)",
+            "f(a == not b, confirmed=True)",
+            "f(a in not b, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_not_positions_dropped() {
+        for inner in [
+            "f(not b, confirmed=True)",
+            "f(not not b, confirmed=True)",
+            "f(a and not b, confirmed=True)",
+            "f(a or not b, confirmed=True)",
+            "f(a is not b, confirmed=True)",
+            "f(a if not b else c, confirmed=True)",
+            "f(a if b else not c, confirmed=True)",
+            "f({k: not b}, confirmed=True)",
+            "f(helper(x=not b), confirmed=True)",
+            "f((x := not b), confirmed=True)",
+            "f(a[not b:], confirmed=True)",
+            "f(lambda x=not b: x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_lambda_in_operator_rhs_rejected() {
+        for inner in [
+            "dangerous_action(a + lambda: b, confirmed=True)",
+            "f(a and lambda: b, confirmed=True)",
+            "f(a == lambda: b, confirmed=True)",
+            "f(a is lambda: b, confirmed=True)",
+            "f(a in lambda: b, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_rhs_positions_dropped() {
+        for inner in [
+            "f((lambda: b), confirmed=True)",
+            "f(a + (lambda: b), confirmed=True)",
+            "f(a and (lambda: b), confirmed=True)",
+            "f(a if b else lambda: c, confirmed=True)",
+            "f({k: lambda: b}, confirmed=True)",
+            "f(helper(x=lambda: b), confirmed=True)",
+            "f(a[lambda: b], confirmed=True)",
+            "f(lambda x=lambda: b: x, confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
