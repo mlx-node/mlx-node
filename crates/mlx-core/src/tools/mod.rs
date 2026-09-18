@@ -525,15 +525,67 @@ impl<'a> PyLiteralParser<'a> {
 
     /// `name` or `a.b.c` — dotted attribute chains are preserved.
     fn dotted_name(&mut self) -> Result<String, ()> {
-        let mut name = self.ident()?.to_string();
+        // Every dotted segment must be usable as an attribute — a keyword
+        // (`for(x)`, `a.lambda(x)`) is a SyntaxError, and `None(x)` /
+        // `True(x)` parse to a `Constant` with no `.func.id` under vLLM's
+        // AST extraction. Soft keywords (`match`, `case`) stay callable.
+        fn reserved(id: &[u8]) -> bool {
+            matches!(
+                id,
+                b"and"
+                    | b"as"
+                    | b"assert"
+                    | b"async"
+                    | b"await"
+                    | b"break"
+                    | b"class"
+                    | b"continue"
+                    | b"def"
+                    | b"del"
+                    | b"elif"
+                    | b"else"
+                    | b"except"
+                    | b"finally"
+                    | b"for"
+                    | b"from"
+                    | b"global"
+                    | b"if"
+                    | b"import"
+                    | b"in"
+                    | b"is"
+                    | b"lambda"
+                    | b"nonlocal"
+                    | b"not"
+                    | b"or"
+                    | b"pass"
+                    | b"raise"
+                    | b"return"
+                    | b"try"
+                    | b"while"
+                    | b"with"
+                    | b"yield"
+                    | b"True"
+                    | b"False"
+                    | b"None"
+            )
+        }
+        let first = self.ident()?;
+        if reserved(first.as_bytes()) {
+            return Err(());
+        }
+        let mut name = first.to_string();
         loop {
             self.skip_ws();
             if self.peek() != Some(b'.') {
                 break;
             }
             self.pos += 1;
+            let seg = self.ident()?;
+            if reserved(seg.as_bytes()) {
+                return Err(());
+            }
             name.push('.');
-            name.push_str(self.ident()?);
+            name.push_str(seg);
         }
         Ok(name)
     }
@@ -666,6 +718,11 @@ impl<'a> PyLiteralParser<'a> {
         // comprehensions and outer clauses survive inner closes.
         let mut pending_ifs = 0usize;
         let mut comp_depths: Vec<usize> = Vec::new();
+        // Every `for` is a comprehension clause that owes an `in` at the
+        // same bracket depth (`[x for x]` is a SyntaxError). An `in`
+        // inside deeper brackets belongs to the target or iterable
+        // expression and must not satisfy it.
+        let mut for_depths: Vec<usize> = Vec::new();
         // A `for` at top level is a genexpr — valid only as the sole
         // argument, so a `,` boundary after it is a SyntaxError.
         let mut top_genexpr = false;
@@ -690,7 +747,11 @@ impl<'a> PyLiteralParser<'a> {
                 // Top-level argument boundary — valid only after an operand
                 // (not inside `lambda` params, where `,` separates names).
                 b')' | b',' if stack.is_empty() && st != St::Lambda => {
-                    return if st == St::Have && pending_ifs == 0 && !(b == b',' && top_genexpr) {
+                    return if st == St::Have
+                        && pending_ifs == 0
+                        && for_depths.is_empty()
+                        && !(b == b',' && top_genexpr)
+                    {
                         Ok(())
                     } else {
                         Err(())
@@ -974,12 +1035,17 @@ impl<'a> PyLiteralParser<'a> {
                                 ) =>
                             {
                                 // `(a if b)` closes with the ternary's
-                                // `else` still owed — a SyntaxError.
-                                if pending_ifs > 0 {
+                                // `else` still owed — a SyntaxError. So
+                                // does a `for` whose `in` never arrived:
+                                // the pop above already ran, so its depth
+                                // is `stack.len() + 1` (`[x for x]`).
+                                if pending_ifs > 0 || for_depths.last() == Some(&(stack.len() + 1))
+                                {
                                     return Err(());
                                 }
                                 self.pos += 1;
                                 comp_depths.retain(|&d| d <= stack.len());
+                                for_depths.retain(|&d| d <= stack.len());
                             }
                             _ => return Err(()),
                         },
@@ -1063,7 +1129,16 @@ impl<'a> PyLiteralParser<'a> {
                             let id_start = self.pos;
                             self.pos = ident_end(self.s, self.pos);
                             match &self.s[id_start..self.pos] {
-                                b"and" | b"or" | b"in" | b"is" => {
+                                b"and" | b"or" | b"is" => {
+                                    st = St::Need;
+                                }
+                                b"in" => {
+                                    // Satisfies the innermost `for` at
+                                    // this bracket depth; `in` inside
+                                    // deeper brackets is a membership op.
+                                    if for_depths.last() == Some(&stack.len()) {
+                                        for_depths.pop();
+                                    }
                                     st = St::Need;
                                 }
                                 b"if" => {
@@ -1085,10 +1160,12 @@ impl<'a> PyLiteralParser<'a> {
                                 }
                                 b"for" => {
                                     // Comprehension clauses run at the
-                                    // bracket depth they appear in; a
+                                    // bracket depth they appear in and
+                                    // each owes an `in` at that depth; a
                                     // top-level `for` is a genexpr, valid
                                     // only as the call's sole argument.
                                     comp_depths.push(stack.len());
+                                    for_depths.push(stack.len());
                                     top_genexpr |= stack.is_empty();
                                     st = St::Need;
                                 }
@@ -4437,6 +4514,11 @@ The weather in Tokyo is sunny."#;
             "f([1:2], x=1)",         // `:` inside a list display
             "f((1:2), x=1)",         // `:` inside parens
             "f([a: b], x=1)",        // `:` inside a list via idents
+            "f([x for x], confirmed=True)", // `for` with no `in`
+            "f([x for x for y in z], x=1)", // first `for` missing `in`
+            "f((x for x), y=1)",     // genexpr missing `in`
+            "f(x for x)",            // sole-arg genexpr missing `in`
+            "f([x for (a in b)], y=1)", // `in` inside target parens
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4450,6 +4532,41 @@ The weather in Tokyo is sunny."#;
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(text, input);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_keyword_call_names_rejected() {
+        // A Python keyword can't be the call name — `for(x)` is a
+        // SyntaxError and `None(x)`/`True(x)` parse to a `Constant` with
+        // no `.func.id` under vLLM's AST extraction. The whole block must
+        // stay verbatim; a surviving kwarg must not promote it.
+        for inner in [
+            "for(confirmed=True)",
+            "lambda(x=1)",
+            "def()",
+            "return()",
+            "class()",
+            "import()",
+            "None()",
+            "True(x=1)",
+            "False()",
+            "a.for(x=1)", // keyword after a dot
+            "a.lambda()",
+            "a.None(x=1)",
+            "not(x=1)", // unary-op keyword can't name a call
+            "in(x=1)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+
+        // Soft keywords stay callable; normal names are unaffected.
+        let input = "<|tool_call_start|>[match(x=1)]<|tool_call_end|>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "match");
     }
 
     #[test]
@@ -4511,6 +4628,12 @@ The weather in Tokyo is sunny."#;
             ("f(x[1:2, 3], y=1)", "{\"y\":1}"), // tuple index
             ("f({1:2}, y=1)", "{\"y\":1}"),     // dict literal positional
             ("f({k: v for k in y}, y=1)", "{\"y\":1}"), // dict comprehension
+            ("f([x for a in y for b in z], y=1)", "{\"y\":1}"), // chained fors
+            ("f([x for a in b in c], y=1)", "{\"y\":1}"), // `in` in iterable
+            ("f([x for a in (b in c)], y=1)", "{\"y\":1}"), // paren iterable
+            ("f([x for a, b in y], y=1)", "{\"y\":1}"), // tuple target
+            ("f((x for x in y), y=1)", "{\"y\":1}"), // parenthesized genexpr
+            ("f(x[i for i in y], y=1)", "{\"y\":1}"), // genexpr in subscript
             ("f(lambda x=(1, 2), y='a': x, k=1)", "{\"k\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
