@@ -636,6 +636,21 @@ impl<'a> PyLiteralParser<'a> {
     /// unpacking — a `for` at the top level then makes it a comp
     /// element (`*a for a in b` is a SyntaxError).
     fn skip_expression(&mut self, starred: bool) -> Result<(), ()> {
+        self.skip_expression_until(starred, false)
+    }
+
+    fn skip_expression_until(&mut self, starred: bool, lambda_default: bool) -> Result<(), ()> {
+        self.depth += 1;
+        if self.depth > MAX_PY_LITERAL_DEPTH {
+            self.depth -= 1;
+            return Err(());
+        }
+        let result = self.skip_expression_inner(starred, lambda_default);
+        self.depth -= 1;
+        result
+    }
+
+    fn skip_expression_inner(&mut self, starred: bool, lambda_default: bool) -> Result<(), ()> {
         #[derive(Clone, Copy, PartialEq)]
         enum St {
             Need,
@@ -721,7 +736,7 @@ impl<'a> PyLiteralParser<'a> {
         // SyntaxError. Comprehension `if`s (`[x for i in y if z]`) are
         // filters — no `else` — tracked per bracket depth so nested
         // comprehensions and outer clauses survive inner closes.
-        let mut pending_ifs = 0usize;
+        let mut pending_ifs: Vec<usize> = Vec::new();
         let mut comp_depths: Vec<usize> = Vec::new();
         // Every `for` is a comprehension clause that owes an `in` at the
         // same bracket depth (`[x for x]` is a SyntaxError). An `in`
@@ -746,6 +761,7 @@ impl<'a> PyLiteralParser<'a> {
         // A completed param name admits only `,` `=` or the ending `:` —
         // `lambda a b` / `lambda a.b` / `lambda a(` are SyntaxErrors.
         let mut param_done = false;
+        let mut lambda_depth = 0;
         // Implicit-concat / string-prefix tracking: a quote after an
         // operand is legal only directly glued to a prefix identifier
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
@@ -773,7 +789,7 @@ impl<'a> PyLiteralParser<'a> {
         // `,`, a bracket open, or the expression start. After an
         // operator, `:`, `=`, or a unary prefix it is a SyntaxError
         // (`f(1 + *a)`).
-        let mut elem_start = true;
+        let mut elem_start = !lambda_default;
         // Argument ordering inside a nested call: once a `x=1` kwarg is
         // consumed at a CALLPAREN depth, later elements must be `*a` or
         // kwargs — a bare positional (`helper(x=1, 2)`) is a SyntaxError.
@@ -797,11 +813,13 @@ impl<'a> PyLiteralParser<'a> {
                 b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
                 // Top-level argument boundary — valid only after an operand
                 // (not inside `lambda` params, where `,` separates names).
-                b')' | b',' if stack.is_empty() && st != St::Lambda => {
+                b')' | b',' | b':'
+                    if stack.is_empty() && st != St::Lambda && (b != b':' || lambda_default) =>
+                {
                     return if st == St::Have
-                        && pending_ifs == 0
+                        && pending_ifs.is_empty()
                         && for_depths.is_empty()
-                        && !(b == b',' && top_genexpr)
+                        && !(top_genexpr && (b == b',' || lambda_default))
                     {
                         Ok(())
                     } else {
@@ -1016,7 +1034,9 @@ impl<'a> PyLiteralParser<'a> {
                                     } // unary — still need an operand
                                     b"lambda" => {
                                         st = St::Lambda;
+                                        lambda_depth = stack.len();
                                         param_start = true;
+                                        param_done = false;
                                         saw_marker = false;
                                     }
                                     _ => {
@@ -1143,7 +1163,7 @@ impl<'a> PyLiteralParser<'a> {
                                 // `else` still owed — a SyntaxError. So
                                 // does a `for` whose `in` never arrived
                                 // (`[x for x]`).
-                                if pending_ifs > 0 || for_depths.last() == Some(&d) {
+                                if pending_ifs.contains(&d) || for_depths.last() == Some(&d) {
                                     return Err(());
                                 }
                                 // `(*a)` — a bare starred group is a
@@ -1477,7 +1497,7 @@ impl<'a> PyLiteralParser<'a> {
                                     // Ternary needs `else`; a filter `if`
                                     // inside a comprehension does not.
                                     if !comp_depths.contains(&stack.len()) {
-                                        pending_ifs += 1;
+                                        pending_ifs.push(stack.len());
                                     }
                                     st = St::Need;
                                     elem_start = false;
@@ -1485,10 +1505,12 @@ impl<'a> PyLiteralParser<'a> {
                                 b"else" => {
                                     // `else` without an open ternary is a
                                     // SyntaxError.
-                                    if pending_ifs == 0 {
+                                    let Some(index) =
+                                        pending_ifs.iter().rposition(|&d| d == stack.len())
+                                    else {
                                         return Err(());
-                                    }
-                                    pending_ifs -= 1;
+                                    };
+                                    pending_ifs.remove(index);
                                     st = St::Need;
                                     elem_start = false;
                                 }
@@ -1540,7 +1562,7 @@ impl<'a> PyLiteralParser<'a> {
                         // After a param name only `,`, `=`, or the ending
                         // `:` is legal — `lambda a b`, `lambda a.b`, and
                         // `lambda a(` are all SyntaxErrors.
-                        _ if param_done && stack.is_empty() => match b {
+                        _ if param_done && stack.len() == lambda_depth => match b {
                             b',' => {
                                 param_start = true;
                                 param_done = false;
@@ -1548,8 +1570,8 @@ impl<'a> PyLiteralParser<'a> {
                                 self.pos += 1;
                             }
                             b'=' => {
-                                param_done = false;
                                 self.pos += 1;
+                                self.skip_expression_until(false, true)?;
                             }
                             b':' => {
                                 param_done = false;
@@ -1559,7 +1581,7 @@ impl<'a> PyLiteralParser<'a> {
                             _ => return Err(()),
                         },
                         // The lambda's own `:` ends its parameter list.
-                        b':' if stack.is_empty() => {
+                        b':' if stack.len() == lambda_depth => {
                             self.pos += 1;
                             st = St::Need;
                         }
@@ -1568,26 +1590,26 @@ impl<'a> PyLiteralParser<'a> {
                         // param start is a SyntaxError; inside a default
                         // expression brackets are fine.
                         b'(' | b'[' | b'{' => {
-                            if param_start && stack.is_empty() {
+                            if param_start && stack.len() == lambda_depth {
                                 return Err(());
                             }
                             stack.push(b);
                             self.pos += 1;
                         }
-                        b')' | b']' | b'}' if !stack.is_empty() => match stack.pop() {
+                        b')' | b']' | b'}' if stack.len() > lambda_depth => match stack.pop() {
                             Some(o) if close_match(o, b) => {
                                 self.pos += 1;
                             }
                             _ => return Err(()),
                         },
                         b'\'' | b'"' => {
-                            if param_start && stack.is_empty() {
+                            if param_start && stack.len() == lambda_depth {
                                 return Err(());
                             }
                             self.skip_quoted()?;
                         }
                         b',' => {
-                            if stack.is_empty() {
+                            if stack.len() == lambda_depth {
                                 // `a,,b` — a `,` is only legal right after
                                 // a `*`/`/` marker or a name.
                                 if param_start && !saw_marker {
@@ -1600,18 +1622,20 @@ impl<'a> PyLiteralParser<'a> {
                         }
                         // `=x` with no name; unary/dot bytes at a param
                         // start — all SyntaxErrors.
-                        b'=' | b'-' | b'+' | b'~' | b'.' if param_start && stack.is_empty() => {
+                        b'=' | b'-' | b'+' | b'~' | b'.'
+                            if param_start && stack.len() == lambda_depth =>
+                        {
                             return Err(());
                         }
                         b'=' | b'-' | b'+' | b'~' | b'.' => self.pos += 1,
                         b'*' | b'/' => {
-                            if param_start && stack.is_empty() {
+                            if param_start && stack.len() == lambda_depth {
                                 saw_marker = true;
                             }
                             self.pos += 1;
                         }
                         _ if ident_char_at(self.s, self.pos, false) => {
-                            if param_start && stack.is_empty() {
+                            if param_start && stack.len() == lambda_depth {
                                 // Param names start with a letter/`_` and
                                 // can't be keywords — `lambda 1: x` and
                                 // `lambda for: x` are both SyntaxErrors.
@@ -4926,6 +4950,75 @@ The weather in Tokyo is sunny."#;
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(text, input);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_lambda_defaults_rejected() {
+        for inner in [
+            "dangerous_action(lambda x=+: x, confirmed=True)",
+            "f(lambda x=: x, confirmed=True)",
+            "f(lambda x=1 +: x, confirmed=True)",
+            "f(lambda x=a b: x, confirmed=True)",
+            "f(lambda x=a if b: x, confirmed=True)",
+            "f(lambda x=a if (b else c): x, confirmed=True)",
+            "f(lambda x=helper(a=1, 2): x, confirmed=True)",
+            "f((lambda x=+: x), confirmed=True)",
+            "f(lambda x=(lambda y=+: y): x, confirmed=True)",
+            "f(lambda x=*a: x, confirmed=True)",
+            "f(lambda x=a for a in src: x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_defaults_dropped() {
+        for inner in [
+            "f(lambda x=+1: x, confirmed=True)",
+            "f(lambda x=1 + 2, y=-3: x + y, confirmed=True)",
+            "f(lambda x=a if b else c: x, confirmed=True)",
+            "f(lambda x=a if ready(flag) else b: x, confirmed=True)",
+            "f(lambda x=(a if ready(flag) else b): x, confirmed=True)",
+            "f(lambda x=helper(a=1): x, confirmed=True)",
+            "f(lambda x=helper(lambda y=1: y): x, confirmed=True)",
+            "f(lambda x=[a for a in src]: x, confirmed=True)",
+            "f(lambda x={1: 2}, y=items[1:]: x, confirmed=True)",
+            "f((lambda x=+1: x), confirmed=True)",
+            "f(lambda x=(lambda y=1: y): x, confirmed=True)",
+            "f(lambda x=lambda y=1: y: x, confirmed=True)",
+            "f(lambda x=1, /, *, y=2: x + y, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_lambda_default_depth_cap() {
+        for depth in [4, MAX_PY_LITERAL_DEPTH as usize + 1] {
+            let expr = format!("{}0{}", "lambda x=".repeat(depth), ": x".repeat(depth));
+            let input = format!("<|tool_call_start|>[f({expr}, confirmed=True)]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            if depth == 4 {
+                assert!(text.is_empty());
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].arguments.to_string(), "{\"confirmed\":true}");
+            } else {
+                assert_eq!(text, input);
+                assert!(calls.is_empty());
+            }
+        }
     }
 
     #[test]
