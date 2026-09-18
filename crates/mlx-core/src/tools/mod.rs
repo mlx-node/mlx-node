@@ -130,7 +130,10 @@ pub(crate) struct MarkupSpec {
 
 /// The default ChatML markup spec.
 pub(crate) const CHATML_MARKUP: MarkupSpec = MarkupSpec {
-    reasoning: &[("<think>", "</think>"), ("<longcat_think>", "</longcat_think>")],
+    reasoning: &[
+        ("<think>", "</think>"),
+        ("<longcat_think>", "</longcat_think>"),
+    ],
     tool_open: "<tool_call>",
     tool_close: "</tool_call>",
 };
@@ -3844,7 +3847,8 @@ fn keep_only_genuine_tool_spans(
         // fragments (`<|tool_call_start` + `|>[f()]<|tool_call_end|>`) into a
         // fabricated block just like `<tool_call>` ones.
         let mut spans = extract_tag_blocks(&out, spec.tool_open, spec.tool_close);
-        if spec.tool_open == CHATML_MARKUP.tool_open && spec.tool_close == CHATML_MARKUP.tool_close {
+        if spec.tool_open == CHATML_MARKUP.tool_open && spec.tool_close == CHATML_MARKUP.tool_close
+        {
             spans.extend(extract_tag_blocks(
                 &out,
                 LFM2_TOOL_CALL_START,

@@ -794,25 +794,16 @@ export class Qwen4ExpModel extends makeStreamingModel(Qwen4ExpModelNative, FAMIL
 export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, FAMILY_ROWS.lfm2.streamOpts) {}
 
 /** Nemotron 3.5 Lightning (text-only) — see {@link Qwen35Model} for the wrapper shape. */
-export class NemotronHModel extends makeStreamingModel(
-  NemotronHModelNative,
-  FAMILY_ROWS.nemotron_h.streamOpts,
-) {}
+export class NemotronHModel extends makeStreamingModel(NemotronHModelNative, FAMILY_ROWS.nemotron_h.streamOpts) {}
 
 /** K2-Horizon model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
-export class K2HorizonModel extends makeStreamingModel(
-  K2HorizonModelNative,
-  FAMILY_ROWS.k2_horizon.streamOpts,
-) {}
+export class K2HorizonModel extends makeStreamingModel(K2HorizonModelNative, FAMILY_ROWS.k2_horizon.streamOpts) {}
 
 /** Gemma4 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
 export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, FAMILY_ROWS.gemma4.streamOpts) {}
 
 /** Muse-Glimmer text model with embedded DFlash speculative decoding. */
-export class MuseGlimmerModel extends makeStreamingModel(
-  MuseGlimmerModelNative,
-  FAMILY_ROWS.muse_glimmer.streamOpts,
-) {}
+export class MuseGlimmerModel extends makeStreamingModel(MuseGlimmerModelNative, FAMILY_ROWS.muse_glimmer.streamOpts) {}
 
 /**
  * Qwen3 (first-gen, text-only) model.
@@ -889,8 +880,8 @@ type PreservedNativeSurface<C extends NativeStreamingCtor> = Omit<
 type FamilyCheck<K extends ChatFamilyId> =
   InstanceType<(typeof FAMILY_WRAPPERS)[K]['wrapper']> extends SessionCapableModel
     ? InstanceType<(typeof FAMILY_WRAPPERS)[K]['wrapper']> extends PreservedNativeSurface<
-          (typeof FAMILY_WRAPPERS)[K]['native']
-        >
+        (typeof FAMILY_WRAPPERS)[K]['native']
+      >
       ? (typeof FAMILY_WRAPPERS)[K] extends { readonly vision: true }
         ? InstanceType<(typeof FAMILY_WRAPPERS)[K]['native']> extends QwenVisionSurface
           ? InstanceType<(typeof FAMILY_WRAPPERS)[K]['wrapper']> extends QwenVisionSurface
@@ -919,16 +910,15 @@ void _familyConformance;
  * field type resolves to a failure string, which is not assignable to
  * `true`.
  */
-type StreamOptsShapeCheck =
-  keyof FamilyStreamOpts extends keyof StreamingModelOptions
-    ? keyof StreamingModelOptions extends keyof FamilyStreamOpts
-      ? FamilyStreamOpts extends StreamingModelOptions
-        ? StreamingModelOptions extends FamilyStreamOpts
-          ? true
-          : 'streamOpts drift: StreamingModelOptions widened past FamilyStreamOpts'
-        : 'streamOpts drift: FamilyStreamOpts widened past StreamingModelOptions'
-      : 'streamOpts drift: StreamingModelOptions has keys FamilyStreamOpts lacks'
-    : 'streamOpts drift: FamilyStreamOpts has keys StreamingModelOptions lacks';
+type StreamOptsShapeCheck = keyof FamilyStreamOpts extends keyof StreamingModelOptions
+  ? keyof StreamingModelOptions extends keyof FamilyStreamOpts
+    ? FamilyStreamOpts extends StreamingModelOptions
+      ? StreamingModelOptions extends FamilyStreamOpts
+        ? true
+        : 'streamOpts drift: StreamingModelOptions widened past FamilyStreamOpts'
+      : 'streamOpts drift: FamilyStreamOpts widened past StreamingModelOptions'
+    : 'streamOpts drift: StreamingModelOptions has keys FamilyStreamOpts lacks'
+  : 'streamOpts drift: FamilyStreamOpts has keys StreamingModelOptions lacks';
 
 const _streamOptsShape: true = null as unknown as StreamOptsShapeCheck;
 void _streamOptsShape;

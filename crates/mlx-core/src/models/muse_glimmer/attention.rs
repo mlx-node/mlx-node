@@ -97,8 +97,7 @@ impl MuseGlimmerAttention {
         let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (
@@ -170,8 +169,7 @@ impl MuseGlimmerAttention {
         let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (
@@ -337,8 +335,7 @@ impl MuseGlimmerAttention {
         let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (
@@ -452,8 +449,7 @@ impl MuseGlimmerAttention {
         let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (

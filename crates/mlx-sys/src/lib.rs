@@ -1464,10 +1464,7 @@ unsafe extern "C-unwind" {
 
     /// Context-table D128 stripe count clamped by `mlx_paged_grouped_d128_max_stripes`.
     /// Returns 0 when the grouped route is unavailable (dispatch then keeps generic V2).
-    pub fn mlx_paged_grouped_d128_default_stripes(
-        context: u32,
-        attention_layers: u32,
-    ) -> u32;
+    pub fn mlx_paged_grouped_d128_default_stripes(context: u32, attention_layers: u32) -> u32;
 
     /// Return 1 when the canonical direct-read D512 Metal pipeline, reducer,
     /// and threadgroup limits

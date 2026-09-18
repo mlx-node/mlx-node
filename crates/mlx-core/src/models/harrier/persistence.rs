@@ -9,9 +9,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::MxArray;
-use crate::engine::persistence::{
-    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors,
-};
+use crate::engine::persistence::{KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors};
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::{HarrierConfig, HarrierModel};

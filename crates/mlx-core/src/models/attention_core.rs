@@ -196,12 +196,8 @@ impl PagedAttentionCore<'_> {
 
         // 2. [B,T,H,D] reshape, optional per-head Q/K norm, [B,H,T,D]
         //    transpose.
-        let queries = queries.reshape(&[
-            batch,
-            seq_len,
-            self.num_heads as i64,
-            self.head_dim as i64,
-        ])?;
+        let queries =
+            queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
         let queries = match self.qk_norm {
             Some((q_norm, _)) => q_norm.forward(&queries)?,
             None => queries,
@@ -329,9 +325,11 @@ impl PagedAttentionCore<'_> {
         };
 
         // 6. [B, H, T, D] -> [B, T, H*D] -> output projection.
-        let output = attn_bhtd
-            .transpose(Some(&[0, 2, 1, 3]))?
-            .reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch,
+            seq_len,
+            (self.num_heads * self.head_dim) as i64,
+        ])?;
         self.o_proj.forward(&output)
     }
 
@@ -487,9 +485,7 @@ impl PagedAttentionCore<'_> {
         let total_ctx = cached_prefix_len + (seq_len as u32);
         let try_bridge = match self.cache_hit_prefill {
             CacheHitPrefillRoute::HostReadSdpa => false,
-            CacheHitPrefillRoute::BridgeIfBatch1ThenGraphSdpa { gate } => {
-                batch == 1 && gate()
-            }
+            CacheHitPrefillRoute::BridgeIfBatch1ThenGraphSdpa { gate } => batch == 1 && gate(),
             CacheHitPrefillRoute::BridgeUnconditional => true,
         };
         let maybe_paged_attn = if try_bridge {

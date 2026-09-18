@@ -249,7 +249,10 @@ mod tests {
             "use_block_paged_cache": 1,
             "persist_paged_cache": "yes",
         });
-        assert_eq!(PagedCacheConfig::from_raw_json(&raw), PagedCacheConfig::default());
+        assert_eq!(
+            PagedCacheConfig::from_raw_json(&raw),
+            PagedCacheConfig::default()
+        );
         assert_eq!(
             PagedCacheConfig::from_raw_json(&json!({})),
             PagedCacheConfig::default()

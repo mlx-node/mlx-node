@@ -65,9 +65,7 @@ impl PagedStepModel for Qwen35MoePagedDecode<'_> {
             Error::from_reason("Qwen35MoePagedDecode::paged_step: caches dropped mid-decode")
         })?;
         let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
-            Error::from_reason(
-                "Qwen35MoePagedDecode::paged_step: paged_adapter dropped mid-decode",
-            )
+            Error::from_reason("Qwen35MoePagedDecode::paged_step: paged_adapter dropped mid-decode")
         })?;
         crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
             token_id,

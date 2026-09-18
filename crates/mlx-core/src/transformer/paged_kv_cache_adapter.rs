@@ -100,11 +100,11 @@ use super::paged_metadata_cache::{
 // aux-prefix latch helpers) lives in the sibling `cold_tier` module. These
 // re-exports keep `paged_kv_cache_adapter::ColdTierContext` & friends
 // resolving for the model families — zero API change.
+pub(crate) use super::cold_tier::PagedRestoreTicket;
+use super::cold_tier::{self, ColdTierWalk};
 pub use super::cold_tier::{
     ColdCaptureBudget, ColdCaptureOutcome, ColdCaptureStop, ColdTierContext,
 };
-pub(crate) use super::cold_tier::PagedRestoreTicket;
-use super::cold_tier::{self, ColdTierWalk};
 
 use crate::array::{DType, MxArray};
 use crate::inference_trace::{
@@ -1359,11 +1359,7 @@ impl PagedKVCacheAdapter {
     /// Fail closed on any operation that would build on — or publish — a
     /// cached prefix whose auxiliary half nobody has established.
     fn ensure_aux_prefix_primed(&self, op: &str) -> Result<(), String> {
-        cold_tier::ensure_aux_prefix_primed(
-            self.aux_prefix_unbacked,
-            self.cached_token_count,
-            op,
-        )
+        cold_tier::ensure_aux_prefix_primed(self.aux_prefix_unbacked, self.cached_token_count, op)
     }
 
     fn bind_request_cache_salt(&mut self, cache_salt: u64, op: &str) -> Result<(), String> {
@@ -3568,10 +3564,12 @@ impl PagedKVCacheAdapter {
             .as_ref()
             .map(|table| table.physical_revision())
             .unwrap_or(0);
-        if let Some(hit) =
-            self.meta
-                .write_slot_mapping(token_count, first_logical_position, num_tokens, physical_revision)
-        {
+        if let Some(hit) = self.meta.write_slot_mapping(
+            token_count,
+            first_logical_position,
+            num_tokens,
+            physical_revision,
+        ) {
             return Ok(hit);
         }
 
@@ -7226,7 +7224,8 @@ impl PagedKVCacheAdapter {
         }
 
         let snapshot = probe(self);
-        self.meta.store_prefill_memory_snapshot(token_count, snapshot);
+        self.meta
+            .store_prefill_memory_snapshot(token_count, snapshot);
         snapshot
     }
 
@@ -11242,18 +11241,14 @@ mod tests {
         adapter.allocate_suffix_blocks_for(2, 8).unwrap();
         adapter.record_tokens(&[5, 6, 7, 8, 9, 10, 11, 12]).unwrap();
 
-        let planned = adapter.record_tokens_batched(&[(1, 100), (2, 200)]).unwrap();
+        let planned = adapter
+            .record_tokens_batched(&[(1, 100), (2, 200)])
+            .unwrap();
         assert_eq!(planned, vec![(1, 4), (2, 8)]);
         assert_eq!(adapter.current_token_count_for(1), Some(5));
         assert_eq!(adapter.current_token_count_for(2), Some(9));
-        assert_eq!(
-            adapter.request_tokens_for(1).unwrap().last(),
-            Some(&100)
-        );
-        assert_eq!(
-            adapter.request_tokens_for(2).unwrap().last(),
-            Some(&200)
-        );
+        assert_eq!(adapter.request_tokens_for(1).unwrap().last(), Some(&100));
+        assert_eq!(adapter.request_tokens_for(2).unwrap().last(), Some(&200));
     }
 
     /// A duplicated seq_id is rejected during the snapshot pass, before ANY

@@ -1,6 +1,6 @@
 #!/usr/bin/env oxnode
 
-import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, loadModel, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
 
 const SRC = process.env.K2_SRC ?? '/Users/brooklyn/workspace/github/mlx-node/.cache/models/k2-horizon-7b-fp8';
 
@@ -15,9 +15,7 @@ console.log(JSON.stringify({ turn1: r1.text.slice(0, 120), finish: r1.finishReas
 const r2 = await session.send('And what is that number plus 5?', {
   config: { maxNewTokens: 128, temperature: 0, reasoningEffort: 'low' },
 });
-console.log(
-  JSON.stringify({ turn2: r2.text.slice(0, 120), has47: (r2.text + (r2.rawText ?? '')).includes('47') }),
-);
+console.log(JSON.stringify({ turn2: r2.text.slice(0, 120), has47: (r2.text + (r2.rawText ?? '')).includes('47') }));
 
 // --- tool call ---
 const session2 = new ChatSession(model as unknown as SessionCapableModel, {
@@ -52,11 +50,11 @@ console.log(
 
 // --- streaming ---
 const session3 = new ChatSession(model as unknown as SessionCapableModel);
-const events: Record<string, unknown>[] = [];
+const events: ChatStreamEvent[] = [];
 for await (const ev of session3.sendStream('What is 9 * 9? Final number only.', {
   config: { maxNewTokens: 128, temperature: 0, reasoningEffort: 'low' },
 })) {
-  events.push(ev as Record<string, unknown>);
+  events.push(ev);
 }
 const deltas = events.filter((e) => e.done === false);
 const finalEv = events.find((e) => e.done === true);

@@ -24,9 +24,8 @@ use crate::engine::hybrid_scheduler::{
     ScheduledRestoreResult, ScheduledTurn, scheduler_max_num_seqs_for, scheduler_per_seq_context,
 };
 use crate::engine::paged_epilogue::{
-    FinalTokenPolicy, SimplePagedPrefix, abort_single_adapter_turn,
-    finalize_single_adapter_turn, prime_single_adapter_prefix, reconcile_paged_surplus,
-    save_paged_token_history,
+    FinalTokenPolicy, SimplePagedPrefix, abort_single_adapter_turn, finalize_single_adapter_turn,
+    prime_single_adapter_prefix, reconcile_paged_surplus, save_paged_token_history,
 };
 use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
@@ -3883,11 +3882,8 @@ impl PagedStepModel for Qwen3PagedDecode<'_> {
         // The paged forward needs the concrete token id (record_tokens +
         // re-embed as [1, 1]) — handed by the engine, so the absorbed
         // per-step `item_at_int32` the old `forward` paid is gone.
-        self.inner.run_paged_decode_step(
-            token_id,
-            self.num_layers,
-            &self.positions_dummy,
-        )
+        self.inner
+            .run_paged_decode_step(token_id, self.num_layers, &self.positions_dummy)
     }
 
     fn materialize_final_token(&mut self, token_id: u32) -> Result<()> {

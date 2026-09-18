@@ -15,8 +15,7 @@ use crate::array::MxArray;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
     ChatBackend, DecodeStep, FinalizeArgs, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, TurnOutput, TurnSetup,
-    WholeTurnArgs,
+    PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::decode::{DecodeLoopArgs, TurnStreaming, run_decode_loop};
 use crate::engine::hybrid_scheduler::{
@@ -2299,7 +2298,12 @@ impl NemotronHInner {
         // only when a sink exists so the sync path never runs the emitter
         // hook.
         let mut turn_streaming = args.sink.map(|_| {
-            TurnStreaming::new(self, tokenizer.inner(), args.thinking.enabled, stream_skip_special)
+            TurnStreaming::new(
+                self,
+                tokenizer.inner(),
+                args.thinking.enabled,
+                stream_skip_special,
+            )
         });
         let turn_token_observer = ChatBackend::turn_token_observer(self);
 

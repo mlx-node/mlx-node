@@ -774,7 +774,9 @@ export async function run(
     models = await discoverMlxModels(modelsDir);
     if (models.length === 0) {
       console.error(`No usable model found in ${modelsDir} after the download.`);
-      console.error(`Expected a subdirectory with a config.json for a supported family (${CHAT_FAMILY_IDS.join('/')}).`);
+      console.error(
+        `Expected a subdirectory with a config.json for a supported family (${CHAT_FAMILY_IDS.join('/')}).`,
+      );
       console.error('Check the download output above, or point --models-dir at an existing models directory.');
       process.exitCode = 1;
       return;

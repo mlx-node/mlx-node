@@ -20,8 +20,8 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix, TurnOutput,
-    TurnTokenObserver, WholeTurnArgs,
+    DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix,
+    TurnOutput, TurnTokenObserver, WholeTurnArgs,
 };
 use crate::engine::decode::{StreamingCtx, TurnStreaming};
 use crate::engine::paged_turn::FinishPagedTurnArgs;
@@ -1221,7 +1221,12 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     // One streaming bundle — detokenizer + cursors + emitter — built only
     // when a sink exists so the sync path never runs the emitter hook.
     let mut turn_streaming = args.sink.map(|_| {
-        TurnStreaming::new(backend, tokenizer.inner(), thinking.enabled, stream_skip_special)
+        TurnStreaming::new(
+            backend,
+            tokenizer.inner(),
+            thinking.enabled,
+            stream_skip_special,
+        )
     });
     let turn_token_observer = backend.turn_token_observer();
 
@@ -1337,9 +1342,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
             // The epilogue takes scalar copies — the same defaults the
             // locals had when the (sink-less) sync path never created a
             // streaming bundle.
-            streamed_text_len: turn_streaming
-                .as_ref()
-                .map_or(0, |ts| ts.streamed_text_len),
+            streamed_text_len: turn_streaming.as_ref().map_or(0, |ts| ts.streamed_text_len),
             last_is_reasoning: turn_streaming
                 .as_ref()
                 .map_or(thinking.enabled, |ts| ts.last_is_reasoning),

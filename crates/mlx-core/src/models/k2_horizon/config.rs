@@ -186,9 +186,7 @@ impl K2HorizonConfig {
                 self.num_attention_heads, self.num_key_value_heads,
             )));
         }
-        if self.layernorm_num_groups <= 0
-            || self.hidden_size % self.layernorm_num_groups != 0
-        {
+        if self.layernorm_num_groups <= 0 || self.hidden_size % self.layernorm_num_groups != 0 {
             return Err(napi::Error::from_reason(format!(
                 "k2_horizon config: hidden_size ({}) must be divisible by \
                  layernorm_num_groups ({})",
@@ -281,7 +279,10 @@ mod tests {
 
     #[test]
     fn test_resolve_use_block_paged_default() {
-        assert_eq!(K2HorizonConfig::resolve_use_block_paged_default(None), Some(true));
+        assert_eq!(
+            K2HorizonConfig::resolve_use_block_paged_default(None),
+            Some(true)
+        );
         assert_eq!(
             K2HorizonConfig::resolve_use_block_paged_default(Some(false)),
             Some(false)

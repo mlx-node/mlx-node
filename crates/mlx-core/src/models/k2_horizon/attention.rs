@@ -94,10 +94,20 @@ impl K2Attention {
             .reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?
             .transpose(Some(&[0, 2, 1, 3]))?;
         let keys = keys
-            .reshape(&[batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])?
+            .reshape(&[
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])?
             .transpose(Some(&[0, 2, 1, 3]))?;
         let values = values
-            .reshape(&[batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])?
+            .reshape(&[
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])?
             .transpose(Some(&[0, 2, 1, 3]))?;
 
         let offset = cache.as_ref().map_or(0, |c| c.get_offset());
@@ -118,9 +128,11 @@ impl K2Attention {
             scaled_dot_product_attention(&queries, &keys, &values, self.scale, None)?
         };
 
-        let output = output
-            .transpose(Some(&[0, 2, 1, 3]))?
-            .reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch,
+            seq_len,
+            (self.num_heads * self.head_dim) as i64,
+        ])?;
         self.o_proj.forward(&output)
     }
 

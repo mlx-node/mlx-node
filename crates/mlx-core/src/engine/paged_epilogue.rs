@@ -113,9 +113,7 @@ pub(crate) fn finalize_single_adapter_turn(
 /// Error-path teardown for a single-adapter paged turn: `release_request`
 /// ONLY — never register / keep live (partial `block_table` state is
 /// unsafe to keep).
-pub(crate) fn abort_single_adapter_turn(
-    adapter: &mut PagedKVCacheAdapter,
-) -> Result<(), String> {
+pub(crate) fn abort_single_adapter_turn(adapter: &mut PagedKVCacheAdapter) -> Result<(), String> {
     adapter.release_request().map(|_| ())
 }
 

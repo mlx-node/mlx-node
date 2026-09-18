@@ -592,15 +592,14 @@ impl Qwen3_5Attention {
 
         // Paged-pool layout: `[num_tokens, num_kv_heads, head_dim]`.
         // [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D].
-        let (keys_paged, values_paged) =
-            crate::models::attention_core::paged_kv_layout(
-                &keys_bhtd,
-                &values_bhtd,
-                batch,
-                seq_len,
-                self.num_kv_heads as i64,
-                self.head_dim as i64,
-            )?;
+        let (keys_paged, values_paged) = crate::models::attention_core::paged_kv_layout(
+            &keys_bhtd,
+            &values_bhtd,
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        )?;
 
         let trace_enabled = inference_trace_enabled();
         let inference_info_enabled =

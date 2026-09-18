@@ -877,7 +877,12 @@ impl Gemma4Inner {
         // so the sync path never runs the emitter hook.
         let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
         let mut turn_streaming = args.sink.map(|_| {
-            TurnStreaming::new(self, tokenizer.inner(), thinking.enabled, stream_skip_special)
+            TurnStreaming::new(
+                self,
+                tokenizer.inner(),
+                thinking.enabled,
+                stream_skip_special,
+            )
         });
 
         // --- variant prefill: target K/V + the draft's per-turn state ---

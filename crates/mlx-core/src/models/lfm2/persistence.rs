@@ -21,16 +21,15 @@ use crate::models::quant_dispatch::{
     has_sym8_mode, load_dense_mlp_variant, load_embedding_affine_or_bf16,
     load_linear_proj_quantized_or_bf16, load_quant_settings_from_disk, resolve_default_mode,
 };
-use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
-    try_build_kquant_quantized_linear,
+    QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint, try_build_kquant_quantized_linear,
     try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
 };
+use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -2096,8 +2095,15 @@ mod tests {
             default_per_layer_quant(MXFP8_BITS, MXFP8_GROUP_SIZE, PerLayerMode::Mxfp8),
         );
         let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
-        load_linear_proj_quantized_or_bf16(&mut proj, &params, "x_proj", &plq_map, default_plq, FAMILY)
-            .expect("mxfp8 quantized load must succeed (no fail-loud)");
+        load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &params,
+            "x_proj",
+            &plq_map,
+            default_plq,
+            FAMILY,
+        )
+        .expect("mxfp8 quantized load must succeed (no fail-loud)");
 
         let ql = match &proj {
             LinearProj::Quantized(ql) => ql,
@@ -2891,9 +2897,15 @@ mod tests {
             "{}",
             err.reason
         );
-        let err = build_non_moe_ql(&dense_params, dense_prefix, &HashMap::new(), explicit_fp8, FAMILY)
-            .err()
-            .expect("LFM plain-FP8 QL is unsupported");
+        let err = build_non_moe_ql(
+            &dense_params,
+            dense_prefix,
+            &HashMap::new(),
+            explicit_fp8,
+            FAMILY,
+        )
+        .err()
+        .expect("LFM plain-FP8 QL is unsupported");
         assert!(
             err.reason.contains("supported only by Qwen3.5"),
             "{}",

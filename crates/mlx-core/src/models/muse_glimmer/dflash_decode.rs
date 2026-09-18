@@ -431,7 +431,12 @@ impl MuseGlimmerInner {
         // only when a sink exists so the sync path never runs the emitter
         // hook.
         let mut turn_streaming = args.sink.map(|_| {
-            TurnStreaming::new(self, tokenizer.inner(), args.thinking.enabled, stream_skip_special)
+            TurnStreaming::new(
+                self,
+                tokenizer.inner(),
+                args.thinking.enabled,
+                stream_skip_special,
+            )
         });
         let turn_token_observer = ChatBackend::turn_token_observer(self);
         let block_size = self

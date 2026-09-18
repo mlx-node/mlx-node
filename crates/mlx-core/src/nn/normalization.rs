@@ -1,7 +1,7 @@
+use super::activations::Activations;
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use super::activations::Activations;
 
 // ============================================
 // Normalization Layers
@@ -316,9 +316,8 @@ impl GroupedRMSNorm {
         grouped.push(group_size);
         let xg = x32.reshape(&grouped)?;
 
-        let handle = unsafe {
-            sys::mlx_fast_rms_norm(xg.handle.0, std::ptr::null_mut(), self.eps as f32)
-        };
+        let handle =
+            unsafe { sys::mlx_fast_rms_norm(xg.handle.0, std::ptr::null_mut(), self.eps as f32) };
         let normed = MxArray::from_handle(handle, "grouped_fast_rms_norm")?;
 
         // Back to [..., H], apply learned weight in f32, restore dtype.
@@ -413,8 +412,18 @@ mod tests {
 
         let x: Vec<f32> = (0..hidden).map(|i| i as f32 * 0.5 - 2.0).collect();
         let input = MxArray::from_float32(&x, &[hidden]).unwrap();
-        let a = grouped.forward(&input).unwrap().to_float32().unwrap().to_vec();
-        let b = plain.forward(&input).unwrap().to_float32().unwrap().to_vec();
+        let a = grouped
+            .forward(&input)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let b = plain
+            .forward(&input)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
         for (x, y) in a.iter().zip(b.iter()) {
             assert!((x - y).abs() < 1e-5, "grouped {x} vs plain {y}");
         }

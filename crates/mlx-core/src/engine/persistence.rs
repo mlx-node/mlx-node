@@ -1046,9 +1046,7 @@ fn eval_key_rule(rule: &KeyRule, key: &str) -> Option<RuleOutcome> {
         KeyRule::DropPrefix(p) if key.starts_with(p) => RuleOutcome::Drop,
         KeyRule::DropContains(s) if key.contains(s) => RuleOutcome::Drop,
         KeyRule::DropSuffix(s) if key.ends_with(s) => RuleOutcome::Drop,
-        KeyRule::RenameExact { from, to } if key == from => {
-            RuleOutcome::Rename(to.to_string())
-        }
+        KeyRule::RenameExact { from, to } if key == from => RuleOutcome::Rename(to.to_string()),
         KeyRule::RenamePrefix { from, to } if key.starts_with(from) => {
             RuleOutcome::Rename(format!("{to}{}", &key[from.len()..]))
         }
@@ -1589,7 +1587,10 @@ mod rename_spec_tests {
         let w_ptr = w.as_raw_ptr();
         params.insert("model.embed_tokens.weight".into(), w);
         params.insert("model.norm.weight".into(), dummy());
-        params.insert("model.layers.0.self_attn.rotary_emb.inv_freq".into(), dummy());
+        params.insert(
+            "model.layers.0.self_attn.rotary_emb.inv_freq".into(),
+            dummy(),
+        );
         params.insert("untouched.key".into(), dummy());
 
         let out = apply_rename_spec(params, &spec).expect("apply");

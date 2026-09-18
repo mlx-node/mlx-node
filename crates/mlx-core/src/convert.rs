@@ -2717,8 +2717,7 @@ pub(crate) mod recipe {
                     continue;
                 }
                 if k.ends_with(".scales") {
-                    if let Sym8ScalesCastAction::NormalizeToF32 =
-                        sym8_scales_cast_action(&k, &out)?
+                    if let Sym8ScalesCastAction::NormalizeToF32 = sym8_scales_cast_action(&k, &out)?
                         && let Some(v) = out.get(&k)
                     {
                         let normalized = v.astype(DType::Float32)?;
@@ -11743,7 +11742,13 @@ mod tests {
                 r.sym8_supported(),
                 matches!(
                     mt,
-                    "qwen3_5" | "qwen3_5_moe" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified" | "k2_horizon"
+                    "qwen3_5"
+                        | "qwen3_5_moe"
+                        | "lfm2"
+                        | "lfm2_moe"
+                        | "gemma4"
+                        | "gemma4_unified"
+                        | "k2_horizon"
                 ),
                 "{mt}: sym8_supported mismatch vs inline sym8 allowlist"
             );

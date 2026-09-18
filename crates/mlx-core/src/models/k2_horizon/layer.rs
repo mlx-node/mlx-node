@@ -15,8 +15,8 @@
 use crate::array::MxArray;
 use crate::models::qwen3_5_moe::quantized_linear::MLPVariant;
 use crate::nn::GroupedRMSNorm;
-use crate::transformer::MLP;
 use crate::transformer::KVCache;
+use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
 

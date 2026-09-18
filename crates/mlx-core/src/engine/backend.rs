@@ -700,11 +700,7 @@ pub(crate) trait ChatBackend {
     /// tracker is built), so it must be a pure function of
     /// `(config, tokenizer)`: same inputs ⇒ same resolution, no side
     /// effects.
-    fn think_end_for_turn(
-        &self,
-        _config: &ChatConfig,
-        tok: &Qwen3Tokenizer,
-    ) -> ThinkEndResolution {
+    fn think_end_for_turn(&self, _config: &ChatConfig, tok: &Qwen3Tokenizer) -> ThinkEndResolution {
         ThinkEndResolution {
             think_end_id: tok.think_end_id(),
             think_end_str: tok.think_end_str().map(str::to_string),

@@ -30,9 +30,7 @@ use std::cell::Cell;
 use mlx_paged_attn::{LayerKVPool, SequenceBlockTable};
 
 use crate::array::MxArray;
-use crate::inference_trace::{
-    enabled as inference_trace_enabled, write as write_inference_trace,
-};
+use crate::inference_trace::{enabled as inference_trace_enabled, write as write_inference_trace};
 
 use super::paged_kv_cache_adapter::{
     PagedPrefillMemorySnapshot, PagedRaggedRow, SeqId, build_prefill_block_ids_for_total,
@@ -386,8 +384,7 @@ impl PagedMetadataCache {
                 .map_err(|e| format!("gather_kv_for_decode_graph seq_lens eval: {e}"))?;
         }
 
-        self.request
-            .decode_attention_inputs_cache = Some(DecodePagedAttentionInputsCache {
+        self.request.decode_attention_inputs_cache = Some(DecodePagedAttentionInputsCache {
             first_block,
             physical_revision,
             token_count: recorded,
@@ -696,9 +693,8 @@ impl PagedMetadataCache {
             ));
         }
 
-        let block_ids =
-            build_prefill_block_ids_for_total(block_table, expected_total, block_size)
-                .map_err(|e| format!("gather_kv_for_prefill_chunk: {e}"))?;
+        let block_ids = build_prefill_block_ids_for_total(block_table, expected_total, block_size)
+            .map_err(|e| format!("gather_kv_for_prefill_chunk: {e}"))?;
         if block_ids.is_empty() {
             return Err(
                 "gather_kv_for_prefill_chunk: active request has no allocated blocks".to_string(),
@@ -764,8 +760,7 @@ impl PagedMetadataCache {
         MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
             .map_err(|e| format!("gather_kv_for_prefill_chunk metadata eval: {e}"))?;
 
-        self.request
-            .prefill_attention_inputs_cache = Some(PrefillPagedAttentionInputsCache {
+        self.request.prefill_attention_inputs_cache = Some(PrefillPagedAttentionInputsCache {
             token_count: recorded,
             cached_prefix_len,
             num_new_tokens,
@@ -838,11 +833,9 @@ impl PagedMetadataCache {
 
     /// Whether graph-native SDPA already failed in this context bucket.
     pub(crate) fn decode_sdpa_failed(&self, context_bucket_end: u32) -> bool {
-        self.request
-            .decode_planning_cache
-            .is_some_and(|cached| {
-                cached.context_bucket_end == context_bucket_end && cached.sdpa_failed
-            })
+        self.request.decode_planning_cache.is_some_and(|cached| {
+            cached.context_bucket_end == context_bucket_end && cached.sdpa_failed
+        })
     }
 
     /// Latch an SDPA construction/gather failure for the rest of this
@@ -898,9 +891,8 @@ impl PagedMetadataCache {
         {
             return stripes;
         }
-        let stripes = unsafe {
-            mlx_sys::mlx_paged_grouped_d128_default_stripes(max_context_len, num_layers)
-        };
+        let stripes =
+            unsafe { mlx_sys::mlx_paged_grouped_d128_default_stripes(max_context_len, num_layers) };
         self.d128_stripe_plan_cache
             .set(Some((max_context_len, stripes)));
         stripes
@@ -913,13 +905,13 @@ impl PagedMetadataCache {
         num_query_heads: i32,
         num_kv_heads: i32,
     ) -> Result<bool, String> {
-        if let Some((cached_heads, cached_result)) =
-            self.grouped_d512_capability_cache.as_ref()
+        if let Some((cached_heads, cached_result)) = self.grouped_d512_capability_cache.as_ref()
             && *cached_heads == num_query_heads
         {
             return cached_result.clone();
         }
-        let result = unsafe { mlx_sys::mlx_paged_grouped_d512_capability(num_query_heads, num_kv_heads) };
+        let result =
+            unsafe { mlx_sys::mlx_paged_grouped_d512_capability(num_query_heads, num_kv_heads) };
         let result = match result {
             1 => Ok(true),
             0 => Ok(false),

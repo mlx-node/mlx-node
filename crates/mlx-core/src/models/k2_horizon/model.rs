@@ -38,9 +38,8 @@ use crate::engine::hybrid_scheduler::{
     ScheduledRestoreResult, scheduler_max_num_seqs_for, scheduler_per_seq_context,
 };
 use crate::engine::paged_epilogue::{
-    FinalTokenPolicy, SimplePagedPrefix, abort_single_adapter_turn,
-    finalize_single_adapter_turn, prime_single_adapter_prefix, reconcile_paged_surplus,
-    save_paged_token_history,
+    FinalTokenPolicy, SimplePagedPrefix, abort_single_adapter_turn, finalize_single_adapter_turn,
+    prime_single_adapter_prefix, reconcile_paged_surplus, save_paged_token_history,
 };
 use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
@@ -153,7 +152,9 @@ pub(crate) struct K2Inner {
 
 /// Allocate the flat-path cache stack (one `KVCache` per layer).
 pub(crate) fn init_caches(config: &K2HorizonConfig) -> Vec<KVCache> {
-    (0..config.num_hidden_layers).map(|_| KVCache::new()).collect()
+    (0..config.num_hidden_layers)
+        .map(|_| KVCache::new())
+        .collect()
 }
 
 /// Force-materialize every live flat-cache array (post-prefill sync).
@@ -165,8 +166,7 @@ impl K2Inner {
     /// Construct `K2Inner` from the parsed config. Weight tensors are
     /// placeholders until `persistence::apply_weights` installs them.
     pub(crate) fn new(config: K2HorizonConfig) -> Result<Self> {
-        let embed_tokens =
-            Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
+        let embed_tokens = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|_| K2DecoderLayer::new(&config))
@@ -321,9 +321,7 @@ impl K2Inner {
             sizing.selected_blocks,
             cache_dtype,
         )
-        .map_err(|error| {
-            Error::from_reason(format!("Failed to construct K2 KV pool: {error}"))
-        })?;
+        .map_err(|error| Error::from_reason(format!("Failed to construct K2 KV pool: {error}")))?;
         self.paged_adapter = Some(
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|error| {
                 Error::from_reason(format!("Failed to construct K2 paged adapter: {error}"))
@@ -638,11 +636,7 @@ impl K2Inner {
         first_logical_position: u32,
     ) -> Result<MxArray> {
         let chunk_size = crate::array::paged_prefill_chunk_size();
-        self.run_paged_prefill_chunk_with_size(
-            suffix_tokens,
-            first_logical_position,
-            chunk_size,
-        )
+        self.run_paged_prefill_chunk_with_size(suffix_tokens, first_logical_position, chunk_size)
     }
 
     /// Final grouped norm + lm_head over the last position only.
@@ -808,12 +802,9 @@ impl K2Inner {
             // now-active request's cached decode inputs instead.
             let position = planned_rows[0].1;
             for layer_idx in 0..self.layers.len() {
-                let layer: &K2DecoderLayer =
-                    unsafe { &*self.layers.as_ptr().add(layer_idx) };
+                let layer: &K2DecoderLayer = unsafe { &*self.layers.as_ptr().add(layer_idx) };
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "run_paged_decode_step_batched: paged adapter dropped",
-                    )
+                    Error::from_reason("run_paged_decode_step_batched: paged adapter dropped")
                 })?;
                 hidden_states = layer.forward_paged(
                     &hidden_states,
@@ -826,12 +817,9 @@ impl K2Inner {
             }
         } else {
             for layer_idx in 0..self.layers.len() {
-                let layer: &K2DecoderLayer =
-                    unsafe { &*self.layers.as_ptr().add(layer_idx) };
+                let layer: &K2DecoderLayer = unsafe { &*self.layers.as_ptr().add(layer_idx) };
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "run_paged_decode_step_batched: paged adapter dropped",
-                    )
+                    Error::from_reason("run_paged_decode_step_batched: paged adapter dropped")
                 })?;
                 hidden_states = layer.forward_paged_batched(
                     &hidden_states,
@@ -1178,11 +1166,7 @@ impl ChatBackend for K2Inner {
     /// The request's effort reaches the template only after
     /// [`normalize_k2_effort`] — applied here too so the tracker's close
     /// token always matches the tag the render actually opened.
-    fn think_end_for_turn(
-        &self,
-        config: &ChatConfig,
-        tok: &Qwen3Tokenizer,
-    ) -> ThinkEndResolution {
+    fn think_end_for_turn(&self, config: &ChatConfig, tok: &Qwen3Tokenizer) -> ThinkEndResolution {
         let tag = match normalize_k2_effort(config.reasoning_effort.as_deref()).as_deref() {
             Some("medium") => K2_THINK_END_MEDIUM,
             Some("low") => K2_THINK_END_LOW,
@@ -1682,12 +1666,18 @@ mod tests {
     #[test]
     fn test_normalize_k2_effort() {
         assert_eq!(normalize_k2_effort(Some("high")), Some("high".to_string()));
-        assert_eq!(normalize_k2_effort(Some("medium")), Some("medium".to_string()));
+        assert_eq!(
+            normalize_k2_effort(Some("medium")),
+            Some("medium".to_string())
+        );
         assert_eq!(normalize_k2_effort(Some("low")), Some("low".to_string()));
         // pi's "reasoning unset" sentinel and the minimal level both pick
         // the least thinking K2 can emit.
         assert_eq!(normalize_k2_effort(Some("none")), Some("low".to_string()));
-        assert_eq!(normalize_k2_effort(Some("minimal")), Some("low".to_string()));
+        assert_eq!(
+            normalize_k2_effort(Some("minimal")),
+            Some("low".to_string())
+        );
         // Over-ceiling levels clamp.
         assert_eq!(normalize_k2_effort(Some("xhigh")), Some("high".to_string()));
         assert_eq!(normalize_k2_effort(Some("max")), Some("high".to_string()));

@@ -7,6 +7,7 @@
 // Run: oxnode scripts/k2-bench-session-node.ts  (K2_MXFP8 overrides path)
 
 import { readFileSync } from 'node:fs';
+
 import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
 
 const MODEL = process.env.K2_MXFP8 ?? '/tmp/k2-out/k2-horizon-7b-mxfp8';

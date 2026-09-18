@@ -12,9 +12,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
-
 import { MODEL_FAMILY_DATA } from '@mlx-node/lm/family-data';
+import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
 import { discoverLocalModels } from '../src/models.js';
 

@@ -22,10 +22,7 @@ import type { SessionCapableModel } from '@mlx-node/lm';
  * Qianfan-OCR records its model path so `applyChatTemplate` uses the exact
  * tokenizer/template asset required by native inference and token counting.
  */
-export class QianfanOCRModel extends makeStreamingModel(
-  QianfanOCRModelNative,
-  FAMILY_ROWS['qianfan-ocr'].streamOpts,
-) {}
+export class QianfanOCRModel extends makeStreamingModel(QianfanOCRModelNative, FAMILY_ROWS['qianfan-ocr'].streamOpts) {}
 
 // -------------------------------------------------------------------
 // Compile-time conformance check

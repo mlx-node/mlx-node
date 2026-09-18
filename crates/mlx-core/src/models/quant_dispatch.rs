@@ -1409,14 +1409,13 @@ pub(crate) fn load_dense_mlp_variant(
         // groups, but the builder-level guard catches any skew it cannot
         // see). The first `?` preserves the sym8 builder's own descriptive
         // `Err`.
-        let gate_proj =
-            build_non_moe_ql(params, &gate_base, per_layer_quant, default_plq, family)?
-                .ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "{family}: quantized dense-MLP projection '{gate_base}' could not be \
+        let gate_proj = build_non_moe_ql(params, &gate_base, per_layer_quant, default_plq, family)?
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "{family}: quantized dense-MLP projection '{gate_base}' could not be \
                          built (missing weight/scales)"
-                    ))
-                })?;
+                ))
+            })?;
         let up_proj = build_non_moe_ql(params, &up_base, per_layer_quant, default_plq, family)?
             .ok_or_else(|| {
                 Error::from_reason(format!(
@@ -1424,14 +1423,13 @@ pub(crate) fn load_dense_mlp_variant(
                      (missing weight/scales)"
                 ))
             })?;
-        let down_proj =
-            build_non_moe_ql(params, &down_base, per_layer_quant, default_plq, family)?
-                .ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "{family}: quantized dense-MLP projection '{down_base}' could not be \
+        let down_proj = build_non_moe_ql(params, &down_base, per_layer_quant, default_plq, family)?
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "{family}: quantized dense-MLP projection '{down_base}' could not be \
                          built (missing weight/scales)"
-                    ))
-                })?;
+                ))
+            })?;
         *ff = MLPVariant::Quantized {
             gate_proj,
             up_proj,

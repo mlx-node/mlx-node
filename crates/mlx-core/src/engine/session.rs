@@ -1245,11 +1245,8 @@ fn chat_turn_core<B: ChatBackend>(
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker = ReasoningTracker::from_setup_multi(
-        &thinking,
-        think_end_id,
-        think_end_extra_ids.clone(),
-    );
+    let mut reasoning_tracker =
+        ReasoningTracker::from_setup_multi(&thinking, think_end_id, think_end_extra_ids.clone());
 
     // Stop set + streaming-order knob, resolved ONCE per turn.
     let extra_eos_ids = backend.extra_eos_ids();
@@ -1263,7 +1260,12 @@ fn chat_turn_core<B: ChatBackend>(
     // — the emitter hook must not run on sync turns.
     let stream_skip_special = backend.stream_skip_special_tokens();
     let mut turn_streaming = streaming.as_ref().map(|_| {
-        TurnStreaming::new(backend, tokenizer.inner(), thinking.enabled, stream_skip_special)
+        TurnStreaming::new(
+            backend,
+            tokenizer.inner(),
+            thinking.enabled,
+            stream_skip_special,
+        )
     });
     let turn_token_observer = backend.turn_token_observer();
 

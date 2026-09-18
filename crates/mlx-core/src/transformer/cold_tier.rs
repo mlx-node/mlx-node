@@ -45,9 +45,7 @@ use std::time::{Duration, Instant};
 
 use mlx_paged_attn::{BlockAllocator, LayerKVPool, PhysicalBlock};
 
-use crate::inference_trace::{
-    enabled as inference_trace_enabled, write as write_inference_trace,
-};
+use crate::inference_trace::{enabled as inference_trace_enabled, write as write_inference_trace};
 
 use super::paged_kv_cache_adapter::{PagedTurnPlanReason, SeqId};
 

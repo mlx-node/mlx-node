@@ -32,11 +32,7 @@ const K2_MARKUP: MarkupSpec = MarkupSpec {
 
 /// K2 reasoning open tags (for the strip-open-prefix arms that mirror the
 /// ChatML `<think>`/`<longcat_think>` prefix handling).
-const K2_OPEN_PREFIXES: &[&str] = &[
-    "<ifm|think>",
-    "<ifm|think_fast>",
-    "<ifm|think_faster>",
-];
+const K2_OPEN_PREFIXES: &[&str] = &["<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>"];
 
 /// Coerce one `xml`/`xml_typed` argument value.
 ///
@@ -125,10 +121,7 @@ fn classify_k2_tool_call(inner: &str, raw_content: &str) -> Option<ToolCallResul
             continue;
         }
         let arg_type = types.get(i).map(|(_, _, t)| *t);
-        args.insert(
-            key.to_string(),
-            coerce_arg_value(values[i].2, arg_type),
-        );
+        args.insert(key.to_string(), coerce_arg_value(values[i].2, arg_type));
     }
     Some(ToolCallResult::ok(
         name.to_string(),
@@ -204,9 +197,7 @@ fn parse_k2_thinking(text: &str) -> (String, Option<String>) {
 
 /// K2 port of `tools::parse_generation_output` — the text-level fallback
 /// when no think-end token is available.
-fn parse_k2_generation_output(
-    text: &str,
-) -> (String, Vec<ToolCallResult>, Option<String>) {
+fn parse_k2_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Option<String>) {
     let (text_without_tools, tool_calls) = parse_tool_calls(text);
     let (cleaned_text, thinking) = parse_k2_thinking(&text_without_tools);
     (cleaned_text, tool_calls, thinking)

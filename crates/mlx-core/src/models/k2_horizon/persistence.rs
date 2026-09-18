@@ -292,8 +292,11 @@ impl K2Inner {
         // shard-identity guard brackets the complete load. Pure standard-KV
         // — no sidecar policy.
         let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
-        let persist_cold =
-            resolve_persist_cold("k2_horizon", persist_env.as_deref(), config.persist_paged_cache);
+        let persist_cold = resolve_persist_cold(
+            "k2_horizon",
+            persist_env.as_deref(),
+            config.persist_paged_cache,
+        );
         let shard_snapshot_before_mmap = if persist_cold {
             snapshot_shard_identities(path)
         } else {

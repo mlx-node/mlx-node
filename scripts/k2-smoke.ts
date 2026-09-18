@@ -29,9 +29,7 @@ async function runOnce(path: string, label: string, maxTok = 256) {
   const model = await loadModel(path);
   const loadMs = Math.round(performance.now() - t0);
   const native = model as unknown as { hasBlockPagedCache?: () => boolean };
-  console.log(
-    JSON.stringify({ label, loadMs, paged: native.hasBlockPagedCache?.() ?? 'n/a' }),
-  );
+  console.log(JSON.stringify({ label, loadMs, paged: native.hasBlockPagedCache?.() ?? 'n/a' }));
   const session = new ChatSession(model as unknown as SessionCapableModel);
   const t1 = performance.now();
   const result = await session.send(PROMPT, {

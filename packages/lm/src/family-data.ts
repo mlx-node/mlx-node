@@ -562,9 +562,7 @@ export type TrainableFamilyId = Extract<FamilyDataRow, { readonly kind: 'trainab
  */
 type FamilyRowById = { [R in FamilyDataRow as R['id']]: R };
 
-export const FAMILY_ROWS = Object.fromEntries(
-  MODEL_FAMILY_DATA.map((row) => [row.id, row] as const),
-) as FamilyRowById;
+export const FAMILY_ROWS = Object.fromEntries(MODEL_FAMILY_DATA.map((row) => [row.id, row] as const)) as FamilyRowById;
 
 /**
  * Every chat-capable family (kind trainable | loadable), in registry order —

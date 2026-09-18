@@ -36,6 +36,7 @@ use crate::vision::qwen::processing::QwenImageProcessor;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
 use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, Qwen35MoeSchedulerState};
+use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
@@ -47,7 +48,6 @@ use crate::models::quantized_linear::{
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
     try_build_sym8_quantized_linear,
 };
-use super::switch_glu::SwitchGLU;
 
 /// Sanitize weights from HuggingFace format.
 fn sanitize_weights(
