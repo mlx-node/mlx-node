@@ -53,6 +53,7 @@ pub struct Qwen3_5Attention {
     num_kv_heads: i32,
     head_dim: i32,
     scale: f32,
+    is_prism_model: bool,
 
     /// Pre-transposed, OUTPUT-reordered `[hidden, 2*num_heads*head_dim]`
     /// q_proj weight: block order `[Q_h0..Q_h{H-1}, G_h0..G_h{H-1}]` instead
@@ -208,8 +209,12 @@ fn select_cache_hit_prefill_plan(
 }
 
 impl Qwen3_5Attention {
-    fn paged_attention_operand(&self, x: &MxArray, cache_dtype: Option<DType>) -> Result<MxArray> {
-        if self.q_proj.has_hadamard() && x.dtype()? == DType::Float32 {
+    pub(super) fn paged_attention_operand(
+        &self,
+        x: &MxArray,
+        cache_dtype: Option<DType>,
+    ) -> Result<MxArray> {
+        if (self.is_prism_model || self.q_proj.has_hadamard()) && x.dtype()? == DType::Float32 {
             let dtype = cache_dtype
                 .filter(|dtype| matches!(dtype, DType::Float16 | DType::BFloat16))
                 .ok_or_else(|| {
@@ -219,6 +224,10 @@ impl Qwen3_5Attention {
         } else {
             Ok(x.clone())
         }
+    }
+
+    pub(super) fn set_prism_model(&mut self, enabled: bool) {
+        self.is_prism_model = enabled;
     }
 
     pub fn new(config: &Qwen3_5Config) -> Result<Self> {
@@ -272,6 +281,7 @@ impl Qwen3_5Attention {
             num_kv_heads,
             head_dim,
             scale,
+            is_prism_model: false,
             q_gate_block_t: None,
             q_gate_block_bias: None,
         })
@@ -2054,6 +2064,50 @@ mod tests {
             attention
                 .paged_attention_operand(&x, Some(DType::Float32))
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prism_hadamard_paged_operands_cast_for_dense_attention() -> Result<()> {
+        let mut attention = Qwen3_5Attention::new(&tiny_cfg())?;
+        let x = MxArray::from_float32(&[0.1, -0.2, 0.3, 0.4], &[1, 1, 4])?;
+        assert_eq!(
+            attention.prism_hadamard_sites(),
+            (false, false, false, false)
+        );
+        attention.set_prism_model(true);
+        for dtype in [DType::Float16, DType::BFloat16] {
+            let actual = attention.paged_attention_operand(&x, Some(dtype))?;
+            assert_eq!(actual.dtype()?, dtype);
+            assert_eq!(actual.shape()?.as_ref(), x.shape()?.as_ref());
+            assert_eq!(
+                actual.astype(DType::Float32)?.to_float32()?.as_ref(),
+                x.astype(dtype)?
+                    .astype(DType::Float32)?
+                    .to_float32()?
+                    .as_ref()
+            );
+            let half = x.astype(dtype)?;
+            assert_eq!(
+                attention
+                    .paged_attention_operand(&half, Some(dtype))?
+                    .as_raw_ptr(),
+                half.as_raw_ptr()
+            );
+        }
+        assert!(attention.paged_attention_operand(&x, None).is_err());
+        assert!(
+            attention
+                .paged_attention_operand(&x, Some(DType::Float32))
+                .is_err()
+        );
+        attention.set_prism_model(false);
+        assert_eq!(
+            attention
+                .paged_attention_operand(&x, Some(DType::BFloat16))?
+                .as_raw_ptr(),
+            x.as_raw_ptr()
         );
         Ok(())
     }

@@ -1673,6 +1673,7 @@ fn apply_weights_inner_with_residency(
                 gdn.finalize_in_proj()?;
             }
             AttentionType::Full(attn) => {
+                attn.set_prism_model(prism.is_some());
                 if is_quantized {
                     // Dense fallbacks below are dtype-guarded (see the GDN
                     // branch above): truncated sym8 groups must fail loud.
@@ -3745,6 +3746,88 @@ mod tests {
                 assert!(
                     msg.contains("missing mandatory weights"),
                     "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        for all_attention_dense in [false, true] {
+            let mut mixed_params = params.clone();
+            let mut mixed_contract = contract.clone();
+            for (projection, rows) in [
+                ("q_proj", q_rows),
+                ("k_proj", kv_rows),
+                ("v_proj", kv_rows),
+                ("o_proj", hidden),
+            ] {
+                if projection != "q_proj" && !all_attention_dense {
+                    continue;
+                }
+                let prefix = format!("layers.1.self_attn.{projection}");
+                let name = format!("{prefix}.weight");
+                mixed_params.insert(
+                    name.clone(),
+                    MxArray::zeros(&[rows, hidden], Some(DType::Float32)).unwrap(),
+                );
+                mixed_params.remove(&format!("{prefix}.scales"));
+                mixed_params.remove(&format!("{prefix}.biases"));
+                mixed_contract.weight_names.retain(|weight| weight != &name);
+            }
+            let mixed_runtime = mixed_contract
+                .prepare(&mixed_params, &cfg, plq, &HashMap::new())
+                .expect("mixed dense/PQ2 contract must be valid");
+            let mut mixed_inner = Qwen35Inner::new(cfg.clone()).unwrap();
+            if let Err(err) = apply_weights_inner(
+                &mut mixed_inner,
+                &mixed_params,
+                &cfg,
+                2,
+                128,
+                None,
+                &HashMap::new(),
+                false,
+                Some(&mixed_runtime),
+            ) {
+                assert!(
+                    err.reason.contains("missing mandatory weights"),
+                    "{}",
+                    err.reason
+                );
+            }
+            let AttentionType::Full(attn) = &mixed_inner.layers[1].attn else {
+                panic!("mixed layer must use full attention");
+            };
+            assert!(!attn.prism_hadamard_sites().0);
+            assert_eq!(attn.get_q_proj_weight().dtype().unwrap(), DType::Float32);
+            if all_attention_dense {
+                assert_eq!(attn.prism_hadamard_sites(), (false, false, false, false));
+            }
+            let operand = MxArray::from_float32(&[0.1, -0.2, 0.3, 0.4], &[1, 1, 4]).unwrap();
+            for dtype in [DType::Float16, DType::BFloat16] {
+                let actual = attn.paged_attention_operand(&operand, Some(dtype)).unwrap();
+                assert_eq!(
+                    actual.dtype().unwrap(),
+                    dtype,
+                    "all_attention_dense={all_attention_dense}"
+                );
+                assert_eq!(
+                    actual.shape().unwrap().as_ref(),
+                    operand.shape().unwrap().as_ref()
+                );
+                assert_eq!(
+                    actual
+                        .astype(DType::Float32)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap()
+                        .as_ref(),
+                    operand
+                        .astype(dtype)
+                        .unwrap()
+                        .astype(DType::Float32)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap()
+                        .as_ref()
                 );
             }
         }
