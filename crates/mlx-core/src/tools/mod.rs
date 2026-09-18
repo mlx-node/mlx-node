@@ -798,6 +798,7 @@ impl<'a> PyLiteralParser<'a> {
         // state with a key pending rejects; in Need it's a legal
         // trailing comma.
         let mut dict_key_next: Vec<usize> = Vec::new();
+        let mut slice_colons: Vec<(usize, u8)> = Vec::new();
         // `*a`/`**a` unpacking is legal only at an element start — after
         // `,`, a bracket open, or the expression start. After an
         // operator, `:`, `=`, or a unary prefix it is a SyntaxError
@@ -930,6 +931,7 @@ impl<'a> PyLiteralParser<'a> {
                                         starred_depths.retain(|&(d, _)| d <= stack.len());
                                         comma_depths.retain(|&d| d <= stack.len());
                                         dict_key_next.retain(|&d| d <= stack.len());
+                                        slice_colons.retain(|(d, _)| *d <= stack.len());
                                         kwarg_seen_depths.retain(|&d| d <= stack.len());
                                         kw_unpack_depths.retain(|&d| d <= stack.len());
                                         kwarg_elem_depths.retain(|&d| d <= stack.len());
@@ -1043,8 +1045,21 @@ impl<'a> PyLiteralParser<'a> {
                             // `x[:2]` / `x[::]` — `:` where an operand is
                             // expected is slice syntax, only in a subscript.
                             b':' if stack.last() == Some(&SUBSCRIPT) => {
+                                let depth = stack.len();
+                                match slice_colons.iter_mut().find(|(d, _)| *d == depth) {
+                                    Some((_, count)) if *count >= 2 => return Err(()),
+                                    Some((_, count)) => *count += 1,
+                                    None => slice_colons.push((depth, 1)),
+                                }
                                 self.pos += 1;
                                 elem_start = false;
+                            }
+                            b',' if stack.last() == Some(&SUBSCRIPT)
+                                && slice_colons.iter().any(|(d, _)| *d == stack.len()) =>
+                            {
+                                slice_colons.retain(|(d, _)| *d != stack.len());
+                                self.pos += 1;
+                                elem_start = true;
                             }
                             _ if ident_char_at(self.s, self.pos, true) => {
                                 let id_start = self.pos;
@@ -1229,6 +1244,7 @@ impl<'a> PyLiteralParser<'a> {
                                 starred_depths.retain(|&(x, _)| x <= stack.len());
                                 comma_depths.retain(|&x| x <= stack.len());
                                 dict_key_next.retain(|&x| x <= stack.len());
+                                slice_colons.retain(|(x, _)| *x <= stack.len());
                                 kwarg_seen_depths.retain(|&x| x <= stack.len());
                                 kw_unpack_depths.retain(|&x| x <= stack.len());
                                 kwarg_elem_depths.retain(|&x| x <= stack.len());
@@ -1303,6 +1319,9 @@ impl<'a> PyLiteralParser<'a> {
                             {
                                 return Err(());
                             }
+                            if stack.last() == Some(&SUBSCRIPT) {
+                                slice_colons.retain(|(d, _)| *d != stack.len());
+                            }
                             match stack.last() {
                                 // `{a,` — a bare element locks the
                                 // display to a set.
@@ -1372,6 +1391,12 @@ impl<'a> PyLiteralParser<'a> {
                             // list display, or call is a SyntaxError
                             // (`[1:2]`, `{1, 2:3}`, `f(a:1)`).
                             Some(&SUBSCRIPT) => {
+                                let depth = stack.len();
+                                match slice_colons.iter_mut().find(|(d, _)| *d == depth) {
+                                    Some((_, count)) if *count >= 2 => return Err(()),
+                                    Some((_, count)) => *count += 1,
+                                    None => slice_colons.push((depth, 1)),
+                                }
                                 self.pos += 1;
                                 st = St::Need;
                                 elem_start = false;
@@ -5294,6 +5319,50 @@ The weather in Tokyo is sunny."#;
             "f(lambda a=(lambda **kw: kw): a, confirmed=True)",
             "f(lambda **kw: lambda extra: extra, confirmed=True)",
             "f(lambda **kw: helper(extra=1), confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_excess_slice_colons_rejected() {
+        for inner in [
+            "dangerous_action(a[:::], confirmed=True)",
+            "f(a[1:2:3:4], confirmed=True)",
+            "f(a[:2::3], confirmed=True)",
+            "f(a[::, :::], confirmed=True)",
+            "f(a[x[:::]], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_slice_colons_dropped() {
+        for inner in [
+            "f(a[:], confirmed=True)",
+            "f(a[::], confirmed=True)",
+            "f(a[1:2:3], confirmed=True)",
+            "f(a[:2:], confirmed=True)",
+            "f(a[::3], confirmed=True)",
+            "f(a[1, ::], confirmed=True)",
+            "f(a[::, ::], confirmed=True)",
+            "f(a[1:2, 3:4:5], confirmed=True)",
+            "f(a[x[::], ::], confirmed=True)",
+            "f(a[1:,], confirmed=True)",
+            "f(a[..., ::], confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
