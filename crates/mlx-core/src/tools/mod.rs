@@ -471,6 +471,52 @@ struct PyLiteralParser<'a> {
 /// Hard cap on literal nesting — far beyond any real tool argument.
 const MAX_PY_LITERAL_DEPTH: u32 = 64;
 
+/// Python reserved words that can never be a name — a call segment
+/// (`for(x)`), a comprehension target (`for not in y`), or a lambda
+/// parameter (`lambda True: x`) is a SyntaxError, and `None(x)` parses to
+/// a `Constant` with no `.func.id` under vLLM's AST extraction. Soft
+/// keywords (`match`, `case`, `type`) stay usable as names.
+fn reserved_ident(id: &[u8]) -> bool {
+    matches!(
+        id,
+        b"and"
+            | b"as"
+            | b"assert"
+            | b"async"
+            | b"await"
+            | b"break"
+            | b"class"
+            | b"continue"
+            | b"def"
+            | b"del"
+            | b"elif"
+            | b"else"
+            | b"except"
+            | b"finally"
+            | b"for"
+            | b"from"
+            | b"global"
+            | b"if"
+            | b"import"
+            | b"in"
+            | b"is"
+            | b"lambda"
+            | b"nonlocal"
+            | b"not"
+            | b"or"
+            | b"pass"
+            | b"raise"
+            | b"return"
+            | b"try"
+            | b"while"
+            | b"with"
+            | b"yield"
+            | b"True"
+            | b"False"
+            | b"None"
+    )
+}
+
 impl<'a> PyLiteralParser<'a> {
     fn new(text: &'a str) -> Self {
         Self {
@@ -525,52 +571,8 @@ impl<'a> PyLiteralParser<'a> {
 
     /// `name` or `a.b.c` — dotted attribute chains are preserved.
     fn dotted_name(&mut self) -> Result<String, ()> {
-        // Every dotted segment must be usable as an attribute — a keyword
-        // (`for(x)`, `a.lambda(x)`) is a SyntaxError, and `None(x)` /
-        // `True(x)` parse to a `Constant` with no `.func.id` under vLLM's
-        // AST extraction. Soft keywords (`match`, `case`) stay callable.
-        fn reserved(id: &[u8]) -> bool {
-            matches!(
-                id,
-                b"and"
-                    | b"as"
-                    | b"assert"
-                    | b"async"
-                    | b"await"
-                    | b"break"
-                    | b"class"
-                    | b"continue"
-                    | b"def"
-                    | b"del"
-                    | b"elif"
-                    | b"else"
-                    | b"except"
-                    | b"finally"
-                    | b"for"
-                    | b"from"
-                    | b"global"
-                    | b"if"
-                    | b"import"
-                    | b"in"
-                    | b"is"
-                    | b"lambda"
-                    | b"nonlocal"
-                    | b"not"
-                    | b"or"
-                    | b"pass"
-                    | b"raise"
-                    | b"return"
-                    | b"try"
-                    | b"while"
-                    | b"with"
-                    | b"yield"
-                    | b"True"
-                    | b"False"
-                    | b"None"
-            )
-        }
         let first = self.ident()?;
-        if reserved(first.as_bytes()) {
+        if reserved_ident(first.as_bytes()) {
             return Err(());
         }
         let mut name = first.to_string();
@@ -581,7 +583,7 @@ impl<'a> PyLiteralParser<'a> {
             }
             self.pos += 1;
             let seg = self.ident()?;
-            if reserved(seg.as_bytes()) {
+            if reserved_ident(seg.as_bytes()) {
                 return Err(());
             }
             name.push('.');
@@ -723,6 +725,11 @@ impl<'a> PyLiteralParser<'a> {
         // inside deeper brackets belongs to the target or iterable
         // expression and must not satisfy it.
         let mut for_depths: Vec<usize> = Vec::new();
+        // Subscript brackets opened while a `for` target is open
+        // (`for a[x + 1] in` — a subscript value is a real expression).
+        // Recorded as the stack depth at which they were pushed; inside
+        // them the target grammar does not apply.
+        let mut island_stack: Vec<usize> = Vec::new();
         // A `for` at top level is a genexpr — valid only as the sole
         // argument, so a `,` boundary after it is a SyntaxError.
         let mut top_genexpr = false;
@@ -733,6 +740,9 @@ impl<'a> PyLiteralParser<'a> {
         // expressions after `=` are scanned loosely like the rest.
         let mut param_start = false;
         let mut saw_marker = false;
+        // A completed param name admits only `,` `=` or the ending `:` —
+        // `lambda a b` / `lambda a.b` / `lambda a(` are SyntaxErrors.
+        let mut param_done = false;
         // Implicit-concat / string-prefix tracking: a quote after an
         // operand is legal only directly glued to a prefix identifier
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
@@ -742,6 +752,13 @@ impl<'a> PyLiteralParser<'a> {
             let Some(&b) = self.s.get(self.pos) else {
                 return Err(()); // ran out of text — unterminated
             };
+            // Inside a `for` target only target grammar is legal — names,
+            // `*` starred items, `(`/`[` target groups, `.`/`[` postfix,
+            // `,` separators, and the terminating `in`. Binary operators,
+            // literals, and calls are all SyntaxErrors (`[x for x + y
+            // in z]`). A subscript island suspends the target grammar
+            // until it closes (`for a[x + 1] in` is valid).
+            let strict_target = !for_depths.is_empty() && island_stack.is_empty();
             match b {
                 b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
                 // Top-level argument boundary — valid only after an operand
@@ -772,6 +789,33 @@ impl<'a> PyLiteralParser<'a> {
                             return Err(());
                         }
                         match b {
+                            // A `for` target admits only names, `*` starred
+                            // items, and `(`/`[` target groups — literals,
+                            // unary ops, `{}`, and every other first are
+                            // SyntaxErrors.
+                            _ if strict_target => match b {
+                                b'*' => {
+                                    if self.s.get(self.pos + 1) == Some(&b'*') {
+                                        return Err(()); // `**a` is no target
+                                    }
+                                    self.pos += 1;
+                                }
+                                b'(' | b'[' => {
+                                    stack.push(b);
+                                    self.pos += 1;
+                                }
+                                _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                                    let id_start = self.pos;
+                                    self.pos = ident_end(self.s, self.pos);
+                                    if reserved_ident(&self.s[id_start..self.pos]) {
+                                        return Err(());
+                                    }
+                                    st = St::Have;
+                                    last_str = false;
+                                    prefix_end = usize::MAX;
+                                }
+                                _ => return Err(()),
+                            },
                             b'(' | b'[' | b'{' => {
                                 stack.push(b);
                                 self.pos += 1;
@@ -807,6 +851,11 @@ impl<'a> PyLiteralParser<'a> {
                                                 | (SUBSCRIPT, b']')
                                         ) =>
                                     {
+                                        if o == SUBSCRIPT
+                                            && island_stack.last() == Some(&stack.len())
+                                        {
+                                            island_stack.pop();
+                                        }
                                         self.pos += 1;
                                         st = St::Have;
                                         last_str = false;
@@ -1020,13 +1069,6 @@ impl<'a> PyLiteralParser<'a> {
                         }
                     }
                     St::Have => match b {
-                        b'(' | b'[' => {
-                            // Postfix call / index — a subscript `[` admits
-                            // slice `:` inside; a call `(` does not.
-                            stack.push(if b == b'[' { SUBSCRIPT } else { b'(' });
-                            self.pos += 1;
-                            st = St::Need;
-                        }
                         b')' | b']' | b'}' => match stack.pop() {
                             Some(o)
                                 if matches!(
@@ -1043,12 +1085,67 @@ impl<'a> PyLiteralParser<'a> {
                                 {
                                     return Err(());
                                 }
+                                if o == SUBSCRIPT && island_stack.last() == Some(&stack.len()) {
+                                    island_stack.pop();
+                                }
                                 self.pos += 1;
                                 comp_depths.retain(|&d| d <= stack.len());
                                 for_depths.retain(|&d| d <= stack.len());
                             }
                             _ => return Err(()),
                         },
+                        // Inside a `for` target only `,` separators, `.`/`[`
+                        // postfix chains, and the terminating `in` are
+                        // legal — operators, calls, and literals are
+                        // SyntaxErrors (`[x for x + y in z]`).
+                        _ if strict_target => match b {
+                            b',' => {
+                                self.pos += 1;
+                                st = St::Need;
+                            }
+                            b'[' => {
+                                // `a[i]` — a subscript target; its value is
+                                // a full expression island.
+                                island_stack.push(stack.len());
+                                stack.push(SUBSCRIPT);
+                                self.pos += 1;
+                                st = St::Need;
+                            }
+                            b'.' => {
+                                // `a.b` attribute target.
+                                self.pos += 1;
+                                match self.s.get(self.pos) {
+                                    Some(&c)
+                                        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 =>
+                                    {
+                                        self.pos = ident_end(self.s, self.pos);
+                                    }
+                                    _ => return Err(()),
+                                }
+                            }
+                            _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                                let id_start = self.pos;
+                                self.pos = ident_end(self.s, self.pos);
+                                // `in` completes the target at the `for`'s
+                                // own depth; anything else is a SyntaxError.
+                                if &self.s[id_start..self.pos] == b"in"
+                                    && for_depths.last() == Some(&stack.len())
+                                {
+                                    for_depths.pop();
+                                    st = St::Need;
+                                } else {
+                                    return Err(());
+                                }
+                            }
+                            _ => return Err(()),
+                        },
+                        b'(' | b'[' => {
+                            // Postfix call / index — a subscript `[` admits
+                            // slice `:` inside; a call `(` does not.
+                            stack.push(if b == b'[' { SUBSCRIPT } else { b'(' });
+                            self.pos += 1;
+                            st = St::Need;
+                        }
                         b',' if !stack.is_empty() => {
                             self.pos += 1;
                             st = St::Need;
@@ -1179,6 +1276,27 @@ impl<'a> PyLiteralParser<'a> {
                         _ => return Err(()),
                     },
                     St::Lambda => match b {
+                        // After a param name only `,`, `=`, or the ending
+                        // `:` is legal — `lambda a b`, `lambda a.b`, and
+                        // `lambda a(` are all SyntaxErrors.
+                        _ if param_done && stack.is_empty() => match b {
+                            b',' => {
+                                param_start = true;
+                                param_done = false;
+                                saw_marker = false;
+                                self.pos += 1;
+                            }
+                            b'=' => {
+                                param_done = false;
+                                self.pos += 1;
+                            }
+                            b':' => {
+                                param_done = false;
+                                self.pos += 1;
+                                st = St::Need;
+                            }
+                            _ => return Err(()),
+                        },
                         // The lambda's own `:` ends its parameter list.
                         b':' if stack.is_empty() => {
                             self.pos += 1;
@@ -1238,15 +1356,23 @@ impl<'a> PyLiteralParser<'a> {
                         }
                         _ if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => {
                             if param_start && stack.is_empty() {
-                                // Param names start with a letter/`_` —
-                                // `lambda 1: x` is a SyntaxError.
+                                // Param names start with a letter/`_` and
+                                // can't be keywords — `lambda 1: x` and
+                                // `lambda for: x` are both SyntaxErrors.
                                 if !(b.is_ascii_alphabetic() || b == b'_' || b >= 0x80) {
+                                    return Err(());
+                                }
+                                let id_start = self.pos;
+                                self.pos = ident_end(self.s, self.pos);
+                                if reserved_ident(&self.s[id_start..self.pos]) {
                                     return Err(());
                                 }
                                 param_start = false;
                                 saw_marker = false;
+                                param_done = true;
+                            } else {
+                                self.pos += 1;
                             }
-                            self.pos += 1;
                         }
                         _ => return Err(()),
                     },
@@ -4519,6 +4645,23 @@ The weather in Tokyo is sunny."#;
             "f((x for x), y=1)",     // genexpr missing `in`
             "f(x for x)",            // sole-arg genexpr missing `in`
             "f([x for (a in b)], y=1)", // `in` inside target parens
+            "f([x for x + y in z], confirmed=True)", // `x + y` is no target
+            "f([x for x and y in z], x=1)", // `and` in a target
+            "f([x for 1 in z], x=1)", // literal target
+            "f([x for 's' in z], x=1)", // string target
+            "f([x for a(b) in z], x=1)", // call target
+            "f([x for a.b c in z], x=1)", // juxtaposed names
+            "f([x for -a in z], x=1)", // unary target
+            "f([x for {a: b} in z], x=1)", // dict target
+            "f([x for not a in z], x=1)", // keyword target
+            "f([x for a + if b in z], x=1)", // operator then keyword
+            "f(x for x + y in z)",   // genexpr target
+            "f(lambda for: x, confirmed=True)", // keyword param name
+            "f(lambda True: x)",     // constant param name
+            "f(lambda None: x)",     // `None` param name
+            "f(lambda a b: x)",      // param without `,`
+            "f(lambda a.b: x)",      // dotted param name
+            "f(lambda a(x): y)",     // call-shaped param
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4632,8 +4775,17 @@ The weather in Tokyo is sunny."#;
             ("f([x for a in b in c], y=1)", "{\"y\":1}"), // `in` in iterable
             ("f([x for a in (b in c)], y=1)", "{\"y\":1}"), // paren iterable
             ("f([x for a, b in y], y=1)", "{\"y\":1}"), // tuple target
+            ("f([x for (a, b) in y], y=1)", "{\"y\":1}"), // group target
+            ("f([x for [a, b] in y], y=1)", "{\"y\":1}"), // list target
+            ("f([x for a.b in y], y=1)", "{\"y\":1}"), // attribute target
+            ("f([x for a[i + 1] in y], y=1)", "{\"y\":1}"), // subscript target
+            ("f([x for a, *b in y], y=1)", "{\"y\":1}"), // starred target
+            ("f([x for a[i for j in z] in w], y=1)", "{\"y\":1}"), // nested
             ("f((x for x in y), y=1)", "{\"y\":1}"), // parenthesized genexpr
             ("f(x[i for i in y], y=1)", "{\"y\":1}"), // genexpr in subscript
+            ("f(lambda match: x, y=1)", "{\"y\":1}"), // soft-keyword param
+            ("f(lambda a1: x, y=1)", "{\"y\":1}"), // digit-suffix param
+            ("f(lambda a, *b: x, y=1)", "{\"y\":1}"), // starred param
             ("f(lambda x=(1, 2), y='a': x, k=1)", "{\"k\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
