@@ -615,18 +615,64 @@ impl<'a> PyLiteralParser<'a> {
                 continue;
             }
             if b == b'\\' {
-                if !raw_mode
-                    && self.s.get(self.pos + 1) == Some(&b'x')
-                    && (!self
-                        .s
-                        .get(self.pos + 2)
-                        .is_some_and(|c| c.is_ascii_hexdigit())
-                        || !self
-                            .s
-                            .get(self.pos + 3)
-                            .is_some_and(|c| c.is_ascii_hexdigit()))
-                {
-                    return Err(());
+                if !raw_mode {
+                    // Mandatory escapes must be well-formed or `ast.parse`
+                    // raises and vLLM keeps the whole block verbatim:
+                    // `\x` needs 2 hex digits, `\u`/`\U` need 4/8, and
+                    // `\N` needs a non-empty `{NAME}`. `\u`/`\U`/`\N` are
+                    // NOT escapes in bytes literals, so they stay literal
+                    // there (only `\x` is checked).
+                    let escape = self.s.get(self.pos + 1).copied();
+                    let hex_run = |start: usize, len: usize| {
+                        (0..len)
+                            .all(|i| self.s.get(start + i).is_some_and(|c| c.is_ascii_hexdigit()))
+                    };
+                    let hex_value = |start: usize, len: usize| {
+                        (0..len).fold(0u32, |acc, i| {
+                            acc * 16 + (self.s[start + i] as char).to_digit(16).unwrap_or(0)
+                        })
+                    };
+                    match escape {
+                        Some(b'x') if !hex_run(self.pos + 2, 2) => return Err(()),
+                        Some(b'u') if !bytes_mode && !hex_run(self.pos + 2, 4) => {
+                            return Err(());
+                        }
+                        // `\U` is also range-checked: past 0x10FFFF is
+                        // "illegal Unicode character" (surrogates are fine).
+                        Some(b'U')
+                            if !bytes_mode
+                                && (!hex_run(self.pos + 2, 8)
+                                    || hex_value(self.pos + 2, 8) > 0x10FFFF) =>
+                        {
+                            return Err(());
+                        }
+                        // `\N` is a recognized escape introducer in str: a
+                        // bare `\N` and a malformed `{NAME}` are both hard
+                        // SyntaxErrors (`b'\N'` is only a warning, so bytes
+                        // skip this). The name itself is not validated
+                        // against the Unicode table we don't carry — the
+                        // scan only bounds its characters so it can never
+                        // run past the closing quote.
+                        Some(b'N') if !bytes_mode => {
+                            if self.s.get(self.pos + 2) != Some(&b'{') {
+                                return Err(());
+                            }
+                            let mut name_end = self.pos + 3;
+                            while matches!(
+                                self.s.get(name_end),
+                                Some(c) if c.is_ascii_alphanumeric()
+                                    || matches!(c, b' ' | b'-' | b'_')
+                            ) {
+                                name_end += 1;
+                            }
+                            if name_end == self.pos + 3 || self.s.get(name_end) != Some(&b'}') {
+                                return Err(());
+                            }
+                            self.pos = name_end + 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
                 self.pos += if f_mode && matches!(self.s.get(self.pos + 1), Some(b'{' | b'}')) {
                     1
@@ -2594,10 +2640,12 @@ impl<'a> PyLiteralParser<'a> {
                         out.push(char::from_u32(h).ok_or(())?);
                     }
                     b'\n' => {} // line continuation
-                    b'N' if self.peek() == Some(b'{') => {
-                        // `\N{NAME}` resolves through a Unicode-name
-                        // table we don't carry — reject the block
-                        // verbatim rather than corrupt the argument.
+                    b'N' => {
+                        // `\N` is a recognized escape introducer: a bare
+                        // `\N` is a hard SyntaxError, and every `\N{NAME}`
+                        // needs a Unicode-name table we don't carry. Reject
+                        // rather than ship the literal escape text as the
+                        // argument.
                         return Err(());
                     }
                     _ => {
@@ -6802,6 +6850,58 @@ The weather in Tokyo is sunny."#;
     }
 
     #[test]
+    fn test_lfm2_tool_call_malformed_unicode_escapes_rejected() {
+        for inner in [
+            "f('\\uZZZZ', confirmed=True)",
+            "f('\\u12', confirmed=True)",
+            "f('\\u', confirmed=True)",
+            "f('\\U0001F60', confirmed=True)",
+            "f('\\U', confirmed=True)",
+            "f('\\U00110000', confirmed=True)",
+            "f('\\UFFFFFFFF', confirmed=True)",
+            "f('\\N{BULLET', confirmed=True)",
+            "f('\\N{}', confirmed=True)",
+            "f('\\N', confirmed=True)",
+            "f('C:\\New folder', confirmed=True)",
+            "f(\"\\uZZZZ\", confirmed=True)",
+            "f(f'\\uZZZZ', confirmed=True)",
+            "f(f'\\N', confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+
+        for inner in [
+            "f('\\u1234', confirmed=True)",
+            "f('\\U0001F600', confirmed=True)",
+            "f('\\U0010FFFF', confirmed=True)",
+            "f('\\uD800', confirmed=True)",
+            "f('\\N{BULLET}', confirmed=True)",
+            "f('\\q', confirmed=True)",
+            "f('\\400', confirmed=True)",
+            "f(b'\\uZZZZ', confirmed=True)",
+            "f(b'\\N', confirmed=True)",
+            "f(b'\\N{X}', confirmed=True)",
+            "f(r'\\uZZZZ', confirmed=True)",
+            "f(r'\\N', confirmed=True)",
+            "f(rb'\\uZZZZ', confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
     fn test_lfm2_tool_call_nfkc_normalizes_identifiers() {
         let input = "<|tool_call_start|>[K(x=1), a.K(y=2), ｆｏｒ(z=3)]<|tool_call_end|>";
         let (text, calls) = parse_tool_calls(input);
@@ -7199,16 +7299,18 @@ The weather in Tokyo is sunny."#;
         }
     }
 
-    /// `\N{NAME}` needs a Unicode-name table we don't carry — the block
-    /// stays verbatim rather than shipping the literal escape text as
-    /// the argument. A bare `\N` without braces is not an escape in
-    /// Python either, so it keeps the backslash like `\d`.
+    /// `\N` is a recognized escape introducer: a bare `\N` is a hard
+    /// SyntaxError in Python, and every `\N{NAME}` needs a Unicode-name
+    /// table we don't carry — the block stays verbatim rather than
+    /// shipping the literal escape text as the argument.
     #[test]
     fn test_lfm2_tool_call_named_unicode_rejected() {
         for inner in [
             "f(value='\\N{SNOWMAN}')",
             "f(value='x\\N{BAD}y')",
             "f(value=\"\\N{X}\")",
+            "f(value='\\N')",
+            "f(value='C:\\New folder')",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -7216,12 +7318,14 @@ The weather in Tokyo is sunny."#;
             assert!(calls.is_empty(), "{inner} must not promote a call");
         }
 
-        // Bare `\N` (no brace) is not a valid escape but Python keeps
-        // it literally — same as `\d`; a positional `\N{..}` literal is
-        // still a valid skipped expression.
+        // Unrecognized escapes (`\d`) keep the backslash like Python, and
+        // raw/bytes literals have no `\N` escape at all — Python only warns
+        // there, so those positional literals stay valid.
         for (inner, want_args) in [
-            ("f(value='\\N')", "{\"value\":\"\\\\N\"}"),
-            ("f('\\N{SNOWMAN}', x=1)", "{\"x\":1}"),
+            ("f(value='\\d')", "{\"value\":\"\\\\d\"}"),
+            ("f(value=r'\\N')", "{\"value\":\"\\\\N\"}"),
+            ("f(b'\\N', x=1)", "{\"x\":1}"),
+            ("f(r'\\N', x=1)", "{\"x\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
