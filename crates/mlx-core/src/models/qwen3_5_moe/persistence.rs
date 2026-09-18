@@ -1549,16 +1549,23 @@ fn declared_residual_dtype(raw: &Value) -> Option<DType> {
     None
 }
 
-/// The dtype the checkpoint's residual stream runs in: the dtype it declares,
-/// else the dtype of the dense weights the norms multiply (the native GGUF
-/// import writes those in the requested conversion dtype, and a synthesized
-/// standalone config declares nothing at all).
+/// The dtype the checkpoint's residual stream runs in: the dtype of the dense
+/// weights the norms multiply, else the dtype the config declares.
+///
+/// The loaded norm dtype is the ground truth: `mlx convert --dtype float16`
+/// casts every float tensor — norms included — but copies config.json
+/// verbatim, so the output still declares the SOURCE dtype (`torch_dtype:
+/// bfloat16`). Trusting the declaration first picks bf16,
+/// `align_affine_embedding_dtype` casts the embedding sidecars to bf16, the
+/// first f16 RMSNorm then promotes the residual stream to f32, and the paged
+/// KV pool aborts with "input dtype Float32 not supported by LayerKVPool".
+/// The declared dtype is only the fallback for a config that declares
+/// nothing — the GGUF-synthesized standalone config.
 fn residual_stream_dtype(raw: &Value, params: &HashMap<String, MxArray>) -> Option<DType> {
-    declared_residual_dtype(raw).or_else(|| {
-        ["layers.0.input_layernorm.weight", "final_norm.weight"]
-            .iter()
-            .find_map(|key| params.get(*key).and_then(|w| w.dtype().ok()))
-    })
+    ["layers.0.input_layernorm.weight", "final_norm.weight"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(|w| w.dtype().ok()))
+        .or_else(|| declared_residual_dtype(raw))
 }
 
 /// Normalize an imported affine embedding group to the checkpoint's dtype.
@@ -1781,9 +1788,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                 // Sanitize weights
                 let mut params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
-                // The residual stream's dtype is the checkpoint's own: a
-                // declared `dtype`/`torch_dtype`, else the dtype of the dense
-                // weights the norms multiply.
+                // The residual stream's dtype is the checkpoint's own: the
+                // dtype of the dense weights the norms multiply, else a
+                // declared `dtype`/`torch_dtype` (convert casts the weights
+                // but copies the config verbatim, so the declaration can be
+                // stale — the loaded dtype is the ground truth).
                 let residual_dtype = residual_stream_dtype(&raw, &params);
                 if align_affine_embedding_dtype(&mut params, residual_dtype)? {
                     info!(
@@ -2430,6 +2439,61 @@ mod tests {
         assert_eq!(
             stream_dtype(&aligned_scales, &aligned_biases),
             DType::BFloat16
+        );
+    }
+
+    /// Regression for `mlx convert --dtype float16`: convert casts every
+    /// float tensor — norms included — but copies config.json verbatim, so
+    /// the output still declares `torch_dtype: bfloat16`. Declared-first
+    /// precedence picked bf16, `align_affine_embedding_dtype` cast the
+    /// embedding sidecars to bf16, the first f16 RMSNorm promoted the
+    /// residual stream to f32, and the paged KV pool aborted with "input
+    /// dtype Float32 not supported by LayerKVPool". The loaded norm dtype is
+    /// the ground truth; the declaration is only the fallback for a config
+    /// that declares nothing (the GGUF-synthesized standalone config).
+    #[test]
+    fn residual_stream_dtype_prefers_the_loaded_norm_over_a_stale_declaration() {
+        let hidden = 64u32;
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; hidden as usize], &[hidden as i64])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap(),
+        );
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_uint32(&[0u32; 16], &[8, 2]).unwrap(),
+        );
+        params.insert(
+            "embedding.scales".to_string(),
+            MxArray::from_float32(&[1.0f32; 16], &[8, 2]).unwrap(),
+        );
+        params.insert(
+            "embedding.biases".to_string(),
+            MxArray::from_float32(&[0.0f32; 16], &[8, 2]).unwrap(),
+        );
+
+        // The verbatim-copied config still declares the SOURCE dtype; the f16
+        // norm wins, and the fp32 sidecars follow it — not the declaration.
+        let target =
+            residual_stream_dtype(&serde_json::json!({"torch_dtype": "bfloat16"}), &params);
+        assert_eq!(target, Some(DType::Float16));
+        assert!(align_affine_embedding_dtype(&mut params, target).unwrap());
+        assert_eq!(params["embedding.scales"].dtype().unwrap(), DType::Float16);
+        assert_eq!(params["embedding.biases"].dtype().unwrap(), DType::Float16);
+
+        // A config that declares nothing still resolves from the probe alone.
+        assert_eq!(
+            residual_stream_dtype(&serde_json::json!({}), &params),
+            Some(DType::Float16)
+        );
+        // And with nothing to probe, the declaration is the only signal left.
+        let declared_only: HashMap<String, MxArray> = HashMap::new();
+        assert_eq!(
+            residual_stream_dtype(&serde_json::json!({"dtype": "bfloat16"}), &declared_only),
+            Some(DType::BFloat16)
         );
     }
 
