@@ -685,181 +685,74 @@ impl<'a> PyLiteralParser<'a> {
                     };
                 }
                 _ => match st {
-                    St::Need => match b {
-                        b'(' | b'[' | b'{' => {
-                            stack.push(b);
-                            self.pos += 1;
-                        }
-                        // Empty container (`()` `[]` `{}`) or a close after
-                        // `,`/`:` inside brackets (`(a,)` `a[1:]`) — never
-                        // after an operator (`(a +)` is a SyntaxError).
-                        b')' | b']' | b'}' => {
-                            let mut p = self.pos;
-                            while p > 0 && matches!(self.s[p - 1], b' ' | b'\t' | b'\n' | b'\r') {
-                                p -= 1;
-                            }
-                            let trailing_ok =
-                                p > 0 && matches!(self.s[p - 1], b'(' | b'[' | b'{' | b',' | b':');
-                            if !trailing_ok {
-                                return Err(());
-                            }
-                            match stack.pop() {
-                                Some(o)
-                                    if matches!(
-                                        (o, b),
-                                        (b'(', b')') | (b'[', b']') | (b'{', b'}')
-                                    ) =>
-                                {
-                                    self.pos += 1;
-                                    st = St::Have;
-                                    last_str = false;
-                                    prefix_end = usize::MAX;
-                                }
-                                _ => return Err(()),
-                            }
-                        }
-                        b'\'' | b'"' => {
-                            self.skip_quoted()?;
-                            st = St::Have;
-                            last_str = true;
-                            prefix_end = usize::MAX;
-                        }
-                        b'-' | b'+' | b'~' | b'*' => self.pos += 1, // unary / spread
-                        b'.' => {
-                            // `...` ellipsis or `.5` float — nothing else.
-                            if self.s.get(self.pos + 1) == Some(&b'.')
-                                && self.s.get(self.pos + 2) == Some(&b'.')
-                            {
-                                self.pos += 3;
-                                st = St::Have;
-                            } else if self.s.get(self.pos + 1).is_some_and(|c| c.is_ascii_digit()) {
-                                let num_start = self.pos;
-                                self.pos += 2;
-                                while self
-                                    .s
-                                    .get(self.pos)
-                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
-                                {
-                                    self.pos += 1;
-                                }
-                                if matches!(
-                                    self.s.get(self.pos),
-                                    Some(c) if matches!(c, b'e' | b'E')
-                                ) {
-                                    self.pos += 1;
-                                    if matches!(
-                                        self.s.get(self.pos),
-                                        Some(c) if matches!(c, b'+' | b'-')
-                                    ) {
-                                        self.pos += 1;
-                                    }
-                                    let exp_start = self.pos;
-                                    while self
-                                        .s
-                                        .get(self.pos)
-                                        .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
-                                    {
-                                        self.pos += 1;
-                                    }
-                                    if self.pos == exp_start {
-                                        return Err(());
-                                    }
-                                }
-                                if matches!(
-                                    self.s.get(self.pos),
-                                    Some(c) if matches!(c, b'j' | b'J')
-                                ) {
-                                    self.pos += 1;
-                                }
-                                if !Self::valid_numeric_underscores(
-                                    &self.s[num_start..self.pos],
-                                    |c| c.is_ascii_digit(),
-                                    false,
-                                ) {
-                                    return Err(());
-                                }
-                                st = St::Have;
-                            } else {
-                                return Err(());
-                            }
-                            last_str = false;
-                            prefix_end = usize::MAX;
-                        }
-                        b':' if !stack.is_empty() => self.pos += 1, // `a[:…]` `{…:…}`
-                        _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                    St::Need => {
+                        if after_not_op {
+                            // A `not` after an operand only ever forms
+                            // `x not in y` — anything else next (`is`, a
+                            // value, a group) is a SyntaxError.
                             let id_start = self.pos;
                             self.pos = ident_end(self.s, self.pos);
-                            let id = &self.s[id_start..self.pos];
-                            // Compound `not in` / `not is` — `in`/`is` is
-                            // still an operator here, not the operand.
-                            if after_not_op && matches!(id, b"in" | b"is") {
+                            if self.pos > id_start && &self.s[id_start..self.pos] == b"in" {
                                 after_not_op = false;
-                                continue;
+                                continue; // still Need — the operand follows
                             }
-                            if reject_keyword(id) {
-                                return Err(());
-                            }
-                            after_not_op = false;
-                            match id {
-                                b"not" => {} // unary — still need an operand
-                                b"lambda" => st = St::Lambda,
-                                _ => {
-                                    st = St::Have;
-                                    last_str = false;
-                                    prefix_end = if string_prefix(id) {
-                                        self.pos
-                                    } else {
-                                        usize::MAX
-                                    };
-                                }
-                            }
+                            return Err(());
                         }
-                        // Number operand: digits with optional `0x`/`0o`/`0b`
-                        // radix, fraction, exponent, `_` separators, `j`. A
-                        // letter glued straight on (`5x`) is a SyntaxError,
-                        // and `_` placement follows PEP 515 (between digits,
-                        // or right after the base prefix).
-                        _ if b.is_ascii_digit() => {
-                            if b == b'0'
-                                && matches!(
-                                    self.s.get(self.pos + 1),
-                                    Some(c) if matches!(c, b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
-                                )
-                            {
-                                let radix = match self.s[self.pos + 1].to_ascii_lowercase() {
-                                    b'x' => 16,
-                                    b'o' => 8,
-                                    _ => 2,
-                                };
-                                self.pos += 2;
-                                let dstart = self.pos;
-                                while self
-                                    .s
-                                    .get(self.pos)
-                                    .is_some_and(|c| (*c as char).is_digit(radix) || *c == b'_')
+                        match b {
+                            b'(' | b'[' | b'{' => {
+                                stack.push(b);
+                                self.pos += 1;
+                            }
+                            // Empty container (`()` `[]` `{}`) or a close after
+                            // `,`/`:` inside brackets (`(a,)` `a[1:]`) — never
+                            // after an operator (`(a +)` is a SyntaxError).
+                            b')' | b']' | b'}' => {
+                                let mut p = self.pos;
+                                while p > 0 && matches!(self.s[p - 1], b' ' | b'\t' | b'\n' | b'\r')
                                 {
-                                    self.pos += 1;
+                                    p -= 1;
                                 }
-                                if self.pos == dstart
-                                    || !Self::valid_numeric_underscores(
-                                        &self.s[dstart..self.pos],
-                                        |c| (c as char).is_digit(radix),
-                                        true,
-                                    )
-                                {
+                                let trailing_ok = p > 0
+                                    && matches!(self.s[p - 1], b'(' | b'[' | b'{' | b',' | b':');
+                                if !trailing_ok {
                                     return Err(());
                                 }
-                            } else {
-                                let num_start = self.pos;
-                                while self
-                                    .s
-                                    .get(self.pos)
-                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
-                                {
-                                    self.pos += 1;
+                                match stack.pop() {
+                                    Some(o)
+                                        if matches!(
+                                            (o, b),
+                                            (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                                        ) =>
+                                    {
+                                        self.pos += 1;
+                                        st = St::Have;
+                                        last_str = false;
+                                        prefix_end = usize::MAX;
+                                    }
+                                    _ => return Err(()),
                                 }
-                                if self.s.get(self.pos) == Some(&b'.') {
-                                    self.pos += 1;
+                            }
+                            b'\'' | b'"' => {
+                                self.skip_quoted()?;
+                                st = St::Have;
+                                last_str = true;
+                                prefix_end = usize::MAX;
+                            }
+                            b'-' | b'+' | b'~' | b'*' => self.pos += 1, // unary / spread
+                            b'.' => {
+                                // `...` ellipsis or `.5` float — nothing else.
+                                if self.s.get(self.pos + 1) == Some(&b'.')
+                                    && self.s.get(self.pos + 2) == Some(&b'.')
+                                {
+                                    self.pos += 3;
+                                    st = St::Have;
+                                } else if self
+                                    .s
+                                    .get(self.pos + 1)
+                                    .is_some_and(|c| c.is_ascii_digit())
+                                {
+                                    let num_start = self.pos;
+                                    self.pos += 2;
                                     while self
                                         .s
                                         .get(self.pos)
@@ -867,19 +760,108 @@ impl<'a> PyLiteralParser<'a> {
                                     {
                                         self.pos += 1;
                                     }
-                                }
-                                if matches!(
-                                    self.s.get(self.pos),
-                                    Some(c) if matches!(c, b'e' | b'E')
-                                ) {
-                                    self.pos += 1;
                                     if matches!(
                                         self.s.get(self.pos),
-                                        Some(c) if matches!(c, b'+' | b'-')
+                                        Some(c) if matches!(c, b'e' | b'E')
+                                    ) {
+                                        self.pos += 1;
+                                        if matches!(
+                                            self.s.get(self.pos),
+                                            Some(c) if matches!(c, b'+' | b'-')
+                                        ) {
+                                            self.pos += 1;
+                                        }
+                                        let exp_start = self.pos;
+                                        while self
+                                            .s
+                                            .get(self.pos)
+                                            .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
+                                        {
+                                            self.pos += 1;
+                                        }
+                                        if self.pos == exp_start {
+                                            return Err(());
+                                        }
+                                    }
+                                    if matches!(
+                                        self.s.get(self.pos),
+                                        Some(c) if matches!(c, b'j' | b'J')
                                     ) {
                                         self.pos += 1;
                                     }
-                                    let exp_start = self.pos;
+                                    if !Self::valid_numeric_underscores(
+                                        &self.s[num_start..self.pos],
+                                        |c| c.is_ascii_digit(),
+                                        false,
+                                    ) {
+                                        return Err(());
+                                    }
+                                    st = St::Have;
+                                } else {
+                                    return Err(());
+                                }
+                                last_str = false;
+                                prefix_end = usize::MAX;
+                            }
+                            b':' if !stack.is_empty() => self.pos += 1, // `a[:…]` `{…:…}`
+                            _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                                let id_start = self.pos;
+                                self.pos = ident_end(self.s, self.pos);
+                                let id = &self.s[id_start..self.pos];
+                                if reject_keyword(id) {
+                                    return Err(());
+                                }
+                                match id {
+                                    b"not" => {} // unary — still need an operand
+                                    b"lambda" => st = St::Lambda,
+                                    _ => {
+                                        st = St::Have;
+                                        last_str = false;
+                                        prefix_end = if string_prefix(id) {
+                                            self.pos
+                                        } else {
+                                            usize::MAX
+                                        };
+                                    }
+                                }
+                            }
+                            // Number operand: digits with optional `0x`/`0o`/`0b`
+                            // radix, fraction, exponent, `_` separators, `j`. A
+                            // letter glued straight on (`5x`) is a SyntaxError,
+                            // and `_` placement follows PEP 515 (between digits,
+                            // or right after the base prefix).
+                            _ if b.is_ascii_digit() => {
+                                if b == b'0'
+                                    && matches!(
+                                        self.s.get(self.pos + 1),
+                                        Some(c) if matches!(c, b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+                                    )
+                                {
+                                    let radix = match self.s[self.pos + 1].to_ascii_lowercase() {
+                                        b'x' => 16,
+                                        b'o' => 8,
+                                        _ => 2,
+                                    };
+                                    self.pos += 2;
+                                    let dstart = self.pos;
+                                    while self
+                                        .s
+                                        .get(self.pos)
+                                        .is_some_and(|c| (*c as char).is_digit(radix) || *c == b'_')
+                                    {
+                                        self.pos += 1;
+                                    }
+                                    if self.pos == dstart
+                                        || !Self::valid_numeric_underscores(
+                                            &self.s[dstart..self.pos],
+                                            |c| (c as char).is_digit(radix),
+                                            true,
+                                        )
+                                    {
+                                        return Err(());
+                                    }
+                                } else {
+                                    let num_start = self.pos;
                                     while self
                                         .s
                                         .get(self.pos)
@@ -887,37 +869,67 @@ impl<'a> PyLiteralParser<'a> {
                                     {
                                         self.pos += 1;
                                     }
-                                    // `1e`, `1e+`, `.5e-` — an exponent
-                                    // marker with no digits is a SyntaxError.
-                                    if self.pos == exp_start {
+                                    if self.s.get(self.pos) == Some(&b'.') {
+                                        self.pos += 1;
+                                        while self
+                                            .s
+                                            .get(self.pos)
+                                            .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
+                                        {
+                                            self.pos += 1;
+                                        }
+                                    }
+                                    if matches!(
+                                        self.s.get(self.pos),
+                                        Some(c) if matches!(c, b'e' | b'E')
+                                    ) {
+                                        self.pos += 1;
+                                        if matches!(
+                                            self.s.get(self.pos),
+                                            Some(c) if matches!(c, b'+' | b'-')
+                                        ) {
+                                            self.pos += 1;
+                                        }
+                                        let exp_start = self.pos;
+                                        while self
+                                            .s
+                                            .get(self.pos)
+                                            .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
+                                        {
+                                            self.pos += 1;
+                                        }
+                                        // `1e`, `1e+`, `.5e-` — an exponent
+                                        // marker with no digits is a SyntaxError.
+                                        if self.pos == exp_start {
+                                            return Err(());
+                                        }
+                                    }
+                                    if matches!(
+                                        self.s.get(self.pos),
+                                        Some(c) if matches!(c, b'j' | b'J')
+                                    ) {
+                                        self.pos += 1;
+                                    }
+                                    if !Self::valid_numeric_underscores(
+                                        &self.s[num_start..self.pos],
+                                        |c| c.is_ascii_digit(),
+                                        false,
+                                    ) {
                                         return Err(());
                                     }
                                 }
-                                if matches!(
-                                    self.s.get(self.pos),
-                                    Some(c) if matches!(c, b'j' | b'J')
-                                ) {
-                                    self.pos += 1;
-                                }
-                                if !Self::valid_numeric_underscores(
-                                    &self.s[num_start..self.pos],
-                                    |c| c.is_ascii_digit(),
-                                    false,
-                                ) {
+                                if self.s.get(self.pos).is_some_and(|c| {
+                                    c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80
+                                }) {
                                     return Err(());
                                 }
+                                st = St::Have;
+                                last_str = false;
+                                prefix_end = usize::MAX;
                             }
-                            if self.s.get(self.pos).is_some_and(|c| {
-                                c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80
-                            }) {
-                                return Err(());
-                            }
-                            st = St::Have;
-                            last_str = false;
-                            prefix_end = usize::MAX;
+                            _ => return Err(()),
                         }
-                        _ => return Err(()),
-                    },
+                    }
                     St::Have => match b {
                         b'(' | b'[' => {
                             // Postfix call / index.
@@ -4326,6 +4338,10 @@ The weather in Tokyo is sunny."#;
             "f([a if b], x=1)",          // `if` outside a comprehension
             "f([a if b for c in d], x=1)", // `for` doesn't rescue the ternary
             "f(x for x in y, k=1)",      // genexpr must be the sole argument
+            "f(a not is b, x=1)",        // `not is` isn't an operator
+            "f(a not b, x=1)",           // `not` isn't binary — only `in` follows
+            "f(a not (b), x=1)",
+            "f(a is not in b, x=1)", // `is not` can't chain into `in`
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4383,6 +4399,9 @@ The weather in Tokyo is sunny."#;
             ("f([x for i in (a if b else c)], k=1)", "{\"k\":1}"),
             ("f(x for i in y)", "{}"), // sole genexpr positional
             ("f(x for i in y if i)", "{}"),
+            ("f(a not in b, x=1)", "{\"x\":1}"), // `not in` compound
+            ("f(a is not b, x=1)", "{\"x\":1}"), // `is not` via unary `not`
+            ("f(a not in b and c, x=1)", "{\"x\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
