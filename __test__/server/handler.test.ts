@@ -10415,6 +10415,65 @@ describe('createHandler', () => {
       expect(allDeltaText).not.toContain('<|tool_call_start|>');
     });
 
+    it('drops leading whitespace that the trimmed done text no longer carries', async () => {
+      // A whitespace-only chunk before the sentinel would emit "\n\n"
+      // eagerly while the native final text is outer-trimmed to "after" —
+      // the delta stream would run ahead of `output_text.done`.
+      const streamEvents = [
+        { done: false, text: '\n\n', isReasoning: false },
+        { done: false, text: '<|tool_call_start|>[get_weather()]<|tool_call_end|>after', isReasoning: false },
+        {
+          done: true,
+          text: 'after',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_lfm2',
+              name: 'get_weather',
+              arguments: '{}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '\n\n<|tool_call_start|>[get_weather()]<|tool_call_end|>after',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('after');
+      expect(allDeltaText).toBe('after');
+    });
+
     it('skips message item when final text is empty and tool calls are present', async () => {
       // Model immediately produces tool-call markup, no visible text
       const streamEvents = [

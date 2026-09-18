@@ -664,6 +664,13 @@ impl<'a> PyLiteralParser<'a> {
         // A `for` at top level is a genexpr — valid only as the sole
         // argument, so a `,` boundary after it is a SyntaxError.
         let mut top_genexpr = false;
+        // Lambda parameter tracking: at a param start (entry / after
+        // `,`) only a name, `*`/`/` markers, `:` (zero params), or `,`
+        // after a marker are legal — `lambda 1: x`, `lambda 'a': x`,
+        // `lambda ,: x`, `lambda =x: y` are all SyntaxErrors. Default
+        // expressions after `=` are scanned loosely like the rest.
+        let mut param_start = false;
+        let mut saw_marker = false;
         // Implicit-concat / string-prefix tracking: a quote after an
         // operand is legal only directly glued to a prefix identifier
         // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
@@ -813,7 +820,11 @@ impl<'a> PyLiteralParser<'a> {
                                 }
                                 match id {
                                     b"not" => {} // unary — still need an operand
-                                    b"lambda" => st = St::Lambda,
+                                    b"lambda" => {
+                                        st = St::Lambda;
+                                        param_start = true;
+                                        saw_marker = false;
+                                    }
                                     _ => {
                                         st = St::Have;
                                         last_str = false;
@@ -1070,7 +1081,13 @@ impl<'a> PyLiteralParser<'a> {
                             st = St::Need;
                         }
                         b':' => self.pos += 1, // inside default-expr brackets
+                        // `(a)`-style params are Python 2 — an opener at a
+                        // param start is a SyntaxError; inside a default
+                        // expression brackets are fine.
                         b'(' | b'[' | b'{' => {
+                            if param_start && stack.is_empty() {
+                                return Err(());
+                            }
                             stack.push(b);
                             self.pos += 1;
                         }
@@ -1082,11 +1099,48 @@ impl<'a> PyLiteralParser<'a> {
                             }
                             _ => return Err(()),
                         },
-                        b'\'' | b'"' => self.skip_quoted()?,
-                        // Param names, separators, defaults, `*`, unary
-                        // signs and dots in default expressions.
-                        b',' | b'=' | b'*' | b'/' | b'-' | b'+' | b'~' | b'.' => self.pos += 1,
-                        _ if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => self.pos += 1,
+                        b'\'' | b'"' => {
+                            if param_start && stack.is_empty() {
+                                return Err(());
+                            }
+                            self.skip_quoted()?;
+                        }
+                        b',' => {
+                            if stack.is_empty() {
+                                // `a,,b` — a `,` is only legal right after
+                                // a `*`/`/` marker or a name.
+                                if param_start && !saw_marker {
+                                    return Err(());
+                                }
+                                param_start = true;
+                                saw_marker = false;
+                            }
+                            self.pos += 1;
+                        }
+                        // `=x` with no name; unary/dot bytes at a param
+                        // start — all SyntaxErrors.
+                        b'=' | b'-' | b'+' | b'~' | b'.' if param_start && stack.is_empty() => {
+                            return Err(());
+                        }
+                        b'=' | b'-' | b'+' | b'~' | b'.' => self.pos += 1,
+                        b'*' | b'/' => {
+                            if param_start && stack.is_empty() {
+                                saw_marker = true;
+                            }
+                            self.pos += 1;
+                        }
+                        _ if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => {
+                            if param_start && stack.is_empty() {
+                                // Param names start with a letter/`_` —
+                                // `lambda 1: x` is a SyntaxError.
+                                if !(b.is_ascii_alphabetic() || b == b'_' || b >= 0x80) {
+                                    return Err(());
+                                }
+                                param_start = false;
+                                saw_marker = false;
+                            }
+                            self.pos += 1;
+                        }
                         _ => return Err(()),
                     },
                 },
@@ -4342,6 +4396,12 @@ The weather in Tokyo is sunny."#;
             "f(a not b, x=1)",           // `not` isn't binary — only `in` follows
             "f(a not (b), x=1)",
             "f(a is not in b, x=1)", // `is not` can't chain into `in`
+            "f(lambda 1: x, confirmed=True)", // digit-led param name
+            "f(lambda 'a': x)",      // string where a param name belongs
+            "f(lambda ,: x)",        // `,` before any param
+            "f(lambda =x: y)",       // `=` with no name
+            "f(lambda (a): x)",      // `(a)` params are Python 2
+            "f(lambda a,,b: x)",     // empty param between commas
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4402,6 +4462,12 @@ The weather in Tokyo is sunny."#;
             ("f(a not in b, x=1)", "{\"x\":1}"), // `not in` compound
             ("f(a is not b, x=1)", "{\"x\":1}"), // `is not` via unary `not`
             ("f(a not in b and c, x=1)", "{\"x\":1}"),
+            ("f(lambda a, b: a + b, x=1)", "{\"x\":1}"),
+            ("f(lambda: x, y=1)", "{\"y\":1}"), // zero-param lambda
+            ("f(lambda a,: a, x=1)", "{\"x\":1}"), // trailing comma
+            ("f(lambda *a, b=1: a, x=1)", "{\"x\":1}"),
+            ("f(lambda a, /, b: a, x=1)", "{\"x\":1}"),
+            ("f(lambda x=(1, 2), y='a': x, k=1)", "{\"k\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
