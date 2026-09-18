@@ -2584,7 +2584,7 @@ fn stable_gpu_routing_preserves_duplicates_tails_and_inverse() {
 #[test]
 fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
     use crate::array::{DType, MxArray};
-    use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+    use crate::models::quantized_linear::QuantizedLinear;
     // Fast GEMV, the ordinary K tail, four-row injection, a paired
     // down/inject projection, and output row tails use distinct MLX walks.
     for (n, k) in [
@@ -2774,7 +2774,7 @@ fn two_column_mixer_preserves_projections_and_halfway_rounding() {
 #[test]
 fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
     use crate::array::DType;
-    use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+    use crate::models::quantized_linear::QuantizedLinear;
     use crate::nn::Activations;
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
@@ -3645,7 +3645,7 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
 #[test]
 fn compact_dense_prefill_preserves_affine_rounding_views_and_fallbacks() {
     use crate::array::DType;
-    use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+    use crate::models::quantized_linear::QuantizedLinear;
     if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0") {
         return;
     }
@@ -4127,7 +4127,7 @@ fn mixer_split_k_preserves_independent_projections() {
 #[test]
 fn mixer_down_injection_matches_independent_projections() {
     use crate::array::DType;
-    use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+    use crate::models::quantized_linear::QuantizedLinear;
     use crate::nn::Activations;
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
@@ -4256,7 +4256,7 @@ fn mixer_down_injection_matches_independent_projections() {
 #[test]
 fn reference_prefill_mixer_tile_preserves_affine8_projection() {
     use crate::array::DType;
-    use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+    use crate::models::quantized_linear::QuantizedLinear;
     if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0") {
         return;
     }
@@ -4563,7 +4563,7 @@ fn reference_hyper_norm_preserves_mean_boundaries_and_offset_views() {
 #[test]
 fn shared_prefill_preserves_q8_values_companions_and_row_tails() {
     use crate::array::DType;
-    use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+    use crate::models::quantized_linear::QuantizedLinear;
     if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0")
         || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_Q8")
     {

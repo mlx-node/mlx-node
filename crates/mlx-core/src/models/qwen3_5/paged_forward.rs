@@ -49,7 +49,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 
 fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)

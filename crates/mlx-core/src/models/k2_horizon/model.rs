@@ -129,7 +129,7 @@ pub(crate) struct K2Inner {
     /// Untied output projection (`lm_head.weight`). `LinearProj` so the
     /// persistence layer may install a quantized backend; the shipped
     /// checkpoint keeps it dense.
-    pub(crate) lm_head: crate::models::qwen3_5_moe::quantized_linear::LinearProj,
+    pub(crate) lm_head: crate::models::quantized_linear::LinearProj,
     /// Flat-path KV caches (one per layer). Committed state lives here
     /// across turns; a failed turn resets them via `fail_closed_flat_turn`
     /// → `reset_caches`.
@@ -180,12 +180,11 @@ impl K2Inner {
 
         // Untied lm_head (K2 ships `tie_word_embeddings: false`). Dense
         // `Linear` placeholder; persistence may upgrade to mxfp8.
-        let lm_head =
-            crate::models::qwen3_5_moe::quantized_linear::LinearProj::Standard(Linear::new(
-                config.hidden_size as u32,
-                config.vocab_size as u32,
-                Some(false),
-            )?);
+        let lm_head = crate::models::quantized_linear::LinearProj::Standard(Linear::new(
+            config.hidden_size as u32,
+            config.vocab_size as u32,
+            Some(false),
+        )?);
 
         // Block-paged KV adapter — default ON (pure standard-KV model; the
         // Metal-only write/gather kernels mean non-Metal builds leave it

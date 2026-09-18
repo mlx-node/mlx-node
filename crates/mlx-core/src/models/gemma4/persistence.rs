@@ -14,6 +14,7 @@ use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
     prewarm_checkpoint_pages,
 };
+use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
@@ -138,6 +139,7 @@ fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Conf
         .map_err(|e| Error::from_reason(format!("Failed to read config.json: {}", e)))?;
     let raw: Value = serde_json::from_str(&raw_str)
         .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {}", e)))?;
+    let paged = PagedCacheConfig::from_raw_json(&raw);
 
     // Gemma4 HF configs wrap text params in a `text_config` sub-dict
     let text_cfg = raw.get("text_config");
@@ -363,18 +365,11 @@ fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Conf
             None
         },
 
-        // Paged-attention knobs — opt-in, default to None so existing
-        // checkpoints without these keys load unchanged.
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_block_size: raw
-            .get("paged_block_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
-        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
+        // Preserve absent options for the model's load-time defaults.
+        paged_cache_memory_mb: paged.paged_cache_memory_mb,
+        paged_block_size: paged.paged_block_size,
+        use_block_paged_cache: paged.use_block_paged_cache,
+        persist_paged_cache: paged.persist_paged_cache,
     };
 
     Ok(ParsedGemma4Config {
@@ -3187,6 +3182,36 @@ mod tests {
         .expect("write config.json");
         let cfg = parse_config(&dir).expect("parse_config");
         (cfg, dir)
+    }
+
+    #[test]
+    fn paged_config_reads_root_options_without_nested_fallback() {
+        let mut raw = serde_json::json!({
+            "text_config": {
+                "hidden_size": 64,
+                "paged_cache_memory_mb": 999,
+                "paged_block_size": 32,
+                "use_block_paged_cache": true,
+                "persist_paged_cache": true
+            }
+        });
+        let (absent, dir) = parse_config_from_json(raw.clone());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(absent.paged_cache_memory_mb, None);
+        assert_eq!(absent.paged_block_size, None);
+        assert_eq!(absent.use_block_paged_cache, None);
+        assert_eq!(absent.persist_paged_cache, None);
+        raw["paged_cache_memory_mb"] = serde_json::json!(4294967360_u64);
+        raw["paged_block_size"] = serde_json::json!(-1);
+        raw["pagedBlockSize"] = serde_json::json!(32);
+        raw["use_block_paged_cache"] = serde_json::json!(false);
+        raw["persist_paged_cache"] = serde_json::json!(false);
+        let (config, dir) = parse_config_from_json(raw);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(config.paged_cache_memory_mb, Some(64));
+        assert_eq!(config.paged_block_size, None);
+        assert_eq!(config.use_block_paged_cache, Some(false));
+        assert_eq!(config.persist_paged_cache, Some(false));
     }
 
     /// The unified 12B checkpoint advertises `model_type == "gemma4_unified"`

@@ -9,7 +9,7 @@ use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5Config;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::{MLPVariant, QuantizedLinear};
+use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
 
 /// Per-layer routing kind for Qwen3.5's paged dispatch.
 ///

@@ -13,7 +13,7 @@ use napi::{Error, Result};
 use serde::Deserialize;
 
 use crate::array::{DType, MxArray};
-use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+use crate::models::quantized_linear::QuantizedLinear;
 use crate::utils::gguf::{
     GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensors,
     parse_gguf, symmetric_zero_point,

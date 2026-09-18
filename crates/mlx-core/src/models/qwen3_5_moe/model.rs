@@ -63,13 +63,13 @@ use crate::engine::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
 };
+use crate::models::quantized_linear::LinearProj;
 use crate::models::qwen3_5::mtp_decode;
 use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
 use crate::models::qwen3_5_moe::decoder_layer::DecoderLayer;
 use crate::models::qwen3_5_moe::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule;
 use crate::models::qwen3_5_moe::persistence;
-use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};

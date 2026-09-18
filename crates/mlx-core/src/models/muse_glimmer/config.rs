@@ -884,18 +884,6 @@ impl MuseGlimmerConfig {
             persist_paged_cache: raw.paged.persist_paged_cache,
         })
     }
-
-    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`]
-    /// (`paged_cache_initial_memory_mb` is qwen3_5-only; always `None` here).
-    pub fn paged_cache_config(&self) -> PagedCacheConfig {
-        PagedCacheConfig {
-            paged_cache_memory_mb: self.paged_cache_memory_mb,
-            paged_cache_initial_memory_mb: None,
-            paged_block_size: self.paged_block_size,
-            use_block_paged_cache: self.use_block_paged_cache,
-            persist_paged_cache: self.persist_paged_cache,
-        }
-    }
 }
 
 /// `config.json` bodies for tests.

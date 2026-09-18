@@ -22,6 +22,7 @@ use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_s
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, prewarm_checkpoint_pages,
 };
+use crate::models::paged_config::PagedCacheConfig;
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::model::Qwen3FamilyCommand;
@@ -361,6 +362,7 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
         .as_i64()
         .or_else(|| raw_config["bosTokenId"].as_i64())
         .unwrap_or(151643) as i32;
+    let paged = PagedCacheConfig::from_raw_json_camel_aliases(raw_config);
 
     Ok(Qwen3Config {
         vocab_size: raw_config["vocab_size"]
@@ -420,20 +422,10 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
             .or_else(|| raw_config["eosTokenId"].as_i64())
             .unwrap_or(151645) as i32,
         bos_token_id,
-        paged_cache_memory_mb: raw_config["paged_cache_memory_mb"]
-            .as_i64()
-            .or_else(|| raw_config["pagedCacheMemoryMb"].as_i64())
-            .map(|x| x as u32),
-        paged_block_size: raw_config["paged_block_size"]
-            .as_i64()
-            .or_else(|| raw_config["pagedBlockSize"].as_i64())
-            .map(|x| x as u32),
-        use_block_paged_cache: raw_config["use_block_paged_cache"]
-            .as_bool()
-            .or_else(|| raw_config["useBlockPagedCache"].as_bool()),
-        persist_paged_cache: raw_config["persist_paged_cache"]
-            .as_bool()
-            .or_else(|| raw_config["persistPagedCache"].as_bool()),
+        paged_cache_memory_mb: paged.paged_cache_memory_mb,
+        paged_block_size: paged.paged_block_size,
+        use_block_paged_cache: paged.use_block_paged_cache,
+        persist_paged_cache: paged.persist_paged_cache,
     })
 }
 
@@ -835,6 +827,30 @@ fn parse_head_dim(raw_config: &Value) -> Result<i32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn paged_config_keeps_qwen3_alias_and_signed_reads() {
+        let config = parse_config(&json!({
+            "paged_cache_memory_mb": -1,
+            "pagedCacheMemoryMb": 64,
+            "paged_block_size": "invalid",
+            "pagedBlockSize": 32,
+            "use_block_paged_cache": false,
+            "useBlockPagedCache": true,
+            "persist_paged_cache": null,
+            "persistPagedCache": false
+        }))
+        .unwrap();
+        assert_eq!(config.paged_cache_memory_mb, Some(u32::MAX));
+        assert_eq!(config.paged_block_size, Some(32));
+        assert_eq!(config.use_block_paged_cache, Some(false));
+        assert_eq!(config.persist_paged_cache, Some(false));
+        let absent = parse_config(&json!({})).unwrap();
+        assert_eq!(absent.paged_cache_memory_mb, None);
+        assert_eq!(absent.paged_block_size, None);
+        assert_eq!(absent.use_block_paged_cache, None);
+        assert_eq!(absent.persist_paged_cache, None);
+    }
 
     /// A K-quant config that the dense loader cannot honor must fail CLOSED
     /// with a mode-named, actionable error — never be silently ignored and

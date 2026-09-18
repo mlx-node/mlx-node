@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
-use crate::models::qwen3_5::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Activations, Embedding, Linear, RMSNorm, RoPE};
 use crate::sampling::{SparseDistribution, is_greedy_temperature};
 use crate::utils::safetensors::load_safetensors_lazy;

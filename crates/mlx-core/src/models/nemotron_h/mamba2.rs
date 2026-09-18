@@ -7,7 +7,7 @@
 //! entry dtype at the exit boundary.
 
 use crate::array::{DType, MxArray};
-use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Activations, Conv1d};
 use napi::bindgen_prelude::*;
 

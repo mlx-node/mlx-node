@@ -65,14 +65,14 @@ use crate::nn::{Linear, RMSNorm};
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, DecoderLayer, MLPType};
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::{
+use super::switch_glu::SwitchGLU;
+use crate::models::quantized_linear::{
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedSwitchLinear,
     is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
 };
-use super::switch_glu::SwitchGLU;
 
 /// Build an affine-mode `QuantizedSwitchLinear` from `params` if both
 /// `<prefix>.weight` and `<prefix>.scales` exist.
@@ -1493,7 +1493,7 @@ mod tests {
     /// do not matter — only the install path (mode dispatch) is asserted.
     #[test]
     fn mtp_fc_installs_mode_aware_linearproj() {
-        use super::super::quantized_linear::{
+        use crate::models::quantized_linear::{
             DEFAULT_QUANT_MODE, LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
         };
         let label = "mtp_fc_installs_mode_aware_linearproj";

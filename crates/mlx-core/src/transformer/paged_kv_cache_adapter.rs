@@ -87,7 +87,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use mlx_paged_attn::metal::KvScaleManager;
 use mlx_paged_attn::{
-    BlockAllocator, LayerKVPool, PagedAttentionConfig, PhysicalBlock, SequenceBlockTable,
+    BlockAllocator, LayerKVPool, PagedAttentionConfig, PhysicalBlock, PrefixKeys,
+    SequenceBlockTable,
 };
 
 #[cfg(target_os = "macos")]
@@ -667,18 +668,6 @@ pub(crate) enum PagedRestorePoll {
         bytes_restored: u64,
         wait: Duration,
     },
-}
-
-/// Prefix-cache identity supplied to the shared turn-preparation lifecycle.
-///
-/// The turn lifecycle itself (live continuation, reset, suffix allocation,
-/// and plan reporting) is identical for both variants. Only the cold
-/// prefix-cache lookup differs: text-only callers use one uniform key vector,
-/// while multimodal callers use image-aware keys for each block.
-#[derive(Clone, Copy)]
-enum PreparePrefixKeys<'a> {
-    Uniform(&'a [u64]),
-    PerBlock(&'a [Vec<u64>]),
 }
 
 /// Process-local Metal/MLX memory counters captured once for a prefill chunk.
@@ -1563,7 +1552,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::Uniform(extra_keys),
+            PrefixKeys::Uniform(extra_keys),
             cache_salt,
             skip_lookup,
             None,
@@ -1594,7 +1583,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::Uniform(extra_keys),
+            PrefixKeys::Uniform(extra_keys),
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
@@ -1652,7 +1641,7 @@ impl PagedKVCacheAdapter {
                 prompt_tokens,
                 total_budget,
                 reuse_cache,
-                PreparePrefixKeys::Uniform(extra_keys),
+                PrefixKeys::Uniform(extra_keys),
                 cache_salt,
                 skip_lookup,
                 Some(max_cache_hit_tokens),
@@ -1892,7 +1881,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::PerBlock(extra_keys_per_block),
+            PrefixKeys::PerBlock(extra_keys_per_block),
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
@@ -1921,7 +1910,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             /* reuse_cache */ false,
-            PreparePrefixKeys::PerBlock(extra_keys_per_block),
+            PrefixKeys::PerBlock(extra_keys_per_block),
             cache_salt,
             /* skip_lookup */ true,
             /* max_cache_hit_tokens */ Some(0),
@@ -1935,7 +1924,7 @@ impl PagedKVCacheAdapter {
         prompt_tokens: &[u32],
         total_budget: u32,
         reuse_cache: bool,
-        prefix_keys: PreparePrefixKeys<'_>,
+        prefix_keys: PrefixKeys<'_>,
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
@@ -1971,7 +1960,7 @@ impl PagedKVCacheAdapter {
         prompt_tokens: &[u32],
         total_budget: u32,
         reuse_cache: bool,
-        prefix_keys: PreparePrefixKeys<'_>,
+        prefix_keys: PrefixKeys<'_>,
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
@@ -2058,36 +2047,26 @@ impl PagedKVCacheAdapter {
     fn find_cached_prefix_for_prepare(
         &mut self,
         prompt_tokens: &[u32],
-        prefix_keys: PreparePrefixKeys<'_>,
+        prefix_keys: PrefixKeys<'_>,
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
     ) -> Result<CachedPrefix, String> {
-        match prefix_keys {
-            PreparePrefixKeys::Uniform(extra_keys) => self.find_cached_prefix_inner(
-                prompt_tokens,
-                extra_keys,
-                cache_salt,
-                skip_lookup,
-                max_cache_hit_tokens,
-                true,
-            ),
-            PreparePrefixKeys::PerBlock(extra_keys_per_block) => self
-                .find_cached_prefix_per_block_inner(
-                    prompt_tokens,
-                    extra_keys_per_block,
-                    cache_salt,
-                    skip_lookup,
-                    max_cache_hit_tokens,
-                ),
-        }
+        self.find_cached_prefix_with_keys_inner(
+            prompt_tokens,
+            prefix_keys,
+            cache_salt,
+            skip_lookup,
+            max_cache_hit_tokens,
+            true,
+        )
     }
 
     /// Look up the longest cached prefix matching `prompt_tokens` and
     /// populate the request's block_table with those blocks. Returns the
     /// cached prefix length so the caller knows where prefill must start.
     ///
-    /// Calls `BlockAllocator::find_longest_cache_hit` which increments
+    /// Calls `BlockAllocator::find_longest_cache_hit_with_keys` which increments
     /// refcount on matched blocks. The adapter takes ownership (`Arc` clones)
     /// so subsequent `release_request()` correctly decrements.
     ///
@@ -2204,6 +2183,29 @@ impl PagedKVCacheAdapter {
         max_cache_hit_tokens: Option<u32>,
         restore_cold: bool,
     ) -> Result<CachedPrefix, String> {
+        self.find_cached_prefix_with_keys_inner(
+            prompt_tokens,
+            PrefixKeys::Uniform(extra_keys),
+            cache_salt,
+            skip_lookup,
+            max_cache_hit_tokens,
+            restore_cold,
+        )
+    }
+
+    fn find_cached_prefix_with_keys_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: Option<u32>,
+        restore_cold: bool,
+    ) -> Result<CachedPrefix, String> {
+        let op = match keys {
+            PrefixKeys::Uniform(_) => "find_cached_prefix",
+            PrefixKeys::PerBlock(_) => "find_cached_prefix_per_block",
+        };
         // Reject re-entrant calls BEFORE touching the allocator. The flag
         // tracks lookup-already-ran regardless of hit/miss outcome, so a
         // miss-then-call sequence is rejected too — block_table.num_blocks()
@@ -2212,11 +2214,11 @@ impl PagedKVCacheAdapter {
         // turn the second lookup into a hit that grafts cached blocks into
         // a request whose miss path already started).
         if self.prefix_lookup_done {
-            return Err("find_cached_prefix already called on this request. \
-                 Call reset_for_new_request() to start a new request."
-                .to_string());
+            return Err(format!(
+                "{op} already called on this request. Call reset_for_new_request() to start a new request."
+            ));
         }
-        self.bind_request_cache_salt(cache_salt, "find_cached_prefix")?;
+        self.bind_request_cache_salt(cache_salt, op)?;
         // Consume the command-reset one-shot on every processed lookup
         // (including the forced-miss `skip_lookup` path below), so exactly the
         // immediately-following request is suppressed.
@@ -2224,7 +2226,7 @@ impl PagedKVCacheAdapter {
         let block_table = self
             .block_table
             .as_mut()
-            .ok_or_else(|| "find_cached_prefix called before reset_for_new_request".to_string())?;
+            .ok_or_else(|| format!("{op} called before reset_for_new_request"))?;
 
         // vLLM `skip_reading_prefix_cache` short-circuit. Behaves as a
         // forced 0-block cache miss: same post-conditions as a real
@@ -2258,11 +2260,12 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.find_longest_cache_hit(lookup_tokens, self.block_size, extra_keys, cache_salt)
+            guard.find_longest_cache_hit_with_keys(lookup_tokens, self.block_size, keys, cache_salt)
         };
 
         // Extend the hot hit with SSD-persisted blocks (see
-        // [`ColdTierWalk::restore_extend`]).
+        // [`ColdTierWalk::restore_extend`]). A short per-block key list caps
+        // both walks at the first block without a cache identity.
         //
         // Skipped for one lookup after a command reset (`suppress_cold_restore`)
         // so the just-purged prefix is re-prefilled cold rather than restored.
@@ -2281,12 +2284,11 @@ impl PagedKVCacheAdapter {
                 lookup_tokens,
                 cached_tokens,
                 cache_salt,
-                |_| Some(extra_keys),
+                |i| keys.get(i),
                 |full_blocks| {
-                    mlx_paged_attn::chain_hashes(
+                    keys.chain_hashes(
                         &lookup_tokens[..full_blocks * block_size as usize],
                         block_size,
-                        extra_keys,
                         cache_salt,
                     )
                 },
@@ -2419,117 +2421,14 @@ impl PagedKVCacheAdapter {
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
     ) -> Result<CachedPrefix, String> {
-        if self.prefix_lookup_done {
-            return Err(
-                "find_cached_prefix_per_block already called on this request. \
-                 Call reset_for_new_request() to start a new request."
-                    .to_string(),
-            );
-        }
-        self.bind_request_cache_salt(cache_salt, "find_cached_prefix_per_block")?;
-        // Consume the command-reset one-shot on every processed lookup
-        // (including the forced-miss `skip_lookup` path below), exactly as the
-        // uniform entry point does. Leaving it armed here would let a
-        // suppression armed by `release_request_and_purge_prefix_cache` survive
-        // a per-block lookup and later land on an unrelated uniform lookup.
-        let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
-        let block_table = self.block_table.as_mut().ok_or_else(|| {
-            "find_cached_prefix_per_block called before reset_for_new_request".to_string()
-        })?;
-
-        // vLLM `skip_reading_prefix_cache` short-circuit; see
-        // `find_cached_prefix` for the full rationale. Same 0-block-miss
-        // post-conditions; same read-side-only contract.
-        if skip_lookup {
-            self.cached_token_count = 0;
-            self.request_tokens.clear();
-            block_table.set_num_tokens(0);
-            self.prefix_lookup_done = true;
-            return Ok(CachedPrefix {
-                blocks: Vec::new(),
-                cached_token_count: 0,
-            });
-        }
-
-        let lookup_len = max_cache_hit_tokens
-            .map(|max_tokens| {
-                usize::try_from(max_tokens)
-                    .unwrap_or(usize::MAX)
-                    .min(prompt_tokens.len())
-            })
-            .unwrap_or(prompt_tokens.len());
-        let lookup_tokens = &prompt_tokens[..lookup_len];
-
-        let (mut blocks, mut cached_tokens) = {
-            let mut guard = self
-                .allocator
-                .lock()
-                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.find_longest_cache_hit_per_block(
-                lookup_tokens,
-                self.block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )
-        };
-
-        // Extend the hot hit with SSD-persisted blocks (see
-        // [`ColdTierWalk::restore_extend`]). The chain hashes come from the
-        // PER-BLOCK walk so a restored block is published under exactly the
-        // identity `find_longest_cache_hit_per_block` will look it up by;
-        // `chain_hashes_per_block` truncates when `extra_keys_per_block` runs
-        // short, which caps the restore at the covered blocks — the same
-        // break-at-the-first-block-without-keys rule the hot walk applies.
-        if !suppress_cold_restore && let Some(cold) = self.cold_tier.as_ref() {
-            let block_size = self.block_size;
-            let walk = ColdTierWalk {
-                cold,
-                pool: &self.layer_kv_pool,
-                allocator: &self.allocator,
-                block_size,
-            };
-            let restored = walk.restore_extend(
-                lookup_tokens,
-                cached_tokens,
-                cache_salt,
-                |i| extra_keys_per_block.get(i).map(Vec::as_slice),
-                |full_blocks| {
-                    mlx_paged_attn::chain_hashes_per_block(
-                        &lookup_tokens[..full_blocks * block_size as usize],
-                        block_size,
-                        extra_keys_per_block,
-                        cache_salt,
-                    )
-                },
-            );
-            cached_tokens += restored.blocks.len() * block_size as usize;
-            blocks.extend(restored.blocks);
-            // Backs exactly `cached_tokens` — the walk reduced the prefix and
-            // the state together.
-            self.restored_sidecar = restored.sidecar;
-        }
-
-        for block in &blocks {
-            block_table.add_block(Arc::clone(block));
-        }
-
-        let cached_token_count = cached_tokens.min(lookup_len) as u32;
-        self.cached_token_count = cached_token_count;
-
-        self.request_tokens.clear();
-        let cached_token_count_us = cached_tokens.min(prompt_tokens.len());
-        self.request_tokens
-            .extend_from_slice(&prompt_tokens[..cached_token_count_us]);
-        block_table.set_num_tokens(self.request_tokens.len() as u32);
-
-        self.prefix_lookup_done = true;
-        // Same obligation as the uniform entry point — and this is the path
-        // `qwen3_5` / `qwen3_5_moe` / `gemma4` use exclusively.
-        self.aux_prefix_unbacked = self.aux_prefix_state_missing();
-        Ok(CachedPrefix {
-            blocks,
-            cached_token_count,
-        })
+        self.find_cached_prefix_with_keys_inner(
+            prompt_tokens,
+            PrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+            skip_lookup,
+            max_cache_hit_tokens,
+            true,
+        )
     }
 
     /// Allocate enough new blocks to hold `total_tokens` tokens beyond
@@ -6280,11 +6179,38 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         capture_cold: bool,
     ) -> Result<u32, String> {
-        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse")?;
+        self.register_full_blocks_for_reuse_with_keys_inner(
+            PrefixKeys::Uniform(extra_keys),
+            cache_salt,
+            capture_cold,
+        )
+    }
+
+    fn register_full_blocks_for_reuse_with_keys_inner(
+        &mut self,
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+        capture_cold: bool,
+    ) -> Result<u32, String> {
+        let (op, cache_op, trace_label, invariant_suffix) = match keys {
+            PrefixKeys::Uniform(_) => (
+                "register_full_blocks_for_reuse",
+                "cache_full_blocks",
+                "uniform",
+                " See find_cached_prefix doc.",
+            ),
+            PrefixKeys::PerBlock(_) => (
+                "register_full_blocks_for_reuse_per_block",
+                "cache_full_blocks_per_block",
+                "per_block",
+                "",
+            ),
+        };
+        self.bind_request_cache_salt(cache_salt, op)?;
         // Never publish blocks computed on top of a prefix whose out-of-pool
         // half nobody established — that would hand the same unsound resume
         // point to every later request.
-        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse")?;
+        self.ensure_aux_prefix_primed(op)?;
         // Idempotent: subsequent calls within the same request are no-ops.
         if self.already_registered {
             return Ok(0);
@@ -6293,9 +6219,10 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         self.eval_pending_pool_writes()?;
 
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "register_full_blocks_for_reuse called before reset_for_new_request".to_string()
-        })?;
+        let block_table = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| format!("{op} called before reset_for_new_request"))?;
 
         // Belt-and-suspenders invariant check: `request_tokens` must hold
         // EVERY token in the request (cached prefix + suffix), not just
@@ -6309,10 +6236,8 @@ impl PagedKVCacheAdapter {
         let expected_tokens = block_table.num_tokens() as usize;
         if self.request_tokens.len() != expected_tokens {
             return Err(format!(
-                "register_full_blocks_for_reuse invariant violation: \
-                 request_tokens.len() == {} but block_table.num_tokens() == {}. \
-                 The caller must record_tokens() all tokens (cached prefix + new suffix) \
-                 before registering. See find_cached_prefix doc.",
+                "{op} invariant violation: request_tokens.len() == {} but block_table.num_tokens() == {}. \
+                 The caller must record_tokens() all tokens (cached prefix + new suffix) before registering.{invariant_suffix}",
                 self.request_tokens.len(),
                 expected_tokens,
             ));
@@ -6338,20 +6263,33 @@ impl PagedKVCacheAdapter {
             return Ok(0);
         }
 
+        if let PrefixKeys::PerBlock(extra_keys_per_block) = keys
+            && extra_keys_per_block.len() < actual_blocks_to_register
+        {
+            return Err(format!(
+                "register_full_blocks_for_reuse_per_block: extra_keys_per_block has {} \
+                 entries but {} blocks need registration. The caller must size the per-\
+                 block vec to the registered-block count (typically the result of \
+                 compute_per_block_image_extra_keys with num_blocks=block_table.num_blocks()).",
+                extra_keys_per_block.len(),
+                actual_blocks_to_register,
+            ));
+        }
+
         let mut guard = self
             .allocator
             .lock()
             .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
 
         let registered = guard
-            .cache_full_blocks(
+            .cache_full_blocks_with_keys(
                 &self.request_tokens[..actual_blocks_to_register * block_size_us],
                 blocks_slice,
                 self.block_size,
-                extra_keys,
+                keys,
                 cache_salt,
             )
-            .map_err(|e| format!("cache_full_blocks failed: {e}"))?;
+            .map_err(|e| format!("{cache_op} failed: {e}"))?;
 
         // Release the shared allocator before the cold-tier capture below:
         // `capture_and_enqueue` blits every layer's block bytes off Metal,
@@ -6374,9 +6312,9 @@ impl PagedKVCacheAdapter {
                 blocks_slice,
                 cache_salt,
                 self.cold_capture_budget,
-                |_| Some(extra_keys),
+                |i| keys.get(i),
             );
-            cold_tier::trace_cold_capture_walk("uniform", outcome, self.cold_capture_budget);
+            cold_tier::trace_cold_capture_walk(trace_label, outcome, self.cold_capture_budget);
             self.cold_capture = outcome;
         }
 
@@ -6439,103 +6377,11 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
-        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse_per_block")?;
-        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse_per_block")?;
-        if self.already_registered {
-            return Ok(0);
-        }
-        #[cfg(target_os = "macos")]
-        self.eval_pending_pool_writes()?;
-
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "register_full_blocks_for_reuse_per_block called before reset_for_new_request"
-                .to_string()
-        })?;
-
-        let expected_tokens = block_table.num_tokens() as usize;
-        if self.request_tokens.len() != expected_tokens {
-            return Err(format!(
-                "register_full_blocks_for_reuse_per_block invariant violation: \
-                 request_tokens.len() == {} but block_table.num_tokens() == {}. \
-                 The caller must record_tokens() all tokens (cached prefix + new suffix) \
-                 before registering.",
-                self.request_tokens.len(),
-                expected_tokens,
-            ));
-        }
-
-        let block_size_us = self.block_size as usize;
-        if block_size_us == 0 {
-            return Err("block_size must be > 0".to_string());
-        }
-        let num_full_blocks = self.request_tokens.len() / block_size_us;
-        if num_full_blocks == 0 {
-            return Ok(0);
-        }
-
-        let blocks_slice = &block_table.blocks()[..num_full_blocks.min(block_table.num_blocks())];
-        let actual_blocks_to_register = blocks_slice.len();
-        if actual_blocks_to_register == 0 {
-            return Ok(0);
-        }
-
-        if extra_keys_per_block.len() < actual_blocks_to_register {
-            return Err(format!(
-                "register_full_blocks_for_reuse_per_block: extra_keys_per_block has {} \
-                 entries but {} blocks need registration. The caller must size the per-\
-                 block vec to the registered-block count (typically the result of \
-                 compute_per_block_image_extra_keys with num_blocks=block_table.num_blocks()).",
-                extra_keys_per_block.len(),
-                actual_blocks_to_register,
-            ));
-        }
-
-        let mut guard = self
-            .allocator
-            .lock()
-            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-
-        let registered = guard
-            .cache_full_blocks_per_block(
-                &self.request_tokens[..actual_blocks_to_register * block_size_us],
-                blocks_slice,
-                self.block_size,
-                &extra_keys_per_block[..actual_blocks_to_register],
-                cache_salt,
-            )
-            .map_err(|e| format!("cache_full_blocks_per_block failed: {e}"))?;
-
-        // Release the shared allocator before the cold-tier capture below:
-        // `capture_and_enqueue` blits every layer's block bytes off Metal, and
-        // holding the lock across that would serialize other requests. The
-        // blocks stay pinned by this request's own references until
-        // `release_request`, so dropping the lock cannot race an eviction.
-        drop(guard);
-
-        // Persist the same chain to the SSD cold tier (see
-        // [`ColdTierWalk::capture_chain`]). The `extra_keys_per_block.len()`
-        // check above already guarantees a per-block entry for every block
-        // handed to the walk.
-        if let Some(cold) = self.cold_tier.as_ref() {
-            let outcome = ColdTierWalk {
-                cold,
-                pool: &self.layer_kv_pool,
-                allocator: &self.allocator,
-                block_size: self.block_size,
-            }
-            .capture_chain(
-                &self.request_tokens,
-                blocks_slice,
-                cache_salt,
-                self.cold_capture_budget,
-                |i| extra_keys_per_block.get(i).map(Vec::as_slice),
-            );
-            cold_tier::trace_cold_capture_walk("per_block", outcome, self.cold_capture_budget);
-            self.cold_capture = outcome;
-        }
-
-        self.already_registered = true;
-        Ok(registered as u32)
+        self.register_full_blocks_for_reuse_with_keys_inner(
+            PrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+            true,
+        )
     }
 
     /// Release this request's block references. Decrefs every block in

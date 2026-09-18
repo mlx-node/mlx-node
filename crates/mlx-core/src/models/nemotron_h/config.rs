@@ -168,19 +168,6 @@ impl NemotronHConfig {
         // 2 bytes per param (bf16)
         total_params * 2
     }
-
-    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`].
-    /// `persist_paged_cache` / `paged_cache_initial_memory_mb` have no fields
-    /// on this config and stay `None`.
-    pub fn paged_cache_config(&self) -> PagedCacheConfig {
-        PagedCacheConfig {
-            paged_cache_memory_mb: self.paged_cache_memory_mb,
-            paged_cache_initial_memory_mb: None,
-            paged_block_size: self.paged_block_size,
-            use_block_paged_cache: self.use_block_paged_cache,
-            persist_paged_cache: None,
-        }
-    }
 }
 
 /// Remap a `layers_block_type` entry to the HF `MIXER_TYPES` name.

@@ -15172,10 +15172,8 @@ mod tests {
             crate::models::quant_dispatch::PerLayerMode::Nvfp4
         );
         assert!(
-            crate::models::qwen3_5::quantized_linear::try_build_nvfp4_quantized_linear(
-                &weights, early,
-            )
-            .is_some()
+            crate::models::quantized_linear::try_build_nvfp4_quantized_linear(&weights, early,)
+                .is_some()
         );
         crate::models::quant_dispatch::ensure_plain_fp8_storage_resolves_fp8_e4m3(
             &weights,
@@ -15185,11 +15183,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            crate::models::qwen3_5::quantized_linear::try_build_fp8_e4m3_quantized_linear(
-                &weights, high,
-            )
-            .unwrap()
-            .is_some()
+            crate::models::quantized_linear::try_build_fp8_e4m3_quantized_linear(&weights, high,)
+                .unwrap()
+                .is_some()
         );
     }
 

@@ -31,7 +31,7 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::model_thread::ResponseTx;
-use crate::models::qwen3_5::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};

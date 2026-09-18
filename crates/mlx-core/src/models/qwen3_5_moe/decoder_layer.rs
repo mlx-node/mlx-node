@@ -9,8 +9,8 @@ use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5MoeConfig;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::{MLPVariant, QuantizedLinear};
 use super::sparse_moe::SparseMoeBlock;
+use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
 // Reuse the dense layer-kind enum for MoE; the routing semantics
 // (Linear vs FullAttentionPaged) are identical between dense and MoE.
 pub(crate) use crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind;

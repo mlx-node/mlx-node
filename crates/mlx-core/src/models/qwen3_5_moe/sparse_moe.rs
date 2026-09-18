@@ -5,8 +5,8 @@ use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5MoeConfig;
-use super::quantized_linear::{LinearProj, MLPVariant, QuantizedLinear};
 use super::switch_glu::SwitchGLU;
+use crate::models::quantized_linear::{LinearProj, MLPVariant, QuantizedLinear};
 
 /// SparseMoeBlock: Mixture-of-Experts block with shared expert.
 pub struct SparseMoeBlock {

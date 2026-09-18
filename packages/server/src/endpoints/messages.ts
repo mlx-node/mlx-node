@@ -10,10 +10,8 @@
  * whether the underlying native model has the block-paged KV cache
  * adapter active (`SessionCapableModel.hasBlockPagedCache?.()`):
  *
- *   * **Paged-active path** (Qwen3 + LFM2 + Gemma4 are paged-active
- *     today; Qwen3.5 dense/MoE and Qianfan-OCR remain non-paged /
- *     default-off pending a perf decision and adapter wiring
- *     respectively). Each request allocates a fresh `ChatSession` via
+ *   * **Paged-active path** (`hasBlockPagedCache()` is true).
+ *     Each request allocates a fresh `ChatSession` via
  *     `SessionRegistry.createFreshSession()` and runs a full
  *     `session.reset()` + `primeHistory()` +
  *     `startFromHistory[Stream]()`. The JS-side warm slot is
@@ -28,9 +26,8 @@
  *     `prefix_hit` after dispatch when the engine reports
  *     `cachedTokens > 0`.
  *
- *   * **Non-paged path** (Qwen3.5 dense + MoE — default-off pending a
- *     perf decision; the Qianfan-OCR VLM — no adapter wired). Each
- *     request looks up the warm slot via
+ *   * **Non-paged path** (the loaded model has no active paged cache).
+ *     Each request looks up the warm slot via
  *     `SessionRegistry.getOrCreateWarmAny(requestedSystem, cacheSalt)`. On a
  *     HIT we keep the underlying native KV cache alive
  *     (`resetPreservingNativeCacheForWarmReuse` wipes only JS-side
@@ -72,6 +69,7 @@ import {
   sendAnthropicRateLimit,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
+import { withAdmissionControlledInference } from '../inference-admission.js';
 import { canonicalizeSystemForCacheKey, mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
   buildAnthropicResponse,
@@ -93,6 +91,7 @@ import {
   type ModelWorkCoordinator,
 } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
+import { MAX_OUTPUT_TOKENS, validateAndCanonicalizeHistoryToolOrder } from '../request-validation.js';
 import { QueueFullError, type PreDispatchAdmission, type SessionRegistry } from '../session-registry.js';
 import { StopSequenceBuffer } from '../stop-sequence-buffer.js';
 import {
@@ -114,7 +113,6 @@ import {
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
-import { MAX_OUTPUT_TOKENS, validateAndCanonicalizeHistoryToolOrder } from './responses.js';
 
 /**
  * Sentinel response id used to adopt and drop the per-model warm slot
@@ -128,22 +126,6 @@ import { MAX_OUTPUT_TOKENS, validateAndCanonicalizeHistoryToolOrder } from './re
  */
 const MESSAGES_WARM_SLOT_ID = '__msg_warm__';
 const CLAUDE_CODE_TITLE_MAX_TOKENS = 128;
-
-function withAdmissionControlledInference<T>(
-  sessionReg: SessionRegistry,
-  modelWorkCoordinator: ModelWorkCoordinator | undefined,
-  // Pre-dispatch permit handed off ATOMICALLY as this call's admission
-  // (the selected admission lane consumes it instead of charging
-  // `queuedCount` a second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
-  // so call sites keep the trailing-closure layout.
-  permit: PreDispatchAdmission | undefined,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const run = () => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn());
-  return sessionReg.concurrentAdmissionLimit > 1
-    ? sessionReg.withAdmission(run, permit)
-    : sessionReg.withExclusive(run, permit);
-}
 
 function requestAllowsToolUse(body: AnthropicMessagesRequest): boolean {
   return Array.isArray(body.tools) && body.tools.length > 0;

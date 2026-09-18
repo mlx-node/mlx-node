@@ -2316,7 +2316,7 @@ mod tests {
                 Some(additive_bias.clone()),
                 32,
                 4,
-                super::super::quantized_linear::DEFAULT_QUANT_MODE.to_string(),
+                crate::models::quantized_linear::DEFAULT_QUANT_MODE.to_string(),
             )
         };
         let mut block = Qwen3_5Attention::new(&cfg)?;

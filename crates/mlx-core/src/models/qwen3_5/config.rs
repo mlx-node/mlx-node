@@ -334,25 +334,6 @@ impl Qwen3_5Config {
         // 2 bytes per param (bf16)
         total_params * 2
     }
-
-    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`]
-    /// (all five fields — qwen3_5 is the family that owns
-    /// `paged_cache_initial_memory_mb`).
-    ///
-    /// The fields stay declared inline on the struct: `Qwen3_5Config` is a
-    /// `#[napi(object)]` bridge type whose generated TS interface is flat
-    /// camelCase, and `Qwen3_5Config { .. }` literals exist outside this
-    /// file (persistence's raw-value parse, test helpers) —
-    /// `#[serde(flatten)]` would break both contracts.
-    pub fn paged_cache_config(&self) -> PagedCacheConfig {
-        PagedCacheConfig {
-            paged_cache_memory_mb: self.paged_cache_memory_mb,
-            paged_cache_initial_memory_mb: self.paged_cache_initial_memory_mb,
-            paged_block_size: self.paged_block_size,
-            use_block_paged_cache: self.use_block_paged_cache,
-            persist_paged_cache: self.persist_paged_cache,
-        }
-    }
 }
 
 #[cfg(test)]

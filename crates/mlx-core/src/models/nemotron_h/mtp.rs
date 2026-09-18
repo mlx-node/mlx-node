@@ -19,7 +19,7 @@
 //! the cache offset plus the bottom-right-aligned "causal" SDPA mask.
 
 use crate::array::MxArray;
-use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Linear, RMSNorm};
 use napi::bindgen_prelude::*;
 
@@ -434,7 +434,7 @@ mod mtp_turn_tests {
     use crate::models::nemotron_h::config::NemotronHConfig;
     use crate::models::nemotron_h::layer_cache::NemotronHLayerCache;
     use crate::models::nemotron_h::model::NemotronHInner;
-    use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
+    use crate::models::quantized_linear::LinearProj;
     use crate::nn::Linear;
     use crate::stream::{DeviceType, Stream};
     use napi::bindgen_prelude::{Error, Result};

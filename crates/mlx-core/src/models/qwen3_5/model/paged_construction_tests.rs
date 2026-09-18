@@ -10,11 +10,9 @@
 
 use super::*;
 use crate::array::DType;
+use crate::models::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedLinear};
 use crate::models::qwen3_5::config::Qwen3_5Config;
 use crate::models::qwen3_5::decoder_layer::{self, AttentionType};
-use crate::models::qwen3_5::quantized_linear::{
-    MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedLinear,
-};
 
 fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
     Qwen3_5Config {

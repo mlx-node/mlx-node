@@ -3,8 +3,8 @@ use crate::moe::{gather_sort, scatter_unsort};
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
 
-use super::quantized_linear::QuantizedSwitchLinear;
 use super::switch_linear::SwitchLinear;
+use crate::models::quantized_linear::QuantizedSwitchLinear;
 
 /// A projection layer that can be either standard or quantized.
 pub enum SwitchProj {

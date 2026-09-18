@@ -17,6 +17,7 @@ use crate::engine::persistence::{
     prewarm_checkpoint_pages, strip_qwen35_vision_weight_prefix,
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
+use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
@@ -790,7 +791,7 @@ fn apply_weights_moe_inner_with_residency(
     // lm_head — direct access, no lock
     if is_quantized {
         if let Some(ql) = try_build_ql(params, "lm_head")? {
-            inner.lm_head = Some(super::quantized_linear::LinearProj::Quantized(ql));
+            inner.lm_head = Some(crate::models::quantized_linear::LinearProj::Quantized(ql));
         } else if let Some(ref mut head) = inner.lm_head
             && let Some(w) = params.get("lm_head.weight")
         {
@@ -2116,6 +2117,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 /// Parse Qwen3.5 MoE config from JSON.
 fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let text_cfg = raw.get("text_config");
+    let paged = PagedCacheConfig::from_raw_json(raw);
 
     let gi = |keys: &[&str], default: i32| get_config_i32(raw, text_cfg, keys, default);
     let gf = |keys: &[&str], default: f64| get_config_f64(raw, text_cfg, keys, default);
@@ -2225,20 +2227,11 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
                     .filter_map(|v| v.as_i64().map(|i| i as i32))
                     .collect()
             }),
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_cache_initial_memory_mb: raw
-            .get("paged_cache_initial_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_block_size: raw
-            .get("paged_block_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+        paged_cache_memory_mb: paged.paged_cache_memory_mb,
+        paged_cache_initial_memory_mb: paged.paged_cache_initial_memory_mb,
+        paged_block_size: paged.paged_block_size,
         use_block_paged_cache: {
-            let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
+            let explicit = paged.use_block_paged_cache;
             let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
             let resolved = crate::models::qwen3_5::config::resolve_qwen35_paged_default(
                 explicit,
@@ -2253,7 +2246,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
         // unless explicitly present as a bool (the agent overlay / a config
         // override). `MLX_PERSIST_PAGED_CACHE` supplies the env default at load
         // (`resolve_persist_cold`), so this stays a strict tri-state read.
-        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
+        persist_paged_cache: paged.persist_paged_cache,
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
         qwen35_gguf_gdn_layout: raw
             .get("qwen35_gguf_gdn_layout")
@@ -2321,6 +2314,48 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
 #[cfg(test)]
 mod tests {
     use crate::models::mtp_drafter::strip_wrapper_prefix;
+    use serde_json::json;
+
+    #[test]
+    fn paged_config_reads_root_options_without_losing_absence() {
+        let mut raw = json!({
+            "text_config": {
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "intermediate_size": 128,
+                "num_experts": 2,
+                "paged_cache_memory_mb": 999,
+                "paged_cache_initial_memory_mb": 999,
+                "paged_block_size": 999,
+                "persist_paged_cache": true
+            }
+        });
+        let absent = parse_config(&raw).unwrap();
+        assert_eq!(absent.paged_cache_memory_mb, None);
+        assert_eq!(absent.paged_cache_initial_memory_mb, None);
+        assert_eq!(absent.paged_block_size, None);
+        assert_eq!(absent.persist_paged_cache, None);
+        raw["paged_cache_memory_mb"] = json!(4294967360_u64);
+        raw["paged_cache_initial_memory_mb"] = json!(16);
+        raw["paged_block_size"] = json!(-1);
+        raw["pagedBlockSize"] = json!(32);
+        raw["use_block_paged_cache"] = json!(false);
+        raw["persist_paged_cache"] = json!(false);
+        let config = parse_config(&raw).unwrap();
+        assert_eq!(config.paged_cache_memory_mb, Some(64));
+        assert_eq!(config.paged_cache_initial_memory_mb, Some(16));
+        assert_eq!(config.paged_block_size, None);
+        assert_eq!(config.persist_paged_cache, Some(false));
+        let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
+        assert_eq!(
+            config.use_block_paged_cache,
+            crate::models::qwen3_5::config::resolve_qwen35_paged_default(
+                Some(false),
+                env_override.as_deref()
+            )
+        );
+    }
 
     /// The MoE body strip (`sanitize_weights`) delegates to the shared
     /// longest-first `strip_wrapper_prefix`, so a raw, un-converted HF
@@ -2340,7 +2375,7 @@ mod tests {
         AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MLPType, MxArray,
         PerLayerMode, PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner,
         align_affine_embedding_dtype, apply_weights_moe_inner, declared_residual_dtype,
-        default_per_layer_quant, load_vision_encoder_moe, pin_sym8_to_flat_kv_cache,
+        default_per_layer_quant, load_vision_encoder_moe, parse_config, pin_sym8_to_flat_kv_cache,
         residual_stream_dtype, sanitize_weights,
     };
     use std::collections::HashMap;
@@ -3358,7 +3393,7 @@ mod tests {
     /// pre-fix this observes `Some(2.0)` (RED), post-fix `None` (GREEN).
     #[test]
     fn mxfp8_non_site_lm_head_drops_input_amax_through_moe_loader() {
-        use super::super::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
+        use crate::models::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
         let config = tiny_sym8_moe_cfg();
         let mut inner =
             Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");

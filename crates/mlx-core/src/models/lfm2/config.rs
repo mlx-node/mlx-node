@@ -211,25 +211,6 @@ impl Lfm2Config {
         self.num_experts.is_some()
     }
 
-    /// The family's paged-cache knobs as the shared [`PagedCacheConfig`]
-    /// (`paged_cache_initial_memory_mb` is qwen3_5-only; always `None` here).
-    ///
-    /// The four fields stay declared inline on the struct: `Lfm2Config` is a
-    /// `#[napi(object)]` bridge type whose generated TS interface is flat
-    /// camelCase (`useBlockPagedCache` etc., constructed literally in
-    /// `packages/lm/src/models/lfm2-configs.ts`), and `Lfm2Config { .. }`
-    /// literals exist outside this file — `#[serde(flatten)]` would break
-    /// both contracts.
-    pub fn paged_cache_config(&self) -> PagedCacheConfig {
-        PagedCacheConfig {
-            paged_cache_memory_mb: self.paged_cache_memory_mb,
-            paged_cache_initial_memory_mb: None,
-            paged_block_size: self.paged_block_size,
-            use_block_paged_cache: self.use_block_paged_cache,
-            persist_paged_cache: self.persist_paged_cache,
-        }
-    }
-
     /// Resolve the load-time default for `use_block_paged_cache`.
     ///
     /// Policy (pure, no I/O — isolated here for unit testing):

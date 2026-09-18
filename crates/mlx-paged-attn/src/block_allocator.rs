@@ -63,6 +63,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use hashlink::LinkedHashSet;
 
+use crate::prefix_registry::{PrefixKeys, hash_block};
+#[cfg(test)]
+use crate::{chain_hashes, chain_hashes_per_block, hash_tokens};
+
 /// A physical block in GPU memory
 #[derive(Debug)]
 pub struct PhysicalBlock {
@@ -674,50 +678,12 @@ impl BlockAllocator {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> (Vec<Arc<PhysicalBlock>>, usize) {
-        // Defensive: 0 block_size would cause infinite loop / divide by zero
-        if block_size == 0 || token_ids.is_empty() || token_ids.len() < block_size as usize {
-            return (Vec::new(), 0);
-        }
-
-        let block_size_us = block_size as usize;
-        let num_full_blocks = token_ids.len() / block_size_us;
-
-        // Precompute the per-block chained hashes with the shared walk so the
-        // lookup and the cold-tier restore path (Task A4) hash the identical
-        // chain. `chain_hashes[n]` equals the hash this loop computed inline
-        // before the refactor; `chain_hashes[n - 1]` is block `n`'s parent.
-        let hashes = chain_hashes(token_ids, block_size, extra_keys, cache_salt);
-
-        let mut blocks: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(num_full_blocks);
-
-        for n in 0..num_full_blocks {
-            let start = n * block_size_us;
-            let end = start + block_size_us;
-            let block_tokens = &token_ids[start..end];
-            let parent_hash = if n == 0 { 0 } else { hashes[n - 1] };
-            let block_hash = hashes[n];
-
-            if self.prefix_identity_mismatches(
-                block_hash,
-                block_tokens,
-                parent_hash,
-                extra_keys,
-                cache_salt,
-                n,
-            ) {
-                break;
-            }
-
-            match self.lookup_prefix(block_hash) {
-                Some(block) => {
-                    blocks.push(block);
-                }
-                None => break,
-            }
-        }
-
-        let cached_tokens = blocks.len() * block_size_us;
-        (blocks, cached_tokens)
+        self.find_longest_cache_hit_with_keys(
+            token_ids,
+            block_size,
+            PrefixKeys::Uniform(extra_keys),
+            cache_salt,
+        )
     }
 
     /// Per-block-extra_keys variant of [`Self::find_longest_cache_hit`].
@@ -752,53 +718,50 @@ impl BlockAllocator {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> (Vec<Arc<PhysicalBlock>>, usize) {
+        self.find_longest_cache_hit_with_keys(
+            token_ids,
+            block_size,
+            PrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+        )
+    }
+
+    pub fn find_longest_cache_hit_with_keys(
+        &mut self,
+        token_ids: &[u32],
+        block_size: u32,
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+    ) -> (Vec<Arc<PhysicalBlock>>, usize) {
         if block_size == 0 || token_ids.is_empty() || token_ids.len() < block_size as usize {
             return (Vec::new(), 0);
         }
-
         let block_size_us = block_size as usize;
         let num_full_blocks = token_ids.len() / block_size_us;
-
-        // Same shared-walk contract as `find_longest_cache_hit`: one source of
-        // truth for the chained per-block hashes so the hot lookup and the
-        // cold-tier restore path can never drift. The walk stops early when
-        // `extra_keys_per_block` runs short, which reproduces the old inline
-        // `break` (caller didn't supply keys for this block → treat as a miss
-        // to keep cache identity unambiguous; vLLM aborts here too).
-        let hashes =
-            chain_hashes_per_block(token_ids, block_size, extra_keys_per_block, cache_salt);
-
-        let mut blocks: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(num_full_blocks);
-
-        for n in 0..num_full_blocks {
-            let (Some(per_block), Some(&block_hash)) = (extra_keys_per_block.get(n), hashes.get(n))
-            else {
-                break;
-            };
+        // A short per-block key list truncates the shared hash walk at the
+        // first block without a cache identity, matching the old miss behavior.
+        let hashes = keys.chain_hashes(token_ids, block_size, cache_salt);
+        let mut blocks = Vec::with_capacity(num_full_blocks);
+        for (n, &block_hash) in hashes.iter().enumerate() {
             let start = n * block_size_us;
-            let end = start + block_size_us;
-            let block_tokens = &token_ids[start..end];
+            let block_tokens = &token_ids[start..start + block_size_us];
             let parent_hash = if n == 0 { 0 } else { hashes[n - 1] };
-
+            let extra_keys = keys.get(n).expect("hash walk requires keys for each block");
             if self.prefix_identity_mismatches(
                 block_hash,
                 block_tokens,
                 parent_hash,
-                per_block,
+                extra_keys,
                 cache_salt,
                 n,
             ) {
                 break;
             }
-
             match self.lookup_prefix(block_hash) {
-                Some(block) => {
-                    blocks.push(block);
-                }
+                Some(block) => blocks.push(block),
                 None => break,
             }
         }
-
         let cached_tokens = blocks.len() * block_size_us;
         (blocks, cached_tokens)
     }
@@ -860,61 +823,13 @@ impl BlockAllocator {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<usize, &'static str> {
-        if block_size == 0 {
-            return Err("block_size must be > 0");
-        }
-
-        let block_size_us = block_size as usize;
-        if blocks.len() * block_size_us > token_ids.len() {
-            return Err("blocks exceed token_ids length");
-        }
-
-        let mut previous_block_hash: u64 = 0;
-        let mut registered = 0usize;
-        for (n, block) in blocks.iter().enumerate() {
-            let start = n * block_size_us;
-            let end = start + block_size_us;
-            let block_tokens = &token_ids[start..end];
-            let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
-            if !self.register_prefix(Arc::clone(block), block_hash) {
-                if self.prefix_identity_matches(
-                    block_hash,
-                    block_tokens,
-                    parent_hash,
-                    extra_keys,
-                    cache_salt,
-                    n,
-                ) {
-                    // The same logical block is already cached under a
-                    // different physical block. This happens after a cold
-                    // prefill recomputes an existing prefix: skip the
-                    // duplicate leading block but keep walking so the new
-                    // tail can be published.
-                    previous_block_hash = block_hash;
-                    continue;
-                } else {
-                    // Chain broke (collision drop or cache disabled). Stop
-                    // here: any further block we register would chain off a
-                    // hash that resolves to someone else's block, which
-                    // corrupts future find_longest_cache_hit walks. Return
-                    // the count of accepted registrations up to (but not
-                    // including) the dropped block.
-                    break;
-                }
-            }
-            self.remember_prefix_identity(
-                block_hash,
-                block_tokens,
-                parent_hash,
-                extra_keys,
-                cache_salt,
-                n,
-            );
-            previous_block_hash = block_hash;
-            registered += 1;
-        }
-        Ok(registered)
+        self.cache_full_blocks_with_keys(
+            token_ids,
+            blocks,
+            block_size,
+            PrefixKeys::Uniform(extra_keys),
+            cache_salt,
+        )
     }
 
     /// Per-block-extra_keys variant of [`Self::cache_full_blocks`].
@@ -949,14 +864,34 @@ impl BlockAllocator {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<usize, &'static str> {
+        self.cache_full_blocks_with_keys(
+            token_ids,
+            blocks,
+            block_size,
+            PrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+        )
+    }
+
+    pub fn cache_full_blocks_with_keys(
+        &mut self,
+        token_ids: &[u32],
+        blocks: &[Arc<PhysicalBlock>],
+        block_size: u32,
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+    ) -> Result<usize, &'static str> {
         if block_size == 0 {
             return Err("block_size must be > 0");
         }
+
         let block_size_us = block_size as usize;
         if blocks.len() * block_size_us > token_ids.len() {
             return Err("blocks exceed token_ids length");
         }
-        if extra_keys_per_block.len() < blocks.len() {
+        if let PrefixKeys::PerBlock(per_block) = keys
+            && per_block.len() < blocks.len()
+        {
             return Err("extra_keys_per_block shorter than blocks");
         }
 
@@ -966,8 +901,8 @@ impl BlockAllocator {
             let start = n * block_size_us;
             let end = start + block_size_us;
             let block_tokens = &token_ids[start..end];
-            let extra_keys = &extra_keys_per_block[n];
             let parent_hash = if n == 0 { 0 } else { previous_block_hash };
+            let extra_keys = keys.get(n).expect("registration key count was validated");
             let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
             if !self.register_prefix(Arc::clone(block), block_hash) {
                 if self.prefix_identity_matches(
@@ -978,9 +913,20 @@ impl BlockAllocator {
                     cache_salt,
                     n,
                 ) {
+                    // The same logical block is already cached under a
+                    // different physical block. This happens after a cold
+                    // prefill recomputes an existing prefix: skip the
+                    // duplicate leading block but keep walking so the new
+                    // tail can be published.
                     previous_block_hash = block_hash;
                     continue;
                 } else {
+                    // Chain broke (collision drop or cache disabled). Stop
+                    // here: any further block we register would chain off a
+                    // hash that resolves to someone else's block, which
+                    // corrupts future find_longest_cache_hit walks. Return
+                    // the count of accepted registrations up to (but not
+                    // including) the dropped block.
                     break;
                 }
             }
@@ -1209,178 +1155,6 @@ impl BlockAllocator {
         }
         Ok(true)
     }
-}
-
-/// Hash function for token sequences (for prefix caching).
-///
-/// Computes a chained block hash in vLLM's style: feeds `parent_hash` first,
-/// then each token id in order, then each entry of `extra_keys` in order.
-///
-/// `extra_keys` is reserved for per-block side-channel information that must
-/// participate in cache identity — image content hashes, cache-salt, LoRA
-/// names, etc. (see vLLM commit 269bf46d). Order matters: `[a, b]` and
-/// `[b, a]` produce different hashes. Most callers should pass `&[]`.
-///
-/// Uses Rust's `DefaultHasher` (SipHash-1-3). vLLM uses xxhash/sha256 for
-/// cross-process determinism, but our prefix cache is process-local — every
-/// hash is computed and consumed in the same process — so SipHash's stronger
-/// collision resistance is the better trade-off and we don't need stable
-/// hashes across runs.
-///
-// FIXME: SipHash u64 is not cryptographically collision-resistant.
-// `find_longest_cache_hit` walks chained block hashes via `lookup_prefix`, so a
-// mid-chain collision between two different token chains could cause a
-// mixed-prefix lookup for entries registered without block identity metadata.
-// cache_full_blocks/cache_full_blocks_per_block entries are verified on lookup
-// and duplicate registration, but direct register_prefix callers still have no
-// token/extra-key metadata. See the module-level "SipHash collision limitation"
-// doc above for details.
-pub fn hash_tokens(tokens: &[u32], parent_hash: u64, extra_keys: &[u64]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    parent_hash.hash(&mut hasher);
-    for &token in tokens {
-        token.hash(&mut hasher);
-    }
-    for &key in extra_keys {
-        key.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Per-block hash helper for the four hashing-loop sites in this module.
-///
-/// Mixes `cache_salt` into block 0's hash only (when `cache_salt != 0` and
-/// `block_index == 0`), matching vLLM's first-block-only `cache_salt`
-/// composition (`vllm/v1/core/kv_cache_utils.py:521-531`):
-///
-/// ```text
-/// cache_salt_keys = [cache_salt] if start_token_idx == 0 and cache_salt else []
-/// extra_keys      = ... + cache_salt_keys + ...
-/// ```
-///
-/// When `cache_salt == 0` OR `block_index > 0`, this collapses to
-/// `hash_tokens(tokens, parent_hash, extra_keys)` byte-for-byte — no extra
-/// allocation, no salt mixed in. The leading-block + non-zero-salt branch
-/// drives the `Hasher` directly (`parent_hash`, every token, every
-/// `extra_keys` entry, then `cache_salt`) instead of materializing an
-/// `extra_keys` + `[cache_salt]` slice; the result is bit-equal to
-/// `hash_tokens(tokens, parent_hash, &[extra_keys..., cache_salt])` but
-/// avoids the heap allocation that path used to do. Ordering matches vLLM:
-/// `cache_salt` is hashed AFTER the existing `extra_keys` entries.
-#[inline]
-fn hash_block(
-    tokens: &[u32],
-    parent_hash: u64,
-    extra_keys: &[u64],
-    cache_salt: u64,
-    block_index: usize,
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    if cache_salt == 0 || block_index != 0 {
-        return hash_tokens(tokens, parent_hash, extra_keys);
-    }
-    // First block + non-zero salt → drive the hasher directly. Bit-equal to
-    // `hash_tokens(tokens, parent_hash, [extra_keys..., cache_salt])` because
-    // `hash_tokens` writes the same prefix in the same order, then iterates
-    // its `extra_keys` slice; appending `cache_salt` here matches that.
-    let mut hasher = DefaultHasher::new();
-    parent_hash.hash(&mut hasher);
-    for &token in tokens {
-        token.hash(&mut hasher);
-    }
-    for &key in extra_keys {
-        key.hash(&mut hasher);
-    }
-    cache_salt.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Chained per-block hot hashes for the leading full blocks of `token_ids`.
-///
-/// This is the single source for the per-block chain-hash walk shared by the
-/// hot lookup ([`BlockAllocator::find_longest_cache_hit`]) and the cold-tier
-/// restore path: block 0's parent hash seeds at `0`, every later block chains
-/// off its predecessor's hash, and `cache_salt` is mixed into block 0 only
-/// (via [`hash_block`]) — identical math to `find_longest_cache_hit` and
-/// `cache_full_blocks`. Entry `n` is the hash the allocator looks up /
-/// registers for full block `n`, so `chain_hashes(...)[n]` is the `hot_hash`
-/// and `chain_hashes(...)[n - 1]` the `parent_hot_hash` a restore must supply.
-///
-/// Returns one hash per full block (`token_ids.len() / block_size`); an empty
-/// vec when `block_size == 0` or fewer than one full block is present. Only
-/// the leading `num_full_blocks * block_size` tokens participate; trailing
-/// partial-block tokens are ignored.
-pub fn chain_hashes(
-    token_ids: &[u32],
-    block_size: u32,
-    extra_keys: &[u64],
-    cache_salt: u64,
-) -> Vec<u64> {
-    if block_size == 0 {
-        return Vec::new();
-    }
-    let block_size_us = block_size as usize;
-    let num_full_blocks = token_ids.len() / block_size_us;
-    let mut hashes = Vec::with_capacity(num_full_blocks);
-    let mut previous_block_hash: u64 = 0;
-    for n in 0..num_full_blocks {
-        let start = n * block_size_us;
-        let end = start + block_size_us;
-        let block_tokens = &token_ids[start..end];
-        let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-        let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
-        hashes.push(block_hash);
-        previous_block_hash = block_hash;
-    }
-    hashes
-}
-
-/// Per-block-`extra_keys` variant of [`chain_hashes`].
-///
-/// Block `n` is hashed with `extra_keys_per_block[n]`; everything else matches
-/// [`chain_hashes`] exactly (parent seeded at `0`, later blocks chain off their
-/// predecessor, `cache_salt` mixed into block 0 only via [`hash_block`]).
-///
-/// The walk STOPS at the first block index without per-block keys, so the
-/// returned vec has `min(token_ids.len() / block_size, extra_keys_per_block.len())`
-/// entries. Callers must treat a short result as "no cache identity beyond this
-/// point" — that is exactly what [`BlockAllocator::find_longest_cache_hit_per_block`]
-/// does (break → miss), and what the cold-tier restore walk must do as well.
-///
-/// With an all-empty per-block vec of full length, the result is bit-equal to
-/// `chain_hashes(token_ids, block_size, &[], cache_salt)`.
-pub fn chain_hashes_per_block(
-    token_ids: &[u32],
-    block_size: u32,
-    extra_keys_per_block: &[Vec<u64>],
-    cache_salt: u64,
-) -> Vec<u64> {
-    if block_size == 0 {
-        return Vec::new();
-    }
-    let block_size_us = block_size as usize;
-    let num_full_blocks = (token_ids.len() / block_size_us).min(extra_keys_per_block.len());
-    let mut hashes = Vec::with_capacity(num_full_blocks);
-    let mut previous_block_hash: u64 = 0;
-    for (n, per_block) in extra_keys_per_block
-        .iter()
-        .enumerate()
-        .take(num_full_blocks)
-    {
-        let start = n * block_size_us;
-        let end = start + block_size_us;
-        let block_tokens = &token_ids[start..end];
-        let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-        let block_hash = hash_block(block_tokens, parent_hash, per_block, cache_salt, n);
-        hashes.push(block_hash);
-        previous_block_hash = block_hash;
-    }
-    hashes
 }
 
 #[cfg(test)]
@@ -3202,6 +2976,60 @@ mod tests {
             0,
         );
         assert!(res.is_err());
+        assert!(allocator.prefix_cache.is_empty());
+        assert_eq!(b0.get_ref_count(), 1);
+        assert_eq!(b1.get_ref_count(), 1);
+    }
+
+    #[test]
+    fn prefix_registry_modes_preserve_duplicate_tail_and_refs() {
+        let tokens: Vec<u32> = (0..16).collect();
+        let keys = vec![vec![11, 22]; 4];
+        for per_block in [false, true] {
+            let mut allocator = BlockAllocator::new(12, 12, 4);
+            let old: Vec<_> = (0..2).map(|_| allocator.allocate().unwrap()).collect();
+            let old_ids: Vec<_> = old.iter().map(|b| b.block_id).collect();
+            let count = if per_block {
+                allocator.cache_full_blocks_per_block(&tokens[..8], &old, 4, &keys, 99)
+            } else {
+                allocator.cache_full_blocks(&tokens[..8], &old, 4, &[11, 22], 99)
+            }
+            .unwrap();
+            assert_eq!(count, 2);
+            for block in old {
+                allocator.free(block);
+            }
+            let new: Vec<_> = (0..4).map(|_| allocator.allocate().unwrap()).collect();
+            let count = if per_block {
+                allocator.cache_full_blocks_per_block(&tokens, &new, 4, &keys, 99)
+            } else {
+                allocator.cache_full_blocks(&tokens, &new, 4, &[11, 22], 99)
+            }
+            .unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(
+                new.iter().map(|b| b.get_ref_count()).collect::<Vec<_>>(),
+                vec![1, 1, 2, 2]
+            );
+            let (hits, cached) = if per_block {
+                allocator.find_longest_cache_hit_per_block(&tokens, 4, &keys, 99)
+            } else {
+                allocator.find_longest_cache_hit(&tokens, 4, &[11, 22], 99)
+            };
+            assert_eq!(cached, 16);
+            assert_eq!(
+                hits.iter().map(|b| b.block_id).collect::<Vec<_>>(),
+                vec![old_ids[0], old_ids[1], new[2].block_id, new[3].block_id]
+            );
+            for block in hits {
+                allocator.free(block);
+            }
+            for block in new {
+                allocator.free(block);
+            }
+            allocator.purge_prefix_cache();
+            assert_eq!(allocator.num_free_blocks(), 12);
+        }
     }
 
     /// `find_longest_cache_hit_per_block` with too-short keys treats the

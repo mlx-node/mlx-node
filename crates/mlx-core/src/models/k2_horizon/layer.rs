@@ -13,7 +13,7 @@
 //! is identical, so there is no per-layer kind dispatch (unlike LFM2).
 
 use crate::array::MxArray;
-use crate::models::qwen3_5_moe::quantized_linear::MLPVariant;
+use crate::models::quantized_linear::MLPVariant;
 use crate::nn::GroupedRMSNorm;
 use crate::transformer::KVCache;
 use crate::transformer::MLP;

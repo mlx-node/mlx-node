@@ -24,7 +24,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 
 fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)
@@ -1264,8 +1264,8 @@ mod tests {
     /// casting (it stays f32 and is cast on-the-fly inside
     /// `compute_g`). Casting it would diverge from mlx-lm semantics.
     fn cast_moe_inner_weights_bf16(inner: &mut Qwen35MoeInner) {
+        use crate::models::quantized_linear::MLPVariant;
         use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
-        use crate::models::qwen3_5_moe::quantized_linear::MLPVariant;
         let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
 
         // Embedding.

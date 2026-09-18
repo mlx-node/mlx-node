@@ -29,7 +29,7 @@
 //! - `expert_bias` stays f32 (matches Python `cast_predicate`).
 
 use crate::array::{DType, MxArray};
-use crate::models::qwen3_5::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 use crate::nn::{Activations, Linear};
 use napi::bindgen_prelude::*;

@@ -18,7 +18,7 @@
 //!   `transpose = false` (computes `x @ w` per expert).
 //!
 //! That second pattern means we cannot reuse Qwen3.5's
-//! [`crate::models::qwen3_5_moe::quantized_linear::QuantizedSwitchLinear`]
+//! [`crate::models::quantized_linear::QuantizedSwitchLinear`]
 //! verbatim — it hard-codes `transpose = true`. To avoid touching the
 //! Qwen3.5 shipping path we introduce a small wrapper here:
 //! [`PrivacyFilterQuantizedSwitchLinear`]. It mirrors the upstream type
@@ -39,7 +39,7 @@ use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
-pub use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+pub use crate::models::quantized_linear::QuantizedLinear;
 
 /// Per-tensor quantization parameters resolved from the `quantization`
 /// block in `config.json`. Constructed lazily by `LoadedProj::from_tensors`.
@@ -158,7 +158,7 @@ impl LoadedProj {
     }
 }
 
-/// Privacy-filter analog of [`crate::models::qwen3_5_moe::quantized_linear::QuantizedSwitchLinear`]
+/// Privacy-filter analog of [`crate::models::quantized_linear::QuantizedSwitchLinear`]
 /// that supports the `[E, in, out_packed]` weight layout via `transpose
 /// = false`. Used for both the fused gate-up projection and the down
 /// projection, both of which ship in `[E, in, out]` orientation pre-

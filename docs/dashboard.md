@@ -227,9 +227,3 @@ idle session instead. This is a best-effort product rule, not a hard guarantee: 
 session that goes idle and is then written concurrently, or one that goes live
 inside the brief check→append window, can still race — the pre-check removes the
 realistic reachability, it does not eliminate the theoretical race.
-
-## Design
-
-The full design and phasing (Phase A cold-cache wiring, Phase B metrics sink,
-Phase C dashboard package) live in
-`docs/superpowers/specs/2026-07-20-mlx-dashboard-design.md`.

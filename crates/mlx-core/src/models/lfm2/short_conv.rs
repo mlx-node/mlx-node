@@ -1,6 +1,6 @@
 use crate::array::MxArray;
+use crate::models::quantized_linear::LinearProj;
 use crate::models::qwen3_5::arrays_cache::ArraysCache;
-use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::{Conv1d, Linear};
 use napi::bindgen_prelude::*;
 

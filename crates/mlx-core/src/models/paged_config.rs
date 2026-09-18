@@ -1,29 +1,8 @@
-//! Shared block-paged KV cache options (`config.json` keys).
+//! Shared block-paged KV cache options and raw `config.json` parsing.
 //!
-//! Every paged-capable model family declares the same flat set of optional
-//! `config.json` keys — `paged_cache_memory_mb`, `paged_block_size`,
-//! `use_block_paged_cache`, `persist_paged_cache` (plus
-//! `paged_cache_initial_memory_mb` on the qwen3_5 dense/MoE pair). This
-//! module holds the canonical declaration so the shape, serde defaults, and
-//! the hand-rolled `serde_json::Value` reads exist exactly once.
-//!
-//! ## Why most families still declare the fields inline
-//!
-//! The family `Config` structs are `#[napi(object)]` bridge types whose
-//! generated TypeScript interface maps every Rust field to one flat
-//! camelCase property (`useBlockPagedCache`, `pagedCacheMemoryMb`, … —
-//! `napi-derive` has no flatten support), and dozens of
-//! `Config { paged_cache_memory_mb: .. }` struct literals live outside
-//! `models/*/config.rs`. Embedding this struct as
-//! `#[serde(flatten)] paged: PagedCacheConfig` would nest those JS
-//! properties under `config.paged.*` and break every literal construction
-//! site, so those families keep their flat fields and project into this
-//! type via `paged_cache_config()`. The two exceptions:
-//!
-//! * `muse_glimmer`'s serde-only `RawConfig` embeds `PagedCacheConfig`
-//!   directly through `#[serde(flatten)]` (no napi surface, no literals).
-//! * `nemotron_h`'s hand-rolled `parse_config` shares
-//!   [`PagedCacheConfig::from_raw_json`].
+//! NAPI configs keep flat fields to preserve their TypeScript shape. Manual
+//! loaders use the shared parsers without changing family-specific defaults;
+//! Muse's serde-only `RawConfig` embeds this type with `#[serde(flatten)]`.
 
 use serde_json::Value;
 
@@ -42,8 +21,7 @@ pub const DEFAULT_PAGED_CACHE_MEMORY_MB: u32 = 2048;
 ///
 /// All fields are optional at the serde layer and presence is load-bearing —
 /// `None` means "not configured", not "default value" — so keep resolving
-/// through each family's own defaults (`*_or` helpers take the default as an
-/// argument; they do not pick one).
+/// through each family's own defaults.
 ///
 /// Serde notes for future `#[serde(flatten)]` adopters: every field carries
 /// `#[serde(default)]`, so the flattened struct never fails on absent keys,
@@ -85,31 +63,6 @@ pub struct PagedCacheConfig {
 }
 
 impl PagedCacheConfig {
-    /// `paged_block_size.unwrap_or(default)` — see [`DEFAULT_PAGED_BLOCK_SIZE`]
-    /// for the value every family passes today.
-    pub fn block_size_or(&self, default: u32) -> u32 {
-        self.paged_block_size.unwrap_or(default)
-    }
-
-    /// `paged_cache_memory_mb.unwrap_or(default)` — the default is
-    /// family-specific (`DEFAULT_PAGED_CACHE_MEMORY_MB` for the fixed-budget
-    /// families, a context-derived size for the auto-sizing ones).
-    pub fn memory_mb_or(&self, default: u32) -> u32 {
-        self.paged_cache_memory_mb.unwrap_or(default)
-    }
-
-    /// `paged_cache_initial_memory_mb.unwrap_or(default)` — `None` callers
-    /// keep initial == max (the historical fixed pool).
-    pub fn initial_memory_mb_or(&self, default: u32) -> u32 {
-        self.paged_cache_initial_memory_mb.unwrap_or(default)
-    }
-
-    /// `use_block_paged_cache.unwrap_or(default)` — `default` is the family's
-    /// already-resolved load-time policy.
-    pub fn use_paged_or(&self, default: bool) -> bool {
-        self.use_block_paged_cache.unwrap_or(default)
-    }
-
     /// Shared `Some(explicit.unwrap_or(default))` policy behind each family's
     /// `resolve_use_block_paged_default`: an explicit `config.json` value
     /// always wins; absent resolves to the family default.
@@ -276,19 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_helpers_apply_caller_defaults() {
-        let empty = PagedCacheConfig::default();
-        assert_eq!(empty.block_size_or(DEFAULT_PAGED_BLOCK_SIZE), 16);
-        assert_eq!(empty.memory_mb_or(DEFAULT_PAGED_CACHE_MEMORY_MB), 2048);
-        assert_eq!(empty.initial_memory_mb_or(99), 99);
-        assert!(empty.use_paged_or(true));
-        let set = PagedCacheConfig {
-            paged_block_size: Some(32),
-            use_block_paged_cache: Some(false),
-            ..PagedCacheConfig::default()
-        };
-        assert_eq!(set.block_size_or(16), 32);
-        assert!(!set.use_paged_or(true));
+    fn resolve_use_paged_default_applies_caller_default() {
         assert_eq!(
             PagedCacheConfig::resolve_use_paged_default(None, true),
             Some(true)

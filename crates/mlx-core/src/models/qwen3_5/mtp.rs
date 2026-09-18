@@ -45,7 +45,7 @@ use crate::nn::{Linear, RMSNorm};
 use super::config::Qwen3_5Config;
 use super::decoder_layer::{AttentionType, DecoderLayer};
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::{
+use crate::models::quantized_linear::{
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, is_quantized_checkpoint,
     try_build_kquant_quantized_linear, try_build_mxfp4_quantized_linear,
     try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
@@ -953,7 +953,7 @@ mod tests {
     /// do not matter — only the install path (mode dispatch) is asserted.
     #[test]
     fn mtp_fc_installs_mode_aware_linearproj() {
-        use super::super::quantized_linear::{
+        use crate::models::quantized_linear::{
             DEFAULT_QUANT_MODE, LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
         };
         let label = "mtp_fc_installs_mode_aware_linearproj";

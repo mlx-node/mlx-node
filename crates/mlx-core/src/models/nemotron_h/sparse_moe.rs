@@ -5,7 +5,7 @@
 //! but the routing weights are gathered from the UNBIASED sigmoid scores.
 
 use crate::array::{DType, MxArray};
-use crate::models::qwen3_5_moe::quantized_linear::{LinearProj, QuantizedSwitchLinear};
+use crate::models::quantized_linear::{LinearProj, QuantizedSwitchLinear};
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
 
@@ -250,7 +250,7 @@ impl NemotronHMoE {
                     None,
                     16,
                     4,
-                    crate::models::qwen3_5::quantized_linear::NVFP4_MODE.to_string(),
+                    crate::models::quantized_linear::NVFP4_MODE.to_string(),
                 ),
                 up_global_scale: unit.clone(),
                 down: QuantizedSwitchLinear::new(
@@ -259,7 +259,7 @@ impl NemotronHMoE {
                     None,
                     16,
                     4,
-                    crate::models::qwen3_5::quantized_linear::NVFP4_MODE.to_string(),
+                    crate::models::quantized_linear::NVFP4_MODE.to_string(),
                 ),
                 down_global_scale: unit,
             }
@@ -571,7 +571,7 @@ mod tests {
                 None,
                 16,
                 4,
-                crate::models::qwen3_5::quantized_linear::NVFP4_MODE.to_string(),
+                crate::models::quantized_linear::NVFP4_MODE.to_string(),
             )
         };
 

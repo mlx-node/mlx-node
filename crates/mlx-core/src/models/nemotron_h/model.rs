@@ -105,7 +105,7 @@ pub(crate) struct NemotronHInner {
     pub(crate) layers: Vec<NemotronHDecoderLayer>,
     pub(crate) final_norm: RMSNorm,
     /// Untied lm_head (tie_word_embeddings=false); NVFP4-quantized or dense.
-    pub(crate) lm_head: Option<crate::models::qwen3_5_moe::quantized_linear::LinearProj>,
+    pub(crate) lm_head: Option<crate::models::quantized_linear::LinearProj>,
     pub(crate) caches: Vec<NemotronHLayerCache>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) cached_token_history: Vec<u32>,

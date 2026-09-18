@@ -5,7 +5,7 @@ use napi::bindgen_prelude::*;
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::{GdnKernelTape, gated_delta_update, gated_delta_update_with_tape};
-use super::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Per-GDN-layer tape recorded during the eager MTP verify forward.
 ///

@@ -1,5 +1,5 @@
 use crate::array::MxArray;
-use crate::models::qwen3_5_moe::quantized_linear::MLPVariant;
+use crate::models::quantized_linear::MLPVariant;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};

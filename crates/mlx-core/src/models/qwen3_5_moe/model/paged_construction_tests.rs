@@ -2,11 +2,11 @@
 
 use super::*;
 use crate::array::DType;
-use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
-use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
-use crate::models::qwen3_5_moe::quantized_linear::{
+use crate::models::quantized_linear::{
     MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedSwitchLinear,
 };
+use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 
 fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {

@@ -25,6 +25,7 @@ mod config;
 #[cfg(target_os = "macos")]
 mod extern_c;
 mod layer_kv_pool;
+mod prefix_registry;
 pub mod profile;
 
 #[cfg(target_os = "macos")]
@@ -57,6 +58,7 @@ pub use block_table::*;
 pub use cold_cache::*;
 pub use config::*;
 pub use layer_kv_pool::{LayerKVPool, RESTORE_STAGING_BYTES};
+pub use prefix_registry::{PrefixKeys, chain_hashes, chain_hashes_per_block, hash_tokens};
 
 /// Path to the compiled Metal library (set at build time)
 /// Only valid on macOS; empty string on other platforms

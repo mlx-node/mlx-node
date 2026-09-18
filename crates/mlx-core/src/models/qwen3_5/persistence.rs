@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
@@ -1279,7 +1280,7 @@ fn apply_weights_inner_with_residency(
 
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
-     -> Result<Option<super::quantized_linear::QuantizedLinear>> {
+     -> Result<Option<crate::models::quantized_linear::QuantizedLinear>> {
         // Per-layer override lookup. For merged GDN projections (in_proj_qkvz,
         // in_proj_ba) the source overrides may live under the split keys; if
         // the two sides disagree we pick the higher-precision combination:
@@ -2453,6 +2454,7 @@ pub async fn load_with_thread(
 /// Parse Qwen3.5 dense config from JSON.
 fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let text_cfg = raw.get("text_config");
+    let paged = PagedCacheConfig::from_raw_json(raw);
 
     let gi = |keys: &[&str], default: i32| get_config_i32(raw, text_cfg, keys, default);
     let gf = |keys: &[&str], default: f64| get_config_f64(raw, text_cfg, keys, default);
@@ -2558,25 +2560,16 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // made the constructor treat a ~4K-token benchmark fallback as a user
         // override and bypass full-context sizing. Small MTP benchmark pools
         // remain available by setting `paged_cache_memory_mb` explicitly.
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_cache_initial_memory_mb: raw
-            .get("paged_cache_initial_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_block_size: raw
-            .get("paged_block_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+        paged_cache_memory_mb: paged.paged_cache_memory_mb,
+        paged_cache_initial_memory_mb: paged.paged_cache_initial_memory_mb,
+        paged_block_size: paged.paged_block_size,
         // Block-paged attention is the production default for Qwen3.5. The
         // explicit config bit and MLX_QWEN35_PAGED_OVERRIDE remain useful for
         // deliberate flat-path diagnostics; sym8 is forced flat later because
         // that storage format is not structurally compatible with the paged
         // compiled core.
         use_block_paged_cache: {
-            let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
+            let explicit = paged.use_block_paged_cache;
             let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
             let resolved = crate::models::qwen3_5::config::resolve_qwen35_paged_default(
                 explicit,
@@ -2591,7 +2584,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // unless explicitly present as a bool (the agent overlay / a config
         // override). `MLX_PERSIST_PAGED_CACHE` supplies the env default at load
         // (`resolve_persist_cold`), so this stays a strict tri-state read.
-        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
+        persist_paged_cache: paged.persist_paged_cache,
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
         qwen35_gguf_gdn_layout: raw
             .get("qwen35_gguf_gdn_layout")
@@ -2648,6 +2641,47 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn paged_config_reads_root_options_without_losing_absence() {
+        let mut raw = json!({
+            "text_config": {
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "intermediate_size": 128,
+                "num_experts": 2,
+                "paged_cache_memory_mb": 999,
+                "paged_cache_initial_memory_mb": 999,
+                "paged_block_size": 999,
+                "persist_paged_cache": true
+            }
+        });
+        let absent = parse_config(&raw).unwrap();
+        assert_eq!(absent.paged_cache_memory_mb, None);
+        assert_eq!(absent.paged_cache_initial_memory_mb, None);
+        assert_eq!(absent.paged_block_size, None);
+        assert_eq!(absent.persist_paged_cache, None);
+        raw["paged_cache_memory_mb"] = json!(4294967360_u64);
+        raw["paged_cache_initial_memory_mb"] = json!(16);
+        raw["paged_block_size"] = json!(-1);
+        raw["pagedBlockSize"] = json!(32);
+        raw["use_block_paged_cache"] = json!(false);
+        raw["persist_paged_cache"] = json!(false);
+        let config = parse_config(&raw).unwrap();
+        assert_eq!(config.paged_cache_memory_mb, Some(64));
+        assert_eq!(config.paged_cache_initial_memory_mb, Some(16));
+        assert_eq!(config.paged_block_size, None);
+        assert_eq!(config.persist_paged_cache, Some(false));
+        let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
+        assert_eq!(
+            config.use_block_paged_cache,
+            crate::models::qwen3_5::config::resolve_qwen35_paged_default(
+                Some(false),
+                env_override.as_deref()
+            )
+        );
+    }
 
     fn packed_projection(rows: i64, weight_cols: i64) -> (MxArray, MxArray, MxArray) {
         (
@@ -3528,7 +3562,7 @@ mod tests {
     /// on `inner`.
     #[test]
     fn dense_lm_head_installs_mode_aware_linearproj() {
-        use super::super::quantized_linear::{
+        use crate::models::quantized_linear::{
             FP8_E4M3_BITS, FP8_E4M3_GROUP_SIZE, FP8_E4M3_MODE, LinearProj, MXFP8_BITS,
             MXFP8_GROUP_SIZE, MXFP8_MODE,
         };
@@ -3781,7 +3815,7 @@ mod tests {
     /// this observes `Some(2.0)` (RED); post-fix `None` (GREEN).
     #[test]
     fn mxfp8_non_site_lm_head_drops_input_amax_dense_loader() {
-        use super::super::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
+        use crate::models::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
         let label = "mxfp8_non_site_lm_head_drops_input_amax_dense_loader";
 
         let untied_cfg = Qwen3_5Config {
@@ -3874,7 +3908,7 @@ mod tests {
     /// full-attention layer (`full_attention_interval = 4`, `(i + 1) % 4 == 0`).
     #[test]
     fn mxfp8_attention_q_proj_threads_input_amax_dense_loader() {
-        use super::super::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
+        use crate::models::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
         const AMAX: f32 = 37.5;
         let label = "mxfp8_attention_q_proj_threads_input_amax_dense_loader";
 
