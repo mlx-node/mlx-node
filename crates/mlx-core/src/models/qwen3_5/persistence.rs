@@ -2232,9 +2232,13 @@ pub async fn load_with_thread(
                 };
 
                 let prism_runtime = match prism_config.as_ref() {
-                    Some(pc) => {
-                        Some(pc.prepare(&params, &config, runtime_default_plq, &per_layer_quant)?)
-                    }
+                    Some(pc) => Some(pc.prepare_for_load(
+                        &mut params,
+                        &config,
+                        runtime_default_plq,
+                        &per_layer_quant,
+                        crate::quant::prism_hadamard::hoist_metadata_enabled(),
+                    )?),
                     None => None,
                 };
 

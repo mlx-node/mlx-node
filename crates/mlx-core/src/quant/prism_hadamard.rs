@@ -602,6 +602,32 @@ impl PrismHadamardConfig {
             signs: sign_arrays,
         })
     }
+
+    pub(crate) fn prepare_for_load(
+        &self,
+        params: &mut HashMap<String, MxArray>,
+        config: &Qwen3_5Config,
+        default_quant: PerLayerQuant,
+        overrides: &HashMap<String, PerLayerQuant>,
+        hoist_metadata: bool,
+    ) -> Result<PrismHadamardRuntime> {
+        let runtime = self.prepare(params, config, default_quant, overrides)?;
+        if hoist_metadata {
+            for prefix in runtime.projections.keys() {
+                for suffix in ["scales", "biases"] {
+                    let name = format!("{prefix}.{suffix}");
+                    let metadata = params.get_mut(&name).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "prism_hadamard: validated metadata '{name}' disappeared during load"
+                        ))
+                    })?;
+                    *metadata = metadata.astype(DType::Float32)?;
+                    metadata.eval();
+                }
+            }
+        }
+        Ok(runtime)
+    }
 }
 
 impl HadamardTransform {
@@ -1355,6 +1381,113 @@ mod tests {
             MxArray::from_float32(&[0.0f32; 16], &[4, 4]).unwrap(),
         );
         (config, params)
+    }
+
+    #[test]
+    fn prism_hadamard_load_preparation_accounts_for_hoisted_metadata() {
+        use crate::models::quantized_linear::QuantizedLinear;
+        for enabled in [false, true] {
+            let (config, mut params) = mini_prism_params();
+            let original = params.clone();
+            let bytes = |params: &HashMap<String, MxArray>| {
+                params.values().fold(0u64, |total, array| {
+                    total.saturating_add(array.nbytes() as u64)
+                })
+            };
+            let before = bytes(&params);
+            let runtime = config
+                .prepare_for_load(
+                    &mut params,
+                    &mini_qwen35_config(),
+                    pq2_quant(),
+                    &HashMap::new(),
+                    enabled,
+                )
+                .unwrap();
+            let expected_extra = if enabled { 524_544 } else { 0 };
+            assert_eq!(
+                bytes(&params).saturating_add(runtime.nbytes()),
+                before
+                    .saturating_add(runtime.nbytes())
+                    .saturating_add(expected_extra)
+            );
+            let metadata: HashSet<String> = config
+                .weight_names
+                .iter()
+                .flat_map(|name| {
+                    let prefix = name.strip_suffix(".weight").unwrap();
+                    [format!("{prefix}.scales"), format!("{prefix}.biases")]
+                })
+                .collect();
+            for (name, source) in &original {
+                let actual = &params[name];
+                assert_eq!(
+                    actual.shape().unwrap().as_ref(),
+                    source.shape().unwrap().as_ref()
+                );
+                if enabled && metadata.contains(name) {
+                    assert_eq!(actual.dtype().unwrap(), DType::Float32, "{name}");
+                    assert_eq!(
+                        actual.to_float32().unwrap().as_ref(),
+                        source
+                            .astype(DType::Float32)
+                            .unwrap()
+                            .to_float32()
+                            .unwrap()
+                            .as_ref(),
+                        "{name}"
+                    );
+                } else {
+                    assert_eq!(actual.as_raw_ptr(), source.as_raw_ptr(), "{name}");
+                }
+            }
+            if enabled {
+                let linear = QuantizedLinear::new(
+                    params["lm_head.weight"].clone(),
+                    params["lm_head.scales"].clone(),
+                    Some(params["lm_head.biases"].clone()),
+                    None,
+                    128,
+                    2,
+                    "affine".to_string(),
+                )
+                .with_hadamard(runtime.projection("lm_head"))
+                .unwrap();
+                assert_eq!(linear.get_scales().dtype().unwrap(), DType::Float32);
+                assert_eq!(
+                    linear.get_scales().nbytes(),
+                    params["lm_head.scales"].nbytes()
+                );
+                assert_eq!(
+                    linear.get_biases().unwrap().nbytes(),
+                    params["lm_head.biases"].nbytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prism_hadamard_load_preparation_validates_before_hoisting() {
+        let (config, mut params) = mini_prism_params();
+        params.insert(
+            "lm_head.scales".to_string(),
+            params["lm_head.scales"].astype(DType::Float32).unwrap(),
+        );
+        let original = params.clone();
+        let error = match config.prepare_for_load(
+            &mut params,
+            &mini_qwen35_config(),
+            pq2_quant(),
+            &HashMap::new(),
+            true,
+        ) {
+            Ok(_) => panic!("non-FP16 source metadata must still be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("must be Float16"), "{}", error.reason);
+        for (name, source) in original {
+            assert_eq!(params[&name].as_raw_ptr(), source.as_raw_ptr(), "{name}");
+        }
     }
 
     #[test]
