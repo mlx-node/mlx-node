@@ -662,6 +662,7 @@ impl<'a> PyLiteralParser<'a> {
             None,
             Star,
             DoubleStar,
+            VarargsDone,
             KwargsDone,
             Slash,
         }
@@ -774,6 +775,7 @@ impl<'a> PyLiteralParser<'a> {
         let mut lambda_keyword_only = false;
         let mut param_has_default = false;
         let mut lambda_positional_seen = false;
+        let mut lambda_slash_seen = false;
         let mut lambda_bare_star_pending = false;
         // Implicit-concat / string-prefix tracking: a quote after an
         // operand is legal only directly glued to a prefix identifier
@@ -959,14 +961,25 @@ impl<'a> PyLiteralParser<'a> {
                                     return Err(());
                                 }
                                 let is_kw_unpack = self.s.get(self.pos + 1) == Some(&b'*');
-                                if stack.last() == Some(&CALLPAREN) {
-                                    let depth = stack.len();
-                                    if is_kw_unpack {
-                                        kwarg_seen_depths.push(depth);
-                                        kw_unpack_depths.push(depth);
-                                    } else if kw_unpack_depths.contains(&depth) {
-                                        return Err(());
+                                let depth = stack.len();
+                                match stack.last().copied() {
+                                    Some(CALLPAREN) => {
+                                        if is_kw_unpack {
+                                            kwarg_seen_depths.push(depth);
+                                            kw_unpack_depths.push(depth);
+                                        } else if kw_unpack_depths.contains(&depth) {
+                                            return Err(());
+                                        }
                                     }
+                                    Some(b'{') if is_kw_unpack => {
+                                        *stack.last_mut().unwrap() = DICT;
+                                    }
+                                    Some(DICT) if is_kw_unpack => {
+                                        dict_key_next.retain(|&d| d != depth);
+                                    }
+                                    Some(DICT) => return Err(()),
+                                    Some(SET) if is_kw_unpack => return Err(()),
+                                    _ => {}
                                 }
                                 if let Some(&top) = stack.last() {
                                     starred_depths.push((stack.len(), top));
@@ -1082,6 +1095,7 @@ impl<'a> PyLiteralParser<'a> {
                                         lambda_keyword_only = false;
                                         param_has_default = false;
                                         lambda_positional_seen = false;
+                                        lambda_slash_seen = false;
                                         lambda_bare_star_pending = false;
                                     }
                                     _ => {
@@ -1322,6 +1336,9 @@ impl<'a> PyLiteralParser<'a> {
                             if stack.last() == Some(&SUBSCRIPT) {
                                 slice_colons.retain(|(d, _)| *d != stack.len());
                             }
+                            if stack.last() == Some(&DICT) && dict_key_next.contains(&stack.len()) {
+                                return Err(());
+                            }
                             match stack.last() {
                                 // `{a,` — a bare element locks the
                                 // display to a set.
@@ -1553,6 +1570,9 @@ impl<'a> PyLiteralParser<'a> {
                                     // Ternary needs `else`; a filter `if`
                                     // inside a comprehension does not.
                                     if !comp_depths.contains(&stack.len()) {
+                                        if pending_ifs.contains(&stack.len()) {
+                                            return Err(());
+                                        }
                                         pending_ifs.push(stack.len());
                                     }
                                     st = St::Need;
@@ -1615,6 +1635,11 @@ impl<'a> PyLiteralParser<'a> {
                         _ => return Err(()),
                     },
                     St::Lambda => match b {
+                        b'=' if lambda_marker == LambdaMarker::VarargsDone
+                            && stack.len() == lambda_depth =>
+                        {
+                            return Err(());
+                        }
                         _ if lambda_marker == LambdaMarker::KwargsDone
                             && stack.len() == lambda_depth
                             && b != b':'
@@ -1727,10 +1752,14 @@ impl<'a> PyLiteralParser<'a> {
                                 return Err(());
                             }
                             if b == b'/' {
-                                if !lambda_positional_seen || lambda_keyword_only {
+                                if !lambda_positional_seen
+                                    || lambda_keyword_only
+                                    || lambda_slash_seen
+                                {
                                     return Err(());
                                 }
                                 lambda_marker = LambdaMarker::Slash;
+                                lambda_slash_seen = true;
                             } else {
                                 lambda_marker = if self.s.get(self.pos + 1) == Some(&b'*') {
                                     self.pos += 1;
@@ -1766,10 +1795,10 @@ impl<'a> PyLiteralParser<'a> {
                                     lambda_bare_star_pending = false;
                                 }
                                 param_start = false;
-                                lambda_marker = if lambda_marker == LambdaMarker::DoubleStar {
-                                    LambdaMarker::KwargsDone
-                                } else {
-                                    LambdaMarker::None
+                                lambda_marker = match lambda_marker {
+                                    LambdaMarker::Star => LambdaMarker::VarargsDone,
+                                    LambdaMarker::DoubleStar => LambdaMarker::KwargsDone,
+                                    _ => LambdaMarker::None,
                                 };
                                 param_done = true;
                                 param_has_default = false;
@@ -5363,6 +5392,156 @@ The weather in Tokyo is sunny."#;
             "f(a[x[::], ::], confirmed=True)",
             "f(a[1:,], confirmed=True)",
             "f(a[..., ::], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_dictionary_unpacking_mode_rejected() {
+        for inner in [
+            "dangerous_action({**a, b}, confirmed=True)",
+            "f({**a, *b}, confirmed=True)",
+            "f({*a, **b}, confirmed=True)",
+            "f({**a for x in y}, confirmed=True)",
+            "f({**a, b, c:1}, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_dictionary_unpacking_dropped() {
+        for inner in [
+            "f({**a}, confirmed=True)",
+            "f({**a,}, confirmed=True)",
+            "f({**a, b:1}, confirmed=True)",
+            "f({a:1, **b}, confirmed=True)",
+            "f({**a, **b}, confirmed=True)",
+            "f({**outer(x=1), b:2}, confirmed=True)",
+            "f([{**a, b:1}], confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_lambda_varargs_defaults_rejected() {
+        for inner in [
+            "dangerous_action(lambda *args=1: x, confirmed=True)",
+            "f(lambda *args=(1): x, confirmed=True)",
+            "f((lambda *args=1: x), confirmed=True)",
+            "f(lambda a=(lambda *args=1: x): a, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_varargs_dropped() {
+        for inner in [
+            "f(lambda *args: args, confirmed=True)",
+            "f(lambda *args,: args, confirmed=True)",
+            "f(lambda *args,b: b, confirmed=True)",
+            "f(lambda *args,b=1: b, confirmed=True)",
+            "f(lambda *args,**kw: args, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_repeated_lambda_slash_rejected() {
+        for inner in [
+            "dangerous_action(lambda x,/,y,/: x, confirmed=True)",
+            "f(lambda x,/,/: x, confirmed=True)",
+            "f((lambda x,/,y,/: x), confirmed=True)",
+            "f(lambda a=(lambda x,/,y,/: x): a, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_lambda_slash_dropped() {
+        for inner in [
+            "f(lambda x,/: x, confirmed=True)",
+            "f(lambda x,/,y: y, confirmed=True)",
+            "f(lambda x,/,*,y: y, confirmed=True)",
+            "f((lambda x,/: x) + (lambda y,/: y), confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_nested_ternary_condition_rejected() {
+        for inner in [
+            "dangerous_action(a if b if c else d else e, confirmed=True)",
+            "f(a if b if c else d, confirmed=True)",
+            "f(lambda x=a if b if c else d else e: x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_nested_ternaries_dropped() {
+        for inner in [
+            "f(a if b else c if d else e, confirmed=True)",
+            "f(a if (b if c else d) else e, confirmed=True)",
+            "f((a if b else c) if d else e, confirmed=True)",
+            "f(a if helper(b if c else d) else e, confirmed=True)",
+            "f([a if b else c for x in y], confirmed=True)",
+            "f(lambda x=a if b else c if d else e: x, confirmed=True)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
