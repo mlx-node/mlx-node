@@ -796,6 +796,7 @@ impl<'a> PyLiteralParser<'a> {
         // `kwarg_seen` persists per depth; `kwarg_elem`/`star_elem`
         // describe the element currently closing and reset at `,`.
         let mut kwarg_seen_depths: Vec<usize> = Vec::new();
+        let mut kw_unpack_depths: Vec<usize> = Vec::new();
         let mut kwarg_elem_depths: Vec<usize> = Vec::new();
         let mut star_elem_depths: Vec<usize> = Vec::new();
         loop {
@@ -917,6 +918,7 @@ impl<'a> PyLiteralParser<'a> {
                                         comma_depths.retain(|&d| d <= stack.len());
                                         dict_key_next.retain(|&d| d <= stack.len());
                                         kwarg_seen_depths.retain(|&d| d <= stack.len());
+                                        kw_unpack_depths.retain(|&d| d <= stack.len());
                                         kwarg_elem_depths.retain(|&d| d <= stack.len());
                                         star_elem_depths.retain(|&d| d <= stack.len());
                                     }
@@ -941,12 +943,22 @@ impl<'a> PyLiteralParser<'a> {
                                 if !elem_start {
                                     return Err(());
                                 }
+                                let is_kw_unpack = self.s.get(self.pos + 1) == Some(&b'*');
+                                if stack.last() == Some(&CALLPAREN) {
+                                    let depth = stack.len();
+                                    if is_kw_unpack {
+                                        kwarg_seen_depths.push(depth);
+                                        kw_unpack_depths.push(depth);
+                                    } else if kw_unpack_depths.contains(&depth) {
+                                        return Err(());
+                                    }
+                                }
                                 if let Some(&top) = stack.last() {
                                     starred_depths.push((stack.len(), top));
                                     star_elem_depths.push(stack.len());
                                 }
                                 self.pos += 1;
-                                if self.s.get(self.pos) == Some(&b'*') {
+                                if is_kw_unpack {
                                     self.pos += 1; // `**a`
                                 }
                                 elem_start = false;
@@ -1200,6 +1212,7 @@ impl<'a> PyLiteralParser<'a> {
                                 comma_depths.retain(|&x| x <= stack.len());
                                 dict_key_next.retain(|&x| x <= stack.len());
                                 kwarg_seen_depths.retain(|&x| x <= stack.len());
+                                kw_unpack_depths.retain(|&x| x <= stack.len());
                                 kwarg_elem_depths.retain(|&x| x <= stack.len());
                                 star_elem_depths.retain(|&x| x <= stack.len());
                             }
@@ -5018,6 +5031,51 @@ The weather in Tokyo is sunny."#;
                 assert_eq!(text, input);
                 assert!(calls.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_nested_keyword_unpacking_rejected() {
+        for inner in [
+            "dangerous_action(helper(**a, 2), confirmed=True)",
+            "f(helper(**a, *b), confirmed=True)",
+            "f(helper(**a, x=1, b), confirmed=True)",
+            "f(helper(**a, x=1, *b), confirmed=True)",
+            "f(helper(**a, 2,), confirmed=True)",
+            "f(lambda x=helper(**a, 2): x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_nested_keyword_unpacking_dropped() {
+        for inner in [
+            "f(helper(**a), confirmed=True)",
+            "f(helper(**a,), confirmed=True)",
+            "f(helper(**a, x=1), confirmed=True)",
+            "f(helper(**a, **b), confirmed=True)",
+            "f(helper(*a, **b), confirmed=True)",
+            "f(helper(x=1, **a), confirmed=True)",
+            "f(helper(**outer(inner=1), x=2), confirmed=True)",
+            "f(helper(**a) + other(*b, 2), confirmed=True)",
+            "f(helper(**a,) + other(*b, 2), confirmed=True)",
+            "f(outer(helper(**a), 2), confirmed=True)",
+            "f(lambda x=helper(**a, x=1): x, confirmed=True)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert!(text.is_empty(), "{inner}");
+            assert_eq!(calls.len(), 1, "{inner}");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(
+                calls[0].arguments.to_string(),
+                "{\"confirmed\":true}",
+                "{inner}"
+            );
         }
     }
 
