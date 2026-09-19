@@ -75,6 +75,8 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_LFM2_FUSED_BATCH_DECODE`            | Opt-in (default off): LFM2 multi-row decode waves run one fused `[N,1]` forward instead of the default row-exact wave (per-row N=1 forwards, bit-identical to serial). Fused M=N GEMM tiles round differently than M=1 and the carried ShortConv state amplifies the ULP diff into occasional greedy near-tie flips |
 | `MLX_BONSAI_HOIST_METADATA=1` | Experimental, default off: materialize rotated PQ2 projection scales/biases in FP32 once at load. Rotated projections promote their transformed inputs to FP32 (the 16-bit residual stream a normal Prism load produces), so outputs propagate FP32; adds about 0.8 GB for Bonsai 2 27B. No stable speedup is claimed. |
 | `MLX_BONSAI_SHARE_HADAMARD=1` | Experimental, default off: reuse identical signed Hadamard transforms within one paged Qwen3.5 decode step. Cache entries retain input/sign owners and are cleared on return or error; flat inference and prefill do not retain entries. |
+| `MLX_QMM_SPLITK_MIN_M`        | Diagnostic override for the quantized-matmul vector/GEMM dispatch boundary: quantized matvecs with M ≥ this many rows take the `qmm`/split-k path instead of `qmv_wide`. A/B tuning only; unset keeps the hardware-derived heuristic. |
+| `MLX_KQUANT_SMALL_M_BENCH=1`  | Body-level opt-in for the `#[ignore]`d `kquant_small_m_bench` integration test: exact-shape K/IQ small-M quantized-matmul timings (MLP + lm_head shapes, M sweep). Run `MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --test kquant_small_m_bench -- --ignored --test-threads=1 --nocapture` (serial — the two benches share the GPU). |
 
 ### Paged-attention
 

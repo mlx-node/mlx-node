@@ -59,6 +59,13 @@ const N: i64 = 128;
 /// N % 32 != 0, which is what picks the `_alN_false` kernels.
 const N_UNALIGNED: i64 = 136;
 
+/// The `qmv_wide` dispatcher caps a threadgroup's input-vector tile at 5
+/// below this N and at 8 at or above it (metal/quantized.cpp:459), so only an
+/// output dim of at least 2048 lets M = 6..8 dispatch the `_nv_6`..`_nv_8`
+/// kernels in a single tile. Still a multiple of the 256-element super-block
+/// `validate_quantized_input` requires on the packed axis.
+const N_WIDE: i64 = 2048;
+
 /// Four super-blocks per row rather than one, so a flat group index crosses a
 /// super-block boundary while walking a single row.
 const K_DEEP: i64 = 1024;
@@ -960,7 +967,10 @@ fn cpu_runs_dequantize_matmul_and_gather_for_every_kquant_mode() {
 /// ```text
 ///   M = 1        -> dispatch_qmv:1728, and 1 < vector_limit (>= 6 on every
 ///                   arch branch of get_qmv_batch_limit:191-233)
-///   M in [2, 5]  -> qmv_wide:1668, which needs GPU gen >= 15 (use_qmv_wide:411)
+///   M in [2, 8]  -> qmv_wide:1719, which needs GPU gen >= 15 (use_qmv_wide:427);
+///                   the per-threadgroup tile is capped at 5 below N = 2048 and
+///                   8 at or above it (:459), so the `_nv_6`..`_nv_8` kernels
+///                   only dispatch on the N_WIDE shapes
 ///   M = 64       -> the qmm branch:1701, since vector_limit <= 32 everywhere
 ///   fast         -> N % 8 == 0 && K % 512 == 0 (:368)
 ///   aligned      -> N % 32 == 0 (:956, :1070)
@@ -1063,9 +1073,9 @@ fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
         });
 
         // qmv_wide, one case per instantiated input-vector tile: n_tiles is
-        // ceil(M / 5) and vecs_per_tg is ceil(M / n_tiles) (:438-439), so
-        // M = 2..5 picks _nv_2 .. _nv_5. k_lanes is pinned to 8 for K-quants
-        // (:446).
+        // ceil(M / tile_cap) and vecs_per_tg is ceil(M / n_tiles) (:459-461),
+        // with tile_cap = 5 at this N, so M = 2..5 picks _nv_2 .. _nv_5 in a
+        // single tile. k_lanes is pinned to 8 for K-quants (:468).
         for mm in 2i64..=5 {
             let xw = activation(&[mm, K], 41 + mm as u32, DType::Float32);
             compare_devices(&format!("qmv_wide nv_{mm} batch_0 {m}"), F32_TOL, || {
@@ -1076,6 +1086,24 @@ fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
             let xwb = activation(&[3, mm, K], 53 + mm as u32, DType::Float32);
             compare_devices(&format!("qmv_wide nv_{mm} batch_1 {m}"), F32_TOL, || {
                 qmm_of(kq, &xwb, &wb, true)
+            });
+        }
+
+        // At N >= 2048 the tile cap lifts to 8, so M = 6..8 still fits one
+        // threadgroup and dispatches _nv_6 .. _nv_8 — the tiles DFlash2
+        // verification depths reach on the wide MLP/attention projections.
+        let wl = filled_kquant_weights(kq, &[N_WIDE], K);
+        for mm in 6i64..=8 {
+            let xw = activation(&[mm, K], 61 + mm as u32, DType::Float32);
+            compare_devices(&format!("qmv_wide nv_{mm} batch_0 {m}"), F32_TOL, || {
+                qmm_of(kq, &xw, &wl, true)
+            });
+        }
+        let wbl = filled_kquant_weights(kq, &[3, N_WIDE], K);
+        for mm in 6i64..=8 {
+            let xwb = activation(&[3, mm, K], 71 + mm as u32, DType::Float32);
+            compare_devices(&format!("qmv_wide nv_{mm} batch_1 {m}"), F32_TOL, || {
+                qmm_of(kq, &xwb, &wbl, true)
             });
         }
 
