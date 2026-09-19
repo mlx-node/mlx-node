@@ -183,6 +183,54 @@ fn measure(x: &MxArray, w: &MxArray, scales: &MxArray, biases: &MxArray, format:
     median_ms(&mut samples)
 }
 
+/// lm_head shape [N=248320, K=5120] q6k — DFlash2 verify proposes L+1 rows
+/// and the draft selector proposes L rows; M sweeps the depth-4..8 window.
+#[test]
+#[ignore = "manual exact-shape K/IQ small-M microbenchmark"]
+fn qwen38_lm_head_small_m_qmm() {
+    if std::env::var("MLX_KQUANT_SMALL_M_BENCH").as_deref() != Ok("1") {
+        eprintln!("set MLX_KQUANT_SMALL_M_BENCH=1 to run this benchmark");
+        return;
+    }
+    if !select_gpu() {
+        eprintln!("skipping: no GPU device");
+        return;
+    }
+    const LN: i64 = 248_320;
+    let format = Format {
+        mode: "q6k",
+        bits: 6,
+        group_size: 16,
+        scales_cols: K / 16,
+        biases_cols: K / 256,
+        signed_scales: true,
+    };
+    let mut state = 0x51a7_0000u32;
+    let weight_cols = K * i64::from(format.bits) / 32;
+    let weight: Vec<u32> = (0..LN * weight_cols).map(|_| lcg(&mut state)).collect();
+    let scales_len = LN * format.scales_cols;
+    let scales: Vec<i8> = (0..scales_len)
+        .map(|_| (lcg(&mut state) % 31) as i8 - 15)
+        .collect();
+    let biases: Vec<u16> = (0..LN * format.biases_cols)
+        .map(|_| half_scales_for(lcg(&mut state)))
+        .collect();
+    fn half_scales_for(v: u32) -> u16 {
+        [0x2800u16, 0x2c00, 0x3000, 0x3200, 0x3400, 0x3600][(v as usize) % 6]
+    }
+    let w = MxArray::from_uint32(&weight, &[LN, weight_cols]).expect("weight");
+    let sc = MxArray::from_int8(&scales, &[LN, format.scales_cols]).expect("scales");
+    let bi = MxArray::from_float16(&biases, &[LN, format.biases_cols]).expect("biases");
+    w.eval();
+    sc.eval();
+    bi.eval();
+    println!("\n  lm_head BF16 x, N={LN}, K={K}, q6k");
+    for m in [1i64, 4, 5, 6, 7, 8, 9, 12] {
+        let x = activation(m, 0x9090 + m as u32);
+        println!("  M={m:>2}: {:.4} ms", measure(&x, &w, &sc, &bi, format));
+    }
+}
+
 #[test]
 #[ignore = "manual exact-shape K/IQ small-M microbenchmark"]
 fn qwen38_dominant_small_m_qmm() {
