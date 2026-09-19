@@ -1780,6 +1780,7 @@ fn apply_weights_inner_with_residency(
                 // K/IQ projections reorder packed operands without
                 // dequantizing.
                 attn.finalize_q_gate_block()?;
+                attn.finalize_kv_proj()?;
             }
         }
 
@@ -1794,7 +1795,7 @@ fn apply_weights_inner_with_residency(
                     let q_up = try_build_ql(params, &up_key)?;
                     let q_down = try_build_ql(params, &down_key)?;
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
-                        layer.set_quantized_dense_mlp(qg, qu, qd);
+                        layer.set_quantized_dense_mlp(qg, qu, qd)?;
                     } else {
                         // Dense fallback (incomplete quant group): each load
                         // is dtype-guarded so a truncated sym8/affine group
