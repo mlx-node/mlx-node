@@ -1699,6 +1699,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn prism_hadamard_hoisted_projection_promotes_half_inputs() -> Result<()> {
+        use crate::models::quantized_linear::QuantizedLinear;
+        let mut params = HashMap::new();
+        packed_triplet(&mut params, "probe", 32, 1024);
+        let transform = transform_for(&nontrivial_signs(1024), 1024, None);
+        let make = |dtype| -> Result<QuantizedLinear> {
+            QuantizedLinear::new(
+                params["probe.weight"].clone(),
+                params["probe.scales"].astype(dtype)?,
+                Some(params["probe.biases"].astype(dtype)?),
+                None,
+                128,
+                2,
+                "affine".to_string(),
+            )
+            .with_hadamard(Some(transform.clone()))
+        };
+        // FP32 metadata stands in for the hoisted loader path; whether the
+        // env flag itself is set decides what `with_hadamard` leaves behind
+        // for the FP16 operand, so the expected baseline dtype follows it.
+        let hoisted = make(DType::Float32)?;
+        let unhoisted = make(DType::Float16)?;
+        // The promoted pipeline is transform-then-widen: the transform keeps
+        // its residual-dtype output contract, so the exact reference applies
+        // it on the 16-bit input, widens, and runs a plain FP32-metadata QMM.
+        let base32 = QuantizedLinear::new(
+            params["probe.weight"].clone(),
+            params["probe.scales"].astype(DType::Float32)?,
+            Some(params["probe.biases"].astype(DType::Float32)?),
+            None,
+            128,
+            2,
+            "affine".to_string(),
+        );
+        for dtype in [DType::Float16, DType::BFloat16] {
+            let x = MxArray::from_float32(&det_input(4 * 1024), &[4, 1024])?.astype(dtype)?;
+            // A real Prism load feeds the transform 16-bit residual-stream
+            // activations; hoisted metadata must promote them, not error.
+            let out = hoisted.forward(&x)?;
+            assert_eq!(out.dtype()?, DType::Float32);
+            let expected = base32.forward(&transform.apply(&x, false)?.astype(DType::Float32)?)?;
+            assert_eq!(out.to_float32()?.as_ref(), expected.to_float32()?.as_ref());
+            let baseline = unhoisted.forward(&x)?;
+            let baseline_dtype = if hoist_metadata_enabled() {
+                DType::Float32
+            } else {
+                dtype
+            };
+            assert_eq!(baseline.dtype()?, baseline_dtype);
+        }
+        Ok(())
+    }
+
     fn prism_case(
         declared: &[(&str, i64, i64)],
     ) -> (PrismHadamardConfig, HashMap<String, MxArray>) {

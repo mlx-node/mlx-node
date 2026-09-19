@@ -889,14 +889,22 @@ impl QuantizedLinear {
             .map(|t| t.apply(x, false))
             .transpose()?;
         let x = transformed.as_ref().unwrap_or(x);
-        if self.hadamard.is_some()
-            && crate::quant::prism_hadamard::hoist_metadata_enabled()
+        // Hoisted FP32 scale/bias metadata requires FP32 projection inputs,
+        // but a normal Prism load feeds the transform the 16-bit residual
+        // stream (the packed embedding keeps FP16 scales). Promote the
+        // transformed activation instead of rejecting the dtype; the
+        // transform itself keeps its residual-dtype output contract so
+        // same-input projections still share one cached result.
+        let xp_owned;
+        let x = if self.hadamard.is_some()
+            && self.scales.dtype()? == crate::array::DType::Float32
             && x.dtype()? != crate::array::DType::Float32
         {
-            return Err(Error::from_reason(
-                "prism_hadamard: FP32 metadata hoisting requires FP32 projection inputs",
-            ));
-        }
+            xp_owned = x.astype(crate::array::DType::Float32)?;
+            &xp_owned
+        } else {
+            x
+        };
         // Whether THIS thread is the calibrating model thread (thread-local, so
         // a concurrently-running inference model on another thread never trips
         // this). Read once and reused for both the tap and the fake-quant
