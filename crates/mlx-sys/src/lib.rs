@@ -1720,6 +1720,17 @@ unsafe extern "C-unwind" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
+    // Fused DFlash2 grouped dynamic causal conv: one elementwise dispatch
+    // reproducing the pad/slice/add/mul/add chain bit-exactly (per-op dtype
+    // rounding preserved inside the kernel).
+    pub fn mlx_dflash2_conv(
+        x: *mut mlx_array,
+        dyn_: *mut mlx_array,
+        base: *mut mlx_array,
+        side: i32,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+
     // Chunked gated delta recurrence for prefill (BT=32 tokens per chunk)
     pub fn mlx_gated_delta_chunked(
         q: *mut mlx_array,
