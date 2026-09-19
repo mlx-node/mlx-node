@@ -62,6 +62,8 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_NODE_LOG`             | Tracing-level filter              |
 | `MLX_INFERENCE_TRACE_FILE` | Path for inference trace dump     |
 | `MLX_DEBUG_GEMMA4_DUMP`    | Diagnostic dumps for Gemma4       |
+| `MLX_DFLASH2_PHASE_TIME`   | Per-cycle stderr timing of the DFlash2 draft-build / draft+selector / verify-build / verify phases. Forces extra evals to isolate the phases — diagnostic only, never set in production. |
+| `MLX_DFLASH2_VERIFY_LAYERS` | stderr timing per 15-layer block inside the DFlash2 verify forward (forces mid-graph evals — diagnostic only). |
 
 ### Compile / decode control
 
@@ -80,6 +82,9 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_DISABLE_QUANTIZED_GATE_UP_MERGE=1` | Restore the per-projection quantized matmuls for quantized MLP gate\|up pairs (no load-time packed row-merge). Outputs are bit-identical either way; the switch exists for A/B and driver rollback. |
 | `MLX_DISABLE_QATTN_KV_MERGE=1` | Restore two separate quantized matmuls for attention k\|v pairs where the merge applies (checked per forward, so it can flip without reload). Bit-identical; A/B and rollback. Calibration-keyed sites merge too — the merged projection records under both source keys. |
 | `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1` | Revert the GDN `in_proj_qkvz`/`in_proj_ba` pair to two matmuls — covers both the dense stacked-transpose path and the quantized row-merge. Bit-identical; A/B only. |
+| `MLX_DFLASH2_DRAFT_QUANT=q4\|q8` | Opt-in (default off): affine-quantize the DFlash2 draft's own projections at load and run a draft-precision clone of the target `lm_head` for proposal logits (~2.4 GiB resident saved on the Qwen3.8 pack). Verify still uses the target head, so emitted tokens are unaffected; draft precision only shifts proposal acceptance. |
+| `MLX_DFLASH2_CONV_ELEMENTWISE=1` | Force the elementwise pad/slice/add/mul chain for the DFlash2 grouped dynamic causal conv instead of the fused Metal dispatch. Bit-identical; A/B and rollback. |
+| `MLX_BENCH_PROMPT` / `MLX_BENCH_DEPTHS` | Inputs for the ignored `qwen3_8_dflash2_bench` e2e test: decode prompt (literal, or `@file` relative to the repo root) and comma-separated draft depths to sweep. |
 
 ### Paged-attention
 

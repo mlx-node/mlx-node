@@ -2276,11 +2276,21 @@ pub async fn load_with_thread(
                 };
 
                 let dflash2_weight_bytes = if let Some(draft_path) = draft_model_path.as_deref() {
-                    let (draft, bytes) = super::dflash2::load_dflash2(Path::new(draft_path))?;
+                    let (mut draft, bytes) = super::dflash2::load_dflash2(Path::new(draft_path))?;
                     draft.validate_target(&config)?;
+                    let draft_head = super::dflash2::build_draft_lm_head(inner.lm_head.as_ref())?;
+                    // The clone is a fresh packed allocation — count it toward
+                    // permanent residency so the cache-limit coordinator does
+                    // not oversubscribe unified memory.
+                    let head_bytes = draft_head.as_ref().map_or(0, |(_, b)| *b);
+                    draft.weight_bytes += head_bytes;
                     inner.dflash2 = Some(draft);
+                    inner.dflash2_draft_lm_head = draft_head.map(|(proj, _)| proj);
+                    if inner.dflash2_draft_lm_head.is_some() {
+                        info!("Installed draft-precision DFlash2 lm_head clone");
+                    }
                     info!("Loaded external Qwen3.8 DFlash2 companion from {draft_path}");
-                    bytes
+                    bytes + head_bytes
                 } else {
                     0
                 };

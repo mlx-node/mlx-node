@@ -405,6 +405,8 @@ pub(crate) fn forward_dflash2_with_taps(
     let mut tape = std::iter::repeat_with(|| None)
         .take(inner.layers.len())
         .collect::<Vec<_>>();
+    let layer_probe = std::env::var("MLX_DFLASH2_VERIFY_LAYERS").is_ok();
+    let mut probe_t = std::time::Instant::now();
     for index in 0..inner.layers.len() {
         let cache = inner.caches.as_mut().map(|caches| &mut caches[index]);
         hidden = if record_tape {
@@ -427,7 +429,19 @@ pub(crate) fn forward_dflash2_with_taps(
                 taps[slot] = Some(hidden.clone());
             }
         }
+        if layer_probe && (index + 1) % 15 == 0 {
+            MxArray::eval_arrays(&[&hidden])?;
+            let now = std::time::Instant::now();
+            eprintln!(
+                "[verify-layers] layers {:>2}-{:>2}: {:?}",
+                index + 1 - 14,
+                index + 1,
+                now.duration_since(probe_t)
+            );
+            probe_t = now;
+        }
     }
+    let _ = probe_t;
     let taps = taps
         .into_iter()
         .enumerate()

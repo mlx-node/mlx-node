@@ -222,7 +222,10 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             && params.frequency_penalty == 0.0;
         let (path, draft_sparse_dists) = draft.propose(
             &self.inner.embedding,
-            self.inner.lm_head.as_ref(),
+            self.inner
+                .dflash2_draft_lm_head
+                .as_ref()
+                .or(self.inner.lm_head.as_ref()),
             &self.context,
             anchor_id,
             max_len,
@@ -280,6 +283,8 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             false,
         )?;
         let input = verify_ids.reshape(&[1, verify_ids.shape_at(0)?])?;
+        let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
+        let t0 = std::time::Instant::now();
         let (logits, tapped, tape) = super::model::forward_dflash2_with_taps(
             self.inner,
             &input,
@@ -287,10 +292,18 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             true,
             super::model::DFlash2LogitsSpan::All,
         )?;
+        if phase_time {
+            eprintln!("[dflash2-phase] verify-build: {:?}", t0.elapsed());
+        }
         self.snapshot = Some(snapshot);
         self.tape = Some(tape);
         self.tapped = Some(tapped);
         self.verified_ids_device = Some(verify_ids.clone());
+        if phase_time {
+            let t = std::time::Instant::now();
+            MxArray::eval_arrays(&[&logits])?;
+            eprintln!("[dflash2-phase] verify: {:?}", t.elapsed());
+        }
         Ok(DsparkVerifyOutput { logits })
     }
 

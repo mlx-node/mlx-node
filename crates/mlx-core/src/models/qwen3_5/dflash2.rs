@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use rand::{Rng, RngExt};
 use serde::Deserialize;
@@ -17,7 +18,7 @@ use serde::Deserialize;
 use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
-use crate::models::quantized_linear::LinearProj;
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::nn::{Activations, Embedding, Linear, RMSNorm, RoPE};
 use crate::sampling::{SparseDistribution, is_greedy_temperature};
 use crate::utils::safetensors::load_safetensors_lazy;
@@ -303,12 +304,61 @@ struct GroupedDynamicCausalConv {
 }
 
 impl GroupedDynamicCausalConv {
+    /// Fused single-dispatch conv; `None` when the FFI rejects the inputs
+    /// (non-Metal build, dtype mismatch, unusual dims) so the caller can run
+    /// the elementwise chain instead.
+    fn fused_convolve(&self, hidden: &MxArray, dynamic: &MxArray, side: usize) -> Option<MxArray> {
+        if std::env::var_os("MLX_DFLASH2_CONV_ELEMENTWISE").is_some() {
+            return None;
+        }
+        // On non-Metal builds the FFI throws and this falls back anyway —
+        // skip the throw/catch + stderr line per call (~4 per layer).
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return None;
+        }
+        let dtype = hidden.dtype().ok()?;
+        if dynamic.dtype().ok()? != dtype || self.base_kernel.dtype().ok()? != dtype {
+            return None;
+        }
+        let mut out = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_dflash2_conv(
+                hidden.as_raw_ptr(),
+                dynamic.as_raw_ptr(),
+                self.base_kernel.as_raw_ptr(),
+                side as i32,
+                &mut out,
+            )
+        };
+        if !ok || out.is_null() {
+            return None;
+        }
+        MxArray::from_handle(out, "dflash2_conv").ok()
+    }
+
+    /// `dynamic` is the full kernel-projection output `[B, L, 2, K, G]`;
+    /// `side` selects which of the two tap blocks applies.
     fn convolve(&self, hidden: &MxArray, dynamic: &MxArray, side: usize) -> Result<MxArray> {
+        if let Some(out) = self.fused_convolve(hidden, dynamic, side) {
+            return Ok(out);
+        }
+        self.convolve_elementwise(hidden, dynamic, side)
+    }
+
+    fn convolve_elementwise(
+        &self,
+        hidden: &MxArray,
+        dynamic: &MxArray,
+        side: usize,
+    ) -> Result<MxArray> {
         let batch = hidden.shape_at(0)?;
         let length = hidden.shape_at(1)?;
         let hidden_size = hidden.shape_at(2)?;
         let groups = hidden_size / self.group_size as i64;
         let blocks = hidden.reshape(&[batch, length, groups, self.group_size as i64])?;
+        let dynamic = dynamic
+            .slice_axis(2, side as i64, side as i64 + 1)?
+            .squeeze(Some(&[2]))?;
         let mut output = MxArray::zeros(blocks.shape()?.as_ref(), Some(hidden.dtype()?))?;
         for offset in 0..self.kernel_size {
             let values = if offset == 0 {
@@ -341,6 +391,8 @@ impl GroupedDynamicCausalConv {
         let batch = hidden.shape_at(0)?;
         let length = hidden.shape_at(1)?;
         let groups = hidden.shape_at(2)? / self.group_size as i64;
+        // The full `[B, L, 2, K, G]` projection is carried into `finish` so the
+        // fused conv can index both tap blocks without a materializing slice.
         let dynamic = self.kernel_projection.forward(hidden)?.reshape(&[
             batch,
             length,
@@ -348,9 +400,7 @@ impl GroupedDynamicCausalConv {
             self.kernel_size as i64,
             groups,
         ])?;
-        let before = dynamic.slice_axis(2, 0, 1)?.squeeze(Some(&[2]))?;
-        let after = dynamic.slice_axis(2, 1, 2)?.squeeze(Some(&[2]))?;
-        Ok((self.convolve(hidden, &before, 0)?, after))
+        Ok((self.convolve(hidden, &dynamic, 0)?, dynamic))
     }
 
     fn finish(&self, hidden: &MxArray, dynamic: &MxArray) -> Result<MxArray> {
@@ -787,6 +837,8 @@ impl DFlash2Model {
             )));
         }
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
+        let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
+        let t0 = std::time::Instant::now();
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
         let hidden = self.forward_hidden(target_embedding, &block, context.logical_len, context)?;
         let hidden = hidden.slice_axis(1, 1, max_len as i64 + 1)?;
@@ -794,8 +846,20 @@ impl DFlash2Model {
             Some(head) => head.forward(&hidden)?,
             None => target_embedding.as_linear(&hidden)?,
         };
-        self.selector
-            .select(&hidden, &logits, anchor, temperature, device_path, rng)
+        let out = self
+            .selector
+            .select(&hidden, &logits, anchor, temperature, device_path, rng)?;
+        if phase_time {
+            eprintln!("[dflash2-phase] draft-build: {:?}", t0.elapsed());
+            let t = std::time::Instant::now();
+            if let SelectorPath::Device(ids) = &out.0 {
+                MxArray::eval_arrays(&[ids])?;
+            } else {
+                MxArray::eval_arrays(&[&logits])?;
+            }
+            eprintln!("[dflash2-phase] draft+selector: {:?}", t.elapsed());
+        }
+        Ok(out)
     }
 }
 
@@ -820,17 +884,171 @@ fn required(params: &mut HashMap<String, MxArray>, key: &str, shape: &[i64]) -> 
     Ok(value)
 }
 
+/// Load-time quantization for the dense DFlash2 companion. The published
+/// checkpoints ship bf16 only; affine-quantizing the draft projections cuts
+/// ~2.6 GB of per-cycle weight streaming on this model. Draft numerics affect
+/// only the proposal acceptance rate — the target verifies every emitted
+/// token, so output correctness is preserved regardless of draft precision.
+///
+/// `MLX_DFLASH2_DRAFT_QUANT`: `off`/`bf16` (default — bit-exact draft),
+/// `q4` (affine 4-bit, group 64), `q8` (affine 8-bit, group 32).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DraftQuantization {
+    Off,
+    Affine4x64,
+    Affine8x32,
+}
+
+impl DraftQuantization {
+    fn params(self) -> Option<(i32, i32)> {
+        match self {
+            DraftQuantization::Off => None,
+            DraftQuantization::Affine4x64 => Some((64, 4)),
+            DraftQuantization::Affine8x32 => Some((32, 8)),
+        }
+    }
+}
+
+fn draft_quantization() -> DraftQuantization {
+    static QUANT: std::sync::OnceLock<DraftQuantization> = std::sync::OnceLock::new();
+    *QUANT.get_or_init(|| {
+        let value = std::env::var("MLX_DFLASH2_DRAFT_QUANT")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match value.as_str() {
+            "q4" | "4" | "affine4" | "int4" => DraftQuantization::Affine4x64,
+            "q8" | "8" | "affine8" | "int8" => DraftQuantization::Affine8x32,
+            "" | "off" | "0" | "none" | "bf16" | "false" => DraftQuantization::Off,
+            other => {
+                eprintln!(
+                    "warning: unrecognized MLX_DFLASH2_DRAFT_QUANT='{other}', expected q4|q8|off; using off"
+                );
+                DraftQuantization::Off
+            }
+        }
+    })
+}
+
+/// Draft-only clone of the target LM head at [`draft_quantization`]
+/// precision. The draft runs the head every cycle only to feed the selector's
+/// top-k, so proposal logits do not need the target's q6k bits — a q4 copy
+/// streams ~0.56 GB less per cycle. The verify head stays the target's
+/// original projection, so emitted tokens are unaffected.
+///
+/// Returns the clone plus its resident byte count so the caller can fold the
+/// extra allocation into model-residency accounting — the clone is a fresh
+/// packed copy, not a view of the target head.
+pub(crate) fn build_draft_lm_head(
+    target: Option<&LinearProj>,
+) -> Result<Option<(LinearProj, u64)>> {
+    let Some((group_size, bits)) = draft_quantization().params() else {
+        return Ok(None);
+    };
+    let Some(proj) = target else {
+        return Ok(None);
+    };
+    let (dense, bias) = match proj {
+        LinearProj::Standard(l) => (l.get_weight().astype(DType::BFloat16)?, l.get_bias()),
+        // A Hadamard projection transforms the input at forward time;
+        // dense_weight_bf16 returns the stored (rotated-space) weight, so a
+        // plain affine clone would multiply untransformed hidden states and
+        // produce invalid proposal logits. The loader already rejects
+        // prism+draft checkpoints, but if that ever changes, skip the clone —
+        // proposals then fall back to the target head (slower, still correct).
+        LinearProj::Quantized(ql) if ql.has_hadamard() => return Ok(None),
+        // fp8_e4m3/sym8 heads keep crate-specific storage that the generic
+        // dequantizer cannot read — dense_weight_bf16 dispatches to the
+        // retained/manual reconstruction for those modes.
+        LinearProj::Quantized(ql) => (ql.dense_weight_bf16()?, ql.additive_bias().cloned()),
+    };
+    let (packed, scales, biases) = quantize_affine(&dense, group_size, bits)?;
+    // The additive bias clone shares the target head's storage — already
+    // counted in the params fold — so only the fresh packed arrays count here.
+    let resident = packed.nbytes() as u64 + scales.nbytes() as u64 + biases.nbytes() as u64;
+    Ok(Some((
+        LinearProj::Quantized(QuantizedLinear::new(
+            packed,
+            scales,
+            Some(biases),
+            bias,
+            group_size,
+            bits,
+            "affine".to_string(),
+        )),
+        resident,
+    )))
+}
+
+/// Affine-quantize a floating `[out, in]` weight, returning MLX's packed
+/// `(weight, scales, biases)` triple consumed by `quantized_matmul`.
+fn quantize_affine(
+    weight: &MxArray,
+    group_size: i32,
+    bits: i32,
+) -> Result<(MxArray, MxArray, MxArray)> {
+    let mut out_q = std::ptr::null_mut();
+    let mut out_s = std::ptr::null_mut();
+    let mut out_b = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_quantize(
+            weight.as_raw_ptr(),
+            group_size,
+            bits,
+            c"affine".as_ptr(),
+            &mut out_q,
+            &mut out_s,
+            &mut out_b,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_quantize(affine) failed on a DFlash2 draft weight",
+        ));
+    }
+    let packed = MxArray::from_handle(out_q, "dflash2 quantized weight")?;
+    let scales = MxArray::from_handle(out_s, "dflash2 quantization scales")?;
+    let biases = MxArray::from_handle(out_b, "dflash2 quantization biases")?;
+    // mlx_quantize outputs are lazy: left unevaluated they pin the dense bf16
+    // source in the graph until the first draft forward, so residency sizing
+    // would run against ~3.6 GB of still-live dense weights and the first
+    // proposal would pay the whole quantize cost. Evaluating here releases
+    // each dense source when the caller drops it.
+    packed.eval();
+    scales.eval();
+    biases.eval();
+    Ok((packed, scales, biases))
+}
+
+/// Builds a draft projection, honoring [`draft_quantization`]. `savings`
+/// accumulates `dense − resident` bytes so the loader can report true
+/// residency rather than the bf16 file size.
 fn linear(
     params: &mut HashMap<String, MxArray>,
     prefix: &str,
     input: usize,
     output: usize,
+    quant: DraftQuantization,
+    savings: &mut u64,
 ) -> Result<LinearProj> {
     let weight = required(
         params,
         &format!("{prefix}.weight"),
         &[output as i64, input as i64],
     )?;
+    if let Some((group_size, bits)) = quant.params() {
+        let (packed, scales, biases) = quantize_affine(&weight, group_size, bits)?;
+        let resident = packed.nbytes() as u64 + scales.nbytes() as u64 + biases.nbytes() as u64;
+        *savings += (weight.nbytes() as u64).saturating_sub(resident);
+        return Ok(LinearProj::Quantized(QuantizedLinear::new(
+            packed,
+            scales,
+            Some(biases),
+            None,
+            group_size,
+            bits,
+            "affine".to_string(),
+        )));
+    }
     Ok(LinearProj::Standard(Linear::from_weights(&weight, None)?))
 }
 
@@ -860,6 +1078,8 @@ fn grouped_conv(
     base: &str,
     name: &str,
     config: &DFlash2Config,
+    quant: DraftQuantization,
+    savings: &mut u64,
 ) -> Result<GroupedDynamicCausalConv> {
     let hidden = config.hidden_size;
     let groups = hidden / config.conv_group_size;
@@ -874,6 +1094,8 @@ fn grouped_conv(
             &format!("{base}.{name}.kernel_projection"),
             hidden,
             2 * config.conv_kernel_size * groups,
+            quant,
+            savings,
         )?,
         kernel_size: config.conv_kernel_size,
         group_size: config.conv_group_size,
@@ -1067,11 +1289,15 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     let _resident = crate::array::memory::materialize_weights(&arrays)?;
 
     let hidden = config.hidden_size;
+    let quant = draft_quantization();
+    let mut savings = 0u64;
     let fc = linear(
         &mut params,
         "fc",
         hidden * config.target_layers.len(),
         hidden,
+        quant,
+        &mut savings,
     )?;
     let hidden_norm = norm(
         &mut params,
@@ -1090,24 +1316,32 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
                 &format!("{attention_base}.q_proj"),
                 hidden,
                 config.num_attention_heads * config.head_dim,
+                quant,
+                &mut savings,
             )?,
             k_proj: linear(
                 &mut params,
                 &format!("{attention_base}.k_proj"),
                 hidden,
                 config.num_key_value_heads * config.head_dim,
+                quant,
+                &mut savings,
             )?,
             v_proj: linear(
                 &mut params,
                 &format!("{attention_base}.v_proj"),
                 hidden,
                 config.num_key_value_heads * config.head_dim,
+                quant,
+                &mut savings,
             )?,
             o_proj: linear(
                 &mut params,
                 &format!("{attention_base}.o_proj"),
                 config.num_attention_heads * config.head_dim,
                 hidden,
+                quant,
+                &mut savings,
             )?,
             q_norm: norm(
                 &mut params,
@@ -1139,18 +1373,24 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
                 &format!("{mlp_base}.gate_proj"),
                 hidden,
                 config.intermediate_size,
+                quant,
+                &mut savings,
             )?,
             up_proj: linear(
                 &mut params,
                 &format!("{mlp_base}.up_proj"),
                 hidden,
                 config.intermediate_size,
+                quant,
+                &mut savings,
             )?,
             down_proj: linear(
                 &mut params,
                 &format!("{mlp_base}.down_proj"),
                 config.intermediate_size,
                 hidden,
+                quant,
+                &mut savings,
             )?,
         };
         let input_norm = norm(
@@ -1165,8 +1405,15 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
             hidden,
             config.rms_norm_eps,
         )?;
-        let attention_conv = grouped_conv(&mut params, &base, "attention_conv", &config)?;
-        let mlp_conv = grouped_conv(&mut params, &base, "mlp_conv", &config)?;
+        let attention_conv = grouped_conv(
+            &mut params,
+            &base,
+            "attention_conv",
+            &config,
+            quant,
+            &mut savings,
+        )?;
+        let mlp_conv = grouped_conv(&mut params, &base, "mlp_conv", &config, quant, &mut savings)?;
         layers.push(DFlash2Layer {
             attention,
             mlp,
@@ -1189,11 +1436,15 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
             config.vocab_size,
             config.selector_rank,
         )?,
+        // The selector's hidden projection stays dense: at 2.6 MB it is not
+        // worth risking score fidelity for the predecessor walk.
         hidden_projection: linear(
             &mut params,
             "candidate_selector.hidden_projection",
             hidden,
             config.selector_rank,
+            DraftQuantization::Off,
+            &mut savings,
         )?,
         top_k: config.selector_top_k,
         rank: config.selector_rank,
@@ -1205,6 +1456,14 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         return Err(Error::from_reason(format!(
             "DFlash2 checkpoint contains unexpected tensors: {unexpected:?}"
         )));
+    }
+    let weight_bytes = weight_bytes.saturating_sub(savings);
+    if quant != DraftQuantization::Off {
+        eprintln!(
+            "dflash2 draft quant {quant:?}: resident {:.2} GiB (saved {:.2} GiB)",
+            weight_bytes as f64 / (1 << 30) as f64,
+            savings as f64 / (1 << 30) as f64,
+        );
     }
     Ok((
         DFlash2Model {
@@ -1376,6 +1635,76 @@ mod tests {
     }
 
     #[test]
+    fn fused_convolve_matches_elementwise_chain() {
+        use super::GroupedDynamicCausalConv;
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            eprintln!("skipping: fused conv requires a Metal back-end");
+            return;
+        }
+        let (hidden_size, group_size, kernel_size) = (64usize, 16i64, 2usize);
+        let groups = hidden_size / group_size as usize;
+        let conv = GroupedDynamicCausalConv {
+            base_kernel: MxArray::random_normal(
+                &[2, kernel_size as i64, hidden_size as i64],
+                0.0,
+                0.5,
+                Some(DType::BFloat16),
+            )
+            .expect("base"),
+            kernel_projection: LinearProj::Standard(
+                Linear::from_weights(
+                    &MxArray::zeros(
+                        &[2 * kernel_size as i64 * groups as i64, hidden_size as i64],
+                        Some(DType::BFloat16),
+                    )
+                    .expect("proj weight"),
+                    None,
+                )
+                .expect("proj"),
+            ),
+            kernel_size,
+            group_size: group_size as usize,
+        };
+        for length in [1i64, 5, 33] {
+            let hidden = MxArray::random_normal(
+                &[1, length, hidden_size as i64],
+                0.0,
+                1.0,
+                Some(DType::BFloat16),
+            )
+            .expect("hidden");
+            let dynamic = MxArray::random_normal(
+                &[1, length, 2, kernel_size as i64, groups as i64],
+                0.0,
+                0.5,
+                Some(DType::BFloat16),
+            )
+            .expect("dynamic");
+            for side in [0usize, 1] {
+                let fused = conv
+                    .fused_convolve(&hidden, &dynamic, side)
+                    .expect("fused conv must accept well-formed bf16 inputs");
+                let reference = conv
+                    .convolve_elementwise(&hidden, &dynamic, side)
+                    .expect("reference conv");
+                let max_abs = fused
+                    .sub(&reference)
+                    .and_then(|d| d.abs())
+                    .and_then(|d| d.astype(DType::Float32))
+                    .and_then(|d| d.reshape(&[-1]))
+                    .and_then(|d| d.max(Some(&[0]), Some(false)))
+                    .expect("diff");
+                max_abs.eval();
+                assert_eq!(
+                    max_abs.item_at_float32(0).expect("item"),
+                    0.0,
+                    "fused conv diverged at L={length} side={side}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires the external 3.6 GB DFlash2 checkpoint"]
     fn loads_real_qwen38_dflash2_checkpoint_strictly() {
         let path = std::env::var("MLX_TEST_QWEN38_DFLASH2_PATH")
@@ -1384,6 +1713,9 @@ mod tests {
             .expect("real DFlash2 checkpoint must load");
         assert_eq!(model.config.block_size, 7);
         assert_eq!(model.config.target_layers, vec![5, 19, 33, 47, 61]);
-        assert!(bytes > 3_000_000_000);
+        match super::draft_quantization() {
+            super::DraftQuantization::Off => assert!(bytes > 3_000_000_000),
+            _ => assert!(bytes > 500_000_000 && bytes < 3_000_000_000),
+        }
     }
 }

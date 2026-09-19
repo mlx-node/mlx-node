@@ -579,6 +579,102 @@ bool mlx_gated_delta_replay(
     }
 }
 
+static const char* dflash2_conv_source =
+#include "metal/common/dflash2_conv.metal.inc"
+    ;
+
+/// Fused grouped dynamic causal conv for the DFlash2 drafter.
+///
+/// out[b,l,h] = Σ_k (base[side,k,h] + dyn[b,l,side,k,g(h)]) · x[b,l-k,h]
+///
+/// Replaces the ~13-dispatch elementwise chain (pad/slice/astype/add/mul/add
+/// per tap) with a single elementwise kernel; every add/mul rounds through
+/// the model dtype inside the kernel, matching the chain bit-for-bit.
+///
+/// Inputs:
+///   x:    [B, L, H]       - hidden states (model dtype)
+///   dyn:  [B, L, 2, K, G] - dynamic kernel correction (same dtype)
+///   base: [2, K, H]       - base conv kernels (same dtype)
+///   side: scalar int32    - 0 = "before" tap set, 1 = "after"
+///   L:    scalar int32    - sequence length
+///
+/// Output: [B, L, H]. Returns true on success; callers fall back to the
+/// elementwise chain on false.
+bool mlx_dflash2_conv(
+    mlx_array* x_handle,
+    mlx_array* dyn_handle,
+    mlx_array* base_handle,
+    int32_t side,
+    mlx_array** out
+) {
+    try {
+        auto& x_arr = *reinterpret_cast<array*>(x_handle);
+        auto& dyn_arr = *reinterpret_cast<array*>(dyn_handle);
+        auto& base_arr = *reinterpret_cast<array*>(base_handle);
+        if (side < 0 || side > 1 || x_arr.ndim() != 3 || dyn_arr.ndim() != 5
+            || base_arr.ndim() != 3) {
+            throw std::invalid_argument("mlx_dflash2_conv: bad inputs");
+        }
+        if (x_arr.dtype() != dyn_arr.dtype() || x_arr.dtype() != base_arr.dtype()) {
+            throw std::invalid_argument("mlx_dflash2_conv: dtype mismatch");
+        }
+        int B = x_arr.shape(0);
+        int L = x_arr.shape(1);
+        int H = x_arr.shape(2);
+        int K = base_arr.shape(1);
+        int G = dyn_arr.shape(4);
+        if (H % G != 0 || dyn_arr.shape(0) != B || dyn_arr.shape(1) != L
+            || dyn_arr.shape(2) != 2 || dyn_arr.shape(3) != K
+            || base_arr.shape(0) != 2 || base_arr.shape(2) != H) {
+            throw std::invalid_argument("mlx_dflash2_conv: inconsistent tensor dims");
+        }
+
+        auto side_arr = array(side, mlx::core::int32);
+        auto L_arr = array(L, mlx::core::int32);
+        std::vector<array> inputs = {x_arr, dyn_arr, base_arr, side_arr, L_arr};
+        std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
+            {"InT", x_arr.dtype()},
+            {"H", H},
+            {"K", K},
+            {"G", G},
+        };
+
+        static std::mutex conv_mutex;
+        static std::optional<fast::CustomKernelFunction> conv_kernel;
+        {
+            std::lock_guard<std::mutex> lock(conv_mutex);
+            if (!conv_kernel.has_value()) {
+                conv_kernel = fast::metal_kernel(
+                    "dflash2_conv",
+                    {"x", "dyn", "base", "side", "Lp"},
+                    {"out"},
+                    dflash2_conv_source,
+                    "",
+                    /* ensure_row_contiguous */ true,
+                    /* atomic_outputs */ false);
+            }
+        }
+
+        auto results = conv_kernel.value()(
+            inputs,
+            {x_arr.shape()},
+            {x_arr.dtype()},
+            std::make_tuple(H, L, B),               // grid
+            std::make_tuple(256, 1, 1),             // threadgroup
+            template_args,
+            std::nullopt,
+            false,
+            mlx::core::default_stream(mlx::core::Device::gpu)
+        );
+        *out = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_dflash2_conv error: " << e.what() << std::endl;
+        *out = nullptr;
+        return false;
+    }
+}
+
 // Qwen4's measured M5 shape benefits from four value rows per SIMD group.
 // Other model families retain the existing default and environment controls.
 bool mlx_qwen4_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g,
