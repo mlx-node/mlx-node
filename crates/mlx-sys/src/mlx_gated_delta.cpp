@@ -525,9 +525,11 @@ bool mlx_gated_delta_replay(
             throw std::invalid_argument("mlx_gated_delta_replay: inconsistent tensor dims");
         }
 
-        // The per-token state store dtype — identical to what the T=1 chain
-        // rounds through each call.
-        auto input_type = state_arr.dtype();
+        // The per-token state store dtype — the T=1 chain rounds through
+        // `input_type = q.dtype()` (the model dtype) each call; the tape
+        // records k in that same dtype, so k's dtype reproduces it even for
+        // a state snapshot stored at a different precision.
+        auto input_type = k_arr.dtype();
 
         auto T_arr = array(replay_steps, mlx::core::int32);
         auto S_arr = array(window_stride, mlx::core::int32);

@@ -1225,6 +1225,40 @@ mod tests {
         }
     }
 
+    /// Production GDN runs GQA (`Hk < Hv`): the kernel maps each value head to
+    /// key head `hv % Hk`. The fused replay must stay bit-identical there too.
+    #[test]
+    fn fused_replay_gqa_heads() {
+        let (b, hk, hv, dk, dv, t) = (1i64, 2i64, 4i64, 64i64, 64i64, 4i64);
+        let q = rand_bf16(&[b, t, hk, dk]);
+        let k = rand_bf16(&[b, t, hk, dk]);
+        let v = rand_bf16(&[b, t, hv, dv]);
+        let g = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap();
+        let beta = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let state0 = rand_bf16(&[b, hv, dv, dk]);
+        let tape = GdnKernelTape { q, k, v, g, beta };
+
+        for steps in 1..=t as usize {
+            let oracle = sequential_replay(&tape, &state0, steps);
+            let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
+            fused.eval();
+            let diff = max_abs_diff(&oracle, &fused);
+            assert_eq!(
+                diff, 0.0,
+                "GQA fused replay diverged at accepted_steps={steps} \
+                 (max_abs_diff={diff:.6e})"
+            );
+        }
+    }
+
     /// Parity: the chunk-parallel ops path must match the per-step recurrence (the oracle)
     /// in f32 across chunk boundaries (T = 64, 65, 127, 128, 256). A mask off-by-one,
     /// padding leak, or state-orientation bug shows up as an O(1) diff; a correct port

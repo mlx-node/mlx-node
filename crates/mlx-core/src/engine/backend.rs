@@ -1826,9 +1826,17 @@ impl DsparkProposal {
     pub fn truncate(&mut self, len: usize) {
         self.draft_ids.truncate(len);
         if let Some(ids) = self.device_draft_ids.take() {
-            // A failed slice drops the device handle: the (truncated) host
-            // ids stay authoritative either way.
-            self.device_draft_ids = ids.slice_axis(0, 0, len as i64).ok();
+            match ids.slice_axis(0, 0, len as i64) {
+                Ok(sliced) => self.device_draft_ids = Some(sliced),
+                // A failed slice must not silently empty the proposal:
+                // back-fill the host ids and truncate those instead.
+                Err(_) => {
+                    if let Ok(host) = ids.to_int32() {
+                        self.draft_ids = host.as_ref().to_vec();
+                        self.draft_ids.truncate(len);
+                    }
+                }
+            }
         }
         self.draft_dists.truncate(len);
         self.draft_sparse_dists.truncate(len);

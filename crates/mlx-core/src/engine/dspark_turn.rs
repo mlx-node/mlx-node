@@ -1488,14 +1488,34 @@ mod tests {
     /// handed it so tests assert the exact per-cycle sequencing.
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Call {
-        Reserve { rows: usize, granted: bool },
-        Propose { anchor: u32, max_len: usize },
-        VerifyArProbe { anchor: u32 },
-        Verify { ids: Vec<u32> },
+        Reserve {
+            rows: usize,
+            granted: bool,
+        },
+        Propose {
+            anchor: u32,
+            max_len: usize,
+        },
+        VerifyArProbe {
+            anchor: u32,
+        },
+        Verify {
+            ids: Vec<u32>,
+        },
+        /// Device-resident verify — the engine hands the stepper the
+        /// `[1+L]` concat itself, so the ledger keeps only the width.
+        VerifyDevice {
+            len: usize,
+        },
         CommitArProbe,
-        Commit { keep: usize, total: usize },
+        Commit {
+            keep: usize,
+            total: usize,
+        },
         EnterArFallback,
-        EvalBoundary { token: i32 },
+        EvalBoundary {
+            token: i32,
+        },
     }
 
     /// Canned per-cycle script.
@@ -1578,6 +1598,9 @@ mod tests {
         /// exhaustion — the paged steppers' `Ok(false)`.
         reserve_exhausted_from: Option<usize>,
         reserve_calls: Cell<usize>,
+        /// Emit `device_draft_ids` instead of host ids — exercises the
+        /// engine's `verify_device` dispatch and post-eval materialization.
+        emit_device_proposals: bool,
         ledger: Rc<RefCell<Vec<Call>>>,
     }
 
@@ -1678,9 +1701,20 @@ mod tests {
                 .iter()
                 .map(|row| MxArray::from_float32(row, &[self.vocab]))
                 .collect::<Result<Vec<_>>>()?;
+            let (draft_ids, device_draft_ids) = if self.emit_device_proposals {
+                (
+                    Vec::new(),
+                    Some(MxArray::from_int32(
+                        &script.draft_ids,
+                        &[script.draft_ids.len() as i64],
+                    )?),
+                )
+            } else {
+                (script.draft_ids.clone(), None)
+            };
             Ok(DsparkProposal {
-                draft_ids: script.draft_ids.clone(),
-                device_draft_ids: None,
+                draft_ids,
+                device_draft_ids,
                 draft_dists,
                 draft_sparse_dists: Vec::new(),
                 keep_probabilities: None,
@@ -1697,6 +1731,13 @@ mod tests {
                 ids: verify_ids.to_vec(),
             });
             self.scripted_verify_output(verify_ids.len())
+        }
+
+        fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
+            let len = usize::try_from(verify_ids.shape_at(0)?)
+                .map_err(|_| Error::from_reason("mock verify_device bad len"))?;
+            self.ledger.borrow_mut().push(Call::VerifyDevice { len });
+            self.scripted_verify_output(len)
         }
 
         fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
@@ -1749,6 +1790,8 @@ mod tests {
         /// Drafted block width the plan sizes the lookahead reservation
         /// from; `None` advertises no speculative plan at all.
         draft_block_size: Option<usize>,
+        /// Forwarded to the stepper — proposals carry `device_draft_ids`.
+        emit_device_proposals: bool,
         ledger: Rc<RefCell<Vec<Call>>>,
         begin_calls: Cell<usize>,
         /// `block_size` observed by `begin_dspark_decode` (setup plumbing).
@@ -1767,6 +1810,7 @@ mod tests {
                 ar_probe_target_build_delay: None,
                 reserve_exhausted_from: None,
                 draft_block_size: None,
+                emit_device_proposals: false,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: Cell::new(0),
                 seen_block_size: Cell::new(usize::MAX),
@@ -1790,6 +1834,13 @@ mod tests {
         ) -> Self {
             self.draft_block_size = Some(block_size);
             self.reserve_exhausted_from = Some(exhausted_from);
+            self
+        }
+
+        /// Stepper emits `device_draft_ids` proposals — the engine must
+        /// dispatch `verify_device` and materialize ids post-eval.
+        fn with_device_proposals(mut self) -> Self {
+            self.emit_device_proposals = true;
             self
         }
 
@@ -1898,6 +1949,7 @@ mod tests {
                 ar_probe_target_build_delay: self.ar_probe_target_build_delay,
                 reserve_exhausted_from: self.reserve_exhausted_from,
                 reserve_calls: Cell::new(0),
+                emit_device_proposals: self.emit_device_proposals,
                 ledger: Rc::clone(&self.ledger),
             })
         }
@@ -2534,6 +2586,61 @@ mod tests {
         assert!((mean - 4.0 / 3.0).abs() < 1e-9);
         assert_eq!(per_pos, vec![1.0, 0.5]);
         assert_eq!(cycles, 3);
+    }
+
+    /// The same script driven over `device_draft_ids` proposals: the engine
+    /// must concat anchor + device path into `verify_device` (never `verify`),
+    /// materialize host ids only inside acceptance, and emit the exact same
+    /// token stream as the host-proposal run.
+    #[test]
+    fn dspark_turn_device_proposals_dispatch_verify_device() {
+        let script = vec![
+            CycleScript::greedy(vec![4, 5], vec![4, 5, 6]),
+            CycleScript::greedy(vec![7, 8], vec![7, 9, 0]),
+            CycleScript::greedy(vec![10], vec![10, 11]),
+        ];
+        let mut device_backend =
+            MockDsparkBackend::greedy(16, script.clone()).with_device_proposals();
+        let mut host_backend = MockDsparkBackend::greedy(16, script);
+        let mut p = greedy_params();
+        p.max_new_tokens = 8;
+        p.mtp_depth = 2;
+        let device_out = drive_turn(&mut device_backend, p.clone(), 3, 15, 2);
+        let host_out = drive_turn(&mut host_backend, p, 3, 15, 2);
+
+        assert_eq!(device_out.generated, host_out.generated);
+        assert_eq!(
+            device_out.ledger,
+            vec![
+                Call::Propose {
+                    anchor: 3,
+                    max_len: 2
+                },
+                Call::VerifyDevice { len: 3 },
+                Call::Commit { keep: 3, total: 3 },
+                Call::EvalBoundary { token: 6 },
+                Call::Propose {
+                    anchor: 6,
+                    max_len: 2
+                },
+                Call::VerifyDevice { len: 3 },
+                Call::Commit { keep: 2, total: 3 },
+                Call::EvalBoundary { token: 9 },
+                Call::Propose {
+                    anchor: 9,
+                    max_len: 1
+                },
+                Call::VerifyDevice { len: 2 },
+                Call::Commit { keep: 2, total: 2 },
+                Call::EvalBoundary { token: 11 },
+            ],
+            "device proposals: propose → verify_device(1+L) → commit → boundary"
+        );
+        assert_eq!(
+            count(&device_out.ledger, |c| matches!(c, Call::Verify { .. })),
+            0,
+            "device proposals must never reach the host verify path"
+        );
     }
 
     // ---- 2. keep math (stop-clamp BEFORE commit) --------------------------
