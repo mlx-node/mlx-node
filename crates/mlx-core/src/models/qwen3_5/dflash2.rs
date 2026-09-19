@@ -72,7 +72,7 @@ pub(crate) struct DFlash2Config {
     vocab_size: usize,
     rms_norm_eps: f64,
     max_position_embeddings: usize,
-    sliding_window: usize,
+    pub(crate) sliding_window: usize,
     conv_group_size: usize,
     conv_kernel_size: usize,
     selector_rank: usize,
@@ -444,6 +444,17 @@ fn sample_selector_index<R: Rng + ?Sized>(probs: &[f64], rng: &mut R) -> usize {
     last
 }
 
+/// The selector's drafted token path.
+pub(crate) enum SelectorPath {
+    /// Host-walked ids — sampled turns need the score rows on CPU anyway, so
+    /// the conditional predecessor walk pays the same readback either way.
+    Host(Vec<i32>),
+    /// Device-resident greedy path `[L]` i32: the conditional predecessor
+    /// walk ran inside the lazy graph (gather + argmax per position), so no
+    /// per-cycle GPU→CPU readback gates the verify block on the proposal.
+    Device(MxArray),
+}
+
 impl CandidateSelector {
     fn select<R: Rng + ?Sized>(
         &self,
@@ -451,8 +462,9 @@ impl CandidateSelector {
         logits: &MxArray,
         anchor: u32,
         temperature: f64,
+        device_path: bool,
         rng: &mut R,
-    ) -> Result<(Vec<i32>, Vec<SparseDistribution>)> {
+    ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let length = hidden.shape_at(1)? as usize;
         let candidates = logits
             .argpartition(-(self.top_k as i32), Some(-1))?
@@ -498,11 +510,50 @@ impl CandidateSelector {
         let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
         let candidates = candidates.astype(DType::Int32)?;
         let scores = scores.astype(DType::Float32)?;
+
+        let greedy = is_greedy_temperature(temperature);
+        if greedy && device_path {
+            // Device walk: per position, gather the score row addressed by
+            // the running predecessor index, argmax it, gather that column's
+            // candidate token. ~4 lazy ops per position, zero host reads —
+            // the path stays a graph node the verify block consumes directly.
+            let mut predecessor = MxArray::from_int32(&[0], &[1])?;
+            // The host walk's `max_by` keeps the LAST maximum on score ties;
+            // argmax returns the first. Argmax over the reversed row and
+            // un-reverse the index so both walks agree bit-for-bit. (For NaN
+            // scores the walks can still diverge — `total_cmp` ranks NaN
+            // above +inf while argmax skips NaN — but NaN selector scores
+            // are already-corrupt upstream state.)
+            let descending = MxArray::from_int32(
+                &(0..self.top_k as i32).rev().collect::<Vec<_>>(),
+                &[self.top_k as i64],
+            )?;
+            let last_index = MxArray::from_int32(&[self.top_k as i32 - 1], &[1])?;
+            let mut tokens = Vec::with_capacity(length);
+            for position in 0..length {
+                let scores_i = scores.slice_axis(0, position as i64, position as i64 + 1)?;
+                let row = scores_i.take(&predecessor, 1)?; // [1, 1, K]
+                let selected = last_index
+                    .sub(
+                        &row.take(&descending, -1)?
+                            .argmax(-1, Some(false))?
+                            .reshape(&[1])?,
+                    )?
+                    .astype(DType::Int32)?; // [1]
+                // candidates: [1, L, K] — gather slot `selected` of row
+                // `position` (the host walk's `candidate_ids[position*K + sel]`).
+                let cand_i = candidates.slice_axis(1, position as i64, position as i64 + 1)?;
+                tokens.push(cand_i.take(&selected, 2)?.reshape(&[1])?); // [1]
+                predecessor = selected;
+            }
+            let path = MxArray::concatenate_many(tokens.iter().collect(), Some(0))?;
+            return Ok((SelectorPath::Device(path), Vec::new()));
+        }
+
         MxArray::eval_arrays(&[&candidates, &scores])?;
         let candidate_ids = candidates.to_int32()?;
         let edge_scores = scores.to_float32()?;
 
-        let greedy = is_greedy_temperature(temperature);
         let mut path = Vec::with_capacity(length);
         let mut rows = Vec::with_capacity(if greedy { 0 } else { length });
         let mut predecessor_index = 0usize;
@@ -529,7 +580,7 @@ impl CandidateSelector {
             path.push(token);
             predecessor_index = selected;
         }
-        Ok((path, rows))
+        Ok((SelectorPath::Host(path), rows))
     }
 }
 
@@ -591,6 +642,24 @@ impl DFlash2ContextCache {
             .checked_add(i32::try_from(rows).map_err(|_| {
                 Error::from_reason(format!(
                     "DFlash2 context append row count {rows} exceeds i32"
+                ))
+            })?)
+            .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
+        self.token_history.extend_from_slice(token_ids);
+        Ok(())
+    }
+
+    /// Advance logical length and token provenance WITHOUT writing draft
+    /// K/V. Prefill uses this for rows older than the sliding window's
+    /// retained tail: those rows would be evicted by later appends unread,
+    /// so their fc fusion + per-layer K/V projections are dead work.
+    pub(crate) fn record_only(&mut self, token_ids: &[u32]) -> Result<()> {
+        self.logical_len = self
+            .logical_len
+            .checked_add(i32::try_from(token_ids.len()).map_err(|_| {
+                Error::from_reason(format!(
+                    "DFlash2 context skip row count {} exceeds i32",
+                    token_ids.len()
                 ))
             })?)
             .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
@@ -705,8 +774,9 @@ impl DFlash2Model {
         anchor: u32,
         max_len: usize,
         temperature: f64,
+        device_path: bool,
         rng: &mut R,
-    ) -> Result<(Vec<i32>, Vec<SparseDistribution>)> {
+    ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let query_end = context
             .logical_len
             .saturating_add(max_len.saturating_add(1) as i32);
@@ -725,7 +795,7 @@ impl DFlash2Model {
             None => target_embedding.as_linear(&hidden)?,
         };
         self.selector
-            .select(&hidden, &logits, anchor, temperature, rng)
+            .select(&hidden, &logits, anchor, temperature, device_path, rng)
     }
 }
 
@@ -1152,7 +1222,143 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalized_selector_probs, parallel_query_ids};
+    use super::{
+        CandidateSelector, DFlash2Config, DFlash2ContextCache, SelectorPath,
+        normalized_selector_probs, parallel_query_ids,
+    };
+    use crate::array::{DType, MxArray};
+    use crate::models::quantized_linear::LinearProj;
+    use crate::nn::{Embedding, Linear};
+
+    fn test_selector(vocab: usize, top_k: usize, rank: usize, hidden: usize) -> CandidateSelector {
+        let normal = |rows: usize, cols: usize| {
+            MxArray::random_normal(&[rows as i64, cols as i64], 0.0, 0.5, Some(DType::Float32))
+                .unwrap()
+        };
+        CandidateSelector {
+            predecessor_codebook: Embedding::from_weight(&normal(vocab, rank)).unwrap(),
+            successor_codebook: Embedding::from_weight(&normal(vocab, rank)).unwrap(),
+            hidden_projection: LinearProj::Standard(
+                Linear::from_weights(&normal(rank, hidden), None).unwrap(),
+            ),
+            top_k,
+            rank,
+            vocab_size: vocab,
+        }
+    }
+
+    #[test]
+    fn selector_device_walk_matches_host_greedy_walk() {
+        let (vocab, top_k, rank, hidden, len) = (32usize, 4usize, 8usize, 8usize, 6i64);
+        let selector = test_selector(vocab, top_k, rank, hidden);
+        let hidden =
+            MxArray::random_normal(&[1, len, hidden as i64], 0.0, 1.0, Some(DType::Float32))
+                .unwrap();
+        let logits =
+            MxArray::random_normal(&[1, len, vocab as i64], 0.0, 1.0, Some(DType::Float32))
+                .unwrap();
+
+        let (host_path, _) = selector
+            .select(&hidden, &logits, 3, 0.0, false, &mut rand::rng())
+            .expect("host select");
+        let SelectorPath::Host(host_ids) = host_path else {
+            panic!("host walk must return host ids");
+        };
+        let (device_path, sparse) = selector
+            .select(&hidden, &logits, 3, 0.0, true, &mut rand::rng())
+            .expect("device select");
+        assert!(sparse.is_empty(), "greedy device walk emits no sparse rows");
+        let SelectorPath::Device(ids) = device_path else {
+            panic!("greedy device walk must return device ids");
+        };
+        let device_ids: Vec<i32> = ids.to_int32().unwrap().as_ref().to_vec();
+        assert_eq!(device_ids, host_ids);
+    }
+
+    /// Zeroing the hidden projection zeroes the edge term, so every top-k
+    /// score row degenerates to the unary logits and duplicate maxima become
+    /// EXACT f32 ties. The host walk's `max_by` keeps the last maximum; the
+    /// device walk must agree (reversed argmax), or the greedy proposal path
+    /// would silently diverge on ties.
+    #[test]
+    fn selector_device_walk_matches_host_last_max_on_ties() {
+        let (vocab, top_k, rank, hidden, len) = (16usize, 4usize, 4usize, 4usize, 4i64);
+        let mut selector = test_selector(vocab, top_k, rank, hidden);
+        selector.hidden_projection = LinearProj::Standard(
+            Linear::from_weights(
+                &MxArray::zeros(&[rank as i64, hidden as i64], Some(DType::Float32)).unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        let hidden = MxArray::zeros(&[1, len, hidden as i64], Some(DType::Float32)).unwrap();
+        // Two equal maxima inside the top-4 of every row: ties at different
+        // candidate slots always discriminate first- vs last-max policies.
+        let row: Vec<f32> = (0..vocab)
+            .map(|i| {
+                if i == 5 || i == 9 {
+                    2.0
+                } else {
+                    i as f32 * 0.1
+                }
+            })
+            .collect();
+        let flat = row.repeat(len as usize);
+        let logits = MxArray::from_float32(&flat, &[1, len, vocab as i64]).unwrap();
+
+        let (host_path, _) = selector
+            .select(&hidden, &logits, 0, 0.0, false, &mut rand::rng())
+            .unwrap();
+        let SelectorPath::Host(host_ids) = host_path else {
+            panic!("host walk must return host ids");
+        };
+        let (device_path, _) = selector
+            .select(&hidden, &logits, 0, 0.0, true, &mut rand::rng())
+            .unwrap();
+        let SelectorPath::Device(ids) = device_path else {
+            panic!("greedy device walk must return device ids");
+        };
+        let device_ids: Vec<i32> = ids.to_int32().unwrap().as_ref().to_vec();
+        assert_eq!(device_ids, host_ids);
+        assert!(
+            device_ids.iter().all(|&id| id == 5 || id == 9),
+            "tie rows must select one of the tied maxima, got {device_ids:?}"
+        );
+    }
+
+    /// `record_only` advances logical length and provenance identically to
+    /// `append` — just without the (dead) K/V write. The `logical_len ==
+    /// token_history.len()` invariant is what `append` validates on the next
+    /// retained segment.
+    #[test]
+    fn record_only_advances_context_without_kv() {
+        let config = DFlash2Config {
+            block_size: 7,
+            mask_token_id: 0,
+            target_layers: vec![0],
+            target_num_layers: 1,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            vocab_size: 32,
+            rms_norm_eps: 1e-5,
+            max_position_embeddings: 128,
+            sliding_window: 8,
+            conv_group_size: 1,
+            conv_kernel_size: 2,
+            selector_rank: 4,
+            selector_top_k: 4,
+            rope_theta: 10_000.0,
+        };
+        let mut context = DFlash2ContextCache::new(&config);
+        context.record_only(&[10, 11, 12]).unwrap();
+        context.record_only(&[13, 14]).unwrap();
+        assert_eq!(context.logical_len(), 5);
+        assert_eq!(context.token_history(), &[10, 11, 12, 13, 14]);
+    }
 
     #[test]
     fn block_has_one_anchor_and_mask_rows() {

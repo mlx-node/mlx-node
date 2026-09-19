@@ -16,6 +16,7 @@ struct VerifyWork {
 fn empty_proposal() -> DsparkProposal {
     DsparkProposal {
         draft_ids: Vec::new(),
+        device_draft_ids: None,
         draft_dists: Vec::new(),
         draft_sparse_dists: Vec::new(),
         keep_probabilities: None,
@@ -268,9 +269,18 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             } else {
                 Ok(empty_proposal())
             };
-            match proposal {
+            // The scheduled verify wave is host-batched (`ScheduledVerifyRow`
+            // tokens), so a device-resident proposal is normalized to host
+            // ids here at the boundary rather than carried deeper.
+            match proposal.and_then(|mut proposal| {
+                proposal.materialize_draft_ids()?;
                 Ok(proposal)
-                    if proposal.draft_ids.len() <= item.cap
+            }) {
+                Ok(proposal)
+                    if proposal
+                        .draft_len()
+                        .map(|len| len <= item.cap)
+                        .unwrap_or(false)
                         && proposal.draft_ids.iter().all(|&token| token >= 0) =>
                 {
                     item.proposal = proposal;
@@ -288,9 +298,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         if profiling
             && (work.len() != profile_rows.len()
                 || (!zero_probe
-                    && work
-                        .iter()
-                        .any(|item| item.proposal.draft_ids.len() != item.cap)))
+                    && work.iter().any(|item| {
+                        item.proposal
+                            .draft_len()
+                            .map(|len| len != item.cap)
+                            .unwrap_or(true)
+                    })))
         {
             profiling = false;
             self.inner.scheduled_verification_budget().unwrap().clear();
@@ -395,7 +408,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         let mut decisions = Vec::with_capacity(work.len());
         let mut commits = Vec::with_capacity(work.len());
         let mut offset = 0i64;
-        for (item, verify) in work.iter().zip(&verify_rows) {
+        for (item, verify) in work.iter_mut().zip(&verify_rows) {
             let turn = &mut running[item.turn_index];
             let end = offset + verify.tokens.len() as i64;
             let accepted = logits
@@ -417,7 +430,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     } else if let Some(rng) = turn.payload.scheduled_speculation.as_mut() {
                         accept_dspark_proposal(
                             &row,
-                            &item.proposal,
+                            &mut item.proposal,
                             &turn.token_history,
                             &turn.payload.params,
                             rng,
@@ -425,7 +438,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     } else {
                         accept_dspark_proposal(
                             &row,
-                            &item.proposal,
+                            &mut item.proposal,
                             &turn.token_history,
                             &turn.payload.params,
                             &mut rand::rng(),

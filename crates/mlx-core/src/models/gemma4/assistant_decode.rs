@@ -219,6 +219,7 @@ impl DsparkStepper for Gemma4AssistantStepper<'_> {
 
         Ok(DsparkProposal {
             draft_ids: sampling::materialize_draft_tokens(&draft_ids)?,
+            device_draft_ids: None,
             draft_dists,
             draft_sparse_dists: Vec::new(),
             keep_probabilities: None,

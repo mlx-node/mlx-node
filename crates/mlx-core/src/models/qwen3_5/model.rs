@@ -88,8 +88,8 @@ mod training;
 use self::chat_backend::resolve_qwen35_chat_params;
 pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
 pub(crate) use self::forward::{
-    PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches, forward_dflash2_with_taps,
-    partition_prefill_chunks,
+    DFlash2LogitsSpan, PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches,
+    forward_dflash2_with_taps, partition_prefill_chunks,
 };
 use self::forward::{
     chunked_prefill, chunked_prefill_with_hidden, eager_verify_step, forward_inner,

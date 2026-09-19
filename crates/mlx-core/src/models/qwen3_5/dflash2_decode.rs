@@ -35,6 +35,10 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     tape: Option<Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
     tapped: Option<Vec<MxArray>>,
     verified_ids: Option<Vec<u32>>,
+    /// Device-resident verify ids `[1+L]` set by [`DsparkStepper::verify_device`]
+    /// — the token provenance [`Self::commit`] materializes once the verify
+    /// graph has been forced (post-acceptance read = plain copy, no sync).
+    verified_ids_device: Option<MxArray>,
 }
 
 fn reusable_dflash2_prefix(
@@ -102,6 +106,7 @@ impl Qwen35DFlash2Stepper<'_> {
             || self.tape.is_some()
             || self.tapped.is_some()
             || self.verified_ids.is_some()
+            || self.verified_ids_device.is_some()
         {
             return Err(Error::from_reason(format!(
                 "Qwen3.8 DFlash2 {operation}: prior verify was not committed"
@@ -121,7 +126,13 @@ impl Qwen35DFlash2Stepper<'_> {
     )> {
         let ids = ids.iter().map(|&id| id as i32).collect::<Vec<_>>();
         let input = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
-        super::model::forward_dflash2_with_taps(self.inner, &input, &self.tap_layers, record_tape)
+        super::model::forward_dflash2_with_taps(
+            self.inner,
+            &input,
+            &self.tap_layers,
+            record_tape,
+            super::model::DFlash2LogitsSpan::All,
+        )
     }
 
     fn append_tapped(&mut self, tapped: &[MxArray], token_ids: &[u32]) -> Result<()> {
@@ -201,17 +212,31 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             .unwrap_or_default()
             .temperature
             .unwrap_or(1.0);
-        let (draft_ids, draft_sparse_dists) = draft.propose(
+        // Mirror `accept_dspark_proposal`'s `greedy_fast` predicate: the
+        // device-resident path is only offered when acceptance will consume
+        // it without a mid-cycle host read. Sampled or penalized-greedy
+        // turns keep the host walk (their accept path needs host ids anyway).
+        let greedy_fast = crate::sampling::is_greedy_temperature(temperature)
+            && params.repetition_penalty == 1.0
+            && params.presence_penalty == 0.0
+            && params.frequency_penalty == 0.0;
+        let (path, draft_sparse_dists) = draft.propose(
             &self.inner.embedding,
             self.inner.lm_head.as_ref(),
             &self.context,
             anchor_id,
             max_len,
             temperature,
+            greedy_fast,
             rng,
         )?;
+        let (draft_ids, device_draft_ids) = match path {
+            super::dflash2::SelectorPath::Device(ids) => (Vec::new(), Some(ids)),
+            super::dflash2::SelectorPath::Host(ids) => (ids, None),
+        };
         Ok(DsparkProposal {
             draft_ids,
+            device_draft_ids,
             draft_dists: Vec::new(),
             draft_sparse_dists,
             keep_probabilities: None,
@@ -240,6 +265,35 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         Ok(DsparkVerifyOutput { logits })
     }
 
+    /// Device-resident verify: `verify_ids` is the `[1+L]` concat of the
+    /// anchor and the selector's device path — the whole propose → verify
+    /// chain stays one lazy graph (no proposal readback in between).
+    /// Provenance materializes in `commit`, after acceptance has forced the
+    /// shared roots.
+    fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
+        self.ensure_clean("verify")?;
+        let snapshot = snapshot_all_mtp(
+            self.inner
+                .caches
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
+            false,
+        )?;
+        let input = verify_ids.reshape(&[1, verify_ids.shape_at(0)?])?;
+        let (logits, tapped, tape) = super::model::forward_dflash2_with_taps(
+            self.inner,
+            &input,
+            &self.tap_layers,
+            true,
+            super::model::DFlash2LogitsSpan::All,
+        )?;
+        self.snapshot = Some(snapshot);
+        self.tape = Some(tape);
+        self.tapped = Some(tapped);
+        self.verified_ids_device = Some(verify_ids.clone());
+        Ok(DsparkVerifyOutput { logits })
+    }
+
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
         if keep == 0 || keep > total_written {
             return Err(Error::from_reason(format!(
@@ -258,10 +312,22 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             .tapped
             .take()
             .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no target taps"))?;
-        let verified_ids = self
-            .verified_ids
-            .take()
-            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no token provenance"))?;
+        // The verify graph has already been forced by acceptance, so a
+        // device-resident provenance read here is a plain copy, not a sync.
+        let verified_ids = match (self.verified_ids.take(), self.verified_ids_device.take()) {
+            (Some(ids), None) => ids,
+            (None, Some(ids)) => ids
+                .to_int32()?
+                .as_ref()
+                .iter()
+                .map(|&id| id as u32)
+                .collect(),
+            _ => {
+                return Err(Error::from_reason(
+                    "Qwen3.8 DFlash2 commit has no token provenance",
+                ));
+            }
+        };
         if verified_ids.len() != total_written {
             return Err(Error::from_reason(format!(
                 "Qwen3.8 DFlash2 commit wrote {total_written} rows for {} token ids",
@@ -338,6 +404,7 @@ impl DsparkBackend for Qwen35Inner {
             tape: None,
             tapped: None,
             verified_ids: None,
+            verified_ids_device: None,
         })
     }
 }
@@ -375,6 +442,16 @@ impl Qwen35Inner {
                 )));
             }
         };
+        // Draft-context retention: each layer's sliding cache keeps only the
+        // last `sliding_window - 1` rows, so rows below `keep_from` would be
+        // evicted by later appends without ever being read. Their fc fusion
+        // and per-layer K/V projections are dead work — skip the appends but
+        // still advance logical length and token provenance (`record_only`).
+        let base_usize = position_base.max(0) as usize;
+        let window_rows = draft_config.sliding_window.saturating_sub(1);
+        let keep_from = (base_usize + tokens.len())
+            .saturating_sub(window_rows)
+            .max(base_usize);
         let mut offset = 0usize;
         let mut last_logits = None;
         while offset < tokens.len() {
@@ -394,25 +471,49 @@ impl Qwen35Inner {
             let input = MxArray::from_int32(&chunk, &[1, chunk.len() as i64])?;
             let (logits, taps, _) = {
                 let _stream = StreamContext::new(stream);
-                super::model::forward_dflash2_with_taps(self, &input, &tap_layers, false)?
+                super::model::forward_dflash2_with_taps(
+                    self,
+                    &input,
+                    &tap_layers,
+                    false,
+                    super::model::DFlash2LogitsSpan::LastRow,
+                )?
             };
             let draft = self
                 .dflash2
                 .as_ref()
                 .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
-            let fused = draft.fuse_context(&taps)?;
-            context.append(
-                draft,
-                &fused,
-                position_base + offset as i32,
-                &tokens[offset..end],
-            )?;
+            let chunk_end = base_usize + end;
+            if chunk_end <= keep_from {
+                context.record_only(&tokens[offset..end])?;
+            } else {
+                let head = keep_from.saturating_sub(base_usize + offset);
+                if head > 0 {
+                    context.record_only(&tokens[offset..offset + head])?;
+                }
+                // Rows at or past `keep_from` survive in the sliding window:
+                // fuse + project only that tail (RoPE keys are per-row at
+                // absolute base + row, so a sliced append is identical).
+                let fused = if head == 0 {
+                    draft.fuse_context(&taps)?
+                } else {
+                    let tail_taps = taps
+                        .iter()
+                        .map(|tap| tap.slice_axis(1, head as i64, (end - offset) as i64))
+                        .collect::<Result<Vec<_>>>()?;
+                    draft.fuse_context(&tail_taps)?
+                };
+                context.append(
+                    draft,
+                    &fused,
+                    (base_usize + offset + head) as i32,
+                    &tokens[offset + head..end],
+                )?;
+            }
+            // `LastRow` span already reduced the logits to the chunk's final
+            // row ([1, 1, vocab]); only non-final chunks' rows are dropped.
             let vocab = logits.shape_at(2)?;
-            last_logits = Some(
-                logits
-                    .slice_axis(1, chunk.len() as i64 - 1, chunk.len() as i64)?
-                    .reshape(&[vocab])?,
-            );
+            last_logits = Some(logits.reshape(&[vocab])?);
             if end < tokens.len() {
                 super::model::eval_layer_caches(&self.caches)?;
                 context.eval()?;
@@ -445,8 +546,13 @@ impl Qwen35Inner {
             .clone();
         let input = MxArray::from_int32(&[token as i32], &[1, 1])?;
         let _stream = StreamContext::new(stream);
-        let (_, taps, _) =
-            super::model::forward_dflash2_with_taps(self, &input, &tap_layers, false)?;
+        let (_, taps, _) = super::model::forward_dflash2_with_taps(
+            self,
+            &input,
+            &tap_layers,
+            false,
+            super::model::DFlash2LogitsSpan::LastRow,
+        )?;
         let fused = self
             .dflash2
             .as_ref()

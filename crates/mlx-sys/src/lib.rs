@@ -1706,6 +1706,20 @@ unsafe extern "C-unwind" {
         dt_bias: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    // Fused accepted-prefix replay for the eager-MTP GDN tape: ONE dispatch
+    // replays `replay_steps` recorded window tokens, rounding the state through
+    // the store dtype after every token (bit-identical to the T=1 kernel chain).
+    pub fn mlx_gated_delta_replay(
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        replay_steps: i32,
+        window_stride: i32,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
     // Chunked gated delta recurrence for prefill (BT=32 tokens per chunk)
     pub fn mlx_gated_delta_chunked(
         q: *mut mlx_array,

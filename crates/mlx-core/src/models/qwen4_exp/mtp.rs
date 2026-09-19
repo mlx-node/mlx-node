@@ -187,6 +187,7 @@ impl Inner {
         }
         Ok(DsparkProposal {
             draft_ids,
+            device_draft_ids: None,
             draft_dists,
             draft_sparse_dists: Vec::new(),
             keep_probabilities: confidence.then_some(keep_probabilities),

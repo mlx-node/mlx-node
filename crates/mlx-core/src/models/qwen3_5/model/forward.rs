@@ -366,6 +366,19 @@ fn forward_pre_norm_inner_with_tape(
     )
 }
 
+/// How much of the sequence an LM-head projection must cover for a DFlash2
+/// target forward.
+///
+/// Verify blocks need every row (each verify position's next-token
+/// distribution feeds acceptance). Prefill and single-token materialization
+/// callers keep only the final row's logits, so projecting the head over the
+/// whole chunk would run a full `M x vocab` GEMM for one surviving row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DFlash2LogitsSpan {
+    All,
+    LastRow,
+}
+
 /// Target forward used by the external DFlash2 stepper. Captures post-layer
 /// residuals in the companion checkpoint's declared order and optionally
 /// records the GDN recurrence tape needed to roll a speculative verify block
@@ -375,6 +388,7 @@ pub(crate) fn forward_dflash2_with_taps(
     input_ids: &MxArray,
     tap_layers: &[usize],
     record_tape: bool,
+    logits_span: DFlash2LogitsSpan,
 ) -> Result<(
     MxArray,
     Vec<MxArray>,
@@ -426,6 +440,16 @@ pub(crate) fn forward_dflash2_with_taps(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Norm and the LM head are per-row ops: slicing the hidden tail first is
+    // value-identical to projecting every row and slicing the logits after,
+    // but skips the full-width head GEMM for callers that keep one row.
+    let hidden = match logits_span {
+        DFlash2LogitsSpan::All => hidden,
+        DFlash2LogitsSpan::LastRow => {
+            let rows = hidden.shape_at(1)?;
+            hidden.slice_axis(1, rows - 1, rows)?
+        }
+    };
     let normalized = inner.final_norm.forward(&hidden)?;
     let logits = project_logits_from_hidden(&normalized, &inner.lm_head, &inner.embedding)?;
     Ok((logits, taps, tape))
