@@ -444,6 +444,7 @@ impl Qwen3_5MTPModule {
             // cache a transpose, while affine and native K/IQ projections
             // reorder their packed row-coupled operands without dequantizing.
             attn.finalize_q_gate_block()?;
+            attn.finalize_kv_proj()?;
 
             // MLP — dense or per-mode quantized via the same swap as
             // the main loop. The MTP MLP is always a `Standard` MLP at
@@ -459,7 +460,7 @@ impl Qwen3_5MTPModule {
                         let q_up = try_build_ql(params, &up_key)?;
                         let q_down = try_build_ql(params, &down_key)?;
                         if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
-                            layer.set_quantized_dense_mlp(qg, qu, qd);
+                            layer.set_quantized_dense_mlp(qg, qu, qd)?;
                         } else {
                             if let Some(w) = params.get(&format!("{}.weight", gate_key)) {
                                 mlp.set_gate_proj_weight(w)?;

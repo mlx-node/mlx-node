@@ -498,6 +498,7 @@ impl Qwen3_5MoeMTPModule {
             // forward_paged() split queries/gate without a strided
             // reshape-copy. No-op for quantized q_proj.
             attn.finalize_q_gate_block()?;
+            attn.finalize_kv_proj()?;
 
             // MLP — dense MLP, MoE switch_mlp + router gate +
             // shared_expert, or already-quantized (no-op). Mirrors the
@@ -512,7 +513,7 @@ impl Qwen3_5MoeMTPModule {
                         let q_up = try_build_ql(params, &up_key);
                         let q_down = try_build_ql(params, &down_key);
                         if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
-                            layer.set_quantized_dense_mlp(qg, qu, qd);
+                            layer.set_quantized_dense_mlp(qg, qu, qd)?;
                         } else {
                             if let Some(w) = params.get(&format!("{}.weight", gate_key)) {
                                 mlp.set_gate_proj_weight(w)?;
@@ -582,7 +583,7 @@ impl Qwen3_5MoeMTPModule {
                         let q_se_down = try_build_ql(params, &se_down_key);
 
                         if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
-                            moe.set_quantized_shared_expert(qg, qu, qd);
+                            moe.set_quantized_shared_expert(qg, qu, qd)?;
                         } else {
                             if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
                                 moe.set_shared_expert_gate_proj_weight(w)?;

@@ -41,6 +41,17 @@ pub enum MLPType {
     MoE(Box<SparseMoeBlock>),
 }
 
+impl MLPType {
+    /// Forward `finalize_gate_up` to the dense variant (MoE blocks merge
+    /// their shared expert via `set_quantized_shared_expert`).
+    pub fn finalize_gate_up(&mut self) -> Result<()> {
+        match self {
+            MLPType::Dense(mlp) => mlp.finalize_gate_up(),
+            MLPType::MoE(_) => Ok(()),
+        }
+    }
+}
+
 /// A single decoder layer in the Qwen3.5 MoE model.
 pub struct DecoderLayer {
     pub attn: AttentionType,
@@ -497,12 +508,14 @@ impl DecoderLayer {
         gate_proj: QuantizedLinear,
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
-    ) {
+    ) -> Result<()> {
         self.mlp = MLPType::Dense(MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
+            gate_up: None,
         });
+        self.mlp.finalize_gate_up()
     }
 
     /// Whether any main-model projection in this decoder layer is quantized,
