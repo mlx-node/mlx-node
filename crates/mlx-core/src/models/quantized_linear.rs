@@ -97,6 +97,58 @@ impl LinearProj {
         matches!(self, LinearProj::Quantized(_))
     }
 
+    /// Row-merge two quantized projections into one `[N1 + N2, K]` packed
+    /// linear (see [`QuantizedLinear::concat_rows`]). `Ok(None)` when either
+    /// side is dense or the packed formats are incompatible — the caller then
+    /// keeps the two separate matmuls.
+    pub fn concat_rows(&self, other: &LinearProj) -> Result<Option<LinearProj>> {
+        match (self, other) {
+            (LinearProj::Quantized(a), LinearProj::Quantized(b)) => {
+                Ok(a.concat_rows(b)?.map(LinearProj::Quantized))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Row-slice view of a quantized projection — see
+    /// [`QuantizedLinear::slice_rows`]. `Err` on a dense projection (dense
+    /// callers have their own slicing) or a non-plain quantized projection.
+    pub fn slice_rows(&self, start: i64, end: i64) -> Result<LinearProj> {
+        match self {
+            LinearProj::Quantized(ql) => Ok(LinearProj::Quantized(ql.slice_rows(start, end)?)),
+            LinearProj::Standard(_) => Err(Error::from_reason(
+                "LinearProj::slice_rows requires a quantized projection",
+            )),
+        }
+    }
+
+    /// The calibration-tap config key of the underlying projection, if any.
+    /// Used by merge finalization to re-attach a source projection's key onto
+    /// its post-merge slice view (slice views are built with `amax_key: None`).
+    pub(crate) fn amax_key(&self) -> Option<&str> {
+        match self {
+            LinearProj::Quantized(ql) => ql.amax_key(),
+            LinearProj::Standard(_) => None,
+        }
+    }
+
+    /// Re-attach a calibration-tap config key — see
+    /// [`QuantizedLinear::with_amax_key`]. No-op on a dense projection.
+    pub(crate) fn with_amax_key(self, amax_key: Option<String>) -> Self {
+        match self {
+            LinearProj::Quantized(ql) => LinearProj::Quantized(ql.with_amax_key(amax_key)),
+            LinearProj::Standard(_) => self,
+        }
+    }
+
+    /// Packed weight row count (output features) of the underlying linear.
+    pub(crate) fn packed_out_features(&self) -> Result<i64> {
+        match self {
+            LinearProj::Standard(l) => Ok(l.get_weight().shape()?[0]),
+            LinearProj::Quantized(ql) => Ok(ql.get_weight().shape()?[0]),
+        }
+    }
+
     pub(crate) fn has_q_gate_block_layout(&self) -> bool {
         matches!(self, LinearProj::Quantized(ql) if ql.has_q_gate_block_layout())
     }
@@ -127,6 +179,13 @@ pub enum MLPVariant {
         gate_proj: QuantizedLinear,
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
+        /// Row-merged gate|up projection (`[gate_N + up_N, K]` packed) and
+        /// its `gate_N` split point, installed by `finalize_gate_up` when the
+        /// two packed formats are mergeable. `gate_proj`/`up_proj` then hold
+        /// zero-copy row-slice views so getters stay correct and the merged
+        /// buffer is the only resident copy. `None` falls back to the two
+        /// original matmuls. Boxed to keep the enum small.
+        gate_up: Option<Box<(QuantizedLinear, i64)>>,
     },
 }
 
@@ -138,9 +197,21 @@ impl MLPVariant {
                 gate_proj,
                 up_proj,
                 down_proj,
+                gate_up,
             } => {
-                let gate = gate_proj.forward(x)?;
-                let up = up_proj.forward(x)?;
+                let (gate, up) = match gate_up {
+                    Some(pair) => {
+                        let (merged, split) = &**pair;
+                        let combined = merged.forward(x)?;
+                        let last = combined.ndim()? as usize - 1;
+                        let width = combined.shape_at(last as u32)?;
+                        (
+                            combined.slice_axis(last, 0, *split)?,
+                            combined.slice_axis(last, *split, width)?,
+                        )
+                    }
+                    None => (gate_proj.forward(x)?, up_proj.forward(x)?),
+                };
                 let activated = Activations::swiglu_compiled(&gate, &up)?;
                 down_proj.forward(&activated)
             }
@@ -185,6 +256,7 @@ impl MLPVariant {
                 gate_proj,
                 up_proj,
                 down_proj,
+                ..
             } => Some((
                 gate_proj.has_hadamard(),
                 up_proj.has_hadamard(),
@@ -211,11 +283,44 @@ impl MLPVariant {
         }
     }
 
-    /// E39: finalize stacked gate+up weight. No-op for quantized variant.
+    /// E39: finalize stacked gate+up weight. For the quantized variant this
+    /// attempts a packed row-merge (`concat_rows`): on success `gate_up`
+    /// holds the single `[gate_N + up_N, K]` projection and `gate_proj` /
+    /// `up_proj` are swapped for zero-copy row-slice views of it, so the
+    /// originals' storage is released and per-projection getters still work.
+    /// Any incompatibility (mixed modes/bits/group sizes, asymmetric sidecars,
+    /// special output layouts or transforms) leaves the pair unmerged —
+    /// `forward` then takes the two-matmul path exactly as before.
     pub fn finalize_gate_up(&mut self) -> Result<()> {
         match self {
             MLPVariant::Standard(mlp) => mlp.finalize_gate_up(),
-            MLPVariant::Quantized { .. } => Ok(()),
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                gate_up,
+                ..
+            } => {
+                if gate_up.is_some()
+                    || std::env::var_os("MLX_DISABLE_QUANTIZED_GATE_UP_MERGE").is_some()
+                {
+                    return Ok(());
+                }
+                if let Some(merged) = gate_proj.concat_rows(up_proj)? {
+                    let gate_rows = gate_proj.weight.shape()?[0];
+                    let up_rows = up_proj.weight.shape()?[0];
+                    // Slice views are built keyless; re-attach each source's
+                    // calibration key so a view forward still records under
+                    // the right bucket.
+                    let gate_key = gate_proj.amax_key().map(str::to_owned);
+                    let up_key = up_proj.amax_key().map(str::to_owned);
+                    *gate_proj = merged.slice_rows(0, gate_rows)?.with_amax_key(gate_key);
+                    *up_proj = merged
+                        .slice_rows(gate_rows, gate_rows + up_rows)?
+                        .with_amax_key(up_key);
+                    *gate_up = Some(Box::new((merged, gate_rows)));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -574,7 +679,12 @@ pub struct QuantizedLinear {
     // Read ONLY by the calibration tap in `forward` (gated by
     // `mode == MXFP8_MODE` + collector-enabled), so it never affects normal
     // inference.
-    amax_key: Option<String>,
+    // The second tuple element is populated only by `concat_rows` when both
+    // merged projections were calibration sites: the merge shares one input
+    // activation, so `forward` records the same `max|x|` under both keys —
+    // exactly what the two unmerged projections would have recorded. Boxed so
+    // `MLPVariant::Quantized` stays under clippy's enum-size threshold.
+    amax_keys: Option<Box<(String, Option<String>)>>,
     output_layout: QuantizedOutputLayout,
     hadamard: Option<HadamardTransform>,
 }
@@ -621,10 +731,168 @@ impl QuantizedLinear {
             fp8_dequant_weight: None,
             s_w: None,
             input_amax: None,
-            amax_key: None,
+            amax_keys: None,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
         }
+    }
+
+    /// Row-concatenate two quantized projections into one `[N1+N2, K]`
+    /// projection that shares a single quantized-matmul dispatch. Packed
+    /// weights, scales, and biases are all row-indexed, so the merge is
+    /// value-identical to running the two projections and concatenating their
+    /// outputs.
+    ///
+    /// Returns `Ok(None)` when the pair cannot share a dispatch: different
+    /// mode/bits/group_size/K, a one-sided `biases`/`bias` presence, or any
+    /// per-projection feature that a merged matrix cannot express (hadamard
+    /// input transform, FP8 fallback storage, sym8 scale, unequal
+    /// `input_amax`, non-native output layout).
+    ///
+    /// Calibration taps (`amax_keys`) do NOT block the merge: the merged
+    /// projection keeps up to two keys and records the shared input under
+    /// each, which reproduces the unmerged recordings exactly.
+    pub fn concat_rows(&self, other: &QuantizedLinear) -> Result<Option<QuantizedLinear>> {
+        if self.mode != other.mode
+            || self.bits != other.bits
+            || self.group_size != other.group_size
+            || self.output_layout != QuantizedOutputLayout::Native
+            || other.output_layout != QuantizedOutputLayout::Native
+            || self.input_amax != other.input_amax
+            || self.fp8_dequant_weight.is_some()
+            || other.fp8_dequant_weight.is_some()
+            || self.s_w.is_some()
+            || other.s_w.is_some()
+            || self.hadamard.is_some()
+            || other.hadamard.is_some()
+            // An already-merged projection carries a peer key a second merge
+            // cannot represent; refuse rather than silently drop it.
+            || self.amax_keys.as_ref().is_some_and(|k| k.1.is_some())
+            || other.amax_keys.as_ref().is_some_and(|k| k.1.is_some())
+        {
+            return Ok(None);
+        }
+        let (w1, w2) = (self.weight.shape()?, other.weight.shape()?);
+        if w1.len() != 2 || w2.len() != 2 || w1[1] != w2[1] {
+            return Ok(None);
+        }
+        // Sidecar dtypes must match exactly: a merged matmul sees one scales/
+        // biases dtype, and a silent concatenate-promotion would change the
+        // dequant arithmetic on half the rows.
+        if self.weight.dtype()? != other.weight.dtype()?
+            || self.scales.dtype()? != other.scales.dtype()?
+            || match (&self.biases, &other.biases) {
+                (Some(a), Some(b)) => a.dtype()? != b.dtype()?,
+                (None, None) => false,
+                _ => true,
+            }
+            || match (&self.bias, &other.bias) {
+                (Some(a), Some(b)) => a.dtype()? != b.dtype()?,
+                (None, None) => false,
+                _ => true,
+            }
+        {
+            return Ok(None);
+        }
+        let weight = MxArray::concatenate(&self.weight, &other.weight, 0)?;
+        let scales = MxArray::concatenate(&self.scales, &other.scales, 0)?;
+        let biases = match (&self.biases, &other.biases) {
+            (Some(a), Some(b)) => Some(MxArray::concatenate(a, b, 0)?),
+            (None, None) => None,
+            _ => return Ok(None),
+        };
+        let bias = match (&self.bias, &other.bias) {
+            (Some(a), Some(b)) => Some(MxArray::concatenate(a, b, 0)?),
+            (None, None) => None,
+            _ => return Ok(None),
+        };
+        weight.eval();
+        scales.eval();
+        if let Some(b) = &biases {
+            b.eval();
+        }
+        if let Some(b) = &bias {
+            b.eval();
+        }
+        // Carry both sources' calibration keys (deduplicated) so a merged
+        // mxfp8 site still records under each per-layer config key.
+        let a_key = self.amax_keys.as_ref().map(|k| k.0.clone());
+        let b_key = other.amax_keys.as_ref().map(|k| k.0.clone());
+        let amax_keys = match (a_key, b_key) {
+            (Some(a), Some(b)) if a != b => Some(Box::new((a, Some(b)))),
+            (a, b) => a.or(b).map(|k| Box::new((k, None))),
+        };
+        Ok(Some(QuantizedLinear {
+            weight,
+            scales,
+            biases,
+            bias,
+            group_size: self.group_size,
+            bits: self.bits,
+            mode: self.mode.clone(),
+            fp8_dequant_weight: None,
+            s_w: None,
+            input_amax: self.input_amax,
+            amax_keys,
+            output_layout: QuantizedOutputLayout::Native,
+            hadamard: None,
+        }))
+    }
+
+    /// A `[start, end)` row-slice view of this projection's packed weights.
+    /// The view shares storage (no copy) and forwards normally — an axis-0
+    /// slice of a row-contiguous packed weight is itself row-contiguous.
+    /// Intended for keeping per-projection accessors cheap after a
+    /// [`concat_rows`](Self::concat_rows) merge replaces the originals.
+    ///
+    /// Returns `Err` on out-of-range rows or on projections carrying features
+    /// a view cannot represent (hadamard, fp8 storage, sym8, non-native output
+    /// layout).
+    ///
+    /// The view always gets `amax_key: None` — slice rows do not know which
+    /// source's calibration key applies to them, so callers replacing a
+    /// calibration site with a view must re-attach the source's key via
+    /// [`with_amax_key`](Self::with_amax_key).
+    pub fn slice_rows(&self, start: i64, end: i64) -> Result<QuantizedLinear> {
+        if self.fp8_dequant_weight.is_some()
+            || self.s_w.is_some()
+            || self.hadamard.is_some()
+            || self.output_layout != QuantizedOutputLayout::Native
+        {
+            return Err(Error::from_reason(
+                "QuantizedLinear::slice_rows requires a plain projection",
+            ));
+        }
+        let rows = self.weight.shape()?;
+        if rows.len() != 2 || start < 0 || end > rows[0] || start >= end {
+            return Err(Error::from_reason(format!(
+                "QuantizedLinear::slice_rows out of range: [{start},{end}) of {:?}",
+                rows.to_vec()
+            )));
+        }
+        Ok(QuantizedLinear {
+            weight: self.weight.slice_axis(0, start, end)?,
+            scales: self.scales.slice_axis(0, start, end)?,
+            biases: self
+                .biases
+                .as_ref()
+                .map(|b| b.slice_axis(0, start, end))
+                .transpose()?,
+            bias: self
+                .bias
+                .as_ref()
+                .map(|b| b.slice_axis(0, start, end))
+                .transpose()?,
+            group_size: self.group_size,
+            bits: self.bits,
+            mode: self.mode.clone(),
+            fp8_dequant_weight: None,
+            s_w: None,
+            input_amax: self.input_amax,
+            amax_keys: None,
+            output_layout: QuantizedOutputLayout::Native,
+            hadamard: None,
+        })
     }
 
     /// Construct a plain E4M3 storage-backed linear with a load-time BF16
@@ -647,7 +915,7 @@ impl QuantizedLinear {
             fp8_dequant_weight: Some(dequant_weight),
             s_w: None,
             input_amax: None,
-            amax_key: None,
+            amax_keys: None,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
         }
@@ -669,6 +937,12 @@ impl QuantizedLinear {
         self.input_amax
     }
 
+    /// The projection's calibration-tap config key, if this is an
+    /// activation-FP8 calibration site.
+    pub(crate) fn amax_key(&self) -> Option<&str> {
+        self.amax_keys.as_ref().map(|k| k.0.as_str())
+    }
+
     /// Attach the projection's normalized config key for the calibration tap.
     ///
     /// Consuming builder used at the load-time dispatch site (next to
@@ -676,7 +950,7 @@ impl QuantizedLinear {
     /// collector can bucket recorded `max|activation|` by projection. `None` is
     /// the default (no calibration bucket — test-fabricated instances).
     pub fn with_amax_key(mut self, amax_key: Option<String>) -> Self {
-        self.amax_key = amax_key;
+        self.amax_keys = amax_key.map(|k| Box::new((k, None)));
         self
     }
 
@@ -689,7 +963,7 @@ impl QuantizedLinear {
         {
             return Err(Error::from_reason(format!(
                 "prism_hadamard rotations require an affine 2-bit group-size-128 projection without input_amax; '{}' resolved to mode={} bits={} group_size={}",
-                self.amax_key.as_deref().unwrap_or("<unnamed>"),
+                self.amax_key().unwrap_or("<unnamed>"),
                 self.mode,
                 self.bits,
                 self.group_size
@@ -734,7 +1008,7 @@ impl QuantizedLinear {
             fp8_dequant_weight: None,
             s_w: Some(s_w),
             input_amax: None,
-            amax_key: None,
+            amax_keys: None,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
         }
@@ -927,9 +1201,15 @@ impl QuantizedLinear {
         // activation fake-quant for a model that was never a W8A8_FP8 source.
         if calibrating
             && self.mode == MXFP8_MODE
-            && let Some(key) = &self.amax_key
+            && let Some(keys) = &self.amax_keys
         {
-            crate::calibration::activation_amax::ActivationAmaxCollector::record(key, x)?;
+            // A `concat_rows` merge of two calibration sites carries both keys
+            // and records the shared input under each — the same `max|x|` the
+            // unmerged pair would have recorded.
+            crate::calibration::activation_amax::ActivationAmaxCollector::record(&keys.0, x)?;
+            if let Some(peer) = &keys.1 {
+                crate::calibration::activation_amax::ActivationAmaxCollector::record(peer, x)?;
+            }
         }
 
         // Calibrated per-tensor FP8 (E4M3) activation fake-quant, matching
@@ -2615,5 +2895,284 @@ mod switch_affine_dtype_tests {
         );
         let actual = linear.forward(&input, &indices, false).unwrap();
         assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
+    }
+}
+
+#[cfg(test)]
+mod gate_up_merge_tests {
+    use super::*;
+    use crate::array::DType;
+
+    /// Affine-quantize a `[N, K]` bf16 weight with `mlx_quantize`, returning the
+    /// packed `(weight, scales, biases)` triple `QuantizedLinear::new` expects.
+    fn quantize_affine(
+        weight: &MxArray,
+        group_size: i32,
+        bits: i32,
+    ) -> (MxArray, MxArray, MxArray) {
+        let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed");
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+            MxArray::from_handle(out_b, "b").expect("b"),
+        )
+    }
+
+    fn bf16_weight(seed: u64, n: i64, k: i64) -> MxArray {
+        // Deterministic pseudo-random-ish pattern, no RNG dependency.
+        let len = (n * k) as usize;
+        let vals: Vec<u16> = (0..len)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(0x9E37_79B9).wrapping_add(seed);
+                half::bf16::from_f32(((h % 1024) as f32 - 512.0) / 128.0).to_bits()
+            })
+            .collect();
+        MxArray::from_bfloat16(&vals, &[n, k]).unwrap()
+    }
+
+    fn make_affine_linear(weight: &MxArray, group_size: i32, bits: i32) -> QuantizedLinear {
+        let (w, s, b) = quantize_affine(weight, group_size, bits);
+        QuantizedLinear::new(
+            w,
+            s,
+            Some(b),
+            None,
+            group_size,
+            bits,
+            DEFAULT_QUANT_MODE.to_string(),
+        )
+    }
+
+    fn assert_bit_identical(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        assert_eq!(
+            a.to_uint16_native().unwrap(),
+            b.to_uint16_native().unwrap(),
+            "{ctx}: outputs differ"
+        );
+    }
+
+    #[test]
+    fn concat_rows_matches_separate_forwards_bit_identical() {
+        let (n1, n2, k) = (48i64, 32i64, 128i64);
+        let gate = make_affine_linear(&bf16_weight(7, n1, k), 32, 4);
+        let up = make_affine_linear(&bf16_weight(11, n2, k), 32, 4);
+
+        let merged = gate
+            .concat_rows(&up)
+            .unwrap()
+            .expect("same-format projections must merge");
+
+        // Different M tile widths exercise qmv / qmv_wide / qmm dispatch.
+        for m in [1i64, 2, 4, 6, 8, 16] {
+            let x = bf16_weight(3 + m as u64, m, k);
+            let combined = merged.forward(&x).unwrap();
+            let last = combined.ndim().unwrap() as usize - 1;
+            let got_gate = combined.slice_axis(last, 0, n1).unwrap();
+            let got_up = combined.slice_axis(last, n1, n1 + n2).unwrap();
+            assert_bit_identical(&got_gate, &gate.forward(&x).unwrap(), "gate half");
+            assert_bit_identical(&got_up, &up.forward(&x).unwrap(), "up half");
+        }
+    }
+
+    #[test]
+    fn concat_rows_rejects_incompatible_pairs() {
+        let w = bf16_weight(5, 32, 128);
+        let gate = make_affine_linear(&w, 32, 4);
+        let other_group = make_affine_linear(&w, 64, 4);
+        let other_bits = make_affine_linear(&w, 32, 8);
+        let mxfp4 = {
+            let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+            assert!(unsafe {
+                sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    32,
+                    4,
+                    c"mxfp4".as_ptr(),
+                    &mut out_q,
+                    &mut out_s,
+                    &mut out_b,
+                )
+            });
+            QuantizedLinear::new(
+                MxArray::from_handle(out_q, "q").unwrap(),
+                MxArray::from_handle(out_s, "s").unwrap(),
+                None,
+                None,
+                32,
+                4,
+                MXFP4_MODE.to_string(),
+            )
+        };
+        assert!(gate.concat_rows(&other_group).unwrap().is_none());
+        assert!(gate.concat_rows(&other_bits).unwrap().is_none());
+        assert!(gate.concat_rows(&mxfp4).unwrap().is_none());
+
+        // Mismatched K (input width) cannot share a matmul.
+        let narrow = make_affine_linear(&bf16_weight(9, 32, 64), 32, 4);
+        assert!(gate.concat_rows(&narrow).unwrap().is_none());
+    }
+
+    /// Two keyed mxfp8 calibration sites merge (loaders attach `amax_key` to
+    /// every attn/GDN site regardless of recipe): the merged projection
+    /// records the shared input's `max|x|` under BOTH keys, and each key's
+    /// slice view keeps recording under its own key when the merged path is
+    /// not taken.
+    #[test]
+    fn concat_rows_preserves_calibration_keys() {
+        use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
+
+        let _g = CALIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ActivationAmaxCollector::disarm_current_thread();
+        let _ = ActivationAmaxCollector::take();
+
+        let (n, k) = (32i64, 64i64); // k % MXFP8_GROUP_SIZE == 0
+        let w_bf16 = bf16_weight(29, 2 * n, k);
+        let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+        assert!(unsafe {
+            sys::mlx_quantize(
+                w_bf16.as_raw_ptr(),
+                MXFP8_GROUP_SIZE,
+                MXFP8_BITS,
+                c"mxfp8".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        });
+        let w_q = MxArray::from_handle(out_q, "q").unwrap();
+        let scales = MxArray::from_handle(out_s, "s").unwrap();
+        let make = |w: &MxArray, s: &MxArray, key: &str| {
+            QuantizedLinear::new(
+                w.clone(),
+                s.clone(),
+                None,
+                None,
+                MXFP8_GROUP_SIZE,
+                MXFP8_BITS,
+                MXFP8_MODE.to_string(),
+            )
+            .with_amax_key(Some(key.to_string()))
+        };
+        let key_a = "layers.0.self_attn.k_proj";
+        let key_b = "layers.0.self_attn.v_proj";
+        let a = make(
+            &w_q.slice_axis(0, 0, n).unwrap(),
+            &scales.slice_axis(0, 0, n).unwrap(),
+            key_a,
+        );
+        let b = make(
+            &w_q.slice_axis(0, n, 2 * n).unwrap(),
+            &scales.slice_axis(0, n, 2 * n).unwrap(),
+            key_b,
+        );
+        let merged = a
+            .concat_rows(&b)
+            .unwrap()
+            .expect("two keyed mxfp8 sites must merge");
+
+        let x = bf16_weight(31, 4, k);
+        let expected = {
+            let xv = x.astype(DType::Float32).unwrap();
+            xv.eval();
+            xv.to_float32()
+                .unwrap()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // Merged forward records under both source keys.
+        ActivationAmaxCollector::arm_current_thread();
+        let _ = merged.forward(&x).unwrap();
+        ActivationAmaxCollector::disarm_current_thread();
+        let recorded = ActivationAmaxCollector::take();
+        for key in [key_a, key_b] {
+            let got = recorded
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| panic!("merged projection must record under {key}"));
+            assert!(
+                (got - expected).abs() <= 1e-4,
+                "{key}: recorded {got} vs expected {expected}"
+            );
+        }
+
+        // A keyless slice view re-keyed to its source still records on its
+        // own (the env-killed-merge fallback path).
+        let view = merged
+            .slice_rows(0, n)
+            .unwrap()
+            .with_amax_key(Some(key_a.to_string()));
+        ActivationAmaxCollector::arm_current_thread();
+        let _ = view.forward(&x).unwrap();
+        ActivationAmaxCollector::disarm_current_thread();
+        let recorded = ActivationAmaxCollector::take();
+        assert!(recorded.contains_key(key_a));
+        assert!(!recorded.contains_key(key_b));
+    }
+
+    #[test]
+    fn quantized_mlp_finalize_gate_up_is_bit_identical_and_keeps_getters() {
+        let (i, k) = (64i64, 128i64);
+        let gate = make_affine_linear(&bf16_weight(13, i, k), 32, 4);
+        let up = make_affine_linear(&bf16_weight(17, i, k), 32, 4);
+        // down: [K_out=K_hidden, K_in=I] — reuse the affine helper.
+        let down = make_affine_linear(&bf16_weight(19, k, i), 32, 4);
+
+        let gate_w = gate.get_weight().clone();
+        let up_w = up.get_weight().clone();
+        let mut mlp = MLPVariant::Quantized {
+            gate_proj: gate,
+            up_proj: up,
+            down_proj: down,
+            gate_up: None,
+        };
+
+        for m in [1i64, 6, 8] {
+            let x = bf16_weight(23 + m as u64, m, k);
+            let want = mlp.forward(&x).unwrap();
+            // Re-finalize must be a no-op once merged (idempotent).
+            mlp.finalize_gate_up().unwrap();
+            mlp.finalize_gate_up().unwrap();
+            let got = mlp.forward(&x).unwrap();
+            assert_bit_identical(&got, &want, "merged vs unmerged MLP");
+        }
+
+        // Getters still expose per-projection packed rows (views).
+        assert_eq!(
+            mlp.get_gate_proj_weight().shape().unwrap().to_vec(),
+            gate_w.shape().unwrap().to_vec()
+        );
+        assert_eq!(
+            mlp.get_gate_proj_weight().to_uint32().unwrap().to_vec(),
+            gate_w.to_uint32().unwrap().to_vec(),
+            "gate rows must be the leading slice of the merged weight"
+        );
+        assert_eq!(
+            mlp.get_up_proj_weight().to_uint32().unwrap().to_vec(),
+            up_w.to_uint32().unwrap().to_vec(),
+        );
     }
 }

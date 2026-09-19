@@ -444,18 +444,22 @@ impl DecoderLayer {
         self.post_attention_layernorm.get_weight()
     }
 
-    /// Replace the dense MLP with a quantized version.
+    /// Replace the dense MLP with a quantized version. Attempts the packed
+    /// gate|up row-merge (`finalize_gate_up`); incompatible pairs simply stay
+    /// unmerged, but an internal merge error fails the load loud.
     pub fn set_quantized_dense_mlp(
         &mut self,
         gate_proj: QuantizedLinear,
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
-    ) {
+    ) -> Result<()> {
         self.mlp = MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
+            gate_up: None,
         };
+        self.mlp.finalize_gate_up()
     }
 
     /// Whether any main-model projection in this decoder layer is quantized.

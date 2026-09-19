@@ -76,6 +76,13 @@ pub struct Qwen3_5Attention {
     /// Reordered `[2*num_heads*head_dim]` q_proj bias matching
     /// `q_gate_block_t`'s column order. `None` when q_proj has no bias.
     q_gate_block_bias: Option<MxArray>,
+
+    /// Packed row-merged `[w_k; w_v]` quantized projection plus the k-row
+    /// split point, installed by `finalize_kv_proj()` when both projections
+    /// are mergeable quantized linears. `k_proj`/`v_proj` are then swapped
+    /// for zero-copy row-slice views (getters/set_weight unaffected), so the
+    /// merged buffer is the only resident copy.
+    kv_proj: Option<(LinearProj, i64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +291,7 @@ impl Qwen3_5Attention {
             is_prism_model: false,
             q_gate_block_t: None,
             q_gate_block_bias: None,
+            kv_proj: None,
         })
     }
 
@@ -341,6 +349,51 @@ impl Qwen3_5Attention {
         }
     }
 
+    /// Project keys and values. When `finalize_kv_proj` merged the two
+    /// quantized projections this is ONE packed matmul plus two axis-2 slices;
+    /// otherwise the original two matmuls. `MLX_DISABLE_QATTN_KV_MERGE=1`
+    /// forces the two-matmul path for A/B.
+    fn project_kv(&self, x: &MxArray) -> Result<(MxArray, MxArray)> {
+        if let Some((merged, k_rows)) = &self.kv_proj
+            && std::env::var("MLX_DISABLE_QATTN_KV_MERGE").is_err()
+        {
+            let kv = merged.forward(x)?; // [B, T, k_dim + v_dim]
+            let last = kv.ndim()? as usize - 1;
+            let width = kv.shape_at(last as u32)?;
+            return Ok((
+                kv.slice_axis(last, 0, *k_rows)?,
+                kv.slice_axis(last, *k_rows, width)?,
+            ));
+        }
+        Ok((self.k_proj.forward(x)?, self.v_proj.forward(x)?))
+    }
+
+    /// Merge `k_proj` + `v_proj` into one packed quantized projection when both
+    /// are merge-compatible (`LinearProj::concat_rows`). The originals are
+    /// replaced by row-slice views of the merged buffer, so per-projection
+    /// getters and the unfused forwards stay correct. Dense or mixed-format
+    /// pairs keep the two-matmul path. Idempotent.
+    pub fn finalize_kv_proj(&mut self) -> Result<()> {
+        if self.kv_proj.is_some() {
+            return Ok(());
+        }
+        if let Some(merged) = self.k_proj.concat_rows(&self.v_proj)? {
+            let k_rows = self.k_proj.packed_out_features()?;
+            let v_rows = self.v_proj.packed_out_features()?;
+            // Re-attach each source's calibration key onto its view: the
+            // MLX_DISABLE_QATTN_KV_MERGE check runs per-forward, so a disabled
+            // merge falls back to these views and must still record.
+            let k_key = self.k_proj.amax_key().map(str::to_owned);
+            let v_key = self.v_proj.amax_key().map(str::to_owned);
+            self.k_proj = merged.slice_rows(0, k_rows)?.with_amax_key(k_key);
+            self.v_proj = merged
+                .slice_rows(k_rows, k_rows + v_rows)?
+                .with_amax_key(v_key);
+            self.kv_proj = Some((merged, k_rows));
+        }
+        Ok(())
+    }
+
     /// Forward pass.
     ///
     /// # Arguments
@@ -366,9 +419,9 @@ impl Qwen3_5Attention {
         // queries [B,T,H,D] and flat gate [B,T,H*D]. See `project_q_gate`.
         let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
 
-        // Project keys and values
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        // Project keys and values (one merged matmul when `finalize_kv_proj`
+        // packed the two quantized projections into `kv_proj`).
+        let (keys, values) = self.project_kv(x)?;
 
         // Reshape to head format: [B, T, H, D]
         // queries already in [B, T, H, D] from per-head split above
@@ -534,8 +587,7 @@ impl Qwen3_5Attention {
         let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
 
         // K/V projections + reshape to per-head layout.
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        let (keys, values) = self.project_kv(x)?;
         let keys = keys.reshape(&[
             batch,
             seq_len,
@@ -1310,14 +1362,15 @@ impl Qwen3_5Attention {
                 let (query, gate) = self.project_q_gate(&x_row, 1, seq_len)?;
                 query_rows.push(self.q_norm.forward(&query)?);
                 gate_rows.push(gate);
-                let key = self.k_proj.forward(&x_row)?.reshape(&[
+                let (key_raw, value_raw) = self.project_kv(&x_row)?;
+                let key = key_raw.reshape(&[
                     1,
                     seq_len,
                     self.num_kv_heads as i64,
                     self.head_dim as i64,
                 ])?;
                 key_rows.push(self.k_norm.forward(&key)?);
-                value_rows.push(self.v_proj.forward(&x_row)?.reshape(&[
+                value_rows.push(value_raw.reshape(&[
                     1,
                     seq_len,
                     self.num_kv_heads as i64,
@@ -1333,13 +1386,14 @@ impl Qwen3_5Attention {
         } else {
             let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
             let queries = self.q_norm.forward(&queries)?;
-            let keys = self.k_norm.forward(&self.k_proj.forward(x)?.reshape(&[
+            let (key_raw, value_raw) = self.project_kv(x)?;
+            let keys = self.k_norm.forward(&key_raw.reshape(&[
                 batch,
                 seq_len,
                 self.num_kv_heads as i64,
                 self.head_dim as i64,
             ])?)?;
-            let values = self.v_proj.forward(x)?.reshape(&[
+            let values = value_raw.reshape(&[
                 batch,
                 seq_len,
                 self.num_kv_heads as i64,
@@ -1443,9 +1497,11 @@ impl Qwen3_5Attention {
         self.q_proj.set_weight(w, "q_proj")
     }
     pub fn set_k_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        self.kv_proj = None;
         self.k_proj.set_weight(w, "k_proj")
     }
     pub fn set_v_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        self.kv_proj = None;
         self.v_proj.set_weight(w, "v_proj")
     }
     pub fn set_o_proj_weight(&mut self, w: &MxArray) -> Result<()> {
@@ -1457,9 +1513,11 @@ impl Qwen3_5Attention {
         self.q_proj.set_bias(b, "q_proj")
     }
     pub fn set_k_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
+        self.kv_proj = None;
         self.k_proj.set_bias(b, "k_proj")
     }
     pub fn set_v_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
+        self.kv_proj = None;
         self.v_proj.set_bias(b, "v_proj")
     }
     pub fn set_o_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
@@ -1538,9 +1596,11 @@ impl Qwen3_5Attention {
         self.q_proj.set_quantized(ql);
     }
     pub fn set_quantized_k_proj(&mut self, ql: QuantizedLinear) {
+        self.kv_proj = None;
         self.k_proj.set_quantized(ql);
     }
     pub fn set_quantized_v_proj(&mut self, ql: QuantizedLinear) {
+        self.kv_proj = None;
         self.v_proj.set_quantized(ql);
     }
     pub fn set_quantized_o_proj(&mut self, ql: QuantizedLinear) {

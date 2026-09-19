@@ -187,6 +187,10 @@ pub struct GatedDeltaNet {
     /// (and non-quantized), `forward()` does ONE matmul + two slices instead of
     /// two separate matmuls.
     in_proj_qkvz_ba_t: Option<MxArray>,
+    /// Packed row-merged `[w_qkvz; w_ba]` quantized projection — the
+    /// quantized counterpart of `in_proj_qkvz_ba_t`. `in_proj_qkvz` and
+    /// `in_proj_ba` are replaced by row-slice views of it.
+    in_proj_qkvz_ba_q: Option<LinearProj>,
 }
 
 impl GatedDeltaNet {
@@ -254,24 +258,50 @@ impl GatedDeltaNet {
             conv_kernel_dim,
             tiled_gguf_layout: config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled"),
             in_proj_qkvz_ba_t: None,
+            in_proj_qkvz_ba_q: None,
         })
     }
 
-    /// Precompute the stacked `[qkvz; ba]^T` weight once after both in_proj
-    /// weights have been loaded. Forward will then use one matmul (x @ wqb_t)
-    /// plus two axis-2 slices instead of two matmuls (x @ w_qkvz.T) + (x @ w_ba.T).
+    /// Precompute the stacked `[qkvz; ba]` input projection once after both
+    /// in_proj weights have been loaded. Forward will then use one matmul
+    /// plus two axis-2 slices instead of two separate matmuls.
     /// Safe to call repeatedly (idempotent).
     ///
-    /// Only applies when both in_proj_qkvz and in_proj_ba are non-quantized
-    /// Standard linears. Quantized models stay on the unfused 2-matmul
-    /// path (no-op here).
+    /// Dense path: stacks the transposed weights into `in_proj_qkvz_ba_t`.
+    /// Quantized path: row-merges the packed weights into `in_proj_qkvz_ba_q`
+    /// when both formats are mergeable (`LinearProj::concat_rows`), and swaps
+    /// `in_proj_qkvz`/`in_proj_ba` for zero-copy row-slice views so getters
+    /// keep working and no duplicate storage is retained. Incompatible pairs
+    /// (mixed modes, split in_proj variants, special layouts) keep the
+    /// unfused two-matmul path.
     pub fn finalize_in_proj(&mut self) -> Result<()> {
         if self.split_in_proj_qkv_z.is_some() || self.split_in_proj_b_a.is_some() {
             self.in_proj_qkvz_ba_t = None;
+            self.in_proj_qkvz_ba_q = None;
             return Ok(());
         }
         match (&self.in_proj_qkvz, &self.in_proj_ba) {
             (LinearProj::Standard(_), LinearProj::Standard(_)) => {}
+            (LinearProj::Quantized(_), LinearProj::Quantized(_)) => {
+                if self.in_proj_qkvz_ba_q.is_none()
+                    && let Some(merged) = self.in_proj_qkvz.concat_rows(&self.in_proj_ba)?
+                {
+                    let qkvz_rows = self.in_proj_qkvz.packed_out_features()?;
+                    let ba_rows = self.in_proj_ba.packed_out_features()?;
+                    // Re-attach each source's calibration key onto its view:
+                    // MLX_DISABLE_E51_STACKED_GDN_IN_PROJ is read per-forward,
+                    // so a disabled merge falls back to these views and must
+                    // still record under the right bucket.
+                    let qkvz_key = self.in_proj_qkvz.amax_key().map(str::to_owned);
+                    let ba_key = self.in_proj_ba.amax_key().map(str::to_owned);
+                    self.in_proj_qkvz = merged.slice_rows(0, qkvz_rows)?.with_amax_key(qkvz_key);
+                    self.in_proj_ba = merged
+                        .slice_rows(qkvz_rows, qkvz_rows + ba_rows)?
+                        .with_amax_key(ba_key);
+                    self.in_proj_qkvz_ba_q = Some(merged);
+                }
+                return Ok(());
+            }
             _ => return Ok(()),
         }
         let w_qkvz = self.in_proj_qkvz.get_weight(); // [qkvz_dim, hidden]
@@ -324,13 +354,20 @@ impl GatedDeltaNet {
         // MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 reverts to the two-matmul path.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
         let ba_dim = (self.num_v_heads * 2) as i64;
-        let stacked = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t
-            && std::env::var("MLX_DISABLE_E51_STACKED_GDN_IN_PROJ").is_err()
-        {
-            let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
-            let qkvz = combined.slice_axis(2, 0, qkvz_dim)?;
-            let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
-            Some((qkvz, ba))
+        let stacked = if std::env::var("MLX_DISABLE_E51_STACKED_GDN_IN_PROJ").is_err() {
+            if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
+                let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
+                let qkvz = combined.slice_axis(2, 0, qkvz_dim)?;
+                let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
+                Some((qkvz, ba))
+            } else if let Some(merged) = &self.in_proj_qkvz_ba_q {
+                let combined = merged.forward(x)?; // [B, T, qkvz_dim + ba_dim]
+                let qkvz = combined.slice_axis(2, 0, qkvz_dim)?;
+                let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
+                Some((qkvz, ba))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -563,11 +600,13 @@ impl GatedDeltaNet {
 
     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
         self.in_proj_qkvz_ba_t = None; // invalidate stacked cache
+        self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_qkv_z = None;
         self.in_proj_qkvz.set_weight(w, "in_proj_qkvz")
     }
     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {
         self.in_proj_qkvz_ba_t = None;
+        self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_b_a = None;
         self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
@@ -603,20 +642,24 @@ impl GatedDeltaNet {
 
     pub fn set_quantized_in_proj_qkvz(&mut self, ql: QuantizedLinear) {
         self.in_proj_qkvz_ba_t = None;
+        self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_qkv_z = None;
         self.in_proj_qkvz.set_quantized(ql);
     }
     pub fn set_quantized_in_proj_ba(&mut self, ql: QuantizedLinear) {
         self.in_proj_qkvz_ba_t = None;
+        self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_b_a = None;
         self.in_proj_ba.set_quantized(ql);
     }
     pub fn set_split_in_proj_qkv_z(&mut self, qkv: LinearProj, z: LinearProj) {
         self.in_proj_qkvz_ba_t = None;
+        self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_qkv_z = Some((qkv, z));
     }
     pub fn set_split_in_proj_b_a(&mut self, b: LinearProj, a: LinearProj) {
         self.in_proj_qkvz_ba_t = None;
+        self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_b_a = Some((b, a));
     }
     pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {

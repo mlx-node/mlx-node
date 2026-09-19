@@ -984,6 +984,10 @@ fn apply_weights_moe_inner_with_residency(
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
                 }
+                // Same finalizer as the dense loader: stacks/merges the
+                // in_proj_qkvz + in_proj_ba pair (dense transpose for
+                // bf16 weights, packed row-merge for quantized).
+                gdn.finalize_in_proj()?;
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
@@ -1091,6 +1095,7 @@ fn apply_weights_moe_inner_with_residency(
                 // forward_paged() split queries/gate without a strided
                 // reshape-copy. No-op for quantized q_proj.
                 attn.finalize_q_gate_block()?;
+                attn.finalize_kv_proj()?;
             }
         }
 
@@ -1107,7 +1112,7 @@ fn apply_weights_moe_inner_with_residency(
                     let q_down = try_build_ql(params, &down_key)?;
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
-                        layer.set_quantized_dense_mlp(qg, qu, qd);
+                        layer.set_quantized_dense_mlp(qg, qu, qd)?;
                     } else {
                         // Partial trio: ALL THREE fall back to the dense
                         // setters, so any quantized member's packed payload
@@ -1196,7 +1201,7 @@ fn apply_weights_moe_inner_with_residency(
                     let q_se_down = try_build_ql(params, &se_down_key)?;
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
-                        moe.set_quantized_shared_expert(qg, qu, qd);
+                        moe.set_quantized_shared_expert(qg, qu, qd)?;
                     } else {
                         if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
                             ensure_dense_weight_floating(&format!("{}.weight", se_gate_key), w)?;

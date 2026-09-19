@@ -236,11 +236,13 @@ impl SparseMoeBlock {
         gate_proj: QuantizedLinear,
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
-    ) {
+    ) -> Result<()> {
         self.shared_expert = MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
+            gate_up: None,
         };
+        self.shared_expert.finalize_gate_up()
     }
 }

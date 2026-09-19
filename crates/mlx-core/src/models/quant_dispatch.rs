@@ -1434,7 +1434,9 @@ pub(crate) fn load_dense_mlp_variant(
             gate_proj,
             up_proj,
             down_proj,
+            gate_up: None,
         };
+        ff.finalize_gate_up()?;
     } else {
         // Plain bf16 dense MLP. The variant is `Standard(MLP)` (default at
         // construction); load each projection's weight through the

@@ -77,6 +77,9 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_BONSAI_SHARE_HADAMARD=1` | Experimental, default off: reuse identical signed Hadamard transforms within one paged Qwen3.5 decode step. Cache entries retain input/sign owners and are cleared on return or error; flat inference and prefill do not retain entries. |
 | `MLX_QMM_SPLITK_MIN_M`        | Diagnostic override for the quantized-matmul vector/GEMM dispatch boundary: quantized matvecs with M ≥ this many rows take the `qmm`/split-k path instead of `qmv_wide`. A/B tuning only; unset keeps the hardware-derived heuristic. |
 | `MLX_KQUANT_SMALL_M_BENCH=1`  | Body-level opt-in for the `#[ignore]`d `kquant_small_m_bench` integration test: exact-shape K/IQ small-M quantized-matmul timings (MLP + lm_head shapes, M sweep). Run `MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --test kquant_small_m_bench -- --ignored --test-threads=1 --nocapture` (serial — the two benches share the GPU). |
+| `MLX_DISABLE_QUANTIZED_GATE_UP_MERGE=1` | Restore the per-projection quantized matmuls for quantized MLP gate\|up pairs (no load-time packed row-merge). Outputs are bit-identical either way; the switch exists for A/B and driver rollback. |
+| `MLX_DISABLE_QATTN_KV_MERGE=1` | Restore two separate quantized matmuls for attention k\|v pairs where the merge applies (checked per forward, so it can flip without reload). Bit-identical; A/B and rollback. Calibration-keyed sites merge too — the merged projection records under both source keys. |
+| `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1` | Revert the GDN `in_proj_qkvz`/`in_proj_ba` pair to two matmuls — covers both the dense stacked-transpose path and the quantized row-merge. Bit-identical; A/B only. |
 
 ### Paged-attention
 
