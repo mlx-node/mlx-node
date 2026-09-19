@@ -251,6 +251,49 @@ fn gated_delta_kernel(
     Ok((y, new_state))
 }
 
+/// Fused accepted-prefix replay for the eager-MTP GDN tape.
+///
+/// ONE Metal dispatch replays `accepted_steps` tokens of the recorded verify
+/// window from `start_state`, rounding the recurrent state through the store
+/// dtype after every token — bit-identical to chaining [`gated_delta_kernel`]
+/// at T=1. The recurrent update never reads `q`, so the kernel omits it.
+///
+/// Shapes:
+///   k: [B, S, Hk, Dk], v: [B, S, Hv, Dv]  (`S` = recorded window length)
+///   g: [B, S, Hv] (post-`exp`, f32), beta: [B, S, Hv] (post-sigmoid)
+///   state: [B, Hv, Dv, Dk]  (model dtype)
+///
+/// Returns the carried state `[B, Hv, Dv, Dk]` after `accepted_steps` tokens.
+fn gated_delta_replay(
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    accepted_steps: i32,
+) -> Result<MxArray> {
+    let window_stride = k.shape_at(1)? as i32;
+    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_gated_delta_replay(
+            k.as_raw_ptr(),
+            v.as_raw_ptr(),
+            g.as_raw_ptr(),
+            beta.as_raw_ptr(),
+            state.as_raw_ptr(),
+            accepted_steps,
+            window_stride,
+            &mut out_state,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "Fused gated delta replay kernel failed (check stderr for details)",
+        ));
+    }
+    MxArray::from_handle(out_state, "gated_delta_replay:state")
+}
+
 /// Per-step GDN recurrence record for the eager MTP tape replay.
 ///
 /// Captures the EXACT inputs passed to [`gated_delta_kernel`] for the whole
@@ -259,12 +302,12 @@ fn gated_delta_kernel(
 /// (`g_log.exp()`), and `beta` is post-sigmoid. All handles are lazy `MxArray`
 /// clones (no eval, no copy).
 ///
-/// On accept the replay slices each window tensor to step `t` as `[B, 1, ...]`
-/// and re-runs [`gated_delta_kernel`] AT T=1 per accepted step, threading the
-/// bf16 recurrent state between calls. Re-running the SAME kernel AR uses at
-/// T=1 reproduces the per-token bf16 round-trip of true autoregressive decode
-/// by construction — the windowed verify kernel keeps state fp32 across the
-/// whole window, which is the divergence the replay corrects.
+/// On accept the replay walks the recorded window up to the accepted prefix,
+/// threading the bf16 recurrent state between token updates — ONE fused
+/// [`gated_delta_replay`] dispatch that replicates the per-token bf16
+/// round-trip of true autoregressive decode (the windowed verify kernel keeps
+/// state fp32 across the whole window, which is the divergence the replay
+/// corrects). The sequential T=1 [`gated_delta_kernel`] chain is the fallback.
 #[derive(Clone)]
 pub(crate) struct GdnKernelTape {
     /// Queries `[B, T, Hk, Dk]` (expanded or compact tiled, RMS-norm-scaled).
@@ -285,19 +328,37 @@ impl GdnKernelTape {
         self.q.shape_at(1)
     }
 
-    /// Replay the first `accepted_steps` recorded steps at T=1, threading the
-    /// bf16 recurrent state between kernel calls. Starts from `start_state`
+    /// Replay the first `accepted_steps` recorded steps, threading the
+    /// bf16 recurrent state between token updates. Starts from `start_state`
     /// (the pre-verify snapshot's bf16 recurrent state) and returns the
     /// AR-exact carried state after `accepted_steps` tokens.
     ///
-    /// Each T=1 [`gated_delta_kernel`] call casts the recurrent state to bf16
-    /// at the end (matching the AR per-token decode), so threading the bf16
-    /// state across the loop reproduces autoregressive decode bit-for-bit.
+    /// The fused [`gated_delta_replay`] kernel reproduces the T=1
+    /// [`gated_delta_kernel`] chain in ONE dispatch: it keeps state in fp32
+    /// registers during each token's delta-rule update but rounds through the
+    /// store dtype after every token, matching the per-call write/reload the
+    /// sequential loop below performs. On any dispatch failure the sequential
+    /// T=1 chain remains the fallback (and the test oracle).
     pub(crate) fn replay_recurrent_state(
         &self,
         start_state: &MxArray,
         accepted_steps: usize,
     ) -> Result<MxArray> {
+        if accepted_steps == 0 {
+            return Ok(start_state.clone());
+        }
+        if let Ok(state) = gated_delta_replay(
+            &self.k,
+            &self.v,
+            &self.g,
+            &self.beta,
+            start_state,
+            accepted_steps as i32,
+        ) {
+            return Ok(state);
+        }
+        // Sequential fallback: per-step T=1 kernel calls threading the bf16
+        // state, reproducing autoregressive decode bit-for-bit.
         let mut state = start_state.clone();
         for t in 0..accepted_steps as i64 {
             let q_t = self.q.slice_axis(1, t, t + 1)?; // [B, 1, Hk, Dk]
@@ -1067,6 +1128,135 @@ mod tests {
             "per-step tape replay must equal the AR per-step loop bit-for-bit \
              (got max_abs_diff={ar_vs_replay:.6e})"
         );
+    }
+
+    /// Sequential T=1 kernel chain — the replay oracle the fused dispatch
+    /// must reproduce bit-for-bit at every accepted-prefix length.
+    fn sequential_replay(
+        tape: &GdnKernelTape,
+        start_state: &MxArray,
+        accepted_steps: usize,
+    ) -> MxArray {
+        let mut state = start_state.clone();
+        for t in 0..accepted_steps as i64 {
+            let q_t = tape.q.slice_axis(1, t, t + 1).unwrap();
+            let k_t = tape.k.slice_axis(1, t, t + 1).unwrap();
+            let v_t = tape.v.slice_axis(1, t, t + 1).unwrap();
+            let g_t = tape.g.slice_axis(1, t, t + 1).unwrap();
+            let beta_t = tape.beta.slice_axis(1, t, t + 1).unwrap();
+            let (_y, ns) =
+                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None).unwrap();
+            state = ns;
+        }
+        state.eval();
+        state
+    }
+
+    /// The fused [`gated_delta_replay`] kernel must equal the sequential T=1
+    /// kernel chain bit-for-bit for EVERY accepted prefix length (rejection
+    /// at any position), over a window larger than the replay count (the
+    /// stride case: S > T) and at production dims Dk=Dv=128.
+    #[test]
+    fn fused_replay_matches_t1_chain_every_prefix() {
+        let (b, hv, dk, dv, t) = (1i64, 4i64, 128i64, 128i64, 8i64);
+        let q = rand_bf16(&[b, t, hv, dk]);
+        let k = rand_bf16(&[b, t, hv, dk]);
+        let v = rand_bf16(&[b, t, hv, dv]);
+        let g = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap();
+        // Production beta is model dtype (bf16) while g stays f32.
+        let beta = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let state0 = rand_bf16(&[b, hv, dv, dk]);
+        let tape = GdnKernelTape { q, k, v, g, beta };
+
+        for steps in 0..=t as usize {
+            let oracle = sequential_replay(&tape, &state0, steps);
+            let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
+            fused.eval();
+            let diff = max_abs_diff(&oracle, &fused);
+            assert_eq!(
+                diff, 0.0,
+                "fused replay diverged from the T=1 chain at accepted_steps={steps} \
+                 (max_abs_diff={diff:.6e})"
+            );
+        }
+    }
+
+    /// Stacked owner tapes replay through the same fused kernel with B>1 —
+    /// each batch lane must stay independent (the S stride only matters once
+    /// B>1 shares a dispatch).
+    #[test]
+    fn fused_replay_batch_lanes_independent() {
+        let (hv, dk, dv, t) = (4i64, 64i64, 64i64, 5i64);
+        let b = 2i64;
+        let q = rand_bf16(&[b, t, hv, dk]);
+        let k = rand_bf16(&[b, t, hv, dk]);
+        let v = rand_bf16(&[b, t, hv, dv]);
+        let g = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap();
+        let beta = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let state0 = rand_bf16(&[b, hv, dv, dk]);
+        let tape = GdnKernelTape { q, k, v, g, beta };
+
+        for steps in 1..=t as usize {
+            let oracle = sequential_replay(&tape, &state0, steps);
+            let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
+            fused.eval();
+            let diff = max_abs_diff(&oracle, &fused);
+            assert_eq!(
+                diff, 0.0,
+                "batched fused replay diverged at accepted_steps={steps} \
+                 (max_abs_diff={diff:.6e})"
+            );
+        }
+    }
+
+    /// Production GDN runs GQA (`Hk < Hv`): the kernel maps each value head to
+    /// key head `hv % Hk`. The fused replay must stay bit-identical there too.
+    #[test]
+    fn fused_replay_gqa_heads() {
+        let (b, hk, hv, dk, dv, t) = (1i64, 2i64, 4i64, 64i64, 64i64, 4i64);
+        let q = rand_bf16(&[b, t, hk, dk]);
+        let k = rand_bf16(&[b, t, hk, dk]);
+        let v = rand_bf16(&[b, t, hv, dv]);
+        let g = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap();
+        let beta = Activations::sigmoid(
+            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let state0 = rand_bf16(&[b, hv, dv, dk]);
+        let tape = GdnKernelTape { q, k, v, g, beta };
+
+        for steps in 1..=t as usize {
+            let oracle = sequential_replay(&tape, &state0, steps);
+            let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
+            fused.eval();
+            let diff = max_abs_diff(&oracle, &fused);
+            assert_eq!(
+                diff, 0.0,
+                "GQA fused replay diverged at accepted_steps={steps} \
+                 (max_abs_diff={diff:.6e})"
+            );
+        }
     }
 
     /// Parity: the chunk-parallel ops path must match the per-step recurrence (the oracle)

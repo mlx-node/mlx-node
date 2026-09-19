@@ -316,6 +316,7 @@ pub(crate) trait ScheduledMtpTarget: Sized {
             let draft_ids = materialize_draft_tokens(&device_ids)?;
             Ok(DsparkProposal {
                 draft_ids,
+                device_draft_ids: None,
                 draft_dists: distributions,
                 draft_sparse_dists: Vec::new(),
                 keep_probabilities: None,

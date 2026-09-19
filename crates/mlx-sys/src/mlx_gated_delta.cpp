@@ -44,6 +44,13 @@ static const char* gated_delta_fused_gating_source =
     #include "metal/common/gated_delta_fused_gating.metal.inc"
 ;
 
+// Fused accepted-prefix replay for the eager-MTP tape: one dispatch walks all
+// accepted tokens, rounding the recurrent state through InT after EVERY token
+// so the result is bit-identical to chaining the per-step kernel at T=1.
+static const char* gated_delta_replay_source =
+    #include "metal/common/gated_delta_replay.metal.inc"
+;
+
 // Cache compiled kernels to avoid recompilation
 static std::mutex kernel_cache_mutex;
 static std::unordered_map<int, mlx::core::fast::CustomKernelFunction> kernel_cache;
@@ -458,6 +465,118 @@ int32_t mlx_gpu_architecture_gen() {
 bool mlx_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g,
     mlx_array* beta, mlx_array* state, mlx_array* mask, mlx_array** out_y, mlx_array** out_state) {
     return gated_delta_kernel_impl(q,k,v,g,beta,state,mask,out_y,out_state,false);
+}
+
+/// Fused accepted-prefix replay for the eager-MTP GDN tape.
+///
+/// Replays `replay_steps` tokens of the recorded verify window in ONE dispatch,
+/// rounding the fp32 register state through `InT` after every token so the
+/// result is bit-identical to chaining `mlx_gated_delta_kernel` at T=1 — the
+/// exact autoregressive state rounding the rollback contract requires. The
+/// recurrent update never reads `q`, so the query input and `y` output do not
+/// exist here.
+///
+/// Inputs:
+///   k: [B, S, Hk, Dk]  - recorded window keys (S = full window stride)
+///   v: [B, S, Hv, Dv]  - recorded window values
+///   g: [B, S, Hv]       - recorded decay gate (post-exp, f32)
+///   beta: [B, S, Hv]    - recorded beta (post-sigmoid)
+///   state: [B, Hv, Dv, Dk] - pre-verify snapshot state (model dtype)
+///   replay_steps: accepted prefix length (T loop bound, <= S)
+///   window_stride: recorded window length S (batch/time striding)
+///
+/// Output (via out_state): [B, Hv, Dv, Dk] in the state dtype.
+/// Returns true on success.
+bool mlx_gated_delta_replay(
+    mlx_array* k_handle,
+    mlx_array* v_handle,
+    mlx_array* g_handle,
+    mlx_array* beta_handle,
+    mlx_array* state_handle,
+    int32_t replay_steps,
+    int32_t window_stride,
+    mlx_array** out_state
+) {
+    try {
+        auto& k_arr = *reinterpret_cast<array*>(k_handle);
+        auto& v_arr = *reinterpret_cast<array*>(v_handle);
+        auto& g_arr = *reinterpret_cast<array*>(g_handle);
+        auto& beta_arr = *reinterpret_cast<array*>(beta_handle);
+        auto& state_arr = *reinterpret_cast<array*>(state_handle);
+
+        if (k_arr.ndim() != 4 || v_arr.ndim() != 4 || state_arr.ndim() != 4
+            || g_arr.ndim() != 3 || beta_arr.ndim() != 3
+            || replay_steps < 0 || replay_steps > window_stride) {
+            throw std::invalid_argument("mlx_gated_delta_replay: bad inputs");
+        }
+        int B = v_arr.shape(0);
+        int Hk = k_arr.shape(2);
+        int Dk = k_arr.shape(3);
+        int Hv = v_arr.shape(2);
+        int Dv = v_arr.shape(3);
+        if (Dk % 32 != 0
+            || k_arr.shape(0) != B || k_arr.shape(1) != window_stride
+            || v_arr.shape(1) != window_stride
+            || g_arr.shape(0) != B || g_arr.shape(1) != window_stride || g_arr.shape(2) != Hv
+            || beta_arr.shape(0) != B || beta_arr.shape(1) != window_stride
+            || beta_arr.shape(2) != Hv
+            || state_arr.shape(0) != B || state_arr.shape(1) != Hv
+            || state_arr.shape(2) != Dv || state_arr.shape(3) != Dk) {
+            throw std::invalid_argument("mlx_gated_delta_replay: inconsistent tensor dims");
+        }
+
+        // The per-token state store dtype — the T=1 chain rounds through
+        // `input_type = q.dtype()` (the model dtype) each call; the tape
+        // records k in that same dtype, so k's dtype reproduces it even for
+        // a state snapshot stored at a different precision.
+        auto input_type = k_arr.dtype();
+
+        auto T_arr = array(replay_steps, mlx::core::int32);
+        auto S_arr = array(window_stride, mlx::core::int32);
+
+        std::vector<array> inputs = {k_arr, v_arr, g_arr, beta_arr, state_arr, T_arr, S_arr};
+
+        std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
+            {"InT", input_type},
+            {"Dk", Dk},
+            {"Dv", Dv},
+            {"Hk", Hk},
+            {"Hv", Hv},
+        };
+
+        static std::mutex replay_mutex;
+        static std::optional<fast::CustomKernelFunction> replay_kernel;
+        {
+            std::lock_guard<std::mutex> lock(replay_mutex);
+            if (!replay_kernel.has_value()) {
+                replay_kernel = fast::metal_kernel(
+                    "gated_delta_replay",
+                    {"k", "v", "g", "beta", "state_in", "T", "S"},
+                    {"state_out"},
+                    gated_delta_replay_source
+                );
+            }
+        }
+
+        auto results = replay_kernel.value()(
+            inputs,
+            {state_arr.shape()},
+            {input_type},
+            std::make_tuple(32, Dv, B * Hv),          // Grid: same lane map as per-step
+            std::make_tuple(32, 4, 1),                // Threadgroup
+            template_args,
+            std::nullopt,
+            false,
+            mlx::core::default_stream(mlx::core::Device::gpu)
+        );
+
+        *out_state = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_gated_delta_replay error: " << e.what() << std::endl;
+        *out_state = nullptr;
+        return false;
+    }
 }
 
 // Qwen4's measured M5 shape benefits from four value rows per SIMD group.

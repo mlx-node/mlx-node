@@ -1767,6 +1767,14 @@ pub(crate) struct DsparkProposal {
     /// on an over-long block (it would overrun the near-tail budget cap's
     /// target-cache slot expectations).
     pub draft_ids: Vec<i32>,
+    /// Device-resident proposal ids `[L]` (i32) — present when the stepper
+    /// can keep its draft selection on-device into the verify block instead
+    /// of paying a per-cycle GPU→CPU readback. `draft_ids` is EMPTY while
+    /// this is `Some`: read [`Self::draft_len`] for the proposal length and
+    /// call [`Self::materialize_draft_ids`] to back-fill the host ids once
+    /// the consuming verify graph has been forced (the device array shares
+    /// that graph's roots, so the read is then a plain copy, not a sync).
+    pub device_draft_ids: Option<MxArray>,
     /// Per-position f32 `[vocab]` proposal-density rows `q_i` — the
     /// distribution `draft_ids[i]` was actually drawn from, consumed by
     /// `sampling::accept_with_residual` on the sampled accept path. EMPTY
@@ -1783,8 +1791,53 @@ pub(crate) struct DsparkProposal {
 }
 
 impl DsparkProposal {
+    /// Proposal length without forcing evaluation: host ids, else the device
+    /// path's leading dim. The engine uses this for its over-return check and
+    /// the `1 + L` verify width.
+    pub fn draft_len(&self) -> Result<usize> {
+        match &self.device_draft_ids {
+            Some(ids) => {
+                if ids.ndim()? != 1 {
+                    return Err(Error::from_reason(
+                        "device draft ids must be a 1-D token path",
+                    ));
+                }
+                usize::try_from(ids.shape_at(0)?)
+                    .map_err(|_| Error::from_reason("device draft ids length does not fit usize"))
+            }
+            None => Ok(self.draft_ids.len()),
+        }
+    }
+
+    /// Back-fill `draft_ids` from `device_draft_ids` and drop the device
+    /// handle. Forces evaluation of the proposal path — callers must only
+    /// invoke this AFTER the consuming verify graph has been forced (inside
+    /// or after acceptance); an early call reintroduces the readback the
+    /// device path exists to avoid. No-op for host-resident proposals.
+    pub fn materialize_draft_ids(&mut self) -> Result<()> {
+        let Some(ids) = self.device_draft_ids.take() else {
+            return Ok(());
+        };
+        let host = ids.to_int32()?;
+        self.draft_ids = host.as_ref().to_vec();
+        Ok(())
+    }
+
     pub fn truncate(&mut self, len: usize) {
         self.draft_ids.truncate(len);
+        if let Some(ids) = self.device_draft_ids.take() {
+            match ids.slice_axis(0, 0, len as i64) {
+                Ok(sliced) => self.device_draft_ids = Some(sliced),
+                // A failed slice must not silently empty the proposal:
+                // back-fill the host ids and truncate those instead.
+                Err(_) => {
+                    if let Ok(host) = ids.to_int32() {
+                        self.draft_ids = host.as_ref().to_vec();
+                        self.draft_ids.truncate(len);
+                    }
+                }
+            }
+        }
         self.draft_dists.truncate(len);
         self.draft_sparse_dists.truncate(len);
         if let Some(probs) = self.keep_probabilities.as_mut() {
@@ -1924,6 +1977,18 @@ pub(crate) trait DsparkStepper {
     /// [`Self::commit`].
     fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput>;
 
+    /// Device-resident [`Self::verify`] variant: `verify_ids` is a `[1+L]`
+    /// device token array — the engine calls it when the proposal carries
+    /// `device_draft_ids`, so the anchor + draft path enter the target graph
+    /// without a host round-trip. The default materializes the ids on the
+    /// host and forwards to [`Self::verify`] — correct but synchronous;
+    /// steppers that emit device proposals override it.
+    fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
+        let ids = verify_ids.to_int32()?;
+        let ids: Vec<u32> = ids.as_ref().iter().map(|&id| id as u32).collect();
+        self.verify(&ids)
+    }
+
     /// Commit the cycle: keep the first `keep` of the `total_written`
     /// (`== 1+L`) target-cache slots [`Self::verify`] wrote and roll back
     /// the rest; consume the stashed tapped hiddens to re-seed the draft
@@ -2022,4 +2087,65 @@ pub(crate) trait TrainBackend {
 
     /// Restore the optimizer state.
     fn load_optimizer_state_sync(&mut self, path: String) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DsparkProposal;
+    use crate::array::MxArray;
+
+    fn host_proposal(draft_ids: Vec<i32>) -> DsparkProposal {
+        DsparkProposal {
+            draft_ids,
+            device_draft_ids: None,
+            draft_dists: Vec::new(),
+            draft_sparse_dists: Vec::new(),
+            keep_probabilities: None,
+        }
+    }
+
+    #[test]
+    fn device_proposal_reports_len_without_materializing() {
+        let mut proposal = host_proposal(Vec::new());
+        proposal.device_draft_ids =
+            Some(MxArray::from_int32(&[10, 11, 12], &[3]).expect("device ids"));
+        assert_eq!(proposal.draft_len().unwrap(), 3);
+        assert!(proposal.draft_ids.is_empty());
+    }
+
+    #[test]
+    fn materialize_backfills_host_ids_once() {
+        let mut proposal = host_proposal(Vec::new());
+        proposal.device_draft_ids =
+            Some(MxArray::from_int32(&[10, 11, 12], &[3]).expect("device ids"));
+        proposal.materialize_draft_ids().unwrap();
+        assert_eq!(proposal.draft_ids, vec![10, 11, 12]);
+        assert!(proposal.device_draft_ids.is_none());
+        // Second call is a no-op on the host-resident proposal.
+        proposal.materialize_draft_ids().unwrap();
+        assert_eq!(proposal.draft_len().unwrap(), 3);
+    }
+
+    #[test]
+    fn truncate_slices_device_and_host_variants() {
+        let mut device = host_proposal(Vec::new());
+        device.device_draft_ids =
+            Some(MxArray::from_int32(&[10, 11, 12], &[3]).expect("device ids"));
+        device.truncate(2);
+        assert_eq!(device.draft_len().unwrap(), 2);
+        device.materialize_draft_ids().unwrap();
+        assert_eq!(device.draft_ids, vec![10, 11]);
+
+        let mut host = host_proposal(vec![1, 2, 3]);
+        host.truncate(2);
+        assert_eq!(host.draft_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn draft_len_rejects_non_vector_device_path() {
+        let mut proposal = host_proposal(Vec::new());
+        proposal.device_draft_ids =
+            Some(MxArray::from_int32(&[1, 2, 3, 4], &[2, 2]).expect("device ids"));
+        assert!(proposal.draft_len().is_err());
+    }
 }

@@ -945,6 +945,7 @@ impl DsparkDraftModel {
         MxArray::eval_arrays_with_context(&roots, "dspark_proposal_and_confidence")?;
         Ok(crate::engine::backend::DsparkProposal {
             draft_ids: sampling::materialize_draft_tokens(&tokens)?,
+            device_draft_ids: None,
             draft_dists: dists,
             draft_sparse_dists: Vec::new(),
             keep_probabilities: confidence
