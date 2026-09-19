@@ -1285,6 +1285,42 @@ impl QuantizedLinear {
         &self.mode
     }
 
+    /// The additive linear bias (distinct from the quantization `biases`
+    /// sidecar). `None` on every current checkpoint head/MLP projection.
+    pub(crate) fn additive_bias(&self) -> Option<&MxArray> {
+        self.bias.as_ref()
+    }
+
+    /// Reconstruct the dense `[N, K]` weight in bf16 from the packed
+    /// operands. Used to re-quantize a draft-only head at a different
+    /// precision (`install_runtime_draft_lm_head`-style) without a second
+    /// checkpoint copy.
+    pub(crate) fn dequantize_bf16(&self) -> Result<MxArray> {
+        let biases_ptr = self
+            .biases
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
+        let mode_c = CString::new(self.mode.as_str())
+            .map_err(|_| Error::from_reason("quantized mode string contains NUL"))?;
+        let handle = unsafe {
+            sys::mlx_dequantize(
+                self.weight.as_raw_ptr(),
+                self.scales.as_raw_ptr(),
+                biases_ptr,
+                self.group_size,
+                self.bits,
+                crate::array::DType::BFloat16 as i32,
+                mode_c.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(Error::from_reason(
+                "mlx_dequantize failed on a quantized projection",
+            ));
+        }
+        MxArray::from_handle(handle, "quantized_linear_dequantize")
+    }
+
     /// Test-scope accessor for the sym8 operands
     /// `(w_nk [N,K] checkpoint, s_w [N])`.
     /// Used by the routing/parity unit tests to call the reference kernels with

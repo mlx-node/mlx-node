@@ -1,0 +1,38 @@
+Continue writing this Python file exactly as started. It defines one Pydantic model per HTTP endpoint for a user-management REST API. Continue the pattern for all remaining endpoints (create user, get user, update user, delete user, list users, search users, get profile, update profile, change password, reset password, verify email, resend verification). Output code only.
+
+```python
+from datetime import datetime
+from typing import List, Optional
+from pydantic import BaseModel, EmailStr, Field
+
+
+class RegisterUserRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32)
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+    display_name: Optional[str] = None
+
+
+class RegisterUserResponse(BaseModel):
+    user_id: int
+    username: str
+    email: EmailStr
+    created_at: datetime
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32)
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+    role: str = "member"
+
+
+class CreateUserResponse(BaseModel):
+    user_id: int
+    username: str
+    email: EmailStr
+    role: str
+    created_at: datetime
+
+
+class GetUserRequest(BaseModel):

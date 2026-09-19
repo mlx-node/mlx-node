@@ -61,6 +61,7 @@ impl Qwen35Inner {
             lm_head,
             prism_hadamard: None,
             dflash2: None,
+            dflash2_draft_lm_head: None,
             dflash2_context: None,
             dflash2_turn_state: None,
             caches: None,

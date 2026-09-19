@@ -2279,6 +2279,11 @@ pub async fn load_with_thread(
                     let (draft, bytes) = super::dflash2::load_dflash2(Path::new(draft_path))?;
                     draft.validate_target(&config)?;
                     inner.dflash2 = Some(draft);
+                    inner.dflash2_draft_lm_head =
+                        super::dflash2::build_draft_lm_head(inner.lm_head.as_ref())?;
+                    if inner.dflash2_draft_lm_head.is_some() {
+                        info!("Installed draft-precision DFlash2 lm_head clone");
+                    }
                     info!("Loaded external Qwen3.8 DFlash2 companion from {draft_path}");
                     bytes
                 } else {
