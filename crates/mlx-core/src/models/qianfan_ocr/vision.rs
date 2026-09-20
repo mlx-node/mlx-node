@@ -146,15 +146,9 @@ impl InternVisionEmbeddings {
 impl Clone for InternVisionEmbeddings {
     fn clone(&self) -> Self {
         Self {
-            patch_conv: Conv2d::new(
-                &self.patch_conv.weight(),
-                self.patch_conv.bias().as_ref(),
-                Some(vec![self.patch_size, self.patch_size]),
-                Some(vec![0, 0]),
-                None,
-                None,
-            )
-            .expect("clone Conv2d"),
+            // `Conv2d::clone` shares the Arc'd tensors — identical to the
+            // previous `Conv2d::new` rebuild but without re-validation.
+            patch_conv: self.patch_conv.clone(),
             cls_token: self.cls_token.clone(),
             position_embedding: self.position_embedding.clone(),
             patch_size: self.patch_size,

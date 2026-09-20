@@ -158,7 +158,11 @@ pub(crate) fn quantize_mx(
             "{mode} quantization for '{key_for_error}' needs at least a 2-D weight, got {shape:?}"
         )));
     }
-    let last = *shape.last().expect("checked non-empty above");
+    let last = *shape.last().ok_or_else(|| {
+        Error::from_reason(format!(
+            "{mode} quantization for '{key_for_error}' got an empty shape"
+        ))
+    })?;
     if last <= 0 || last % MX_GROUP_SIZE != 0 {
         return Err(Error::from_reason(format!(
             "{mode} quantization for '{key_for_error}' needs a last dimension divisible by \
@@ -168,8 +172,16 @@ pub(crate) fn quantize_mx(
 
     let mut packed_shape = shape.clone();
     let mut scales_shape = shape.clone();
-    *packed_shape.last_mut().expect("non-empty") = last / values_per_word;
-    *scales_shape.last_mut().expect("non-empty") = last / MX_GROUP_SIZE;
+    *packed_shape.last_mut().ok_or_else(|| {
+        Error::from_reason(format!(
+            "{mode} quantization for '{key_for_error}' got an empty shape"
+        ))
+    })? = last / values_per_word;
+    *scales_shape.last_mut().ok_or_else(|| {
+        Error::from_reason(format!(
+            "{mode} quantization for '{key_for_error}' got an empty shape"
+        ))
+    })? = last / MX_GROUP_SIZE;
 
     let leading = shape[0];
     let per_leading: i64 = shape[1..].iter().product();
@@ -204,8 +216,16 @@ pub(crate) fn quantize_mx(
     }
 
     if packed_chunks.len() == 1 {
-        let scales = scale_chunks.pop().expect("one chunk");
-        let packed = packed_chunks.pop().expect("one chunk");
+        let scales = scale_chunks.pop().ok_or_else(|| {
+            Error::from_reason(format!(
+                "{mode} quantization for '{key_for_error}' produced no scale chunk"
+            ))
+        })?;
+        let packed = packed_chunks.pop().ok_or_else(|| {
+            Error::from_reason(format!(
+                "{mode} quantization for '{key_for_error}' produced no packed chunk"
+            ))
+        })?;
         return Ok((packed, scales));
     }
     Ok((

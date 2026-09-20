@@ -1271,7 +1271,10 @@ impl Lfm2Inner {
             // Single-row call (the default row-exact decode wave): skip the
             // identity concat — a one-element `concatenate_many` still
             // enqueues a copy kernel per conv layer per row per step.
-            return Ok(states.into_iter().next().unwrap());
+            return states
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::from_reason("LFM2 conv states vec is empty"));
         }
         MxArray::concatenate_many(states.iter().collect(), Some(0))
     }

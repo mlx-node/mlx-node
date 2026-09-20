@@ -238,22 +238,28 @@ fn varlen_t1_matches_single_row_kernel() {
 
     let key_pool = state
         .device
-        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let q_buf = state
         .device
-        .new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let block_table_buf = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let seq_lens_buf = state
         .device
-        .new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let cu_seqlens_q_buf = state
         .device
-        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
     let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
@@ -360,9 +366,15 @@ fn read_output_bf16(state: &MetalState, buf: &metal::Buffer, count: usize) -> Ve
     let bytes = count * std::mem::size_of::<u16>();
     let shared = state
         .device
-        .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-    let cmd = state.command_queue.new_command_buffer();
-    let blit = cmd.new_blit_command_encoder();
+        .try_new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
+    let cmd = state
+        .command_queue
+        .try_new_command_buffer()
+        .expect("test command queue must provide a command buffer");
+    let blit = cmd
+        .try_new_blit_command_encoder()
+        .expect("test command buffer must provide a blit encoder");
     blit.copy_from_buffer(buf, 0, &shared, 0, bytes as u64);
     blit.end_encoding();
     cmd.commit();
@@ -512,22 +524,28 @@ fn varlen_ragged_batch_matches_host_reference() {
 
     let key_pool = state
         .device
-        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let q_buf = state
         .device
-        .new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let block_table_buf = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let seq_lens_buf = state
         .device
-        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let cu_seqlens_q_buf = state
         .device
-        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
@@ -731,22 +749,28 @@ fn varlen_v2_high_partition_matches_host_reference() {
 
     let key_pool = state
         .device
-        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let q_buf = state
         .device
-        .new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let block_table_buf = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let seq_lens_buf = state
         .device
-        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let cu_seqlens_q_buf = state
         .device
-        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
@@ -931,22 +955,28 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
 
     let key_pool = state
         .device
-        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let q_buf = state
         .device
-        .new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let block_table_buf = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let seq_lens_buf = state
         .device
-        .new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let cu_seqlens_q_buf = state
         .device
-        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;

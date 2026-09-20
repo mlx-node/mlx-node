@@ -63,7 +63,9 @@ impl MetalState {
                 .new_library_with_file(&temp_path)
                 .map_err(|e| format!("Failed to load metallib: {}", e))?;
 
-            let command_queue = device.new_command_queue();
+            let command_queue = device
+                .try_new_command_queue()
+                .ok_or_else(|| "Metal device returned no command queue".to_string())?;
 
             Ok(MetalState {
                 device,

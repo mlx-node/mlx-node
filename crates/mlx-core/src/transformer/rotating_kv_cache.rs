@@ -221,8 +221,15 @@ impl RotatingKVCache {
             return Ok(vec![keys.clone(), values.clone()]);
         }
 
-        let ordered_keys = self.temporal_order(self.keys.as_ref().unwrap())?;
-        let ordered_values = self.temporal_order(self.values.as_ref().unwrap())?;
+        let ordered_keys = self.temporal_order(self.keys.as_ref().ok_or_else(|| {
+            Error::new(Status::InvalidArg, "Keys not existing on rotating kv cache")
+        })?)?;
+        let ordered_values = self.temporal_order(self.values.as_ref().ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                "Values not existing on rotating kv cache",
+            )
+        })?)?;
 
         let current_len = ordered_keys.shape_at(2)? as i32;
         self.idx = current_len;
@@ -283,7 +290,12 @@ impl RotatingKVCache {
             if let Some(existing_keys) = &self.keys {
                 self.keys = Some(MxArray::concatenate(existing_keys, &new_k, 2)?);
                 self.values = Some(MxArray::concatenate(
-                    self.values.as_ref().unwrap(),
+                    self.values.as_ref().ok_or_else(|| {
+                        Error::new(
+                            Status::InvalidArg,
+                            "Values not existing on rotating kv cache",
+                        )
+                    })?,
                     &new_v,
                     2,
                 )?);

@@ -1809,10 +1809,9 @@ impl PagedKVCacheAdapter {
                 return Err("restore commit has no active block table".to_string());
             }
             {
-                let block_table = self
-                    .block_table
-                    .as_mut()
-                    .expect("presence checked before consuming restored blocks");
+                let block_table = self.block_table.as_mut().ok_or_else(|| {
+                    "presence checked before consuming restored blocks".to_string()
+                })?;
                 for block in blocks {
                     block_table.add_block(block);
                 }
@@ -2548,7 +2547,10 @@ impl PagedKVCacheAdapter {
             grow_attempted = true;
         }
 
-        let block_table = self.block_table.as_mut().expect("checked above");
+        let block_table = self
+            .block_table
+            .as_mut()
+            .ok_or_else(|| "block_table checked above".to_string())?;
         for block in newly_allocated {
             block_table.add_block(block);
         }
@@ -2666,7 +2668,10 @@ impl PagedKVCacheAdapter {
             grow_attempted = true;
         }
 
-        let block_table = self.block_table.as_mut().expect("checked above");
+        let block_table = self
+            .block_table
+            .as_mut()
+            .ok_or_else(|| "block_table checked above".to_string())?;
         for block in newly_allocated {
             block_table.add_block(block);
         }
@@ -3404,9 +3409,11 @@ impl PagedKVCacheAdapter {
                 generation: pool_generation,
             });
         }
-        let state = self.native_pool_arrays[idx]
-            .as_ref()
-            .expect("native pool arrays initialized above");
+        let state = self
+            .native_pool_arrays
+            .get(idx)
+            .and_then(|arrays| arrays.as_ref())
+            .ok_or_else(|| "native pool arrays initialized above".to_string())?;
         Ok((state.key.clone(), state.value.clone()))
     }
 
@@ -3997,7 +4004,11 @@ impl PagedKVCacheAdapter {
         // preparation and command-buffer resource pattern until traced.
         let slot_mapping = if rows.iter().all(|row| row.query_len == 1) {
             self.ensure_ragged_inputs(rows)?;
-            let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
+            let cache = self
+                .meta
+                .ragged_inputs_cache
+                .as_ref()
+                .ok_or_else(|| "ragged_inputs_cache was just populated".to_string())?;
             if let Some(slot) = cache.aliased_slot {
                 return Err(format!(
                     "ragged KV write aliases physical slot {slot} across query rows"
@@ -4203,7 +4214,11 @@ impl PagedKVCacheAdapter {
             })
             .collect::<Result<Vec<_>, String>>()?;
         self.ensure_ragged_inputs(&rows)?;
-        let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
+        let cache = self
+            .meta
+            .ragged_inputs_cache
+            .as_ref()
+            .ok_or_else(|| "ragged_inputs_cache was just populated".to_string())?;
         Ok((
             cache.block_tables.clone(),
             cache.seq_lens.clone(),
@@ -4319,7 +4334,11 @@ impl PagedKVCacheAdapter {
     ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
         if rows.iter().all(|row| row.query_len == 1) {
             self.ensure_ragged_inputs(rows)?;
-            let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
+            let cache = self
+                .meta
+                .ragged_inputs_cache
+                .as_ref()
+                .ok_or_else(|| "ragged_inputs_cache was just populated".to_string())?;
             return Ok((
                 cache.block_tables.clone(),
                 cache.seq_lens.clone(),
@@ -6432,10 +6451,9 @@ impl PagedKVCacheAdapter {
             guard.free(block);
         }
         drop(guard);
-        let _released_table = self
-            .block_table
-            .take()
-            .expect("release_request table remained present while allocator was locked");
+        let _released_table = self.block_table.take().ok_or_else(|| {
+            "release_request table remained present while allocator was locked".to_string()
+        })?;
         self.active_seq = None;
 
         self.cached_token_count = 0;

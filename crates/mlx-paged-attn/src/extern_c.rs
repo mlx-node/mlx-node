@@ -92,10 +92,13 @@ fn parse_kv_dtype(raw: u8) -> Option<KvDtypeC> {
 /// dispatch. The returned wrapper owns that explicit retain and releases it
 /// normally on drop.
 ///
+/// Returns `None` when `raw` is null or the retain fails — callers already
+/// null-check every pointer, so `None` here means Metal handed back nil.
+///
 /// # Safety
 /// - `raw` must be a live `MTLBuffer*` (`id<MTLBuffer>` retained by
 ///   MLX) and remain valid while the retain is taken.
-unsafe fn retain_buffer(raw: *mut c_void) -> Buffer {
+unsafe fn retain_buffer(raw: *mut c_void) -> Option<Buffer> {
     // SAFETY: the caller guarantees a live, non-null MTLBuffer pointer.
     unsafe { Buffer::retain_from_ptr(raw) }
 }
@@ -211,8 +214,14 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
 
     // SAFETY: caller guarantees the pool buffers are live MTLBuffer*
     // pointers retained by MLX. Each wrapper takes its own temporary retain.
-    let key_pool = unsafe { retain_buffer(key_pool_buffer) };
-    let value_pool = unsafe { retain_buffer(value_pool_buffer) };
+    let Some(key_pool) = (unsafe { retain_buffer(key_pool_buffer) }) else {
+        eprintln!("mlx_paged_attn_reshape_and_cache_dispatch: key_pool retain returned nil");
+        return -1;
+    };
+    let Some(value_pool) = (unsafe { retain_buffer(value_pool_buffer) }) else {
+        eprintln!("mlx_paged_attn_reshape_and_cache_dispatch: value_pool retain returned nil");
+        return -1;
+    };
 
     let result = unsafe {
         dispatch_reshape_and_cache_raw(
@@ -362,10 +371,22 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
 
     // SAFETY: caller guarantees the pool/aux buffers are live MTLBuffer*
     // pointers retained by MLX.
-    let key_pool = unsafe { retain_buffer(key_pool_buffer) };
-    let value_pool = unsafe { retain_buffer(value_pool_buffer) };
-    let block_table = unsafe { retain_buffer(block_table_buffer) };
-    let seq_lens = unsafe { retain_buffer(seq_lens_buffer) };
+    let Some(key_pool) = (unsafe { retain_buffer(key_pool_buffer) }) else {
+        eprintln!("mlx_paged_attn_paged_attention_dispatch: key_pool retain returned nil");
+        return -1;
+    };
+    let Some(value_pool) = (unsafe { retain_buffer(value_pool_buffer) }) else {
+        eprintln!("mlx_paged_attn_paged_attention_dispatch: value_pool retain returned nil");
+        return -1;
+    };
+    let Some(block_table) = (unsafe { retain_buffer(block_table_buffer) }) else {
+        eprintln!("mlx_paged_attn_paged_attention_dispatch: block_table retain returned nil");
+        return -1;
+    };
+    let Some(seq_lens) = (unsafe { retain_buffer(seq_lens_buffer) }) else {
+        eprintln!("mlx_paged_attn_paged_attention_dispatch: seq_lens retain returned nil");
+        return -1;
+    };
 
     let dispatch_result = unsafe {
         dispatch_paged_attention_auto(
@@ -385,8 +406,15 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
         Ok(out) => {
             // SAFETY: caller guarantees output_buffer is live for the
             // call, and large enough to hold the output.
-            let output_owned = unsafe { retain_buffer(output_buffer) };
-            blit_attention_output(&out, &output_owned, output_offset, io_dtype)
+            match unsafe { retain_buffer(output_buffer) } {
+                Some(output_owned) => {
+                    blit_attention_output(&out, &output_owned, output_offset, io_dtype)
+                }
+                None => Err(
+                    "mlx_paged_attn_paged_attention_dispatch: output retain returned nil"
+                        .to_string(),
+                ),
+            }
         }
         Err(e) => Err(e),
     };
@@ -412,8 +440,13 @@ fn blit_attention_output(
     let total_bytes = out.num_elements() * element_size;
 
     let state = crate::metal::MetalState::get()?;
-    let command_buffer = state.command_queue.new_command_buffer();
-    let blit_encoder = command_buffer.new_blit_command_encoder();
+    let command_buffer = state
+        .command_queue
+        .try_new_command_buffer()
+        .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+    let blit_encoder = command_buffer
+        .try_new_blit_command_encoder()
+        .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
 
     blit_encoder.copy_from_buffer(
         &out.buffer,
@@ -551,11 +584,30 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
 
     // SAFETY: caller guarantees the buffers are live MTLBuffer* pointers
     // retained by MLX. Each wrapper takes its own temporary retain.
-    let key_pool = unsafe { retain_buffer(key_pool_buffer) };
-    let value_pool = unsafe { retain_buffer(value_pool_buffer) };
-    let block_table = unsafe { retain_buffer(block_table_buffer) };
-    let seq_lens = unsafe { retain_buffer(seq_lens_buffer) };
-    let cu_seqlens_q = unsafe { retain_buffer(cu_seqlens_q_buffer) };
+    let Some(key_pool) = (unsafe { retain_buffer(key_pool_buffer) }) else {
+        eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: key_pool retain returned nil");
+        return -1;
+    };
+    let Some(value_pool) = (unsafe { retain_buffer(value_pool_buffer) }) else {
+        eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: value_pool retain returned nil");
+        return -1;
+    };
+    let Some(block_table) = (unsafe { retain_buffer(block_table_buffer) }) else {
+        eprintln!(
+            "mlx_paged_attn_paged_attention_varlen_dispatch: block_table retain returned nil"
+        );
+        return -1;
+    };
+    let Some(seq_lens) = (unsafe { retain_buffer(seq_lens_buffer) }) else {
+        eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: seq_lens retain returned nil");
+        return -1;
+    };
+    let Some(cu_seqlens_q) = (unsafe { retain_buffer(cu_seqlens_q_buffer) }) else {
+        eprintln!(
+            "mlx_paged_attn_paged_attention_varlen_dispatch: cu_seqlens_q retain returned nil"
+        );
+        return -1;
+    };
 
     let dispatch_result = unsafe {
         dispatch_paged_attention_varlen_auto(
@@ -576,8 +628,15 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
         Ok(out) => {
             // SAFETY: caller guarantees output_buffer is live and large
             // enough. Reuses the same blit helper as the single-row path.
-            let output_owned = unsafe { retain_buffer(output_buffer) };
-            blit_attention_output(&out, &output_owned, output_offset, io_dtype)
+            match unsafe { retain_buffer(output_buffer) } {
+                Some(output_owned) => {
+                    blit_attention_output(&out, &output_owned, output_offset, io_dtype)
+                }
+                None => Err(
+                    "mlx_paged_attn_paged_attention_varlen_dispatch: output retain returned nil"
+                        .to_string(),
+                ),
+            }
         }
         Err(e) => Err(e),
     };

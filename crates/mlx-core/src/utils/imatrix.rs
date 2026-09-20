@@ -234,7 +234,9 @@ pub fn parse_imatrix<P: AsRef<Path>>(path: P) -> Result<ImatrixData> {
         for _ in 0..n_dims {
             let dim = read_u64_le(&mut reader)
                 .map_err(|e| Error::from_reason(format!("Failed to read tensor dim: {e}")))?;
-            n_elements *= dim;
+            n_elements = n_elements.checked_mul(dim).ok_or_else(|| {
+                Error::from_reason(format!("imatrix tensor '{name}' dimensions overflow u64"))
+            })?;
         }
 
         let type_u32 = read_u32_le(&mut reader)
@@ -273,7 +275,20 @@ pub fn parse_imatrix<P: AsRef<Path>>(path: P) -> Result<ImatrixData> {
             Error::from_reason(format!("Failed to seek to tensor '{}': {e}", ti.name))
         })?;
 
-        let mut data = vec![0f32; ti.n_elements as usize];
+        let n_elements = usize::try_from(ti.n_elements).map_err(|_| {
+            Error::from_reason(format!(
+                "imatrix tensor '{}' element count exceeds usize",
+                ti.name
+            ))
+        })?;
+        let mut data: Vec<f32> = Vec::new();
+        data.try_reserve_exact(n_elements).map_err(|e| {
+            Error::from_reason(format!(
+                "Failed to allocate {} f32s for imatrix tensor '{}': {e}",
+                n_elements, ti.name
+            ))
+        })?;
+        data.resize(n_elements, 0.0);
         for val in &mut data {
             *val = read_f32_le(&mut reader).map_err(|e| {
                 Error::from_reason(format!("Failed to read tensor '{}' data: {e}", ti.name))
@@ -281,10 +296,28 @@ pub fn parse_imatrix<P: AsRef<Path>>(path: P) -> Result<ImatrixData> {
         }
 
         if ti.name.ends_with(".in_sum2") {
-            let base = ti.name.strip_suffix(".in_sum2").unwrap().to_string();
+            let base = ti
+                .name
+                .strip_suffix(".in_sum2")
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "imatrix tensor '{}' lost its '.in_sum2' suffix",
+                        ti.name
+                    ))
+                })?
+                .to_string();
             sum2_map.insert(base, data);
         } else if ti.name.ends_with(".counts") {
-            let base = ti.name.strip_suffix(".counts").unwrap().to_string();
+            let base = ti
+                .name
+                .strip_suffix(".counts")
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "imatrix tensor '{}' lost its '.counts' suffix",
+                        ti.name
+                    ))
+                })?
+                .to_string();
             counts_map.insert(base, data[0]);
         }
     }

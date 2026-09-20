@@ -80,7 +80,11 @@ fn load_impl(model_path: &str) -> Result<HarrierModel> {
             tokenizer_path.display()
         )));
     }
-    let tokenizer = Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap())?;
+    let tokenizer = Qwen3Tokenizer::load_from_file_sync(
+        tokenizer_path
+            .to_str()
+            .ok_or_else(|| Error::from_reason("tokenizer path is not valid UTF-8"))?,
+    )?;
 
     let prompts = load_prompts(path);
     if !prompts.is_empty() {

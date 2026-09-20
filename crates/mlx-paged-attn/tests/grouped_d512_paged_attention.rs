@@ -40,9 +40,15 @@ fn read_bf16_bits(state: &MetalState, source: &Buffer, elements: usize) -> Vec<u
     let bytes = elements * std::mem::size_of::<u16>();
     let shared = state
         .device
-        .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-    let command_buffer = state.command_queue.new_command_buffer();
-    let encoder = command_buffer.new_blit_command_encoder();
+        .try_new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
+    let command_buffer = state
+        .command_queue
+        .try_new_command_buffer()
+        .expect("test command queue must provide a command buffer");
+    let encoder = command_buffer
+        .try_new_blit_command_encoder()
+        .expect("test command buffer must provide a blit encoder");
     encoder.copy_from_buffer(source, 0, &shared, 0, bytes as u64);
     encoder.end_encoding();
     command_buffer.commit();
@@ -61,7 +67,8 @@ fn read_bf16(state: &MetalState, source: &Buffer, elements: usize) -> Vec<f32> {
 fn zeroed_shared_buffer(state: &MetalState, bytes: usize) -> Buffer {
     let buffer = state
         .device
-        .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
     unsafe { std::ptr::write_bytes(buffer.contents() as *mut u8, 0, bytes) };
     buffer
 }
@@ -111,19 +118,24 @@ fn run_case(state: &MetalState, num_heads: u32, num_kv_heads: u32, context_len: 
     let context_lens = [context_len as u32];
     let key_buffer = state
         .device
-        .new_buffer_with_slice(key_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(key_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let value_buffer = state
         .device
-        .new_buffer_with_slice(value_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(value_pool.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let query_buffer = state
         .device
-        .new_buffer_with_slice(queries.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(queries.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let table_buffer = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let lens_buffer = state
         .device
-        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     let query = RawBufferInfo {
         ptr: query_buffer.as_ptr() as *mut c_void,
@@ -283,10 +295,12 @@ fn benchmark_dispatch(
     let context_lens = [context_len as u32];
     let table_buffer = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let lens_buffer = state
         .device
-        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let query = RawBufferInfo {
         ptr: query_buffer.as_ptr() as *mut c_void,
         offset: 0,
@@ -471,10 +485,13 @@ fn exact_benchmark_value_buffer(
     let per_head = HEAD_SIZE as usize * BLOCK_SIZE as usize;
     let per_block = num_kv_heads * per_head;
     let elements = logical_blocks * per_block;
-    let buffer = state.device.new_buffer(
-        (elements * std::mem::size_of::<u16>()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let buffer = state
+        .device
+        .try_new_buffer(
+            (elements * std::mem::size_of::<u16>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("test buffer allocation must succeed");
     let values = unsafe { std::slice::from_raw_parts_mut(buffer.contents() as *mut u16, elements) };
     for physical_block in 0..logical_blocks {
         for kv_head in 0..num_kv_heads {
@@ -508,10 +525,12 @@ impl D512OperatorBenchmark {
         let context_lens = [TARGET_CONTEXT as u32];
         let table_buffer = state
             .device
-            .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+            .expect("test buffer-with-slice allocation must succeed");
         let lens_buffer = state
             .device
-            .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+            .expect("test buffer-with-slice allocation must succeed");
         let params = PagedAttentionParams {
             num_seqs: 1,
             num_heads: TARGET_NUM_HEADS,
@@ -529,50 +548,85 @@ impl D512OperatorBenchmark {
             v_scale: 1.0,
             sliding_window: 0,
         };
-        let output = state.device.new_buffer(
-            (TARGET_NUM_HEADS as usize * HEAD_SIZE as usize * std::mem::size_of::<u16>()) as u64,
-            MTLResourceOptions::StorageModePrivate,
-        );
+        let output = state
+            .device
+            .try_new_buffer(
+                (TARGET_NUM_HEADS as usize * HEAD_SIZE as usize * std::mem::size_of::<u16>())
+                    as u64,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .expect("test buffer allocation must succeed");
         let stats_elements = TARGET_NUM_HEADS as usize * TARGET_STRIPES;
-        let exp_sums = state.device.new_buffer(
-            (stats_elements * std::mem::size_of::<f32>()) as u64,
-            MTLResourceOptions::StorageModePrivate,
-        );
-        let max_logits = state.device.new_buffer(
-            (stats_elements * std::mem::size_of::<f32>()) as u64,
-            MTLResourceOptions::StorageModePrivate,
-        );
-        let partials = state.device.new_buffer(
-            (stats_elements * HEAD_SIZE as usize * std::mem::size_of::<u16>()) as u64,
-            MTLResourceOptions::StorageModePrivate,
-        );
+        let exp_sums = state
+            .device
+            .try_new_buffer(
+                (stats_elements * std::mem::size_of::<f32>()) as u64,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .expect("test buffer allocation must succeed");
+        let max_logits = state
+            .device
+            .try_new_buffer(
+                (stats_elements * std::mem::size_of::<f32>()) as u64,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .expect("test buffer allocation must succeed");
+        let partials = state
+            .device
+            .try_new_buffer(
+                (stats_elements * HEAD_SIZE as usize * std::mem::size_of::<u16>()) as u64,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .expect("test buffer allocation must succeed");
         let shared = MTLResourceOptions::StorageModeShared;
-        let k_scale = state.device.new_buffer_with_value(&params.k_scale, shared);
-        let v_scale = state.device.new_buffer_with_value(&params.v_scale, shared);
+        let k_scale = state
+            .device
+            .try_new_buffer_with_value(&params.k_scale, shared)
+            .expect("test buffer-with-value allocation must succeed");
+        let v_scale = state
+            .device
+            .try_new_buffer_with_value(&params.v_scale, shared)
+            .expect("test buffer-with-value allocation must succeed");
         let num_kv_heads = state
             .device
-            .new_buffer_with_value(&(params.num_kv_heads as i32), shared);
-        let scale = state.device.new_buffer_with_value(&params.scale, shared);
+            .try_new_buffer_with_value(&(params.num_kv_heads as i32), shared)
+            .expect("test buffer-with-value allocation must succeed");
+        let scale = state
+            .device
+            .try_new_buffer_with_value(&params.scale, shared)
+            .expect("test buffer-with-value allocation must succeed");
         let softcapping = state
             .device
-            .new_buffer_with_value(&params.softcapping, shared);
+            .try_new_buffer_with_value(&params.softcapping, shared)
+            .expect("test buffer-with-value allocation must succeed");
         let max_num_blocks = state
             .device
-            .new_buffer_with_value(&(params.max_num_blocks_per_seq as i32), shared);
-        let alibi_slopes = state.device.new_buffer_with_value(&0.0f32, shared);
-        let q_stride = state.device.new_buffer_with_value(&params.q_stride, shared);
+            .try_new_buffer_with_value(&(params.max_num_blocks_per_seq as i32), shared)
+            .expect("test buffer-with-value allocation must succeed");
+        let alibi_slopes = state
+            .device
+            .try_new_buffer_with_value(&0.0f32, shared)
+            .expect("test buffer-with-value allocation must succeed");
+        let q_stride = state
+            .device
+            .try_new_buffer_with_value(&params.q_stride, shared)
+            .expect("test buffer-with-value allocation must succeed");
         let kv_block_stride = state
             .device
-            .new_buffer_with_value(&params.kv_block_stride, shared);
+            .try_new_buffer_with_value(&params.kv_block_stride, shared)
+            .expect("test buffer-with-value allocation must succeed");
         let kv_head_stride = state
             .device
-            .new_buffer_with_value(&params.kv_head_stride, shared);
+            .try_new_buffer_with_value(&params.kv_head_stride, shared)
+            .expect("test buffer-with-value allocation must succeed");
         let sliding_window = state
             .device
-            .new_buffer_with_value(&params.sliding_window, shared);
+            .try_new_buffer_with_value(&params.sliding_window, shared)
+            .expect("test buffer-with-value allocation must succeed");
         let num_stripes = state
             .device
-            .new_buffer_with_value(&(TARGET_STRIPES as i32), shared);
+            .try_new_buffer_with_value(&(TARGET_STRIPES as i32), shared)
+            .expect("test buffer-with-value allocation must succeed");
         let staged_pipeline = state
             .get_pipeline(MetalState::paged_attention_grouped_d512_staged_kernel_name())
             .expect("staged rollback D512 benchmark pipeline must load");
@@ -616,8 +670,13 @@ impl D512OperatorBenchmark {
             D512StageMode::Staged => &self.staged_pipeline,
             D512StageMode::Direct => &self.direct_pipeline,
         };
-        let command_buffer = state.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .expect("test command queue must provide a command buffer");
+        let encoder = command_buffer
+            .try_new_compute_command_encoder()
+            .expect("test command buffer must provide a compute encoder");
         encoder.set_compute_pipeline_state(stage_pipeline);
         encoder.set_buffer(0, Some(&self.exp_sums), 0);
         encoder.set_buffer(1, Some(&self.max_logits), 0);
@@ -646,8 +705,13 @@ impl D512OperatorBenchmark {
         command_buffer.commit();
         command_buffer.wait_until_completed();
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .expect("test command queue must provide a command buffer");
+        let encoder = command_buffer
+            .try_new_compute_command_encoder()
+            .expect("test command buffer must provide a compute encoder");
         encoder.set_compute_pipeline_state(&self.reduce_pipeline);
         encoder.set_buffer(0, Some(&self.output), 0);
         encoder.set_buffer(1, Some(&self.exp_sums), 0);
@@ -780,27 +844,39 @@ impl D512ReducerBenchmark {
             }
         }
 
-        let output = state.device.new_buffer(
-            (rows * HEAD_SIZE as usize * std::mem::size_of::<u16>()) as u64,
-            MTLResourceOptions::StorageModePrivate,
-        );
+        let output = state
+            .device
+            .try_new_buffer(
+                (rows * HEAD_SIZE as usize * std::mem::size_of::<u16>()) as u64,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .expect("test buffer allocation must succeed");
         let exp_sums = state
             .device
-            .new_buffer_with_slice(exp_sums.as_ref(), MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(exp_sums.as_ref(), MTLResourceOptions::StorageModeShared)
+            .expect("test buffer-with-slice allocation must succeed");
         let max_logits = state
             .device
-            .new_buffer_with_slice(max_logits.as_ref(), MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(max_logits.as_ref(), MTLResourceOptions::StorageModeShared)
+            .expect("test buffer-with-slice allocation must succeed");
         let partials = state
             .device
-            .new_buffer_with_slice(partials.as_ref(), MTLResourceOptions::StorageModeShared);
-        let context_lens = state.device.new_buffer_with_slice(
-            &[TARGET_CONTEXT as u32],
-            MTLResourceOptions::StorageModeShared,
-        );
-        let num_stripes = state.device.new_buffer_with_value(
-            &(TARGET_STRIPES as i32),
-            MTLResourceOptions::StorageModeShared,
-        );
+            .try_new_buffer_with_slice(partials.as_ref(), MTLResourceOptions::StorageModeShared)
+            .expect("test buffer-with-slice allocation must succeed");
+        let context_lens = state
+            .device
+            .try_new_buffer_with_slice(
+                &[TARGET_CONTEXT as u32],
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("test buffer-with-slice allocation must succeed");
+        let num_stripes = state
+            .device
+            .try_new_buffer_with_value(
+                &(TARGET_STRIPES as i32),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("test buffer-with-value allocation must succeed");
         let pipeline = state
             .get_pipeline(MetalState::paged_attention_grouped_d512_reduce_kernel_name())
             .expect("D512 reducer pipeline must load");
@@ -817,9 +893,14 @@ impl D512ReducerBenchmark {
     }
 
     fn dispatch_logical_layers(&self, state: &MetalState) {
-        let command_buffer = state.command_queue.new_command_buffer();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .expect("test command queue must provide a command buffer");
         for _ in 0..LOGICAL_LAYERS {
-            let encoder = command_buffer.new_compute_command_encoder();
+            let encoder = command_buffer
+                .try_new_compute_command_encoder()
+                .expect("test command buffer must provide a compute encoder");
             encoder.set_compute_pipeline_state(&self.pipeline);
             encoder.set_buffer(0, Some(&self.output), 0);
             encoder.set_buffer(1, Some(&self.exp_sums), 0);

@@ -524,8 +524,9 @@ pub(crate) fn decode_snapshots(
                 .collect();
             arrays.push(MxArray::from_bfloat16(&raw, &shape)?);
         }
-        let values = arrays.pop().expect("values tensor");
-        let keys = arrays.pop().expect("keys tensor");
+        let (Some(values), Some(keys)) = (arrays.pop(), arrays.pop()) else {
+            return Ok(None);
+        };
         let Some(slot) = snapshots.get_mut(layer_idx) else {
             return Ok(None);
         };

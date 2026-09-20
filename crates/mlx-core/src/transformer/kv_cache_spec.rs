@@ -438,6 +438,9 @@ pub enum KVCacheSpecError {
         layer_index: usize,
         physical_layer_index: usize,
     },
+    UnknownGroupLayerIndex {
+        layer_index: usize,
+    },
 }
 
 impl fmt::Display for KVCacheSpecError {
@@ -489,6 +492,10 @@ impl fmt::Display for KVCacheSpecError {
                 f,
                 "layer {layer_index} maps to physical KV layer {physical_layer_index}, \
                  but that physical layer is not present in its KV group"
+            ),
+            Self::UnknownGroupLayerIndex { layer_index } => write!(
+                f,
+                "KV cache group returned layer {layer_index}, which has no spec"
             ),
         }
     }
@@ -577,9 +584,12 @@ pub(crate) fn derive_layer_kv_cache_routes_from_groups(
             .collect();
 
         for layer_index in &group.layer_indices {
-            let spec = by_layer
-                .get(layer_index)
-                .expect("group_layer_kv_cache_specs returned an unknown layer");
+            let spec =
+                by_layer
+                    .get(layer_index)
+                    .ok_or(KVCacheSpecError::UnknownGroupLayerIndex {
+                        layer_index: *layer_index,
+                    })?;
             let physical_layer_index = spec.physical_layer_index();
             let physical_layer_ordinal = physical_ordinals
                 .get(&physical_layer_index)

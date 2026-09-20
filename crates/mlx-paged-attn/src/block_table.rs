@@ -40,8 +40,10 @@ impl SequenceBlockTable {
     pub fn new(seq_id: u32, block_size: u32) -> Self {
         Self {
             metadata_identity: NEXT_TABLE_IDENTITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                .expect("block table identity overflow"),
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                    Some(id.saturating_add(1))
+                })
+                .unwrap_or(u64::MAX),
             seq_id,
             blocks: Vec::new(),
             num_tokens: 0,
@@ -51,10 +53,7 @@ impl SequenceBlockTable {
     }
 
     fn bump_physical_revision(&mut self) {
-        self.physical_revision = self
-            .physical_revision
-            .checked_add(1)
-            .expect("SequenceBlockTable physical revision overflow");
+        self.physical_revision = self.physical_revision.saturating_add(1);
     }
 
     /// Add a block to the sequence

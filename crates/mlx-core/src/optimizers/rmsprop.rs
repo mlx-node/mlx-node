@@ -106,10 +106,13 @@ impl RMSprop {
         // Initialize state if needed
         if !self.state.contains_key(&param_name) {
             let shape = param.shape()?;
-            self.init_state(&param_name, &shape);
+            self.init_state(&param_name, &shape)?;
         }
 
-        let state = self.state.get_mut(&param_name).unwrap();
+        let state = self
+            .state
+            .get_mut(&param_name)
+            .ok_or_else(|| Error::from_reason("optimizer state missing after init"))?;
 
         unsafe {
             // Apply weight decay if specified
@@ -175,9 +178,10 @@ impl RMSprop {
         self.state.len()
     }
 
-    fn init_state(&mut self, param_name: &str, shape: &[i64]) {
-        let v = MxArray::zeros(shape, None).unwrap();
+    fn init_state(&mut self, param_name: &str, shape: &[i64]) -> Result<()> {
+        let v = MxArray::zeros(shape, None)?;
         self.state
             .insert(param_name.to_string(), RMSpropState { v });
+        Ok(())
     }
 }

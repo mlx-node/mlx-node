@@ -849,7 +849,7 @@ impl Store {
                     return Err(err(format!("Invalid GGUF tensor dimensions: {}", t.name)));
                 }
                 let shape = t.dims.iter().rev().map(|&d| d as usize).collect();
-                let bytes = t.data_size();
+                let bytes = t.data_size()?;
                 self.insert(
                     t.name.clone(),
                     Tensor {

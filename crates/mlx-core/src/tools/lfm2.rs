@@ -985,7 +985,7 @@ impl<'a> PyLiteralParser<'a> {
                                         }
                                     }
                                     Some(b'{') if is_kw_unpack => {
-                                        *stack.last_mut().unwrap() = DICT;
+                                        *stack.last_mut().ok_or(())? = DICT;
                                     }
                                     Some(DICT) if is_kw_unpack => {
                                         dict_key_next.retain(|&d| d != depth);
@@ -1551,7 +1551,7 @@ impl<'a> PyLiteralParser<'a> {
                             match stack.last() {
                                 // `{a,` — a bare element locks the
                                 // display to a set.
-                                Some(&b'{') => *stack.last_mut().unwrap() = SET,
+                                Some(&b'{') => *stack.last_mut().ok_or(())? = SET,
                                 // `{k:v,` — the next operand is a key
                                 // that owes a `:`.
                                 Some(&DICT) => dict_key_next.push(stack.len()),
@@ -1606,7 +1606,7 @@ impl<'a> PyLiteralParser<'a> {
                                 return Err(());
                             }
                             if stack.last() == Some(&b'{') {
-                                *stack.last_mut().unwrap() = SET;
+                                *stack.last_mut().ok_or(())? = SET;
                             }
                             self.pos += 2;
                             st = St::Need;
@@ -1637,7 +1637,7 @@ impl<'a> PyLiteralParser<'a> {
                                 if starred_depths.iter().any(|&(d, _)| d == stack.len()) {
                                     return Err(());
                                 }
-                                *stack.last_mut().unwrap() = DICT;
+                                *stack.last_mut().ok_or(())? = DICT;
                                 self.pos += 1;
                                 st = St::Need;
                                 elem_start = false;
@@ -1867,7 +1867,7 @@ impl<'a> PyLiteralParser<'a> {
                                     // the element was a bare value, so the
                                     // display can never become a dict.
                                     if stack.last() == Some(&b'{') {
-                                        *stack.last_mut().unwrap() = SET;
+                                        *stack.last_mut().ok_or(())? = SET;
                                     }
                                     // Comprehension clauses run at the
                                     // bracket depth they appear in and

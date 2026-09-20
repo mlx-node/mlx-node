@@ -272,26 +272,39 @@ struct MetalInputs {
 
 impl MetalInputs {
     fn new(state: &MetalState, inputs: &ExactShapeInputs) -> Self {
-        let key_pool = state.device.new_buffer_with_slice(
-            inputs.k_pool_bf16.as_ref(),
-            MTLResourceOptions::StorageModeShared,
-        );
-        let value_pool = state.device.new_buffer_with_slice(
-            inputs.v_pool_bf16.as_ref(),
-            MTLResourceOptions::StorageModeShared,
-        );
-        let q = state.device.new_buffer_with_slice(
-            inputs.q_bf16.as_ref(),
-            MTLResourceOptions::StorageModeShared,
-        );
-        let block_table = state.device.new_buffer_with_slice(
-            inputs.block_table.as_ref(),
-            MTLResourceOptions::StorageModeShared,
-        );
+        let key_pool = state
+            .device
+            .try_new_buffer_with_slice(
+                inputs.k_pool_bf16.as_ref(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("test buffer-with-slice allocation must succeed");
+        let value_pool = state
+            .device
+            .try_new_buffer_with_slice(
+                inputs.v_pool_bf16.as_ref(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("test buffer-with-slice allocation must succeed");
+        let q = state
+            .device
+            .try_new_buffer_with_slice(
+                inputs.q_bf16.as_ref(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("test buffer-with-slice allocation must succeed");
+        let block_table = state
+            .device
+            .try_new_buffer_with_slice(
+                inputs.block_table.as_ref(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("test buffer-with-slice allocation must succeed");
         let context_lens = [inputs.context_len as u32];
         let context_lens = state
             .device
-            .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+            .expect("test buffer-with-slice allocation must succeed");
         Self {
             key_pool,
             value_pool,
@@ -314,9 +327,15 @@ fn read_bf16_output(state: &MetalState, source: &Buffer, elements: usize) -> Vec
     let bytes = elements * std::mem::size_of::<u16>();
     let shared = state
         .device
-        .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-    let command_buffer = state.command_queue.new_command_buffer();
-    let encoder = command_buffer.new_blit_command_encoder();
+        .try_new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
+    let command_buffer = state
+        .command_queue
+        .try_new_command_buffer()
+        .expect("test command queue must provide a command buffer");
+    let encoder = command_buffer
+        .try_new_blit_command_encoder()
+        .expect("test command buffer must provide a blit encoder");
     encoder.copy_from_buffer(source, 0, &shared, 0, bytes as u64);
     encoder.end_encoding();
     command_buffer.commit();
@@ -387,7 +406,8 @@ fn dispatch_varlen_two_rows(
     let cu_seqlens = [0i32, 2];
     let cu_seqlens = state
         .device
-        .new_buffer_with_slice(cu_seqlens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(cu_seqlens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let (q_stride, kv_block_stride, kv_head_stride) =
         common_strides(inputs.shape.num_heads, inputs.shape.num_kv_heads);
     let params = PagedAttentionVarlenParams {
@@ -611,10 +631,12 @@ fn run_full_context_stage1_case(state: &MetalState, context_len: usize) {
     let pool_bytes = pool_elements * std::mem::size_of::<u16>();
     let key_pool = state
         .device
-        .new_buffer(pool_bytes as u64, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(pool_bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer(pool_bytes as u64, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(pool_bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
 
     // Allocate directly in shared Metal storage so the 65K fixture does not
     // retain duplicate 128 MiB host vectors. Unmapped pages and partial-block
@@ -694,11 +716,13 @@ fn run_full_context_stage1_case(state: &MetalState, context_len: usize) {
     );
     let block_table_buffer = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let context_lens = [context_len as u32];
     let context_lens_buffer = state
         .device
-        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let q_raw = RawBufferInfo {
         ptr: q.as_ptr() as *mut c_void,
         offset: 0,
@@ -799,7 +823,8 @@ fn grouped_qwen35_full_context_stage1_matches_analytic_mean() {
 fn zeroed_shared_buffer(state: &MetalState, bytes: usize) -> Buffer {
     let buffer = state
         .device
-        .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
     unsafe { std::ptr::write_bytes(buffer.contents() as *mut u8, 0, bytes) };
     buffer
 }
@@ -821,11 +846,13 @@ fn benchmark_context(state: &MetalState, context_len: u32) {
     let block_table: Vec<u32> = (0..logical_blocks).collect();
     let block_table = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let context_lens = [context_len];
     let context_lens = state
         .device
-        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let q_elements = 2 * NUM_HEADS as usize * HEAD_SIZE as usize;
     let q = zeroed_shared_buffer(state, q_elements * std::mem::size_of::<u16>());
     let q_raw = RawBufferInfo {
@@ -872,7 +899,8 @@ fn benchmark_context(state: &MetalState, context_len: u32) {
     let cu_seqlens = [0i32, 2];
     let cu_seqlens = state
         .device
-        .new_buffer_with_slice(cu_seqlens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(cu_seqlens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     let run_decode = || unsafe {
         dispatch_paged_attention_v2_raw(

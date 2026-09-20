@@ -98,7 +98,12 @@ impl ResponseStore {
     pub async fn cleanup_expired(&self) -> Result<u32> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("system clock is set before UNIX_EPOCH: {e}"),
+                )
+            })?
             .as_secs() as i64;
         writer::cleanup_expired(&self.pool, now)
             .await

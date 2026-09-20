@@ -228,7 +228,7 @@ impl DsparkBackend for MuseGlimmerInner {
         let tap_layers = self
             .dflash
             .as_ref()
-            .expect("checked DFlash companion")
+            .ok_or_else(|| Error::from_reason("checked DFlash companion"))?
             .config
             .target_layers
             .clone();
@@ -312,7 +312,7 @@ impl MuseGlimmerInner {
         }
         Ok((
             last_logits
-                .expect("non-empty prefill")
+                .ok_or_else(|| Error::from_reason("non-empty prefill"))?
                 .squeeze(Some(&[1]))?,
             DFlashTurnState {
                 context,
@@ -443,7 +443,7 @@ impl MuseGlimmerInner {
         let block_size = self
             .dflash
             .as_ref()
-            .expect("loaded DFlash companion")
+            .ok_or_else(|| Error::from_reason("loaded DFlash companion"))?
             .config
             .block_size;
         let mut rng = rand::rng();

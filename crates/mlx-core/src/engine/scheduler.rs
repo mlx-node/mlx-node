@@ -1116,11 +1116,10 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         for planned_kind in [StepKind::Decode, StepKind::Prefill] {
             if planned_kind == StepKind::Prefill {
                 for row in &mut rows {
-                    let turn = self
-                        .running
-                        .iter()
-                        .find(|turn| turn.seq_id == row.seq_id)
-                        .unwrap();
+                    let Some(turn) = self.running.iter().find(|turn| turn.seq_id == row.seq_id)
+                    else {
+                        continue;
+                    };
                     let extra = turn.decode_draft_allowance.min(budget);
                     row.num_tokens += extra;
                     budget -= extra;

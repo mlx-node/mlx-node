@@ -284,7 +284,9 @@ pub(crate) mod recipe {
             let dtype = weight.dtype()?;
             if !matches!(dtype, DType::Float32 | DType::Float16 | DType::BFloat16) {
                 has_prequantized_vision = true;
-                let base = key.strip_suffix(".weight").expect("suffix checked");
+                let base = key.strip_suffix(".weight").ok_or_else(|| {
+                    Error::from_reason(format!("vision key '{key}' lost its '.weight' suffix"))
+                })?;
                 if !weights.contains_key(&format!("{base}.scales"))
                     && !weights.contains_key(&format!("{base}.weight_scale_inv"))
                 {
@@ -333,7 +335,12 @@ pub(crate) mod recipe {
                     .to_string(),
             ));
         }
-        let mode = top_level_mode.expect("explicit mode was parsed above");
+        let mode = top_level_mode.ok_or_else(|| {
+            Error::from_reason(
+                "Qwen vision source declared quantization metadata but no explicit mode"
+                    .to_string(),
+            )
+        })?;
         let uniform = match mode {
             PerLayerMode::Affine => QwenVisionUniformQuant {
                 mode: "affine",
@@ -371,7 +378,11 @@ pub(crate) mod recipe {
         };
 
         for scale_key in &vision_scale_keys {
-            let base = scale_key.strip_suffix(".scales").expect("suffix checked");
+            let base = scale_key.strip_suffix(".scales").ok_or_else(|| {
+                Error::from_reason(format!(
+                    "vision scale key '{scale_key}' lost its '.scales' suffix"
+                ))
+            })?;
             if !weights.contains_key(&format!("{base}.weight")) {
                 return Err(Error::from_reason(format!(
                     "Qwen vision quantization group '{base}' is missing its .weight tensor"
@@ -391,7 +402,11 @@ pub(crate) mod recipe {
             }
         }
         for bias_key in &vision_bias_keys {
-            let base = bias_key.strip_suffix(".biases").expect("suffix checked");
+            let base = bias_key.strip_suffix(".biases").ok_or_else(|| {
+                Error::from_reason(format!(
+                    "vision bias key '{bias_key}' lost its '.biases' suffix"
+                ))
+            })?;
             if !weights.contains_key(&format!("{base}.scales")) {
                 return Err(Error::from_reason(format!(
                     "Qwen vision quantization group '{base}' has orphaned .biases without .scales"
@@ -522,7 +537,11 @@ pub(crate) mod recipe {
                 continue;
             };
             let prefix = prefix.to_string();
-            let array = weights.get(&key).expect("key collected from weights");
+            let array = weights.get(&key).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "pre-stacked expert key '{key}' vanished from weights"
+                ))
+            })?;
             let ndim = array.ndim()?;
             if ndim < 2 {
                 return Err(Error::from_reason(format!(
@@ -583,16 +602,22 @@ pub(crate) mod recipe {
                     projection.source_name(),
                 )));
             }
-            let weight = weights.get(weight_key).expect("preflight weight exists");
+            let weight = weights.get(weight_key).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "preflighted weight '{weight_key}' vanished from weights"
+                ))
+            })?;
             let experts = weight.shape_at(0)?;
             let outputs = weight.shape_at(1)?;
             for (suffix, companion_key) in companions {
                 if *suffix == ".weight" {
                     continue;
                 }
-                let companion = weights
-                    .get(companion_key)
-                    .expect("preflight companion exists");
+                let companion = weights.get(companion_key).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "preflighted companion '{companion_key}' vanished from weights"
+                    ))
+                })?;
                 let companion_experts = companion.shape_at(0)?;
                 let companion_outputs = companion.shape_at(1)?;
                 if (companion_experts, companion_outputs) != (experts, outputs) {
@@ -605,9 +630,11 @@ pub(crate) mod recipe {
 
         let normalized = plans.len();
         for (source, _prefix, projection, _suffix, outputs) in plans {
-            let array = weights
-                .remove(&source)
-                .expect("preflighted source tensor must still exist");
+            let array = weights.remove(&source).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "preflighted source tensor '{source}' must still exist"
+                ))
+            })?;
             match projection {
                 PrestackedExpertProjection::GateUp => {
                     let fused = array.shape_at(1)?;
@@ -807,7 +834,11 @@ pub(crate) mod recipe {
                     })?;
 
                     for scale_key in &vision_scale_keys {
-                        let base = scale_key.strip_suffix(".scales").unwrap();
+                        let base = scale_key.strip_suffix(".scales").ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "vision scale key '{scale_key}' lost its '.scales' suffix"
+                            ))
+                        })?;
                         let weight_key = format!("{}.weight", base);
                         let biases_key = format!("{}.biases", base);
 
@@ -867,7 +898,11 @@ pub(crate) mod recipe {
 
                 for scale_key in &scale_keys {
                     let weight_key = scale_key.replace("_scale_inv", "");
-                    let scale_inv = new_weights.remove(scale_key).unwrap();
+                    let scale_inv = new_weights.remove(scale_key).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "FP8 scale_inv key '{scale_key}' vanished from weights"
+                        ))
+                    })?;
                     if let Some(weight) = new_weights.remove(&weight_key) {
                         let dequant = dequant_fp8(&weight, &scale_inv, target_dtype)?;
                         // Eval immediately to prevent lazy chain accumulation (OOM with many FP8 pairs)
@@ -929,7 +964,9 @@ pub(crate) mod recipe {
                     {
                         continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
                     }
-                    let v = new_weights.get(&k).unwrap();
+                    let v = new_weights.get(&k).ok_or_else(|| {
+                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
+                    })?;
                     // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
                     // packed Uint32, Uint8 scales) are never astype'd.
                     let current_dtype = v.dtype()?;
@@ -963,8 +1000,7 @@ pub(crate) mod recipe {
                 //     storage → fail loud (Err propagated).
                 let quantized_bases: std::collections::HashSet<String> = new_weights
                     .keys()
-                    .filter(|k| k.ends_with(".scales"))
-                    .map(|k| k.strip_suffix(".scales").unwrap().to_string())
+                    .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
                     .collect();
                 let keys: Vec<String> = new_weights.keys().cloned().collect();
                 for k in keys {
@@ -985,13 +1021,14 @@ pub(crate) mod recipe {
                         }
                         continue;
                     }
-                    if k.ends_with(".weight") {
-                        let base = k.strip_suffix(".weight").unwrap();
-                        if quantized_bases.contains(base) {
-                            continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
-                        }
+                    if let Some(base) = k.strip_suffix(".weight")
+                        && quantized_bases.contains(base)
+                    {
+                        continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
                     }
-                    let v = new_weights.get(&k).unwrap();
+                    let v = new_weights.get(&k).ok_or_else(|| {
+                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
+                    })?;
                     // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
                     // packed Uint32, Uint8 scales) are never astype'd.
                     let current_dtype = v.dtype()?;
@@ -1157,7 +1194,11 @@ pub(crate) mod recipe {
                     .find(|k| k.ends_with(".input_layernorm.weight") && !k.starts_with("mtp."))
                     .cloned();
                 if let Some(ref k) = test_key {
-                    let v = new_weights.get(k).unwrap();
+                    let v = new_weights.get(k).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "sanitization probe key '{k}' vanished from weights"
+                        ))
+                    })?;
                     // Check first element value: ~0.0 = raw HF, ~1.0 = already shifted
                     let f32_v = v.astype(DType::Float32)?;
                     f32_v.eval();
@@ -1225,7 +1266,9 @@ pub(crate) mod recipe {
                 if k.contains("patch_embed.proj.weight") {
                     // Conv3d/Conv2d: PyTorch [out, in, t, h, w] → MLX [out, t, h, w, in]
                     // Skip if already in MLX format (last dim == in_channels, typically 3 for RGB)
-                    let v = new_weights.get(&k).unwrap();
+                    let v = new_weights.get(&k).ok_or_else(|| {
+                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
+                    })?;
                     let ndim = v.ndim()? as usize;
                     if ndim == 5 {
                         let last_dim = v.shape_at(4)?;
@@ -1246,7 +1289,9 @@ pub(crate) mod recipe {
                     // Conv1d: PyTorch [out, in/g, k] → MLX [out, k, in/g]
                     // For GatedDeltaNet conv1d, k=4 (linear_conv_kernel_dim)
                     // Skip if already in MLX format (last dim == in_channels >> k)
-                    let v = new_weights.get(&k).unwrap();
+                    let v = new_weights.get(&k).ok_or_else(|| {
+                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
+                    })?;
                     let ndim = v.ndim()? as usize;
                     if ndim == 3 {
                         let dim2 = v.shape_at(2)?;
@@ -1265,7 +1310,9 @@ pub(crate) mod recipe {
                     // MTP-head norms are excluded here (the body suffixes also
                     // match `mtp.*` keys) and shifted separately below under the
                     // independent `mtp_norms_need_shift` probe.
-                    let v = new_weights.get(&k).unwrap();
+                    let v = new_weights.get(&k).ok_or_else(|| {
+                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
+                    })?;
                     if v.ndim()? == 1 {
                         let shifted = v.add_scalar(1.0)?;
                         new_weights.insert(k, shifted);
@@ -1285,7 +1332,9 @@ pub(crate) mod recipe {
                     .cloned()
                     .collect();
                 for k in mtp_keys {
-                    let v = new_weights.get(&k).unwrap();
+                    let v = new_weights.get(&k).ok_or_else(|| {
+                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
+                    })?;
                     if v.ndim()? == 1 {
                         let shifted = v.add_scalar(1.0)?;
                         new_weights.insert(k, shifted);
@@ -1989,7 +2038,11 @@ pub(crate) mod recipe {
                 // Split fused experts.gate_up_proj and rename experts.down_proj.
                 if stripped.ends_with(".experts.gate_up_proj") {
                     // Split [num_experts, 2*moe_inter, hidden] along axis -2 into two halves
-                    let base = stripped.strip_suffix(".gate_up_proj").unwrap();
+                    let base = stripped.strip_suffix(".gate_up_proj").ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "expert key '{stripped}' lost its '.gate_up_proj' suffix"
+                        ))
+                    })?;
                     let shape = array.shape()?;
                     let mid = shape[1] / 2; // split the output dimension in half
 
@@ -2009,7 +2062,11 @@ pub(crate) mod recipe {
                 }
 
                 if stripped.ends_with(".experts.down_proj") {
-                    let base = stripped.strip_suffix(".down_proj").unwrap();
+                    let base = stripped.strip_suffix(".down_proj").ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "expert key '{stripped}' lost its '.down_proj' suffix"
+                        ))
+                    })?;
                     let out_key =
                         format!("language_model.model.{base}.switch_glu.down_proj.weight");
                     sanitized.insert(out_key, array);
@@ -4198,7 +4255,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 classes.bits,
                 classes.group_size,
                 &classes.mode,
-                classes.predicate.as_deref().expect(PREDICATE_RESOLVED),
+                classes
+                    .predicate
+                    .as_deref()
+                    .ok_or_else(|| Error::from_reason(PREDICATE_RESOLVED))?,
                 classes.embed_quantizable,
             )?;
 
@@ -4231,7 +4291,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 classes.bits,
                 classes.group_size,
                 &classes.mode,
-                classes.predicate.as_deref().expect(PREDICATE_RESOLVED),
+                classes
+                    .predicate
+                    .as_deref()
+                    .ok_or_else(|| Error::from_reason(PREDICATE_RESOLVED))?,
                 classes.embed_quantizable,
             )?;
             if classes.uniform_default {
@@ -8288,9 +8351,9 @@ fn resolve_quant_classes(
         }));
     };
 
-    let weight_keys = recipe_weight_keys
-        .as_deref()
-        .expect("recipe keys are collected whenever quant_recipe is present");
+    let weight_keys = recipe_weight_keys.as_deref().ok_or_else(|| {
+        Error::from_reason("recipe keys are collected whenever quant_recipe is present")
+    })?;
     // Recipes emit affine `Custom` decisions for protected tensors (lm_head,
     // AWQ-corrected attn/SSM projections, etc). Affine quantize only supports
     // group_size ∈ {32, 64, 128}, so when the global mode is nvfp4 (which
@@ -8451,8 +8514,14 @@ fn quantize_weights_inner(
                     // Plain FP8 cannot inherit any supported uniform top-level
                     // default. Without a recipe there is no safe way to
                     // reconstruct its required per-layer mode override.
-                    let weight = weights.get(key).expect("key comes from weights.keys()");
-                    let scales = &weights[&format!("{base}.scales")];
+                    let weight = weights.get(key).ok_or_else(|| {
+                        Error::from_reason(format!("weight key '{key}' vanished from weights"))
+                    })?;
+                    let scales = weights.get(&format!("{base}.scales")).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "quantization group '{base}' lost its .scales sidecar"
+                        ))
+                    })?;
                     if weight.dtype()? == DType::Uint8
                         && matches!(
                             scales.dtype()?,

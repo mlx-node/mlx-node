@@ -533,7 +533,9 @@ impl VLModelInner {
                 offset += n_to_process;
             }
 
-            let logits = chunk_logits.unwrap();
+            let logits = chunk_logits.ok_or_else(|| {
+                Error::new(Status::GenericFailure, "empty prompt produced no logits")
+            })?;
             let last_seq = logits.shape_at(1)?;
             logits
                 .slice_axis(1, last_seq - 1, last_seq)?
@@ -690,7 +692,9 @@ impl VLModelInner {
             }
 
             // Token was already evaluated and pushed above (before penalties)
-            let token_value = *all_tokens.last().unwrap();
+            let token_value = *all_tokens
+                .last()
+                .ok_or_else(|| Error::new(Status::GenericFailure, "decode produced no token"))?;
 
             if token_value == eos_token_id as u32 {
                 finish_reason = "stop";
@@ -1100,7 +1104,10 @@ impl VLModelInner {
         }
 
         // === STEP 2: Merge KV caches into batch ===
-        let max_cache_idx = *item_cache_idxs.iter().max().unwrap();
+        let max_cache_idx = *item_cache_idxs
+            .iter()
+            .max()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "batch has no KV cache index"))?;
         let mut left_padding_values: Vec<i32> = Vec::with_capacity(batch_size);
 
         for &cache_idx in &item_cache_idxs {
@@ -1683,7 +1690,12 @@ fn get_rope_index(
         return Ok((position_ids, 0));
     }
 
-    let grid_thw = image_grid_thw.unwrap();
+    let grid_thw = image_grid_thw.ok_or_else(|| {
+        Error::new(
+            Status::GenericFailure,
+            "image_grid_thw missing after is_none check",
+        )
+    })?;
 
     // Get input IDs and grid data
     let input_ids_data = input_ids.to_int32()?;

@@ -200,7 +200,12 @@ pub(crate) fn top_level_quant_metadata(
         .into_iter()
         .max_by_key(|&(bits, count)| (count, bits))
         .map(|(bits, _)| bits)
-        .expect("non-empty overrides imply at least one bits entry");
+        .ok_or_else(|| {
+            Error::from_reason(
+                "gemma-QAT import collected no bits entries despite non-empty overrides"
+                    .to_string(),
+            )
+        })?;
     Ok((bits as i32, group_size as i32, mode))
 }
 
@@ -519,15 +524,15 @@ pub(crate) fn import_gemma_prequantized(
         }
         // Embedding scale: `{m}.embedding_scale` (paired with embedding_quantized).
         if let Some(prefix) = stripped.strip_suffix(".embedding_scale") {
-            quant
+            let part = quant
                 .entry(prefix.to_string())
                 .or_insert_with(|| QuantParts {
                     weight: None,
                     scale: None,
                     stripped_prefix: prefix.to_string(),
-                })
-                .stripped_prefix = prefix.to_string();
-            quant.get_mut(prefix).unwrap().scale = Some(array);
+                });
+            part.stripped_prefix = prefix.to_string();
+            part.scale = Some(array);
             continue;
         }
         if let Some(prefix) = stripped.strip_suffix(".embedding_quantized") {

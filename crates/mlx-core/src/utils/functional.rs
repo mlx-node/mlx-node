@@ -414,7 +414,10 @@ pub fn qwen3_forward_hidden_states_impl(
                 ckpt_contexts,
             )?;
 
-            hidden_states = outputs.into_iter().next().unwrap();
+            hidden_states = outputs
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::from_reason("checkpointed layer produced no output"))?;
         } else {
             // Standard path
             let layer_params = get_layer_params(params, layer_idx, config)?;
@@ -532,7 +535,10 @@ pub fn qwen3_forward_hidden_states_chunked(
 
     // Concatenate all chunks: Vec<[chunk, T, H]> -> [B, T, H]
     if chunk_results.len() == 1 {
-        Ok(chunk_results.into_iter().next().unwrap())
+        chunk_results
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::from_reason("expected exactly one chunk result"))
     } else {
         let refs: Vec<&MxArray> = chunk_results.iter().collect();
         MxArray::concatenate_many(refs, Some(0))
@@ -718,7 +724,10 @@ pub fn chunked_lm_head_selective_logprobs(
 
     // Concatenate all chunks: Vec<[chunk, T]> -> [B, T]
     if chunk_logprobs.len() == 1 {
-        Ok(chunk_logprobs.into_iter().next().unwrap())
+        chunk_logprobs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::from_reason("expected exactly one chunk logprobs result"))
     } else {
         let refs: Vec<&MxArray> = chunk_logprobs.iter().collect();
         MxArray::concatenate_many(refs, Some(0))
@@ -1234,7 +1243,10 @@ fn qwen3_5_block_checkpointed(
         ckpt_contexts,
     )?;
 
-    Ok(outputs.into_iter().next().unwrap())
+    outputs
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::from_reason("checkpointed forward produced no output"))
 }
 
 /// Qwen3.5 Dense forward with optional gradient checkpointing.
@@ -1549,7 +1561,10 @@ fn qwen3_5_moe_block_checkpointed(
         ckpt_contexts,
     )?;
 
-    Ok(outputs.into_iter().next().unwrap())
+    outputs
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::from_reason("checkpointed forward produced no output"))
 }
 
 /// Qwen3.5 MoE forward with optional gradient checkpointing.

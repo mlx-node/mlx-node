@@ -404,7 +404,7 @@ impl DsparkBackend for Qwen35Inner {
         let tap_layers = self
             .dflash2
             .as_ref()
-            .expect("checked DFlash2 companion")
+            .ok_or_else(|| Error::from_reason("checked DFlash2 companion"))?
             .config
             .target_layers
             .clone();
@@ -535,7 +535,7 @@ impl Qwen35Inner {
             offset = end;
         }
         Ok((
-            last_logits.expect("non-empty DFlash2 prefill"),
+            last_logits.ok_or_else(|| Error::from_reason("non-empty DFlash2 prefill"))?,
             DFlash2TurnState {
                 context,
                 next_position: position_base.saturating_add(tokens.len() as i32),
@@ -597,7 +597,7 @@ impl Qwen35Inner {
             self.config.max_position_embeddings,
             self.dflash2
                 .as_ref()
-                .expect("loaded DFlash2 companion")
+                .ok_or_else(|| Error::from_reason("loaded DFlash2 companion"))?
                 .max_position_embeddings(),
             &mut params,
         )?;
@@ -688,7 +688,7 @@ impl Qwen35Inner {
         let block_size = self
             .dflash2
             .as_ref()
-            .expect("loaded DFlash2 companion")
+            .ok_or_else(|| Error::from_reason("loaded DFlash2 companion"))?
             .config
             .block_size;
         let mut rng = rand::rng();

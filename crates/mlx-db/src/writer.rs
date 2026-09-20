@@ -17,7 +17,7 @@ pub async fn start_run(
     config: &str,
 ) -> Result<String, DbError> {
     let run_id = Uuid::new_v4().to_string();
-    let started_at = chrono_now_ms();
+    let started_at = chrono_now_ms()?;
 
     sqlx::query(
         "INSERT INTO training_runs (id, name, model_name, model_path, config, started_at, status) VALUES (?, ?, ?, ?, ?, ?, 'running')",
@@ -37,7 +37,7 @@ pub async fn start_run(
 
 /// End a training run
 pub async fn end_run(pool: &SqlitePool, run_id: &str, status: &str) -> Result<(), DbError> {
-    let ended_at = chrono_now_ms();
+    let ended_at = chrono_now_ms()?;
 
     sqlx::query("UPDATE training_runs SET ended_at = ?, status = ? WHERE id = ?")
         .bind(ended_at)
@@ -70,7 +70,7 @@ pub async fn record_step(
     generations: Vec<GenerationRecord>,
     tool_calls: Vec<Vec<ToolCallRecord>>,
 ) -> Result<i64, DbError> {
-    let created_at = chrono_now_ms();
+    let created_at = chrono_now_ms()?;
 
     // Start transaction for atomicity
     let mut tx = pool
@@ -170,7 +170,7 @@ pub async fn write_log(
     file: Option<&str>,
     line: Option<u32>,
 ) -> Result<(), DbError> {
-    let created_at = chrono_now_ms();
+    let created_at = chrono_now_ms()?;
 
     sqlx::query(
         "INSERT INTO logs (run_id, level, target, message, file, line, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -203,11 +203,12 @@ pub async fn increment_run_steps(pool: &SqlitePool, run_id: &str) -> Result<(), 
 }
 
 /// Get current timestamp in milliseconds
-fn chrono_now_ms() -> i64 {
-    std::time::SystemTime::now()
+fn chrono_now_ms() -> Result<i64, DbError> {
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is set before UNIX_EPOCH")
-        .as_millis() as i64
+        .map_err(|e| DbError::Write(format!("system clock is set before UNIX_EPOCH: {e}")))?
+        .as_millis();
+    Ok(millis as i64)
 }
 
 /// Record step from RewardOutput JSON (direct integration)

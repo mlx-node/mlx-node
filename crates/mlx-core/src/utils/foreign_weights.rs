@@ -158,7 +158,9 @@ fn convert_pp_lcnet_ori(
         "input_size": 224,
     });
 
-    Ok((tensors, serde_json::to_string_pretty(&config).unwrap()))
+    let config_json = serde_json::to_string_pretty(&config)
+        .map_err(|e| Error::from_reason(format!("Failed to serialize config: {e}")))?;
+    Ok((tensors, config_json))
 }
 
 // ===========================================================================
@@ -219,7 +221,9 @@ fn convert_uvdoc(input_path: &Path, verbose: bool) -> Result<(HashMap<String, Mx
         "img_size": [488, 712],
     });
 
-    Ok((tensors, serde_json::to_string_pretty(&config).unwrap()))
+    let config_json = serde_json::to_string_pretty(&config)
+        .map_err(|e| Error::from_reason(format!("Failed to serialize config: {e}")))?;
+    Ok((tensors, config_json))
 }
 
 /// Process PyTorch UVDoc checkpoint keys.

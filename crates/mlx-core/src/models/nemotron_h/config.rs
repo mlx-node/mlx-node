@@ -255,7 +255,7 @@ fn parse_eos_ids(raw: &Value) -> Result<Vec<i32>> {
         None => Ok(Vec::new()),
         Some(v) if v.is_array() => v
             .as_array()
-            .expect("checked is_array")
+            .ok_or_else(|| Error::from_reason("config.json eos_token_id failed is_array re-check"))?
             .iter()
             .map(|item| {
                 item.as_i64().map(|v| v as i32).ok_or_else(|| {

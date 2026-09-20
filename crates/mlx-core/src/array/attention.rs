@@ -4,7 +4,6 @@
 
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use std::ffi::CString;
 
 use super::MxArray;
 
@@ -81,7 +80,7 @@ pub fn scaled_dot_product_attention_causal(
 ) -> Result<MxArray> {
     let handle = unsafe {
         // Use "causal" mode - MLX handles causal masking internally with optimized kernel
-        let mask_mode = CString::new("causal").unwrap();
+        let mask_mode = c"causal";
         sys::mlx_fast_scaled_dot_product_attention(
             queries.handle.0,
             keys.handle.0,

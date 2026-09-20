@@ -151,7 +151,9 @@ pub(crate) fn merge_split_projections(
         .collect();
 
     for qkv_key in &split_qkv_keys {
-        let prefix = qkv_key.strip_suffix(".in_proj_qkv.weight").unwrap();
+        let prefix = qkv_key
+            .strip_suffix(".in_proj_qkv.weight")
+            .ok_or_else(|| Error::from_reason("qkv key lost its suffix"))?;
         let qkv_prefix = format!("{}.in_proj_qkv", prefix);
         let z_prefix = format!("{}.in_proj_z", prefix);
         let z_weight_key = format!("{}.in_proj_z.weight", prefix);
@@ -169,8 +171,12 @@ pub(crate) fn merge_split_projections(
             continue;
         }
 
-        let qkv_w = result.remove(qkv_key).unwrap();
-        let z_w = result.remove(&z_weight_key).unwrap();
+        let qkv_w = result
+            .remove(qkv_key)
+            .ok_or_else(|| Error::from_reason("qkv weight missing"))?;
+        let z_w = result
+            .remove(&z_weight_key)
+            .ok_or_else(|| Error::from_reason("z weight missing"))?;
         let combined_w = MxArray::concatenate(&qkv_w, &z_w, 0)?;
         result.insert(format!("{}.in_proj_qkvz.weight", prefix), combined_w);
 
@@ -192,7 +198,9 @@ pub(crate) fn merge_split_projections(
         .collect();
 
     for b_key in &split_b_keys {
-        let prefix = b_key.strip_suffix(".in_proj_b.weight").unwrap();
+        let prefix = b_key
+            .strip_suffix(".in_proj_b.weight")
+            .ok_or_else(|| Error::from_reason("in_proj_b key lost its suffix"))?;
         let b_prefix = format!("{}.in_proj_b", prefix);
         let a_prefix = format!("{}.in_proj_a", prefix);
         let a_weight_key = format!("{}.in_proj_a.weight", prefix);
@@ -207,8 +215,12 @@ pub(crate) fn merge_split_projections(
             continue;
         }
 
-        let b_w = result.remove(b_key).unwrap();
-        let a_w = result.remove(&a_weight_key).unwrap();
+        let b_w = result
+            .remove(b_key)
+            .ok_or_else(|| Error::from_reason("in_proj_b weight missing"))?;
+        let a_w = result
+            .remove(&a_weight_key)
+            .ok_or_else(|| Error::from_reason("in_proj_a weight missing"))?;
         let combined_w = MxArray::concatenate(&b_w, &a_w, 0)?;
         result.insert(format!("{}.in_proj_ba.weight", prefix), combined_w);
 
@@ -1015,7 +1027,8 @@ fn quantize_array(
             crate::quant::fp8_weight::quantize_per_output_channel(array, key_for_error)?;
         return Ok((weight, scales, None));
     }
-    let mode_c = CString::new(mode_to_str(plq.mode)).expect("static mode has no NUL");
+    let mode_c = CString::new(mode_to_str(plq.mode))
+        .map_err(|_| Error::from_reason("quant mode string contains NUL"))?;
     let mut out_quantized: *mut mlx_sys::mlx_array = std::ptr::null_mut();
     let mut out_scales: *mut mlx_sys::mlx_array = std::ptr::null_mut();
     let mut out_biases: *mut mlx_sys::mlx_array = std::ptr::null_mut();
@@ -1071,7 +1084,8 @@ fn dequantize_source_head(
     let biases_ptr = params
         .get(&format!("{prefix}.biases"))
         .map_or(std::ptr::null_mut(), |biases| biases.as_raw_ptr());
-    let mode_c = CString::new(mode_to_str(source_plq.mode)).expect("static mode has no NUL");
+    let mode_c = CString::new(mode_to_str(source_plq.mode))
+        .map_err(|_| Error::from_reason("quant mode string contains NUL"))?;
     let handle = unsafe {
         mlx_sys::mlx_dequantize(
             weight.as_raw_ptr(),
@@ -1129,11 +1143,11 @@ fn install_runtime_draft_lm_head(
     if source_plq == target_plq && params.contains_key(&format!("{source_prefix}.scales")) {
         let weight = params
             .get(&format!("{source_prefix}.weight"))
-            .expect("source weight checked")
+            .ok_or_else(|| Error::from_reason("source weight checked"))?
             .clone();
         let scales = params
             .get(&format!("{source_prefix}.scales"))
-            .expect("source scales checked")
+            .ok_or_else(|| Error::from_reason("source scales checked"))?
             .clone();
         params.insert(format!("{PREFIX}.weight"), weight);
         params.insert(format!("{PREFIX}.scales"), scales);
@@ -1297,12 +1311,12 @@ fn apply_weights_inner_with_residency(
             .copied()
             .or_else(|| {
                 if prefix.ends_with(".in_proj_qkvz") {
-                    let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
+                    let base = prefix.strip_suffix(".in_proj_qkvz")?;
                     let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
                     let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
                     merge_per_layer(qkv, z, "in_proj_qkvz", "qkv", "z")
                 } else if prefix.ends_with(".in_proj_ba") {
-                    let base = prefix.strip_suffix(".in_proj_ba").unwrap();
+                    let base = prefix.strip_suffix(".in_proj_ba")?;
                     let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
                     let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
                     merge_per_layer(b_val, a_val, "in_proj_ba", "b", "a")

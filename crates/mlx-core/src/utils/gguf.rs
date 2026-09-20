@@ -334,20 +334,43 @@ impl GgufTensorInfo {
     }
 
     /// Total number of elements
-    pub fn num_elements(&self) -> u64 {
-        self.dims.iter().product::<u64>().max(1)
+    ///
+    /// `dims` come straight off the GGUF header, so the product is checked: a
+    /// hostile descriptor that overflows u64 is an `Err`, not a panic or a
+    /// silently wrapped count.
+    pub fn num_elements(&self) -> Result<u64> {
+        self.dims
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+            .map(|n| n.max(1))
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "GGUF tensor '{}' dimensions {:?} overflow a u64 element count",
+                    self.name, self.dims
+                ))
+            })
     }
 
     /// Size in bytes of the raw tensor data
-    pub fn data_size(&self) -> u64 {
-        let n = self.num_elements();
-        if self.tensor_type.is_quantized() {
+    ///
+    /// Checked for the same reason as [`Self::num_elements`]: the element count
+    /// is header-supplied and `* type_size` can overflow u64 on its own.
+    pub fn data_size(&self) -> Result<u64> {
+        let n = self.num_elements()?;
+        let type_size = self.tensor_type.type_size() as u64;
+        let total = if self.tensor_type.is_quantized() {
             let block_size = self.tensor_type.block_size() as u64;
             let n_blocks = n / block_size;
-            n_blocks * self.tensor_type.type_size() as u64
+            n_blocks.checked_mul(type_size)
         } else {
-            n * self.tensor_type.type_size() as u64
-        }
+            n.checked_mul(type_size)
+        };
+        total.ok_or_else(|| {
+            Error::from_reason(format!(
+                "GGUF tensor '{}' data size overflows u64",
+                self.name
+            ))
+        })
     }
 }
 
@@ -686,8 +709,20 @@ fn load_unquantized_tensor(
         Error::from_reason(format!("Failed to seek to tensor '{}': {e}", tensor.name))
     })?;
 
-    let n_bytes = tensor.data_size() as usize;
-    let mut buf = vec![0u8; n_bytes];
+    let n_bytes = usize::try_from(tensor.data_size()?).map_err(|_| {
+        Error::from_reason(format!(
+            "GGUF tensor '{}' data size exceeds usize",
+            tensor.name
+        ))
+    })?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(n_bytes).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to allocate {} bytes for tensor '{}': {e}",
+            n_bytes, tensor.name
+        ))
+    })?;
+    buf.resize(n_bytes, 0);
     reader
         .read_exact(&mut buf)
         .map_err(|e| Error::from_reason(format!("Failed to read tensor '{}': {e}", tensor.name)))?;
@@ -757,7 +792,12 @@ fn load_q6k_tensor_bf16(
             tensor.name
         )));
     }
-    let num_elements = tensor.num_elements() as usize;
+    let num_elements = usize::try_from(tensor.num_elements()?).map_err(|_| {
+        Error::from_reason(format!(
+            "Q6_K tensor '{}' element count exceeds usize",
+            tensor.name
+        ))
+    })?;
     if !num_elements.is_multiple_of(QK_K) {
         return Err(Error::from_reason(format!(
             "Q6_K tensor '{}' has {num_elements} elements; expected a multiple of {QK_K}",
@@ -877,7 +917,12 @@ fn load_quantized_tensor(
     tensor: &GgufTensorInfo,
 ) -> Result<Vec<(String, MxArray)>> {
     let shape = tensor.mlx_shape();
-    let num_elements = tensor.num_elements() as usize;
+    let num_elements = usize::try_from(tensor.num_elements()?).map_err(|_| {
+        Error::from_reason(format!(
+            "Quantized tensor '{}' element count exceeds usize",
+            tensor.name
+        ))
+    })?;
     let block_size = tensor.tensor_type.block_size();
     let n_blocks = num_elements / block_size;
 
@@ -890,7 +935,13 @@ fn load_quantized_tensor(
         GgufTensorType::Q5_1 => 5,                        // 32 x 5-bit = 160 bits
         GgufTensorType::Q8_0 => 8,                        // 32 x 8-bit = 256 bits
         GgufTensorType::PQ2_0 => 8,
-        _ => unreachable!(),
+        other => {
+            return Err(Error::from_reason(format!(
+                "Tensor '{}' has type {} which is not an MLX affine block format",
+                tensor.name,
+                other.name()
+            )));
+        }
     };
 
     // Weight shape: the innermost dimension shrinks to its packed word count.
@@ -913,11 +964,47 @@ fn load_quantized_tensor(
     let mut sb_shape = leading_dims.to_vec();
     sb_shape.push(last / block_size as i64);
 
-    let w_elements: usize = w_shape.iter().map(|&d| d as usize).product();
-    let sb_elements: usize = sb_shape.iter().map(|&d| d as usize).product();
+    let w_elements: usize = w_shape
+        .iter()
+        .try_fold(1usize, |acc, &d| {
+            usize::try_from(d).ok().and_then(|d| acc.checked_mul(d))
+        })
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "Quantized tensor '{}' packed weight shape {w_shape:?} overflows usize",
+                tensor.name
+            ))
+        })?;
+    let sb_elements: usize = sb_shape
+        .iter()
+        .try_fold(1usize, |acc, &d| {
+            usize::try_from(d).ok().and_then(|d| acc.checked_mul(d))
+        })
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "Quantized tensor '{}' scales/biases shape {sb_shape:?} overflows usize",
+                tensor.name
+            ))
+        })?;
 
-    let mut weights_packed = vec![0u32; w_elements];
-    let mut scales = vec![0u16; sb_elements]; // f16
+    // Header-derived sizes: reserve fallibly so a hostile header is an Err,
+    // not an allocation abort.
+    let mut weights_packed: Vec<u32> = Vec::new();
+    weights_packed.try_reserve_exact(w_elements).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to allocate packed weights for tensor '{}': {e}",
+            tensor.name
+        ))
+    })?;
+    weights_packed.resize(w_elements, 0);
+    let mut scales: Vec<u16> = Vec::new(); // f16
+    scales.try_reserve_exact(sb_elements).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to allocate scales for tensor '{}': {e}",
+            tensor.name
+        ))
+    })?;
+    scales.resize(sb_elements, 0);
     // Only the asymmetric format fills this; the symmetric ones reconstruct
     // their offset from the scale at load and never allocate the array.
     let mut biases: Vec<u16> = Vec::new(); // f16
@@ -927,8 +1014,20 @@ fn load_quantized_tensor(
         Error::from_reason(format!("Failed to seek to tensor '{}': {e}", tensor.name))
     })?;
 
-    let data_size = tensor.data_size() as usize;
-    let mut raw = vec![0u8; data_size];
+    let data_size = usize::try_from(tensor.data_size()?).map_err(|_| {
+        Error::from_reason(format!(
+            "Quantized tensor '{}' data size exceeds usize",
+            tensor.name
+        ))
+    })?;
+    let mut raw: Vec<u8> = Vec::new();
+    raw.try_reserve_exact(data_size).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to allocate {data_size} bytes for tensor '{}': {e}",
+            tensor.name
+        ))
+    })?;
+    raw.resize(data_size, 0);
     reader
         .read_exact(&mut raw)
         .map_err(|e| Error::from_reason(format!("Failed to read tensor '{}': {e}", tensor.name)))?;
@@ -961,7 +1060,13 @@ fn load_quantized_tensor(
         }
         GgufTensorType::Q4_1 => {
             // Block: 2 bytes f16 scale, 2 bytes f16 bias, 16 bytes (32 x 4-bit weights)
-            biases = vec![0u16; sb_elements];
+            biases.try_reserve_exact(sb_elements).map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to allocate biases for tensor '{}': {e}",
+                    tensor.name
+                ))
+            })?;
+            biases.resize(sb_elements, 0);
             for i in 0..n_blocks {
                 let block = &raw[i * type_size..(i + 1) * type_size];
                 scales[i] = u16::from_le_bytes([block[0], block[1]]);
@@ -990,7 +1095,13 @@ fn load_quantized_tensor(
             // the HIGH nibble and bit `j + 16`. Each code is `d * q + m` with
             // q in 0..32 — exactly MLX's affine contract at 5 bits, so only
             // the container changes and the dequantized values are identical.
-            biases = vec![0u16; sb_elements];
+            biases.try_reserve_exact(sb_elements).map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to allocate biases for tensor '{}': {e}",
+                    tensor.name
+                ))
+            })?;
+            biases.resize(sb_elements, 0);
             for i in 0..n_blocks {
                 let block = &raw[i * type_size..(i + 1) * type_size];
                 scales[i] = u16::from_le_bytes([block[0], block[1]]);
@@ -1042,7 +1153,13 @@ fn load_quantized_tensor(
             }
         }
         GgufTensorType::PQ2_0 => {
-            biases = vec![0u16; sb_elements];
+            biases.try_reserve_exact(sb_elements).map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to allocate biases for tensor '{}': {e}",
+                    tensor.name
+                ))
+            })?;
+            biases.resize(sb_elements, 0);
             for (i, block) in raw.as_chunks::<34>().0.iter().enumerate() {
                 let d = u16::from_le_bytes([block[0], block[1]]);
                 if !half::f16::from_bits(d).is_finite() {
@@ -1058,7 +1175,13 @@ fn load_quantized_tensor(
                 }
             }
         }
-        _ => unreachable!(),
+        other => {
+            return Err(Error::from_reason(format!(
+                "Tensor '{}' has type {} which is not an MLX affine block format",
+                tensor.name,
+                other.name()
+            )));
+        }
     }
 
     // Create MxArray tensors
@@ -1105,8 +1228,17 @@ fn repack_rows_from_reader(
     label: &str,
 ) -> Result<KQuantArrays> {
     let row_bytes = format.row_bytes(k);
-    let chunk_rows = (chunk_target_bytes / row_bytes).clamp(1, rows.max(1));
-    let mut buf = vec![0u8; chunk_rows * row_bytes];
+    let chunk_rows = (chunk_target_bytes / row_bytes.max(1)).clamp(1, rows.max(1));
+    let buf_len = chunk_rows.checked_mul(row_bytes).ok_or_else(|| {
+        Error::from_reason(format!("K-quant chunk size overflows usize for {label}"))
+    })?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(buf_len).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to allocate {buf_len}-byte read buffer for {label}: {e}"
+        ))
+    })?;
+    buf.resize(buf_len, 0);
 
     let mut repacker = KQuantRepacker::new(format, k, rows)?;
     let mut done = 0usize;
@@ -1174,7 +1306,13 @@ fn load_kquant_repack(
     let k = last_dim as usize;
     // `num_elements()` is the product of the dims, so dividing by the last one
     // is exact.
-    let rows = tensor.num_elements() as usize / k;
+    let rows = usize::try_from(tensor.num_elements()?).map_err(|_| {
+        Error::from_reason(format!(
+            "{} tensor '{}' element count exceeds usize",
+            tensor.tensor_type.name(),
+            tensor.name
+        ))
+    })? / k;
 
     let abs_offset = gguf.data_offset + tensor.offset;
     reader.seek(SeekFrom::Start(abs_offset)).map_err(|e| {
@@ -2293,8 +2431,12 @@ fn fixup_shapes(weights: &mut HashMap<String, MxArray>) -> Result<()> {
     let w0_key = "vision_tower.patch_embed.proj.weight".to_string();
     let w1_key = "vision_tower.patch_embed.proj.weight.1".to_string();
     if weights.contains_key(&w0_key) && weights.contains_key(&w1_key) {
-        let w0 = weights.remove(&w0_key).unwrap();
-        let w1 = weights.remove(&w1_key).unwrap();
+        let w0 = weights.remove(&w0_key).ok_or_else(|| {
+            Error::from_reason(format!("'{w0_key}' vanished from the weight map"))
+        })?;
+        let w1 = weights.remove(&w1_key).ok_or_else(|| {
+            Error::from_reason(format!("'{w1_key}' vanished from the weight map"))
+        })?;
         // Stack: 2x [out, in, kH, kW] → [out, in, kH, kW, 2]
         let stacked = MxArray::stack(vec![&w0, &w1], Some(4))?;
         // Transpose [0, 4, 2, 3, 1]: [out, in, kH, kW, 2] → [out, 2, kH, kW, in]
@@ -3475,11 +3617,11 @@ fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<Strin
         )));
     }
 
-    let fewest_kv_heads = kv_per_layer
-        .iter()
-        .copied()
-        .min()
-        .expect("length was just checked against a non-empty layer set");
+    let fewest_kv_heads = kv_per_layer.iter().copied().min().ok_or_else(|| {
+        Error::from_reason(
+            "Gemma4 GGUF 'gemma4.attention.head_count_kv' is empty after the per-layer length check",
+        )
+    })?;
     let global_by_kv: std::collections::BTreeSet<u32> = kv_per_layer
         .iter()
         .enumerate()
@@ -3656,7 +3798,9 @@ fn preserved_source_quantization(
         .into_iter()
         .max_by_key(|&(profile, count)| (count, profile))
         .map(|(profile, _)| profile)
-        .expect("non-empty profiles imply a profile count");
+        .ok_or_else(|| {
+            Error::from_reason("non-empty source quantization profiles imply a profile count")
+        })?;
     let mixed = profiles.values().any(|&profile| profile != default_profile);
 
     let mut quant = serde_json::Map::new();
@@ -3994,7 +4138,11 @@ fn prepare_muse_secondary_config(
                     })
                     .collect::<Vec<_>>();
                 for (source, rest) in target_keys {
-                    let value = block.remove(&source).expect("collected quantization key");
+                    let value = block.remove(&source).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "collected quantization key '{source}' vanished from the override block"
+                        ))
+                    })?;
                     let target = format!("language_model.model.language_model.layers.{rest}");
                     if block.insert(target.clone(), value).is_some() {
                         return Err(Error::from_reason(format!(
@@ -4004,10 +4152,9 @@ fn prepare_muse_secondary_config(
                 }
                 block
             }
-            None => companion_quantization
-                .as_object()
-                .cloned()
-                .expect("preserved_source_quantization builds a JSON object"),
+            None => companion_quantization.as_object().cloned().ok_or_else(|| {
+                Error::from_reason("preserved_source_quantization did not build a JSON object")
+            })?,
         };
         for (prefix, profile) in &profiles {
             quant.insert(prefix.clone(), profile.to_json());
@@ -4031,7 +4178,7 @@ fn prepare_muse_secondary_config(
             validated
                 .dflash_config
                 .as_ref()
-                .expect("validated DFlash config must be present"),
+                .ok_or_else(|| Error::from_reason("validated DFlash config must be present"))?,
         )?;
     }
     Ok(Some(output))
@@ -4075,7 +4222,7 @@ pub fn preflight_muse_dflash_gguf(input_path: String, target_config_dir: String)
         validated
             .dflash_config
             .as_ref()
-            .expect("validated DFlash config must be present"),
+            .ok_or_else(|| Error::from_reason("validated DFlash config must be present"))?,
     )?;
     Ok(())
 }
@@ -5663,7 +5810,15 @@ fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<P
     let parent = input.parent().unwrap_or(Path::new("."));
     let exact = parent.join(format!(
         "mmproj-{}",
-        input.file_name().unwrap().to_string_lossy()
+        input
+            .file_name()
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Gemma4 GGUF input '{}' has no file name",
+                    input.display()
+                ))
+            })?
+            .to_string_lossy()
     ));
     if exact.is_file() {
         let metadata = parse_gguf(&exact)?.metadata;
@@ -5710,7 +5865,7 @@ fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<P
                 .iter()
                 .map(|path| mmproj_dtype_tier(path))
                 .min()
-                .unwrap();
+                .ok_or_else(|| Error::from_reason("media projector candidate list went empty"))?;
             let mut preferred: Vec<PathBuf> = candidates
                 .iter()
                 .filter(|path| mmproj_dtype_tier(path) == best)
@@ -5723,7 +5878,9 @@ fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<P
                     exact.display()
                 )));
             }
-            let chosen = preferred.pop().unwrap();
+            let chosen = preferred
+                .pop()
+                .ok_or_else(|| Error::from_reason("media projector preference list went empty"))?;
             let skipped: Vec<String> = candidates
                 .iter()
                 .filter(|path| *path != &chosen)
@@ -5762,7 +5919,12 @@ async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<Path
             "Gemma4Model.load requires a Gemma4 text GGUF, not a media projector or another architecture",
         ));
     }
-    let parent = input.parent().unwrap();
+    let parent = input.parent().ok_or_else(|| {
+        Error::from_reason(format!(
+            "Gemma4 GGUF input '{}' has no parent directory",
+            input.display()
+        ))
+    })?;
     for asset in ["config.json", "tokenizer.json"] {
         if !parent.join(asset).is_file() {
             return Err(Error::from_reason(format!(
@@ -5808,7 +5970,15 @@ fn muse_glimmer_native_draft(input: &Path) -> Result<Option<PathBuf>> {
     let parent = input.parent().unwrap_or(Path::new("."));
     let exact = parent.join(format!(
         "dflash-{}",
-        input.file_name().unwrap().to_string_lossy()
+        input
+            .file_name()
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Muse-Glimmer GGUF input '{}' has no file name",
+                    input.display()
+                ))
+            })?
+            .to_string_lossy()
     ));
     for preferred in [&exact, &parent.join("dflash-kquant.gguf")] {
         if preferred.is_file() {
@@ -5856,7 +6026,12 @@ async fn prepare_muse_glimmer_native_gguf_in(input: &Path, root: &Path) -> Resul
             "MuseGlimmerModel.load requires a Muse-Glimmer text GGUF, not a projector, draft or another architecture",
         ));
     }
-    let parent = input.parent().unwrap();
+    let parent = input.parent().ok_or_else(|| {
+        Error::from_reason(format!(
+            "Muse-Glimmer GGUF input '{}' has no parent directory",
+            input.display()
+        ))
+    })?;
     for asset in ["config.json", "tokenizer.json"] {
         if !parent.join(asset).is_file() {
             return Err(Error::from_reason(format!(
@@ -9630,7 +9805,7 @@ mod tests {
 
         let gguf = parse_gguf(&tmp).unwrap();
         assert_eq!(gguf.tensors[0].tensor_type, GgufTensorType::Q6K);
-        assert_eq!(gguf.tensors[0].data_size(), 210);
+        assert_eq!(gguf.tensors[0].data_size().unwrap(), 210);
         let weights = load_gguf_tensors(&tmp, &gguf, GgufLoadOptions::default()).unwrap();
         let embedding = weights.get("token_embd.weight").unwrap();
         assert_eq!(embedding.dtype().unwrap(), DType::BFloat16);
@@ -9709,8 +9884,13 @@ mod tests {
                 tensor_type: ty,
                 offset: 0,
             };
-            assert_eq!(tensor.num_elements(), 32768);
-            assert_eq!(tensor.data_size(), 128 * block_bytes, "{}", ty.name());
+            assert_eq!(tensor.num_elements().unwrap(), 32768);
+            assert_eq!(
+                tensor.data_size().unwrap(),
+                128 * block_bytes,
+                "{}",
+                ty.name()
+            );
         }
     }
 
@@ -13925,8 +14105,8 @@ mod tests {
 
         // MLX shape should be reversed
         assert_eq!(info.mlx_shape(), vec![1024, 768]);
-        assert_eq!(info.num_elements(), 786432);
-        assert_eq!(info.data_size(), 786432 * 2); // BF16 = 2 bytes
+        assert_eq!(info.num_elements().unwrap(), 786432);
+        assert_eq!(info.data_size().unwrap(), 786432 * 2); // BF16 = 2 bytes
     }
 
     fn prism_sign_values(width: usize) -> Vec<i32> {

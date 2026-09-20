@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! MLX-DB: Shared database operations for MLX-Node
 //!
 //! This crate provides SQLite database operations using sqlx for storing and querying

@@ -64,7 +64,9 @@ fn convert_impl(input_path: &str, output_path: &str) -> std::result::Result<(), 
         if col_indices.is_none() {
             col_indices = Some(resolve_indices(&row)?);
         }
-        let indices = col_indices.as_ref().unwrap();
+        let indices = col_indices
+            .as_ref()
+            .ok_or_else(|| format!("Row {}: column indices not resolved", index + 1))?;
 
         let question = row
             .get_string(indices.question)

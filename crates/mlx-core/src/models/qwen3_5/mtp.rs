@@ -82,7 +82,9 @@ pub(crate) fn reject_unsupported_fp8_mtp_state(
             continue;
         }
 
-        let prefix = key.strip_suffix(".weight").expect("suffix checked");
+        let prefix = key
+            .strip_suffix(".weight")
+            .ok_or_else(|| Error::from_reason("MTP weight key lost its suffix"))?;
         let mode = crate::models::quant_dispatch::effective_plq_for(
             prefix,
             per_layer_quant,

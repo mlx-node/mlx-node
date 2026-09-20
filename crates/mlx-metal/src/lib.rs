@@ -1,4 +1,7 @@
 #![cfg(target_os = "macos")]
+// Dispatch runs inside `extern "C"` calls — a panic aborts the process, so
+// every allocation/object-creation path here is fallible (`try_*`/`Option`).
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 //! Small, ownership-aware adapter over the generated `objc2-metal` bindings.
 //!
@@ -133,15 +136,18 @@ impl Buffer {
 
     /// Retain a live, borrowed `MTLBuffer*` and return an owned wrapper.
     ///
+    /// Returns `None` when `ptr` is null or the retain itself hands back nil.
+    ///
     /// # Safety
-    /// `ptr` must be a non-null, live `MTLBuffer*` for the duration of the
-    /// retain operation.
+    /// `ptr` must be a live `MTLBuffer*` for the duration of the retain
+    /// operation.
     #[inline]
-    pub unsafe fn retain_from_ptr(ptr: *mut c_void) -> Self {
+    pub unsafe fn retain_from_ptr(ptr: *mut c_void) -> Option<Self> {
         let ptr = ptr.cast::<ObjcBuffer>();
         // SAFETY: upheld by this method's caller. Taking an explicit +1 here
         // lets ordinary RAII release it after the synchronous dispatch.
-        Self(unsafe { Retained::retain(ptr) }.expect("MTLBuffer pointer must not be null"))
+        // `Retained::retain` returns `None` for a null pointer.
+        unsafe { Retained::retain(ptr) }.map(Self)
     }
 }
 
@@ -185,28 +191,19 @@ impl Device {
             .map_err(error_string)
     }
 
+    /// Fallible: returns `None` when Metal hands back nil (the device cannot
+    /// provide a queue) instead of panicking.
     #[inline]
-    pub fn new_command_queue(&self) -> CommandQueue {
-        CommandQueue(
-            self.0
-                .newCommandQueue()
-                .expect("Metal device returned no command queue"),
-        )
+    pub fn try_new_command_queue(&self) -> Option<CommandQueue> {
+        self.0.newCommandQueue().map(CommandQueue)
     }
 
-    #[inline]
-    pub fn new_buffer(&self, length: u64, options: MTLResourceOptions) -> Buffer {
-        Buffer(
-            self.0
-                .newBufferWithLength_options(length as usize, options)
-                .expect("Metal device failed to allocate buffer"),
-        )
-    }
-
-    /// Fallible variant of [`Self::new_buffer`]: returns `None` when Metal
-    /// hands back nil (the allocation could not be backed) instead of
-    /// panicking. Used by paged-KV pool growth, where an OOM must degrade
-    /// to a declined grow, not a model-thread panic.
+    /// Fallible allocation: returns `None` when Metal hands back nil (the
+    /// allocation could not be backed) instead of panicking. Used by
+    /// paged-KV pool growth, where an OOM must degrade to a declined grow,
+    /// not a model-thread panic — and by every other caller, since these
+    /// code paths run inside `extern "C"` FFI where a panic aborts the
+    /// process.
     #[inline]
     pub fn try_new_buffer(&self, length: u64, options: MTLResourceOptions) -> Option<Buffer> {
         self.0
@@ -215,17 +212,19 @@ impl Device {
     }
 
     /// Allocate a Metal buffer initialized from a slice of plain scalar values.
+    ///
+    /// Returns `None` when Metal cannot back the allocation.
     #[inline]
-    pub fn new_buffer_with_slice<T: MetalBufferElement>(
+    pub fn try_new_buffer_with_slice<T: MetalBufferElement>(
         &self,
         values: &[T],
         options: MTLResourceOptions,
-    ) -> Buffer {
+    ) -> Option<Buffer> {
         // SAFETY: the sealed element set has no padding or uninitialized bytes,
         // and the slice remains readable for its complete inferred byte length
         // until Metal's synchronous copy returns.
         unsafe {
-            self.new_buffer_with_data(
+            self.try_new_buffer_with_data(
                 values.as_ptr().cast(),
                 std::mem::size_of_val(values) as u64,
                 options,
@@ -234,16 +233,21 @@ impl Device {
     }
 
     /// Allocate a Metal buffer initialized from one plain scalar value.
+    ///
+    /// Returns `None` when Metal cannot back the allocation.
     #[inline]
-    pub fn new_buffer_with_value<T: MetalBufferElement>(
+    pub fn try_new_buffer_with_value<T: MetalBufferElement>(
         &self,
         value: &T,
         options: MTLResourceOptions,
-    ) -> Buffer {
-        self.new_buffer_with_slice(std::slice::from_ref(value), options)
+    ) -> Option<Buffer> {
+        self.try_new_buffer_with_slice(std::slice::from_ref(value), options)
     }
 
     /// Allocate a Metal buffer and copy `length` bytes from `bytes`.
+    ///
+    /// Returns `None` when `bytes` is null, `length` does not fit `usize`, or
+    /// Metal cannot back the allocation.
     ///
     /// # Safety
     ///
@@ -251,23 +255,21 @@ impl Device {
     /// The region must remain valid until this method returns; Metal copies it
     /// synchronously and does not retain the source pointer.
     #[inline]
-    pub unsafe fn new_buffer_with_data(
+    pub unsafe fn try_new_buffer_with_data(
         &self,
         bytes: *const c_void,
         length: u64,
         options: MTLResourceOptions,
-    ) -> Buffer {
-        let bytes = NonNull::new(bytes.cast_mut()).expect("buffer source pointer must not be null");
-        let length = usize::try_from(length).expect("Metal buffer length does not fit usize");
+    ) -> Option<Buffer> {
+        let bytes = NonNull::new(bytes.cast_mut())?;
+        let length = usize::try_from(length).ok()?;
         // SAFETY: upheld by this method's caller; Metal copies the source
         // region before returning.
-        Buffer(
-            unsafe {
-                self.0
-                    .newBufferWithBytes_length_options(bytes, length, options)
-            }
-            .expect("Metal device failed to allocate initialized buffer"),
-        )
+        unsafe {
+            self.0
+                .newBufferWithBytes_length_options(bytes, length, options)
+        }
+        .map(Buffer)
     }
 
     #[inline]
@@ -330,35 +332,29 @@ impl ComputePipelineState {
 pub struct CommandQueue(Retained<ProtocolObject<dyn MTLCommandQueue>>);
 
 impl CommandQueue {
+    /// Fallible: returns `None` when the queue hands back nil instead of
+    /// panicking.
     #[inline]
-    pub fn new_command_buffer(&self) -> CommandBuffer {
-        CommandBuffer(
-            self.0
-                .commandBuffer()
-                .expect("Metal command queue returned no command buffer"),
-        )
+    pub fn try_new_command_buffer(&self) -> Option<CommandBuffer> {
+        self.0.commandBuffer().map(CommandBuffer)
     }
 }
 
 pub struct CommandBuffer(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
 
 impl CommandBuffer {
+    /// Fallible: returns `None` when the buffer hands back nil instead of
+    /// panicking.
     #[inline]
-    pub fn new_compute_command_encoder(&self) -> ComputeCommandEncoder {
-        ComputeCommandEncoder(
-            self.0
-                .computeCommandEncoder()
-                .expect("Metal command buffer returned no compute encoder"),
-        )
+    pub fn try_new_compute_command_encoder(&self) -> Option<ComputeCommandEncoder> {
+        self.0.computeCommandEncoder().map(ComputeCommandEncoder)
     }
 
+    /// Fallible: returns `None` when the buffer hands back nil instead of
+    /// panicking.
     #[inline]
-    pub fn new_blit_command_encoder(&self) -> BlitCommandEncoder {
-        BlitCommandEncoder(
-            self.0
-                .blitCommandEncoder()
-                .expect("Metal command buffer returned no blit encoder"),
-        )
+    pub fn try_new_blit_command_encoder(&self) -> Option<BlitCommandEncoder> {
+        self.0.blitCommandEncoder().map(BlitCommandEncoder)
     }
 
     #[inline]
@@ -542,8 +538,9 @@ mod tests {
         };
 
         let values = [0x1020_3040u32, 0x5060_7080, 0x90a0_b0c0];
-        let slice_buffer =
-            device.new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+        let slice_buffer = device
+            .try_new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared)
+            .expect("slice buffer must allocate on a live device");
         assert_eq!(slice_buffer.length(), std::mem::size_of_val(&values) as u64);
         // SAFETY: StorageModeShared exposes CPU-readable contents, and the
         // constructor allocated exactly `values.len()` initialized `u32`s.
@@ -553,8 +550,9 @@ mod tests {
         assert_eq!(copied, values);
 
         let value = -1234i32;
-        let value_buffer =
-            device.new_buffer_with_value(&value, MTLResourceOptions::StorageModeShared);
+        let value_buffer = device
+            .try_new_buffer_with_value(&value, MTLResourceOptions::StorageModeShared)
+            .expect("value buffer must allocate on a live device");
         assert_eq!(value_buffer.length(), std::mem::size_of::<i32>() as u64);
         // SAFETY: same StorageModeShared and initialized-length guarantees as
         // above, for one `i32`.
@@ -634,13 +632,22 @@ mod tests {
             eprintln!("skipping healthy submission status test: no Metal device");
             return;
         };
-        let queue = device.new_command_queue();
-        let source =
-            device.new_buffer_with_slice(&[1u32, 2, 3, 4], MTLResourceOptions::StorageModeShared);
-        let destination = device.new_buffer(16, MTLResourceOptions::StorageModeShared);
+        let queue = device
+            .try_new_command_queue()
+            .expect("device must provide a command queue");
+        let source = device
+            .try_new_buffer_with_slice(&[1u32, 2, 3, 4], MTLResourceOptions::StorageModeShared)
+            .expect("source buffer must allocate");
+        let destination = device
+            .try_new_buffer(16, MTLResourceOptions::StorageModeShared)
+            .expect("destination buffer must allocate");
 
-        let command_buffer = queue.new_command_buffer();
-        let blit = command_buffer.new_blit_command_encoder();
+        let command_buffer = queue
+            .try_new_command_buffer()
+            .expect("queue must provide a command buffer");
+        let blit = command_buffer
+            .try_new_blit_command_encoder()
+            .expect("command buffer must provide a blit encoder");
         blit.copy_from_buffer(&source, 0, &destination, 0, 16);
         blit.end_encoding();
         command_buffer.commit();

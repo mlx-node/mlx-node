@@ -142,7 +142,11 @@ fn submission_candidates(plan: DecodePlan, layers: usize) -> Vec<DecodePlan> {
         });
         depth = depth.saturating_mul(2);
     }
-    if layers > 1 && candidates.last().unwrap().early_layers != layers - 1 {
+    if layers > 1
+        && candidates
+            .last()
+            .is_none_or(|last| last.early_layers != layers - 1)
+    {
         candidates.push(DecodePlan {
             early_layers: layers - 1,
             ..plan
@@ -186,8 +190,9 @@ impl DecodeTuning {
             .iter()
             .position(|entry| entry.bucket == bucket && entry.max_stripes == max_stripes)
         {
-            let entry = self.contexts.remove(index).unwrap();
-            self.contexts.push_front(entry);
+            if let Some(entry) = self.contexts.remove(index) {
+                self.contexts.push_front(entry);
+            }
         } else {
             let plan = DecodePlan {
                 early_layers: 0,

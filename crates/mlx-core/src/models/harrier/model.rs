@@ -362,10 +362,15 @@ fn last_token_pool(hidden_states: &MxArray, seq_len: usize, hidden_size: i32) ->
 /// the model to pool a content token instead — deviating from the training recipe.
 /// This keeps the first `max_len - 1` tokens plus the original tail token.
 fn truncate_preserving_tail(token_ids: &mut Vec<u32>, max_len: usize) {
-    if token_ids.len() > max_len && max_len > 0 {
-        let tail = *token_ids.last().unwrap();
-        token_ids.truncate(max_len);
-        *token_ids.last_mut().unwrap() = tail;
+    if token_ids.len() <= max_len || max_len == 0 {
+        return;
+    }
+    let Some(&tail) = token_ids.last() else {
+        return;
+    };
+    token_ids.truncate(max_len);
+    if let Some(last) = token_ids.last_mut() {
+        *last = tail;
     }
 }
 

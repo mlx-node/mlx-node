@@ -996,7 +996,10 @@ impl Gemma4Attention {
         let values = if self.k_is_v {
             keys.clone()
         } else {
-            self.v_proj.as_ref().unwrap().forward(x)?
+            self.v_proj
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Gemma4 non-shared V projection"))?
+                .forward(x)?
         };
 
         // Reshape to [B, T, H, D]
@@ -1857,7 +1860,10 @@ impl Gemma4Attention {
         let values = if self.k_is_v {
             keys.clone()
         } else {
-            self.v_proj.as_ref().unwrap().forward(x)?
+            self.v_proj
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Gemma4 non-shared V projection"))?
+                .forward(x)?
         };
 
         // 2. Reshape to [B, T, H, D] BEFORE per-head norm (matches `forward`).
@@ -2130,7 +2136,7 @@ impl Gemma4Attention {
         } else {
             self.v_proj
                 .as_ref()
-                .expect("Gemma4 non-shared V projection")
+                .ok_or_else(|| Error::from_reason("Gemma4 non-shared V projection"))?
                 .forward(x)?
                 .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
         };
@@ -2214,7 +2220,7 @@ impl Gemma4Attention {
             } else {
                 self.v_proj
                     .as_ref()
-                    .expect("Gemma4 non-shared V projection")
+                    .ok_or_else(|| Error::from_reason("Gemma4 non-shared V projection"))?
                     .forward(x)?
                     .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
             };

@@ -27,15 +27,31 @@ impl<'a> PrefixKeys<'a> {
         }
         let mut hashes = Vec::with_capacity(num_full_blocks);
         let mut parent_hash = 0;
-        for (n, tokens) in token_ids
-            .chunks_exact(block_size_us)
-            .take(num_full_blocks)
-            .enumerate()
-        {
-            let keys = self.get(n).expect("full block count is covered by keys");
-            let hash = hash_block(tokens, parent_hash, keys, cache_salt, n);
-            hashes.push(hash);
-            parent_hash = hash;
+        match self {
+            Self::Uniform(keys) => {
+                for (n, tokens) in token_ids
+                    .chunks_exact(block_size_us)
+                    .take(num_full_blocks)
+                    .enumerate()
+                {
+                    let hash = hash_block(tokens, parent_hash, keys, cache_salt, n);
+                    hashes.push(hash);
+                    parent_hash = hash;
+                }
+            }
+            Self::PerBlock(keys) => {
+                // Zip stops at the shorter of the two inputs, which is exactly
+                // the `min(num_full_blocks, keys.len())` bound computed above.
+                for (n, (tokens, block_keys)) in token_ids
+                    .chunks_exact(block_size_us)
+                    .zip(keys.iter())
+                    .enumerate()
+                {
+                    let hash = hash_block(tokens, parent_hash, block_keys, cache_salt, n);
+                    hashes.push(hash);
+                    parent_hash = hash;
+                }
+            }
         }
         hashes
     }

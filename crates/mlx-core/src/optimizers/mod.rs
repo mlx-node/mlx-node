@@ -20,7 +20,7 @@ pub use sgd::SGD;
 /// Base trait for all optimizers (internal use)
 pub trait OptimizerImpl {
     /// Initialize optimizer state for a parameter
-    fn init_state(&mut self, param_name: &str, param_shape: &[i64]);
+    fn init_state(&mut self, param_name: &str, param_shape: &[i64]) -> Result<()>;
 
     /// Apply gradients and update parameters
     fn apply_gradient(
@@ -65,7 +65,9 @@ impl GradientUtils {
                 Some(acc) => acc.add(&sum)?,
             });
         }
-        let total_norm = total_squared.unwrap().sqrt()?;
+        let total_norm = total_squared
+            .ok_or_else(|| Error::from_reason("no gradients to clip"))?
+            .sqrt()?;
 
         // Step 2: Compute scaling factor on GPU
         // scale = min(max_norm / (total_norm + eps), 1.0)
@@ -113,7 +115,9 @@ impl GradientUtils {
                 Some(acc) => acc.add(&sum)?,
             });
         }
-        let total_norm_arr = total_squared.unwrap().sqrt()?;
+        let total_norm_arr = total_squared
+            .ok_or_else(|| Error::from_reason("no gradients to clip"))?
+            .sqrt()?;
 
         // Extract norm value for return (single scalar, fast)
         total_norm_arr.eval();
@@ -180,7 +184,9 @@ impl GradientUtils {
                     Some(acc) => acc.add(&sum)?,
                 });
             }
-            let total_norm = total_squared.unwrap().sqrt()?;
+            let total_norm = total_squared
+                .ok_or_else(|| Error::from_reason("no gradients to clip"))?
+                .sqrt()?;
 
             let max_norm_arr = MxArray::full(&[], napi::Either::A(max_norm), None)?;
             let eps_arr = MxArray::full(&[], napi::Either::A(1e-6), None)?;

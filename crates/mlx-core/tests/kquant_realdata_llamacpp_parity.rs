@@ -392,7 +392,7 @@ fn run_case(root: &Path, case: &Case) -> Totals {
             case.label,
             info.tensor_type
         );
-        let n = info.num_elements() as usize;
+        let n = info.num_elements().unwrap() as usize;
         assert_eq!(
             len, n,
             "{}: {gguf_name} element count differs (ours {len}, llama.cpp {n})",

@@ -215,19 +215,24 @@ fn run_dispatch(
 ) -> Vec<f32> {
     let key_pool = state
         .device
-        .new_buffer_with_slice(k_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(k_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer_with_slice(v_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(v_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let q_buf = state
         .device
-        .new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let block_table_buf = state
         .device
-        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let seq_lens_buf = state
         .device
-        .new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
     let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
@@ -278,9 +283,15 @@ fn run_dispatch(
     // first so we can read it host-side.
     let shared_out = state
         .device
-        .new_buffer(out_bytes as u64, MTLResourceOptions::StorageModeShared);
-    let cmd = state.command_queue.new_command_buffer();
-    let blit = cmd.new_blit_command_encoder();
+        .try_new_buffer(out_bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
+    let cmd = state
+        .command_queue
+        .try_new_command_buffer()
+        .expect("test command queue must provide a command buffer");
+    let blit = cmd
+        .try_new_blit_command_encoder()
+        .expect("test command buffer must provide a blit encoder");
     blit.copy_from_buffer(&out.buffer, 0, &shared_out, 0, out_bytes as u64);
     blit.end_encoding();
     cmd.commit();

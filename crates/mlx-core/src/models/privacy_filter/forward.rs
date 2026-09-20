@@ -95,7 +95,7 @@ impl PrivacyFilterModel {
             }
             let band_mask = band_mask_cache
                 .get(&band)
-                .expect("band_mask inserted above");
+                .ok_or_else(|| Error::from_reason("band_mask inserted above"))?;
 
             let block = Block {
                 weights: layer,

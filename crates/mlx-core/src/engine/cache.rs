@@ -159,7 +159,7 @@ fn combine_image_hashes(digests: &[ImageCacheDigest]) -> u64 {
         hasher.update(digest.as_bytes());
     }
     let combined: [u8; 32] = hasher.finalize().into();
-    u64::from_le_bytes(combined[..8].try_into().expect("SHA-256 prefix is 8 bytes"))
+    u64::from_le_bytes(combined[..8].try_into().unwrap_or_default())
 }
 
 /// Compute a combined cache key from raw image bytes.

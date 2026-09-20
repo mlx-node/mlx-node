@@ -52,8 +52,11 @@ impl KVCache {
         let prev = self.offset;
 
         // Check if we need to grow the buffer
-        if self.keys.is_none() || (prev + seq_len) > self.keys.as_ref().unwrap().shape_at(2)? as i32
-        {
+        let needs_grow = match &self.keys {
+            Some(cached_keys) => (prev + seq_len) > cached_keys.shape_at(2)? as i32,
+            None => true,
+        };
+        if needs_grow {
             // Calculate how many steps we need to allocate
             let n_steps = (self.step + seq_len - 1) / self.step;
             let k_shape = [
@@ -83,10 +86,17 @@ impl KVCache {
                 let cached_values = if prev % self.step != 0 {
                     self.values
                         .as_ref()
-                        .unwrap()
+                        .ok_or_else(|| {
+                            Error::from_reason("KV cache values missing while keys are present")
+                        })?
                         .slice_axis(2, 0, prev as i64)?
                 } else {
-                    self.values.as_ref().unwrap().clone()
+                    self.values
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::from_reason("KV cache values missing while keys are present")
+                        })?
+                        .clone()
                 };
 
                 // Only concatenate when growing buffer (rare!)
@@ -117,12 +127,12 @@ impl KVCache {
         let result_keys = self
             .keys
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::from_reason("KV cache keys missing after buffer update"))?
             .slice_axis(2, 0, self.offset as i64)?;
         let result_values = self
             .values
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::from_reason("KV cache values missing after buffer update"))?
             .slice_axis(2, 0, self.offset as i64)?;
 
         Ok((result_keys, result_values))

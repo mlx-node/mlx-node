@@ -97,7 +97,7 @@ impl OutputStore {
         config: String,
     ) -> Result<String> {
         let run_id = Uuid::new_v4().to_string();
-        let started_at = chrono_now_ms();
+        let started_at = chrono_now_ms()?;
 
         sqlx::query(
             "INSERT INTO training_runs (id, name, model_name, model_path, config, started_at, status) VALUES (?, ?, ?, ?, ?, ?, 'running')",
@@ -128,7 +128,7 @@ impl OutputStore {
                 .ok_or_else(|| Error::new(Status::GenericFailure, "No active training run"))?
         };
 
-        let ended_at = chrono_now_ms();
+        let ended_at = chrono_now_ms()?;
 
         sqlx::query("UPDATE training_runs SET ended_at = ?, status = ? WHERE id = ?")
             .bind(ended_at)
@@ -488,9 +488,15 @@ impl OutputStore {
     }
 }
 
-fn chrono_now_ms() -> i64 {
-    std::time::SystemTime::now()
+fn chrono_now_ms() -> Result<i64> {
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is set before UNIX_EPOCH")
-        .as_millis() as i64
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("system clock is set before UNIX_EPOCH: {e}"),
+            )
+        })?
+        .as_millis();
+    Ok(millis as i64)
 }

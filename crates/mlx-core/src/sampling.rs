@@ -769,7 +769,12 @@ fn sparse_distributions_from_logits_with_mode(
             "sparse_distributions_from_logits: expected at least 1D logits".to_string(),
         ));
     }
-    let vocab_size_i64 = *shape_vec.last().unwrap();
+    let vocab_size_i64 = *shape_vec.last().ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            "sparse_distributions_from_logits: expected at least 1D logits".to_string(),
+        )
+    })?;
     if vocab_size_i64 <= 0 {
         return Err(Error::new(
             Status::InvalidArg,

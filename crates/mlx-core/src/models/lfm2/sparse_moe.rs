@@ -196,10 +196,9 @@ impl Lfm2SparseMoeBlock {
         // if norm_topk_prob: scores /= sum(scores, -1, keepdims) + 1e-6
         if self.norm_topk_prob {
             let denom = scores.sum(Some(&[-1]), Some(true))?; // [ne, 1]
-            let eps = self
-                .renorm_eps
-                .as_ref()
-                .expect("renorm_eps is built when norm_topk_prob is true");
+            let eps = self.renorm_eps.as_ref().ok_or_else(|| {
+                Error::from_reason("renorm_eps is built when norm_topk_prob is true")
+            })?;
             let denom = denom.add(eps)?;
             scores = scores.div(&denom)?;
         }

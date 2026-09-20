@@ -1257,22 +1257,29 @@ pub fn mask_to_box_coordinate(mask: &MxArray) -> Result<MxArray> {
     let normalized = normalized.reshape(&bbox_shape)?;
 
     // x_min_n, y_min_n, x_max_n, y_max_n
+    // `bbox_shape` is non-empty (the `4` axis was just pushed), so every
+    // `last_mut` below is Some; keep them fallible anyway.
+    let set_last = |v: &mut Vec<i64>, x: i64| -> Result<()> {
+        *v.last_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "empty bbox slice bounds"))? = x;
+        Ok(())
+    };
     let starts_x_min = vec![0i64; bbox_shape.len()];
     let mut stops_x_min: Vec<i64> = bbox_shape.clone();
-    *stops_x_min.last_mut().unwrap() = 1;
+    set_last(&mut stops_x_min, 1)?;
 
     let mut starts_y_min = vec![0i64; bbox_shape.len()];
-    *starts_y_min.last_mut().unwrap() = 1;
+    set_last(&mut starts_y_min, 1)?;
     let mut stops_y_min: Vec<i64> = bbox_shape.clone();
-    *stops_y_min.last_mut().unwrap() = 2;
+    set_last(&mut stops_y_min, 2)?;
 
     let mut starts_x_max = vec![0i64; bbox_shape.len()];
-    *starts_x_max.last_mut().unwrap() = 2;
+    set_last(&mut starts_x_max, 2)?;
     let mut stops_x_max: Vec<i64> = bbox_shape.clone();
-    *stops_x_max.last_mut().unwrap() = 3;
+    set_last(&mut stops_x_max, 3)?;
 
     let mut starts_y_max = vec![0i64; bbox_shape.len()];
-    *starts_y_max.last_mut().unwrap() = 3;
+    set_last(&mut starts_y_max, 3)?;
     let stops_y_max: Vec<i64> = bbox_shape.clone();
 
     let x_min_n = normalized.slice(&starts_x_min, &stops_x_min)?;

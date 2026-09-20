@@ -661,7 +661,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     }
                     info!("Loading tokenizer from: {}", tokenizer_path.display());
                     let tokenizer =
-                        Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap())?;
+                        Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().ok_or_else(
+                            || Error::new(Status::InvalidArg, "tokenizer path is not valid UTF-8"),
+                        )?)?;
                     info!("Tokenizer loaded successfully");
 
                     // Create Qwen3Inner

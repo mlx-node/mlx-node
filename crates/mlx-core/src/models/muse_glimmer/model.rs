@@ -9,8 +9,9 @@ use napi_derive::napi;
 use crate::array::MxArray;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, ResetScope, SaveStateArgs,
-    StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, DefaultStreamEmitter, FinalizeArgs, PagedBackend,
+    ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver,
+    WholeTurnArgs,
 };
 #[cfg(test)]
 use crate::engine::cmd::ChatCmd;
@@ -162,8 +163,10 @@ impl MuseGlimmerContextLimits {
     }
 
     pub(crate) fn from_inner(inner: &MuseGlimmerInner) -> Self {
-        let trained = u32::try_from(inner.config.text_config.max_position_embeddings)
-            .expect("validated Muse-Glimmer context fits u32");
+        // Config validation guarantees the context fits u32; clamp to
+        // u32::MAX (effectively unbounded) rather than panic if it does not.
+        let trained =
+            u32::try_from(inner.config.text_config.max_position_embeddings).unwrap_or(u32::MAX);
         let paged = inner.paged.as_ref().map(|runtime| {
             let adapter = runtime.coordinator.full_adapter();
             (
@@ -278,8 +281,9 @@ fn init_caches(config: &MuseGlimmerConfig) -> Vec<Gemma4LayerCache> {
         .iter()
         .map(|kind| match kind {
             LayerKind::Sliding => Gemma4LayerCache::new_sliding(
-                i32::try_from(config.text_config.sliding_window)
-                    .expect("validated Muse-Glimmer sliding window"),
+                // Config validation guarantees the window fits i32; clamp to
+                // i32::MAX (effectively no sliding bound) rather than panic.
+                i32::try_from(config.text_config.sliding_window).unwrap_or(i32::MAX),
             ),
             LayerKind::Full => Gemma4LayerCache::new_global(),
         })
@@ -440,7 +444,7 @@ impl MuseGlimmerInner {
             let continued = self
                 .paged
                 .as_mut()
-                .expect("checked Muse paged runtime")
+                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                 .coordinator
                 .continue_sliding_all(seq_id, tokens, total_budget, plan.cached_prefix_len);
             if continued.is_ok() {
@@ -454,7 +458,7 @@ impl MuseGlimmerInner {
             let coordinator = &mut self
                 .paged
                 .as_mut()
-                .expect("checked Muse paged runtime")
+                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                 .coordinator;
             coordinator
                 .full_adapter_mut()
@@ -479,7 +483,7 @@ impl MuseGlimmerInner {
         if plan.cached_prefix_len == 0 {
             self.paged
                 .as_mut()
-                .expect("checked Muse paged runtime")
+                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                 .coordinator
                 .reset_sliding_requests(seq_id)
                 .map_err(Error::from_reason)?;
@@ -489,7 +493,7 @@ impl MuseGlimmerInner {
         let restored = self
             .paged
             .as_mut()
-            .expect("checked Muse paged runtime")
+            .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
             .coordinator
             .full_adapter_mut()
             .take_restored_sidecar();
@@ -506,7 +510,7 @@ impl MuseGlimmerInner {
                 let coordinator = &mut self
                     .paged
                     .as_mut()
-                    .expect("checked Muse paged runtime")
+                    .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                     .coordinator;
                 if coordinator
                     .restore_sliding_groups(seq_id, tokens, boundary, &layer_kv)
@@ -527,7 +531,7 @@ impl MuseGlimmerInner {
         let coordinator = &mut self
             .paged
             .as_mut()
-            .expect("checked Muse paged runtime")
+            .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
             .coordinator;
         coordinator
             .full_adapter_mut()
@@ -910,7 +914,7 @@ impl MuseGlimmerInner {
             let adapter = self
                 .paged
                 .as_mut()
-                .expect("checked Muse paged runtime")
+                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                 .coordinator
                 .adapter_mut(route.group_id)
                 .map_err(Error::from_reason)?;
@@ -1026,7 +1030,7 @@ impl MuseGlimmerInner {
             let result = self
                 .paged
                 .as_mut()
-                .expect("checked Muse paged runtime")
+                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                 .coordinator
                 .record_tokens_all(seq_id, &[token]);
             if let Err(error) = result {
@@ -1034,7 +1038,7 @@ impl MuseGlimmerInner {
                     let _ = self
                         .paged
                         .as_mut()
-                        .expect("checked Muse paged runtime")
+                        .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                         .coordinator
                         .rollback_last_tokens_all(recorded_seq, 1);
                 }
@@ -1088,14 +1092,17 @@ impl MuseGlimmerInner {
         for index in 0..self.layers.len() {
             let layer: &MuseGlimmerDecoderLayer = unsafe { &*self.layers.as_ptr().add(index) };
             let (route, window) = {
-                let paged = self.paged.as_ref().expect("checked Muse paged runtime");
+                let paged = self
+                    .paged
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?;
                 let route = paged.routes[index].clone();
                 (route.clone(), paged.decode_windows[route.group_id])
             };
             let adapter = self
                 .paged
                 .as_mut()
-                .expect("checked Muse paged runtime")
+                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                 .coordinator
                 .adapter_mut(route.group_id)
                 .map_err(Error::from_reason)?;
@@ -1348,7 +1355,7 @@ impl PagedBackend for MuseGlimmerInner {
         } else {
             self.paged
                 .as_mut()
-                .expect("checked Muse paged runtime")
+                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
                 .coordinator
                 .reset_scheduled_request(seq_id)
                 .map_err(Error::from_reason)?;
@@ -1379,7 +1386,10 @@ impl PagedBackend for MuseGlimmerInner {
             return;
         }
         let result = (|| -> std::result::Result<Vec<Vec<u64>>, String> {
-            let paged = self.paged.as_mut().expect("checked Muse paged runtime");
+            let paged = self
+                .paged
+                .as_mut()
+                .ok_or_else(|| "checked Muse paged runtime".to_string())?;
             paged.coordinator.activate_request_all(seq_id)?;
             paged.coordinator.eval_pending_pool_writes_all()?;
             let full = paged.coordinator.full_adapter();
@@ -1627,23 +1637,23 @@ impl ChatBackend for MuseGlimmerInner {
     }
 
     fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .expect("loaded Muse-Glimmer tokenizer")
-            .inner_arc();
+        // Tokenizer is installed at load time; if it is somehow absent,
+        // degrade to the trait default rather than panic across the FFI.
+        let Some(tokenizer) = self.tokenizer.as_ref().map(|t| t.inner_arc()) else {
+            return Box::new(DefaultStreamEmitter);
+        };
         Box::new(MuseGlimmerEmitter {
             guard: StreamGuard::new(tokenizer, 1024, usize::MAX, 4096),
         })
     }
 
     fn turn_token_observer(&self) -> Option<Box<dyn TurnTokenObserver>> {
-        let tokenizer = self
-            .tokenizer
+        self.tokenizer
             .as_ref()
-            .expect("loaded Muse-Glimmer tokenizer")
-            .inner_arc();
-        Some(Box::new(MuseGlimmerTurnObserver::new(tokenizer)))
+            .map(|t| t.inner_arc())
+            .map(|tokenizer| {
+                Box::new(MuseGlimmerTurnObserver::new(tokenizer)) as Box<dyn TurnTokenObserver>
+            })
     }
 
     fn eos_before_emit(&self) -> bool {

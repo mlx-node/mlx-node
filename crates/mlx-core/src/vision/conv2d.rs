@@ -18,6 +18,11 @@ use std::sync::Arc;
 ///
 /// Note: Currently only supports the patch embedding case where stride == kernel_size
 /// and padding == 0. General convolution is not yet implemented.
+///
+/// `Clone` shares the `Arc`'d weight/bias handles — the same sharing a manual
+/// `Conv2d::new(weight.clone(), ...)` rebuild would produce, without the
+/// fallible re-validation.
+#[derive(Clone)]
 pub struct Conv2d {
     /// Convolution weights [out_channels, kernel_h, kernel_w, in_channels]
     weight: Arc<MxArray>,

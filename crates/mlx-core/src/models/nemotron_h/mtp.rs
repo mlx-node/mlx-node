@@ -592,7 +592,7 @@ mod mtp_turn_tests {
     /// tokens through the same inner (stopping at the config EOS). Returns
     /// the exact token sequence a plain AR turn would emit.
     fn greedy_ar_oracle(inner: &mut NemotronHInner, prompt: &[u32], n: usize) -> Result<Vec<u32>> {
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         let stream = Stream::new(DeviceType::Gpu);
         let arr = MxArray::from_uint32(prompt, &[1, prompt.len() as i64])?;
         let logits = inner.chunked_prefill(&arr, stream)?;
@@ -653,7 +653,7 @@ mod mtp_turn_tests {
             assert!(!oracle.is_empty(), "oracle must decode at least one token");
 
             // Fresh flat state for the speculative run.
-            inner.reset_caches_internal();
+            inner.reset_caches_internal().unwrap();
             let stream = Stream::new(DeviceType::Gpu);
 
             let chat_cfg = ChatConfig {
@@ -820,15 +820,15 @@ mod mtp_turn_tests {
             "fresh zero-state caches must not count as survived state"
         );
         // Park (state survives in the map) and re-activate: now it survived.
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
         inner.activate_paged_seq(0).expect("reactivate parked seq");
         assert!(
             inner.active_seq_recurrent_survived,
             "parked caches restored at the exact boundary must count as survived"
         );
         // Preemption releases the state; the next activation is fresh again.
-        inner.park_active_scheduled_caches();
-        inner.release_scheduled_caches_for(0);
+        inner.park_active_scheduled_caches().unwrap();
+        inner.release_scheduled_caches_for(0).unwrap();
         inner
             .activate_paged_seq(0)
             .expect("reactivate after preemption");
@@ -926,7 +926,7 @@ mod mtp_turn_tests {
         let stream = Stream::new(DeviceType::Gpu);
 
         // --- the production seed path ---
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         let arr = MxArray::from_uint32(&prompt, &[1, prompt.len() as i64]).unwrap();
         let mut seeded = NemotronHMtpModule::fresh_caches(&inner.config);
         let mut committed = 0i32;
@@ -952,7 +952,7 @@ mod mtp_turn_tests {
         );
 
         // --- reference: one backbone forward, ids shifted by hand ---
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         let embedding = inner.embedding.clone();
         let (_l, hidden) = inner
             .forward_with_hidden_3d(&arr, &embedding)
@@ -1012,7 +1012,7 @@ mod mtp_turn_tests {
         let arr = MxArray::from_uint32(&prompt, &[1, prompt.len() as i64]).unwrap();
 
         let mut seed_with = |step: u32| -> (Vec<NemotronHLayerCache>, i32) {
-            inner.reset_caches_internal();
+            inner.reset_caches_internal().unwrap();
             let mut caches = NemotronHMtpModule::fresh_caches(&inner.config);
             let mut committed = 0i32;
             let (_l, h_last) = inner
@@ -1077,7 +1077,7 @@ mod mtp_turn_tests {
     fn reset_clears_the_pending_draft_seed() {
         let mut inner = mtp_ready_inner();
         inner.pending_mtp_draft_seed = Some((NemotronHMtpModule::fresh_caches(&inner.config), 4));
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         assert!(
             inner.pending_mtp_draft_seed.is_none(),
             "reset must drop the drafter seed"
@@ -1104,7 +1104,7 @@ mod mtp_turn_tests {
         // Same inner run twice, once WITH a rejected draft before the commit and once
         // without: the committed history — and so the next draft — must be identical.
         let mut run = |with_draft: bool| -> Vec<f32> {
-            inner.reset_caches_internal();
+            inner.reset_caches_internal().unwrap();
             let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
             let setup = flat_mtp_setup(&inner, 7);
             let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
@@ -1189,7 +1189,7 @@ mod mtp_turn_tests {
         let stream = Stream::new(DeviceType::Gpu);
         let t = prompt.len() as i32;
 
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
         let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
@@ -1242,7 +1242,7 @@ mod mtp_turn_tests {
         let p = greedy_params();
         let stream = Stream::new(DeviceType::Gpu);
 
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
         let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
@@ -1337,7 +1337,7 @@ mod mtp_turn_tests {
         let p = greedy_params();
         let stream = Stream::new(DeviceType::Gpu);
 
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
         let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
@@ -1487,7 +1487,7 @@ mod mtp_turn_tests {
         let ar = greedy_ar_oracle(&mut inner, &prompt, n).expect("AR oracle");
 
         // ---- MTP loop from the same cold prefix ----
-        inner.reset_caches_internal();
+        inner.reset_caches_internal().unwrap();
         let stream = Stream::new(DeviceType::Gpu);
         let chat_cfg = ChatConfig {
             temperature: Some(0.0),

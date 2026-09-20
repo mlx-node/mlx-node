@@ -563,15 +563,23 @@ impl PagedAttentionOutput {
         let size_bytes = self.size_bytes();
 
         // Create shared (CPU-accessible) buffer
-        let shared_buffer = state.device.new_buffer(
-            size_bytes as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let shared_buffer = state
+            .device
+            .try_new_buffer(
+                size_bytes as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| "Metal device failed to allocate shared output buffer".to_string())?;
 
         // Blit copy from private to shared
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let blit_encoder = command_buffer.new_blit_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit_encoder = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
 
         blit_encoder.copy_from_buffer(&self.buffer, 0, &shared_buffer, 0, size_bytes as u64);
         blit_encoder.end_encoding();
@@ -730,7 +738,8 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
         (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
     let output = state
         .device
-        .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
+        .try_new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate)
+        .ok_or_else(|| "Metal device failed to allocate attention output buffer".to_string())?;
 
     // Get V1 pipeline (partition_size = 0)
     let kernel_name = MetalState::paged_attention_v1_kernel_name(
@@ -744,8 +753,13 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
 
     // Create command buffer and encoder
 
-    let command_buffer = state.command_queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
+    let command_buffer = state
+        .command_queue
+        .try_new_command_buffer()
+        .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+    let encoder = command_buffer
+        .try_new_compute_command_encoder()
+        .ok_or_else(|| "Metal command buffer returned no compute encoder".to_string())?;
 
     encoder.set_compute_pipeline_state(&pipeline);
 
@@ -753,7 +767,8 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     let dummy_float: f32 = 0.0;
     let dummy_buffer = state
         .device
-        .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| "Metal device failed to allocate dummy buffer".to_string())?;
 
     // Convert queries raw pointer to BufferRef
     // SAFETY: Caller guarantees queries.ptr is a valid MTLBuffer*
@@ -768,37 +783,45 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     encoder.set_buffer(5, Some(value_cache), 0);
 
     // k_scale and v_scale - use params values for FP8 support
-    let k_scale_buffer = state.device.new_buffer_with_value(
-        &params.k_scale,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let v_scale_buffer = state.device.new_buffer_with_value(
-        &params.v_scale,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let k_scale_buffer = state
+        .device
+        .try_new_buffer_with_value(
+            &params.k_scale,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
+    let v_scale_buffer = state
+        .device
+        .try_new_buffer_with_value(
+            &params.v_scale,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
     encoder.set_buffer(6, Some(&k_scale_buffer), 0);
     encoder.set_buffer(7, Some(&v_scale_buffer), 0);
 
     // Set constant buffers
-    let create_int_buffer = |value: i32| {
+    let create_int_buffer = |value: i32| -> Result<Buffer, String> {
         state
             .device
-            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| "Metal device failed to allocate i32 constant buffer".to_string())
     };
 
-    let create_float_buffer = |value: f32| {
+    let create_float_buffer = |value: f32| -> Result<Buffer, String> {
         state
             .device
-            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| "Metal device failed to allocate f32 constant buffer".to_string())
     };
 
-    let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
-    let scale_buf = create_float_buffer(params.scale);
-    let softcapping_buf = create_float_buffer(params.softcapping);
-    let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32);
-    let q_stride_buf = create_int_buffer(params.q_stride);
-    let kv_block_stride_buf = create_int_buffer(params.kv_block_stride);
-    let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
+    let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32)?;
+    let scale_buf = create_float_buffer(params.scale)?;
+    let softcapping_buf = create_float_buffer(params.softcapping)?;
+    let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32)?;
+    let q_stride_buf = create_int_buffer(params.q_stride)?;
+    let kv_block_stride_buf = create_int_buffer(params.kv_block_stride)?;
+    let kv_head_stride_buf = create_int_buffer(params.kv_head_stride)?;
 
     encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
     encoder.set_buffer(9, Some(&scale_buf), 0);
@@ -815,7 +838,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
     // sliding-window mask. 0 = full context (default).
-    let sliding_window_buf = create_int_buffer(params.sliding_window);
+    let sliding_window_buf = create_int_buffer(params.sliding_window)?;
     encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
     // Calculate threadgroup memory size.
@@ -936,7 +959,8 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
     let output = state
         .device
-        .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
+        .try_new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate)
+        .ok_or_else(|| "Metal device failed to allocate attention output buffer".to_string())?;
 
     let grouped_kind = select_grouped_paged_attention(
         io_dtype,
@@ -974,18 +998,27 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         as usize
         * io_dtype.size();
 
-    let exp_sums = state.device.new_buffer(
-        exp_sums_size as u64,
-        metal::MTLResourceOptions::StorageModePrivate,
-    );
-    let max_logits = state.device.new_buffer(
-        max_logits_size as u64,
-        metal::MTLResourceOptions::StorageModePrivate,
-    );
-    let tmp_out = state.device.new_buffer(
-        tmp_out_size as u64,
-        metal::MTLResourceOptions::StorageModePrivate,
-    );
+    let exp_sums = state
+        .device
+        .try_new_buffer(
+            exp_sums_size as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        )
+        .ok_or_else(|| "Metal device failed to allocate exp_sums buffer".to_string())?;
+    let max_logits = state
+        .device
+        .try_new_buffer(
+            max_logits_size as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        )
+        .ok_or_else(|| "Metal device failed to allocate max_logits buffer".to_string())?;
+    let tmp_out = state
+        .device
+        .try_new_buffer(
+            tmp_out_size as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        )
+        .ok_or_else(|| "Metal device failed to allocate tmp_out buffer".to_string())?;
 
     // Convert queries raw pointer to BufferRef
     // SAFETY: Caller guarantees queries.ptr is a valid MTLBuffer*
@@ -1006,8 +1039,13 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let encoder = command_buffer
+            .try_new_compute_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no compute encoder".to_string())?;
 
         encoder.set_compute_pipeline_state(&pipeline);
 
@@ -1020,42 +1058,51 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         encoder.set_buffer(5, Some(value_cache), 0);
 
         // k_scale and v_scale - use params values for FP8 support
-        let k_scale_buffer = state.device.new_buffer_with_value(
-            &params.k_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
-        let v_scale_buffer = state.device.new_buffer_with_value(
-            &params.v_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let k_scale_buffer = state
+            .device
+            .try_new_buffer_with_value(
+                &params.k_scale,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
+        let v_scale_buffer = state
+            .device
+            .try_new_buffer_with_value(
+                &params.v_scale,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
         encoder.set_buffer(6, Some(&k_scale_buffer), 0);
         encoder.set_buffer(7, Some(&v_scale_buffer), 0);
 
         // Set constant buffers
-        let create_int_buffer = |value: i32| {
+        let create_int_buffer = |value: i32| -> Result<Buffer, String> {
             state
                 .device
-                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| "Metal device failed to allocate i32 constant buffer".to_string())
         };
 
-        let create_float_buffer = |value: f32| {
+        let create_float_buffer = |value: f32| -> Result<Buffer, String> {
             state
                 .device
-                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| "Metal device failed to allocate f32 constant buffer".to_string())
         };
 
-        let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
-        let scale_buf = create_float_buffer(params.scale);
-        let softcapping_buf = create_float_buffer(params.softcapping);
-        let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32);
-        let q_stride_buf = create_int_buffer(params.q_stride);
-        let kv_block_stride_buf = create_int_buffer(params.kv_block_stride);
-        let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
+        let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32)?;
+        let scale_buf = create_float_buffer(params.scale)?;
+        let softcapping_buf = create_float_buffer(params.softcapping)?;
+        let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32)?;
+        let q_stride_buf = create_int_buffer(params.q_stride)?;
+        let kv_block_stride_buf = create_int_buffer(params.kv_block_stride)?;
+        let kv_head_stride_buf = create_int_buffer(params.kv_head_stride)?;
 
         let dummy_float: f32 = 0.0;
         let dummy_buffer = state
             .device
-            .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| "Metal device failed to allocate dummy buffer".to_string())?;
 
         encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
         encoder.set_buffer(9, Some(&scale_buf), 0);
@@ -1069,7 +1116,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
         // sliding-window mask. 0 = full context (default).
-        let sliding_window_buf = create_int_buffer(params.sliding_window);
+        let sliding_window_buf = create_int_buffer(params.sliding_window)?;
         encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
         if !use_grouped {
@@ -1129,8 +1176,13 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let encoder = command_buffer
+            .try_new_compute_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no compute encoder".to_string())?;
 
         encoder.set_compute_pipeline_state(&pipeline);
 
@@ -1140,10 +1192,15 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         encoder.set_buffer(3, Some(&tmp_out), 0);
         encoder.set_buffer(4, Some(context_lens), 0);
 
-        let max_num_partitions_buf = state.device.new_buffer_with_value(
-            &(max_num_partitions as i32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let max_num_partitions_buf = state
+            .device
+            .try_new_buffer_with_value(
+                &(max_num_partitions as i32),
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| {
+                "Metal device failed to allocate max_num_partitions buffer".to_string()
+            })?;
         encoder.set_buffer(5, Some(&max_num_partitions_buf), 0);
 
         if !use_grouped {
@@ -1384,7 +1441,8 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
         * output_element_size;
     let output = state
         .device
-        .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
+        .try_new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate)
+        .ok_or_else(|| "Metal device failed to allocate attention output buffer".to_string())?;
 
     let kernel_name = MetalState::paged_attention_varlen_v1_kernel_name(
         io_dtype,
@@ -1395,14 +1453,20 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
     );
     let pipeline = state.get_pipeline(&kernel_name)?;
 
-    let command_buffer = state.command_queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
+    let command_buffer = state
+        .command_queue
+        .try_new_command_buffer()
+        .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+    let encoder = command_buffer
+        .try_new_compute_command_encoder()
+        .ok_or_else(|| "Metal command buffer returned no compute encoder".to_string())?;
     encoder.set_compute_pipeline_state(&pipeline);
 
     let dummy_float: f32 = 0.0;
     let dummy_buffer = state
         .device
-        .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| "Metal device failed to allocate dummy buffer".to_string())?;
 
     // SAFETY: caller guarantees queries.ptr is a valid MTLBuffer*.
     let queries_ref: &BufferRef = unsafe { ForeignTypeRef::from_ptr(queries.ptr as *mut _) };
@@ -1414,35 +1478,43 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
     encoder.set_buffer(4, Some(key_cache), 0);
     encoder.set_buffer(5, Some(value_cache), 0);
 
-    let k_scale_buffer = state.device.new_buffer_with_value(
-        &params.k_scale,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let v_scale_buffer = state.device.new_buffer_with_value(
-        &params.v_scale,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let k_scale_buffer = state
+        .device
+        .try_new_buffer_with_value(
+            &params.k_scale,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
+    let v_scale_buffer = state
+        .device
+        .try_new_buffer_with_value(
+            &params.v_scale,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
     encoder.set_buffer(6, Some(&k_scale_buffer), 0);
     encoder.set_buffer(7, Some(&v_scale_buffer), 0);
 
-    let create_int_buffer = |value: i32| {
+    let create_int_buffer = |value: i32| -> Result<Buffer, String> {
         state
             .device
-            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| "Metal device failed to allocate i32 constant buffer".to_string())
     };
-    let create_float_buffer = |value: f32| {
+    let create_float_buffer = |value: f32| -> Result<Buffer, String> {
         state
             .device
-            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| "Metal device failed to allocate f32 constant buffer".to_string())
     };
 
-    let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
-    let scale_buf = create_float_buffer(params.scale);
-    let softcapping_buf = create_float_buffer(params.softcapping);
-    let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32);
-    let q_stride_buf = create_int_buffer(params.q_stride);
-    let kv_block_stride_buf = create_int_buffer(params.kv_block_stride);
-    let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
+    let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32)?;
+    let scale_buf = create_float_buffer(params.scale)?;
+    let softcapping_buf = create_float_buffer(params.softcapping)?;
+    let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32)?;
+    let q_stride_buf = create_int_buffer(params.q_stride)?;
+    let kv_block_stride_buf = create_int_buffer(params.kv_block_stride)?;
+    let kv_head_stride_buf = create_int_buffer(params.kv_head_stride)?;
 
     encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
     encoder.set_buffer(9, Some(&scale_buf), 0);
@@ -1455,12 +1527,12 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
     encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
     encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-    let sliding_window_buf = create_int_buffer(params.sliding_window);
+    let sliding_window_buf = create_int_buffer(params.sliding_window)?;
     encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
     // New buffers for varlen: cu_seqlens_q + num_seqs.
     encoder.set_buffer(19, Some(cu_seqlens_q), 0);
-    let num_seqs_buf = create_int_buffer(params.num_seqs as i32);
+    let num_seqs_buf = create_int_buffer(params.num_seqs as i32)?;
     encoder.set_buffer(20, Some(&num_seqs_buf), 0);
 
     // Threadgroup memory layout matches the single-row V1 dispatcher.
@@ -1529,7 +1601,8 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         * output_element_size;
     let output = state
         .device
-        .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
+        .try_new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate)
+        .ok_or_else(|| "Metal device failed to allocate attention output buffer".to_string())?;
 
     let grouped_kind = (params.total_queries == 2)
         .then(|| {
@@ -1577,18 +1650,27 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         (params.total_queries * params.num_heads * max_num_partitions * params.head_size) as usize
             * io_dtype.size();
 
-    let exp_sums = state.device.new_buffer(
-        exp_sums_size as u64,
-        metal::MTLResourceOptions::StorageModePrivate,
-    );
-    let max_logits = state.device.new_buffer(
-        max_logits_size as u64,
-        metal::MTLResourceOptions::StorageModePrivate,
-    );
-    let tmp_out = state.device.new_buffer(
-        tmp_out_size as u64,
-        metal::MTLResourceOptions::StorageModePrivate,
-    );
+    let exp_sums = state
+        .device
+        .try_new_buffer(
+            exp_sums_size as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        )
+        .ok_or_else(|| "Metal device failed to allocate exp_sums buffer".to_string())?;
+    let max_logits = state
+        .device
+        .try_new_buffer(
+            max_logits_size as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        )
+        .ok_or_else(|| "Metal device failed to allocate max_logits buffer".to_string())?;
+    let tmp_out = state
+        .device
+        .try_new_buffer(
+            tmp_out_size as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        )
+        .ok_or_else(|| "Metal device failed to allocate tmp_out buffer".to_string())?;
 
     // SAFETY: caller guarantees queries.ptr is a valid MTLBuffer*.
     let queries_ref: &BufferRef = unsafe { ForeignTypeRef::from_ptr(queries.ptr as *mut _) };
@@ -1608,8 +1690,13 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let encoder = command_buffer
+            .try_new_compute_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no compute encoder".to_string())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
         encoder.set_buffer(0, Some(&exp_sums), 0);
@@ -1619,40 +1706,49 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         encoder.set_buffer(4, Some(key_cache), 0);
         encoder.set_buffer(5, Some(value_cache), 0);
 
-        let k_scale_buffer = state.device.new_buffer_with_value(
-            &params.k_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
-        let v_scale_buffer = state.device.new_buffer_with_value(
-            &params.v_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let k_scale_buffer = state
+            .device
+            .try_new_buffer_with_value(
+                &params.k_scale,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
+        let v_scale_buffer = state
+            .device
+            .try_new_buffer_with_value(
+                &params.v_scale,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
         encoder.set_buffer(6, Some(&k_scale_buffer), 0);
         encoder.set_buffer(7, Some(&v_scale_buffer), 0);
 
-        let create_int_buffer = |value: i32| {
+        let create_int_buffer = |value: i32| -> Result<Buffer, String> {
             state
                 .device
-                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| "Metal device failed to allocate i32 constant buffer".to_string())
         };
-        let create_float_buffer = |value: f32| {
+        let create_float_buffer = |value: f32| -> Result<Buffer, String> {
             state
                 .device
-                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| "Metal device failed to allocate f32 constant buffer".to_string())
         };
 
-        let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
-        let scale_buf = create_float_buffer(params.scale);
-        let softcapping_buf = create_float_buffer(params.softcapping);
-        let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32);
-        let q_stride_buf = create_int_buffer(params.q_stride);
-        let kv_block_stride_buf = create_int_buffer(params.kv_block_stride);
-        let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
+        let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32)?;
+        let scale_buf = create_float_buffer(params.scale)?;
+        let softcapping_buf = create_float_buffer(params.softcapping)?;
+        let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32)?;
+        let q_stride_buf = create_int_buffer(params.q_stride)?;
+        let kv_block_stride_buf = create_int_buffer(params.kv_block_stride)?;
+        let kv_head_stride_buf = create_int_buffer(params.kv_head_stride)?;
 
         let dummy_float: f32 = 0.0;
         let dummy_buffer = state
             .device
-            .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| "Metal device failed to allocate dummy buffer".to_string())?;
 
         encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
         encoder.set_buffer(9, Some(&scale_buf), 0);
@@ -1665,11 +1761,11 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
         encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-        let sliding_window_buf = create_int_buffer(params.sliding_window);
+        let sliding_window_buf = create_int_buffer(params.sliding_window)?;
         encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
         encoder.set_buffer(19, Some(cu_seqlens_q), 0);
-        let num_seqs_buf = create_int_buffer(params.num_seqs as i32);
+        let num_seqs_buf = create_int_buffer(params.num_seqs as i32)?;
         encoder.set_buffer(20, Some(&num_seqs_buf), 0);
 
         if !use_grouped {
@@ -1724,8 +1820,13 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let encoder = command_buffer
+            .try_new_compute_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no compute encoder".to_string())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
         encoder.set_buffer(0, Some(&output), 0);
@@ -1734,17 +1835,25 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         encoder.set_buffer(3, Some(&tmp_out), 0);
         encoder.set_buffer(4, Some(context_lens), 0);
 
-        let max_num_partitions_buf = state.device.new_buffer_with_value(
-            &(max_num_partitions as i32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let max_num_partitions_buf = state
+            .device
+            .try_new_buffer_with_value(
+                &(max_num_partitions as i32),
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| {
+                "Metal device failed to allocate max_num_partitions buffer".to_string()
+            })?;
         encoder.set_buffer(5, Some(&max_num_partitions_buf), 0);
 
         encoder.set_buffer(6, Some(cu_seqlens_q), 0);
-        let num_seqs_buf = state.device.new_buffer_with_value(
-            &(params.num_seqs as i32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let num_seqs_buf = state
+            .device
+            .try_new_buffer_with_value(
+                &(params.num_seqs as i32),
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| "Metal device failed to allocate num_seqs buffer".to_string())?;
         encoder.set_buffer(7, Some(&num_seqs_buf), 0);
 
         if !use_grouped {

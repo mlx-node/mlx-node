@@ -718,7 +718,9 @@ fn items_to_pairs(items: Vec<PickleValue>) -> Result<Vec<(PickleValue, PickleVal
     let mut pairs = Vec::new();
     let mut iter = items.into_iter();
     while let Some(key) = iter.next() {
-        let val = iter.next().unwrap();
+        let val = iter
+            .next()
+            .ok_or_else(|| Error::from_reason("pickle: dict key without value".to_string()))?;
         pairs.push((key, val));
     }
     Ok(pairs)

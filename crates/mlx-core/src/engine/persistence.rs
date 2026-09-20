@@ -267,7 +267,7 @@ pub(crate) fn expand_symmetric_affine_biases(
     for (base, zero_point) in &pending {
         let scales = params
             .get(&format!("{base}.scales"))
-            .expect("scales key was just observed");
+            .ok_or_else(|| Error::from_reason("scales key was just observed"))?;
         let dtype = scales.dtype()?;
         if !matches!(dtype, DType::Float32 | DType::Float16 | DType::BFloat16) {
             return Err(Error::from_reason(format!(
@@ -851,7 +851,7 @@ pub(crate) fn dequant_fp8_weights(
         let weight_key = scale_key.replace("_scale_inv", "");
         let scale_inv = params
             .remove(&scale_key)
-            .expect("scale_key must exist in params");
+            .ok_or_else(|| Error::from_reason("scale_key must exist in params"))?;
         if let Some(weight) = params.remove(&weight_key) {
             let dequantized = dequant_fp8(&weight, &scale_inv, target_dtype)?;
             // Eval immediately to prevent lazy chain accumulation (OOM with ~31K FP8 pairs)
@@ -897,7 +897,7 @@ pub(crate) fn dequant_fp8_block_scale(
         let weight_key = scale_key.replace(".weight_scale", ".weight");
         let scale = params
             .remove(&scale_key)
-            .expect("scale_key must exist in params");
+            .ok_or_else(|| Error::from_reason("scale_key must exist in params"))?;
         let Some(weight) = params.remove(&weight_key) else {
             return Err(Error::from_reason(format!(
                 "'{scale_key}' has no matching '{weight_key}' — \

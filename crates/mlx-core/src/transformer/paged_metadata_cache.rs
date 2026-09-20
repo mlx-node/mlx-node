@@ -396,7 +396,7 @@ impl PagedMetadataCache {
             .request
             .decode_attention_inputs_cache
             .as_ref()
-            .expect("decode_attention_inputs_cache was just populated");
+            .ok_or_else(|| "decode_attention_inputs_cache was just populated".to_string())?;
         Ok((
             cache.block_table.clone(),
             cache.seq_lens.clone(),
@@ -464,7 +464,7 @@ impl PagedMetadataCache {
             .request
             .write_slot_mapping_cache
             .as_ref()
-            .expect("write_slot_mapping_cache was just populated");
+            .ok_or_else(|| "write_slot_mapping_cache was just populated".to_string())?;
         Ok((
             cache.slot_mapping.clone(),
             cache.first_slot,
@@ -562,7 +562,7 @@ impl PagedMetadataCache {
             .request
             .compact_prefill_inputs_cache
             .as_ref()
-            .expect("compact_prefill_inputs_cache was just populated");
+            .ok_or_else(|| "compact_prefill_inputs_cache was just populated".to_string())?;
         Ok((cache.block_ids.clone(), cache.block_count))
     }
 
@@ -646,7 +646,7 @@ impl PagedMetadataCache {
             .request
             .varlen_prefill_inputs_cache
             .as_ref()
-            .expect("varlen_prefill_inputs_cache was just populated");
+            .ok_or_else(|| "varlen_prefill_inputs_cache was just populated".to_string())?;
         Ok((
             cache.block_table.clone(),
             cache.seq_lens.clone(),
@@ -772,7 +772,7 @@ impl PagedMetadataCache {
             .request
             .prefill_attention_inputs_cache
             .as_ref()
-            .expect("prefill_attention_inputs_cache was just populated");
+            .ok_or_else(|| "prefill_attention_inputs_cache was just populated".to_string())?;
         Ok((
             cache.block_table.clone(),
             cache.seq_lens.clone(),

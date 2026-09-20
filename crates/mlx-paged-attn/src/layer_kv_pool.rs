@@ -559,14 +559,26 @@ impl LayerKVPool {
 
             let mut layers = Vec::with_capacity(config.num_layers as usize);
             for _ in 0..config.num_layers {
-                let key_cache = state.device.new_buffer(
-                    key_cache_size,
-                    pool_storage_options(&state.device, _cpu_access),
-                );
-                let value_cache = state.device.new_buffer(
-                    value_cache_size,
-                    pool_storage_options(&state.device, _cpu_access),
-                );
+                let key_cache = state
+                    .device
+                    .try_new_buffer(
+                        key_cache_size,
+                        pool_storage_options(&state.device, _cpu_access),
+                    )
+                    .ok_or_else(|| {
+                        "LayerKVPool::new: Metal device failed to allocate key cache buffer"
+                            .to_string()
+                    })?;
+                let value_cache = state
+                    .device
+                    .try_new_buffer(
+                        value_cache_size,
+                        pool_storage_options(&state.device, _cpu_access),
+                    )
+                    .ok_or_else(|| {
+                        "LayerKVPool::new: Metal device failed to allocate value cache buffer"
+                            .to_string()
+                    })?;
                 layers.push((key_cache, value_cache));
             }
 
@@ -696,10 +708,20 @@ impl LayerKVPool {
             for _ in 0..num_layers {
                 let k = state
                     .device
-                    .new_buffer(key_cache_size, MTLResourceOptions::StorageModePrivate);
+                    .try_new_buffer(key_cache_size, MTLResourceOptions::StorageModePrivate)
+                    .ok_or_else(|| {
+                        "LayerKVPool::new_for_test: Metal device failed to allocate key cache \
+                         buffer"
+                            .to_string()
+                    })?;
                 let v = state
                     .device
-                    .new_buffer(value_cache_size, MTLResourceOptions::StorageModePrivate);
+                    .try_new_buffer(value_cache_size, MTLResourceOptions::StorageModePrivate)
+                    .ok_or_else(|| {
+                        "LayerKVPool::new_for_test: Metal device failed to allocate value cache \
+                         buffer"
+                            .to_string()
+                    })?;
                 layers.push((k, v));
             }
 
@@ -919,8 +941,13 @@ impl LayerKVPool {
             new_layers.push((key_cache, value_cache));
         }
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let blit = command_buffer.new_blit_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
         for ((old_key, old_value), (new_key, new_value)) in
             inner.layers.iter().zip(new_layers.iter())
         {
@@ -1325,7 +1352,11 @@ impl LayerKVPool {
         let state = MetalState::get()?;
         let slot_buffer = state
             .device
-            .new_buffer_with_slice(slot_mapping, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(slot_mapping, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::write_kv: Metal device failed to allocate slot_mapping buffer"
+                    .to_string()
+            })?;
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] layer_kv_pool write_kv_slot_upload_done layer={} bytes={} elapsed_ms={:.1}",
@@ -1567,11 +1598,21 @@ impl LayerKVPool {
         // (kernel reads i32 for both).
         let block_tables_buffer = state
             .device
-            .new_buffer_with_slice(block_ids, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(block_ids, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::gather_attention: Metal device failed to allocate block_tables \
+                 buffer"
+                    .to_string()
+            })?;
         let context_lens: [i32; 1] = [num_tokens_in_request as i32];
         let context_lens_buffer = state
             .device
-            .new_buffer_with_slice(&context_lens, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(&context_lens, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::gather_attention: Metal device failed to allocate context_lens \
+                 buffer"
+                    .to_string()
+            })?;
 
         // Stride math (vLLM convention, mirrors AttentionLayer::forward):
         // - q_stride = num_query_heads * head_size  (per-token query stride)
@@ -1748,13 +1789,28 @@ impl LayerKVPool {
         let state = MetalState::get()?;
         let key_staging = state
             .device
-            .new_buffer(total_keys as u64, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer(total_keys as u64, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::read_blocks_to_host: Metal device failed to allocate key staging \
+                 buffer"
+                    .to_string()
+            })?;
         let value_staging = state
             .device
-            .new_buffer(total_values as u64, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer(total_values as u64, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::read_blocks_to_host: Metal device failed to allocate value staging \
+                 buffer"
+                    .to_string()
+            })?;
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let blit_encoder = command_buffer.new_blit_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit_encoder = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
 
         for (i, &block_id) in block_ids.iter().enumerate() {
             let key_src_offset = block_id as u64 * key_block_size;
@@ -1922,13 +1978,28 @@ impl LayerKVPool {
         let state = MetalState::get()?;
         let key_staging = state
             .device
-            .new_buffer(key_staging_size, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer(key_staging_size, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::read_block_all_layers: Metal device failed to allocate key staging \
+                 buffer"
+                    .to_string()
+            })?;
         let value_staging = state
             .device
-            .new_buffer(value_staging_size, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer(value_staging_size, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::read_block_all_layers: Metal device failed to allocate value \
+                 staging buffer"
+                    .to_string()
+            })?;
 
-        let command_buffer = state.command_queue.new_command_buffer();
-        let blit = command_buffer.new_blit_command_encoder();
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
         for (layer_idx, (key_cache, value_cache)) in layers.iter().enumerate() {
             blit.copy_from_buffer(
                 key_cache,
@@ -2063,12 +2134,27 @@ impl LayerKVPool {
         let state = MetalState::get()?;
         let key_staging = state
             .device
-            .new_buffer_with_slice(keys_bytes, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(keys_bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::write_blocks_from_host: Metal device failed to allocate key \
+                 staging buffer"
+                    .to_string()
+            })?;
         let value_staging = state
             .device
-            .new_buffer_with_slice(values_bytes, MTLResourceOptions::StorageModeShared);
-        let command_buffer = state.command_queue.new_command_buffer();
-        let blit = command_buffer.new_blit_command_encoder();
+            .try_new_buffer_with_slice(values_bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                "LayerKVPool::write_blocks_from_host: Metal device failed to allocate value \
+                 staging buffer"
+                    .to_string()
+            })?;
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
         for (i, &block_id) in block_ids.iter().enumerate() {
             blit.copy_from_buffer(
                 &key_staging,
@@ -2292,8 +2378,13 @@ impl LayerKVPool {
                     }
                 }
             }
-            let command_buffer = state.command_queue.new_command_buffer();
-            let blit = command_buffer.new_blit_command_encoder();
+            let command_buffer = state
+                .command_queue
+                .try_new_command_buffer()
+                .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+            let blit = command_buffer
+                .try_new_blit_command_encoder()
+                .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
             for (position, (block_id, _)) in chunk.iter().enumerate() {
                 for (layer, (key_pool, value_pool)) in layers.iter().enumerate() {
                     let source = (position * layers.len() + layer) as u64;
@@ -3028,7 +3119,8 @@ mod tests {
         let saved = inner.layers[layer_idx].clone();
         let stub = state
             .device
-            .new_buffer(1, MTLResourceOptions::StorageModePrivate);
+            .try_new_buffer(1, MTLResourceOptions::StorageModePrivate)
+            .expect("stub buffer must allocate");
         match side {
             ShrinkSide::Key => inner.layers[layer_idx].0 = stub,
             ShrinkSide::Value => inner.layers[layer_idx].1 = stub,
@@ -4048,12 +4140,19 @@ mod upload_batching_bench {
             for _ in 0..REPS {
                 let ks = st
                     .device
-                    .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+                    .try_new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared)
+                    .expect("staging keys buffer must allocate");
                 let vs = st
                     .device
-                    .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
-                let cb = st.command_queue.new_command_buffer();
-                let bl = cb.new_blit_command_encoder();
+                    .try_new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared)
+                    .expect("staging values buffer must allocate");
+                let cb = st
+                    .command_queue
+                    .try_new_command_buffer()
+                    .expect("queue must provide a command buffer");
+                let bl = cb
+                    .try_new_blit_command_encoder()
+                    .expect("command buffer must provide a blit encoder");
                 for x in 0..l as usize {
                     let (kc, vc) = pool.inner_read().layers[x].clone();
                     bl.copy_from_buffer(&ks, 0, &kc, bid as u64 * per_side as u64, per_side as u64);
@@ -4119,12 +4218,19 @@ mod upload_batching_bench {
         let batched_once = |pool: &LayerKVPool| {
             let ks = state
                 .device
-                .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+                .try_new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared)
+                .expect("staging keys buffer must allocate");
             let vs = state
                 .device
-                .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
-            let cb = state.command_queue.new_command_buffer();
-            let blit = cb.new_blit_command_encoder();
+                .try_new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared)
+                .expect("staging values buffer must allocate");
+            let cb = state
+                .command_queue
+                .try_new_command_buffer()
+                .expect("queue must provide a command buffer");
+            let blit = cb
+                .try_new_blit_command_encoder()
+                .expect("command buffer must provide a blit encoder");
             for l in 0..L as usize {
                 let (kc, vc) = pool.inner_read().layers[l].clone();
                 blit.copy_from_buffer(
@@ -4158,8 +4264,13 @@ mod upload_batching_bench {
         // Arm 3: bare command-buffer round-trip cost (no blits at all).
         let t = Instant::now();
         for _ in 0..REPS * L as usize {
-            let cb = state.command_queue.new_command_buffer();
-            let blit = cb.new_blit_command_encoder();
+            let cb = state
+                .command_queue
+                .try_new_command_buffer()
+                .expect("queue must provide a command buffer");
+            let blit = cb
+                .try_new_blit_command_encoder()
+                .expect("command buffer must provide a blit encoder");
             blit.end_encoding();
             cb.commit();
             cb.wait_until_completed();
@@ -4170,16 +4281,23 @@ mod upload_batching_bench {
         // Isolates command-buffer round-trip cost from staging allocation.
         let ks_reuse = state
             .device
-            .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared)
+            .expect("staging keys buffer must allocate");
         let vs_reuse = state
             .device
-            .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+            .try_new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared)
+            .expect("staging values buffer must allocate");
         let t = Instant::now();
         for _ in 0..REPS {
             for l in 0..L as usize {
                 let (kc, vc) = pool.inner_read().layers[l].clone();
-                let cb = state.command_queue.new_command_buffer();
-                let blit = cb.new_blit_command_encoder();
+                let cb = state
+                    .command_queue
+                    .try_new_command_buffer()
+                    .expect("queue must provide a command buffer");
+                let blit = cb
+                    .try_new_blit_command_encoder()
+                    .expect("command buffer must provide a blit encoder");
                 blit.copy_from_buffer(
                     &ks_reuse,
                     0,
@@ -4205,16 +4323,23 @@ mod upload_batching_bench {
         // Isolates staging allocation cost from command-buffer round-trips.
         let t = Instant::now();
         for _ in 0..REPS {
-            let cb = state.command_queue.new_command_buffer();
-            let blit = cb.new_blit_command_encoder();
+            let cb = state
+                .command_queue
+                .try_new_command_buffer()
+                .expect("queue must provide a command buffer");
+            let blit = cb
+                .try_new_blit_command_encoder()
+                .expect("command buffer must provide a blit encoder");
             let mut hold = Vec::with_capacity(L as usize * 2);
             for l in 0..L as usize {
                 let ks = state
                     .device
-                    .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+                    .try_new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared)
+                    .expect("staging keys buffer must allocate");
                 let vs = state
                     .device
-                    .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+                    .try_new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared)
+                    .expect("staging values buffer must allocate");
                 let (kc, vc) = pool.inner_read().layers[l].clone();
                 blit.copy_from_buffer(
                     &ks,
@@ -4246,10 +4371,12 @@ mod upload_batching_bench {
                 hold.push((
                     state
                         .device
-                        .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared),
+                        .try_new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared)
+                        .expect("staging keys buffer must allocate"),
                     state
                         .device
-                        .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared),
+                        .try_new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared)
+                        .expect("staging values buffer must allocate"),
                 ));
             }
             std::hint::black_box(&hold);
@@ -4306,14 +4433,21 @@ mod upload_batching_bench {
             let st = MetalState::get().unwrap();
             let a = st
                 .device
-                .new_buffer_with_slice(&big, MTLResourceOptions::StorageModeShared);
+                .try_new_buffer_with_slice(&big, MTLResourceOptions::StorageModeShared)
+                .expect("background source buffer must allocate");
             let b = st
                 .device
-                .new_buffer(big.len() as u64, MTLResourceOptions::StorageModePrivate);
+                .try_new_buffer(big.len() as u64, MTLResourceOptions::StorageModePrivate)
+                .expect("background destination buffer must allocate");
             let mut n = 0u64;
             while !stop_bg.load(AtomicOrdering::Relaxed) {
-                let cb = st.command_queue.new_command_buffer();
-                let bl = cb.new_blit_command_encoder();
+                let cb = st
+                    .command_queue
+                    .try_new_command_buffer()
+                    .expect("queue must provide a command buffer");
+                let bl = cb
+                    .try_new_blit_command_encoder()
+                    .expect("command buffer must provide a blit encoder");
                 for _ in 0..8 {
                     bl.copy_from_buffer(&a, 0, &b, 0, big.len() as u64);
                 }

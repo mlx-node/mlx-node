@@ -126,7 +126,10 @@ impl SGD {
                 .insert(param_name.to_string(), SGDState { v: None });
         }
 
-        let state = self.state.get_mut(&param_name).unwrap();
+        let state = self
+            .state
+            .get_mut(&param_name)
+            .ok_or_else(|| Error::from_reason("optimizer state missing after init"))?;
 
         unsafe {
             // Apply weight decay if specified

@@ -242,9 +242,9 @@ impl DenseMtpStepper<'_> {
                 "MTP verifier token count does not match depth",
             ));
         }
-        let owner = self
-            .owner
-            .expect("paged_verify_step is only reached on a paged turn");
+        let owner = self.owner.ok_or_else(|| {
+            Error::from_reason("paged_verify_step is only reached on a paged turn")
+        })?;
         self.open_verify_cycle(owner, depth + 1);
         let inner = &mut *self.inner;
         let adapter = owner

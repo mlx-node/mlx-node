@@ -613,7 +613,9 @@ fn structured_reasoning_boundary_ordinals(
     )?;
     let salt = (0usize..)
         .find(|salt| !completed_template.contains(&format!("__MLX_REASONING_PROVENANCE_{salt}_")))
-        .expect("an unbounded numeric salt must produce a unique sentinel");
+        .ok_or_else(|| {
+            Error::from_reason("an unbounded numeric salt must produce a unique sentinel")
+        })?;
 
     let mut replacements = Vec::new();
     let mut shadow_history = Vec::with_capacity(completed_history.len());
@@ -830,19 +832,17 @@ fn normalize_reasoning_boundaries(
     source_boundaries.push(0);
     for (index, &byte) in bytes.iter().enumerate() {
         if omitted[index] {
-            *source_boundaries
-                .last_mut()
-                .expect("the initial boundary is always present") = index + 1;
+            *source_boundaries.last_mut()? = index + 1;
         } else {
             normalized.push(byte);
             source_boundaries.push(index + 1);
         }
     }
 
-    Some((
-        String::from_utf8(normalized).expect("removing ASCII whitespace preserves valid UTF-8"),
-        source_boundaries,
-    ))
+    let Ok(normalized) = String::from_utf8(normalized) else {
+        return None;
+    };
+    Some((normalized, source_boundaries))
 }
 
 /// Reconstruct a live continuation from the exact committed token IDs plus

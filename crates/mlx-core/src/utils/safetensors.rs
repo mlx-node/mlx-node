@@ -693,7 +693,9 @@ fn save_safetensors_single<P: AsRef<Path>>(
     let mut current_offset = 0usize;
 
     for name in names {
-        let array = tensors.get(name).unwrap();
+        let array = tensors
+            .get(name)
+            .ok_or_else(|| Error::from_reason(format!("tensor '{name}' missing from map")))?;
         let shape = array.shape()?;
         let shape_vec: Vec<usize> = shape.as_ref().iter().map(|&x| x as usize).collect();
         let dtype = array.dtype()?;
@@ -743,7 +745,9 @@ fn save_safetensors_single<P: AsRef<Path>>(
     //          you want in production logs.
     let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
     for name in names {
-        let array = tensors.get(name).unwrap();
+        let array = tensors
+            .get(name)
+            .ok_or_else(|| Error::from_reason(format!("tensor '{name}' missing from map")))?;
         let t0 = std::time::Instant::now();
         if trace_enabled {
             let dtype = array.dtype().ok();
@@ -893,7 +897,9 @@ pub fn save_safetensors_sharded(
     let mut tensor_sizes: Vec<(String, usize)> = Vec::with_capacity(all_names.len());
     let mut total_size: usize = 0;
     for name in &all_names {
-        let array = tensors.get(name).unwrap();
+        let array = tensors
+            .get(name)
+            .ok_or_else(|| Error::from_reason(format!("tensor '{name}' missing from map")))?;
         let size = array.size()? as usize;
         let byte_size = size * array.dtype()?.byte_size();
         tensor_sizes.push((name.clone(), byte_size));
@@ -940,13 +946,13 @@ pub fn save_safetensors_sharded(
         };
 
         let shard_path = output_dir.join(&shard_filename);
-        let shard_bytes: u64 = shard_names
-            .iter()
-            .map(|n| {
-                let a = tensors.get(n).unwrap();
-                a.size().unwrap_or(0) * (a.dtype().map(|d| d.byte_size()).unwrap_or(0) as u64)
-            })
-            .sum();
+        let mut shard_bytes: u64 = 0;
+        for n in shard_names {
+            let a = tensors
+                .get(n)
+                .ok_or_else(|| Error::from_reason(format!("tensor '{n}' missing from map")))?;
+            shard_bytes += a.size()? * (a.dtype()?.byte_size() as u64);
+        }
         info!(
             shard_index = i + 1,
             shard_count = num_shards,

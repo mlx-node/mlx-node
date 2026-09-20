@@ -157,10 +157,12 @@ fn round_trip_k_v_through_shim() {
 
     let key_pool = state
         .device
-        .new_buffer(key_cache_size, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(key_cache_size, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer(value_cache_size, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(value_cache_size, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
 
     // Zero-initialize pools so we can detect what got written.
     unsafe {
@@ -190,18 +192,23 @@ fn round_trip_k_v_through_shim() {
     }
     let new_k = state
         .device
-        .new_buffer_with_slice(new_k_host.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(new_k_host.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let new_v = state
         .device
-        .new_buffer_with_slice(new_v_host.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(new_v_host.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     // Slot mapping: token 0 → slot 5 (block 0, position 5),
     //               token 1 → slot 21 (block 1, position 5).
     let slot_mapping_host: Vec<i64> = vec![5, 21];
-    let slot_mapping = state.device.new_buffer_with_slice(
-        slot_mapping_host.as_ref(),
-        MTLResourceOptions::StorageModeShared,
-    );
+    let slot_mapping = state
+        .device
+        .try_new_buffer_with_slice(
+            slot_mapping_host.as_ref(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("test buffer-with-slice allocation must succeed");
 
     // Dispatch through the shim.
     let rc = unsafe {
@@ -478,10 +485,12 @@ fn fp8_dispatch_uses_runtime_scales() {
 
     let key_pool = state
         .device
-        .new_buffer(key_cache_size, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(key_cache_size, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
     let value_pool = state
         .device
-        .new_buffer(value_cache_size, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer(value_cache_size, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
 
     // Mark every cache byte with a sentinel (0xff) so we can tell
     // which slots actually got written.
@@ -511,18 +520,23 @@ fn fp8_dispatch_uses_runtime_scales() {
 
     let new_k = state
         .device
-        .new_buffer_with_slice(new_k_host.as_slice(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(new_k_host.as_slice(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let new_v = state
         .device
-        .new_buffer_with_slice(new_v_host.as_slice(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(new_v_host.as_slice(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
 
     // Slot mapping: token 0 → slot 0, token 1 → slot 1 (block 0,
     // positions 0/1).
     let slot_mapping_host: Vec<i64> = vec![0, 1];
-    let slot_mapping = state.device.new_buffer_with_slice(
-        slot_mapping_host.as_ref(),
-        MTLResourceOptions::StorageModeShared,
-    );
+    let slot_mapping = state
+        .device
+        .try_new_buffer_with_slice(
+            slot_mapping_host.as_ref(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("test buffer-with-slice allocation must succeed");
 
     // Non-default scales chosen so K/k_scale = V/v_scale = 1.0.
     let k_scale: f32 = 0.5;

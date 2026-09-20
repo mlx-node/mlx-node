@@ -123,27 +123,39 @@ fn run_reducer_case(state: &MetalState, head_size: usize, num_stripes: usize) {
     let output_bytes = NUM_ROWS * head_size * std::mem::size_of::<u16>();
     let output = state
         .device
-        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
-    let exp_sums = state.device.new_buffer_with_slice(
-        inputs.exp_sums.as_ref(),
-        MTLResourceOptions::StorageModeShared,
-    );
-    let max_logits = state.device.new_buffer_with_slice(
-        inputs.max_logits.as_ref(),
-        MTLResourceOptions::StorageModeShared,
-    );
-    let partials = state.device.new_buffer_with_slice(
-        inputs.partials_bf16.as_ref(),
-        MTLResourceOptions::StorageModeShared,
-    );
+        .try_new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer allocation must succeed");
+    let exp_sums = state
+        .device
+        .try_new_buffer_with_slice(
+            inputs.exp_sums.as_ref(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("test buffer-with-slice allocation must succeed");
+    let max_logits = state
+        .device
+        .try_new_buffer_with_slice(
+            inputs.max_logits.as_ref(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("test buffer-with-slice allocation must succeed");
+    let partials = state
+        .device
+        .try_new_buffer_with_slice(
+            inputs.partials_bf16.as_ref(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("test buffer-with-slice allocation must succeed");
     let context_lens = [num_stripes as u32; QUERY_ROWS];
     let context_lens = state
         .device
-        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-slice allocation must succeed");
     let num_stripes_i32 = num_stripes as i32;
     let num_stripes_buffer = state
         .device
-        .new_buffer_with_value(&num_stripes_i32, MTLResourceOptions::StorageModeShared);
+        .try_new_buffer_with_value(&num_stripes_i32, MTLResourceOptions::StorageModeShared)
+        .expect("test buffer-with-value allocation must succeed");
 
     let pipeline_name = match head_size {
         256 => MetalState::paged_attention_grouped_qwen35_reduce_kernel_name(),
@@ -153,8 +165,13 @@ fn run_reducer_case(state: &MetalState, head_size: usize, num_stripes: usize) {
     let pipeline = state
         .get_pipeline(pipeline_name)
         .expect("grouped striped reducer pipeline must load");
-    let command_buffer = state.command_queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
+    let command_buffer = state
+        .command_queue
+        .try_new_command_buffer()
+        .expect("test command queue must provide a command buffer");
+    let encoder = command_buffer
+        .try_new_compute_command_encoder()
+        .expect("test command buffer must provide a compute encoder");
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(&output), 0);
     encoder.set_buffer(1, Some(&exp_sums), 0);

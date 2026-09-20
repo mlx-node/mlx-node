@@ -317,10 +317,10 @@ impl BlockAllocator {
 
         // Re-borrow now that the scan's immutable borrow of `lru_order` has
         // ended, so we're free to mutate `prefix_cache` / `lru_order` below.
-        let block = self
-            .prefix_cache
-            .get(&hash)
-            .expect("hash found during the scan above; no mutation happened in between");
+        // The hash was found during the scan above and no mutation happened
+        // in between, so this is `Some`; a desynced cache simply declines the
+        // eviction rather than panicking.
+        let block = self.prefix_cache.get(&hash)?;
         let block_id = block.block_id;
         // Release the cache's logical ref (1 → 0).
         let _ = block.decref();
@@ -746,7 +746,12 @@ impl BlockAllocator {
             let start = n * block_size_us;
             let block_tokens = &token_ids[start..start + block_size_us];
             let parent_hash = if n == 0 { 0 } else { hashes[n - 1] };
-            let extra_keys = keys.get(n).expect("hash walk requires keys for each block");
+            // `hashes` was produced by `keys.chain_hashes`, so a missing key
+            // cannot occur; if it ever did, the documented "first block
+            // without a cache identity" behavior is to stop the walk.
+            let Some(extra_keys) = keys.get(n) else {
+                break;
+            };
             if self.prefix_identity_mismatches(
                 block_hash,
                 block_tokens,
@@ -902,7 +907,9 @@ impl BlockAllocator {
             let end = start + block_size_us;
             let block_tokens = &token_ids[start..end];
             let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let extra_keys = keys.get(n).expect("registration key count was validated");
+            // Registration key count was validated against `blocks.len()`
+            // above, so this is `Some` for every n we reach.
+            let extra_keys = keys.get(n).ok_or("missing per-block registration keys")?;
             let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
             if !self.register_prefix(Arc::clone(block), block_hash) {
                 if self.prefix_identity_matches(

@@ -272,7 +272,7 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
     }
     let block_size = config.paged_block_size.unwrap_or(16);
     let max_chunk = u32::try_from(super::model::PREFILL_STEP_SIZE)
-        .expect("positive Muse-Glimmer prefill chunk");
+        .map_err(|_| Error::from_reason("positive Muse-Glimmer prefill chunk"))?;
     let specs = compute_layer_kv_cache_specs(config, block_size, KVCacheDType::BFloat16)
         .map_err(Error::from_reason)?;
     let groups =

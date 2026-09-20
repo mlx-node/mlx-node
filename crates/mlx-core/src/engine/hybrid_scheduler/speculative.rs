@@ -258,14 +258,19 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             let turn = &mut running[item.turn_index];
             let row = &plan.rows[item.plan_index];
             let proposal = if item.cap > 0 && !zero_probe {
-                self.inner.propose_scheduled(
-                    row.seq_id,
-                    item.anchor,
-                    item.cap,
-                    &turn.payload.params,
-                    turn.payload.scheduled_speculation.as_mut().unwrap(),
-                    profiling,
-                )
+                match turn.payload.scheduled_speculation.as_mut() {
+                    Some(rng) => self.inner.propose_scheduled(
+                        row.seq_id,
+                        item.anchor,
+                        item.cap,
+                        &turn.payload.params,
+                        rng,
+                        profiling,
+                    ),
+                    None => Err(Error::from_reason(
+                        "scheduled speculation state missing for capped row",
+                    )),
+                }
             } else {
                 Ok(empty_proposal())
             };
@@ -306,7 +311,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     })))
         {
             profiling = false;
-            self.inner.scheduled_verification_budget().unwrap().clear();
+            if let Some(budget) = self.inner.scheduled_verification_budget() {
+                budget.clear();
+            }
         }
         if work.is_empty() {
             return Ok((results, 0, 0));
@@ -319,8 +326,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     .collect::<Vec<_>>();
                 self.inner
                     .scheduled_verification_budget()
-                    .unwrap()
-                    .choose(&confidence)
+                    .and_then(|budget| budget.choose(&confidence))
             })
         } else {
             None
@@ -510,20 +516,24 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         .iter()
                         .map(|row| row.tokens.len() - 1)
                         .collect::<Vec<_>>();
-                    self.inner.scheduled_verification_budget().unwrap().record(
-                        &shape,
-                        if zero_probe {
-                            zero_probe_ns
-                        } else {
-                            wave_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
-                        },
-                    );
+                    if let Some(budget) = self.inner.scheduled_verification_budget() {
+                        budget.record(
+                            &shape,
+                            if zero_probe {
+                                zero_probe_ns
+                            } else {
+                                wave_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                            },
+                        );
+                    }
                 }
                 Err(error) => {
                     for result in &mut committed {
                         *result = Err(Error::from_reason(error.reason.clone()));
                     }
-                    self.inner.scheduled_verification_budget().unwrap().clear();
+                    if let Some(budget) = self.inner.scheduled_verification_budget() {
+                        budget.clear();
+                    }
                 }
             }
         }

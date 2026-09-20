@@ -293,7 +293,9 @@ impl PaddleOCRVisionModel {
             let h = grid_data[img_idx * 3 + 1];
             let w = grid_data[img_idx * 3 + 2];
             for _ in 0..t {
-                let prev = *cu_seqlens.last().unwrap();
+                let prev = *cu_seqlens.last().ok_or_else(|| {
+                    Error::new(Status::GenericFailure, "cu_seqlens lost its seed element")
+                })?;
                 cu_seqlens.push(prev + h * w);
             }
         }

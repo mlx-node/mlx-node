@@ -546,16 +546,22 @@ impl TextDecoder {
             }
             layers.push(layer);
         }
+        let packed = match quantization {
+            Some(settings) => Some(PackedDecoder {
+                settings,
+                embedding: packed_embedding.ok_or_else(|| {
+                    Error::from_reason("packed embedding exists with quantization")
+                })?,
+                layers: packed_layers,
+            }),
+            None => None,
+        };
         Ok(Self {
             embedding,
             layers,
             final_norm,
             config,
-            packed: quantization.map(|settings| PackedDecoder {
-                settings,
-                embedding: packed_embedding.expect("packed embedding exists with quantization"),
-                layers: packed_layers,
-            }),
+            packed,
         })
     }
 
@@ -800,7 +806,7 @@ impl TextDecoder {
                 (
                     dense_embedding
                         .as_ref()
-                        .expect("dense embedding exists")
+                        .ok_or_else(|| Error::from_reason("dense embedding exists"))?
                         .handle
                         .0,
                     ptr::null_mut(),
@@ -1031,7 +1037,9 @@ impl Qwen3AsrInner {
             .unwrap_or(true);
         let mut fallback_caches = Some(caches);
         let (mut fused_keys, mut fused_values, mut fused_cache_idx) = if use_fused_decode {
-            let owned = fallback_caches.take().expect("ASR prefill caches exist");
+            let owned = fallback_caches
+                .take()
+                .ok_or_else(|| Error::from_reason("ASR prefill caches exist"))?;
             let mut keys = Vec::with_capacity(owned.len());
             let mut values = Vec::with_capacity(owned.len());
             let mut offset = None;
@@ -1072,7 +1080,9 @@ impl Qwen3AsrInner {
             } else {
                 self.text_decoder.decode(
                     token,
-                    fallback_caches.as_mut().expect("fallback ASR caches exist"),
+                    fallback_caches
+                        .as_mut()
+                        .ok_or_else(|| Error::from_reason("fallback ASR caches exist"))?,
                 )?
             };
         }
@@ -1453,10 +1463,9 @@ impl Qwen3AsrInner {
             Error::from_reason(format!("Unknown or already finished ASR stream {id}"))
         })?;
         validate_stream_finish(state)?;
-        let mut state = self
-            .streams
-            .remove(id)
-            .expect("stream registration was validated immediately before removal");
+        let mut state = self.streams.remove(id).ok_or_else(|| {
+            Error::from_reason("stream registration was validated immediately before removal")
+        })?;
         let result = if !state.pending_samples.is_empty() {
             let mut transaction = state.finalization_copy(self.text_decoder.layers.len());
             let audio = std::mem::take(&mut transaction.pending_samples);
@@ -1721,8 +1730,11 @@ fn join_transcript_fragments(previous: &str, recovered: &str) -> String {
     if recovered.is_empty() {
         return previous.to_string();
     }
-    let left = previous.chars().next_back().expect("previous is non-empty");
-    let right = recovered.chars().next().expect("recovered is non-empty");
+    let (Some(left), Some(right)) = (previous.chars().next_back(), recovered.chars().next()) else {
+        // Both strings were just checked non-empty; concat without a spacer
+        // decision rather than panic if that ever drifts.
+        return format!("{previous}{recovered}");
+    };
     let needs_space = !left.is_whitespace()
         && !right.is_whitespace()
         && !matches!(right, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}')

@@ -283,7 +283,7 @@ fn property_value<T: Copy>(object_id: AudioObjectID, selector: u32, scope: u32) 
             null(),
             NonNull::from(&mut size),
             NonNull::new(value.as_mut_ptr())
-                .expect("MaybeUninit pointer")
+                .ok_or_else(|| Error::from_reason("MaybeUninit pointer"))?
                 .cast(),
         )
     };
@@ -348,7 +348,7 @@ fn device_channels(id: AudioObjectID, scope: u32) -> Result<u32> {
             null(),
             NonNull::from(&mut size),
             NonNull::new(storage.as_mut_ptr())
-                .expect("non-empty channel layout")
+                .ok_or_else(|| Error::from_reason("non-empty channel layout"))?
                 .cast(),
         )
     };
@@ -443,7 +443,8 @@ fn create_system_tap(
         tap_uid,
         &aggregate_uid,
         &format!("mlx-node system audio {process_id}.{instance}"),
-    );
+    )
+    .ok_or_else(|| Error::from_reason("Core Audio aggregate dictionary allocation failed"))?;
     let mut aggregate_device_id = 0;
     let status = unsafe {
         AudioHardwareCreateAggregateDevice(
@@ -499,7 +500,7 @@ fn process_ids_for_bundle_ids(bundle_ids: &[String]) -> Result<Vec<AudioObjectID
             null(),
             NonNull::from(&mut size),
             NonNull::new(process_ids.as_mut_ptr())
-                .expect("process object list pointer")
+                .ok_or_else(|| Error::from_reason("process object list pointer"))?
                 .cast(),
         )
     };
@@ -523,7 +524,7 @@ fn process_bundle_id(id: AudioObjectID) -> Result<String> {
     Ok(string.to_string())
 }
 
-fn to_cfstring(value: &'static CStr) -> CFRetained<CFString> {
+fn to_cfstring(value: &'static CStr) -> Option<CFRetained<CFString>> {
     unsafe {
         CFString::with_c_string(
             kCFAllocatorDefault,
@@ -531,30 +532,31 @@ fn to_cfstring(value: &'static CStr) -> CFRetained<CFString> {
             0x0800_0100, // kCFStringEncodingUTF8
         )
     }
-    .expect("Core Audio dictionary key")
 }
 
+/// Builds the aggregate-device property dictionary. Returns `None` when a Core
+/// Foundation allocator call fails — a panic here is unrecoverable across the
+/// napi boundary, so every CF allocation is propagated instead.
 fn aggregate_properties(
     tap_uid: Retained<NSString>,
     aggregate_uid: &str,
     aggregate_name: &str,
-) -> CFRetained<CFDictionary> {
+) -> Option<CFRetained<CFDictionary>> {
     let tap_dictionary = unsafe {
         let dictionary = CFMutableDictionary::new(
             kCFAllocatorDefault,
             2,
             &kCFTypeDictionaryKeyCallBacks,
             &kCFTypeDictionaryValueCallBacks,
-        )
-        .expect("tap dictionary");
+        )?;
         CFMutableDictionary::set_value(
             Some(dictionary.as_ref()),
-            &*to_cfstring(kAudioSubTapUIDKey) as *const _ as *const c_void,
+            &*to_cfstring(kAudioSubTapUIDKey)? as *const _ as *const c_void,
             &*tap_uid as *const _ as *const c_void,
         );
         CFMutableDictionary::set_value(
             Some(dictionary.as_ref()),
-            &*to_cfstring(kAudioSubTapDriftCompensationKey) as *const _ as *const c_void,
+            &*to_cfstring(kAudioSubTapDriftCompensationKey)? as *const _ as *const c_void,
             &*NSNumber::new_bool(true) as *const _ as *const c_void,
         );
         dictionary
@@ -566,8 +568,7 @@ fn aggregate_properties(
             tap_dictionaries.as_ptr().cast::<*const c_void>().cast_mut(),
             tap_dictionaries.len() as isize,
             &kCFTypeArrayCallBacks,
-        )
-        .expect("tap list")
+        )?
     };
     unsafe {
         let dictionary = CFMutableDictionary::new(
@@ -575,8 +576,7 @@ fn aggregate_properties(
             5,
             &kCFTypeDictionaryKeyCallBacks,
             &kCFTypeDictionaryValueCallBacks,
-        )
-        .expect("aggregate dictionary");
+        )?;
         let aggregate_name = CFString::from_str(aggregate_name);
         let aggregate_uid = CFString::from_str(aggregate_uid);
         let auto_start = NSNumber::new_bool(true);
@@ -606,11 +606,11 @@ fn aggregate_properties(
         for (key, value) in values {
             CFMutableDictionary::set_value(
                 Some(dictionary.as_ref()),
-                &*to_cfstring(key) as *const _ as *const c_void,
+                &*to_cfstring(key)? as *const _ as *const c_void,
                 value,
             );
         }
-        CFRetained::cast_unchecked::<CFDictionary>(dictionary)
+        Some(CFRetained::cast_unchecked::<CFDictionary>(dictionary))
     }
 }
 

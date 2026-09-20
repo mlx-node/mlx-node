@@ -3,6 +3,10 @@
 #![allow(clippy::type_complexity)]
 // Allow doc formatting variations
 #![allow(clippy::doc_nested_refdefs)]
+// The inference path must not panic: a panic crossing the napi / extern "C"
+// boundary aborts the host process. Production code propagates `Result`;
+// `#[cfg(test)]` code keeps unwrap/expect.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod array;
 pub mod autograd;

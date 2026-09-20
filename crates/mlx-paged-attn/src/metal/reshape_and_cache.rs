@@ -96,8 +96,13 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
 
     // Create command buffer and encoder
 
-    let command_buffer = state.command_queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
+    let command_buffer = state
+        .command_queue
+        .try_new_command_buffer()
+        .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+    let encoder = command_buffer
+        .try_new_compute_command_encoder()
+        .ok_or_else(|| "Metal command buffer returned no compute encoder".to_string())?;
 
     encoder.set_compute_pipeline_state(&pipeline);
 
@@ -115,14 +120,20 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
     encoder.set_buffer(4, Some(slot_buffer_ref), slot_mapping.offset as u64);
 
     // k_scale and v_scale - use params values for FP8
-    let k_scale_buffer = state.device.new_buffer_with_value(
-        &params.k_scale,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let v_scale_buffer = state.device.new_buffer_with_value(
-        &params.v_scale,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let k_scale_buffer = state
+        .device
+        .try_new_buffer_with_value(
+            &params.k_scale,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
+    let v_scale_buffer = state
+        .device
+        .try_new_buffer_with_value(
+            &params.v_scale,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
     encoder.set_buffer(5, Some(&k_scale_buffer), 0);
     encoder.set_buffer(6, Some(&v_scale_buffer), 0);
 
@@ -134,18 +145,19 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
     let block_size = params.block_size as i32;
     let x = params.x;
 
-    let create_const_buffer = |value: i32| {
+    let create_const_buffer = |value: i32| -> Result<Buffer, String> {
         state
             .device
-            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .try_new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| "Metal device failed to allocate i32 constant buffer".to_string())
     };
 
-    let key_stride_buf = create_const_buffer(key_stride);
-    let value_stride_buf = create_const_buffer(value_stride);
-    let num_heads_buf = create_const_buffer(num_heads);
-    let head_size_buf = create_const_buffer(head_size);
-    let block_size_buf = create_const_buffer(block_size);
-    let x_buf = create_const_buffer(x);
+    let key_stride_buf = create_const_buffer(key_stride)?;
+    let value_stride_buf = create_const_buffer(value_stride)?;
+    let num_heads_buf = create_const_buffer(num_heads)?;
+    let head_size_buf = create_const_buffer(head_size)?;
+    let block_size_buf = create_const_buffer(block_size)?;
+    let x_buf = create_const_buffer(x)?;
 
     encoder.set_buffer(7, Some(&key_stride_buf), 0);
     encoder.set_buffer(8, Some(&value_stride_buf), 0);

@@ -772,6 +772,14 @@ fn apply_mtp_weights(inner: &mut NemotronHInner, params: &HashMap<String, MxArra
         return Ok(());
     }
 
+    // The `required` gate above guarantees presence; keep the lookups
+    // fallible anyway so a future drift in that list can't panic across FFI.
+    let get = |key: &str| -> Result<&MxArray> {
+        params
+            .get(key)
+            .ok_or_else(|| Error::from_reason(format!("NemotronH MTP weight {key} missing")))
+    };
+
     // The MTP head runs its OWN attention over its OWN KV cache, so k_proj /
     // v_proj are live weights. A mis-shaped one would only surface as a matmul
     // failure deep inside the first draft; fail closed here instead.
@@ -781,7 +789,7 @@ fn apply_mtp_weights(inner: &mut NemotronHInner, params: &HashMap<String, MxArra
         "mtp.layers.0.mixer.k_proj.weight",
         "mtp.layers.0.mixer.v_proj.weight",
     ] {
-        let w = params.get(key).unwrap();
+        let w = get(key)?;
         let shape = w.shape()?.to_vec();
         if shape.len() != 2 || shape[0] != kv_dim || shape[1] != hidden {
             inner.mtp_weights_loaded = false;
@@ -817,7 +825,7 @@ fn apply_mtp_weights(inner: &mut NemotronHInner, params: &HashMap<String, MxArra
             vec![hidden, shared_inter],
         ),
     ] {
-        let w = params.get(key).unwrap();
+        let w = get(key)?;
         let dtype = w.dtype()?;
         let shape = w.shape()?.to_vec();
         if !matches!(dtype, DType::Float32 | DType::Float16 | DType::BFloat16) || shape != want {
@@ -831,88 +839,53 @@ fn apply_mtp_weights(inner: &mut NemotronHInner, params: &HashMap<String, MxArra
         }
     }
 
-    mtp.enorm
-        .set_weight(params.get("mtp.layers.0.enorm.weight").unwrap())?;
-    mtp.hnorm
-        .set_weight(params.get("mtp.layers.0.hnorm.weight").unwrap())?;
-    mtp.eh_proj.set_weight(
-        params.get("mtp.layers.0.eh_proj.weight").unwrap(),
-        "mtp.eh_proj",
-    )?;
+    mtp.enorm.set_weight(get("mtp.layers.0.enorm.weight")?)?;
+    mtp.hnorm.set_weight(get("mtp.layers.0.hnorm.weight")?)?;
+    mtp.eh_proj
+        .set_weight(get("mtp.layers.0.eh_proj.weight")?, "mtp.eh_proj")?;
     mtp.final_layernorm
-        .set_weight(params.get("mtp.layers.1.final_layernorm.weight").unwrap())?;
+        .set_weight(get("mtp.layers.1.final_layernorm.weight")?)?;
 
     {
         let layer = &mut mtp.layers[0];
-        layer
-            .norm
-            .set_weight(params.get("mtp.layers.0.norm.weight").unwrap())?;
+        layer.norm.set_weight(get("mtp.layers.0.norm.weight")?)?;
         let attn = match &mut layer.mixer {
             super::mtp::NemotronHMtpMixer::Attention(a) => a,
             _ => return Err(Error::from_reason("MTP layer 0 must be attention")),
         };
-        attn.q_proj.set_weight(
-            params.get("mtp.layers.0.mixer.q_proj.weight").unwrap(),
-            "mtp.q_proj",
-        )?;
-        attn.k_proj.set_weight(
-            params.get("mtp.layers.0.mixer.k_proj.weight").unwrap(),
-            "mtp.k_proj",
-        )?;
-        attn.v_proj.set_weight(
-            params.get("mtp.layers.0.mixer.v_proj.weight").unwrap(),
-            "mtp.v_proj",
-        )?;
-        attn.o_proj.set_weight(
-            params.get("mtp.layers.0.mixer.o_proj.weight").unwrap(),
-            "mtp.o_proj",
-        )?;
+        attn.q_proj
+            .set_weight(get("mtp.layers.0.mixer.q_proj.weight")?, "mtp.q_proj")?;
+        attn.k_proj
+            .set_weight(get("mtp.layers.0.mixer.k_proj.weight")?, "mtp.k_proj")?;
+        attn.v_proj
+            .set_weight(get("mtp.layers.0.mixer.v_proj.weight")?, "mtp.v_proj")?;
+        attn.o_proj
+            .set_weight(get("mtp.layers.0.mixer.o_proj.weight")?, "mtp.o_proj")?;
     }
 
     {
         let layer = &mut mtp.layers[1];
-        layer
-            .norm
-            .set_weight(params.get("mtp.layers.1.norm.weight").unwrap())?;
+        layer.norm.set_weight(get("mtp.layers.1.norm.weight")?)?;
         let moe = match &mut layer.mixer {
             super::mtp::NemotronHMtpMixer::MoE(m) => m,
             _ => return Err(Error::from_reason("MTP layer 1 must be MoE")),
         };
         moe.gate.set_weight(
-            &params
-                .get("mtp.layers.1.mixer.gate.weight")
-                .unwrap()
-                .astype(DType::Float32)?,
+            &get("mtp.layers.1.mixer.gate.weight")?.astype(DType::Float32)?,
             "mtp.gate",
         )?;
-        moe.e_score_correction_bias = params
-            .get("mtp.layers.1.mixer.gate.e_score_correction_bias")
-            .unwrap()
-            .astype(DType::Float32)?;
+        moe.e_score_correction_bias =
+            get("mtp.layers.1.mixer.gate.e_score_correction_bias")?.astype(DType::Float32)?;
         moe.experts.set_experts(
-            ExpertProj::Dense(
-                params
-                    .get("mtp.layers.1.mixer.experts.up_proj.weight")
-                    .unwrap()
-                    .clone(),
-            ),
-            ExpertProj::Dense(
-                params
-                    .get("mtp.layers.1.mixer.experts.down_proj.weight")
-                    .unwrap()
-                    .clone(),
-            ),
+            ExpertProj::Dense(get("mtp.layers.1.mixer.experts.up_proj.weight")?.clone()),
+            ExpertProj::Dense(get("mtp.layers.1.mixer.experts.down_proj.weight")?.clone()),
         )?;
         moe.shared_experts.up_proj.set_weight(
-            params
-                .get("mtp.layers.1.mixer.shared_experts.up_proj.weight")
-                .unwrap(),
+            get("mtp.layers.1.mixer.shared_experts.up_proj.weight")?,
             "mtp.shared_up",
         )?;
         moe.shared_experts.down_proj.set_weight(
-            params
-                .get("mtp.layers.1.mixer.shared_experts.down_proj.weight")
-                .unwrap(),
+            get("mtp.layers.1.mixer.shared_experts.down_proj.weight")?,
             "mtp.shared_down",
         )?;
     }

@@ -849,7 +849,7 @@ impl RootDir {
         }
         let rel = absolute
             .strip_prefix(anchor)
-            .expect("anchor is a lexical ancestor")
+            .map_err(|_| "cold-cache root escaped its lexical ancestor".to_string())?
             .to_path_buf();
         Self::open_beneath(anchor, &rel, root)
     }
