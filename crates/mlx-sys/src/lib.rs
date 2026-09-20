@@ -2097,6 +2097,11 @@ unsafe extern "C" {
         beta_input_dtype: bool,
         outputs: *mut *mut mlx_array,
     ) -> bool;
+    pub fn mlx_dflash2_topk16(
+        logits: *mut mlx_array,
+        out_ids: *mut *mut mlx_array,
+        out_values: *mut *mut mlx_array,
+    ) -> bool;
     pub fn mlx_qwen4_window_conv(
         x: *mut mlx_array,
         history: *mut mlx_array,

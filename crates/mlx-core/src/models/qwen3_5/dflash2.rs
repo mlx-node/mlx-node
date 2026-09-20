@@ -508,6 +508,36 @@ pub(crate) enum SelectorPath {
 }
 
 impl CandidateSelector {
+    /// Sharded top-16 over the vocab via `mlx_dflash2_topk16`: two Metal
+    /// dispatches instead of argpartition's full per-row merge sort. Returns
+    /// (ids [1,L,16] i32, values [1,L,16] f32) ascending by value — the same
+    /// contract the argpartition slice produces. `None` falls back to the
+    /// generic path (non-16 K, non-Metal, shape/dtype mismatch).
+    fn fused_topk16(&self, logits: &MxArray) -> Option<(MxArray, MxArray)> {
+        if self.top_k != 16
+            || std::env::var_os("MLX_DISABLE_DFLASH2_TOPK16").is_some()
+            || !unsafe { sys::mlx_metal_is_available() }
+        {
+            return None;
+        }
+        let shape = logits.shape().ok()?;
+        if shape.len() != 3 || shape[0] != 1 {
+            return None;
+        }
+        let mut ids = std::ptr::null_mut();
+        let mut values = std::ptr::null_mut();
+        if !unsafe { sys::mlx_dflash2_topk16(logits.as_raw_ptr(), &mut ids, &mut values) }
+            || ids.is_null()
+            || values.is_null()
+        {
+            return None;
+        }
+        let ids = MxArray::from_handle(ids, "dflash2_topk16:ids").ok()?;
+        let values = MxArray::from_handle(values, "dflash2_topk16:values").ok()?;
+        let dims = [1, shape[1], self.top_k as i64];
+        Some((ids.reshape(&dims).ok()?, values.reshape(&dims).ok()?))
+    }
+
     fn select<R: Rng + ?Sized>(
         &self,
         hidden: &MxArray,
@@ -518,14 +548,20 @@ impl CandidateSelector {
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let length = hidden.shape_at(1)? as usize;
-        let candidates = logits
-            .argpartition(-(self.top_k as i32), Some(-1))?
-            .slice_axis(
-                2,
-                self.vocab_size as i64 - self.top_k as i64,
-                self.vocab_size as i64,
-            )?;
-        let unary = logits.take_along_axis(&candidates, -1)?;
+        let (candidates, unary) = match self.fused_topk16(logits) {
+            Some((ids, values)) => (ids, values),
+            None => {
+                let candidates = logits
+                    .argpartition(-(self.top_k as i32), Some(-1))?
+                    .slice_axis(
+                        2,
+                        self.vocab_size as i64 - self.top_k as i64,
+                        self.vocab_size as i64,
+                    )?;
+                let unary = logits.take_along_axis(&candidates, -1)?;
+                (candidates, unary)
+            }
+        };
         let projected = self.hidden_projection.forward(hidden)?.reshape(&[
             length as i64,
             1,
@@ -1585,6 +1621,60 @@ mod tests {
             device_ids.iter().all(|&id| id == 5 || id == 9),
             "tie rows must select one of the tied maxima, got {device_ids:?}"
         );
+    }
+
+    /// The sharded top-16 kernel must return exactly the argpartition
+    /// candidate SET per row — same ids, matching logits values, ascending
+    /// value order. Called through the FFI directly so the test can never
+    /// pass vacuously on the fallback path.
+    #[test]
+    fn fused_topk16_matches_argpartition_candidate_set() {
+        let vocab: i64 = 8192;
+        let logits =
+            MxArray::random_normal(&[1, 5, vocab], 0.0, 1.0, Some(DType::Float32)).unwrap();
+        let mut ids = std::ptr::null_mut();
+        let mut values = std::ptr::null_mut();
+        if !unsafe { mlx_sys::mlx_dflash2_topk16(logits.as_raw_ptr(), &mut ids, &mut values) } {
+            return; // no Metal backend
+        }
+        let ids = MxArray::from_handle(ids, "topk16 ids").unwrap();
+        let values = MxArray::from_handle(values, "topk16 values").unwrap();
+        let ids: Vec<i32> = ids.to_int32().unwrap().as_ref().to_vec();
+        let values: Vec<f32> = values.to_float32().unwrap().as_ref().to_vec();
+        let logits_f: Vec<f32> = logits.to_float32().unwrap().as_ref().to_vec();
+
+        let reference = logits
+            .argpartition(-16, Some(-1))
+            .unwrap()
+            .slice_axis(2, vocab - 16, vocab)
+            .unwrap();
+        let ref_ids: Vec<i32> = reference.to_int32().unwrap().as_ref().to_vec();
+
+        for row in 0..5usize {
+            let mine = &ids[row * 16..(row + 1) * 16];
+            let mine_v = &values[row * 16..(row + 1) * 16];
+            let theirs = &ref_ids[row * 16..(row + 1) * 16];
+            // Same candidate set (tie order may differ between the two
+            // orderings — compare sorted).
+            let mut a = mine.to_vec();
+            let mut b = theirs.to_vec();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "row {row}: candidate sets differ");
+            // Ascending order + values equal the logits at those indices.
+            assert!(
+                mine_v.windows(2).all(|w| w[0] <= w[1]),
+                "row {row}: values not ascending: {mine_v:?}"
+            );
+            for (i, (&id, &v)) in mine.iter().zip(mine_v.iter()).enumerate() {
+                assert!(
+                    id >= 0 && (id as i64) < vocab,
+                    "row {row} slot {i}: bad id {id}"
+                );
+                let expected = logits_f[row * vocab as usize + id as usize];
+                assert_eq!(v, expected, "row {row} slot {i}: value mismatch");
+            }
+        }
     }
 
     /// `record_only` advances logical length and provenance identically to
