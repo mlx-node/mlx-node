@@ -204,11 +204,8 @@ impl MLPVariant {
                         let (merged, split) = &**pair;
                         let combined = merged.forward(x)?;
                         let last = combined.ndim()? as usize - 1;
-                        let width = combined.shape_at(last as u32)?;
-                        (
-                            combined.slice_axis(last, 0, *split)?,
-                            combined.slice_axis(last, *split, width)?,
-                        )
+                        let gu = combined.split_sections(&[*split], last as i32)?;
+                        (gu[0].clone(), gu[1].clone())
                     }
                     None => (gate_proj.forward(x)?, up_proj.forward(x)?),
                 };
@@ -735,6 +732,33 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
         }
+    }
+
+    /// Cast affine-mode `scales`/`biases`/`bias` f16→f32 once at load. With
+    /// bf16 activations `quantized_matmul` promotes the whole call to f32
+    /// anyway (`promote_types(bf16, f16)`), so the kernel receives f32
+    /// sidecars either way — pre-casting is bit-identical while removing two
+    /// per-forward `AsType` dispatches (three when a linear bias is present).
+    /// Only call from bf16-activation families: an f16 model would flip from
+    /// native f16 QMV to the f32 promote path and pay MORE casts.
+    pub fn promote_affine_sidecars_to_f32(&mut self) -> Result<()> {
+        if self.mode != DEFAULT_QUANT_MODE {
+            return Ok(());
+        }
+        if self.scales.dtype()? == crate::array::DType::Float16 {
+            self.scales = self.scales.astype(crate::array::DType::Float32)?;
+        }
+        if let Some(b) = &self.biases
+            && b.dtype()? == crate::array::DType::Float16
+        {
+            self.biases = Some(b.astype(crate::array::DType::Float32)?);
+        }
+        if let Some(b) = &self.bias
+            && b.dtype()? == crate::array::DType::Float16
+        {
+            self.bias = Some(b.astype(crate::array::DType::Float32)?);
+        }
+        Ok(())
     }
 
     /// Row-concatenate two quantized projections into one `[N1+N2, K]`

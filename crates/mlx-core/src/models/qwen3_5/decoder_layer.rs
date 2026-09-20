@@ -427,11 +427,12 @@ impl DecoderLayer {
     // ========== Weight accessors ==========
 
     pub fn set_input_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.input_layernorm.set_weight(w)
+        self.input_layernorm.set_weight(&super::bf16_load_param(w)?)
     }
 
     pub fn set_post_attention_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.post_attention_layernorm.set_weight(w)
+        self.post_attention_layernorm
+            .set_weight(&super::bf16_load_param(w)?)
     }
 
     // ========== Weight getters (for training parameter extraction) ==========

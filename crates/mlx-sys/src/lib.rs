@@ -486,6 +486,16 @@ unsafe extern "C-unwind" {
         out_handles: *mut u64,
         max_outputs: usize,
     ) -> usize;
+    /// Unequal split: `indices` are the N-1 cut points on `axis`, producing
+    /// N sections through a single Split primitive (one GPU dispatch).
+    pub fn mlx_array_split_indices(
+        handle: *mut mlx_array,
+        indices: *const i64,
+        indices_len: usize,
+        axis: i32,
+        out_handles: *mut u64,
+        max_outputs: usize,
+    ) -> usize;
     pub fn mlx_array_tile(
         handle: *mut mlx_array,
         reps: *const i32,
@@ -1969,6 +1979,7 @@ unsafe extern "C-unwind" {
     ) -> bool;
 
     // Fused GDN gating: beta = sigmoid(b), g = -exp(a_log) * softplus(a + dt_bias)
+    // `emit_exp` selects exp(g) output for the per-step recurrence path.
     pub fn mlx_fused_gdn_gating(
         b: *mut mlx_array,
         a: *mut mlx_array,
@@ -1976,6 +1987,7 @@ unsafe extern "C-unwind" {
         dt_bias: *mut mlx_array,
         num_heads: i32,
         total_elements: i32,
+        emit_exp: bool,
         out_beta: *mut *mut mlx_array,
         out_g: *mut *mut mlx_array,
     ) -> bool;

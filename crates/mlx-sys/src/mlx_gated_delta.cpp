@@ -325,6 +325,7 @@ bool mlx_fused_gdn_gating(
     mlx_array* dt_bias_handle,
     int num_heads,
     int total_elements,
+    bool emit_exp,
     mlx_array** out_beta,
     mlx_array** out_g
 ) {
@@ -357,6 +358,7 @@ bool mlx_fused_gdn_gating(
 
         std::vector<std::pair<std::string, fast::TemplateArg>> template_args = {
             {"InT", input_type},
+            {"EMIT_EXP", emit_exp},
         };
 
         int threads = 256;

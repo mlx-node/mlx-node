@@ -299,9 +299,11 @@ impl Qwen3_5Attention {
     /// [B,T,H*D])`.
     ///
     /// Fast path (`finalize_q_gate_block()` installed either the dense cache or
-    /// a packed quantized block layout): one projection followed by two flat
-    /// `slice_axis` calls. Both halves are already row-contiguous, so queries'
-    /// `[B,T,H,D]` reshape is a free view and gate needs no reshape at all.
+    /// a packed quantized block layout): one projection followed by a single
+    /// `split_sections` — zero-copy views instead of two `slice_axis` copy
+    /// dispatches. Queries' `[B,T,H,D]` reshape stays a strided view and
+    /// materializes only if a downstream kernel requires contiguous input;
+    /// gate feeds elementwise ops directly.
     /// `MLX_DISABLE_QGATE_BLOCK_SPLIT=1` is sampled by the finalizer at load
     /// time, letting a second process load native order for same-binary A/B
     /// without retaining both quantized layouts.
@@ -318,8 +320,9 @@ impl Qwen3_5Attention {
                 (Some(w_block_t), None) => x.matmul(w_block_t)?,
                 (None, _) => self.q_proj.forward(x)?,
             };
-            let queries_flat = flat.slice_axis(2, 0, hd)?;
-            let gate = flat.slice_axis(2, hd, 2 * hd)?;
+            let qg = flat.split_sections(&[hd], 2)?;
+            let queries_flat = &qg[0];
+            let gate = qg[1].clone();
             let queries = queries_flat.reshape(&[
                 batch,
                 seq_len,
@@ -359,11 +362,8 @@ impl Qwen3_5Attention {
         {
             let kv = merged.forward(x)?; // [B, T, k_dim + v_dim]
             let last = kv.ndim()? as usize - 1;
-            let width = kv.shape_at(last as u32)?;
-            return Ok((
-                kv.slice_axis(last, 0, *k_rows)?,
-                kv.slice_axis(last, *k_rows, width)?,
-            ));
+            let kv_split = kv.split_sections(&[*k_rows], last as i32)?;
+            return Ok((kv_split[0].clone(), kv_split[1].clone()));
         }
         Ok((self.k_proj.forward(x)?, self.v_proj.forward(x)?))
     }
@@ -509,7 +509,61 @@ impl Qwen3_5Attention {
         let output = if let Some(m) = mask {
             scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, Some(m))?
         } else if seq_len > 1 {
-            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+            // The fused vector kernel launches 32×gqa×qL threads in its
+            // 2-pass variant — qL·gqa > 32 exceeds the threadgroup limit and
+            // MLX falls back to a ~15-op unfused graph (expand + scores matmul
+            // + arange mask + where + softmax + matmul). Speculative verify
+            // blocks land just over the bound (e.g. qL=7, gqa=6 → 42).
+            // Splitting the query block keeps each call inside the fused
+            // kernel: causal alignment follows from qL_off = kL − qL, so the
+            // head chunk runs against keys truncated to kL − tail while the
+            // tail chunk sees the full cache.
+            let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+            let vector_dims = matches!(self.head_dim, 64 | 96 | 128 | 256);
+            let tail = if (1..=32).contains(&gqa) {
+                (32 / gqa).min(seq_len - 1)
+            } else {
+                0
+            };
+            if vector_dims
+                && tail >= 1
+                && seq_len <= 8
+                && seq_len * gqa > 32
+                && std::env::var("MLX_DISABLE_SDPA_VERIFY_SPLIT").is_err()
+            {
+                let head_len = seq_len - tail;
+                let kv_len = keys.shape_at(2)?;
+                let q_parts = queries.split_sections(&[head_len], 2)?;
+                let kv_split = keys.split_sections(&[kv_len - tail], 2)?;
+                let vv_split = values.split_sections(&[kv_len - tail], 2)?;
+                let out_head = if head_len > 1 {
+                    scaled_dot_product_attention_causal(
+                        &q_parts[0],
+                        &kv_split[0],
+                        &vv_split[0],
+                        self.scale as f64,
+                    )?
+                } else {
+                    // Single-row head: causal is a no-op, it attends to the
+                    // whole truncated prefix.
+                    scaled_dot_product_attention(
+                        &q_parts[0],
+                        &kv_split[0],
+                        &vv_split[0],
+                        self.scale as f64,
+                        None,
+                    )?
+                };
+                let out_tail = scaled_dot_product_attention_causal(
+                    &q_parts[1],
+                    &keys,
+                    &values,
+                    self.scale as f64,
+                )?;
+                MxArray::concatenate(&out_head, &out_tail, 2)?
+            } else {
+                scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+            }
         } else {
             scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
         };
@@ -518,10 +572,10 @@ impl Qwen3_5Attention {
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
-        // Apply gate: output * sigmoid(gate)
+        // Apply gate: output * sigmoid(gate) — one compiled fusion instead
+        // of a Sigmoid + Multiply pair.
         // gate is already [B, T, H*D] from the per-head split above
-        let gate_sigmoid = Activations::sigmoid(&gate)?;
-        let gated_output = output.mul(&gate_sigmoid)?;
+        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
 
         // Output projection
         self.o_proj.forward(&gated_output)
@@ -1296,9 +1350,8 @@ impl Qwen3_5Attention {
         let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
-        // Apply gate: output * sigmoid(gate).
-        let gate_sigmoid = Activations::sigmoid(&gate)?;
-        let gated_output = output.mul(&gate_sigmoid)?;
+        // Apply gate: output * sigmoid(gate) — one compiled fusion.
+        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
 
         // Output projection.
         self.o_proj.forward(&gated_output)
@@ -1457,7 +1510,7 @@ impl Qwen3_5Attention {
         }
         .astype(x.dtype()?)?
         .reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-        let output = output.mul(&Activations::sigmoid(&gate)?)?;
+        let output = Activations::sigmoid_mul_compiled(&gate, &output)?;
         if preserve_singleton_projection_graphs {
             let projected = (0..rows.len())
                 .map(|row| {
@@ -1524,10 +1577,10 @@ impl Qwen3_5Attention {
         self.o_proj.set_bias(b, "o_proj")
     }
     pub fn set_q_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.q_norm.set_weight(w)
+        self.q_norm.set_weight(&super::bf16_load_param(w)?)
     }
     pub fn set_k_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.k_norm.set_weight(w)
+        self.k_norm.set_weight(&super::bf16_load_param(w)?)
     }
 
     /// Precompute the block-ordered `[hidden, 2*H*D]` q_proj weight (queries

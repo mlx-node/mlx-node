@@ -822,6 +822,31 @@ size_t mlx_array_split_multi(mlx_array* handle,
   return count;
 }
 
+// Unequal split: `indices` are the N-1 cut points on `axis`, producing N
+// sections through a single Split primitive (one GPU dispatch). Returns the
+// section count written into out_handles.
+size_t mlx_array_split_indices(mlx_array* handle,
+                               const int64_t* indices,
+                               size_t indices_len,
+                               int32_t axis,
+                               uint64_t* out_handles,
+                               size_t max_outputs) {
+  if (!handle || !out_handles || (indices_len > 0 && !indices)) return 0;
+  auto arr = reinterpret_cast<array*>(handle);
+  mlx::core::Shape cuts;
+  cuts.reserve(indices_len);
+  for (size_t i = 0; i < indices_len; ++i) {
+    cuts.push_back(indices[i]);
+  }
+  auto splits = mlx::core::split(*arr, cuts, axis);
+  size_t count = std::min(splits.size(), max_outputs);
+  for (size_t i = 0; i < count; ++i) {
+    out_handles[i] =
+        reinterpret_cast<uint64_t>(new array(std::move(splits[i])));
+  }
+  return count;
+}
+
 // Keep the old single-output version for backwards compatibility
 mlx_array* mlx_array_split(mlx_array* handle,
                            int32_t indices_or_sections,

@@ -20,6 +20,14 @@ pub fn rms_norm_unscaled(x: &MxArray, eps: f32) -> Result<MxArray> {
     MxArray::from_handle(handle, "rms_norm_unscaled")
 }
 
+/// `rms_norm(x) * weight` in one fused dispatch — for constant per-channel
+/// scales that would otherwise cost a separate `Multiply` op (e.g. the GDN
+/// q/k `inv_scale` factors).
+pub fn rms_norm_scaled(x: &MxArray, weight: &MxArray, eps: f32) -> Result<MxArray> {
+    let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, weight.handle.0, eps) };
+    MxArray::from_handle(handle, "rms_norm_scaled")
+}
+
 pub struct RMSNorm {
     weight: MxArray,
     eps: f64,
@@ -215,7 +223,7 @@ impl RMSNormGated {
         let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, self.weight.handle.0, self.eps) };
         let normed = MxArray::from_handle(handle, "rms_norm_gated")?;
         match gate {
-            Some(g) => Activations::swiglu(g, &normed),
+            Some(g) => Activations::swiglu_compiled(g, &normed),
             None => Ok(normed),
         }
     }

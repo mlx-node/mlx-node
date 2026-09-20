@@ -248,6 +248,41 @@ impl MxArray {
         Ok(result)
     }
 
+    /// Unequal split: `indices` are the N-1 cut points on `axis`, producing
+    /// `indices.len() + 1` sections through a single Split primitive — one GPU
+    /// dispatch instead of N separate `slice_axis` copies.
+    pub(crate) fn split_sections(&self, indices: &[i64], axis: i32) -> Result<Vec<MxArray>> {
+        let num_outputs = indices.len() + 1;
+        let mut handles = vec![0u64; num_outputs];
+        let count = unsafe {
+            sys::mlx_array_split_indices(
+                self.handle.0,
+                indices.as_ptr(),
+                indices.len(),
+                axis,
+                handles.as_mut_ptr(),
+                num_outputs,
+            )
+        };
+        if count == 0 {
+            return Err(Error::new(Status::GenericFailure, "split_sections failed"));
+        }
+        if count != num_outputs {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!("split_sections produced {count} sections, expected {num_outputs}"),
+            ));
+        }
+        let mut result = Vec::with_capacity(count);
+        for handle in handles.iter().take(count) {
+            result.push(MxArray::from_handle(
+                *handle as *mut sys::mlx_array,
+                "split_sections",
+            )?);
+        }
+        Ok(result)
+    }
+
     #[napi]
     pub fn tile(&self, reps: &[i32]) -> Result<MxArray> {
         let handle = unsafe { sys::mlx_array_tile(self.handle.0, reps.as_ptr(), reps.len()) };

@@ -347,17 +347,22 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 verified_ids.len()
             )));
         }
-        replay_mtp_snapshot_to(
-            self.inner
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
-            &snapshot,
-            &tape,
-            keep,
-            false,
-            "Qwen3.8 DFlash2 commit",
-        )?;
+        // Full accept: the verify forward already advanced every GDN conv/recurrent
+        // state and the attention K/V through all `total_written` rows, so the live
+        // caches ARE the committed state — `replay_mtp_snapshot_to` would rebuild the
+        // identical values (~5 ops × every GDN layer) only to set them again.
+        if keep < total_written {
+            replay_mtp_snapshot_to(
+                self.inner.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("Qwen3.8 DFlash2 target caches are absent")
+                })?,
+                &snapshot,
+                &tape,
+                keep,
+                false,
+                "Qwen3.8 DFlash2 commit",
+            )?;
+        }
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 

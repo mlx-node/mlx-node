@@ -21,7 +21,9 @@ pub use conv1d::Conv1d;
 pub use embedding::Embedding;
 pub use linear::Linear;
 pub use losses::Losses;
-pub use normalization::{GroupedRMSNorm, LayerNorm, RMSNorm, RMSNormGated, rms_norm_unscaled};
+pub use normalization::{
+    GroupedRMSNorm, LayerNorm, RMSNorm, RMSNormGated, rms_norm_scaled, rms_norm_unscaled,
+};
 pub use rope::RoPE;
 
 /// Compute logsumexp in chunks along the vocabulary dimension.

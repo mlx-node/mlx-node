@@ -84,6 +84,9 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1` | Revert the GDN `in_proj_qkvz`/`in_proj_ba` pair to two matmuls — covers both the dense stacked-transpose path and the quantized row-merge. Bit-identical; A/B only. |
 | `MLX_DFLASH2_DRAFT_QUANT=q4\|q8` | Opt-in (default off): affine-quantize the DFlash2 draft's own projections at load and run a draft-precision clone of the target `lm_head` for proposal logits (~2.4 GiB resident saved on the Qwen3.8 pack). Verify still uses the target head, so emitted tokens are unaffected; draft precision only shifts proposal acceptance. |
 | `MLX_DFLASH2_CONV_ELEMENTWISE=1` | Force the elementwise pad/slice/add/mul chain for the DFlash2 grouped dynamic causal conv instead of the fused Metal dispatch. Bit-identical; A/B and rollback. |
+| `MLX_DISABLE_QWEN35_WINDOW_CONV=1` | Restore the generic `conv_general` + concat-history path for Qwen3.5 GDN conv instead of the fused `window_conv` Metal dispatch (history prepend + depthwise conv + SiLU + next-history in one kernel). Same math; A/B and rollback. |
+| `MLX_DISABLE_SDPA_VERIFY_SPLIT=1` | Disable the two-chunk query split that keeps speculative verify blocks inside the fused vector SDPA kernel when `q_len × gqa > 32` (threadgroup limit). Fallback is MLX's decomposed ~15-op masked-softmax path. A/B and rollback; outputs differ by ~1 bf16 ULP (two valid reduction orderings). |
+| `MLX_METAL_OP_TRACE=1\|2\|3` | Diagnostic: print one line per Metal primitive eval to stderr — `commit`/`kernel`/`synchronize` events with node counts (1), plus primitive names (2) and input→output dtypes (3). Zero cost when unset. Used to count dispatches per decode/verify cycle. |
 | `MLX_BENCH_PROMPT` / `MLX_BENCH_DEPTHS` | Inputs for the ignored `qwen3_8_dflash2_bench` e2e test: decode prompt (literal, or `@file` relative to the repo root) and comma-separated draft depths to sweep. |
 
 ### Paged-attention

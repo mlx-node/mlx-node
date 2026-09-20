@@ -148,4 +148,63 @@ mod tests {
             );
         }
     }
+
+    /// The verify-block split used by `Qwen3_5Attention::forward` when
+    /// `q_len * gqa > 32` overflows the fused vector kernel's threadgroup:
+    /// the head chunk attends to keys truncated at `kv_len - tail`, the tail
+    /// chunk sees the full cache. Both pieces keep causal alignment because
+    /// the kernel derives the offset as `kL - qL` per call.
+    #[test]
+    fn split_causal_attention_matches_unsplit() {
+        let batch = 1i64;
+        let heads = 24i64;
+        let kv_heads = 4i64;
+        let head_dim = 64i64;
+        let q_len = 7i64;
+        let kv_len = 1100i64; // past the 2-pass threshold on Apple Silicon
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        let q = MxArray::from_float32(
+            &deterministic_data((batch * heads * q_len * head_dim) as usize, 0.0),
+            &[batch, heads, q_len, head_dim],
+        )
+        .unwrap();
+        let k = MxArray::from_float32(
+            &deterministic_data((batch * kv_heads * kv_len * head_dim) as usize, 1.0),
+            &[batch, kv_heads, kv_len, head_dim],
+        )
+        .unwrap();
+        let v = MxArray::from_float32(
+            &deterministic_data((batch * kv_heads * kv_len * head_dim) as usize, 2.0),
+            &[batch, kv_heads, kv_len, head_dim],
+        )
+        .unwrap();
+
+        let whole = scaled_dot_product_attention_causal(&q, &k, &v, scale).unwrap();
+
+        let gqa = heads / kv_heads;
+        let tail = (32 / gqa).min(q_len - 1);
+        let head_len = q_len - tail;
+        let q_parts = q.split_sections(&[head_len], 2).unwrap();
+        let k_head = k.split_sections(&[kv_len - tail], 2).unwrap()[0].clone();
+        let v_head = v.split_sections(&[kv_len - tail], 2).unwrap()[0].clone();
+        let out_head = if head_len > 1 {
+            scaled_dot_product_attention_causal(&q_parts[0], &k_head, &v_head, scale).unwrap()
+        } else {
+            scaled_dot_product_attention(&q_parts[0], &k_head, &v_head, scale, None).unwrap()
+        };
+        let out_tail = scaled_dot_product_attention_causal(&q_parts[1], &k, &v, scale).unwrap();
+        let split = MxArray::concatenate(&out_head, &out_tail, 2).unwrap();
+
+        let whole = whole.to_float32().unwrap();
+        let split = split.to_float32().unwrap();
+        assert_eq!(whole.len(), split.len());
+        for (idx, (a, b)) in whole.iter().zip(split.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= 1e-3,
+                "split causal SDPA diverged from unsplit at {idx}: {a} vs {b} (diff {diff})"
+            );
+        }
+    }
 }

@@ -1341,7 +1341,14 @@ fn apply_weights_inner_with_residency(
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
             PerLayerMode::Affine => {
+                // This family runs bf16 activations: GGUF affine sidecars are
+                // f16, so `quantized_matmul` promotes the call to f32 and
+                // re-casts scales/biases EVERY forward. Pre-cast them to f32
+                // once — bit-identical values, two fewer `AsType` dispatches
+                // per projection per cycle.
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+                    .map(|mut ql| ql.promote_affine_sidecars_to_f32().map(|_| ql))
+                    .transpose()?
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
             PerLayerMode::Q6K
@@ -1479,7 +1486,7 @@ fn apply_weights_inner_with_residency(
 
     // Final norm
     if let Some(w) = params.get("final_norm.weight") {
-        inner.final_norm.set_weight(w)?;
+        inner.final_norm.set_weight(&super::bf16_load_param(w)?)?;
     }
 
     // LM head. The outer `Some(head)` guard preserves the tied-embeddings

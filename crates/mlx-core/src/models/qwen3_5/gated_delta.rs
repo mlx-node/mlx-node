@@ -129,6 +129,7 @@ fn fused_gdn_gating(
     a_log: &MxArray,
     dt_bias: &MxArray,
     num_heads: i32,
+    emit_exp: bool,
 ) -> Result<(MxArray, MxArray)> {
     let total_elements = b.size()? as i32;
     let mut out_beta: *mut sys::mlx_array = std::ptr::null_mut();
@@ -142,6 +143,7 @@ fn fused_gdn_gating(
             dt_bias.as_raw_ptr(),
             num_heads,
             total_elements,
+            emit_exp,
             &mut out_beta,
             &mut out_g,
         )
@@ -832,24 +834,39 @@ pub(crate) fn gated_delta_update_with_tape(
         return gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask);
     }
 
-    // Compute beta = sigmoid(b) and g_log = -exp(A_log) * softplus(a + dt_bias)
+    // Decide chunked vs per-step BEFORE gating so the fused kernel can emit
+    // exp(g_log) directly for the per-step/ops paths — the only consumers of
+    // log-space g are the chunked kernels (opt-in via `MLX_GDN_KERNEL=chunked`).
+    let seq_len = q.shape_at(1)?;
+    let try_chunked = k_dim % 32 == 0
+        && seq_len >= CHUNK_THRESHOLD
+        && mask.is_none()
+        && should_use_chunked(seq_len, true, gpu_architecture_gen(), gdn_kernel_override());
+
+    // Compute beta = sigmoid(b) and g = -exp(A_log) * softplus(a + dt_bias).
     // Try fused Metal kernel first (single dispatch), fall back to separate ops.
-    // g_log is the log-space gate; per-step kernel needs exp(g_log), chunked needs g_log directly.
-    let (beta, g_log) = match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
-        Ok((beta_flat, g_flat)) => {
-            let seq_len_tmp = b.shape_at(1)?;
-            let beta = beta_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
-            let g_log = g_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
-            (beta, g_log)
-        }
-        Err(_) => {
-            let beta = Activations::sigmoid(b)?;
-            // compute_g returns exp(g_log), so take log to get g_log
-            let g = compute_g(a_log, a, dt_bias)?;
-            let g_log = g.log()?;
-            (beta, g_log)
-        }
-    };
+    // With `emit_exp` the kernel returns exp(g_log) — the decay factor the
+    // per-step kernel and ops fallback both consume — saving an Exp dispatch
+    // per layer per forward. `g_is_exp` records which space `g_gate` is in.
+    let (beta, g_gate, g_is_exp) =
+        match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32, !try_chunked) {
+            Ok((beta_flat, g_flat)) => {
+                let seq_len_tmp = b.shape_at(1)?;
+                let beta = beta_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
+                let g = g_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
+                (beta, g, !try_chunked)
+            }
+            Err(_) => {
+                let beta = Activations::sigmoid(b)?;
+                // compute_g returns exp(g_log) directly
+                let g_exp = compute_g(a_log, a, dt_bias)?;
+                if try_chunked {
+                    (beta, g_exp.log()?, false)
+                } else {
+                    (beta, g_exp, true)
+                }
+            }
+        };
 
     // Standard checkpoints group each key head contiguously and need
     // repeat-interleave. GGUF Qwen3.5 keeps the value-major tiled order; the
@@ -882,50 +899,47 @@ pub(crate) fn gated_delta_update_with_tape(
         None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
     };
 
-    let seq_len = q.shape_at(1)?;
-
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
     if k_dim % 32 == 0 {
         // GDN recurrence kernel selection. Per-step is the default on EVERY GPU generation:
         // chunked is 2.8–3.5× slower prefill on M5 and ~2× slower on M3 (see `GdnKernel`).
         // Chunked is opt-in only via `MLX_GDN_KERNEL=chunked` (A/B / bring-up), and needs g in
-        // log-space directly (no exp/log roundtrip).
-        //
-        // Cheap eligibility first — mirrors `should_use_chunked`'s early-out (same
-        // `CHUNK_THRESHOLD` / `mask` terms) so short or masked calls (every per-token decode
-        // step) never pay the env + GPU-gen lookups below. The pure `should_use_chunked` still
-        // owns the full contract and is unit-tested; this is just lazy argument evaluation.
-        if seq_len >= CHUNK_THRESHOLD && mask.is_none() {
-            let choice = gdn_kernel_override();
-            if should_use_chunked(seq_len, mask.is_none(), gpu_architecture_gen(), choice) {
-                let (chunk_q, chunk_k) = if tiled_gqa && num_v_heads != num_k_heads {
-                    let repeat_factor = num_v_heads / num_k_heads;
-                    (
-                        MxArray::tile(&q, &[1, 1, repeat_factor as i32, 1])?,
-                        MxArray::tile(&k, &[1, 1, repeat_factor as i32, 1])?,
-                    )
-                } else {
-                    (q.clone(), k.clone())
-                };
-                match gated_delta_chunked(&chunk_q, &chunk_k, v, &g_log, &beta, &initial_state) {
-                    Ok(result) => return Ok(result),
-                    Err(e) => {
-                        // An explicit `MLX_GDN_KERNEL=chunked` force must be observable when it
-                        // fails — otherwise an A/B run silently measures per-step while reporting
-                        // "chunked". (Auto never reaches here: it returns per-step above.)
-                        if choice == GdnKernel::ForceChunked {
-                            eprintln!(
-                                "[mlx-gdn] MLX_GDN_KERNEL=chunked forced but the chunked kernel failed ({e}); falling back to per-step"
-                            );
-                        }
-                        // Fall through to per-step kernel.
+        // log-space directly (no exp/log roundtrip) — `g_gate` is log-space exactly when
+        // `try_chunked` was true above.
+        if try_chunked {
+            let (chunk_q, chunk_k) = if tiled_gqa && num_v_heads != num_k_heads {
+                let repeat_factor = num_v_heads / num_k_heads;
+                (
+                    MxArray::tile(&q, &[1, 1, repeat_factor as i32, 1])?,
+                    MxArray::tile(&k, &[1, 1, repeat_factor as i32, 1])?,
+                )
+            } else {
+                (q.clone(), k.clone())
+            };
+            match gated_delta_chunked(&chunk_q, &chunk_k, v, &g_gate, &beta, &initial_state) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // An explicit `MLX_GDN_KERNEL=chunked` force must be observable when it
+                    // fails — otherwise an A/B run silently measures per-step while reporting
+                    // "chunked". (Auto never reaches here: it returns per-step above.)
+                    if gdn_kernel_override() == GdnKernel::ForceChunked {
+                        eprintln!(
+                            "[mlx-gdn] MLX_GDN_KERNEL=chunked forced but the chunked kernel failed ({e}); falling back to per-step"
+                        );
                     }
+                    // Fall through to per-step kernel.
                 }
             }
         }
 
-        // Per-step kernel needs exponentiated decay factor
-        let g = g_log.exp()?;
+        // Per-step kernel needs exponentiated decay factor — already exp-space
+        // when `emit_exp` ran, otherwise exp the log-space gate here.
+        // Clone: the ops fallback below may still need `g_gate` if the kernel fails.
+        let g = if g_is_exp {
+            g_gate.clone()
+        } else {
+            g_gate.exp()?
+        };
         if let Ok(result) = gated_delta_kernel(&q, &k, v, &g, &beta, &initial_state, mask) {
             // Record the EXACT kernel inputs (lazy clones, no eval) for the
             // eager MTP tape replay. Only the per-step kernel path is recorded —
@@ -945,7 +959,7 @@ pub(crate) fn gated_delta_update_with_tape(
     }
 
     // Ops-based sequential loop fallback (also needs exp(g_log))
-    let g = g_log.exp()?;
+    let g = if g_is_exp { g_gate } else { g_gate.exp()? };
     let (ops_q, ops_k) = if tiled_gqa && num_v_heads != num_k_heads {
         let repeat_factor = num_v_heads / num_k_heads;
         (

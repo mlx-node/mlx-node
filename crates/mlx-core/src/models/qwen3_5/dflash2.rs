@@ -290,9 +290,11 @@ struct DFlash2Mlp {
 
 impl DFlash2Mlp {
     fn forward(&self, hidden: &MxArray) -> Result<MxArray> {
-        let gated = Activations::silu(&self.gate_proj.forward(hidden)?)?;
-        self.down_proj
-            .forward(&gated.mul(&self.up_proj.forward(hidden)?)?)
+        let gated = Activations::swiglu_compiled(
+            &self.gate_proj.forward(hidden)?,
+            &self.up_proj.forward(hidden)?,
+        )?;
+        self.down_proj.forward(&gated)
     }
 }
 

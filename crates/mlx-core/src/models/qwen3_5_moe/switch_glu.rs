@@ -69,13 +69,13 @@ impl SwitchGLU {
 
             let gate_out = self.gate_proj.forward(&sorted.x_sorted, idx, true)?;
             let up_out = self.up_proj.forward(&sorted.x_sorted, idx, true)?;
-            let activated = Activations::swiglu(&gate_out, &up_out)?;
+            let activated = Activations::swiglu_compiled(&gate_out, &up_out)?;
             let result = self.down_proj.forward(&activated, idx, true)?;
             scatter_unsort(&result, &sorted.inv_order, &idx_shape)?
         } else {
             let gate_out = self.gate_proj.forward(&x_expanded, indices, false)?;
             let up_out = self.up_proj.forward(&x_expanded, indices, false)?;
-            let activated = Activations::swiglu(&gate_out, &up_out)?;
+            let activated = Activations::swiglu_compiled(&gate_out, &up_out)?;
             self.down_proj.forward(&activated, indices, false)?
         };
 

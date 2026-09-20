@@ -1,5 +1,6 @@
 use crate::array::MxArray;
-use crate::nn::{Activations, Conv1d, Linear, RMSNormGated, rms_norm_unscaled};
+use crate::nn::{Activations, Conv1d, Linear, RMSNormGated, rms_norm_scaled, rms_norm_unscaled};
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
@@ -143,8 +144,8 @@ impl GdnLayerTape {
             // GatedDeltaNet::forward's conv-state update (cache slot 0).
             let total_len = conv_input.shape_at(1)?;
             if total_len >= keep {
-                let new_conv_state = conv_input.slice_axis(1, total_len - keep, total_len)?;
-                cache.set(0, new_conv_state)?;
+                let parts = conv_input.split_sections(&[total_len - keep], 1)?;
+                cache.set(0, parts[1].clone())?;
             }
         }
         Ok(())
@@ -191,6 +192,15 @@ pub struct GatedDeltaNet {
     /// quantized counterpart of `in_proj_qkvz_ba_t`. `in_proj_qkvz` and
     /// `in_proj_ba` are replaced by row-slice views of it.
     in_proj_qkvz_ba_q: Option<LinearProj>,
+    /// F32 `[conv_dim, 4]` view of the depthwise conv filter for the fused
+    /// `mlx_qwen4_window_conv` kernel (history prepend + conv + SiLU +
+    /// next-state in one dispatch). `None` when the loaded weight layout is
+    /// not the flat `[conv_dim, 4]` tap-major order the kernel reads.
+    conv1d_w4_f32: Option<MxArray>,
+    /// Constant `[key_head_dim]` norm weights folding the q/k `inv_scale`
+    /// factors into `fast_rms_norm` (one dispatch instead of norm + mul).
+    qk_norm_w_q: MxArray,
+    qk_norm_w_k: MxArray,
 }
 
 impl GatedDeltaNet {
@@ -238,6 +248,23 @@ impl GatedDeltaNet {
         let dt_bias = MxArray::ones(&[num_v_heads as i64], None)?;
         let a_log = MxArray::zeros(&[num_v_heads as i64], None)?; // Will be loaded from weights
 
+        // Constant per-channel norm weights folding the q/k head-dim scale
+        // factors into `fast_rms_norm` — bf16 to match the family compute
+        // dtype (mul_scalar also rounds the scalar to bf16, so the folded
+        // constant keeps identical rounding; the fused op just drops the
+        // intermediate round between norm and scale).
+        let inv_scale = (key_head_dim as f64).powf(-0.5);
+        let qk_norm_w_q = MxArray::full(
+            &[key_head_dim as i64],
+            Either::A(inv_scale * inv_scale),
+            Some(crate::array::DType::BFloat16),
+        )?;
+        let qk_norm_w_k = MxArray::full(
+            &[key_head_dim as i64],
+            Either::A(inv_scale),
+            Some(crate::array::DType::BFloat16),
+        )?;
+
         Ok(Self {
             in_proj_qkvz: LinearProj::Standard(in_proj_qkvz),
             in_proj_ba: LinearProj::Standard(in_proj_ba),
@@ -259,6 +286,9 @@ impl GatedDeltaNet {
             tiled_gguf_layout: config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled"),
             in_proj_qkvz_ba_t: None,
             in_proj_qkvz_ba_q: None,
+            conv1d_w4_f32: None,
+            qk_norm_w_q,
+            qk_norm_w_k,
         })
     }
 
@@ -350,21 +380,18 @@ impl GatedDeltaNet {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
-        // When the stacked weight is available, do one matmul + two slices.
+        // When the stacked weight is available, do one matmul + one split.
         // MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 reverts to the two-matmul path.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
-        let ba_dim = (self.num_v_heads * 2) as i64;
         let stacked = if std::env::var("MLX_DISABLE_E51_STACKED_GDN_IN_PROJ").is_err() {
             if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
                 let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
-                let qkvz = combined.slice_axis(2, 0, qkvz_dim)?;
-                let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
-                Some((qkvz, ba))
+                let parts = combined.split_sections(&[qkvz_dim], 2)?;
+                Some((parts[0].clone(), parts[1].clone()))
             } else if let Some(merged) = &self.in_proj_qkvz_ba_q {
                 let combined = merged.forward(x)?; // [B, T, qkvz_dim + ba_dim]
-                let qkvz = combined.slice_axis(2, 0, qkvz_dim)?;
-                let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
-                Some((qkvz, ba))
+                let parts = combined.split_sections(&[qkvz_dim], 2)?;
+                Some((parts[0].clone(), parts[1].clone()))
             } else {
                 None
             }
@@ -380,14 +407,8 @@ impl GatedDeltaNet {
             } else {
                 self.in_proj_qkvz.forward(x)?
             };
-            (
-                qkvz.slice_axis(2, 0, self.conv_dim as i64)?,
-                qkvz.slice_axis(
-                    2,
-                    self.conv_dim as i64,
-                    (self.key_dim * 2 + self.value_dim * 2) as i64,
-                )?,
-            )
+            let qkvz_split = qkvz.split_sections(&[self.conv_dim as i64], 2)?;
+            (qkvz_split[0].clone(), qkvz_split[1].clone())
         };
 
         let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
@@ -398,10 +419,8 @@ impl GatedDeltaNet {
             } else {
                 self.in_proj_ba.forward(x)?
             };
-            (
-                ba.slice_axis(2, 0, self.num_v_heads as i64)?,
-                ba.slice_axis(2, self.num_v_heads as i64, (self.num_v_heads * 2) as i64)?,
-            )
+            let ba_split = ba.split_sections(&[self.num_v_heads as i64], 2)?;
+            (ba_split[0].clone(), ba_split[1].clone())
         };
 
         // Apply mask before conv to prevent masked values leaking through convolution
@@ -426,50 +445,125 @@ impl GatedDeltaNet {
             None
         };
 
-        let conv_input = match conv_state {
-            Some(state) => {
-                // Prepend cached conv_state: [B, kernel-1, conv_dim]
-                MxArray::concatenate(&state, &qkv, 1)?
+        // Fused path: one Metal dispatch covering history prepend + 4-tap
+        // depthwise conv + SiLU + next-state emission (`mlx_qwen4_window_conv`
+        // is width-generic: bf16 x [1,T,W], bf16 [3,W] history, f32 [W,4]
+        // tap-major weight, batch == 1). Anything off-contract falls back to
+        // the generic conv path below.
+        let fused_conv = (|| -> Option<(MxArray, MxArray)> {
+            if batch != 1
+                || self.conv_kernel_dim != 4
+                || !use_kernel
+                || std::env::var("MLX_DISABLE_QWEN35_WINDOW_CONV").is_ok()
+                || !crate::engine::persistence::compiled_forward_backend_available()
+            {
+                return None;
             }
-            None => {
-                // No cache: prepend zeros of size (kernel_size - 1)
-                // Use qkv's dtype to avoid f32 promotion for bf16/f16 models
-                let pad_len = (self.conv_kernel_dim - 1) as i64;
-                let zeros =
-                    MxArray::zeros(&[batch, pad_len, self.conv_dim as i64], Some(qkv.dtype()?))?;
-                MxArray::concatenate(&zeros, &qkv, 1)?
+            let w = self.conv1d_w4_f32.as_ref()?;
+            let qkv_shape = qkv.shape().ok()?;
+            if qkv.dtype().ok()? != crate::array::DType::BFloat16
+                || qkv_shape.len() != 3
+                || qkv_shape[0] != 1
+                || qkv_shape[1] != seq_len
+                || qkv_shape[2] != self.conv_dim as i64
+            {
+                return None;
             }
-        };
-
-        // Update conv_state in cache
-        if let Some(cache) = cache.as_deref_mut() {
-            // Save last (kernel_size - 1) timesteps as new conv_state
-            let total_len = conv_input.shape_at(1)?;
-            let keep = (self.conv_kernel_dim - 1) as i64;
-            if total_len >= keep {
-                let new_conv_state = conv_input.slice_axis(1, total_len - keep, total_len)?;
-                cache.set(0, new_conv_state)?;
+            let history = match &conv_state {
+                Some(s) => s.squeeze(Some(&[0])).ok()?,
+                None => MxArray::zeros(
+                    &[(self.conv_kernel_dim - 1) as i64, self.conv_dim as i64],
+                    Some(crate::array::DType::BFloat16),
+                )
+                .ok()?,
+            };
+            let mut out = std::ptr::null_mut();
+            let mut next = std::ptr::null_mut();
+            if unsafe {
+                sys::mlx_qwen4_window_conv(
+                    qkv.handle.0,
+                    history.handle.0,
+                    w.handle.0,
+                    &mut out,
+                    &mut next,
+                )
+            } {
+                Some((
+                    MxArray::from_handle(out, "window_conv:out").ok()?,
+                    MxArray::from_handle(next, "window_conv:history").ok()?,
+                ))
+            } else {
+                None
             }
-        }
+        })();
 
-        // Conv1d: [B, T_in, conv_dim] → [B, T_out, conv_dim]
-        let conv_out = self.conv1d.forward(&conv_input)?;
-
-        // Take last seq_len timesteps (conv may produce more than seq_len if conv_state was prepended)
-        let conv_out_len = conv_out.shape_at(1)?;
-        let conv_out = if conv_out_len > seq_len {
-            conv_out.slice_axis(1, conv_out_len - seq_len, conv_out_len)?
+        let conv_out = if let Some((fused_out, next_history)) = fused_conv {
+            if let Some(cache) = cache.as_deref_mut() {
+                // next_history is [K-1, W] — the raw window tail, identical to
+                // the conv_input slice the fallback path stores.
+                cache.set(
+                    0,
+                    next_history.reshape(&[
+                        1,
+                        (self.conv_kernel_dim - 1) as i64,
+                        self.conv_dim as i64,
+                    ])?,
+                )?;
+            }
+            fused_out
         } else {
-            conv_out
-        };
+            let conv_input = match conv_state {
+                Some(state) => {
+                    // Prepend cached conv_state: [B, kernel-1, conv_dim]
+                    MxArray::concatenate(&state, &qkv, 1)?
+                }
+                None => {
+                    // No cache: prepend zeros of size (kernel_size - 1)
+                    // Use qkv's dtype to avoid f32 promotion for bf16/f16 models
+                    let pad_len = (self.conv_kernel_dim - 1) as i64;
+                    let zeros = MxArray::zeros(
+                        &[batch, pad_len, self.conv_dim as i64],
+                        Some(qkv.dtype()?),
+                    )?;
+                    MxArray::concatenate(&zeros, &qkv, 1)?
+                }
+            };
 
-        // Apply SiLU activation
-        let conv_out = Activations::silu(&conv_out)?;
+            // Update conv_state in cache
+            if let Some(cache) = cache.as_deref_mut() {
+                // Save last (kernel_size - 1) timesteps as new conv_state
+                let total_len = conv_input.shape_at(1)?;
+                let keep = (self.conv_kernel_dim - 1) as i64;
+                if total_len >= keep {
+                    let parts = conv_input.split_sections(&[total_len - keep], 1)?;
+                    cache.set(0, parts[1].clone())?;
+                }
+            }
+
+            // Conv1d: [B, T_in, conv_dim] → [B, T_out, conv_dim]
+            let conv_out = self.conv1d.forward(&conv_input)?;
+
+            // Take last seq_len timesteps (conv may produce more than seq_len if conv_state was prepended)
+            let conv_out_len = conv_out.shape_at(1)?;
+            let conv_out = if conv_out_len > seq_len {
+                conv_out
+                    .split_sections(&[conv_out_len - seq_len], 1)?
+                    .swap_remove(1)
+            } else {
+                conv_out
+            };
+
+            // Apply SiLU activation — silu(x) = x * sigmoid(x), fused through the
+            // compiled sigmoid-mul kernel (one dispatch instead of Sigmoid+Multiply).
+            Activations::sigmoid_mul_compiled(&conv_out, &conv_out)?
+        };
 
         // Split into q, k, v
-        let q_flat = conv_out.slice_axis(2, 0, self.key_dim as i64)?;
-        let k_flat = conv_out.slice_axis(2, self.key_dim as i64, (self.key_dim * 2) as i64)?;
-        let v_flat = conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
+        let conv_split =
+            conv_out.split_sections(&[self.key_dim as i64, (self.key_dim * 2) as i64], 2)?;
+        let q_flat = &conv_split[0];
+        let k_flat = &conv_split[1];
+        let v_flat = &conv_split[2];
 
         // Reshape to head format
         // q, k: [B, T, key_dim] → [B, T, Hk, Dk]
@@ -497,11 +591,23 @@ impl GatedDeltaNet {
         //   inv_scale = head_k_dim^(-0.5)
         //   q = (inv_scale^2) * rms_norm(q, None, 1e-6)
         //   k = inv_scale * rms_norm(k, None, 1e-6)
-        let inv_scale = (self.key_head_dim as f64).powf(-0.5);
-        let q_normed = rms_norm_unscaled(&q, 1e-6)?;
-        let k_normed = rms_norm_unscaled(&k, 1e-6)?;
-        let q = q_normed.mul_scalar(inv_scale * inv_scale)?;
-        let k = k_normed.mul_scalar(inv_scale)?;
+        // The scale factors live in constant bf16 vectors so the norm+scale
+        // is ONE fast_rms_norm dispatch per tensor (bf16 activations only —
+        // other dtypes keep the scalar path to avoid a promote).
+        let (q, k) = if q.dtype()? == crate::array::DType::BFloat16
+            && k.dtype()? == crate::array::DType::BFloat16
+        {
+            (
+                rms_norm_scaled(&q, &self.qk_norm_w_q, 1e-6)?,
+                rms_norm_scaled(&k, &self.qk_norm_w_k, 1e-6)?,
+            )
+        } else {
+            let inv_scale = (self.key_head_dim as f64).powf(-0.5);
+            (
+                rms_norm_unscaled(&q, 1e-6)?.mul_scalar(inv_scale * inv_scale)?,
+                rms_norm_unscaled(&k, 1e-6)?.mul_scalar(inv_scale)?,
+            )
+        };
         if self.tiled_gguf_layout
             && (self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0)
         {
@@ -611,19 +717,41 @@ impl GatedDeltaNet {
         self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
     pub fn set_conv1d_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.conv1d.set_weight(w)
+        // Prepare the fused window-conv weight from the RAW checkpoint tensor
+        // (before the bf16 fallback normalization below): the kernel wants f32
+        // tap-major `[conv_dim, 4]`, which is exactly the flat order of the
+        // MLX `[conv_dim, K, 1]` / `[conv_dim, 1, K]` / `[conv_dim, K]` conv
+        // layouts. Any other layout stays None → forward uses conv_general.
+        self.conv1d_w4_f32 = None;
+        if self.conv_kernel_dim == 4
+            && let Ok(shape) = w.shape()
+        {
+            let cd = self.conv_dim as i64;
+            let kd = self.conv_kernel_dim as i64;
+            // Accept only layouts whose flat order is channel-major
+            // `[conv_dim, K]` taps: [W,K], [W,K,1], [W,1,K].
+            let tap_major = match shape.len() {
+                2 => shape[0] == cd && shape[1] == kd,
+                3 => {
+                    shape[0] == cd
+                        && ((shape[1] == kd && shape[2] == 1) || (shape[1] == 1 && shape[2] == kd))
+                }
+                _ => false,
+            };
+            if tap_major {
+                self.conv1d_w4_f32 = w
+                    .reshape(&[cd, kd])
+                    .and_then(|v| v.astype(crate::array::DType::Float32))
+                    .ok();
+            }
+        }
+        self.conv1d.set_weight(&super::bf16_load_param(w)?)
     }
     pub fn set_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        // norm.weight may be stored as f32 in checkpoints for precision,
-        // but must match model dtype to avoid cascading f32 promotion.
-        let target_dtype = self.dt_bias.dtype()?;
-        let w_dtype = w.dtype()?;
-        if w_dtype != target_dtype {
-            let casted = w.astype(target_dtype)?;
-            self.norm.set_weight(&casted)
-        } else {
-            self.norm.set_weight(w)
-        }
+        // norm.weight may be stored as f32 in checkpoints for precision;
+        // cast to bf16 — the family compute dtype — not to dt_bias's dtype
+        // (GGUF keeps dt_bias f32 for the gating kernel's `float*` reads).
+        self.norm.set_weight(&super::bf16_load_param(w)?)
     }
     pub fn set_out_proj_weight(&mut self, w: &MxArray) -> Result<()> {
         self.out_proj.set_weight(w, "out_proj")
