@@ -568,6 +568,7 @@ fn forward_dflash2_compiled(
     // `flat_attention_frontier`) is that every FA cache agrees on it.
     let mut rope_base: Option<i32> = None;
     let mut per_layer_state: Vec<MxArray> = Vec::with_capacity(2 * caches.len());
+    let mut fa_prefix_offsets: Vec<Option<i32>> = Vec::with_capacity(caches.len());
     for index in 0..inner.layers.len() {
         match (&inner.layers[index].attn, &caches[index]) {
             (
@@ -579,6 +580,7 @@ fn forward_dflash2_compiled(
                 };
                 per_layer_state.push(conv.clone());
                 per_layer_state.push(rec.clone());
+                fa_prefix_offsets.push(None);
             }
             (
                 crate::models::qwen3_5::decoder_layer::AttentionType::Full(_),
@@ -598,6 +600,7 @@ fn forward_dflash2_compiled(
                 }
                 per_layer_state.push(keys.slice_axis(2, 0, offset as i64)?);
                 per_layer_state.push(values.slice_axis(2, 0, offset as i64)?);
+                fa_prefix_offsets.push(Some(offset));
             }
             _ => return Ok(None),
         }
@@ -700,58 +703,77 @@ fn forward_dflash2_compiled(
     };
 
     // Unpack the contract: logits, taps, then per-layer extras in layer order.
-    let mut cursor = 1 + tap_layers.len();
-    let logits = outputs[0].clone();
-    let taps: Vec<MxArray> = outputs[1..1 + tap_layers.len()].to_vec();
+    // Any failure after the invoke must leave the live FA caches at their
+    // prefix offsets — the caller falls back to the eager forward, which
+    // appends through `update_and_fetch` again.
+    let unpack = |outputs: &[MxArray],
+                  caches: &mut [Qwen3_5LayerCache],
+                  tape: &mut [Option<GdnLayerTape>]|
+     -> Result<()> {
+        let mut cursor = 1 + tap_layers.len();
+        for (index, layer) in inner.layers.iter().enumerate() {
+            if layer.is_linear() {
+                let kd = match &layer.attn {
+                    crate::models::qwen3_5::decoder_layer::AttentionType::Linear(gdn) => {
+                        gdn.conv_kernel_dim()
+                    }
+                    _ => {
+                        return Err(Error::from_reason(
+                            "compiled verify: linear layer kind mismatch",
+                        ));
+                    }
+                };
+                let mut take = |outputs: &[MxArray]| -> Result<MxArray> {
+                    let a = outputs.get(cursor).ok_or_else(|| {
+                        Error::from_reason("compiled verify: output arity shortfall")
+                    })?;
+                    cursor += 1;
+                    Ok(a.clone())
+                };
+                tape[index] = Some(GdnLayerTape {
+                    kernel: GdnKernelTape {
+                        q: take(outputs)?,
+                        k: take(outputs)?,
+                        v: take(outputs)?,
+                        g: take(outputs)?,
+                        beta: take(outputs)?,
+                    },
+                    qkv: take(outputs)?,
+                    conv_kernel_dim: kd,
+                });
+            } else {
+                let kvc = caches[index].as_kv_cache_mut().ok_or_else(|| {
+                    Error::from_reason("compiled verify: attention cache kind mismatch")
+                })?;
+                let (Some(new_k), Some(new_v)) = (outputs.get(cursor), outputs.get(cursor + 1))
+                else {
+                    return Err(Error::from_reason(
+                        "compiled verify: output arity shortfall",
+                    ));
+                };
+                cursor += 2;
+                kvc.update_and_fetch(new_k, new_v)?;
+            }
+        }
+        Ok(())
+    };
     let mut tape: Vec<Option<GdnLayerTape>> = std::iter::repeat_with(|| None)
         .take(inner.layers.len())
         .collect();
-    let caches = inner
-        .caches
-        .as_mut()
-        .ok_or_else(|| Error::from_reason("compiled verify: caches dropped mid-invoke"))?;
-    for (index, layer) in inner.layers.iter().enumerate() {
-        if layer.is_linear() {
-            let kd = match &layer.attn {
-                crate::models::qwen3_5::decoder_layer::AttentionType::Linear(gdn) => {
-                    gdn.conv_kernel_dim()
+    let logits = outputs[0].clone();
+    let taps: Vec<MxArray> = outputs[1..1 + tap_layers.len()].to_vec();
+    {
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("compiled verify: caches dropped mid-invoke"))?;
+        if let Err(e) = unpack(&outputs, caches, &mut tape) {
+            for (index, prefix) in fa_prefix_offsets.iter().enumerate() {
+                if let (Some(prefix), Some(kvc)) = (*prefix, caches[index].as_kv_cache_mut()) {
+                    kvc.trim(prefix);
                 }
-                _ => {
-                    return Err(Error::from_reason(
-                        "compiled verify: linear layer kind mismatch",
-                    ));
-                }
-            };
-            let mut take = |outputs: &Vec<MxArray>| -> Result<MxArray> {
-                let a = outputs
-                    .get(cursor)
-                    .ok_or_else(|| Error::from_reason("compiled verify: output arity shortfall"))?;
-                cursor += 1;
-                Ok(a.clone())
-            };
-            tape[index] = Some(GdnLayerTape {
-                kernel: GdnKernelTape {
-                    q: take(&outputs)?,
-                    k: take(&outputs)?,
-                    v: take(&outputs)?,
-                    g: take(&outputs)?,
-                    beta: take(&outputs)?,
-                },
-                qkv: take(&outputs)?,
-                conv_kernel_dim: kd,
-            });
-        } else {
-            let kvc = caches[index].as_kv_cache_mut().ok_or_else(|| {
-                Error::from_reason("compiled verify: attention cache kind mismatch")
-            })?;
-            let new_k = outputs
-                .get(cursor)
-                .ok_or_else(|| Error::from_reason("compiled verify: output arity shortfall"))?;
-            let new_v = outputs
-                .get(cursor + 1)
-                .ok_or_else(|| Error::from_reason("compiled verify: output arity shortfall"))?;
-            cursor += 2;
-            kvc.update_and_fetch(new_k, new_v)?;
+            }
+            return Err(e);
         }
     }
     Ok(Some((logits, taps, tape)))
