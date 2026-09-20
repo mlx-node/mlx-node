@@ -147,12 +147,23 @@ impl Qwen3_5LayerCache {
                 })
             }
             Self::Linear(c) => {
+                // Lazy aliases suffice: every GDN state update is functional
+                // (`ArraysCache::set` swaps in a new MxArray; `get` yields only
+                // &MxArray, so no caller can `overwrite` the stored handle in
+                // place). The snapshotted Arc keeps the pre-verify descriptor
+                // and buffer alive and untouched until `restore` rebinds it —
+                // same values as `.copy()` without ~72 copy kernels per
+                // verify cycle. MLX_SNAPSHOT_STATE_COPY=1 restores the old
+                // defensive copies for A/B.
+                let eager_copy = std::env::var_os("MLX_SNAPSHOT_STATE_COPY").is_some();
                 let conv_state = match c.get(0) {
-                    Some(arr) => Some(arr.copy()?),
+                    Some(arr) if eager_copy => Some(arr.copy()?),
+                    Some(arr) => Some(arr.clone()),
                     None => None,
                 };
                 let recurrent_state = match c.get(1) {
-                    Some(arr) => Some(arr.copy()?),
+                    Some(arr) if eager_copy => Some(arr.copy()?),
+                    Some(arr) => Some(arr.clone()),
                     None => None,
                 };
                 Ok(Qwen3_5LayerSnapshot::Linear {
