@@ -98,6 +98,24 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    /// `h = x + res` + `normed = norm(h)` — one Metal dispatch via the fused
+    /// add_rmsnorm kernel when the contract holds, else the separate ops.
+    /// The fused kernel is bit-identical to `x.add(res)` + `norm.forward(h)`
+    /// (same element mapping as `rms_single_row`/`rms_looped`), so this is
+    /// safe on every path — eager, paged, prefill and compiled verify alike.
+    fn add_residual_norm(
+        norm: &RMSNorm,
+        x: &MxArray,
+        res: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        if let Some(pair) = norm.forward_residual_add(x, res) {
+            return Ok(pair);
+        }
+        let h = x.add(res)?;
+        let normed = norm.forward(&h)?;
+        Ok((h, normed))
+    }
+
     /// Whether this layer uses linear attention (derived from attention type).
     pub fn is_linear(&self) -> bool {
         matches!(self.attn, AttentionType::Linear(_))
@@ -199,11 +217,8 @@ impl DecoderLayer {
             }
         };
 
-        // Residual connection
-        let h = x.add(&attn_out)?;
-
-        // Pre-norm + MLP
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        // Residual + post-attention norm (fused add_rmsnorm when eligible)
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
         // Residual connection
@@ -239,8 +254,7 @@ impl DecoderLayer {
             }
         };
 
-        let h = x.add(&attn_out)?;
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         let mlp_out = self.mlp.forward(&normed)?;
         h.add(&mlp_out)
     }
@@ -333,10 +347,9 @@ impl DecoderLayer {
                     rope_position_offset,
                     mrope_cache,
                 )?;
-                // Residual.
-                let h = x.add(&attn_out)?;
-                // Pre-norm + MLP.
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                // Residual + post-attention norm (fused when eligible).
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)
             }
@@ -388,8 +401,8 @@ impl DecoderLayer {
                 let normed = self.input_layernorm.forward(x)?;
                 let attn_out =
                     attn.forward_paged_batched(&normed, adapter, paged_idx, rows, false)?;
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)
             }
@@ -468,8 +481,8 @@ impl DecoderLayer {
                     rope_position_offset,
                     &mut None,
                 )?;
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)
             }

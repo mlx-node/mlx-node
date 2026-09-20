@@ -54,6 +54,45 @@ impl RMSNorm {
         MxArray::from_handle(handle, "fast_rms_norm")
     }
 
+    /// Fused `h = x + res` + `normed = self.forward(h)` — one Metal dispatch
+    /// replacing the [Add + RMSNorm] pair at residual/norm boundaries, while
+    /// still emitting `h` so the residual stream stays exact.
+    ///
+    /// `None` → contract miss (non-Metal, dtype/shape/contiguity mismatch);
+    /// callers must fall back to `x.add(res)` + `self.forward(h)`.
+    pub fn forward_residual_add(
+        &self,
+        x: &MxArray,
+        res: &MxArray,
+    ) -> Option<(MxArray, MxArray)> {
+        if std::env::var_os("MLX_DISABLE_FUSED_ADD_RMSNORM").is_some()
+            || !unsafe { sys::mlx_metal_is_available() }
+        {
+            return None;
+        }
+        let eps = MxArray::from_float32(&[self.eps as f32], &[]).ok()?;
+        let mut h = std::ptr::null_mut();
+        let mut normed = std::ptr::null_mut();
+        if !unsafe {
+            sys::mlx_fused_add_rmsnorm(
+                x.handle.0,
+                res.handle.0,
+                self.weight.handle.0,
+                eps.handle.0,
+                &mut h,
+                &mut normed,
+            )
+        } || h.is_null()
+            || normed.is_null()
+        {
+            return None;
+        }
+        // Both pointers are non-null, so from_handle cannot fail.
+        let h = MxArray::from_handle(h, "add_rmsnorm:h").ok()?;
+        let normed = MxArray::from_handle(normed, "add_rmsnorm:normed").ok()?;
+        Some((h, normed))
+    }
+
     /// Get the weight (scale) parameter
     pub fn get_weight(&self) -> MxArray {
         self.weight.clone()
@@ -444,5 +483,87 @@ mod tests {
         let out = norm.forward(&input).unwrap();
         assert_eq!(out.dtype().unwrap(), DType::BFloat16);
         assert_eq!(out.shape().unwrap().as_ref(), &[8]);
+    }
+
+    /// Fused add_rmsnorm must be bit-identical to `x.add(res)` + `norm.forward`
+    /// across dtypes and row counts — the kernel mirrors the stock
+    /// rms_single_row/rms_looped element mapping and reduction order.
+    #[test]
+    fn test_fused_add_rmsnorm_bit_exact() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        let eps = 1e-6f64;
+        for dtype in [DType::Float32, DType::Float16, DType::BFloat16] {
+            for shape in [
+                vec![1i64, 256i64],
+                vec![7, 2560],
+                vec![8, 128],
+                vec![1, 4096],
+                vec![1, 7, 2560],
+                vec![2, 3, 128],
+            ] {
+                let hidden = *shape.last().unwrap();
+                let mut norm = RMSNorm::new(hidden as u32, Some(eps)).unwrap();
+                let weight: Vec<f32> = (0..hidden)
+                    .map(|i| 0.8 + (i as f32 * 0.01).sin() * 0.4)
+                    .collect();
+                norm.set_weight(
+                    &MxArray::from_float32(&weight, &[hidden])
+                        .unwrap()
+                        .astype(dtype)
+                        .unwrap(),
+                )
+                .unwrap();
+                let n = shape.iter().product::<i64>() as usize;
+                let xv: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 2.0).collect();
+                let rv: Vec<f32> = (0..n).map(|i| (i as f32 * 0.53).cos()).collect();
+                let x = MxArray::from_float32(&xv, &shape)
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap();
+                let res = MxArray::from_float32(&rv, &shape)
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap();
+
+                let (h, normed) = norm
+                    .forward_residual_add(&x, &res)
+                    .expect("fused path declined a valid contract");
+                let h_ref = x.add(&res).unwrap();
+                let normed_ref = norm.forward(&h_ref).unwrap();
+                assert_eq!(h.shape().unwrap().as_ref(), shape.as_slice());
+                assert_eq!(normed.shape().unwrap().as_ref(), shape.as_slice());
+
+                assert_eq!(
+                    h.to_float32().unwrap().to_vec(),
+                    h_ref.to_float32().unwrap().to_vec(),
+                    "h mismatch dtype={dtype:?} shape={shape:?}"
+                );
+                assert_eq!(
+                    normed.to_float32().unwrap().to_vec(),
+                    normed_ref.to_float32().unwrap().to_vec(),
+                    "normed mismatch dtype={dtype:?} shape={shape:?}"
+                );
+            }
+        }
+    }
+
+    /// Shape/dtype contract violations must return None so callers fall back.
+    #[test]
+    fn test_fused_add_rmsnorm_contract_misses() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        let norm = RMSNorm::new(64, Some(1e-6)).unwrap();
+        let x = MxArray::from_float32(&vec![0.1; 4 * 64], &[4, 64]).unwrap();
+        let res = MxArray::from_float32(&vec![0.1; 4 * 64], &[4, 64]).unwrap();
+        // Weight dtype mismatch (weight stays f32, x is bf16) → decline.
+        let xb = x.astype(DType::BFloat16).unwrap();
+        let rb = res.astype(DType::BFloat16).unwrap();
+        assert!(norm.forward_residual_add(&xb, &rb).is_none());
+        // Shape mismatch between x and res → decline.
+        let res_bad = MxArray::from_float32(&vec![0.1; 4 * 32], &[4, 32]).unwrap();
+        assert!(norm.forward_residual_add(&x, &res_bad).is_none());
     }
 }

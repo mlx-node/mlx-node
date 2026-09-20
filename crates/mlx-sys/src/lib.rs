@@ -2112,6 +2112,17 @@ unsafe extern "C" {
         out_ids: *mut *mut mlx_array,
         out_values: *mut *mut mlx_array,
     ) -> bool;
+    /// Fused residual-add + RMSNorm: writes `h = x + res` and
+    /// `normed = rms_norm(h) * w` into the out pointers. Returns false on
+    /// contract violation (shape/dtype/contiguity) or kernel build failure.
+    pub fn mlx_fused_add_rmsnorm(
+        x: *mut mlx_array,
+        res: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: *mut mlx_array,
+        out_h: *mut *mut mlx_array,
+        out_normed: *mut *mut mlx_array,
+    ) -> bool;
     /// Owning handle copy sharing the source's ArrayDesc (no graph node —
     /// unlike `mlx_array_copy`). Used by the compiled-graph builder to hand
     /// outputs across the FFI boundary.

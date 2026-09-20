@@ -415,4 +415,77 @@ mlx_array* mlx_fused_attention_output(
     }
 }
 
+// Fused residual-add + RMSNorm: h = x + res (rounded to the compute dtype),
+// normed = rms_norm(h) * w. One dispatch replaces the [Add + RMSNorm] pair at
+// every post-attention and post-MLP norm site, and the kernel emits BOTH
+// outputs so the residual stream stays exact. The element mapping mirrors
+// MLX's rms_single_row/rms_looped partitioning (contiguous N_READS chunks
+// striding lsize*N_READS, same simd_sum folds), so the result is bit-identical
+// to the separate ops at the sizes those kernels serve.
+//
+// Contract: `x` and `res` are contiguous [rows, AXIS] (or flattened
+// equivalents) of the same dtype T in {f32, f16, bf16}; `w` is [AXIS] in T;
+// `eps` is a scalar f32 array. Outputs are `h` and `normed`, both [rows, AXIS]
+// in T.
+extern "C" bool mlx_fused_add_rmsnorm(mlx_array* x_handle,
+                                    mlx_array* res_handle,
+                                    mlx_array* w_handle,
+                                    mlx_array* eps_handle,
+                                    mlx_array** out_h,
+                                    mlx_array** out_normed) {
+  if (!x_handle || !res_handle || !w_handle || !eps_handle || !out_h ||
+      !out_normed)
+    return false;
+  *out_h = nullptr;
+  *out_normed = nullptr;
+  try {
+    const auto& x = *reinterpret_cast<array*>(x_handle);
+    const auto& res = *reinterpret_cast<array*>(res_handle);
+    const auto& w = *reinterpret_cast<array*>(w_handle);
+    const auto& eps = *reinterpret_cast<array*>(eps_handle);
+    if (x.ndim() < 1 || res.shape() != x.shape() || w.size() != x.shape(-1) ||
+        eps.size() != 1 || eps.dtype() != mlx::core::float32)
+      return false;
+    // The kernel reads x/res/w at flat row-major offsets.
+    if (!x.flags().row_contiguous || !res.flags().row_contiguous ||
+        !w.flags().row_contiguous)
+      return false;
+    const auto dt = x.dtype();
+    if (dt != res.dtype() || dt != w.dtype())
+      return false;
+    if (dt != mlx::core::bfloat16 && dt != mlx::core::float16 &&
+        dt != mlx::core::float32)
+      return false;
+    const int axis = x.shape(-1);
+    const int rows = x.size() / axis;
+    if (rows < 1 || rows > 4096 || x.size() != rows * axis ||
+        res.size() != rows * axis)
+      return false;
+
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "add_rmsnorm", {"x", "res", "w", "eps"}, {"h_out", "normed"},
+#include "metal/common/add_rmsnorm.metal.inc"
+    );
+    // Mirror normalization.cpp's threadgroup sizing so the element mapping
+    // matches rms_single_row (axis <= 4096) or rms_looped (above) exactly.
+    constexpr int n_reads = 4;
+    const int lsize = axis <= 4096
+        ? ((axis + n_reads - 1) / n_reads + 31) / 32 * 32
+        : 1024;
+    auto outs = kernel({x, res, w, eps}, {x.shape(), x.shape()}, {dt, dt},
+                       {lsize, rows, 1}, {lsize, 1, 1},
+                       {{"T", dt}, {"AXIS", axis}}, std::nullopt, false,
+                       mlx::core::Device::gpu);
+    *out_h = reinterpret_cast<mlx_array*>(new array(std::move(outs[0])));
+    *out_normed = reinterpret_cast<mlx_array*>(new array(std::move(outs[1])));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_fused_add_rmsnorm error: " << e.what() << std::endl;
+    return false;
+  } catch (...) {
+    std::cerr << "mlx_fused_add_rmsnorm error: unknown exception" << std::endl;
+    return false;
+  }
+}
+
 }  // extern "C"
