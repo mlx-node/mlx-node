@@ -1576,11 +1576,13 @@ impl Qwen3_5Attention {
     pub fn set_o_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
         self.o_proj.set_bias(b, "o_proj")
     }
-    pub fn set_q_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.q_norm.set_weight(&super::bf16_load_param(w)?)
+    pub fn set_q_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        self.q_norm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
-    pub fn set_k_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.k_norm.set_weight(&super::bf16_load_param(w)?)
+    pub fn set_k_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        self.k_norm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
     /// Precompute the block-ordered `[hidden, 2*H*D]` q_proj weight (queries

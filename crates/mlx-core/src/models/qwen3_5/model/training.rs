@@ -1338,6 +1338,10 @@ impl Qwen35Inner {
                     && layer_idx < self.layers.len()
                 {
                     let layer = &mut self.layers[layer_idx];
+                    // Training updates arrive in the optimizer's dtype — pass
+                    // the param's own dtype so sidecars are never silently
+                    // downcast mid-training.
+                    let updated_dtype = updated_param.dtype()?;
                     if name.contains(".linear_attn.") {
                         if let AttentionType::Linear(ref mut gdn) = layer.attn {
                             if name.ends_with(".in_proj_qkvz.weight") {
@@ -1345,9 +1349,9 @@ impl Qwen35Inner {
                             } else if name.ends_with(".in_proj_ba.weight") {
                                 gdn.set_in_proj_ba_weight(updated_param)?;
                             } else if name.ends_with(".conv1d.weight") {
-                                gdn.set_conv1d_weight(updated_param)?;
+                                gdn.set_conv1d_weight(updated_param, updated_dtype)?;
                             } else if name.ends_with(".norm.weight") {
-                                gdn.set_norm_weight(updated_param)?;
+                                gdn.set_norm_weight(updated_param, updated_dtype)?;
                             } else if name.ends_with(".out_proj.weight") {
                                 gdn.set_out_proj_weight(updated_param)?;
                             } else if name.ends_with(".dt_bias") {
@@ -1367,9 +1371,9 @@ impl Qwen35Inner {
                             } else if name.ends_with(".o_proj.weight") {
                                 attn.set_o_proj_weight(updated_param)?;
                             } else if name.ends_with(".q_norm.weight") {
-                                attn.set_q_norm_weight(updated_param)?;
+                                attn.set_q_norm_weight(updated_param, updated_dtype)?;
                             } else if name.ends_with(".k_norm.weight") {
-                                attn.set_k_norm_weight(updated_param)?;
+                                attn.set_k_norm_weight(updated_param, updated_dtype)?;
                             }
                         }
                     } else if name.contains(".mlp.") {
@@ -1381,9 +1385,9 @@ impl Qwen35Inner {
                             layer.mlp.set_down_proj_weight(updated_param)?;
                         }
                     } else if name.ends_with(".input_layernorm.weight") {
-                        layer.set_input_layernorm_weight(updated_param)?;
+                        layer.set_input_layernorm_weight(updated_param, updated_dtype)?;
                     } else if name.ends_with(".post_attention_layernorm.weight") {
-                        layer.set_post_attention_layernorm_weight(updated_param)?;
+                        layer.set_post_attention_layernorm_weight(updated_param, updated_dtype)?;
                     }
                 }
             }

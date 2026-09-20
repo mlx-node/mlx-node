@@ -297,6 +297,7 @@ impl Qwen3_5MTPModule {
         params: &HashMap<String, MxArray>,
         default_plq: PerLayerQuant,
         per_layer_quant: &HashMap<String, PerLayerQuant>,
+        compute_dtype: DType,
     ) -> Result<()> {
         reject_unsupported_fp8_mtp_state(
             params,
@@ -425,10 +426,10 @@ impl Qwen3_5MTPModule {
                 }
             }
             if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
-                attn.set_q_norm_weight(w)?;
+                attn.set_q_norm_weight(w, compute_dtype)?;
             }
             if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
-                attn.set_k_norm_weight(w)?;
+                attn.set_k_norm_weight(w, compute_dtype)?;
             }
             if let Some(w) = params.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
                 attn.set_q_proj_bias(Some(w))?;
@@ -494,10 +495,10 @@ impl Qwen3_5MTPModule {
             }
 
             if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
-                layer.set_input_layernorm_weight(w)?;
+                layer.set_input_layernorm_weight(w, compute_dtype)?;
             }
             if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-                layer.set_post_attention_layernorm_weight(w)?;
+                layer.set_post_attention_layernorm_weight(w, compute_dtype)?;
             }
         }
 
@@ -779,7 +780,7 @@ mod tests {
             ),
         ]);
         let err = mtp
-            .apply_weights(&stored_fp8, default_plq, &HashMap::new())
+            .apply_weights(&stored_fp8, default_plq, &HashMap::new(), DType::BFloat16)
             .expect_err("raw Uint8 MTP storage must not reach Linear::set_weight");
         assert!(err.reason.contains("Uint8 MTP storage"), "{}", err.reason);
         assert!(err.reason.contains("dense fallback"), "{}", err.reason);
@@ -802,7 +803,7 @@ mod tests {
             ),
         ]);
         let err = mtp
-            .apply_weights(&stale_mxfp8, default_plq, &HashMap::new())
+            .apply_weights(&stale_mxfp8, default_plq, &HashMap::new(), DType::BFloat16)
             .expect_err("MXFP8 MTP storage with stale affine metadata must reject");
         assert!(err.reason.contains("MXFP8 MTP storage"), "{}", err.reason);
         assert!(err.reason.contains("resolves to Affine"), "{}", err.reason);
@@ -827,7 +828,7 @@ mod tests {
             },
         )]);
         let err = mtp
-            .apply_weights(&dense, default_plq, &explicit)
+            .apply_weights(&dense, default_plq, &explicit, DType::BFloat16)
             .expect_err("explicit fp8_e4m3 MTP metadata must reject even with dense bytes");
         assert!(err.reason.contains("explicit fp8_e4m3"), "{}", err.reason);
     }
@@ -930,7 +931,7 @@ mod tests {
         per_layer_quant: &HashMap<String, PerLayerQuant>,
         label: &str,
     ) -> bool {
-        match mtp.apply_weights(params, default_plq, per_layer_quant) {
+        match mtp.apply_weights(params, default_plq, per_layer_quant, DType::BFloat16) {
             Ok(()) => true,
             Err(err) => {
                 let msg = err.reason.to_string();

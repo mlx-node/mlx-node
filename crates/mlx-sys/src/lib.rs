@@ -2093,6 +2093,8 @@ unsafe extern "C" {
         history: *mut mlx_array,
         scale: *mut mlx_array,
         dt: *mut mlx_array,
+        mean_eps: bool,
+        beta_input_dtype: bool,
         outputs: *mut *mut mlx_array,
     ) -> bool;
     pub fn mlx_qwen4_window_conv(

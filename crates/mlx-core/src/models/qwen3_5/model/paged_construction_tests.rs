@@ -302,11 +302,11 @@ pub(super) fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
     for layer in inner.layers.iter_mut() {
         let w = layer.get_input_layernorm_weight();
         layer
-            .set_input_layernorm_weight(&cast(&w))
+            .set_input_layernorm_weight(&cast(&w), DType::BFloat16)
             .expect("set input_layernorm");
         let w = layer.get_post_attention_layernorm_weight();
         layer
-            .set_post_attention_layernorm_weight(&cast(&w))
+            .set_post_attention_layernorm_weight(&cast(&w), DType::BFloat16)
             .expect("set post_attention_layernorm");
 
         match &mut layer.attn {
@@ -322,9 +322,11 @@ pub(super) fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
                 gdn.set_in_proj_ba_weight(&cast(&w))
                     .expect("set in_proj_ba");
                 let w = gdn.get_conv1d_weight();
-                gdn.set_conv1d_weight(&cast(&w)).expect("set conv1d");
+                gdn.set_conv1d_weight(&cast(&w), DType::BFloat16)
+                    .expect("set conv1d");
                 let w = gdn.get_norm_weight();
-                gdn.set_norm_weight(&cast(&w)).expect("set gdn norm");
+                gdn.set_norm_weight(&cast(&w), DType::BFloat16)
+                    .expect("set gdn norm");
                 let w = gdn.get_out_proj_weight();
                 gdn.set_out_proj_weight(&cast(&w)).expect("set out_proj");
             }
@@ -338,9 +340,11 @@ pub(super) fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
                 let w = attn.get_o_proj_weight();
                 attn.set_o_proj_weight(&cast(&w)).expect("set o_proj");
                 let w = attn.get_q_norm_weight();
-                attn.set_q_norm_weight(&cast(&w)).expect("set q_norm");
+                attn.set_q_norm_weight(&cast(&w), DType::BFloat16)
+                    .expect("set q_norm");
                 let w = attn.get_k_norm_weight();
-                attn.set_k_norm_weight(&cast(&w)).expect("set k_norm");
+                attn.set_k_norm_weight(&cast(&w), DType::BFloat16)
+                    .expect("set k_norm");
             }
         }
 

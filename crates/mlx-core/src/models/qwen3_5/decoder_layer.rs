@@ -1,4 +1,4 @@
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -426,13 +426,18 @@ impl DecoderLayer {
 
     // ========== Weight accessors ==========
 
-    pub fn set_input_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.input_layernorm.set_weight(&super::bf16_load_param(w)?)
+    pub fn set_input_layernorm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        self.input_layernorm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
-    pub fn set_post_attention_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
+    pub fn set_post_attention_layernorm_weight(
+        &mut self,
+        w: &MxArray,
+        compute_dtype: DType,
+    ) -> Result<()> {
         self.post_attention_layernorm
-            .set_weight(&super::bf16_load_param(w)?)
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
     // ========== Weight getters (for training parameter extraction) ==========

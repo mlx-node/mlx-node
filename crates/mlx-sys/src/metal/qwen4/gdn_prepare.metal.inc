@@ -31,7 +31,12 @@ R"(
         }
     }
     if (vec < 32) {
-        float divisor = metal::precise::sqrt(simd_sum(squared) + 1e-6f);
+        // MEAN_EPS: RMSNorm semantics — eps inside the mean, i.e.
+        // x/sqrt(mean(x^2)+eps) == x/sqrt((sum+d*eps)/d); after the q/k
+        // scale fold the divisor is sqrt(sum + d*eps). Off: L2-style
+        // x/sqrt(sum + eps) (qwen4's math::l2).
+        float divisor = metal::precise::sqrt(
+            simd_sum(squared) + (MEAN_EPS ? 128.0f * 1e-6f : 1e-6f));
         for (uint i = 0; i < 4; ++i) {
             uint ch = (vec % 16) * 128 + lane * 4 + i;
             T normalized = T(values[i] / divisor);
@@ -47,7 +52,8 @@ R"(
         float ax = float(a[h]) + dt[vec];
         float softplus = metal::max(ax, 0.0f) + log1p(metal::precise::exp(-metal::abs(ax)));
         decay[h] = metal::precise::exp(softplus * scale[vec]);
-        beta[h] = precise_sigmoid(float(b[h]));
+        beta[h] = metal::remove_reference_t<decltype(beta[0])>(
+            precise_sigmoid(float(b[h])));
     }
   }
 )"

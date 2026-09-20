@@ -57,7 +57,7 @@ use std::collections::HashMap;
 
 use napi::bindgen_prelude::*;
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::models::mtp_drafter::DrafterBodyVariant;
 use crate::models::quant_dispatch::effective_plq_for;
 use crate::nn::{Linear, RMSNorm};
@@ -304,6 +304,7 @@ impl Qwen3_5MoeMTPModule {
         default_plq: PerLayerQuant,
         default_gate_plq: PerLayerQuant,
         per_layer_quant: &HashMap<String, PerLayerQuant>,
+        compute_dtype: DType,
     ) -> Result<()> {
         crate::models::qwen3_5::mtp::reject_unsupported_fp8_mtp_state(
             params,
@@ -477,10 +478,10 @@ impl Qwen3_5MoeMTPModule {
                 }
             }
             if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
-                attn.set_q_norm_weight(w)?;
+                attn.set_q_norm_weight(w, compute_dtype)?;
             }
             if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
-                attn.set_k_norm_weight(w)?;
+                attn.set_k_norm_weight(w, compute_dtype)?;
             }
             if let Some(w) = params.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
                 attn.set_q_proj_bias(Some(w))?;
@@ -979,7 +980,13 @@ mod tests {
             ),
         ]);
         let err = mtp
-            .apply_weights(&stored_fp8, default_plq, gate_plq, &HashMap::new())
+            .apply_weights(
+                &stored_fp8,
+                default_plq,
+                gate_plq,
+                &HashMap::new(),
+                DType::BFloat16,
+            )
             .expect_err("raw Uint8 MoE MTP storage must not reach Linear::set_weight");
         assert!(err.reason.contains("Uint8 MTP storage"), "{}", err.reason);
         assert!(err.reason.contains("dense fallback"), "{}", err.reason);
@@ -1001,7 +1008,13 @@ mod tests {
             ),
         ]);
         let err = mtp
-            .apply_weights(&stale_mxfp8, default_plq, gate_plq, &HashMap::new())
+            .apply_weights(
+                &stale_mxfp8,
+                default_plq,
+                gate_plq,
+                &HashMap::new(),
+                DType::BFloat16,
+            )
             .expect_err("MXFP8 MoE MTP storage with stale affine metadata must reject");
         assert!(err.reason.contains("MXFP8 MTP storage"), "{}", err.reason);
         assert!(err.reason.contains("resolves to Affine"), "{}", err.reason);
@@ -1026,7 +1039,7 @@ mod tests {
             },
         )]);
         let err = mtp
-            .apply_weights(&dense, default_plq, gate_plq, &explicit)
+            .apply_weights(&dense, default_plq, gate_plq, &explicit, DType::BFloat16)
             .expect_err("explicit fp8_e4m3 MoE MTP metadata must reject");
         assert!(err.reason.contains("explicit fp8_e4m3"), "{}", err.reason);
     }
@@ -1198,9 +1211,13 @@ mod tests {
             mode: PerLayerMode::Affine,
             input_amax: None,
         };
-        if let Err(err) =
-            mtp.apply_weights(&q_params, default_plq, default_gate_plq, &per_layer_quant)
-        {
+        if let Err(err) = mtp.apply_weights(
+            &q_params,
+            default_plq,
+            default_gate_plq,
+            &per_layer_quant,
+            DType::BFloat16,
+        ) {
             let msg = err.reason.to_string();
             if msg.contains("Metal") || msg.contains("device") {
                 eprintln!("skipping {label} (MLX/Metal unavailable during apply): {msg}");
@@ -1468,7 +1485,13 @@ mod tests {
         per_layer_quant: &HashMap<String, PerLayerQuant>,
         label: &str,
     ) -> bool {
-        match mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant) {
+        match mtp.apply_weights(
+            params,
+            default_plq,
+            default_gate_plq,
+            per_layer_quant,
+            DType::BFloat16,
+        ) {
             Ok(()) => true,
             Err(err) => {
                 let msg = err.reason.to_string();

@@ -1,4 +1,4 @@
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::nn::{Activations, Conv1d, Linear, RMSNormGated, rms_norm_scaled, rms_norm_unscaled};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -497,6 +497,8 @@ impl GatedDeltaNet {
             };
             let mut outputs = [std::ptr::null_mut(); 6];
             if unsafe {
+                // qwen3_5 semantics: mean-eps norm (rms_norm eps inside the
+                // mean) and bf16 beta — bit-faithful to the conv fallback.
                 sys::mlx_qwen4_gdn_prepare(
                     qkv.handle.0,
                     a.handle.0,
@@ -505,6 +507,8 @@ impl GatedDeltaNet {
                     history.handle.0,
                     scale.handle.0,
                     dt.handle.0,
+                    true,
+                    true,
                     outputs.as_mut_ptr(),
                 )
             } {
@@ -835,12 +839,14 @@ impl GatedDeltaNet {
         self.split_in_proj_b_a = None;
         self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
-    pub fn set_conv1d_weight(&mut self, w: &MxArray) -> Result<()> {
-        // Prepare the fused window-conv weight from the RAW checkpoint tensor
-        // (before the bf16 fallback normalization below): the kernel wants f32
-        // tap-major `[conv_dim, 4]`, which is exactly the flat order of the
-        // MLX `[conv_dim, K, 1]` / `[conv_dim, 1, K]` / `[conv_dim, K]` conv
-        // layouts. Any other layout stays None → forward uses conv_general.
+    pub fn set_conv1d_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        let w = super::sidecar_to_compute_dtype(w, compute_dtype)?;
+        // Prepare the fused window-conv weight from the SAME post-normalization
+        // tensor the fallback conv reads: bf16→f32 widening is exact, so both
+        // paths see identical values and toggling the kernel changes dispatch
+        // only. The kernel wants f32 tap-major `[conv_dim, 4]`, which is the
+        // flat order of the MLX `[conv_dim, K, 1]` / `[conv_dim, 1, K]` /
+        // `[conv_dim, K]` conv layouts. Other layouts stay None → conv_general.
         self.conv1d_w4_f32 = None;
         if self.conv_kernel_dim == 4
             && let Ok(shape) = w.shape()
@@ -864,13 +870,14 @@ impl GatedDeltaNet {
                     .ok();
             }
         }
-        self.conv1d.set_weight(&super::bf16_load_param(w)?)
+        self.conv1d.set_weight(&w)
     }
-    pub fn set_norm_weight(&mut self, w: &MxArray) -> Result<()> {
+    pub fn set_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
         // norm.weight may be stored as f32 in checkpoints for precision;
-        // cast to bf16 — the family compute dtype — not to dt_bias's dtype
+        // cast to the model's compute dtype — not to dt_bias's dtype
         // (GGUF keeps dt_bias f32 for the gating kernel's `float*` reads).
-        self.norm.set_weight(&super::bf16_load_param(w)?)
+        self.norm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
     pub fn set_out_proj_weight(&mut self, w: &MxArray) -> Result<()> {
         self.out_proj.set_weight(w, "out_proj")
@@ -1009,11 +1016,25 @@ mod tests {
     fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
         let af = a.astype(DType::Float32).unwrap().to_float32().unwrap();
         let bf = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        // NaN must never compare as "equal": f32::max drops NaN, so fold
+        // manually — any non-finite diff surfaces as +inf and fails bounds.
         af.as_ref()
             .iter()
             .zip(bf.as_ref())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max)
+            .map(|(x, y)| {
+                assert!(
+                    x.is_finite() && y.is_finite(),
+                    "non-finite element: {x} vs {y}"
+                );
+                (x - y).abs()
+            })
+            .fold(0.0f32, |acc, d| {
+                if d.is_nan() {
+                    f32::INFINITY
+                } else {
+                    acc.max(d)
+                }
+            })
     }
 
     /// Kernel geometry: 16k×128 + 48v×128 → conv_dim 10240, the only shape
@@ -1055,8 +1076,10 @@ mod tests {
         net.set_in_proj_qkvz_weight(&rand_bf16(&[16384, 64]))
             .unwrap();
         net.set_in_proj_ba_weight(&rand_bf16(&[96, 64])).unwrap();
-        net.set_conv1d_weight(&rand_bf16(&[10240, 1, 4])).unwrap();
-        net.set_norm_weight(&rand_bf16(&[128])).unwrap();
+        net.set_conv1d_weight(&rand_bf16(&[10240, 1, 4]), DType::BFloat16)
+            .unwrap();
+        net.set_norm_weight(&rand_bf16(&[128]), DType::BFloat16)
+            .unwrap();
         net.set_out_proj_weight(&rand_bf16(&[64, 6144])).unwrap();
         net.set_dt_bias(&rand_bf16(&[48]));
         net.set_a_log(&rand_bf16(&[48])).unwrap();
@@ -1083,6 +1106,8 @@ mod tests {
                 history.handle.0,
                 scale.handle.0,
                 dt.handle.0,
+                true,
+                true,
                 outputs.as_mut_ptr(),
             )
         };
@@ -1106,12 +1131,16 @@ mod tests {
         let net = kernel_geometry_net();
         let x1 = rand_bf16(&[1, 3, 64]);
         let x2 = rand_bf16(&[1, 5, 64]);
+        // Near-zero input exercises the norm's small-Σ regime where eps
+        // placement (Σ+ε vs Σ+d·ε) actually diverges — the review case.
+        let x3 = rand_bf16(&[1, 4, 64]).mul_scalar(1e-3)?;
 
         // Fallback prep (window_conv + split + folded norms + fused gating).
         unsafe { std::env::set_var("MLX_DISABLE_QWEN35_GDN_PREPARE", "1") };
         let mut cache_a = ArraysCache::new(2);
         let out_a1 = net.forward(&x1, None, Some(&mut cache_a), true)?;
         let out_a2 = net.forward(&x2, None, Some(&mut cache_a), true)?;
+        let out_a3 = net.forward(&x3, None, Some(&mut cache_a), true)?;
 
         // Fused prepare. The env var is read synchronously inside forward()
         // (the prepared closure), so removing it here is safe even though
@@ -1120,8 +1149,12 @@ mod tests {
         let mut cache_b = ArraysCache::new(2);
         let out_b1 = net.forward(&x1, None, Some(&mut cache_b), true)?;
         let out_b2 = net.forward(&x2, None, Some(&mut cache_b), true)?;
+        let out_b3 = net.forward(&x3, None, Some(&mut cache_b), true)?;
 
-        for (step, (a, b)) in [(&out_a1, &out_b1), (&out_a2, &out_b2)].iter().enumerate() {
+        for (step, (a, b)) in [(&out_a1, &out_b1), (&out_a2, &out_b2), (&out_a3, &out_b3)]
+            .iter()
+            .enumerate()
+        {
             let diff = max_abs_diff(a, b);
             assert!(
                 diff <= 0.1,

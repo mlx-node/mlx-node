@@ -1305,9 +1305,11 @@ mod tests {
                     let w = attn.get_o_proj_weight();
                     attn.set_o_proj_weight(&cast(&w)).expect("set o_proj");
                     let w = attn.get_q_norm_weight();
-                    attn.set_q_norm_weight(&cast(&w)).expect("set q_norm");
+                    attn.set_q_norm_weight(&cast(&w), DType::BFloat16)
+                        .expect("set q_norm");
                     let w = attn.get_k_norm_weight();
-                    attn.set_k_norm_weight(&cast(&w)).expect("set k_norm");
+                    attn.set_k_norm_weight(&cast(&w), DType::BFloat16)
+                        .expect("set k_norm");
                 }
                 AttentionType::Linear(gdn) => {
                     // dt_bias must be cast FIRST: `set_norm_weight` derives
@@ -1323,9 +1325,11 @@ mod tests {
                     gdn.set_in_proj_ba_weight(&cast(&w))
                         .expect("set in_proj_ba");
                     let w = gdn.get_conv1d_weight();
-                    gdn.set_conv1d_weight(&cast(&w)).expect("set conv1d");
+                    gdn.set_conv1d_weight(&cast(&w), DType::BFloat16)
+                        .expect("set conv1d");
                     let w = gdn.get_norm_weight();
-                    gdn.set_norm_weight(&cast(&w)).expect("set norm");
+                    gdn.set_norm_weight(&cast(&w), DType::BFloat16)
+                        .expect("set norm");
                     let w = gdn.get_out_proj_weight();
                     gdn.set_out_proj_weight(&cast(&w)).expect("set out_proj");
                     // a_log stays f32 (mlx-lm cast_predicate excludes it).

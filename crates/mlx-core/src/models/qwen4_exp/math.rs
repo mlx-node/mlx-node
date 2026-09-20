@@ -498,6 +498,8 @@ pub(super) fn gdn_prepare(
     };
     let mut outputs = [std::ptr::null_mut(); 6];
     if !unsafe {
+        // qwen4 semantics: L2-style norm (eps on the sum) and f32 beta —
+        // matches this family's `math::l2` reference exactly.
         mlx_sys::mlx_qwen4_gdn_prepare(
             qkv.as_raw_ptr(),
             a.as_raw_ptr(),
@@ -506,6 +508,8 @@ pub(super) fn gdn_prepare(
             old.as_raw_ptr(),
             scale.as_raw_ptr(),
             dt.as_raw_ptr(),
+            false,
+            false,
             outputs.as_mut_ptr(),
         )
     } {

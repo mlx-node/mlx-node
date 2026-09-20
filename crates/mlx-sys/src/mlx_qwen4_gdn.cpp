@@ -107,7 +107,9 @@ std::vector<array> complete_gdn(const std::vector<array> &in) {
 extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
                                       mlx_array *b, mlx_array *conv,
                                       mlx_array *history, mlx_array *scale,
-                                      mlx_array *dt, mlx_array **outputs) {
+                                      mlx_array *dt, bool mean_eps,
+                                      bool beta_input_dtype,
+                                      mlx_array **outputs) {
   if (!outputs)
     return false;
   for (int i = 0; i < 6; ++i)
@@ -149,8 +151,10 @@ extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
                       {1, t, 48},
                       {3, 10240}},
                      {x.dtype(), x.dtype(), x.dtype(), mlx::core::float32,
-                      mlx::core::float32, x.dtype()},
-                     {32, 80, t}, {32, 4, 1}, {{"T", x.dtype()}, {"TOKENS", t}},
+                      beta_input_dtype ? x.dtype() : mlx::core::float32,
+                      x.dtype()},
+                     {32, 80, t}, {32, 4, 1},
+                     {{"T", x.dtype()}, {"TOKENS", t}, {"MEAN_EPS", mean_eps}},
                      std::nullopt, false, mlx::core::Device::gpu);
     std::vector<std::unique_ptr<array>> owned;
     for (auto &y : result)

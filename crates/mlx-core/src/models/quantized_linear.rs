@@ -735,14 +735,17 @@ impl QuantizedLinear {
     }
 
     /// Cast affine-mode `scales`/`biases`/`bias` f16→f32 once at load. With
-    /// bf16 activations `quantized_matmul` promotes the whole call to f32
+    /// bf16/f32 activations `quantized_matmul` promotes the whole call to f32
     /// anyway (`promote_types(bf16, f16)`), so the kernel receives f32
     /// sidecars either way — pre-casting is bit-identical while removing two
     /// per-forward `AsType` dispatches (three when a linear bias is present).
-    /// Only call from bf16-activation families: an f16 model would flip from
-    /// native f16 QMV to the f32 promote path and pay MORE casts.
-    pub fn promote_affine_sidecars_to_f32(&mut self) -> Result<()> {
-        if self.mode != DEFAULT_QUANT_MODE {
+    /// Skipped under f16 compute: native f16 sidecars already match the
+    /// activation and hoisting would flip the call to the f32 promote path.
+    pub fn promote_affine_sidecars_to_f32(
+        &mut self,
+        compute_dtype: crate::array::DType,
+    ) -> Result<()> {
+        if self.mode != DEFAULT_QUANT_MODE || compute_dtype == crate::array::DType::Float16 {
             return Ok(());
         }
         if self.scales.dtype()? == crate::array::DType::Float16 {
