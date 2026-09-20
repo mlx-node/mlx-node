@@ -2023,6 +2023,16 @@ pub type LayerFunctionPtr = extern "C-unwind" fn(
     context: *mut std::os::raw::c_void,
 ) -> usize;
 
+// Compiled-graph builder: receives owning `mlx_array` handles for the traced
+// inputs, writes `n_outputs` owning handles to `outputs`, returns success.
+pub type MlxGraphBuilder = unsafe extern "C" fn(
+    ctx: *mut std::os::raw::c_void,
+    inputs: *const *const mlx_array,
+    n_inputs: usize,
+    outputs: *mut *mut mlx_array,
+    n_outputs: usize,
+) -> bool;
+
 unsafe extern "C" {
     /// Forward-local runtime settings. Begin/end must run on the same thread.
     pub fn mlx_qwen4_flags_begin();
@@ -2101,6 +2111,20 @@ unsafe extern "C" {
         logits: *mut mlx_array,
         out_ids: *mut *mut mlx_array,
         out_values: *mut *mut mlx_array,
+    ) -> bool;
+    /// Owning handle copy sharing the source's ArrayDesc (no graph node —
+    /// unlike `mlx_array_copy`). Used by the compiled-graph builder to hand
+    /// outputs across the FFI boundary.
+    pub fn mlx_array_clone_handle(handle: *const mlx_array) -> *mut mlx_array;
+    pub fn mlx_compiled_graph_invoke(
+        fn_id: u64,
+        builder: Option<MlxGraphBuilder>,
+        ctx: *mut std::ffi::c_void,
+        inputs: *const *const mlx_array,
+        n_inputs: usize,
+        outputs: *mut *mut mlx_array,
+        n_outputs: usize,
+        shapeless: bool,
     ) -> bool;
     pub fn mlx_qwen4_window_conv(
         x: *mut mlx_array,

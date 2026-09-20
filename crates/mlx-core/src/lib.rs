@@ -21,6 +21,7 @@ pub mod decode_profiler;
 pub mod engine;
 pub mod gradients;
 pub mod grpo;
+pub(crate) mod compiled_graph;
 pub(crate) mod inference_trace;
 pub mod model_thread;
 pub mod models;
