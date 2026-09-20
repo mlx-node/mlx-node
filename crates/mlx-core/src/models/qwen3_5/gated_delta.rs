@@ -721,9 +721,22 @@ pub fn gated_delta_update(
     state: Option<&MxArray>,
     mask: Option<&MxArray>,
     use_kernel: bool,
+    precomputed_gates: Option<(&MxArray, &MxArray)>,
 ) -> Result<(MxArray, MxArray)> {
     gated_delta_update_with_tape(
-        q, k, v, a, b, a_log, dt_bias, state, mask, use_kernel, false, None,
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel,
+        false,
+        precomputed_gates,
+        None,
     )
 }
 
@@ -749,6 +762,11 @@ pub(crate) fn gated_delta_update_with_tape(
     mask: Option<&MxArray>,
     use_kernel: bool,
     tiled_gqa: bool,
+    // `(decay_exp, beta)` already computed by the fused `gdn_prepare` kernel —
+    // skips the gating block entirely. Exp-space decay only feeds the
+    // per-step/ops paths; callers must not pass it for chunked-eligible calls
+    // (the chunked kernels consume log-space g).
+    precomputed_gates: Option<(&MxArray, &MxArray)>,
     mut tape_sink: Option<&mut Option<GdnKernelTape>>,
 ) -> Result<(MxArray, MxArray)> {
     let batch = q.shape_at(0)?;
@@ -844,12 +862,14 @@ pub(crate) fn gated_delta_update_with_tape(
         && should_use_chunked(seq_len, true, gpu_architecture_gen(), gdn_kernel_override());
 
     // Compute beta = sigmoid(b) and g = -exp(A_log) * softplus(a + dt_bias).
-    // Try fused Metal kernel first (single dispatch), fall back to separate ops.
-    // With `emit_exp` the kernel returns exp(g_log) — the decay factor the
+    // `precomputed_gates` (from the fused gdn_prepare kernel) supplies exp-space
+    // decay + post-sigmoid beta directly, skipping this block. With `emit_exp`
+    // the fused kernel likewise returns exp(g_log) — the decay factor the
     // per-step kernel and ops fallback both consume — saving an Exp dispatch
     // per layer per forward. `g_is_exp` records which space `g_gate` is in.
-    let (beta, g_gate, g_is_exp) =
-        match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32, !try_chunked) {
+    let (beta, g_gate, g_is_exp) = match precomputed_gates {
+        Some((decay, beta)) if !try_chunked => (beta.clone(), decay.clone(), true),
+        _ => match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32, !try_chunked) {
             Ok((beta_flat, g_flat)) => {
                 let seq_len_tmp = b.shape_at(1)?;
                 let beta = beta_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
@@ -858,15 +878,18 @@ pub(crate) fn gated_delta_update_with_tape(
             }
             Err(_) => {
                 let beta = Activations::sigmoid(b)?;
-                // compute_g returns exp(g_log) directly
-                let g_exp = compute_g(a_log, a, dt_bias)?;
+                // compute_g_log builds log-space g DIRECTLY — compute_g().log()
+                // underflows to -inf on strong decay (NaN in the chunked
+                // cumulative-diff math; see the compute_g_log docstring).
                 if try_chunked {
-                    (beta, g_exp.log()?, false)
+                    (beta, compute_g_log(a_log, a, dt_bias)?, false)
                 } else {
-                    (beta, g_exp, true)
+                    // compute_g returns exp(g_log) directly
+                    (beta, compute_g(a_log, a, dt_bias)?, true)
                 }
             }
-        };
+        },
+    };
 
     // Standard checkpoints group each key head contiguously and need
     // repeat-interleave. GGUF Qwen3.5 keeps the value-major tiled order; the

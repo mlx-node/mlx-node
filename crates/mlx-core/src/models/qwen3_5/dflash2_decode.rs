@@ -347,22 +347,22 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 verified_ids.len()
             )));
         }
-        // Full accept: the verify forward already advanced every GDN conv/recurrent
-        // state and the attention K/V through all `total_written` rows, so the live
-        // caches ARE the committed state — `replay_mtp_snapshot_to` would rebuild the
-        // identical values (~5 ops × every GDN layer) only to set them again.
-        if keep < total_written {
-            replay_mtp_snapshot_to(
-                self.inner.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("Qwen3.8 DFlash2 target caches are absent")
-                })?,
-                &snapshot,
-                &tape,
-                keep,
-                false,
-                "Qwen3.8 DFlash2 commit",
-            )?;
-        }
+        // Replay is required even on full accept: the windowed verify kernel
+        // carries the recurrent state in f32 across the whole window and rounds
+        // to bf16 once at the end, while replay re-rounds per token to restore
+        // the AR-exact state serial decode would leave. Skipping it would let a
+        // sub-ULP divergence compound across cycles.
+        replay_mtp_snapshot_to(
+            self.inner
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
+            &snapshot,
+            &tape,
+            keep,
+            false,
+            "Qwen3.8 DFlash2 commit",
+        )?;
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 

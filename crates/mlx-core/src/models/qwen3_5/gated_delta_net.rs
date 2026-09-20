@@ -201,6 +201,13 @@ pub struct GatedDeltaNet {
     /// factors into `fast_rms_norm` (one dispatch instead of norm + mul).
     qk_norm_w_q: MxArray,
     qk_norm_w_k: MxArray,
+    /// F32 `[num_v_heads]` `-exp(a_log)` for the fused `mlx_qwen4_gdn_prepare`
+    /// kernel, whose decay output is `exp(softplus(a + dt) * scale)`. Built in
+    /// `set_a_log`; `None` until the weight loads or when the build fails.
+    gdn_scale_f32: Option<MxArray>,
+    /// F32 copy of `dt_bias` for `gdn_prepare`, which requires `float*` —
+    /// checkpoints that store it bf16 would otherwise always miss the kernel.
+    dt_bias_f32: Option<MxArray>,
 }
 
 impl GatedDeltaNet {
@@ -289,6 +296,8 @@ impl GatedDeltaNet {
             conv1d_w4_f32: None,
             qk_norm_w_q,
             qk_norm_w_k,
+            gdn_scale_f32: None,
+            dt_bias_f32: None,
         })
     }
 
@@ -445,6 +454,207 @@ impl GatedDeltaNet {
             None
         };
 
+        // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
+        // gating in ONE Metal dispatch (`mlx_qwen4_gdn_prepare` — hardcoded to
+        // this family's 10240-wide 16k/48v×128 geometry). Decode/verify only:
+        // seq_len < 64 keeps the kernel's exp-space decay valid (chunked
+        // prefill consumes log-space g) and the per-step recurrence is the only
+        // downstream. `decay`/`beta` arrive f32 — the recurrence kernel reads
+        // both natively; the sub-ULP deltas (L2-norm eps placement, f32 beta)
+        // are the same class as the chunked-kernel variant documented for
+        // MLX_GDN_KERNEL. Kill-switch: MLX_DISABLE_QWEN35_GDN_PREPARE.
+        let prepared = (|| -> Option<[MxArray; 6]> {
+            if batch != 1
+                || seq_len >= 64
+                || self.conv_kernel_dim != 4
+                || self.conv_dim != 10240
+                || self.num_k_heads != 16
+                || self.key_head_dim != 128
+                || self.num_v_heads != 48
+                || self.value_head_dim != 128
+                || !use_kernel
+                || std::env::var("MLX_DISABLE_QWEN35_GDN_PREPARE").is_ok()
+                || !crate::engine::persistence::compiled_forward_backend_available()
+            {
+                return None;
+            }
+            let conv_w = self.conv1d_w4_f32.as_ref()?;
+            let scale = self.gdn_scale_f32.as_ref()?;
+            let dt = self.dt_bias_f32.as_ref()?;
+            if qkv.dtype().ok()? != crate::array::DType::BFloat16
+                || a.dtype().ok()? == crate::array::DType::Float16
+                || b.dtype().ok()? == crate::array::DType::Float16
+            {
+                return None;
+            }
+            let history = match &conv_state {
+                Some(s) => s.squeeze(Some(&[0])).ok()?,
+                None => MxArray::zeros(
+                    &[(self.conv_kernel_dim - 1) as i64, self.conv_dim as i64],
+                    Some(crate::array::DType::BFloat16),
+                )
+                .ok()?,
+            };
+            let mut outputs = [std::ptr::null_mut(); 6];
+            if unsafe {
+                sys::mlx_qwen4_gdn_prepare(
+                    qkv.handle.0,
+                    a.handle.0,
+                    b.handle.0,
+                    conv_w.handle.0,
+                    history.handle.0,
+                    scale.handle.0,
+                    dt.handle.0,
+                    outputs.as_mut_ptr(),
+                )
+            } {
+                Some([
+                    MxArray::from_handle(outputs[0], "gdn_prepare:q").ok()?,
+                    MxArray::from_handle(outputs[1], "gdn_prepare:k").ok()?,
+                    MxArray::from_handle(outputs[2], "gdn_prepare:v").ok()?,
+                    MxArray::from_handle(outputs[3], "gdn_prepare:decay").ok()?,
+                    MxArray::from_handle(outputs[4], "gdn_prepare:beta").ok()?,
+                    MxArray::from_handle(outputs[5], "gdn_prepare:history").ok()?,
+                ])
+            } else {
+                None
+            }
+        })();
+
+        let (q, k, v, precomputed) = if let Some([pq, pk, pv, decay, beta, history]) = prepared {
+            if let Some(cache) = cache.as_deref_mut() {
+                // Same [K-1, W] window tail the fused/fallback conv paths store.
+                cache.set(
+                    0,
+                    history.reshape(&[
+                        1,
+                        (self.conv_kernel_dim - 1) as i64,
+                        self.conv_dim as i64,
+                    ])?,
+                )?;
+            }
+            (pq, pk, pv, Some((decay, beta)))
+        } else {
+            let (q, k, v) = self.prep_via_conv(
+                &qkv,
+                batch,
+                seq_len,
+                cache.as_deref_mut(),
+                conv_state,
+                use_kernel,
+            )?;
+            (q, k, v, None)
+        };
+        if self.tiled_gguf_layout
+            && (self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0)
+        {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 tiled GGUF GDN layout requires Hv ({}) to be divisible by Hk ({})",
+                self.num_v_heads, self.num_k_heads
+            )));
+        }
+
+        // Run gated delta recurrence
+        let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
+        let (y, new_state) = if tape_sink.is_some() {
+            // Record the per-step kernel inputs into a local sink, then fold
+            // them (plus the recorded qkv) into the layer tape below.
+            let mut kernel_sink: Option<GdnKernelTape> = None;
+            let result = gated_delta_update_with_tape(
+                &q,
+                &k,
+                &v,
+                &a,
+                &b,
+                &self.a_log,
+                &self.dt_bias,
+                recurrent_state,
+                mask,
+                use_kernel,
+                self.tiled_gguf_layout,
+                precomputed.as_ref().map(|(d, b)| (d, b)),
+                Some(&mut kernel_sink),
+            )?;
+            if let (Some(sink), Some(kernel), Some(qkv)) = (tape_sink.take(), kernel_sink, tape_qkv)
+            {
+                *sink = Some(GdnLayerTape {
+                    kernel,
+                    qkv,
+                    conv_kernel_dim: self.conv_kernel_dim,
+                });
+            }
+            result
+        } else {
+            if self.tiled_gguf_layout {
+                gated_delta_update_with_tape(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    recurrent_state,
+                    mask,
+                    use_kernel,
+                    true,
+                    precomputed.as_ref().map(|(d, b)| (d, b)),
+                    None,
+                )?
+            } else {
+                gated_delta_update(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    recurrent_state,
+                    mask,
+                    use_kernel,
+                    precomputed.as_ref().map(|(d, b)| (d, b)),
+                )?
+            }
+        };
+
+        // Update recurrent state in cache
+        if let Some(cache) = cache {
+            cache.set(1, new_state)?;
+        }
+
+        // Reshape z to per-head format: [B, T, value_dim] → [B, T, Hv, Dv]
+        let z = z.reshape(&[
+            batch,
+            seq_len,
+            self.num_v_heads as i64,
+            self.value_head_dim as i64,
+        ])?;
+
+        // Apply RMSNormGated on per-head tensors: [B, T, Hv, Dv]
+        // Norm weight is [Dv], operates on last dimension
+        let y_normed = self.norm.forward(&y, Some(&z))?;
+
+        // Flatten heads: [B, T, Hv, Dv] → [B, T, value_dim]
+        let y_flat = y_normed.reshape(&[batch, seq_len, self.value_dim as i64])?;
+
+        // Output projection
+        self.out_proj.forward(&y_flat)
+    }
+
+    /// Generic prep path: depthwise conv (fused `window_conv` when possible)
+    /// → SiLU → q|k|v split → head reshape → q/k RMS-norm+scale. Runs whenever
+    /// the fully-fused `gdn_prepare` kernel is off-contract (batch > 1,
+    /// seq ≥ 64, non-10240 geometry, kill-switch) or declines.
+    fn prep_via_conv(
+        &self,
+        qkv: &MxArray,
+        batch: i64,
+        seq_len: i64,
+        mut cache: Option<&mut ArraysCache>,
+        conv_state: Option<MxArray>,
+        use_kernel: bool,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
         // Fused path: one Metal dispatch covering history prepend + 4-tap
         // depthwise conv + SiLU + next-state emission (`mlx_qwen4_window_conv`
         // is width-generic: bf16 x [1,T,W], bf16 [3,W] history, f32 [W,4]
@@ -515,7 +725,7 @@ impl GatedDeltaNet {
             let conv_input = match conv_state {
                 Some(state) => {
                     // Prepend cached conv_state: [B, kernel-1, conv_dim]
-                    MxArray::concatenate(&state, &qkv, 1)?
+                    MxArray::concatenate(&state, qkv, 1)?
                 }
                 None => {
                     // No cache: prepend zeros of size (kernel_size - 1)
@@ -525,12 +735,12 @@ impl GatedDeltaNet {
                         &[batch, pad_len, self.conv_dim as i64],
                         Some(qkv.dtype()?),
                     )?;
-                    MxArray::concatenate(&zeros, &qkv, 1)?
+                    MxArray::concatenate(&zeros, qkv, 1)?
                 }
             };
 
             // Update conv_state in cache
-            if let Some(cache) = cache.as_deref_mut() {
+            if let Some(cache) = cache {
                 // Save last (kernel_size - 1) timesteps as new conv_state
                 let total_len = conv_input.shape_at(1)?;
                 let keep = (self.conv_kernel_dim - 1) as i64;
@@ -608,98 +818,7 @@ impl GatedDeltaNet {
                 rms_norm_unscaled(&k, 1e-6)?.mul_scalar(inv_scale)?,
             )
         };
-        if self.tiled_gguf_layout
-            && (self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0)
-        {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 tiled GGUF GDN layout requires Hv ({}) to be divisible by Hk ({})",
-                self.num_v_heads, self.num_k_heads
-            )));
-        }
-
-        // Run gated delta recurrence
-        let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
-        let (y, new_state) = if tape_sink.is_some() {
-            // Record the per-step kernel inputs into a local sink, then fold
-            // them (plus the recorded qkv) into the layer tape below.
-            let mut kernel_sink: Option<GdnKernelTape> = None;
-            let result = gated_delta_update_with_tape(
-                &q,
-                &k,
-                &v,
-                &a,
-                &b,
-                &self.a_log,
-                &self.dt_bias,
-                recurrent_state,
-                mask,
-                use_kernel,
-                self.tiled_gguf_layout,
-                Some(&mut kernel_sink),
-            )?;
-            if let (Some(sink), Some(kernel), Some(qkv)) = (tape_sink.take(), kernel_sink, tape_qkv)
-            {
-                *sink = Some(GdnLayerTape {
-                    kernel,
-                    qkv,
-                    conv_kernel_dim: self.conv_kernel_dim,
-                });
-            }
-            result
-        } else {
-            if self.tiled_gguf_layout {
-                gated_delta_update_with_tape(
-                    &q,
-                    &k,
-                    &v,
-                    &a,
-                    &b,
-                    &self.a_log,
-                    &self.dt_bias,
-                    recurrent_state,
-                    mask,
-                    use_kernel,
-                    true,
-                    None,
-                )?
-            } else {
-                gated_delta_update(
-                    &q,
-                    &k,
-                    &v,
-                    &a,
-                    &b,
-                    &self.a_log,
-                    &self.dt_bias,
-                    recurrent_state,
-                    mask,
-                    use_kernel,
-                )?
-            }
-        };
-
-        // Update recurrent state in cache
-        if let Some(cache) = cache {
-            cache.set(1, new_state)?;
-        }
-
-        // Reshape z to per-head format: [B, T, value_dim] → [B, T, Hv, Dv]
-        let z = z.reshape(&[
-            batch,
-            seq_len,
-            self.num_v_heads as i64,
-            self.value_head_dim as i64,
-        ])?;
-
-        // Apply RMSNormGated on per-head tensors: [B, T, Hv, Dv]
-        // Norm weight is [Dv], operates on last dimension
-        let y_normed = self.norm.forward(&y, Some(&z))?;
-
-        // Flatten heads: [B, T, Hv, Dv] → [B, T, value_dim]
-        let y_flat = y_normed.reshape(&[batch, seq_len, self.value_dim as i64])?;
-
-        // Output projection
-        self.out_proj.forward(&y_flat)
+        Ok((q, k, v))
     }
 
     // ========== Weight accessors (standard mode) ==========
@@ -758,11 +877,21 @@ impl GatedDeltaNet {
     }
     pub fn set_dt_bias(&mut self, w: &MxArray) {
         self.dt_bias = w.clone();
+        self.dt_bias_f32 = w.astype(crate::array::DType::Float32).ok();
     }
     pub fn set_a_log(&mut self, w: &MxArray) -> Result<()> {
         // Cast A_log to model dtype (bf16) to avoid f32→bf16 promotion overhead.
         // The precision difference is negligible for inference.
         self.a_log = w.astype(self.dt_bias.dtype()?)?;
+        // `-exp(a_log)` in f32 for the fused gdn_prepare kernel — exp() of the
+        // f32-widened STORED a_log matches what the gating kernels compute at
+        // runtime. `None` on failure keeps the generic prep path.
+        self.gdn_scale_f32 = self
+            .a_log
+            .astype(crate::array::DType::Float32)
+            .and_then(|v| v.exp())
+            .and_then(|v| v.mul_scalar(-1.0))
+            .ok();
         Ok(())
     }
 
@@ -862,5 +991,153 @@ impl GatedDeltaNet {
     }
     pub fn get_a_log(&self) -> MxArray {
         self.a_log.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::array::DType;
+
+    fn rand_bf16(shape: &[i64]) -> MxArray {
+        MxArray::random_normal(shape, 0.0, 0.3, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
+        let af = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let bf = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        af.as_ref()
+            .iter()
+            .zip(bf.as_ref())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Kernel geometry: 16k×128 + 48v×128 → conv_dim 10240, the only shape
+    /// `mlx_qwen4_gdn_prepare` accepts.
+    fn kernel_geometry_net() -> GatedDeltaNet {
+        let config = Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
+            vocab_size: 32,
+            hidden_size: 64,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            head_dim: 8,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 48,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(true),
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        };
+        let mut net = GatedDeltaNet::new(&config).unwrap();
+        // key_dim*2 + value_dim*2 = 2048*2 + 6144*2 = 16384 rows out.
+        net.set_in_proj_qkvz_weight(&rand_bf16(&[16384, 64]))
+            .unwrap();
+        net.set_in_proj_ba_weight(&rand_bf16(&[96, 64])).unwrap();
+        net.set_conv1d_weight(&rand_bf16(&[10240, 1, 4])).unwrap();
+        net.set_norm_weight(&rand_bf16(&[128])).unwrap();
+        net.set_out_proj_weight(&rand_bf16(&[64, 6144])).unwrap();
+        net.set_dt_bias(&rand_bf16(&[48]));
+        net.set_a_log(&rand_bf16(&[48])).unwrap();
+        net
+    }
+
+    /// Probe the FFI directly so the parity test below can never pass
+    /// vacuously when the Metal backend is absent.
+    fn gdn_prepare_backend_probe() -> bool {
+        let qkv = rand_bf16(&[1, 1, 10240]);
+        let a = rand_bf16(&[1, 1, 48]);
+        let b = rand_bf16(&[1, 1, 48]);
+        let conv = MxArray::random_normal(&[10240, 4], 0.0, 0.1, Some(DType::Float32)).unwrap();
+        let history = rand_bf16(&[3, 10240]);
+        let scale = MxArray::full(&[48], Either::A(-0.5), Some(DType::Float32)).unwrap();
+        let dt = MxArray::full(&[48], Either::A(0.0), Some(DType::Float32)).unwrap();
+        let mut outputs = [std::ptr::null_mut(); 6];
+        let ok = unsafe {
+            sys::mlx_qwen4_gdn_prepare(
+                qkv.handle.0,
+                a.handle.0,
+                b.handle.0,
+                conv.handle.0,
+                history.handle.0,
+                scale.handle.0,
+                dt.handle.0,
+                outputs.as_mut_ptr(),
+            )
+        };
+        if ok {
+            for p in outputs {
+                drop(MxArray::from_handle(p, "gdn_prepare probe"));
+            }
+        }
+        ok
+    }
+
+    /// The fused `gdn_prepare` path (conv + SiLU + q|k|v + q/k L2-norm +
+    /// decay/beta in one dispatch) must reproduce `prep_via_conv` + fused
+    /// gating within bf16 rounding, and leave the conv history bit-identical
+    /// (it is the raw bf16 input window tail on both paths).
+    #[test]
+    fn fused_gdn_prepare_matches_conv_prep_path() -> Result<()> {
+        if !gdn_prepare_backend_probe() {
+            return Ok(());
+        }
+        let net = kernel_geometry_net();
+        let x1 = rand_bf16(&[1, 3, 64]);
+        let x2 = rand_bf16(&[1, 5, 64]);
+
+        // Fallback prep (window_conv + split + folded norms + fused gating).
+        unsafe { std::env::set_var("MLX_DISABLE_QWEN35_GDN_PREPARE", "1") };
+        let mut cache_a = ArraysCache::new(2);
+        let out_a1 = net.forward(&x1, None, Some(&mut cache_a), true)?;
+        let out_a2 = net.forward(&x2, None, Some(&mut cache_a), true)?;
+
+        // Fused prepare. The env var is read synchronously inside forward()
+        // (the prepared closure), so removing it here is safe even though
+        // eval is lazy.
+        unsafe { std::env::remove_var("MLX_DISABLE_QWEN35_GDN_PREPARE") };
+        let mut cache_b = ArraysCache::new(2);
+        let out_b1 = net.forward(&x1, None, Some(&mut cache_b), true)?;
+        let out_b2 = net.forward(&x2, None, Some(&mut cache_b), true)?;
+
+        for (step, (a, b)) in [(&out_a1, &out_b1), (&out_a2, &out_b2)].iter().enumerate() {
+            let diff = max_abs_diff(a, b);
+            assert!(
+                diff <= 0.1,
+                "gdn_prepare vs conv-prep output diverged at step {step}: {diff}"
+            );
+        }
+        let hdiff = max_abs_diff(cache_a.get(0).unwrap(), cache_b.get(0).unwrap());
+        assert_eq!(
+            hdiff, 0.0,
+            "conv history must be bit-identical on both paths"
+        );
+        let sdiff = max_abs_diff(cache_a.get(1).unwrap(), cache_b.get(1).unwrap());
+        assert!(
+            sdiff <= 0.1,
+            "gdn_prepare vs conv-prep recurrent state diverged: {sdiff}"
+        );
+        Ok(())
     }
 }

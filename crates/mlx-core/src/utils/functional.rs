@@ -985,7 +985,8 @@ fn gated_delta_net_functional(
         .ok_or_else(|| Error::from_reason(format!("Missing {}.dt_bias", prefix)))?;
 
     use crate::models::qwen3_5::gated_delta::gated_delta_update;
-    let (y, _state) = gated_delta_update(&q, &k, &v, &a, &b, a_log, dt_bias, None, None, false)?;
+    let (y, _state) =
+        gated_delta_update(&q, &k, &v, &a, &b, a_log, dt_bias, None, None, false, None)?;
 
     // Reshape z to per-head format
     let z = z.reshape(&[batch, seq_len, num_v_heads as i64, value_head_dim as i64])?;
