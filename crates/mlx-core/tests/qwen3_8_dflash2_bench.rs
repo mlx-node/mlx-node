@@ -3,8 +3,15 @@
 //! ```shell
 //! MLX_TEST_QWEN38_TARGET_PATH=/path/to/target.gguf \
 //! MLX_TEST_QWEN38_DFLASH2_PATH=/path/to/dflash2 \
-//! cargo test -p mlx-core --test qwen3_8_dflash2_bench -- --ignored --nocapture
+//! cargo test -p mlx-core --release --test qwen3_8_dflash2_bench -- \
+//!   --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Decode lines report the speculative-cycle decomposition:
+//! `A` = committed tokens/cycle (numerator) and `C` = ms/cycle
+//! (denominator), so `decode_tps ≈ 1000·A/C`. A throughput change is only
+//! interpretable alongside both. `d<N>` is the configured `mtp_depth`
+//! label — the actual proposal width is `mtp_mean_depth`.
 
 use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::qwen3_5::model::{Qwen3_5Model, Qwen35LoadOptions};
@@ -38,6 +45,18 @@ fn print_perf(tag: &str, num_tokens: u32, perf: &PerformanceMetrics) {
         perf.mtp_mean_depth,
         perf.mtp_acceptance_by_position,
     );
+    // Speculative-cycle decomposition: A = committed tokens/cycle,
+    // C = decode ms/cycle; decode_tps ≈ 1000·A/C. decode_ms is derived
+    // from tokens and decode_tps (the only wall-clock the metrics carry).
+    if let (Some(cycles), Some(a)) = (perf.mtp_cycles, perf.mtp_mean_accepted_tokens_total) {
+        if cycles > 0 && perf.decode_tokens_per_second > 0.0 {
+            let decode_ms = num_tokens as f64 / perf.decode_tokens_per_second * 1000.0;
+            let c = decode_ms / cycles as f64;
+            eprintln!(
+                "[bench]   cycle: A={a:.3} tok/cycle C={c:.2} ms/cycle (decode_ms={decode_ms:.0})"
+            );
+        }
+    }
     if let Some(phases) = &perf.profile_phases {
         for p in phases {
             eprintln!(
