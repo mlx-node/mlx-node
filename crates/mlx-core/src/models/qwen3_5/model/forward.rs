@@ -394,6 +394,24 @@ pub(crate) fn forward_dflash2_with_taps(
     Vec<MxArray>,
     Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
 )> {
+    // The compiled verify path replays the whole decode forward as one fused
+    // MLX tape — see `forward_dflash2_compiled` for the contract. It only
+    // covers the speculative-verify shape (B=1, tape recorded, all-rows
+    // logits); anything else stays on the eager path below.
+    if record_tape && matches!(logits_span, DFlash2LogitsSpan::All) {
+        match forward_dflash2_compiled(inner, input_ids, tap_layers) {
+            Ok(Some(out)) => return Ok(out),
+            Ok(None) => {}
+            Err(e) => {
+                // Trace/replay failures leave the caches untouched (all cache
+                // writes happen after a successful invoke), so the eager path
+                // is a safe retry — but a builder-level failure is structural,
+                // not transient, so disable the compiled path for this model.
+                inner.dflash2_compiled_verify_disabled = true;
+                eprintln!("[dflash2] compiled verify disabled: {e}");
+            }
+        }
+    }
     if tap_layers.is_empty() || tap_layers.iter().any(|&layer| layer >= inner.layers.len()) {
         return Err(Error::from_reason(format!(
             "DFlash2 target tap layers are invalid: {tap_layers:?} for {} layers",
@@ -467,6 +485,276 @@ pub(crate) fn forward_dflash2_with_taps(
     let normalized = inner.final_norm.forward(&hidden)?;
     let logits = project_logits_from_hidden(&normalized, &inner.lm_head, &inner.embedding)?;
     Ok((logits, taps, tape))
+}
+
+/// Compiled-graph variant of the DFlash2 verify forward (the
+/// `record_tape=true`, `DFlash2LogitsSpan::All`, batch-1 shape).
+///
+/// The entire verify forward — embedding lookup, every decoder layer, final
+/// norm, LM head — is traced once per `(model, verify length L)` and replayed
+/// through `mlx::core::compile`'s fused tape: the ~2400 per-cycle Rust op
+/// constructions collapse into one FFI call plus `compile_replace`, and MLX's
+/// fusion pass merges the elementwise/layout soup the eager builder emits.
+///
+/// # Graph contract
+///
+/// Inputs, in order:
+///   `input_ids` `[1, L]` i32, `rope_offsets` `[1]` i32, then per layer:
+///     Linear        — conv_state `[1, K-1, conv_dim]`,
+///                     recurrent `[1, Hv, Dv, Dk]`
+///     FullAttention — live K prefix `[1, Hkv, P, D]`, V prefix `[1, Hkv, P, D]`
+/// Outputs, in order:
+///   `logits` `[1, L, V]`, tap hiddens (in `tap_layers` order), then per layer:
+///     Linear        — kernel tape `q, k, v, g, beta` + post-mask `qkv` (6)
+///     FullAttention — post-RoPE `new_k, new_v` `[1, Hkv, L, D]` (2)
+///
+/// `shapeless` lifts the prefix length `P` — which changes every cycle — out
+/// of the compile cache key. Every host-int branch inside the builder depends
+/// only on `L` and model constants, both folded into the `fn_id`, so the
+/// traced tape is consistent on replay. `P` flows only through
+/// shape-polymorphic ops: the K/V prefix concat (axis 2) and the fused SDPA
+/// primitive, which derives `qL_off = kL - qL` from real input shapes at eval
+/// time.
+///
+/// After a successful invoke the caller writes each emitted `(new_k, new_v)`
+/// into the real `KVCache` via `update_and_fetch` — the same grow +
+/// in-place-write + offset-bump semantics the eager path uses — so commit's
+/// `trim(snapshot_offset + steps)` rollback is unchanged.
+///
+/// Returns `Ok(None)` when the caches are not in the flat-verify shape the
+/// graph expects (missing state slots, variant mismatch, divergent
+/// full-attention offsets) or the FFI invoke fails — the caller falls back
+/// to the eager path. Builder errors surface as `Err`.
+fn forward_dflash2_compiled(
+    inner: &mut Qwen35Inner,
+    input_ids: &MxArray,
+    tap_layers: &[usize],
+) -> Result<
+    Option<(
+        MxArray,
+        Vec<MxArray>,
+        Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
+    )>,
+> {
+    use crate::models::qwen3_5::decoder_layer::LayerVerifyIo;
+    use crate::models::qwen3_5::gated_delta::GdnKernelTape;
+    use crate::models::qwen3_5::gated_delta_net::GdnLayerTape;
+
+    if inner.dflash2_compiled_verify_disabled
+        || std::env::var("MLX_DISABLE_DFLASH2_COMPILED_VERIFY").is_ok()
+    {
+        return Ok(None);
+    }
+    if tap_layers.is_empty() || tap_layers.iter().any(|&l| l >= inner.layers.len()) {
+        return Err(Error::from_reason(format!(
+            "DFlash2 target tap layers are invalid: {tap_layers:?} for {} layers",
+            inner.layers.len()
+        )));
+    }
+    let batch = input_ids.shape_at(0)?;
+    let seq_len = input_ids.shape_at(1)?;
+    if batch != 1 || seq_len < 1 || seq_len > 255 {
+        return Ok(None);
+    }
+    let Some(caches) = inner.caches.as_ref() else {
+        return Ok(None);
+    };
+    if caches.len() != inner.layers.len() {
+        return Ok(None);
+    }
+
+    // Gather graph inputs in the contract order. The shared RoPE base is the
+    // full-attention offset — the flat verify invariant (asserted by
+    // `flat_attention_frontier`) is that every FA cache agrees on it.
+    let mut rope_base: Option<i32> = None;
+    let mut per_layer_state: Vec<MxArray> = Vec::with_capacity(2 * caches.len());
+    for index in 0..inner.layers.len() {
+        match (&inner.layers[index].attn, &caches[index]) {
+            (
+                crate::models::qwen3_5::decoder_layer::AttentionType::Linear(_),
+                Qwen3_5LayerCache::Linear(ac),
+            ) => {
+                let (Some(conv), Some(rec)) = (ac.get(0), ac.get(1)) else {
+                    return Ok(None);
+                };
+                per_layer_state.push(conv.clone());
+                per_layer_state.push(rec.clone());
+            }
+            (
+                crate::models::qwen3_5::decoder_layer::AttentionType::Full(_),
+                Qwen3_5LayerCache::FullAttention(kvc),
+            ) => {
+                let offset = kvc.get_offset();
+                let (Some(keys), Some(values)) = (kvc.keys_ref(), kvc.values_ref()) else {
+                    return Ok(None);
+                };
+                if offset <= 0 || offset as i64 > keys.shape_at(2)? {
+                    return Ok(None);
+                }
+                match rope_base {
+                    Some(base) if base != offset => return Ok(None),
+                    None => rope_base = Some(offset),
+                    _ => {}
+                }
+                per_layer_state.push(keys.slice_axis(2, 0, offset as i64)?);
+                per_layer_state.push(values.slice_axis(2, 0, offset as i64)?);
+            }
+            _ => return Ok(None),
+        }
+    }
+    let rope_offsets = MxArray::from_int32(&[rope_base.unwrap_or(0)], &[1])?;
+    let mut inputs: Vec<MxArray> = Vec::with_capacity(2 + per_layer_state.len());
+    inputs.push(input_ids.clone());
+    inputs.push(rope_offsets);
+    inputs.extend(per_layer_state);
+
+    let n_linear = inner.layers.iter().filter(|l| l.is_linear()).count();
+    let n_fa = inner.layers.len() - n_linear;
+    let n_outputs = 1 + tap_layers.len() + 6 * n_linear + 2 * n_fa;
+    // Per-(model, L) id: the verify length decides every host-int branch in
+    // the builder (SDPA verify-split geometry), while the prefix length stays
+    // shapeless. The high tag namespaces these ids away from the C++-side
+    // pointer-derived ids and the test range.
+    let fn_id =
+        0xD51A_3500_0000_0000 | ((inner.model_id & 0x00FF_FFFF) << 8) | (seq_len as u64 & 0xFF);
+
+    let layers = &mut inner.layers;
+    let embedding = &inner.embedding;
+    let final_norm = &inner.final_norm;
+    let lm_head = &inner.lm_head;
+    let mut builder = move |graph_inputs: &[MxArray]| -> Result<Vec<MxArray>> {
+        let ids = &graph_inputs[0];
+        let rope_offsets = &graph_inputs[1];
+        let mut cursor = 2usize;
+        let mut hidden = embedding.forward(ids)?;
+        let mut taps: Vec<Option<MxArray>> = vec![None; tap_layers.len()];
+        let mut extras: Vec<MxArray> = Vec::with_capacity(6 * n_linear + 2 * n_fa);
+        for (index, layer) in layers.iter_mut().enumerate() {
+            let mut tape_slot: Option<GdnLayerTape> = None;
+            if layer.is_linear() {
+                // Detached cache seeded with the graph-input states: the
+                // verify-time writes land in it and are dropped; commit
+                // replays the accepted prefix from the snapshot.
+                let mut detached = crate::models::qwen3_5::arrays_cache::ArraysCache::new(2);
+                detached.set(0, graph_inputs[cursor].clone())?;
+                detached.set(1, graph_inputs[cursor + 1].clone())?;
+                let mut io = LayerVerifyIo::Linear(&mut detached);
+                hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
+                let tape = tape_slot.ok_or_else(|| {
+                    Error::from_reason("compiled verify: GDN layer produced no tape")
+                })?;
+                let GdnLayerTape { kernel, qkv, .. } = tape;
+                let GdnKernelTape { q, k, v, g, beta } = kernel;
+                extras.extend([q, k, v, g, beta, qkv]);
+            } else {
+                let mut out_kv = None;
+                let mut io = LayerVerifyIo::FullAttention(
+                    crate::models::qwen3_5::attention::AttentionVerifyIo {
+                        prefix_keys: &graph_inputs[cursor],
+                        prefix_values: &graph_inputs[cursor + 1],
+                        rope_offsets,
+                        out_kv: &mut out_kv,
+                    },
+                );
+                hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
+                drop(io);
+                let (new_k, new_v) = out_kv.ok_or_else(|| {
+                    Error::from_reason("compiled verify: attention layer produced no kv block")
+                })?;
+                extras.push(new_k);
+                extras.push(new_v);
+            }
+            cursor += 2;
+            for (slot, &tap_layer) in tap_layers.iter().enumerate() {
+                if tap_layer == index {
+                    taps[slot] = Some(hidden.clone());
+                }
+            }
+        }
+        let normalized = final_norm.forward(&hidden)?;
+        let logits = project_logits_from_hidden(&normalized, lm_head, embedding)?;
+        let mut outputs = Vec::with_capacity(n_outputs);
+        outputs.push(logits);
+        for (slot, tap) in taps.into_iter().enumerate() {
+            outputs.push(tap.ok_or_else(|| {
+                Error::from_reason(format!(
+                    "compiled verify: tap {slot} at layer {} was not captured",
+                    tap_layers[slot]
+                ))
+            })?);
+        }
+        outputs.extend(extras);
+        Ok(outputs)
+    };
+
+    let input_refs: Vec<&MxArray> = inputs.iter().collect();
+    let Some(outputs) = crate::compiled_graph::invoke_compiled_graph(
+        fn_id,
+        &input_refs,
+        n_outputs,
+        true,
+        &mut builder,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    // Unpack the contract: logits, taps, then per-layer extras in layer order.
+    let mut cursor = 1 + tap_layers.len();
+    let logits = outputs[0].clone();
+    let taps: Vec<MxArray> = outputs[1..1 + tap_layers.len()].to_vec();
+    let mut tape: Vec<Option<GdnLayerTape>> = std::iter::repeat_with(|| None)
+        .take(inner.layers.len())
+        .collect();
+    let caches = inner
+        .caches
+        .as_mut()
+        .ok_or_else(|| Error::from_reason("compiled verify: caches dropped mid-invoke"))?;
+    for (index, layer) in inner.layers.iter().enumerate() {
+        if layer.is_linear() {
+            let kd = match &layer.attn {
+                crate::models::qwen3_5::decoder_layer::AttentionType::Linear(gdn) => {
+                    gdn.conv_kernel_dim()
+                }
+                _ => {
+                    return Err(Error::from_reason(
+                        "compiled verify: linear layer kind mismatch",
+                    ));
+                }
+            };
+            let mut take = |outputs: &Vec<MxArray>| -> Result<MxArray> {
+                let a = outputs
+                    .get(cursor)
+                    .ok_or_else(|| Error::from_reason("compiled verify: output arity shortfall"))?;
+                cursor += 1;
+                Ok(a.clone())
+            };
+            tape[index] = Some(GdnLayerTape {
+                kernel: GdnKernelTape {
+                    q: take(&outputs)?,
+                    k: take(&outputs)?,
+                    v: take(&outputs)?,
+                    g: take(&outputs)?,
+                    beta: take(&outputs)?,
+                },
+                qkv: take(&outputs)?,
+                conv_kernel_dim: kd,
+            });
+        } else {
+            let kvc = caches[index].as_kv_cache_mut().ok_or_else(|| {
+                Error::from_reason("compiled verify: attention cache kind mismatch")
+            })?;
+            let new_k = outputs
+                .get(cursor)
+                .ok_or_else(|| Error::from_reason("compiled verify: output arity shortfall"))?;
+            let new_v = outputs
+                .get(cursor + 1)
+                .ok_or_else(|| Error::from_reason("compiled verify: output arity shortfall"))?;
+            cursor += 2;
+            kvc.update_and_fetch(new_k, new_v)?;
+        }
+    }
+    Ok(Some((logits, taps, tape)))
 }
 
 pub(super) fn project_logits_from_hidden(

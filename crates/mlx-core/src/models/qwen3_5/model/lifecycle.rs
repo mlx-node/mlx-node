@@ -75,6 +75,7 @@ impl Qwen35Inner {
             cached_paged_image_token_positions: Vec::new(),
             cached_rope_deltas: None,
             model_id,
+            dflash2_compiled_verify_disabled: false,
             active_cache_owner_id: String::new(),
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,

@@ -170,6 +170,10 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2_draft_lm_head: Option<LinearProj>,
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_decode::DFlash2TurnState>,
+    /// Latched when the compiled DFlash2 verify graph fails at trace or
+    /// replay — the failure mode is structural, so the stepper stays on the
+    /// eager path for the rest of the model's lifetime.
+    pub(crate) dflash2_compiled_verify_disabled: bool,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,

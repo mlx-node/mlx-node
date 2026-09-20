@@ -61,9 +61,7 @@ unsafe extern "C" fn builder_trampoline(
             }
         }
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (ctx.builder)(&wrapped)
-    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (ctx.builder)(&wrapped)));
     let out = match result {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {

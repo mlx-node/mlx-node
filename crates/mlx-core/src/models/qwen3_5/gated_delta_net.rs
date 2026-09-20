@@ -301,6 +301,12 @@ impl GatedDeltaNet {
         })
     }
 
+    /// Depthwise conv kernel width — the caller needs it to rebuild
+    /// [`GdnLayerTape`]s from compiled-graph outputs (`keep = kd - 1`).
+    pub(crate) fn conv_kernel_dim(&self) -> i32 {
+        self.conv_kernel_dim
+    }
+
     /// Precompute the stacked `[qkvz; ba]` input projection once after both
     /// in_proj weights have been loaded. Forward will then use one matmul
     /// plus two axis-2 slices instead of two separate matmuls.
