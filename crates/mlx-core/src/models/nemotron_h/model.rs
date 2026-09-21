@@ -831,30 +831,44 @@ impl NemotronHInner {
     /// into `caches`, parking the previously active sequence (lfm2 ShortConv
     /// pattern).
     pub(crate) fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        // Presence check first, matching the original ordering: a missing
+        // adapter must fail before any cache state is mutated.
+        if self.paged_adapter.is_none() {
+            return Err(Error::from_reason(
+                "nemotron_h paged adapter is unavailable",
+            ));
+        }
+        if self.active_scheduled_seq != Some(seq_id) {
+            // Capture BEFORE the remove: a preempted sequence's recurrent state was
+            // released, so the remove falls back to FRESH zero-state caches and the reuse
+            // predicate must know the state did not survive.
+            let had_state = self.scheduled_caches.contains_key(&seq_id);
+            // Swap the sequence's caches BEFORE activating the adapter: if the
+            // park or the fresh recurrent-state allocation fails, the adapter,
+            // `caches`, and `active_scheduled_seq` all still describe the
+            // previously active sequence and the caller can retry cleanly.
+            // (`active_scheduled_seq == seq_id` leaves the flags untouched on
+            // purpose — see the prime_prefix_state_for note below.)
+            self.park_active_scheduled_caches()?;
+            self.caches = match self.scheduled_caches.remove(&seq_id) {
+                Some(caches) => caches,
+                None => fresh_caches(&self.config, &self.layers)?,
+            };
+            self.active_scheduled_seq = Some(seq_id);
+            self.active_seq_recurrent_survived = had_state;
+        }
+        // Adapter activation is pure request-table bookkeeping (no fallible
+        // allocation), so it runs last: on success every side names seq_id.
+        // When the sequence is already live this is a no-op, and the flags stay
+        // as they were — re-asserting `active_seq_recurrent_survived` here would
+        // overwrite a preempted sequence's honest `had_state = false` before
+        // `prime_prefix_state_for` reads it, resuming with mamba state at zero
+        // against a full cached KV prefix.
         self.paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason("nemotron_h paged adapter is unavailable"))?
             .activate_request(seq_id)
             .map_err(Error::from_reason)?;
-        if self.active_scheduled_seq == Some(seq_id) {
-            // Already live: LEAVE THE FLAG ALONE. The scheduler activates a
-            // sequence and then activates it AGAIN through `prime_prefix_state_for`;
-            // re-asserting `true` here would overwrite a preempted sequence's honest
-            // `had_state = false` before that function reads it, resuming with mamba
-            // state at zero against a full cached KV prefix.
-            return Ok(());
-        }
-        // Capture BEFORE the remove: a preempted sequence's recurrent state was
-        // released, so the remove falls back to FRESH zero-state caches and the reuse
-        // predicate must know the state did not survive.
-        let had_state = self.scheduled_caches.contains_key(&seq_id);
-        self.park_active_scheduled_caches()?;
-        self.caches = match self.scheduled_caches.remove(&seq_id) {
-            Some(caches) => caches,
-            None => fresh_caches(&self.config, &self.layers)?,
-        };
-        self.active_scheduled_seq = Some(seq_id);
-        self.active_seq_recurrent_survived = had_state;
         Ok(())
     }
 

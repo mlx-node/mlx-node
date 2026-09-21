@@ -439,12 +439,21 @@ fn create_system_tap(
     let tap_id = unsafe { tap_id.assume_init() };
     let tap_uid = unsafe { tap.UUID().UUIDString() };
     let aggregate_uid = format!("ai.mlxnode.asr.system-audio.{process_id}.{instance}");
-    let properties = aggregate_properties(
+    let properties = match aggregate_properties(
         tap_uid,
         &aggregate_uid,
         &format!("mlx-node system audio {process_id}.{instance}"),
-    )
-    .ok_or_else(|| Error::from_reason("Core Audio aggregate dictionary allocation failed"))?;
+    ) {
+        Some(properties) => properties,
+        None => {
+            unsafe {
+                let _ = AudioHardwareDestroyProcessTap(tap_id);
+            }
+            return Err(Error::from_reason(
+                "Core Audio aggregate dictionary allocation failed",
+            ));
+        }
+    };
     let mut aggregate_device_id = 0;
     let status = unsafe {
         AudioHardwareCreateAggregateDevice(
