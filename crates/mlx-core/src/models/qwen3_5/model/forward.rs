@@ -559,7 +559,7 @@ fn forward_dflash2_compiled(
     }
     let batch = input_ids.shape_at(0)?;
     let seq_len = input_ids.shape_at(1)?;
-    if batch != 1 || seq_len < 1 || seq_len > 255 {
+    if batch != 1 || !(1..=255).contains(&seq_len) {
         return Ok(None);
     }
     let Some(caches) = inner.caches.as_ref() else {
@@ -575,8 +575,8 @@ fn forward_dflash2_compiled(
     let mut rope_base: Option<i32> = None;
     let mut per_layer_state: Vec<MxArray> = Vec::with_capacity(2 * caches.len());
     let mut fa_prefix_offsets: Vec<Option<i32>> = Vec::with_capacity(caches.len());
-    for index in 0..inner.layers.len() {
-        match (&inner.layers[index].attn, &caches[index]) {
+    for (layer, cache) in inner.layers.iter().zip(caches.iter()) {
+        match (&layer.attn, cache) {
             (
                 crate::models::qwen3_5::decoder_layer::AttentionType::Linear(_),
                 Qwen3_5LayerCache::Linear(ac),
@@ -657,16 +657,17 @@ fn forward_dflash2_compiled(
                 extras.extend([q, k, v, g, beta, qkv]);
             } else {
                 let mut out_kv = None;
-                let mut io = LayerVerifyIo::FullAttention(
-                    crate::models::qwen3_5::attention::AttentionVerifyIo {
-                        prefix_keys: &graph_inputs[cursor],
-                        prefix_values: &graph_inputs[cursor + 1],
-                        rope_offsets,
-                        out_kv: &mut out_kv,
-                    },
-                );
-                hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
-                drop(io);
+                {
+                    let mut io = LayerVerifyIo::FullAttention(
+                        crate::models::qwen3_5::attention::AttentionVerifyIo {
+                            prefix_keys: &graph_inputs[cursor],
+                            prefix_values: &graph_inputs[cursor + 1],
+                            rope_offsets,
+                            out_kv: &mut out_kv,
+                        },
+                    );
+                    hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
+                }
                 let (new_k, new_v) = out_kv.ok_or_else(|| {
                     Error::from_reason("compiled verify: attention layer produced no kv block")
                 })?;
