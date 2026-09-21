@@ -60,11 +60,7 @@ impl RMSNorm {
     ///
     /// `None` → contract miss (non-Metal, dtype/shape/contiguity mismatch);
     /// callers must fall back to `x.add(res)` + `self.forward(h)`.
-    pub fn forward_residual_add(
-        &self,
-        x: &MxArray,
-        res: &MxArray,
-    ) -> Option<(MxArray, MxArray)> {
+    pub fn forward_residual_add(&self, x: &MxArray, res: &MxArray) -> Option<(MxArray, MxArray)> {
         if std::env::var_os("MLX_DISABLE_FUSED_ADD_RMSNORM").is_some()
             || !unsafe { sys::mlx_metal_is_available() }
         {

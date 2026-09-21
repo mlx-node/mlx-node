@@ -103,11 +103,7 @@ impl DecoderLayer {
     /// The fused kernel is bit-identical to `x.add(res)` + `norm.forward(h)`
     /// (same element mapping as `rms_single_row`/`rms_looped`), so this is
     /// safe on every path — eager, paged, prefill and compiled verify alike.
-    fn add_residual_norm(
-        norm: &RMSNorm,
-        x: &MxArray,
-        res: &MxArray,
-    ) -> Result<(MxArray, MxArray)> {
+    fn add_residual_norm(norm: &RMSNorm, x: &MxArray, res: &MxArray) -> Result<(MxArray, MxArray)> {
         if let Some(pair) = norm.forward_residual_add(x, res) {
             return Ok(pair);
         }
