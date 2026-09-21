@@ -886,3 +886,17 @@ impl Qwen35Inner {
         self.paged_finalize_failed = true;
     }
 }
+
+impl Drop for Qwen35Inner {
+    fn drop(&mut self) {
+        // Each compiled-verify graph id namespaces a process-lifetime C++
+        // registry entry whose tape retains this model's captured weights.
+        // Erase every seq_len variant for this model id so an
+        // unload → reload cycle doesn't keep the previous instance's
+        // weights resident.
+        crate::compiled_graph::erase_compiled_graphs_matching(
+            0xFFFF_FFFF_FFFF_FF00,
+            forward::COMPILED_VERIFY_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
+        );
+    }
+}

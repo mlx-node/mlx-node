@@ -8,6 +8,12 @@ use crate::models::forward as fwd;
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 
+/// High tag on compiled-verify `fn_id`s. The low byte carries the verify
+/// length; bits 8..31 carry the per-instance `model_id`. `Qwen35Inner`'s Drop
+/// erases `COMPILED_VERIFY_TAG | model_id << 8` under mask `...FF00` so an
+/// unload releases the tapes' captured weights.
+pub(crate) const COMPILED_VERIFY_TAG: u64 = 0xD51A_3500_0000_0000;
+
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
 pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<()> {
@@ -619,7 +625,7 @@ fn forward_dflash2_compiled(
     // shapeless. The high tag namespaces these ids away from the C++-side
     // pointer-derived ids and the test range.
     let fn_id =
-        0xD51A_3500_0000_0000 | ((inner.model_id & 0x00FF_FFFF) << 8) | (seq_len as u64 & 0xFF);
+        COMPILED_VERIFY_TAG | ((inner.model_id & 0x00FF_FFFF) << 8) | (seq_len as u64 & 0xFF);
 
     let layers = &mut inner.layers;
     let embedding = &inner.embedding;

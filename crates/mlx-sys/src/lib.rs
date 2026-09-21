@@ -2137,6 +2137,14 @@ unsafe extern "C" {
         n_outputs: usize,
         shapeless: bool,
     ) -> bool;
+    /// Erase every cached compiled-graph entry whose fn_id matches `value`
+    /// under `mask`. Erasing drops the compiled `std::function`, whose
+    /// shared_ptr deleter also removes MLX's internal tape cache — releasing
+    /// the constants (model weights) the tape retains.
+    pub fn mlx_compiled_graph_erase_matching(mask: u64, value: u64);
+    /// Test hook: toggle MLX's global compile mode so tests can exercise the
+    /// raw-closure path (builder runs on every invoke).
+    pub fn mlx_compiled_graph_set_compile_disabled(disabled: bool);
     pub fn mlx_qwen4_window_conv(
         x: *mut mlx_array,
         history: *mut mlx_array,

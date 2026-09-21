@@ -52,6 +52,14 @@ std::mutex& registry_mutex() {
   return *m;
 }
 
+// `ctx` is a per-invocation pointer to a Rust stack local, so the cached
+// closure must not capture it: under MLX_DISABLE_COMPILE (or on a device
+// without compile support) `compile()` returns the raw closure and MLX runs
+// it on EVERY call — long after the first call's stack frame is gone — and a
+// shape-signature change under shapeless=false re-traces, running it again
+// too. The invoke sets the slot fresh before each entry.fn() call.
+thread_local void* current_builder_ctx = nullptr;
+
 } // namespace
 
 extern "C" {
@@ -84,7 +92,7 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
       entry.n_inputs = n_inputs;
       entry.n_outputs = n_outputs;
       entry.fn = mlx::core::compile(
-          [builder, ctx, n_outputs](const std::vector<array>& traced)
+          [builder, n_outputs](const std::vector<array>& traced)
               -> std::vector<array> {
             // Hand Rust owning copies of the tracers: `array` shares the
             // underlying ArrayDesc, so the copies stay tracers and record
@@ -95,7 +103,8 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
                   reinterpret_cast<mlx_array*>(new array(traced[i]));
             }
             std::vector<mlx_array*> out_handles(n_outputs, nullptr);
-            bool ok = builder(ctx, in_handles.data(), in_handles.size(),
+            bool ok = builder(current_builder_ctx, in_handles.data(),
+                              in_handles.size(),
                               out_handles.data(), out_handles.size());
             if (!ok) {
               // Leak any unconsumed handles rather than double-free: the
@@ -132,6 +141,16 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
     for (size_t i = 0; i < n_inputs; ++i) {
       in.push_back(*reinterpret_cast<const array*>(inputs[i]));
     }
+    // The cached closure reads the builder context from this slot rather than
+    // capturing a pointer into the first invocation's stack frame. Restores
+    // the previous value on exit so nested invokes stay correct.
+    struct CtxSlotGuard {
+      explicit CtxSlotGuard(void* ctx) : prev_(current_builder_ctx) {
+        current_builder_ctx = ctx;
+      }
+      ~CtxSlotGuard() { current_builder_ctx = prev_; }
+      void* prev_;
+    } slot(ctx);
     auto out = entry.fn(in);
     if (out.size() != n_outputs) {
       std::cerr << "mlx_compiled_graph_invoke: fn_id " << fn_id
@@ -147,4 +166,28 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
     std::cerr << "mlx_compiled_graph_invoke error: " << e.what() << std::endl;
     return false;
   }
+}
+
+// Drop every cached entry whose fn_id matches `value` under `mask`. Compiled
+// tapes hold their captured constants (model weights) alive, so a model must
+// erase its ids on destruction or a reload keeps the old weights resident.
+extern "C" void mlx_compiled_graph_erase_matching(uint64_t mask,
+                                                  uint64_t value) {
+  std::lock_guard<std::mutex> lock(registry_mutex());
+  auto& map = registry();
+  for (auto it = map.begin(); it != map.end();) {
+    if ((it->first & mask) == value) {
+      it = map.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// Test hook: with compile disabled, `compile()` returns the raw builder
+// closure and it runs on EVERY invoke — the path that made a captured
+// stack-local ctx dangle. Re-enabling restores the compiled path.
+extern "C" void mlx_compiled_graph_set_compile_disabled(bool disabled) {
+  mlx::core::set_compile_mode(disabled ? mlx::core::CompileMode::disabled
+                                       : mlx::core::CompileMode::enabled);
 }
