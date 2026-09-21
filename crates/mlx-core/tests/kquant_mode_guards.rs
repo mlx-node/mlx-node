@@ -1107,6 +1107,32 @@ fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
             });
         }
 
+        // Multi-tile: with tile_cap = 8, M = 9..16 splits across two
+        // threadgroups at vecs_per_tg = ceil(M / 2), covering nv_5..nv_8
+        // again but now through the second-tile row offset and the partial
+        // tail (odd M leaves the last tile short). At K = 256, N = 2048 the
+        // qmv vector limit is 32 on `d`-class devices and 14 elsewhere
+        // (:207-240), so on smaller GPUs the M >= 14 cases fall back to
+        // qmm_t and pass trivially while still covering 9..13.
+        for mm in 9i64..=16 {
+            let xw = activation(&[mm, K], 81 + mm as u32, DType::Float32);
+            let nv = (mm + 1) / 2;
+            compare_devices(
+                &format!("qmv_wide 2x nv_{nv} M={mm} batch_0 {m}"),
+                F32_TOL,
+                || qmm_of(kq, &xw, &wl, true),
+            );
+        }
+        for mm in 9i64..=16 {
+            let xwb = activation(&[3, mm, K], 91 + mm as u32, DType::Float32);
+            let nv = (mm + 1) / 2;
+            compare_devices(
+                &format!("qmv_wide 2x nv_{nv} M={mm} batch_1 {m}"),
+                F32_TOL,
+                || qmm_of(kq, &xwb, &wbl, true),
+            );
+        }
+
         // qmm_t_splitk: M = 64 clears vector_limit, B == 1 picks the split-K
         // path, and split_k lands on 8 (512 / 8 tiles, capped by K / 32).
         let x64 = activation(&[64, K], 59, DType::Float32);
