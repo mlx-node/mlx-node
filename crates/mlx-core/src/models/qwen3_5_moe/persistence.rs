@@ -559,13 +559,21 @@ fn apply_weights_moe_inner_with_residency(
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
     // The model's actual compute dtype is whatever the embedding emits —
-    // packed-quantized embeddings take their scales dtype, dense takes the
-    // weight dtype. Sidecar casts must target this, not a hardcoded family
-    // default (f32/f16 checkpoints must keep f32/f16 sidecars).
+    // affine-quantized tables emit their `.scales` dtype, but K-quant/IQ/mxfp
+    // `.scales` are integer sub-block codes and MLX `dequantize` emits bf16
+    // for them; dense tables emit their own dtype. Sidecar casts must target
+    // this, not a hardcoded family default (f32/f16 checkpoints must keep
+    // f32/f16 sidecars).
     let compute_dtype = params
         .get("embedding.scales")
-        .or_else(|| params.get("embedding.weight"))
         .and_then(|w| w.dtype().ok())
+        .map(|d| match d {
+            crate::array::DType::Float16
+            | crate::array::DType::BFloat16
+            | crate::array::DType::Float32 => d,
+            _ => crate::array::DType::BFloat16,
+        })
+        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
         .unwrap_or(crate::array::DType::BFloat16);
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
 

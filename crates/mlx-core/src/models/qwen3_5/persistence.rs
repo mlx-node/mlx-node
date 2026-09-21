@@ -1298,14 +1298,22 @@ fn apply_weights_inner_with_residency(
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
 
-    // The family's activation dtype = the embedding's output dtype: packed
-    // tables dequantize into the scales dtype, a dense table emits its own.
+    // The family's activation dtype = the embedding's dequantized OUTPUT dtype,
+    // which is NOT always the `.scales` dtype: MLX `dequantize` emits
+    // `result_type(scales, biases)` for affine but bf16 for K-quant/IQ/mxfp
+    // (whose `.scales` hold integer sub-block codes — the fp16 super-scale
+    // lives in `.biases`). Dense tables emit their own dtype.
     // Sidecar params (norm/conv f32 tensors) fold down to THIS dtype — never
     // blanket-bf16, so an f32/f16-compute checkpoint keeps matching numerics.
     let compute_dtype = params
         .get("embedding.scales")
-        .or_else(|| params.get("embedding.weight"))
         .and_then(|w| w.dtype().ok())
+        .map(|d| match d {
+            DType::Float16 | DType::BFloat16 | DType::Float32 => d,
+            // K-quant/IQ/mxfp scales are integer codes; MLX emits bf16.
+            _ => DType::BFloat16,
+        })
+        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
         .unwrap_or(DType::BFloat16);
 
     let try_build_ql = |params: &HashMap<String, MxArray>,
