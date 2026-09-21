@@ -843,16 +843,25 @@ impl NemotronHInner {
             // released, so the remove falls back to FRESH zero-state caches and the reuse
             // predicate must know the state did not survive.
             let had_state = self.scheduled_caches.contains_key(&seq_id);
-            // Swap the sequence's caches BEFORE activating the adapter: if the
-            // park or the fresh recurrent-state allocation fails, the adapter,
-            // `caches`, and `active_scheduled_seq` all still describe the
-            // previously active sequence and the caller can retry cleanly.
+            // Run every fallible allocation BEFORE the first mutation: an
+            // uncached seq_id needs fresh recurrent state, and parking the
+            // active sequence allocates its blank replacement. Any failure
+            // returns with the adapter, `caches`, and the scheduled-seq flags
+            // all still describing the previously active sequence — and with
+            // seq_id's parked entry intact, since the remove runs last.
             // (`active_scheduled_seq == seq_id` leaves the flags untouched on
             // purpose — see the prime_prefix_state_for note below.)
+            let fresh = if had_state {
+                None
+            } else {
+                Some(fresh_caches(&self.config, &self.layers)?)
+            };
             self.park_active_scheduled_caches()?;
-            self.caches = match self.scheduled_caches.remove(&seq_id) {
+            self.caches = match fresh {
                 Some(caches) => caches,
-                None => fresh_caches(&self.config, &self.layers)?,
+                None => self.scheduled_caches.remove(&seq_id).ok_or_else(|| {
+                    Error::from_reason("nemotron_h scheduled caches entry vanished mid-activation")
+                })?,
             };
             self.active_scheduled_seq = Some(seq_id);
             self.active_seq_recurrent_survived = had_state;
