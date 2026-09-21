@@ -1322,78 +1322,89 @@ impl Qwen35Inner {
             crate::training_model::compute_sgd_updates(&gradients, learning_rate, current_params)?;
 
         // Apply updated parameters directly to model fields
-        for (name, updated_param) in updated_params.iter() {
-            if name == "lm_head.weight" {
-                if let Some(ref mut lm) = self.lm_head {
-                    lm.set_weight(updated_param, "lm_head")?;
-                }
-            } else if name == "final_norm.weight" {
-                self.final_norm.set_weight(updated_param)?;
-            } else if name == "embedding.weight" {
-                self.embedding.set_weight(updated_param)?;
-            } else if name.starts_with("layers.") {
-                let parts: Vec<&str> = name.split('.').collect();
-                if parts.len() >= 3
-                    && let Ok(layer_idx) = parts[1].parse::<usize>()
-                    && layer_idx < self.layers.len()
-                {
-                    let layer = &mut self.layers[layer_idx];
-                    // Training updates arrive in the optimizer's dtype — pass
-                    // the param's own dtype so sidecars are never silently
-                    // downcast mid-training.
-                    let updated_dtype = updated_param.dtype()?;
-                    if name.contains(".linear_attn.") {
-                        if let AttentionType::Linear(ref mut gdn) = layer.attn {
-                            if name.ends_with(".in_proj_qkvz.weight") {
-                                gdn.set_in_proj_qkvz_weight(updated_param)?;
-                            } else if name.ends_with(".in_proj_ba.weight") {
-                                gdn.set_in_proj_ba_weight(updated_param)?;
-                            } else if name.ends_with(".conv1d.weight") {
-                                gdn.set_conv1d_weight(updated_param, updated_dtype)?;
-                            } else if name.ends_with(".norm.weight") {
-                                gdn.set_norm_weight(updated_param, updated_dtype)?;
-                            } else if name.ends_with(".out_proj.weight") {
-                                gdn.set_out_proj_weight(updated_param)?;
-                            } else if name.ends_with(".dt_bias") {
-                                gdn.set_dt_bias(updated_param);
-                            } else if name.ends_with(".a_log") {
-                                gdn.set_a_log(updated_param)?;
+        let result: Result<()> = (|| {
+            for (name, updated_param) in updated_params.iter() {
+                if name == "lm_head.weight" {
+                    if let Some(ref mut lm) = self.lm_head {
+                        lm.set_weight(updated_param, "lm_head")?;
+                    }
+                } else if name == "final_norm.weight" {
+                    self.final_norm.set_weight(updated_param)?;
+                } else if name == "embedding.weight" {
+                    self.embedding.set_weight(updated_param)?;
+                } else if name.starts_with("layers.") {
+                    let parts: Vec<&str> = name.split('.').collect();
+                    if parts.len() >= 3
+                        && let Ok(layer_idx) = parts[1].parse::<usize>()
+                        && layer_idx < self.layers.len()
+                    {
+                        let layer = &mut self.layers[layer_idx];
+                        // Training updates arrive in the optimizer's dtype — pass
+                        // the param's own dtype so sidecars are never silently
+                        // downcast mid-training.
+                        let updated_dtype = updated_param.dtype()?;
+                        if name.contains(".linear_attn.") {
+                            if let AttentionType::Linear(ref mut gdn) = layer.attn {
+                                if name.ends_with(".in_proj_qkvz.weight") {
+                                    gdn.set_in_proj_qkvz_weight(updated_param)?;
+                                } else if name.ends_with(".in_proj_ba.weight") {
+                                    gdn.set_in_proj_ba_weight(updated_param)?;
+                                } else if name.ends_with(".conv1d.weight") {
+                                    gdn.set_conv1d_weight(updated_param, updated_dtype)?;
+                                } else if name.ends_with(".norm.weight") {
+                                    gdn.set_norm_weight(updated_param, updated_dtype)?;
+                                } else if name.ends_with(".out_proj.weight") {
+                                    gdn.set_out_proj_weight(updated_param)?;
+                                } else if name.ends_with(".dt_bias") {
+                                    gdn.set_dt_bias(updated_param);
+                                } else if name.ends_with(".a_log") {
+                                    gdn.set_a_log(updated_param)?;
+                                }
                             }
-                        }
-                    } else if name.contains(".self_attn.") {
-                        if let AttentionType::Full(ref mut attn) = layer.attn {
-                            if name.ends_with(".q_proj.weight") {
-                                attn.set_q_proj_weight(updated_param)?;
-                            } else if name.ends_with(".k_proj.weight") {
-                                attn.set_k_proj_weight(updated_param)?;
-                            } else if name.ends_with(".v_proj.weight") {
-                                attn.set_v_proj_weight(updated_param)?;
-                            } else if name.ends_with(".o_proj.weight") {
-                                attn.set_o_proj_weight(updated_param)?;
-                            } else if name.ends_with(".q_norm.weight") {
-                                attn.set_q_norm_weight(updated_param, updated_dtype)?;
-                            } else if name.ends_with(".k_norm.weight") {
-                                attn.set_k_norm_weight(updated_param, updated_dtype)?;
+                        } else if name.contains(".self_attn.") {
+                            if let AttentionType::Full(ref mut attn) = layer.attn {
+                                if name.ends_with(".q_proj.weight") {
+                                    attn.set_q_proj_weight(updated_param)?;
+                                } else if name.ends_with(".k_proj.weight") {
+                                    attn.set_k_proj_weight(updated_param)?;
+                                } else if name.ends_with(".v_proj.weight") {
+                                    attn.set_v_proj_weight(updated_param)?;
+                                } else if name.ends_with(".o_proj.weight") {
+                                    attn.set_o_proj_weight(updated_param)?;
+                                } else if name.ends_with(".q_norm.weight") {
+                                    attn.set_q_norm_weight(updated_param, updated_dtype)?;
+                                } else if name.ends_with(".k_norm.weight") {
+                                    attn.set_k_norm_weight(updated_param, updated_dtype)?;
+                                }
                             }
+                        } else if name.contains(".mlp.") {
+                            if name.ends_with(".gate_proj.weight") {
+                                layer.mlp.set_gate_proj_weight(updated_param)?;
+                            } else if name.ends_with(".up_proj.weight") {
+                                layer.mlp.set_up_proj_weight(updated_param)?;
+                            } else if name.ends_with(".down_proj.weight") {
+                                layer.mlp.set_down_proj_weight(updated_param)?;
+                            }
+                        } else if name.ends_with(".input_layernorm.weight") {
+                            layer.set_input_layernorm_weight(updated_param, updated_dtype)?;
+                        } else if name.ends_with(".post_attention_layernorm.weight") {
+                            layer.set_post_attention_layernorm_weight(
+                                updated_param,
+                                updated_dtype,
+                            )?;
                         }
-                    } else if name.contains(".mlp.") {
-                        if name.ends_with(".gate_proj.weight") {
-                            layer.mlp.set_gate_proj_weight(updated_param)?;
-                        } else if name.ends_with(".up_proj.weight") {
-                            layer.mlp.set_up_proj_weight(updated_param)?;
-                        } else if name.ends_with(".down_proj.weight") {
-                            layer.mlp.set_down_proj_weight(updated_param)?;
-                        }
-                    } else if name.ends_with(".input_layernorm.weight") {
-                        layer.set_input_layernorm_weight(updated_param, updated_dtype)?;
-                    } else if name.ends_with(".post_attention_layernorm.weight") {
-                        layer.set_post_attention_layernorm_weight(updated_param, updated_dtype)?;
                     }
                 }
             }
-        }
+            Ok(())
+        })();
 
-        Ok(())
+        // Any application — full or partial — invalidates the constants the
+        // compiled-verify tapes traced: a `?` mid-loop still applied the
+        // earlier params, and erasing when nothing changed is a harmless
+        // registry scan.
+        self.erase_compiled_verifies();
+        result
     }
 
     /// Extract all trainable parameters from the model.
