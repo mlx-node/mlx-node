@@ -534,6 +534,12 @@ impl CandidateSelector {
         }
         let ids = MxArray::from_handle(ids, "dflash2_topk16:ids").ok()?;
         let values = MxArray::from_handle(values, "dflash2_topk16:values").ok()?;
+        // The kernel emits f32 values (widened for the merge compare), while
+        // the take_along_axis fallback returns logits.dtype(). bf16→f32 is
+        // lossless, so casting back restores bit-parity: `scores`' add then
+        // runs in the model dtype instead of promoting to f32 before the
+        // final astype — a different rounding that flips near-tie picks.
+        let values = values.astype(logits.dtype().ok()?).ok()?;
         let dims = [1, shape[1], self.top_k as i64];
         Some((ids.reshape(&dims).ok()?, values.reshape(&dims).ok()?))
     }
