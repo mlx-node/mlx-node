@@ -404,8 +404,19 @@ impl NemotronHInner {
         self.mtp.is_some() && self.mtp_weights_loaded
     }
 
+    /// `release_scheduled_caches_for` can leave `caches` empty — release must
+    /// not depend on a fresh allocation succeeding. Repopulate lazily at use
+    /// time; every caller of this still sees a fully populated set.
+    fn ensure_caches(&mut self) -> Result<()> {
+        if self.caches.is_empty() {
+            self.caches = fresh_caches(&self.config, &self.layers)?;
+        }
+        Ok(())
+    }
+
     /// Full forward over input_ids [1, T]: returns [1, T, vocab] logits.
     pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        self.ensure_caches()?;
         let h = fwd::forward_body_normed(
             input_ids,
             &self.embedding,
@@ -425,6 +436,7 @@ impl NemotronHInner {
         input_ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray)> {
+        self.ensure_caches()?;
         let hidden = fwd::forward_body_normed(
             input_ids,
             embedding,
@@ -639,7 +651,7 @@ impl NemotronHInner {
         let mut bytes = 0u64;
         for i in 0..self.layers.len() {
             if self.config.is_mamba_layer(i)
-                && let Some(state) = self.caches[i].as_mamba_state()
+                && let Some(state) = self.caches.get(i).and_then(|c| c.as_mamba_state())
             {
                 bytes = bytes
                     .saturating_add(state.conv.nbytes() as u64)
@@ -905,9 +917,13 @@ impl NemotronHInner {
 
     pub(crate) fn release_scheduled_caches_for(&mut self, seq_id: SeqId) -> Result<()> {
         if self.active_scheduled_seq == Some(seq_id) {
-            // On error the sequence stays active with its caches untouched.
-            self.caches = fresh_caches(&self.config, &self.layers)?;
+            // Freeing must not depend on a fresh allocation succeeding: clear
+            // in place so the recurrent state is released even under memory
+            // pressure. `caches` stays empty until the next activate or reset
+            // repopulates it — `forward` lazily allocates when it finds the
+            // set empty.
             self.active_scheduled_seq = None;
+            self.caches.clear();
         }
         self.scheduled_caches.remove(&seq_id);
         Ok(())
