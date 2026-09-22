@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_portable_qmm.h"
 
 // ============================================================================
 // FUSED QWEN3 GENERATION
@@ -1301,6 +1302,9 @@ mlx_array* mlx_quantized_matmul(
             std::optional<int>(bits),
             mode_str
         );
+        if (auto portable = mlx::core::portable_kquant_matmul(
+                *x_arr, *w_arr, *scales_arr, biases_opt, transpose, group_size, bits, mode_str))
+            result = std::move(*portable);
         return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
     } catch (const std::exception& e) {
         std::cerr << "mlx_quantized_matmul error: " << e.what() << std::endl;

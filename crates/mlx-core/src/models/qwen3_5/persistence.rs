@@ -2403,6 +2403,42 @@ pub async fn load_with_thread(
                     }
                     None => weights_resident,
                 };
+                // Deterministic weight-byte total for the cache-limit
+                // coordinator. Includes both text `params` and the
+                // separated `vision_params` (when present) so the
+                // cap covers the full materialized footprint.
+                // `saturating_add` guards against overflow on a
+                // corrupted checkpoint.
+                let mut weight_bytes: u64 = params
+                    .values()
+                    .map(|a| a.nbytes() as u64)
+                    .fold(0u64, |acc, v| acc.saturating_add(v));
+                if let Some(ref vparams) = vision_params {
+                    weight_bytes = vparams
+                        .values()
+                        .map(|a| a.nbytes() as u64)
+                        .fold(weight_bytes, |acc, v| acc.saturating_add(v));
+                }
+                // The raw Uint8 weights + scales are already in `params`.
+                // Count only the retained BF16 correctness fallback arrays.
+                weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
+                weight_bytes = weight_bytes.saturating_add(dflash2_weight_bytes);
+                if let Some(runtime) = inner.prism_hadamard.as_ref() {
+                    weight_bytes = weight_bytes.saturating_add(runtime.nbytes());
+                }
+
+                // Prepared projections own their retained arrays. The loader's
+                // source maps can still hold the replaced gate/up, Q/K/V and
+                // GDN tensors alive after those projections are merged. Release
+                // those temporary owners before the live-memory pool probe;
+                // otherwise smaller hosts budget for both copies and can reject
+                // a model whose steady-state weights fit. Keep the materialize
+                // witness above for the cold-tier identity check below.
+                drop(params);
+                drop(vision_params);
+                drop(plain_fp8_residency);
+                crate::array::memory::synchronize_and_clear_cache();
+
                 // Hold the process-wide pool-growth lock across the sizing
                 // probe → pool allocation → coordinator registration so a
                 // concurrent grow (or another model's load) cannot read
@@ -2455,30 +2491,6 @@ pub async fn load_with_thread(
                              KV persistence stays off for safety"
                         );
                     }
-                }
-
-                // Deterministic weight-byte total for the cache-limit
-                // coordinator. Includes both text `params` and the
-                // separated `vision_params` (when present) so the
-                // cap covers the full materialized footprint.
-                // `saturating_add` guards against overflow on a
-                // corrupted checkpoint.
-                let mut weight_bytes: u64 = params
-                    .values()
-                    .map(|a| a.nbytes() as u64)
-                    .fold(0u64, |acc, v| acc.saturating_add(v));
-                if let Some(ref vparams) = vision_params {
-                    weight_bytes = vparams
-                        .values()
-                        .map(|a| a.nbytes() as u64)
-                        .fold(weight_bytes, |acc, v| acc.saturating_add(v));
-                }
-                // The raw Uint8 weights + scales are already in `params`.
-                // Count only the retained BF16 correctness fallback arrays.
-                weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
-                weight_bytes = weight_bytes.saturating_add(dflash2_weight_bytes);
-                if let Some(runtime) = inner.prism_hadamard.as_ref() {
-                    weight_bytes = weight_bytes.saturating_add(runtime.nbytes());
                 }
 
                 Ok((inner, weight_bytes, pool_cache_limit_guard))

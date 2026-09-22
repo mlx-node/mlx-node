@@ -508,6 +508,17 @@ ggml packs Q4_K/Q5_K sub-scales into 6 bits. Storing them unpacked costs 0.125 b
 
 ### K-quants and the NAX tensor op
 
+`MLX_PORTABLE_KQUANT` controls a separate BF16/FP16 prefill path on Metal
+without NAX. It keeps 16-bit matrix operands with FP32 accumulation and uses
+a 64×64×32 SIMD tile (10 KiB threadgroup scratch). It does not dequantize or
+retain a dense model copy. Automatic selection requires at least 128 input
+rows, at least 1,024 output columns, contiguous operands, native q4k/q5k/q6k/iq4xs,
+and enough tiles to avoid replacing stock split-K arithmetic. Pipeline limits
+are checked on the actual device; unsupported compilation retains stock MLX.
+Set `0` to roll back, or `1` to force the eligible path for qualification on
+an M5. NAX, decode, short verification, training, and unsupported formats keep
+their existing routes by default. See the [portable investigation](research/portable-inference/README.md).
+
 K-quant prefill is routed onto the NAX tensor op through a `nax_supports_mode()` allowlist in `metal/quantized.cpp`. **Do not gate this on `is_nax_available()`** — that is a device capability shared with matmul and SDPA. With the allowlist closed, K-quant `qmm_t` runs 3.40–3.49× the affine control; open, it is level with affine (`M=512 N=8192 K=8192`, bf16, M5 Max). That is removal of a penalty, not a win over affine — an A/A affine control on the same harness lands 0.53% off unity, which is the noise floor those deltas sit near.
 
 `kquant_nax_bench` only means anything on `applegpu_g17s` / macOS ≥ 26.2; elsewhere both arms fall back to the same simdgroup kernel. `KQ_NAX_REQUIRE=1` turns its skip — and the NAX band inside `kquant_mode_guards` — into a hard failure.

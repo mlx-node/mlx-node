@@ -659,6 +659,9 @@ unsafe extern "C-unwind" {
     // ignore the value.
     pub fn mlx_metal_is_available() -> bool;
     pub fn mlx_metal_is_nax_available() -> bool;
+    /// Compiles and checks portable BF16/FP16 D256 attention pipelines.
+    /// Auto-enabled without NAX; MLX_PORTABLE_D256_SDPA=1 forces for validation.
+    pub fn mlx_metal_portable_d256_sdpa_available() -> bool;
     /// Probe whether MLX can dispatch the fused D=256 full-SDPA kernel for the
     /// effective input dtype. Returns 0 on success and writes a conservative
     /// result to `out_available`; returns -1 on invalid output or a caught C++
