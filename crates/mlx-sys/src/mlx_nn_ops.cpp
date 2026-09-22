@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_portable_sdpa.h"
 #include "mlx_sampling.h"
 #include <limits>
 
@@ -1209,6 +1210,11 @@ mlx_array* mlx_fast_scaled_dot_product_attention(mlx_array* queries,
   }
 
   try {
+    if (mask_mode == "causal" && !mask_arr) {
+      if (auto result = fast::portable_d256_sdpa(*q, *k, *v, scale)) {
+        return reinterpret_cast<mlx_array*>(new array(std::move(*result)));
+      }
+    }
     array result = fast::scaled_dot_product_attention(
         *q, *k, *v, scale, mask_mode, mask_arr, std::nullopt);
     return reinterpret_cast<mlx_array*>(new array(std::move(result)));

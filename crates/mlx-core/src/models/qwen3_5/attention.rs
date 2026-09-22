@@ -18,12 +18,13 @@ use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_wri
 use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use crate::transformer::paged_policy::{
-    LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes, estimate_varlen_paged_attention_bytes,
-    live_prefill_headroom, prefill_sdpa_effective_dtype,
+    LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes_with_portable,
+    estimate_varlen_paged_attention_bytes, live_prefill_headroom, prefill_sdpa_effective_dtype,
 };
 #[cfg(test)]
 use crate::transformer::paged_policy::{
-    PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES, mlx_sdpa_uses_fused_kernel, select_live_prefill_headroom,
+    PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES, estimate_paged_pool_sdpa_bytes,
+    mlx_sdpa_uses_fused_kernel, select_live_prefill_headroom,
 };
 use napi::bindgen_prelude::*;
 
@@ -1020,7 +1021,11 @@ impl Qwen3_5Attention {
                 let d256_full_sdpa_available = effective_sdpa_dtype
                     .map(|dtype| d256_full_sdpa_available(dtype == DType::Float32))
                     .unwrap_or(false);
-                let estimated_sdpa_bytes = estimate_paged_pool_sdpa_bytes(
+                let portable_d256_available = self.head_dim == 256
+                    && dtype_bytes == 2
+                    && seq_len > 8
+                    && unsafe { mlx_sys::mlx_metal_portable_d256_sdpa_available() };
+                let estimated_sdpa_bytes = estimate_paged_pool_sdpa_bytes_with_portable(
                     seq_len as u64,
                     total_ctx as u64,
                     self.num_heads as u64,
@@ -1028,6 +1033,7 @@ impl Qwen3_5Attention {
                     self.head_dim as u64,
                     dtype_bytes,
                     d256_full_sdpa_available,
+                    portable_d256_available,
                 );
                 let estimated_varlen_bytes = estimate_varlen_paged_attention_bytes(
                     seq_len as u64,
@@ -1085,6 +1091,7 @@ impl Qwen3_5Attention {
                         graph_backend_available,
                         effective_sdpa_dtype = ?effective_sdpa_dtype,
                         d256_full_sdpa_available,
+                        portable_d256_available,
                         varlen_aux_fits,
                         estimated_sdpa_mib = plan.estimated_sdpa_bytes as f64
                             / (1024.0 * 1024.0),
@@ -1961,6 +1968,58 @@ mod tests {
             Some(16 * 1024 * 1024 * 1024),
         );
         assert_eq!(plan.path, CacheHitPrefillPath::PagedPoolSdpa);
+    }
+
+    #[test]
+    fn m3_pro_recorded_continuation_uses_portable_sdpa_within_headroom() {
+        // Supplied M3 Pro trace: 1,012-token materialized chunk following
+        // 78,012 cached tokens; 3,318.9 MiB of Metal headroom. The old route
+        // estimated 4,389.7 MiB for SDPA and chose 1,942.8 MiB varlen scratch.
+        let portable =
+            estimate_paged_pool_sdpa_bytes_with_portable(1_012, 79_024, 24, 4, 256, 2, false, true);
+        let old = estimate_paged_pool_sdpa_bytes(1_012, 79_024, 24, 4, 256, 2, false);
+        let varlen = estimate_varlen_paged_attention_bytes(1_012, 79_024, 24, 4, 256, 2);
+        let headroom = Some((3318.9 * 1024.0 * 1024.0) as u64);
+        assert!(portable < 710 * 1024 * 1024);
+        assert!(old > 4 * 1024 * 1024 * 1024);
+        assert_eq!(
+            select_cache_hit_prefill_plan(CacheHitPrefillMode::Auto, 1_012, old, varlen, headroom)
+                .path,
+            CacheHitPrefillPath::PagedVarlen
+        );
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                1_012,
+                portable,
+                varlen,
+                headroom
+            )
+            .path,
+            CacheHitPrefillPath::PagedPoolSdpa
+        );
+    }
+
+    #[test]
+    fn portable_estimate_covers_ragged_continuations_without_nax_padding() {
+        for query in [9_u64, 31, 32, 33, 531, 1_012, 1_024, 2_049] {
+            let total = 85_501 + query;
+            let estimate = estimate_paged_pool_sdpa_bytes_with_portable(
+                query, total, 24, 4, 256, 2, false, true,
+            );
+            let expected = total * 4 * 256 * 2 * 4
+                + query * 24 * 256 * 2 * 2
+                + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES;
+            assert_eq!(estimate, expected);
+        }
+        for (query, dim, dtype) in [(8, 256, 2), (33, 256, 4), (33, 512, 2)] {
+            assert_eq!(
+                estimate_paged_pool_sdpa_bytes_with_portable(
+                    query, 4097, 24, 4, dim, dtype, false, true
+                ),
+                estimate_paged_pool_sdpa_bytes(query, 4097, 24, 4, dim, dtype, false),
+            );
+        }
     }
 
     #[test]

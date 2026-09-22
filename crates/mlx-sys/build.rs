@@ -743,11 +743,13 @@ fn main() -> io::Result<()> {
         let preambles = out_dir_path.join("quantized-preambles");
         let script = mlx_dir.join("mlx/backend/metal/make_compiled_preamble.sh");
         for (source_name, name) in [
+            ("utils", "utils"),
             ("steel/gemm/gemm", "gemm"),
             ("quantized_utils", "quantized_utils"),
             ("kquant", "kquant"),
             ("steel/gemm/nax", "nax"),
             ("kquant_nax", "kquant_nax"),
+            ("steel/attn/kernels/steel_attention", "steel_attention"),
         ] {
             let status = Command::new("bash")
                 .arg(&script)
@@ -763,10 +765,27 @@ fn main() -> io::Result<()> {
                 )));
             }
             let path = preambles.join(format!("{name}.cpp"));
-            let source = read_build_source(&path)?.replace(
+            let mut source = read_build_source(&path)?.replace(
                 "namespace mlx::core::metal",
                 "namespace mlx::core::quantized_preamble",
             );
+            if name == "steel_attention" {
+                // Backport the wide-head V-tile synchronization fix from
+                // ml-explore/mlx#4185 into this private kernel only. The
+                // pinned vendor template guards both barriers with BD==128,
+                // which omits the D256 instantiation added by our bridge.
+                // Fail visibly if a vendor update changes these sites.
+                let legacy = "if constexpr (BD == 128)";
+                let fixed = "if constexpr (BD >= 128)";
+                match (
+                    source.matches(legacy).count(),
+                    source.matches(fixed).count(),
+                ) {
+                    (2, 0) => source = source.replace(legacy, fixed),
+                    (0, 2) => {} // A future vendor update already contains the fix.
+                    _ => return Err(io::Error::other("Review Steel attention V-tile barriers")),
+                }
+            }
             std::fs::write(&path, source).map_err(|error| {
                 build_file_error("write private quantized preamble", &path, error)
             })?;

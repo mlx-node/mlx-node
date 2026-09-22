@@ -268,6 +268,32 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes(
     dtype_bytes: u64,
     d256_full_sdpa_available: bool,
 ) -> u64 {
+    estimate_paged_pool_sdpa_bytes_with_portable(
+        query_tokens,
+        total_context,
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+        dtype_bytes,
+        d256_full_sdpa_available,
+        false,
+    )
+}
+
+/// The portable D256 tile handles ragged queries without NAX padding and
+/// never allocates scores. Keep its capability separate from NAX's >=1024
+/// query gate so small continuations on M1-M4 receive the correct estimate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_paged_pool_sdpa_bytes_with_portable(
+    query_tokens: u64,
+    total_context: u64,
+    num_query_heads: u64,
+    num_kv_heads: u64,
+    head_dim: u64,
+    dtype_bytes: u64,
+    d256_full_sdpa_available: bool,
+    portable_d256_available: bool,
+) -> u64 {
     let one_kv = total_context
         .saturating_mul(num_kv_heads)
         .saturating_mul(head_dim)
@@ -280,6 +306,17 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes(
         .saturating_mul(4)
         .saturating_add(one_query.saturating_mul(2))
         .saturating_add(PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES);
+    if portable_d256_available
+        && head_dim == 256
+        && dtype_bytes == 2
+        && query_tokens > 8
+        && total_context >= query_tokens
+        && num_kv_heads > 0
+        && num_query_heads > 0
+        && num_query_heads.is_multiple_of(num_kv_heads)
+    {
+        return gathered;
+    }
     if mlx_sdpa_uses_fused_kernel(
         query_tokens,
         num_query_heads,

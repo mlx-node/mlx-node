@@ -25,7 +25,10 @@
 //! limit is reported as a hard benchmark error before the large pool is
 //! allocated. An SDPA run must explicitly expect `fused` or `fallback`; the
 //! benchmark probes MLX's D=256 eligibility predicate and fails before
-//! allocating the pool if the predicted execution does not match.
+//! allocating the pool if the predicted execution does not match. To validate
+//! the pre-M5 kernel on any Apple GPU, set `MLX_PORTABLE_D256_SDPA=1` and
+//! `MLX_QWEN35_PREFILL_BENCH_EXPECT=portable`. Set the portable flag to 0
+//! and `MLX_ENABLE_D256_FULL_SDPA=0` for the unfused SDPA comparison.
 
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -64,6 +67,7 @@ enum Route {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedExecution {
     Fused,
+    Portable,
     Fallback,
     Varlen,
 }
@@ -72,17 +76,18 @@ impl ExpectedExecution {
     fn from_env() -> BenchResult<Self> {
         let raw = env::var(EXPECT_ENV).map_err(|error| match error {
             env::VarError::NotPresent => format!(
-                "{EXPECT_ENV} is required; use 'fused' or 'fallback' for the SDPA route, \
+                "{EXPECT_ENV} is required; use 'fused', 'portable', or 'fallback' for the SDPA route, \
                  or 'varlen' for the varlen route"
             ),
             other => format!("failed to read {EXPECT_ENV}: {other}"),
         })?;
         match raw.to_ascii_lowercase().as_str() {
             "fused" => Ok(Self::Fused),
+            "portable" => Ok(Self::Portable),
             "fallback" => Ok(Self::Fallback),
             "varlen" => Ok(Self::Varlen),
             value => Err(format!(
-                "{EXPECT_ENV} must be exactly 'fused', 'fallback', or 'varlen'; got {value:?}"
+                "{EXPECT_ENV} must be 'fused', 'portable', 'fallback', or 'varlen'; got {value:?}"
             )),
         }
     }
@@ -90,6 +95,7 @@ impl ExpectedExecution {
     fn name(self) -> &'static str {
         match self {
             Self::Fused => "fused",
+            Self::Portable => "portable",
             Self::Fallback => "fallback",
             Self::Varlen => "varlen",
         }
@@ -101,6 +107,7 @@ struct ExecutionProbe {
     predicted_execution: ExpectedExecution,
     d256_full_sdpa_available: bool,
     d256_full_sdpa_would_use: bool,
+    portable_d256_available: bool,
 }
 
 impl Route {
@@ -159,11 +166,16 @@ impl BenchConfig {
             return Err(format!("{ITERS_ENV} must be greater than zero"));
         }
         match (config.route, config.expected_execution) {
-            (Route::Sdpa, ExpectedExecution::Fused | ExpectedExecution::Fallback) => {}
+            (
+                Route::Sdpa,
+                ExpectedExecution::Fused
+                | ExpectedExecution::Portable
+                | ExpectedExecution::Fallback,
+            ) => {}
             (Route::Varlen, ExpectedExecution::Varlen) => {}
             (route, expected) => {
                 return Err(format!(
-                    "incompatible {ROUTE_ENV}={} and {EXPECT_ENV}={}: SDPA requires fused or \
+                    "incompatible {ROUTE_ENV}={} and {EXPECT_ENV}={}: SDPA requires fused, portable, or \
                      fallback, while varlen requires varlen",
                     route.name(),
                     expected.name()
@@ -217,9 +229,12 @@ fn probe_execution(config: &BenchConfig) -> BenchResult<ExecutionProbe> {
         ));
     }
 
+    let portable_d256_available = unsafe { mlx_sys::mlx_metal_portable_d256_sdpa_available() };
     let predicted_execution = match config.route {
         Route::Sdpa => {
-            if would_use {
+            if portable_d256_available && config.query > 8 {
+                ExpectedExecution::Portable
+            } else if would_use {
                 ExpectedExecution::Fused
             } else {
                 ExpectedExecution::Fallback
@@ -243,6 +258,7 @@ fn probe_execution(config: &BenchConfig) -> BenchResult<ExecutionProbe> {
         predicted_execution,
         d256_full_sdpa_available: available,
         d256_full_sdpa_would_use: would_use,
+        portable_d256_available,
     })
 }
 
@@ -502,6 +518,7 @@ fn run_benchmark() -> BenchResult<()> {
             "predicted_execution": execution_probe.predicted_execution.name(),
             "d256_full_sdpa_available": execution_probe.d256_full_sdpa_available,
             "d256_full_sdpa_would_use": execution_probe.d256_full_sdpa_would_use,
+            "portable_d256_available": execution_probe.portable_d256_available,
             "dtype": "bf16",
             "batch": 1,
             "query_heads": NUM_QUERY_HEADS,

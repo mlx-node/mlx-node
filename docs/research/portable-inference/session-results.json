@@ -1,0 +1,134 @@
+{
+  "timestamp": "2026-09-22T07:58:03.688958+00:00",
+  "nativeAddonSha256": "625dd1a610da4eba8ad7d04e7b774cdefad9f667c3e4f68ee8f30d5877cabced",
+  "wideHeadBarriers": "BD >= 128",
+  "order": ["old_route", "portable"],
+  "limitations": [
+    "Forced attention paths on M5; other M5 kernels remain enabled, not M3 emulation",
+    "One final pair on shared desktop; compilation and other task GPU tests had completed",
+    "Old control forces unfused SDPA and varlen continuations; it does not emulate the M3 memory budget",
+    "Thermals are not controlled; no actual M3 end-to-end speedup established"
+  ],
+  "portable": {
+    "device": "Apple M5 Max",
+    "memoryBytes": 137438953472,
+    "osRelease": "27.0.0",
+    "modelBytes": 17559178144,
+    "fixture": "qwen38-oxc-review-v1",
+    "fixtureSha256": "c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b",
+    "caseName": "16k",
+    "config": {
+      "cacheOwnerId": "portable-prefill-bench",
+      "cacheRootOwnerId": "portable-prefill-bench",
+      "maxNewTokens": 64,
+      "temperature": 0,
+      "enableMtp": false,
+      "reasoningEffort": "none",
+      "reportPerformance": true,
+      "maxConsecutiveTokens": 0,
+      "maxNgramRepeats": 0
+    },
+    "switches": {
+      "MLX_PORTABLE_D256_SDPA": "1",
+      "MLX_ENABLE_D256_FULL_SDPA": null,
+      "MLX_PAGED_PREFILL_PAGED_ATTENTION": null,
+      "MLX_PAGED_PREFILL_CHUNK_SIZE": "2048"
+    },
+    "loadMs": 2617.765042,
+    "cold": {
+      "wallMs": 59548.939042,
+      "inputSha256": "010839204c56670d0d30fc432ad0068feec8ac5f4c18d6f2162131a0d7170e9f",
+      "outputSha256": "6d43d45609b80f823d6473efc3418534e177a52e343182444f754f80056bfb72",
+      "promptTokens": 18718,
+      "cachedTokens": 0,
+      "generatedTokens": 64,
+      "finishReason": "length",
+      "performance": {
+        "ttftMs": 52585.472084,
+        "prefillTokensPerSecond": 355.953826374324,
+        "decodeTokensPerSecond": 9.065994775720512
+      }
+    },
+    "continuation": {
+      "wallMs": 10150.223415999993,
+      "inputSha256": "f5fafe3843f5a8c6c59d4eda505b9cef206e1d3934e9cfd3392508ead03df27b",
+      "outputSha256": "a12e3911fb503b8a203378d7e44b3333dc184578e23e2f0f99b96184d2dad6d9",
+      "promptTokens": 19653,
+      "cachedTokens": 18781,
+      "generatedTokens": 64,
+      "finishReason": "length",
+      "performance": {
+        "ttftMs": 3201.40925,
+        "prefillTokensPerSecond": 272.38004638113665,
+        "decodeTokensPerSecond": 9.100158347406436
+      }
+    },
+    "memory": {
+      "active": 17958937006,
+      "peak": 23270202358,
+      "cache": 334584756,
+      "wiredLimit": 115448725504
+    }
+  },
+  "old_route": {
+    "device": "Apple M5 Max",
+    "memoryBytes": 137438953472,
+    "osRelease": "27.0.0",
+    "modelBytes": 17559178144,
+    "fixture": "qwen38-oxc-review-v1",
+    "fixtureSha256": "c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b",
+    "caseName": "16k",
+    "config": {
+      "cacheOwnerId": "portable-prefill-bench",
+      "cacheRootOwnerId": "portable-prefill-bench",
+      "maxNewTokens": 64,
+      "temperature": 0,
+      "enableMtp": false,
+      "reasoningEffort": "none",
+      "reportPerformance": true,
+      "maxConsecutiveTokens": 0,
+      "maxNgramRepeats": 0
+    },
+    "switches": {
+      "MLX_PORTABLE_D256_SDPA": "0",
+      "MLX_ENABLE_D256_FULL_SDPA": "0",
+      "MLX_PAGED_PREFILL_PAGED_ATTENTION": "1",
+      "MLX_PAGED_PREFILL_CHUNK_SIZE": "2048"
+    },
+    "loadMs": 1714.9827910000001,
+    "cold": {
+      "wallMs": 98614.145833,
+      "inputSha256": "010839204c56670d0d30fc432ad0068feec8ac5f4c18d6f2162131a0d7170e9f",
+      "outputSha256": "6d43d45609b80f823d6473efc3418534e177a52e343182444f754f80056bfb72",
+      "promptTokens": 18718,
+      "cachedTokens": 0,
+      "generatedTokens": 64,
+      "finishReason": "length",
+      "performance": {
+        "ttftMs": 91427.596125,
+        "prefillTokensPerSecond": 204.73030893657875,
+        "decodeTokensPerSecond": 8.782020374531214
+      }
+    },
+    "continuation": {
+      "wallMs": 17896.154500000004,
+      "inputSha256": "f5fafe3843f5a8c6c59d4eda505b9cef206e1d3934e9cfd3392508ead03df27b",
+      "outputSha256": "a12e3911fb503b8a203378d7e44b3333dc184578e23e2f0f99b96184d2dad6d9",
+      "promptTokens": 19653,
+      "cachedTokens": 18781,
+      "generatedTokens": 64,
+      "finishReason": "length",
+      "performance": {
+        "ttftMs": 7655.636291999999,
+        "prefillTokensPerSecond": 113.90300776321155,
+        "decodeTokensPerSecond": 6.168914927238621
+      }
+    },
+    "memory": {
+      "active": 17958906286,
+      "peak": 23245206510,
+      "cache": 334717876,
+      "wiredLimit": 115448725504
+    }
+  }
+}
