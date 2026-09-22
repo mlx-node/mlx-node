@@ -127,6 +127,16 @@ pub enum ProfileError {
         budget_bytes: u64,
         bytes_per_block: u64,
     },
+    /// Live load-time sizing could not fit a block. Retain the inputs so
+    /// callers can distinguish resident weights from sibling pools/reserves.
+    LoadTimeBudgetExhausted {
+        limit_bytes: u64,
+        active_bytes: u64,
+        reserved_bytes: u64,
+        safety_margin_bytes: u64,
+        available_bytes: u64,
+        bytes_per_block: u64,
+    },
 }
 
 impl std::fmt::Display for ProfileError {
@@ -170,7 +180,21 @@ impl std::fmt::Display for ProfileError {
             } => write!(
                 f,
                 "profile budget {budget_bytes} B is smaller than per-block size \
-                 {bytes_per_block} B; would yield 0 blocks"
+                {bytes_per_block} B; would yield 0 blocks"
+            ),
+            ProfileError::LoadTimeBudgetExhausted {
+                limit_bytes,
+                active_bytes,
+                reserved_bytes,
+                safety_margin_bytes,
+                available_bytes,
+                bytes_per_block,
+            } => write!(
+                f,
+                "profile budget {available_bytes} B is smaller than per-block size \
+                 {bytes_per_block} B; would yield 0 blocks (effective limit={limit_bytes} B, \
+                 MLX active={active_bytes} B, other pools/restore reserve={reserved_bytes} B, \
+                 safety margin={safety_margin_bytes} B)"
             ),
         }
     }
@@ -538,8 +562,13 @@ pub fn compute_load_time_pool_sizing(
     let selected_bytes = requested_bytes.min(safe_bytes);
     let selected_blocks_u64 = selected_bytes / bytes_per_block;
     if selected_blocks_u64 == 0 {
-        return Err(ProfileError::NotEnoughBlocks {
-            budget_bytes: selected_bytes,
+        let ceiling = total_memory_bytes.min(metal_working_set_bytes.unwrap_or(u64::MAX));
+        return Err(ProfileError::LoadTimeBudgetExhausted {
+            limit_bytes: (ceiling as f64 * util) as u64,
+            active_bytes: metal_active_bytes,
+            reserved_bytes: extra_reserved_bytes,
+            safety_margin_bytes,
+            available_bytes: selected_bytes,
             bytes_per_block,
         });
     }
@@ -976,7 +1005,42 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(matches!(err, ProfileError::NotEnoughBlocks { .. }));
+        assert!(matches!(err, ProfileError::LoadTimeBudgetExhausted { .. }));
+    }
+
+    #[test]
+    fn exhausted_load_time_budget_explains_memory_accounting() {
+        let gib = 1u64 << 30;
+        let mib = 1u64 << 20;
+        let error = compute_load_time_pool_sizing(
+            8192,
+            36 * gib,
+            Some(28 * gib),
+            24 * gib,
+            0.85,
+            gib,
+            mib,
+            64 * mib,
+        )
+        .unwrap_err();
+        let limit = (28.0 * gib as f64 * 0.85) as u64;
+        assert_eq!(
+            error,
+            ProfileError::LoadTimeBudgetExhausted {
+                limit_bytes: limit,
+                active_bytes: 24 * gib,
+                reserved_bytes: 64 * mib,
+                safety_margin_bytes: gib,
+                available_bytes: 0,
+                bytes_per_block: mib,
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("profile budget 0 B"));
+        assert!(message.contains(&format!("effective limit={limit} B")));
+        assert!(message.contains(&format!("MLX active={} B", 24 * gib)));
+        assert!(message.contains(&format!("other pools/restore reserve={} B", 64 * mib)));
+        assert!(message.contains(&format!("safety margin={gib} B")));
     }
 
     #[test]

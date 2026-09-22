@@ -1,6 +1,6 @@
 /// <reference types="node" />
 // Run from the repository root after yarn build:native. One model/process.
-// Usage: oxnode docs/research/portable-inference/benchmark-session.ts MODEL.gguf OUTPUT.json [16k|32k]
+// Usage: oxnode docs/research/portable-inference/benchmark-session.ts MODEL.gguf OUTPUT.json [16k|32k] [ar|mtp]
 import { createHash } from 'node:crypto';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -9,9 +9,9 @@ import { resolve } from 'node:path';
 
 import type { ChatMessage, ChatResult } from '../../../packages/core/index.cjs';
 
-const [modelPath, outputPath, caseName = '16k'] = process.argv.slice(2);
-if (!modelPath || !outputPath || !['16k', '32k'].includes(caseName)) {
-  throw new Error('Expected MODEL.gguf OUTPUT.json [16k|32k]');
+const [modelPath, outputPath, caseName = '16k', decode = 'ar'] = process.argv.slice(2);
+if (!modelPath || !outputPath || !['16k', '32k'].includes(caseName) || !['ar', 'mtp'].includes(decode)) {
+  throw new Error('Expected MODEL.gguf OUTPUT.json [16k|32k] [ar|mtp]');
 }
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const manifest = JSON.parse(await readFile('scripts/fixtures/qwen38-oxc-review-v1.json', 'utf8'));
@@ -31,13 +31,16 @@ const core: typeof import('../../../packages/core/index.cjs') = createRequire(im
 const started = performance.now();
 const model = await core.Qwen35Model.load(resolve(modelPath));
 if (!model.hasBlockPagedCache()) throw new Error('Benchmark requires the production paged model');
+if (decode === 'mtp' && !model.hasMtpWeights()) throw new Error('MTP benchmark requires loaded MTP weights');
 const loadMs = performance.now() - started;
+const loadMemory = core.memoryStats();
+const contextLimits = model.contextLimits();
 const config = {
   cacheOwnerId: 'portable-prefill-bench',
   cacheRootOwnerId: 'portable-prefill-bench',
   maxNewTokens: 64,
   temperature: 0,
-  enableMtp: false,
+  enableMtp: decode === 'mtp',
   reasoningEffort: 'none' as const,
   reportPerformance: true,
   maxConsecutiveTokens: 0,
@@ -97,9 +100,14 @@ const report = {
       'MLX_ENABLE_D256_FULL_SDPA',
       'MLX_PAGED_PREFILL_PAGED_ATTENTION',
       'MLX_PAGED_PREFILL_CHUNK_SIZE',
+      'MLX_KV_MEMORY_UTILIZATION',
+      'MLX_KV_SAFETY_MARGIN_BYTES',
+      'MLX_PAGED_CACHE_INITIAL_MB',
     ].map((key) => [key, process.env[key] ?? null]),
   ),
   loadMs,
+  loadMemory,
+  contextLimits,
   cold: coldSample,
   continuation: warmSample,
   memory: core.memoryStats(),

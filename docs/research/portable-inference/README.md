@@ -109,6 +109,51 @@ explicit `force_fused` option. That API and its barrier fix are absent from our
 pinned fork. This patch provides the narrow D256 bridge and backports those
 barriers without replacing the fork's other kernels.
 
+## Startup pool sizing follow-up
+
+The M3 test app subsequently failed at load with `profile budget 0 B`.
+The Qwen dense and MoE loaders still owned the checkpoint tensor maps when
+sizing the pool. Prepared gate/up, attention and GDN projections can replace
+those tensors with merged/reordered arrays, leaving both copies alive until
+the loader returns. The live probe therefore included temporary source weights.
+
+On the same 27B checkpoint, the load-time probe fell from **22,152 MiB to
+17,106 MiB** after releasing those maps before sizing. Deterministic weight-byte
+accounting and the text/vision materialization witness are retained before the
+release. Model-owned arrays stay alive; the allocator is synchronized and its
+freelist cleared before the probe. Utilization, safety reserves, sibling-pool
+accounting and Metal limits are unchanged. Genuine failures now include the
+effective limit, MLX active bytes, sibling/restore reserves and safety margin.
+
+`pool-sizing-regression.json` retains the measurements and complete application
+samples. On this M5, utilization `0.18` reproduced the exact zero-budget failure
+before the fix and passed after it; `0.15` still fails safely with the expanded
+diagnostic. These are deliberately restricted local budgets, **not M3 hardware
+emulation**. With the normal initial-pool policy, both AR and MTP complete the
+18,718-token prompt and 19,653-token follow-up, generate 64 tokens each, and
+reuse 18,781 cached tokens. Each mode's input/output hashes match the preceding
+build. MTP and AR continuation hashes differ from each other in both builds;
+this follow-up does not establish cross-mode parity.
+
+A separate `MLX_PAGED_CACHE_INITIAL_MB=64` stress run successfully loads and
+prefills, but cannot grow the nearly full pool for decode under the same tight
+budget: growth must temporarily retain both current and replacement buffers.
+That guard is preserved. Use the default initial-pool policy for the successful
+full-session reproduction below; do not copy the artificial budget onto the M3.
+
+```sh
+MLX_KV_MEMORY_UTILIZATION=0.18 MLX_PORTABLE_D256_SDPA=1 \
+MLX_PAGED_PREFILL_CHUNK_SIZE=2048 \
+oxnode docs/research/portable-inference/benchmark-session.ts \
+  /path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf pool-session.json 16k ar
+```
+
+Leave `MLX_PAGED_CACHE_INITIAL_MB` unset. Use final argument `mtp` for the MTP
+regression. Validation includes 23 budget tests and 206 persistence tests
+(three checkpoint-dependent cases ignored), the native build, and signature
+verification of the packaged app and extracted transfer ZIP. Actual M3 startup
+and throughput remain to be verified by the user.
+
 ## Validation and reproduction
 
 Measurements below were taken on **M5 Max, 128 GB**, forcing the portable
