@@ -1,0 +1,212 @@
+{
+  "sourceCommit": "263b10df",
+  "host": "M5 Max 128GB",
+  "backend": "MLX_METAL_GPU_ARCH=applegpu_g15s; real M5, not M3 emulation",
+  "diagnostic": "Materialize inputs and outputs around QMM and layer stages; excludes graph-only timings; invasive synchronization can change scheduling. No M3 attribution or performance proof.",
+  "totalStageMs": 35126.89053399999,
+  "qmmMs": 32323.45740099999,
+  "qmmShareOfStages": 0.9201912526163821,
+  "stages": {
+    "gdn": {
+      "calls": 192,
+      "ms": 8392.098663
+    },
+    "mlp": {
+      "calls": 256,
+      "ms": 23132.796870999995
+    },
+    "paged_attention": {
+      "calls": 64,
+      "ms": 3601.994999999999
+    }
+  },
+  "quantizedMatmul": {
+    "q5k": {
+      "calls": 632,
+      "ms": 15237.722419999991
+    },
+    "affine": {
+      "calls": 236,
+      "ms": 281.107401
+    },
+    "iq4xs": {
+      "calls": 216,
+      "ms": 7746.657750000001
+    },
+    "q3k": {
+      "calls": 12,
+      "ms": 370.0174999999999
+    },
+    "q4k": {
+      "calls": 228,
+      "ms": 5504.272249999999
+    },
+    "q6k": {
+      "calls": 176,
+      "ms": 2362.217109999999
+    },
+    "iq4nl": {
+      "calls": 24,
+      "ms": 694.2697699999999
+    },
+    "iq3s": {
+      "calls": 4,
+      "ms": 127.19319999999999
+    }
+  },
+  "session": {
+    "device": "Apple M5 Max",
+    "memoryBytes": 137438953472,
+    "osRelease": "27.0.0",
+    "modelBytes": 17559178144,
+    "fixture": "qwen38-oxc-review-v1",
+    "fixtureSha256": "c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b",
+    "caseName": "6k",
+    "config": {
+      "cacheOwnerId": "portable-prefill-bench",
+      "cacheRootOwnerId": "portable-prefill-bench",
+      "maxNewTokens": 64,
+      "temperature": 0,
+      "enableMtp": false,
+      "reasoningEffort": "none",
+      "reportPerformance": true,
+      "maxConsecutiveTokens": 0,
+      "maxNgramRepeats": 0
+    },
+    "switches": {
+      "MLX_PORTABLE_D256_SDPA": "1",
+      "MLX_PORTABLE_KQUANT": "1",
+      "MLX_METAL_GPU_ARCH": "applegpu_g15s",
+      "MLX_ENABLE_D256_FULL_SDPA": null,
+      "MLX_PAGED_PREFILL_PAGED_ATTENTION": null,
+      "MLX_PAGED_PREFILL_CHUNK_SIZE": "2048",
+      "MLX_KV_MEMORY_UTILIZATION": null,
+      "MLX_KV_SAFETY_MARGIN_BYTES": null,
+      "MLX_PAGED_CACHE_INITIAL_MB": "2048",
+      "MLX_PREFILL_PROFILE": "1"
+    },
+    "loadMs": 1790.6096670000002,
+    "loadMemory": {
+      "active": 17938012142,
+      "peak": 23241504760,
+      "cache": 0,
+      "wiredLimit": 115448725504
+    },
+    "contextLimits": {
+      "trainedWindowTokens": 262144,
+      "effectiveWindowTokens": 260944,
+      "pagedBlockCapacity": 2048,
+      "pagedBlockSize": 16
+    },
+    "cold": {
+      "wallMs": 33422.993625,
+      "inputSha256": "dfcfd3816e9889c29d5c2ff62c1f3b07dee66888b8bce799f465dd042a8fc20f",
+      "outputSha256": "e7ee828c4c5acb6452fb6f7afef092b290cf1a6597163bb3333cb82115e94015",
+      "promptTokens": 6183,
+      "cachedTokens": 0,
+      "generatedTokens": 64,
+      "finishReason": "length",
+      "performance": {
+        "ttftMs": 30658.616958,
+        "prefillTokensPerSecond": 201.67250233336503,
+        "decodeTokensPerSecond": 22.83959141938781,
+        "profilePhases": [
+          {
+            "name": "eval_token",
+            "totalMs": 0,
+            "avgUsPerToken": 0,
+            "count": 64
+          },
+          {
+            "name": "extract",
+            "totalMs": 0.019,
+            "avgUsPerToken": 0.296875,
+            "count": 64
+          },
+          {
+            "name": "forward",
+            "totalMs": 134.226,
+            "avgUsPerToken": 2097.28125,
+            "count": 63
+          },
+          {
+            "name": "rep_penalty",
+            "totalMs": 0,
+            "avgUsPerToken": 0,
+            "count": 63
+          },
+          {
+            "name": "sample",
+            "totalMs": 0.067,
+            "avgUsPerToken": 1.046875,
+            "count": 63
+          },
+          {
+            "name": "schedule_eval",
+            "totalMs": 2623.054,
+            "avgUsPerToken": 40985.21875,
+            "count": 63
+          }
+        ]
+      }
+    },
+    "continuation": {
+      "wallMs": 7925.9598329999935,
+      "inputSha256": "997650e5629a820fa5666a0c14747f00556be188eb0e0922e68aaed43cb8cedf",
+      "outputSha256": "53ba4e377184f3d2cf0ab7df8c98db116918475ebd3604b8b8a75fac6ff42dc1",
+      "promptTokens": 7118,
+      "cachedTokens": 6246,
+      "generatedTokens": 64,
+      "finishReason": "length",
+      "performance": {
+        "ttftMs": 5157.324125,
+        "prefillTokensPerSecond": 169.0799296039979,
+        "decodeTokensPerSecond": 22.840032683260176,
+        "profilePhases": [
+          {
+            "name": "eval_token",
+            "totalMs": 0,
+            "avgUsPerToken": 0,
+            "count": 64
+          },
+          {
+            "name": "extract",
+            "totalMs": 0.01,
+            "avgUsPerToken": 0.15625,
+            "count": 64
+          },
+          {
+            "name": "forward",
+            "totalMs": 134.287,
+            "avgUsPerToken": 2098.234375,
+            "count": 63
+          },
+          {
+            "name": "rep_penalty",
+            "totalMs": 0,
+            "avgUsPerToken": 0,
+            "count": 63
+          },
+          {
+            "name": "sample",
+            "totalMs": 0.073,
+            "avgUsPerToken": 1.140625,
+            "count": 63
+          },
+          {
+            "name": "schedule_eval",
+            "totalMs": 2622.991,
+            "avgUsPerToken": 40984.234375,
+            "count": 63
+          }
+        ]
+      }
+    },
+    "memory": {
+      "active": 17958878638,
+      "peak": 23241504760,
+      "cache": 329166068,
+      "wiredLimit": 115448725504
+    }
+  }
+}

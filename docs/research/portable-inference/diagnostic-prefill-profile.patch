@@ -1,0 +1,123 @@
+diff --git a/crates/mlx-core/src/models/qwen3_5/decoder_layer.rs b/crates/mlx-core/src/models/qwen3_5/decoder_layer.rs
+index dee34143..1df34591 100644
+--- a/crates/mlx-core/src/models/qwen3_5/decoder_layer.rs
++++ b/crates/mlx-core/src/models/qwen3_5/decoder_layer.rs
+@@ -97,6 +97,27 @@ pub struct DecoderLayer {
+     post_attention_layernorm: RMSNorm,
+ }
+
++// Diagnostic only: force materialization so measurements include GPU work.
++fn profile_begin(x: &MxArray) -> Option<std::time::Instant> {
++    if std::env::var("MLX_PREFILL_PROFILE").ok().as_deref() != Some("1")
++        || x.shape_at(1).ok()? < 64
++    {
++        return None;
++    }
++    x.eval();
++    crate::array::synchronize();
++    Some(std::time::Instant::now())
++}
++
++fn profile_end(start: Option<std::time::Instant>, x: &MxArray, stage: &str) {
++    if let Some(start) = start {
++        x.eval();
++        crate::array::synchronize();
++        eprintln!("PREFILL_STAGE stage={} tokens={} ms={:.6}", stage,
++            x.shape_at(1).unwrap_or(0), start.elapsed().as_secs_f64() * 1000.0);
++    }
++}
++
+ impl DecoderLayer {
+     /// `h = x + res` + `normed = norm(h)` — one Metal dispatch via the fused
+     /// add_rmsnorm kernel when the contract holds, else the separate ops.
+@@ -198,6 +219,7 @@ impl DecoderLayer {
+         use_kernel: bool,
+         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+     ) -> Result<MxArray> {
++        let profile = profile_begin(x);
+         // Pre-norm + attention (always on full T for cache fidelity)
+         let normed = self.input_layernorm.forward(x)?;
+         let attn_out = match &mut self.attn {
+@@ -213,12 +235,15 @@ impl DecoderLayer {
+             }
+         };
+
++        profile_end(profile, &attn_out, if self.is_linear() { "gdn" } else { "attention" });
++        let profile = profile_begin(&attn_out);
+         // Residual + post-attention norm (fused add_rmsnorm when eligible)
+         let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+         let mlp_out = self.mlp.forward(&normed)?;
+
+-        // Residual connection
+-        h.add(&mlp_out)
++        let output = h.add(&mlp_out)?;
++        profile_end(profile, &output, "mlp");
++        Ok(output)
+     }
+
+     /// Compiled-verify forward for the DFlash2 flat-cache path — the same
+@@ -331,6 +356,7 @@ impl DecoderLayer {
+                 // Pre-norm + paged attention. `position_ids` carries M-RoPE
+                 // positions for the image-bearing prefill; `None` keeps the
+                 // scalar-offset text path.
++                let profile = profile_begin(x);
+                 let normed = self.input_layernorm.forward(x)?;
+                 let attn_out = attn.forward_paged(
+                     &normed,
+@@ -343,11 +369,15 @@ impl DecoderLayer {
+                     rope_position_offset,
+                     mrope_cache,
+                 )?;
++                profile_end(profile, &attn_out, "paged_attention");
++                let profile = profile_begin(&attn_out);
+                 // Residual + post-attention norm (fused when eligible).
+                 let (h, normed) =
+                     Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+                 let mlp_out = self.mlp.forward(&normed)?;
+-                h.add(&mlp_out)
++                let output = h.add(&mlp_out)?;
++                profile_end(profile, &output, "mlp");
++                Ok(output)
+             }
+         }
+     }
+diff --git a/crates/mlx-sys/src/mlx_advanced_ops.cpp b/crates/mlx-sys/src/mlx_advanced_ops.cpp
+index 7fe4af8f..62781439 100644
+--- a/crates/mlx-sys/src/mlx_advanced_ops.cpp
++++ b/crates/mlx-sys/src/mlx_advanced_ops.cpp
+@@ -1,5 +1,7 @@
+ #include "mlx_common.h"
+ #include "mlx_portable_qmm.h"
++#include <chrono>
++#include "mlx/transforms_impl.h"
+
+ // ============================================================================
+ // FUSED QWEN3 GENERATION
+@@ -1295,6 +1297,12 @@ mlx_array* mlx_quantized_matmul(
+
+         std::string mode_str(mode ? mode : "affine");
+
++        auto profile_env = std::getenv("MLX_PREFILL_PROFILE");
++        const bool profile = profile_env && std::string(profile_env) == "1"
++            && !mlx::core::detail::in_grad_tracing() && x_arr->ndim() >= 2
++            && x_arr->shape(-1) > 0 && x_arr->size() / x_arr->shape(-1) >= 64;
++        if (profile) mlx::core::eval(*x_arr, *w_arr, *scales_arr);
++        auto profile_start = std::chrono::steady_clock::now();
+         mlx::core::array result = mlx::core::quantized_matmul(
+             *x_arr, *w_arr, *scales_arr, biases_opt,
+             transpose,
+@@ -1305,6 +1313,14 @@ mlx_array* mlx_quantized_matmul(
+         if (auto portable = mlx::core::portable_kquant_matmul(
+                 *x_arr, *w_arr, *scales_arr, biases_opt, transpose, group_size, bits, mode_str))
+             result = std::move(*portable);
++        if (profile) {
++            mlx::core::eval(result);
++            std::cerr << "PREFILL_QMM mode=" << mode_str << " bits=" << bits
++                << " m=" << x_arr->size() / x_arr->shape(-1) << " n=" << w_arr->shape(0)
++                << " k=" << x_arr->shape(-1) << " dtype=" << x_arr->dtype()
++                << " ms=" << std::chrono::duration<double, std::milli>(
++                    std::chrono::steady_clock::now() - profile_start).count() << std::endl;
++        }
+         return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+     } catch (const std::exception& e) {
+         std::cerr << "mlx_quantized_matmul error: " << e.what() << std::endl;
