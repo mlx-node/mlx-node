@@ -699,6 +699,21 @@ A focused local worker for bounded investigations. It shares the `mlx agent`
 model, session, cache and thinking settings, defaults to print mode, and uses
 read/bash tools without project instructions, skills or nested agents.
 
+Repeated and simultaneous delegate calls automatically connect to one local
+background inference service per OS user. It keeps one model resident, admits
+up to four independent sessions using the model's supported continuous-batching
+capacity, and queues inference for models without that support. Changing models
+or cache policy waits for active inference to finish before replacing the resident.
+Each caller still runs its own tools, permission checks and agent session.
+
+The service starts on demand and exits after five minutes without requests or
+pending inference. Its private connection record and startup log are in
+`~/.mlx-node/delegate/`. A failed service returns an error; delegate never falls
+back to loading a separate model in the caller. Ordinary `mlx agent`, `mlx serve`
+and the desktop inference service retain their own model processes.
+Native engine environment settings, including native tracing, come from the
+caller that starts the service and remain fixed until that service exits.
+
 From a regular terminal, Claude Code, Grok or another caller, approve the bounded
 task and its tool execution before passing `--caller-approved`. This also applies
 when resuming a session. After approving these read-only investigations:
