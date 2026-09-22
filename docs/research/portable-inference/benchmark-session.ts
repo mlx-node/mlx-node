@@ -1,6 +1,6 @@
 /// <reference types="node" />
 // Run from the repository root after yarn build:native. One model/process.
-// Usage: oxnode docs/research/portable-inference/benchmark-session.ts MODEL.gguf OUTPUT.json [16k|32k] [ar|mtp]
+// Usage: oxnode docs/research/portable-inference/benchmark-session.ts MODEL.gguf OUTPUT.json [6k|16k|32k] [ar|mtp]
 import { createHash } from 'node:crypto';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -10,8 +10,8 @@ import { resolve } from 'node:path';
 import type { ChatMessage, ChatResult } from '../../../packages/core/index.cjs';
 
 const [modelPath, outputPath, caseName = '16k', decode = 'ar'] = process.argv.slice(2);
-if (!modelPath || !outputPath || !['16k', '32k'].includes(caseName) || !['ar', 'mtp'].includes(decode)) {
-  throw new Error('Expected MODEL.gguf OUTPUT.json [16k|32k] [ar|mtp]');
+if (!modelPath || !outputPath || !['6k', '16k', '32k'].includes(caseName) || !['ar', 'mtp'].includes(decode)) {
+  throw new Error('Expected MODEL.gguf OUTPUT.json [6k|16k|32k] [ar|mtp]');
 }
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const manifest = JSON.parse(await readFile('scripts/fixtures/qwen38-oxc-review-v1.json', 'utf8'));
@@ -97,6 +97,8 @@ const report = {
   switches: Object.fromEntries(
     [
       'MLX_PORTABLE_D256_SDPA',
+      'MLX_PORTABLE_KQUANT',
+      'MLX_METAL_GPU_ARCH',
       'MLX_ENABLE_D256_FULL_SDPA',
       'MLX_PAGED_PREFILL_PAGED_ATTENTION',
       'MLX_PAGED_PREFILL_CHUNK_SIZE',

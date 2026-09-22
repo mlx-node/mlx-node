@@ -1534,6 +1534,40 @@ fn gpu_matches_cpu_for_every_activation_dtype() {
     select(Device::Cpu);
 }
 
+/// Exercise the large-M portable prefill tile, including partial M/N tiles
+/// and flattened batch dimensions. Run with MLX_PORTABLE_KQUANT=1 on NAX
+/// hosts as well; the ordinary dtype sweep above retains unsupported paths.
+#[test]
+fn portable_prefill_tiles_match_cpu() {
+    if !select(Device::Gpu) {
+        return;
+    }
+    for kq in KQUANTS
+        .iter()
+        .filter(|q| matches!(q.mode, "q4k" | "q5k" | "q6k" | "iq4xs"))
+    {
+        for (dtype, tol) in [
+            (DType::Float16, F16_TILE_TOL),
+            (DType::BFloat16, BF16_TILE_TOL),
+        ] {
+            for (shape, n, k) in [
+                (vec![129, 512], 4097, 512),
+                (vec![256, 768], 2049, 768),
+                (vec![2, 128, 512], 4096, 512),
+            ] {
+                let w = filled_kquant_weights(kq, &[n], k);
+                let x = activation(&shape, 157, dtype);
+                compare_devices(
+                    &format!("portable {} {dtype:?} {shape:?} N={n}", kq.mode),
+                    tol,
+                    || qmm_of(kq, &x, &w, true),
+                );
+            }
+        }
+    }
+    select(Device::Cpu);
+}
+
 /// The control for the bfloat16 tolerances above.
 ///
 /// `load_vector` and `qdot` in `kquant.h` are byte-identical to the affine

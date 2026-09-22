@@ -1,5 +1,58 @@
 # Portable Qwen dense prefill: M3 Pro investigation
 
+## Follow-up: roughly 77 tokens/s on the corrected test app
+
+The user reports roughly 77 prefill tokens/s after the pool-sizing repair;
+the report does not distinguish cold prompts from cached continuations.
+This is still an unresolved M3 throughput target. The earlier attention fix
+addresses the long-context fallback, but does not accelerate all dense
+projections in every layer.
+
+The next test build adds a portable K/IQ matrix path in `mlx_portable_qmm.cpp`.
+The linked Steel `BlockMMA` widens both BF16/FP16 input fragments to FP32
+before multiplying. A private specialization keeps their original 16-bit
+values and retains FP32 accumulators. It also uses a 64×64×32 tile with 10 KiB
+of threadgroup scratch. The packed weight interpretation, per-group arithmetic,
+stored output dtype, model files, KV budgets, and cache boundaries are unchanged.
+This is not a lower-precision model conversion or a persistent dense-weight cache.
+
+The selector checks the real Metal pipeline's limits and falls back on compilation
+failure. It applies automatically without NAX, only to contiguous inference
+BF16/FP16 q4k/q5k/q6k/iq4xs projections, M≥128, N≥1024, K divisible by 256,
+and at least 512 stock 32×32 tiles. This leaves small matrices and stock
+split-K reduction arithmetic alone. `MLX_PORTABLE_KQUANT=0` rolls back;
+`=1` forces qualifying shapes for local verification. Default NAX execution
+is unchanged.
+
+Research compared wider FP32-input tiles and dequantize-then-GEMM as well.
+Neither justified adopting an expanded dense-weight path. The retained kernel
+requires no additional model-sized allocations. `benchmark-portable-qmm.cpp`
+compares stock and candidate SIMD kernels with fresh graphs and alternating
+arms, and requires exact output equality. Its M=32 cases deliberately compare
+the same fallback with itself, exposing timing noise.
+
+On the M5, `MLX_METAL_GPU_ARCH=applegpu_g15s` selects the pre-NAX implementation
+for qualification; **it does not emulate an M3's hardware or memory budget**.
+`MLX_METAL_NO_NAX` is a compile-time macro, not a runtime environment switch.
+Other inference jobs ran during these tests; A/A timings were unstable, so
+these timings cannot establish a speedup. The M3 must complete a matched run
+before reporting a device throughput improvement.
+
+Validation and matched conversation results are recorded in
+`portable-qmm-results.json`. The native artifact is built using `vp run build:native`.
+The dtype/shape regression can be forced on a NAX host with:
+
+```sh
+MLX_METAL_GPU_ARCH=applegpu_g15s MLX_PORTABLE_KQUANT=1 \
+cargo test -p mlx-core --release --test kquant_mode_guards -- --nocapture
+```
+
+For M3 A/B, use fresh agent processes with the same saved conversation and
+MTP setting. Launch the default test build, then repeat with
+`MLX_PORTABLE_KQUANT=0` before the CLI command. Preserve the entire completed
+performance footer and inference log for each run. On M3, leave GPU-architecture,
+memory-limit, pool-size, and attention overrides unset.
+
 The supplied September 17 trace exposes a missing fast path for D=256 full
 attention on pre-M5 GPUs. Prefix reuse works, but long-context suffix processing
 falls back to either a materialized score matrix or a paged kernel designed
