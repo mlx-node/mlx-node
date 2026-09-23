@@ -23,12 +23,12 @@
 //! `MLX_QWEN35_PREFILL_BENCH_EXPECT=varlen`. The varlen arm never falls back
 //! to SDPA: an auxiliary buffer that would exceed Metal's `INT_MAX` element
 //! limit is reported as a hard benchmark error before the large pool is
-//! allocated. An SDPA run must explicitly expect `fused` or `fallback`; the
+//! allocated. An SDPA run must explicitly expect `fused`, `portable`, or `fallback`; the
 //! benchmark probes MLX's D=256 eligibility predicate and fails before
 //! allocating the pool if the predicted execution does not match. To validate
 //! the pre-M5 kernel on any Apple GPU, set `MLX_PORTABLE_D256_SDPA=1` and
-//! `MLX_QWEN35_PREFILL_BENCH_EXPECT=portable`. Set the portable flag to 0
-//! and `MLX_ENABLE_D256_FULL_SDPA=0` for the unfused SDPA comparison.
+//! `MLX_QWEN35_PREFILL_BENCH_EXPECT=portable`. Use `fallback` only for workloads
+//! whose device/shape guards reject both kernels.
 
 use std::env;
 use std::sync::{Arc, Mutex};

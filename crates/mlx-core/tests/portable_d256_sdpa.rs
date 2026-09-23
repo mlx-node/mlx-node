@@ -139,7 +139,6 @@ fn portable_d256_matches_reference_and_continuations() {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .env("MLX_PORTABLE_D256_TEST_CHILD", "1")
             .env("MLX_PORTABLE_D256_SDPA", "1")
-            .env_remove("MLX_ENABLE_D256_FULL_SDPA")
             .args([
                 "--ignored",
                 "--exact",
