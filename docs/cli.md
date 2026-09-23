@@ -705,11 +705,16 @@ up to four independent sessions using the model's supported continuous-batching
 capacity, and queues inference for models without that support. Changing models
 or cache policy waits for active inference to finish before replacing the resident.
 Each caller still runs its own tools, permission checks and agent session.
+Follow-up turns retain their own cache identity; at most four warm sessions are
+kept, with older idle sessions released as needed. Separate callers resuming the
+same saved session have independent caches.
 
 The service starts on demand and exits after five minutes without requests or
 pending inference. Its private connection record and startup log are in
-`~/.mlx-node/delegate/`. A failed service returns an error; delegate never falls
-back to loading a separate model in the caller. Ordinary `mlx agent`, `mlx serve`
+`~/.mlx-node/delegate/`. It selects an available local port automatically and
+elects one worker through that private directory. A failed service returns an
+error; delegate never falls back to loading a separate model in the caller.
+Ordinary `mlx agent`, `mlx serve`
 and the desktop inference service retain their own model processes.
 Native engine environment settings, including native tracing, come from the
 caller that starts the service and remain fixed until that service exits.

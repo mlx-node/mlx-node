@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { open, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -24,7 +25,7 @@ import type { makeMlxStreamSimple } from './stream-adapter.js';
 
 /** A failed shared service is an error, never permission to load another model locally. */
 export async function ensureSharedWorker(signal?: AbortSignal): Promise<SharedEndpoint> {
-  const { directory, port } = sharedLocation();
+  const { directory } = sharedLocation();
   const probe = async (): Promise<SharedEndpoint | undefined> => {
     signal?.throwIfAborted();
     let endpoint: SharedEndpoint;
@@ -34,10 +35,11 @@ export async function ensureSharedWorker(signal?: AbortSignal): Promise<SharedEn
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;
     }
-    if (endpoint.port !== port || !endpoint.token) throw new Error('Invalid shared delegate endpoint.');
+    if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535 || !endpoint.token)
+      throw new Error('Invalid shared delegate endpoint.');
     let response: Response;
     try {
-      response = await fetch(`http://127.0.0.1:${port}/health`, {
+      response = await fetch(`http://127.0.0.1:${endpoint.port}/health`, {
         headers: { authorization: `Bearer ${endpoint.token}` },
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(1000)]) : AbortSignal.timeout(1000),
         redirect: 'error',
@@ -66,8 +68,8 @@ export async function ensureSharedWorker(signal?: AbortSignal): Promise<SharedEn
     signal?.throwIfAborted();
     if (spawnError) throw spawnError;
     if (!child || child.exitCode === 0) {
-      // A contender exits successfully if the retiring worker still holds the
-      // election port. Try again after it exits, once cleanup can release it.
+      // A contender exits successfully while a retiring worker still owns the
+      // election claim. Try again once cleanup releases it.
       const log = await open(join(directory, 'service.log'), 'a', 0o600);
       try {
         const entry = new URL(
@@ -136,6 +138,7 @@ export function sharedStreamFactory(
   profile: Pick<SharedRequest['profile'], 'persistPagedCache' | 'preserveEmbeddedGemmaDraft'>,
   connect = ensureSharedWorker,
 ): typeof makeMlxStreamSimple {
+  const clientId = randomUUID();
   return (host, onPerformance, rootOwner, onRecord, _onStart, rootFile, thinkingBudget) =>
     (model, context, options) => {
       const stream = createAssistantMessageEventStream();
@@ -170,6 +173,7 @@ export function sharedStreamFactory(
         const discovered = host.modelInfo(model.id);
         if (!discovered) throw new Error(`Unknown local model: ${model.id}`);
         request = {
+          clientId,
           profile: { ...profile, discovered },
           model,
           context,

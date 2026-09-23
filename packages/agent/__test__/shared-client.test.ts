@@ -124,7 +124,7 @@ describe('shared worker rotation', () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
-  it('re-elects after a contender exits while the retiring worker holds the port', async () => {
+  it('re-elects after a contender exits while the retiring worker holds the claim', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'mlx-shared-discovery-'));
     let release!: () => void;
     const cleanupGate = new Promise<void>((resolve) => {
@@ -145,6 +145,7 @@ describe('shared worker rotation', () => {
       method: 'POST',
       headers: { authorization: `Bearer ${original.endpoint.token}` },
       body: JSON.stringify({
+        clientId: 'fixture',
         profile: { discovered: { path: '/fixture', name: 'local' } },
         model,
         context: { messages: [] },
@@ -152,7 +153,7 @@ describe('shared worker rotation', () => {
     });
     await response.text();
     const closing = original.close();
-    const location = { directory, port: original.endpoint.port };
+    const location = { directory };
     vi.mocked(sharedLocation).mockReturnValue(location);
     let lostElection!: () => void;
     const contenderExited = new Promise<void>((resolve) => {
@@ -189,7 +190,7 @@ describe('shared worker rotation', () => {
       release();
       await closing;
       const replacement = await pending;
-      expect(replacement.port).toBe(original.endpoint.port);
+      expect(replacement).toEqual(elected[0]!.endpoint);
       expect(replacement.token).not.toBe(original.endpoint.token);
       expect(spawn).toHaveBeenCalledTimes(2);
       expect(elected).toHaveLength(1);

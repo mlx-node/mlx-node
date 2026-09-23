@@ -1,7 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,18 +12,13 @@ import type { SharedEndpoint } from '../src/provider/shared-protocol.js';
 describe('shared inference across OS processes', () => {
   it('elects one worker for simultaneous launches and recovers after its exit', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'mlx-shared-process-'));
-    const reservation = createServer();
-    reservation.listen(0, '127.0.0.1');
-    await once(reservation, 'listening');
-    const port = (reservation.address() as { port: number }).port;
-    await new Promise<void>((resolve) => reservation.close(() => resolve()));
     const children: ChildProcess[] = [];
     const workerPids: number[] = [];
     const workers = new Map<number, ChildProcess>();
     const launch = async (): Promise<string> => {
       const child = spawn(
         fileURLToPath(new URL('../../../node_modules/.bin/oxnode', import.meta.url)),
-        [fileURLToPath(new URL('./fixtures/shared-service-worker.ts', import.meta.url)), directory, String(port)],
+        [fileURLToPath(new URL('./fixtures/shared-service-worker.ts', import.meta.url)), directory, '0'],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
       children.push(child);
@@ -62,6 +56,7 @@ describe('shared inference across OS processes', () => {
           method: 'POST',
           headers: { authorization: `Bearer ${connection.token}` },
           body: JSON.stringify({
+            clientId: 'fixture',
             profile: { discovered: { path: '/fixture', name: 'test' } },
             model: { id: 'test' },
             context: { messages: [] },
@@ -89,6 +84,19 @@ describe('shared inference across OS processes', () => {
       expect(replacement.token).not.toBe(endpoint.token);
       expect(await send(replacement, 'after restart')).toEqual({ error: `${replacement.pid}:after restart` });
       expect(await readFile(join(directory, 'loads'), 'utf8')).toBe(`${endpoint.pid}\n${replacement.pid}\n`);
+
+      // A killed worker cannot release its claim. Election must recognize the
+      // dead process without deleting a slot a delayed contender could reuse.
+      const crashed = once(workers.get(replacement.pid)!, 'exit');
+      process.kill(replacement.pid, 'SIGKILL');
+      await crashed;
+      expect(await launch()).toMatch(/^ready:/);
+      const recovered = JSON.parse(await readFile(join(directory, 'endpoint.json'), 'utf8')) as SharedEndpoint;
+      expect(recovered.pid).not.toBe(replacement.pid);
+      expect(await send(recovered, 'after crash')).toEqual({ error: `${recovered.pid}:after crash` });
+      expect(await readFile(join(directory, 'loads'), 'utf8')).toBe(
+        `${endpoint.pid}\n${replacement.pid}\n${recovered.pid}\n`,
+      );
     } finally {
       for (const pid of workerPids) {
         try {
@@ -97,7 +105,11 @@ describe('shared inference across OS processes', () => {
           /* already exited */
         }
       }
-      await Promise.all(children.map((child) => (child.exitCode !== null ? Promise.resolve() : once(child, 'exit'))));
+      await Promise.all(
+        children.map((child) =>
+          child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : once(child, 'exit'),
+        ),
+      );
       await rm(directory, { recursive: true, force: true });
     }
   }, 20_000);

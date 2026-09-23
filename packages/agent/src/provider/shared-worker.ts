@@ -1,7 +1,5 @@
-import { randomUUID } from 'node:crypto';
-
 import { encodeSharedEvent } from './shared-events.js';
-import { sharedLocation } from './shared-protocol.js';
+import { sharedCacheOwners, sharedLocation } from './shared-protocol.js';
 import { startSharedService, type SharedBackend } from './shared-service.js';
 
 /** Imports native code only in the elected process, on its first inference request. */
@@ -22,22 +20,20 @@ async function loadBackend(): Promise<SharedBackend> {
       const { model, options } = request;
       let performance: import('./shared-protocol.js').SharedFrame | undefined;
       let record: import('./shared-protocol.js').SharedFrame | undefined;
-      // Independent lifetimes must never release another request's native owner,
-      // including two callers resuming the same saved Pi session concurrently.
-      const nativeOwner = randomUUID();
+      const owners = sharedCacheOwners(request);
       const stream = makeMlxStreamSimple(
         host.forRequest(request.profile, signal),
         (message, metrics) => {
           performance = { message, performance: metrics };
         },
-        () => nativeOwner,
+        () => owners.root,
         (value) => {
           record = { record: { ...value, sessionId: options.sessionId, rootSessionId: request.rootSessionId } };
         },
         undefined,
         () => request.rootSessionFile,
         () => request.thinkingBudget,
-      )(model, request.context, { ...options, sessionId: nativeOwner, signal });
+      )(model, request.context, { ...options, sessionId: owners.owner, signal });
       for await (const event of stream) yield { event: encodeSharedEvent(event) };
       if (performance) yield performance;
       if (record) yield record;

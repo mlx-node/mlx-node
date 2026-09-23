@@ -5,6 +5,7 @@ import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 
+import { claimSharedService } from './shared-election.js';
 import {
   SHARED_IDLE_MS,
   SHARED_PROTOCOL,
@@ -22,7 +23,7 @@ export interface SharedBackend {
 
 export async function startSharedService(options: {
   directory: string;
-  port: number;
+  port?: number;
   loadBackend: () => Promise<SharedBackend>;
   idleMs?: number;
 }): Promise<{ endpoint: SharedEndpoint; close(): Promise<void> }> {
@@ -39,10 +40,7 @@ export async function startSharedService(options: {
       return;
     }
     if (request.method === 'GET' && request.url === '/health') {
-      if (closing) {
-        response.writeHead(503).end();
-        return;
-      }
+      response.statusCode = closing ? 503 : 200;
       response.setHeader('content-type', 'application/json');
       response.end(JSON.stringify({ protocol: SHARED_PROTOCOL, pid: process.pid }));
       return;
@@ -62,7 +60,11 @@ export async function startSharedService(options: {
     active++;
     lastActivity = Date.now();
     const controller = new AbortController();
-    response.on('close', () => controller.abort());
+    response.on('close', () => {
+      // Normal completion may precede the host's native cleanup/retention step.
+      // Only a premature disconnect should cancel that request's owner.
+      if (!response.writableFinished) controller.abort();
+    });
     try {
       const chunks: Buffer[] = [];
       let bytes = 0;
@@ -74,6 +76,8 @@ export async function startSharedService(options: {
       controller.signal.throwIfAborted();
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as SharedRequest;
       if (
+        typeof body.clientId !== 'string' ||
+        !body.clientId ||
         !body.profile?.discovered?.path ||
         body.model?.id !== body.profile.discovered.name ||
         !body.context?.messages
@@ -104,10 +108,11 @@ export async function startSharedService(options: {
   });
   server.requestTimeout = 60_000;
   server.headersTimeout = 10_000;
-  // The kernel is the election lock. Losers exit before loadBackend or any weights.
+  // Let the OS choose a free port. Election happens before publishing the
+  // endpoint, so contenders can never accept inference or load weights.
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(options.port, '127.0.0.1', () => {
+    server.listen(options.port ?? 0, '127.0.0.1', () => {
       server.off('error', reject);
       resolve();
     });
@@ -115,13 +120,16 @@ export async function startSharedService(options: {
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Shared inference listener has no port.');
   const endpoint: SharedEndpoint = { protocol: SHARED_PROTOCOL, pid: process.pid, port: address.port, token };
+  let releaseClaim: (() => Promise<void>) | undefined;
   try {
+    releaseClaim = await claimSharedService(options.directory, endpoint);
     await mkdir(options.directory, { recursive: true, mode: 0o700 });
     const temporary = join(options.directory, `endpoint-${process.pid}.json`);
     await writeFile(temporary, JSON.stringify(endpoint), { mode: 0o600 });
     await rename(temporary, join(options.directory, 'endpoint.json'));
   } catch (error) {
-    server.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await releaseClaim?.();
     throw error;
   }
   const close = (): Promise<void> => {
@@ -131,10 +139,14 @@ export async function startSharedService(options: {
         await new Promise<void>((resolve) => {
           requestsDrained = resolve;
         });
-      // Retain the kernel election lock until native work and resident disposal
-      // finish. Unbinding earlier would let a replacement load a second model.
-      await resolvedBackend?.close();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      // Retain the claim and listener until native work and resident disposal
+      // finish. A failed cleanup still closes the service instead of wedging it.
+      try {
+        await resolvedBackend?.close();
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await releaseClaim?.();
+      }
     })();
     return closing;
   };

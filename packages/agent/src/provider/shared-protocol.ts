@@ -1,5 +1,4 @@
 /** Private, local-only transport. Tools and agent execution never cross this boundary. */
-import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,9 +9,10 @@ import type { DiscoveredModelLike } from '../types.js';
 import type { SharedEvent } from './shared-events.js';
 import type { TurnRecorder } from './stream-adapter.js';
 
-export const SHARED_PROTOCOL = 'mlx-delegate-inference-v1';
+export const SHARED_PROTOCOL = 'mlx-delegate-inference-v2';
 export const SHARED_IDLE_MS = 5 * 60_000;
 export const SHARED_REQUEST_LIMIT = 20;
+export const SHARED_SESSION_LIMIT = 4;
 
 export interface SharedProfile {
   discovered: DiscoveredModelLike;
@@ -21,6 +21,7 @@ export interface SharedProfile {
 }
 
 export interface SharedRequest {
+  clientId: string;
   profile: SharedProfile;
   model: Model<Api>;
   context: Context;
@@ -28,6 +29,18 @@ export interface SharedRequest {
   rootSessionId?: string;
   rootSessionFile?: string;
   thinkingBudget?: number;
+}
+
+/** Stable within one caller, isolated from other callers resuming the same Pi session. */
+export function sharedCacheOwners(request: Pick<SharedRequest, 'clientId' | 'options' | 'rootSessionId'>): {
+  owner: string;
+  root: string;
+} {
+  const session = request.options.sessionId || request.rootSessionId || 'default';
+  return {
+    owner: JSON.stringify([request.clientId, session]),
+    root: JSON.stringify([request.clientId, request.rootSessionId || session]),
+  };
 }
 
 export type SharedFrame =
@@ -44,8 +57,7 @@ export interface SharedEndpoint {
   token: string;
 }
 
-/** One port per OS user, independent of checkout, model, caller, or agent config. */
-export function sharedLocation(home = homedir()): { directory: string; port: number } {
-  const hash = createHash('sha256').update(home).digest().readUInt32BE(0);
-  return { directory: join(home, '.mlx-node', 'delegate'), port: 19000 + (hash % 10000) };
+/** Election is scoped to this private directory; listening ports are OS-assigned. */
+export function sharedLocation(home = homedir()): { directory: string } {
+  return { directory: join(home, '.mlx-node', 'delegate') };
 }

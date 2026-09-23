@@ -5,11 +5,12 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { sharedStreamFactory } from '../src/provider/shared-client.js';
-import { SHARED_PROTOCOL, type SharedRequest } from '../src/provider/shared-protocol.js';
+import { SHARED_PROTOCOL, sharedCacheOwners, type SharedRequest } from '../src/provider/shared-protocol.js';
 import { startSharedService, type SharedBackend } from '../src/provider/shared-service.js';
 import type { StreamSimpleHost } from '../src/provider/stream-adapter.js';
 
 const request: SharedRequest = {
+  clientId: 'fixture',
   profile: {
     discovered: { name: 'local', path: '/models/local', modelType: 'qwen3' },
     persistPagedCache: true,
@@ -85,6 +86,64 @@ describe('shared delegate service transport', () => {
     };
     expect(await Promise.all([send('one'), send('two')])).toEqual(['{"error":"one"}\n', '{"error":"two"}\n']);
     expect(service.loadBackend).toHaveBeenCalledOnce();
+  });
+
+  it('elects one worker per private directory even when contenders use different free ports', async () => {
+    const service = await fixture(async function* () {});
+    const loadBackend = vi.fn();
+    await expect(startSharedService({ directory: service.directory, port: 0, loadBackend })).rejects.toMatchObject({
+      code: 'EADDRINUSE',
+    });
+    expect(loadBackend).not.toHaveBeenCalled();
+    const anotherUser = await fixture(async function* () {});
+    expect(anotherUser.endpoint.port).not.toBe(service.endpoint.port);
+    expect(JSON.parse(await readFile(join(service.directory, 'endpoint.json'), 'utf8'))).toEqual(service.endpoint);
+  });
+
+  it('does not replace a live owner whose health check times out', async () => {
+    const service = await fixture(async function* () {});
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new DOMException('expired', 'TimeoutError'));
+    try {
+      await expect(startSharedService({ directory: service.directory, loadBackend: vi.fn() })).rejects.toMatchObject({
+        code: 'EADDRINUSE',
+      });
+      expect(JSON.parse(await readFile(join(service.directory, 'endpoint.json'), 'utf8'))).toEqual(service.endpoint);
+      expect(service.loadBackend).not.toHaveBeenCalled();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it('recovers an unreleased claim when its PID is alive but its listener is gone', async () => {
+    const service = await fixture(async function* () {});
+    await service.close();
+    // Simulate a crash followed by PID reuse: the recorded PID is this still
+    // live test process, but the claimed listener no longer exists.
+    await rm(join(service.directory, 'claims', '0.json.released'));
+    const replacement = await startSharedService({ directory: service.directory, loadBackend: vi.fn() });
+    cleanup.push(() => replacement.close());
+    expect(replacement.endpoint.token).not.toBe(service.endpoint.token);
+  });
+
+  it('keeps cache owners stable across turns and isolates callers resuming the same Pi session', async () => {
+    const owners: ReturnType<typeof sharedCacheOwners>[] = [];
+    const service = await fixture(async function* (body) {
+      owners.push(sharedCacheOwners(body));
+      yield { error: 'captured' };
+    });
+    const host = { modelInfo: () => request.profile.discovered } as unknown as StreamSimpleHost;
+    const caller = () =>
+      sharedStreamFactory(request.profile, async () => service.endpoint)(host, undefined, () => 'same-root');
+    const first = caller();
+    for (const stream of [first, first, caller()]) {
+      for await (const _event of stream(request.model, request.context, { sessionId: 'same-child' })) {
+        /* drain */
+      }
+    }
+    expect(owners[0]).toEqual(owners[1]);
+    expect(owners[2]!.owner).not.toBe(owners[0]!.owner);
+    expect(owners[2]!.root).not.toBe(owners[0]!.root);
+    expect(owners[0]!.owner).not.toBe(owners[0]!.root);
   });
 
   it('keeps terminal message identity, settings, model limits, and metrics across the client', async () => {
@@ -268,6 +327,19 @@ describe('shared delegate service transport', () => {
     await vi.waitFor(() => expect(service.closeBackend).toHaveBeenCalledOnce());
   });
 
+  it('does not cancel backend cleanup after a normally completed response', async () => {
+    let signal: AbortSignal | undefined;
+    const service = await fixture(async function* (_body, requestSignal) {
+      signal = requestSignal;
+      yield { model: { contextWindow: 2048, maxTokens: 1024, input: ['text'] } };
+    });
+    await (
+      await fetch(`${service.url}/stream`, { method: 'POST', headers: service.headers, body: JSON.stringify(request) })
+    ).text();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(signal?.aborted).toBe(false);
+  });
+
   it('holds the election port until model cleanup finishes', async () => {
     const service = await fixture(async function* () {
       yield { error: 'done' };
@@ -285,6 +357,9 @@ describe('shared delegate service transport', () => {
     const closing = service.close();
     await vi.waitFor(() => expect(service.closeBackend).toHaveBeenCalledOnce());
     try {
+      await expect(startSharedService({ directory: service.directory, loadBackend: vi.fn() })).rejects.toMatchObject({
+        code: 'EADDRINUSE',
+      });
       await expect(
         startSharedService({ directory: service.directory, port: service.endpoint.port, loadBackend: vi.fn() }),
       ).rejects.toMatchObject({ code: 'EADDRINUSE' });
@@ -292,5 +367,25 @@ describe('shared delegate service transport', () => {
       release();
       await closing;
     }
+  });
+
+  it('releases the listener when backend cleanup fails', async () => {
+    const service = await fixture(async function* () {
+      yield { error: 'primed' };
+    });
+    await (
+      await fetch(`${service.url}/stream`, { method: 'POST', headers: service.headers, body: JSON.stringify(request) })
+    ).text();
+    service.closeBackend.mockRejectedValue(new Error('native owner release failed'));
+    // The expected rejection is already asserted below; afterEach can safely
+    // retry the idempotent close without treating it as a second failure.
+    cleanup.pop();
+    await expect(service.close()).rejects.toThrow('native owner release failed');
+    const replacement = await startSharedService({
+      directory: service.directory,
+      port: service.endpoint.port,
+      loadBackend: vi.fn(),
+    });
+    cleanup.push(() => replacement.close());
   });
 });
