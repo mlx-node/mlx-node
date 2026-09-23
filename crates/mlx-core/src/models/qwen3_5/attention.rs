@@ -31,6 +31,103 @@ use napi::bindgen_prelude::*;
 use super::config::Qwen3_5Config;
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 
+fn segmented_verify_sdpa(
+    queries: &MxArray,
+    prefix_keys: &MxArray,
+    prefix_values: &MxArray,
+    new_keys: &MxArray,
+    new_values: &MxArray,
+    scale: f32,
+    causal: bool,
+) -> Result<MxArray> {
+    let handle = unsafe {
+        mlx_sys::mlx_segmented_sdpa_forward(
+            queries.as_raw_ptr(),
+            prefix_keys.as_raw_ptr(),
+            prefix_values.as_raw_ptr(),
+            new_keys.as_raw_ptr(),
+            new_values.as_raw_ptr(),
+            scale,
+            causal,
+        )
+    };
+    MxArray::from_handle(handle, "segmented_verify_sdpa")
+}
+
+fn verify_sdpa_without_kv_concat(
+    queries: &MxArray,
+    prefix_keys: &MxArray,
+    prefix_values: &MxArray,
+    new_keys: &MxArray,
+    new_values: &MxArray,
+    scale: f32,
+    causal: bool,
+) -> Result<MxArray> {
+    let q_heads = queries.shape_at(1)?;
+    let kv_heads = prefix_keys.shape_at(1)?;
+    let gqa = if kv_heads > 0 { q_heads / kv_heads } else { 0 };
+    let fallback = || {
+        let keys = MxArray::concatenate(prefix_keys, new_keys, 2)?;
+        let values = MxArray::concatenate(prefix_values, new_values, 2)?;
+        if causal {
+            scaled_dot_product_attention_causal(queries, &keys, &values, scale as f64)
+        } else {
+            scaled_dot_product_attention(queries, &keys, &values, scale as f64, None)
+        }
+    };
+    // Empty prefixes have no buffer to bind. They are uncommon after the
+    // first verify cycle and retain the established contiguous path.
+    if !unsafe { mlx_sys::mlx_metal_is_available() }
+        || unsafe { mlx_sys::mlx_default_device() } != 1
+        || prefix_keys.shape_at(2)? == 0
+        || queries.shape_at(3)? != 256
+        || queries.dtype()? != DType::BFloat16
+        || kv_heads < 1
+        || q_heads < 1
+        || q_heads % kv_heads != 0
+        || q_heads / kv_heads > 32
+    {
+        return fallback();
+    }
+    let max_q = (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64;
+    if max_q < 1 || queries.shape_at(2)? > max_q {
+        return fallback();
+    }
+    segmented_verify_sdpa(
+        queries,
+        prefix_keys,
+        prefix_values,
+        new_keys,
+        new_values,
+        scale,
+        causal,
+    )
+}
+
+fn verify_shapeless_geometry(seq_len: i64, gqa: i64, head_dim: i32, device_max_q: i64) -> bool {
+    if !(1..=8).contains(&seq_len)
+        || !(1..=32).contains(&gqa)
+        || !matches!(head_dim, 64 | 96 | 128 | 256)
+    {
+        return false;
+    }
+    // This is the pinned vector kernel's reduction contract, not a device
+    // performance threshold. A detected segmented limit may narrow a chunk.
+    let vector_max_q = 32 / gqa;
+    if seq_len <= vector_max_q {
+        return true;
+    }
+    let max_q = if device_max_q > 0 {
+        device_max_q.min(vector_max_q)
+    } else {
+        vector_max_q
+    };
+    let tail = max_q.min(seq_len - 1);
+    // Use the smaller bound for both dtype routes: BF16 may use segmented
+    // attention; other types use the ordinary vector partition.
+    tail >= 1 && seq_len - tail <= vector_max_q
+}
+
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
 /// Key differences from standard Qwen3 attention:
@@ -233,6 +330,26 @@ fn select_cache_hit_prefill_plan(
 }
 
 impl Qwen3_5Attention {
+    /// Unfused causal SDPA constructs its mask from host-side prefix lengths.
+    /// Such a trace cannot be reused as the prefix grows. Keep
+    /// shapeless replay only when every query chunk uses the fused primitive.
+    pub(crate) fn verify_can_be_shapeless(&self, seq_len: i64) -> bool {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+            || self.num_kv_heads <= 0
+            || self.num_heads % self.num_kv_heads != 0
+        {
+            return false;
+        }
+        let gqa = i64::from(self.num_heads / self.num_kv_heads);
+        let device_max_q = if self.head_dim == 256 {
+            (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64
+        } else {
+            0
+        };
+        verify_shapeless_geometry(seq_len, gqa, self.head_dim, device_max_q)
+    }
+
     pub(super) fn paged_attention_operand(
         &self,
         x: &MxArray,
@@ -321,11 +438,7 @@ impl Qwen3_5Attention {
     /// dispatches. Queries' `[B,T,H,D]` reshape stays a strided view and
     /// materializes only if a downstream kernel requires contiguous input;
     /// gate feeds elementwise ops directly.
-    /// `MLX_DISABLE_QGATE_BLOCK_SPLIT=1` is sampled by the finalizer at load
-    /// time, letting a second process load native order for same-binary A/B
-    /// without retaining both quantized layouts.
-    ///
-    /// Fallback path (quantized `q_proj`, or the env override above):
+    /// Fallback path (unsupported packed formats or an unfinalized projection):
     /// the original per-head reshape+slice, unchanged from before this
     /// split existed. `gate`'s reshape here pays a strided
     /// `copy_gpu_inplace` every call — see `q_gate_block_t`'s doc comment.
@@ -371,12 +484,9 @@ impl Qwen3_5Attention {
 
     /// Project keys and values. When `finalize_kv_proj` merged the two
     /// quantized projections this is ONE packed matmul plus two axis-2 slices;
-    /// otherwise the original two matmuls. `MLX_DISABLE_QATTN_KV_MERGE=1`
-    /// forces the two-matmul path for A/B.
+    /// otherwise the original two matmuls for incompatible projections.
     fn project_kv(&self, x: &MxArray) -> Result<(MxArray, MxArray)> {
-        if let Some((merged, k_rows)) = &self.kv_proj
-            && std::env::var("MLX_DISABLE_QATTN_KV_MERGE").is_err()
-        {
+        if let Some((merged, k_rows)) = &self.kv_proj {
             let kv = merged.forward(x)?; // [B, T, k_dim + v_dim]
             let last = kv.ndim()? as usize - 1;
             let kv_split = kv.split_sections(&[*k_rows], last as i32)?;
@@ -397,9 +507,7 @@ impl Qwen3_5Attention {
         if let Some(merged) = self.k_proj.concat_rows(&self.v_proj)? {
             let k_rows = self.k_proj.packed_out_features()?;
             let v_rows = self.v_proj.packed_out_features()?;
-            // Re-attach each source's calibration key onto its view: the
-            // MLX_DISABLE_QATTN_KV_MERGE check runs per-forward, so a disabled
-            // merge falls back to these views and must still record.
+            // Preserve calibration keys for consumers of individual views.
             let k_key = self.k_proj.amax_key().map(str::to_owned);
             let v_key = self.v_proj.amax_key().map(str::to_owned);
             self.k_proj = merged.slice_rows(0, k_rows)?.with_amax_key(k_key);
@@ -542,12 +650,7 @@ impl Qwen3_5Attention {
             } else {
                 0
             };
-            if vector_dims
-                && tail >= 1
-                && seq_len <= 8
-                && seq_len * gqa > 32
-                && std::env::var("MLX_DISABLE_SDPA_VERIFY_SPLIT").is_err()
-            {
+            if vector_dims && tail >= 1 && seq_len <= 8 && seq_len * gqa > 32 {
                 let head_len = seq_len - tail;
                 let kv_len = keys.shape_at(2)?;
                 let q_parts = queries.split_sections(&[head_len], 2)?;
@@ -610,10 +713,11 @@ impl Qwen3_5Attention {
     ///   * RoPE uses `forward_with_offsets` — `offset[b] + t` equals the
     ///     scalar path's `offset + t` bit-for-bit, but the base is a runtime
     ///     array instead of a baked host int.
-    ///   * The full K/V for SDPA is `concat(prefix, new)`; the verify-split's
-    ///     truncated head reads `concat(prefix, new[..head_len])` — a slice on
-    ///     the constant block axis rather than the varying prefix axis, so no
-    ///     host-bound slice enters the tape.
+    ///   * Segmented vector SDPA reads prefix K/V and new K/V as two logical
+    ///     spans. The verify-split's truncated head reads `new[..head_len]` — a
+    ///     slice on the constant block axis rather than the varying prefix
+    ///     axis, so no host-bound prefix slice or full-prefix concat enters the
+    ///     tape.
     ///   * The fused SDPA primitive derives `qL_off = kL - qL` from the real
     ///     input shapes at eval time (see
     ///     `backend/metal/scaled_dot_product_attention.cpp`), so the causal
@@ -661,10 +765,6 @@ impl Qwen3_5Attention {
         let new_values = values.transpose(Some(&[0, 2, 1, 3]))?;
         *io.out_kv = Some((new_keys.clone(), new_values.clone()));
 
-        // Full K/V for SDPA without touching the cache buffer.
-        let keys = MxArray::concatenate(io.prefix_keys, &new_keys, 2)?;
-        let values = MxArray::concatenate(io.prefix_values, &new_values, 2)?;
-
         let output = if seq_len > 1 {
             // Same qL·gqa verify-split as `forward` — see its comment for the
             // threadgroup-limit rationale — but the head chunk's truncated
@@ -672,54 +772,75 @@ impl Qwen3_5Attention {
             // depends on the (shape-varying) prefix length.
             let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
             let vector_dims = matches!(self.head_dim, 64 | 96 | 128 | 256);
-            let tail = if (1..=32).contains(&gqa) {
-                (32 / gqa).min(seq_len - 1)
+            let segmented_enabled = unsafe { mlx_sys::mlx_metal_is_available() }
+                && unsafe { mlx_sys::mlx_default_device() } == 1
+                && self.head_dim == 256
+                && queries.dtype()? == DType::BFloat16;
+            let device_max_q = if segmented_enabled {
+                (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64
             } else {
                 0
             };
-            if vector_dims
-                && tail >= 1
-                && seq_len <= 8
-                && seq_len * gqa > 32
-                && std::env::var("MLX_DISABLE_SDPA_VERIFY_SPLIT").is_err()
-            {
+            // Query partitioning is constrained by the selected pipeline's
+            // SIMD width and maximum threads. Keep the established 32-thread
+            // arithmetic as a fallback when the capability probe is absent.
+            let max_q = if device_max_q > 0 {
+                device_max_q
+            } else if (1..=32).contains(&gqa) {
+                32 / gqa
+            } else {
+                0
+            };
+            let tail = if (1..=32).contains(&gqa) {
+                max_q.min(seq_len - 1)
+            } else {
+                0
+            };
+            if vector_dims && tail >= 1 && seq_len <= 8 && seq_len > max_q {
                 let head_len = seq_len - tail;
                 let q_parts = queries.split_sections(&[head_len], 2)?;
-                let head_k =
-                    MxArray::concatenate(io.prefix_keys, &new_keys.slice_axis(2, 0, head_len)?, 2)?;
-                let head_v = MxArray::concatenate(
+                let head_new_k = new_keys.slice_axis(2, 0, head_len)?;
+                let head_new_v = new_values.slice_axis(2, 0, head_len)?;
+                let out_head = verify_sdpa_without_kv_concat(
+                    &q_parts[0],
+                    io.prefix_keys,
                     io.prefix_values,
-                    &new_values.slice_axis(2, 0, head_len)?,
-                    2,
+                    &head_new_k,
+                    &head_new_v,
+                    self.scale,
+                    head_len > 1,
                 )?;
-                let out_head = if head_len > 1 {
-                    scaled_dot_product_attention_causal(
-                        &q_parts[0],
-                        &head_k,
-                        &head_v,
-                        self.scale as f64,
-                    )?
-                } else {
-                    scaled_dot_product_attention(
-                        &q_parts[0],
-                        &head_k,
-                        &head_v,
-                        self.scale as f64,
-                        None,
-                    )?
-                };
-                let out_tail = scaled_dot_product_attention_causal(
+                let out_tail = verify_sdpa_without_kv_concat(
                     &q_parts[1],
-                    &keys,
-                    &values,
-                    self.scale as f64,
+                    io.prefix_keys,
+                    io.prefix_values,
+                    &new_keys,
+                    &new_values,
+                    self.scale,
+                    true,
                 )?;
                 MxArray::concatenate(&out_head, &out_tail, 2)?
             } else {
-                scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+                verify_sdpa_without_kv_concat(
+                    &queries,
+                    io.prefix_keys,
+                    io.prefix_values,
+                    &new_keys,
+                    &new_values,
+                    self.scale,
+                    true,
+                )?
             }
         } else {
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
+            verify_sdpa_without_kv_concat(
+                &queries,
+                io.prefix_keys,
+                io.prefix_values,
+                &new_keys,
+                &new_values,
+                self.scale,
+                false,
+            )?
         };
 
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
@@ -1750,13 +1871,6 @@ impl Qwen3_5Attention {
     /// materialized block-order arrays. Other quantization modes remain on the
     /// fallback.
     pub fn finalize_q_gate_block(&mut self) -> Result<()> {
-        self.finalize_q_gate_block_enabled(std::env::var("MLX_DISABLE_QGATE_BLOCK_SPLIT").is_err())
-    }
-
-    fn finalize_q_gate_block_enabled(&mut self, enabled: bool) -> Result<()> {
-        if !enabled {
-            return Ok(());
-        }
         let h = self.num_heads as i64;
         let d = self.head_dim as i64;
 
@@ -1872,6 +1986,364 @@ impl Qwen3_5Attention {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shapeless_verify_requires_dynamic_prefix_safe_attention() {
+        assert!(!verify_shapeless_geometry(8, 1, 32, 0));
+        assert!(verify_shapeless_geometry(8, 1, 64, 0));
+        assert!(verify_shapeless_geometry(8, 6, 256, 5));
+        assert!(!verify_shapeless_geometry(8, 6, 256, 2));
+        assert!(!verify_shapeless_geometry(8, 32, 256, 1));
+        assert!(!verify_shapeless_geometry(9, 1, 64, 0));
+        assert!(!verify_shapeless_geometry(8, 0, 64, 0));
+    }
+
+    fn synthetic_segmented_plan(
+        q_len: i32,
+        gqa: i32,
+        two_pass: bool,
+        partitions: i32,
+        stage1_width: usize,
+        stage1_max_threads: usize,
+        stage1_static_memory: usize,
+        device_max_memory: usize,
+        stage2_width: usize,
+        stage2_max_threads: usize,
+        stage2_static_memory: usize,
+    ) -> (bool, u32, u32) {
+        let mut stage1_threads = 0;
+        let mut stage2_threads = 0;
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_plan(
+                q_len,
+                gqa,
+                two_pass,
+                partitions,
+                stage1_width,
+                stage1_max_threads,
+                stage1_static_memory,
+                device_max_memory,
+                stage2_width,
+                stage2_max_threads,
+                stage2_static_memory,
+                &mut stage1_threads,
+                &mut stage2_threads,
+            )
+        } == 1;
+        (supported, stage1_threads, stage2_threads)
+    }
+
+    #[test]
+    fn segmented_sdpa_capability_planner_accepts_only_supported_profiles() {
+        let valid =
+            synthetic_segmented_plan(5, 6, true, 128, 32, 1024, 4096, 32768, 32, 1024, 4096);
+        assert_eq!(valid, (true, 960, 1024));
+
+        // SIMD width 32 belongs to the reduction algorithm. Device capacities
+        // are runtime inputs and must independently reject an unsafe launch.
+        assert!(
+            !synthetic_segmented_plan(5, 6, true, 128, 16, 1024, 4096, 32768, 32, 1024, 4096).0
+        );
+        assert!(!synthetic_segmented_plan(5, 6, true, 128, 32, 512, 4096, 32768, 32, 1024, 4096).0);
+        assert!(
+            !synthetic_segmented_plan(5, 6, true, 128, 32, 1024, 65536, 32768, 32, 1024, 4096).0
+        );
+        assert!(!synthetic_segmented_plan(5, 6, true, 128, 32, 1024, 4096, 32768, 32, 512, 4096).0);
+
+        let one_pass = synthetic_segmented_plan(8, 6, false, 32, 32, 1024, 4096, 32768, 0, 0, 0);
+        assert_eq!(one_pass, (true, 1024, 0));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn deterministic_bf16(len: usize, salt: u32) -> Vec<u16> {
+        (0..len)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(0x9e37_79b9).wrapping_add(salt);
+                let sign = ((x >> 23) as u16 & 1) << 15;
+                sign | 0x3f00 | ((x >> 16) as u16 & 0x7f)
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn concat_sdpa_for_test(
+        q: &MxArray,
+        pk: &MxArray,
+        pv: &MxArray,
+        nk: &MxArray,
+        nv: &MxArray,
+        causal: bool,
+    ) -> Result<MxArray> {
+        let k = MxArray::concatenate(pk, nk, 2)?;
+        let v = MxArray::concatenate(pv, nv, 2)?;
+        if causal {
+            scaled_dot_product_attention_causal(q, &k, &v, 0.0625)
+        } else {
+            scaled_dot_product_attention(q, &k, &v, 0.0625, None)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn segmented_or_concat_split_for_test(
+        q: &MxArray,
+        pk: &MxArray,
+        pv: &MxArray,
+        nk: &MxArray,
+        nv: &MxArray,
+        segmented: bool,
+    ) -> Result<MxArray> {
+        let q_len = q.shape_at(2)?;
+        let gqa = q.shape_at(1)? / pk.shape_at(1)?;
+        let probed_max =
+            (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64;
+        let max_q = if probed_max > 0 { probed_max } else { 32 / gqa };
+        let call =
+            |query: &MxArray, new_k: &MxArray, new_v: &MxArray, causal: bool| -> Result<MxArray> {
+                if segmented && pk.shape_at(2)? > 0 {
+                    let handle = unsafe {
+                        mlx_sys::mlx_segmented_sdpa_test_forward(
+                            query.as_raw_ptr(),
+                            pk.as_raw_ptr(),
+                            pv.as_raw_ptr(),
+                            new_k.as_raw_ptr(),
+                            new_v.as_raw_ptr(),
+                            0.0625,
+                            causal,
+                        )
+                    };
+                    MxArray::from_handle(handle, "strict segmented SDPA test")
+                } else {
+                    concat_sdpa_for_test(query, pk, pv, new_k, new_v, causal)
+                }
+            };
+        if q_len <= max_q {
+            return call(q, nk, nv, q_len > 1);
+        }
+        let tail = max_q.min(q_len - 1);
+        let head_len = q_len - tail;
+        let q_parts = q.split_sections(&[head_len], 2)?;
+        let head_k = nk.slice_axis(2, 0, head_len)?;
+        let head_v = nv.slice_axis(2, 0, head_len)?;
+        let head = call(&q_parts[0], &head_k, &head_v, head_len > 1)?;
+        let tail = call(&q_parts[1], nk, nv, true)?;
+        MxArray::concatenate(&head, &tail, 2)
+    }
+
+    /// This is intentionally an explicit GPU test: it covers every required
+    /// verify width and prefix boundary, including the capability-derived
+    /// split at q=8 (3/5 on the measured pipeline). Comparing f32 views is
+    /// bit-exact for BF16 because every BF16 value has a unique f32
+    /// representation.
+    #[test]
+    #[ignore = "requires coordinated Metal GPU validation"]
+    #[cfg(target_os = "macos")]
+    fn segmented_sdpa_matches_concat_bf16_exactly() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        // The dedicated test entry rejects unsupported pipelines instead of
+        // falling back to concat SDPA, so eligible parity cases must exercise
+        // SegmentedSdpa without changing process-global environment state.
+        let max_query_length = unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) };
+        eprintln!("segmented SDPA GQA=6 max_query_length={max_query_length}");
+        if max_query_length < 1 {
+            eprintln!(
+                "SKIP segmented SDPA parity: selected Metal pipelines do not support any query width"
+            );
+            return Ok(());
+        }
+        // Production uses at most two chunks. A smaller legal pipeline can
+        // support some widths without supporting the full eight-row split.
+        let max_split_width = i64::from(max_query_length) * 2;
+        if max_split_width < 8 {
+            eprintln!(
+                "SKIP segmented SDPA parity query widths {}..=8: production \
+                 two-chunk route supports at most {max_split_width} rows",
+                max_split_width + 1
+            );
+        }
+        const D: i64 = 256;
+        // Include segment and partition boundaries on either side of the
+        // split traversal, including transitions crossed by an eight-row tail.
+        for prefix in [
+            0_i64, 1, 31, 32, 87, 1015, 1016, 1023, 1024, 4095, 4096, 6143, 6144, 6145, 32759,
+            32760, 32767, 32768, 32769,
+        ] {
+            let prefix_elements = (prefix * D) as usize;
+            let pk = MxArray::from_bfloat16(
+                &deterministic_bf16(prefix_elements, 0x1234_5678),
+                &[1, 1, prefix, D],
+            )?;
+            let pv = MxArray::from_bfloat16(
+                &deterministic_bf16(prefix_elements, 0x8765_4321),
+                &[1, 1, prefix, D],
+            )?;
+            for q_len in 1_i64..=8 {
+                if q_len > max_split_width {
+                    continue;
+                }
+                let q_elements = (6 * q_len * D) as usize;
+                let kv_elements = (q_len * D) as usize;
+                let q = MxArray::from_bfloat16(
+                    &deterministic_bf16(q_elements, 0x1357_9bdf),
+                    &[1, 6, q_len, D],
+                )?;
+                let nk = MxArray::from_bfloat16(
+                    &deterministic_bf16(kv_elements, 0x2468_ace0),
+                    &[1, 1, q_len, D],
+                )?;
+                let nv = MxArray::from_bfloat16(
+                    &deterministic_bf16(kv_elements, 0xfdb9_7531),
+                    &[1, 1, q_len, D],
+                )?;
+                let got = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?
+                    .to_float32()?;
+                let expected = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?
+                    .to_float32()?;
+                assert_eq!(
+                    got.as_ref(),
+                    expected.as_ref(),
+                    "BF16 mismatch at prefix={prefix}, query_length={q_len}"
+                );
+            }
+        }
+
+        // Production layout coverage: projection outputs start as [B,T,H,D]
+        // and are transposed into [B,H,T,D] views. Exercise non-unit batch,
+        // multiple KV heads, the q=8 split, and both vector-SDPA routes.
+        if max_split_width < 8 {
+            eprintln!(
+                "SKIP segmented SDPA eight-row strided cases: unsupported \
+                 production split; supported contiguous widths were checked"
+            );
+            return Ok(());
+        }
+        for prefix in [87_i64, 4096] {
+            let pk = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 2 * prefix * D) as usize, 0x1020_3040),
+                &[2, 2, prefix, D],
+            )?;
+            let pv = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 2 * prefix * D) as usize, 0x5060_7080),
+                &[2, 2, prefix, D],
+            )?;
+            let q_source = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 12 * D) as usize, 0x90a0_b0c0),
+                &[2, 8, 12, D],
+            )?;
+            let nk_source = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 2 * D) as usize, 0xd0e0_f001),
+                &[2, 8, 2, D],
+            )?;
+            let nv_source = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 2 * D) as usize, 0x1234_abcd),
+                &[2, 8, 2, D],
+            )?;
+            let q = q_source.transpose(Some(&[0, 2, 1, 3]))?;
+            let nk = nk_source.transpose(Some(&[0, 2, 1, 3]))?;
+            let nv = nv_source.transpose(Some(&[0, 2, 1, 3]))?;
+            let got =
+                segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?.to_float32()?;
+            let expected =
+                segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?.to_float32()?;
+            assert_eq!(
+                got.as_ref(),
+                expected.as_ref(),
+                "production-layout BF16 mismatch at prefix={prefix}, query_length=8"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual rotating-prefix SDPA benchmark; run without other GPU work"]
+    #[cfg(target_os = "macos")]
+    fn segmented_sdpa_rotating_prefix_benchmark() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            eprintln!("SKIP segmented benchmark: Metal backend unavailable");
+            return Ok(());
+        }
+        let max_query_length = unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) };
+        if max_query_length < 4 {
+            eprintln!(
+                "SKIP segmented benchmark: q=8 requires two supported chunks; \
+                 GQA=6 pipeline supports at most {max_query_length} rows per chunk"
+            );
+            return Ok(());
+        }
+        const D: i64 = 256;
+        const SETS: usize = 4;
+        const SAMPLES: usize = 24;
+        for prefix in [87_i64, 6219, 32768] {
+            let mut cases = Vec::with_capacity(SETS);
+            for i in 0..SETS {
+                let salt = 0x1234_5678u32.wrapping_add(i as u32 * 29);
+                let q = MxArray::from_bfloat16(
+                    &deterministic_bf16((24 * 8 * D) as usize, salt),
+                    &[1, 24, 8, D],
+                )?;
+                let pk = MxArray::from_bfloat16(
+                    &deterministic_bf16((4 * prefix * D) as usize, salt ^ 0x12),
+                    &[1, 4, prefix, D],
+                )?;
+                let pv = MxArray::from_bfloat16(
+                    &deterministic_bf16((4 * prefix * D) as usize, salt ^ 0x34),
+                    &[1, 4, prefix, D],
+                )?;
+                let nk = MxArray::from_bfloat16(
+                    &deterministic_bf16((4 * 8 * D) as usize, salt ^ 0x56),
+                    &[1, 4, 8, D],
+                )?;
+                let nv = MxArray::from_bfloat16(
+                    &deterministic_bf16((4 * 8 * D) as usize, salt ^ 0x78),
+                    &[1, 4, 8, D],
+                )?;
+                cases.push((q, pk, pv, nk, nv));
+            }
+            let run = |i: usize, segmented: bool| -> Result<MxArray> {
+                let (q, pk, pv, nk, nv) = &cases[i % SETS];
+                let out = segmented_or_concat_split_for_test(q, pk, pv, nk, nv, segmented)?;
+                MxArray::eval_arrays(&[&out])?;
+                Ok(out)
+            };
+            for i in 0..SETS * 2 {
+                let before = run(i, false)?.to_float32()?;
+                let after = run(i, true)?.to_float32()?;
+                assert_eq!(before.as_ref(), after.as_ref(), "prefix={prefix}, set={i}");
+            }
+            let mut baseline_ms = Vec::with_capacity(SAMPLES);
+            let mut segmented_ms = Vec::with_capacity(SAMPLES);
+            for i in 0..SAMPLES {
+                // Alternate order so the candidate is not always the second
+                // reader of a just-warmed prefix. Rotate four independent KV sets.
+                for segmented in if i % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let started = Instant::now();
+                    let out = run(i, segmented)?;
+                    let ms = started.elapsed().as_secs_f64() * 1e3;
+                    if segmented {
+                        segmented_ms.push(ms);
+                    } else {
+                        baseline_ms.push(ms);
+                    }
+                    drop(out);
+                }
+            }
+            baseline_ms.sort_by(f64::total_cmp);
+            segmented_ms.sort_by(f64::total_cmp);
+            eprintln!(
+                "segmented prefix={prefix} q=8 hq=24 hkv=4 sets={SETS} samples={SAMPLES} baseline_min_ms={:.4} baseline_median_ms={:.4} segmented_min_ms={:.4} segmented_median_ms={:.4}",
+                baseline_ms[0],
+                baseline_ms[SAMPLES / 2],
+                segmented_ms[0],
+                segmented_ms[SAMPLES / 2]
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn cache_hit_prefill_mode_preserves_explicit_override_semantics() {
@@ -2790,8 +3262,8 @@ mod tests {
         let block_original_weight = block.get_q_proj_weight().as_raw_ptr();
         let native_original_weight = native.get_q_proj_weight().as_raw_ptr();
 
-        block.finalize_q_gate_block_enabled(true)?;
-        native.finalize_q_gate_block_enabled(false)?;
+        block.finalize_q_gate_block()?;
+        // The independent reference keeps its original unfinalized layout.
         assert!(block.q_proj.has_q_gate_block_layout());
         assert!(!native.q_proj.has_q_gate_block_layout());
         assert!(
@@ -2898,8 +3370,8 @@ mod tests {
         let mut native = Qwen3_5Attention::new(&cfg)?;
         block.set_quantized_q_proj(make_q_proj());
         native.set_quantized_q_proj(make_q_proj());
-        block.finalize_q_gate_block_enabled(true)?;
-        native.finalize_q_gate_block_enabled(false)?;
+        block.finalize_q_gate_block()?;
+        // The independent reference keeps its original unfinalized layout.
         assert!(block.q_proj.has_q_gate_block_layout());
         assert!(!native.q_proj.has_q_gate_block_layout());
         assert!(block.q_gate_block_t.is_none());

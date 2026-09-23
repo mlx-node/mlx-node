@@ -21,6 +21,8 @@
 #include "mlx_common.h"
 
 #include <mutex>
+#include <chrono>
+#include <cstdio>
 #include <unordered_map>
 
 // Rust-side graph builder: wraps `inputs` (owning handles during trace),
@@ -85,6 +87,12 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
   if (!builder || (!inputs && n_inputs > 0) || (!outputs && n_outputs > 0)) {
     return false;
   }
+  static const bool trace = [] {
+    const char* v = std::getenv("MLX_METAL_COMMAND_TRACE");
+    return v && std::string(v) == "1";
+  }();
+  const auto trace_start = trace ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
   try {
     std::lock_guard<std::mutex> lock(registry_mutex());
     auto& entry = registry()[fn_id];
@@ -160,6 +168,14 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
     }
     for (size_t i = 0; i < n_outputs; ++i) {
       outputs[i] = reinterpret_cast<mlx_array*>(new array(std::move(out[i])));
+    }
+    if (trace) {
+      const double elapsed_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - trace_start).count();
+      fprintf(stderr,
+          "[mlx-compiled] {\"fnId\":\"%llu\",\"inputs\":%zu,\"outputs\":%zu,"
+          "\"hostSpanMs\":%.6f}\n",
+          static_cast<unsigned long long>(fn_id), n_inputs, n_outputs, elapsed_ms);
     }
     return true;
   } catch (const std::exception& e) {

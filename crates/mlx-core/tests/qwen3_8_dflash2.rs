@@ -54,7 +54,6 @@ async fn qwen38_dflash2_loads_and_runs_a_verified_cycle() {
                 temperature: Some(0.0),
                 report_performance: Some(true),
                 enable_mtp: Some(true),
-                mtp_depth: Some(2),
                 reasoning_effort: Some("none".to_string()),
                 ..ChatConfig::default()
             }),
@@ -107,7 +106,6 @@ async fn qwen38_dflash2_loads_and_runs_a_verified_cycle() {
                 temperature: Some(0.0),
                 report_performance: Some(true),
                 enable_mtp: Some(true),
-                mtp_depth: Some(2),
                 reasoning_effort: Some("none".to_string()),
                 ..ChatConfig::default()
             }),
@@ -144,7 +142,6 @@ async fn qwen38_dflash2_loads_and_runs_a_verified_cycle() {
                 top_p: Some(0.9),
                 report_performance: Some(true),
                 enable_mtp: Some(true),
-                mtp_depth: Some(2),
                 reasoning_effort: Some("none".to_string()),
                 ..ChatConfig::default()
             }),

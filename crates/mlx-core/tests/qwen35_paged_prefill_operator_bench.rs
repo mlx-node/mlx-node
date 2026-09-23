@@ -246,7 +246,7 @@ fn probe_execution(config: &BenchConfig) -> BenchResult<ExecutionProbe> {
         return Err(format!(
             "SDPA execution expectation mismatch before allocation: expected {}, but MLX's \
              D=256 eligibility predicate predicts {} (available={available}, query={}, context={}); \
-             check MLX_ENABLE_D256_FULL_SDPA, MLX_ENABLE_TF32, OS, and GPU capability",
+             check MLX_ENABLE_TF32, OS, and GPU capability",
             config.expected_execution.name(),
             predicted_execution.name(),
             config.query,

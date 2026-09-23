@@ -190,6 +190,24 @@ pub enum MLPVariant {
 }
 
 impl MLPVariant {
+    fn quantized_activated(
+        x: &MxArray,
+        gate_proj: &QuantizedLinear,
+        up_proj: &QuantizedLinear,
+        gate_up: &Option<Box<(QuantizedLinear, i64)>>,
+    ) -> Result<MxArray> {
+        if let Some(pair) = gate_up {
+            let (merged, split) = &**pair;
+            let combined = merged.forward(x)?;
+            let last = combined.ndim()? as usize - 1;
+            let gu = combined.split_sections(&[*split], last as i32)?;
+            return Activations::swiglu_compiled(&gu[0], &gu[1]);
+        }
+        let gate = gate_proj.forward(x)?;
+        let up = up_proj.forward(x)?;
+        Activations::swiglu_compiled(&gate, &up)
+    }
+
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         match self {
             MLPVariant::Standard(mlp) => mlp.forward(x),
@@ -199,17 +217,7 @@ impl MLPVariant {
                 down_proj,
                 gate_up,
             } => {
-                let (gate, up) = match gate_up {
-                    Some(pair) => {
-                        let (merged, split) = &**pair;
-                        let combined = merged.forward(x)?;
-                        let last = combined.ndim()? as usize - 1;
-                        let gu = combined.split_sections(&[*split], last as i32)?;
-                        (gu[0].clone(), gu[1].clone())
-                    }
-                    None => (gate_proj.forward(x)?, up_proj.forward(x)?),
-                };
-                let activated = Activations::swiglu_compiled(&gate, &up)?;
+                let activated = Self::quantized_activated(x, gate_proj, up_proj, gate_up)?;
                 down_proj.forward(&activated)
             }
         }
@@ -297,9 +305,7 @@ impl MLPVariant {
                 gate_up,
                 ..
             } => {
-                if gate_up.is_some()
-                    || std::env::var_os("MLX_DISABLE_QUANTIZED_GATE_UP_MERGE").is_some()
-                {
+                if gate_up.is_some() {
                     return Ok(());
                 }
                 if let Some(merged) = gate_proj.concat_rows(up_proj)? {
@@ -1372,63 +1378,6 @@ impl QuantizedLinear {
     /// K/IQ, `fp8_e4m3`, or `sym8`).
     pub fn mode(&self) -> &str {
         &self.mode
-    }
-
-    /// The additive linear bias (distinct from the quantization `biases`
-    /// sidecar). `None` on every current checkpoint head/MLP projection.
-    pub(crate) fn additive_bias(&self) -> Option<&MxArray> {
-        self.bias.as_ref()
-    }
-
-    /// Reconstruct the dense `[N, K]` weight in bf16 from the packed
-    /// operands. Used to re-quantize a draft-only head at a different
-    /// precision (`install_runtime_draft_lm_head`-style) without a second
-    /// checkpoint copy.
-    pub(crate) fn dequantize_bf16(&self) -> Result<MxArray> {
-        let biases_ptr = self
-            .biases
-            .as_ref()
-            .map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
-        let mode_c = CString::new(self.mode.as_str())
-            .map_err(|_| Error::from_reason("quantized mode string contains NUL"))?;
-        let handle = unsafe {
-            sys::mlx_dequantize(
-                self.weight.as_raw_ptr(),
-                self.scales.as_raw_ptr(),
-                biases_ptr,
-                self.group_size,
-                self.bits,
-                crate::array::DType::BFloat16 as i32,
-                mode_c.as_ptr(),
-            )
-        };
-        if handle.is_null() {
-            return Err(Error::from_reason(
-                "mlx_dequantize failed on a quantized projection",
-            ));
-        }
-        MxArray::from_handle(handle, "quantized_linear_dequantize")
-    }
-
-    /// Dense bf16 reconstruction of this projection's `[N, K]` weight,
-    /// dispatching per storage family. `mlx_dequantize` only understands
-    /// MLX-native packed formats; plain `fp8_e4m3` keeps its load-time bf16
-    /// decode in `fp8_dequant_weight`, and `sym8` stores an int8 `[N,K]`
-    /// tensor with f32 per-row scales (`s_w`), so both are reconstructed
-    /// here without the generic dequantizer.
-    pub(crate) fn dense_weight_bf16(&self) -> Result<MxArray> {
-        if let Some(w) = &self.fp8_dequant_weight {
-            return Ok(w.clone());
-        }
-        if let Some(s_w) = &self.s_w {
-            let n = self.weight.shape()?[0];
-            let dense = self
-                .weight
-                .astype(crate::array::DType::Float32)?
-                .mul(&s_w.reshape(&[n, 1])?)?;
-            return dense.astype(crate::array::DType::BFloat16);
-        }
-        self.dequantize_bf16()
     }
 
     /// Test-scope accessor for the sym8 operands

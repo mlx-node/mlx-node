@@ -1858,11 +1858,11 @@ pub(crate) struct DsparkVerifyOutput {
 /// ([`crate::engine::dspark_turn::run_dspark_turn`]) drives.
 ///
 /// The `&mut self` borrow model is strictly sequential: the engine calls
-/// exactly one method at a time, in the fixed per-cycle order
-/// `propose → verify → commit → eval_boundary`. The adaptive calibration
-/// substitutes `verify_ar_probe → commit_ar_probe` for its one-token AR
-/// sample. `eval_boundary` is `&self` (schedule-only, no state mutation),
-/// the rest are `&mut self`.
+/// exactly one method at a time, in this fixed per-cycle order:
+/// `propose → verify → commit → eval_boundary`.
+/// The adaptive calibration substitutes `verify_ar_probe → commit_ar_probe`
+/// for its one-token AR sample. The boundary scheduling hook is `&self`
+/// (schedule-only, no state mutation); the rest are `&mut self`.
 ///
 /// # Invariant — tapped hidden states NEVER cross this trait
 ///
@@ -1996,6 +1996,19 @@ pub(crate) trait DsparkStepper {
     /// unconditionally kept); the cycle's boundary token has NO K/V slot —
     /// it becomes the next cycle's anchor.
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()>;
+
+    /// Commit with the exact host token provenance used to build the verify
+    /// block. The engine already materializes proposal ids after acceptance;
+    /// steppers whose verify input stayed device-resident can override this to
+    /// avoid copying the same `[anchor, drafts..]` array a second time.
+    fn commit_with_provenance(
+        &mut self,
+        keep: usize,
+        total_written: usize,
+        _verified_ids: &[u32],
+    ) -> Result<()> {
+        self.commit(keep, total_written)
+    }
 
     /// Publish model-private state retained by a successful speculative turn.
     /// Most steppers keep all persistent state behind their backend and need

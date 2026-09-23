@@ -28,6 +28,34 @@ pub(crate) struct GdnLayerTape {
     pub conv_kernel_dim: i32,
 }
 
+/// Rebuild the convolution history from the pre-verify snapshot and accepted rows.
+fn replay_conv_state(
+    qkv: &MxArray,
+    snapshot: Option<&MxArray>,
+    keep: i64,
+    accepted_steps: usize,
+) -> Result<MxArray> {
+    let accepted = i64::try_from(accepted_steps)
+        .map_err(|_| Error::from_reason("GDN convolution replay prefix is too large"))?;
+    if keep <= 0 || accepted > qkv.shape_at(1)? {
+        return Err(Error::from_reason("invalid GDN convolution replay window"));
+    }
+    let prefix = qkv.slice_axis(1, 0, accepted)?;
+    let input = match snapshot {
+        Some(state) => MxArray::concatenate(state, &prefix, 1)?,
+        None => {
+            let zeros = MxArray::zeros(
+                &[qkv.shape_at(0)?, keep, qkv.shape_at(2)?],
+                Some(qkv.dtype()?),
+            )?;
+            MxArray::concatenate(&zeros, &prefix, 1)?
+        }
+    };
+    let total = input.shape_at(1)?;
+    let parts = input.split_sections(&[total - keep], 1)?;
+    Ok(parts[1].clone())
+}
+
 impl GdnLayerTape {
     pub(crate) fn stack_rows(rows: &[Self]) -> Result<Self> {
         let first = rows
@@ -128,25 +156,10 @@ impl GdnLayerTape {
         // --- Conv state --------------------------------------------------
         let keep = (self.conv_kernel_dim - 1) as i64;
         if keep > 0 {
-            let conv_dim = self.qkv.shape_at(2)?;
-            // Prefix of the recorded qkv covering exactly the accepted steps.
-            let qkv_prefix = self.qkv.slice_axis(1, 0, accepted_steps as i64)?;
-            // conv_input = snapshot.conv_state ++ qkv_prefix  (axis 1).
-            let conv_input = match snapshot_conv {
-                Some(state) => MxArray::concatenate(state, &qkv_prefix, 1)?,
-                None => {
-                    let batch = self.qkv.shape_at(0)?;
-                    let zeros = MxArray::zeros(&[batch, keep, conv_dim], Some(self.qkv.dtype()?))?;
-                    MxArray::concatenate(&zeros, &qkv_prefix, 1)?
-                }
-            };
-            // Keep the last `keep` timesteps as the new conv_state — mirrors
-            // GatedDeltaNet::forward's conv-state update (cache slot 0).
-            let total_len = conv_input.shape_at(1)?;
-            if total_len >= keep {
-                let parts = conv_input.split_sections(&[total_len - keep], 1)?;
-                cache.set(0, parts[1].clone())?;
-            }
+            cache.set(
+                0,
+                replay_conv_state(&self.qkv, snapshot_conv, keep, accepted_steps)?,
+            )?;
         }
         Ok(())
     }
@@ -333,10 +346,7 @@ impl GatedDeltaNet {
                 {
                     let qkvz_rows = self.in_proj_qkvz.packed_out_features()?;
                     let ba_rows = self.in_proj_ba.packed_out_features()?;
-                    // Re-attach each source's calibration key onto its view:
-                    // MLX_DISABLE_E51_STACKED_GDN_IN_PROJ is read per-forward,
-                    // so a disabled merge falls back to these views and must
-                    // still record under the right bucket.
+                    // Preserve calibration keys for individual projection views.
                     let qkvz_key = self.in_proj_qkvz.amax_key().map(str::to_owned);
                     let ba_key = self.in_proj_ba.amax_key().map(str::to_owned);
                     self.in_proj_qkvz = merged.slice_rows(0, qkvz_rows)?.with_amax_key(qkvz_key);
@@ -396,20 +406,15 @@ impl GatedDeltaNet {
         let seq_len = x.shape_at(1)?;
 
         // When the stacked weight is available, do one matmul + one split.
-        // MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 reverts to the two-matmul path.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
-        let stacked = if std::env::var("MLX_DISABLE_E51_STACKED_GDN_IN_PROJ").is_err() {
-            if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
-                let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
-                let parts = combined.split_sections(&[qkvz_dim], 2)?;
-                Some((parts[0].clone(), parts[1].clone()))
-            } else if let Some(merged) = &self.in_proj_qkvz_ba_q {
-                let combined = merged.forward(x)?; // [B, T, qkvz_dim + ba_dim]
-                let parts = combined.split_sections(&[qkvz_dim], 2)?;
-                Some((parts[0].clone(), parts[1].clone()))
-            } else {
-                None
-            }
+        let stacked = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
+            let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
+            let parts = combined.split_sections(&[qkvz_dim], 2)?;
+            Some((parts[0].clone(), parts[1].clone()))
+        } else if let Some(merged) = &self.in_proj_qkvz_ba_q {
+            let combined = merged.forward(x)?; // [B, T, qkvz_dim + ba_dim]
+            let parts = combined.split_sections(&[qkvz_dim], 2)?;
+            Some((parts[0].clone(), parts[1].clone()))
         } else {
             None
         };
@@ -462,13 +467,9 @@ impl GatedDeltaNet {
 
         // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
         // gating in ONE Metal dispatch (`mlx_qwen4_gdn_prepare` — hardcoded to
-        // this family's 10240-wide 16k/48v×128 geometry). Decode/verify only:
-        // seq_len < 64 keeps the kernel's exp-space decay valid (chunked
-        // prefill consumes log-space g) and the per-step recurrence is the only
-        // downstream. `decay`/`beta` arrive f32 — the recurrence kernel reads
-        // both natively; the sub-ULP deltas (L2-norm eps placement, f32 beta)
-        // are the same class as the chunked-kernel variant documented for
-        // MLX_GDN_KERNEL. Kill-switch: MLX_DISABLE_QWEN35_GDN_PREPARE.
+        // this family's 10240-wide 16k/48v×128 geometry). Keep its existing
+        // decode/verify eligibility (seq_len < 64); decay and beta feed the
+        // per-step recurrence directly, with Qwen3.5 rounding semantics below.
         let prepared = (|| -> Option<[MxArray; 6]> {
             if batch != 1
                 || seq_len >= 64
@@ -479,7 +480,6 @@ impl GatedDeltaNet {
                 || self.num_v_heads != 48
                 || self.value_head_dim != 128
                 || !use_kernel
-                || std::env::var("MLX_DISABLE_QWEN35_GDN_PREPARE").is_ok()
                 || !crate::engine::persistence::compiled_forward_backend_available()
             {
                 return None;
@@ -655,7 +655,7 @@ impl GatedDeltaNet {
     /// Generic prep path: depthwise conv (fused `window_conv` when possible)
     /// → SiLU → q|k|v split → head reshape → q/k RMS-norm+scale. Runs whenever
     /// the fully-fused `gdn_prepare` kernel is off-contract (batch > 1,
-    /// seq ≥ 64, non-10240 geometry, kill-switch) or declines.
+    /// seq ≥ 64, non-10240 geometry) or declines.
     fn prep_via_conv(
         &self,
         qkv: &MxArray,
@@ -674,7 +674,6 @@ impl GatedDeltaNet {
             if batch != 1
                 || self.conv_kernel_dim != 4
                 || !use_kernel
-                || std::env::var("MLX_DISABLE_QWEN35_WINDOW_CONV").is_ok()
                 || !crate::engine::persistence::compiled_forward_backend_available()
             {
                 return None;
@@ -1012,6 +1011,63 @@ mod tests {
     use super::*;
     use crate::array::DType;
 
+    #[test]
+    fn conv_replay_preserves_every_prefix_and_batch() -> Result<()> {
+        for batch in [1i64, 2] {
+            for keep in [1i64, 3, 9] {
+                for dtype in [DType::Float32, DType::BFloat16] {
+                    // The retained five channels are strided views when the
+                    // backing row has ten channels. This catches assumptions
+                    // that a batched tape slice must be contiguous.
+                    for width in [5i64, 10] {
+                        let data: Vec<f32> =
+                            (0..batch * 8 * width).map(|i| (i % 97) as f32).collect();
+                        let qkv = MxArray::from_float32(&data, &[batch, 8, width])?
+                            .astype(dtype)?
+                            .slice_axis(2, 0, 5)?;
+                        let history: Vec<f32> = (0..batch * keep * 5)
+                            .map(|i| -1.0 - (i % 97) as f32)
+                            .collect();
+                        let snapshot =
+                            MxArray::from_float32(&history, &[batch, keep, 5])?.astype(dtype)?;
+                        for warm in [false, true] {
+                            for accepted in 0usize..=8 {
+                                let state = warm.then_some(&snapshot);
+                                let result = replay_conv_state(&qkv, state, keep, accepted)?;
+                                let mut expected = Vec::new();
+                                for b in 0..batch {
+                                    for position in accepted as i64..accepted as i64 + keep {
+                                        for channel in 0..5 {
+                                            let value = if position < keep {
+                                                if warm {
+                                                    history[((b * keep + position) * 5 + channel)
+                                                        as usize]
+                                                } else {
+                                                    0.0
+                                                }
+                                            } else {
+                                                data[((b * 8 + position - keep) * width + channel)
+                                                    as usize]
+                                            };
+                                            expected.push(value);
+                                        }
+                                    }
+                                }
+                                assert_eq!(result.shape()?.as_ref(), &[batch, keep, 5]);
+                                assert_eq!(result.dtype()?, dtype);
+                                assert_eq!(
+                                    result.astype(DType::Float32)?.to_float32()?.as_ref(),
+                                    expected.as_slice()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn rand_bf16(shape: &[i64]) -> MxArray {
         MxArray::random_normal(shape, 0.0, 0.3, Some(DType::Float32))
             .unwrap()
@@ -1134,24 +1190,28 @@ mod tests {
         if !gdn_prepare_backend_probe() {
             return Ok(());
         }
-        let net = kernel_geometry_net();
+        let mut net = kernel_geometry_net();
         let x1 = rand_bf16(&[1, 3, 64]);
         let x2 = rand_bf16(&[1, 5, 64]);
         // Near-zero input exercises the norm's small-Σ regime where eps
         // placement (Σ+ε vs Σ+d·ε) actually diverges — the review case.
         let x3 = rand_bf16(&[1, 4, 64]).mul_scalar(1e-3)?;
 
-        // Fallback prep (window_conv + split + folded norms + fused gating).
-        unsafe { std::env::set_var("MLX_DISABLE_QWEN35_GDN_PREPARE", "1") };
+        // Exercise the genuine missing-sidecar fallback without process-global
+        // switches: only fused prepare needs this cached scale.
+        let prepare_scale = net.gdn_scale_f32.take();
+        assert!(
+            prepare_scale.is_some(),
+            "fixture must support fused prepare"
+        );
         let mut cache_a = ArraysCache::new(2);
         let out_a1 = net.forward(&x1, None, Some(&mut cache_a), true)?;
         let out_a2 = net.forward(&x2, None, Some(&mut cache_a), true)?;
         let out_a3 = net.forward(&x3, None, Some(&mut cache_a), true)?;
 
-        // Fused prepare. The env var is read synchronously inside forward()
-        // (the prepared closure), so removing it here is safe even though
-        // eval is lazy.
-        unsafe { std::env::remove_var("MLX_DISABLE_QWEN35_GDN_PREPARE") };
+        // Restore the same sidecar for the optimized path; all weights and
+        // inputs remain shared with the independently constructed reference.
+        net.gdn_scale_f32 = prepare_scale;
         let mut cache_b = ArraysCache::new(2);
         let out_b1 = net.forward(&x1, None, Some(&mut cache_b), true)?;
         let out_b2 = net.forward(&x2, None, Some(&mut cache_b), true)?;

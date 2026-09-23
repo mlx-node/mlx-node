@@ -3,44 +3,24 @@ use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
-/// Minimum sequence length for the chunked prefill kernel to even be *eligible*.
-/// Below this the per-step recurrence always wins, so chunked is never considered.
-/// (Chunked is opt-in only — see [`GdnKernel`] / [`should_use_chunked`].)
+/// Minimum sequence length eligible for CUDA chunk-parallel prefill.
 const CHUNK_THRESHOLD: i64 = 64;
 
-/// GDN recurrence kernel selection. **Per-step is the default on EVERY GPU generation.**
-///
-/// History (corrected 2026-06-04): a `gen >= 17` (M5) gate once routed long prefills to the
-/// chunked kernel on the unvalidated theory that M5's memory bandwidth made its `O(BT^2)`
-/// tiling a net win. Measured on an M5 Max (gen 17, isolated worktree): the chunked kernel is
-/// **2.8–3.5× SLOWER** end-to-end prefill TTFT than per-step (24–31× slower per isolated GDN
-/// call) at `Hv=32, B=1` across 580–5384 prompt tokens — and it is ~2× slower on M3 too. The
-/// chunked Metal kernel (`gated_delta_chunked.metal.inc`) is pure scalar-FMA + `simd_sum`
-/// reductions with ZERO `simdgroup_matrix` / NAX matmul, so it never had a tensor-core
-/// advantage. The gen gate was a stale inversion of an old M3 result that was never A/B'd on
-/// M5; it is removed. Per-step is already the canonical path on M1–M4, for all `seq < 64`, and
-/// all masked GDN calls — so per-step is the de-facto
-/// reference everywhere.
-///
-/// Chunked is retained behind `MLX_GDN_KERNEL=chunked` for A/B and bring-up only. NOTE: the two
-/// kernels are NOT token-identical — they differ by 1–2 bf16 ULP (two valid reduction
-/// orderings), which can flip a greedy argmax and change the continuation on some long prompts.
+/// CUDA ops-path selection. Metal always uses the per-step kernel when supported.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GdnKernel {
-    /// Measured-best default: per-step on every arch.
+    /// Use CUDA chunk-parallel ops for eligible prefill calls.
     Auto,
     /// Force the per-step recurrence.
     ForcePerStep,
-    /// Force the chunked prefill kernel (A/B only — changes output by 1–2 bf16 ULP).
-    ForceChunked,
     /// Force the device-agnostic chunk-parallel ops path (`gated_delta_chunked_ops`).
     /// This is the default on the CUDA ops path (where the Metal kernels are absent);
     /// `MLX_GDN_KERNEL=perstep` reverts it for same-binary A/B. No effect on Metal,
-    /// whose production path takes the `use_kernel=true` per-step/chunked kernels.
+    /// whose production path takes the `use_kernel=true` per-step kernel.
     ForceChunkedOps,
 }
 
-/// Read the `MLX_GDN_KERNEL` override fresh per call (`perstep` | `chunked` | `chunked_ops`).
+/// Read the `MLX_GDN_KERNEL` override fresh per call (`perstep` | `chunked_ops`).
 /// Anything else (incl. unset) → [`GdnKernel::Auto`].
 fn gdn_kernel_override() -> GdnKernel {
     parse_gdn_kernel(std::env::var("MLX_GDN_KERNEL").ok().as_deref())
@@ -55,35 +35,8 @@ fn parse_gdn_kernel(mlx_gdn_kernel: Option<&str>) -> GdnKernel {
     match v.trim().to_ascii_lowercase().as_str() {
         "perstep" | "per_step" | "per-step" | "step" => GdnKernel::ForcePerStep,
         "chunked_ops" | "chunkedops" | "chunked-ops" | "ops" => GdnKernel::ForceChunkedOps,
-        "chunked" | "chunk" => GdnKernel::ForceChunked,
         _ => GdnKernel::Auto,
     }
-}
-
-/// Pure routing predicate: should this GDN call take the chunked prefill kernel?
-///
-/// `Auto` is ALWAYS false — per-step is faster on every measured arch, so chunked only runs
-/// when explicitly forced AND the call is a long (`seq >= CHUNK_THRESHOLD`), unmasked prefill
-/// the chunked kernel can actually handle. `_gpu_gen` is retained for documentation and to make
-/// any future arch-gating a localized one-line change; `Auto` ignores it today (M5 included).
-fn should_use_chunked(seq_len: i64, mask_is_none: bool, _gpu_gen: i32, choice: GdnKernel) -> bool {
-    // Chunked has no masked variant and loses on short sequences — never eligible there.
-    if !mask_is_none || seq_len < CHUNK_THRESHOLD {
-        return false;
-    }
-    match choice {
-        GdnKernel::ForceChunked => true,
-        // ChunkedOps is the CUDA ops-path selector, not the Metal chunked kernel this
-        // predicate guards — it never selects the Metal kernel here.
-        GdnKernel::Auto | GdnKernel::ForcePerStep | GdnKernel::ForceChunkedOps => false,
-    }
-}
-
-/// Returns the GPU architecture generation, cached after first call.
-fn gpu_architecture_gen() -> i32 {
-    use std::sync::OnceLock;
-    static GEN: OnceLock<i32> = OnceLock::new();
-    *GEN.get_or_init(|| unsafe { sys::mlx_gpu_architecture_gen() })
 }
 
 /// Compute decay gate: g = exp(-exp(A_log) * softplus(a + dt_bias))
@@ -108,7 +61,7 @@ fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray>
 /// computed DIRECTLY rather than as `compute_g(...).log()`. Strong decay drives the exp-space
 /// gate `compute_g` to underflow to 0, so `log(g)` is `-inf`; the chunked path then forms
 /// `gcum_i - gcum_j = (-inf) - (-inf) = NaN` and emits garbage. The log-space form stays finite
-/// (softplus is numerically stable). Mirrors the native `g_log` the fused Metal gating returns.
+/// (softplus is numerically stable). Used by the CUDA chunk-parallel ops path.
 fn compute_g_log(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray> {
     use crate::array::DType;
     let f32 = DType::Float32;
@@ -120,7 +73,7 @@ fn compute_g_log(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxAr
 /// Fused gating: computes both beta and g in a single Metal kernel dispatch.
 ///
 /// beta = sigmoid(b)
-/// g = -exp(a_log) * softplus(a + dt_bias)
+/// g = exp(-exp(a_log) * softplus(a + dt_bias))
 ///
 /// Returns: (beta [B, T, Hv] in input dtype, g [B, T, Hv] in f32)
 fn fused_gdn_gating(
@@ -129,7 +82,6 @@ fn fused_gdn_gating(
     a_log: &MxArray,
     dt_bias: &MxArray,
     num_heads: i32,
-    emit_exp: bool,
 ) -> Result<(MxArray, MxArray)> {
     let total_elements = b.size()? as i32;
     let mut out_beta: *mut sys::mlx_array = std::ptr::null_mut();
@@ -143,7 +95,6 @@ fn fused_gdn_gating(
             dt_bias.as_raw_ptr(),
             num_heads,
             total_elements,
-            emit_exp,
             &mut out_beta,
             &mut out_g,
         )
@@ -156,43 +107,6 @@ fn fused_gdn_gating(
     let beta = MxArray::from_handle(out_beta, "fused_gating:beta")?;
     let g = MxArray::from_handle(out_g, "fused_gating:g")?;
     Ok((beta, g))
-}
-
-/// Chunked gated delta recurrence for prefill (BT=32 tokens per chunk).
-/// Processes multiple tokens in parallel within each chunk.
-fn gated_delta_chunked(
-    q: &MxArray,
-    k: &MxArray,
-    v: &MxArray,
-    g: &MxArray,
-    beta: &MxArray,
-    state: &MxArray,
-) -> Result<(MxArray, MxArray)> {
-    let mut out_y: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
-
-    let ok = unsafe {
-        sys::mlx_gated_delta_chunked(
-            q.as_raw_ptr(),
-            k.as_raw_ptr(),
-            v.as_raw_ptr(),
-            g.as_raw_ptr(),
-            beta.as_raw_ptr(),
-            state.as_raw_ptr(),
-            &mut out_y,
-            &mut out_state,
-        )
-    };
-
-    if !ok {
-        return Err(Error::from_reason(
-            "Chunked gated delta kernel failed (check stderr for details)",
-        ));
-    }
-
-    let y = MxArray::from_handle(out_y, "gated_delta_chunked:y")?;
-    let new_state = MxArray::from_handle(out_state, "gated_delta_chunked:state")?;
-    Ok((y, new_state))
 }
 
 /// Run the gated delta recurrence using a custom Metal kernel.
@@ -542,8 +456,7 @@ fn invert_i_plus_strict_lower(a: &MxArray, l: i64) -> Result<MxArray> {
 
 /// Chunk-parallel port of the per-step recurrence (`gated_delta_ops`) for the CUDA
 /// prefill path. Collapses the O(T) token-serial recurrence into O(T/BT) chunk-serial
-/// steps of dense batched matmuls (cuBLAS / tensor cores), matching the in-tree Metal
-/// chunked kernel's math (`crates/mlx-sys/src/metal/common/gated_delta_chunked.metal.inc`).
+/// steps of dense batched matmuls (cuBLAS / tensor cores).
 ///
 /// Device-agnostic (portable MxArray ops) so it also runs on Metal, where the unit-test
 /// parity check against `gated_delta_ops` lives. `g_log` is the LOG-space decay gate
@@ -743,7 +656,7 @@ pub fn gated_delta_update(
 /// Tape-recording variant of [`gated_delta_update`].
 ///
 /// Identical to [`gated_delta_update`] except that, when the per-step Metal
-/// kernel runs (`use_kernel`, `k_dim % 32 == 0`, not chunked), it records the
+/// kernel runs (`use_kernel`, `k_dim % 32 == 0`), it records the
 /// exact `(q, k, v, g, beta)` window tensors into `tape_sink` for the eager
 /// MTP replay. The captured `q`/`k` are RMS-norm-scaled and may retain compact
 /// tiled-GGUF heads; `g` is `g_log.exp()` — i.e. EXACTLY the tensors handed to
@@ -763,9 +676,8 @@ pub(crate) fn gated_delta_update_with_tape(
     use_kernel: bool,
     tiled_gqa: bool,
     // `(decay_exp, beta)` already computed by the fused `gdn_prepare` kernel —
-    // skips the gating block entirely. Exp-space decay only feeds the
-    // per-step/ops paths; callers must not pass it for chunked-eligible calls
-    // (the chunked kernels consume log-space g).
+    // skips the Metal gating block entirely. The per-step kernel and its
+    // ops fallback both consume exp-space decay.
     precomputed_gates: Option<(&MxArray, &MxArray)>,
     mut tape_sink: Option<&mut Option<GdnKernelTape>>,
 ) -> Result<(MxArray, MxArray)> {
@@ -775,7 +687,7 @@ pub(crate) fn gated_delta_update_with_tape(
     let v_dim = v.shape_at(3)?;
     let k_dim = q.shape_at(3)?;
 
-    // The fused GDN gating + per-step/chunked recurrence are `fast::metal_kernel`
+    // The fused GDN gating + per-step recurrence are `fast::metal_kernel`
     // kernels that throw without MLX's Metal backend. On the CUDA/Linux build
     // (`mlx_metal_is_available()` is false) route straight to the
     // device-agnostic ops path instead of paying a per-layer-per-token
@@ -852,42 +764,18 @@ pub(crate) fn gated_delta_update_with_tape(
         return gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask);
     }
 
-    // Decide chunked vs per-step BEFORE gating so the fused kernel can emit
-    // exp(g_log) directly for the per-step/ops paths — the only consumers of
-    // log-space g are the chunked kernels (opt-in via `MLX_GDN_KERNEL=chunked`).
-    let seq_len = q.shape_at(1)?;
-    let try_chunked = k_dim % 32 == 0
-        && seq_len >= CHUNK_THRESHOLD
-        && mask.is_none()
-        && should_use_chunked(seq_len, true, gpu_architecture_gen(), gdn_kernel_override());
-
-    // Compute beta = sigmoid(b) and g = -exp(A_log) * softplus(a + dt_bias).
-    // `precomputed_gates` (from the fused gdn_prepare kernel) supplies exp-space
-    // decay + post-sigmoid beta directly, skipping this block. With `emit_exp`
-    // the fused kernel likewise returns exp(g_log) — the decay factor the
-    // per-step kernel and ops fallback both consume — saving an Exp dispatch
-    // per layer per forward. `g_is_exp` records which space `g_gate` is in.
-    let (beta, g_gate, g_is_exp) = match precomputed_gates {
-        Some((decay, beta)) if !try_chunked => (beta.clone(), decay.clone(), true),
-        _ => match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32, !try_chunked) {
+    // The fused gate and precomputed gdn_prepare outputs both supply the
+    // exp-space decay consumed by the per-step kernel and its ops fallback.
+    let (beta, g) = match precomputed_gates {
+        Some((decay, beta)) => (beta.clone(), decay.clone()),
+        None => match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
             Ok((beta_flat, g_flat)) => {
-                let seq_len_tmp = b.shape_at(1)?;
-                let beta = beta_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
-                let g = g_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
-                (beta, g, !try_chunked)
+                let seq_len = b.shape_at(1)?;
+                let beta = beta_flat.reshape(&[batch, seq_len, num_v_heads])?;
+                let g = g_flat.reshape(&[batch, seq_len, num_v_heads])?;
+                (beta, g)
             }
-            Err(_) => {
-                let beta = Activations::sigmoid(b)?;
-                // compute_g_log builds log-space g DIRECTLY — compute_g().log()
-                // underflows to -inf on strong decay (NaN in the chunked
-                // cumulative-diff math; see the compute_g_log docstring).
-                if try_chunked {
-                    (beta, compute_g_log(a_log, a, dt_bias)?, false)
-                } else {
-                    // compute_g returns exp(g_log) directly
-                    (beta, compute_g(a_log, a, dt_bias)?, true)
-                }
-            }
+            Err(_) => (Activations::sigmoid(b)?, compute_g(a_log, a, dt_bias)?),
         },
     };
 
@@ -923,66 +811,26 @@ pub(crate) fn gated_delta_update_with_tape(
     };
 
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
-    if k_dim % 32 == 0 {
-        // GDN recurrence kernel selection. Per-step is the default on EVERY GPU generation:
-        // chunked is 2.8–3.5× slower prefill on M5 and ~2× slower on M3 (see `GdnKernel`).
-        // Chunked is opt-in only via `MLX_GDN_KERNEL=chunked` (A/B / bring-up), and needs g in
-        // log-space directly (no exp/log roundtrip) — `g_gate` is log-space exactly when
-        // `try_chunked` was true above.
-        if try_chunked {
-            let (chunk_q, chunk_k) = if tiled_gqa && num_v_heads != num_k_heads {
-                let repeat_factor = num_v_heads / num_k_heads;
-                (
-                    MxArray::tile(&q, &[1, 1, repeat_factor as i32, 1])?,
-                    MxArray::tile(&k, &[1, 1, repeat_factor as i32, 1])?,
-                )
-            } else {
-                (q.clone(), k.clone())
-            };
-            match gated_delta_chunked(&chunk_q, &chunk_k, v, &g_gate, &beta, &initial_state) {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    // An explicit `MLX_GDN_KERNEL=chunked` force must be observable when it
-                    // fails — otherwise an A/B run silently measures per-step while reporting
-                    // "chunked". (Auto never reaches here: it returns per-step above.)
-                    if gdn_kernel_override() == GdnKernel::ForceChunked {
-                        eprintln!(
-                            "[mlx-gdn] MLX_GDN_KERNEL=chunked forced but the chunked kernel failed ({e}); falling back to per-step"
-                        );
-                    }
-                    // Fall through to per-step kernel.
-                }
-            }
+    if k_dim % 32 == 0
+        && let Ok(result) = gated_delta_kernel(&q, &k, v, &g, &beta, &initial_state, mask)
+    {
+        // Record the EXACT kernel inputs (lazy clones, no eval) for the
+        // eager MTP tape replay. Only the per-step kernel path is recorded —
+        // verify decode lands here when k_dim % 32 == 0, so a `None`
+        // sink on every other path is correct.
+        if let Some(sink) = tape_sink.take() {
+            *sink = Some(GdnKernelTape {
+                q: q.clone(),
+                k: k.clone(),
+                v: v.clone(),
+                g: g.clone(),
+                beta: beta.clone(),
+            });
         }
-
-        // Per-step kernel needs exponentiated decay factor — already exp-space
-        // when `emit_exp` ran, otherwise exp the log-space gate here.
-        // Clone: the ops fallback below may still need `g_gate` if the kernel fails.
-        let g = if g_is_exp {
-            g_gate.clone()
-        } else {
-            g_gate.exp()?
-        };
-        if let Ok(result) = gated_delta_kernel(&q, &k, v, &g, &beta, &initial_state, mask) {
-            // Record the EXACT kernel inputs (lazy clones, no eval) for the
-            // eager MTP tape replay. Only the per-step kernel path is recorded —
-            // verify decode always lands here (seq < CHUNK_THRESHOLD, k_dim % 32
-            // == 0, mask=None), so a `None` sink on every other path is correct.
-            if let Some(sink) = tape_sink.take() {
-                *sink = Some(GdnKernelTape {
-                    q: q.clone(),
-                    k: k.clone(),
-                    v: v.clone(),
-                    g: g.clone(),
-                    beta: beta.clone(),
-                });
-            }
-            return Ok(result);
-        }
+        return Ok(result);
     }
 
-    // Ops-based sequential loop fallback (also needs exp(g_log))
-    let g = if g_is_exp { g_gate } else { g_gate.exp()? };
+    // Ops-based sequential loop fallback consumes the same exp-space decay.
     let (ops_q, ops_k) = if tiled_gqa && num_v_heads != num_k_heads {
         let repeat_factor = num_v_heads / num_k_heads;
         (
@@ -999,65 +847,14 @@ pub(crate) fn gated_delta_update_with_tape(
 mod tests {
     use super::*;
 
-    // All GPU generations this engine targets (M1=13 … M5=17). The shipped contract is
-    // arch-independent: `Auto` is per-step on every one of these — including M5 (gen 17),
-    // whose old `>= 17` chunked gate was a measured-2.8–3.5×-slower stale inversion.
-    const ALL_GENS: [i32; 5] = [13, 14, 15, 16, 17];
-
-    /// Locks the SHIPPED routing intent so a future edit that re-inverts the M5 default
-    /// (or makes chunked the default on any arch) trips a failing assert. See [`GdnKernel`].
-    #[test]
-    fn chunked_is_never_the_default_on_any_arch() {
-        for gpu_gen in ALL_GENS {
-            // A long, unmasked prefill — the only shape chunked is even eligible for —
-            // still routes to per-step under `Auto`, on EVERY arch (M5 included).
-            assert!(
-                !should_use_chunked(4096, true, gpu_gen, GdnKernel::Auto),
-                "Auto must route to per-step on gen {gpu_gen} (chunked is 2.8–3.5× slower on M5)",
-            );
-            assert!(
-                !should_use_chunked(4096, true, gpu_gen, GdnKernel::ForcePerStep),
-                "ForcePerStep must never select chunked (gen {gpu_gen})",
-            );
-            // Chunked is reachable ONLY by explicit force, and on every arch (so a future
-            // default-flip can be A/B'd in both directions without a rebuild).
-            assert!(
-                should_use_chunked(4096, true, gpu_gen, GdnKernel::ForceChunked),
-                "ForceChunked must select chunked for a long unmasked prefill (gen {gpu_gen})",
-            );
-        }
-    }
-
-    /// Chunked is ineligible for short or masked calls regardless of the override.
-    #[test]
-    fn chunked_eligibility_requires_long_unmasked_prefill() {
-        for choice in [
-            GdnKernel::Auto,
-            GdnKernel::ForcePerStep,
-            GdnKernel::ForceChunked,
-        ] {
-            // Below CHUNK_THRESHOLD → never chunked, even when forced.
-            assert!(!should_use_chunked(CHUNK_THRESHOLD - 1, true, 17, choice));
-            // Masked (decode / banded) → never chunked, even when forced (no masked variant).
-            assert!(!should_use_chunked(4096, false, 17, choice));
-        }
-        // Exactly at the threshold, forced, unmasked → eligible.
-        assert!(should_use_chunked(
-            CHUNK_THRESHOLD,
-            true,
-            17,
-            GdnKernel::ForceChunked
-        ));
-    }
-
     /// The env-override parser maps strings → [`GdnKernel`] (tested env-free, race-free).
     #[test]
     fn parse_gdn_kernel_override_semantics() {
         // Default: nothing set.
         assert_eq!(parse_gdn_kernel(None), GdnKernel::Auto);
-        // MLX_GDN_KERNEL=chunked / perstep (case-insensitive, trimmed, aliases).
-        assert_eq!(parse_gdn_kernel(Some("chunked")), GdnKernel::ForceChunked);
-        assert_eq!(parse_gdn_kernel(Some("  CHUNK ")), GdnKernel::ForceChunked);
+        // Removed Metal chunked values are unrecognized and use the backend default.
+        assert_eq!(parse_gdn_kernel(Some("chunked")), GdnKernel::Auto);
+        assert_eq!(parse_gdn_kernel(Some("  CHUNK ")), GdnKernel::Auto);
         // MLX_GDN_KERNEL=chunked_ops selects the device-agnostic ops path (CUDA default).
         assert_eq!(
             parse_gdn_kernel(Some("chunked_ops")),

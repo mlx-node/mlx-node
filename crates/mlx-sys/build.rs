@@ -65,8 +65,8 @@ fn metal_residency_overlay(manifest: &Path, mlx: &Path, out_dir: &Path) -> io::R
             )?;
             replace(
                 &mut text,
-                "void CommandEncoder::commit(std::function<void()> completion) {",
-                "void CommandEncoder::commit(std::function<void()> completion) {\n  // Metal fixes residency at commit, including sets created after this queue.\n  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
+                "void CommandEncoder::commit(\n    std::function<void()> completion,\n    const char* reason) {",
+                "void CommandEncoder::commit(\n    std::function<void()> completion,\n    const char* reason) {\n  // Metal fixes residency at commit, including sets created after this queue.\n  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
             )?;
         }
         write_changed(output.join(name), text.as_bytes())?;

@@ -164,10 +164,6 @@ pub(crate) struct Qwen35Inner {
     /// Optional external DFlash2 companion. When installed it takes
     /// precedence over the target checkpoint's inline one-layer MTP head.
     pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,
-    /// Draft-precision clone of `lm_head` used only to produce DFlash2
-    /// proposal logits (`build_draft_lm_head`). The verify path keeps using
-    /// `lm_head` itself.
-    pub(crate) dflash2_draft_lm_head: Option<LinearProj>,
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_decode::DFlash2TurnState>,
     /// Latched when the compiled DFlash2 verify graph fails at trace or

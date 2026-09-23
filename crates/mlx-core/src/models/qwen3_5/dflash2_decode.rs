@@ -118,7 +118,6 @@ impl Qwen35DFlash2Stepper<'_> {
     fn target_forward(
         &mut self,
         ids: &[u32],
-        record_tape: bool,
     ) -> Result<(
         MxArray,
         Vec<MxArray>,
@@ -130,7 +129,7 @@ impl Qwen35DFlash2Stepper<'_> {
             self.inner,
             &input,
             &self.tap_layers,
-            record_tape,
+            true,
             super::model::DFlash2LogitsSpan::All,
         )
     }
@@ -159,42 +158,6 @@ impl Qwen35DFlash2Stepper<'_> {
 }
 
 impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
-    fn supports_adaptive_ar_fallback(&self) -> bool {
-        true
-    }
-
-    fn enter_ar_fallback(&mut self) -> Result<()> {
-        self.ensure_clean("AR fallback")
-    }
-
-    fn materialize_adaptive_state(&self) -> Result<()> {
-        self.context.eval()
-    }
-
-    fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<DsparkVerifyOutput> {
-        self.ensure_clean("AR probe")?;
-        let (logits, tapped, _) = self.target_forward(&[anchor_id], false)?;
-        self.tapped = Some(tapped);
-        self.verified_ids = Some(vec![anchor_id]);
-        Ok(DsparkVerifyOutput { logits })
-    }
-
-    fn commit_ar_probe(&mut self) -> Result<()> {
-        let tapped = self.tapped.take().ok_or_else(|| {
-            Error::from_reason("Qwen3.8 DFlash2 AR probe has no tapped target state")
-        })?;
-        let verified_ids = self.verified_ids.take().ok_or_else(|| {
-            Error::from_reason("Qwen3.8 DFlash2 AR probe has no token provenance")
-        })?;
-        if verified_ids.len() != 1 {
-            return Err(Error::from_reason(format!(
-                "Qwen3.8 DFlash2 AR probe retained {} token ids, expected 1",
-                verified_ids.len()
-            )));
-        }
-        self.append_tapped(&tapped, &verified_ids)
-    }
-
     fn propose(
         &mut self,
         anchor_id: u32,
@@ -222,10 +185,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             && params.frequency_penalty == 0.0;
         let (path, draft_sparse_dists) = draft.propose(
             &self.inner.embedding,
-            self.inner
-                .dflash2_draft_lm_head
-                .as_ref()
-                .or(self.inner.lm_head.as_ref()),
+            self.inner.lm_head.as_ref(),
             &self.context,
             anchor_id,
             max_len,
@@ -260,7 +220,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
             false,
         )?;
-        let (logits, tapped, tape) = self.target_forward(verify_ids, true)?;
+        let (logits, tapped, tape) = self.target_forward(verify_ids)?;
         self.snapshot = Some(snapshot);
         self.tape = Some(tape);
         self.tapped = Some(tapped);
@@ -352,11 +312,13 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         // to bf16 once at the end, while replay re-rounds per token to restore
         // the AR-exact state serial decode would leave. Skipping it would let a
         // sub-ULP divergence compound across cycles.
+        let caches = self
+            .inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
         replay_mtp_snapshot_to(
-            self.inner
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
+            caches,
             &snapshot,
             &tape,
             keep,
@@ -364,6 +326,41 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             "Qwen3.8 DFlash2 commit",
         )?;
         self.append_tapped(&tapped, &verified_ids[..keep])
+    }
+
+    fn commit_with_provenance(
+        &mut self,
+        keep: usize,
+        total_written: usize,
+        verified_ids: &[u32],
+    ) -> Result<()> {
+        if verified_ids.len() != total_written {
+            return Err(Error::from_reason(format!(
+                "Qwen3.8 DFlash2 commit wrote {total_written} rows for {} supplied token ids",
+                verified_ids.len()
+            )));
+        }
+        match (&self.verified_ids, &self.verified_ids_device) {
+            (Some(expected), None) if expected.as_slice() == verified_ids => {}
+            (None, Some(device))
+                if device.ndim()? == 1 && device.shape_at(0)? as usize == total_written => {}
+            (Some(_), None) => {
+                return Err(Error::from_reason(
+                    "Qwen3.8 DFlash2 supplied commit provenance disagrees with host verify input",
+                ));
+            }
+            _ => {
+                return Err(Error::from_reason(
+                    "Qwen3.8 DFlash2 commit has invalid token provenance ownership",
+                ));
+            }
+        }
+        // Acceptance has already copied these ids. Replace the device verify
+        // provenance with that host vector so `commit` keeps its established
+        // validation and settlement path without another device copy.
+        self.verified_ids = Some(verified_ids.to_vec());
+        self.verified_ids_device = None;
+        self.commit(keep, total_written)
     }
 
     fn finish(self) -> Result<()> {
@@ -803,11 +800,292 @@ impl Qwen35Inner {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        constrain_dflash2_context_params, dflash2_final_token_fits_context, reusable_dflash2_prefix,
-    };
+    use super::*;
+    use crate::array::DType;
     use crate::engine::extract_chat_params;
     use crate::engine::types::ChatConfig;
+    use crate::models::quantized_linear::LinearProj;
+    use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
+    use crate::nn::Linear;
+    use rand::SeedableRng;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ArTrace {
+        logits: Vec<Vec<u32>>,
+        target_cache: Vec<(Vec<i64>, Vec<u32>)>,
+        draft_cache: Vec<(Vec<i64>, Vec<u32>)>,
+        context_tokens: Vec<u32>,
+        frontier: SpecFrontier,
+        continuation_draft: Vec<i32>,
+    }
+
+    fn assert_trace_eq(actual: &ArTrace, expected: &ArTrace, label: &str) {
+        fn words(actual: &[u32], expected: &[u32], label: &str) {
+            assert_eq!(actual.len(), expected.len(), "{label}: element count");
+            if let Some((index, (actual, expected))) = actual
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .find(|(_, (actual, expected))| actual != expected)
+            {
+                panic!(
+                    "{label}: first mismatch at element {index}: actual={actual:#010x} ({}), expected={expected:#010x} ({})",
+                    f32::from_bits(*actual),
+                    f32::from_bits(*expected),
+                );
+            }
+        }
+
+        assert_eq!(
+            actual.logits.len(),
+            expected.logits.len(),
+            "{label}: cycles"
+        );
+        for (cycle, (actual, expected)) in actual.logits.iter().zip(&expected.logits).enumerate() {
+            words(actual, expected, &format!("{label}: logits cycle={cycle}"));
+        }
+        for (name, actual, expected) in [
+            ("target cache", &actual.target_cache, &expected.target_cache),
+            ("draft cache", &actual.draft_cache, &expected.draft_cache),
+        ] {
+            assert_eq!(actual.len(), expected.len(), "{label}: {name} array count");
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(actual.0, expected.0, "{label}: {name} array={index} shape");
+                words(
+                    &actual.1,
+                    &expected.1,
+                    &format!("{label}: {name} array={index} shape={:?}", actual.0),
+                );
+            }
+        }
+        assert_eq!(
+            actual.context_tokens, expected.context_tokens,
+            "{label}: tokens"
+        );
+        assert_eq!(actual.frontier, expected.frontier, "{label}: frontier");
+        assert_eq!(
+            actual.continuation_draft, expected.continuation_draft,
+            "{label}: continuation draft"
+        );
+    }
+
+    fn array_fingerprints(arrays: Vec<&MxArray>) -> Result<Vec<(Vec<i64>, Vec<u32>)>> {
+        arrays
+            .into_iter()
+            .map(|array| {
+                let values = array.astype(DType::Float32)?;
+                values.eval();
+                Ok((
+                    array.shape()?.as_ref().to_vec(),
+                    values
+                        .to_float32()?
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
+
+    fn reset_flat_fixture(inner: &mut Qwen35Inner) {
+        inner.caches = Some(
+            (0..inner.config.num_layers as usize)
+                .map(|index| {
+                    if inner.config.is_linear_layer(index) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect(),
+        );
+        inner.dflash2_context = None;
+        inner.dflash2_turn_state = None;
+    }
+
+    fn tiny_dflash_inner(seed: u64) -> Qwen35Inner {
+        tiny_dflash_inner_with_attention_head_dim(seed, 32)
+    }
+
+    fn tiny_dflash_inner_with_attention_head_dim(seed: u64, head_dim: i32) -> Qwen35Inner {
+        unsafe { mlx_sys::mlx_seed(seed) };
+        let mut inner = super::super::model::scheduled_mtp::seeded_inner_with_attention_head_dim(
+            seed, head_dim,
+        );
+        inner.paged_adapter = None;
+
+        // The shared scheduled fixture deliberately installs a constant head;
+        // replace it so logits remain sensitive to hidden/cache divergence.
+        let mut head = Linear::new(
+            inner.config.hidden_size as u32,
+            inner.config.vocab_size as u32,
+            Some(false),
+        )
+        .expect("construct sensitive tiny LM head");
+        head.set_weight(
+            &MxArray::random_normal(
+                &[
+                    inner.config.vocab_size as i64,
+                    inner.config.hidden_size as i64,
+                ],
+                0.0,
+                0.02,
+                Some(DType::BFloat16),
+            )
+            .expect("tiny LM head weights"),
+        )
+        .expect("install tiny LM head weights");
+        inner.lm_head = Some(LinearProj::Standard(head));
+        let draft = super::super::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
+            .expect("construct tiny DFlash2 companion");
+        draft
+            .validate_target(&inner.config)
+            .expect("tiny DFlash2 companion must match target");
+        inner.dflash2 = Some(draft);
+        inner
+    }
+
+    fn run_retained_prefix_trace(inner: &mut Qwen35Inner, first_keep: usize) -> Result<ArTrace> {
+        reset_flat_fixture(inner);
+        let stream = Stream::new(DeviceType::Gpu);
+        let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+        prefill_logits.eval();
+        inner.dflash2_turn_state = Some(state);
+        let block_size = inner
+            .dflash2
+            .as_ref()
+            .expect("fixture draft")
+            .config
+            .block_size;
+        let mut step = inner.begin_dspark_decode(block_size)?;
+        // Force retained widths independently of model acceptance, including
+        // keep=1 immediately followed by keep=8 and multiple draft-window wraps.
+        let mut logits_trace = Vec::new();
+        for (cycle, keep) in [first_keep, 1, 8, first_keep].into_iter().enumerate() {
+            let ids = (0..8)
+                .map(|row| (row + cycle + 1) as u32)
+                .collect::<Vec<_>>();
+            let logits = step.verify(&ids)?.logits;
+            let floats = logits.astype(DType::Float32)?;
+            floats.eval();
+            logits_trace.push(floats.to_float32()?.iter().map(|x| x.to_bits()).collect());
+            step.commit_with_provenance(keep, ids.len(), &ids)?;
+        }
+        let frontier = step.frontier().expect("fixture frontier");
+        let mut target_arrays = Vec::new();
+        for cache in step.inner.caches.as_ref().expect("fixture caches") {
+            cache.collect_arrays(&mut target_arrays);
+        }
+        let target_cache = array_fingerprints(target_arrays)?;
+        let draft_cache = array_fingerprints(step.context.cache_arrays_for_stepper_test())?;
+        let context_tokens = step.context.token_history().to_vec();
+        step.finish()?;
+
+        let context = inner
+            .dflash2_context
+            .take()
+            .expect("retained draft context");
+        let next_position = context.logical_len();
+        inner.dflash2_turn_state = Some(DFlash2TurnState {
+            context,
+            next_position,
+        });
+        let mut continuation = inner.begin_dspark_decode(block_size)?;
+        let params = extract_chat_params(&ChatConfig {
+            temperature: Some(0.0),
+            repetition_penalty: Some(1.01),
+            ..ChatConfig::default()
+        });
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let proposal = continuation.propose(3, 2, &params, &mut rng)?;
+        assert!(proposal.device_draft_ids.is_none());
+        let continuation_draft = proposal.draft_ids;
+        // An ordinary one-row verify must consume the committed state and
+        // use its own compiled sequence-length key when supported.
+        let logits = continuation.verify(&[3])?.logits;
+        let floats = logits.astype(DType::Float32)?;
+        floats.eval();
+        logits_trace.push(floats.to_float32()?.iter().map(|x| x.to_bits()).collect());
+        continuation.commit(1, 1)?;
+        continuation.finish()?;
+        Ok(ArTrace {
+            logits: logits_trace,
+            target_cache,
+            draft_cache,
+            context_tokens,
+            frontier,
+            continuation_draft,
+        })
+    }
+
+    #[test]
+    fn compiled_verifier_state_and_continuation_repeat_for_every_keep() -> Result<()> {
+        repeat_retained_prefix_trace(64)
+    }
+
+    #[test]
+    fn unfused_attention_state_and_continuation_repeat_for_every_keep() -> Result<()> {
+        repeat_retained_prefix_trace(32)
+    }
+
+    fn repeat_retained_prefix_trace(head_dim: i32) -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!("SKIP retained-prefix verifier regression: Metal must be the default device");
+            return Ok(());
+        }
+        let require_compiled = head_dim == 64;
+        if require_compiled {
+            // Presence disables MLX compilation, including a value of "0".
+            // This regression must fail explicitly rather than silently
+            // validating an eager run under a compiled-test name.
+            assert!(
+                std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+                "compiled verifier regression requires MLX_DISABLE_COMPILE to be unset"
+            );
+        }
+        let mut inner = tiny_dflash_inner_with_attention_head_dim(0xDFA5_2203, head_dim);
+        // D=64 uses fused vector attention and can reuse the shapeless verifier.
+        // D=32 must stay eager: its unfused causal mask contains the current
+        // prefix length. Reusing that trace caused intermittent state errors.
+        for layer in &inner.layers {
+            if let super::super::decoder_layer::AttentionType::Full(attention) = &layer.attn {
+                for seq_len in [1, 8] {
+                    assert_eq!(attention.verify_can_be_shapeless(seq_len), head_dim == 64);
+                }
+            }
+        }
+        Qwen35Inner::take_dflash2_compiled_test_counts();
+        for keep in 1..=8 {
+            let expected = run_retained_prefix_trace(&mut inner, keep)?;
+            // Four eight-row verifies and one ordinary one-row verify each
+            // invoke compilation. The first trace builds both sequence-length
+            // keys; subsequent traces reuse them despite changing prefixes.
+            let expected_counts = if require_compiled {
+                (5, 2 * usize::from(keep == 1))
+            } else {
+                (0, 0)
+            };
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts(),
+                expected_counts,
+                "initial trace must use the required verifier route: head_dim={head_dim} keep={keep}"
+            );
+            let actual = run_retained_prefix_trace(&mut inner, keep)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts(),
+                if require_compiled { (5, 0) } else { (0, 0) },
+                "resetting caches must preserve compiled replay or eager-only routing: head_dim={head_dim} keep={keep}"
+            );
+            assert_trace_eq(
+                &actual,
+                &expected,
+                &format!("repeated retained prefix head_dim={head_dim} keep={keep}"),
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn context_budget_uses_the_smaller_target_or_draft_window() {
@@ -868,5 +1146,154 @@ mod tests {
             0,
             "a paged-owned target frontier cannot reuse flat DFlash2 state"
         );
+    }
+
+    #[test]
+    fn commit_provenance_validation_is_non_mutating_and_published_state_survives_consumption() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            eprintln!("skipping DFlash2 commit durability: Metal unavailable");
+            return;
+        }
+
+        fn begin_verified_step(inner: &mut Qwen35Inner) -> Result<(Qwen35DFlash2Stepper<'_>, u32)> {
+            reset_flat_fixture(inner);
+            let stream = Stream::new(DeviceType::Gpu);
+            let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+            prefill_logits.eval();
+            let anchor = prefill_logits.argmax(-1, None)?.item_at_int32(0)? as u32;
+            inner.dflash2_turn_state = Some(state);
+            let block_size = inner
+                .dflash2
+                .as_ref()
+                .expect("tiny companion")
+                .config
+                .block_size;
+            let mut step = inner.begin_dspark_decode(block_size)?;
+            step.verify(&[anchor])?.logits.eval();
+            Ok((step, anchor))
+        }
+
+        let mut inner = tiny_dflash_inner(0xDFA5_2202);
+        let params = extract_chat_params(&ChatConfig {
+            temperature: Some(0.0),
+            repetition_penalty: Some(1.01),
+            ..ChatConfig::default()
+        });
+        // Establish a valid-commit reference on the same weights, consuming
+        // its roots while the stepper still owns them. The actual trace below
+        // resets caches and consumes roots only after finish transfers ownership.
+        let (mut reference, expected_anchor) =
+            begin_verified_step(&mut inner).expect("reference verify");
+        reference.commit(1, 1).expect("reference commit");
+        let mut reference_target_arrays = Vec::new();
+        for cache in reference
+            .inner
+            .caches
+            .as_ref()
+            .expect("reference target caches")
+        {
+            cache.collect_arrays(&mut reference_target_arrays);
+        }
+        let expected_target =
+            array_fingerprints(reference_target_arrays).expect("reference target state");
+        let expected_draft = array_fingerprints(reference.context.cache_arrays_for_stepper_test())
+            .expect("reference draft state");
+        let expected_tokens = reference.context.token_history().to_vec();
+        let expected_frontier = reference.frontier();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let expected_proposal = reference
+            .propose(expected_anchor, 2, &params, &mut rng)
+            .expect("reference continuation");
+        assert!(expected_proposal.device_draft_ids.is_none());
+        reference.finish().expect("publish reference context");
+
+        let (mut step, anchor) = begin_verified_step(&mut inner).expect("actual verify");
+        assert_eq!(anchor, expected_anchor);
+        let assert_pending = |step: &Qwen35DFlash2Stepper<'_>| {
+            assert!(
+                step.snapshot.is_some(),
+                "snapshot was consumed on validation error"
+            );
+            assert!(step.tape.is_some(), "tape was consumed on validation error");
+            assert!(
+                step.tapped.is_some(),
+                "taps were consumed on validation error"
+            );
+            assert!(
+                step.verified_ids.is_some(),
+                "provenance was consumed on validation error"
+            );
+        };
+        assert!(
+            step.commit_with_provenance(1, 1, &[anchor, anchor])
+                .is_err(),
+            "wrong provenance length must fail"
+        );
+        assert_pending(&step);
+        assert!(
+            step.commit_with_provenance(1, 1, &[anchor.wrapping_add(1)])
+                .is_err(),
+            "host provenance mismatch must fail"
+        );
+        assert_pending(&step);
+        step.verified_ids_device =
+            Some(MxArray::from_int32(&[anchor as i32], &[1]).expect("duplicate device provenance"));
+        assert!(
+            step.commit_with_provenance(1, 1, &[anchor]).is_err(),
+            "dual provenance ownership must fail"
+        );
+        assert_pending(&step);
+        step.verified_ids_device = None;
+
+        step.commit_with_provenance(1, 1, &[anchor])
+            .expect("valid provenance commit");
+        assert_eq!(step.frontier(), expected_frontier);
+        step.finish().expect("publish committed context");
+
+        let mut target_arrays = Vec::new();
+        for cache in inner.caches.as_ref().expect("target caches after finish") {
+            cache.collect_arrays(&mut target_arrays);
+        }
+        let context = inner
+            .dflash2_context
+            .as_ref()
+            .expect("published draft context");
+        let draft_arrays = context.cache_arrays_for_stepper_test();
+        assert!(!target_arrays.is_empty() && !draft_arrays.is_empty());
+        assert_eq!(context.token_history(), expected_tokens.as_slice());
+        // Finish preserves lazy publication. Consuming these roots must still
+        // reconstruct the exact committed state; pre-consumption availability
+        // is intentionally not part of the normal stepper contract.
+        assert_eq!(
+            array_fingerprints(target_arrays).expect("consume target roots"),
+            expected_target
+        );
+        assert_eq!(
+            array_fingerprints(draft_arrays).expect("consume draft roots"),
+            expected_draft
+        );
+
+        let context = inner.dflash2_context.take().expect("retained context");
+        let next_position = context.logical_len();
+        inner.dflash2_turn_state = Some(DFlash2TurnState {
+            context,
+            next_position,
+        });
+        let block_size = inner
+            .dflash2
+            .as_ref()
+            .expect("tiny companion")
+            .config
+            .block_size;
+        let mut continuation = inner
+            .begin_dspark_decode(block_size)
+            .expect("resume published state");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let actual_proposal = continuation
+            .propose(anchor, 2, &params, &mut rng)
+            .expect("continuation after published-root consumption");
+        assert!(actual_proposal.device_draft_ids.is_none());
+        assert_eq!(actual_proposal.draft_ids, expected_proposal.draft_ids);
+        continuation.finish().expect("publish resumed context");
     }
 }

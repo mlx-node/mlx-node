@@ -287,6 +287,54 @@ impl Drop for WiredLimitContext {
 }
 
 #[cfg(test)]
+mod submission_tests {
+    use super::{DeviceType, Stream, StreamContext};
+    use crate::array::{MxArray, clear_cache};
+
+    /// Also run with MLX_MAX_OPS_PER_BUFFER=1 to exercise finalization
+    /// immediately after threshold commits. Releasing temporary roots and
+    /// clearing the allocator cache must not lose cross-stream event or retention work.
+    #[test]
+    fn asynchronous_cross_stream_views_retain_dependencies() -> napi::Result<()> {
+        let first = Stream::new(DeviceType::Gpu);
+        let second = Stream::new(DeviceType::Gpu);
+        let source: Vec<f32> = (0..256).map(|i| i as f32 - 128.0).collect();
+        let mut state = {
+            let _ctx = StreamContext::new(first);
+            MxArray::from_float32(&source, &[16, 16])?
+        };
+        for _ in 0..24 {
+            let next = {
+                let _ctx = StreamContext::new(first);
+                let result = state.add_scalar(1.0)?.reshape(&[256])?;
+                MxArray::async_eval_arrays(&[&result]);
+                result
+            };
+            state = {
+                let _ctx = StreamContext::new(second);
+                let result = next.mul_scalar(2.0)?.reshape(&[16, 16])?;
+                MxArray::async_eval_arrays(&[&result]);
+                result
+            };
+            state = {
+                let _ctx = StreamContext::new(first);
+                let result = state.mul_scalar(0.5)?;
+                MxArray::async_eval_arrays(&[&result]);
+                result
+            };
+            clear_cache();
+        }
+        // Synchronizing a stream remains a queue-completion boundary even
+        // when its current command buffer contains no new dispatches.
+        second.synchronize();
+        first.synchronize();
+        let expected: Vec<f32> = source.into_iter().map(|x| x + 24.0).collect();
+        assert_eq!(state.to_float32()?.as_ref(), expected.as_slice());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod wired_tests {
     use super::WiredLeases;
     use std::cell::Cell;

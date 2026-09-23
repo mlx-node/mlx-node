@@ -727,6 +727,48 @@ unsafe extern "C-unwind" {
         dtype_code: i32,
     ) -> *mut mlx_array;
 
+    // Segmented BF16 vector attention, with concatenated SDPA fallback for
+    // unsupported pipeline capabilities. Null indicates a construction error
+    // (or an unavailable backend, which Rust checks before calling).
+    pub fn mlx_segmented_sdpa_forward(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        scale: f32,
+        causal: bool,
+    ) -> *mut mlx_array;
+
+    // Strict test entry: null on unsupported segmented dispatch; no concat fallback.
+    pub fn mlx_segmented_sdpa_test_forward(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        scale: f32,
+        causal: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_segmented_sdpa_max_query_length(gqa_factor: i32) -> i32;
+
+    pub fn mlx_segmented_sdpa_test_plan(
+        query_length: i32,
+        gqa_factor: i32,
+        two_pass: bool,
+        partitions: i32,
+        stage1_width: usize,
+        stage1_max_threads: usize,
+        stage1_static_memory: usize,
+        device_max_memory: usize,
+        stage2_width: usize,
+        stage2_max_threads: usize,
+        stage2_static_memory: usize,
+        out_stage1_threads: *mut u32,
+        out_stage2_threads: *mut u32,
+    ) -> i32;
+
     // Fused forward step - single FFI call for entire forward pass
     // This reduces FFI overhead from ~300 calls to 1 call per token
     // Uses array offsets for batched generation with proper per-sequence RoPE positions.
@@ -1745,18 +1787,6 @@ unsafe extern "C-unwind" {
         out: *mut *mut mlx_array,
     ) -> bool;
 
-    // Chunked gated delta recurrence for prefill (BT=32 tokens per chunk)
-    pub fn mlx_gated_delta_chunked(
-        q: *mut mlx_array,
-        k: *mut mlx_array,
-        v: *mut mlx_array,
-        g: *mut mlx_array,
-        beta: *mut mlx_array,
-        state: *mut mlx_array,
-        out_y: *mut *mut mlx_array,
-        out_state: *mut *mut mlx_array,
-    ) -> bool;
-
     // GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17)
     pub fn mlx_gpu_architecture_gen() -> i32;
 
@@ -1981,8 +2011,7 @@ unsafe extern "C-unwind" {
         out_bf16: *mut *mut mlx_array,
     ) -> bool;
 
-    // Fused GDN gating: beta = sigmoid(b), g = -exp(a_log) * softplus(a + dt_bias)
-    // `emit_exp` selects exp(g) output for the per-step recurrence path.
+    // Fused GDN gating: beta = sigmoid(b), g = exp(-exp(a_log) * softplus(a + dt_bias)).
     pub fn mlx_fused_gdn_gating(
         b: *mut mlx_array,
         a: *mut mlx_array,
@@ -1990,7 +2019,6 @@ unsafe extern "C-unwind" {
         dt_bias: *mut mlx_array,
         num_heads: i32,
         total_elements: i32,
-        emit_exp: bool,
         out_beta: *mut *mut mlx_array,
         out_g: *mut *mut mlx_array,
     ) -> bool;
@@ -2114,6 +2142,20 @@ unsafe extern "C" {
         logits: *mut mlx_array,
         out_ids: *mut *mut mlx_array,
         out_values: *mut *mut mlx_array,
+    ) -> bool;
+    /// Test status: 1=fused outputs, 0=invalid/unsupported, -1=construction error.
+    pub fn mlx_dflash2_topk16_test(
+        logits: *mut mlx_array,
+        out_ids: *mut *mut mlx_array,
+        out_values: *mut *mut mlx_array,
+    ) -> i32;
+    /// Fused device-resident greedy predecessor walk for DFlash2 selector
+    /// candidates `[1,L,K]` i32 and score tables `[L,K,K]` f32. Returns a
+    /// lazy `[L]` i32 path, or false when the input contract is not met.
+    pub fn mlx_dflash2_greedy_path(
+        candidates: *mut mlx_array,
+        scores: *mut mlx_array,
+        out_path: *mut *mut mlx_array,
     ) -> bool;
     /// Fused residual-add + RMSNorm: writes `h = x + res` and
     /// `normed = rms_norm(h) * w` into the out pointers. Returns false on

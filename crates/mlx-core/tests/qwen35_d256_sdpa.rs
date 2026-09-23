@@ -9,7 +9,6 @@ use mlx_core::array::{
     synchronize_and_clear_cache,
 };
 
-const ROLLBACK_CHILD_ENV: &str = "MLX_D256_ROLLBACK_TEST_CHILD";
 const TF32_CHILD_ENV: &str = "MLX_D256_TF32_TEST_CHILD";
 
 const BATCH: i64 = 1;
@@ -155,39 +154,6 @@ fn d256_fused_sdpa_matches_fallback_across_boundaries() {
 }
 
 #[test]
-#[ignore = "requires a NAX Metal GPU; explicit execution must prove rollback from an available baseline"]
-fn d256_rollback_gate_disables_route_in_fresh_process() {
-    if std::env::var_os(ROLLBACK_CHILD_ENV).is_some() {
-        let mut available = true;
-        let status = unsafe { mlx_sys::mlx_metal_d256_full_sdpa_available(false, &mut available) };
-        assert_eq!(status, 0, "rollback child capability probe failed");
-        assert!(!available, "rollback must disable D=256 capability");
-        assert!(!would_use_fused_d256(2_048, 8_192));
-        return;
-    }
-    assert!(
-        d256_available(false),
-        "rollback proof requires an available BF16 D=256 baseline"
-    );
-
-    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
-        .env("MLX_ENABLE_D256_FULL_SDPA", "0")
-        .env(ROLLBACK_CHILD_ENV, "1")
-        .arg("--ignored")
-        .arg("--exact")
-        .arg("d256_rollback_gate_disables_route_in_fresh_process")
-        .arg("--nocapture")
-        .output()
-        .expect("run rollback child process");
-    assert!(
-        output.status.success(),
-        "rollback child failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-#[test]
 #[ignore = "requires a NAX Metal GPU with TF32 enabled for the parent baseline"]
 fn d256_float32_route_honors_tf32_gate_in_fresh_process() {
     if std::env::var_os(TF32_CHILD_ENV).is_some() {
@@ -204,7 +170,6 @@ fn d256_float32_route_honors_tf32_gate_in_fresh_process() {
     );
 
     let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
-        .env("MLX_ENABLE_D256_FULL_SDPA", "1")
         .env("MLX_ENABLE_TF32", "0")
         .env(TF32_CHILD_ENV, "1")
         .arg("--ignored")

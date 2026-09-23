@@ -135,8 +135,10 @@ At sampled temperatures the runtime retains those sparse conditional
 probabilities for exact rejection correction against the target distribution.
 
 The checkpoint's block size 8 means one verified anchor plus seven proposals.
-Unset `mtpDepth` uses all seven; an explicit value clamps to `[1, 7]`.
-`mtpAdaptiveDepth` is off by default. The target verify path is flat because
+Qwen DFlash2 always uses the checkpoint's full proposal width; `mtpDepth`
+does not override it. The final cycle still respects the remaining token budget.
+`mtpAdaptiveDepth` is also ignored for this companion. Native MTP and other
+draft families retain their own adaptive policies. The target verify path is flat because
 accepted-prefix rollback must restore both full-attention KV and Qwen3.8's GDN
 recurrent state; normal `enableMtp: false` requests may still use paged AR.
 An external DFlash2 companion takes precedence over an inline native MTP head.

@@ -907,6 +907,12 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         };
         profiler.end();
         let (accepted_drafts_k, boundary_id) = accept_res?;
+        // Acceptance has forced the verify graph. Back-fill a device proposal
+        // now so commit can reuse the engine's exact verify provenance instead
+        // of reading the concatenated verify input from the device again. The
+        // ordinary accept paths already did this; this call also covers the
+        // force-think branch.
+        proposal.materialize_draft_ids()?;
         let verify_ns = verify_started_at
             .elapsed()
             .as_nanos()
@@ -962,6 +968,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             },
         );
         let kept_drafts = keep - 1;
+        let mut verified_ids = Vec::with_capacity(1 + draft_len);
+        verified_ids.push(anchor);
+        verified_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
         profiler.begin("dspark_commit");
         let commit_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
             if keep != 1 || draft_len != 0 {
@@ -972,11 +981,10 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 step.commit_ar_probe()
             }
         } else {
-            step.commit(keep, 1 + draft_len)
+            step.commit_with_provenance(keep, 1 + draft_len, &verified_ids)
         };
         profiler.end();
         commit_res?;
-
         let break_even_decision = if stop.is_some() {
             None
         } else {
@@ -1091,7 +1099,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
         profiler.end();
 
-        // Every-256-emitted-token cache clear (mtp_turn's cadence).
+        // Bound allocator cache growth at the established token cadence.
         if generated.len() >= last_clear_at + 256 {
             crate::array::synchronize_and_clear_cache();
             last_clear_at = generated.len();
@@ -1747,6 +1755,29 @@ mod tests {
             });
             self.cursor.set(self.cursor.get() + 1);
             Ok(())
+        }
+
+        fn commit_with_provenance(
+            &mut self,
+            keep: usize,
+            total_written: usize,
+            verified_ids: &[u32],
+        ) -> Result<()> {
+            let expected_drafts = self
+                .script()
+                .draft_ids
+                .iter()
+                .take(total_written.saturating_sub(1))
+                .map(|&id| id as u32)
+                .collect::<Vec<_>>();
+            if verified_ids.len() != total_written
+                || verified_ids.get(1..) != Some(expected_drafts.as_slice())
+            {
+                return Err(Error::from_reason(format!(
+                    "mock commit provenance mismatch: ids={verified_ids:?}, total={total_written}, drafts={expected_drafts:?}"
+                )));
+            }
+            self.commit(keep, total_written)
         }
 
         fn eval_boundary(&self, token: &MxArray) {

@@ -14,6 +14,22 @@ pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 /// unload releases the tapes' captured weights.
 pub(crate) const COMPILED_VERIFY_TAG: u64 = 0xD51A_3500_0000_0000;
 
+#[cfg(test)]
+thread_local! {
+    // Completed compiled-path calls and Rust builder entries on the model's
+    // owner thread. Counting both distinguishes cached replay from the raw
+    // closure that MLX returns when compilation is disabled.
+    static DFLASH2_COMPILED_TEST_COUNTS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+impl Qwen35Inner {
+    pub(crate) fn take_dflash2_compiled_test_counts() -> (usize, usize) {
+        DFLASH2_COMPILED_TEST_COUNTS.with(|counts| counts.replace((0, 0)))
+    }
+}
+
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
 pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<()> {
@@ -69,9 +85,6 @@ pub(super) fn chunked_prefill_with_size(
     chunk_size: i64,
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
-    // `MLX_PREFILL_SYNC_BETWEEN_CHUNKS` forces synchronous `eval_layer_caches`
-    // between chunks instead of the async default.
-    let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
     let mut ctx = (embedding, layers, caches, final_norm, lm_head);
     fwd::chunked_prefill(
         &mut ctx,
@@ -89,11 +102,7 @@ pub(super) fn chunked_prefill_with_size(
             }
         },
         |ctx| {
-            if chunk_async {
-                fwd::async_eval_layer_caches(&*ctx.2);
-            } else {
-                fwd::eval_layer_caches(&*ctx.2)?;
-            }
+            fwd::async_eval_layer_caches(&*ctx.2);
             crate::array::clear_cache();
             Ok(())
         },
@@ -546,9 +555,7 @@ fn forward_dflash2_compiled(
     use crate::models::qwen3_5::gated_delta::GdnKernelTape;
     use crate::models::qwen3_5::gated_delta_net::GdnLayerTape;
 
-    if inner.dflash2_compiled_verify_disabled
-        || std::env::var("MLX_DISABLE_DFLASH2_COMPILED_VERIFY").is_ok()
-    {
+    if inner.dflash2_compiled_verify_disabled {
         return Ok(None);
     }
     if tap_layers.is_empty() || tap_layers.iter().any(|&l| l >= inner.layers.len()) {
@@ -624,6 +631,18 @@ fn forward_dflash2_compiled(
     // the builder (SDPA verify-split geometry), while the prefix length stays
     // shapeless. The high tag namespaces these ids away from the C++-side
     // pointer-derived ids and the test range.
+    let shapeless_verify = inner.layers.iter().all(|layer| match &layer.attn {
+        crate::models::qwen3_5::decoder_layer::AttentionType::Linear(_) => true,
+        crate::models::qwen3_5::decoder_layer::AttentionType::Full(attention) => {
+            attention.verify_can_be_shapeless(seq_len)
+        }
+    });
+    if !shapeless_verify {
+        // Unfused causal attention bakes prefix-sized mask constants. Reusing
+        // that graph as the prefix grows is invalid; specializing every prefix
+        // would retain an unbounded set of full-model traces. Use eager verify.
+        return Ok(None);
+    }
     let fn_id =
         COMPILED_VERIFY_TAG | ((inner.model_id & 0x00FF_FFFF) << 8) | (seq_len as u64 & 0xFF);
 
@@ -632,6 +651,11 @@ fn forward_dflash2_compiled(
     let final_norm = &inner.final_norm;
     let lm_head = &inner.lm_head;
     let mut builder = move |graph_inputs: &[MxArray]| -> Result<Vec<MxArray>> {
+        #[cfg(test)]
+        DFLASH2_COMPILED_TEST_COUNTS.with(|counts| {
+            let (completed, builds) = counts.get();
+            counts.set((completed, builds + 1));
+        });
         let ids = &graph_inputs[0];
         let rope_offsets = &graph_inputs[1];
         let mut cursor = 2usize;
@@ -783,6 +807,11 @@ fn forward_dflash2_compiled(
             return Err(e);
         }
     }
+    #[cfg(test)]
+    DFLASH2_COMPILED_TEST_COUNTS.with(|counts| {
+        let (completed, builds) = counts.get();
+        counts.set((completed + 1, builds));
+    });
     Ok(Some((logits, taps, tape)))
 }
 

@@ -904,7 +904,6 @@ fn vector_recurrence_preserves_outputs_state_and_continuation() {
                 "--test-threads=1",
             ])
             .env(CHILD, "1")
-            .env_remove("MLX_DISABLE_E47_GDN_2VCOL")
             .env("MLX_QWEN4_GDN_4ROWS", "1")
             .output()
             .unwrap();

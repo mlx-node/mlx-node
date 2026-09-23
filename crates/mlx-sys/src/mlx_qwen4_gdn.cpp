@@ -237,8 +237,7 @@ mlx_qwen4_complete_gdn(mlx_array *qkv, mlx_array *z, mlx_array *a, mlx_array *b,
     auto setting = qwen4_env("MLX_QWEN4_COMPLETE_GDN_METAL");
     auto rows = qwen4_env("MLX_QWEN4_GDN_4ROWS");
     bool fused = arch >= 17 && (!setting || std::string(setting) != "0") &&
-                 (!rows || std::string(rows) != "0") &&
-                 qwen4_env("MLX_DISABLE_E47_GDN_2VCOL") == nullptr;
+                 (!rows || std::string(rows) != "0");
     static auto compiled_metal = mlx::core::compile(complete_gdn_metal<false>);
     static auto compiled_prefetch = mlx::core::compile(complete_gdn_metal<true>);
     const auto pf = qwen4_env("MLX_QWEN4_GDN_DECODE_PREFETCH");

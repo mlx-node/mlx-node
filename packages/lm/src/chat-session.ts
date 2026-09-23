@@ -577,9 +577,9 @@ export interface SessionCapableModel {
    *
    * A dense Qwen3.8 target can attach `z-lab/Qwen3.8-27B-DFlash2`. Its
    * checkpoint block size is 8 total target rows: one anchor plus seven
-   * proposals. With `mtpDepth` unset all seven proposals are used; an
-   * explicit value clamps to `[1, 7]`. `mtpAdaptiveDepth` is off by default
-   * and may be enabled explicitly for the engine's measured AR fallback.
+   * proposals. The full checkpoint width is used; `mtpDepth` is ignored.
+   * `mtpAdaptiveDepth` is also ignored for this fixed-width companion.
+   * Native MTP and other draft families retain their own adaptive policies.
    * DFlash2 uses flat target caches so hybrid GDN state can be rewound by
    * snapshot plus tape replay after verification.
    *

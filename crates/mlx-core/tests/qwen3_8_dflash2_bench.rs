@@ -10,8 +10,8 @@
 //! Decode lines report the speculative-cycle decomposition:
 //! `A` = committed tokens/cycle (numerator) and `C` = ms/cycle
 //! (denominator), so `decode_tps ≈ 1000·A/C`. A throughput change is only
-//! interpretable alongside both. `d<N>` is the configured `mtp_depth`
-//! label — the actual proposal width is `mtp_mean_depth`.
+//! interpretable alongside both. DFlash2 uses its checkpoint proposal width;
+//! `mtp_mean_depth` reports the actual mean proposal width after budget clamping.
 
 use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::qwen3_5::model::{Qwen3_5Model, Qwen35LoadOptions};
@@ -111,7 +111,6 @@ async fn qwen38_dflash2_perf() {
                 temperature: Some(0.0),
                 report_performance: Some(true),
                 enable_mtp: Some(true),
-                mtp_depth: Some(4),
                 reasoning_effort: Some("none".to_string()),
                 ..ChatConfig::default()
             },
@@ -124,7 +123,7 @@ async fn qwen38_dflash2_perf() {
         );
     }
 
-    // --- Decode: medium prompt, long generation, depth sweep -------------
+    // --- Decode: medium prompt, fixed checkpoint width, long generation ---
     let medium_prompt = std::env::var("MLX_BENCH_PROMPT")
         .map(|p| {
             if let Some(f) = p.strip_prefix('@') {
@@ -142,36 +141,30 @@ async fn qwen38_dflash2_perf() {
             }
         })
         .unwrap_or_else(|_| "Write a short story about a robot learning to paint.".to_string());
-    let depths: Vec<i32> = std::env::var("MLX_BENCH_DEPTHS")
-        .map(|s| s.split(',').filter_map(|d| d.trim().parse().ok()).collect())
-        .unwrap_or_else(|_| vec![4, 8]);
-    for depth in depths {
-        for rep in 0..3 {
-            model.reset_caches().await.expect("reset");
-            let r = chat(
-                medium_prompt.clone(),
-                ChatConfig {
-                    max_new_tokens: Some(256),
-                    temperature: Some(0.0),
-                    report_performance: Some(true),
-                    enable_mtp: Some(true),
-                    mtp_depth: Some(depth),
-                    reasoning_effort: Some("none".to_string()),
-                    ..ChatConfig::default()
-                },
-            )
-            .await;
-            print_perf(
-                &format!("decode_dflash2_d{depth} rep{rep}"),
-                r.num_tokens,
-                r.performance.as_ref().expect("perf"),
-            );
-            if rep == 0 {
-                // char-boundary truncation: byte-slicing panics when 400
-                // lands inside a multibyte char (non-ASCII completions).
-                let text: String = r.text.chars().take(400).collect();
-                eprintln!("[bench] d{depth} finish={} text: {}", r.finish_reason, text);
-            }
+    for rep in 0..3 {
+        model.reset_caches().await.expect("reset");
+        let r = chat(
+            medium_prompt.clone(),
+            ChatConfig {
+                max_new_tokens: Some(256),
+                temperature: Some(0.0),
+                report_performance: Some(true),
+                enable_mtp: Some(true),
+                reasoning_effort: Some("none".to_string()),
+                ..ChatConfig::default()
+            },
+        )
+        .await;
+        print_perf(
+            &format!("decode_dflash2 rep{rep}"),
+            r.num_tokens,
+            r.performance.as_ref().expect("perf"),
+        );
+        if rep == 0 {
+            // char-boundary truncation: byte-slicing panics when 400
+            // lands inside a multibyte char (non-ASCII completions).
+            let text: String = r.text.chars().take(400).collect();
+            eprintln!("[bench] dflash2 finish={} text: {}", r.finish_reason, text);
         }
     }
 

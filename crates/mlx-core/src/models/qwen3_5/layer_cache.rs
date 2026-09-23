@@ -89,33 +89,25 @@ impl Qwen3_5LayerCache {
     ///   K/V buffer is reused in place. After [`Self::restore`], the slots beyond
     ///   the snapshotted offset become "free for reuse" and the next
     ///   `update_and_fetch` overwrites them. No tensor data is copied.
-    /// * **Linear / GDN**: clones `conv_state` and `recurrent_state`. Both arrays
-    ///   are replaced (not mutated in place) on every decode step, but we issue
-    ///   an explicit `MxArray::copy()` so the saved handle owns independent
-    ///   storage in the MLX graph — matching MTPLX's
-    ///   `cache_state._clone_tree` invariant and guarding against any future
-    ///   GDN path that introduces in-place mutation.
+    /// * **Linear / GDN**: retains immutable aliases of `conv_state` and
+    ///   `recurrent_state`. Each decode step replaces those cache slots with
+    ///   new arrays, so the saved handles keep the pre-verify values alive
+    ///   without adding copy operations to the graph.
     ///
-    /// # Lazy-copy invariant
-    ///
-    /// `MxArray::copy()` is **lazy**: it appends a copy node to the MLX
-    /// compute graph rather than performing an immediate `memcpy`. The
-    /// snapshot is therefore captured against whatever the live cache array
-    /// represents *at evaluation time*, not at the moment `snapshot()`
-    /// returns.
+    /// # Immutable-state invariant
     ///
     /// **Safety contract**: no in-place mutation of `conv_state` /
     /// `recurrent_state` is performed by any forward path in the qwen3_5 /
     /// qwen3_5_moe stack — every decode step replaces the cache slot with a
-    /// fresh `MxArray` handle. As long as that contract holds, the lazy copy
+    /// fresh `MxArray` handle. As long as that contract holds, the alias
     /// is functionally equivalent to a materialized snapshot for the
     /// purposes of speculative decode rollback.
     ///
     /// If a future change introduces in-place mutation on Linear caches
     /// (e.g. writing into an existing `conv_state` buffer rather than
-    /// allocating a new one), this API MUST be updated to call `eval()` on
-    /// each cloned `MxArray` before the mutation occurs, so the snapshot
-    /// materializes against the pre-mutation tensor.
+    /// allocating a new one), this API MUST first create independent copies
+    /// and evaluate them before the mutation. Evaluating an alias alone does
+    /// not detach its storage or protect the snapshot against mutation.
     ///
     /// # Paged-KV caveat
     ///
@@ -153,19 +145,9 @@ impl Qwen3_5LayerCache {
                 // place). The snapshotted Arc keeps the pre-verify descriptor
                 // and buffer alive and untouched until `restore` rebinds it —
                 // same values as `.copy()` without ~72 copy kernels per
-                // verify cycle. MLX_SNAPSHOT_STATE_COPY=1 restores the old
-                // defensive copies for A/B.
-                let eager_copy = std::env::var_os("MLX_SNAPSHOT_STATE_COPY").is_some();
-                let conv_state = match c.get(0) {
-                    Some(arr) if eager_copy => Some(arr.copy()?),
-                    Some(arr) => Some(arr.clone()),
-                    None => None,
-                };
-                let recurrent_state = match c.get(1) {
-                    Some(arr) if eager_copy => Some(arr.copy()?),
-                    Some(arr) => Some(arr.clone()),
-                    None => None,
-                };
+                // verify cycle.
+                let conv_state = c.get(0).cloned();
+                let recurrent_state = c.get(1).cloned();
                 Ok(Qwen3_5LayerSnapshot::Linear {
                     conv_state,
                     recurrent_state,
@@ -537,20 +519,9 @@ mod tests {
             } => {
                 assert!(conv_state.is_some());
                 assert!(recurrent_state.is_some());
-                // Document the lazy-eval contract: `snapshot()` produces a
-                // lazy `MxArray::copy()` graph node. Forcing `eval()` here
-                // materializes the copy against the *current* tensor data,
-                // BEFORE we mutate the live cache below. Without this, the
-                // restore round-trip would still pass today (because the
-                // cache slot is replaced, not mutated in place) — but it
-                // would silently start failing the moment any future GDN
-                // path introduces in-place mutation.
-                if let Some(arr) = conv_state {
-                    arr.eval();
-                }
-                if let Some(arr) = recurrent_state {
-                    arr.eval();
-                }
+                // Do not evaluate the snapshot before replacing the live
+                // slots: its immutable aliases must preserve the old values
+                // independently of when the lazy graph is evaluated.
             }
             _ => panic!("expected Linear snapshot"),
         }

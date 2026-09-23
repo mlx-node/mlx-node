@@ -155,7 +155,8 @@ export interface MappedRequest {
  *     assistant draft clamps to [1, 8]. The server therefore only
  *     rejects garbage — non-integers, non-positives, and values
  *     > 64 (a generous sanity ceiling far above any family's real
- *     clamp) — which saves a round-trip into the model thread.
+ *     clamp) — which saves a round-trip into the model thread. Qwen DFlash2
+ *     uses its checkpoint block width and ignores this native-MTP override.
  *
  * Kept as a pure helper rather than inlined into each mapper so the
  * two endpoints can't drift in semantics.

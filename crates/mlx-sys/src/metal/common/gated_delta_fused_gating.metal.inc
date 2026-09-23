@@ -1,7 +1,7 @@
 // Fused GDN gating kernel: computes beta and g from raw inputs.
 //
 //   beta = sigmoid(b)
-//   g    = -exp(a_log[head_idx]) * softplus(a + dt_bias[head_idx])
+//   g    = exp(-exp(a_log[head_idx]) * softplus(a + dt_bias[head_idx]))
 //
 // where softplus(x) = x > 20 ? x : log(1 + exp(x))  (numerically stable)
 //
@@ -11,14 +11,13 @@
 //   a_log:  [num_heads]      (f32)  -- per-head log-scale (always f32)
 //   dt_bias:[num_heads]      (f32)  -- per-head bias (always f32)
 //   beta:   [total_elements] (InT)  -- output: sigmoid(b)
-//   g_out:  [total_elements] (f32)  -- output: gate value (f32 for log-space accumulation)
-//           When EMIT_EXP is set the output is exp(g) — the decay factor the
-//           per-step recurrence kernel consumes — saving a separate Exp dispatch.
+//   g_out:  [total_elements] (f32)  -- output: exp-space decay factor consumed
+//           by the per-step recurrence, saving a separate Exp dispatch.
 //
 // Grid:  (total_elements,)
 // Block: (256,) or similar
 //
-// Template params: InT (bfloat16_t or half), EMIT_EXP (bool)
+// Template params: InT (bfloat16_t or half)
 R"(
     auto idx = thread_position_in_grid.x;
     if (idx >= total_elements) return;
@@ -39,5 +38,5 @@ R"(
     float g_val = -exp(a_log_val) * softplus_val;
 
     beta_out[idx] = static_cast<InT>(beta_val);
-    g_out[idx] = EMIT_EXP ? exp(g_val) : g_val;
+    g_out[idx] = exp(g_val);
 )"

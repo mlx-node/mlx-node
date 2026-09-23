@@ -18,10 +18,6 @@ static const char* gated_delta_sources[] = {
     #include "metal/common/gated_delta_step_vec_mask.metal.inc"
 };
 
-static const char* gated_delta_chunked_source =
-    #include "metal/common/gated_delta_chunked.metal.inc"
-;
-
 // E47 (catalog D1): per-step kernel with 2 v-columns per simdgroup.
 // Same shape contract as gated_delta_sources[0] (non-vec, non-mask) but each
 // simdgroup processes dv_A=2y and dv_B=2y+1, sharing q[Dk] + k[Dk] loads.
@@ -30,7 +26,7 @@ static const char* gated_delta_step_2vcol_source =
     #include "metal/common/gated_delta_step_2vcol.metal.inc"
 ;
 
-// E48: per-step kernel with 4 v-columns per simdgroup.
+// Qwen4 per-step kernel with 4 v-columns per simdgroup.
 // Extends E47 by another factor. Grid Y must be quartered by the dispatcher.
 static const char* gated_delta_step_4vcol_source =
     #include "metal/common/gated_delta_step_4vcol.metal.inc"
@@ -171,13 +167,11 @@ static bool gated_delta_kernel_impl(
             {"Hv", Hv},
         };
 
-        // per_step_variant: default = E47 (2 v-cols). Opt-in:
-        //   MLX_ENABLE_E48_GDN_4VCOL=1 → 4 v-cols (E48 experimental).
-        //   MLX_DISABLE_E47_GDN_2VCOL=1 → legacy 1 v-col (overrides E48).
+        // Use two v-columns when eligible; Qwen4 can prefer four columns.
         int per_step_variant = 0;
         bool elig = !has_mask && !vectorized;
-        if (elig && std::getenv("MLX_DISABLE_E47_GDN_2VCOL") == nullptr) {
-            if ((prefer_four || std::getenv("MLX_ENABLE_E48_GDN_4VCOL") != nullptr) && Dv % 4 == 0) {
+        if (elig) {
+            if (prefer_four && Dv % 4 == 0) {
                 per_step_variant = 2;
             } else if (Dv % 2 == 0) {
                 per_step_variant = 1;
@@ -227,95 +221,7 @@ static bool gated_delta_kernel_impl(
     }
 }
 
-/// Chunked gated delta recurrence for prefill (BT=32 tokens per chunk).
-/// Accepts native [B, S, Hv, D] layout — no transposes needed.
-/// All inputs must have GQA already expanded (Hk == Hv).
-bool mlx_gated_delta_chunked(
-    mlx_array* q_handle,
-    mlx_array* k_handle,
-    mlx_array* v_handle,
-    mlx_array* g_handle,
-    mlx_array* beta_handle,
-    mlx_array* state_handle,
-    mlx_array** out_y,
-    mlx_array** out_state
-) {
-    try {
-        auto& q_arr = *reinterpret_cast<array*>(q_handle);
-        auto& k_arr = *reinterpret_cast<array*>(k_handle);
-        auto& v_arr = *reinterpret_cast<array*>(v_handle);
-        auto& g_arr = *reinterpret_cast<array*>(g_handle);
-        auto& beta_arr = *reinterpret_cast<array*>(beta_handle);
-        auto& state_arr = *reinterpret_cast<array*>(state_handle);
-
-        // Native layout: q,k [B,S,Hv,Dk], v [B,S,Hv,Dv], g,beta [B,S,Hv], state [B,Hv,Dv,Dk]
-        int B  = q_arr.shape(0);
-        int S  = q_arr.shape(1);
-        int Hv = v_arr.shape(2);
-        int Dk = q_arr.shape(3);
-        int Dv = v_arr.shape(3);
-
-        constexpr int BT = 32;
-        int DV_PER_TG = std::min(4, Dv);
-
-        auto input_type = q_arr.dtype();
-        auto S_arr = array(S, mlx::core::int32);
-
-        // Pass tensors directly — no transpose, no reshape
-        std::vector<array> inputs = {q_arr, k_arr, v_arr, g_arr, beta_arr, state_arr, S_arr};
-
-        static std::mutex chunked_mutex;
-        static std::optional<fast::CustomKernelFunction> chunked_kernel;
-        {
-            std::lock_guard<std::mutex> lock(chunked_mutex);
-            if (!chunked_kernel.has_value()) {
-                chunked_kernel = fast::metal_kernel(
-                    "gated_delta_chunked",
-                    {"q", "k", "v", "g", "beta", "state_in", "S"},
-                    {"y", "state_out"},
-                    gated_delta_chunked_source
-                );
-            }
-        }
-
-        std::vector<std::pair<std::string, fast::TemplateArg>> template_args = {
-            {"InT", input_type},
-            {"BT", BT},
-            {"BK", Dk},
-            {"DV_PER_TG", DV_PER_TG},
-            {"Dv", Dv},
-            {"Hv", Hv},
-        };
-
-        auto results = chunked_kernel.value()(
-            inputs,
-            // Output shapes match kernel's native write layout
-            {Shape{B, S, Hv, Dv}, Shape{B, Hv, Dv, Dk}},
-            {input_type, mlx::core::float32},
-            std::make_tuple(32, Dv, B * Hv),         // Grid: (32, Dv, B*Hv)
-            std::make_tuple(32, DV_PER_TG, 1),       // Threadgroup: (32, DV_PER_TG, 1)
-            template_args,
-            std::nullopt,
-            false,
-            mlx::core::default_stream(Device::gpu)
-        );
-
-        // Outputs already in native layout — just cast state f32 → model dtype
-        auto& y_out = results[0];
-        auto state_out = astype(results[1], input_type);
-
-        *out_y = reinterpret_cast<mlx_array*>(new array(std::move(y_out)));
-        *out_state = reinterpret_cast<mlx_array*>(new array(std::move(state_out)));
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "mlx_gated_delta_chunked error: " << e.what() << std::endl;
-        *out_y = nullptr;
-        *out_state = nullptr;
-        return false;
-    }
-}
-
-/// Fused GDN gating: computes beta = sigmoid(b) and g = -exp(a_log) * softplus(a + dt_bias).
+/// Fused GDN gating: beta = sigmoid(b), g = exp(-exp(a_log) * softplus(a + dt_bias)).
 /// Returns (beta, g) via output pointers.
 /// a_log and dt_bias are always f32 (per-head). b, a are InT. beta is InT, g is f32.
 bool mlx_fused_gdn_gating(
@@ -325,7 +231,6 @@ bool mlx_fused_gdn_gating(
     mlx_array* dt_bias_handle,
     int num_heads,
     int total_elements,
-    bool emit_exp,
     mlx_array** out_beta,
     mlx_array** out_g
 ) {
@@ -358,7 +263,6 @@ bool mlx_fused_gdn_gating(
 
         std::vector<std::pair<std::string, fast::TemplateArg>> template_args = {
             {"InT", input_type},
-            {"EMIT_EXP", emit_exp},
         };
 
         int threads = 256;
@@ -439,7 +343,7 @@ mlx_array* mlx_fused_compute_g(mlx_array* a_log_ptr, mlx_array* a_ptr, mlx_array
 
 /// Returns the GPU architecture generation number.
 /// M1=13, M2=14, M3=15, M4=16, M5=17.
-/// Used by Rust to gate chunked GDN kernel on M5+ (Neural Accelerators).
+/// Shared by runtime capability checks and profiling.
 int32_t mlx_gpu_architecture_gen() {
     try {
         auto& info = mlx::core::gpu::device_info(0);

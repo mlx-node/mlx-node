@@ -215,10 +215,7 @@ impl DecoderLayer {
 
         // Residual + post-attention norm (fused add_rmsnorm when eligible)
         let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-
-        // Residual connection
-        h.add(&mlp_out)
+        h.add(&self.mlp.forward(&normed)?)
     }
 
     /// Compiled-verify forward for the DFlash2 flat-cache path — the same
@@ -251,8 +248,7 @@ impl DecoderLayer {
         };
 
         let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        h.add(&mlp_out)
+        h.add(&self.mlp.forward(&normed)?)
     }
 
     /// Forward pass with paged-or-flat dispatch for Qwen3.5.
@@ -346,8 +342,7 @@ impl DecoderLayer {
                 // Residual + post-attention norm (fused when eligible).
                 let (h, normed) =
                     Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-                let mlp_out = self.mlp.forward(&normed)?;
-                h.add(&mlp_out)
+                h.add(&self.mlp.forward(&normed)?)
             }
         }
     }
@@ -399,8 +394,7 @@ impl DecoderLayer {
                     attn.forward_paged_batched(&normed, adapter, paged_idx, rows, false)?;
                 let (h, normed) =
                     Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-                let mlp_out = self.mlp.forward(&normed)?;
-                h.add(&mlp_out)
+                h.add(&self.mlp.forward(&normed)?)
             }
         }
     }
@@ -479,8 +473,7 @@ impl DecoderLayer {
                 )?;
                 let (h, normed) =
                     Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-                let mlp_out = self.mlp.forward(&normed)?;
-                h.add(&mlp_out)
+                h.add(&self.mlp.forward(&normed)?)
             }
         }
     }

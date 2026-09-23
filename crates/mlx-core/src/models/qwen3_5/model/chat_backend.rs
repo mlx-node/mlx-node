@@ -14,11 +14,12 @@ pub(super) fn resolve_qwen35_chat_params(
     crate::engine::apply_generation_defaults(&mut merged, defaults);
     let mut params = crate::engine::extract_chat_params(&merged);
     if let Some(block_size) = dflash_block_size {
-        params.mtp_depth = config
-            .mtp_depth
-            .map(|depth| (depth.max(1) as usize).min(block_size))
-            .unwrap_or(block_size);
-        params.mtp_adaptive_depth = config.mtp_adaptive_depth.unwrap_or(false);
+        // DFlash uses the companion's trained proposal width. The shared
+        // mtpDepth option belongs to native MTP, not this block draft.
+        params.mtp_depth = block_size;
+        // This companion uses fixed-width speculation; shared adaptive
+        // controls remain available to native MTP and other draft families.
+        params.mtp_adaptive_depth = false;
     }
     params
 }
