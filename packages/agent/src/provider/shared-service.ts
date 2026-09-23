@@ -51,7 +51,11 @@ export async function startSharedService(options: {
       response.writeHead(404).end();
       return;
     }
-    if (active >= SHARED_REQUEST_LIMIT || closing) {
+    if (closing) {
+      response.writeHead(503).end('Shared inference worker is retiring.');
+      return;
+    }
+    if (active >= SHARED_REQUEST_LIMIT) {
       response.writeHead(429).end('Shared inference queue is full.');
       return;
     }

@@ -139,10 +139,8 @@ describe('shared delegate service transport', () => {
     });
     const local = vi.fn();
     const host = { modelInfo: () => request.profile.discovered, runWithResident: local } as unknown as StreamSimpleHost;
-    const stream = sharedStreamFactory(request.profile, async () => service.endpoint)(host)(
-      request.model,
-      request.context,
-    );
+    const connect = vi.fn(async () => service.endpoint);
+    const stream = sharedStreamFactory(request.profile, connect)(host)(request.model, request.context);
     const events = [];
     for await (const event of stream) events.push(event);
     expect(events).toHaveLength(1);
@@ -152,6 +150,68 @@ describe('shared delegate service transport', () => {
       error: { errorMessage: 'Shared inference connection ended before completion.' },
     });
     expect(local).not.toHaveBeenCalled();
+    expect(connect).toHaveBeenCalledOnce();
+  });
+
+  it('reconnects when a healthy worker retires before accepting the stream', async () => {
+    const originalStream = vi.fn(async function* () {
+      yield { error: 'primed' };
+    });
+    const service = await fixture(originalStream);
+    await (
+      await fetch(`${service.url}/stream`, { method: 'POST', headers: service.headers, body: JSON.stringify(request) })
+    ).text();
+    let release!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    service.closeBackend.mockImplementation(() => cleanupGate);
+    let closing: Promise<void> | undefined;
+    const replacementStream = vi.fn(async function* () {
+      yield {
+        event: {
+          type: 'done',
+          reason: 'stop',
+          message: { content: [{ type: 'text', text: 'replacement finished' }] },
+        },
+      } as never;
+    });
+    const connect = vi.fn(async () => {
+      if (!closing) {
+        const health = await fetch(`${service.url}/health`, { headers: service.headers });
+        expect(health.ok).toBe(true);
+        await health.body?.cancel();
+        // Deterministically place shutdown between discovery and POST /stream.
+        closing = service.close();
+        return service.endpoint;
+      }
+      release();
+      await closing;
+      const replacement = await startSharedService({
+        directory: service.directory,
+        port: service.endpoint.port,
+        loadBackend: async () => ({ stream: replacementStream, busy: () => false, close: async () => {} }),
+      });
+      cleanup.push(() => replacement.close());
+      return replacement.endpoint;
+    });
+    const local = vi.fn();
+    const host = { modelInfo: () => request.profile.discovered, runWithResident: local } as unknown as StreamSimpleHost;
+    try {
+      const stream = sharedStreamFactory(request.profile, connect)(host)(request.model, request.context);
+      const events = [];
+      for await (const event of stream) events.push(event);
+      expect(events).toEqual([
+        { type: 'done', reason: 'stop', message: { content: [{ type: 'text', text: 'replacement finished' }] } },
+      ]);
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(originalStream).toHaveBeenCalledOnce();
+      expect(replacementStream).toHaveBeenCalledOnce();
+      expect(local).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await closing;
+    }
   });
 
   it('cancels only the disconnected request and allows the other to finish', async () => {

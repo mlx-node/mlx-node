@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { open, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -59,35 +59,77 @@ export async function ensureSharedWorker(signal?: AbortSignal): Promise<SharedEn
   const running = await probe();
   if (running) return running;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const log = await open(join(directory, 'service.log'), 'a', 0o600);
-  let spawnError: Error | undefined;
-  try {
-    const entry = new URL(
-      import.meta.url.endsWith('.ts') ? './shared-worker.ts' : './shared-worker.js',
-      import.meta.url,
-    );
-    const child = spawn(
-      process.execPath,
-      [...process.execArgv.filter((arg) => !arg.startsWith('--inspect')), fileURLToPath(entry)],
-      { detached: true, stdio: ['ignore', 'ignore', log.fd] },
-    );
-    child.on('error', (error) => {
-      spawnError = error;
-    });
-    child.unref();
-  } finally {
-    await log.close();
-  }
   const deadline = Date.now() + 15_000;
+  let child: ChildProcess | undefined;
+  let spawnError: Error | undefined;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     if (spawnError) throw spawnError;
+    if (!child || child.exitCode === 0) {
+      // A contender exits successfully if the retiring worker still holds the
+      // election port. Try again after it exits, once cleanup can release it.
+      const log = await open(join(directory, 'service.log'), 'a', 0o600);
+      try {
+        const entry = new URL(
+          import.meta.url.endsWith('.ts') ? './shared-worker.ts' : './shared-worker.js',
+          import.meta.url,
+        );
+        child = spawn(
+          process.execPath,
+          [...process.execArgv.filter((arg) => !arg.startsWith('--inspect')), fileURLToPath(entry)],
+          { detached: true, stdio: ['ignore', 'ignore', log.fd] },
+        );
+        child.on('error', (error) => {
+          spawnError = error;
+        });
+        child.unref();
+      } finally {
+        await log.close();
+      }
+    }
     await delay(100, undefined, { signal });
     const endpoint = await probe();
     if (endpoint) return endpoint;
+    if (child.exitCode !== null && child.exitCode !== 0) break;
+    if (child.signalCode !== null) break;
   }
   throw new Error(
     `The shared delegate service could not start. See ${join(directory, 'service.log')}. No local model was loaded.`,
   );
+}
+
+async function openSharedStream(
+  body: string,
+  connect: typeof ensureSharedWorker,
+  signal?: AbortSignal,
+): Promise<ReadableStream<Uint8Array>> {
+  for (let attempt = 0; ; attempt++) {
+    signal?.throwIfAborted();
+    const endpoint = await connect(signal);
+    let response: Response;
+    try {
+      response = await fetch(`http://127.0.0.1:${endpoint.port}/stream`, {
+        method: 'POST',
+        redirect: 'error',
+        signal,
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${endpoint.token}` },
+        body,
+      });
+    } catch (error) {
+      signal?.throwIfAborted();
+      // Connection refusal proves that inference never started. A reset or a
+      // truncated response does not, so those failures must not replay a turn.
+      if (attempt < 2 && error instanceof Error && (error.cause as NodeJS.ErrnoException)?.code === 'ECONNREFUSED')
+        continue;
+      throw error;
+    }
+    if (response.ok && response.body) return response.body;
+    await response.body?.cancel();
+    // Retirement and stale credentials both reject before backend admission.
+    // Queue saturation (429) is deliberately not a worker rotation signal.
+    if (attempt < 2 && (response.status === 503 || response.status === 401)) continue;
+    throw new Error(`Shared delegate inference failed (HTTP ${response.status}).`);
+  }
 }
 
 export function sharedStreamFactory(
@@ -149,22 +191,10 @@ export function sharedStreamFactory(
       const abort = () => fail(new Error('Request was aborted'));
       options?.signal?.addEventListener('abort', abort, { once: true });
       void (async () => {
-        options?.signal?.throwIfAborted();
-        const endpoint = await connect(options?.signal);
-        const response = await fetch(`http://127.0.0.1:${endpoint.port}/stream`, {
-          method: 'POST',
-          redirect: 'error',
-          signal: options?.signal,
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${endpoint.token}` },
-          body: JSON.stringify(request),
-        });
-        if (!response.ok || !response.body) {
-          await response.body?.cancel();
-          throw new Error(`Shared delegate inference failed (HTTP ${response.status}).`);
-        }
+        const body = await openSharedStream(JSON.stringify(request), connect, options?.signal);
         let buffered = '';
         const decoder = new TextDecoder();
-        const reader = response.body.getReader();
+        const reader = body.getReader();
         try {
           while (!settled) {
             const { done, value } = await reader.read();
