@@ -23,7 +23,7 @@ use super::dflash2::DFlash2ContextCache;
 use super::layer_cache::{
     Qwen3_5LayerCache, Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp,
 };
-use super::model::{PREFILL_STEP_SIZE, Qwen35Inner, async_eval_layer_caches};
+use super::model::{PREFILL_STEP_SIZE, Qwen35Inner};
 
 pub(crate) struct DFlash2TurnState {
     context: DFlash2ContextCache,
@@ -301,7 +301,15 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             rng,
         )?;
         let (draft_ids, device_draft_ids) = match path {
-            super::dflash2::SelectorPath::Device(ids) => (Vec::new(), Some(ids)),
+            super::dflash2::SelectorPath::Device(ids) => {
+                // Queue the draft before the verify graph is built so the GPU
+                // is not idle during that host work. Off Metal this call is a
+                // blocking eval, which would only serialize the two builds.
+                if unsafe { mlx_sys::mlx_metal_is_available() } {
+                    MxArray::async_eval_arrays(&[&ids]);
+                }
+                (Vec::new(), Some(ids))
+            }
             super::dflash2::SelectorPath::Host(ids) => (ids, None),
         };
         Ok(DsparkProposal {
@@ -477,8 +485,11 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     }
 
     fn eval_boundary(&self, token: &MxArray) {
-        async_eval_layer_caches(&self.inner.caches);
-        MxArray::async_eval_arrays(&[token]);
+        let mut arrays: Vec<&MxArray> = Vec::new();
+        crate::models::forward::CollectCacheArrays::collect_arrays(&self.inner.caches, &mut arrays);
+        self.context.collect_arrays(&mut arrays);
+        arrays.push(token);
+        MxArray::async_eval_arrays(&arrays);
     }
 
     fn frontier(&self) -> Option<SpecFrontier> {
@@ -1151,7 +1162,9 @@ mod tests {
             cache.collect_arrays(&mut target_arrays);
         }
         let target_cache = array_fingerprints(target_arrays)?;
-        let draft_cache = array_fingerprints(step.context.cache_arrays_for_stepper_test())?;
+        let mut draft_arrays = Vec::new();
+        step.context.collect_arrays(&mut draft_arrays);
+        let draft_cache = array_fingerprints(draft_arrays)?;
         let context_tokens = step.context.token_history().to_vec();
         step.finish()?;
 
@@ -1404,7 +1417,9 @@ mod tests {
         let frontier = step.frontier().expect("fixture frontier");
         let target_cache =
             live_target_cache_fingerprints(step.inner.caches.as_ref().expect("fixture caches"))?;
-        let draft_cache = array_fingerprints(step.context.cache_arrays_for_stepper_test())?;
+        let mut draft_arrays = Vec::new();
+        step.context.collect_arrays(&mut draft_arrays);
+        let draft_cache = array_fingerprints(draft_arrays)?;
         let context_tokens = step.context.token_history().to_vec();
         step.finish()?;
 
@@ -1606,8 +1621,12 @@ mod tests {
         }
         let expected_target =
             array_fingerprints(reference_target_arrays).expect("reference target state");
-        let expected_draft = array_fingerprints(reference.context.cache_arrays_for_stepper_test())
-            .expect("reference draft state");
+        let mut reference_draft_arrays = Vec::new();
+        reference
+            .context
+            .collect_arrays(&mut reference_draft_arrays);
+        let expected_draft =
+            array_fingerprints(reference_draft_arrays).expect("reference draft state");
         let expected_tokens = reference.context.token_history().to_vec();
         let expected_frontier = reference.frontier();
         let mut rng = rand::rngs::StdRng::seed_from_u64(11);
@@ -1668,7 +1687,8 @@ mod tests {
             .dflash2_context
             .as_ref()
             .expect("published draft context");
-        let draft_arrays = context.cache_arrays_for_stepper_test();
+        let mut draft_arrays = Vec::new();
+        context.collect_arrays(&mut draft_arrays);
         assert!(!target_arrays.is_empty() && !draft_arrays.is_empty());
         assert_eq!(context.token_history(), expected_tokens.as_slice());
         // Finish preserves lazy publication. Consuming these roots must still
@@ -1705,5 +1725,271 @@ mod tests {
         assert!(actual_proposal.device_draft_ids.is_none());
         assert_eq!(actual_proposal.draft_ids, expected_proposal.draft_ids);
         continuation.finish().expect("publish resumed context");
+    }
+
+    fn metal_is_default_device() -> bool {
+        crate::engine::persistence::compiled_forward_backend_available()
+            && unsafe { mlx_sys::mlx_default_device() } == 1
+    }
+
+    fn is_available(array: &MxArray) -> bool {
+        unsafe { mlx_sys::mlx_array_is_available(array.as_raw_ptr()) }
+    }
+
+    fn greedy_params() -> crate::engine::params::ChatParams {
+        extract_chat_params(&ChatConfig {
+            temperature: Some(0.0),
+            ..ChatConfig::default()
+        })
+    }
+
+    /// Prefill `[1, 2, 3, 4]` and open a stepper. The caller must hold a
+    /// `StreamContext` on the generation stream for the whole test, so
+    /// `synchronize()` waits on the stream the stepper submits to.
+    fn begin_seeded_step(
+        inner: &mut Qwen35Inner,
+        stream: Stream,
+    ) -> Result<(Qwen35DFlash2Stepper<'_>, u32)> {
+        reset_flat_fixture(inner);
+        let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+        let anchor = prefill_logits.argmax(-1, None)?;
+        anchor.eval();
+        let anchor = anchor.item_at_int32(0)? as u32;
+        super::super::model::eval_layer_caches(&inner.caches)?;
+        inner.dflash2_turn_state = Some(state);
+        let block_size = inner
+            .dflash2
+            .as_ref()
+            .expect("tiny companion")
+            .config
+            .block_size;
+        Ok((inner.begin_dspark_decode(block_size)?, anchor))
+    }
+
+    #[test]
+    fn device_proposal_is_submitted_before_verify() -> Result<()> {
+        if !metal_is_default_device() {
+            eprintln!("SKIP device proposal submission: Metal must be the default device");
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner(0xDFA5_2204);
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let (mut step, anchor) = begin_seeded_step(&mut inner, stream)?;
+        let ids = std::iter::once(anchor).chain(1..8).collect::<Vec<_>>();
+        step.verify(&ids)?.logits.eval();
+        step.commit_with_provenance(5, ids.len(), &ids)?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let proposal = step.propose(ids[4], 2, &greedy_params(), &mut rng)?;
+        let device_ids = proposal
+            .device_draft_ids
+            .as_ref()
+            .expect("greedy no-penalty proposal must stay device-resident");
+        crate::array::synchronize();
+        assert!(
+            is_available(device_ids),
+            "the device draft must be queued by propose, not by the verify eval"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn eval_boundary_submits_draft_context_append() -> Result<()> {
+        if !metal_is_default_device() {
+            eprintln!("SKIP boundary draft-context submission: Metal must be the default device");
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner(0xDFA5_2205);
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let (mut step, anchor) = begin_seeded_step(&mut inner, stream)?;
+        let ids = std::iter::once(anchor).chain(1..8).collect::<Vec<_>>();
+        step.verify(&ids)?.logits.eval();
+        step.commit_with_provenance(5, ids.len(), &ids)?;
+        let token = MxArray::from_int32(&[ids[5] as i32], &[1])?;
+        step.eval_boundary(&token);
+        crate::array::synchronize();
+        let mut draft_arrays = Vec::new();
+        step.context.collect_arrays(&mut draft_arrays);
+        assert!(!draft_arrays.is_empty());
+        for (index, array) in draft_arrays.iter().enumerate() {
+            assert!(
+                is_available(array),
+                "draft context root {index} was left for the next proposal eval"
+            );
+        }
+        let mut target_arrays = Vec::new();
+        crate::models::forward::CollectCacheArrays::collect_arrays(
+            &step.inner.caches,
+            &mut target_arrays,
+        );
+        assert!(!target_arrays.is_empty());
+        for (index, array) in target_arrays.iter().enumerate() {
+            assert!(is_available(array), "target cache root {index} not settled");
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum CycleScheduling {
+        /// Draft, verify and the draft-context append share one eval; the
+        /// boundary submits only the target caches.
+        Deferred,
+        /// The stepper's own propose/eval_boundary scheduling.
+        Stepper,
+    }
+
+    fn run_forced_keep_cycles(
+        inner: &mut Qwen35Inner,
+        scheduling: CycleScheduling,
+    ) -> Result<(Vec<Vec<i32>>, ArTrace)> {
+        const DRAFT_LEN: usize = 7;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let params = greedy_params();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let (mut step, mut anchor) = begin_seeded_step(inner, stream)?;
+
+        fn propose_device(
+            step: &mut Qwen35DFlash2Stepper<'_>,
+            scheduling: CycleScheduling,
+            anchor: u32,
+            params: &crate::engine::params::ChatParams,
+            rng: &mut rand::rngs::StdRng,
+        ) -> Result<MxArray> {
+            match scheduling {
+                CycleScheduling::Stepper => Ok(step
+                    .propose(anchor, DRAFT_LEN, params, rng)?
+                    .device_draft_ids
+                    .expect("greedy no-penalty proposal must stay device-resident")),
+                CycleScheduling::Deferred => {
+                    let draft = step.inner.dflash2.as_ref().expect("tiny companion");
+                    let (path, _) = draft.propose(
+                        &step.inner.embedding,
+                        step.inner.lm_head.as_ref(),
+                        &step.context,
+                        anchor,
+                        DRAFT_LEN,
+                        0.0,
+                        true,
+                        rng,
+                    )?;
+                    match path {
+                        super::super::dflash2::SelectorPath::Device(ids) => Ok(ids),
+                        super::super::dflash2::SelectorPath::Host(_) => {
+                            panic!("greedy device proposal expected")
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut drafts = Vec::new();
+        let mut logits_trace = Vec::new();
+        // keep=1 exercises the single-row append, keep>=2 the multi-row one,
+        // and a full keep wraps the sliding draft window.
+        for keep in [1, 3, DRAFT_LEN + 1, 2, 5, 1] {
+            let device_ids = propose_device(&mut step, scheduling, anchor, &params, &mut rng)?;
+            let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1])?;
+            let verify_ids = MxArray::concatenate(&anchor_arr, &device_ids, 0)?;
+            let logits = step.verify_device(&verify_ids)?.logits;
+            let argmax = logits.argmax(-1, None)?;
+            argmax.eval();
+            let draft = device_ids.to_int32()?.as_ref().to_vec();
+            let floats = logits.astype(DType::Float32)?;
+            floats.eval();
+            logits_trace.push(floats.to_float32()?.iter().map(|x| x.to_bits()).collect());
+            let mut verified = vec![anchor];
+            verified.extend(draft.iter().map(|&id| id as u32));
+            step.commit_with_provenance(keep, verified.len(), &verified)?;
+            anchor = argmax.item_at_int32(keep - 1)? as u32;
+            let token = MxArray::from_int32(&[anchor as i32], &[1])?;
+            match scheduling {
+                CycleScheduling::Stepper => step.eval_boundary(&token),
+                CycleScheduling::Deferred => {
+                    super::super::model::async_eval_layer_caches(&step.inner.caches);
+                    MxArray::async_eval_arrays(&[&token]);
+                }
+            }
+            drafts.push(draft);
+        }
+        let frontier = step.frontier().expect("fixture frontier");
+        let mut target_arrays = Vec::new();
+        for cache in step.inner.caches.as_ref().expect("fixture caches") {
+            cache.collect_arrays(&mut target_arrays);
+        }
+        let target_cache = array_fingerprints(target_arrays)?;
+        let mut draft_arrays = Vec::new();
+        step.context.collect_arrays(&mut draft_arrays);
+        let draft_cache = array_fingerprints(draft_arrays)?;
+        let context_tokens = step.context.token_history().to_vec();
+        step.finish()?;
+
+        let context = inner
+            .dflash2_context
+            .take()
+            .expect("retained draft context");
+        let next_position = context.logical_len();
+        inner.dflash2_turn_state = Some(DFlash2TurnState {
+            context,
+            next_position,
+        });
+        let block_size = inner
+            .dflash2
+            .as_ref()
+            .expect("tiny companion")
+            .config
+            .block_size;
+        let mut continuation = inner.begin_dspark_decode(block_size)?;
+        let continuation_draft =
+            propose_device(&mut continuation, scheduling, anchor, &params, &mut rng)?
+                .to_int32()?
+                .as_ref()
+                .to_vec();
+        continuation.finish()?;
+        Ok((
+            drafts,
+            ArTrace {
+                logits: logits_trace,
+                target_cache,
+                draft_cache,
+                context_tokens,
+                frontier,
+                continuation_draft,
+            },
+        ))
+    }
+
+    fn assert_cycle_scheduling_is_bit_exact(head_dim: i32, seed: u64) -> Result<()> {
+        if !metal_is_default_device() {
+            eprintln!("SKIP cycle scheduling exactness: Metal must be the default device");
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner_with_attention_head_dim(seed, head_dim);
+        let (expected_drafts, expected) =
+            run_forced_keep_cycles(&mut inner, CycleScheduling::Deferred)?;
+        let (actual_drafts, actual) = run_forced_keep_cycles(&mut inner, CycleScheduling::Stepper)?;
+        assert_eq!(
+            actual_drafts, expected_drafts,
+            "head_dim={head_dim}: per-cycle draft ids"
+        );
+        assert_trace_eq(
+            &actual,
+            &expected,
+            &format!("stepper scheduling head_dim={head_dim}"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_verify_cycle_scheduling_is_bit_exact() -> Result<()> {
+        assert_cycle_scheduling_is_bit_exact(64, 0xDFA5_2206)
+    }
+
+    #[test]
+    fn eager_verify_cycle_scheduling_is_bit_exact() -> Result<()> {
+        // Seeds whose tiny drafts ignore the anchor would hide a wrong-anchor
+        // proposal; this one does not.
+        assert_cycle_scheduling_is_bit_exact(32, 0xDFA5_2208)
     }
 }

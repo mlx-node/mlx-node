@@ -793,11 +793,15 @@ impl DFlash2ContextCache {
         &self.token_history
     }
 
+    pub(crate) fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
+        for cache in &self.layers {
+            cache.collect_cache_arrays(out);
+        }
+    }
+
     pub(crate) fn eval(&self) -> Result<()> {
         let mut arrays = Vec::new();
-        for cache in &self.layers {
-            cache.collect_cache_arrays(&mut arrays);
-        }
+        self.collect_arrays(&mut arrays);
         if arrays.is_empty() {
             Ok(())
         } else {
@@ -1052,17 +1056,6 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
         config,
         weight_bytes: 0,
     })
-}
-
-#[cfg(test)]
-impl DFlash2ContextCache {
-    pub(crate) fn cache_arrays_for_stepper_test(&self) -> Vec<&MxArray> {
-        let mut arrays = Vec::new();
-        for layer in &self.layers {
-            layer.collect_cache_arrays(&mut arrays);
-        }
-        arrays
-    }
 }
 
 fn required(params: &mut HashMap<String, MxArray>, key: &str, shape: &[i64]) -> Result<MxArray> {
