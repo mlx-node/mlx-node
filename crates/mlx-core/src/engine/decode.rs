@@ -821,7 +821,7 @@ mod run_decode_loop_tests {
     use crate::engine::params::{ChatParams, extract_chat_params};
     use crate::engine::penalties::ReasoningTracker;
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
-    use crate::stream::{DeviceType, Stream};
+    use crate::stream::Stream;
 
     /// Scripted stepper: forward call N returns `[1, vocab]` logits
     /// whose argmax is `script[N]` (the last entry repeats once the
@@ -958,7 +958,7 @@ mod run_decode_loop_tests {
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         run_decode_loop(
             step,
@@ -1197,7 +1197,7 @@ mod run_decode_loop_tests {
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         run_decode_loop(
             &mut step,
@@ -1286,7 +1286,7 @@ mod run_decode_loop_tests {
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         run_decode_loop(
             &mut step,
@@ -1446,7 +1446,7 @@ mod run_decode_loop_tests {
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         run_decode_loop(
             &mut step,
@@ -1545,7 +1545,7 @@ mod run_decode_loop_tests {
             let mut token_history: Vec<u32> = Vec::new();
             let mut finish_reason = String::from("length");
             let mut first_token_instant: Option<std::time::Instant> = None;
-            let generation_stream = Stream::new(DeviceType::Gpu);
+            let generation_stream = Stream::generation();
 
             run_decode_loop(
                 &mut step,
@@ -1620,7 +1620,7 @@ mod run_decode_loop_tests {
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         run_decode_loop(
             step,
@@ -1959,7 +1959,7 @@ mod run_decode_loop_tests {
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         run_decode_loop(
             &mut step,
@@ -2108,7 +2108,7 @@ mod run_decode_loop_tests {
                     finish_reason: &mut finish,
                     first_token_instant: &mut first,
                     report_perf: false,
-                    generation_stream: Stream::new(DeviceType::Gpu),
+                    generation_stream: Stream::generation(),
                     cancel_flag: Some(&cancel),
                     turn_token_observer: None,
                 },

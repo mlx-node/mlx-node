@@ -34,7 +34,7 @@ use crate::model_thread::ResponseTx;
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use crate::transformer::paged_policy::record_decode_wave;

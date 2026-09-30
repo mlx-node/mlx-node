@@ -15,7 +15,7 @@ impl Qwen35Inner {
         self.init_caches_sync()?;
 
         let embedding = self.embedding.clone();
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         // Prefill
         let prompt = prompt_tokens.reshape(&[1, -1])?;
@@ -163,7 +163,7 @@ impl Qwen35Inner {
             // Fresh turn-0 caches per row (prefill asserts `self.caches` is set,
             // and a stale cache would append rows into one growing context).
             self.init_caches_sync()?;
-            let generation_stream = Stream::new(DeviceType::Gpu);
+            let generation_stream = Stream::generation();
             // PREFILL ONLY — trips every mxfp8 attn/GDN tap once. No generated
             // token: a decode step would fold a synthetic argmax token's
             // activations into the amax.
@@ -386,7 +386,7 @@ impl Qwen35Inner {
         let return_logprobs = config.return_logprobs.unwrap_or(true);
 
         let embedding = self.embedding.clone();
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         // Use fresh caches for training (not shared inference caches)
         let mut training_caches: Option<Vec<Qwen3_5LayerCache>> = Some(
@@ -1545,7 +1545,7 @@ impl crate::quality::runner::EvalBackend for Qwen35Inner {
 
     fn teacher_forced_hidden(&mut self, tokens: &[u32]) -> Result<MxArray> {
         self.init_caches_sync()?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let hidden = crate::quality::runner::chunked_hidden(
             &tokens[..tokens.len() - 1],
             PREFILL_STEP_SIZE,

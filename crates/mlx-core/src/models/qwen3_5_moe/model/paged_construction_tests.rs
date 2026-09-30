@@ -1267,7 +1267,7 @@ fn moe_hybrid_n2_batched_decode_matches_scalar_replay() {
             .paged_prefill(
                 &prompt[prefix.effective_cached_prefix_len..],
                 &prefix,
-                Stream::new(DeviceType::Gpu),
+                Stream::generation(),
             )
             .expect("prefill sparse MoE request")
             .eval();
@@ -1589,7 +1589,7 @@ fn scheduled_mtp_owner_replay_matches_independent() {
                 .paged_prefill(
                     &prompt[prefix.effective_cached_prefix_len..],
                     &prefix,
-                    Stream::new(DeviceType::Gpu),
+                    Stream::generation(),
                 )
                 .unwrap()
                 .eval();

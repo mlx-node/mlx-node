@@ -40,7 +40,7 @@ use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::engine::spec_paged::{SpecPagedCache, VerifyTicket};
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 
 use super::assistant_decode::{AssistantTurnState, Gemma4AssistantStepper};
 use super::decoder_layer::Gemma4LayerKind;
@@ -861,7 +861,7 @@ impl Gemma4Inner {
             Vec::with_capacity(generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         let mut profiler = DecodeProfiler::new(
             ChatBackend::profiler_label(self, is_delta, is_streaming),
@@ -1557,7 +1557,7 @@ pub(crate) mod tests {
             &mut inner,
             suffix,
             &prefix,
-            Stream::new(DeviceType::Gpu),
+            Stream::generation(),
         )
         .expect("tapped paged prefill must succeed");
         assert!(

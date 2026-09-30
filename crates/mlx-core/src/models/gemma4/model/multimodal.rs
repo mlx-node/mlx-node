@@ -678,7 +678,7 @@ impl Gemma4Inner {
         let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
         let prompt_token_count = tokens.len();
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
 
         let generation_start = std::time::Instant::now();
@@ -910,7 +910,7 @@ impl Gemma4Inner {
         let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
         let prompt_token_count = tokens.len();
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
 
         let generation_start = std::time::Instant::now();

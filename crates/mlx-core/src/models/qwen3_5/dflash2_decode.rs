@@ -15,7 +15,7 @@ use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::generated_capacity_hint;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 
 use super::dflash2::DFlash2ContextCache;
 use super::layer_cache::{Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp};
@@ -637,7 +637,7 @@ impl Qwen35Inner {
             tokens.clone()
         };
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let report_performance = params.report_performance;
         let generation_start = report_performance.then(Instant::now);
         let mut first_token_instant = None;
@@ -947,7 +947,8 @@ mod tests {
 
     fn run_retained_prefix_trace(inner: &mut Qwen35Inner, first_keep: usize) -> Result<ArTrace> {
         reset_flat_fixture(inner);
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
         let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
         prefill_logits.eval();
         inner.dflash2_turn_state = Some(state);
@@ -1157,7 +1158,8 @@ mod tests {
 
         fn begin_verified_step(inner: &mut Qwen35Inner) -> Result<(Qwen35DFlash2Stepper<'_>, u32)> {
             reset_flat_fixture(inner);
-            let stream = Stream::new(DeviceType::Gpu);
+            let stream = Stream::generation();
+            let _ctx = StreamContext::new(stream);
             let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
             prefill_logits.eval();
             let anchor = prefill_logits.argmax(-1, None)?.item_at_int32(0)? as u32;

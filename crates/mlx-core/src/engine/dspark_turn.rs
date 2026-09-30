@@ -30,7 +30,7 @@ use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::engine::plan::SpeculativeDraftWidth;
 use crate::engine::spec_paged::SpecTurnEpilogue;
 use crate::sampling;
-use crate::stream::{DeviceType, Stream};
+use crate::stream::Stream;
 
 /// Before the first rejection, row i's history is exactly `history + drafts[..i]`.
 /// Prepare every deterministic decision from that prefix, then cross the device
@@ -1236,7 +1236,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
         Vec::with_capacity(generated_capacity_hint(max_new_tokens));
     let mut finish_reason = String::from("length");
 
-    let generation_stream = Stream::new(DeviceType::Gpu);
+    let generation_stream = Stream::generation();
     let _wired_ctx = backend
         .wired_limit_bytes()
         .map(|bytes| crate::stream::WiredLimitContext::new(bytes, vec![generation_stream]));
@@ -1415,7 +1415,7 @@ mod tests {
     use crate::engine::penalties::ReasoningTracker;
     use crate::engine::types::{ChatResult, ChatStreamChunk};
     use crate::sampling::SamplingConfig;
-    use crate::stream::{DeviceType, Stream};
+    use crate::stream::Stream;
     use crate::tokenizer::Qwen3Tokenizer;
 
     use super::{
@@ -2125,7 +2125,7 @@ mod tests {
         let mut first_token_instant: Option<Instant> = None;
         let y = MxArray::from_int32(&[first_token as i32], &[1])
             .unwrap_or_else(|e| panic!("y construction: {}", e.reason));
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let max_new_tokens = params.max_new_tokens;
 
         let result = run_dspark_turn(
@@ -3235,7 +3235,7 @@ mod tests {
         let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE);
         let y = MxArray::from_int32(&[first_token as i32], &[1])
             .unwrap_or_else(|e| panic!("y construction: {}", e.reason));
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let max_new_tokens = params.max_new_tokens;
 
         let tokenizer = tiny_tokenizer();

@@ -34,7 +34,7 @@ use crate::engine::plan::{
 use crate::model_thread::{ResponseTx, send_and_await};
 use crate::models::forward as fwd;
 use crate::nn::{Embedding, RMSNorm};
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedTurnPlanReason, SeqId};
 use crate::transformer::paged_policy::record_decode_wave;
@@ -2342,7 +2342,7 @@ impl NemotronHInner {
             (tokens.clone(), 0)
         };
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let _wired_ctx = ChatBackend::wired_limit_bytes(self)
             .map(|bytes| crate::stream::WiredLimitContext::new(bytes, vec![generation_stream]));
 
@@ -2602,7 +2602,7 @@ impl NemotronHInner {
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -2936,6 +2936,7 @@ mod scheduler_tests {
     use crate::engine::persistence::compiled_forward_backend_available;
     use crate::engine::plan::{MediaInputs, TurnPath, TurnPlan, TurnRequest};
     use crate::engine::types::{ChatConfig, ChatStreamChunk};
+    use crate::stream::DeviceType;
 
     /// Tiny hybrid config: mamba(0) + moe(1) + attention(2), dense bf16
     /// weights (random init), paged adapter ON.

@@ -795,7 +795,7 @@ impl Qwen35MoeInner {
             // Fresh turn-0 caches per row (prefill asserts `self.caches` is set,
             // and a stale cache would append rows into one growing context).
             self.init_caches_sync()?;
-            let generation_stream = Stream::new(DeviceType::Gpu);
+            let generation_stream = Stream::generation();
             // PREFILL ONLY — trips every mxfp8 attn/GDN tap once. No generated
             // token: a decode step would fold a synthetic argmax token's
             // activations into the amax.

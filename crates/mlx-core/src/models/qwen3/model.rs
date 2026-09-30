@@ -40,7 +40,7 @@ use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
     check_repetition_cutoff, sample, sample_and_logprobs,
 };
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::training_model::ModelType;
 use crate::transformer::paged_kv_cache_adapter::{
@@ -1986,7 +1986,7 @@ impl Qwen3Inner {
         let lm_head = &self.lm_head;
         let model_config = &self.config;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         let num_layers = layers.len();
         let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
@@ -2669,7 +2669,7 @@ impl Qwen3Inner {
         let lm_head = &self.lm_head;
         let model_config = &self.config;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         let num_layers = layers.len();
         let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
@@ -4832,6 +4832,7 @@ crate::models::chat_napi::chat_napi_surface! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::DeviceType;
 
     #[test]
     fn test_repetition_cutoff_disabled() {

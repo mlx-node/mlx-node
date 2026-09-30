@@ -16,7 +16,7 @@ use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::engine::types::ChatConfig;
-use crate::stream::{DeviceType, Stream};
+use crate::stream::Stream;
 use crate::tokenizer::Qwen3Tokenizer;
 
 /// Owned-by-the-caller state consumed by the shared paged turn epilogue.
@@ -245,7 +245,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         Vec::with_capacity(generated_capacity_hint(max_new_tokens));
     let mut finish_reason = String::from("length");
 
-    let generation_stream = Stream::new(DeviceType::Gpu);
+    let generation_stream = Stream::generation();
     // `None` skips the WiredLimitContext ENTIRELY (qwen3 creates none);
     // `Some(bytes)` wires the family's byte budget for the turn.
     let _wired_ctx = backend

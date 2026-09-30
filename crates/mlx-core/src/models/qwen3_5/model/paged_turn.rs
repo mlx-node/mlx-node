@@ -461,7 +461,7 @@ impl Qwen35Inner {
             })?;
 
             let eos_id = eos_token_id;
-            let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
+            let generation_stream = crate::stream::Stream::generation();
             let model_size_bytes = self.config.estimate_memory_bytes() as usize;
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -674,7 +674,7 @@ impl Qwen35Inner {
         let embed = self.embedding.clone();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -1060,7 +1060,7 @@ impl Qwen35Inner {
         let embed = self.embedding.clone();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -2035,7 +2035,7 @@ impl Qwen35Inner {
             })?;
 
             let eos_id = eos_token_id;
-            let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
+            let generation_stream = crate::stream::Stream::generation();
             let model_size_bytes = self.config.estimate_memory_bytes() as usize;
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);

@@ -36,7 +36,7 @@ use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::engine::plan::{MediaCapabilities, MediaInputs, TurnPath, TurnPlan, TurnRequest};
 use crate::engine::types::{ChatConfig, ChatResult};
-use crate::stream::{DeviceType, Stream};
+use crate::stream::Stream;
 use crate::tokenizer::ChatMessage;
 
 /// Streaming context handed to [`chat_turn_core`] by the streaming
@@ -1246,7 +1246,7 @@ fn chat_turn_core<B: ChatBackend>(
         Vec::with_capacity(generated_capacity_hint(max_new_tokens));
     let mut finish_reason = String::from("length");
 
-    let generation_stream = Stream::new(DeviceType::Gpu);
+    let generation_stream = Stream::generation();
     // `None` skips the WiredLimitContext ENTIRELY (qwen3 creates none —
     // see the `wired_limit_bytes` rustdoc); `Some(bytes)` wires the
     // family's byte budget for the turn.

@@ -497,7 +497,7 @@ impl Qwen35MoeInner {
         let return_logprobs = config.return_logprobs.unwrap_or(true);
 
         let embedding = self.embedding.clone();
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let fa_idx = self.fa_idx;
 
         // Use fresh caches for training (not shared inference caches)
@@ -1684,7 +1684,7 @@ impl crate::quality::runner::EvalBackend for Qwen35MoeInner {
 
     fn teacher_forced_hidden(&mut self, tokens: &[u32]) -> Result<MxArray> {
         self.init_caches_sync()?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let fa_idx = self.fa_idx;
         let hidden = crate::quality::runner::chunked_hidden(
             &tokens[..tokens.len() - 1],

@@ -2348,7 +2348,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .scheduler_materialized_blocks(seq_id)
             .saturating_add(restore.as_ref().map_or(0, B::restore_reserved_blocks));
         let is_streaming = response.sink().is_some();
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let mut profiler = DecodeProfiler::new(
             self.inner
                 .profiler_label(admitted.plan.is_delta, is_streaming),

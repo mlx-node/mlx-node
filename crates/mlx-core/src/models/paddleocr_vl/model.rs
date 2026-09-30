@@ -22,7 +22,7 @@ use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
     sample, sample_and_logprobs,
 };
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, MultimodalContentOrder, Qwen3Tokenizer};
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
@@ -433,7 +433,7 @@ impl VLModelInner {
         );
 
         // Create dedicated generation stream for GPU-CPU pipelining.
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         // Prepare sampling config
         let sampling_config = SamplingConfig {
@@ -973,7 +973,7 @@ impl VLModelInner {
             min_p: Some(min_p),
         };
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         let lm = self
             .language_model

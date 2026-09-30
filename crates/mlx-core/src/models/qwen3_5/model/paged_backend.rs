@@ -453,7 +453,7 @@ impl PagedBackend for Qwen35Inner {
 
     fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
         // Run the paged DECODE on the canonical DEFAULT stream, NOT the
-        // per-turn `generation_stream`. dense's paged forward + every
+        // `generation_stream`. dense's paged forward + every
         // `y.eval()` run on the MLX DEFAULT stream; running the forward on a
         // queue separate from the shared loop's top-of-iteration `y.eval()`
         // (always on the default stream) would force a cross-queue

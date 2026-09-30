@@ -49,7 +49,7 @@ use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
     check_repetition_cutoff, sample,
 };
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, MultimodalContentOrder, Qwen3Tokenizer};
 use crate::tools;
 use crate::transformer::kv_cache::KVCache;
@@ -685,7 +685,7 @@ impl QianfanOCRInner {
             None
         };
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let prepared =
             self.prepare_chat_prefill(&messages, &config, reuse_cache, generation_stream)?;
         ensure_qianfan_turn_not_cancelled(cancelled)?;
@@ -1010,7 +1010,7 @@ impl QianfanOCRInner {
                 None
             };
 
-            let generation_stream = Stream::new(DeviceType::Gpu);
+            let generation_stream = Stream::generation();
             let prepared =
                 self.prepare_chat_prefill(&messages, &config, reuse_cache, generation_stream)?;
             let PreparedQianfanPrompt {
@@ -1480,7 +1480,7 @@ impl QianfanOCRInner {
         max_new_tokens: i32,
         temperature: f64,
     ) -> Result<Vec<u32>> {
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         let sampling_config = SamplingConfig {
             temperature: Some(temperature),

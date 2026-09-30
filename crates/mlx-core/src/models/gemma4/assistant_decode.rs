@@ -488,7 +488,6 @@ mod tests {
         DsparkTurnState, Gemma4DraftStepper, Gemma4DraftTurnState,
     };
     use crate::models::gemma4::model::{Gemma4Draft, dspark_shared_slot_mask};
-    use crate::stream::DeviceType;
 
     fn to_vec_f32(a: &MxArray) -> Vec<f32> {
         a.eval();
@@ -514,7 +513,7 @@ mod tests {
         block_size: usize,
     ) -> Gemma4DraftStepper<'a> {
         let tokens: Vec<u32> = vec![0, 1, 2, 3];
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
         let (_logits, state) = inner
             .assistant_prefill_with_hidden(&tokens, 0, stream)
             .expect("tiny assistant prefill must succeed");

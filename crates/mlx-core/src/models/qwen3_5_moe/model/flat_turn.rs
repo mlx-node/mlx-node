@@ -201,7 +201,7 @@ impl Qwen35MoeInner {
             true,
         );
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -558,7 +558,7 @@ impl Qwen35MoeInner {
         let eager_mtp = p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none();
 
         let embedding = self.embedding.clone();
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -850,7 +850,7 @@ impl Qwen35MoeInner {
         let eager_mtp = p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none();
 
         let embedding = self.embedding.clone();
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -1153,7 +1153,7 @@ impl Qwen35MoeInner {
         self.init_caches_sync()?;
 
         let embedding = self.embedding.clone();
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let fa_idx = self.fa_idx;
 
         // Prefill. Chunked to bound peak GPU memory for long prompts —

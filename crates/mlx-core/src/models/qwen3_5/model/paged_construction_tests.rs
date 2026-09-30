@@ -388,7 +388,7 @@ fn dense_hybrid_n2_batched_decode_matches_scalar_replay() {
             .paged_prefill(
                 &prompt[prefix.effective_cached_prefix_len..],
                 &prefix,
-                Stream::new(DeviceType::Gpu),
+                Stream::generation(),
             )
             .expect("prefill request")
             .eval();
@@ -705,7 +705,7 @@ fn run_dense_final_logits_legacy_chunked_projection(
     } else {
         chunk_size
     };
-    let generation_stream = Stream::new(DeviceType::Gpu);
+    let generation_stream = Stream::generation();
     let mut offset = 0;
     while total_len - offset > chunk_size {
         let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
@@ -757,7 +757,7 @@ fn run_dense_final_logits_chunked(
         &mut inner.caches,
         &inner.final_norm,
         &inner.lm_head,
-        Stream::new(DeviceType::Gpu),
+        Stream::generation(),
         chunk_size,
         None,
     )
@@ -1345,7 +1345,7 @@ fn run_dense_chunked_prefill_with_hidden_keeps_tail_contract() -> Result<()> {
         &mut inner.caches,
         &inner.final_norm,
         &inner.lm_head,
-        Stream::new(DeviceType::Gpu),
+        Stream::generation(),
         Some(5),
         16,
         None,
@@ -1382,7 +1382,7 @@ fn run_dense_chunked_prefill_with_hidden_keeps_tail_contract() -> Result<()> {
         &mut inner.caches,
         &inner.final_norm,
         &inner.lm_head,
-        Stream::new(DeviceType::Gpu),
+        Stream::generation(),
         Some(100),
         16,
         None,
@@ -3225,7 +3225,7 @@ fn scheduled_mtp_owner_replay_matches_independent() {
             .paged_prefill(
                 &prompt[prefix.effective_cached_prefix_len..],
                 &prefix,
-                Stream::new(DeviceType::Gpu),
+                Stream::generation(),
             )
             .unwrap()
             .eval();

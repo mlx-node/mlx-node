@@ -72,7 +72,7 @@ use crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule;
 use crate::models::qwen3_5_moe::persistence;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::paged_policy::record_decode_wave;

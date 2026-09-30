@@ -2347,7 +2347,7 @@ impl PagedBackend for Lfm2Inner {
 
     fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
         // Run the eager-paged DECODE on the canonical DEFAULT stream, NOT
-        // the per-turn `generation_stream`. lfm2's eager forward holds
+        // the `generation_stream`. lfm2's eager forward holds
         // persistent per-layer K/V pools; running it on a queue separate from
         // the shared loop's top-of-iteration `y.eval()` (always on the default
         // stream) forces a cross-queue completion-wait every token (~5% on

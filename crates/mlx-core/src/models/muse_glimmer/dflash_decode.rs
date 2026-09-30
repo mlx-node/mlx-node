@@ -18,7 +18,7 @@ use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::models::gemma4::layer_cache::{
     Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
 };
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 
 use super::dflash::DFlashContextCache;
 use super::model::MuseGlimmerInner;
@@ -392,7 +392,7 @@ impl MuseGlimmerInner {
             tokens.clone()
         };
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
         let report_performance = params.report_performance;
         let generation_start = report_performance.then(Instant::now);
         let mut first_token_instant = None;

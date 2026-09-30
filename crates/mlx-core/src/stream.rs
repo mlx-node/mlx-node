@@ -37,18 +37,36 @@ impl Stream {
         Stream { inner }
     }
 
-    /// Create a new stream on the given device
-    pub fn new(device: DeviceType) -> Self {
+    /// This thread's GPU generation stream, created on first use and reused
+    /// for every later turn on the thread.
+    ///
+    /// MLX keeps a stream's command queue (and every compile-cache entry
+    /// keyed by it) in thread-local storage that is freed only at thread
+    /// exit, so a stream per turn grows without bound and re-traces every
+    /// compiled graph on each turn's first call. The stream is valid only on
+    /// the thread that created it.
+    pub fn generation() -> Self {
         // MLX-CUDA: a secondary GPU stream made the default makes the eval graph
         // span streams, and the resulting cross-stream synchronization in
         // `cu::AtomicEvent::wait` segfaults. Single-stream eval is correct on
-        // CUDA, so collapse new GPU streams onto the default stream when the
-        // Metal backend is unavailable. macOS is unaffected.
-        if device == DeviceType::Gpu && !metal_backend_available() {
-            return Stream::default(device);
+        // CUDA, so use the default stream when the Metal backend is unavailable.
+        if !metal_backend_available() {
+            return Stream::default(DeviceType::Gpu);
         }
-        let inner = unsafe { sys::mlx_new_stream(device as i32) };
-        Stream { inner }
+        thread_local! {
+            static GENERATION: std::cell::Cell<Option<Stream>> = const { std::cell::Cell::new(None) };
+        }
+        GENERATION
+            .try_with(|slot| {
+                slot.get().unwrap_or_else(|| {
+                    let stream = Stream {
+                        inner: unsafe { sys::mlx_new_stream(DeviceType::Gpu as i32) },
+                    };
+                    slot.set(Some(stream));
+                    stream
+                })
+            })
+            .unwrap_or_else(|_| Stream::default(DeviceType::Gpu))
     }
 
     /// Get the device type of this stream
@@ -77,8 +95,8 @@ impl Stream {
 ///
 /// # Example
 /// ```no_run
-/// # use mlx_core::stream::{Stream, StreamContext, DeviceType};
-/// let generation_stream = Stream::new(DeviceType::Gpu);
+/// # use mlx_core::stream::{Stream, StreamContext};
+/// let generation_stream = Stream::generation();
 /// {
 ///     let _ctx = StreamContext::new(generation_stream);
 ///     // All operations here use generation_stream
@@ -132,9 +150,9 @@ impl Drop for StreamContext {
 ///
 /// # Example
 /// ```no_run
-/// # use mlx_core::stream::{Stream, WiredLimitContext, DeviceType};
+/// # use mlx_core::stream::{Stream, WiredLimitContext};
 /// # let model_size_bytes = 1024;
-/// let generation_stream = Stream::new(DeviceType::Gpu);
+/// let generation_stream = Stream::generation();
 /// {
 ///     let _ctx = WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 ///     // All operations here benefit from proper wired memory limit
@@ -296,8 +314,8 @@ mod submission_tests {
     /// clearing the allocator cache must not lose cross-stream event or retention work.
     #[test]
     fn asynchronous_cross_stream_views_retain_dependencies() -> napi::Result<()> {
-        let first = Stream::new(DeviceType::Gpu);
-        let second = Stream::new(DeviceType::Gpu);
+        let first = Stream::generation();
+        let second = Stream::default(DeviceType::Gpu);
         let source: Vec<f32> = (0..256).map(|i| i as f32 - 128.0).collect();
         let mut state = {
             let _ctx = StreamContext::new(first);
@@ -330,6 +348,53 @@ mod submission_tests {
         first.synchronize();
         let expected: Vec<f32> = source.into_iter().map(|x| x + 24.0).collect();
         assert_eq!(state.to_float32()?.as_ref(), expected.as_slice());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod generation_stream_tests {
+    use super::{DeviceType, Stream, StreamContext, metal_backend_available};
+    use crate::array::MxArray;
+
+    fn id(stream: Stream) -> (i32, i32) {
+        (stream.inner.index, stream.inner.device_type)
+    }
+
+    /// Every `mlx_new_stream` takes the next global index and adds a command
+    /// queue, so a stable index proves the thread reuses one stream.
+    #[test]
+    fn generation_stream_is_created_once_per_thread() -> napi::Result<()> {
+        let generation = Stream::generation();
+        for _ in 0..64 {
+            assert_eq!(id(Stream::generation()), id(generation));
+        }
+        {
+            let _ctx = StreamContext::new(generation);
+            assert_eq!(id(Stream::generation()), id(generation));
+        }
+        if !metal_backend_available() {
+            assert_eq!(id(generation), id(Stream::default(DeviceType::Gpu)));
+            return Ok(());
+        }
+        assert_ne!(
+            generation.inner.index,
+            Stream::default(DeviceType::Gpu).inner.index
+        );
+
+        let (other, values) = std::thread::spawn(|| -> napi::Result<((i32, i32), Vec<f32>)> {
+            let stream = Stream::generation();
+            assert_eq!(id(Stream::generation()), id(stream));
+            let _ctx = StreamContext::new(stream);
+            let result = MxArray::from_float32(&[1.0, 2.0], &[2])?.add_scalar(1.0)?;
+            result.eval();
+            Ok((id(stream), result.to_float32()?.to_vec()))
+        })
+        .join()
+        .map_err(|_| napi::Error::from_reason("generation stream thread panicked"))??;
+        assert_ne!(other, id(generation));
+        assert_eq!(values, [2.0, 3.0]);
+        assert_eq!(id(Stream::generation()), id(generation));
         Ok(())
     }
 }

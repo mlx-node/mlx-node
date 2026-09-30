@@ -1448,11 +1448,12 @@ pub(crate) trait PagedBackend: ChatBackend {
     }
 
     /// The GPU [`Stream`] the per-step DECODE forward (and its `eval_step`)
-    /// runs on, given the dedicated `generation_stream` `run_paged_turn`
-    /// created for this turn.
+    /// runs on, given the model thread's `generation_stream`
+    /// ([`Stream::generation`]) that `run_paged_turn` uses.
     ///
-    /// Default — the dedicated `generation_stream`: a fresh Metal command
-    /// queue that isolates decode work for the standard-KV families.
+    /// Default — the `generation_stream`: a Metal command queue separate
+    /// from the default stream that isolates decode work for the
+    /// standard-KV families.
     ///
     /// lfm2 OVERRIDES this to the canonical DEFAULT stream. Its paged
     /// forward holds persistent per-layer K/V pools across steps; running that

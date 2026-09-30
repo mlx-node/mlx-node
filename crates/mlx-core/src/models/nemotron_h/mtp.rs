@@ -436,7 +436,7 @@ mod mtp_turn_tests {
     use crate::models::nemotron_h::model::NemotronHInner;
     use crate::models::quantized_linear::LinearProj;
     use crate::nn::Linear;
-    use crate::stream::{DeviceType, Stream};
+    use crate::stream::Stream;
     use napi::bindgen_prelude::{Error, Result};
 
     /// Tiny flat config: mamba(0) + moe(1) + attention(2), hidden 8, MTP
@@ -593,7 +593,7 @@ mod mtp_turn_tests {
     /// the exact token sequence a plain AR turn would emit.
     fn greedy_ar_oracle(inner: &mut NemotronHInner, prompt: &[u32], n: usize) -> Result<Vec<u32>> {
         inner.reset_caches_internal().unwrap();
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
         let arr = MxArray::from_uint32(prompt, &[1, prompt.len() as i64])?;
         let logits = inner.chunked_prefill(&arr, stream)?;
         let seq_len = logits.shape_at(1)?;
@@ -654,7 +654,7 @@ mod mtp_turn_tests {
 
             // Fresh flat state for the speculative run.
             inner.reset_caches_internal().unwrap();
-            let stream = Stream::new(DeviceType::Gpu);
+            let stream = Stream::generation();
 
             let chat_cfg = ChatConfig {
                 temperature: Some(0.0),
@@ -923,7 +923,7 @@ mod mtp_turn_tests {
         let h = inner.config.hidden_size as usize;
         let prompt: Vec<u32> = vec![1, 5, 9, 3];
         let y_id: u32 = 7;
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
 
         // --- the production seed path ---
         inner.reset_caches_internal().unwrap();
@@ -1008,7 +1008,7 @@ mod mtp_turn_tests {
         // 7 tokens over chunk_size 3: a step of 3 gives [0,3) [3,6) [6,7).
         let prompt: Vec<u32> = vec![1, 5, 9, 3, 4, 8, 2];
         let y_id: u32 = 6;
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
         let arr = MxArray::from_uint32(&prompt, &[1, prompt.len() as i64]).unwrap();
 
         let mut seed_with = |step: u32| -> (Vec<NemotronHLayerCache>, i32) {
@@ -1098,7 +1098,7 @@ mod mtp_turn_tests {
         let h = inner.config.hidden_size as usize;
         let prompt: Vec<u32> = vec![1, 5, 9, 3];
         let p = greedy_params();
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
         let committed_ids: Vec<u32> = vec![13, 21];
 
         // Same inner run twice, once WITH a rejected draft before the commit and once
@@ -1186,7 +1186,7 @@ mod mtp_turn_tests {
         let h = inner.config.hidden_size as usize;
         let prompt: Vec<u32> = vec![1, 5, 9, 3];
         let p = greedy_params();
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
         let t = prompt.len() as i32;
 
         inner.reset_caches_internal().unwrap();
@@ -1240,7 +1240,7 @@ mod mtp_turn_tests {
         let h = inner.config.hidden_size as usize;
         let prompt: Vec<u32> = vec![1, 5, 9, 3];
         let p = greedy_params();
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
 
         inner.reset_caches_internal().unwrap();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
@@ -1335,7 +1335,7 @@ mod mtp_turn_tests {
         let h = inner.config.hidden_size as usize;
         let prompt: Vec<u32> = vec![1, 5, 9, 3];
         let p = greedy_params();
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
 
         inner.reset_caches_internal().unwrap();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
@@ -1488,7 +1488,7 @@ mod mtp_turn_tests {
 
         // ---- MTP loop from the same cold prefix ----
         inner.reset_caches_internal().unwrap();
-        let stream = Stream::new(DeviceType::Gpu);
+        let stream = Stream::generation();
         let chat_cfg = ChatConfig {
             temperature: Some(0.0),
             max_new_tokens: Some(n as i32),

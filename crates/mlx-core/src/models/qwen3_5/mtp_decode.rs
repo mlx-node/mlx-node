@@ -963,7 +963,7 @@ mod decode_loop_sync_cancel_tests {
     use crate::engine::penalties::ReasoningTracker;
     use crate::nn::Embedding;
     use crate::sampling::SamplingConfig;
-    use crate::stream::{DeviceType, Stream};
+    use crate::stream::Stream;
 
     /// Greedy T=0 params with every penalty/cutoff neutral, mirroring the
     /// engine turn tests' `greedy_params`.
@@ -1052,7 +1052,7 @@ mod decode_loop_sync_cancel_tests {
         let mut finish_reason = String::from("length");
         let mut last_in_cache = true;
         let mut first_tok: Option<std::time::Instant> = None;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         decode_loop!(
             ops: ops,

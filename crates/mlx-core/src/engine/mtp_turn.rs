@@ -3686,7 +3686,7 @@ mod tests {
     };
     use crate::engine::penalties::ReasoningTracker;
     use crate::engine::types::ChatResult;
-    use crate::stream::{DeviceType, Stream};
+    use crate::stream::Stream;
     use crate::tokenizer::Qwen3Tokenizer;
 
     /// Serializes the `MLX_MTP_CHAINED_CYCLES` set + the `mtp_chained_cycles_enabled`
@@ -4014,7 +4014,7 @@ mod tests {
         let mut rng = rand::rng();
         let y = MxArray::from_int32(&[first_token as i32], &[1])
             .unwrap_or_else(|e| panic!("y construction: {}", e.reason));
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         let outcome = run_mtp_turn(
             backend,
@@ -4698,7 +4698,7 @@ mod tests {
         let mut first_token_instant = None;
         let mut rng = rand::rng();
         let y = MxArray::from_int32(&[3], &[1]).expect("seed construction");
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = Stream::generation();
 
         let result = run_mtp_turn(
             &mut backend,
