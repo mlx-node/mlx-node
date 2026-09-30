@@ -1239,4 +1239,120 @@ mod tests {
         );
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_prepare_raw(
+        qkv: &MxArray,
+        a: &MxArray,
+        b: &MxArray,
+        conv: &MxArray,
+        history: &MxArray,
+        scale: &MxArray,
+        dt: &MxArray,
+        mean_eps: bool,
+        beta_input_dtype: bool,
+    ) -> [MxArray; 6] {
+        let mut outputs = [std::ptr::null_mut(); 6];
+        let ok = unsafe {
+            sys::mlx_qwen4_gdn_prepare(
+                qkv.handle.0,
+                a.handle.0,
+                b.handle.0,
+                conv.handle.0,
+                history.handle.0,
+                scale.handle.0,
+                dt.handle.0,
+                mean_eps,
+                beta_input_dtype,
+                outputs.as_mut_ptr(),
+            )
+        };
+        assert!(ok, "gdn_prepare rejected valid inputs");
+        outputs.map(|p| MxArray::from_handle(p, "gdn_prepare").unwrap())
+    }
+
+    fn raw_bits(x: &MxArray) -> Vec<u32> {
+        x.eval();
+        if x.dtype().unwrap() == DType::Float32 {
+            x.to_float32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        } else {
+            x.to_uint16_native()
+                .unwrap()
+                .into_iter()
+                .map(u32::from)
+                .collect()
+        }
+    }
+
+    /// The prepare kernel reads qkv/a/b/history through their strides. Feeding
+    /// it the production split views (qkvz and ba sections, a column slice of
+    /// a wider history) must give the same bits as feeding row-contiguous
+    /// copies of the same values.
+    #[test]
+    fn gdn_prepare_strided_inputs_bit_identical() -> Result<()> {
+        if !gdn_prepare_backend_probe() {
+            eprintln!("SKIP gdn_prepare_strided_inputs_bit_identical: no Metal gdn_prepare");
+            return Ok(());
+        }
+        let conv = MxArray::random_normal(&[10240, 4], 0.0, 0.3, Some(DType::Float32))?;
+        let scale = MxArray::random_normal(&[48], -0.5, 0.2, Some(DType::Float32))?;
+        let dt = MxArray::random_normal(&[48], 0.0, 0.5, Some(DType::Float32))?;
+        let mut cases = 0;
+        for t in [1i64, 3, 8, 63] {
+            let qkvz = rand_bf16(&[1, t, 16384]);
+            let qkv = qkvz.split_sections(&[10240], 2)?[0].clone();
+            let history = rand_bf16(&[3, 16384]).slice_axis(1, 0, 10240)?;
+            for ba_dtype in [DType::BFloat16, DType::Float32] {
+                let ba = MxArray::random_normal(&[1, t, 96], 0.0, 2.0, Some(DType::Float32))?
+                    .astype(ba_dtype)?;
+                let parts = ba.split_sections(&[48], 2)?;
+                let (b, a) = (parts[0].clone(), parts[1].clone());
+                let dense = [&qkv, &a, &b, &history].map(|x| {
+                    let y = x.deep_copy().unwrap();
+                    y.eval();
+                    y
+                });
+                for mean_eps in [false, true] {
+                    for beta_input_dtype in [false, true] {
+                        let strided = gdn_prepare_raw(
+                            &qkv,
+                            &a,
+                            &b,
+                            &conv,
+                            &history,
+                            &scale,
+                            &dt,
+                            mean_eps,
+                            beta_input_dtype,
+                        );
+                        let reference = gdn_prepare_raw(
+                            &dense[0],
+                            &dense[1],
+                            &dense[2],
+                            &conv,
+                            &dense[3],
+                            &scale,
+                            &dt,
+                            mean_eps,
+                            beta_input_dtype,
+                        );
+                        for (i, (x, y)) in strided.iter().zip(reference.iter()).enumerate() {
+                            assert_eq!(
+                                raw_bits(x),
+                                raw_bits(y),
+                                "output {i} differs: T={t} ba={ba_dtype:?} mean_eps={mean_eps} beta_input_dtype={beta_input_dtype}"
+                            );
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 32);
+        Ok(())
+    }
 }

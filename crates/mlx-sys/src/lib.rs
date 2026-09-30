@@ -1759,6 +1759,18 @@ unsafe extern "C-unwind" {
         mode: *const std::os::raw::c_char,
     ) -> *mut mlx_array;
 
+    /// BF16 `x` times a transposed affine projection whose scales/biases are
+    /// F32: BF16 result from one primitive with the promoted path's F32 math.
+    /// Null unless the operands have exactly that form (and Metal is present).
+    pub fn mlx_quantized_matmul_affine_bf16(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+    ) -> *mut mlx_array;
+
     // ============================================
     // Gather QMM (for QuantizedSwitchLinear / MoE)
     // ============================================

@@ -1298,6 +1298,36 @@ impl QuantizedLinear {
             None
         };
 
+        // BF16 rows against F32 sidecars (Qwen3.5 GGUF affine): one primitive
+        // with the promoted path's F32 math and a single BF16 rounding, instead
+        // of casting x up and the result back. Small row counts only, so M=1
+        // decode and prefill graphs keep their standalone casts.
+        if activation_dtype == Some(crate::array::DType::BFloat16)
+            && self.bias.is_none()
+            && self.scales.dtype()? == crate::array::DType::Float32
+            && let Some(biases) = &self.biases
+            && biases.dtype()? == crate::array::DType::Float32
+            && crate::engine::persistence::compiled_forward_backend_available()
+        {
+            let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+            let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+            if (2..=8).contains(&rows) {
+                let handle = unsafe {
+                    sys::mlx_quantized_matmul_affine_bf16(
+                        x.handle.0,
+                        self.weight.handle.0,
+                        self.scales.handle.0,
+                        biases.handle.0,
+                        self.group_size,
+                        self.bits,
+                    )
+                };
+                if !handle.is_null() {
+                    return MxArray::from_handle(handle, "quantized_matmul_affine_bf16");
+                }
+            }
+        }
+
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
 
@@ -3207,5 +3237,352 @@ mod gate_up_merge_tests {
             mlp.get_up_proj_weight().to_uint32().unwrap().to_vec(),
             up_w.to_uint32().unwrap().to_vec(),
         );
+    }
+}
+
+#[cfg(test)]
+mod affine_qmv_wide_lock_tests {
+    use super::*;
+    use crate::array::DType;
+
+    fn quantize(weight: &MxArray, group_size: i32, bits: i32) -> (MxArray, MxArray, MxArray) {
+        let mut q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut q,
+                &mut s,
+                &mut b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed");
+        (
+            MxArray::from_handle(q, "q").unwrap(),
+            MxArray::from_handle(s, "s").unwrap(),
+            MxArray::from_handle(b, "b").unwrap(),
+        )
+    }
+
+    /// Deterministic values without an RNG; `fine` leaves bits that BF16
+    /// cannot hold, so the F32 variant is a genuine F32 input.
+    fn pattern(seed: u64, len: usize, fine: bool) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let h = (i as u64 ^ seed)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .rotate_left(17)
+                    .wrapping_add(seed);
+                let coarse = ((h % 2048) as f32 - 1024.0) / 256.0;
+                if fine {
+                    coarse + ((h >> 20) % 1000) as f32 * 1.0e-6
+                } else {
+                    coarse
+                }
+            })
+            .collect()
+    }
+
+    fn fnv(hash: &mut u64, bytes: impl IntoIterator<Item = u8>) {
+        for byte in bytes {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+
+    fn qmm(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray, gs: i32, bits: i32) -> MxArray {
+        let handle = unsafe {
+            sys::mlx_quantized_matmul(
+                x.handle.0,
+                w.handle.0,
+                s.handle.0,
+                b.handle.0,
+                true,
+                gs,
+                bits,
+                c"affine".as_ptr(),
+            )
+        };
+        let y = MxArray::from_handle(handle, "qmm").unwrap();
+        y.eval();
+        y
+    }
+
+    /// Output bits of the affine `qmv_wide` kernels (M = 2..8, both tile caps)
+    /// recorded on an M5 (GPU gen 17) before the kernel gained a separate
+    /// scale type. Variants: BF16 x with BF16 sidecars, F32 x with F32
+    /// sidecars, and BF16 x with F32 sidecars (promoted to the F32 kernel).
+    #[test]
+    fn affine_qmv_wide_outputs_hash_locked() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            eprintln!("SKIP affine_qmv_wide_outputs_hash_locked: no Metal");
+            return;
+        }
+        let arch = unsafe { sys::mlx_gpu_architecture_gen() };
+        if arch != 17 {
+            eprintln!(
+                "SKIP affine_qmv_wide_outputs_hash_locked: hashes recorded on GPU gen 17, this is {arch}"
+            );
+            return;
+        }
+        const EXPECTED: &[(&str, u64)] = &[
+            ("gs32_b4_n40_k768_bf16", 0xE959_49D8_9222_7145),
+            ("gs32_b4_n40_k768_f32", 0xFE8D_BABC_6F5B_8694),
+            ("gs32_b4_n40_k768_bf16x_f32s", 0xF5F3_A62C_0411_87AE),
+            ("gs32_b4_n2048_k256_bf16", 0xC223_B96B_B6A3_B1B3),
+            ("gs32_b4_n2048_k256_f32", 0x778A_0F43_DA22_BE73),
+            ("gs32_b4_n2048_k256_bf16x_f32s", 0xE69D_EF7C_3E8D_1976),
+            ("gs32_b8_n40_k768_bf16", 0x3112_1A8E_72EF_DECE),
+            ("gs32_b8_n40_k768_f32", 0xC8F3_AB62_6C10_B00D),
+            ("gs32_b8_n40_k768_bf16x_f32s", 0x2F08_A8D9_4DCD_E1C9),
+            ("gs32_b8_n2048_k256_bf16", 0x1D05_D26E_BC61_1E68),
+            ("gs32_b8_n2048_k256_f32", 0xBC58_F0AA_5264_5C74),
+            ("gs32_b8_n2048_k256_bf16x_f32s", 0x7C7B_A989_7953_C2FC),
+            ("gs64_b4_n40_k768_bf16", 0x4AEC_574E_57B0_B5E8),
+            ("gs64_b4_n40_k768_f32", 0x3622_6BBE_2B41_2E20),
+            ("gs64_b4_n40_k768_bf16x_f32s", 0x990D_3728_44D1_5BFE),
+            ("gs64_b4_n2048_k256_bf16", 0x1C8A_762F_8862_241B),
+            ("gs64_b4_n2048_k256_f32", 0x476C_6C5D_C588_994E),
+            ("gs64_b4_n2048_k256_bf16x_f32s", 0xBD06_D6D6_979F_8AC8),
+            ("gs64_b8_n40_k768_bf16", 0x1A8B_4D7E_5314_2D71),
+            ("gs64_b8_n40_k768_f32", 0x1F6E_E45D_4D22_C7E4),
+            ("gs64_b8_n40_k768_bf16x_f32s", 0xC5EF_6FB7_CE18_8BBF),
+            ("gs64_b8_n2048_k256_bf16", 0x3A53_A1D8_DF2A_1051),
+            ("gs64_b8_n2048_k256_f32", 0xC90C_E0A3_BA3E_906D),
+            ("gs64_b8_n2048_k256_bf16x_f32s", 0x2AE8_B026_94F3_C2AA),
+        ];
+        let mut got = Vec::new();
+        for (gs, bits) in [(32, 4), (32, 8), (64, 4), (64, 8)] {
+            for (n, k) in [(40i64, 768i64), (2048, 256)] {
+                let wf = pattern(n as u64 * 31 + k as u64, (n * k) as usize, true);
+                let w32 = MxArray::from_float32(&wf, &[n, k]).unwrap();
+                let w16 = w32.astype(DType::BFloat16).unwrap();
+                let (q16, s16, b16) = quantize(&w16, gs, bits);
+                let (q32, s32, b32) = quantize(&w32, gs, bits);
+                let (s16p, b16p) = (
+                    s16.astype(DType::Float32).unwrap(),
+                    b16.astype(DType::Float32).unwrap(),
+                );
+                for variant in ["bf16", "f32", "bf16x_f32s"] {
+                    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+                    for m in 2i64..=8 {
+                        let xf = pattern(m as u64 * 7 + bits as u64, (m * k) as usize, true);
+                        let x32 = MxArray::from_float32(&xf, &[m, k]).unwrap();
+                        let x16 = x32.astype(DType::BFloat16).unwrap();
+                        let y = match variant {
+                            "bf16" => qmm(&x16, &q16, &s16, &b16, gs, bits),
+                            "f32" => qmm(&x32, &q32, &s32, &b32, gs, bits),
+                            _ => qmm(&x16, &q16, &s16p, &b16p, gs, bits),
+                        };
+                        if y.dtype().unwrap() == DType::Float32 {
+                            let v = y.to_float32().unwrap();
+                            fnv(&mut hash, v.iter().flat_map(|f| f.to_bits().to_le_bytes()));
+                        } else {
+                            let v = y.to_uint16_native().unwrap();
+                            fnv(&mut hash, v.iter().flat_map(|h| h.to_le_bytes()));
+                        }
+                    }
+                    got.push((format!("gs{gs}_b{bits}_n{n}_k{k}_{variant}"), hash));
+                }
+            }
+        }
+        for (label, hash) in &got {
+            eprintln!("        (\"{label}\", 0x{hash:016X}),");
+        }
+        let expected: Vec<(String, u64)> =
+            EXPECTED.iter().map(|(l, h)| (l.to_string(), *h)).collect();
+        assert_eq!(got, expected, "affine qmv_wide output bits moved");
+    }
+
+    fn bf16_bits(y: &MxArray) -> Vec<u16> {
+        y.eval();
+        assert_eq!(y.dtype().unwrap(), DType::BFloat16);
+        y.to_uint16_native().unwrap()
+    }
+
+    /// The promoted path the mixed primitive replaces: F32 x, F32 kernels,
+    /// then one cast to BF16.
+    fn promoted(
+        x: &MxArray,
+        w: &MxArray,
+        s: &MxArray,
+        b: &MxArray,
+        gs: i32,
+        bits: i32,
+    ) -> Vec<u16> {
+        bf16_bits(
+            &qmm(&x.astype(DType::Float32).unwrap(), w, s, b, gs, bits)
+                .astype(DType::BFloat16)
+                .unwrap(),
+        )
+    }
+
+    fn mixed_ffi(
+        x: &MxArray,
+        w: &MxArray,
+        s: &MxArray,
+        b: &MxArray,
+        gs: i32,
+        bits: i32,
+    ) -> Option<MxArray> {
+        let handle = unsafe {
+            sys::mlx_quantized_matmul_affine_bf16(
+                x.handle.0, w.handle.0, s.handle.0, b.handle.0, gs, bits,
+            )
+        };
+        (!handle.is_null()).then(|| MxArray::from_handle(handle, "mixed").unwrap())
+    }
+
+    /// GGUF-style sidecars: FP16 storage (more mantissa than BF16, so a BF16
+    /// rounding of a scale is visible), promoted to F32 at load.
+    fn gguf_linear(n: i64, k: i64, gs: i32, bits: i32) -> QuantizedLinear {
+        let w = MxArray::random_normal(&[n, k], 0.0, 0.05, Some(DType::Float32)).unwrap();
+        let (q, s, b) = quantize(&w, gs, bits);
+        let mut linear = QuantizedLinear::new(
+            q,
+            s.astype(DType::Float16).unwrap(),
+            Some(b.astype(DType::Float16).unwrap()),
+            None,
+            gs,
+            bits,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        linear
+            .promote_affine_sidecars_to_f32(DType::BFloat16)
+            .unwrap();
+        assert_eq!(linear.get_scales().dtype().unwrap(), DType::Float32);
+        linear
+    }
+
+    /// BF16 x with F32 affine sidecars: `QuantizedLinear::forward` (the
+    /// mixed primitive for 2..=8 rows) and the mixed FFI at every row count
+    /// (native qmv_wide or the in-primitive promoted fallback) must equal the
+    /// promoted F32 path bit for bit.
+    #[test]
+    fn affine_q8_bf16_mixed_matches_promoted_path_bitwise() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            eprintln!("SKIP affine_q8_bf16_mixed_matches_promoted_path_bitwise: no Metal");
+            return;
+        }
+        let mut cases = 0;
+        for (n, k) in [
+            (96i64, 5120i64),
+            (1024, 5120),
+            (5120, 6144),
+            (17, 5120),
+            (96, 128),
+        ] {
+            let linear = gguf_linear(n, k, 32, 8);
+            let (w, s) = (linear.get_weight(), linear.get_scales());
+            let b = linear.get_biases().unwrap();
+            let rounded = s
+                .astype(DType::BFloat16)
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap();
+            assert_ne!(
+                rounded.to_float32().unwrap().to_vec(),
+                s.to_float32().unwrap().to_vec(),
+                "scales must carry more precision than BF16"
+            );
+            for seed in 0..3u64 {
+                for amp in [1.0e-3f64, 1.0, 30.0] {
+                    for m in [1i64, 2, 3, 4, 5, 6, 7, 8, 9, 16, 64] {
+                        let x = MxArray::random_normal(&[1, m, k], 0.0, amp, Some(DType::Float32))
+                            .unwrap()
+                            .mul_scalar(1.0 + seed as f64 * 0.37)
+                            .unwrap()
+                            .astype(DType::BFloat16)
+                            .unwrap();
+                        let want = promoted(&x, w, s, b, 32, 8);
+                        let ctx = format!("N={n} K={k} M={m} seed={seed} amp={amp}");
+                        assert_eq!(
+                            bf16_bits(&linear.forward(&x).unwrap()),
+                            want,
+                            "forward {ctx}"
+                        );
+                        let direct = mixed_ffi(&x, w, s, b, 32, 8).expect("mixed FFI accepts");
+                        assert_eq!(bf16_bits(&direct), want, "mixed FFI {ctx}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 5 * 3 * 3 * 11);
+    }
+
+    /// Operands the native kernel does not cover (4-bit / group 64, a
+    /// transposed x, batched rows) take the in-primitive promoted fallback,
+    /// which must also equal the promoted path bit for bit.
+    #[test]
+    fn affine_mixed_fallback_matches_promoted_path_bitwise() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            eprintln!("SKIP affine_mixed_fallback_matches_promoted_path_bitwise: no Metal");
+            return;
+        }
+        let mut cases = 0;
+        for (gs, bits) in [(64, 8), (32, 4), (64, 4)] {
+            let linear = gguf_linear(96, 768, gs, bits);
+            let (w, s) = (linear.get_weight(), linear.get_scales());
+            let b = linear.get_biases().unwrap();
+            for m in [1i64, 2, 5, 8, 12] {
+                let x = MxArray::random_normal(&[m, 768], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+                let want = promoted(&x, w, s, b, gs, bits);
+                let got = mixed_ffi(&x, w, s, b, gs, bits).expect("mixed FFI accepts");
+                assert_eq!(bf16_bits(&got), want, "gs={gs} bits={bits} M={m}");
+                cases += 1;
+            }
+        }
+        let linear = gguf_linear(96, 768, 32, 8);
+        let (w, s) = (linear.get_weight(), linear.get_scales());
+        let b = linear.get_biases().unwrap();
+        let wide = MxArray::random_normal(&[768, 6], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let transposed = wide.transpose(Some(&[1, 0])).unwrap();
+        let batched =
+            MxArray::random_normal(&[3, 4, 768], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        for x in [&transposed, &batched] {
+            let want = promoted(x, w, s, b, 32, 8);
+            assert_eq!(bf16_bits(&mixed_ffi(x, w, s, b, 32, 8).unwrap()), want);
+            cases += 1;
+        }
+        assert_eq!(cases, 17);
+    }
+
+    #[test]
+    fn affine_mixed_ffi_rejects_other_operands() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            eprintln!("SKIP affine_mixed_ffi_rejects_other_operands: no Metal");
+            return;
+        }
+        let linear = gguf_linear(96, 256, 32, 8);
+        let (w, s) = (linear.get_weight(), linear.get_scales());
+        let b = linear.get_biases().unwrap();
+        let x = MxArray::random_normal(&[4, 256], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        assert!(mixed_ffi(&x, w, s, b, 32, 8).is_some());
+        let x16 = x.astype(DType::Float16).unwrap();
+        assert!(mixed_ffi(&x16, w, s, b, 32, 8).is_none(), "f16 x");
+        let x32 = x.astype(DType::Float32).unwrap();
+        assert!(mixed_ffi(&x32, w, s, b, 32, 8).is_none(), "f32 x");
+        let s16 = s.astype(DType::BFloat16).unwrap();
+        let b16 = b.astype(DType::BFloat16).unwrap();
+        assert!(
+            mixed_ffi(&x, w, &s16, &b16, 32, 8).is_none(),
+            "bf16 sidecars"
+        );
+        assert!(mixed_ffi(&x, w, s, &b16, 32, 8).is_none(), "mixed sidecars");
+        assert!(
+            mixed_ffi(&x, w, s, b, 64, 8).is_none(),
+            "group size vs sidecar shape"
+        );
+        assert!(
+            mixed_ffi(&x, w, s, b, 32, 4).is_none(),
+            "bits vs packed width"
+        );
+        let narrow = MxArray::random_normal(&[4, 128], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        assert!(mixed_ffi(&narrow, w, s, b, 32, 8).is_none(), "K mismatch");
     }
 }

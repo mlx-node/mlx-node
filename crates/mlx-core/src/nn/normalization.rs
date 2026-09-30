@@ -498,6 +498,13 @@ mod tests {
                 vec![1, 4096],
                 vec![1, 7, 2560],
                 vec![2, 3, 128],
+                // Above 4096 the kernel mirrors rms_looped (Qwen3.8 hidden
+                // 5120, draft rows 8, verify rows 1..8).
+                vec![1, 5120],
+                vec![7, 5120],
+                vec![8, 5120],
+                vec![1, 8, 5120],
+                vec![1, 6144],
             ] {
                 let hidden = *shape.last().unwrap();
                 let mut norm = RMSNorm::new(hidden as u32, Some(eps)).unwrap();

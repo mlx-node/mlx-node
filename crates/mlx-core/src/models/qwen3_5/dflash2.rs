@@ -19,6 +19,7 @@ use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::qwen3_5::decoder_layer::DecoderLayer;
 use crate::nn::{Activations, Embedding, Linear, RMSNorm, RoPE};
 use crate::sampling::{SparseDistribution, is_greedy_temperature};
 use crate::utils::safetensors::load_safetensors_lazy;
@@ -207,6 +208,30 @@ fn non_causal_sliding_mask(
     ))
 }
 
+/// The sliding mask depends only on `(query_base, query_len, key_base,
+/// key_len, window)`, which every draft layer shares, so one propose builds it
+/// once and every layer reuses the same array.
+type SlidingMaskMemo = Option<((i32, i64, i32, i64, i64), Option<MxArray>)>;
+
+fn memo_sliding_mask(
+    memo: &mut SlidingMaskMemo,
+    query_base: i32,
+    query_len: i64,
+    key_base: i32,
+    key_len: i64,
+    window: i64,
+) -> Result<Option<MxArray>> {
+    let key = (query_base, query_len, key_base, key_len, window);
+    if let Some((cached, mask)) = memo.as_ref()
+        && *cached == key
+    {
+        return Ok(mask.clone());
+    }
+    let mask = non_causal_sliding_mask(query_base, query_len, key_base, key_len, window)?;
+    *memo = Some((key, mask.clone()));
+    Ok(mask)
+}
+
 struct DFlash2Attention {
     q_proj: LinearProj,
     k_proj: LinearProj,
@@ -245,6 +270,7 @@ impl DFlash2Attention {
         context: Option<&(MxArray, MxArray)>,
         context_base: i32,
         query_base: i32,
+        masks: &mut SlidingMaskMemo,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq = x.shape_at(1)?;
@@ -267,8 +293,14 @@ impl DFlash2Attention {
             None => (block_keys, block_values, query_base),
         };
         let key_len = keys.shape_at(2)?;
-        let mask =
-            non_causal_sliding_mask(query_base, seq, key_base, key_len, self.sliding_window)?;
+        let mask = memo_sliding_mask(
+            masks,
+            query_base,
+            seq,
+            key_base,
+            key_len,
+            self.sliding_window,
+        )?;
         let attended = scaled_dot_product_attention(
             &queries,
             &keys,
@@ -416,30 +448,45 @@ struct DFlash2Layer {
     mlp_conv: GroupedDynamicCausalConv,
 }
 
+/// A layer's input: the materialized hidden state, or the previous layer's
+/// residual and its MLP delta, whose sum is fused into this layer's input
+/// norm.
+enum DraftResidual<'a> {
+    Hidden(&'a MxArray),
+    Pending(&'a MxArray, &'a MxArray),
+}
+
 impl DFlash2Layer {
+    /// Returns this layer's post-attention residual and MLP delta; the caller
+    /// adds them inside the next norm.
     fn forward(
         &self,
-        hidden: &MxArray,
+        input: DraftResidual<'_>,
         context: Option<&(MxArray, MxArray)>,
         context_base: i32,
         query_base: i32,
-    ) -> Result<MxArray> {
-        let residual = hidden;
-        let (prepared, dynamic) = self
-            .attention_conv
-            .prepare(&self.input_norm.forward(hidden)?)?;
-        let attention = self
-            .attention
-            .forward(&prepared, context, context_base, query_base)?;
-        let hidden = residual.add(&self.attention_conv.finish(&attention, &dynamic)?)?;
-        let (prepared, dynamic) = self
+        masks: &mut SlidingMaskMemo,
+    ) -> Result<(MxArray, MxArray)> {
+        let (residual, normed) = match input {
+            DraftResidual::Hidden(hidden) => (hidden.clone(), self.input_norm.forward(hidden)?),
+            DraftResidual::Pending(hidden, delta) => {
+                DecoderLayer::add_residual_norm(&self.input_norm, hidden, delta)?
+            }
+        };
+        let (prepared, dynamic) = self.attention_conv.prepare(&normed)?;
+        let attention =
+            self.attention
+                .forward(&prepared, context, context_base, query_base, masks)?;
+        let (hidden, normed) = DecoderLayer::add_residual_norm(
+            &self.post_attention_norm,
+            &residual,
+            &self.attention_conv.finish(&attention, &dynamic)?,
+        )?;
+        let (prepared, dynamic) = self.mlp_conv.prepare(&normed)?;
+        let delta = self
             .mlp_conv
-            .prepare(&self.post_attention_norm.forward(&hidden)?)?;
-        hidden.add(
-            &self
-                .mlp_conv
-                .finish(&self.mlp.forward(&prepared)?, &dynamic)?,
-        )
+            .finish(&self.mlp.forward(&prepared)?, &dynamic)?;
+        Ok((hidden, delta))
     }
 }
 
@@ -874,7 +921,9 @@ impl DFlash2Model {
         query_base: i32,
         context: &DFlash2ContextCache,
     ) -> Result<MxArray> {
-        let mut hidden = target_embedding.forward(block_ids)?;
+        let embedded = target_embedding.forward(block_ids)?;
+        let mut pending: Option<(MxArray, MxArray)> = None;
+        let mut masks: SlidingMaskMemo = None;
         for (index, layer) in self.layers.iter().enumerate() {
             let cached = context.layers[index].get_cached_kv();
             let live_len = cached
@@ -883,9 +932,20 @@ impl DFlash2Model {
                 .transpose()?
                 .unwrap_or(0) as i32;
             let context_base = context.logical_len.saturating_sub(live_len);
-            hidden = layer.forward(&hidden, cached.as_ref(), context_base, query_base)?;
+            let input = match &pending {
+                Some((hidden, delta)) => DraftResidual::Pending(hidden, delta),
+                None => DraftResidual::Hidden(&embedded),
+            };
+            let next =
+                layer.forward(input, cached.as_ref(), context_base, query_base, &mut masks)?;
+            pending = Some(next);
         }
-        self.norm.forward(&hidden)
+        match &pending {
+            Some((hidden, delta)) => {
+                Ok(DecoderLayer::add_residual_norm(&self.norm, hidden, delta)?.1)
+            }
+            None => self.norm.forward(&embedded),
+        }
     }
 
     pub(crate) fn propose<R: Rng + ?Sized>(
@@ -2437,5 +2497,155 @@ mod tests {
                 assert!(bytes > 500_000_000 && bytes < 3_000_000_000)
             }
         }
+    }
+
+    fn three_layer_tiny_draft() -> super::DFlash2Model {
+        let target = super::super::config::Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
+            vocab_size: 32,
+            hidden_size: 64,
+            num_layers: 4,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 256,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(false),
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        };
+        unsafe { mlx_sys::mlx_seed(0xDF1A_5A11) };
+        let mut model = super::tiny_dflash2_model_for_stepper_test(&target).unwrap();
+        for _ in 0..2 {
+            let extra = super::tiny_dflash2_model_for_stepper_test(&target).unwrap();
+            model.layers.extend(extra.layers);
+        }
+        model.config.num_hidden_layers = model.layers.len();
+        // Non-unit norm weights so a skipped or misplaced norm changes bits.
+        for layer in &mut model.layers {
+            for norm in [&mut layer.input_norm, &mut layer.post_attention_norm] {
+                norm.set_weight(
+                    &MxArray::random_normal(&[64], 1.0, 0.2, Some(DType::BFloat16)).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        model
+            .norm
+            .set_weight(&MxArray::random_normal(&[64], 1.0, 0.2, Some(DType::BFloat16)).unwrap())
+            .unwrap();
+        model
+    }
+
+    /// The draft forward as it was before residual sums moved into the next
+    /// norm and before the sliding mask was shared: plain adds, separate
+    /// norms and a mask built per layer.
+    fn reference_forward_hidden(
+        model: &super::DFlash2Model,
+        embedding: &Embedding,
+        block_ids: &MxArray,
+        query_base: i32,
+        context: &super::DFlash2ContextCache,
+    ) -> MxArray {
+        let mut hidden = embedding.forward(block_ids).unwrap();
+        for (index, layer) in model.layers.iter().enumerate() {
+            let cached = context.layers[index].get_cached_kv();
+            let live_len = cached
+                .as_ref()
+                .map(|(keys, _)| keys.shape_at(2).unwrap())
+                .unwrap_or(0) as i32;
+            let context_base = context.logical_len.saturating_sub(live_len);
+            let residual = hidden.clone();
+            let (prepared, dynamic) = layer
+                .attention_conv
+                .prepare(&layer.input_norm.forward(&hidden).unwrap())
+                .unwrap();
+            let mut fresh = None;
+            let attention = layer
+                .attention
+                .forward(
+                    &prepared,
+                    cached.as_ref(),
+                    context_base,
+                    query_base,
+                    &mut fresh,
+                )
+                .unwrap();
+            hidden = residual
+                .add(&layer.attention_conv.finish(&attention, &dynamic).unwrap())
+                .unwrap();
+            let (prepared, dynamic) = layer
+                .mlp_conv
+                .prepare(&layer.post_attention_norm.forward(&hidden).unwrap())
+                .unwrap();
+            hidden = hidden
+                .add(
+                    &layer
+                        .mlp_conv
+                        .finish(&layer.mlp.forward(&prepared).unwrap(), &dynamic)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        model.norm.forward(&hidden).unwrap()
+    }
+
+    /// `forward_hidden` fuses each residual sum into the next norm and shares
+    /// one sliding mask across layers; with and without a mask (context
+    /// shorter and longer than the window) it must equal the reference bits.
+    #[test]
+    fn forward_hidden_fused_residuals_and_shared_mask_are_bit_identical() {
+        let model = three_layer_tiny_draft();
+        let mut embedding = Embedding::new(32, 64).unwrap();
+        embedding
+            .load_weight(
+                &MxArray::random_normal(&[32, 64], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+            )
+            .unwrap();
+        let mut cases = 0;
+        for context_rows in [3usize, 12, 30] {
+            let mut context = super::DFlash2ContextCache::new(&model.config);
+            let fused = MxArray::random_normal(
+                &[1, context_rows as i64, 64],
+                0.0,
+                1.0,
+                Some(DType::BFloat16),
+            )
+            .unwrap();
+            let tokens: Vec<u32> = (0..context_rows as u32).map(|t| 3 + t % 20).collect();
+            context.append(&model, &fused, 0, &tokens).unwrap();
+            let base = context.logical_len;
+            let block = MxArray::from_int32(&[7, 0, 0], &[1, 3]).unwrap();
+            let got = model
+                .forward_hidden(&embedding, &block, base, &context)
+                .unwrap();
+            let want = reference_forward_hidden(&model, &embedding, &block, base, &context);
+            got.eval();
+            want.eval();
+            assert_eq!(
+                got.to_uint16_native().unwrap(),
+                want.to_uint16_native().unwrap(),
+                "context_rows={context_rows}"
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 3);
     }
 }

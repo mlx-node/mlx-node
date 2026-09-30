@@ -1205,6 +1205,72 @@ mod tests {
         })
     }
 
+    /// The compiled verify adds each layer's MLP delta inside the next
+    /// layer's input norm (the final norm for the last layer) and takes every
+    /// tap from those fused sums. Logits, every layer's tap and every GDN tape
+    /// array must equal the eager verify (plain adds and norms) bit for bit.
+    #[test]
+    fn compiled_verify_matches_eager_verify_bitwise() -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!(
+                "SKIP compiled_verify_matches_eager_verify_bitwise: Metal must be the default device"
+            );
+            return Ok(());
+        }
+        assert!(
+            std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+            "compiled verify parity requires MLX_DISABLE_COMPILE to be unset"
+        );
+        let mut inner = tiny_dflash_inner_with_attention_head_dim(0xDFA5_5E3A, 64);
+        let tap_layers: Vec<usize> = (0..inner.layers.len()).collect();
+        let run = |inner: &mut Qwen35Inner, ids: &[i32]| -> Result<Vec<(Vec<i64>, Vec<u32>)>> {
+            reset_flat_fixture(inner);
+            let stream = Stream::generation();
+            let _ctx = StreamContext::new(stream);
+            let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+            prefill_logits.eval();
+            inner.dflash2_turn_state = Some(state);
+            let input = MxArray::from_int32(ids, &[1, ids.len() as i64])?;
+            let (logits, taps, tape) = super::super::model::forward_dflash2_with_taps(
+                inner,
+                &input,
+                &tap_layers,
+                true,
+                super::super::model::DFlash2LogitsSpan::All,
+            )?;
+            let mut arrays = vec![&logits];
+            arrays.extend(taps.iter());
+            for layer in tape.iter().flatten() {
+                let k = &layer.kernel;
+                arrays.extend([&k.q, &k.k, &k.v, &k.g, &k.beta, &layer.qkv]);
+            }
+            array_fingerprints(arrays)
+        };
+        for ids in [vec![5, 6, 7, 8, 9, 10, 11, 12], vec![9, 3, 14, 2, 6, 11]] {
+            Qwen35Inner::take_dflash2_compiled_test_counts();
+            inner.dflash2_compiled_verify_disabled = false;
+            let compiled = run(&mut inner, &ids)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts().0,
+                1,
+                "the compiled verify must run"
+            );
+            inner.dflash2_compiled_verify_disabled = true;
+            let eager = run(&mut inner, &ids)?;
+            assert_eq!(Qwen35Inner::take_dflash2_compiled_test_counts(), (0, 0));
+            assert_eq!(
+                compiled.len(),
+                1 + tap_layers.len() + 6 * inner.layers.iter().filter(|l| l.is_linear()).count()
+            );
+            for (index, (a, b)) in compiled.iter().zip(eager.iter()).enumerate() {
+                assert_eq!(a, b, "verify output {index} differs (rows {})", ids.len());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn compiled_verifier_state_and_continuation_repeat_for_every_keep() -> Result<()> {
         repeat_retained_prefix_trace(64)

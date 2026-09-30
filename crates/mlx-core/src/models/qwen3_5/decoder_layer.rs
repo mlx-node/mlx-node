@@ -84,6 +84,13 @@ pub(crate) fn compute_layer_kinds(
     kinds
 }
 
+/// Input of [`DecoderLayer::forward_verify`]: the embedding, or the previous
+/// layer's residual and MLP delta (summed inside this layer's input norm).
+pub(crate) enum VerifyResidual<'a> {
+    Hidden(&'a MxArray),
+    Pending { h: &'a MxArray, delta: &'a MxArray },
+}
+
 /// A single decoder layer in the Qwen3.5 dense model.
 ///
 /// Each layer has:
@@ -103,7 +110,11 @@ impl DecoderLayer {
     /// The fused kernel is bit-identical to `x.add(res)` + `norm.forward(h)`
     /// (same element mapping as `rms_single_row`/`rms_looped`), so this is
     /// safe on every path — eager, paged, prefill and compiled verify alike.
-    fn add_residual_norm(norm: &RMSNorm, x: &MxArray, res: &MxArray) -> Result<(MxArray, MxArray)> {
+    pub(crate) fn add_residual_norm(
+        norm: &RMSNorm,
+        x: &MxArray,
+        res: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
         if let Some(pair) = norm.forward_residual_add(x, res) {
             return Ok(pair);
         }
@@ -225,14 +236,23 @@ impl DecoderLayer {
     /// (graph inputs in, graph outputs out) instead of mutating
     /// `Qwen3_5LayerCache`. GDN layers still record their tape via
     /// `tape_sink` — the tape fields become compiled-graph outputs upstream.
+    ///
+    /// Returns `(x, h, mlp_out)`: the materialized layer input, the
+    /// post-attention residual and the MLP delta. The layer output `h +
+    /// mlp_out` is left to the caller, which fuses it into the next norm.
     pub(crate) fn forward_verify(
         &mut self,
-        x: &MxArray,
+        input: VerifyResidual<'_>,
         io: &mut LayerVerifyIo<'_>,
         use_kernel: bool,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
-    ) -> Result<MxArray> {
-        let normed = self.input_layernorm.forward(x)?;
+    ) -> Result<(MxArray, MxArray, MxArray)> {
+        let (x, normed) = match input {
+            VerifyResidual::Hidden(x) => (x.clone(), self.input_layernorm.forward(x)?),
+            VerifyResidual::Pending { h, delta } => {
+                Self::add_residual_norm(&self.input_layernorm, h, delta)?
+            }
+        };
         let attn_out = match (&mut self.attn, io) {
             (AttentionType::Linear(gdn), LayerVerifyIo::Linear(ac)) => {
                 gdn.forward_with_tape(&normed, None, Some(&mut **ac), use_kernel, tape_sink)?
@@ -247,8 +267,9 @@ impl DecoderLayer {
             }
         };
 
-        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-        h.add(&self.mlp.forward(&normed)?)
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, &x, &attn_out)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        Ok((x, h, mlp_out))
     }
 
     /// Forward pass with paged-or-flat dispatch for Qwen3.5.

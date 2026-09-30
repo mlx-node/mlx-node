@@ -1,5 +1,7 @@
 // Wide GGUF preparation: one SIMD group per 128-channel vector. Preserve
 // conv_sequence's F32 products, BF16 SiLU/QK boundaries and owned history.
+// qkv/a/b/history are read through their strides (split views, no copies);
+// axis 0 of qkv/a/b has size 1. conv/scale/dt are flat row-contiguous.
 R"(
   {
     #pragma clang fp contract(off)
@@ -14,7 +16,9 @@ R"(
         float total = 0.0f;
         for (uint tap = 0; tap < 4; ++tap) {
             uint row = token + tap;
-            float value = float(row < 3 ? history[row * W + ch] : qkv[(row - 3) * W + ch]);
+            float value = float(row < 3
+                ? history[row * history_strides[0] + ch * history_strides[1]]
+                : qkv[(row - 3) * qkv_strides[1] + ch * qkv_strides[2]]);
             float product = value * conv[ch * 4 + tap];
             total = product + total;
         }
@@ -26,7 +30,8 @@ R"(
             for (uint row = 0; row < 3; ++row) {
                 uint source = TOKENS + row;
                 next_history[row * W + ch] = source < 3
-                    ? history[source * W + ch] : qkv[(source - 3) * W + ch];
+                    ? history[source * history_strides[0] + ch * history_strides[1]]
+                    : qkv[(source - 3) * qkv_strides[1] + ch * qkv_strides[2]];
             }
         }
     }
@@ -49,11 +54,11 @@ R"(
     }
     if (vec < 48 && lane == 0) {
         uint h = token * 48 + vec;
-        float ax = float(a[h]) + dt[vec];
+        float ax = float(a[token * a_strides[1] + vec * a_strides[2]]) + dt[vec];
         float softplus = metal::max(ax, 0.0f) + log1p(metal::precise::exp(-metal::abs(ax)));
         decay[h] = metal::precise::exp(softplus * scale[vec]);
         beta[h] = metal::remove_reference_t<decltype(beta[0])>(
-            precise_sigmoid(float(b[h])));
+            precise_sigmoid(float(b[token * b_strides[1] + vec * b_strides[2]])));
     }
   }
 )"

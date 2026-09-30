@@ -551,7 +551,7 @@ fn forward_dflash2_compiled(
         Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
     )>,
 > {
-    use crate::models::qwen3_5::decoder_layer::LayerVerifyIo;
+    use crate::models::qwen3_5::decoder_layer::{DecoderLayer, LayerVerifyIo, VerifyResidual};
     use crate::models::qwen3_5::gated_delta::GdnKernelTape;
     use crate::models::qwen3_5::gated_delta_net::GdnLayerTape;
 
@@ -659,10 +659,24 @@ fn forward_dflash2_compiled(
         let ids = &graph_inputs[0];
         let rope_offsets = &graph_inputs[1];
         let mut cursor = 2usize;
-        let mut hidden = embedding.forward(ids)?;
+        let embedded = embedding.forward(ids)?;
+        // Layer i's output h + mlp_out is summed inside layer i+1's input norm
+        // (or the final norm); that fused sum is also the tap for layer i.
+        let mut pending: Option<(MxArray, MxArray)> = None;
         let mut taps: Vec<Option<MxArray>> = vec![None; tap_layers.len()];
+        let mut capture = |layer: usize, hidden: &MxArray| {
+            for (slot, &tap_layer) in tap_layers.iter().enumerate() {
+                if tap_layer == layer {
+                    taps[slot] = Some(hidden.clone());
+                }
+            }
+        };
         let mut extras: Vec<MxArray> = Vec::with_capacity(6 * n_linear + 2 * n_fa);
         for (index, layer) in layers.iter_mut().enumerate() {
+            let input = match &pending {
+                Some((h, delta)) => VerifyResidual::Pending { h, delta },
+                None => VerifyResidual::Hidden(&embedded),
+            };
             let mut tape_slot: Option<GdnLayerTape> = None;
             if layer.is_linear() {
                 // Detached cache seeded with the graph-input states: the
@@ -672,7 +686,12 @@ fn forward_dflash2_compiled(
                 detached.set(0, graph_inputs[cursor].clone())?;
                 detached.set(1, graph_inputs[cursor + 1].clone())?;
                 let mut io = LayerVerifyIo::Linear(&mut detached);
-                hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
+                let (x, h, delta) =
+                    layer.forward_verify(input, &mut io, true, Some(&mut tape_slot))?;
+                if index > 0 {
+                    capture(index - 1, &x);
+                }
+                pending = Some((h, delta));
                 let tape = tape_slot.ok_or_else(|| {
                     Error::from_reason("compiled verify: GDN layer produced no tape")
                 })?;
@@ -690,7 +709,12 @@ fn forward_dflash2_compiled(
                             out_kv: &mut out_kv,
                         },
                     );
-                    hidden = layer.forward_verify(&hidden, &mut io, true, Some(&mut tape_slot))?;
+                    let (x, h, delta) =
+                        layer.forward_verify(input, &mut io, true, Some(&mut tape_slot))?;
+                    if index > 0 {
+                        capture(index - 1, &x);
+                    }
+                    pending = Some((h, delta));
                 }
                 let (new_k, new_v) = out_kv.ok_or_else(|| {
                     Error::from_reason("compiled verify: attention layer produced no kv block")
@@ -699,13 +723,11 @@ fn forward_dflash2_compiled(
                 extras.push(new_v);
             }
             cursor += 2;
-            for (slot, &tap_layer) in tap_layers.iter().enumerate() {
-                if tap_layer == index {
-                    taps[slot] = Some(hidden.clone());
-                }
-            }
         }
-        let normalized = final_norm.forward(&hidden)?;
+        let (h, delta) =
+            pending.ok_or_else(|| Error::from_reason("compiled verify: model has no layers"))?;
+        let (hidden, normalized) = DecoderLayer::add_residual_norm(final_norm, &h, &delta)?;
+        capture(layers.len() - 1, &hidden);
         let logits = project_logits_from_hidden(&normalized, lm_head, embedding)?;
         let mut outputs = Vec::with_capacity(n_outputs);
         outputs.push(logits);
