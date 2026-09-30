@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use napi::bindgen_prelude::*;
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
@@ -13,12 +13,16 @@ use crate::engine::backend::{
 use crate::engine::decode::TurnStreaming;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
-use crate::engine::params::generated_capacity_hint;
+use crate::engine::params::{generated_capacity_hint, kv_capacity_round_up};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::stream::{Stream, StreamContext};
+use crate::stream::{Stream, StreamContext, WiredLimitContext};
+use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
+use crate::transformer::paged_policy::live_prefill_headroom;
 
 use super::dflash2::DFlash2ContextCache;
-use super::layer_cache::{Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp};
+use super::layer_cache::{
+    Qwen3_5LayerCache, Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp,
+};
 use super::model::{PREFILL_STEP_SIZE, Qwen35Inner, async_eval_layer_caches};
 
 pub(crate) struct DFlash2TurnState {
@@ -98,6 +102,109 @@ fn constrain_dflash2_context_params(
 
 fn dflash2_final_token_fits_context(logical_len: i32, capacity: usize) -> bool {
     usize::try_from(logical_len).is_ok_and(|logical_len| logical_len < capacity)
+}
+
+/// Process reserve kept out of the live headroom before sizing the target KV
+/// reservation; 90% of the rest is usable, leaving room for prefill and
+/// verify transients.
+const DFLASH2_KV_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Growth step of the flat `KVCache`; a smaller look-ahead saves nothing.
+const DFLASH2_KV_MIN_AHEAD_ROWS: u64 = 256;
+
+fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
+    let (mut active, mut cached, mut limit) = (0u64, 0u64, 0u64);
+    // SAFETY: each probe writes one u64 through a valid pointer and reports
+    // failure through its return code.
+    let allocator_ok = unsafe {
+        mlx_sys::mlx_get_active_memory(&mut active) == 0
+            && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
+            && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
+            && limit > 0
+    };
+    let recommended = WiredLimitContext::get_max_working_set_size() as u64;
+    PagedPrefillMemorySnapshot {
+        allocator_active_bytes: allocator_ok.then_some(active),
+        allocator_cached_bytes: allocator_ok.then_some(cached),
+        allocator_limit_bytes: allocator_ok.then_some(limit),
+        metal_recommended_working_set_bytes: (recommended > 0).then_some(recommended),
+        metal_current_allocated_bytes: None,
+        // Private paged pools are invisible to MLX's active counter.
+        paged_pool_allocated_bytes: Some(crate::cache_limit::coordinator().registered_pool_bytes()),
+    }
+}
+
+/// Bytes the target KV reservation may claim, or `None` when the device
+/// limits cannot be read.
+fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
+    live_prefill_headroom(snapshot)
+        .selected_bytes
+        .map(|headroom| headroom.saturating_sub(DFLASH2_KV_HEADROOM_RESERVE_BYTES) / 10 * 9)
+}
+
+fn kv_row_bytes(full_attention_layers: usize, kv_heads: i32, head_dim: i32, dtype: DType) -> u64 {
+    (full_attention_layers as u64)
+        .saturating_mul(2)
+        .saturating_mul(kv_heads.max(0) as u64)
+        .saturating_mul(head_dim.max(0) as u64)
+        .saturating_mul(dtype.byte_size() as u64)
+}
+
+/// Target rows to reserve for one DFlash2 turn: the whole turn
+/// (`prompt + max_new`, rounded to the growth step) when the budget covers
+/// it, else as many look-ahead rows as fit. `None` keeps the growth path.
+/// `resident_rows` are already allocated and so already paid for.
+fn dflash2_kv_reserve_rows(
+    prompt_len: usize,
+    max_new_tokens: i32,
+    resident_rows: i64,
+    row_bytes: u64,
+    budget_bytes: Option<u64>,
+) -> Result<Option<i64>> {
+    let prompt = i32::try_from(prompt_len).map_err(|_| {
+        Error::from_reason(format!(
+            "Qwen3.8 DFlash2 prompt of {prompt_len} tokens is too long"
+        ))
+    })?;
+    kv_capacity_round_up(prompt, max_new_tokens)?;
+    let Some(budget) = budget_bytes else {
+        return Ok(None);
+    };
+    if row_bytes == 0 {
+        return Ok(None);
+    }
+    let unallocated_prompt_rows = (prompt as i64 - resident_rows.max(0)).max(0) as u64;
+    let ahead_cap =
+        budget.saturating_sub(unallocated_prompt_rows.saturating_mul(row_bytes)) / row_bytes;
+    if ahead_cap < DFLASH2_KV_MIN_AHEAD_ROWS {
+        return Ok(None);
+    }
+    let ahead = ahead_cap.min(max_new_tokens.max(0) as u64) as i32;
+    Ok(Some(kv_capacity_round_up(prompt, ahead)? as i64))
+}
+
+/// Smallest full-attention buffer capacity, `None` without full-attention
+/// caches.
+fn min_fa_capacity(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<Option<i64>> {
+    let mut min = None;
+    for cache in caches.iter().flatten() {
+        if let Qwen3_5LayerCache::FullAttention(kv) = cache {
+            let capacity = kv.capacity()?;
+            min = Some(min.map_or(capacity, |m: i64| m.min(capacity)));
+        }
+    }
+    Ok(min)
+}
+
+fn reserve_dflash2_target_kv(caches: &mut Option<Vec<Qwen3_5LayerCache>>, rows: i64) -> Result<()> {
+    let caches = caches
+        .as_mut()
+        .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
+    for cache in caches.iter_mut() {
+        if let Some(kv) = cache.as_kv_cache_mut() {
+            kv.reserve(rows)?;
+        }
+    }
+    Ok(())
 }
 
 impl Qwen35DFlash2Stepper<'_> {
@@ -545,6 +652,65 @@ impl Qwen35Inner {
         ))
     }
 
+    /// K/V element type the target's full-attention caches hold or will be
+    /// allocated with: activations follow the embedding output dtype.
+    fn dflash2_target_kv_dtype(&self) -> Result<DType> {
+        let allocated = self.caches.iter().flatten().find_map(|cache| match cache {
+            Qwen3_5LayerCache::FullAttention(kv) => kv.keys_ref(),
+            Qwen3_5LayerCache::Linear(_) => None,
+        });
+        match allocated {
+            Some(keys) => keys.dtype(),
+            None => self
+                .embedding
+                .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
+                .dtype(),
+        }
+    }
+
+    /// Size every flat full-attention cache for this turn so decode never
+    /// grows it. Runs before prefill: on a cold turn it only records the
+    /// size for the first allocation; a warm turn copies its prefix once.
+    fn reserve_dflash2_turn_kv(&mut self, prompt_len: usize, max_new_tokens: i32) -> Result<()> {
+        let Some(resident_rows) = min_fa_capacity(&self.caches)? else {
+            return Ok(());
+        };
+        let full_attention_layers = self
+            .caches
+            .iter()
+            .flatten()
+            .filter(|cache| matches!(cache, Qwen3_5LayerCache::FullAttention(_)))
+            .count();
+        let row_bytes = kv_row_bytes(
+            full_attention_layers,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            self.dflash2_target_kv_dtype()?,
+        );
+        let budget_bytes = dflash2_kv_budget_bytes(dflash2_memory_snapshot());
+        let rows = dflash2_kv_reserve_rows(
+            prompt_len,
+            max_new_tokens,
+            resident_rows,
+            row_bytes,
+            budget_bytes,
+        )?;
+        tracing::debug!(
+            target: "mlx_core::inference",
+            prompt_len,
+            max_new_tokens,
+            resident_rows,
+            row_bytes,
+            budget_bytes,
+            reserved_rows = rows,
+            "DFlash2 target KV reservation"
+        );
+        match rows {
+            Some(rows) => reserve_dflash2_target_kv(&mut self.caches, rows),
+            None => Ok(()),
+        }
+    }
+
     fn dflash2_fail_closed(&mut self, error: Error) -> Error {
         let _ = ChatBackend::reset_caches(self, ResetScope::Command);
         self.dflash2_turn_state = None;
@@ -647,6 +813,13 @@ impl Qwen35Inner {
         );
         profiler.set_prompt_tokens(prefill.len() as u32);
         profiler.snapshot_memory_before();
+        let reserved = {
+            let _stream = StreamContext::new(generation_stream);
+            self.reserve_dflash2_turn_kv(tokens.len(), params.max_new_tokens)
+        };
+        if let Err(error) = reserved {
+            return Err(self.dflash2_fail_closed(error));
+        }
         profiler.begin_prefill();
         let (last_logits, state) =
             match self.dflash2_prefill(&prefill, cached_prefix as i32, generation_stream) {
@@ -1086,6 +1259,241 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const QWEN38_ROW_BYTES: u64 = 64 * 1024;
+
+    #[test]
+    fn kv_row_bytes_counts_every_full_attention_layer_and_dtype() {
+        assert_eq!(kv_row_bytes(16, 4, 256, DType::BFloat16), QWEN38_ROW_BYTES);
+        assert_eq!(
+            kv_row_bytes(16, 4, 256, DType::Float32),
+            2 * QWEN38_ROW_BYTES
+        );
+        assert_eq!(kv_row_bytes(0, 4, 256, DType::BFloat16), 0);
+    }
+
+    #[test]
+    fn kv_budget_uses_the_lower_device_limit_minus_active_and_reserve() {
+        let snapshot = PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(30 * GIB),
+            allocator_cached_bytes: Some(7 * GIB),
+            allocator_limit_bytes: Some(200 * GIB),
+            metal_recommended_working_set_bytes: Some(100 * GIB),
+            metal_current_allocated_bytes: None,
+            paged_pool_allocated_bytes: Some(5 * GIB),
+        };
+        // min(200, 95% of 100) - 30 active - 5 pool - 2 reserve = 58 GiB; 90% usable.
+        assert_eq!(dflash2_kv_budget_bytes(snapshot), Some(58 * GIB / 10 * 9));
+        let lower_mlx_limit = PagedPrefillMemorySnapshot {
+            allocator_limit_bytes: Some(60 * GIB),
+            ..snapshot
+        };
+        assert_eq!(
+            dflash2_kv_budget_bytes(lower_mlx_limit),
+            Some(23 * GIB / 10 * 9)
+        );
+        let exhausted = PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(96 * GIB),
+            ..snapshot
+        };
+        assert_eq!(dflash2_kv_budget_bytes(exhausted), Some(0));
+        let unreadable = PagedPrefillMemorySnapshot {
+            allocator_active_bytes: None,
+            allocator_limit_bytes: None,
+            ..snapshot
+        };
+        assert_eq!(dflash2_kv_budget_bytes(unreadable), None);
+    }
+
+    #[test]
+    fn kv_reserve_rows_covers_turn_and_caps_lookahead() {
+        let rows = |prompt, max_new, resident, budget| {
+            dflash2_kv_reserve_rows(prompt, max_new, resident, QWEN38_ROW_BYTES, budget)
+                .expect("valid reservation input")
+        };
+        let plenty = Some(64 * GIB);
+        assert_eq!(rows(87, 1024, 0, plenty), Some(1280));
+        assert_eq!(rows(6219, 1024, 0, plenty), Some(7424));
+        assert_eq!(rows(32488, 1024, 0, plenty), Some(33536));
+        // The budget first pays for the prompt rows that are not allocated
+        // yet; the rest bounds the look-ahead.
+        assert_eq!(
+            rows(100, 100_000, 0, Some((100 + 8192) * QWEN38_ROW_BYTES)),
+            Some(8448)
+        );
+        assert_eq!(
+            rows(6000, 1024, 6144, Some(300 * QWEN38_ROW_BYTES)),
+            Some(6400),
+            "resident rows are already paid for"
+        );
+        // Less than one growth step of look-ahead keeps the growth path.
+        assert_eq!(
+            rows(100, 1024, 0, Some((100 + 255) * QWEN38_ROW_BYTES)),
+            None
+        );
+        assert_eq!(rows(32488, 1024, 0, Some(GIB)), None);
+        assert_eq!(rows(87, 1024, 0, None), None);
+        assert_eq!(rows(0, 0, 0, plenty), Some(0));
+        assert_eq!(
+            dflash2_kv_reserve_rows(87, 1024, 0, 0, plenty).expect("no full attention"),
+            None
+        );
+        assert!(dflash2_kv_reserve_rows(1, i32::MAX, 0, QWEN38_ROW_BYTES, plenty).is_err());
+    }
+
+    fn live_target_cache_fingerprints(
+        caches: &[Qwen3_5LayerCache],
+    ) -> Result<Vec<(Vec<i64>, Vec<u32>)>> {
+        let mut arrays = Vec::new();
+        for cache in caches {
+            match cache {
+                Qwen3_5LayerCache::FullAttention(kv) => {
+                    let rows = kv.get_offset() as i64;
+                    for buffer in [kv.keys_ref(), kv.values_ref()].into_iter().flatten() {
+                        arrays.push(buffer.slice_axis(2, 0, rows)?);
+                    }
+                }
+                Qwen3_5LayerCache::Linear(_) => {
+                    let mut linear = Vec::new();
+                    cache.collect_arrays(&mut linear);
+                    arrays.extend(linear.into_iter().cloned());
+                }
+            }
+        }
+        array_fingerprints(arrays.iter().collect())
+    }
+
+    fn run_reserved_growth_trace(
+        inner: &mut Qwen35Inner,
+        reserve_rows: Option<i64>,
+    ) -> Result<(ArTrace, Vec<i64>)> {
+        reset_flat_fixture(inner);
+        if let Some(rows) = reserve_rows {
+            reserve_dflash2_target_kv(&mut inner.caches, rows)?;
+        }
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let prompt = (0..250).map(|i| (i % 15 + 1) as u32).collect::<Vec<_>>();
+        let (prefill_logits, state) = inner.dflash2_prefill(&prompt, 0, stream)?;
+        prefill_logits.eval();
+        inner.dflash2_turn_state = Some(state);
+        let mut capacities = vec![min_fa_capacity(&inner.caches)?.expect("fixture FA caches")];
+        let block_size = inner
+            .dflash2
+            .as_ref()
+            .expect("fixture draft")
+            .config
+            .block_size;
+        let mut step = inner.begin_dspark_decode(block_size)?;
+        let mut logits_trace = Vec::new();
+        // The first verify block writes rows 250..258 and so crosses the
+        // unreserved 256-row buffer inside a verify commit.
+        for (cycle, keep) in [8, 3, 8, 8, 1, 8, 5, 8].into_iter().enumerate() {
+            let ids = (0..8)
+                .map(|row| ((row + cycle) % 15 + 1) as u32)
+                .collect::<Vec<_>>();
+            let logits = step.verify(&ids)?.logits;
+            let floats = logits.astype(DType::Float32)?;
+            floats.eval();
+            logits_trace.push(floats.to_float32()?.iter().map(|x| x.to_bits()).collect());
+            step.commit_with_provenance(keep, ids.len(), &ids)?;
+            capacities.push(min_fa_capacity(&step.inner.caches)?.expect("fixture FA caches"));
+        }
+        let frontier = step.frontier().expect("fixture frontier");
+        let target_cache =
+            live_target_cache_fingerprints(step.inner.caches.as_ref().expect("fixture caches"))?;
+        let draft_cache = array_fingerprints(step.context.cache_arrays_for_stepper_test())?;
+        let context_tokens = step.context.token_history().to_vec();
+        step.finish()?;
+
+        let context = inner
+            .dflash2_context
+            .take()
+            .expect("retained draft context");
+        let next_position = context.logical_len();
+        inner.dflash2_turn_state = Some(DFlash2TurnState {
+            context,
+            next_position,
+        });
+        let mut continuation = inner.begin_dspark_decode(block_size)?;
+        let params = extract_chat_params(&ChatConfig {
+            temperature: Some(0.0),
+            repetition_penalty: Some(1.01),
+            ..ChatConfig::default()
+        });
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let proposal = continuation.propose(3, 2, &params, &mut rng)?;
+        let continuation_draft = proposal.draft_ids;
+        continuation.finish()?;
+        Ok((
+            ArTrace {
+                logits: logits_trace,
+                target_cache,
+                draft_cache,
+                context_tokens,
+                frontier,
+                continuation_draft,
+            },
+            capacities,
+        ))
+    }
+
+    fn assert_reserved_trace_is_bit_identical(head_dim: i32) -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!("SKIP reserved KV trace: Metal must be the default device");
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner_with_attention_head_dim(0xDFA5_2204, head_dim);
+        Qwen35Inner::take_dflash2_compiled_test_counts();
+        run_reserved_growth_trace(&mut inner, None)?;
+        Qwen35Inner::take_dflash2_compiled_test_counts();
+        let (reserved, reserved_capacities) = run_reserved_growth_trace(&mut inner, Some(1024))?;
+        let reserved_counts = Qwen35Inner::take_dflash2_compiled_test_counts();
+        let (grown, grown_capacities) = run_reserved_growth_trace(&mut inner, None)?;
+        let grown_counts = Qwen35Inner::take_dflash2_compiled_test_counts();
+        assert_trace_eq(
+            &reserved,
+            &grown,
+            &format!("reserved vs grown head_dim={head_dim}"),
+        );
+        assert_eq!(
+            reserved_counts, grown_counts,
+            "reservation must not change verifier routing or traces: head_dim={head_dim}"
+        );
+        assert_eq!(
+            grown_counts.0,
+            if head_dim == 64 { 8 } else { 0 },
+            "verifier route: head_dim={head_dim}"
+        );
+        assert!(
+            reserved_capacities.iter().all(|&capacity| capacity == 1024),
+            "reserved capacity must never change: {reserved_capacities:?}"
+        );
+        assert_eq!(grown_capacities.first(), Some(&256));
+        assert_eq!(
+            grown_capacities.last(),
+            Some(&(250 + 256)),
+            "the unreserved twin must grow inside decode"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_target_kv_trace_is_bit_identical_across_growth_boundary_compiled() -> Result<()> {
+        assert!(
+            std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+            "compiled verifier regression requires MLX_DISABLE_COMPILE to be unset"
+        );
+        assert_reserved_trace_is_bit_identical(64)
+    }
+
+    #[test]
+    fn reserved_target_kv_trace_is_bit_identical_across_growth_boundary_eager() -> Result<()> {
+        assert_reserved_trace_is_bit_identical(32)
     }
 
     #[test]

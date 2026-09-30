@@ -10,6 +10,9 @@ pub struct KVCache {
     values: Option<MxArray>,
     offset: i32,
     step: i32,
+    /// Rows the first allocation must hold (set by [`Self::reserve`] while
+    /// the cache is still empty); 0 when nothing is reserved.
+    pending_rows: i64,
 }
 
 impl Default for KVCache {
@@ -26,6 +29,7 @@ impl KVCache {
             values: None,
             offset: 0,
             step: 256, // Pre-allocate 256 tokens at a time (matching MLX-LM)
+            pending_rows: 0,
         }
     }
 
@@ -59,54 +63,27 @@ impl KVCache {
         if needs_grow {
             // Calculate how many steps we need to allocate
             let n_steps = (self.step + seq_len - 1) / self.step;
-            let k_shape = [
-                batch_size,
-                n_kv_heads,
-                n_steps as i64 * self.step as i64,
-                k_head_dim,
-            ];
-            let v_shape = [
-                batch_size,
-                n_kv_heads,
-                n_steps as i64 * self.step as i64,
-                v_head_dim,
-            ];
+            let step_rows = n_steps as i64 * self.step as i64;
+            let new_rows = if self.keys.is_some() {
+                step_rows
+            } else {
+                step_rows.max(std::mem::take(&mut self.pending_rows))
+            };
+            let k_shape = [batch_size, n_kv_heads, new_rows, k_head_dim];
+            let v_shape = [batch_size, n_kv_heads, new_rows, v_head_dim];
 
             // Pre-allocate new buffer filled with zeros
             let new_k = MxArray::zeros(&k_shape, Some(keys.dtype()?))?;
             let new_v = MxArray::zeros(&v_shape, Some(values.dtype()?))?;
 
-            if let Some(cached_keys) = &self.keys {
-                // Align to step boundary if needed
-                let cached_keys = if prev % self.step != 0 {
-                    cached_keys.slice_axis(2, 0, prev as i64)?
-                } else {
-                    cached_keys.clone()
-                };
-                let cached_values = if prev % self.step != 0 {
-                    self.values
-                        .as_ref()
-                        .ok_or_else(|| {
-                            Error::from_reason("KV cache values missing while keys are present")
-                        })?
-                        .slice_axis(2, 0, prev as i64)?
-                } else {
-                    self.values
-                        .as_ref()
-                        .ok_or_else(|| {
-                            Error::from_reason("KV cache values missing while keys are present")
-                        })?
-                        .clone()
-                };
-
-                // Only concatenate when growing buffer (rare!)
-                self.keys = Some(MxArray::concatenate(&cached_keys, &new_k, 2)?);
-                self.values = Some(MxArray::concatenate(&cached_values, &new_v, 2)?);
+            // Align to step boundary if needed; only concatenate when growing
+            // the buffer (rare!)
+            let keep_rows = if prev % self.step != 0 {
+                Some(prev as i64)
             } else {
-                // First allocation
-                self.keys = Some(new_k);
-                self.values = Some(new_v);
-            }
+                None
+            };
+            self.append_rows(keep_rows, new_k, new_v)?;
         }
 
         // In-place assignment: write new keys/values to pre-allocated buffer
@@ -143,6 +120,93 @@ impl KVCache {
         self.keys = None;
         self.values = None;
         self.offset = 0;
+        self.pending_rows = 0;
+    }
+
+    /// Make the buffer hold at least `rows` rows (rounded up to the step), so
+    /// appends up to that frontier never grow it. An empty cache only records
+    /// the size for its first allocation; a live cache copies `[0:offset]`
+    /// into the larger buffer once. Rows past `offset` are never read.
+    pub(crate) fn reserve(&mut self, rows: i64) -> Result<()> {
+        if rows <= 0 {
+            return Ok(());
+        }
+        let step = self.step as i64;
+        let target = rows
+            .checked_add(step - 1)
+            .map(|rows| rows / step * step)
+            .filter(|&target| target <= i32::MAX as i64)
+            .ok_or_else(|| {
+                Error::from_reason(format!("KV cache reservation of {rows} rows is too large"))
+            })?;
+        let Some(keys) = &self.keys else {
+            self.pending_rows = self.pending_rows.max(target);
+            return Ok(());
+        };
+        if self.capacity()? >= rows {
+            return Ok(());
+        }
+        let values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("KV cache values missing while keys are present"))?;
+        let extra = target - self.offset as i64;
+        let zeros_like = |cached: &MxArray| -> Result<MxArray> {
+            MxArray::zeros(
+                &[
+                    cached.shape_at(0)?,
+                    cached.shape_at(1)?,
+                    extra,
+                    cached.shape_at(3)?,
+                ],
+                Some(cached.dtype()?),
+            )
+        };
+        let new_k = zeros_like(keys)?;
+        let new_v = zeros_like(values)?;
+        self.append_rows(Some(self.offset as i64), new_k, new_v)
+    }
+
+    /// Rows the key buffer can hold without growing (0 before the first
+    /// allocation).
+    pub(crate) fn capacity(&self) -> Result<i64> {
+        self.keys.as_ref().map_or(Ok(0), |keys| keys.shape_at(2))
+    }
+
+    /// Replace the buffers with `buffer[0:keep_rows]` (the whole buffer when
+    /// `None`) followed by `new_k` / `new_v`, or with `new_k` / `new_v` alone
+    /// before the first allocation or when no row is kept.
+    fn append_rows(
+        &mut self,
+        keep_rows: Option<i64>,
+        new_k: MxArray,
+        new_v: MxArray,
+    ) -> Result<()> {
+        let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values) else {
+            if self.keys.is_some() {
+                return Err(Error::from_reason(
+                    "KV cache values missing while keys are present",
+                ));
+            }
+            self.keys = Some(new_k);
+            self.values = Some(new_v);
+            return Ok(());
+        };
+        if keep_rows == Some(0) {
+            self.keys = Some(new_k);
+            self.values = Some(new_v);
+            return Ok(());
+        }
+        let keep = |cached: &MxArray| -> Result<MxArray> {
+            match keep_rows {
+                Some(rows) => cached.slice_axis(2, 0, rows),
+                None => Ok(cached.clone()),
+            }
+        };
+        let (kept_keys, kept_values) = (keep(cached_keys)?, keep(cached_values)?);
+        self.keys = Some(MxArray::concatenate(&kept_keys, &new_k, 2)?);
+        self.values = Some(MxArray::concatenate(&kept_values, &new_v, 2)?);
+        Ok(())
     }
 
     /// Returns the current offset (number of cached tokens).
@@ -392,5 +456,139 @@ mod tests {
         assert_eq!(cache.get_offset(), 8);
         assert_shape(&result_k, &[4, 2, 8, 16]);
         assert_shape(&result_v, &[4, 2, 8, 16]);
+    }
+
+    fn rows(n: i64, seed: f64) -> (MxArray, MxArray) {
+        let k = MxArray::random_normal(&[1, 2, n, 8], seed, 1.0, None).unwrap();
+        let v = MxArray::random_normal(&[1, 2, n, 8], -seed, 1.0, None).unwrap();
+        (k, v)
+    }
+
+    fn bits(arr: &MxArray) -> (Vec<i64>, Vec<u32>) {
+        arr.eval();
+        (
+            arr.shape().unwrap().to_vec(),
+            arr.to_float32()
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn reserve_before_first_append_allocates_reserved_rows_once() {
+        let mut cache = KVCache::new();
+        cache.reserve(600).unwrap();
+        assert_eq!(
+            cache.capacity().unwrap(),
+            0,
+            "reserve on an empty cache is lazy"
+        );
+        let (k, v) = rows(4, 0.5);
+        cache.update_and_fetch(&k, &v).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 768);
+        assert_eq!(cache.get_offset(), 4);
+        while cache.get_offset() < 600 {
+            let (k, v) = rows(8, 0.25);
+            cache.update_and_fetch(&k, &v).unwrap();
+            assert_eq!(cache.capacity().unwrap(), 768);
+        }
+    }
+
+    #[test]
+    fn reserve_after_append_copies_prefix_once_and_is_bit_identical() {
+        let mut plain = KVCache::new();
+        let mut reserved = KVCache::new();
+        let (k, v) = rows(300, 1.0);
+        plain.update_and_fetch(&k, &v).unwrap();
+        reserved.update_and_fetch(&k, &v).unwrap();
+        reserved.reserve(2000).unwrap();
+        assert_eq!(reserved.capacity().unwrap(), 2048);
+        assert_eq!(reserved.get_offset(), 300);
+
+        let mut plain_capacities = vec![plain.capacity().unwrap()];
+        for (cycle, keep) in [8, 1, 5, 8, 3, 8, 2, 7]
+            .iter()
+            .cycle()
+            .take(200)
+            .enumerate()
+        {
+            let (k, v) = rows(8, cycle as f64 * 0.01);
+            let base = plain.get_offset();
+            let (pk, pv) = plain.update_and_fetch(&k, &v).unwrap();
+            let (rk, rv) = reserved.update_and_fetch(&k, &v).unwrap();
+            assert_eq!(bits(&pk), bits(&rk), "keys cycle={cycle}");
+            assert_eq!(bits(&pv), bits(&rv), "values cycle={cycle}");
+            plain.trim(base + keep);
+            reserved.trim(base + keep);
+            assert_eq!(reserved.capacity().unwrap(), 2048, "cycle={cycle}");
+            plain_capacities.push(plain.capacity().unwrap());
+        }
+        assert!(
+            reserved.get_offset() > 300 + 4 * 256,
+            "the trace must cross four 256-row boundaries"
+        );
+        plain_capacities.dedup();
+        assert!(
+            plain_capacities.len() >= 5,
+            "the unreserved twin must grow at every boundary: {plain_capacities:?}"
+        );
+    }
+
+    #[test]
+    fn reserve_is_noop_when_capacity_suffices() {
+        let mut cache = KVCache::new();
+        let (k, v) = rows(300, 1.0);
+        cache.update_and_fetch(&k, &v).unwrap();
+        let before = cache.keys_ref().unwrap().clone();
+        cache.reserve(512).unwrap();
+        cache.reserve(400).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 512);
+        assert_eq!(bits(cache.keys_ref().unwrap()), bits(&before));
+    }
+
+    #[test]
+    fn reserve_nonpositive_is_noop() {
+        let mut cache = KVCache::new();
+        cache.reserve(0).unwrap();
+        cache.reserve(-5).unwrap();
+        let (k, v) = rows(4, 1.0);
+        cache.update_and_fetch(&k, &v).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 256);
+        assert!(
+            cache.reserve(i32::MAX as i64).is_err(),
+            "rounding past i32 must fail"
+        );
+    }
+
+    #[test]
+    fn reset_clears_pending_rows() {
+        let mut cache = KVCache::new();
+        cache.reserve(4096).unwrap();
+        cache.reset();
+        let (k, v) = rows(300, 1.0);
+        cache.update_and_fetch(&k, &v).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 512);
+    }
+
+    #[test]
+    fn unreserved_growth_is_unchanged() {
+        let mut cache = KVCache::new();
+        let (k, v) = rows(300, 1.0);
+        cache.update_and_fetch(&k, &v).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 512);
+        cache.trim(257);
+        let (k, v) = rows(300, 2.0);
+        cache.update_and_fetch(&k, &v).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 257 + 2 * 256);
+        cache.trim(512);
+        let (k, v) = rows(300, 3.0);
+        cache.update_and_fetch(&k, &v).unwrap();
+        assert_eq!(
+            cache.capacity().unwrap(),
+            769 + 2 * 256,
+            "a step-aligned frontier keeps the whole old buffer"
+        );
     }
 }
