@@ -728,8 +728,10 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
 
     // Segmented BF16 vector attention, with concatenated SDPA fallback for
-    // unsupported pipeline capabilities. Null indicates a construction error
-    // (or an unavailable backend, which Rust checks before calling).
+    // unsupported pipeline capabilities. A causal block wider than one
+    // supported query chunk is one call with no fallback. Null indicates a
+    // construction error (or an unavailable backend, which Rust checks before
+    // calling).
     pub fn mlx_segmented_sdpa_forward(
         q: *mut mlx_array,
         prefix_k: *mut mlx_array,
@@ -767,6 +769,38 @@ unsafe extern "C-unwind" {
         stage2_static_memory: usize,
         out_stage1_threads: *mut u32,
         out_stage2_threads: *mut u32,
+    ) -> i32;
+
+    pub fn mlx_segmented_sdpa_test_verify_route(
+        rows: i32,
+        max_query_length: i32,
+        head_two_pass: bool,
+        head_partitions: i32,
+        tail_two_pass: bool,
+        tail_partitions: i32,
+        unified_supported: bool,
+    ) -> i32;
+
+    pub fn mlx_segmented_sdpa_test_verify_plan(
+        rows: i32,
+        gqa_factor: i32,
+        partitions: i32,
+        stage1_width: usize,
+        stage1_max_threads: usize,
+        stage1_static_memory: usize,
+        device_max_memory: usize,
+        stage2_width: usize,
+        stage2_max_threads: usize,
+        stage2_static_memory: usize,
+        out_stage1_threads: *mut u32,
+    ) -> i32;
+
+    pub fn mlx_segmented_sdpa_test_device_verify_route(
+        q_heads: i32,
+        kv_heads: i32,
+        rows: i32,
+        prefix_n: i32,
+        out_device_class: *mut std::ffi::c_char,
     ) -> i32;
 
     // Fused forward step - single FFI call for entire forward pass

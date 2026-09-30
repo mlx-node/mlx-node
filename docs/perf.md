@@ -84,7 +84,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_METAL_OP_TRACE=1\|2\|3`             | Diagnostic: print one line per Metal primitive eval to stderr — `commit`/`kernel`/`synchronize` events with node counts (1), plus primitive names (2) and input→output dtypes (3). Zero cost when unset. Used to count dispatches per decode/verify cycle.                                                                                                                                                                                                            |
 
 Eligible Qwen/DFlash projection merges, fused GDN preparation/window convolution,
-fused draft convolution/top-16/greedy selection, segmented/split verifier attention,
+fused draft convolution/top-16/greedy selection, segmented one-call verifier attention,
 compiled verification, eligible two-column GDN recurrence and D256 full prefill
 attention now use their optimized paths without manual rollback switches.
 Runtime shape, dtype and device guards retain required fallbacks; D256 FP32

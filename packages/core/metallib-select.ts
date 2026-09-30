@@ -59,7 +59,7 @@ export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
 export const MIN_PAGED_METALLIB_BYTES = 4 * 1024 * 1024;
 
 /** Kernel names present in every healthy mlx.metallib from the vendored MLX. */
-export const BASE_KERNEL_MARKERS = ['steel_attention', 'sdpa_vector'] as const;
+export const BASE_KERNEL_MARKERS = ['steel_attention', 'sdpa_vector', 'sdpa_vector_segmented_verify_2pass_1'] as const;
 
 /**
  * Kernel names introduced by the current MLX pin (e9463bbf): the NAX gen-17

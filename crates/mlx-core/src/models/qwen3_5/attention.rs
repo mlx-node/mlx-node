@@ -90,8 +90,10 @@ fn verify_sdpa_without_kv_concat(
         return fallback();
     }
     let max_q = (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64;
-    if max_q < 1 || queries.shape_at(2)? > max_q {
-        return fallback();
+    match segmented_verify_head_len(queries.shape_at(2)?, max_q) {
+        Some(0) => {}
+        Some(_) if causal => {}
+        _ => return fallback(),
     }
     segmented_verify_sdpa(
         queries,
@@ -102,6 +104,21 @@ fn verify_sdpa_without_kv_concat(
         scale,
         causal,
     )
+}
+
+/// Rows of the leading chunk when `seq_len` exceeds the widest supported
+/// segmented query chunk (`Some(0)`: one chunk). `None` when two chunks
+/// cannot cover the block. The segmented primitive serves such a block in one
+/// call and splits internally only where the chunks' reductions differ.
+fn segmented_verify_head_len(seq_len: i64, max_q: i64) -> Option<i64> {
+    if max_q < 1 || !(1..=8).contains(&seq_len) {
+        return None;
+    }
+    if seq_len <= max_q {
+        return Some(0);
+    }
+    let head = seq_len - max_q.min(seq_len - 1);
+    (head <= max_q).then_some(head)
 }
 
 fn verify_shapeless_geometry(seq_len: i64, gqa: i64, head_dim: i32, device_max_q: i64) -> bool {
@@ -714,17 +731,18 @@ impl Qwen3_5Attention {
     ///     scalar path's `offset + t` bit-for-bit, but the base is a runtime
     ///     array instead of a baked host int.
     ///   * Segmented vector SDPA reads prefix K/V and new K/V as two logical
-    ///     spans. The verify-split's truncated head reads `new[..head_len]` — a
-    ///     slice on the constant block axis rather than the varying prefix
-    ///     axis, so no host-bound prefix slice or full-prefix concat enters the
-    ///     tape.
-    ///   * The fused SDPA primitive derives `qL_off = kL - qL` from the real
-    ///     input shapes at eval time (see
+    ///     spans, so no host-bound prefix slice or full-prefix concat enters
+    ///     the tape. The whole verify block is one call: the primitive picks
+    ///     its dispatch from the real prefix length at eval time.
+    ///   * Without segmented attention (other dtypes or head dims) the block
+    ///     is split so each piece keeps `qL·gqa <= 32`; the truncated head
+    ///     reads `new[..head_len]`, a slice on the constant block axis. The
+    ///     fused SDPA primitive derives `qL_off = kL - qL` from the real input
+    ///     shapes at eval time (see
     ///     `backend/metal/scaled_dot_product_attention.cpp`), so the causal
-    ///     alignment stays correct for any prefix length. The split keeps
-    ///     each piece at `qL·gqa <= 32` so the primitive is always the fused
-    ///     vector kernel — never the unfused fallback, which would bake
-    ///     `kL - qL` into `arange` nodes at trace time.
+    ///     alignment stays correct for any prefix length, and each piece stays
+    ///     on the fused vector kernel — never the unfused fallback, which
+    ///     would bake `kL - qL` into `arange` nodes at trace time.
     ///
     /// The caller persists `out_kv` after invoke via `KVCache::update_and_fetch`.
     pub(crate) fn forward_verify(
@@ -766,10 +784,6 @@ impl Qwen3_5Attention {
         *io.out_kv = Some((new_keys.clone(), new_values.clone()));
 
         let output = if seq_len > 1 {
-            // Same qL·gqa verify-split as `forward` — see its comment for the
-            // threadgroup-limit rationale — but the head chunk's truncated
-            // K/V is `concat(prefix, new[..head_len])` so no slice bound
-            // depends on the (shape-varying) prefix length.
             let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
             let vector_dims = matches!(self.head_dim, 64 | 96 | 128 | 256);
             let segmented_enabled = unsafe { mlx_sys::mlx_metal_is_available() }
@@ -781,9 +795,17 @@ impl Qwen3_5Attention {
             } else {
                 0
             };
-            // Query partitioning is constrained by the selected pipeline's
-            // SIMD width and maximum threads. Keep the established 32-thread
-            // arithmetic as a fallback when the capability probe is absent.
+            // Segmented attention serves the whole block in one call.
+            let one_call = segmented_enabled
+                && io.prefix_keys.shape_at(2)? > 0
+                && segmented_verify_head_len(seq_len, device_max_q).is_some();
+            // Otherwise the same qL·gqa verify-split as `forward` — see its
+            // comment for the threadgroup-limit rationale — but the head
+            // chunk's truncated K/V is `concat(prefix, new[..head_len])` so no
+            // slice bound depends on the (shape-varying) prefix length. Query
+            // partitioning is constrained by the selected pipeline's SIMD
+            // width and maximum threads; keep the established 32-thread
+            // arithmetic when the capability probe is absent.
             let max_q = if device_max_q > 0 {
                 device_max_q
             } else if (1..=32).contains(&gqa) {
@@ -796,7 +818,7 @@ impl Qwen3_5Attention {
             } else {
                 0
             };
-            if vector_dims && tail >= 1 && seq_len <= 8 && seq_len > max_q {
+            if !one_call && vector_dims && tail >= 1 && seq_len <= 8 && seq_len > max_q {
                 let head_len = seq_len - tail;
                 let q_parts = queries.split_sections(&[head_len], 2)?;
                 let head_new_k = new_keys.slice_axis(2, 0, head_len)?;
@@ -2255,6 +2277,443 @@ mod tests {
         Ok(())
     }
 
+    const VERIFY_SINGLE: i32 = 0;
+    const VERIFY_ONE_PASS: i32 = 1;
+    const VERIFY_UNIFIED: i32 = 2;
+    const VERIFY_SPLIT: i32 = 3;
+
+    fn verify_route(
+        rows: i64,
+        max_q: i64,
+        head: (bool, i64),
+        tail: (bool, i64),
+        unified_supported: bool,
+    ) -> i32 {
+        unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_verify_route(
+                rows as i32,
+                max_q as i32,
+                head.0,
+                head.1 as i32,
+                tail.0,
+                tail.1 as i32,
+                unified_supported,
+            )
+        }
+    }
+
+    fn verify_plan(
+        rows: i32,
+        gqa: i32,
+        partitions: i32,
+        stage1: (usize, usize, usize),
+        stage2: (usize, usize, usize),
+    ) -> (bool, u32) {
+        let mut threads = 0;
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_verify_plan(
+                rows,
+                gqa,
+                partitions,
+                stage1.0,
+                stage1.1,
+                stage1.2,
+                32768,
+                stage2.0,
+                stage2.1,
+                stage2.2,
+                &mut threads,
+            )
+        } == 1;
+        (supported, threads)
+    }
+
+    #[test]
+    fn segmented_verify_route_planner_is_exact_contract() {
+        // The Rust eligibility rule must agree with the C++ chunk rule.
+        for rows in 0_i64..=9 {
+            for max_q in 0_i64..=9 {
+                let route = verify_route(rows, max_q, (false, 32), (false, 32), false);
+                let expected = match segmented_verify_head_len(rows, max_q) {
+                    None => -1,
+                    Some(0) => VERIFY_SINGLE,
+                    Some(_) => VERIFY_ONE_PASS,
+                };
+                assert_eq!(route, expected, "rows={rows}, max_q={max_q}");
+            }
+        }
+        assert_eq!(segmented_verify_head_len(8, 5), Some(3));
+        assert_eq!(segmented_verify_head_len(7, 5), Some(2));
+        assert_eq!(segmented_verify_head_len(6, 5), Some(1));
+        assert_eq!(segmented_verify_head_len(8, 4), Some(4));
+        assert_eq!(segmented_verify_head_len(8, 3), None);
+        assert_eq!(segmented_verify_head_len(5, 5), Some(0));
+        assert_eq!(segmented_verify_head_len(8, 8), Some(0));
+        assert_eq!(segmented_verify_head_len(8, 0), None);
+
+        // One dispatch is exact only when both chunks reduce the same way.
+        let one = (false, 32);
+        let p256 = (true, 256);
+        let p512 = (true, 512);
+        assert_eq!(verify_route(5, 5, p256, p512, true), VERIFY_SINGLE);
+        assert_eq!(verify_route(8, 5, one, one, true), VERIFY_ONE_PASS);
+        assert_eq!(verify_route(8, 5, p256, p256, true), VERIFY_UNIFIED);
+        assert_eq!(verify_route(8, 5, p256, p512, true), VERIFY_SPLIT);
+        assert_eq!(verify_route(8, 5, one, p256, true), VERIFY_SPLIT);
+        assert_eq!(verify_route(8, 5, p256, one, true), VERIFY_SPLIT);
+        assert_eq!(verify_route(8, 5, p256, p256, false), VERIFY_SPLIT);
+        assert_eq!(
+            verify_route(6, 5, (true, 128), (true, 128), true),
+            VERIFY_UNIFIED
+        );
+
+        // Two pairs per simdgroup: 32 * gqa * rows / 2 threads, with the same
+        // partition and device-capability rules as the chunked launch.
+        let caps = (32, 1024, 0);
+        assert_eq!(verify_plan(8, 6, 256, caps, caps), (true, 768));
+        assert_eq!(verify_plan(7, 6, 128, caps, caps), (true, 672));
+        assert_eq!(verify_plan(6, 6, 64, caps, caps), (true, 576));
+        assert!(!verify_plan(3, 3, 256, caps, caps).0, "odd pair count");
+        assert!(
+            !verify_plan(1, 6, 256, caps, caps).0,
+            "one row is not a block"
+        );
+        assert!(!verify_plan(8, 6, 256, (32, 512, 0), caps).0);
+        assert!(!verify_plan(8, 6, 256, (16, 1024, 0), caps).0);
+        assert!(!verify_plan(8, 6, 256, (32, 1024, 65536), caps).0);
+        assert!(!verify_plan(8, 6, 256, caps, (32, 512, 0)).0);
+        assert!(!verify_plan(8, 6, 256, caps, (16, 1024, 0)).0);
+        assert!(!verify_plan(8, 6, 48, caps, caps).0, "partitions % 32");
+        assert!(!verify_plan(8, 6, 0, caps, caps).0, "partitions < 32");
+    }
+
+    /// Class-'s' vector-SDPA reduction policy (`sdpa_vector_plan.h`), used to
+    /// predict the verify route independently of the C++ planner.
+    #[cfg(target_os = "macos")]
+    fn class_s_reduction(total: i64, active_simdgroups: i64) -> (bool, i64) {
+        if total < 1024 {
+            return (false, 32);
+        }
+        let partitions = if total > 1024 && active_simdgroups > 4 {
+            match total {
+                ..=8192 => 128,
+                8193..=32768 => 256,
+                32769..=65536 => 512,
+                _ => 1024,
+            }
+        } else {
+            64
+        };
+        (true, partitions)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn device_verify_route(q_heads: i64, kv_heads: i64, rows: i64, prefix: i64) -> (i32, u8) {
+        let mut class: std::ffi::c_char = 0;
+        let route = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_device_verify_route(
+                q_heads as i32,
+                kv_heads as i32,
+                rows as i32,
+                prefix as i32,
+                &mut class,
+            )
+        };
+        (route, class as u8)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn strict_segmented_for_test(
+        q: &MxArray,
+        pk: &MxArray,
+        pv: &MxArray,
+        nk: &MxArray,
+        nv: &MxArray,
+    ) -> Result<MxArray> {
+        let handle = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_forward(
+                q.as_raw_ptr(),
+                pk.as_raw_ptr(),
+                pv.as_raw_ptr(),
+                nk.as_raw_ptr(),
+                nv.as_raw_ptr(),
+                0.0625,
+                true,
+            )
+        };
+        MxArray::from_handle(handle, "strict one-call segmented SDPA test")
+    }
+
+    /// `[B, H, prefix, D]` view of a `[B, H, prefix + 64, D]` cache whose rows
+    /// past the prefix are NaN, as the compiled verify slices its KV cache.
+    #[cfg(target_os = "macos")]
+    fn nan_tailed_prefix(base: &MxArray, prefix: i64) -> Result<MxArray> {
+        let batch = base.shape_at(0)?;
+        let heads = base.shape_at(1)?;
+        let d = base.shape_at(3)?;
+        let nan = MxArray::from_bfloat16(
+            &vec![0x7fc0_u16; (batch * heads * 64 * d) as usize],
+            &[batch, heads, 64, d],
+        )?;
+        let cache = MxArray::concatenate(&base.slice_axis(2, 0, prefix)?, &nan, 2)?;
+        cache.eval();
+        cache.slice_axis(2, 0, prefix)
+    }
+
+    /// One call over the whole verify block must equal both the per-chunk
+    /// segmented calls and the independent concat + MLX vector SDPA chunks,
+    /// for the request-tail widths 6 and 7 and the full width 8, on every
+    /// route. On class 's' the chosen route is asserted per (rows, prefix) so
+    /// the one-call kernel cannot pass vacuously.
+    #[test]
+    #[ignore = "requires coordinated Metal GPU validation"]
+    #[cfg(target_os = "macos")]
+    fn segmented_verify_one_call_matches_split_bf16_exactly() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        const D: i64 = 256;
+        const HQ: i64 = 24;
+        const HKV: i64 = 4;
+        let gqa = HQ / HKV;
+        let max_q = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) });
+        eprintln!("segmented SDPA GQA={gqa} max_query_length={max_q}");
+        let prefixes = [
+            1_i64, 87, 1000, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 4095,
+            4096, 6219, 8184, 8185, 8186, 8187, 8189, 8190, 8191, 8192, 16384, 32488, 32760, 32761,
+            32762, 32763, 32765, 32766, 32767, 32768, 33000,
+        ];
+        let max_prefix = *prefixes.iter().max().unwrap_or(&1);
+        let kv_elements = (HKV * max_prefix * D) as usize;
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16(kv_elements, 0x1234_5678),
+            &[1, HKV, max_prefix, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16(kv_elements, 0x8765_4321),
+            &[1, HKV, max_prefix, D],
+        )?;
+        let mut checked = 0usize;
+        for rows in [6_i64, 7, 8] {
+            let Some(head_len) = segmented_verify_head_len(rows, max_q) else {
+                eprintln!("SKIP rows={rows}: max_query_length={max_q} cannot cover the block");
+                continue;
+            };
+            let q_bits = deterministic_bf16((HQ * rows * D) as usize, 0x1357_9bdf);
+            // x8 adds 3 to every exponent: exact in BF16, sharper softmax.
+            let q_sharp_bits: Vec<u16> = q_bits.iter().map(|&b| b + 0x0180).collect();
+            let queries = [
+                MxArray::from_bfloat16(&q_bits, &[1, HQ, rows, D])?,
+                MxArray::from_bfloat16(&q_sharp_bits, &[1, HQ, rows, D])?,
+            ];
+            let nk = MxArray::from_bfloat16(
+                &deterministic_bf16((HKV * rows * D) as usize, 0x2468_ace0),
+                &[1, HKV, rows, D],
+            )?;
+            let nv = MxArray::from_bfloat16(
+                &deterministic_bf16((HKV * rows * D) as usize, 0xfdb9_7531),
+                &[1, HKV, rows, D],
+            )?;
+            let mut seen = [0usize; 4];
+            let mut class_s = false;
+            for prefix in prefixes {
+                let (route, class) = device_verify_route(HQ, HKV, rows, prefix);
+                assert!(
+                    route >= 0,
+                    "no segmented route for rows={rows}, prefix={prefix}"
+                );
+                seen[route as usize] += 1;
+                if class == b's' {
+                    class_s = true;
+                    let expected = if head_len == 0 {
+                        VERIFY_SINGLE
+                    } else {
+                        verify_route(
+                            rows,
+                            max_q,
+                            class_s_reduction(prefix + head_len, gqa * head_len),
+                            class_s_reduction(prefix + rows, gqa * (rows - head_len)),
+                            true,
+                        )
+                    };
+                    assert_eq!(route, expected, "route for rows={rows}, prefix={prefix}");
+                }
+                let pk = nan_tailed_prefix(&base_k, prefix)?;
+                let pv = nan_tailed_prefix(&base_v, prefix)?;
+                for (set, q) in queries.iter().enumerate() {
+                    let got = strict_segmented_for_test(q, &pk, &pv, &nk, &nv)?.to_float32()?;
+                    let chunks = segmented_or_concat_split_for_test(q, &pk, &pv, &nk, &nv, true)?
+                        .to_float32()?;
+                    let concat = segmented_or_concat_split_for_test(q, &pk, &pv, &nk, &nv, false)?
+                        .to_float32()?;
+                    assert!(got.iter().all(|x| x.is_finite()), "non-finite output");
+                    assert_eq!(
+                        got.as_ref(),
+                        chunks.as_ref(),
+                        "one call vs segmented chunks: rows={rows}, prefix={prefix}, set={set}, route={route}"
+                    );
+                    assert_eq!(
+                        got.as_ref(),
+                        concat.as_ref(),
+                        "one call vs concat SDPA chunks: rows={rows}, prefix={prefix}, set={set}, route={route}"
+                    );
+                    checked += 1;
+                }
+            }
+            eprintln!(
+                "rows={rows} routes single={} one_pass={} unified={} split={}",
+                seen[0], seen[1], seen[2], seen[3]
+            );
+            if class_s {
+                for route in [VERIFY_ONE_PASS, VERIFY_UNIFIED, VERIFY_SPLIT] {
+                    assert!(
+                        seen[route as usize] > 0,
+                        "rows={rows} never took route {route}"
+                    );
+                }
+            }
+        }
+        eprintln!("checked {checked} one-call cases");
+
+        // Production layout: projections leave [B,T,H,D] and are transposed
+        // into [B,H,T,D] views; non-unit batch and several KV heads.
+        if segmented_verify_head_len(8, max_q).is_none() {
+            return Ok(());
+        }
+        for prefix in [87_i64, 4096, 32766] {
+            let pk = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 2 * prefix * D) as usize, 0x1020_3040),
+                &[2, 2, prefix, D],
+            )?;
+            let pv = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 2 * prefix * D) as usize, 0x5060_7080),
+                &[2, 2, prefix, D],
+            )?;
+            let q = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 12 * D) as usize, 0x90a0_b0c0),
+                &[2, 8, 12, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let nk = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 2 * D) as usize, 0xd0e0_f001),
+                &[2, 8, 2, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let nv = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 2 * D) as usize, 0x1234_abcd),
+                &[2, 8, 2, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let (route, _) = device_verify_route(12, 2, 8, prefix);
+            let got = strict_segmented_for_test(&q, &pk, &pv, &nk, &nv)?.to_float32()?;
+            let chunks =
+                segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?.to_float32()?;
+            let concat =
+                segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?.to_float32()?;
+            assert_eq!(
+                got.as_ref(),
+                chunks.as_ref(),
+                "production layout prefix={prefix} route={route}"
+            );
+            assert_eq!(
+                got.as_ref(),
+                concat.as_ref(),
+                "production layout prefix={prefix} route={route}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The route is chosen from the real prefix at eval time, so one shapeless
+    /// trace must stay exact while replays cross every route boundary.
+    #[test]
+    #[ignore = "requires coordinated Metal GPU validation"]
+    #[cfg(target_os = "macos")]
+    fn segmented_verify_shapeless_replay_crosses_routes() -> Result<()> {
+        use crate::compiled_graph::invoke_compiled_graph;
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        const D: i64 = 256;
+        const HQ: i64 = 24;
+        const HKV: i64 = 4;
+        let max_q = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) });
+        let prefixes: Vec<i64> = (1010..=1030)
+            .chain(8180..=8195)
+            .chain(32755..=32770)
+            .collect();
+        let max_prefix = 32770;
+        let kv_elements = (HKV * max_prefix * D) as usize;
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16(kv_elements, 0x0bad_cafe),
+            &[1, HKV, max_prefix, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16(kv_elements, 0x0dea_dbee),
+            &[1, HKV, max_prefix, D],
+        )?;
+        for rows in [6_i64, 7, 8] {
+            if segmented_verify_head_len(rows, max_q).is_none() {
+                eprintln!("SKIP rows={rows}: max_query_length={max_q}");
+                continue;
+            }
+            let q = MxArray::from_bfloat16(
+                &deterministic_bf16((HQ * rows * D) as usize, 0x2233_4455),
+                &[1, HQ, rows, D],
+            )?;
+            let nk = MxArray::from_bfloat16(
+                &deterministic_bf16((HKV * rows * D) as usize, 0x6677_8899),
+                &[1, HKV, rows, D],
+            )?;
+            let nv = MxArray::from_bfloat16(
+                &deterministic_bf16((HKV * rows * D) as usize, 0xaabb_ccdd),
+                &[1, HKV, rows, D],
+            )?;
+            let fn_id = 0xDFC5_0000_0000_0000_u64 | rows as u64;
+            let builds = std::cell::Cell::new(0usize);
+            let mut builder = |inputs: &[MxArray]| -> Result<Vec<MxArray>> {
+                builds.set(builds.get() + 1);
+                Ok(vec![segmented_verify_sdpa(
+                    &inputs[0], &inputs[1], &inputs[2], &inputs[3], &inputs[4], 0.0625, true,
+                )?])
+            };
+            let mut seen = [0usize; 4];
+            for &prefix in &prefixes {
+                let pk = nan_tailed_prefix(&base_k, prefix)?;
+                let pv = nan_tailed_prefix(&base_v, prefix)?;
+                let compiled =
+                    invoke_compiled_graph(fn_id, &[&q, &pk, &pv, &nk, &nv], 1, true, &mut builder)?
+                        .ok_or_else(|| Error::from_reason("compiled invoke failed"))?;
+                let compiled = compiled[0].to_float32()?;
+                let eager = strict_segmented_for_test(&q, &pk, &pv, &nk, &nv)?.to_float32()?;
+                let chunks = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?
+                    .to_float32()?;
+                let (route, _) = device_verify_route(HQ, HKV, rows, prefix);
+                seen[route.max(0) as usize] += 1;
+                assert_eq!(
+                    compiled.as_ref(),
+                    eager.as_ref(),
+                    "rows={rows}, prefix={prefix}, route={route}"
+                );
+                assert_eq!(
+                    compiled.as_ref(),
+                    chunks.as_ref(),
+                    "rows={rows}, prefix={prefix}, route={route}"
+                );
+            }
+            assert_eq!(
+                builds.get(),
+                1,
+                "rows={rows}: the prefix must stay out of the trace key"
+            );
+            eprintln!(
+                "rows={rows} replay routes one_pass={} unified={} split={}",
+                seen[1], seen[2], seen[3]
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "manual rotating-prefix SDPA benchmark; run without other GPU work"]
     #[cfg(target_os = "macos")]
@@ -2263,8 +2722,9 @@ mod tests {
             eprintln!("SKIP segmented benchmark: Metal backend unavailable");
             return Ok(());
         }
-        let max_query_length = unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) };
-        if max_query_length < 4 {
+        let max_query_length =
+            i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) });
+        if segmented_verify_head_len(8, max_query_length).is_none() {
             eprintln!(
                 "SKIP segmented benchmark: q=8 requires two supported chunks; \
                  GQA=6 pipeline supports at most {max_query_length} rows per chunk"
@@ -2300,9 +2760,13 @@ mod tests {
                 )?;
                 cases.push((q, pk, pv, nk, nv));
             }
-            let run = |i: usize, segmented: bool| -> Result<MxArray> {
+            let run = |i: usize, one_call: bool| -> Result<MxArray> {
                 let (q, pk, pv, nk, nv) = &cases[i % SETS];
-                let out = segmented_or_concat_split_for_test(q, pk, pv, nk, nv, segmented)?;
+                let out = if one_call {
+                    strict_segmented_for_test(q, pk, pv, nk, nv)?
+                } else {
+                    segmented_or_concat_split_for_test(q, pk, pv, nk, nv, true)?
+                };
                 MxArray::eval_arrays(&[&out])?;
                 Ok(out)
             };
@@ -2311,35 +2775,35 @@ mod tests {
                 let after = run(i, true)?.to_float32()?;
                 assert_eq!(before.as_ref(), after.as_ref(), "prefix={prefix}, set={i}");
             }
-            let mut baseline_ms = Vec::with_capacity(SAMPLES);
-            let mut segmented_ms = Vec::with_capacity(SAMPLES);
+            let mut split_ms = Vec::with_capacity(SAMPLES);
+            let mut one_call_ms = Vec::with_capacity(SAMPLES);
             for i in 0..SAMPLES {
                 // Alternate order so the candidate is not always the second
                 // reader of a just-warmed prefix. Rotate four independent KV sets.
-                for segmented in if i % 2 == 0 {
+                for one_call in if i % 2 == 0 {
                     [false, true]
                 } else {
                     [true, false]
                 } {
                     let started = Instant::now();
-                    let out = run(i, segmented)?;
+                    let out = run(i, one_call)?;
                     let ms = started.elapsed().as_secs_f64() * 1e3;
-                    if segmented {
-                        segmented_ms.push(ms);
+                    if one_call {
+                        one_call_ms.push(ms);
                     } else {
-                        baseline_ms.push(ms);
+                        split_ms.push(ms);
                     }
                     drop(out);
                 }
             }
-            baseline_ms.sort_by(f64::total_cmp);
-            segmented_ms.sort_by(f64::total_cmp);
+            split_ms.sort_by(f64::total_cmp);
+            one_call_ms.sort_by(f64::total_cmp);
             eprintln!(
-                "segmented prefix={prefix} q=8 hq=24 hkv=4 sets={SETS} samples={SAMPLES} baseline_min_ms={:.4} baseline_median_ms={:.4} segmented_min_ms={:.4} segmented_median_ms={:.4}",
-                baseline_ms[0],
-                baseline_ms[SAMPLES / 2],
-                segmented_ms[0],
-                segmented_ms[SAMPLES / 2]
+                "segmented prefix={prefix} q=8 hq=24 hkv=4 sets={SETS} samples={SAMPLES} split_min_ms={:.4} split_median_ms={:.4} one_call_min_ms={:.4} one_call_median_ms={:.4}",
+                split_ms[0],
+                split_ms[SAMPLES / 2],
+                one_call_ms[0],
+                one_call_ms[SAMPLES / 2]
             );
         }
         Ok(())
