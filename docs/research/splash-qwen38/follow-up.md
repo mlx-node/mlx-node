@@ -16,6 +16,10 @@ precision with mandatory head sharing. Dense Q4 and adaptive fallback are remove
 The [final cleanup report](cleanup-final.md) records completed native/lifecycle
 validation and the reversed before/after performance comparison.
 
+Superseded on October 2, 2026: every statement on this page that BF16 is the
+default, or that Q8 is an option. The draft now always loads as affine
+Q4/group64 and reuses the target head; see [Draft precision](README.md#draft-precision-current).
+
 These measurements continue the [initial investigation](README.md) using the
 same target GGUF, supplied DFlash2 checkpoint, and M5 Max. Artifacts live under
 `.cache/benchmarks/splash-qwen38-phase2`. They do not establish parity with
@@ -79,6 +83,11 @@ matching metallib.
 The dense Q4 option and its private proposal-head clone have since been removed.
 BF16 remains the default; optional Q8 always shares the target head. Historical
 precision measurements below are not results from the cleanup binary.
+
+Superseded on October 2, 2026. The comparisons below use E2E runs, and each
+precision decodes a different transcript. A later teacher-forced study found Q4
+and Q8 acceptance within 1% of BF16 and chose affine Q4/group64 with the shared
+target head as the only draft precision. See [Draft precision](README.md#draft-precision-current).
 
 Q8 draft projections plus the existing Q8 head clone were measured in four
 fresh processes ordered BF16/Q8/Q8/BF16. For 256 output tokens, median short

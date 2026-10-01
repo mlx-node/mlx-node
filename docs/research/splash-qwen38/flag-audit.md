@@ -8,7 +8,8 @@ companion, and shared Metal execution paths.
 Cleanup status, September 23: the imported packed-Q4 loader and DFlash depth
 override are removed. Retained eligible optimizations no longer expose manual
 rollback switches; Q8 target-head reuse is unconditional within Q8, while BF16
-remains the default. The earlier [cleanup](cleanup.md) removed only five phase-6
+remains the default. (Superseded on October 2, 2026: the draft now always loads
+as affine Q4/group64; see the table below.) The earlier [cleanup](cleanup.md) removed only five phase-6
 experiments; this cleanup also addresses controls from earlier phases.
 
 The retained evidence below did not demonstrate a general speedup left disabled
@@ -90,10 +91,10 @@ continues to use per-step recurrence.
 
 ## Conditional precision and adaptive options
 
-| Option             | Current behavior                                                                                                                                                    | Retained evidence and limitation                                                                                                                                                                                                                                                                                                                                     |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Draft precision    | Fixed, no switch: every dense draft projection loads as affine Q4/group64 and the draft reuses the target head. The selector projection keeps checkpoint precision. | Chosen over BF16 and Q8 by teacher-forced acceptance on fixed BF16 transcripts (every arm within about 1.5 % of BF16) and clock-matched decode time: about 3.4 % less time per committed token than BF16 and 1.8 % less than Q8/group64, with 2.40 GiB less resident memory. Precision changes alter proposals and verify grouping, so transcripts differ from BF16. |
-| `mtpAdaptiveDepth` | Ignored for Qwen DFlash2; its adaptive fallback has been removed. Native MTP and other draft families retain their own policies.                                    | Earlier Qwen adaptive pilots are historical, not available optimization choices. See [cleanup-final.md](cleanup-final.md) for decision evidence and validation status.                                                                                                                                                                                               |
+| Option             | Current behavior                                                                                                                                                    | Retained evidence and limitation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Draft precision    | Fixed, no switch: every dense draft projection loads as affine Q4/group64 and the draft reuses the target head. The selector projection keeps checkpoint precision. | Chosen over BF16 and Q8 by teacher-forced acceptance on fixed BF16 transcripts (every arm within about 1.5 % of BF16) and clock-matched decode time: about 3.4 % less time per committed token than BF16 and 1.8 % less than Q8/group64, with 2.40 GiB less resident memory. Precision changes alter proposals and verify grouping, so transcripts differ from BF16. Raw E2E median tok/s (short / 6K / 32K, each arm on its own transcript): Q4 52.23 / 36.33 / 26.99, BF16 42.49 / 47.78 / 24.69. See [Draft precision](README.md#draft-precision-current). |
+| `mtpAdaptiveDepth` | Ignored for Qwen DFlash2; its adaptive fallback has been removed. Native MTP and other draft families retain their own policies.                                    | Earlier Qwen adaptive pilots are historical, not available optimization choices. See [cleanup-final.md](cleanup-final.md) for decision evidence and validation status.                                                                                                                                                                                                                                                                                                                                                                                        |
 
 Current sources: [draft loader/head policy](../../../crates/mlx-core/src/models/qwen3_5/dflash2.rs)
 and [parameter resolution](../../../crates/mlx-core/src/models/qwen3_5/model/chat_backend.rs).
@@ -107,7 +108,8 @@ switches or checkpoint choices:
   2.100 GiB peak MLX allocation. The 256-token pilot improved Q8 throughput
   8–12%, partly through acceptance changes, but Q8+reuse was 12.3% / 34.5%
   slower than BF16 for 1,024-token short/6K responses. Memory is the reliable
-  benefit; current Q8 always reuses the target head and has no clone override.
+  benefit. Q8 then always reused the target head; Q8 was later removed (see
+  [Draft precision](README.md#draft-precision-current)).
 - **Depth three:** three alternating 1,024-token pairs improved the short
   fixture 14.8% and slowed 6K 21.9%, with changed transcripts. DFlash now uses
   the checkpoint proposal width (seven here); `mtpDepth` is a native-MTP
@@ -117,7 +119,8 @@ switches or checkpoint choices:
   regressed 8.4% / 25.6%. The metadata-selected packed loader and importer/tests
   were removed. The separate dense Q4 option and private head clone were also
   removed; that option requantized floating weights and never reproduced
-  Splash's stored Q4 values or quantized selector.
+  Splash's stored Q4 values or quantized selector. Affine Q4/group64 later
+  returned as the only draft precision, with the shared target head.
 
 Evidence: [head reuse pairs](../../../.cache/benchmarks/splash-qwen38-phase2/head-screen-summary.json),
 [long head comparison](../../../.cache/benchmarks/splash-qwen38-phase2/long-head-summary.json),

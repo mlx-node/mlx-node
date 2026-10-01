@@ -2,7 +2,8 @@
 
 The [exact-draft follow-up](exact-draft.md) adds a lossless import of Splash's
 Q4 draft and a fresh three-arm comparison. This page retains the earlier BF16
-baseline and its original measurements.
+baseline and its original measurements. The current runtime loads the draft as
+affine Q4/group64; see [Draft precision](README.md#draft-precision-current).
 
 September 22, 2026. This compares the cleaned candidate-14 runtime from
 [the cleanup](cleanup.md) with the local Splash checkout on the same Apple M5

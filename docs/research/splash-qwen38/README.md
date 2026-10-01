@@ -21,6 +21,11 @@ decode is 38.52 / 43.96 / 21.72 tokens/s on short / 6K / 32K, with exact output
 and acceptance parity. Performance is essentially unchanged versus candidate 16;
 no new speedup or Splash parity is claimed.
 
+Superseded on October 2, 2026: the draft precision statements above. The draft
+now always loads as affine Q4/group64 and reuses the target head. BF16 is no
+longer the default, and Q8 is no longer an option. See
+[Draft precision](#draft-precision-current).
+
 The [exact Splash Q4 draft follow-up](exact-draft.md) is historical evidence from
 candidate 16. Its lossless imported draft improved native 32K decode and reduced
 memory, but slowed shorter fixtures; the loader and importer scripts have since
@@ -34,6 +39,50 @@ The [final same-device comparison](final-performance.md) measures the cleaned
 candidate-14 runtime against local Splash with identical prompt token IDs and
 1,024 generated tokens. It supersedes the earlier reference-only comparisons
 for the BF16 baseline, while retaining the model-package and timing caveats.
+
+## Draft precision (current)
+
+October 2, 2026. The checkpoint ships BF16. The loader quantizes every dense
+draft projection (`fc`, attention, MLP and both convolution kernel projections)
+to affine Q4 with group size 64. The selector projection keeps checkpoint
+precision. The draft reuses the target output head. There is no precision
+switch; `MLX_DFLASH2_DRAFT_QUANT` and the BF16 and Q8 load paths are removed.
+
+Q4/group64 was chosen over BF16 and Q8/group64 on this M5 Max: short / 6K / 32K
+fixtures, 1,024 greedy tokens, five fresh processes per arm and fixture in
+alternating order. A different draft precision produces a different transcript,
+so raw tokens/s compares different texts. The decision therefore uses
+teacher-forced (TF) acceptance: every arm verifies the same fixed BF16-draft
+transcript through the production verifier. Time per committed token is the
+clock-matched E2E time per cycle divided by the TF committed tokens per cycle.
+
+| Fixture | TF acceptance, Q4 / BF16 [95% CI] | ms per committed token, BF16 / Q8 / Q4 | Raw E2E median tok/s, BF16 / Q8 / Q4 | Cycles, BF16 / Q8 / Q4 |
+| ------- | --------------------------------: | -------------------------------------: | -----------------------------------: | ---------------------: |
+| Short   |              0.996 [0.969, 1.025] |                  23.46 / 23.05 / 22.54 |                42.49 / 43.88 / 52.23 |        274 / 274 / 234 |
+| 6K      |              0.995 [0.964, 1.029] |                  20.61 / 19.99 / 19.95 |                47.78 / 30.18 / 36.33 |        216 / 319 / 288 |
+| 32K     |              1.009 [0.990, 1.030] |                  36.90 / 36.65 / 35.74 |                24.69 / 28.18 / 26.99 |        322 / 287 / 293 |
+
+- TF acceptance of Q4 and Q8 is within 1% of BF16 on every fixture, and every
+  95% CI includes 1.0.
+- Q4 has the lowest time per committed token on every fixture. Summed over the
+  three fixtures it is 78.23 ms, versus 80.97 ms for BF16 (-3.4%) and 79.69 ms
+  for Q8/group64 (-1.8%). Q4 speedup over BF16 [approximate 95% CI]: short
+  1.041 [1.009, 1.075], 6K 1.034 [0.982, 1.090], 32K 1.033 [1.000, 1.067].
+- Raw E2E tokens/s changes sign by fixture: Q4 versus BF16 is +22.9% / -24.0% /
+  +9.3%. Each arm decodes its own deterministic transcript with a different
+  cycle count, so the raw numbers mostly measure transcript drift. They are
+  reported, not used to decide.
+- Clock-matched E2E time per cycle falls by 2.5-4.2 ms with Q4.
+- Resident draft memory falls from 3.58 GiB to 1.18 GiB (-2.40 GiB). Load peak is
+  unchanged.
+
+Earlier pages reported a 6K drop for Q4 and Q8, for example Q8 6K committed
+tokens per cycle 4.736 to 3.081. Teacher forcing shows that drop was transcript
+drift: on the same BF16 text, Q8/group32 keeps 4.714 of 4.736 at 6K. The earlier
+dense Q4 mode also quantized a private copy of the target output head; the
+current draft reuses the target head. Evidence is under
+`~/.cache/mlx-node-research/qwen38-arch-2026-09-23/impl/runs/{DRAFT,I8}/`
+(`decision.json`, `out/fin-e2e-ab.txt`).
 
 ## Comparison boundaries
 
@@ -92,6 +141,7 @@ attention correctness fix. Phase-6 rates describe archived binaries only.
 Initial outcome: implemented and reviewed one fused greedy-selector kernel. Whole-model
 median differences were only 0.5–1.3%, within observed run variation. Rejected
 KV reservation and Q4 draft experiments did not improve the measured workload.
+The Q4 draft result was later reversed; see [Draft precision](#draft-precision-current).
 
 ## Source findings and execution plan
 
@@ -223,6 +273,11 @@ about 2.4 GiB of residency, but short/6K decode fell from approximately
 44.81 / 33.34 to 31.19 / 22.45 tokens/s. These are single pilots, not final
 paired estimates. The short transcript changed. The final change keeps the
 supplied BF16 draft and does not alter quantization defaults.
+
+Superseded on October 2, 2026. Those pilots compared different transcripts, and
+that mode also quantized a private copy of the output head. A later
+teacher-forced study chose affine Q4/group64 with the shared target head as the
+only draft precision; see [Draft precision](#draft-precision-current).
 
 ## Validation and review
 

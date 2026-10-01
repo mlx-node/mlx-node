@@ -107,9 +107,13 @@ node .cache/benchmarks/splash-local-20260922/guard.mjs splash-new-short \
   /Users/brooklyn/workspace/github/splash \
   .cache/benchmarks/splash-local-20260922 splash-new-short short
 
-env MLX_DFLASH2_DRAFT_REUSE_TARGET_HEAD=0 \
+env MLX_DFLASH2_DRAFT_QUANT=off MLX_DFLASH2_DRAFT_REUSE_TARGET_HEAD=0 \
   node .cache/benchmarks/splash-local-20260922/guard.mjs mlx-new \
   oxnode docs/research/splash-qwen38/benchmark.ts \
   .cache/benchmarks/splash-qwen38-phase2/final-validated/mlx-core.darwin-arm64.node \
   .cache/benchmarks/splash-local-20260922/mlx-new.json dflash short,6k 1 1024
 ```
+
+This is the command as run against that frozen addon, which read both variables.
+The current runtime reads neither: the draft always loads as affine Q4/group64
+and reuses the target head. See [Draft precision](README.md#draft-precision-current).

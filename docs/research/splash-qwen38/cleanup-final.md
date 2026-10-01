@@ -13,8 +13,8 @@ Splash parity claim is made by this cleanup.
   correctness fallbacks remain.
 - Q8 draft mode always shares the target head. BF16 remains the normal draft
   precision; selecting Q8 no longer creates a larger Q8 head clone. (Superseded
-  later: the draft now always loads as affine Q4/group64 with no precision
-  switch; see [flag-audit.md](flag-audit.md).)
+  on October 2, 2026: the draft now always loads as affine Q4/group64 with no
+  precision switch; see [Draft precision](README.md#draft-precision-current).)
 - Qwen DFlash2 always takes its full proposal width from the loaded checkpoint.
   The terminal token budget can shorten a block. The shared `mtpDepth` API
   remains meaningful for native MTP and other external-draft families.
@@ -139,6 +139,15 @@ Its bracketed full-request changes were +2.9% / -24.5% / -2.9%. On 6K, mean
 accepted tokens per cycle dropped from BF16's 4.736 to 3.081, and cycles rose
 from 216 to 332. BF16 remains the default; Q8 remains an explicit precision choice
 with the requested unconditional target-head sharing.
+
+Superseded on October 2, 2026. The Q4 and Q8 rows above are E2E screens of
+different transcripts. A later teacher-forced study verified every precision on
+the same BF16 transcript: Q4 and Q8 acceptance stayed within 1% of BF16, so the
+6K drop was transcript drift. Affine Q4/group64 with the shared target head is
+now the only draft precision; the BF16 and Q8 paths are removed. Time per
+committed token summed over short / 6K / 32K: Q4 78.23 ms, Q8/group64 79.69 ms,
+BF16 80.97 ms. Raw E2E median tokens/s in that study: Q4 52.23 / 36.33 / 26.99,
+BF16 42.49 / 47.78 / 24.69. See [Draft precision](README.md#draft-precision-current).
 
 Forced split-K at eight rows changed bracketed full-request speed by
 -15.9% / -37.9% / -6.0% and changed output/acceptance. Command-buffer presets

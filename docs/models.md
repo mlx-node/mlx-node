@@ -162,8 +162,12 @@ attention, MLP and both convolution kernel projections) to affine Q4 with group
 size 64, cutting resident draft memory from 3.58 GiB to 1.18 GiB. The selector
 projection, codebooks, norms and convolution base kernels keep checkpoint
 precision. Q4 was measured against BF16 and Q8 on the same transcripts:
-acceptance stayed within noise and time per committed token was lowest. There
-is no precision switch. The implementation follows the [official DFlash repository](https://github.com/z-lab/dflash)
+acceptance stayed within noise and time per committed token was lowest (78.23
+ms versus 80.97 ms for BF16, summed over short / 6K / 32K). Raw end-to-end
+tokens/s changes sign by fixture (Q4 versus BF16: +22.9% / -24.0% / +9.3%)
+because each precision decodes a different transcript; see the
+[draft precision study](research/splash-qwen38/README.md#draft-precision-current).
+There is no precision switch. The implementation follows the [official DFlash repository](https://github.com/z-lab/dflash)
 and [DFlash2 architecture description](https://inco.ai/blog/dflash2/).
 
 ## Muse-Glimmer Q4_K and DFlash

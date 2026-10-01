@@ -3,8 +3,10 @@
 Historical report, September 22, 2026. The imported packed-Q4 loader and its
 research importer/tests were removed in the subsequent cleanup. These results
 and validation counts describe frozen candidate 16, not the current runtime.
-The current loader supports dense native companions; BF16 remains the default.
-See the [cleanup status](README.md) and [final cleanup report](cleanup-final.md).
+The current loader reads the BF16 companion and quantizes its dense projections
+to affine Q4/group64 at load. It does not reproduce Splash's stored Q4 values or
+quantized selector. See [Draft precision](README.md#draft-precision-current) and
+the [final cleanup report](cleanup-final.md).
 
 This follow-up used the Q4 DFlash2 tensors from the same
 local Splash package used in [the earlier comparison](final-performance.md).
