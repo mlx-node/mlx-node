@@ -43,7 +43,6 @@ const cases: Case[] = [
 // Record only performance controls, never the complete process environment.
 const environment = Object.fromEntries(
   [
-    'MLX_DFLASH2_DRAFT_QUANT',
     'MLX_QMM_SPLITK_MIN_M',
     'MLX_METAL_OP_TRACE',
     'MLX_METAL_COMMAND_TRACE',

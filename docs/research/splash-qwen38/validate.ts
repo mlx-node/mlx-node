@@ -37,15 +37,12 @@ const config: ChatConfig = {
 };
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const records: { name: string; hash: string; result: ChatResult | ChatStreamChunk }[] = [];
-const environment = {
-  MLX_DFLASH2_DRAFT_QUANT: process.env.MLX_DFLASH2_DRAFT_QUANT ?? null,
-};
 function record(name: string, result: ChatResult | ChatStreamChunk) {
   assert.ok((result.numTokens ?? 0) > 0);
   assert.equal(typeof result.rawText, 'string');
   records.push({ name, hash: hash(result.rawText!), result });
   // Preserve the failing scenario too if a later lifecycle assertion fails.
-  writeFileSync(output, JSON.stringify({ binding, draft, environment, config, records }, null, 2));
+  writeFileSync(output, JSON.stringify({ binding, draft, config, records }, null, 2));
 }
 const messages: ChatMessage[] = [
   {
@@ -125,7 +122,7 @@ const longContinued = await model.chatSessionContinue(longHistory, {
 });
 record('long-continued', longContinued);
 assert.ok(longContinued.cachedTokens > 2048, 'long continuation must retain target prefix and sliding draft context');
-await writeFile(output, JSON.stringify({ binding, draft, environment, config, records }, null, 2));
+await writeFile(output, JSON.stringify({ binding, draft, config, records }, null, 2));
 console.log(
   JSON.stringify(
     records.map(({ name, hash, result }) => ({ name, hash, cached: result.cachedTokens, tokens: result.numTokens })),

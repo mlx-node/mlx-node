@@ -1142,47 +1142,14 @@ fn validate_tensor(value: &MxArray, key: &str, shape: &[i64]) -> Result<()> {
     Ok(())
 }
 
-/// Load-time quantization for the dense DFlash2 companion. The published
-/// checkpoints ship bf16 only; optional affine-Q8 quantization reduces draft
-/// projection storage. Both modes reuse the target output head. The target still
-/// verifies every emitted token, but changed proposals and verification
-/// grouping can perturb its numerical path and therefore the final transcript.
-///
-/// `MLX_DFLASH2_DRAFT_QUANT`: `off`/`bf16` (default — bit-exact draft),
-/// `q8` (affine 8-bit, group 32).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DraftQuantization {
-    Off,
-    Affine8x32,
-}
-
-impl DraftQuantization {
-    fn params(self) -> Option<(i32, i32)> {
-        match self {
-            DraftQuantization::Off => None,
-            DraftQuantization::Affine8x32 => Some((32, 8)),
-        }
-    }
-}
-
-fn draft_quantization() -> DraftQuantization {
-    static QUANT: std::sync::OnceLock<DraftQuantization> = std::sync::OnceLock::new();
-    *QUANT.get_or_init(|| {
-        let value = std::env::var("MLX_DFLASH2_DRAFT_QUANT")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        match value.as_str() {
-            "q8" | "8" | "affine8" | "int8" => DraftQuantization::Affine8x32,
-            "" | "off" | "0" | "none" | "bf16" | "false" => DraftQuantization::Off,
-            other => {
-                eprintln!(
-                    "warning: unrecognized MLX_DFLASH2_DRAFT_QUANT='{other}', expected q8|off; using off"
-                );
-                DraftQuantization::Off
-            }
-        }
-    })
-}
+/// The published DFlash2 companion ships bf16. Its dense projections load as
+/// affine Q4/group64: against bf16 and Q8 it kept teacher-forced acceptance
+/// within noise and gave the lowest decode time per committed token. The
+/// draft reuses the target output head. A change of draft precision moves
+/// proposals and verify grouping, so it can change the transcript even
+/// though the target verifies every emitted token.
+const DRAFT_GROUP_SIZE: i32 = 64;
+const DRAFT_BITS: i32 = 4;
 
 /// Affine-quantize a floating `[out, in]` weight, returning MLX's packed
 /// `(weight, scales, biases)` triple consumed by `quantized_matmul`.
@@ -1224,15 +1191,14 @@ fn quantize_affine(
     Ok((packed, scales, biases))
 }
 
-/// Builds a draft projection, honoring [`draft_quantization`]. `savings`
-/// accumulates `dense − resident` bytes so the loader can report true
-/// residency rather than the bf16 file size.
-fn linear(
+/// Builds a draft projection as affine Q4/group64. `savings` accumulates
+/// `dense − resident` bytes so the loader can report true residency rather
+/// than the bf16 file size.
+fn draft_linear(
     params: &mut HashMap<String, MxArray>,
     prefix: &str,
     input: usize,
     output: usize,
-    quant: DraftQuantization,
     savings: &mut u64,
 ) -> Result<LinearProj> {
     let weight = required(
@@ -1240,20 +1206,31 @@ fn linear(
         &format!("{prefix}.weight"),
         &[output as i64, input as i64],
     )?;
-    if let Some((group_size, bits)) = quant.params() {
-        let (packed, scales, biases) = quantize_affine(&weight, group_size, bits)?;
-        let resident = packed.nbytes() as u64 + scales.nbytes() as u64 + biases.nbytes() as u64;
-        *savings += (weight.nbytes() as u64).saturating_sub(resident);
-        return Ok(LinearProj::Quantized(QuantizedLinear::new(
-            packed,
-            scales,
-            Some(biases),
-            None,
-            group_size,
-            bits,
-            "affine".to_string(),
-        )));
-    }
+    let (packed, scales, biases) = quantize_affine(&weight, DRAFT_GROUP_SIZE, DRAFT_BITS)?;
+    let resident = packed.nbytes() as u64 + scales.nbytes() as u64 + biases.nbytes() as u64;
+    *savings += (weight.nbytes() as u64).saturating_sub(resident);
+    Ok(LinearProj::Quantized(QuantizedLinear::new(
+        packed,
+        scales,
+        Some(biases),
+        None,
+        DRAFT_GROUP_SIZE,
+        DRAFT_BITS,
+        "affine".to_string(),
+    )))
+}
+
+fn dense_linear(
+    params: &mut HashMap<String, MxArray>,
+    prefix: &str,
+    input: usize,
+    output: usize,
+) -> Result<LinearProj> {
+    let weight = required(
+        params,
+        &format!("{prefix}.weight"),
+        &[output as i64, input as i64],
+    )?;
     Ok(LinearProj::Standard(Linear::from_weights(&weight, None)?))
 }
 
@@ -1283,7 +1260,6 @@ fn grouped_conv(
     base: &str,
     name: &str,
     config: &DFlash2Config,
-    quant: DraftQuantization,
     savings: &mut u64,
 ) -> Result<GroupedDynamicCausalConv> {
     let hidden = config.hidden_size;
@@ -1294,12 +1270,11 @@ fn grouped_conv(
             &format!("{base}.{name}.base_kernel"),
             &[2, config.conv_kernel_size as i64, hidden as i64],
         )?,
-        kernel_projection: linear(
+        kernel_projection: draft_linear(
             params,
             &format!("{base}.{name}.kernel_projection"),
             hidden,
             2 * config.conv_kernel_size * groups,
-            quant,
             savings,
         )?,
         kernel_size: config.conv_kernel_size,
@@ -1481,14 +1456,12 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     let _resident = crate::array::memory::materialize_weights(&arrays)?;
 
     let hidden = config.hidden_size;
-    let quant = draft_quantization();
     let mut savings = 0u64;
-    let fc = linear(
+    let fc = draft_linear(
         &mut params,
         "fc",
         hidden * config.target_layers.len(),
         hidden,
-        quant,
         &mut savings,
     )?;
     let hidden_norm = norm(
@@ -1503,36 +1476,32 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         let base = format!("layers.{index}");
         let attention_base = format!("{base}.self_attn");
         let attention = DFlash2Attention {
-            q_proj: linear(
+            q_proj: draft_linear(
                 &mut params,
                 &format!("{attention_base}.q_proj"),
                 hidden,
                 config.num_attention_heads * config.head_dim,
-                quant,
                 &mut savings,
             )?,
-            k_proj: linear(
+            k_proj: draft_linear(
                 &mut params,
                 &format!("{attention_base}.k_proj"),
                 hidden,
                 config.num_key_value_heads * config.head_dim,
-                quant,
                 &mut savings,
             )?,
-            v_proj: linear(
+            v_proj: draft_linear(
                 &mut params,
                 &format!("{attention_base}.v_proj"),
                 hidden,
                 config.num_key_value_heads * config.head_dim,
-                quant,
                 &mut savings,
             )?,
-            o_proj: linear(
+            o_proj: draft_linear(
                 &mut params,
                 &format!("{attention_base}.o_proj"),
                 config.num_attention_heads * config.head_dim,
                 hidden,
-                quant,
                 &mut savings,
             )?,
             q_norm: norm(
@@ -1560,28 +1529,25 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         };
         let mlp_base = format!("{base}.mlp");
         let mlp = DFlash2Mlp {
-            gate_proj: linear(
+            gate_proj: draft_linear(
                 &mut params,
                 &format!("{mlp_base}.gate_proj"),
                 hidden,
                 config.intermediate_size,
-                quant,
                 &mut savings,
             )?,
-            up_proj: linear(
+            up_proj: draft_linear(
                 &mut params,
                 &format!("{mlp_base}.up_proj"),
                 hidden,
                 config.intermediate_size,
-                quant,
                 &mut savings,
             )?,
-            down_proj: linear(
+            down_proj: draft_linear(
                 &mut params,
                 &format!("{mlp_base}.down_proj"),
                 config.intermediate_size,
                 hidden,
-                quant,
                 &mut savings,
             )?,
         };
@@ -1597,15 +1563,9 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
             hidden,
             config.rms_norm_eps,
         )?;
-        let attention_conv = grouped_conv(
-            &mut params,
-            &base,
-            "attention_conv",
-            &config,
-            quant,
-            &mut savings,
-        )?;
-        let mlp_conv = grouped_conv(&mut params, &base, "mlp_conv", &config, quant, &mut savings)?;
+        let attention_conv =
+            grouped_conv(&mut params, &base, "attention_conv", &config, &mut savings)?;
+        let mlp_conv = grouped_conv(&mut params, &base, "mlp_conv", &config, &mut savings)?;
         layers.push(DFlash2Layer {
             attention,
             mlp,
@@ -1629,13 +1589,11 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
             config.selector_rank,
         )?,
         // Keep the published selector projection at its original precision.
-        hidden_projection: linear(
+        hidden_projection: dense_linear(
             &mut params,
             "candidate_selector.hidden_projection",
             hidden,
             config.selector_rank,
-            DraftQuantization::Off,
-            &mut savings,
         )?,
         top_k: config.selector_top_k,
         rank: config.selector_rank,
@@ -1649,13 +1607,6 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         )));
     }
     let weight_bytes = weight_bytes.saturating_sub(savings);
-    if quant != DraftQuantization::Off {
-        eprintln!(
-            "dflash2 draft quant {quant:?}: resident {:.2} GiB (saved {:.2} GiB)",
-            weight_bytes as f64 / (1 << 30) as f64,
-            savings as f64 / (1 << 30) as f64,
-        );
-    }
     Ok((
         DFlash2Model {
             config,
@@ -1673,7 +1624,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateSelector, DFlash2Config, DFlash2ContextCache, DraftQuantization, SelectorPath,
+        CandidateSelector, DFlash2Config, DFlash2ContextCache, SelectorPath,
         normalized_selector_probs, parallel_query_ids,
     };
     use crate::array::{DType, MxArray};
@@ -1762,67 +1713,75 @@ mod tests {
     }
 
     #[test]
-    fn dense_draft_linear_preserves_bf16_without_quantization() {
+    fn selector_linear_keeps_checkpoint_precision() {
         let mut params = checkpoint_inventory();
-        let mut savings = 0;
-        let projection = super::linear(
-            &mut params,
-            "fc",
-            128,
-            64,
-            DraftQuantization::Off,
-            &mut savings,
-        )
-        .unwrap();
+        let projection = super::dense_linear(&mut params, "fc", 128, 64).unwrap();
         assert!(matches!(projection, LinearProj::Standard(_)));
-        assert_eq!(savings, 0);
         assert_eq!(projection.get_weight().dtype().unwrap(), DType::BFloat16);
     }
 
+    /// Asserts an affine Q4/group64 projection of a bf16 `[rows, cols]`
+    /// weight: 8 codes per u32 and one bf16 scale/offset pair per 64 inputs.
+    fn assert_q4_group64(projection: &LinearProj, rows: i64, cols: i64, name: &str) {
+        let LinearProj::Quantized(packed) = projection else {
+            panic!("{name}: draft projection must load quantized");
+        };
+        assert_eq!(packed.mode(), "affine", "{name}");
+        assert_eq!(
+            packed.get_weight().dtype().unwrap(),
+            DType::Uint32,
+            "{name}"
+        );
+        assert_eq!(
+            packed.get_weight().shape().unwrap().as_ref(),
+            &[rows, cols / 8],
+            "{name}: packed codes"
+        );
+        assert_eq!(
+            packed.get_scales().shape().unwrap().as_ref(),
+            &[rows, cols / 64],
+            "{name}: scales"
+        );
+        let biases = packed.get_biases().expect("affine Q4 has offsets");
+        assert_eq!(
+            biases.shape().unwrap().as_ref(),
+            &[rows, cols / 64],
+            "{name}: offsets"
+        );
+    }
+
     #[test]
-    fn q8_draft_linear_preserves_exact_endpoints_and_accounts_for_residency() {
-        // Integer endpoints span exactly 255 steps, so affine Q8 can retain
-        // both values exactly. Opposite-sign rows also check stored offsets.
-        let values = (0..64)
+    fn draft_linear_is_q4_group64_with_exact_endpoints_and_residency() {
+        // Integer endpoints span exactly 15 steps, so affine Q4 retains both
+        // values exactly. Opposite-sign rows also check stored offsets.
+        let values = (0..256)
             .map(|i| {
                 if i % 2 == 0 {
                     0.0
-                } else if i < 32 {
-                    255.0
+                } else if i < 128 {
+                    15.0
                 } else {
-                    -255.0
+                    -15.0
                 }
             })
             .collect::<Vec<_>>();
-        let weight = MxArray::from_float32(&values, &[2, 32])
+        let weight = MxArray::from_float32(&values, &[2, 128])
             .unwrap()
             .astype(DType::BFloat16)
             .unwrap();
         let source_values = weight.to_float32().unwrap().to_vec();
         let mut params = std::collections::HashMap::from([("fc.weight".into(), weight.clone())]);
         let mut savings = 0;
-        let projection = super::linear(
-            &mut params,
-            "fc",
-            32,
-            2,
-            DraftQuantization::Affine8x32,
-            &mut savings,
-        )
-        .unwrap();
+        let projection = super::draft_linear(&mut params, "fc", 128, 2, &mut savings).unwrap();
+        assert_q4_group64(&projection, 2, 128, "fc");
         let LinearProj::Quantized(packed) = &projection else {
-            panic!("explicit Q8 must produce a quantized draft projection");
+            unreachable!();
         };
-        assert_eq!(packed.mode(), "affine");
-        assert_eq!(packed.get_weight().dtype().unwrap(), DType::Uint32);
-        assert_eq!(packed.get_weight().shape().unwrap().as_ref(), &[2, 8]);
-        assert_eq!(packed.get_scales().shape().unwrap().as_ref(), &[2, 1]);
-        let biases = packed.get_biases().expect("affine Q8 has offsets");
-        assert_eq!(biases.shape().unwrap().as_ref(), &[2, 1]);
-        let resident =
-            packed.get_weight().nbytes() + packed.get_scales().nbytes() + biases.nbytes();
-        // Each row owns 32 packed bytes and BF16 scale/offset sidecars.
-        assert_eq!(resident, 2 * (32 + 2 + 2));
+        let resident = packed.get_weight().nbytes()
+            + packed.get_scales().nbytes()
+            + packed.get_biases().map_or(0, |biases| biases.nbytes());
+        // Each row owns 64 packed bytes and two bf16 scale/offset pairs.
+        assert_eq!(resident, 2 * (64 + 4 + 4));
         assert_eq!(savings, weight.nbytes() as u64 - resident as u64);
         assert!(params.is_empty());
         assert_eq!(weight.dtype().unwrap(), DType::BFloat16);
@@ -1831,12 +1790,126 @@ mod tests {
             source_values.as_slice()
         );
 
-        let input = MxArray::from_float32(&[1.0; 32], &[1, 32])
+        let input = MxArray::from_float32(&[1.0; 128], &[1, 128])
             .unwrap()
             .astype(DType::BFloat16)
             .unwrap();
         let output = projection.forward(&input).unwrap().to_float32().unwrap();
-        assert_eq!(output.as_ref(), &[4080.0, -4080.0]);
+        assert_eq!(output.as_ref(), &[960.0, -960.0]);
+    }
+
+    #[test]
+    fn load_quantizes_every_draft_projection_and_keeps_the_selector_dense() {
+        let config = checkpoint_inventory_config();
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-dflash2-load-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({
+                "architectures": ["DFlash2DraftModel"],
+                "hidden_size": config.hidden_size,
+                "intermediate_size": config.intermediate_size,
+                "num_hidden_layers": config.num_hidden_layers,
+                "num_target_layers": config.target_num_layers,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
+                "head_dim": config.head_dim,
+                "vocab_size": config.vocab_size,
+                "rms_norm_eps": config.rms_norm_eps,
+                "max_position_embeddings": config.max_position_embeddings,
+                "sliding_window": config.sliding_window,
+                "layer_types": ["sliding_attention"],
+                "rope_theta": config.rope_theta,
+                "dflash_config": {
+                    "block_size": config.block_size + 1,
+                    "conv_group_size": config.conv_group_size,
+                    "conv_kernel_size": config.conv_kernel_size,
+                    "mask_token_id": config.mask_token_id,
+                    "selector_rank": config.selector_rank,
+                    "selector_top_k": config.selector_top_k,
+                    "target_layer_ids": config.target_layers,
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let shapes = super::expected_tensor_shapes(&config);
+        let mut tensors = shapes
+            .iter()
+            .map(|(name, shape)| {
+                let array =
+                    MxArray::random_normal(shape, 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+                (name.clone(), array)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        crate::utils::safetensors::save_safetensors(
+            dir.join("model.safetensors"),
+            &mut tensors,
+            None,
+        )
+        .unwrap();
+        let loaded = super::load_dflash2(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (model, bytes) = loaded.unwrap();
+
+        let projection = |name: &str| -> bool {
+            name == "fc.weight"
+                || name.ends_with("_proj.weight")
+                || name.ends_with(".kernel_projection.weight")
+        };
+        let expected_bytes = shapes
+            .iter()
+            .map(|(name, shape)| {
+                let elements = shape.iter().product::<i64>() as u64;
+                if projection(name) {
+                    // u32 codes at 4 bits plus bf16 scale and offset per 64.
+                    elements / 2 + elements / 64 * 4
+                } else {
+                    elements * 2
+                }
+            })
+            .sum::<u64>();
+        assert_eq!(bytes, expected_bytes);
+        assert_eq!(model.weight_bytes, expected_bytes);
+
+        let hidden = config.hidden_size as i64;
+        let intermediate = config.intermediate_size as i64;
+        let attention = (config.num_attention_heads * config.head_dim) as i64;
+        let kv = (config.num_key_value_heads * config.head_dim) as i64;
+        let conv =
+            (2 * config.conv_kernel_size * (config.hidden_size / config.conv_group_size)) as i64;
+        let taps = config.target_layers.len() as i64;
+        assert_q4_group64(&model.fc, hidden, hidden * taps, "fc");
+        assert_eq!(model.layers.len(), 1);
+        let layer = &model.layers[0];
+        for (name, projection, rows, cols) in [
+            ("q_proj", &layer.attention.q_proj, attention, hidden),
+            ("k_proj", &layer.attention.k_proj, kv, hidden),
+            ("v_proj", &layer.attention.v_proj, kv, hidden),
+            ("o_proj", &layer.attention.o_proj, hidden, attention),
+            ("gate_proj", &layer.mlp.gate_proj, intermediate, hidden),
+            ("up_proj", &layer.mlp.up_proj, intermediate, hidden),
+            ("down_proj", &layer.mlp.down_proj, hidden, intermediate),
+            (
+                "attention_conv",
+                &layer.attention_conv.kernel_projection,
+                conv,
+                hidden,
+            ),
+            ("mlp_conv", &layer.mlp_conv.kernel_projection, conv, hidden),
+        ] {
+            assert_q4_group64(projection, rows, cols, name);
+        }
+        let selector = &model.selector.hidden_projection;
+        assert!(matches!(selector, LinearProj::Standard(_)));
+        assert_eq!(selector.get_weight().dtype().unwrap(), DType::BFloat16);
     }
 
     fn test_selector(vocab: usize, top_k: usize, rank: usize, hidden: usize) -> CandidateSelector {
@@ -2491,12 +2564,12 @@ mod tests {
             .expect("real DFlash2 checkpoint must load");
         assert_eq!(model.config.block_size, 7);
         assert_eq!(model.config.target_layers, vec![5, 19, 33, 47, 61]);
-        match super::draft_quantization() {
-            super::DraftQuantization::Off => assert!(bytes > 3_000_000_000),
-            super::DraftQuantization::Affine8x32 => {
-                assert!(bytes > 500_000_000 && bytes < 3_000_000_000)
-            }
-        }
+        // Q4/group64 projections: ~1.27 GB resident versus 3.85 GB bf16
+        // and ~2.17 GB at Q8/group64.
+        assert!(
+            bytes > 1_000_000_000 && bytes < 1_500_000_000,
+            "resident draft bytes {bytes}"
+        );
     }
 
     fn three_layer_tiny_draft() -> super::DFlash2Model {

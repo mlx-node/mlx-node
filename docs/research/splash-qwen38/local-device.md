@@ -107,7 +107,7 @@ node .cache/benchmarks/splash-local-20260922/guard.mjs splash-new-short \
   /Users/brooklyn/workspace/github/splash \
   .cache/benchmarks/splash-local-20260922 splash-new-short short
 
-env MLX_DFLASH2_DRAFT_QUANT=off MLX_DFLASH2_DRAFT_REUSE_TARGET_HEAD=0 \
+env MLX_DFLASH2_DRAFT_REUSE_TARGET_HEAD=0 \
   node .cache/benchmarks/splash-local-20260922/guard.mjs mlx-new \
   oxnode docs/research/splash-qwen38/benchmark.ts \
   .cache/benchmarks/splash-qwen38-phase2/final-validated/mlx-core.darwin-arm64.node \

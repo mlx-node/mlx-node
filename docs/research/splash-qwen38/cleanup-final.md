@@ -12,7 +12,9 @@ Splash parity claim is made by this cleanup.
   rollback switches. Actual device, dtype, shape, quantization and growing-prefix
   correctness fallbacks remain.
 - Q8 draft mode always shares the target head. BF16 remains the normal draft
-  precision; selecting Q8 no longer creates a larger Q8 head clone.
+  precision; selecting Q8 no longer creates a larger Q8 head clone. (Superseded
+  later: the draft now always loads as affine Q4/group64 with no precision
+  switch; see [flag-audit.md](flag-audit.md).)
 - Qwen DFlash2 always takes its full proposal width from the loaded checkpoint.
   The terminal token budget can shorten a block. The shared `mtpDepth` API
   remains meaningful for native MTP and other external-draft families.
