@@ -197,7 +197,7 @@ pub struct GatedDeltaNet {
     conv_kernel_dim: i32,
     tiled_gguf_layout: bool,
     /// Pre-stacked `[w_qkvz; w_ba]` transposed to `[hidden, qkvz_dim + ba_dim]`.
-    /// Populated by `finalize_in_proj()` after weights are loaded. When present
+    /// Populated by `finalize_after_load()`. When present
     /// (and non-quantized), `forward()` does ONE matmul + two slices instead of
     /// two separate matmuls.
     in_proj_qkvz_ba_t: Option<MxArray>,
@@ -320,10 +320,16 @@ impl GatedDeltaNet {
         self.conv_kernel_dim
     }
 
-    /// Precompute the stacked `[qkvz; ba]` input projection once after both
-    /// in_proj weights have been loaded. Forward will then use one matmul
-    /// plus two axis-2 slices instead of two separate matmuls.
-    /// Safe to call repeatedly (idempotent).
+    /// Runs once after every weight of the layer is loaded. Safe to call
+    /// repeatedly (idempotent).
+    ///
+    /// Evaluates the constants the setters derive from the weights: the loader
+    /// evaluates only checkpoint tensors, and a compiled verify traced while
+    /// one of these is lazy bakes its producer ops into a tape that is
+    /// replayed, recomputing them, for the whole process.
+    ///
+    /// Precomputes the stacked `[qkvz; ba]` input projection, so forward uses
+    /// one matmul plus two axis-2 slices instead of two separate matmuls.
     ///
     /// Dense path: stacks the transposed weights into `in_proj_qkvz_ba_t`.
     /// Quantized path: row-merges the packed weights into `in_proj_qkvz_ba_q`
@@ -332,7 +338,14 @@ impl GatedDeltaNet {
     /// keep working and no duplicate storage is retained. Incompatible pairs
     /// (mixed modes, split in_proj variants, special layouts) keep the
     /// unfused two-matmul path.
-    pub fn finalize_in_proj(&mut self) -> Result<()> {
+    pub fn finalize_after_load(&mut self) -> Result<()> {
+        let mut derived = vec![&self.a_log, &self.qk_norm_w_q, &self.qk_norm_w_k];
+        derived.extend(
+            [&self.gdn_scale_f32, &self.dt_bias_f32, &self.conv1d_w4_f32]
+                .into_iter()
+                .flatten(),
+        );
+        MxArray::eval_arrays(&derived)?;
         if self.split_in_proj_qkv_z.is_some() || self.split_in_proj_b_a.is_some() {
             self.in_proj_qkvz_ba_t = None;
             self.in_proj_qkvz_ba_q = None;
@@ -1102,6 +1115,10 @@ mod tests {
     /// Kernel geometry: 16k×128 + 48v×128 → conv_dim 10240, the only shape
     /// `mlx_qwen4_gdn_prepare` accepts.
     fn kernel_geometry_net() -> GatedDeltaNet {
+        kernel_geometry_net_with(rand_bf16)
+    }
+
+    fn kernel_geometry_net_with(weight: impl Fn(&[i64]) -> MxArray) -> GatedDeltaNet {
         let config = Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
             vocab_size: 32,
@@ -1135,16 +1152,15 @@ mod tests {
         };
         let mut net = GatedDeltaNet::new(&config).unwrap();
         // key_dim*2 + value_dim*2 = 2048*2 + 6144*2 = 16384 rows out.
-        net.set_in_proj_qkvz_weight(&rand_bf16(&[16384, 64]))
+        net.set_in_proj_qkvz_weight(&weight(&[16384, 64])).unwrap();
+        net.set_in_proj_ba_weight(&weight(&[96, 64])).unwrap();
+        net.set_conv1d_weight(&weight(&[10240, 1, 4]), DType::BFloat16)
             .unwrap();
-        net.set_in_proj_ba_weight(&rand_bf16(&[96, 64])).unwrap();
-        net.set_conv1d_weight(&rand_bf16(&[10240, 1, 4]), DType::BFloat16)
+        net.set_norm_weight(&weight(&[128]), DType::BFloat16)
             .unwrap();
-        net.set_norm_weight(&rand_bf16(&[128]), DType::BFloat16)
-            .unwrap();
-        net.set_out_proj_weight(&rand_bf16(&[64, 6144])).unwrap();
-        net.set_dt_bias(&rand_bf16(&[48]));
-        net.set_a_log(&rand_bf16(&[48])).unwrap();
+        net.set_out_proj_weight(&weight(&[64, 6144])).unwrap();
+        net.set_dt_bias(&weight(&[48]));
+        net.set_a_log(&weight(&[48])).unwrap();
         net
     }
 
@@ -1237,6 +1253,65 @@ mod tests {
             sdiff <= 0.1,
             "gdn_prepare vs conv-prep recurrent state diverged: {sdiff}"
         );
+        Ok(())
+    }
+
+    /// The loader evaluates the checkpoint tensors, not the constants the
+    /// setters derive from them. A compiled step traced while one is still
+    /// lazy bakes its producer ops into the tape and recomputes them on every
+    /// replay, so the step graph must reach nothing that is input-free.
+    #[test]
+    fn compiled_gdn_step_recomputes_no_derived_constant() -> Result<()> {
+        use crate::compiled_graph::{
+            erase_compiled_graphs_matching, input_free_ops, invoke_compiled_graph,
+        };
+        if !gdn_prepare_backend_probe() {
+            eprintln!(
+                "SKIP compiled_gdn_step_recomputes_no_derived_constant: no Metal gdn_prepare"
+            );
+            return Ok(());
+        }
+        assert!(
+            std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+            "compiled replay requires MLX_DISABLE_COMPILE to be unset"
+        );
+        let loaded = |shape: &[i64]| {
+            let w = rand_bf16(shape);
+            w.eval();
+            w
+        };
+        let mut net = kernel_geometry_net_with(loaded);
+        net.finalize_after_load()?;
+        // A >= 64-token prefill takes the conv path, like a real prompt, so it
+        // leaves the short-step constants untouched.
+        let mut prefill = ArraysCache::new(2);
+        net.forward(&loaded(&[1, 64, 64]), None, Some(&mut prefill), true)?
+            .eval();
+        let (Some(conv_state), Some(recurrent)) = (prefill.get(0), prefill.get(1)) else {
+            return Err(Error::from_reason("prefill left no GDN state"));
+        };
+        conv_state.eval();
+        recurrent.eval();
+        let x = loaded(&[1, 8, 64]);
+        let inputs = [&x, conv_state, recurrent];
+        let fn_id = 0xDFC6_0000_0000_0001_u64;
+        let mut builder = |graph_inputs: &[MxArray]| -> Result<Vec<MxArray>> {
+            let mut cache = ArraysCache::new(2);
+            cache.set(0, graph_inputs[1].clone())?;
+            cache.set(1, graph_inputs[2].clone())?;
+            let y = net.forward(&graph_inputs[0], None, Some(&mut cache), true)?;
+            let (Some(c), Some(r)) = (cache.get(0), cache.get(1)) else {
+                return Err(Error::from_reason("step left no GDN state"));
+            };
+            Ok(vec![y, c.clone(), r.clone()])
+        };
+        for call in 0..2 {
+            let out = invoke_compiled_graph(fn_id, &inputs, 3, true, &mut builder)?
+                .ok_or_else(|| Error::from_reason("compiled GDN step failed"))?;
+            let (count, names) = input_free_ops(&out.iter().collect::<Vec<_>>(), &inputs);
+            assert_eq!(count, 0, "call {call} recomputes lazy constants: {names}");
+        }
+        erase_compiled_graphs_matching(u64::MAX, fn_id);
         Ok(())
     }
 

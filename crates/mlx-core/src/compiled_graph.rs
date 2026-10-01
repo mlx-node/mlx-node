@@ -152,6 +152,30 @@ pub(crate) fn erase_compiled_graphs_matching(mask: u64, value: u64) {
     unsafe { sys::mlx_compiled_graph_erase_matching(mask, value) }
 }
 
+/// Primitive nodes in the graph of `outputs` that depend on none of `inputs`,
+/// as (count, comma-separated names). On a compiled replay these are lazy
+/// constants baked into the tape, recomputed by every replay.
+#[cfg(test)]
+pub(crate) fn input_free_ops(outputs: &[&MxArray], inputs: &[&MxArray]) -> (usize, String) {
+    let outs: Vec<*const sys::mlx_array> =
+        outputs.iter().map(|a| a.as_raw_ptr() as *const _).collect();
+    let ins: Vec<*const sys::mlx_array> =
+        inputs.iter().map(|a| a.as_raw_ptr() as *const _).collect();
+    let mut names = vec![0u8; 4096];
+    let count = unsafe {
+        sys::mlx_graph_count_input_free_ops(
+            outs.as_ptr(),
+            outs.len(),
+            ins.as_ptr(),
+            ins.len(),
+            names.as_mut_ptr() as *mut std::ffi::c_char,
+            names.len(),
+        )
+    };
+    let end = names.iter().position(|&b| b == 0).unwrap_or(names.len());
+    (count, String::from_utf8_lossy(&names[..end]).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

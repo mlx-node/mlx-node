@@ -2236,6 +2236,17 @@ unsafe extern "C" {
     /// Test hook: toggle MLX's global compile mode so tests can exercise the
     /// raw-closure path (builder runs on every invoke).
     pub fn mlx_compiled_graph_set_compile_disabled(disabled: bool);
+    /// Test hook: number of primitive nodes reachable from `outputs` that
+    /// depend on none of `inputs` (lazy constants baked into a compiled
+    /// tape); their names go to `names` (NUL-terminated, truncated).
+    pub fn mlx_graph_count_input_free_ops(
+        outputs: *const *const mlx_array,
+        n_outputs: usize,
+        inputs: *const *const mlx_array,
+        n_inputs: usize,
+        names: *mut std::ffi::c_char,
+        names_len: usize,
+    ) -> usize;
     pub fn mlx_qwen4_window_conv(
         x: *mut mlx_array,
         history: *mut mlx_array,

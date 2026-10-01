@@ -1001,10 +1001,11 @@ fn apply_weights_moe_inner_with_residency(
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
                 }
-                // Same finalizer as the dense loader: stacks/merges the
-                // in_proj_qkvz + in_proj_ba pair (dense transpose for
-                // bf16 weights, packed row-merge for quantized).
-                gdn.finalize_in_proj()?;
+                // Same finalizer as the dense loader: evaluates the derived
+                // constants and stacks/merges the in_proj_qkvz + in_proj_ba
+                // pair (dense transpose for bf16 weights, packed row-merge
+                // for quantized).
+                gdn.finalize_after_load()?;
             }
             AttentionType::Full(attn) => {
                 if is_quantized {

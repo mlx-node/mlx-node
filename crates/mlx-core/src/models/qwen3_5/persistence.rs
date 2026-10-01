@@ -1709,10 +1709,9 @@ fn apply_weights_inner_with_residency(
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
                 }
-                // Precompute the stacked [in_proj_qkvz; in_proj_ba].T weight
-                // so forward() does one matmul + two slices instead of two
-                // separate matmuls. No-op for quantized variants.
-                gdn.finalize_in_proj()?;
+                // Evaluates the derived constants and stacks/merges the
+                // in_proj_qkvz + in_proj_ba pair.
+                gdn.finalize_after_load()?;
             }
             AttentionType::Full(attn) => {
                 attn.set_prism_model(prism.is_some());

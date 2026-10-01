@@ -18,12 +18,18 @@
 // - On the hit path, `inputs`/`outputs` are borrowed/copied through the
 //   standard `array` copy constructor — no ownership changes hands across C.
 
+#include "mlx/primitives.h"
 #include "mlx_common.h"
 
 #include <mutex>
 #include <chrono>
 #include <cstdio>
 #include <unordered_map>
+
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
 
 // Rust-side graph builder: wraps `inputs` (owning handles during trace),
 // writes `n_outputs` owning handles to `outputs`, returns success.
@@ -206,4 +212,65 @@ extern "C" void mlx_compiled_graph_erase_matching(uint64_t mask,
 extern "C" void mlx_compiled_graph_set_compile_disabled(bool disabled) {
   mlx::core::set_compile_mode(disabled ? mlx::core::CompileMode::disabled
                                        : mlx::core::CompileMode::enabled);
+}
+
+// Test hook: count the primitive nodes reachable from `outputs` that depend on
+// none of `inputs`. On a compiled replay these are lazy constants the trace
+// baked into the tape: every replay recomputes them. Writes their primitive
+// names, comma-separated and truncated to `names_len`, when `names` is set.
+extern "C" size_t
+mlx_graph_count_input_free_ops(const mlx_array *const *outputs,
+                               size_t n_outputs, const mlx_array *const *inputs,
+                               size_t n_inputs, char *names, size_t names_len) {
+  std::unordered_map<std::uintptr_t, bool> depends;
+  for (size_t i = 0; i < n_inputs; ++i) {
+    depends[reinterpret_cast<const array *>(inputs[i])->id()] = true;
+  }
+  std::string listed;
+  size_t count = 0;
+  std::vector<std::pair<array, bool>> stack;
+  for (size_t i = 0; i < n_outputs; ++i) {
+    stack.emplace_back(*reinterpret_cast<const array *>(outputs[i]), false);
+  }
+  while (!stack.empty()) {
+    auto [a, expanded] = stack.back();
+    stack.pop_back();
+    if (depends.count(a.id())) {
+      continue;
+    }
+    if (!a.has_primitive()) {
+      depends[a.id()] = false;
+      continue;
+    }
+    if (!expanded) {
+      stack.emplace_back(a, true);
+      for (auto &in : a.inputs()) {
+        if (!depends.count(in.id())) {
+          stack.emplace_back(in, false);
+        }
+      }
+      continue;
+    }
+    bool dep = false;
+    for (auto &in : a.inputs()) {
+      dep = dep || depends[in.id()];
+    }
+    for (auto &s : a.siblings()) {
+      depends[s.id()] = dep;
+    }
+    depends[a.id()] = dep;
+    if (!dep) {
+      ++count;
+      if (!listed.empty()) {
+        listed += ',';
+      }
+      listed += a.primitive().name();
+    }
+  }
+  if (names && names_len > 0) {
+    size_t n = std::min(listed.size(), names_len - 1);
+    std::memcpy(names, listed.data(), n);
+    names[n] = '\0';
+  }
+  return count;
 }
