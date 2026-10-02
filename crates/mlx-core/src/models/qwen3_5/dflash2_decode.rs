@@ -152,7 +152,9 @@ fn kv_row_bytes(full_attention_layers: usize, kv_heads: i32, head_dim: i32, dtyp
 /// Target rows to reserve for one DFlash2 turn: the whole turn
 /// (`prompt + max_new`, rounded to the growth step) when the budget covers
 /// it, else as many look-ahead rows as fit. `None` keeps the growth path.
-/// `resident_rows` are already allocated and so already paid for.
+/// Growing a live buffer allocates the whole new buffer while the old one is
+/// still alive, so every prompt row is charged unless `resident_rows` already
+/// hold the whole turn.
 fn dflash2_kv_reserve_rows(
     prompt_len: usize,
     max_new_tokens: i32,
@@ -165,16 +167,17 @@ fn dflash2_kv_reserve_rows(
             "Qwen3.8 DFlash2 prompt of {prompt_len} tokens is too long"
         ))
     })?;
-    kv_capacity_round_up(prompt, max_new_tokens)?;
+    let whole_turn = kv_capacity_round_up(prompt, max_new_tokens)? as i64;
+    if resident_rows > 0 && resident_rows >= whole_turn {
+        return Ok(Some(whole_turn));
+    }
     let Some(budget) = budget_bytes else {
         return Ok(None);
     };
     if row_bytes == 0 {
         return Ok(None);
     }
-    let unallocated_prompt_rows = (prompt as i64 - resident_rows.max(0)).max(0) as u64;
-    let ahead_cap =
-        budget.saturating_sub(unallocated_prompt_rows.saturating_mul(row_bytes)) / row_bytes;
+    let ahead_cap = budget.saturating_sub((prompt as u64).saturating_mul(row_bytes)) / row_bytes;
     if ahead_cap < DFLASH2_KV_MIN_AHEAD_ROWS {
         return Ok(None);
     }
@@ -1404,8 +1407,12 @@ mod tests {
         );
         assert_eq!(
             rows(6000, 1024, 6144, Some(300 * QWEN38_ROW_BYTES)),
-            Some(6400),
-            "resident rows are already paid for"
+            None,
+            "growing a resident buffer pays for the whole new buffer"
+        );
+        assert_eq!(
+            rows(6000, 1024, 6144, Some((6000 + 400) * QWEN38_ROW_BYTES)),
+            Some(6400)
         );
         // Less than one growth step of look-ahead keeps the growth path.
         assert_eq!(
@@ -1420,6 +1427,40 @@ mod tests {
             None
         );
         assert!(dflash2_kv_reserve_rows(1, i32::MAX, 0, QWEN38_ROW_BYTES, plenty).is_err());
+    }
+
+    #[test]
+    fn kv_reserve_warm_copy_fits_live_headroom() {
+        // A warm 100K-row prompt already resident: its old buffer is in
+        // `active` and stays live while `reserve` copies it into the new one.
+        let resident = 100_096;
+        let snapshot = PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(20 * GIB),
+            allocator_cached_bytes: Some(0),
+            allocator_limit_bytes: Some(36 * GIB),
+            metal_recommended_working_set_bytes: None,
+            metal_current_allocated_bytes: None,
+            paged_pool_allocated_bytes: Some(0),
+        };
+        let headroom = live_prefill_headroom(snapshot)
+            .selected_bytes
+            .expect("fake limits are readable");
+        assert_eq!(headroom, 16 * GIB);
+        let budget = dflash2_kv_budget_bytes(snapshot);
+        let rows = dflash2_kv_reserve_rows(100_000, 200_000, resident, QWEN38_ROW_BYTES, budget)
+            .expect("valid reservation input")
+            .expect("budget admits look-ahead");
+        assert!(rows > resident, "the reservation copies the warm prefix");
+        assert!(
+            rows as u64 * QWEN38_ROW_BYTES <= headroom,
+            "a {rows}-row replacement buffer exceeds {headroom} bytes of headroom"
+        );
+        // Without the copy the budget still covers resident-only turns.
+        assert_eq!(
+            dflash2_kv_reserve_rows(6000, 1024, 7168, QWEN38_ROW_BYTES, Some(0))
+                .expect("valid reservation input"),
+            Some(7168)
+        );
     }
 
     fn live_target_cache_fingerprints(
