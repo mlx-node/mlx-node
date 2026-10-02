@@ -79,7 +79,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_BONSAI_SHARE_HADAMARD=1`            | Experimental, default off: reuse identical signed Hadamard transforms within one paged Qwen3.5 decode step. Cache entries retain input/sign owners and are cleared on return or error; flat inference and prefill do not retain entries.                                                                                                             |
 | `MLX_QMM_SPLITK_MIN_M`                   | Diagnostic override for the quantized-matmul vector/GEMM dispatch boundary: quantized matvecs with M ≥ this many rows take the `qmm`/split-k path instead of `qmv_wide`. A/B tuning only; unset keeps the hardware-derived heuristic.                                                                                                                |
 | `MLX_KQUANT_SMALL_M_BENCH=1`             | Body-level opt-in for the `#[ignore]`d `kquant_small_m_bench` integration test: exact-shape K/IQ small-M quantized-matmul timings (MLP + lm_head shapes, M sweep). Run `MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --test kquant_small_m_bench -- --ignored --test-threads=1 --nocapture` (serial — the two benches share the GPU).           |
-| `MLX_METAL_COMMAND_TRACE=1`              | Diagnostic only: log command completion intervals, submission reasons, resource capacities, barriers and host evaluation/backpressure spans. Logging perturbs timing; exclude traced rates from performance comparisons. See the [trace interpretation](research/splash-qwen38/architecture-implementation.md#command-diagnostics).                  |
+| `MLX_METAL_COMMAND_TRACE=1`              | Diagnostic only: log command completion intervals, submission reasons, resource capacities, barriers and host evaluation/backpressure spans. Logging perturbs timing; exclude traced rates from performance comparisons. See the [trace interpretation](research/splash-qwen38.md#command-trace).                                                    |
 | `MLX_METAL_OP_TRACE=1\|2\|3`             | Diagnostic: print one line per Metal primitive eval to stderr — `commit`/`kernel`/`synchronize` events with node counts (1), plus primitive names (2) and input→output dtypes (3). Zero cost when unset. Used to count dispatches per decode/verify cycle.                                                                                           |
 
 Eligible Qwen/DFlash projection merges, fused GDN preparation/window convolution,
@@ -99,7 +99,7 @@ Qwen override. Qwen4's separate four-column route remains. Ordinary boundary
 submission, lazy context publication and periodic cache clearing are retained.
 Historical evidence remains in the research reports.
 Full end-to-end screening also rejected dense Q4, adaptive fallback, and the
-forced matrix/command-buffer presets. The [cleanup report](research/splash-qwen38/cleanup-final.md)
+forced matrix/command-buffer presets. The [Splash/Qwen3.8 reference](research/splash-qwen38.md)
 records completed validation and final performance: exact output/acceptance
 parity, with no established throughput change from cleanup.
 
@@ -490,7 +490,7 @@ TTFT on M5 Max (24–31× per isolated call) across 580–5,384 prompt tokens, a
 about 2× slower on M3. The two algorithms also differed by 1–2 BF16 ULP and
 could change greedy continuations. These are historical measurements, not
 validation of the final cleanup binary. See the
-[cleanup report](research/splash-qwen38/cleanup-final.md) for the later removal
+[Splash/Qwen3.8 reference](research/splash-qwen38.md) for the later removal
 screen and its limitations.
 
 The separate CUDA/non-Metal `chunked_ops` implementation remains. Eligible

@@ -166,7 +166,7 @@ acceptance stayed within noise and time per committed token was lowest (78.23
 ms versus 80.97 ms for BF16, summed over short / 6K / 32K). Raw end-to-end
 tokens/s changes sign by fixture (Q4 versus BF16: +22.9% / -24.0% / +9.3%)
 because each precision decodes a different transcript; see the
-[draft precision study](research/splash-qwen38/README.md#draft-precision-current).
+[draft precision study](research/splash-qwen38.md#2-current-state-pr-171-base-04ce9b2b).
 There is no precision switch. The implementation follows the [official DFlash repository](https://github.com/z-lab/dflash)
 and [DFlash2 architecture description](https://inco.ai/blog/dflash2/).
 
