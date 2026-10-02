@@ -144,24 +144,37 @@ describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', 
     prompt: string,
     images: Uint8Array[] | undefined,
     maxNewTokens = 80,
+    reasoningEffort?: 'none',
   ): Promise<{ text: string; finishReason: string; numTokens: number }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TURN_TIMEOUT_MS);
     let text = '';
     let finishReason = 'unknown';
     let numTokens = 0;
+    let done = false;
     try {
       for await (const event of session.sendStream(prompt, {
         ...(images !== undefined && { images }),
         signal: controller.signal,
-        config: { maxNewTokens, temperature: 0, reportPerformance: false },
+        config: {
+          maxNewTokens,
+          temperature: 0,
+          reportPerformance: false,
+          ...(reasoningEffort !== undefined && { reasoningEffort }),
+        },
       })) {
         if (event.done) {
+          done = true;
           finishReason = event.finishReason;
           numTokens = event.numTokens;
         } else {
           text += event.text;
         }
+      }
+      // An abort ends the stream without a done event; report it as a
+      // timeout, not as an empty decode.
+      if (!done && controller.signal.aborted) {
+        throw new Error(`turn timed out after ${TURN_TIMEOUT_MS} ms; ${text.length} chars streamed`);
       }
       return { text, finishReason, numTokens };
     } finally {
@@ -211,7 +224,9 @@ describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', 
     async () => {
       const buf = readFileSync(imagePath);
       const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-      const r = await runTurn('Describe this image.', [bytes], 96);
+      // Without thinking the caption streams as answer text. With thinking,
+      // all 96 tokens can stay inside a held-back thought.
+      const r = await runTurn('Describe this image.', [bytes], 96, 'none');
       assertCoherent(r.text, r.finishReason, r.numTokens);
       // A working vision path yields a multi-word description, not one token.
       expect(r.text.trim().split(/\s+/).filter(Boolean).length).toBeGreaterThan(3);
