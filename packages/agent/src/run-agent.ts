@@ -37,6 +37,7 @@ import {
   installMlxOnlyModelRegistryFilter,
 } from './provider/model-registry-filter.js';
 import type { MlxModelInfo } from './provider/models.js';
+import { sharedStreamFactory } from './provider/shared-client.js';
 
 /** Shape of pi's `main(argv, { extensionFactories })` — also the test seam. */
 export type RunAgentMain = (args: string[], opts: { extensionFactories: InlineExtension[] }) => Promise<void>;
@@ -148,7 +149,21 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   try {
     await pi.main(opts.argv, {
       extensionFactories: [
-        createMlxProviderExtension(opts.models, modelHost),
+        createMlxProviderExtension(
+          opts.models,
+          modelHost,
+          opts.mode === 'delegate'
+            ? {
+                makeStreamSimple: sharedStreamFactory({
+                  persistPagedCache: opts.persistPagedCache ?? true,
+                  preserveEmbeddedGemmaDraft,
+                }),
+                // Process-global native counters in this client do not describe the worker.
+                coldStats: () => undefined,
+                sidecarStats: () => undefined,
+              }
+            : {},
+        ),
         createLocalImageInputExtension(),
         opts.mode === 'delegate'
           ? createDelegationExtension({ callerApproved: opts.delegateCallerApproved })

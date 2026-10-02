@@ -9,10 +9,10 @@
  * Why this helper exists at all: `ChatSession.reset()` is the safe
  * public wipe — it always calls `model.resetCaches()` because the
  * underlying `SessionCapableModel` may be shared across session
- * lifetimes. The agent provider bridge, however, owns exactly one
- * session per model process and replays pi's full message history on
- * every LLM call, so the native KV cache always belongs to the chain
- * being replayed. A JS-state-only reset that preserves the native
+ * lifetimes. The agent provider bridge replays pi's full message history
+ * on every LLM call. The shared delegate host keeps each paged session
+ * on its own stable native owner and serializes turns for that owner;
+ * flat models retain only one warm session. A JS-state-only reset that preserves the native
  * cache is correct there: the next `primeHistory()` +
  * `startFromHistoryStream()` lets the native prefix verifier recover
  * the reused prefix and skip the corresponding re-prefill.

@@ -125,6 +125,21 @@ export class MlxModelHost {
     return this.byName.get(modelId);
   }
 
+  /** Shared-service callers hold their own process-wide load/inference gate. */
+  runWithModel<T>(modelId: string, fn: (model: SessionCapableModel, resident: boolean) => Promise<T>): Promise<T> {
+    return this.runWithResident(modelId, (_session, resident) =>
+      fn(this.resident!.model as SessionCapableModel, resident),
+    );
+  }
+
+  /** Release the resident before another host's load; caller must drain inference first. */
+  async dispose(): Promise<void> {
+    await this.runSerialized(async () => {
+      await this.resident?.session.dispose();
+      this.resident = null;
+    });
+  }
+
   /**
    * Make `modelId` resident (loading or swapping on demand) and run `fn`
    * against its `ChatSession` — both inside one serialized closure, so no

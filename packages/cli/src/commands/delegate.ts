@@ -110,6 +110,9 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
        mlx delegate github [--repo OWNER/REPO] [--pr NUMBER] [--caller-approved] [--allow-write] [agent options] 'TASK'
 
 Uses the mlx agent runtime, model settings, session storage, cache and metrics.
+Delegate calls automatically share one background inference service and one
+resident model. Independent sessions decode concurrently when the model supports
+batching; other models queue in that service. It exits after five idle minutes.
 The worker has a focused prompt and read/bash tools, without local subagents,
 project instruction files or skills. Explicit agent prompt/tool options still apply.
 When launched by Codex, tools run inside the caller's inherited process sandbox

@@ -53,6 +53,8 @@ function safeSidecarStats(): ColdSidecarStats | undefined {
 
 /** Injectable seams for {@link createMlxProviderExtension} (unit tests). */
 export interface MlxProviderExtensionDeps {
+  /** Delegate clients forward the same provider contract to the shared worker. */
+  makeStreamSimple?: typeof makeMlxStreamSimple;
   /** Process-wide cold-tier reader; defaults to the native addon (absent in unit tests). */
   coldStats?: () => ColdCacheStats | undefined;
   /** Process-wide sidecar-counter reader; defaults to the native addon. */
@@ -205,7 +207,7 @@ export function createMlxProviderExtension(
   };
 
   let getThinkingBudget = (): number | undefined => undefined;
-  const streamSimple = makeMlxStreamSimple(
+  const streamSimple = (deps.makeStreamSimple ?? makeMlxStreamSimple)(
     resolvedHost,
     performanceStatus.record,
     () => rootCacheOwnerId,
