@@ -64,6 +64,7 @@ export const BASE_KERNEL_MARKERS = [
   'sdpa_vector',
   'sdpa_vector_segmented_verify_2pass_1',
   'affine_qmv_wide_mixed',
+  'qmv_sg8',
 ] as const;
 
 /**
