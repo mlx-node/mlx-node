@@ -9,6 +9,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TABLE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+fn next_table_identity() -> u64 {
+    let mut id = NEXT_TABLE_IDENTITY.load(Ordering::Relaxed);
+    loop {
+        match NEXT_TABLE_IDENTITY.compare_exchange_weak(
+            id,
+            id.saturating_add(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(previous) => return previous,
+            Err(current) => id = current,
+        }
+    }
+}
+
 /// Block table entry for a single sequence
 #[derive(Debug)]
 pub struct SequenceBlockTable {
@@ -39,11 +54,7 @@ impl SequenceBlockTable {
     /// Create a new block table for a sequence
     pub fn new(seq_id: u32, block_size: u32) -> Self {
         Self {
-            metadata_identity: NEXT_TABLE_IDENTITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                    Some(id.saturating_add(1))
-                })
-                .unwrap_or(u64::MAX),
+            metadata_identity: next_table_identity(),
             seq_id,
             blocks: Vec::new(),
             num_tokens: 0,
