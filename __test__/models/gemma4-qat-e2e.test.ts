@@ -125,8 +125,12 @@ const modelPath = findModelPath();
 const modelExists = modelPath !== null;
 const imagePath = resolve(process.cwd(), 'examples/ocr.png');
 const imageExists = existsSync(imagePath);
-const TURN_TIMEOUT_MS = 240_000;
-const TEST_TIMEOUT_MS = TURN_TIMEOUT_MS + 30_000;
+// These tests check decode correctness, not speed. Shared CI runners have
+// slow stretches (seen at ~6 s per decode step), so a turn fails only when it
+// stops making progress or passes the hard cap, never on total wall time.
+const STALL_TIMEOUT_MS = 300_000;
+const TURN_TIMEOUT_MS = 1_200_000;
+const TEST_TIMEOUT_MS = TURN_TIMEOUT_MS + 60_000;
 
 describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', () => {
   let session: ChatSession;
@@ -147,7 +151,16 @@ describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', 
     reasoningEffort?: 'none',
   ): Promise<{ text: string; finishReason: string; numTokens: number }> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TURN_TIMEOUT_MS);
+    let abortReason = '';
+    const abort = (reason: string) => {
+      abortReason = reason;
+      controller.abort();
+    };
+    const hardTimer = setTimeout(() => abort(`passed the ${TURN_TIMEOUT_MS} ms turn cap`), TURN_TIMEOUT_MS);
+    let stallTimer = setTimeout(() => abort(`made no progress for ${STALL_TIMEOUT_MS} ms`), STALL_TIMEOUT_MS);
+    const start = performance.now();
+    let firstEventMs = -1;
+    let events = 0;
     let text = '';
     let finishReason = 'unknown';
     let numTokens = 0;
@@ -163,6 +176,10 @@ describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', 
           ...(reasoningEffort !== undefined && { reasoningEffort }),
         },
       })) {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => abort(`made no progress for ${STALL_TIMEOUT_MS} ms`), STALL_TIMEOUT_MS);
+        events += 1;
+        if (firstEventMs < 0) firstEventMs = performance.now() - start;
         if (event.done) {
           done = true;
           finishReason = event.finishReason;
@@ -171,14 +188,20 @@ describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', 
           text += event.text;
         }
       }
+      const elapsedMs = Math.round(performance.now() - start);
+      // Per-turn timing in the CI log separates a slow runner from a stuck decode.
+      console.log(
+        `[gemma4-qat-e2e] ${JSON.stringify({ prompt, elapsedMs, firstEventMs: Math.round(firstEventMs), events, numTokens, finishReason })}`,
+      );
       // An abort ends the stream without a done event; report it as a
       // timeout, not as an empty decode.
       if (!done && controller.signal.aborted) {
-        throw new Error(`turn timed out after ${TURN_TIMEOUT_MS} ms; ${text.length} chars streamed`);
+        throw new Error(`turn ${abortReason} after ${elapsedMs} ms; ${events} events, ${text.length} chars streamed`);
       }
       return { text, finishReason, numTokens };
     } finally {
-      clearTimeout(timer);
+      clearTimeout(hardTimer);
+      clearTimeout(stallTimer);
       // A timed-out/failed stream must not leave this shared session inFlight
       // and turn every later assertion into a misleading concurrent-send
       // failure. Native cancellation settles before the owner-scoped reset.
