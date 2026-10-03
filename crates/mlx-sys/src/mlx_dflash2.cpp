@@ -1,5 +1,7 @@
 #include "mlx_common.h"
 
+#include <functional>
+#include <sstream>
 #include <stdexcept>
 
 #ifdef MLX_NODE_METAL_ENABLED
@@ -43,8 +45,13 @@ bool selector_pipeline_supported(const array& output, int required_threads) {
   if (tx != required_threads || ty != 1 || tz != 1)
     throw std::runtime_error("selector threadgroup violates its algorithm contract");
   auto& device = mlx::core::metal::device(custom->stream().device);
+  // CustomKernel::eval_gpu's library key; any other key compiles the source
+  // a second time.
+  std::ostringstream library_name;
+  library_name << name << '_' << std::hex << std::hash<std::string>{}(source)
+               << std::dec << '_' << std::get<10>(state);
   auto* library = device.get_library(
-      name, mlx::core::CompileOptions(std::get<10>(state)),
+      library_name.str(), mlx::core::CompileOptions(std::get<10>(state)),
       [&source] { return mlx::core::metal::utils() + source; });
   auto* pipeline = device.get_kernel(name, library);
   const bool supported = pipeline->threadExecutionWidth() == kSimdWidth &&
