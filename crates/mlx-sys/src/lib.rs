@@ -1897,6 +1897,32 @@ unsafe extern "C-unwind" {
         out_eager: *mut *mut mlx_array,
     ) -> bool;
 
+    /// TEST-ONLY oracle: the MLX fork's `QuantizedMatmul` built directly with
+    /// BF16 `x` and F32 affine sidecars on the GPU. Only the fork pin computes
+    /// it correctly; removed with the move to upstream MLX.
+    pub fn mlx_test_fork_affine_mixed_qmm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY: shapeless-compiles the mixed BF16/F32 affine matmul on
+    /// `trace_x`, then replays it on `x`; writes the replay and the eager result.
+    pub fn mlx_test_affine_mixed_shapeless_replay(
+        trace_x: *mut mlx_array,
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_replay: *mut *mut mlx_array,
+        out_eager: *mut *mut mlx_array,
+    ) -> bool;
+
     // Gated Delta Recurrence Metal Kernel
     pub fn mlx_gated_delta_kernel(
         q: *mut mlx_array,
