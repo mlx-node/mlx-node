@@ -58,21 +58,24 @@ export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
  */
 export const MIN_PAGED_METALLIB_BYTES = 4 * 1024 * 1024;
 
-/** Kernel names present in every healthy mlx.metallib from the vendored MLX. */
+/**
+ * Kernel names present in every healthy mlx.metallib from the vendored MLX.
+ * `sdpa_blocked_scale_copy` and `seq_gated_delta` are absent from the previous
+ * pin (053e43fe), so a stale metallib from that pin fails here.
+ */
 export const BASE_KERNEL_MARKERS = [
   'steel_attention',
   'sdpa_vector',
-  'sdpa_vector_segmented_verify_2pass_1',
-  'affine_qmv_wide_mixed',
-  'qmv_sg8',
+  'sdpa_blocked_scale_copy',
+  'seq_gated_delta',
 ] as const;
 
 /**
- * Kernel names introduced by the current MLX pin (e9463bbf): the NAX gen-17
- * family. Absent from the previous pin (a8776b7b), so their absence on a
- * NAX-building host means a stale metallib was selected.
+ * NAX gen-17 kernel names of the current MLX pin (c23b1113). Their absence on a
+ * NAX-building host means a stale or NAX-less metallib was selected;
+ * `steel_attention_dsplit` is absent from the previous pin (053e43fe).
  */
-export const NAX_KERNEL_MARKERS = ['affine_qmv_wide', 'steel_gemm_segmented_nax'] as const;
+export const NAX_KERNEL_MARKERS = ['affine_qmv_wide', 'steel_gemm_segmented_nax', 'steel_attention_dsplit'] as const;
 
 export function hostAppleTriple(arch: string = process.arch): string {
   return arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';

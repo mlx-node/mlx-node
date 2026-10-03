@@ -694,6 +694,15 @@ describe('assertMetallibIntegrity', () => {
     ).toThrow(/missing expected kernel/);
   });
 
+  it('rejects the 053e43fe fork-pin inventory even without NAX', () => {
+    const forkPin = Buffer.from(
+      ['MTLB', 'steel_attention', 'sdpa_vector', 'sdpa_vector_segmented_verify_2pass_1', 'qmv_sg8'].join('\0'),
+    );
+    expect(() => assertMetallibIntegrity(forkPin, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
+      /missing expected kernel\(s\) sdpa_blocked_scale_copy, seq_gated_delta/,
+    );
+  });
+
   it('rejects a previous-pin metallib when the host builds NAX kernels', () => {
     expect(() => assertMetallibIntegrity(stalePin, { path: 'x', expectNax: true, minBytes: 1 })).toThrow(
       /missing NAX kernel/,
