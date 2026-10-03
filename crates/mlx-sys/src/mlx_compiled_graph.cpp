@@ -165,6 +165,10 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
       ~CtxSlotGuard() { current_builder_ctx = prev_; }
       void* prev_;
     } slot(ctx);
+    // MLX keys compile-cache entries by peek_default_stream(), which is empty
+    // until this thread's first op creates the stream. Create it before the
+    // first trace, or the second call misses the cache and traces again.
+    (void)mlx::core::default_stream(mlx::core::default_device());
     auto out = entry.fn(in);
     if (out.size() != n_outputs) {
       std::cerr << "mlx_compiled_graph_invoke: fn_id " << fn_id
