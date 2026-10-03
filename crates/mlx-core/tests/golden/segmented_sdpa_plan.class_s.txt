@@ -1,0 +1,11 @@
+# Golden digests of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
+# <first 8 bytes of SHA-256 over dtype, shape and output bytes, or a value> <case>
+any = machine
+7 = cases
+4775419 inputs
+a2d636920bb8d365 sdpa_vector_uses_two_pass
+d880099d8d7e84e5 sdpa_vector_partition_count
+f9c9ce7840602541 segmented_verify_head_rows
+2504d0abc8bc6c25 plan_segmented_sdpa_launch
+d2c81734f19bac0d plan_segmented_verify_launch
+47a0514ee9ac9f25 select_segmented_verify_route

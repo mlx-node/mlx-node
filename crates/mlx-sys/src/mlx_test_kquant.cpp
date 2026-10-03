@@ -5,8 +5,10 @@
 #include "mlx_kquant.h"
 #include "mlx_test_counters.h"
 
+#include <cstring>
 #include <limits>
 #include <map>
+#include <string>
 
 #ifdef MLX_NODE_METAL_ENABLED
 #include "mlx/backend/metal/device.h"
@@ -84,6 +86,34 @@ int32_t mlx_test_kquant_gpu_gen() {
   }
 #else
   return -1;
+#endif
+}
+
+// The Metal architecture name: the hardware's own when `hardware`, else the
+// one the dispatcher routes by (honours MLX_METAL_GPU_ARCH). False without
+// Metal or when `out` is too small.
+bool mlx_test_metal_architecture(bool hardware, char *out, size_t len) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!out || !mlx::core::metal::is_available())
+      return false;
+    auto &d = mlx::core::metal::device(mlx::core::Device::gpu);
+    std::string name =
+        hardware
+            ? std::string(d.mtl_device()->architecture()->name()->utf8String())
+            : d.get_architecture();
+    if (name.size() + 1 > len)
+      return false;
+    std::memcpy(out, name.c_str(), name.size() + 1);
+    return true;
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)hardware;
+  (void)out;
+  (void)len;
+  return false;
 #endif
 }
 

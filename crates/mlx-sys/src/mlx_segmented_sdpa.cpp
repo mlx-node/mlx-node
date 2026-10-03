@@ -1,6 +1,9 @@
 #include "mlx_common.h"
 #include "mlx_segmented_sdpa_plan.h"
 
+#include <cstdint>
+#include <vector>
+
 #ifdef MLX_NODE_METAL_ENABLED
 
 #include <array>
@@ -736,4 +739,112 @@ extern "C" int mlx_segmented_sdpa_test_verify_plan(
     *out_stage1_threads = plan.stage1_threads;
   }
   return plan.supported ? 1 : 0;
+}
+
+namespace {
+
+struct Fnv1a {
+  uint64_t state = 0xcbf29ce484222325ull;
+  void add(int64_t value) {
+    for (int byte = 0; byte < 8; ++byte) {
+      state ^= static_cast<uint64_t>(value >> (8 * byte)) & 0xff;
+      state *= 0x100000001b3ull;
+    }
+  }
+  void add(const mlx::core::segmented_sdpa::SegmentedSdpaLaunchPlan &plan) {
+    add(plan.supported);
+    add(plan.two_pass);
+    add(plan.partitions);
+    add(plan.stage1_threads);
+    add(plan.stage2_threads);
+  }
+};
+
+} // namespace
+
+// Test-only, platform independent: FNV-1a 64 digests of every planner and
+// policy output over a fixed input sweep for one device class, in the order
+// two-pass, partitions, head rows, launch plan, verify launch, verify route.
+extern "C" int64_t mlx_segmented_sdpa_test_plan_digests(char device_class,
+                                                        int blocks_override,
+                                                        uint64_t *out_digests) {
+  using namespace mlx::core::segmented_sdpa;
+  Fnv1a digests[6];
+  int64_t checked = 0;
+  std::vector<int> lengths;
+  for (int length = 1; length <= 140000;
+       length += length < 2048 ? 1 : (length < 70000 ? 7 : 997)) {
+    lengths.push_back(length);
+  }
+  for (int boundary = 2048; boundary <= (1 << 17); boundary *= 2) {
+    for (int d = -2; d <= 2; ++d) {
+      lengths.push_back(boundary + d);
+    }
+  }
+  for (int length : lengths) {
+    for (int q_heads : {1, 2, 4, 6, 8, 12, 16, 24, 32, 64}) {
+      for (int kv_heads : {1, 2, 4, 8}) {
+        if (q_heads % kv_heads != 0) {
+          continue;
+        }
+        ++checked;
+        digests[0].add(
+            sdpa_vector_uses_two_pass(device_class, length, q_heads, kv_heads));
+      }
+    }
+    for (int simdgroups = 1; simdgroups <= 256; ++simdgroups) {
+      ++checked;
+      digests[1].add(sdpa_vector_partition_count(device_class, length,
+                                                 simdgroups, blocks_override));
+    }
+  }
+
+  const size_t widths[] = {16, 32, 64};
+  const size_t threads[] = {0, 32, 512, 960, 1023, 1024, 2048};
+  const size_t memory[] = {0, 4096, 32768, 65536};
+  for (int rows = -1; rows <= 10; ++rows) {
+    for (int max_q = -1; max_q <= 10; ++max_q) {
+      ++checked;
+      digests[2].add(segmented_verify_head_rows(rows, max_q));
+    }
+    for (int gqa = 0; gqa <= 33; ++gqa) {
+      for (int partitions : {0, 16, 31, 32, 48, 64, 128, 1024}) {
+        for (size_t w : widths) {
+          for (size_t t : threads) {
+            for (size_t m : memory) {
+              SegmentedSdpaCapabilities c1{w, t, m, 32768};
+              SegmentedSdpaCapabilities c2{32, t, m, 32768};
+              for (bool two_pass : {false, true}) {
+                checked += 2;
+                digests[3].add(plan_segmented_sdpa_launch(rows, gqa, two_pass,
+                                                          partitions, c1, &c2));
+                digests[3].add(plan_segmented_sdpa_launch(
+                    rows, gqa, two_pass, partitions, c1, nullptr));
+              }
+              ++checked;
+              digests[4].add(
+                  plan_segmented_verify_launch(rows, gqa, partitions, c1, c2));
+            }
+          }
+        }
+      }
+    }
+  }
+  for (int head_rows = 0; head_rows <= 8; ++head_rows) {
+    for (int a = 0; a < 4; ++a) {
+      for (int b = 0; b < 4; ++b) {
+        const int parts[] = {32, 64, 128, 256};
+        for (bool unified : {false, true}) {
+          ++checked;
+          digests[5].add(static_cast<int>(select_segmented_verify_route(
+              head_rows, {(a & 1) != 0, parts[a]}, {(b & 1) != 0, parts[b]},
+              unified)));
+        }
+      }
+    }
+  }
+  for (int i = 0; i < 6; ++i) {
+    out_digests[i] = digests[i].state;
+  }
+  return checked;
 }

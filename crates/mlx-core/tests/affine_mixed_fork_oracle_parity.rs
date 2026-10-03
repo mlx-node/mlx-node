@@ -17,9 +17,11 @@
 //! ```
 
 mod affine_mixed_support;
+mod golden_support;
 mod kquant_support;
 
 use affine_mixed_support::*;
+use golden_support::{Golden, Mode};
 use kquant_support::{assert_identical, family_count, gpu_gen, start_counting, stop_counting};
 use mlx_core::array::MxArray;
 
@@ -67,6 +69,7 @@ fn route(arch_gen: i32, gs: i32, bits: i32, k: i64, m: i64) -> bool {
 struct Tally {
     cases: u64,
     promoted_above_8: u64,
+    golden: Golden,
 }
 
 impl Tally {
@@ -74,7 +77,8 @@ impl Tally {
     fn check(&mut self, ctx: &str, x: &MxArray, w: &Weights, gs: i32, bits: i32, expect: bool) {
         let wide_before = family_count("affine_mixed_qmv_wide");
         let promoted_before = family_count("affine_mixed_promoted");
-        assert_identical(ctx, ours(x, w, gs, bits), fork(x, w, gs, bits));
+        let (shape, dtype, out) = assert_identical(ctx, ours(x, w, gs, bits), fork(x, w, gs, bits));
+        self.golden.record_bits(ctx, &shape, dtype, &out);
         let wide = family_count("affine_mixed_qmv_wide") - wide_before;
         let promoted = family_count("affine_mixed_promoted") - promoted_before;
         assert_eq!(wide + promoted, 1, "{ctx}: one path per case");
@@ -101,6 +105,7 @@ fn mixed_affine_matches_fork_bitwise() {
     let mut t = Tally {
         cases: 0,
         promoted_above_8: 0,
+        golden: Golden::metal("affine_mixed_matmul", Mode::from_env()),
     };
     for (li, &(gs, bits)) in LAYOUTS.iter().enumerate() {
         for (si, &(n, k)) in SHAPES.iter().enumerate() {
@@ -180,6 +185,7 @@ fn mixed_affine_matches_fork_bitwise() {
     } else {
         assert_eq!(got_wide, 0, "no qmv_wide below gen 15");
     }
+    t.golden.finish();
 }
 
 /// A shapeless compile traced at one row count and replayed at another must
@@ -189,6 +195,7 @@ fn mixed_affine_matches_fork_bitwise() {
 fn mixed_affine_shapeless_replay_matches_fork_bitwise() {
     assert!(metal_available(), "this oracle needs Metal");
     let arch_gen = gpu_gen();
+    let mut g = Golden::metal("affine_mixed_shapeless", Mode::from_env());
     start_counting();
     let mut cases = 0;
     for (si, &(n, k)) in SHAPES.iter().enumerate() {
@@ -215,11 +222,15 @@ fn mixed_affine_shapeless_replay_matches_fork_bitwise() {
                 wide(trace_m) + 2 * wide(m),
                 "{ctx}: the replay must route by its own rows"
             );
-            assert_identical(&format!("{ctx} replay"), replayed, fork(&x, &w, 32, 8));
-            assert_identical(&format!("{ctx} eager"), eager, fork(&x, &w, 32, 8));
+            for (tag, handle) in [("replay", replayed), ("eager", eager)] {
+                let what = format!("{ctx} {tag}");
+                let (shape, dtype, out) = assert_identical(&what, handle, fork(&x, &w, 32, 8));
+                g.record_bits(&what, &shape, dtype, &out);
+            }
             cases += 1;
         }
     }
     stop_counting();
     eprintln!("{cases} shapeless replays bit-identical to the fork");
+    g.finish();
 }

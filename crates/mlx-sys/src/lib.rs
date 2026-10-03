@@ -803,6 +803,15 @@ unsafe extern "C-unwind" {
         out_device_class: *mut std::ffi::c_char,
     ) -> i32;
 
+    /// TEST-ONLY, platform independent: FNV-1a 64 digests of the segmented
+    /// planners and vector-SDPA policy over a fixed sweep for one device
+    /// class, written to `out_digests[0..6]`; returns the number of inputs.
+    pub fn mlx_segmented_sdpa_test_plan_digests(
+        device_class: std::ffi::c_char,
+        blocks_override: i32,
+        out_digests: *mut u64,
+    ) -> i64;
+
     /// TEST-ONLY oracle: `mlx_segmented_sdpa_test_forward` with every
     /// segmented kernel taken from the MLX fork's metallib, evaluated before
     /// returning. Only the fork pin ships those kernels; removed with the move
@@ -1860,6 +1869,14 @@ unsafe extern "C-unwind" {
     pub fn mlx_test_kquant_family_count(family: *const std::os::raw::c_char) -> u64;
     /// TEST-ONLY: the GPU generation the Metal dispatcher sees, -1 without Metal.
     pub fn mlx_test_kquant_gpu_gen() -> i32;
+    /// TEST-ONLY: the Metal architecture name (NUL-terminated) of the hardware
+    /// (`hardware`) or the one the dispatcher routes by (honours
+    /// `MLX_METAL_GPU_ARCH`); false without Metal or when `len` is too small.
+    pub fn mlx_test_metal_architecture(
+        hardware: bool,
+        out: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
 
     /// TEST-ONLY: the bridge K-quant ops on an explicit device (0 CPU, 1 GPU).
     pub fn mlx_test_kquant_quantized_matmul(

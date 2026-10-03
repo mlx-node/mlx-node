@@ -1,0 +1,1057 @@
+# Golden digests of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
+# <first 8 bytes of SHA-256 over dtype, shape and output bytes, or a value> <case>
+applegpu_g17s = machine
+1053 = cases
+fc4eddc1b125a39c cpu q3k Float32 t M=1 N=2048 K=1024
+7bdadb765201f47c cpu q3k Float32 t M=1 N=136 K=768
+e1acf989b65cff8a cpu q3k Float32 t batched M=1
+dabbdd0bf1e4d20e cpu q3k Float32 t batched-aligned M=1
+aa8d262201a85054 cpu q3k Float32 t x-batched M=1
+8d32f1b48c5c343e cpu q3k Float32 n M=1 K=256
+65c3d2f6278a2d37 cpu q3k Float32 n M=1 K=1024
+e0b2a91d881172b8 cpu q3k Float32 t M=2 N=2048 K=1024
+27fd94582aad8245 cpu q3k Float32 t M=2 N=136 K=768
+aacb5ca4ce52c704 cpu q3k Float32 t batched M=2
+db4b3cf0c0e32cc6 cpu q3k Float32 t batched-aligned M=2
+360f983a1927905a cpu q3k Float32 t x-batched M=2
+d5fecd0bd3ca4bff cpu q3k Float32 n M=2 K=256
+6d0658c667e4c519 cpu q3k Float32 n M=2 K=1024
+af0ac5698999b7d0 cpu q3k Float32 t M=8 N=2048 K=1024
+0c3851c59a893d7d cpu q3k Float32 t M=8 N=136 K=768
+6ecef21c5d9cca70 cpu q3k Float32 t batched M=8
+f6992b194117f711 cpu q3k Float32 t batched-aligned M=8
+ec62692fc5eeef2a cpu q3k Float32 t x-batched M=8
+ccb30467e543e76e cpu q3k Float32 n M=8 K=256
+4af7ab460a305ed1 cpu q3k Float32 n M=8 K=1024
+a002d2e0dffc4544 cpu q3k Float32 t M=9 N=2048 K=1024
+b971db6dd34910ab cpu q3k Float32 t M=9 N=136 K=768
+03bd326fd158170f cpu q3k Float32 t batched M=9
+3d93b68032e912bf cpu q3k Float32 t batched-aligned M=9
+9a58b0c26f49fea2 cpu q3k Float32 t x-batched M=9
+8153501460952fe1 cpu q3k Float32 n M=9 K=256
+8f6698bf10ef52c5 cpu q3k Float32 n M=9 K=1024
+6030e6a091290791 cpu q3k Float32 t M=33 N=2048 K=1024
+55889e0cbd3b2bf1 cpu q3k Float32 t M=33 N=136 K=768
+bb30a04a88123e1a cpu q3k Float32 t batched M=33
+c7d2e6d7a366d7ae cpu q3k Float32 t batched-aligned M=33
+b22824c87708eab1 cpu q3k Float32 t x-batched M=33
+a6ec75a23747f8f0 cpu q3k Float32 n M=33 K=256
+d92d44f46363066e cpu q3k Float32 n M=33 K=1024
+15adf6a346f7874f cpu q3k Float16 t M=1 N=2048 K=1024
+304d1c6b0987cbf7 cpu q3k Float16 t M=1 N=136 K=768
+8ff8f9619a33c3c3 cpu q3k Float16 t batched M=1
+2e302b45fbfb121b cpu q3k Float16 t batched-aligned M=1
+91b1bd1f1678458b cpu q3k Float16 t x-batched M=1
+c9b3b16b7720c6c5 cpu q3k Float16 n M=1 K=256
+7dae07849ed16d6a cpu q3k Float16 n M=1 K=1024
+b6ee7308af601b28 cpu q3k Float16 t M=2 N=2048 K=1024
+c49b065165d66c85 cpu q3k Float16 t M=2 N=136 K=768
+89fea3354769ff65 cpu q3k Float16 t batched M=2
+0159bc73218b821b cpu q3k Float16 t batched-aligned M=2
+36d3236a20c3d2d3 cpu q3k Float16 t x-batched M=2
+c9d30b4aca93b777 cpu q3k Float16 n M=2 K=256
+35d62e9e727ca6dc cpu q3k Float16 n M=2 K=1024
+4361cf52c7cf76f6 cpu q3k Float16 t M=8 N=2048 K=1024
+2b8656ae11fc769c cpu q3k Float16 t M=8 N=136 K=768
+b211c574bb7bf00a cpu q3k Float16 t batched M=8
+a2b88a67da4ff226 cpu q3k Float16 t batched-aligned M=8
+25102a57bd3ae264 cpu q3k Float16 t x-batched M=8
+dbff3adc23176bd7 cpu q3k Float16 n M=8 K=256
+9ebd35e7ebcfeeab cpu q3k Float16 n M=8 K=1024
+2b76351781a69c09 cpu q3k Float16 t M=9 N=2048 K=1024
+c1b784cd9866f5fc cpu q3k Float16 t M=9 N=136 K=768
+7eabce35312338b9 cpu q3k Float16 t batched M=9
+0a42562783adfda1 cpu q3k Float16 t batched-aligned M=9
+4df63bf6ce89509a cpu q3k Float16 t x-batched M=9
+0ddf94ec364bf611 cpu q3k Float16 n M=9 K=256
+b80e442d36e2c651 cpu q3k Float16 n M=9 K=1024
+128f66c4c29f6ce3 cpu q3k Float16 t M=33 N=2048 K=1024
+5418ff25ef04ce75 cpu q3k Float16 t M=33 N=136 K=768
+82277d8b0d2cacda cpu q3k Float16 t batched M=33
+d000546893870458 cpu q3k Float16 t batched-aligned M=33
+4f0b9c38b4b71672 cpu q3k Float16 t x-batched M=33
+5e0395fc981bba7a cpu q3k Float16 n M=33 K=256
+6b705d2ad4266b24 cpu q3k Float16 n M=33 K=1024
+bbf00169208cfdc5 cpu q3k BFloat16 t M=1 N=2048 K=1024
+33c4fa51207fbbd9 cpu q3k BFloat16 t M=1 N=136 K=768
+68443e9841518766 cpu q3k BFloat16 t batched M=1
+287a4b184a5018e0 cpu q3k BFloat16 t batched-aligned M=1
+be7b05238850f410 cpu q3k BFloat16 t x-batched M=1
+a57c34f1110b6048 cpu q3k BFloat16 n M=1 K=256
+c57553ade0075d03 cpu q3k BFloat16 n M=1 K=1024
+781994454a1e7cf5 cpu q3k BFloat16 t M=2 N=2048 K=1024
+ca79ae2784df28dd cpu q3k BFloat16 t M=2 N=136 K=768
+8b053fc6956e91ba cpu q3k BFloat16 t batched M=2
+acbb37a736fdd38c cpu q3k BFloat16 t batched-aligned M=2
+d91dd6e77ea2db26 cpu q3k BFloat16 t x-batched M=2
+8c1049589c9c2532 cpu q3k BFloat16 n M=2 K=256
+fe351d02f4827b63 cpu q3k BFloat16 n M=2 K=1024
+5325d37c0a505e58 cpu q3k BFloat16 t M=8 N=2048 K=1024
+7fd968224454381e cpu q3k BFloat16 t M=8 N=136 K=768
+093d339754b493f6 cpu q3k BFloat16 t batched M=8
+d30fe338c9faf8f4 cpu q3k BFloat16 t batched-aligned M=8
+17abe90514c81fa1 cpu q3k BFloat16 t x-batched M=8
+ec1f286bd91c3f41 cpu q3k BFloat16 n M=8 K=256
+2b1ee928f641de84 cpu q3k BFloat16 n M=8 K=1024
+3ab8b277dec88459 cpu q3k BFloat16 t M=9 N=2048 K=1024
+602c6700d588bd1f cpu q3k BFloat16 t M=9 N=136 K=768
+e5feefc9540c7885 cpu q3k BFloat16 t batched M=9
+ec03b6f2766de7f5 cpu q3k BFloat16 t batched-aligned M=9
+0426d555939b194e cpu q3k BFloat16 t x-batched M=9
+1ad3398a6ef9a1b0 cpu q3k BFloat16 n M=9 K=256
+a61f088cb4ad1f66 cpu q3k BFloat16 n M=9 K=1024
+257e0499d7f4d173 cpu q3k BFloat16 t M=33 N=2048 K=1024
+4440176a2d2aff97 cpu q3k BFloat16 t M=33 N=136 K=768
+d48d15026f66591a cpu q3k BFloat16 t batched M=33
+e2744e87ba1744b8 cpu q3k BFloat16 t batched-aligned M=33
+23575eac9c23a434 cpu q3k BFloat16 t x-batched M=33
+26a0662ea03bf174 cpu q3k BFloat16 n M=33 K=256
+9c871b25be801216 cpu q3k BFloat16 n M=33 K=1024
+b71f41d72385d3f2 cpu q6k Float32 t M=1 N=2048 K=1024
+603297c6745dad52 cpu q6k Float32 t M=1 N=136 K=768
+acf6a55f6f2bbcda cpu q6k Float32 t batched M=1
+af3669c0142293bc cpu q6k Float32 t batched-aligned M=1
+8c68c0dcb6e739d5 cpu q6k Float32 t x-batched M=1
+62f812ea46b32d12 cpu q6k Float32 n M=1 K=256
+f8e3fd637c753ef0 cpu q6k Float32 n M=1 K=1024
+ae38077b51bf7ed4 cpu q6k Float32 t M=2 N=2048 K=1024
+eb7c80e652ac7bea cpu q6k Float32 t M=2 N=136 K=768
+896f704dd7313d02 cpu q6k Float32 t batched M=2
+426448617ab202be cpu q6k Float32 t batched-aligned M=2
+09fb26e2f2dd7dc5 cpu q6k Float32 t x-batched M=2
+ed1937b5518c557a cpu q6k Float32 n M=2 K=256
+3f76bfc1d73826be cpu q6k Float32 n M=2 K=1024
+f32395a1c27fb3d5 cpu q6k Float32 t M=8 N=2048 K=1024
+3b6d091153506dc5 cpu q6k Float32 t M=8 N=136 K=768
+db077743e39bed96 cpu q6k Float32 t batched M=8
+555e67472408f42d cpu q6k Float32 t batched-aligned M=8
+6bf5394e1d9bdefa cpu q6k Float32 t x-batched M=8
+3fb098dee2acf5c7 cpu q6k Float32 n M=8 K=256
+423200555d8ac424 cpu q6k Float32 n M=8 K=1024
+e472e8359c5843cb cpu q6k Float32 t M=9 N=2048 K=1024
+52e2c32071edcd10 cpu q6k Float32 t M=9 N=136 K=768
+3d64298e7692e48f cpu q6k Float32 t batched M=9
+6b760a93506d3963 cpu q6k Float32 t batched-aligned M=9
+46ad21ec1b5bdadc cpu q6k Float32 t x-batched M=9
+fec5929433c0a800 cpu q6k Float32 n M=9 K=256
+7a93f8cff9a6cd5f cpu q6k Float32 n M=9 K=1024
+ecdcc3186fa17b0f cpu q6k Float32 t M=33 N=2048 K=1024
+70fcd9a878fcb5b7 cpu q6k Float32 t M=33 N=136 K=768
+ee74d7ab6c1246ac cpu q6k Float32 t batched M=33
+2ff8b73d46fd839f cpu q6k Float32 t batched-aligned M=33
+9c396de95d04160f cpu q6k Float32 t x-batched M=33
+9814ac35540cac24 cpu q6k Float32 n M=33 K=256
+cfd0c74aab2712a6 cpu q6k Float32 n M=33 K=1024
+3731ac99f118a4a5 cpu q6k Float16 t M=1 N=2048 K=1024
+d9955a56e6d83db3 cpu q6k Float16 t M=1 N=136 K=768
+091ab4baaba68ae7 cpu q6k Float16 t batched M=1
+5d39e8814ed0da88 cpu q6k Float16 t batched-aligned M=1
+0a864a396d5cf9ad cpu q6k Float16 t x-batched M=1
+6bf0d26fd03532e5 cpu q6k Float16 n M=1 K=256
+bcb6524290b0dce2 cpu q6k Float16 n M=1 K=1024
+1e18b3e91631be3f cpu q6k Float16 t M=2 N=2048 K=1024
+a6b9ef52dec664de cpu q6k Float16 t M=2 N=136 K=768
+121789aa90a06861 cpu q6k Float16 t batched M=2
+e3b7470dfe67b322 cpu q6k Float16 t batched-aligned M=2
+36f96cbbe5808921 cpu q6k Float16 t x-batched M=2
+a9af54b88369ba20 cpu q6k Float16 n M=2 K=256
+d73e6b9540c897dd cpu q6k Float16 n M=2 K=1024
+6f653a9ed78f22ee cpu q6k Float16 t M=8 N=2048 K=1024
+8cb404749fde59a5 cpu q6k Float16 t M=8 N=136 K=768
+4fbda51777953541 cpu q6k Float16 t batched M=8
+be68d684285e71df cpu q6k Float16 t batched-aligned M=8
+d81108219db817ea cpu q6k Float16 t x-batched M=8
+9f0fd760fac92592 cpu q6k Float16 n M=8 K=256
+5a775300b2ea082b cpu q6k Float16 n M=8 K=1024
+1583425fa853e67e cpu q6k Float16 t M=9 N=2048 K=1024
+1d9cc9be73681a4e cpu q6k Float16 t M=9 N=136 K=768
+b95f5f02d2adaff2 cpu q6k Float16 t batched M=9
+b14e599ee87c8015 cpu q6k Float16 t batched-aligned M=9
+c8bbe97d761caebe cpu q6k Float16 t x-batched M=9
+bf164d03a364338e cpu q6k Float16 n M=9 K=256
+dc474b1467c071ac cpu q6k Float16 n M=9 K=1024
+e004e3945015e6c2 cpu q6k Float16 t M=33 N=2048 K=1024
+a7c498bf2feadedc cpu q6k Float16 t M=33 N=136 K=768
+7001e66e31eb9463 cpu q6k Float16 t batched M=33
+ce24a4dcdc21e4a8 cpu q6k Float16 t batched-aligned M=33
+b88b3e1a03c438bc cpu q6k Float16 t x-batched M=33
+b59e6f3cc35902f7 cpu q6k Float16 n M=33 K=256
+24fc9f16e2c567f3 cpu q6k Float16 n M=33 K=1024
+f5f00c138e309720 cpu q6k BFloat16 t M=1 N=2048 K=1024
+c0a1da2b45459646 cpu q6k BFloat16 t M=1 N=136 K=768
+b8521e34487072ef cpu q6k BFloat16 t batched M=1
+ed29b93dd756a30b cpu q6k BFloat16 t batched-aligned M=1
+f2d697df528a63d4 cpu q6k BFloat16 t x-batched M=1
+de9b595b7e6763d6 cpu q6k BFloat16 n M=1 K=256
+96740d246a024c2f cpu q6k BFloat16 n M=1 K=1024
+a91f6e5d01743c11 cpu q6k BFloat16 t M=2 N=2048 K=1024
+c2be0d380aed6a9f cpu q6k BFloat16 t M=2 N=136 K=768
+17104a906f1ede5e cpu q6k BFloat16 t batched M=2
+cea6a014e8caf232 cpu q6k BFloat16 t batched-aligned M=2
+235b5ab22f923342 cpu q6k BFloat16 t x-batched M=2
+c8848678934f4432 cpu q6k BFloat16 n M=2 K=256
+ccf0b16e63f018ed cpu q6k BFloat16 n M=2 K=1024
+6cab7df89b55790e cpu q6k BFloat16 t M=8 N=2048 K=1024
+8557f98e9887e808 cpu q6k BFloat16 t M=8 N=136 K=768
+7260703c83d330e5 cpu q6k BFloat16 t batched M=8
+e25e4c6fe9417736 cpu q6k BFloat16 t batched-aligned M=8
+d9d58b6855ec42e5 cpu q6k BFloat16 t x-batched M=8
+bba00d9b819b8e45 cpu q6k BFloat16 n M=8 K=256
+d3e980cca9fdca1e cpu q6k BFloat16 n M=8 K=1024
+78f146f39569ebb9 cpu q6k BFloat16 t M=9 N=2048 K=1024
+1431d65076cc861d cpu q6k BFloat16 t M=9 N=136 K=768
+efa1b5b5dd2b96d2 cpu q6k BFloat16 t batched M=9
+89e1536aa41564ce cpu q6k BFloat16 t batched-aligned M=9
+3bd2915bfc5624f0 cpu q6k BFloat16 t x-batched M=9
+2a5df4363b6623b9 cpu q6k BFloat16 n M=9 K=256
+6f33b8030aaad8cc cpu q6k BFloat16 n M=9 K=1024
+2c5c738326f720a3 cpu q6k BFloat16 t M=33 N=2048 K=1024
+938cbb3dc898c57b cpu q6k BFloat16 t M=33 N=136 K=768
+c3b860f15a93537d cpu q6k BFloat16 t batched M=33
+1cf4d235d74c0ff6 cpu q6k BFloat16 t batched-aligned M=33
+d66b2e0a0f1f3450 cpu q6k BFloat16 t x-batched M=33
+1926762418aec9b8 cpu q6k BFloat16 n M=33 K=256
+608b866ba12162c0 cpu q6k BFloat16 n M=33 K=1024
+087df59b6b308694 cpu q4k Float32 t M=1 N=2048 K=1024
+088723e19caf78d9 cpu q4k Float32 t M=1 N=136 K=768
+dbcef6bb76424c68 cpu q4k Float32 t batched M=1
+be608b4ffe1d997b cpu q4k Float32 t batched-aligned M=1
+05f3eeaf376cb91f cpu q4k Float32 t x-batched M=1
+8a4d46e802891c62 cpu q4k Float32 n M=1 K=256
+c580d65f407d3fdd cpu q4k Float32 n M=1 K=1024
+dca69c6a357bfcc8 cpu q4k Float32 t M=2 N=2048 K=1024
+5ca3d643d271d07f cpu q4k Float32 t M=2 N=136 K=768
+adfd0864b82fa1bb cpu q4k Float32 t batched M=2
+e81417f155c5fc88 cpu q4k Float32 t batched-aligned M=2
+4a2f3c530a1fc77d cpu q4k Float32 t x-batched M=2
+4fb31e2ac74f4c53 cpu q4k Float32 n M=2 K=256
+4172b3a65d26f906 cpu q4k Float32 n M=2 K=1024
+608680e4f64d2856 cpu q4k Float32 t M=8 N=2048 K=1024
+478839d510f0d4ee cpu q4k Float32 t M=8 N=136 K=768
+604835e0a2577f28 cpu q4k Float32 t batched M=8
+23caeb6bfc71fa74 cpu q4k Float32 t batched-aligned M=8
+d1554a50dc9e3a0b cpu q4k Float32 t x-batched M=8
+c8a115094092fdd1 cpu q4k Float32 n M=8 K=256
+59dac8ef57b69b62 cpu q4k Float32 n M=8 K=1024
+44782e5b26616f7c cpu q4k Float32 t M=9 N=2048 K=1024
+13d1cb16792a63f0 cpu q4k Float32 t M=9 N=136 K=768
+e7d97d3701e4ff2a cpu q4k Float32 t batched M=9
+6996732d9faa4423 cpu q4k Float32 t batched-aligned M=9
+1a5ec4625d581401 cpu q4k Float32 t x-batched M=9
+3b0a81a7ece50c0f cpu q4k Float32 n M=9 K=256
+62236ba4f747632a cpu q4k Float32 n M=9 K=1024
+b2b9248d8bbd7475 cpu q4k Float32 t M=33 N=2048 K=1024
+ab10174ec33715d3 cpu q4k Float32 t M=33 N=136 K=768
+3f209a58ad160179 cpu q4k Float32 t batched M=33
+78c79ad67b46f7c1 cpu q4k Float32 t batched-aligned M=33
+83b4191af639648a cpu q4k Float32 t x-batched M=33
+a7af795f66d506ec cpu q4k Float32 n M=33 K=256
+7dbebbf43854043c cpu q4k Float32 n M=33 K=1024
+e42412a009ab0f2a cpu q4k Float16 t M=1 N=2048 K=1024
+8f3d189dfea156be cpu q4k Float16 t M=1 N=136 K=768
+b67021f67413a8e7 cpu q4k Float16 t batched M=1
+68bc6a6abbda93e1 cpu q4k Float16 t batched-aligned M=1
+4dedb33e1c2654cf cpu q4k Float16 t x-batched M=1
+5a89f4540ab499eb cpu q4k Float16 n M=1 K=256
+20f607ab1689f6a4 cpu q4k Float16 n M=1 K=1024
+26800e698df92a54 cpu q4k Float16 t M=2 N=2048 K=1024
+7fdb5a4fd4e4d2bf cpu q4k Float16 t M=2 N=136 K=768
+2aaea3cc18261f9d cpu q4k Float16 t batched M=2
+4b992cc48c4f7e86 cpu q4k Float16 t batched-aligned M=2
+64b66d62379a231d cpu q4k Float16 t x-batched M=2
+24c8525e4d816918 cpu q4k Float16 n M=2 K=256
+a061dd6c9c4619d9 cpu q4k Float16 n M=2 K=1024
+9c55dafae798c613 cpu q4k Float16 t M=8 N=2048 K=1024
+73364648d2fc8525 cpu q4k Float16 t M=8 N=136 K=768
+69b70bf8eaf90751 cpu q4k Float16 t batched M=8
+b7b289b8cf3939ea cpu q4k Float16 t batched-aligned M=8
+af2fc9f4e77b315b cpu q4k Float16 t x-batched M=8
+3064ee13a5473755 cpu q4k Float16 n M=8 K=256
+1a43f8f6941d59ea cpu q4k Float16 n M=8 K=1024
+06b4c1efc24942e6 cpu q4k Float16 t M=9 N=2048 K=1024
+9abd3b341d4f227a cpu q4k Float16 t M=9 N=136 K=768
+f8a839d2b5e99fda cpu q4k Float16 t batched M=9
+8070a6d3b64416bc cpu q4k Float16 t batched-aligned M=9
+fbefa8e27c37c672 cpu q4k Float16 t x-batched M=9
+c0c34e6961b14a49 cpu q4k Float16 n M=9 K=256
+4de376fa737cc742 cpu q4k Float16 n M=9 K=1024
+85e7f7e520f5397e cpu q4k Float16 t M=33 N=2048 K=1024
+1db4c8714d7fc5a9 cpu q4k Float16 t M=33 N=136 K=768
+5f9a241caa01ae79 cpu q4k Float16 t batched M=33
+9260890871806b06 cpu q4k Float16 t batched-aligned M=33
+d5ab47b53d8c0432 cpu q4k Float16 t x-batched M=33
+b4be96e6e68b1e7d cpu q4k Float16 n M=33 K=256
+dfb9bcfa1a930194 cpu q4k Float16 n M=33 K=1024
+f6359eaf0e7d32b8 cpu q4k BFloat16 t M=1 N=2048 K=1024
+5abcc9597edb4ec5 cpu q4k BFloat16 t M=1 N=136 K=768
+65485998ab2e8db1 cpu q4k BFloat16 t batched M=1
+9b30337f2966f362 cpu q4k BFloat16 t batched-aligned M=1
+7b86183d626dd475 cpu q4k BFloat16 t x-batched M=1
+98045e1ac3ac7d6f cpu q4k BFloat16 n M=1 K=256
+f0d930eb0ae377f5 cpu q4k BFloat16 n M=1 K=1024
+42e426cde7ec8b81 cpu q4k BFloat16 t M=2 N=2048 K=1024
+54c47f070ba7aedd cpu q4k BFloat16 t M=2 N=136 K=768
+5f75fd6e8ca31f69 cpu q4k BFloat16 t batched M=2
+95ac4a7c7b65eb64 cpu q4k BFloat16 t batched-aligned M=2
+fba371d2e6ba8714 cpu q4k BFloat16 t x-batched M=2
+d5b7597b5dacc709 cpu q4k BFloat16 n M=2 K=256
+65f3846422f09679 cpu q4k BFloat16 n M=2 K=1024
+b2bc4055ce92120b cpu q4k BFloat16 t M=8 N=2048 K=1024
+5b44f9bb50f80d0e cpu q4k BFloat16 t M=8 N=136 K=768
+7a65791ad2ccdc7b cpu q4k BFloat16 t batched M=8
+364146406b7351bf cpu q4k BFloat16 t batched-aligned M=8
+838e309b5cda88d1 cpu q4k BFloat16 t x-batched M=8
+921c5c55a2588187 cpu q4k BFloat16 n M=8 K=256
+652fb38d178e36dc cpu q4k BFloat16 n M=8 K=1024
+0dbd785732e23693 cpu q4k BFloat16 t M=9 N=2048 K=1024
+41340477888a6cdf cpu q4k BFloat16 t M=9 N=136 K=768
+cd2cd54677544e84 cpu q4k BFloat16 t batched M=9
+14d11ecae06844d6 cpu q4k BFloat16 t batched-aligned M=9
+d2f57b2208d097c4 cpu q4k BFloat16 t x-batched M=9
+4b38d264a4718dcc cpu q4k BFloat16 n M=9 K=256
+4264906af265d486 cpu q4k BFloat16 n M=9 K=1024
+af4f13c8c1374bb2 cpu q4k BFloat16 t M=33 N=2048 K=1024
+4547f98adb7292ad cpu q4k BFloat16 t M=33 N=136 K=768
+a77e3744184a4020 cpu q4k BFloat16 t batched M=33
+745b64acbcc3f742 cpu q4k BFloat16 t batched-aligned M=33
+c412d4a4b1d22636 cpu q4k BFloat16 t x-batched M=33
+6ce65bada32a3842 cpu q4k BFloat16 n M=33 K=256
+e12bd2375940699d cpu q4k BFloat16 n M=33 K=1024
+eef5e1bee06671f9 cpu q5k Float32 t M=1 N=2048 K=1024
+121260ef3cd3cdc3 cpu q5k Float32 t M=1 N=136 K=768
+795b3269824f81c9 cpu q5k Float32 t batched M=1
+d5c435c7dca11bd8 cpu q5k Float32 t batched-aligned M=1
+1f56dbbd89e41888 cpu q5k Float32 t x-batched M=1
+882d3a9b408ff042 cpu q5k Float32 n M=1 K=256
+b158fe4b9edc0674 cpu q5k Float32 n M=1 K=1024
+f86c2d71f194bed2 cpu q5k Float32 t M=2 N=2048 K=1024
+8738b9cb6bf40fee cpu q5k Float32 t M=2 N=136 K=768
+08b4ca0c5d23530d cpu q5k Float32 t batched M=2
+7e8156a5ce426c9f cpu q5k Float32 t batched-aligned M=2
+7806ea1e83101388 cpu q5k Float32 t x-batched M=2
+e2a1e92a1edf1eac cpu q5k Float32 n M=2 K=256
+c1690ee59bb92247 cpu q5k Float32 n M=2 K=1024
+9ee559ee19190e94 cpu q5k Float32 t M=8 N=2048 K=1024
+9fa112bf842a7fb4 cpu q5k Float32 t M=8 N=136 K=768
+6666050675546786 cpu q5k Float32 t batched M=8
+9a1a159ff9f948d0 cpu q5k Float32 t batched-aligned M=8
+72aa631b1402adc9 cpu q5k Float32 t x-batched M=8
+b980f7db8e3719f9 cpu q5k Float32 n M=8 K=256
+61d0df09ae0214f9 cpu q5k Float32 n M=8 K=1024
+26873a11ad48415f cpu q5k Float32 t M=9 N=2048 K=1024
+99006286cafde13e cpu q5k Float32 t M=9 N=136 K=768
+4dee3d1317e2823d cpu q5k Float32 t batched M=9
+58df1e70f7f42350 cpu q5k Float32 t batched-aligned M=9
+a6cceffbbb2c6cd6 cpu q5k Float32 t x-batched M=9
+f29ca1f2466c1aa9 cpu q5k Float32 n M=9 K=256
+b548411cf18280d9 cpu q5k Float32 n M=9 K=1024
+057c3066d6623fab cpu q5k Float32 t M=33 N=2048 K=1024
+07f11d05a4aafd8f cpu q5k Float32 t M=33 N=136 K=768
+c8998e105040a7fa cpu q5k Float32 t batched M=33
+f50ea1280a8d0602 cpu q5k Float32 t batched-aligned M=33
+dc353206d514e465 cpu q5k Float32 t x-batched M=33
+73f2df4d7e6a2d17 cpu q5k Float32 n M=33 K=256
+84ae560e0d11ba45 cpu q5k Float32 n M=33 K=1024
+417420e5052d063a cpu q5k Float16 t M=1 N=2048 K=1024
+f4b71147c09c942e cpu q5k Float16 t M=1 N=136 K=768
+866a84cd60fa70af cpu q5k Float16 t batched M=1
+1fb10975cfa4e75c cpu q5k Float16 t batched-aligned M=1
+6bfa5665f0a843cc cpu q5k Float16 t x-batched M=1
+2e7b2bf0e85ccad6 cpu q5k Float16 n M=1 K=256
+0d264866210ea7ee cpu q5k Float16 n M=1 K=1024
+3e105bd1fdae10a2 cpu q5k Float16 t M=2 N=2048 K=1024
+1175bbe28aa1e70c cpu q5k Float16 t M=2 N=136 K=768
+6a780fe416ec7c9a cpu q5k Float16 t batched M=2
+9b8a74c72ee074ab cpu q5k Float16 t batched-aligned M=2
+6d2a83e10b665c99 cpu q5k Float16 t x-batched M=2
+694b24c9d5155359 cpu q5k Float16 n M=2 K=256
+e326784974debe80 cpu q5k Float16 n M=2 K=1024
+edc04e2cbe3f0a3e cpu q5k Float16 t M=8 N=2048 K=1024
+f84e0e13b3dbdc7f cpu q5k Float16 t M=8 N=136 K=768
+23ed2935f4f35375 cpu q5k Float16 t batched M=8
+faa4b4fcc4ab1e9f cpu q5k Float16 t batched-aligned M=8
+dc7e0e78eecaa6ef cpu q5k Float16 t x-batched M=8
+733fe3471587dbf9 cpu q5k Float16 n M=8 K=256
+165489b097550243 cpu q5k Float16 n M=8 K=1024
+50a9781a046cbe96 cpu q5k Float16 t M=9 N=2048 K=1024
+d42f8732cd6ded3f cpu q5k Float16 t M=9 N=136 K=768
+dbe2e382c5253155 cpu q5k Float16 t batched M=9
+898ee26997598141 cpu q5k Float16 t batched-aligned M=9
+8b24d8df4a855fc1 cpu q5k Float16 t x-batched M=9
+6e52d528801cb176 cpu q5k Float16 n M=9 K=256
+8d5fe58fd707002d cpu q5k Float16 n M=9 K=1024
+58a42e2ff05faf16 cpu q5k Float16 t M=33 N=2048 K=1024
+90b8b90860d7219f cpu q5k Float16 t M=33 N=136 K=768
+5debdbcfce2b9bc5 cpu q5k Float16 t batched M=33
+a3ade9bcfc5b60be cpu q5k Float16 t batched-aligned M=33
+e1896e271bdaaa9e cpu q5k Float16 t x-batched M=33
+caa31137f0c49925 cpu q5k Float16 n M=33 K=256
+fd96ead359d6c6ab cpu q5k Float16 n M=33 K=1024
+bafcf776f3c0a68b cpu q5k BFloat16 t M=1 N=2048 K=1024
+18561e7bfe10c83c cpu q5k BFloat16 t M=1 N=136 K=768
+06c6da05cc9b1d45 cpu q5k BFloat16 t batched M=1
+ec709ed910567ea4 cpu q5k BFloat16 t batched-aligned M=1
+ae11890ea608d704 cpu q5k BFloat16 t x-batched M=1
+770143c69b09d15c cpu q5k BFloat16 n M=1 K=256
+fa8761de77277fcc cpu q5k BFloat16 n M=1 K=1024
+5e85496212ef2cba cpu q5k BFloat16 t M=2 N=2048 K=1024
+964f7244463340e7 cpu q5k BFloat16 t M=2 N=136 K=768
+30a2b6215eddaf3f cpu q5k BFloat16 t batched M=2
+d962d54755bcbf07 cpu q5k BFloat16 t batched-aligned M=2
+10f4b858bef4ac1c cpu q5k BFloat16 t x-batched M=2
+f526150c0bce0ada cpu q5k BFloat16 n M=2 K=256
+40a8fe5493d77067 cpu q5k BFloat16 n M=2 K=1024
+5da7c9eaef2a6508 cpu q5k BFloat16 t M=8 N=2048 K=1024
+31d9db1cb6427ad0 cpu q5k BFloat16 t M=8 N=136 K=768
+8bec5a52d26563db cpu q5k BFloat16 t batched M=8
+7ea7512760013b50 cpu q5k BFloat16 t batched-aligned M=8
+5c4af65b20ef1838 cpu q5k BFloat16 t x-batched M=8
+2e73c4c6d857a045 cpu q5k BFloat16 n M=8 K=256
+4915dea2902a3442 cpu q5k BFloat16 n M=8 K=1024
+7b07734669444b62 cpu q5k BFloat16 t M=9 N=2048 K=1024
+25debf1e3e891d4d cpu q5k BFloat16 t M=9 N=136 K=768
+e9d0b191ae7356ab cpu q5k BFloat16 t batched M=9
+696b61cf773d556b cpu q5k BFloat16 t batched-aligned M=9
+d7cf6b2f7bf205f3 cpu q5k BFloat16 t x-batched M=9
+cd08ad0cf0198671 cpu q5k BFloat16 n M=9 K=256
+a0323372c93debb6 cpu q5k BFloat16 n M=9 K=1024
+dc9643a59c2dd351 cpu q5k BFloat16 t M=33 N=2048 K=1024
+f5de5e61e1f884ad cpu q5k BFloat16 t M=33 N=136 K=768
+bb0f18ffa4245e6e cpu q5k BFloat16 t batched M=33
+66739d1e377c26d3 cpu q5k BFloat16 t batched-aligned M=33
+1913eb56037b391c cpu q5k BFloat16 t x-batched M=33
+3881430a43fcce87 cpu q5k BFloat16 n M=33 K=256
+b700026c71ba9e4b cpu q5k BFloat16 n M=33 K=1024
+c56cc0baa6672add cpu iq4nl Float32 t M=1 N=2048 K=1024
+547a00e68c007837 cpu iq4nl Float32 t M=1 N=136 K=768
+e81e886c81f4ff55 cpu iq4nl Float32 t batched M=1
+8cd0d9e5547fbe6b cpu iq4nl Float32 t batched-aligned M=1
+e73e99662c86ea52 cpu iq4nl Float32 t x-batched M=1
+c7cbff4c1eee3c27 cpu iq4nl Float32 n M=1 K=256
+fda3fc39ecb0bd13 cpu iq4nl Float32 n M=1 K=1024
+4dd7ace3042dfa25 cpu iq4nl Float32 t M=2 N=2048 K=1024
+b96db89ffb22659f cpu iq4nl Float32 t M=2 N=136 K=768
+3ff3f6a679cfaa74 cpu iq4nl Float32 t batched M=2
+e4b23f0c29157539 cpu iq4nl Float32 t batched-aligned M=2
+febe84dda5ba59ba cpu iq4nl Float32 t x-batched M=2
+fbb0e2d16e9aaa1b cpu iq4nl Float32 n M=2 K=256
+5f7728f9727970cb cpu iq4nl Float32 n M=2 K=1024
+81d0c527c6e77917 cpu iq4nl Float32 t M=8 N=2048 K=1024
+5a9b067ed907f1ad cpu iq4nl Float32 t M=8 N=136 K=768
+16650a331ecad129 cpu iq4nl Float32 t batched M=8
+ab88cd8dae946c64 cpu iq4nl Float32 t batched-aligned M=8
+a23aa7ff14a086c3 cpu iq4nl Float32 t x-batched M=8
+448595fd8371e0ca cpu iq4nl Float32 n M=8 K=256
+a6aa65507a709e5b cpu iq4nl Float32 n M=8 K=1024
+daf453808dd9e286 cpu iq4nl Float32 t M=9 N=2048 K=1024
+a95bf4e30e9a2a00 cpu iq4nl Float32 t M=9 N=136 K=768
+0bf4f4bb9eb01310 cpu iq4nl Float32 t batched M=9
+a99c462dd7f6a715 cpu iq4nl Float32 t batched-aligned M=9
+0c61b9ef5b546f66 cpu iq4nl Float32 t x-batched M=9
+db924cd462e03296 cpu iq4nl Float32 n M=9 K=256
+7ab46964f82c54fc cpu iq4nl Float32 n M=9 K=1024
+41c3283a5dc133b1 cpu iq4nl Float32 t M=33 N=2048 K=1024
+58b6d064eb1d0be7 cpu iq4nl Float32 t M=33 N=136 K=768
+6652453a26abd4c1 cpu iq4nl Float32 t batched M=33
+2b9d35eaa5edbd81 cpu iq4nl Float32 t batched-aligned M=33
+ec0d7af510bedce6 cpu iq4nl Float32 t x-batched M=33
+d5e40f32770331eb cpu iq4nl Float32 n M=33 K=256
+42bd51e29ad8e204 cpu iq4nl Float32 n M=33 K=1024
+12ac27d5cf5c2a4a cpu iq4nl Float16 t M=1 N=2048 K=1024
+3d18789b544eb17d cpu iq4nl Float16 t M=1 N=136 K=768
+817116c236d4c292 cpu iq4nl Float16 t batched M=1
+ee60fc64d1cafd42 cpu iq4nl Float16 t batched-aligned M=1
+4256de5fe0040263 cpu iq4nl Float16 t x-batched M=1
+1dd136ed8758423d cpu iq4nl Float16 n M=1 K=256
+78c3446f837a934a cpu iq4nl Float16 n M=1 K=1024
+fcf678d01023e571 cpu iq4nl Float16 t M=2 N=2048 K=1024
+4c45e02b31c1da11 cpu iq4nl Float16 t M=2 N=136 K=768
+4964ca3096e13ae7 cpu iq4nl Float16 t batched M=2
+c82a14b7ea15e981 cpu iq4nl Float16 t batched-aligned M=2
+90f0119f75fc2d97 cpu iq4nl Float16 t x-batched M=2
+5ed13fc76dcc10f8 cpu iq4nl Float16 n M=2 K=256
+eb0582fc48d7dde3 cpu iq4nl Float16 n M=2 K=1024
+0e00f92662dbb05e cpu iq4nl Float16 t M=8 N=2048 K=1024
+52ea8888009d37fb cpu iq4nl Float16 t M=8 N=136 K=768
+a7dad2be27fad9c6 cpu iq4nl Float16 t batched M=8
+d79abd2b883cbcc7 cpu iq4nl Float16 t batched-aligned M=8
+77dc05b202a375f1 cpu iq4nl Float16 t x-batched M=8
+448989458a119ae1 cpu iq4nl Float16 n M=8 K=256
+21d87f91ad51d3b7 cpu iq4nl Float16 n M=8 K=1024
+c9753eb8b2480794 cpu iq4nl Float16 t M=9 N=2048 K=1024
+d087e5207e23c29a cpu iq4nl Float16 t M=9 N=136 K=768
+a84c0c67c459b46f cpu iq4nl Float16 t batched M=9
+8db1a4315bb2ac9a cpu iq4nl Float16 t batched-aligned M=9
+34b1344e76e8c18f cpu iq4nl Float16 t x-batched M=9
+ecd253eece733fe3 cpu iq4nl Float16 n M=9 K=256
+1c238066fa55b094 cpu iq4nl Float16 n M=9 K=1024
+d3bea5983a9ff39c cpu iq4nl Float16 t M=33 N=2048 K=1024
+4963303ea07e24ba cpu iq4nl Float16 t M=33 N=136 K=768
+5433a42a26ef14e0 cpu iq4nl Float16 t batched M=33
+0027c896a79b69f7 cpu iq4nl Float16 t batched-aligned M=33
+aa7ef4a2ac6068c4 cpu iq4nl Float16 t x-batched M=33
+74e5aea3383aafa7 cpu iq4nl Float16 n M=33 K=256
+dccc24399ad66266 cpu iq4nl Float16 n M=33 K=1024
+ac30cc7cdfcf6444 cpu iq4nl BFloat16 t M=1 N=2048 K=1024
+54b08f2dbb497f63 cpu iq4nl BFloat16 t M=1 N=136 K=768
+1ae3583988ed43b2 cpu iq4nl BFloat16 t batched M=1
+8c18ccdc5d62dfeb cpu iq4nl BFloat16 t batched-aligned M=1
+b1a482d02379a64a cpu iq4nl BFloat16 t x-batched M=1
+c413b93452bc8211 cpu iq4nl BFloat16 n M=1 K=256
+6e2bd41073b7a4f0 cpu iq4nl BFloat16 n M=1 K=1024
+3091aee2bc3ab870 cpu iq4nl BFloat16 t M=2 N=2048 K=1024
+5d402824a489c076 cpu iq4nl BFloat16 t M=2 N=136 K=768
+bda5fa478984b2ad cpu iq4nl BFloat16 t batched M=2
+3df0511912c42ded cpu iq4nl BFloat16 t batched-aligned M=2
+9c1b56bbc40acbf0 cpu iq4nl BFloat16 t x-batched M=2
+c4a87105d6b47e2e cpu iq4nl BFloat16 n M=2 K=256
+1439772669298be5 cpu iq4nl BFloat16 n M=2 K=1024
+5c3203e61eb83729 cpu iq4nl BFloat16 t M=8 N=2048 K=1024
+81b1ff6eb044d760 cpu iq4nl BFloat16 t M=8 N=136 K=768
+27286c094c3e81ac cpu iq4nl BFloat16 t batched M=8
+fc1f3bf6f39fbae1 cpu iq4nl BFloat16 t batched-aligned M=8
+a5042b215748a27b cpu iq4nl BFloat16 t x-batched M=8
+19a84d13a6b4bac8 cpu iq4nl BFloat16 n M=8 K=256
+23b83a22783dad52 cpu iq4nl BFloat16 n M=8 K=1024
+ae649ba975181db1 cpu iq4nl BFloat16 t M=9 N=2048 K=1024
+8fed3d491e3f84d9 cpu iq4nl BFloat16 t M=9 N=136 K=768
+902f7f6cb19d98a8 cpu iq4nl BFloat16 t batched M=9
+ef619a58ff4c45d7 cpu iq4nl BFloat16 t batched-aligned M=9
+a2afdd49f0f87be8 cpu iq4nl BFloat16 t x-batched M=9
+6243c9797bf55a02 cpu iq4nl BFloat16 n M=9 K=256
+9b4fc8aa1cf0a3ca cpu iq4nl BFloat16 n M=9 K=1024
+fbf405fa5808e0cf cpu iq4nl BFloat16 t M=33 N=2048 K=1024
+98f82c3f89973c36 cpu iq4nl BFloat16 t M=33 N=136 K=768
+5fb8609213de3dcb cpu iq4nl BFloat16 t batched M=33
+0437f34024de55a6 cpu iq4nl BFloat16 t batched-aligned M=33
+64cc71ecb28a6ef4 cpu iq4nl BFloat16 t x-batched M=33
+cde71274b4e41447 cpu iq4nl BFloat16 n M=33 K=256
+84f526c919f85786 cpu iq4nl BFloat16 n M=33 K=1024
+f1a90acd590c7cb7 cpu iq4xs Float32 t M=1 N=2048 K=1024
+9a59112a962da3db cpu iq4xs Float32 t M=1 N=136 K=768
+fa6918a5ef6b7b00 cpu iq4xs Float32 t batched M=1
+fcbbdba840ea0d68 cpu iq4xs Float32 t batched-aligned M=1
+4370cb636f6d279c cpu iq4xs Float32 t x-batched M=1
+51b23894c0cb4f3f cpu iq4xs Float32 n M=1 K=256
+84e170f0026520bb cpu iq4xs Float32 n M=1 K=1024
+0f2bf03e08afc3a7 cpu iq4xs Float32 t M=2 N=2048 K=1024
+6d4d95fb8c43fb2a cpu iq4xs Float32 t M=2 N=136 K=768
+f4317a143aacb6a5 cpu iq4xs Float32 t batched M=2
+f00db64cc718450b cpu iq4xs Float32 t batched-aligned M=2
+d144528d86dfc1ad cpu iq4xs Float32 t x-batched M=2
+1e7fa1e4356b0c67 cpu iq4xs Float32 n M=2 K=256
+6868b8bbcdb4ea22 cpu iq4xs Float32 n M=2 K=1024
+12cdfd7fea03b938 cpu iq4xs Float32 t M=8 N=2048 K=1024
+439a65ce3566079d cpu iq4xs Float32 t M=8 N=136 K=768
+34f49139ff54bd51 cpu iq4xs Float32 t batched M=8
+6b6854d9cd4a8e88 cpu iq4xs Float32 t batched-aligned M=8
+9e58bd8811f5a515 cpu iq4xs Float32 t x-batched M=8
+d61314754bec5799 cpu iq4xs Float32 n M=8 K=256
+5e5e5dc84351e27d cpu iq4xs Float32 n M=8 K=1024
+5691fdc9bd9bcc46 cpu iq4xs Float32 t M=9 N=2048 K=1024
+dd7951c88b96fe9b cpu iq4xs Float32 t M=9 N=136 K=768
+8565543e6ccbd531 cpu iq4xs Float32 t batched M=9
+6745c87436245bed cpu iq4xs Float32 t batched-aligned M=9
+463b55e58d97a29f cpu iq4xs Float32 t x-batched M=9
+63ed4b1329e5eeec cpu iq4xs Float32 n M=9 K=256
+bd3e0613cac4ca74 cpu iq4xs Float32 n M=9 K=1024
+3fc6e334cf1c224f cpu iq4xs Float32 t M=33 N=2048 K=1024
+08617572b531361f cpu iq4xs Float32 t M=33 N=136 K=768
+78040500676e2070 cpu iq4xs Float32 t batched M=33
+19d7ef859cd6e78e cpu iq4xs Float32 t batched-aligned M=33
+9321f3e7a51b42fa cpu iq4xs Float32 t x-batched M=33
+7f6f2ab5b67c0ab0 cpu iq4xs Float32 n M=33 K=256
+a8591f92b195f073 cpu iq4xs Float32 n M=33 K=1024
+4f1784ad95ad2295 cpu iq4xs Float16 t M=1 N=2048 K=1024
+aa993152790a0d78 cpu iq4xs Float16 t M=1 N=136 K=768
+f85ff0a655d59558 cpu iq4xs Float16 t batched M=1
+e318578fa39b1d51 cpu iq4xs Float16 t batched-aligned M=1
+7f3296d147cb9905 cpu iq4xs Float16 t x-batched M=1
+4860a437d716ef6a cpu iq4xs Float16 n M=1 K=256
+e4eaa76b66c0135c cpu iq4xs Float16 n M=1 K=1024
+fe802a17afd973e4 cpu iq4xs Float16 t M=2 N=2048 K=1024
+ee0557f20175f34b cpu iq4xs Float16 t M=2 N=136 K=768
+84a1af7505142f2f cpu iq4xs Float16 t batched M=2
+d64c708fdca55d7d cpu iq4xs Float16 t batched-aligned M=2
+fe7101de47b9d07f cpu iq4xs Float16 t x-batched M=2
+7e980db3966762e3 cpu iq4xs Float16 n M=2 K=256
+437488a1d8185b38 cpu iq4xs Float16 n M=2 K=1024
+6d31d6d86f3a3669 cpu iq4xs Float16 t M=8 N=2048 K=1024
+1655809fc1b98e06 cpu iq4xs Float16 t M=8 N=136 K=768
+d3bd287f3c4bcaad cpu iq4xs Float16 t batched M=8
+c3676a4fccb4e379 cpu iq4xs Float16 t batched-aligned M=8
+d73f81d8b6294732 cpu iq4xs Float16 t x-batched M=8
+b61835d0b2033698 cpu iq4xs Float16 n M=8 K=256
+6cd49b01a1723b0f cpu iq4xs Float16 n M=8 K=1024
+290325e5d511e5e1 cpu iq4xs Float16 t M=9 N=2048 K=1024
+b018fffa8a7d2d09 cpu iq4xs Float16 t M=9 N=136 K=768
+271998ec576c9c06 cpu iq4xs Float16 t batched M=9
+6b2a08504c0f8109 cpu iq4xs Float16 t batched-aligned M=9
+b5ba67d8b18d3119 cpu iq4xs Float16 t x-batched M=9
+b17815155c70ae26 cpu iq4xs Float16 n M=9 K=256
+e6aa70f7ce0f1054 cpu iq4xs Float16 n M=9 K=1024
+42e5f8f9e072921a cpu iq4xs Float16 t M=33 N=2048 K=1024
+37bede0ad22997a3 cpu iq4xs Float16 t M=33 N=136 K=768
+a10fe47520b7692a cpu iq4xs Float16 t batched M=33
+4f59c9898d903598 cpu iq4xs Float16 t batched-aligned M=33
+9321f98fda990248 cpu iq4xs Float16 t x-batched M=33
+3e1b9929104515a5 cpu iq4xs Float16 n M=33 K=256
+761e4738b01d06e7 cpu iq4xs Float16 n M=33 K=1024
+b6758bf7fcc0e6e9 cpu iq4xs BFloat16 t M=1 N=2048 K=1024
+4f047c2053f50db7 cpu iq4xs BFloat16 t M=1 N=136 K=768
+a5eecdd68bbdb63e cpu iq4xs BFloat16 t batched M=1
+56afdd09d0ec4ff1 cpu iq4xs BFloat16 t batched-aligned M=1
+3416736e43080bc4 cpu iq4xs BFloat16 t x-batched M=1
+1c9cdc82697aa7d0 cpu iq4xs BFloat16 n M=1 K=256
+c7a5f93ef516bed6 cpu iq4xs BFloat16 n M=1 K=1024
+5faa6a421a459ab7 cpu iq4xs BFloat16 t M=2 N=2048 K=1024
+a9c1fc270950ca83 cpu iq4xs BFloat16 t M=2 N=136 K=768
+fa447303e6ebd028 cpu iq4xs BFloat16 t batched M=2
+c43e7e5970a93363 cpu iq4xs BFloat16 t batched-aligned M=2
+6e755e517eb2fa70 cpu iq4xs BFloat16 t x-batched M=2
+5caedd0ea2e0c3ae cpu iq4xs BFloat16 n M=2 K=256
+3b8e96bb875fc0e2 cpu iq4xs BFloat16 n M=2 K=1024
+dfe03d17491f4531 cpu iq4xs BFloat16 t M=8 N=2048 K=1024
+4b6ac2181421a39c cpu iq4xs BFloat16 t M=8 N=136 K=768
+e69da666574fad64 cpu iq4xs BFloat16 t batched M=8
+1c87dd85b4070294 cpu iq4xs BFloat16 t batched-aligned M=8
+f5a693b195e78988 cpu iq4xs BFloat16 t x-batched M=8
+d117658030e65121 cpu iq4xs BFloat16 n M=8 K=256
+0cfd2a76ac03f0c1 cpu iq4xs BFloat16 n M=8 K=1024
+4fd32e66b27e803f cpu iq4xs BFloat16 t M=9 N=2048 K=1024
+7b5f1b4724e69258 cpu iq4xs BFloat16 t M=9 N=136 K=768
+6f8e626a1ecbba60 cpu iq4xs BFloat16 t batched M=9
+c197b356889932a4 cpu iq4xs BFloat16 t batched-aligned M=9
+e312ed3505941704 cpu iq4xs BFloat16 t x-batched M=9
+e22f26b126c03d28 cpu iq4xs BFloat16 n M=9 K=256
+d0412e4e0cd8bf2b cpu iq4xs BFloat16 n M=9 K=1024
+a84cdc017d330cdb cpu iq4xs BFloat16 t M=33 N=2048 K=1024
+964999a3e3fd2a65 cpu iq4xs BFloat16 t M=33 N=136 K=768
+fb87c33d7b574691 cpu iq4xs BFloat16 t batched M=33
+fd29a71a507cb9b9 cpu iq4xs BFloat16 t batched-aligned M=33
+2026fb91e0a57d31 cpu iq4xs BFloat16 t x-batched M=33
+8e794785536d0ddc cpu iq4xs BFloat16 n M=33 K=256
+05ad22470cfa3b65 cpu iq4xs BFloat16 n M=33 K=1024
+1ec2b8b22d5ec67c cpu iq3s Float32 t M=1 N=2048 K=1024
+9eede03a0de55b9c cpu iq3s Float32 t M=1 N=136 K=768
+42a422b46502436e cpu iq3s Float32 t batched M=1
+4f14df252c5c5d33 cpu iq3s Float32 t batched-aligned M=1
+2f3a4373c61fbcff cpu iq3s Float32 t x-batched M=1
+b025e75e0cf01bc8 cpu iq3s Float32 n M=1 K=256
+863b5aa482c30ffa cpu iq3s Float32 n M=1 K=1024
+c182fbcda7cf5ec2 cpu iq3s Float32 t M=2 N=2048 K=1024
+7007f49b40a5c078 cpu iq3s Float32 t M=2 N=136 K=768
+a07853d2a24bd309 cpu iq3s Float32 t batched M=2
+c682084cf12d6ba9 cpu iq3s Float32 t batched-aligned M=2
+6076b29295e551dc cpu iq3s Float32 t x-batched M=2
+854aa48bc237b121 cpu iq3s Float32 n M=2 K=256
+f16d5574b872cf0c cpu iq3s Float32 n M=2 K=1024
+02d42b1e4d3a6b4c cpu iq3s Float32 t M=8 N=2048 K=1024
+5b69eede4f355d2f cpu iq3s Float32 t M=8 N=136 K=768
+9129e8af7f516f54 cpu iq3s Float32 t batched M=8
+d10b06319c2e4fd4 cpu iq3s Float32 t batched-aligned M=8
+fbdeaf5580eb8355 cpu iq3s Float32 t x-batched M=8
+f92a30365cd6a7ab cpu iq3s Float32 n M=8 K=256
+cb65445cf099d084 cpu iq3s Float32 n M=8 K=1024
+783776b8a46ff7a0 cpu iq3s Float32 t M=9 N=2048 K=1024
+6c72f3c0e513d236 cpu iq3s Float32 t M=9 N=136 K=768
+019d063cb7f27130 cpu iq3s Float32 t batched M=9
+eed1ed6d2949240b cpu iq3s Float32 t batched-aligned M=9
+081c78e089b458a7 cpu iq3s Float32 t x-batched M=9
+1e055bea9a545813 cpu iq3s Float32 n M=9 K=256
+0f1579c46916a7c2 cpu iq3s Float32 n M=9 K=1024
+ed61291106144f19 cpu iq3s Float32 t M=33 N=2048 K=1024
+dca7fbc746148952 cpu iq3s Float32 t M=33 N=136 K=768
+95ff65c25579e87f cpu iq3s Float32 t batched M=33
+7d040b664119457e cpu iq3s Float32 t batched-aligned M=33
+a73efac2192efcaf cpu iq3s Float32 t x-batched M=33
+563f06be308ad609 cpu iq3s Float32 n M=33 K=256
+97392768ba448230 cpu iq3s Float32 n M=33 K=1024
+cc79c5518c63e145 cpu iq3s Float16 t M=1 N=2048 K=1024
+56e8435511b64282 cpu iq3s Float16 t M=1 N=136 K=768
+aba90a5392036d4c cpu iq3s Float16 t batched M=1
+4e7b69f497d7fe39 cpu iq3s Float16 t batched-aligned M=1
+1f41420c71b5fa03 cpu iq3s Float16 t x-batched M=1
+6e93973b09161502 cpu iq3s Float16 n M=1 K=256
+839a6dd1a9886977 cpu iq3s Float16 n M=1 K=1024
+0904554b4f84b879 cpu iq3s Float16 t M=2 N=2048 K=1024
+d1627663a9841d0d cpu iq3s Float16 t M=2 N=136 K=768
+0e65fa525ab6aa36 cpu iq3s Float16 t batched M=2
+0e2a1f84dde89777 cpu iq3s Float16 t batched-aligned M=2
+9373091389e930cc cpu iq3s Float16 t x-batched M=2
+9a215029065dbcdd cpu iq3s Float16 n M=2 K=256
+7046791ec2338697 cpu iq3s Float16 n M=2 K=1024
+1286aa9dae282985 cpu iq3s Float16 t M=8 N=2048 K=1024
+d9e5852015a87bb9 cpu iq3s Float16 t M=8 N=136 K=768
+8945d5eb992769c2 cpu iq3s Float16 t batched M=8
+5247918f0fc562b0 cpu iq3s Float16 t batched-aligned M=8
+7fc29bf5ef2c03af cpu iq3s Float16 t x-batched M=8
+97b60ea7db17ffc1 cpu iq3s Float16 n M=8 K=256
+5b527873c988f890 cpu iq3s Float16 n M=8 K=1024
+6ed6c8f57bed7bfc cpu iq3s Float16 t M=9 N=2048 K=1024
+915f8ca793c687b5 cpu iq3s Float16 t M=9 N=136 K=768
+4147c86ad4d26312 cpu iq3s Float16 t batched M=9
+f1bc0be79829a14d cpu iq3s Float16 t batched-aligned M=9
+01e05e14dde43afc cpu iq3s Float16 t x-batched M=9
+25778df7c86a2220 cpu iq3s Float16 n M=9 K=256
+e8b498fb69c379e3 cpu iq3s Float16 n M=9 K=1024
+f8ff0e2d534f4da1 cpu iq3s Float16 t M=33 N=2048 K=1024
+ca74cd625f4b155c cpu iq3s Float16 t M=33 N=136 K=768
+eea57a55af514c3e cpu iq3s Float16 t batched M=33
+0f48bf83626c2f0f cpu iq3s Float16 t batched-aligned M=33
+55050f2417b6e5f7 cpu iq3s Float16 t x-batched M=33
+36b5baf6af650812 cpu iq3s Float16 n M=33 K=256
+91be9ec4bba47122 cpu iq3s Float16 n M=33 K=1024
+b78d853653f0d2b3 cpu iq3s BFloat16 t M=1 N=2048 K=1024
+68b2ef884162aaef cpu iq3s BFloat16 t M=1 N=136 K=768
+ba84f556fab6e68f cpu iq3s BFloat16 t batched M=1
+af0547e141b129e3 cpu iq3s BFloat16 t batched-aligned M=1
+db376a7b22d597c3 cpu iq3s BFloat16 t x-batched M=1
+1fc9dade2a1fffa2 cpu iq3s BFloat16 n M=1 K=256
+76cdec52637f4e6a cpu iq3s BFloat16 n M=1 K=1024
+fa65b094e0fada99 cpu iq3s BFloat16 t M=2 N=2048 K=1024
+88b605da1e670a1b cpu iq3s BFloat16 t M=2 N=136 K=768
+7e063e73625abd8e cpu iq3s BFloat16 t batched M=2
+60170c0fd80d936f cpu iq3s BFloat16 t batched-aligned M=2
+425ec2d1632ee2ef cpu iq3s BFloat16 t x-batched M=2
+00387954145a10d7 cpu iq3s BFloat16 n M=2 K=256
+92e13bd2fe06d97b cpu iq3s BFloat16 n M=2 K=1024
+9ca51f2e6242d4b9 cpu iq3s BFloat16 t M=8 N=2048 K=1024
+4dd9c123f4acfbdd cpu iq3s BFloat16 t M=8 N=136 K=768
+98eced7c14c7d498 cpu iq3s BFloat16 t batched M=8
+27c331b9d5b0447c cpu iq3s BFloat16 t batched-aligned M=8
+ba9dcb7f389ba009 cpu iq3s BFloat16 t x-batched M=8
+f6f142eb9b87c185 cpu iq3s BFloat16 n M=8 K=256
+b2abdc8b73670595 cpu iq3s BFloat16 n M=8 K=1024
+39a7b99d979f5630 cpu iq3s BFloat16 t M=9 N=2048 K=1024
+f7f8d9708ad8f027 cpu iq3s BFloat16 t M=9 N=136 K=768
+98d58367793daf2a cpu iq3s BFloat16 t batched M=9
+c70fa856561e3c58 cpu iq3s BFloat16 t batched-aligned M=9
+2387dea5f65fb29e cpu iq3s BFloat16 t x-batched M=9
+c7b2a750a571f124 cpu iq3s BFloat16 n M=9 K=256
+66e1db2a0ad4a67c cpu iq3s BFloat16 n M=9 K=1024
+700157e30ea6e777 cpu iq3s BFloat16 t M=33 N=2048 K=1024
+69d1ee10a1bb7e7e cpu iq3s BFloat16 t M=33 N=136 K=768
+e763599a52791152 cpu iq3s BFloat16 t batched M=33
+6bd0c1d912a7b6f3 cpu iq3s BFloat16 t batched-aligned M=33
+27ac323f919b42c8 cpu iq3s BFloat16 t x-batched M=33
+569cc02ca3f44397 cpu iq3s BFloat16 n M=33 K=256
+dd9d64c1aacb39c4 cpu iq3s BFloat16 n M=33 K=1024
+2355208ab4b8c64d cpu iq4nl Float32 t batched M=64 K=544
+d1afec523b268a5a cpu iq4nl Float16 t batched M=64 K=544
+00d4918160715ac1 cpu iq4nl BFloat16 t batched M=64 K=544
+3aca8217be88bf8b cpu q3k Float32 gather t unsorted
+decab8ea86875346 cpu q3k Float32 gather t sorted
+decab8ea86875346 cpu q3k Float32 gather t sorted-ids unsorted-flag
+b4eab308f1b80c56 cpu q3k Float32 gather t odd unsorted
+f9ff2a1a847e8112 cpu q3k Float32 gather t odd sorted
+0b8e0530b6466812 cpu q3k Float32 gather n sorted
+5add0051338a9b99 cpu q3k Float32 gather n unsorted
+1e1f41d44f714230 cpu q3k Float32 gather t lhs M=1
+2b988a6b18ea8870 cpu q3k Float32 gather n lhs M=1
+0f92dc7844e1ff8e cpu q3k Float32 gather t lhs M=4
+9a02f55bd93902e5 cpu q3k Float32 gather n lhs M=4
+bdabb852880e67b2 cpu q3k Float32 gather t lhs M=33
+f6a6d3746d3935e2 cpu q3k Float32 gather n lhs M=33
+ef93e550e345b3e5 cpu q3k Float16 gather t unsorted
+fb7d71510ab86ad4 cpu q3k Float16 gather t sorted
+fb7d71510ab86ad4 cpu q3k Float16 gather t sorted-ids unsorted-flag
+69138ac1b5e59a8d cpu q3k Float16 gather t odd unsorted
+7c79606cf3f9f9b2 cpu q3k Float16 gather t odd sorted
+9d7e47c4a4800129 cpu q3k Float16 gather n sorted
+98b43d1f4303cd92 cpu q3k Float16 gather n unsorted
+546f57fd271f0da7 cpu q3k Float16 gather t lhs M=1
+2a9afbaa85af2a91 cpu q3k Float16 gather n lhs M=1
+aba1852e48361f14 cpu q3k Float16 gather t lhs M=4
+98fab7f66b40b752 cpu q3k Float16 gather n lhs M=4
+7ff6abd7d4b38dd0 cpu q3k Float16 gather t lhs M=33
+1cb029c94f46c3e4 cpu q3k Float16 gather n lhs M=33
+1e65b4d3b37cb69b cpu q3k BFloat16 gather t unsorted
+34c7825f214bc526 cpu q3k BFloat16 gather t sorted
+34c7825f214bc526 cpu q3k BFloat16 gather t sorted-ids unsorted-flag
+d48923ce7eb8219a cpu q3k BFloat16 gather t odd unsorted
+f1bb66a4d053320c cpu q3k BFloat16 gather t odd sorted
+51de51b385869ed9 cpu q3k BFloat16 gather n sorted
+a67359254d0047ef cpu q3k BFloat16 gather n unsorted
+fdedc6758f7d0eb4 cpu q3k BFloat16 gather t lhs M=1
+9c39705fd9a86dd8 cpu q3k BFloat16 gather n lhs M=1
+e94e7ce869247b71 cpu q3k BFloat16 gather t lhs M=4
+b503223273ed14a3 cpu q3k BFloat16 gather n lhs M=4
+9ac94ba5d4601195 cpu q3k BFloat16 gather t lhs M=33
+07387c2add3a2f5e cpu q3k BFloat16 gather n lhs M=33
+9fc99ab0cb32657a cpu q6k Float32 gather t unsorted
+db10f1d41b72e7ec cpu q6k Float32 gather t sorted
+db10f1d41b72e7ec cpu q6k Float32 gather t sorted-ids unsorted-flag
+7f5eba2c7885d961 cpu q6k Float32 gather t odd unsorted
+321867572e1f20c0 cpu q6k Float32 gather t odd sorted
+dfadd3c6c6a4cd88 cpu q6k Float32 gather n sorted
+524a6bb041f45dd7 cpu q6k Float32 gather n unsorted
+a8ea710a82a05303 cpu q6k Float32 gather t lhs M=1
+1ea6ef33c59ae266 cpu q6k Float32 gather n lhs M=1
+22f54dbf32e8dabb cpu q6k Float32 gather t lhs M=4
+9962ac08d715c490 cpu q6k Float32 gather n lhs M=4
+d5aaa589fb85cf97 cpu q6k Float32 gather t lhs M=33
+0c1bdc557ce4abff cpu q6k Float32 gather n lhs M=33
+64fa4781e894cddf cpu q6k Float16 gather t unsorted
+fd2fc0ddcec52099 cpu q6k Float16 gather t sorted
+fd2fc0ddcec52099 cpu q6k Float16 gather t sorted-ids unsorted-flag
+52305f380f3ef969 cpu q6k Float16 gather t odd unsorted
+2c991abed89cf028 cpu q6k Float16 gather t odd sorted
+d786058c7adad85b cpu q6k Float16 gather n sorted
+7e2a0652f9f84c50 cpu q6k Float16 gather n unsorted
+76e8004f8d7e6f8c cpu q6k Float16 gather t lhs M=1
+a0f17e23ca41e7b1 cpu q6k Float16 gather n lhs M=1
+f92e57bc97600d22 cpu q6k Float16 gather t lhs M=4
+f2ecfb14d7109455 cpu q6k Float16 gather n lhs M=4
+6e500afed5aee148 cpu q6k Float16 gather t lhs M=33
+d6d1810e89071acd cpu q6k Float16 gather n lhs M=33
+86371d861d9dea75 cpu q6k BFloat16 gather t unsorted
+78fc86c58d04d37a cpu q6k BFloat16 gather t sorted
+78fc86c58d04d37a cpu q6k BFloat16 gather t sorted-ids unsorted-flag
+74bef5c5cb89824e cpu q6k BFloat16 gather t odd unsorted
+2a5f9adb6cd135b0 cpu q6k BFloat16 gather t odd sorted
+70e9dfc46a769bf8 cpu q6k BFloat16 gather n sorted
+254a25bd17ce3c89 cpu q6k BFloat16 gather n unsorted
+4be41ed9e5c4028f cpu q6k BFloat16 gather t lhs M=1
+32fa70bdeeaade37 cpu q6k BFloat16 gather n lhs M=1
+879b735350916ec6 cpu q6k BFloat16 gather t lhs M=4
+93c1c0050d84981b cpu q6k BFloat16 gather n lhs M=4
+8da69f471a073a51 cpu q6k BFloat16 gather t lhs M=33
+50a0450b6da924bd cpu q6k BFloat16 gather n lhs M=33
+85087ff69e57d357 cpu q4k Float32 gather t unsorted
+500066dd727ffeef cpu q4k Float32 gather t sorted
+500066dd727ffeef cpu q4k Float32 gather t sorted-ids unsorted-flag
+080571ceb71c7001 cpu q4k Float32 gather t odd unsorted
+b78041893586f1d9 cpu q4k Float32 gather t odd sorted
+a04eafd86e4af36d cpu q4k Float32 gather n sorted
+54b4faa5381cc917 cpu q4k Float32 gather n unsorted
+5736867003b57505 cpu q4k Float32 gather t lhs M=1
+6d44e4259484e110 cpu q4k Float32 gather n lhs M=1
+4e86eb9fd9f63586 cpu q4k Float32 gather t lhs M=4
+57e8edf13405eed2 cpu q4k Float32 gather n lhs M=4
+edeecc0229986f9a cpu q4k Float32 gather t lhs M=33
+218969c515eeee2b cpu q4k Float32 gather n lhs M=33
+bbef450dce4a33bd cpu q4k Float16 gather t unsorted
+cba30fbdea138434 cpu q4k Float16 gather t sorted
+cba30fbdea138434 cpu q4k Float16 gather t sorted-ids unsorted-flag
+bc3af2620bd3a6e4 cpu q4k Float16 gather t odd unsorted
+843a074e35781d12 cpu q4k Float16 gather t odd sorted
+c132737d0a0c780c cpu q4k Float16 gather n sorted
+a0d6b836ae86841f cpu q4k Float16 gather n unsorted
+23703c9b5eb430c9 cpu q4k Float16 gather t lhs M=1
+4a132c3ec1745d43 cpu q4k Float16 gather n lhs M=1
+00e8e074527b86f9 cpu q4k Float16 gather t lhs M=4
+e8dd48fad58f2190 cpu q4k Float16 gather n lhs M=4
+1959e52e0c11fe98 cpu q4k Float16 gather t lhs M=33
+3707e6333a7115e7 cpu q4k Float16 gather n lhs M=33
+1a697b895b3764d9 cpu q4k BFloat16 gather t unsorted
+aed877e3a4d671f8 cpu q4k BFloat16 gather t sorted
+aed877e3a4d671f8 cpu q4k BFloat16 gather t sorted-ids unsorted-flag
+23dab08bc84bbc96 cpu q4k BFloat16 gather t odd unsorted
+e7bcae2b983f22ef cpu q4k BFloat16 gather t odd sorted
+44d491fa188f4759 cpu q4k BFloat16 gather n sorted
+688ecafa23bc1077 cpu q4k BFloat16 gather n unsorted
+dec8c01a1e924713 cpu q4k BFloat16 gather t lhs M=1
+e4f8f0519b94196e cpu q4k BFloat16 gather n lhs M=1
+2f6e7ea7953773ea cpu q4k BFloat16 gather t lhs M=4
+2637e87b051d0fb9 cpu q4k BFloat16 gather n lhs M=4
+05f2fc44cd736d0f cpu q4k BFloat16 gather t lhs M=33
+971e512b488a0bd1 cpu q4k BFloat16 gather n lhs M=33
+0a8499a9a01b0420 cpu q5k Float32 gather t unsorted
+52277661b10fb7b1 cpu q5k Float32 gather t sorted
+52277661b10fb7b1 cpu q5k Float32 gather t sorted-ids unsorted-flag
+638f621a2917cfd4 cpu q5k Float32 gather t odd unsorted
+8d350e2e691e09c8 cpu q5k Float32 gather t odd sorted
+0860ecd69a7c1828 cpu q5k Float32 gather n sorted
+9dfc8b9482058a59 cpu q5k Float32 gather n unsorted
+24c3d5c7e200dabe cpu q5k Float32 gather t lhs M=1
+4a82ea3918baba78 cpu q5k Float32 gather n lhs M=1
+3baced5f9ab6c953 cpu q5k Float32 gather t lhs M=4
+883accce6d3a35f1 cpu q5k Float32 gather n lhs M=4
+993d93bdcc488677 cpu q5k Float32 gather t lhs M=33
+a3c62f25f4b32789 cpu q5k Float32 gather n lhs M=33
+2cbf8ac1ebcb01ca cpu q5k Float16 gather t unsorted
+1b4f11168370c9e2 cpu q5k Float16 gather t sorted
+1b4f11168370c9e2 cpu q5k Float16 gather t sorted-ids unsorted-flag
+5cf821ed18bb1fee cpu q5k Float16 gather t odd unsorted
+b85a504e8c1f5c8c cpu q5k Float16 gather t odd sorted
+7746bb1bd5c2d856 cpu q5k Float16 gather n sorted
+b535be3f446068c3 cpu q5k Float16 gather n unsorted
+787669aede57ed95 cpu q5k Float16 gather t lhs M=1
+e5ee75510a9f1f11 cpu q5k Float16 gather n lhs M=1
+0131ee360c2ccdc7 cpu q5k Float16 gather t lhs M=4
+d18524141de7528a cpu q5k Float16 gather n lhs M=4
+a19291e4465e9d1a cpu q5k Float16 gather t lhs M=33
+224beb50c41cffc3 cpu q5k Float16 gather n lhs M=33
+271af56c0cde44f0 cpu q5k BFloat16 gather t unsorted
+2889e84774b5c863 cpu q5k BFloat16 gather t sorted
+2889e84774b5c863 cpu q5k BFloat16 gather t sorted-ids unsorted-flag
+dabee94787b722f7 cpu q5k BFloat16 gather t odd unsorted
+3b839d81059f3531 cpu q5k BFloat16 gather t odd sorted
+965b9dfb5e1a7f2f cpu q5k BFloat16 gather n sorted
+7bea7a112f920650 cpu q5k BFloat16 gather n unsorted
+9c7e9135558ef655 cpu q5k BFloat16 gather t lhs M=1
+5784e961a8d8e64f cpu q5k BFloat16 gather n lhs M=1
+581236e5e13c9c11 cpu q5k BFloat16 gather t lhs M=4
+96d441fca8a58ebd cpu q5k BFloat16 gather n lhs M=4
+d3f37f2b28731829 cpu q5k BFloat16 gather t lhs M=33
+171fb99efe29b518 cpu q5k BFloat16 gather n lhs M=33
+937078d3c095b62e cpu iq4nl Float32 gather t unsorted
+dd61fc5133e7d1fd cpu iq4nl Float32 gather t sorted
+dd61fc5133e7d1fd cpu iq4nl Float32 gather t sorted-ids unsorted-flag
+b84dc06a3919848b cpu iq4nl Float32 gather t odd unsorted
+8da1a6904b038e36 cpu iq4nl Float32 gather t odd sorted
+bd659c6c1e64234f cpu iq4nl Float32 gather n sorted
+8613d3eb26d33e32 cpu iq4nl Float32 gather n unsorted
+2f23a269cda242a0 cpu iq4nl Float32 gather t lhs M=1
+7da4a8879ba6e6da cpu iq4nl Float32 gather n lhs M=1
+ae7b2eee5c3e13c9 cpu iq4nl Float32 gather t lhs M=4
+0b75422411c29902 cpu iq4nl Float32 gather n lhs M=4
+454c239ba1c67c6e cpu iq4nl Float32 gather t lhs M=33
+03f1e04e1389e7cd cpu iq4nl Float32 gather n lhs M=33
+96d5565690eaebdf cpu iq4nl Float16 gather t unsorted
+0ddb7d1764494ef7 cpu iq4nl Float16 gather t sorted
+0ddb7d1764494ef7 cpu iq4nl Float16 gather t sorted-ids unsorted-flag
+7a1ebd827cc21620 cpu iq4nl Float16 gather t odd unsorted
+04d14a474993bdda cpu iq4nl Float16 gather t odd sorted
+b804e63110c14b7d cpu iq4nl Float16 gather n sorted
+9225036bf00a62dd cpu iq4nl Float16 gather n unsorted
+df5992b45ef26822 cpu iq4nl Float16 gather t lhs M=1
+b7d37a1b6e51612e cpu iq4nl Float16 gather n lhs M=1
+83c30373d3407afa cpu iq4nl Float16 gather t lhs M=4
+34cc7c8533244c8d cpu iq4nl Float16 gather n lhs M=4
+2f6b5944efb66a5f cpu iq4nl Float16 gather t lhs M=33
+3ed81754162bed47 cpu iq4nl Float16 gather n lhs M=33
+f0168e49723ca614 cpu iq4nl BFloat16 gather t unsorted
+e997fc3a1289c72e cpu iq4nl BFloat16 gather t sorted
+e997fc3a1289c72e cpu iq4nl BFloat16 gather t sorted-ids unsorted-flag
+00134e11aa35ce2c cpu iq4nl BFloat16 gather t odd unsorted
+3562a7d8140cebad cpu iq4nl BFloat16 gather t odd sorted
+980d893d9fc58483 cpu iq4nl BFloat16 gather n sorted
+ba941e4d40f3480b cpu iq4nl BFloat16 gather n unsorted
+2d878c87242f9472 cpu iq4nl BFloat16 gather t lhs M=1
+883ace13b8b30a21 cpu iq4nl BFloat16 gather n lhs M=1
+aa09a49a008eff79 cpu iq4nl BFloat16 gather t lhs M=4
+cd68954c5efa504f cpu iq4nl BFloat16 gather n lhs M=4
+b56f80bf933f71b0 cpu iq4nl BFloat16 gather t lhs M=33
+421477b169e40a12 cpu iq4nl BFloat16 gather n lhs M=33
+460e3d10ad8a8738 cpu iq4xs Float32 gather t unsorted
+0e2cc2d1c75b0590 cpu iq4xs Float32 gather t sorted
+0e2cc2d1c75b0590 cpu iq4xs Float32 gather t sorted-ids unsorted-flag
+62b3f8a4c739aef0 cpu iq4xs Float32 gather t odd unsorted
+e9333a93b507855a cpu iq4xs Float32 gather t odd sorted
+2ca4e7fc7819b4cb cpu iq4xs Float32 gather n sorted
+f626990e8011cf71 cpu iq4xs Float32 gather n unsorted
+7d4985dbc293559e cpu iq4xs Float32 gather t lhs M=1
+a079c17b7713cbf8 cpu iq4xs Float32 gather n lhs M=1
+a3b2babf322b2c07 cpu iq4xs Float32 gather t lhs M=4
+1371f410fbfaf36c cpu iq4xs Float32 gather n lhs M=4
+f00a629ee7c1c651 cpu iq4xs Float32 gather t lhs M=33
+18e506b0c40b89aa cpu iq4xs Float32 gather n lhs M=33
+6d2cc76319e2b3f2 cpu iq4xs Float16 gather t unsorted
+9fadc9b85d8a2f59 cpu iq4xs Float16 gather t sorted
+9fadc9b85d8a2f59 cpu iq4xs Float16 gather t sorted-ids unsorted-flag
+9732b31d3b6756d2 cpu iq4xs Float16 gather t odd unsorted
+61d653b2af835a36 cpu iq4xs Float16 gather t odd sorted
+10a2dd5146a9617b cpu iq4xs Float16 gather n sorted
+85ea4792bdddeb23 cpu iq4xs Float16 gather n unsorted
+a836cc1267be01f9 cpu iq4xs Float16 gather t lhs M=1
+6dd5ca0795d0045d cpu iq4xs Float16 gather n lhs M=1
+2b4486baaae3e590 cpu iq4xs Float16 gather t lhs M=4
+d9e835b439ac50f9 cpu iq4xs Float16 gather n lhs M=4
+91d7e8d30e2c4b89 cpu iq4xs Float16 gather t lhs M=33
+81ba18b3b9431357 cpu iq4xs Float16 gather n lhs M=33
+572aea0aedbab514 cpu iq4xs BFloat16 gather t unsorted
+a1b99e0703d33bbf cpu iq4xs BFloat16 gather t sorted
+a1b99e0703d33bbf cpu iq4xs BFloat16 gather t sorted-ids unsorted-flag
+d515949acf206b24 cpu iq4xs BFloat16 gather t odd unsorted
+f831f153a6811118 cpu iq4xs BFloat16 gather t odd sorted
+b6d17b600548435f cpu iq4xs BFloat16 gather n sorted
+c394492dd6e29ced cpu iq4xs BFloat16 gather n unsorted
+b585fc1d5dcbe388 cpu iq4xs BFloat16 gather t lhs M=1
+823d98a200d8abb6 cpu iq4xs BFloat16 gather n lhs M=1
+b259ea48ceb8d20f cpu iq4xs BFloat16 gather t lhs M=4
+9754c806857b4c03 cpu iq4xs BFloat16 gather n lhs M=4
+0da973f500780b9c cpu iq4xs BFloat16 gather t lhs M=33
+a0545e91dfd43869 cpu iq4xs BFloat16 gather n lhs M=33
+d5845dd58426e056 cpu iq3s Float32 gather t unsorted
+8755d27a3fb6af94 cpu iq3s Float32 gather t sorted
+8755d27a3fb6af94 cpu iq3s Float32 gather t sorted-ids unsorted-flag
+d01c45d7be1a7b82 cpu iq3s Float32 gather t odd unsorted
+f9c295c616a2f60c cpu iq3s Float32 gather t odd sorted
+7f80272bd470c769 cpu iq3s Float32 gather n sorted
+4bc374c9cd5a979f cpu iq3s Float32 gather n unsorted
+d2933a4500154262 cpu iq3s Float32 gather t lhs M=1
+482354decf63441d cpu iq3s Float32 gather n lhs M=1
+bfb11935c915d1d8 cpu iq3s Float32 gather t lhs M=4
+dbcc75f2511111b8 cpu iq3s Float32 gather n lhs M=4
+9ac73104bf4a6526 cpu iq3s Float32 gather t lhs M=33
+b25e22101a78f89d cpu iq3s Float32 gather n lhs M=33
+e41c001cb2f52515 cpu iq3s Float16 gather t unsorted
+344c123cdd29aba6 cpu iq3s Float16 gather t sorted
+344c123cdd29aba6 cpu iq3s Float16 gather t sorted-ids unsorted-flag
+8ba352766fdf1aab cpu iq3s Float16 gather t odd unsorted
+efb79c7649de5b47 cpu iq3s Float16 gather t odd sorted
+5b6c9b210b73f246 cpu iq3s Float16 gather n sorted
+926d74bce1c5f8ef cpu iq3s Float16 gather n unsorted
+80ff7d8bf6287437 cpu iq3s Float16 gather t lhs M=1
+190a468f67085406 cpu iq3s Float16 gather n lhs M=1
+c34f0d853e37215d cpu iq3s Float16 gather t lhs M=4
+1797550a2d2f20bd cpu iq3s Float16 gather n lhs M=4
+991c35bd32ed0e3a cpu iq3s Float16 gather t lhs M=33
+fd6f529fde912c66 cpu iq3s Float16 gather n lhs M=33
+40baf63df9586feb cpu iq3s BFloat16 gather t unsorted
+1522503d21792064 cpu iq3s BFloat16 gather t sorted
+1522503d21792064 cpu iq3s BFloat16 gather t sorted-ids unsorted-flag
+4f08dca94fdca06d cpu iq3s BFloat16 gather t odd unsorted
+280a6ff53ebbd3eb cpu iq3s BFloat16 gather t odd sorted
+d7da638f90cdd0bf cpu iq3s BFloat16 gather n sorted
+27c1c95b544fb358 cpu iq3s BFloat16 gather n unsorted
+cac043fffdd064c1 cpu iq3s BFloat16 gather t lhs M=1
+e1c514c63a831f68 cpu iq3s BFloat16 gather n lhs M=1
+8c7fe6c45cb8d2c8 cpu iq3s BFloat16 gather t lhs M=4
+30c4b88605dedd04 cpu iq3s BFloat16 gather n lhs M=4
+048e49062d8e854a cpu iq3s BFloat16 gather t lhs M=33
+7db5af5609e9573e cpu iq3s BFloat16 gather n lhs M=33
+2dc4b03f1ef1e51e cpu q3k Float32 dequantize 2-D
+fbf855489bc1e1c8 cpu q3k Float32 dequantize 3-D
+24fabfd0b705152d cpu q3k Float16 dequantize 2-D
+5ec21a9585de3b2d cpu q3k Float16 dequantize 3-D
+bb9e0709b6590a46 cpu q3k BFloat16 dequantize 2-D
+c14ad14925a42a6e cpu q3k BFloat16 dequantize 3-D
+da7d7975a7c3c112 cpu q6k Float32 dequantize 2-D
+b5b74eb39f69d737 cpu q6k Float32 dequantize 3-D
+29169332e47a08bb cpu q6k Float16 dequantize 2-D
+92a0ef4064710fac cpu q6k Float16 dequantize 3-D
+60f93c10eb8df9b0 cpu q6k BFloat16 dequantize 2-D
+052881a829ad96be cpu q6k BFloat16 dequantize 3-D
+c91def147085e74b cpu q4k Float32 dequantize 2-D
+97e84b8ed2ff0c2f cpu q4k Float32 dequantize 3-D
+1188aa19366e7c69 cpu q4k Float16 dequantize 2-D
+8ad6145d8f4dd764 cpu q4k Float16 dequantize 3-D
+95d5c6ae7434697f cpu q4k BFloat16 dequantize 2-D
+4dacbff07faf379c cpu q4k BFloat16 dequantize 3-D
+e60c49adacee1096 cpu q5k Float32 dequantize 2-D
+e2f1d3ed1f93dbbf cpu q5k Float32 dequantize 3-D
+419af7ecaa0ee650 cpu q5k Float16 dequantize 2-D
+a069939e650400ff cpu q5k Float16 dequantize 3-D
+0d055e99616036e6 cpu q5k BFloat16 dequantize 2-D
+555df68ad2162189 cpu q5k BFloat16 dequantize 3-D
+d020f716e0b2df39 cpu iq4nl Float32 dequantize 2-D
+5ece7363f1e56351 cpu iq4nl Float32 dequantize 3-D
+5000f4b25a7f30a9 cpu iq4nl Float16 dequantize 2-D
+014f44f4377dc3dc cpu iq4nl Float16 dequantize 3-D
+033d2b12c4970c7a cpu iq4nl BFloat16 dequantize 2-D
+5b40018363a6f7f9 cpu iq4nl BFloat16 dequantize 3-D
+7b00431ece232a8d cpu iq4xs Float32 dequantize 2-D
+4e4d1eae4c8d9160 cpu iq4xs Float32 dequantize 3-D
+e0c08dd49568c1fb cpu iq4xs Float16 dequantize 2-D
+d8ad89f5199cf84e cpu iq4xs Float16 dequantize 3-D
+500e0472370e09bf cpu iq4xs BFloat16 dequantize 2-D
+d1bfc67953b73d91 cpu iq4xs BFloat16 dequantize 3-D
+84d761a051ad73b7 cpu iq3s Float32 dequantize 2-D
+57de77ef0aadaa9e cpu iq3s Float32 dequantize 3-D
+f40747f6229d3f88 cpu iq3s Float16 dequantize 2-D
+d0b5ae1cec78dfa3 cpu iq3s Float16 dequantize 3-D
+73285659b9c63822 cpu iq3s BFloat16 dequantize 2-D
+1e6abc06d59864a1 cpu iq3s BFloat16 dequantize 3-D

@@ -1,0 +1,321 @@
+# Golden digests of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
+# <first 8 bytes of SHA-256 over dtype, shape and output bytes, or a value> <case>
+applegpu_g17s = machine
+applegpu_g14s = route
+false = nax
+315 = cases
+864f61e75ae548b3 gpu q3k Float32 gather t unsorted
+decab8ea86875346 gpu q3k Float32 gather t sorted
+dce3b086abffd39e gpu q3k Float32 gather t sorted-ids unsorted-flag
+8e06c0f8653dee79 gpu q3k Float32 gather t odd unsorted
+f9ff2a1a847e8112 gpu q3k Float32 gather t odd sorted
+0b8e0530b6466812 gpu q3k Float32 gather n sorted
+1864c007a12d027b gpu q3k Float32 gather n unsorted
+e83c687aaad57903 gpu q3k Float32 gather t lhs M=1
+1447dbd5d1db832a gpu q3k Float32 gather n lhs M=1
+97acd172767ea9e3 gpu q3k Float32 gather t lhs M=4
+9a02f55bd93902e5 gpu q3k Float32 gather n lhs M=4
+bdabb852880e67b2 gpu q3k Float32 gather t lhs M=33
+f6a6d3746d3935e2 gpu q3k Float32 gather n lhs M=33
+ef93e550e345b3e5 gpu q3k Float16 gather t unsorted
+bf21810baf136e92 gpu q3k Float16 gather t sorted
+ba19a1e783554a7e gpu q3k Float16 gather t sorted-ids unsorted-flag
+e91b924aab906232 gpu q3k Float16 gather t odd unsorted
+5fd93d7c34233ea5 gpu q3k Float16 gather t odd sorted
+af180f47556195a9 gpu q3k Float16 gather n sorted
+ec66b32b9679b9c9 gpu q3k Float16 gather n unsorted
+546f57fd271f0da7 gpu q3k Float16 gather t lhs M=1
+17cbfd4b09dea2c2 gpu q3k Float16 gather n lhs M=1
+3366efe2e155bb57 gpu q3k Float16 gather t lhs M=4
+d3919adfa1e68425 gpu q3k Float16 gather n lhs M=4
+b9bc492e31fca9fc gpu q3k Float16 gather t lhs M=33
+b8e80a614deb6c0f gpu q3k Float16 gather n lhs M=33
+1c6f4a8d0f5dfeb5 gpu q3k BFloat16 gather t unsorted
+a1371b4791c19f40 gpu q3k BFloat16 gather t sorted
+dee95f9366611392 gpu q3k BFloat16 gather t sorted-ids unsorted-flag
+6034acb2edc52bd2 gpu q3k BFloat16 gather t odd unsorted
+7d24812ce0b9a131 gpu q3k BFloat16 gather t odd sorted
+cd5b52d72fa8745c gpu q3k BFloat16 gather n sorted
+02d849fab2dae94d gpu q3k BFloat16 gather n unsorted
+e0df2f1abdefc242 gpu q3k BFloat16 gather t lhs M=1
+1d4f0a06fc2081c5 gpu q3k BFloat16 gather n lhs M=1
+88c1a6b714fd0eb7 gpu q3k BFloat16 gather t lhs M=4
+cbde63b7231600ab gpu q3k BFloat16 gather n lhs M=4
+c6961723a5940e16 gpu q3k BFloat16 gather t lhs M=33
+c18b229d1869c4c5 gpu q3k BFloat16 gather n lhs M=33
+e5443de7e5de2c6c gpu q6k Float32 gather t unsorted
+db10f1d41b72e7ec gpu q6k Float32 gather t sorted
+92d02e0da148e619 gpu q6k Float32 gather t sorted-ids unsorted-flag
+b8b36b2c4d41d383 gpu q6k Float32 gather t odd unsorted
+321867572e1f20c0 gpu q6k Float32 gather t odd sorted
+dfadd3c6c6a4cd88 gpu q6k Float32 gather n sorted
+87d12cc882191b4b gpu q6k Float32 gather n unsorted
+c3b592e84de084fa gpu q6k Float32 gather t lhs M=1
+c300489db21154c2 gpu q6k Float32 gather n lhs M=1
+24578070368585db gpu q6k Float32 gather t lhs M=4
+9962ac08d715c490 gpu q6k Float32 gather n lhs M=4
+d5aaa589fb85cf97 gpu q6k Float32 gather t lhs M=33
+0c1bdc557ce4abff gpu q6k Float32 gather n lhs M=33
+15dbafda5433af68 gpu q6k Float16 gather t unsorted
+bef65a8f078e0859 gpu q6k Float16 gather t sorted
+fd2fc0ddcec52099 gpu q6k Float16 gather t sorted-ids unsorted-flag
+25bd98e4713d756f gpu q6k Float16 gather t odd unsorted
+dfec3985f223ee59 gpu q6k Float16 gather t odd sorted
+61d51d075454c925 gpu q6k Float16 gather n sorted
+4a586018f03389e3 gpu q6k Float16 gather n unsorted
+76e8004f8d7e6f8c gpu q6k Float16 gather t lhs M=1
+d18992057e600f2f gpu q6k Float16 gather n lhs M=1
+8b4e2d4613dc9ed7 gpu q6k Float16 gather t lhs M=4
+5a3a03a5031493b3 gpu q6k Float16 gather n lhs M=4
+389be30dd6c9ce9d gpu q6k Float16 gather t lhs M=33
+112d7fa4dbf11c4b gpu q6k Float16 gather n lhs M=33
+046898f7baa868c1 gpu q6k BFloat16 gather t unsorted
+e45a7a431fa20d6f gpu q6k BFloat16 gather t sorted
+8edcdab4e92d4a6d gpu q6k BFloat16 gather t sorted-ids unsorted-flag
+c3c7646ebe6b696b gpu q6k BFloat16 gather t odd unsorted
+d9b3689d67141d12 gpu q6k BFloat16 gather t odd sorted
+cc91b78c050f2fa4 gpu q6k BFloat16 gather n sorted
+a38fb2407f590f4a gpu q6k BFloat16 gather n unsorted
+3c2e3ea5a7005bbd gpu q6k BFloat16 gather t lhs M=1
+38c16489a8f0b84c gpu q6k BFloat16 gather n lhs M=1
+c776793621427ffe gpu q6k BFloat16 gather t lhs M=4
+092dbb1a021a2247 gpu q6k BFloat16 gather n lhs M=4
+1a6a876d15128100 gpu q6k BFloat16 gather t lhs M=33
+45093f4c5a1f5a36 gpu q6k BFloat16 gather n lhs M=33
+0142593dd2e30b47 gpu q4k Float32 gather t unsorted
+500066dd727ffeef gpu q4k Float32 gather t sorted
+27af8cef87e4ac90 gpu q4k Float32 gather t sorted-ids unsorted-flag
+90941034432651fd gpu q4k Float32 gather t odd unsorted
+b78041893586f1d9 gpu q4k Float32 gather t odd sorted
+a04eafd86e4af36d gpu q4k Float32 gather n sorted
+462a554d4bfbcc2b gpu q4k Float32 gather n unsorted
+31123bfd9ae3e35f gpu q4k Float32 gather t lhs M=1
+25f13a2d26f59712 gpu q4k Float32 gather n lhs M=1
+377a9c96e69d07ad gpu q4k Float32 gather t lhs M=4
+57e8edf13405eed2 gpu q4k Float32 gather n lhs M=4
+edeecc0229986f9a gpu q4k Float32 gather t lhs M=33
+218969c515eeee2b gpu q4k Float32 gather n lhs M=33
+cb5385b2c03d2659 gpu q4k Float16 gather t unsorted
+1d861cccd73f5a06 gpu q4k Float16 gather t sorted
+261f3f172a00fc11 gpu q4k Float16 gather t sorted-ids unsorted-flag
+b73c88102d03933f gpu q4k Float16 gather t odd unsorted
+b47af16c11787a25 gpu q4k Float16 gather t odd sorted
+ce8f6b55f3b10e27 gpu q4k Float16 gather n sorted
+7d25c786c32913eb gpu q4k Float16 gather n unsorted
+23703c9b5eb430c9 gpu q4k Float16 gather t lhs M=1
+918e91e82e46ca92 gpu q4k Float16 gather n lhs M=1
+12f69b8215519ff6 gpu q4k Float16 gather t lhs M=4
+b2f33bf04743032f gpu q4k Float16 gather n lhs M=4
+ee6bcb5a55b73733 gpu q4k Float16 gather t lhs M=33
+bb73634cd82ea06e gpu q4k Float16 gather n lhs M=33
+5bbab45187952069 gpu q4k BFloat16 gather t unsorted
+8d46c5f1908bf155 gpu q4k BFloat16 gather t sorted
+635823121429b02e gpu q4k BFloat16 gather t sorted-ids unsorted-flag
+08fca3bcb4e27c7e gpu q4k BFloat16 gather t odd unsorted
+68968f6818813aa1 gpu q4k BFloat16 gather t odd sorted
+9092f43d62594c8f gpu q4k BFloat16 gather n sorted
+4eb4ebcff72d172b gpu q4k BFloat16 gather n unsorted
+69edc112b50cdd07 gpu q4k BFloat16 gather t lhs M=1
+a89f8beb966945f9 gpu q4k BFloat16 gather n lhs M=1
+d576816e09079ebb gpu q4k BFloat16 gather t lhs M=4
+2e1d1068a4e8dfce gpu q4k BFloat16 gather n lhs M=4
+233e0be7a44dc7b9 gpu q4k BFloat16 gather t lhs M=33
+4e254d9c059148b3 gpu q4k BFloat16 gather n lhs M=33
+a6f84dea0842c987 gpu q5k Float32 gather t unsorted
+52277661b10fb7b1 gpu q5k Float32 gather t sorted
+a937f38603071a42 gpu q5k Float32 gather t sorted-ids unsorted-flag
+0bdac7558169488e gpu q5k Float32 gather t odd unsorted
+8d350e2e691e09c8 gpu q5k Float32 gather t odd sorted
+0860ecd69a7c1828 gpu q5k Float32 gather n sorted
+3aee1f5f675465e5 gpu q5k Float32 gather n unsorted
+2d3f21a057cedda8 gpu q5k Float32 gather t lhs M=1
+8f4d6757d0538ec9 gpu q5k Float32 gather n lhs M=1
+a4a2bc8dcf638fd1 gpu q5k Float32 gather t lhs M=4
+883accce6d3a35f1 gpu q5k Float32 gather n lhs M=4
+993d93bdcc488677 gpu q5k Float32 gather t lhs M=33
+a3c62f25f4b32789 gpu q5k Float32 gather n lhs M=33
+51bd9812743b52cc gpu q5k Float16 gather t unsorted
+a70e165b9dd016e7 gpu q5k Float16 gather t sorted
+4b1a4b36bad7c7b9 gpu q5k Float16 gather t sorted-ids unsorted-flag
+d116fd268eded959 gpu q5k Float16 gather t odd unsorted
+a221b370825057e1 gpu q5k Float16 gather t odd sorted
+daadbdecafec2f0b gpu q5k Float16 gather n sorted
+1d08154d83edf40a gpu q5k Float16 gather n unsorted
+787669aede57ed95 gpu q5k Float16 gather t lhs M=1
+a570469c90c704d8 gpu q5k Float16 gather n lhs M=1
+0131ee360c2ccdc7 gpu q5k Float16 gather t lhs M=4
+7edb0d28cb3b7513 gpu q5k Float16 gather n lhs M=4
+32258a594bbf7285 gpu q5k Float16 gather t lhs M=33
+46f9da628e76217b gpu q5k Float16 gather n lhs M=33
+fb6f520072e834a9 gpu q5k BFloat16 gather t unsorted
+19a234322c84c937 gpu q5k BFloat16 gather t sorted
+743a17e716ec0a48 gpu q5k BFloat16 gather t sorted-ids unsorted-flag
+5c2037f877838d6d gpu q5k BFloat16 gather t odd unsorted
+2c407a8af2ef68f3 gpu q5k BFloat16 gather t odd sorted
+7c061428e9ec50f9 gpu q5k BFloat16 gather n sorted
+7cb4f5758853dd49 gpu q5k BFloat16 gather n unsorted
+6ab8a507ac91d5f7 gpu q5k BFloat16 gather t lhs M=1
+b127147d2d32fe2e gpu q5k BFloat16 gather n lhs M=1
+394c38c40d15da78 gpu q5k BFloat16 gather t lhs M=4
+8035d47611318ecb gpu q5k BFloat16 gather n lhs M=4
+8bcae153b29386d8 gpu q5k BFloat16 gather t lhs M=33
+3fafaba2a2d5275e gpu q5k BFloat16 gather n lhs M=33
+e1860515a94b8367 gpu iq4nl Float32 gather t unsorted
+dd61fc5133e7d1fd gpu iq4nl Float32 gather t sorted
+bd83025ffbc4382b gpu iq4nl Float32 gather t sorted-ids unsorted-flag
+28b6d36838c3cf40 gpu iq4nl Float32 gather t odd unsorted
+8da1a6904b038e36 gpu iq4nl Float32 gather t odd sorted
+bd659c6c1e64234f gpu iq4nl Float32 gather n sorted
+2c0ff8650f7d679f gpu iq4nl Float32 gather n unsorted
+34c097c294244680 gpu iq4nl Float32 gather t lhs M=1
+4b200ee8264f4a0c gpu iq4nl Float32 gather n lhs M=1
+de410f729a4477ff gpu iq4nl Float32 gather t lhs M=4
+0b75422411c29902 gpu iq4nl Float32 gather n lhs M=4
+454c239ba1c67c6e gpu iq4nl Float32 gather t lhs M=33
+03f1e04e1389e7cd gpu iq4nl Float32 gather n lhs M=33
+fe415955f5d73316 gpu iq4nl Float16 gather t unsorted
+7308f365a9676dd2 gpu iq4nl Float16 gather t sorted
+3dc154b47704482f gpu iq4nl Float16 gather t sorted-ids unsorted-flag
+7d5223e66457bbad gpu iq4nl Float16 gather t odd unsorted
+1f0c5f76e1330bd6 gpu iq4nl Float16 gather t odd sorted
+7b1be18c9961b06c gpu iq4nl Float16 gather n sorted
+b9940c93e0f5ad22 gpu iq4nl Float16 gather n unsorted
+df5992b45ef26822 gpu iq4nl Float16 gather t lhs M=1
+4547e921c51d49a1 gpu iq4nl Float16 gather n lhs M=1
+5c85a6e5fe220e22 gpu iq4nl Float16 gather t lhs M=4
+843d16bd66774a00 gpu iq4nl Float16 gather n lhs M=4
+2cba0829f5e6590b gpu iq4nl Float16 gather t lhs M=33
+449fb0e4459e6d76 gpu iq4nl Float16 gather n lhs M=33
+f0168e49723ca614 gpu iq4nl BFloat16 gather t unsorted
+5f756b55e3f1472e gpu iq4nl BFloat16 gather t sorted
+09a4b82192d83a03 gpu iq4nl BFloat16 gather t sorted-ids unsorted-flag
+c52bbe5d9e22930a gpu iq4nl BFloat16 gather t odd unsorted
+70a030986e0932ac gpu iq4nl BFloat16 gather t odd sorted
+87ee3b84b15410d4 gpu iq4nl BFloat16 gather n sorted
+f8987cdc6dcf7ef4 gpu iq4nl BFloat16 gather n unsorted
+2d878c87242f9472 gpu iq4nl BFloat16 gather t lhs M=1
+fdb2e4a92c1159bc gpu iq4nl BFloat16 gather n lhs M=1
+7fbfe9754a9fccfb gpu iq4nl BFloat16 gather t lhs M=4
+73185093ca3bfc04 gpu iq4nl BFloat16 gather n lhs M=4
+26d7fc0cbdeeefeb gpu iq4nl BFloat16 gather t lhs M=33
+43797ffe1ff5262d gpu iq4nl BFloat16 gather n lhs M=33
+eaa536654620af0d gpu iq4xs Float32 gather t unsorted
+0e2cc2d1c75b0590 gpu iq4xs Float32 gather t sorted
+1aad76aa2d5773cc gpu iq4xs Float32 gather t sorted-ids unsorted-flag
+f396a5254e0db995 gpu iq4xs Float32 gather t odd unsorted
+e9333a93b507855a gpu iq4xs Float32 gather t odd sorted
+2ca4e7fc7819b4cb gpu iq4xs Float32 gather n sorted
+aa5c47d18d7cf298 gpu iq4xs Float32 gather n unsorted
+3eba10fc82c2a8d3 gpu iq4xs Float32 gather t lhs M=1
+c7547062ae248cc0 gpu iq4xs Float32 gather n lhs M=1
+a9501d5cfb25acd9 gpu iq4xs Float32 gather t lhs M=4
+1371f410fbfaf36c gpu iq4xs Float32 gather n lhs M=4
+f00a629ee7c1c651 gpu iq4xs Float32 gather t lhs M=33
+18e506b0c40b89aa gpu iq4xs Float32 gather n lhs M=33
+b1a468c999573985 gpu iq4xs Float16 gather t unsorted
+75e0cf78fb3041fb gpu iq4xs Float16 gather t sorted
+a61aea29a3033c17 gpu iq4xs Float16 gather t sorted-ids unsorted-flag
+64a4b6ab98426d17 gpu iq4xs Float16 gather t odd unsorted
+effa6cf9dd4fd27a gpu iq4xs Float16 gather t odd sorted
+8e856043445dee43 gpu iq4xs Float16 gather n sorted
+2cb910e406db55cd gpu iq4xs Float16 gather n unsorted
+a836cc1267be01f9 gpu iq4xs Float16 gather t lhs M=1
+d7e75ae6c74789b6 gpu iq4xs Float16 gather n lhs M=1
+07f8ce43d9f20101 gpu iq4xs Float16 gather t lhs M=4
+6d62be29a51c3f78 gpu iq4xs Float16 gather n lhs M=4
+d00a7a5f80a6c50a gpu iq4xs Float16 gather t lhs M=33
+dc91cb2ce625697b gpu iq4xs Float16 gather n lhs M=33
+572aea0aedbab514 gpu iq4xs BFloat16 gather t unsorted
+8408c8f0c5654c2b gpu iq4xs BFloat16 gather t sorted
+a1b99e0703d33bbf gpu iq4xs BFloat16 gather t sorted-ids unsorted-flag
+1105faec8fa41d33 gpu iq4xs BFloat16 gather t odd unsorted
+5599d8a459eeb10c gpu iq4xs BFloat16 gather t odd sorted
+1a2e2c64a9492aa2 gpu iq4xs BFloat16 gather n sorted
+37622a12f65d468a gpu iq4xs BFloat16 gather n unsorted
+1e9df744f30cf448 gpu iq4xs BFloat16 gather t lhs M=1
+5a02ec199f613fe7 gpu iq4xs BFloat16 gather n lhs M=1
+b259ea48ceb8d20f gpu iq4xs BFloat16 gather t lhs M=4
+ff5ea038906397f8 gpu iq4xs BFloat16 gather n lhs M=4
+e945713afde86340 gpu iq4xs BFloat16 gather t lhs M=33
+e835eb613476a456 gpu iq4xs BFloat16 gather n lhs M=33
+11bd5fc6b3ca3f83 gpu iq3s Float32 gather t unsorted
+8755d27a3fb6af94 gpu iq3s Float32 gather t sorted
+c88b7edcad1e61fe gpu iq3s Float32 gather t sorted-ids unsorted-flag
+a441a19f061fc9a6 gpu iq3s Float32 gather t odd unsorted
+f9c295c616a2f60c gpu iq3s Float32 gather t odd sorted
+7f80272bd470c769 gpu iq3s Float32 gather n sorted
+782048fc2d91dc8a gpu iq3s Float32 gather n unsorted
+a145f9d978a5768d gpu iq3s Float32 gather t lhs M=1
+3fb2fb54a248e6f1 gpu iq3s Float32 gather n lhs M=1
+df898e2134ae7c01 gpu iq3s Float32 gather t lhs M=4
+dbcc75f2511111b8 gpu iq3s Float32 gather n lhs M=4
+9ac73104bf4a6526 gpu iq3s Float32 gather t lhs M=33
+b25e22101a78f89d gpu iq3s Float32 gather n lhs M=33
+ef24a004ef27f1d3 gpu iq3s Float16 gather t unsorted
+ecd3bab960a83fbf gpu iq3s Float16 gather t sorted
+f3e2d7c337e49923 gpu iq3s Float16 gather t sorted-ids unsorted-flag
+74ecf0eeefd956c5 gpu iq3s Float16 gather t odd unsorted
+2e0f592650e57524 gpu iq3s Float16 gather t odd sorted
+5418bf99d0b0ea37 gpu iq3s Float16 gather n sorted
+d2982abc65c30119 gpu iq3s Float16 gather n unsorted
+e65f37a35a61e1c3 gpu iq3s Float16 gather t lhs M=1
+7d6cf9c8a2cf38ec gpu iq3s Float16 gather n lhs M=1
+29e1013ffd3a44bb gpu iq3s Float16 gather t lhs M=4
+724fccd8b07cacc8 gpu iq3s Float16 gather n lhs M=4
+ec21742ede5f962d gpu iq3s Float16 gather t lhs M=33
+3e27317ca73b3df4 gpu iq3s Float16 gather n lhs M=33
+40baf63df9586feb gpu iq3s BFloat16 gather t unsorted
+ab8fa75e81e5fde5 gpu iq3s BFloat16 gather t sorted
+6cfe8c3459cb4b28 gpu iq3s BFloat16 gather t sorted-ids unsorted-flag
+7a9cae2b79579687 gpu iq3s BFloat16 gather t odd unsorted
+a1a8426c565a0294 gpu iq3s BFloat16 gather t odd sorted
+a933fd6d34b1229d gpu iq3s BFloat16 gather n sorted
+782beb8079880ff7 gpu iq3s BFloat16 gather n unsorted
+c9ac140e2493fba1 gpu iq3s BFloat16 gather t lhs M=1
+b8398bb926676fe7 gpu iq3s BFloat16 gather n lhs M=1
+8c7fe6c45cb8d2c8 gpu iq3s BFloat16 gather t lhs M=4
+ec3cf0b52e4d0aa3 gpu iq3s BFloat16 gather n lhs M=4
+922237c3267a667a gpu iq3s BFloat16 gather t lhs M=33
+ad7b8fc063e7ecb7 gpu iq3s BFloat16 gather n lhs M=33
+2dc4b03f1ef1e51e gpu q3k Float32 dequantize 2-D
+fbf855489bc1e1c8 gpu q3k Float32 dequantize 3-D
+24fabfd0b705152d gpu q3k Float16 dequantize 2-D
+5ec21a9585de3b2d gpu q3k Float16 dequantize 3-D
+bb9e0709b6590a46 gpu q3k BFloat16 dequantize 2-D
+c14ad14925a42a6e gpu q3k BFloat16 dequantize 3-D
+da7d7975a7c3c112 gpu q6k Float32 dequantize 2-D
+b5b74eb39f69d737 gpu q6k Float32 dequantize 3-D
+29169332e47a08bb gpu q6k Float16 dequantize 2-D
+92a0ef4064710fac gpu q6k Float16 dequantize 3-D
+60f93c10eb8df9b0 gpu q6k BFloat16 dequantize 2-D
+052881a829ad96be gpu q6k BFloat16 dequantize 3-D
+c91def147085e74b gpu q4k Float32 dequantize 2-D
+97e84b8ed2ff0c2f gpu q4k Float32 dequantize 3-D
+1188aa19366e7c69 gpu q4k Float16 dequantize 2-D
+8ad6145d8f4dd764 gpu q4k Float16 dequantize 3-D
+95d5c6ae7434697f gpu q4k BFloat16 dequantize 2-D
+4dacbff07faf379c gpu q4k BFloat16 dequantize 3-D
+e60c49adacee1096 gpu q5k Float32 dequantize 2-D
+e2f1d3ed1f93dbbf gpu q5k Float32 dequantize 3-D
+419af7ecaa0ee650 gpu q5k Float16 dequantize 2-D
+a069939e650400ff gpu q5k Float16 dequantize 3-D
+0d055e99616036e6 gpu q5k BFloat16 dequantize 2-D
+555df68ad2162189 gpu q5k BFloat16 dequantize 3-D
+d020f716e0b2df39 gpu iq4nl Float32 dequantize 2-D
+5ece7363f1e56351 gpu iq4nl Float32 dequantize 3-D
+5000f4b25a7f30a9 gpu iq4nl Float16 dequantize 2-D
+014f44f4377dc3dc gpu iq4nl Float16 dequantize 3-D
+033d2b12c4970c7a gpu iq4nl BFloat16 dequantize 2-D
+5b40018363a6f7f9 gpu iq4nl BFloat16 dequantize 3-D
+7b00431ece232a8d gpu iq4xs Float32 dequantize 2-D
+4e4d1eae4c8d9160 gpu iq4xs Float32 dequantize 3-D
+e0c08dd49568c1fb gpu iq4xs Float16 dequantize 2-D
+d8ad89f5199cf84e gpu iq4xs Float16 dequantize 3-D
+500e0472370e09bf gpu iq4xs BFloat16 dequantize 2-D
+d1bfc67953b73d91 gpu iq4xs BFloat16 dequantize 3-D
+84d761a051ad73b7 gpu iq3s Float32 dequantize 2-D
+57de77ef0aadaa9e gpu iq3s Float32 dequantize 3-D
+f40747f6229d3f88 gpu iq3s Float16 dequantize 2-D
+d0b5ae1cec78dfa3 gpu iq3s Float16 dequantize 3-D
+73285659b9c63822 gpu iq3s BFloat16 dequantize 2-D
+1e6abc06d59864a1 gpu iq3s BFloat16 dequantize 3-D

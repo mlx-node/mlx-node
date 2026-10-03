@@ -18,8 +18,10 @@
 
 #![cfg(target_os = "macos")]
 
+mod golden_support;
 mod kquant_support;
 
+use golden_support::{Golden, Mode};
 use kquant_support::{family_count, read_bits, start_counting, stop_counting};
 use mlx_core::array::MxArray;
 
@@ -90,6 +92,7 @@ struct Tally {
     cases: usize,
     kernels: [u64; 4],
     routes: [u64; 4],
+    golden: Golden,
 }
 
 impl Tally {
@@ -108,7 +111,7 @@ impl Tally {
         };
         let kernels_before = counts(&KERNELS);
         let routes_before = counts(&ROUTES);
-        let (ours_shape, _, ours) = read_bits(&format!("{ctx} ours"), ours);
+        let (ours_shape, ours_dtype, ours) = read_bits(&format!("{ctx} ours"), ours);
         let kernels: Vec<u64> = counts(&KERNELS)
             .iter()
             .zip(&kernels_before)
@@ -150,6 +153,7 @@ impl Tally {
             ours.iter().any(|&b| b & 0x7fff != 0),
             "{ctx}: an all-zero output proves nothing"
         );
+        self.golden.record_bits(ctx, &ours_shape, ours_dtype, &ours);
         for (total, delta) in self.kernels.iter_mut().zip(&kernels) {
             *total += delta;
         }
@@ -173,13 +177,42 @@ fn planners_and_policy_match_fork() {
     );
     assert_eq!(mismatches, 0);
     assert!(checked > 1_000_000, "the sweep shrank: {checked}");
+    let class = device_class();
+    let mut digests = [0u64; 6];
+    let ours = unsafe {
+        mlx_sys::mlx_segmented_sdpa_test_plan_digests(
+            class as std::ffi::c_char,
+            0,
+            digests.as_mut_ptr(),
+        )
+    };
+    assert_eq!(ours, checked, "the digest sweep must cover the fork sweep");
+    let mut g = Golden::pure(
+        &format!("segmented_sdpa_plan.class_{}", class as char),
+        Mode::from_env(),
+    );
+    g.record_value("inputs", &ours.to_string());
+    for (name, d) in PLAN_DIGESTS.iter().zip(digests) {
+        g.record_value(name, &format!("{d:016x}"));
+    }
+    g.finish();
 }
+
+const PLAN_DIGESTS: [&str; 6] = [
+    "sdpa_vector_uses_two_pass",
+    "sdpa_vector_partition_count",
+    "segmented_verify_head_rows",
+    "plan_segmented_sdpa_launch",
+    "plan_segmented_verify_launch",
+    "select_segmented_verify_route",
+];
 
 #[test]
 fn max_query_length_matches_fork() {
     if !metal() {
         return;
     }
+    let mut g = Golden::metal("segmented_sdpa_max_query_length", Mode::from_env());
     let mut widths = Vec::new();
     for gqa in 0..=33 {
         let ours = max_query_length(gqa);
@@ -187,10 +220,12 @@ fn max_query_length_matches_fork() {
             mlx_sys::mlx_test_fork_segmented_sdpa_max_query_length(gqa as i32)
         });
         assert_eq!(ours, fork, "gqa {gqa}: our pipelines support other widths");
+        g.record_value(&format!("gqa {gqa}"), &ours.to_string());
         widths.push(ours);
     }
     eprintln!("max query length by gqa 0..=33: {widths:?}");
     assert!(widths[1..=32].iter().all(|&w| w >= 1));
+    g.finish();
 }
 
 #[test]
@@ -211,6 +246,7 @@ fn kernels_match_fork_bitwise() {
         cases: 0,
         kernels: [0; 4],
         routes: [0; 4],
+        golden: Golden::metal("segmented_sdpa_kernels", Mode::from_env()),
     };
     // (q heads, kv heads): GQA 1..32 including the Qwen3.5/3.8 head layouts.
     let layouts: [(i64, i64); 9] = [
@@ -273,7 +309,7 @@ fn kernels_match_fork_bitwise() {
                     let nk = bf16(&[1, kv_heads, new_n, D], 0x2468_ace0 ^ index);
                     let nv = bf16(&[1, kv_heads, new_n, D], 0xfdb9_7531 ^ index);
                     let ctx = format!(
-                        "gqa {gqa} ({q_heads}/{kv_heads}) rows {rows} prefix {prefix} \
+                        "#{index} gqa {gqa} ({q_heads}/{kv_heads}) rows {rows} prefix {prefix} \
                          new {new_n} causal {causal} sharp {sharp}"
                     );
                     tally.check(&ctx, &q, [&pk, &pv, &nk, &nv], causal);
@@ -328,4 +364,5 @@ fn kernels_match_fork_bitwise() {
     for (name, n) in ROUTES.iter().zip(tally.routes) {
         assert!(n > 0, "verify route {name} never ran");
     }
+    tally.golden.finish();
 }
