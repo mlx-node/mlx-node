@@ -1,119 +1,119 @@
-# Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
-# One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url.
+# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, captured on pin 053e43fec.
+# One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url, then the route.
 applegpu_g17s = machine
 applegpu_g14d = route
 false = nax
 112 = cases
 1ba2f3c625b84c46 = keys
-aAKve-aY
-aAKve-aY
-ErnW2l9p
-ErnW2l9p
-wjIRECZs
-wjIRECZs
-NK6q4m68
-NK6q4m68
-Agr8oduk
-Agr8oduk
-Agr8oduk
-Agr8oduk
-i3VC3IIB
-i3VC3IIB
-0tRWJvPY
-0tRWJvPY
--2ISGe-Y
--2ISGe-Y
-iZUNmtKT
-iZUNmtKT
-vEI5XZpo
-vEI5XZpo
-PPMY0xFw
-PPMY0xFw
-QDNaek-8
-QDNaek-8
-QDNaek-8
-QDNaek-8
-_kjUe2pw
-_kjUe2pw
-s0sGKQFd
-s0sGKQFd
-dv0igSR9
-dv0igSR9
-FIhfjhax
-FIhfjhax
-bi2IJpGl
-bi2IJpGl
-qS8sjC8Z
-qS8sjC8Z
-tzu-hsgg
-tzu-hsgg
-tzu-hsgg
-tzu-hsgg
-CWppfSFn
-CWppfSFn
-iVjrqEZh
-iVjrqEZh
-3Ljf31rv
-3Ljf31rv
-ar60g0v6
-ar60g0v6
-YIqRzM_8
-YIqRzM_8
-t2FQ8Y8H
-t2FQ8Y8H
-xUAznE03
-xUAznE03
-xUAznE03
-xUAznE03
-ezXdbi2P
-ezXdbi2P
-OxYNpeIa
-OxYNpeIa
-vpkqdS9o
-vpkqdS9o
-ltcKugQf
-ltcKugQf
-lfdMUrOS
-lfdMUrOS
-5lJM6f6T
-5lJM6f6T
-Flbl5ZzT
-Flbl5ZzT
-Flbl5ZzT
-Flbl5ZzT
-oEJ3WAmT
-oEJ3WAmT
-Qep7IVuw
-Qep7IVuw
-wxHmuHym
-wxHmuHym
-85HdIXwC
-85HdIXwC
-zhakrPB2
-zhakrPB2
-9S3Eimfc
-9S3Eimfc
-HGgBcCC8
-HGgBcCC8
-HGgBcCC8
-HGgBcCC8
-42RYIGHk
-42RYIGHk
-RDuTeGxt
-RDuTeGxt
-htela52q
-htela52q
-u3i1ZAsK
-u3i1ZAsK
-xUiuhJ_r
-xUiuhJ_r
-dBahxcKq
-dBahxcKq
-dkp3zJpR
-dkp3zJpR
-dkp3zJpR
-dkp3zJpR
-yhBDLoCw
-yhBDLoCw
-YFFaQ2X8
-YFFaQ2X8
+aAKve-aY promoted
+aAKve-aY promoted
+ErnW2l9p promoted
+ErnW2l9p promoted
+wjIRECZs promoted
+wjIRECZs promoted
+NK6q4m68 promoted
+NK6q4m68 promoted
+Agr8oduk promoted
+Agr8oduk promoted
+Agr8oduk promoted
+Agr8oduk promoted
+i3VC3IIB promoted
+i3VC3IIB promoted
+0tRWJvPY promoted
+0tRWJvPY promoted
+-2ISGe-Y promoted
+-2ISGe-Y promoted
+iZUNmtKT promoted
+iZUNmtKT promoted
+vEI5XZpo promoted
+vEI5XZpo promoted
+PPMY0xFw promoted
+PPMY0xFw promoted
+QDNaek-8 promoted
+QDNaek-8 promoted
+QDNaek-8 promoted
+QDNaek-8 promoted
+_kjUe2pw promoted
+_kjUe2pw promoted
+s0sGKQFd promoted
+s0sGKQFd promoted
+dv0igSR9 promoted
+dv0igSR9 promoted
+FIhfjhax promoted
+FIhfjhax promoted
+bi2IJpGl promoted
+bi2IJpGl promoted
+qS8sjC8Z promoted
+qS8sjC8Z promoted
+tzu-hsgg promoted
+tzu-hsgg promoted
+tzu-hsgg promoted
+tzu-hsgg promoted
+CWppfSFn promoted
+CWppfSFn promoted
+iVjrqEZh promoted
+iVjrqEZh promoted
+3Ljf31rv promoted
+3Ljf31rv promoted
+ar60g0v6 promoted
+ar60g0v6 promoted
+YIqRzM_8 promoted
+YIqRzM_8 promoted
+t2FQ8Y8H promoted
+t2FQ8Y8H promoted
+xUAznE03 promoted
+xUAznE03 promoted
+xUAznE03 promoted
+xUAznE03 promoted
+ezXdbi2P promoted
+ezXdbi2P promoted
+OxYNpeIa promoted
+OxYNpeIa promoted
+vpkqdS9o promoted
+vpkqdS9o promoted
+ltcKugQf promoted
+ltcKugQf promoted
+lfdMUrOS promoted
+lfdMUrOS promoted
+5lJM6f6T promoted
+5lJM6f6T promoted
+Flbl5ZzT promoted
+Flbl5ZzT promoted
+Flbl5ZzT promoted
+Flbl5ZzT promoted
+oEJ3WAmT promoted
+oEJ3WAmT promoted
+Qep7IVuw promoted
+Qep7IVuw promoted
+wxHmuHym promoted
+wxHmuHym promoted
+85HdIXwC promoted
+85HdIXwC promoted
+zhakrPB2 promoted
+zhakrPB2 promoted
+9S3Eimfc promoted
+9S3Eimfc promoted
+HGgBcCC8 promoted
+HGgBcCC8 promoted
+HGgBcCC8 promoted
+HGgBcCC8 promoted
+42RYIGHk promoted
+42RYIGHk promoted
+RDuTeGxt promoted
+RDuTeGxt promoted
+htela52q promoted
+htela52q promoted
+u3i1ZAsK promoted
+u3i1ZAsK promoted
+xUiuhJ_r promoted
+xUiuhJ_r promoted
+dBahxcKq promoted
+dBahxcKq promoted
+dkp3zJpR promoted
+dkp3zJpR promoted
+dkp3zJpR promoted
+dkp3zJpR promoted
+yhBDLoCw promoted
+yhBDLoCw promoted
+YFFaQ2X8 promoted
+YFFaQ2X8 promoted

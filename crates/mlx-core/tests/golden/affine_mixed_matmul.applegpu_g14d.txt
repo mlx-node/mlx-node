@@ -1,1537 +1,1537 @@
-# Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
-# One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url.
+# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, captured on pin 053e43fec.
+# One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url, then the route.
 applegpu_g17s = machine
 applegpu_g14d = route
 false = nax
 1530 = cases
 b802adbf9e0b84fe = keys
-Ap125Wu9
-xc91ds0E
-WA020W1K
-DP-0u5vZ
-J8JkWBsc
-lWaiWU_F
-K9YTA2hM
-0aVNRc4R
-ezb3t0fK
-V6p8ycnv
-_FTeyq9k
-OJUi6MpA
-lS_h8bwP
-23JWuglP
-NqZgmCAU
-BNITLDo-
-EIFjOK_s
-qWTPCuCq
-e91L1aq0
-HR5HLeiO
-kU8_lxTh
-kutZ8TSN
-OlvfmFDP
-gCubXy-G
-eQgmbE0Z
-OObzLB0_
-yx1po5RQ
-wI0PHkuh
-Mlk_Em5L
-twsdgoDS
-UuFo61YX
-M5qJzX0U
-F2cNkNmV
-_gaOXBfM
-XX0X7Q-O
-72WDTNnC
-NhxaN7Ll
-4WMQiXgP
-TISj9b5g
-6c7BtY2u
-NprGj3OP
-gbg8Byl3
--MjVx9DK
-I-Qfbz3X
-3xVolvCN
-mHr5Iy2N
-mphyxKtV
-_rdjq1fV
-Q4BUkB60
-YBQE2khN
-cbqqQS4w
-5cC9jr_P
-omBuJqB5
-R0O1yxy7
-jsc4qZA2
-Pg-QmUdO
-NdaGXG4q
-1qqqtVvk
-yyRQIsYq
-xnlbX1it
-4TBoTbOi
-_uxm04w0
-WCP_8N4s
-QaQ4qoFN
-0rISauu_
-wkw41sy0
-n7xKCASM
-gs9j7iT-
--IYGkc2g
-ATbWtPvC
-bkng7DPg
-CKVxVWKp
-qPmTEV_J
-LZGezh3k
-ObktJKEW
-KSk6lsDH
-DllPmAP5
-C6GEh1Cy
-ZPejT3JC
-e5azFpdW
-HG3bxOYH
-lp1mruwP
-joIGOhLi
-klq_W06G
-tNKl8jBM
-MbJ9w1V-
-QMziTPWU
-1Gi8hcjl
-T4WVTDDP
-2_6RskL0
-5gplQrl5
-pU8hUi0X
-c5oaSyl_
-m6qsdG7h
-EX0e0MoB
-9-lgrZ63
-j2488ahD
-EmCr9TLr
-W0nlVVoA
-6NYV9iWT
-nuABXo-I
-BYRSprDv
-jNa2yBHg
-3aixRblu
-z-EAuu8s
-ktL2cN1b
-8Udbi0xX
-W0GUzkbB
-FF4cI135
-MO6NrKTJ
-dSwRZq4H
-W6ouZyGF
-kpHPIbn8
-BOHv5HZ8
-CB9MMjjR
-YZGIYGXm
-6BHQ2qSu
-W7-vaH95
--XYESJ8O
-kGHGfCKL
-TpDUccAd
-_tmPL_IL
-gtNnr0sf
-x0u1vRmw
-EeKs4Zic
-45bg0qB4
-M74tYppn
-L9mrdcEl
-wmRcGMPg
-FrblOcJF
-nlU0lTbe
-qT-SmFkk
-eXpVZliw
-TwZSox-s
-1FmczTMO
-MeOpLg7e
-6vYCkwdD
-wmYWnE8T
-zUJ4PHmf
-XB8DtTAo
-oRwSRDG8
-Ym475Gl5
-z_6UTL_N
-LEZziEiH
--IpAUbnf
-1uUtgPAp
-Nqwa8EPS
-4JKhRZqm
-6BtINC4a
-a4a65bKh
-kc990D5A
-wFuIuo6X
-G_IktRYE
-tdN0lQm5
-xLPRGMgX
-nNFLbWIo
-miYnVkDg
-pVJyZxqg
-BQ3eKCah
-lRS4aBSV
-pZvhlyb5
-AdMNLYry
-THO-vwf3
-rUteGoHB
-1SxndmRW
-H7L5MPVs
-SU7XKKX9
-DG11uqn5
-nw63gOOM
-RcUKefpA
-ytq5qnoY
-mRIt-FNb
-ir-G-2jV
-ihNXSI01
-76QzVt-p
-QCzhPvIT
-Ag84PnFd
-ynwNUE4l
-kutrSsq9
-2WYfBYY7
-92aJ5PK2
-mPoWDNC8
-g-GSitan
-AMBIomfU
-tpCURPyX
-1eYd9fuO
-ZPjPlfH9
-t_4u1d7T
-jVDIiG-g
-3d-dnLk5
-TgL1MBjO
-6uLflEAk
-B3pkTS9l
-yi2ngNPp
-43cD5kfx
-W6GoyWLp
-Q76CPjmg
-M3G26PfS
-dGxBlkkc
-X7nzbGgc
-3SdDO5p6
-DX3qdgNB
-cfSZTxJM
-2jyZXQMQ
--7yDYhci
-8luGQevK
--7eASGEI
-X_Rdx-BV
-JDiAXcOf
-w9bf_hNI
-ZAOnqD-M
-2kaZigfk
-tWu1mZP1
-tg-zy4_x
-KhW7vtPJ
-VITaCI1N
-EsagxcAp
-DdC2fp-M
-qfzCsNdw
-4qbHpoVX
-aA6QavC8
-uH5_hBx2
-9EL5IQVl
-etQHwacz
-orSMQdid
-VeivEGeb
-_nGmickW
-zRLTaZWm
-5issGRQZ
-yxQSxk_G
-yjEweGM1
-Ev4o8sGc
-y1xaAXvC
-ChEOmsHf
-x2fdtc2u
-kxw_4_fk
-trbleNY8
-e87C-7Pl
-73ePcL3f
-fILnT8h_
-PkGl4fJb
-3cLj1E9P
-R3sGaq41
-3slI4Kns
-CsBAjWZq
-nYGLXmD-
-rjEsJnuq
-Rvj5GyXR
-V3E3SQnq
-HEhHjeQY
-fD9r5dhL
-0_WQjN_l
-Hg0SUaOk
-Hz66BZ0U
-e7TPlS7n
-8lb5mwjw
-dQvFUw8x
-vPeAVS3E
-bOfp307P
-FRfDg9oE
-7ToolAVR
-5cGMvb_J
-DVfAymwE
-EczGZFgW
-sc8jfA8o
-Pb-R4XWF
-6Pyc8HnR
-QIiFV0qb
-mx_l7ArV
-B4z3HkgT
-nXQ7WmC2
-tkxWY_1P
-oji5UxhK
-Cn1Xwtry
-5leaYVhf
-5KV9hOCR
-l-gvI4fz
-OGRbhIXO
-GIN5Fl4Y
-BTO4wAde
-lbtfeSrP
-iT9p_KgB
-KqE8QocR
-U77r_B1o
-kT6CwSy4
-XgzPZCze
-dMR71evk
-ryAHTPUZ
-kLmbB2VD
-bvri4hib
-7yCKpD_H
-1324k9lW
-ONSmYLRh
-bF6CtG7w
-RcaTgxeH
-XYgQW4tO
-QfVawy73
-0Rwoa0_C
-r0HXdFDD
-VQuJHWz9
-oNFayyhI
-jSpdy-u2
-cHhTszbx
-Ul_V5E-y
-NGApME12
-pIQuQK7s
-4OCRfzIT
-1h-3j5lG
-THQc2e0E
-Tjb_PEcS
-lebWnbFH
-fcHIvsZG
-n2ioTlm7
-ba7q9ATm
-91G6hVN7
-x67sj5qU
-wDE4GX9R
-SgG-C7Dt
-d4xtSHR6
-ng3qrrNN
-fwR9HWnX
-UD5w9rDF
-dMs2dT4a
-gJLdD71i
-XU4moA-b
-RSSjWXe1
-gbiCgOQb
-pxzTV-D2
-ApDfhbbN
-_0xEN3wH
-sEV1ac8m
-7h4kJo35
-ee6EhUjA
-i_9PacpX
-hvYEWhRH
-XxteX-Kg
-QdQGbTxK
-IGdmYayL
-UQJdtPqv
-m1L9Wn5x
-1oUWTpf-
-oGzsirPw
-w9N2INLM
-PelMvl96
-hCFLtMhY
-wAVGNKiH
-Fll2NVpy
-hWLwAP5c
-EWZa2d_2
-5bP2h-ys
-Pf-yAOMF
-gpOr7HL4
-K6wH7Cum
-9K2F42DR
-Uo2ZRcLN
-X1X9qWDG
-WVp6HDLZ
-_MVT2kOR
-W1wsJnz5
-f-U-TLbl
-oGEoFOlj
-v-FsGL9l
-s4UfvJq5
-AAiT06Dj
-pqpFH2Xj
-utm6XPBc
-tIJFfZhL
-qAWDbPYN
-CdM6EA_i
-KtxzFcuv
-A_Hp4Jph
-mo7B4pzX
-L6yTuCwA
-3aa8hapE
-zxNlK43c
-s4WLe8iv
-ghs1uila
-h5h6O593
-xeDd7zI5
-3rangy0Y
-Si3YK-Ei
-u1nTPHN7
-fnN9n_uu
-Tj2WeIyL
-gdiHckXZ
-zi08Q7MQ
-rlK51wfr
-wD6vFrZN
-OwaeJhOS
-3T9OMe9S
-HF6PBMNE
-BUPmFvYs
-HmlpnMBg
-_PCS3waR
-9MsER86p
-5PUqM8Iq
-BL6gDMg5
-iTfL-NvZ
-mDeXxOUz
-59X-x5zU
-Qw8_5xC4
-xpF4k6s6
-HN7a5D3i
-nyKRhet0
-tqqKqfM_
-jdonlEDk
-ED2uwSd7
-9b_9AcVj
-I_pIa3Bi
-nyVd5Y_L
-CBT6sX4A
-PQ05QEeF
-ulRVplnG
-33dTmONj
-mBhMFD97
-m3h-ccjA
-21azBYHH
-SPMdXcpQ
-eQiLUw3o
-2dHqYMTC
-bnKCajpb
-2g0kwFa1
-5vQwrEOS
-2ChmC1sZ
-QiZgDFO-
-1lgC3tlP
-bk6hWGcq
-kDwsZpWN
-WbKgUMRz
-wAECPe8B
-Wx937sKA
-ZC77ZY47
-Lhp6NcEh
-4SFZpsRG
--TTq7HH6
-ATvY3afk
-h6or47UZ
-VcnyVp5Q
-EOxy4MIM
-oXU-idG-
-P1UzgXQJ
-Q2A2U9NQ
-PGrmthBT
-P-kDwYAd
-9Gk1CV_V
-1roLAlUt
-dHy5WnLl
-2vuA7WqP
-xDNNRTho
-shUf-H2m
-SNj4l76D
-2Ggdg3er
-N4N9zBWv
-Lam_dbMb
-IJqbHPFg
-t_ngEDU7
-i5HZMvcf
-A63hpUae
-9y0isO3U
-gOE0-88N
-SSRy1OuM
-2eb23ii2
-XFPV7sCZ
-ckjO1wxf
-ACekH06A
-bhWRwZIX
-fdeta3Vn
-qSCUOBOo
-2UuB1OGT
-Abls2fDA
-B8kIXTdU
-TInitHXv
-OW-wGrLv
-3raz1qP1
-41xh-BJd
-D5PJ7UI0
-l1PTdoX7
-e82vLguh
-ZMqlH-iJ
-AE2OwRWg
-ow9fZif0
-LMvb51R5
-5-GQXCvO
-ldfbDibl
-8L_XN8YY
-g1O177f4
-QF6yoj3H
-xByhlAy-
-65OKBxKD
-LQev5gcP
-1fBGdKl1
-q-e3tmge
-OTV3TziI
-efu8CROo
-v78qoS7D
-arU52PYz
-hI1an6SP
-7VnRbib-
-BL07_ZgB
-3oe5wi5m
--cgNy9lE
-hkiBdq7T
-i50PeNRV
-nSwwxlKw
-06V_fhft
-uBL_8Yxq
-LEsQyKGI
-AQPViwZx
-dwYv7zvD
-0G76fao9
-9L2DpMvP
-FcRyVGV9
-jigsRv_Y
-IQN1hdqs
-wgzXaZok
-8BCwFUyU
-MUOFVXcl
-pfPbbP2X
-QRaPpD4B
-XTRC8LoI
-ZjYRtCNQ
-QzWFss3s
-FvuZnQEi
-nHIcR1D8
-NWgy7cVE
-Wykux1bK
-1X4R1Ioq
-eiug3W2F
-GutgKXw7
---zhExZI
-dLs7NVYf
-DcblYc4V
-sM0k33UN
-OWpQTGli
-K0RGiIPy
-1NV5NTDS
-Fcs4w04w
-ncFnLIJy
-QX33AkNp
-dO0HSmUL
-R-rNCeqG
-xdWgh2Qh
-2Qwdq_-X
-WRdBYJU_
-iIUV2Hrd
-jfM9Y4Bu
-nJRPnlTi
-iGqsUQkr
-fhlYU-ek
-0NGpRKfv
-JK3nHMY0
-GGkubyxS
-0u0l5h-X
-9C114H8T
-cP4ygTNQ
-_HafAG9z
-zivIvXv6
-5tLoIIg0
-mRPpNBRW
-6gEUMSKZ
-ggTBXJpl
-8Bki0vKT
-2TuCHdFx
-QGdmyYJX
-RJTkJfBN
-hJT_AwQa
-hhhNfoZt
-xf6pNNr9
-rlQhhk75
-LkF1uv2c
-GhFRB_Lt
-_LOXzM5q
-zXceWan7
-BNQDdef1
-gxy2rAyZ
-rhN_Lvuu
--bTDKV3E
-eiXR9_tU
-izLGUH4y
-gtGq1Xsa
-DzO89a8W
-vPoJQr2x
-pxA3M9to
-OU1AbknG
-t2Vs1Pbm
-10_KcbLd
-w1GgcOOa
-rAQKX-en
-9j9l_9FI
-loS9IAgp
-MC3QKzrS
-bxmn7ZR0
-LvTHWOBL
-xy_OSgqn
-4GvZ82uM
-k8Lgmupp
-x-JOv8rr
-2Gjnw_Hc
-FAToLlDA
-B6-3F84R
-jq-czupj
-KXY4vEos
-Run4RMqg
-ftYw6rVu
-CJmfIEtX
-45GTXdBr
-_mr62MA4
-P8CW48SY
-l9MVXmgN
-hxPjVrcw
-f8YxD2LV
-irLp0Z6e
-i8gIuJit
-okqCFKCC
-IhydwILS
-b2HrgrGD
-NRSMCQZ3
-9OjyuiUR
-erGk-YHL
-dA-w4uB7
-hCdaxMsZ
-0JTszbej
-lofyo195
-FTxj8lvK
-lBY0OwrW
-9zEUIeg7
-jCJiZzTK
-j9CGRDf5
-nv4AQws7
-gBzUMzDs
-teQaxqVH
-_JXDKbli
-5jUY9MC4
-xFUQBUtS
-eOfKmAYE
-uQAyDvHr
-hGsKpu0z
-qm5hpOGf
-ri4wuWuk
-qg5t4KWq
-rmVBuFmw
-X-uwlaxl
-ncD-GsQ5
-fXkhiY-D
-jm3CVVHp
-B0tzBK-y
-1oi_m1PB
-RoxXPYQc
-FeCXjhB_
-evdeyP3l
-nxZUokRQ
-04-es01X
-POZhBox8
-vvG2aP9N
-W4gJiJSr
-b8ajMWAO
-5mmMvrbH
-1PSAvDge
-8l-b8Dkh
-j1ofFB2h
-16aCSWRO
-ZFS2anjh
-hedHpo3I
-LJQafTnU
-nTHtTQk3
-fsfuBCqy
-ng0cZX6Z
-AD7YipS6
-_nu1W64T
-KJVO6Ub8
-blpoWWIz
-BUhSE66N
-ekci9DUT
-6UF3Nocs
-D3ZskxA0
-x2pCDDOa
-LCjzQg1z
-MDLrKteo
-A3oq1zgn
-gzlWmCdZ
-IFfWRkUE
-315Wj_zf
-MWSH0VbX
-yYKAZRnc
-KHKtVX-e
-MwPGZLWL
-vXMWD3Le
-l69K6MT9
-jjcM0G6J
-EI7Z_mf_
-jhgvfZwZ
-EY5yLtq3
-_0hfgq2w
-ZSK_H8kr
-8tmhaE9H
-7KbuSEES
-fpOqrbBM
-YpsjznB-
-DI_Ea938
-lPTAh2MU
-GsSXK6rv
-RBffh7xg
-7iR7IIV6
-2OBfjnuw
-bbYN-Xuo
-nMg-Zxc9
-baKZGfrl
-uMTWxbd_
-6wpQbMoT
-7gxlFKIW
-PUVCba6P
-0WxfzIrG
-epOnJwjH
-BYt0r_xi
-2I8_gnoQ
-5Awj_Y4j
-nHkD9Nup
-MHBTnlp5
-Psv5L02Z
-XqYEScb1
-qSh_W1-M
-BHRv02FN
-XAeBPWSP
-TnVQceqL
-eqwDiqqJ
-ANdrNma7
-fWxJxMOz
-dLb-Gwkd
-jQlRifiP
-uZHnL_J1
-a_JturbJ
-xb9-_68i
-WIShsNLk
-ZohHT2HR
-AxE7OxvM
-XLh9iQCP
-VJl7hY94
-bTD_J-v_
-yuBjDYz8
-77oS-DdY
-M4TGVRsz
-CAeQxOOV
-HRxe5keY
-5hruiLgL
-nvKXPZS6
-hCoFjh3U
-PxiFXcpF
-YLkve5Co
-hv2W1deC
-iTcvLd_3
-3vWAKLnn
-10hfnGmc
-PkchcRHM
-G6XTPxGp
-COp7m1tn
-57vBQC-o
-Gkh5nJeb
-geIuVX9s
-WqKHpY3o
-fCBvDHtv
-fiOyGmGx
-1cgHRf98
-7OfDqSB4
-LRWmGdC3
-v0qZfmnL
-HtMxDJRj
-iIO4wE-E
-Yrhtra7H
-tS4evQau
-pb0JcRA5
-0JoWDCry
-rRUM60Ok
-infTQnEs
-eOFevzOa
-hB-MtuFp
-DkDVzDiT
-0d3tz0od
-V3rP4k9t
-2puYEzvw
-rvf1jEYG
-6FqplG-X
-XVwEyc_E
-eiKpDfQF
-mrv42N5N
-UAtc4QvG
-Tb89YYid
-7LNtSbmR
-lljhUXF5
-Neqx4y2T
-5WVfi6GC
-AmYD-q0l
-tEy9PHk6
-Xw0Bx0cb
-B079LCqs
-drCo8ka_
-X1V4dmc7
-JzHwnyZw
-SirE9Jdy
-redvxt9E
-JUUYwoj6
-He7wnUI8
-U_HvQRE8
-lDzBtsCN
-a4bg51qG
-p2qiuDQC
-XGx4C8nd
-jCAqQMBG
-3jN0ejYp
-KXfTimK5
-dFpLRFWt
-fpUODzoP
-O1GwZIZK
-R8IajiIy
-JiW6uIoB
-KA2S5hPL
--iH6JBH9
-IYr3nqOC
-2ZXALooG
-7f517ITl
-QBAW8_s1
-_qJJoGux
-gGvY5hm0
-FuPbGiNo
-aAu2yleu
-OPMJZdtf
-K-_lQvp7
-LcrGxQrh
-IyYLwglk
-r9nXL-pp
-fYpmcRp3
-cgPhJd31
-rUl8V5Um
-ct3mFCh1
-Y_Go6tKl
-BYPXPa5r
-36yDbB1_
-sYAAEh5O
-BocUB0L_
-nL0CTVl7
-wjzdxCBc
-vvdnmqdt
-Ql0bIDXu
-fp6a0rky
-IOzXToft
-x2S1pJFk
-4O8jR9dG
-sTMCAJvR
-8PM_vnWw
-HB4gGDG7
-amwFLr5C
-RhCDQIW_
-8Wq6LAPW
-9eOCNn1P
-ilySNiav
-NOxpF61L
-xbo5k0oE
-n_YSqRx4
-gM_QqlKW
-LZrfrsWq
--GxKITDT
-QcP0gwJ4
-W7XYUvRz
-DXif3pTt
-gWuCy6-T
-fbVmkmqC
-k4zRc3lN
--IqNrBJI
-IZOkw_Jf
-CxQTPPHO
-fP2gnjUB
-7kEvegfO
-Yg0Vn1C_
-DfwLW3Nf
-Qktjq04Y
-sUiNjcJ_
-ZTIJBs7W
-MeFOh86e
-qFDX_NlV
-x4BctcNv
-laKfdk9X
-OQMMQSI9
-7g1XmdVh
-F1-KEz01
-AZivV9ng
-2HUz0tHC
-Dxrcz_5t
-J-AznR0U
-ekG2rnKI
-u_oGzDSU
-GbX2lTib
-4OAqWtm2
-9P-tS9N_
-JppshFJj
-TwnSIWsD
-KyHGEeon
-O_6o0mqs
-NYgvcoN_
-lbnsNJTk
-jtSvFNJ7
-qcMPGbsU
-SaIi1RKX
-l3Kqh9JA
-DTBm5pMi
-FB1e6zM0
-kGF4PT2_
-CtBk2LSd
-M3x_rnJ1
-tVv2QdVw
-FB4SoKph
-A5ZoAWim
-tYqteypQ
-eDNlUNwV
-aGCaTTnI
-raHdNCLi
-VAfxa0VS
-iVP42C4_
-2z2-7cGB
-S7GZGaA3
-XxDrDACo
-D9xMvxM5
-pC8Z2cjK
-jnVrRH8q
-bnNlLpE7
-FuQGd31e
-s4QnFyHu
-tDGJSnxX
-eblUMOX_
-dAfe-yZE
-zMv-R13x
-L38D3gcj
-djM2PoP5
-ghqOGFIN
-mkcvnKkO
-mxp5WDft
-QxjJMD_u
-U7__WUGf
-7mGMlsZt
-7hpGC4pF
-xKG7zh_o
-gtq6ly7U
-JW5hoEpj
-TXfglarV
-x9HCL1aC
-XqItgFpl
-UqYhZW0j
-AgMRjoDW
-npuUlDJN
-S8yASCp1
-d-ynQebj
-6ohajshJ
-6p9hXmOH
-zBWLLn5f
-YBkt_eOY
-9FWEYLlp
-w4-M29HT
-TJUqckJv
-JKWhFsaN
-dWqhaOU8
-7PF6yv05
-n4iBTRux
-flq_3OUv
-dit5_vio
-yDX314IW
-XEtXObIg
-Gk9wjvw6
-kqfmul7y
-QRkB8dDC
-FP1aNPQ_
-8gcga4nu
-aKoTc1a3
-bTGuRmXs
-FrFLNwnX
-jkwaxs-k
-skUx6dYg
-4yqrlSD6
-LEwrOTb9
-qpgoOVlV
-40tFS8WH
-61VqWvbz
-zp7oE1vr
-9GS_1UzR
-jTAK7DvM
-Tl31rzwK
-skNfFDW-
-RAvDG0AY
-8HqyjbNk
-wDHl8Hsm
-bz2tA2Gm
-Pk8oc7vm
-3KRAcqXG
-AUPSMGIx
-MAv8i6v8
-gtHByALF
-seIBekDn
-gTkXuN9N
-5shZuw_T
-yV44L91j
-TuohTxSo
-alru0JjP
-0Xfg10rQ
-kkdBs5Kx
-BjVrEEYA
-GylAPtAt
-Osz_mlQL
-hMb7BIR7
-YQqmJLxJ
-47xqkSsv
-8j3OOc4C
-p2lMeh-d
-1Uj1qBpA
-8Oc67uLF
-cZiXdTpl
-HWwD6xG_
-B_fm0gF_
-KD-lCQ7U
-Mfbgc_P_
-BXhgm-FM
-Yh11pDG6
-mg7tXYxj
-XeXiBGxJ
-Hrua1KKP
-NQFcm6S8
-oP1ZaPRr
-guGwCwWn
-YFjrFRhS
-3ToDjrdP
-J-6RlKkj
-q_UgdGth
-vuZgO4RC
-ldNQVDZF
-_tjdk9yv
-PtIoe3lb
-RGeIzZvc
-8I7tRpp-
-lzwYNkzw
-DhdQ4EHj
-jAwXsHtE
-pZHE4SvA
-iZijwUHG
-EjdPjZ7D
-1rfEKOPS
-Wuzg-3QE
--pHE5wSx
-Aufd-lzo
-YMB0e2FT
-oegF0PIM
-_vpVetz_
-AY-i6ezO
-B1qUwCIk
-TXg0gDI0
-a-pngSVh
-hlkXaIAd
-GnZsLnO3
-pahB7M-O
-wnvptOZx
-4KDgnuY4
-akb8Mnf3
-GjFItB7o
-YwHp5W3m
-ALu1yCGJ
-XMOdYb2e
-XyC7ZMVt
-XyYhvnbA
-Bp0PCDq7
-jIoWR-A9
-rOlMXrmu
-Sqjpkrkk
-rtBHYWQC
-qZCQROVv
-V2PFxpqw
-2mW9KafX
-mRJCsDoM
-0AkZyI6s
-w1J7B9uC
-tNk8kB_C
-_enC5qvw
-1NEiljgz
-FF9jMLl1
-VlHOt3Pq
-8Brw3T2Y
-lDR34dlJ
-Y36XpCDa
-G-yneqkK
-XadQ9Vmp
-OJWULP69
-yAws6eMZ
-IUPPSMQP
-tT9-NAsy
-8T3VNeQI
-xjPWZrbT
-_8LzufSN
-3r2yTCGY
-_rUzhial
-9fWnPn7j
-F07xgi0h
-7llSTqOz
--tcOikNp
-6E4O-OcC
-gTkCEJsQ
-McDL12K0
-w5AsOpnP
-Kg3M_VF9
-jVgO1WcU
--JMNSyf-
-k1OgtGdv
-ELM7UadA
-sQM_8Spe
-4gfr4lzl
-CsKjjWha
-YXPJUele
-iZo9fAde
-XFGw6hKC
-vRAMTCyA
-IJ-9h4n-
-OlhgPDo0
-d7pK86RF
-5J4nzxXW
-3R2hMJgG
-e8YMEFvD
-4135-k9E
-VERg3JY4
-SjmfeH2O
-fQnBCQyl
-BtP7FXOR
-M5ZwVwQM
-RYJ9_RkZ
-OtLyxJIn
-sg9JBpRD
-HpGRwQGj
-FN9vkV7o
-bqbey4Em
-l67E8Gvx
-FrJ3H8tT
-lcacm5CH
-SS837kVb
--564ZczJ
-LZKO4pHY
-8ioCYcpT
-fZsNLU0D
-GlJFsa_n
-zMt1qOBR
-EnjJBdr4
-5iW3mC9-
-4Fd4rCIl
-cRNzrJ-Q
-SPSAckRs
-n27tP1xw
-2dffgcQl
-a8wJMPHj
-3WnoXhUT
-_-HyW2xw
-Nyh91a6A
-anDD8t7C
-L5CfLP1n
-VtyATypf
-6-RPqt5o
-ogflHiO3
-gHx372VP
-gvTCMFuW
-QmNIxGCS
-VZ8miVth
-ffH83JWi
-ucCQDvwU
-H--Te85M
-7kW4aXiv
-JO_Ewkcu
-GlBk-Aq-
-7YayJ4N7
-KWLtyIYL
-oea9ZZJ8
-rnySOPLD
-6559Yl12
-bTW8Am64
-RFSmvXRk
-KxGad-j-
-oUyOeBpW
-bWyGLLyy
-CDumW0_2
---N15PUv
-7uwlD9Mg
-2MHIIkly
-hGCRqbDg
-YU9s4M3c
-Svuk0_8E
-5F7x3f3W
-cO_pEGRF
-WukJP0pR
-GofaVvtV
-NFf20ktg
-3gnG6hb2
-Y7OhHJc-
-bND80M_O
-43XqHlKu
-mNg8l3vk
-GTS8yWgx
-3M7_EeER
-xwHJl55q
-t00KaG5p
-3h0ntkjY
-e2sJStpC
-2IAAWaBT
-7e7q-2Jf
-dapVFhxu
-Qx7JQrVU
-a7hvH0nZ
-Kk-knnRt
-AjdYKQks
-DC2YDSKR
-9seFZ4Zx
-2DL4TBuz
-rYrDBG9t
-3c9R6LG_
-B4fjbsnd
-BnbyCXy2
-X7jxqG2I
-iQbpklLV
-hBYKUtRV
-Z08OZ2zc
-dSmpcv8-
-uQhRfG2b
-KgWb4ci_
-6DgR1T_Q
-EG5C_4ch
-ZXaZ_fTU
-8iHRGN1q
-la3WKk9U
-3DA30_si
-qOCbeCCB
-VlQQ6eri
-ZU2Kuhdo
-czRLQR_K
-MzpfiJW5
-f6E_xLQm
-ayDYcMC4
-ZQSkBTjD
-S5dFU-Ia
-vgbxftbE
-AiRKMDY-
-TTVxa2dc
-_TzDW6a_
-hqum3F0h
-DzyzV9Ae
-z7_tI34w
-JVRcsAQt
-LrmCDlAV
-Qas7P-EN
-kupqVf3h
-vp-gd1Op
-OX1en5ru
-zKAgyALp
-SAtgSZ_T
-qr4OMdlq
-alNqYrKN
-85CDDcKu
-JeP1_TRt
-zrj6_Dx3
-xdr-OITp
-YyJ_hVXK
-mnILSuSV
-j3IqpfTe
-bxPwFfEp
-6ctOVyWP
-UHdoQrl7
-YTmHF2xx
-Jw95quHy
-AE_wdg8E
-dgaamXmo
-L58nH9RT
-FPaBmNFj
-bdB766rY
-GUwBsh_3
-Yv8V8pk1
-MwUCK-Me
-fefQD6BW
-CUU7Y7c6
-Mjs4yBqr
-Wm627W2I
-68NI8ciz
-xdDdagDz
-8vkhWWe7
-mk_LWsHH
-VkePXD8R
-QDWUvY67
-pq-IHAtF
-X2zf7yVr
-rlo6Sz-U
-KcKRwupF
-SL0FstJ3
-fH9lsm3K
-L8Rko8EO
-kyvDPXOo
-OU28Jqdw
-ahBNWYd9
-LvYebcHz
-QW4HGmUW
-Ze1NMLOg
-nu5laCJz
-qrbxY5Jh
-WXC7rBk9
-LEm-jrHy
-AI-Sk-i7
-YEpHNTrZ
-LzEHeivW
-QHXJkRl8
-OVAxDgGX
-FbqBI3PI
-K9mD1jYs
-g6QSLcdh
-CC5CQCnP
-rOHN0ehh
-Q8dZYDwC
-cs3xy0R7
-phx7slF2
-hQ1Bm-pG
-Rqm0MOl0
-v9Rw9Wua
-UydQwoB3
-LRaIuYXJ
-L7FeWVPw
-Z5FUKaTX
-ONgsQeuI
-ZFn5NdMQ
-nV7OM15V
-HVgv-ZdH
-N1N4EYV4
-Dhi1F1iL
-JphhVehy
-pGG6vmMY
-BWdjFw_P
-iKQMg9md
-GIZ89osp
-7dkPuh6D
-88OxDanm
-5KAtXl9A
-NRx6jzi-
-nwKVwLzK
-UxLncTta
-lm4M90o0
-zTYi8bz2
-30GcoqXY
-VRPJGEjC
-Uw2ONIyA
-FRFdwURw
-cQ5OHkqB
-VIc7unri
-zQW9tClw
--B3A-L6h
-WwAZb-OU
-azFfnYzX
-VoBd8FpE
-iYgk5HS9
-8_jll_CP
-MfkeXad2
-WKPl6CWO
-xG-lOTEf
-OKdPxLQc
-84rpcldy
-fx8AJCDf
-UjgQdKfq
-bam8RP8P
-Cl005dYD
-QzasJRZY
-YxELOo6a
-iBe4imFz
-XJS45kQ8
-anUgWZQh
-RmalcaI0
-uiGyvZjO
-mrhGF1fn
-G5rSu7D2
-6q7NfIxr
-Hpb7H1vs
-h02ZjJ9t
-9KI_PqyN
-9bwDpFym
-A0X6gJga
-IXAvJXlh
-cuvy_0Li
-ZM_yWl9L
-wMaLASIt
-ZJL-SmMh
-FjI39MT0
-0nncoc1f
-CgkaUTec
-0aJl4OFE
-MUd929hz
-u1dxwcCt
-bJLAbTPc
-TWN0FwXw
-4fAuqsn8
-uiPCeGqm
-gA6JtG3r
-ctGYoOVd
-HS7UYdv2
-CIA1pgNp
-ahCiAikK
-WWSuoyDy
-0-frBdJX
-uO6hlMuR
-PQcpNflK
-9_JfCuqe
-ha9gL1GC
-Jfk9_2KX
-XQsrz38r
-Zg7E9Kdz
-GpB6FGPk
-1A7tUxKz
--S_2nU8a
-xP_21MMm
-LeU3TLs2
-KdaVwI2c
-Z28UpEnG
-hX6P5mX0
-NUJghdm4
-jwIoYT2I
-F4OH3NW9
-Kw_FWdmZ
-xfXYklDQ
-gmgRpRvR
-FU1RB_wZ
-USvuX7ft
-uemQE_Iv
-8fgeBV-L
-bqDvPLi-
-2jNtmBkg
--R9FPsfm
-lITwM_pz
-oIcKvhJW
-p5ORGags
-Y_b2nJ-i
-3ZH-8oK4
-blmReVsj
-7rIARMIB
-qSqRcZB2
-BLui-Nkq
-2KIwZyL3
-kidbob-y
-3dvtAMft
-ME7_1BPB
-C7GmP-B9
-aDEA3ig8
--6B6DVTh
-YIMr-f8V
-22dSwo6Q
-X3nyl_L5
-n6ac4DNK
-EW1cXpJJ
-qvURtUI7
-28nnRi1X
-fg3DBZ-2
-YMdwlFzB
-_ExsOazd
-x6VXNhz2
-39KY_vhj
-Q0pCRpva
-g1VMpUIE
-YQ2d_DBt
-9BwGigBR
-5DvH-ukY
-inmCf_S4
-VzgEShIE
-G5m3dA5m
-IMpRDcYL
-zf7pCwfB
-Usc2x4Wp
-EH0O2Smv
-HIdXujzp
-4kQmX59Z
-hW07ZXWI
-sAFsdU5d
--DvL0MXp
-VRNzmi2x
-U4TLFPGR
-nt2Daz7O
-Ete55z68
-ikqr43aa
-3nOKU9SV
-jUj1z_xO
-WxJrKAE0
-kUHNUEh9
-edpxqYlf
-mdApngWt
-q6B8UpTv
-w6kolNd2
-XyGb-vVS
-mOS4PMyW
-AmwOl3n6
-ZAqE94-7
-lUdjLdwL
-orGXTTx2
-HfGJjbfV
-xb01vf8S
-mDTGUKL_
-rwFimHdK
-KYpWIAQT
-FrUivrO2
-ZlH_mA5S
-C7JhHElY
-Wn7tZddJ
-7xF7BS3c
-RQ4_hwU-
-td6Si2ee
-di0w7LL6
-p57Q0XZu
-EKpSU79R
-1IKUuWNp
-xPdQLu9o
-w4wyMroj
-FbRKuEV4
-EPf9PL8b
-tKBELfqu
-9dO3AuqM
-zYGVcPQA
-9WyR7vIE
-7Ke9_Glm
-Kunty_Hd
-rumtOWGj
-2tcIwmIN
-yLjWVetf
-fpC6ufmf
-7mgmSSUR
-lHY7CJSJ
--SG6u2fU
-gx76M_HK
-_POl_r5G
-fI016Nzn
-vuLgLo1w
-EUCG4nQV
-MpzDtv-9
-I29e802j
+Ap125Wu9 promoted
+xc91ds0E promoted
+WA020W1K promoted
+DP-0u5vZ promoted
+J8JkWBsc promoted
+lWaiWU_F promoted
+K9YTA2hM promoted
+0aVNRc4R promoted
+ezb3t0fK promoted
+V6p8ycnv promoted
+_FTeyq9k promoted
+OJUi6MpA promoted
+lS_h8bwP promoted
+23JWuglP promoted
+NqZgmCAU promoted
+BNITLDo- promoted
+EIFjOK_s promoted
+qWTPCuCq promoted
+e91L1aq0 promoted
+HR5HLeiO promoted
+kU8_lxTh promoted
+kutZ8TSN promoted
+OlvfmFDP promoted
+gCubXy-G promoted
+eQgmbE0Z promoted
+OObzLB0_ promoted
+yx1po5RQ promoted
+wI0PHkuh promoted
+Mlk_Em5L promoted
+twsdgoDS promoted
+UuFo61YX promoted
+M5qJzX0U promoted
+F2cNkNmV promoted
+_gaOXBfM promoted
+XX0X7Q-O promoted
+72WDTNnC promoted
+NhxaN7Ll promoted
+4WMQiXgP promoted
+TISj9b5g promoted
+6c7BtY2u promoted
+NprGj3OP promoted
+gbg8Byl3 promoted
+-MjVx9DK promoted
+I-Qfbz3X promoted
+3xVolvCN promoted
+mHr5Iy2N promoted
+mphyxKtV promoted
+_rdjq1fV promoted
+Q4BUkB60 promoted
+YBQE2khN promoted
+cbqqQS4w promoted
+5cC9jr_P promoted
+omBuJqB5 promoted
+R0O1yxy7 promoted
+jsc4qZA2 promoted
+Pg-QmUdO promoted
+NdaGXG4q promoted
+1qqqtVvk promoted
+yyRQIsYq promoted
+xnlbX1it promoted
+4TBoTbOi promoted
+_uxm04w0 promoted
+WCP_8N4s promoted
+QaQ4qoFN promoted
+0rISauu_ promoted
+wkw41sy0 promoted
+n7xKCASM promoted
+gs9j7iT- promoted
+-IYGkc2g promoted
+ATbWtPvC promoted
+bkng7DPg promoted
+CKVxVWKp promoted
+qPmTEV_J promoted
+LZGezh3k promoted
+ObktJKEW promoted
+KSk6lsDH promoted
+DllPmAP5 promoted
+C6GEh1Cy promoted
+ZPejT3JC promoted
+e5azFpdW promoted
+HG3bxOYH promoted
+lp1mruwP promoted
+joIGOhLi promoted
+klq_W06G promoted
+tNKl8jBM promoted
+MbJ9w1V- promoted
+QMziTPWU promoted
+1Gi8hcjl promoted
+T4WVTDDP promoted
+2_6RskL0 promoted
+5gplQrl5 promoted
+pU8hUi0X promoted
+c5oaSyl_ promoted
+m6qsdG7h promoted
+EX0e0MoB promoted
+9-lgrZ63 promoted
+j2488ahD promoted
+EmCr9TLr promoted
+W0nlVVoA promoted
+6NYV9iWT promoted
+nuABXo-I promoted
+BYRSprDv promoted
+jNa2yBHg promoted
+3aixRblu promoted
+z-EAuu8s promoted
+ktL2cN1b promoted
+8Udbi0xX promoted
+W0GUzkbB promoted
+FF4cI135 promoted
+MO6NrKTJ promoted
+dSwRZq4H promoted
+W6ouZyGF promoted
+kpHPIbn8 promoted
+BOHv5HZ8 promoted
+CB9MMjjR promoted
+YZGIYGXm promoted
+6BHQ2qSu promoted
+W7-vaH95 promoted
+-XYESJ8O promoted
+kGHGfCKL promoted
+TpDUccAd promoted
+_tmPL_IL promoted
+gtNnr0sf promoted
+x0u1vRmw promoted
+EeKs4Zic promoted
+45bg0qB4 promoted
+M74tYppn promoted
+L9mrdcEl promoted
+wmRcGMPg promoted
+FrblOcJF promoted
+nlU0lTbe promoted
+qT-SmFkk promoted
+eXpVZliw promoted
+TwZSox-s promoted
+1FmczTMO promoted
+MeOpLg7e promoted
+6vYCkwdD promoted
+wmYWnE8T promoted
+zUJ4PHmf promoted
+XB8DtTAo promoted
+oRwSRDG8 promoted
+Ym475Gl5 promoted
+z_6UTL_N promoted
+LEZziEiH promoted
+-IpAUbnf promoted
+1uUtgPAp promoted
+Nqwa8EPS promoted
+4JKhRZqm promoted
+6BtINC4a promoted
+a4a65bKh promoted
+kc990D5A promoted
+wFuIuo6X promoted
+G_IktRYE promoted
+tdN0lQm5 promoted
+xLPRGMgX promoted
+nNFLbWIo promoted
+miYnVkDg promoted
+pVJyZxqg promoted
+BQ3eKCah promoted
+lRS4aBSV promoted
+pZvhlyb5 promoted
+AdMNLYry promoted
+THO-vwf3 promoted
+rUteGoHB promoted
+1SxndmRW promoted
+H7L5MPVs promoted
+SU7XKKX9 promoted
+DG11uqn5 promoted
+nw63gOOM promoted
+RcUKefpA promoted
+ytq5qnoY promoted
+mRIt-FNb promoted
+ir-G-2jV promoted
+ihNXSI01 promoted
+76QzVt-p promoted
+QCzhPvIT promoted
+Ag84PnFd promoted
+ynwNUE4l promoted
+kutrSsq9 promoted
+2WYfBYY7 promoted
+92aJ5PK2 promoted
+mPoWDNC8 promoted
+g-GSitan promoted
+AMBIomfU promoted
+tpCURPyX promoted
+1eYd9fuO promoted
+ZPjPlfH9 promoted
+t_4u1d7T promoted
+jVDIiG-g promoted
+3d-dnLk5 promoted
+TgL1MBjO promoted
+6uLflEAk promoted
+B3pkTS9l promoted
+yi2ngNPp promoted
+43cD5kfx promoted
+W6GoyWLp promoted
+Q76CPjmg promoted
+M3G26PfS promoted
+dGxBlkkc promoted
+X7nzbGgc promoted
+3SdDO5p6 promoted
+DX3qdgNB promoted
+cfSZTxJM promoted
+2jyZXQMQ promoted
+-7yDYhci promoted
+8luGQevK promoted
+-7eASGEI promoted
+X_Rdx-BV promoted
+JDiAXcOf promoted
+w9bf_hNI promoted
+ZAOnqD-M promoted
+2kaZigfk promoted
+tWu1mZP1 promoted
+tg-zy4_x promoted
+KhW7vtPJ promoted
+VITaCI1N promoted
+EsagxcAp promoted
+DdC2fp-M promoted
+qfzCsNdw promoted
+4qbHpoVX promoted
+aA6QavC8 promoted
+uH5_hBx2 promoted
+9EL5IQVl promoted
+etQHwacz promoted
+orSMQdid promoted
+VeivEGeb promoted
+_nGmickW promoted
+zRLTaZWm promoted
+5issGRQZ promoted
+yxQSxk_G promoted
+yjEweGM1 promoted
+Ev4o8sGc promoted
+y1xaAXvC promoted
+ChEOmsHf promoted
+x2fdtc2u promoted
+kxw_4_fk promoted
+trbleNY8 promoted
+e87C-7Pl promoted
+73ePcL3f promoted
+fILnT8h_ promoted
+PkGl4fJb promoted
+3cLj1E9P promoted
+R3sGaq41 promoted
+3slI4Kns promoted
+CsBAjWZq promoted
+nYGLXmD- promoted
+rjEsJnuq promoted
+Rvj5GyXR promoted
+V3E3SQnq promoted
+HEhHjeQY promoted
+fD9r5dhL promoted
+0_WQjN_l promoted
+Hg0SUaOk promoted
+Hz66BZ0U promoted
+e7TPlS7n promoted
+8lb5mwjw promoted
+dQvFUw8x promoted
+vPeAVS3E promoted
+bOfp307P promoted
+FRfDg9oE promoted
+7ToolAVR promoted
+5cGMvb_J promoted
+DVfAymwE promoted
+EczGZFgW promoted
+sc8jfA8o promoted
+Pb-R4XWF promoted
+6Pyc8HnR promoted
+QIiFV0qb promoted
+mx_l7ArV promoted
+B4z3HkgT promoted
+nXQ7WmC2 promoted
+tkxWY_1P promoted
+oji5UxhK promoted
+Cn1Xwtry promoted
+5leaYVhf promoted
+5KV9hOCR promoted
+l-gvI4fz promoted
+OGRbhIXO promoted
+GIN5Fl4Y promoted
+BTO4wAde promoted
+lbtfeSrP promoted
+iT9p_KgB promoted
+KqE8QocR promoted
+U77r_B1o promoted
+kT6CwSy4 promoted
+XgzPZCze promoted
+dMR71evk promoted
+ryAHTPUZ promoted
+kLmbB2VD promoted
+bvri4hib promoted
+7yCKpD_H promoted
+1324k9lW promoted
+ONSmYLRh promoted
+bF6CtG7w promoted
+RcaTgxeH promoted
+XYgQW4tO promoted
+QfVawy73 promoted
+0Rwoa0_C promoted
+r0HXdFDD promoted
+VQuJHWz9 promoted
+oNFayyhI promoted
+jSpdy-u2 promoted
+cHhTszbx promoted
+Ul_V5E-y promoted
+NGApME12 promoted
+pIQuQK7s promoted
+4OCRfzIT promoted
+1h-3j5lG promoted
+THQc2e0E promoted
+Tjb_PEcS promoted
+lebWnbFH promoted
+fcHIvsZG promoted
+n2ioTlm7 promoted
+ba7q9ATm promoted
+91G6hVN7 promoted
+x67sj5qU promoted
+wDE4GX9R promoted
+SgG-C7Dt promoted
+d4xtSHR6 promoted
+ng3qrrNN promoted
+fwR9HWnX promoted
+UD5w9rDF promoted
+dMs2dT4a promoted
+gJLdD71i promoted
+XU4moA-b promoted
+RSSjWXe1 promoted
+gbiCgOQb promoted
+pxzTV-D2 promoted
+ApDfhbbN promoted
+_0xEN3wH promoted
+sEV1ac8m promoted
+7h4kJo35 promoted
+ee6EhUjA promoted
+i_9PacpX promoted
+hvYEWhRH promoted
+XxteX-Kg promoted
+QdQGbTxK promoted
+IGdmYayL promoted
+UQJdtPqv promoted
+m1L9Wn5x promoted
+1oUWTpf- promoted
+oGzsirPw promoted
+w9N2INLM promoted
+PelMvl96 promoted
+hCFLtMhY promoted
+wAVGNKiH promoted
+Fll2NVpy promoted
+hWLwAP5c promoted
+EWZa2d_2 promoted
+5bP2h-ys promoted
+Pf-yAOMF promoted
+gpOr7HL4 promoted
+K6wH7Cum promoted
+9K2F42DR promoted
+Uo2ZRcLN promoted
+X1X9qWDG promoted
+WVp6HDLZ promoted
+_MVT2kOR promoted
+W1wsJnz5 promoted
+f-U-TLbl promoted
+oGEoFOlj promoted
+v-FsGL9l promoted
+s4UfvJq5 promoted
+AAiT06Dj promoted
+pqpFH2Xj promoted
+utm6XPBc promoted
+tIJFfZhL promoted
+qAWDbPYN promoted
+CdM6EA_i promoted
+KtxzFcuv promoted
+A_Hp4Jph promoted
+mo7B4pzX promoted
+L6yTuCwA promoted
+3aa8hapE promoted
+zxNlK43c promoted
+s4WLe8iv promoted
+ghs1uila promoted
+h5h6O593 promoted
+xeDd7zI5 promoted
+3rangy0Y promoted
+Si3YK-Ei promoted
+u1nTPHN7 promoted
+fnN9n_uu promoted
+Tj2WeIyL promoted
+gdiHckXZ promoted
+zi08Q7MQ promoted
+rlK51wfr promoted
+wD6vFrZN promoted
+OwaeJhOS promoted
+3T9OMe9S promoted
+HF6PBMNE promoted
+BUPmFvYs promoted
+HmlpnMBg promoted
+_PCS3waR promoted
+9MsER86p promoted
+5PUqM8Iq promoted
+BL6gDMg5 promoted
+iTfL-NvZ promoted
+mDeXxOUz promoted
+59X-x5zU promoted
+Qw8_5xC4 promoted
+xpF4k6s6 promoted
+HN7a5D3i promoted
+nyKRhet0 promoted
+tqqKqfM_ promoted
+jdonlEDk promoted
+ED2uwSd7 promoted
+9b_9AcVj promoted
+I_pIa3Bi promoted
+nyVd5Y_L promoted
+CBT6sX4A promoted
+PQ05QEeF promoted
+ulRVplnG promoted
+33dTmONj promoted
+mBhMFD97 promoted
+m3h-ccjA promoted
+21azBYHH promoted
+SPMdXcpQ promoted
+eQiLUw3o promoted
+2dHqYMTC promoted
+bnKCajpb promoted
+2g0kwFa1 promoted
+5vQwrEOS promoted
+2ChmC1sZ promoted
+QiZgDFO- promoted
+1lgC3tlP promoted
+bk6hWGcq promoted
+kDwsZpWN promoted
+WbKgUMRz promoted
+wAECPe8B promoted
+Wx937sKA promoted
+ZC77ZY47 promoted
+Lhp6NcEh promoted
+4SFZpsRG promoted
+-TTq7HH6 promoted
+ATvY3afk promoted
+h6or47UZ promoted
+VcnyVp5Q promoted
+EOxy4MIM promoted
+oXU-idG- promoted
+P1UzgXQJ promoted
+Q2A2U9NQ promoted
+PGrmthBT promoted
+P-kDwYAd promoted
+9Gk1CV_V promoted
+1roLAlUt promoted
+dHy5WnLl promoted
+2vuA7WqP promoted
+xDNNRTho promoted
+shUf-H2m promoted
+SNj4l76D promoted
+2Ggdg3er promoted
+N4N9zBWv promoted
+Lam_dbMb promoted
+IJqbHPFg promoted
+t_ngEDU7 promoted
+i5HZMvcf promoted
+A63hpUae promoted
+9y0isO3U promoted
+gOE0-88N promoted
+SSRy1OuM promoted
+2eb23ii2 promoted
+XFPV7sCZ promoted
+ckjO1wxf promoted
+ACekH06A promoted
+bhWRwZIX promoted
+fdeta3Vn promoted
+qSCUOBOo promoted
+2UuB1OGT promoted
+Abls2fDA promoted
+B8kIXTdU promoted
+TInitHXv promoted
+OW-wGrLv promoted
+3raz1qP1 promoted
+41xh-BJd promoted
+D5PJ7UI0 promoted
+l1PTdoX7 promoted
+e82vLguh promoted
+ZMqlH-iJ promoted
+AE2OwRWg promoted
+ow9fZif0 promoted
+LMvb51R5 promoted
+5-GQXCvO promoted
+ldfbDibl promoted
+8L_XN8YY promoted
+g1O177f4 promoted
+QF6yoj3H promoted
+xByhlAy- promoted
+65OKBxKD promoted
+LQev5gcP promoted
+1fBGdKl1 promoted
+q-e3tmge promoted
+OTV3TziI promoted
+efu8CROo promoted
+v78qoS7D promoted
+arU52PYz promoted
+hI1an6SP promoted
+7VnRbib- promoted
+BL07_ZgB promoted
+3oe5wi5m promoted
+-cgNy9lE promoted
+hkiBdq7T promoted
+i50PeNRV promoted
+nSwwxlKw promoted
+06V_fhft promoted
+uBL_8Yxq promoted
+LEsQyKGI promoted
+AQPViwZx promoted
+dwYv7zvD promoted
+0G76fao9 promoted
+9L2DpMvP promoted
+FcRyVGV9 promoted
+jigsRv_Y promoted
+IQN1hdqs promoted
+wgzXaZok promoted
+8BCwFUyU promoted
+MUOFVXcl promoted
+pfPbbP2X promoted
+QRaPpD4B promoted
+XTRC8LoI promoted
+ZjYRtCNQ promoted
+QzWFss3s promoted
+FvuZnQEi promoted
+nHIcR1D8 promoted
+NWgy7cVE promoted
+Wykux1bK promoted
+1X4R1Ioq promoted
+eiug3W2F promoted
+GutgKXw7 promoted
+--zhExZI promoted
+dLs7NVYf promoted
+DcblYc4V promoted
+sM0k33UN promoted
+OWpQTGli promoted
+K0RGiIPy promoted
+1NV5NTDS promoted
+Fcs4w04w promoted
+ncFnLIJy promoted
+QX33AkNp promoted
+dO0HSmUL promoted
+R-rNCeqG promoted
+xdWgh2Qh promoted
+2Qwdq_-X promoted
+WRdBYJU_ promoted
+iIUV2Hrd promoted
+jfM9Y4Bu promoted
+nJRPnlTi promoted
+iGqsUQkr promoted
+fhlYU-ek promoted
+0NGpRKfv promoted
+JK3nHMY0 promoted
+GGkubyxS promoted
+0u0l5h-X promoted
+9C114H8T promoted
+cP4ygTNQ promoted
+_HafAG9z promoted
+zivIvXv6 promoted
+5tLoIIg0 promoted
+mRPpNBRW promoted
+6gEUMSKZ promoted
+ggTBXJpl promoted
+8Bki0vKT promoted
+2TuCHdFx promoted
+QGdmyYJX promoted
+RJTkJfBN promoted
+hJT_AwQa promoted
+hhhNfoZt promoted
+xf6pNNr9 promoted
+rlQhhk75 promoted
+LkF1uv2c promoted
+GhFRB_Lt promoted
+_LOXzM5q promoted
+zXceWan7 promoted
+BNQDdef1 promoted
+gxy2rAyZ promoted
+rhN_Lvuu promoted
+-bTDKV3E promoted
+eiXR9_tU promoted
+izLGUH4y promoted
+gtGq1Xsa promoted
+DzO89a8W promoted
+vPoJQr2x promoted
+pxA3M9to promoted
+OU1AbknG promoted
+t2Vs1Pbm promoted
+10_KcbLd promoted
+w1GgcOOa promoted
+rAQKX-en promoted
+9j9l_9FI promoted
+loS9IAgp promoted
+MC3QKzrS promoted
+bxmn7ZR0 promoted
+LvTHWOBL promoted
+xy_OSgqn promoted
+4GvZ82uM promoted
+k8Lgmupp promoted
+x-JOv8rr promoted
+2Gjnw_Hc promoted
+FAToLlDA promoted
+B6-3F84R promoted
+jq-czupj promoted
+KXY4vEos promoted
+Run4RMqg promoted
+ftYw6rVu promoted
+CJmfIEtX promoted
+45GTXdBr promoted
+_mr62MA4 promoted
+P8CW48SY promoted
+l9MVXmgN promoted
+hxPjVrcw promoted
+f8YxD2LV promoted
+irLp0Z6e promoted
+i8gIuJit promoted
+okqCFKCC promoted
+IhydwILS promoted
+b2HrgrGD promoted
+NRSMCQZ3 promoted
+9OjyuiUR promoted
+erGk-YHL promoted
+dA-w4uB7 promoted
+hCdaxMsZ promoted
+0JTszbej promoted
+lofyo195 promoted
+FTxj8lvK promoted
+lBY0OwrW promoted
+9zEUIeg7 promoted
+jCJiZzTK promoted
+j9CGRDf5 promoted
+nv4AQws7 promoted
+gBzUMzDs promoted
+teQaxqVH promoted
+_JXDKbli promoted
+5jUY9MC4 promoted
+xFUQBUtS promoted
+eOfKmAYE promoted
+uQAyDvHr promoted
+hGsKpu0z promoted
+qm5hpOGf promoted
+ri4wuWuk promoted
+qg5t4KWq promoted
+rmVBuFmw promoted
+X-uwlaxl promoted
+ncD-GsQ5 promoted
+fXkhiY-D promoted
+jm3CVVHp promoted
+B0tzBK-y promoted
+1oi_m1PB promoted
+RoxXPYQc promoted
+FeCXjhB_ promoted
+evdeyP3l promoted
+nxZUokRQ promoted
+04-es01X promoted
+POZhBox8 promoted
+vvG2aP9N promoted
+W4gJiJSr promoted
+b8ajMWAO promoted
+5mmMvrbH promoted
+1PSAvDge promoted
+8l-b8Dkh promoted
+j1ofFB2h promoted
+16aCSWRO promoted
+ZFS2anjh promoted
+hedHpo3I promoted
+LJQafTnU promoted
+nTHtTQk3 promoted
+fsfuBCqy promoted
+ng0cZX6Z promoted
+AD7YipS6 promoted
+_nu1W64T promoted
+KJVO6Ub8 promoted
+blpoWWIz promoted
+BUhSE66N promoted
+ekci9DUT promoted
+6UF3Nocs promoted
+D3ZskxA0 promoted
+x2pCDDOa promoted
+LCjzQg1z promoted
+MDLrKteo promoted
+A3oq1zgn promoted
+gzlWmCdZ promoted
+IFfWRkUE promoted
+315Wj_zf promoted
+MWSH0VbX promoted
+yYKAZRnc promoted
+KHKtVX-e promoted
+MwPGZLWL promoted
+vXMWD3Le promoted
+l69K6MT9 promoted
+jjcM0G6J promoted
+EI7Z_mf_ promoted
+jhgvfZwZ promoted
+EY5yLtq3 promoted
+_0hfgq2w promoted
+ZSK_H8kr promoted
+8tmhaE9H promoted
+7KbuSEES promoted
+fpOqrbBM promoted
+YpsjznB- promoted
+DI_Ea938 promoted
+lPTAh2MU promoted
+GsSXK6rv promoted
+RBffh7xg promoted
+7iR7IIV6 promoted
+2OBfjnuw promoted
+bbYN-Xuo promoted
+nMg-Zxc9 promoted
+baKZGfrl promoted
+uMTWxbd_ promoted
+6wpQbMoT promoted
+7gxlFKIW promoted
+PUVCba6P promoted
+0WxfzIrG promoted
+epOnJwjH promoted
+BYt0r_xi promoted
+2I8_gnoQ promoted
+5Awj_Y4j promoted
+nHkD9Nup promoted
+MHBTnlp5 promoted
+Psv5L02Z promoted
+XqYEScb1 promoted
+qSh_W1-M promoted
+BHRv02FN promoted
+XAeBPWSP promoted
+TnVQceqL promoted
+eqwDiqqJ promoted
+ANdrNma7 promoted
+fWxJxMOz promoted
+dLb-Gwkd promoted
+jQlRifiP promoted
+uZHnL_J1 promoted
+a_JturbJ promoted
+xb9-_68i promoted
+WIShsNLk promoted
+ZohHT2HR promoted
+AxE7OxvM promoted
+XLh9iQCP promoted
+VJl7hY94 promoted
+bTD_J-v_ promoted
+yuBjDYz8 promoted
+77oS-DdY promoted
+M4TGVRsz promoted
+CAeQxOOV promoted
+HRxe5keY promoted
+5hruiLgL promoted
+nvKXPZS6 promoted
+hCoFjh3U promoted
+PxiFXcpF promoted
+YLkve5Co promoted
+hv2W1deC promoted
+iTcvLd_3 promoted
+3vWAKLnn promoted
+10hfnGmc promoted
+PkchcRHM promoted
+G6XTPxGp promoted
+COp7m1tn promoted
+57vBQC-o promoted
+Gkh5nJeb promoted
+geIuVX9s promoted
+WqKHpY3o promoted
+fCBvDHtv promoted
+fiOyGmGx promoted
+1cgHRf98 promoted
+7OfDqSB4 promoted
+LRWmGdC3 promoted
+v0qZfmnL promoted
+HtMxDJRj promoted
+iIO4wE-E promoted
+Yrhtra7H promoted
+tS4evQau promoted
+pb0JcRA5 promoted
+0JoWDCry promoted
+rRUM60Ok promoted
+infTQnEs promoted
+eOFevzOa promoted
+hB-MtuFp promoted
+DkDVzDiT promoted
+0d3tz0od promoted
+V3rP4k9t promoted
+2puYEzvw promoted
+rvf1jEYG promoted
+6FqplG-X promoted
+XVwEyc_E promoted
+eiKpDfQF promoted
+mrv42N5N promoted
+UAtc4QvG promoted
+Tb89YYid promoted
+7LNtSbmR promoted
+lljhUXF5 promoted
+Neqx4y2T promoted
+5WVfi6GC promoted
+AmYD-q0l promoted
+tEy9PHk6 promoted
+Xw0Bx0cb promoted
+B079LCqs promoted
+drCo8ka_ promoted
+X1V4dmc7 promoted
+JzHwnyZw promoted
+SirE9Jdy promoted
+redvxt9E promoted
+JUUYwoj6 promoted
+He7wnUI8 promoted
+U_HvQRE8 promoted
+lDzBtsCN promoted
+a4bg51qG promoted
+p2qiuDQC promoted
+XGx4C8nd promoted
+jCAqQMBG promoted
+3jN0ejYp promoted
+KXfTimK5 promoted
+dFpLRFWt promoted
+fpUODzoP promoted
+O1GwZIZK promoted
+R8IajiIy promoted
+JiW6uIoB promoted
+KA2S5hPL promoted
+-iH6JBH9 promoted
+IYr3nqOC promoted
+2ZXALooG promoted
+7f517ITl promoted
+QBAW8_s1 promoted
+_qJJoGux promoted
+gGvY5hm0 promoted
+FuPbGiNo promoted
+aAu2yleu promoted
+OPMJZdtf promoted
+K-_lQvp7 promoted
+LcrGxQrh promoted
+IyYLwglk promoted
+r9nXL-pp promoted
+fYpmcRp3 promoted
+cgPhJd31 promoted
+rUl8V5Um promoted
+ct3mFCh1 promoted
+Y_Go6tKl promoted
+BYPXPa5r promoted
+36yDbB1_ promoted
+sYAAEh5O promoted
+BocUB0L_ promoted
+nL0CTVl7 promoted
+wjzdxCBc promoted
+vvdnmqdt promoted
+Ql0bIDXu promoted
+fp6a0rky promoted
+IOzXToft promoted
+x2S1pJFk promoted
+4O8jR9dG promoted
+sTMCAJvR promoted
+8PM_vnWw promoted
+HB4gGDG7 promoted
+amwFLr5C promoted
+RhCDQIW_ promoted
+8Wq6LAPW promoted
+9eOCNn1P promoted
+ilySNiav promoted
+NOxpF61L promoted
+xbo5k0oE promoted
+n_YSqRx4 promoted
+gM_QqlKW promoted
+LZrfrsWq promoted
+-GxKITDT promoted
+QcP0gwJ4 promoted
+W7XYUvRz promoted
+DXif3pTt promoted
+gWuCy6-T promoted
+fbVmkmqC promoted
+k4zRc3lN promoted
+-IqNrBJI promoted
+IZOkw_Jf promoted
+CxQTPPHO promoted
+fP2gnjUB promoted
+7kEvegfO promoted
+Yg0Vn1C_ promoted
+DfwLW3Nf promoted
+Qktjq04Y promoted
+sUiNjcJ_ promoted
+ZTIJBs7W promoted
+MeFOh86e promoted
+qFDX_NlV promoted
+x4BctcNv promoted
+laKfdk9X promoted
+OQMMQSI9 promoted
+7g1XmdVh promoted
+F1-KEz01 promoted
+AZivV9ng promoted
+2HUz0tHC promoted
+Dxrcz_5t promoted
+J-AznR0U promoted
+ekG2rnKI promoted
+u_oGzDSU promoted
+GbX2lTib promoted
+4OAqWtm2 promoted
+9P-tS9N_ promoted
+JppshFJj promoted
+TwnSIWsD promoted
+KyHGEeon promoted
+O_6o0mqs promoted
+NYgvcoN_ promoted
+lbnsNJTk promoted
+jtSvFNJ7 promoted
+qcMPGbsU promoted
+SaIi1RKX promoted
+l3Kqh9JA promoted
+DTBm5pMi promoted
+FB1e6zM0 promoted
+kGF4PT2_ promoted
+CtBk2LSd promoted
+M3x_rnJ1 promoted
+tVv2QdVw promoted
+FB4SoKph promoted
+A5ZoAWim promoted
+tYqteypQ promoted
+eDNlUNwV promoted
+aGCaTTnI promoted
+raHdNCLi promoted
+VAfxa0VS promoted
+iVP42C4_ promoted
+2z2-7cGB promoted
+S7GZGaA3 promoted
+XxDrDACo promoted
+D9xMvxM5 promoted
+pC8Z2cjK promoted
+jnVrRH8q promoted
+bnNlLpE7 promoted
+FuQGd31e promoted
+s4QnFyHu promoted
+tDGJSnxX promoted
+eblUMOX_ promoted
+dAfe-yZE promoted
+zMv-R13x promoted
+L38D3gcj promoted
+djM2PoP5 promoted
+ghqOGFIN promoted
+mkcvnKkO promoted
+mxp5WDft promoted
+QxjJMD_u promoted
+U7__WUGf promoted
+7mGMlsZt promoted
+7hpGC4pF promoted
+xKG7zh_o promoted
+gtq6ly7U promoted
+JW5hoEpj promoted
+TXfglarV promoted
+x9HCL1aC promoted
+XqItgFpl promoted
+UqYhZW0j promoted
+AgMRjoDW promoted
+npuUlDJN promoted
+S8yASCp1 promoted
+d-ynQebj promoted
+6ohajshJ promoted
+6p9hXmOH promoted
+zBWLLn5f promoted
+YBkt_eOY promoted
+9FWEYLlp promoted
+w4-M29HT promoted
+TJUqckJv promoted
+JKWhFsaN promoted
+dWqhaOU8 promoted
+7PF6yv05 promoted
+n4iBTRux promoted
+flq_3OUv promoted
+dit5_vio promoted
+yDX314IW promoted
+XEtXObIg promoted
+Gk9wjvw6 promoted
+kqfmul7y promoted
+QRkB8dDC promoted
+FP1aNPQ_ promoted
+8gcga4nu promoted
+aKoTc1a3 promoted
+bTGuRmXs promoted
+FrFLNwnX promoted
+jkwaxs-k promoted
+skUx6dYg promoted
+4yqrlSD6 promoted
+LEwrOTb9 promoted
+qpgoOVlV promoted
+40tFS8WH promoted
+61VqWvbz promoted
+zp7oE1vr promoted
+9GS_1UzR promoted
+jTAK7DvM promoted
+Tl31rzwK promoted
+skNfFDW- promoted
+RAvDG0AY promoted
+8HqyjbNk promoted
+wDHl8Hsm promoted
+bz2tA2Gm promoted
+Pk8oc7vm promoted
+3KRAcqXG promoted
+AUPSMGIx promoted
+MAv8i6v8 promoted
+gtHByALF promoted
+seIBekDn promoted
+gTkXuN9N promoted
+5shZuw_T promoted
+yV44L91j promoted
+TuohTxSo promoted
+alru0JjP promoted
+0Xfg10rQ promoted
+kkdBs5Kx promoted
+BjVrEEYA promoted
+GylAPtAt promoted
+Osz_mlQL promoted
+hMb7BIR7 promoted
+YQqmJLxJ promoted
+47xqkSsv promoted
+8j3OOc4C promoted
+p2lMeh-d promoted
+1Uj1qBpA promoted
+8Oc67uLF promoted
+cZiXdTpl promoted
+HWwD6xG_ promoted
+B_fm0gF_ promoted
+KD-lCQ7U promoted
+Mfbgc_P_ promoted
+BXhgm-FM promoted
+Yh11pDG6 promoted
+mg7tXYxj promoted
+XeXiBGxJ promoted
+Hrua1KKP promoted
+NQFcm6S8 promoted
+oP1ZaPRr promoted
+guGwCwWn promoted
+YFjrFRhS promoted
+3ToDjrdP promoted
+J-6RlKkj promoted
+q_UgdGth promoted
+vuZgO4RC promoted
+ldNQVDZF promoted
+_tjdk9yv promoted
+PtIoe3lb promoted
+RGeIzZvc promoted
+8I7tRpp- promoted
+lzwYNkzw promoted
+DhdQ4EHj promoted
+jAwXsHtE promoted
+pZHE4SvA promoted
+iZijwUHG promoted
+EjdPjZ7D promoted
+1rfEKOPS promoted
+Wuzg-3QE promoted
+-pHE5wSx promoted
+Aufd-lzo promoted
+YMB0e2FT promoted
+oegF0PIM promoted
+_vpVetz_ promoted
+AY-i6ezO promoted
+B1qUwCIk promoted
+TXg0gDI0 promoted
+a-pngSVh promoted
+hlkXaIAd promoted
+GnZsLnO3 promoted
+pahB7M-O promoted
+wnvptOZx promoted
+4KDgnuY4 promoted
+akb8Mnf3 promoted
+GjFItB7o promoted
+YwHp5W3m promoted
+ALu1yCGJ promoted
+XMOdYb2e promoted
+XyC7ZMVt promoted
+XyYhvnbA promoted
+Bp0PCDq7 promoted
+jIoWR-A9 promoted
+rOlMXrmu promoted
+Sqjpkrkk promoted
+rtBHYWQC promoted
+qZCQROVv promoted
+V2PFxpqw promoted
+2mW9KafX promoted
+mRJCsDoM promoted
+0AkZyI6s promoted
+w1J7B9uC promoted
+tNk8kB_C promoted
+_enC5qvw promoted
+1NEiljgz promoted
+FF9jMLl1 promoted
+VlHOt3Pq promoted
+8Brw3T2Y promoted
+lDR34dlJ promoted
+Y36XpCDa promoted
+G-yneqkK promoted
+XadQ9Vmp promoted
+OJWULP69 promoted
+yAws6eMZ promoted
+IUPPSMQP promoted
+tT9-NAsy promoted
+8T3VNeQI promoted
+xjPWZrbT promoted
+_8LzufSN promoted
+3r2yTCGY promoted
+_rUzhial promoted
+9fWnPn7j promoted
+F07xgi0h promoted
+7llSTqOz promoted
+-tcOikNp promoted
+6E4O-OcC promoted
+gTkCEJsQ promoted
+McDL12K0 promoted
+w5AsOpnP promoted
+Kg3M_VF9 promoted
+jVgO1WcU promoted
+-JMNSyf- promoted
+k1OgtGdv promoted
+ELM7UadA promoted
+sQM_8Spe promoted
+4gfr4lzl promoted
+CsKjjWha promoted
+YXPJUele promoted
+iZo9fAde promoted
+XFGw6hKC promoted
+vRAMTCyA promoted
+IJ-9h4n- promoted
+OlhgPDo0 promoted
+d7pK86RF promoted
+5J4nzxXW promoted
+3R2hMJgG promoted
+e8YMEFvD promoted
+4135-k9E promoted
+VERg3JY4 promoted
+SjmfeH2O promoted
+fQnBCQyl promoted
+BtP7FXOR promoted
+M5ZwVwQM promoted
+RYJ9_RkZ promoted
+OtLyxJIn promoted
+sg9JBpRD promoted
+HpGRwQGj promoted
+FN9vkV7o promoted
+bqbey4Em promoted
+l67E8Gvx promoted
+FrJ3H8tT promoted
+lcacm5CH promoted
+SS837kVb promoted
+-564ZczJ promoted
+LZKO4pHY promoted
+8ioCYcpT promoted
+fZsNLU0D promoted
+GlJFsa_n promoted
+zMt1qOBR promoted
+EnjJBdr4 promoted
+5iW3mC9- promoted
+4Fd4rCIl promoted
+cRNzrJ-Q promoted
+SPSAckRs promoted
+n27tP1xw promoted
+2dffgcQl promoted
+a8wJMPHj promoted
+3WnoXhUT promoted
+_-HyW2xw promoted
+Nyh91a6A promoted
+anDD8t7C promoted
+L5CfLP1n promoted
+VtyATypf promoted
+6-RPqt5o promoted
+ogflHiO3 promoted
+gHx372VP promoted
+gvTCMFuW promoted
+QmNIxGCS promoted
+VZ8miVth promoted
+ffH83JWi promoted
+ucCQDvwU promoted
+H--Te85M promoted
+7kW4aXiv promoted
+JO_Ewkcu promoted
+GlBk-Aq- promoted
+7YayJ4N7 promoted
+KWLtyIYL promoted
+oea9ZZJ8 promoted
+rnySOPLD promoted
+6559Yl12 promoted
+bTW8Am64 promoted
+RFSmvXRk promoted
+KxGad-j- promoted
+oUyOeBpW promoted
+bWyGLLyy promoted
+CDumW0_2 promoted
+--N15PUv promoted
+7uwlD9Mg promoted
+2MHIIkly promoted
+hGCRqbDg promoted
+YU9s4M3c promoted
+Svuk0_8E promoted
+5F7x3f3W promoted
+cO_pEGRF promoted
+WukJP0pR promoted
+GofaVvtV promoted
+NFf20ktg promoted
+3gnG6hb2 promoted
+Y7OhHJc- promoted
+bND80M_O promoted
+43XqHlKu promoted
+mNg8l3vk promoted
+GTS8yWgx promoted
+3M7_EeER promoted
+xwHJl55q promoted
+t00KaG5p promoted
+3h0ntkjY promoted
+e2sJStpC promoted
+2IAAWaBT promoted
+7e7q-2Jf promoted
+dapVFhxu promoted
+Qx7JQrVU promoted
+a7hvH0nZ promoted
+Kk-knnRt promoted
+AjdYKQks promoted
+DC2YDSKR promoted
+9seFZ4Zx promoted
+2DL4TBuz promoted
+rYrDBG9t promoted
+3c9R6LG_ promoted
+B4fjbsnd promoted
+BnbyCXy2 promoted
+X7jxqG2I promoted
+iQbpklLV promoted
+hBYKUtRV promoted
+Z08OZ2zc promoted
+dSmpcv8- promoted
+uQhRfG2b promoted
+KgWb4ci_ promoted
+6DgR1T_Q promoted
+EG5C_4ch promoted
+ZXaZ_fTU promoted
+8iHRGN1q promoted
+la3WKk9U promoted
+3DA30_si promoted
+qOCbeCCB promoted
+VlQQ6eri promoted
+ZU2Kuhdo promoted
+czRLQR_K promoted
+MzpfiJW5 promoted
+f6E_xLQm promoted
+ayDYcMC4 promoted
+ZQSkBTjD promoted
+S5dFU-Ia promoted
+vgbxftbE promoted
+AiRKMDY- promoted
+TTVxa2dc promoted
+_TzDW6a_ promoted
+hqum3F0h promoted
+DzyzV9Ae promoted
+z7_tI34w promoted
+JVRcsAQt promoted
+LrmCDlAV promoted
+Qas7P-EN promoted
+kupqVf3h promoted
+vp-gd1Op promoted
+OX1en5ru promoted
+zKAgyALp promoted
+SAtgSZ_T promoted
+qr4OMdlq promoted
+alNqYrKN promoted
+85CDDcKu promoted
+JeP1_TRt promoted
+zrj6_Dx3 promoted
+xdr-OITp promoted
+YyJ_hVXK promoted
+mnILSuSV promoted
+j3IqpfTe promoted
+bxPwFfEp promoted
+6ctOVyWP promoted
+UHdoQrl7 promoted
+YTmHF2xx promoted
+Jw95quHy promoted
+AE_wdg8E promoted
+dgaamXmo promoted
+L58nH9RT promoted
+FPaBmNFj promoted
+bdB766rY promoted
+GUwBsh_3 promoted
+Yv8V8pk1 promoted
+MwUCK-Me promoted
+fefQD6BW promoted
+CUU7Y7c6 promoted
+Mjs4yBqr promoted
+Wm627W2I promoted
+68NI8ciz promoted
+xdDdagDz promoted
+8vkhWWe7 promoted
+mk_LWsHH promoted
+VkePXD8R promoted
+QDWUvY67 promoted
+pq-IHAtF promoted
+X2zf7yVr promoted
+rlo6Sz-U promoted
+KcKRwupF promoted
+SL0FstJ3 promoted
+fH9lsm3K promoted
+L8Rko8EO promoted
+kyvDPXOo promoted
+OU28Jqdw promoted
+ahBNWYd9 promoted
+LvYebcHz promoted
+QW4HGmUW promoted
+Ze1NMLOg promoted
+nu5laCJz promoted
+qrbxY5Jh promoted
+WXC7rBk9 promoted
+LEm-jrHy promoted
+AI-Sk-i7 promoted
+YEpHNTrZ promoted
+LzEHeivW promoted
+QHXJkRl8 promoted
+OVAxDgGX promoted
+FbqBI3PI promoted
+K9mD1jYs promoted
+g6QSLcdh promoted
+CC5CQCnP promoted
+rOHN0ehh promoted
+Q8dZYDwC promoted
+cs3xy0R7 promoted
+phx7slF2 promoted
+hQ1Bm-pG promoted
+Rqm0MOl0 promoted
+v9Rw9Wua promoted
+UydQwoB3 promoted
+LRaIuYXJ promoted
+L7FeWVPw promoted
+Z5FUKaTX promoted
+ONgsQeuI promoted
+ZFn5NdMQ promoted
+nV7OM15V promoted
+HVgv-ZdH promoted
+N1N4EYV4 promoted
+Dhi1F1iL promoted
+JphhVehy promoted
+pGG6vmMY promoted
+BWdjFw_P promoted
+iKQMg9md promoted
+GIZ89osp promoted
+7dkPuh6D promoted
+88OxDanm promoted
+5KAtXl9A promoted
+NRx6jzi- promoted
+nwKVwLzK promoted
+UxLncTta promoted
+lm4M90o0 promoted
+zTYi8bz2 promoted
+30GcoqXY promoted
+VRPJGEjC promoted
+Uw2ONIyA promoted
+FRFdwURw promoted
+cQ5OHkqB promoted
+VIc7unri promoted
+zQW9tClw promoted
+-B3A-L6h promoted
+WwAZb-OU promoted
+azFfnYzX promoted
+VoBd8FpE promoted
+iYgk5HS9 promoted
+8_jll_CP promoted
+MfkeXad2 promoted
+WKPl6CWO promoted
+xG-lOTEf promoted
+OKdPxLQc promoted
+84rpcldy promoted
+fx8AJCDf promoted
+UjgQdKfq promoted
+bam8RP8P promoted
+Cl005dYD promoted
+QzasJRZY promoted
+YxELOo6a promoted
+iBe4imFz promoted
+XJS45kQ8 promoted
+anUgWZQh promoted
+RmalcaI0 promoted
+uiGyvZjO promoted
+mrhGF1fn promoted
+G5rSu7D2 promoted
+6q7NfIxr promoted
+Hpb7H1vs promoted
+h02ZjJ9t promoted
+9KI_PqyN promoted
+9bwDpFym promoted
+A0X6gJga promoted
+IXAvJXlh promoted
+cuvy_0Li promoted
+ZM_yWl9L promoted
+wMaLASIt promoted
+ZJL-SmMh promoted
+FjI39MT0 promoted
+0nncoc1f promoted
+CgkaUTec promoted
+0aJl4OFE promoted
+MUd929hz promoted
+u1dxwcCt promoted
+bJLAbTPc promoted
+TWN0FwXw promoted
+4fAuqsn8 promoted
+uiPCeGqm promoted
+gA6JtG3r promoted
+ctGYoOVd promoted
+HS7UYdv2 promoted
+CIA1pgNp promoted
+ahCiAikK promoted
+WWSuoyDy promoted
+0-frBdJX promoted
+uO6hlMuR promoted
+PQcpNflK promoted
+9_JfCuqe promoted
+ha9gL1GC promoted
+Jfk9_2KX promoted
+XQsrz38r promoted
+Zg7E9Kdz promoted
+GpB6FGPk promoted
+1A7tUxKz promoted
+-S_2nU8a promoted
+xP_21MMm promoted
+LeU3TLs2 promoted
+KdaVwI2c promoted
+Z28UpEnG promoted
+hX6P5mX0 promoted
+NUJghdm4 promoted
+jwIoYT2I promoted
+F4OH3NW9 promoted
+Kw_FWdmZ promoted
+xfXYklDQ promoted
+gmgRpRvR promoted
+FU1RB_wZ promoted
+USvuX7ft promoted
+uemQE_Iv promoted
+8fgeBV-L promoted
+bqDvPLi- promoted
+2jNtmBkg promoted
+-R9FPsfm promoted
+lITwM_pz promoted
+oIcKvhJW promoted
+p5ORGags promoted
+Y_b2nJ-i promoted
+3ZH-8oK4 promoted
+blmReVsj promoted
+7rIARMIB promoted
+qSqRcZB2 promoted
+BLui-Nkq promoted
+2KIwZyL3 promoted
+kidbob-y promoted
+3dvtAMft promoted
+ME7_1BPB promoted
+C7GmP-B9 promoted
+aDEA3ig8 promoted
+-6B6DVTh promoted
+YIMr-f8V promoted
+22dSwo6Q promoted
+X3nyl_L5 promoted
+n6ac4DNK promoted
+EW1cXpJJ promoted
+qvURtUI7 promoted
+28nnRi1X promoted
+fg3DBZ-2 promoted
+YMdwlFzB promoted
+_ExsOazd promoted
+x6VXNhz2 promoted
+39KY_vhj promoted
+Q0pCRpva promoted
+g1VMpUIE promoted
+YQ2d_DBt promoted
+9BwGigBR promoted
+5DvH-ukY promoted
+inmCf_S4 promoted
+VzgEShIE promoted
+G5m3dA5m promoted
+IMpRDcYL promoted
+zf7pCwfB promoted
+Usc2x4Wp promoted
+EH0O2Smv promoted
+HIdXujzp promoted
+4kQmX59Z promoted
+hW07ZXWI promoted
+sAFsdU5d promoted
+-DvL0MXp promoted
+VRNzmi2x promoted
+U4TLFPGR promoted
+nt2Daz7O promoted
+Ete55z68 promoted
+ikqr43aa promoted
+3nOKU9SV promoted
+jUj1z_xO promoted
+WxJrKAE0 promoted
+kUHNUEh9 promoted
+edpxqYlf promoted
+mdApngWt promoted
+q6B8UpTv promoted
+w6kolNd2 promoted
+XyGb-vVS promoted
+mOS4PMyW promoted
+AmwOl3n6 promoted
+ZAqE94-7 promoted
+lUdjLdwL promoted
+orGXTTx2 promoted
+HfGJjbfV promoted
+xb01vf8S promoted
+mDTGUKL_ promoted
+rwFimHdK promoted
+KYpWIAQT promoted
+FrUivrO2 promoted
+ZlH_mA5S promoted
+C7JhHElY promoted
+Wn7tZddJ promoted
+7xF7BS3c promoted
+RQ4_hwU- promoted
+td6Si2ee promoted
+di0w7LL6 promoted
+p57Q0XZu promoted
+EKpSU79R promoted
+1IKUuWNp promoted
+xPdQLu9o promoted
+w4wyMroj promoted
+FbRKuEV4 promoted
+EPf9PL8b promoted
+tKBELfqu promoted
+9dO3AuqM promoted
+zYGVcPQA promoted
+9WyR7vIE promoted
+7Ke9_Glm promoted
+Kunty_Hd promoted
+rumtOWGj promoted
+2tcIwmIN promoted
+yLjWVetf promoted
+fpC6ufmf promoted
+7mgmSSUR promoted
+lHY7CJSJ promoted
+-SG6u2fU promoted
+gx76M_HK promoted
+_POl_r5G promoted
+fI016Nzn promoted
+vuLgLo1w promoted
+EUCG4nQV promoted
+MpzDtv-9 promoted
+I29e802j promoted

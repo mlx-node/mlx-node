@@ -1,17 +1,22 @@
 //! Pin-bump gate for the bridge BF16-x / F32-sidecar affine matmul
 //! (`mlx_quantized_matmul_affine_bf16`), eager and after a shapeless compile
-//! replay: every case must reproduce the output digest in `tests/golden`,
-//! captured while the same cases were bit-identical to the MLX fork's own
-//! mixed `QuantizedMatmul` (fork commit ce81e3b19, pin 053e43fec). The digests
-//! belong to the capture machine (M5 Max, applegpu_g17s); anywhere else the
-//! gate fails.
+//! replay: every case must reproduce the output digest in `tests/golden`. The
+//! digests belong to the capture machine (M5 Max, applegpu_g17s); anywhere
+//! else the gate fails.
 //!
-//! Shapes the native kernel does not take run MLX's promoted F32 graph, so
-//! bits alone cannot show the native kernel ran: the per-thread family
-//! counters must also match the expected routing. Ours takes the native
-//! kernel for 2..=8 rows only; the promoted graph follows MLX's own
-//! generation, NAX and 'd'-class batch limits. Run every captured route after
-//! an MLX pin change:
+//! Each fixture line carries the case's route, and the per-thread family
+//! counters must agree with it. Ours takes the native kernel for 2..=8 rows
+//! only; everything else runs MLX's promoted F32 graph, which follows MLX's
+//! own generation, NAX and 'd'-class batch limits. The two kinds of line have
+//! different provenance:
+//!
+//! - `native`: our kernel, captured while bit-identical to the MLX fork's own
+//!   mixed `QuantizedMatmul` (fork commit ce81e3b19, pin 053e43fec). An MLX
+//!   pin change must leave these unchanged.
+//! - `promoted`: MLX's own graph. A pin change may move these bits; re-capture
+//!   them only with accuracy evidence against an f64 reference.
+//!
+//! Run every captured route after an MLX pin change:
 //!
 //! ```text
 //! cargo test -p mlx-core --release --test affine_mixed_golden_gate -- --ignored --nocapture
@@ -28,7 +33,7 @@ mod golden_support;
 mod kquant_support;
 
 use affine_mixed_support::*;
-use golden_support::Golden;
+use golden_support::{Golden, digest};
 use kquant_support::{family_count, gpu_gen, read_output, start_counting, stop_counting};
 use mlx_core::array::MxArray;
 
@@ -59,6 +64,11 @@ fn route(arch_gen: i32, gs: i32, bits: i32, k: i64, m: i64) -> bool {
     arch_gen >= 15 && gs == 32 && bits == 8 && k != 64 && k != 128 && (2..=8).contains(&m)
 }
 
+/// A fixture line: the output digest, then the route the counters proved.
+fn routed(digest: String, native: bool) -> String {
+    format!("{digest} {}", if native { "native" } else { "promoted" })
+}
+
 struct Tally {
     cases: u64,
     promoted_above_8: u64,
@@ -71,7 +81,6 @@ impl Tally {
         let wide_before = family_count("affine_mixed_qmv_wide");
         let promoted_before = family_count("affine_mixed_promoted");
         let (shape, dtype, out) = read_output(ctx, ours(x, w, gs, bits));
-        self.golden.record_bits(ctx, &shape, dtype, &out);
         let wide = family_count("affine_mixed_qmv_wide") - wide_before;
         let promoted = family_count("affine_mixed_promoted") - promoted_before;
         assert_eq!(wide + promoted, 1, "{ctx}: one path per case");
@@ -81,6 +90,8 @@ impl Tally {
             "{ctx}: native kernel ran = {}",
             wide == 1
         );
+        self.golden
+            .record_value(ctx, &routed(digest(&shape, dtype, &out), expect));
         let rows = x.size().unwrap() as i64 / x.shape_at(x.ndim().unwrap() - 1).unwrap();
         if rows > 8 {
             self.promoted_above_8 += promoted;
@@ -220,7 +231,7 @@ fn mixed_affine_shapeless_replay_matches_golden() {
             for (tag, handle) in [("replay", replayed), ("eager", eager)] {
                 let what = format!("{ctx} {tag}");
                 let (shape, dtype, out) = read_output(&what, handle);
-                g.record_bits(&what, &shape, dtype, &out);
+                g.record_value(&what, &routed(digest(&shape, dtype, &out), wide(m) == 1));
             }
             cases += 1;
         }
