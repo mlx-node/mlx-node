@@ -3163,7 +3163,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_estimate_covers_ragged_continuations_without_nax_padding() {
+    fn portable_estimate_covers_ragged_continuations() {
         for query in [9_u64, 31, 32, 33, 531, 1_012, 1_024, 2_049] {
             let total = 85_501 + query;
             let estimate = estimate_paged_pool_sdpa_bytes_with_portable(
@@ -3192,26 +3192,18 @@ mod tests {
 
         let one_kv = 64_754_u64 * 4 * 256 * 2;
         let one_query = 2_048_u64 * 24 * 256 * 2;
-        let padded_kv = 64_768_u64 * 4 * 256 * 2;
         assert_eq!(
             fused,
-            one_kv * 4 + one_query * 2 + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES + padded_kv * 2,
-            "ragged K/V padding must remain in the fused peak estimate"
+            one_kv * 4 + one_query * 2 + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES
         );
 
+        // MLX's NAX D=256 kernel reads ragged tiles in place: no padded copies.
         let ragged_query = estimate_paged_pool_sdpa_bytes(1_031, 4_129, 24, 4, 256, 2, true);
-        let ragged_one_kv = 4_129_u64 * 4 * 256 * 2;
-        let ragged_one_query = 1_031_u64 * 24 * 256 * 2;
-        let ragged_padded_kv = 4_160_u64 * 4 * 256 * 2;
-        let ragged_padded_query = 1_088_u64 * 24 * 256 * 2;
         assert_eq!(
             ragged_query,
-            ragged_one_kv * 4
-                + ragged_one_query * 2
+            4_129_u64 * 4 * 256 * 2 * 4
+                + 1_031_u64 * 24 * 256 * 2 * 2
                 + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES
-                + ragged_padded_kv * 2
-                + ragged_padded_query * 2,
-            "ragged Q and K/V padding must both remain in the fused peak estimate"
         );
 
         // Residual chunks below the upstream q_len=1024 routing boundary

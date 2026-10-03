@@ -5,9 +5,9 @@
 
 use mlx_core::array::mask::create_causal_mask;
 use mlx_core::array::{
-    DType, MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal,
-    synchronize_and_clear_cache,
+    DType, MxArray, scaled_dot_product_attention_causal, synchronize_and_clear_cache,
 };
+use mlx_core::nn::Activations;
 
 const TF32_CHILD_ENV: &str = "MLX_D256_TF32_TEST_CHILD";
 
@@ -59,17 +59,7 @@ fn assert_fused_matches_explicit_mask(query_len: i64, key_len: i64) {
     let fused = scaled_dot_product_attention_causal(&queries, &keys, &values, scale)
         .expect("fused causal SDPA");
 
-    // An explicit boolean mask deliberately retains MLX's primitives
-    // fallback, giving an independent reference in the same process.
-    let offset = i32::try_from(key_len - query_len).expect("causal offset");
-    let mask = create_causal_mask(
-        i32::try_from(query_len).expect("query length"),
-        Some(offset),
-        None,
-    )
-    .expect("explicit causal mask");
-    let reference = scaled_dot_product_attention(&queries, &keys, &values, scale, Some(&mask))
-        .expect("explicit-mask SDPA reference");
+    let reference = primitive_reference(&queries, &keys, &values, scale, query_len, key_len);
 
     let expected_shape = [BATCH, QUERY_HEADS, query_len, HEAD_SIZE];
     let fused_shape = fused.shape().expect("fused shape");
@@ -108,6 +98,45 @@ fn assert_fused_matches_explicit_mask(query_len: i64, key_len: i64) {
     synchronize_and_clear_cache();
 }
 
+/// FP32 attention from primitives (MLX's unfused graph). Any `fast::` SDPA
+/// call, even with an explicit mask, now takes the fused NAX kernel at q >= 1024.
+fn primitive_reference(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    scale: f64,
+    query_len: i64,
+    key_len: i64,
+) -> MxArray {
+    let repeats = i32::try_from(QUERY_HEADS / KV_HEADS).expect("GQA factor");
+    let f32_heads = |x: &MxArray| {
+        x.astype(DType::Float32)
+            .and_then(|x| x.repeat(repeats, 1))
+            .expect("GQA-expanded FP32 operand")
+    };
+    let offset = i32::try_from(key_len - query_len).expect("causal offset");
+    let keep = create_causal_mask(
+        i32::try_from(query_len).expect("query length"),
+        Some(offset),
+        None,
+    )
+    .expect("causal mask");
+    let additive = keep
+        .astype(DType::Float32)
+        .and_then(|m| m.sub_scalar(1.0))
+        .and_then(|m| m.mul_scalar(1e9))
+        .expect("additive mask");
+    let scores = queries
+        .astype(DType::Float32)
+        .and_then(|q| q.mul_scalar(scale))
+        .and_then(|q| q.matmul(&f32_heads(keys).transpose(Some(&[0, 1, 3, 2]))?))
+        .and_then(|s| s.add(&additive))
+        .expect("scores");
+    Activations::softmax(&scores, Some(-1))
+        .and_then(|p| p.matmul(&f32_heads(values)))
+        .expect("primitive attention reference")
+}
+
 fn would_use_fused_d256(query_len: i64, key_len: i64) -> bool {
     would_use_fused_d256_for_dtype(false, query_len, key_len)
 }
@@ -117,6 +146,16 @@ fn would_use_fused_d256_for_dtype(
     query_len: i64,
     key_len: i64,
 ) -> bool {
+    would_use_fused_d256_with(effective_dtype_is_float32, query_len, key_len, true, false)
+}
+
+fn would_use_fused_d256_with(
+    effective_dtype_is_float32: bool,
+    query_len: i64,
+    key_len: i64,
+    do_causal: bool,
+    has_array_mask: bool,
+) -> bool {
     let mut would_use = false;
     let status = unsafe {
         mlx_sys::mlx_metal_d256_full_sdpa_would_use(
@@ -125,8 +164,8 @@ fn would_use_fused_d256_for_dtype(
             HEAD_SIZE as i32,
             i32::try_from(query_len).expect("query length"),
             i32::try_from(key_len).expect("key length"),
-            true,
-            false,
+            do_causal,
+            has_array_mask,
             &mut would_use,
         )
     };
@@ -137,15 +176,15 @@ fn would_use_fused_d256_for_dtype(
 #[test]
 #[ignore = "requires a NAX Metal GPU; explicit execution must fail when the fused route is unavailable"]
 fn d256_fused_sdpa_matches_fallback_across_boundaries() {
-    // The exact C++ D=256 eligibility predicate, not a Rust copy, owns the 1024
-    // threshold. This catches a routing regression even if both numerical
-    // calls below would otherwise fall back and compare equal.
     assert!(!would_use_fused_d256(1_023, 8_192));
+    assert!(would_use_fused_d256_with(false, 1_024, 8_192, false, true));
+    assert!(!would_use_fused_d256_with(
+        false, 2_048, 8_192, false, false
+    ));
 
     for (query_len, key_len) in [
         (1_024, 8_192),
-        // Both dimensions are odd, exercising Q/K/V padding while preserving
-        // the true causal diagonal offset.
+        // Ragged Q and K tiles with a non-zero causal diagonal offset.
         (1_031, 4_129),
         (2_049, 4_129),
     ] {

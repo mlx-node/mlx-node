@@ -230,10 +230,12 @@ pub(crate) struct LivePrefillHeadroom {
     pub(crate) paged_pool_allocated_bytes: Option<u64>,
 }
 
-/// Whether MLX's pinned dispatcher will pick a fused full-attention kernel
-/// for this geometry — decides whether the score-matrix fallback estimate
-/// applies. `d256_full_sdpa_available` gates the D=256 NAX path; families
-/// without it (Gemma4's D=512 global attention) pass `false`.
+/// Whether MLX's pinned dispatcher picks a fused kernel for this causal
+/// geometry (q <= k) — decides whether the score-matrix fallback estimate
+/// applies. Conservative: `true` only where MLX fuses; some fused shapes
+/// (D=72/96, D=512, non-NAX square D=256) still report `false`.
+/// `d256_full_sdpa_available` gates the D=256 NAX path; families without it
+/// (Gemma4's D=512 global attention) pass `false`.
 pub(crate) fn mlx_sdpa_uses_fused_kernel(
     query_tokens: u64,
     num_query_heads: u64,
@@ -280,9 +282,9 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes(
     )
 }
 
-/// The portable D256 tile handles ragged queries without NAX padding and
-/// never allocates scores. Keep its capability separate from NAX's >=1024
-/// query gate so small continuations on M1-M4 receive the correct estimate.
+/// The portable D256 tile handles ragged queries and never allocates scores.
+/// Keep its capability separate from NAX's >=1024 query gate so small
+/// continuations on M1-M4 receive the correct estimate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn estimate_paged_pool_sdpa_bytes_with_portable(
     query_tokens: u64,
@@ -324,37 +326,6 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes_with_portable(
         head_dim,
         d256_full_sdpa_available,
     ) {
-        // The D=256 NAX kernel deliberately pads ragged sequence dimensions
-        // so every block can use its aligned pipeline. Those buffers coexist
-        // with the original gathered K/V and Q/output until the command
-        // encoder completes, so include them in the live-headroom estimate.
-        if head_dim == 256 {
-            let kv_padding = if total_context.is_multiple_of(32) {
-                0
-            } else {
-                total_context
-                    .div_ceil(32)
-                    .saturating_mul(32)
-                    .saturating_mul(num_kv_heads)
-                    .saturating_mul(head_dim)
-                    .saturating_mul(dtype_bytes)
-                    .saturating_mul(2)
-            };
-            let query_padding = if query_tokens.is_multiple_of(64) {
-                0
-            } else {
-                query_tokens
-                    .div_ceil(64)
-                    .saturating_mul(64)
-                    .saturating_mul(num_query_heads)
-                    .saturating_mul(head_dim)
-                    .saturating_mul(dtype_bytes)
-                    .saturating_mul(2)
-            };
-            return gathered
-                .saturating_add(kv_padding)
-                .saturating_add(query_padding);
-        }
         return gathered;
     }
     let scores = num_query_heads
