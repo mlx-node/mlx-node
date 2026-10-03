@@ -1,18 +1,20 @@
-//! TEST-ONLY oracle, deleted with the move to upstream MLX: the bridge
-//! BF16-x / F32-sidecar affine matmul (`mlx_quantized_matmul_affine_bf16`)
-//! must equal the MLX fork's own mixed `QuantizedMatmul` (fork commit
-//! ce81e3b19, pin 053e43fec) bit for bit, eagerly and after a shapeless
-//! compile replay.
+//! Pin-bump gate for the bridge BF16-x / F32-sidecar affine matmul
+//! (`mlx_quantized_matmul_affine_bf16`), eager and after a shapeless compile
+//! replay: every case must reproduce the output digest in `tests/golden`,
+//! captured while the same cases were bit-identical to the MLX fork's own
+//! mixed `QuantizedMatmul` (fork commit ce81e3b19, pin 053e43fec). The digests
+//! belong to the capture machine (M5 Max, applegpu_g17s); anywhere else the
+//! gate fails.
 //!
-//! The fork falls back to the promoted F32 graph for shapes its kernel does
-//! not take, and so does ours, so bit-identity alone cannot show the native
-//! kernel ran: the per-thread family counters must also match the expected
-//! routing. Ours takes the native kernel for 2..=8 rows only; from 9 rows the
-//! fork still ran its kernel (up to its batch limit), which equals the
-//! promoted graph bit for bit, so the bits must match either way.
+//! Shapes the native kernel does not take run MLX's promoted F32 graph, so
+//! bits alone cannot show the native kernel ran: the per-thread family
+//! counters must also match the expected routing. Ours takes the native
+//! kernel for 2..=8 rows only. Run all three generations after an MLX pin
+//! change:
 //!
 //! ```text
-//! cargo test -p mlx-core --release --test affine_mixed_fork_oracle_parity -- --nocapture
+//! cargo test -p mlx-core --release --test affine_mixed_golden_gate -- --ignored --nocapture
+//! MLX_METAL_GPU_ARCH=applegpu_g16s cargo test ...   # gen 16: same routing as gen 17
 //! MLX_METAL_GPU_ARCH=applegpu_g14s cargo test ...   # gen 14: no qmv_wide, all promoted
 //! ```
 
@@ -21,8 +23,8 @@ mod golden_support;
 mod kquant_support;
 
 use affine_mixed_support::*;
-use golden_support::{Golden, Mode};
-use kquant_support::{assert_identical, family_count, gpu_gen, start_counting, stop_counting};
+use golden_support::Golden;
+use kquant_support::{family_count, gpu_gen, read_output, start_counting, stop_counting};
 use mlx_core::array::MxArray;
 
 /// Group sizes and bits with F32 sidecars at load that the entry point accepts:
@@ -45,20 +47,6 @@ const SHAPES: [(i64, i64); 7] = [
 
 const ROWS: [i64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 17, 33];
 
-fn fork(x: &mlx_core::array::MxArray, w: &Weights, gs: i32, bits: i32) -> *mut mlx_sys::mlx_array {
-    // SAFETY: every handle outlives the call.
-    unsafe {
-        mlx_sys::mlx_test_fork_affine_mixed_qmm(
-            x.as_raw_ptr(),
-            w.w.as_raw_ptr(),
-            w.scales.as_raw_ptr(),
-            w.biases.as_raw_ptr(),
-            gs,
-            bits,
-        )
-    }
-}
-
 /// Whether a contiguous x must take the native kernel on this GPU: gs 32,
 /// 8 bits, K not 64/128 and 2 <= M <= 8. Everything else, rows 9 and up
 /// included, takes the promoted graph.
@@ -73,11 +61,11 @@ struct Tally {
 }
 
 impl Tally {
-    /// Bit-identity with the fork, then the counter delta proves the path.
+    /// The golden digest, then the counter delta proves the path.
     fn check(&mut self, ctx: &str, x: &MxArray, w: &Weights, gs: i32, bits: i32, expect: bool) {
         let wide_before = family_count("affine_mixed_qmv_wide");
         let promoted_before = family_count("affine_mixed_promoted");
-        let (shape, dtype, out) = assert_identical(ctx, ours(x, w, gs, bits), fork(x, w, gs, bits));
+        let (shape, dtype, out) = read_output(ctx, ours(x, w, gs, bits));
         self.golden.record_bits(ctx, &shape, dtype, &out);
         let wide = family_count("affine_mixed_qmv_wide") - wide_before;
         let promoted = family_count("affine_mixed_promoted") - promoted_before;
@@ -98,14 +86,15 @@ impl Tally {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn mixed_affine_matches_fork_bitwise() {
-    assert!(metal_available(), "this oracle needs Metal");
+#[ignore = "pin-bump gate with hardware-specific goldens; see the module docs"]
+fn mixed_affine_matches_golden() {
+    assert!(metal_available(), "this gate needs Metal");
     let arch_gen = gpu_gen();
     start_counting();
     let mut t = Tally {
         cases: 0,
         promoted_above_8: 0,
-        golden: Golden::metal("affine_mixed_matmul", Mode::from_env()),
+        golden: Golden::metal("affine_mixed_matmul"),
     };
     for (li, &(gs, bits)) in LAYOUTS.iter().enumerate() {
         for (si, &(n, k)) in SHAPES.iter().enumerate() {
@@ -168,7 +157,7 @@ fn mixed_affine_matches_fork_bitwise() {
         .collect();
     stop_counting();
     eprintln!(
-        "gen {arch_gen}: {} cases bit-identical to the fork; qmv_wide {got_wide}, \
+        "gen {arch_gen}: {} cases; qmv_wide {got_wide}, \
          promoted {got_promoted} ({} with M > 8), qmv_wide nv2..8 {per_nv:?}",
         t.cases, t.promoted_above_8
     );
@@ -189,13 +178,14 @@ fn mixed_affine_matches_fork_bitwise() {
 }
 
 /// A shapeless compile traced at one row count and replayed at another must
-/// route by the replay's rows: same bits as the fork's eager result.
+/// route by the replay's rows; replay and eager must both equal the golden.
 #[cfg(target_os = "macos")]
 #[test]
-fn mixed_affine_shapeless_replay_matches_fork_bitwise() {
-    assert!(metal_available(), "this oracle needs Metal");
+#[ignore = "pin-bump gate with hardware-specific goldens; see the module docs"]
+fn mixed_affine_shapeless_replay_matches_golden() {
+    assert!(metal_available(), "this gate needs Metal");
     let arch_gen = gpu_gen();
-    let mut g = Golden::metal("affine_mixed_shapeless", Mode::from_env());
+    let mut g = Golden::metal("affine_mixed_shapeless");
     start_counting();
     let mut cases = 0;
     for (si, &(n, k)) in SHAPES.iter().enumerate() {
@@ -224,13 +214,13 @@ fn mixed_affine_shapeless_replay_matches_fork_bitwise() {
             );
             for (tag, handle) in [("replay", replayed), ("eager", eager)] {
                 let what = format!("{ctx} {tag}");
-                let (shape, dtype, out) = assert_identical(&what, handle, fork(&x, &w, 32, 8));
+                let (shape, dtype, out) = read_output(&what, handle);
                 g.record_bits(&what, &shape, dtype, &out);
             }
             cases += 1;
         }
     }
     stop_counting();
-    eprintln!("{cases} shapeless replays bit-identical to the fork");
+    eprintln!("{cases} shapeless replays");
     g.finish();
 }

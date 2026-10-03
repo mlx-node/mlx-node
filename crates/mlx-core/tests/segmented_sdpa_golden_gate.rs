@@ -1,28 +1,29 @@
-//! TEST-ONLY oracle, deleted with the move to upstream MLX: the bridge's
-//! segmented SDPA kernels (`metal/common/sdpa_segmented.metal.inc`, JIT) and
-//! planners (`mlx_segmented_sdpa_plan.h`) must equal the MLX fork's
-//! `sdpa_vector_segmented*` kernels and `segmented_sdpa_plan.h` /
-//! `sdpa_vector_plan.h` (fork commits 03914b9b3 and a6189690e, pin 053e43fec)
-//! bit for bit.
+//! Pin-bump gate for the bridge's segmented SDPA kernels
+//! (`metal/common/sdpa_segmented.metal.inc`, JIT) and planners
+//! (`mlx_segmented_sdpa_plan.h`): every case must reproduce the digest in
+//! `tests/golden`, captured while the same cases were bit-identical to the
+//! MLX fork's segmented kernels and planners (fork commits 03914b9b3 and
+//! a6189690e, pin 053e43fec). Kernel digests belong to the capture machine
+//! (M5 Max, applegpu_g17s); anywhere else the gate fails. The planner digests
+//! are pure and run by default on any machine.
 //!
-//! `mlx_test_fork_segmented_sdpa_forward` runs the production op with only
-//! the kernel library swapped, so the comparison isolates the kernel bytes.
 //! The thread's kernel-family counters prove every kernel and verify route
-//! ran on our side. Run the native class and the other policy classes:
+//! ran. Run the native class and the other policy classes after an MLX pin
+//! change:
 //!
 //! ```text
-//! cargo test -p mlx-core --release --test segmented_sdpa_fork_oracle_parity -- --nocapture
+//! cargo test -p mlx-core --release --test segmented_sdpa_golden_gate -- --include-ignored --nocapture
 //! MLX_METAL_GPU_ARCH=applegpu_g17d cargo test ...   # class 'd' policy
 //! MLX_METAL_GPU_ARCH=applegpu_g17g cargo test ...   # base-class policy
 //! ```
 
-#![cfg(target_os = "macos")]
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 mod golden_support;
 mod kquant_support;
 
-use golden_support::{Golden, Mode};
-use kquant_support::{family_count, read_bits, start_counting, stop_counting};
+use golden_support::Golden;
+use kquant_support::{family_count, read_output, start_counting, stop_counting};
 use mlx_core::array::MxArray;
 
 const D: i64 = 256;
@@ -41,10 +42,10 @@ const ROUTES: [&str; 4] = [
     "segmented_sdpa_route_split",
 ];
 
-fn metal() -> bool {
+fn require_metal() {
+    // SAFETY: nullary predicate.
     let available = unsafe { mlx_sys::mlx_metal_is_available() };
-    assert!(available, "this oracle needs a Metal device");
-    available
+    assert!(available, "this gate needs a Metal device");
 }
 
 fn bf16_bits(len: usize, salt: u32) -> Vec<u16> {
@@ -111,7 +112,7 @@ impl Tally {
         };
         let kernels_before = counts(&KERNELS);
         let routes_before = counts(&ROUTES);
-        let (ours_shape, ours_dtype, ours) = read_bits(&format!("{ctx} ours"), ours);
+        let (ours_shape, ours_dtype, ours) = read_output(ctx, ours);
         let kernels: Vec<u64> = counts(&KERNELS)
             .iter()
             .zip(&kernels_before)
@@ -127,32 +128,6 @@ impl Tally {
             kernels[0] + kernels[1] + kernels[2] >= 1,
             "{ctx}: no segmented kernel ran"
         );
-        let fork = unsafe {
-            mlx_sys::mlx_test_fork_segmented_sdpa_forward(
-                q.as_raw_ptr(),
-                pk.as_raw_ptr(),
-                pv.as_raw_ptr(),
-                nk.as_raw_ptr(),
-                nv.as_raw_ptr(),
-                SCALE,
-                causal,
-            )
-        };
-        let (fork_shape, _, fork) = read_bits(&format!("{ctx} fork"), fork);
-        assert_eq!(ours_shape, fork_shape, "{ctx}: shape");
-        if let Some(i) = (0..ours.len()).find(|&i| ours[i] != fork[i]) {
-            panic!(
-                "{ctx}: first difference at {i}: ours {:#x}, fork {:#x} ({} of {} differ)",
-                ours[i],
-                fork[i],
-                (0..ours.len()).filter(|&j| ours[j] != fork[j]).count(),
-                ours.len()
-            );
-        }
-        assert!(
-            ours.iter().any(|&b| b & 0x7fff != 0),
-            "{ctx}: an all-zero output proves nothing"
-        );
         self.golden.record_bits(ctx, &ours_shape, ours_dtype, &ours);
         for (total, delta) in self.kernels.iter_mut().zip(&kernels) {
             *total += delta;
@@ -164,38 +139,26 @@ impl Tally {
     }
 }
 
+/// Pure planners and vector-SDPA policy of every device class.
 #[test]
-fn planners_and_policy_match_fork() {
-    if !metal() {
-        return;
+fn planners_and_policy_match_golden() {
+    for class in *b"sdg" {
+        let mut digests = [0u64; 6];
+        // SAFETY: `digests` holds the 6 outputs.
+        let inputs = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_plan_digests(
+                class as std::ffi::c_char,
+                0,
+                digests.as_mut_ptr(),
+            )
+        };
+        let mut g = Golden::pure(&format!("segmented_sdpa_plan.class_{}", class as char));
+        g.record_value("inputs", &inputs.to_string());
+        for (name, d) in PLAN_DIGESTS.iter().zip(digests) {
+            g.record_value(name, &format!("{d:016x}"));
+        }
+        g.finish();
     }
-    let mut checked = 0i64;
-    let mismatches = unsafe { mlx_sys::mlx_test_fork_segmented_sdpa_plan_mismatches(&mut checked) };
-    eprintln!(
-        "class '{}': {checked} planner and policy inputs, {mismatches} mismatches",
-        device_class() as char
-    );
-    assert_eq!(mismatches, 0);
-    assert!(checked > 1_000_000, "the sweep shrank: {checked}");
-    let class = device_class();
-    let mut digests = [0u64; 6];
-    let ours = unsafe {
-        mlx_sys::mlx_segmented_sdpa_test_plan_digests(
-            class as std::ffi::c_char,
-            0,
-            digests.as_mut_ptr(),
-        )
-    };
-    assert_eq!(ours, checked, "the digest sweep must cover the fork sweep");
-    let mut g = Golden::pure(
-        &format!("segmented_sdpa_plan.class_{}", class as char),
-        Mode::from_env(),
-    );
-    g.record_value("inputs", &ours.to_string());
-    for (name, d) in PLAN_DIGESTS.iter().zip(digests) {
-        g.record_value(name, &format!("{d:016x}"));
-    }
-    g.finish();
 }
 
 const PLAN_DIGESTS: [&str; 6] = [
@@ -207,32 +170,28 @@ const PLAN_DIGESTS: [&str; 6] = [
     "select_segmented_verify_route",
 ];
 
+#[cfg(target_os = "macos")]
 #[test]
-fn max_query_length_matches_fork() {
-    if !metal() {
-        return;
-    }
-    let mut g = Golden::metal("segmented_sdpa_max_query_length", Mode::from_env());
+#[ignore = "pin-bump gate with hardware-specific goldens; see the module docs"]
+fn max_query_length_matches_golden() {
+    require_metal();
+    let mut g = Golden::metal("segmented_sdpa_max_query_length");
     let mut widths = Vec::new();
     for gqa in 0..=33 {
-        let ours = max_query_length(gqa);
-        let fork = i64::from(unsafe {
-            mlx_sys::mlx_test_fork_segmented_sdpa_max_query_length(gqa as i32)
-        });
-        assert_eq!(ours, fork, "gqa {gqa}: our pipelines support other widths");
-        g.record_value(&format!("gqa {gqa}"), &ours.to_string());
-        widths.push(ours);
+        let width = max_query_length(gqa);
+        g.record_value(&format!("gqa {gqa}"), &width.to_string());
+        widths.push(width);
     }
     eprintln!("max query length by gqa 0..=33: {widths:?}");
     assert!(widths[1..=32].iter().all(|&w| w >= 1));
     g.finish();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-fn kernels_match_fork_bitwise() {
-    if !metal() {
-        return;
-    }
+#[ignore = "pin-bump gate with hardware-specific goldens; see the module docs"]
+fn kernels_match_golden() {
+    require_metal();
     const KV: i64 = 4;
     const CAPACITY: i64 = 65_600;
     // A cache slice, as the compiled verify reads it: row stride D, head
@@ -246,7 +205,7 @@ fn kernels_match_fork_bitwise() {
         cases: 0,
         kernels: [0; 4],
         routes: [0; 4],
-        golden: Golden::metal("segmented_sdpa_kernels", Mode::from_env()),
+        golden: Golden::metal("segmented_sdpa_kernels"),
     };
     // (q heads, kv heads): GQA 1..32 including the Qwen3.5/3.8 head layouts.
     let layouts: [(i64, i64); 9] = [
@@ -347,11 +306,7 @@ fn kernels_match_fork_bitwise() {
     }
     stop_counting();
 
-    eprintln!(
-        "class '{}': {} cases bit-identical to the fork",
-        device_class() as char,
-        tally.cases
-    );
+    eprintln!("class '{}': {} cases", device_class() as char, tally.cases);
     for (name, n) in KERNELS.iter().zip(tally.kernels) {
         eprintln!("  {name} {n}");
     }

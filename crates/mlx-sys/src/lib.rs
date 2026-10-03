@@ -812,28 +812,6 @@ unsafe extern "C-unwind" {
         out_digests: *mut u64,
     ) -> i64;
 
-    /// TEST-ONLY oracle: `mlx_segmented_sdpa_test_forward` with every
-    /// segmented kernel taken from the MLX fork's metallib, evaluated before
-    /// returning. Only the fork pin ships those kernels; removed with the move
-    /// to upstream MLX.
-    pub fn mlx_test_fork_segmented_sdpa_forward(
-        q: *mut mlx_array,
-        prefix_k: *mut mlx_array,
-        prefix_v: *mut mlx_array,
-        new_k: *mut mlx_array,
-        new_v: *mut mlx_array,
-        scale: f32,
-        causal: bool,
-    ) -> *mut mlx_array;
-
-    /// TEST-ONLY oracle: `mlx_segmented_sdpa_max_query_length` from the fork's
-    /// kernel pipelines.
-    pub fn mlx_test_fork_segmented_sdpa_max_query_length(gqa_factor: i32) -> i32;
-
-    /// TEST-ONLY oracle: mismatches between the fork's segmented planners and
-    /// vector-SDPA policy (this device's class) and ours; -1 on error.
-    pub fn mlx_test_fork_segmented_sdpa_plan_mismatches(out_checked: *mut i64) -> i64;
-
     // Fused forward step - single FFI call for entire forward pass
     // This reduces FFI overhead from ~300 calls to 1 call per token
     // Uses array offsets for batched generation with proper per-sequence RoPE positions.
@@ -1819,48 +1797,6 @@ unsafe extern "C-unwind" {
         sorted_indices: bool,
     ) -> *mut mlx_array;
 
-    /// TEST-ONLY oracle: MLX's built-in K-quant path, which only the MLX fork
-    /// pin has. Removed with the move to upstream MLX. `device`: 0 CPU, 1 GPU.
-    pub fn mlx_test_fork_kquant_quantized_matmul(
-        x: *mut mlx_array,
-        w: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        transpose: bool,
-        group_size: i32,
-        bits: i32,
-        mode: *const std::os::raw::c_char,
-        device: i32,
-    ) -> *mut mlx_array;
-
-    /// TEST-ONLY oracle, see `mlx_test_fork_kquant_quantized_matmul`.
-    pub fn mlx_test_fork_kquant_gather_qmm(
-        x: *mut mlx_array,
-        w: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        lhs_indices: *mut mlx_array,
-        rhs_indices: *mut mlx_array,
-        transpose: bool,
-        group_size: i32,
-        bits: i32,
-        mode: *const std::os::raw::c_char,
-        sorted_indices: bool,
-        device: i32,
-    ) -> *mut mlx_array;
-
-    /// TEST-ONLY oracle, see `mlx_test_fork_kquant_quantized_matmul`.
-    pub fn mlx_test_fork_kquant_dequantize(
-        w: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        group_size: i32,
-        bits: i32,
-        out_dtype: i32,
-        mode: *const std::os::raw::c_char,
-        device: i32,
-    ) -> *mut mlx_array;
-
     /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
     /// disabling resets this thread's counts.
     pub fn mlx_test_kquant_counting(enable: bool);
@@ -1935,18 +1871,6 @@ unsafe extern "C-unwind" {
         out_replay: *mut *mut mlx_array,
         out_eager: *mut *mut mlx_array,
     ) -> bool;
-
-    /// TEST-ONLY oracle: the MLX fork's `QuantizedMatmul` built directly with
-    /// BF16 `x` and F32 affine sidecars on the GPU. Only the fork pin computes
-    /// it correctly; removed with the move to upstream MLX.
-    pub fn mlx_test_fork_affine_mixed_qmm(
-        x: *mut mlx_array,
-        w: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        group_size: i32,
-        bits: i32,
-    ) -> *mut mlx_array;
 
     /// TEST-ONLY: shapeless-compiles the mixed BF16/F32 affine matmul on
     /// `trace_x`, then replays it on `x`; writes the replay and the eager result.

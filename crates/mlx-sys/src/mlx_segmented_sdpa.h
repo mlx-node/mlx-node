@@ -2,8 +2,6 @@
 
 #ifdef MLX_NODE_METAL_ENABLED
 
-#include <string>
-
 #include "mlx/array.h"
 #include "mlx/backend/metal/device.h"
 
@@ -25,14 +23,6 @@ array segmented_sdpa(const array &q, const array &prefix_k,
 
 // Widest query chunk both segmented launches support for `gqa_factor`.
 int segmented_max_query_length(metal::Device &device, int gqa_factor);
-
-namespace testing {
-// Test-only: replaces the segmented kernels on the calling thread.
-using KernelOverride = MTL::ComputePipelineState *(*)(
-    metal::Device &, SegmentedKernel, const std::string &hash,
-    const metal::MTLFCList &constants);
-inline thread_local KernelOverride kernel_override = nullptr;
-} // namespace testing
 
 } // namespace mlx::core::segmented_sdpa
 

@@ -252,12 +252,11 @@ pub fn read_bits(what: &str, h: *mut mlx_sys::mlx_array) -> (Vec<i64>, DType, Ve
 }
 
 /// Both handles must evaluate to the same shape, dtype and bits, not all zero.
-/// Returns ours.
 pub fn assert_identical(
     what: &str,
     ours: *mut mlx_sys::mlx_array,
     reference: *mut mlx_sys::mlx_array,
-) -> (Vec<i64>, DType, Vec<u32>) {
+) {
     let (ours_shape, ours_dtype, ours) = read_bits(&format!("{what} ours"), ours);
     let (ref_shape, ref_dtype, reference) = read_bits(&format!("{what} reference"), reference);
     assert_eq!(ours_shape, ref_shape, "{what}: shape differs");
@@ -275,7 +274,16 @@ pub fn assert_identical(
         ours.iter().any(|&b| b & 0x7fff_ffff != 0),
         "{what}: an all-zero output proves nothing"
     );
-    (ours_shape, ours_dtype, ours)
+}
+
+/// Raw output shape and bits, not all zero; consumes the handle.
+pub fn read_output(what: &str, h: *mut mlx_sys::mlx_array) -> (Vec<i64>, DType, Vec<u32>) {
+    let out = read_bits(what, h);
+    assert!(
+        out.2.iter().any(|&b| b & 0x7fff_ffff != 0),
+        "{what}: an all-zero output proves nothing"
+    );
+    out
 }
 
 pub fn quantized_matmul(

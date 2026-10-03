@@ -1,19 +1,18 @@
-//! The bridge's K-quant ops (`mlx_kquant*.cpp`) against MLX's own K-quant path,
-//! bit for bit, on Metal and on the CPU.
+//! Pin-bump gate for the bridge K-quant ops (`mlx_kquant*.cpp`) on Metal and
+//! on the CPU: every case must reproduce the output digest in `tests/golden`,
+//! captured while the same cases were bit-identical to the MLX fork's own
+//! K-quant kernels (pin 053e43fec). The digests belong to
+//! the capture machine (M5 Max, applegpu_g17s); anywhere else the gate fails.
 //!
-//! The oracle is reachable only while `crates/mlx-sys/mlx` is the MLX fork
-//! pinned at 053e43fec; `mlx_test_fork_kquant_*` call `mlx::core` with the
-//! mode string. When the pin moves to upstream MLX this file becomes a
-//! reference-dequantize test.
-//!
-//! Both sides take an explicit device, so the tests are race-free under any
+//! Every op takes an explicit device, so the tests are race-free under any
 //! `--test-threads`. The Metal tests count the kernel families the bridge
-//! dispatched on their own thread and require every family the device's
-//! generation can reach. Run all three generations:
+//! dispatched on their own thread and require every family the routing
+//! generation can reach, so a route change fails apart from a bit change.
+//! Run all three generations after an MLX pin change:
 //!
-//!   cargo test -p mlx-core --release --test kquant_fork_oracle_parity
-//!   MLX_METAL_GPU_ARCH=applegpu_g16s cargo test -p mlx-core --release --test kquant_fork_oracle_parity
-//!   MLX_METAL_GPU_ARCH=applegpu_g14s cargo test -p mlx-core --release --test kquant_fork_oracle_parity
+//!   cargo test -p mlx-core --release --test kquant_golden_gate -- --ignored
+//!   MLX_METAL_GPU_ARCH=applegpu_g16s cargo test -p mlx-core --release --test kquant_golden_gate -- --ignored
+//!   MLX_METAL_GPU_ARCH=applegpu_g14s cargo test -p mlx-core --release --test kquant_golden_gate -- --ignored
 //!
 //! The native run (gen 17 with NAX) reaches qmm_t_nax and qmv_sg8; g16s turns
 //! both off; g14s also turns qmv_wide off, so multi-row matvecs take qmv.
@@ -21,9 +20,9 @@
 mod golden_support;
 mod kquant_support;
 
-use golden_support::{Golden, Mode};
+use golden_support::Golden;
 use kquant_support::*;
-use mlx_core::array::{DType, MxArray};
+use mlx_core::array::MxArray;
 
 /// Row counts that cross every dispatch boundary: qmv, qmv_wide nv2..8, the
 /// bfloat16 M = 8 sg8 kernel, the batch limit, split-K qmm, and NAX qmm.
@@ -34,80 +33,8 @@ fn label(device: i32) -> &'static str {
     if device == GPU { "gpu" } else { "cpu" }
 }
 
-fn fork_quantized_matmul(
-    x: &MxArray,
-    w: &Weights,
-    transpose: bool,
-    kq: &KQuant,
-    device: i32,
-) -> *mut mlx_sys::mlx_array {
-    let mode = mode_cstr(kq);
-    // SAFETY: every handle outlives the call.
-    unsafe {
-        mlx_sys::mlx_test_fork_kquant_quantized_matmul(
-            x.as_raw_ptr(),
-            w.w.as_raw_ptr(),
-            w.scales.as_raw_ptr(),
-            w.biases.as_raw_ptr(),
-            transpose,
-            kq.group_size,
-            kq.bits,
-            mode.as_ptr(),
-            device,
-        )
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn fork_gather_qmm(
-    x: &MxArray,
-    w: &Weights,
-    lhs: Option<&MxArray>,
-    rhs: &MxArray,
-    transpose: bool,
-    sorted: bool,
-    kq: &KQuant,
-    device: i32,
-) -> *mut mlx_sys::mlx_array {
-    let mode = mode_cstr(kq);
-    // SAFETY: every handle outlives the call; null lhs means "derive from x".
-    unsafe {
-        mlx_sys::mlx_test_fork_kquant_gather_qmm(
-            x.as_raw_ptr(),
-            w.w.as_raw_ptr(),
-            w.scales.as_raw_ptr(),
-            w.biases.as_raw_ptr(),
-            ptr(lhs),
-            rhs.as_raw_ptr(),
-            transpose,
-            kq.group_size,
-            kq.bits,
-            mode.as_ptr(),
-            sorted,
-            device,
-        )
-    }
-}
-
-fn fork_dequantize(w: &Weights, dtype: DType, kq: &KQuant, device: i32) -> *mut mlx_sys::mlx_array {
-    let mode = mode_cstr(kq);
-    // SAFETY: every handle outlives the call.
-    unsafe {
-        mlx_sys::mlx_test_fork_kquant_dequantize(
-            w.w.as_raw_ptr(),
-            w.scales.as_raw_ptr(),
-            w.biases.as_raw_ptr(),
-            kq.group_size,
-            kq.bits,
-            dtype as i32,
-            mode.as_ptr(),
-            device,
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn qmm_pair(
+fn qmm_case(
     g: &mut Golden,
     cases: &mut usize,
     what: &str,
@@ -117,17 +44,13 @@ fn qmm_pair(
     kq: &KQuant,
     device: i32,
 ) {
-    let (shape, dtype, bits) = assert_identical(
-        what,
-        quantized_matmul(x, w, transpose, kq, device),
-        fork_quantized_matmul(x, w, transpose, kq, device),
-    );
+    let (shape, dtype, bits) = read_output(what, quantized_matmul(x, w, transpose, kq, device));
     g.record_bits(what, &shape, dtype, &bits);
     *cases += 1;
 }
 
 #[allow(clippy::too_many_arguments)]
-fn gather_pair(
+fn gather_case(
     g: &mut Golden,
     cases: &mut usize,
     what: &str,
@@ -140,10 +63,9 @@ fn gather_pair(
     kq: &KQuant,
     device: i32,
 ) {
-    let (shape, dtype, bits) = assert_identical(
+    let (shape, dtype, bits) = read_output(
         what,
         gather_qmm(x, w, lhs, rhs, transpose, sorted, kq, device),
-        fork_gather_qmm(x, w, lhs, rhs, transpose, sorted, kq, device),
     );
     g.record_bits(what, &shape, dtype, &bits);
     *cases += 1;
@@ -168,7 +90,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
             for &m in ms {
                 if device == GPU || m <= 33 {
                     let x = activation(&[m, 1024], seed + m as u32, dtype);
-                    qmm_pair(
+                    qmm_case(
                         g,
                         cases,
                         &format!("{dev} {m_} {dtype:?} t M={m} N=2048 K=1024"),
@@ -180,7 +102,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
                     );
                 }
                 let x = activation(&[m, 768], seed + 7 + m as u32, dtype);
-                qmm_pair(
+                qmm_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} t M={m} N=136 K=768"),
@@ -194,7 +116,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
                     continue;
                 }
                 let x = activation(&[2, m, 768], seed + 11 + m as u32, dtype);
-                qmm_pair(
+                qmm_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} t batched M={m}"),
@@ -205,7 +127,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
                     device,
                 );
                 let x = activation(&[2, m, 1024], seed + 23 + m as u32, dtype);
-                qmm_pair(
+                qmm_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} t batched-aligned M={m}"),
@@ -216,7 +138,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
                     device,
                 );
                 let x = activation(&[3, m, 768], seed + 13 + m as u32, dtype);
-                qmm_pair(
+                qmm_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} t x-batched M={m}"),
@@ -227,7 +149,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
                     device,
                 );
                 let x = activation(&[m, 256], seed + 17 + m as u32, dtype);
-                qmm_pair(
+                qmm_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} n M={m} K=256"),
@@ -238,7 +160,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
                     device,
                 );
                 let x = activation(&[m, 1024], seed + 19 + m as u32, dtype);
-                qmm_pair(
+                qmm_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} n M={m} K=1024"),
@@ -262,7 +184,7 @@ fn run_simdgroup_qmm_t(g: &mut Golden, cases: &mut usize, device: i32) {
     let w = weights(kq, &[2, 136], 544, 0x1500);
     for dtype in DTYPES {
         let x = activation(&[2, 64, 544], 0x1501, dtype);
-        qmm_pair(
+        qmm_case(
             g,
             cases,
             &format!("{} iq4nl {dtype:?} t batched M=64 K=544", label(device)),
@@ -298,7 +220,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
                 (true, &sorted_ids, "sorted"),
                 (false, &sorted_ids, "sorted-ids unsorted-flag"),
             ] {
-                gather_pair(
+                gather_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} gather t {tag}"),
@@ -313,7 +235,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
                 );
             }
             let x = activation(&[32, 1, 768], seed + 4, dtype);
-            gather_pair(
+            gather_case(
                 g,
                 cases,
                 &format!("{dev} {m_} {dtype:?} gather t odd unsorted"),
@@ -326,7 +248,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
                 kq,
                 device,
             );
-            gather_pair(
+            gather_case(
                 g,
                 cases,
                 &format!("{dev} {m_} {dtype:?} gather t odd sorted"),
@@ -340,7 +262,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
                 device,
             );
             let xn = activation(&[32, 1, 256], seed + 5, dtype);
-            gather_pair(
+            gather_case(
                 g,
                 cases,
                 &format!("{dev} {m_} {dtype:?} gather n sorted"),
@@ -353,7 +275,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
                 kq,
                 device,
             );
-            gather_pair(
+            gather_case(
                 g,
                 cases,
                 &format!("{dev} {m_} {dtype:?} gather n unsorted"),
@@ -369,7 +291,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
             // Both index sets: vector and matrix kernels on either layout.
             for m in [1i64, 4, 33] {
                 let x = activation(&[4, m, 512], seed + 7 + m as u32, dtype);
-                gather_pair(
+                gather_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} gather t lhs M={m}"),
@@ -383,7 +305,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
                     device,
                 );
                 let x = activation(&[4, m, 256], seed + 9 + m as u32, dtype);
-                gather_pair(
+                gather_case(
                     g,
                     cases,
                     &format!("{dev} {m_} {dtype:?} gather n lhs M={m}"),
@@ -409,11 +331,7 @@ fn run_dequantize(g: &mut Golden, cases: &mut usize, device: i32) {
         for dtype in DTYPES {
             for (w, tag) in [(&flat, "2-D"), (&stacked, "3-D")] {
                 let what = format!("{dev} {} {dtype:?} dequantize {tag}", kq.mode);
-                let (shape, out_dtype, bits) = assert_identical(
-                    &what,
-                    dequantize(w, dtype, kq, device),
-                    fork_dequantize(w, dtype, kq, device),
-                );
+                let (shape, out_dtype, bits) = read_output(&what, dequantize(w, dtype, kq, device));
                 g.record_bits(&what, &shape, out_dtype, &bits);
                 *cases += 1;
             }
@@ -448,11 +366,12 @@ fn expect_absent(families: &[&str]) {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn metal_matmul_matches_fork_bitwise() {
+#[ignore = "pin-bump gate with hardware-specific goldens; see the module docs"]
+fn metal_matmul_matches_golden() {
     let arch = require_metal();
     let nax = nax_available();
     println!("gpu gen {arch}, nax {nax}");
-    let mut g = Golden::metal("kquant_metal_matmul", Mode::from_env());
+    let mut g = Golden::metal("kquant_metal_matmul");
     let mut cases = 0;
 
     // Multi-row matvecs alone first, to see which kernel they take.
@@ -486,7 +405,7 @@ fn metal_matmul_matches_fork_bitwise() {
     run_matmuls(&mut g, &mut cases, GPU, &MULTI_ROW);
     run_matmuls(&mut g, &mut cases, GPU, &OTHER_ROWS);
     run_simdgroup_qmm_t(&mut g, &mut cases, GPU);
-    println!("metal quantized_matmul: {cases} cases bit-identical");
+    println!("metal quantized_matmul: {cases} cases");
     expect_hit(&[
         "qmv",
         "qmv_fast",
@@ -526,16 +445,17 @@ fn metal_matmul_matches_fork_bitwise() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn metal_gather_and_dequantize_match_fork_bitwise() {
+#[ignore = "pin-bump gate with hardware-specific goldens; see the module docs"]
+fn metal_gather_and_dequantize_match_golden() {
     require_metal();
-    let mut g = Golden::metal("kquant_metal_gather_dequantize", Mode::from_env());
+    let mut g = Golden::metal("kquant_metal_gather_dequantize");
     start_counting();
     let mut gather = 0;
     run_gathers(&mut g, &mut gather, GPU);
-    println!("metal gather_qmm: {gather} cases bit-identical");
+    println!("metal gather_qmm: {gather} cases");
     let mut deq = 0;
     run_dequantize(&mut g, &mut deq, GPU);
-    println!("metal dequantize: {deq} cases bit-identical");
+    println!("metal dequantize: {deq} cases");
     expect_hit(&[
         "gather_qmv",
         "gather_qmv_fast",
@@ -551,19 +471,20 @@ fn metal_gather_and_dequantize_match_fork_bitwise() {
 }
 
 #[test]
-fn cpu_matches_fork_bitwise() {
-    let mut g = Golden::cpu("kquant_cpu", Mode::from_env());
+#[ignore = "pin-bump gate with hardware-specific goldens; see the module docs"]
+fn cpu_matches_golden() {
+    let mut g = Golden::cpu("kquant_cpu");
     start_counting();
     let mut mm = 0;
     run_matmuls(&mut g, &mut mm, CPU, &[1, 2, 8, 9, 33]);
     run_simdgroup_qmm_t(&mut g, &mut mm, CPU);
-    println!("cpu quantized_matmul: {mm} cases bit-identical");
+    println!("cpu quantized_matmul: {mm} cases");
     let mut gather = 0;
     run_gathers(&mut g, &mut gather, CPU);
-    println!("cpu gather_qmm: {gather} cases bit-identical");
+    println!("cpu gather_qmm: {gather} cases");
     let mut deq = 0;
     run_dequantize(&mut g, &mut deq, CPU);
-    println!("cpu dequantize: {deq} cases bit-identical");
+    println!("cpu dequantize: {deq} cases");
     // Nothing on this thread may have been encoded for Metal.
     expect_absent(&[
         "qmv",

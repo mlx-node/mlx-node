@@ -100,9 +100,6 @@ MTL::ComputePipelineState *segmented_kernel(metal::Device &device,
                                             SegmentedKernel kernel,
                                             const std::string &hash,
                                             const metal::MTLFCList &constants) {
-  if (testing::kernel_override) {
-    return testing::kernel_override(device, kernel, hash, constants);
-  }
   auto *lib = device.get_library("mlx_node_sdpa_segmented", [] {
     std::string source(kSegmentedSource);
     for (auto [kernel, fn] :
