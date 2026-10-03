@@ -3050,6 +3050,10 @@ int mlx_paged_kv_write_compile_trace_smoke(int num_tokens) {
   // — subsequent calls with the same input shapes/dtypes hit the
   // cache and skip re-tracing.
   auto compiled = mlx::core::compile(&paged_kv_write_trace_fn);
+  // MLX keys compile-cache entries by peek_default_stream(); on a fresh test
+  // thread it is empty until the first trace creates the stream, which makes
+  // the second call trace again.
+  (void)default_stream(default_device());
 
   // Build REAL data-backed inputs. Shapes match the layout above.
   // The K/V pools are shared across both calls so we can verify the
