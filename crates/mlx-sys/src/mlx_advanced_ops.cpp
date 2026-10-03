@@ -1414,7 +1414,8 @@ mlx_array* mlx_gather_qmm(
             : mlx::core::gather_qmm(
                   *x_arr, *w_arr, *scales_arr, biases_opt, lhs_opt, rhs_opt,
                   transpose, std::optional<int>(group_size),
-                  std::optional<int>(bits), mode_str, sorted_indices);
+                  std::optional<int>(bits), mode_str, std::nullopt,
+                  sorted_indices);
         return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
     } catch (const std::exception& e) {
         std::cerr << "mlx_gather_qmm error: " << e.what() << std::endl;

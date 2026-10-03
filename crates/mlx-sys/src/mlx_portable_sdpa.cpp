@@ -33,8 +33,8 @@ MTL::ComputePipelineState* pipeline(Dtype dtype, bool align_q, bool align_k) {
     // precompiled-metallib distribution too, without installed source files.
     return std::string(quantized_preamble::utils()) + quantized_preamble::steel_attention() +
         "\ntemplate [[host_name(\"" + name + "\")]] [[kernel]] decltype(attention<" +
-        type + ",32,16,256,4,1," + type + ",float>) attention<" +
-        type + ",32,16,256,4,1," + type + ",float>;\n";
+        type + ",32,16,256,256,4,1," + type + ",float>) attention<" +
+        type + ",32,16,256,256,4,1," + type + ",float>;\n";
   });
   const bool no = false, causal = true;
   metal::MTLFCList constants = {
@@ -42,7 +42,8 @@ MTL::ComputePipelineState* pipeline(Dtype dtype, bool align_q, bool align_k) {
       {&align_k, MTL::DataType::DataTypeBool, 201},
       {&no, MTL::DataType::DataTypeBool, 300},
       {&causal, MTL::DataType::DataTypeBool, 301},
-      {&no, MTL::DataType::DataTypeBool, 302}};
+      {&no, MTL::DataType::DataTypeBool, 302},
+      {&no, MTL::DataType::DataTypeBool, 303}};
   auto* result = device.get_kernel(
       name, library, name + (align_q ? "_aq" : "_rq") +
                          (align_k ? "_ak" : "_rk"), constants);
@@ -62,7 +63,7 @@ class PortableD256SDPA : public Custom {
       : Custom(stream, [stream, scale](std::vector<array> inputs) {
           return std::vector<array>{scaled_dot_product_attention(
               inputs[0], inputs[1], inputs[2], scale, "causal",
-              std::nullopt, std::nullopt, stream)};
+              std::nullopt, std::nullopt, false, stream)};
         }), scale_(scale) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {

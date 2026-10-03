@@ -69,7 +69,7 @@ std::vector<array> segmented_fallback(std::vector<array> inputs, float scale,
   auto values = concatenate({inputs[2], inputs[4]}, 2, stream);
   return {fast::scaled_dot_product_attention(
       inputs[0], keys, values, scale, causal ? "causal" : "", std::nullopt,
-      std::nullopt, stream)};
+      std::nullopt, false, stream)};
 }
 
 SegmentedSdpaCapabilities capabilities(MTL::ComputePipelineState *pipeline,

@@ -32,7 +32,7 @@ void mlx_clear_cache() {
 // Returns true on success, false on failure
 bool mlx_compile_clear_cache() {
   try {
-    mlx::core::detail::compile_clear_cache();
+    mlx::core::detail::compile_clear_cache(mlx::core::detail::compile_cache());
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in compile_clear_cache: " << e.what() << std::endl;

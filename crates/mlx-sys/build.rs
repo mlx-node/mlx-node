@@ -640,27 +640,10 @@ fn main() -> io::Result<()> {
                 )));
             }
             let path = preambles.join(format!("{name}.cpp"));
-            let mut source = read_build_source(&path)?.replace(
+            let source = read_build_source(&path)?.replace(
                 "namespace mlx::core::metal",
                 "namespace mlx::core::quantized_preamble",
             );
-            if name == "steel_attention" {
-                // Backport the wide-head V-tile synchronization fix from
-                // ml-explore/mlx#4185 into this private kernel only. The
-                // pinned vendor template guards both barriers with BD==128,
-                // which omits the D256 instantiation added by our bridge.
-                // Fail visibly if a vendor update changes these sites.
-                let legacy = "if constexpr (BD == 128)";
-                let fixed = "if constexpr (BD >= 128)";
-                match (
-                    source.matches(legacy).count(),
-                    source.matches(fixed).count(),
-                ) {
-                    (2, 0) => source = source.replace(legacy, fixed),
-                    (0, 2) => {} // A future vendor update already contains the fix.
-                    _ => return Err(io::Error::other("Review Steel attention V-tile barriers")),
-                }
-            }
             std::fs::write(&path, source).map_err(|error| {
                 build_file_error("write private quantized preamble", &path, error)
             })?;

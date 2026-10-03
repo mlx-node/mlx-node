@@ -7,8 +7,15 @@
 #ifdef MLX_NODE_METAL_ENABLED
 #include "mlx/backend/metal/device.h"
 
-namespace mlx::core::fast {
-bool d256_full_sdpa_available(bool effective_dtype_is_float32);
+namespace {
+// Mirror of MLX's D=256 routing in ScaledDotProductAttention::use_fallback
+// and has_fused_kernel (mlx/backend/metal/scaled_dot_product_attention.cpp)
+// for inference (no logsumexp output, no sinks). Re-check on every MLX bump.
+bool d256_full_sdpa_available(bool effective_dtype_is_float32) {
+  return mlx::core::metal::is_nax_available() &&
+      (mlx::core::env::enable_tf32() || !effective_dtype_is_float32);
+}
+
 bool d256_full_sdpa_would_use(
     bool effective_dtype_is_float32,
     int32_t query_head_dim,
@@ -16,8 +23,23 @@ bool d256_full_sdpa_would_use(
     int32_t query_length,
     int32_t key_length,
     bool do_causal,
-    bool has_array_mask);
-}  // namespace mlx::core::fast
+    bool has_array_mask) {
+  if (query_head_dim != 256 || value_head_dim != 256 || query_length <= 8) {
+    return false;
+  }
+  // A causal mask needs q <= k; with no mask at all D=256 always falls back.
+  if (!has_array_mask && !(do_causal && query_length <= key_length)) {
+    return false;
+  }
+  if (query_length >= 1024 &&
+      d256_full_sdpa_available(effective_dtype_is_float32)) {
+    return true;
+  }
+  return !mlx::core::metal::is_nax_available() &&
+      !effective_dtype_is_float32 && do_causal && !has_array_mask &&
+      query_length >= 2048 && query_length == key_length;
+}
+}  // namespace
 #endif
 
 // ============================================================================
@@ -149,7 +171,9 @@ bool mlx_metal_is_nax_available() {
 #endif
 }
 
-// Report the runtime capability used by MLX's D=256 full-SDPA dispatcher.
+// Report whether MLX's NAX D=256 full-SDPA route exists on this device. The
+// non-NAX square-causal route (q == k >= 2048) is not covered: callers that
+// treat `false` as "scores materialize" stay conservative.
 // `effective_dtype_is_float32` must describe the promoted dtype consumed by
 // scaled_dot_product_attention, not merely the query's original dtype.
 //
@@ -166,8 +190,7 @@ int32_t mlx_metal_d256_full_sdpa_available(
   *out_available = false;
 #ifdef MLX_NODE_METAL_ENABLED
   try {
-    *out_available = mlx::core::fast::d256_full_sdpa_available(
-        effective_dtype_is_float32);
+    *out_available = d256_full_sdpa_available(effective_dtype_is_float32);
     return 0;
   } catch (...) {
     return -1;
@@ -178,10 +201,8 @@ int32_t mlx_metal_d256_full_sdpa_available(
 #endif
 }
 
-// D=256 eligibility probe for tests and planners. This calls the same helper
-// used inside ScaledDotProductAttention::use_fallback; callers still own the
-// dispatcher's outer inference/stream gates. It avoids logging, counters, or
-// atomics on the inference hot path.
+// D=256 eligibility probe for tests and planners: the mirror above, assuming a
+// GPU stream and inference (training forces the fused forward for logsumexp).
 int32_t mlx_metal_d256_full_sdpa_would_use(
     bool effective_dtype_is_float32,
     int32_t query_head_dim,
@@ -197,7 +218,7 @@ int32_t mlx_metal_d256_full_sdpa_would_use(
   *out_would_use = false;
 #ifdef MLX_NODE_METAL_ENABLED
   try {
-    *out_would_use = mlx::core::fast::d256_full_sdpa_would_use(
+    *out_would_use = d256_full_sdpa_would_use(
         effective_dtype_is_float32,
         query_head_dim,
         value_head_dim,

@@ -662,7 +662,7 @@ unsafe extern "C-unwind" {
     /// Compiles and checks portable BF16/FP16 D256 attention pipelines.
     /// Auto-enabled without NAX; MLX_PORTABLE_D256_SDPA=1 forces for validation.
     pub fn mlx_metal_portable_d256_sdpa_available() -> bool;
-    /// Probe whether MLX can dispatch the fused D=256 full-SDPA kernel for the
+    /// Probe whether MLX's NAX D=256 full-SDPA route exists for the
     /// effective input dtype. Returns 0 on success and writes a conservative
     /// result to `out_available`; returns -1 on invalid output or a caught C++
     /// exception. Non-Metal builds return success with `false`.
@@ -670,9 +670,8 @@ unsafe extern "C-unwind" {
         effective_dtype_is_float32: bool,
         out_available: *mut bool,
     ) -> i32;
-    /// Evaluate the D=256-specific eligibility predicate shared with MLX's
-    /// Metal dispatcher, without adding hot-path logging or counters. The
-    /// caller still owns the dispatcher's outer inference/stream gates.
+    /// Mirror of MLX's D=256 Metal routing (inference, GPU stream) in
+    /// `mlx_stream.cpp`; re-check it on every MLX bump.
     /// Uses the same 0/-1 fallible-output contract as the capability probe.
     pub fn mlx_metal_d256_full_sdpa_would_use(
         effective_dtype_is_float32: bool,
