@@ -7,7 +7,9 @@
 //! The fork falls back to the promoted F32 graph for shapes its kernel does
 //! not take, and so does ours, so bit-identity alone cannot show the native
 //! kernel ran: the per-thread family counters must also match the expected
-//! routing.
+//! routing. Ours takes the native kernel for 2..=8 rows only; from 9 rows the
+//! fork still ran its kernel (up to its batch limit), which equals the
+//! promoted graph bit for bit, so the bits must match either way.
 //!
 //! ```text
 //! cargo test -p mlx-core --release --test affine_mixed_fork_oracle_parity -- --nocapture
@@ -55,47 +57,36 @@ fn fork(x: &mlx_core::array::MxArray, w: &Weights, gs: i32, bits: i32) -> *mut m
     }
 }
 
-/// Which path a contiguous x must take on this GPU: the native kernel for gs 32,
-/// 8 bits, K not 64/128 and 2 <= M <= 8; the promoted graph otherwise. Rows
-/// from 9 up depend on MLX's per-chip qmv batch limit (None: either path).
-fn route(arch_gen: i32, gs: i32, bits: i32, k: i64, m: i64) -> Option<bool> {
-    let eligible = arch_gen >= 15 && gs == 32 && bits == 8 && k != 64 && k != 128 && m >= 2;
-    match (eligible, m <= 8) {
-        (false, _) => Some(false),
-        (true, true) => Some(true),
-        (true, false) => None,
-    }
+/// Whether a contiguous x must take the native kernel on this GPU: gs 32,
+/// 8 bits, K not 64/128 and 2 <= M <= 8. Everything else, rows 9 and up
+/// included, takes the promoted graph.
+fn route(arch_gen: i32, gs: i32, bits: i32, k: i64, m: i64) -> bool {
+    arch_gen >= 15 && gs == 32 && bits == 8 && k != 64 && k != 128 && (2..=8).contains(&m)
 }
 
 struct Tally {
     cases: u64,
-    wide_above_8: u64,
+    promoted_above_8: u64,
 }
 
 impl Tally {
     /// Bit-identity with the fork, then the counter delta proves the path.
-    fn check(
-        &mut self,
-        ctx: &str,
-        x: &MxArray,
-        w: &Weights,
-        gs: i32,
-        bits: i32,
-        expect: Option<bool>,
-    ) {
-        let before = family_count("affine_mixed_qmv_wide");
+    fn check(&mut self, ctx: &str, x: &MxArray, w: &Weights, gs: i32, bits: i32, expect: bool) {
+        let wide_before = family_count("affine_mixed_qmv_wide");
+        let promoted_before = family_count("affine_mixed_promoted");
         assert_identical(ctx, ours(x, w, gs, bits), fork(x, w, gs, bits));
-        let wide = family_count("affine_mixed_qmv_wide") - before;
-        assert!(wide <= 1, "{ctx}: one dispatch per case");
-        if let Some(expect) = expect {
-            assert_eq!(
-                wide == 1,
-                expect,
-                "{ctx}: native kernel ran = {}",
-                wide == 1
-            );
-        } else {
-            self.wide_above_8 += wide;
+        let wide = family_count("affine_mixed_qmv_wide") - wide_before;
+        let promoted = family_count("affine_mixed_promoted") - promoted_before;
+        assert_eq!(wide + promoted, 1, "{ctx}: one path per case");
+        assert_eq!(
+            wide == 1,
+            expect,
+            "{ctx}: native kernel ran = {}",
+            wide == 1
+        );
+        let rows = x.size().unwrap() as i64 / x.shape_at(x.ndim().unwrap() - 1).unwrap();
+        if rows > 8 {
+            self.promoted_above_8 += promoted;
         }
         self.cases += 1;
     }
@@ -109,7 +100,7 @@ fn mixed_affine_matches_fork_bitwise() {
     start_counting();
     let mut t = Tally {
         cases: 0,
-        wide_above_8: 0,
+        promoted_above_8: 0,
     };
     for (li, &(gs, bits)) in LAYOUTS.iter().enumerate() {
         for (si, &(n, k)) in SHAPES.iter().enumerate() {
@@ -152,7 +143,7 @@ fn mixed_affine_matches_fork_bitwise() {
                 &w,
                 gs,
                 bits,
-                Some(false),
+                false,
             );
             let xb = activation(&[2, 4, k], 0x9000 + seed, 1.0);
             t.check(
@@ -172,9 +163,9 @@ fn mixed_affine_matches_fork_bitwise() {
         .collect();
     stop_counting();
     eprintln!(
-        "gen {arch_gen}: {} cases bit-identical to the fork; qmv_wide {got_wide} ({} with M > 8), \
-         promoted {got_promoted}, qmv_wide nv2..8 {per_nv:?}",
-        t.cases, t.wide_above_8
+        "gen {arch_gen}: {} cases bit-identical to the fork; qmv_wide {got_wide}, \
+         promoted {got_promoted} ({} with M > 8), qmv_wide nv2..8 {per_nv:?}",
+        t.cases, t.promoted_above_8
     );
     assert_eq!(
         got_wide + got_promoted,
@@ -202,14 +193,23 @@ fn mixed_affine_shapeless_replay_matches_fork_bitwise() {
     let mut cases = 0;
     for (si, &(n, k)) in SHAPES.iter().enumerate() {
         let w = weights(n, k, 32, 8, 0xA000 + si as u32);
-        for (trace_m, m) in [(3, 3), (3, 8), (8, 2), (5, 1), (2, 6), (1, 6)] {
+        for (trace_m, m) in [
+            (3, 3),
+            (3, 8),
+            (8, 2),
+            (5, 1),
+            (2, 6),
+            (1, 6),
+            (2, 12),
+            (12, 5),
+        ] {
             let trace_x = activation(&[1, trace_m, k], 0xB000 + si as u32, 1.0);
             let x = activation(&[1, m, k], 0xC000 + si as u32 * 16 + m as u32, 1.0);
             let ctx = format!("N{n} K{k} M {trace_m} -> {m}");
             let before = family_count("affine_mixed_qmv_wide");
             let (replayed, eager) = shapeless_replay(&trace_x, &x, &w, 32, 8);
             // trace eval at trace_m, then the replay and the eager run at m.
-            let wide = |m| u64::from(route(arch_gen, 32, 8, k, m) == Some(true));
+            let wide = |m| u64::from(route(arch_gen, 32, 8, k, m));
             assert_eq!(
                 family_count("affine_mixed_qmv_wide") - before,
                 wide(trace_m) + 2 * wide(m),

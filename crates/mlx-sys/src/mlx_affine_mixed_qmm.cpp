@@ -8,8 +8,9 @@
 #include "mlx/allocator.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
-#include "mlx_kquant.h"
+#include "mlx_test_counters.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #endif
@@ -67,26 +68,18 @@ const char *kQmvWideMixed =
 #include "metal/common/affine_qmv_wide_mixed.metal.inc"
     ;
 
-// MLX's get_qmv_batch_limit and its MLX_QMM_SPLITK_MIN_M override, for a
-// transposed weight: at or above this many rows the F32 path leaves qmv.
-int qmv_vector_limit(int K, int N, metal::Device &d) {
-  int limit;
-  bool small = K <= 2048 && N <= 2048;
-  bool medium = K <= 4096 && N <= 4096;
-  if (d.get_architecture().back() == 'd') {
-    limit = small ? 32 : medium ? 18 : 12;
-  } else if (d.get_architecture_gen() == 13 || d.get_architecture_gen() == 14) {
-    limit = small ? 14 : medium ? 10 : 6;
-  } else {
-    limit = small ? 18 : medium ? 12 : 10;
-  }
+// At most 8 rows. On gen >= 15 MLX's F32 path runs qmv_wide for 2..8 rows
+// on every chip (its smallest qmv batch limit there is 10, fork and upstream)
+// unless MLX_QMM_SPLITK_MIN_M lowers that limit.
+bool rows_take_qmv_wide(int M) {
+  int limit = 9;
   if (const char *e = std::getenv("MLX_QMM_SPLITK_MIN_M")) {
     int v = std::atoi(e);
     if (v > 0) {
-      limit = v;
+      limit = std::min(limit, v);
     }
   }
-  return limit;
+  return M >= 2 && M < limit;
 }
 
 void qmv_wide(const array &x, const array &w, const array &scales,
@@ -104,10 +97,10 @@ void qmv_wide(const array &x, const array &w, const array &scales,
 
   std::string kname =
       "mlx_node_affine_qmv_wide_mixed_q8g32_nv" + std::to_string(vecs_per_tg);
-  kquant::testing::record("affine_mixed_qmv_wide");
-  if (kquant::testing::counting) {
-    kquant::testing::record("affine_mixed_qmv_wide_nv" +
-                            std::to_string(vecs_per_tg));
+  bridge_testing::record("affine_mixed_qmv_wide");
+  if (bridge_testing::counting) {
+    bridge_testing::record("affine_mixed_qmv_wide_nv" +
+                           std::to_string(vecs_per_tg));
   }
   auto *lib = d.get_library(kname, [&] {
     std::string fn =
@@ -134,9 +127,9 @@ void qmv_wide(const array &x, const array &w, const array &scales,
 
 } // namespace
 
-// Mirrors the promoted graph: qmv_wide only where MLX would run the F32
-// qmv_wide for these operands; every other shape runs that graph itself (cast
-// x, MLX's F32 QuantizedMatmul, cast the result).
+// Mirrors the promoted graph: qmv_wide for 2..8 rows where MLX would run the
+// F32 qmv_wide for these operands; every other shape runs that graph itself
+// (cast x, MLX's F32 QuantizedMatmul, cast the result).
 void AffineMixedQmm::eval_gpu(const std::vector<array> &inputs, array &out) {
   auto &s = stream();
   auto &d = metal::device(s.device);
@@ -149,15 +142,14 @@ void AffineMixedQmm::eval_gpu(const std::vector<array> &inputs, array &out) {
   int M = x.size() / K;
   bool wide = group_size_ == 32 && bits_ == 8 && x.flags().row_contiguous &&
               w.flags().row_contiguous && scales.flags().row_contiguous &&
-              biases.flags().row_contiguous && M >= 2 &&
-              M < qmv_vector_limit(K, N, d) && K != 64 && K != 128 &&
-              d.get_architecture_gen() >= 15;
+              biases.flags().row_contiguous && rows_take_qmv_wide(M) &&
+              K != 64 && K != 128 && d.get_architecture_gen() >= 15;
   if (wide) {
     qmv_wide(x, w, scales, biases, out, M, N, K, d, s);
     return;
   }
 
-  kquant::testing::record("affine_mixed_promoted");
+  bridge_testing::record("affine_mixed_promoted");
   array x_promoted(x.shape(), float32, nullptr, {});
   copy_gpu(x, x_promoted,
            x.flags().contiguous ? CopyType::Vector : CopyType::General, s);

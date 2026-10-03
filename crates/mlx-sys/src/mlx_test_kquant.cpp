@@ -1,8 +1,9 @@
-// TEST-ONLY hooks for the bridge K-quant ops: explicit-device entry points,
-// kernel-family counters and a shapeless-compile replay. No production caller.
+// TEST-ONLY hooks: the bridge kernel-family counter store, explicit-device
+// K-quant entry points and a shapeless-compile replay. No production caller.
 
 #include "mlx_common.h"
 #include "mlx_kquant.h"
+#include "mlx_test_counters.h"
 
 #include <limits>
 #include <map>
@@ -14,7 +15,7 @@
 using mlx::core::array;
 namespace kquant = mlx::core::kquant;
 
-namespace mlx::core::kquant::testing {
+namespace mlx::core::bridge_testing {
 namespace {
 thread_local std::map<std::string, uint64_t, std::less<>> family_counts;
 }
@@ -27,7 +28,7 @@ void record_family(std::string_view family) {
     ++it->second;
   }
 }
-} // namespace mlx::core::kquant::testing
+} // namespace mlx::core::bridge_testing
 
 namespace {
 std::optional<array> opt(mlx_array *a) {
@@ -59,12 +60,12 @@ extern "C" {
 
 // Counts from now on are for the calling thread only; enabling resets them.
 void mlx_test_kquant_counting(bool enable) {
-  kquant::testing::family_counts.clear();
-  kquant::testing::counting = enable;
+  mlx::core::bridge_testing::family_counts.clear();
+  mlx::core::bridge_testing::counting = enable;
 }
 
 uint64_t mlx_test_kquant_family_count(const char *family) {
-  auto &counts = kquant::testing::family_counts;
+  auto &counts = mlx::core::bridge_testing::family_counts;
   auto it = counts.find(std::string_view(family ? family : ""));
   return it == counts.end() ? 0 : it->second;
 }

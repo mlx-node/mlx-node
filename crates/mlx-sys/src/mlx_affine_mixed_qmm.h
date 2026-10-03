@@ -2,8 +2,9 @@
 
 // BF16 x times a transposed affine projection whose scales/biases are F32,
 // with a BF16 result. Bit-identical to MLX's promoted path (cast x to F32,
-// F32 quantized_matmul, cast the result to BF16) at every shape; where that
-// path would run F32 qmv_wide, one kernel replaces its three dispatches.
+// F32 quantized_matmul, cast the result to BF16) at every shape; for 2..8 rows
+// where that path would run F32 qmv_wide, one kernel replaces its three
+// dispatches.
 
 #include "mlx/array.h"
 #include "mlx/primitives.h"
