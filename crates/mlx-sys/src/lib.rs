@@ -803,6 +803,28 @@ unsafe extern "C-unwind" {
         out_device_class: *mut std::ffi::c_char,
     ) -> i32;
 
+    /// TEST-ONLY oracle: `mlx_segmented_sdpa_test_forward` with every
+    /// segmented kernel taken from the MLX fork's metallib, evaluated before
+    /// returning. Only the fork pin ships those kernels; removed with the move
+    /// to upstream MLX.
+    pub fn mlx_test_fork_segmented_sdpa_forward(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        scale: f32,
+        causal: bool,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY oracle: `mlx_segmented_sdpa_max_query_length` from the fork's
+    /// kernel pipelines.
+    pub fn mlx_test_fork_segmented_sdpa_max_query_length(gqa_factor: i32) -> i32;
+
+    /// TEST-ONLY oracle: mismatches between the fork's segmented planners and
+    /// vector-SDPA policy (this device's class) and ours; -1 on error.
+    pub fn mlx_test_fork_segmented_sdpa_plan_mismatches(out_checked: *mut i64) -> i64;
+
     // Fused forward step - single FFI call for entire forward pass
     // This reduces FFI overhead from ~300 calls to 1 call per token
     // Uses array offsets for batched generation with proper per-sequence RoPE positions.

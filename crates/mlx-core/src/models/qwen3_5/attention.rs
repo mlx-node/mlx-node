@@ -2277,6 +2277,82 @@ mod tests {
         Ok(())
     }
 
+    /// Segmented SDPA equals concatenated K/V through MLX's vector SDPA only
+    /// while it copies MLX's two-pass route and partition count
+    /// (`sdpa_vector_uses_two_pass` / `sdpa_vector_partition_count` in
+    /// `mlx_segmented_sdpa_plan.h`). Totals on both sides of every boundary of
+    /// every device class, at 1..32 active simdgroups, fail here when the
+    /// linked MLX changes that policy. Run it under `MLX_METAL_GPU_ARCH` with
+    /// a 'd' and a base-class architecture too.
+    #[test]
+    #[ignore = "requires coordinated Metal GPU validation"]
+    #[cfg(target_os = "macos")]
+    fn segmented_sdpa_reduction_policy_matches_mlx_vector_sdpa() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        const D: i64 = 256;
+        const CAPACITY: i64 = 65_600;
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((2 * CAPACITY * D) as usize, 0x0f1e_2d3c),
+            &[1, 2, CAPACITY, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((2 * CAPACITY * D) as usize, 0x4b5a_6978),
+            &[1, 2, CAPACITY, D],
+        )?;
+        base_k.eval();
+        base_v.eval();
+        let mut checked = 0usize;
+        for (q_heads, kv_heads) in [(1_i64, 1_i64), (2, 1), (4, 1), (6, 1), (8, 2), (16, 2)] {
+            let gqa = q_heads / kv_heads;
+            let max_q =
+                i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) });
+            let pk_all = base_k.slice(&[0, 0, 0, 0], &[1, kv_heads, CAPACITY, D])?;
+            let pv_all = base_v.slice(&[0, 0, 0, 0], &[1, kv_heads, CAPACITY, D])?;
+            for rows in 1_i64..=8 {
+                if segmented_verify_head_len(rows, max_q).is_none() {
+                    continue;
+                }
+                let q = MxArray::from_bfloat16(
+                    &deterministic_bf16((q_heads * rows * D) as usize, 0x1357_9bdf),
+                    &[1, q_heads, rows, D],
+                )?;
+                let nk = MxArray::from_bfloat16(
+                    &deterministic_bf16((kv_heads * rows * D) as usize, 0x2468_ace0),
+                    &[1, kv_heads, rows, D],
+                )?;
+                let nv = MxArray::from_bfloat16(
+                    &deterministic_bf16((kv_heads * rows * D) as usize, 0xfdb9_7531),
+                    &[1, kv_heads, rows, D],
+                )?;
+                for boundary in [
+                    1024_i64, 1025, 4096, 4097, 8192, 8193, 16384, 16385, 32768, 32769, 65536,
+                    65537,
+                ] {
+                    for total in [boundary - 1, boundary] {
+                        let prefix = total - rows;
+                        let pk = pk_all.slice(&[0, 0, 0, 0], &[1, kv_heads, prefix, D])?;
+                        let pv = pv_all.slice(&[0, 0, 0, 0], &[1, kv_heads, prefix, D])?;
+                        let got = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?
+                            .to_float32()?;
+                        let expected =
+                            segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?
+                                .to_float32()?;
+                        assert_eq!(
+                            got.as_ref(),
+                            expected.as_ref(),
+                            "gqa {gqa} ({q_heads}/{kv_heads}) rows {rows} total {total}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("{checked} policy-boundary cases equal MLX's vector SDPA");
+        Ok(())
+    }
+
     const VERIFY_SINGLE: i32 = 0;
     const VERIFY_ONE_PASS: i32 = 1;
     const VERIFY_UNIFIED: i32 = 2;
@@ -2387,7 +2463,7 @@ mod tests {
         assert!(!verify_plan(8, 6, 0, caps, caps).0, "partitions < 32");
     }
 
-    /// Class-'s' vector-SDPA reduction policy (`sdpa_vector_plan.h`), used to
+    /// Class-'s' vector-SDPA reduction policy (`mlx_segmented_sdpa_plan.h`), used to
     /// predict the verify route independently of the C++ planner.
     #[cfg(target_os = "macos")]
     fn class_s_reduction(total: i64, active_simdgroups: i64) -> (bool, i64) {
