@@ -1,8 +1,8 @@
 # Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
 # One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url.
 applegpu_g17s = machine
-applegpu_g16s = route
-false = nax
+applegpu_g17d = route
+true = nax
 1530 = cases
 b802adbf9e0b84fe = keys
 Ap125Wu9
@@ -174,12 +174,12 @@ WxgutUp1
 QCdkP-Il
 3xszM4MY
 tWbVfRx2
-rwy9bWgQ
-H4gJmEC8
-0gzEHCg2
-GgRxpyZE
-VBsfcWZB
-d-0tT3_p
+HPFeCFPY
+bPBEkTML
+MdcHnqZs
+Pmf2ybDi
+kLJqxQ73
+3-mtVKcQ
 QCzhPvIT
 Ag84PnFd
 ynwNUE4l
@@ -489,12 +489,12 @@ q2rt8SH6
 YMJ5umaA
 4X71fPO8
 AwlcFPUX
-lpKa24bn
-Fu3VhHzH
-DGf39hVJ
-m8cP0QQb
-Z6_y3W9m
-8PVsth-T
+qOK2-UOJ
+PHJy-Sf0
+zQkEa1OR
+wn8RhsrO
+7itPn6B0
+Sl2abb5N
 1fBGdKl1
 q-e3tmge
 OTV3TziI
@@ -804,12 +804,12 @@ qFsNDSWe
 eYA7ZVPN
 8cP6kcbH
 M0FzvSfG
--PcoHWqv
-FJd2WdwY
-HNuwGn_1
-eLbTOMKj
-QpnKhnQq
-wWxuajaU
+ZaAhjs8e
+WAHRuBrK
+ezue9gwQ
+f3-Gw9Le
+Ks9vymVg
+NSnEU5ty
 XGx4C8nd
 jCAqQMBG
 3jN0ejYp
@@ -855,9 +855,9 @@ sTMCAJvR
 8PM_vnWw
 HB4gGDG7
 amwFLr5C
-RhCDQIW_
-8Wq6LAPW
-9eOCNn1P
+unfimN3D
+IJjwOuNi
+q2fncQvg
 ilySNiav
 NOxpF61L
 xbo5k0oE
@@ -1119,12 +1119,12 @@ rM4ce-ez
 ynMtSb_Y
 O0xgN4zv
 FfAfPWlg
-TKTBONZi
-Bhq8gXAh
-b65qcHV2
-nVEmvC2e
-ry3Z_VRz
-jb20ODEs
+eA-cw1gD
+QyS44X0w
+C9Pa51jp
+BU4d_5Dj
+gyE6ovbu
+n0kz4F_N
 VERg3JY4
 SjmfeH2O
 fQnBCQyl
@@ -1170,9 +1170,9 @@ ffH83JWi
 ucCQDvwU
 H--Te85M
 7kW4aXiv
-JO_Ewkcu
-GlBk-Aq-
-7YayJ4N7
+XL_myGbd
+cPmjstFd
+vVj0rPMe
 KWLtyIYL
 oea9ZZJ8
 rnySOPLD
@@ -1434,12 +1434,12 @@ RU5KSI7l
 0whOaaP5
 452ndxgD
 p5ORGags
-nVWpHrSz
-ZzlsY-2-
-uiJek4iq
-VzMR6Lgi
-KsjDwPMT
-IIIBoENE
+VAhKuGuJ
+_SF_qXdq
+Pd2MqeGW
+tiIVCR7B
+VjcAGnVM
+GKFa3z8g
 2KIwZyL3
 kidbob-y
 3dvtAMft
@@ -1485,9 +1485,9 @@ ikqr43aa
 jUj1z_xO
 WxJrKAE0
 kUHNUEh9
-edpxqYlf
-mdApngWt
-q6B8UpTv
+OHIOkpmO
+H1q9Y7Im
+CVwZpnUp
 w6kolNd2
 XyGb-vVS
 mOS4PMyW

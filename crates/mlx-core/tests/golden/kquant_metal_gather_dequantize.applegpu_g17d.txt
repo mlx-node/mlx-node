@@ -1,8 +1,8 @@
 # Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
 # One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url.
 applegpu_g17s = machine
-applegpu_g14s = route
-false = nax
+applegpu_g17d = route
+true = nax
 315 = cases
 de75f7ccc45e6059 = keys
 hk9h51rl

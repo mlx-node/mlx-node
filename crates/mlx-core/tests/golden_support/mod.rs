@@ -1,10 +1,13 @@
 //! Golden output digests for bridge kernels whose bits were proven equal to a
-//! reference. A fixture under `tests/golden/` maps each case key to the first
-//! 8 bytes of SHA-256 over the output's dtype, shape and raw element bytes
-//! (or to a plain value). Metal and CPU digests are hardware specific: a
-//! fixture records the machine it was captured on, and checking it anywhere
-//! else fails. There is no capture mode: the fork-oracle tests wrote the
-//! fixtures on MLX pin 053e43fec, and a new fixture needs a new proof.
+//! reference. A fixture under `tests/golden/` holds one line per case, in the
+//! order the gate runs its cases: the first 6 bytes of SHA-256 over the
+//! output's dtype, shape and raw element bytes (base64url), or a plain value.
+//! The header pins the case count and a hash of the ordered case keys, so a
+//! mismatch is named by the key the test itself built. Metal and CPU digests
+//! are hardware specific: a fixture records the machine it was captured on,
+//! and checking it anywhere else fails. There is no capture mode: the
+//! fork-oracle tests wrote the fixtures on MLX pin 053e43fec, and a new
+//! fixture needs a new proof.
 
 #![allow(dead_code)]
 
@@ -37,8 +40,20 @@ fn element_bytes(dtype: DType) -> usize {
     }
 }
 
-/// First 8 bytes of SHA-256 over dtype, rank, dims and the element bytes
-/// (little-endian, at the dtype's width), as 16 hex digits.
+fn base64url(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    assert_eq!(bytes.len() % 3, 0);
+    bytes
+        .chunks(3)
+        .flat_map(|c| {
+            let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+            [18, 12, 6, 0].map(|shift| A[((n >> shift) & 63) as usize] as char)
+        })
+        .collect()
+}
+
+/// First 6 bytes of SHA-256 over dtype, rank, dims and the element bytes
+/// (little-endian, at the dtype's width), as 8 base64url characters.
 pub fn digest(shape: &[i64], dtype: DType, bits: &[u32]) -> String {
     let width = element_bytes(dtype);
     let mut h = Sha256::new();
@@ -50,6 +65,16 @@ pub fn digest(shape: &[i64], dtype: DType, bits: &[u32]) -> String {
     for b in bits {
         h.update(&b.to_le_bytes()[..width]);
     }
+    base64url(&h.finalize()[..6])
+}
+
+/// First 8 bytes of SHA-256 over the case keys in order, one per line.
+pub fn keys_hash<'a>(keys: impl IntoIterator<Item = &'a String>) -> String {
+    let mut h = Sha256::new();
+    for key in keys {
+        h.update(key.as_bytes());
+        h.update(b"\n");
+    }
     h.finalize()[..8]
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -58,9 +83,10 @@ pub fn digest(shape: &[i64], dtype: DType, bits: &[u32]) -> String {
 
 pub struct Golden {
     path: PathBuf,
-    expected: HashMap<String, String>,
-    values: HashMap<String, String>,
-    mismatches: usize,
+    expected: Vec<String>,
+    expected_keys: String,
+    cases: Vec<(String, String)>,
+    index: HashMap<String, usize>,
 }
 
 impl Golden {
@@ -68,6 +94,7 @@ impl Golden {
     /// (`<stem>.<arch>.txt`), valid only on the captured hardware.
     pub fn metal(stem: &str) -> Golden {
         let route = metal_architecture(false).expect("golden Metal fixtures need a Metal device");
+        // SAFETY: nullary predicate.
         let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
         Golden::open(
             &format!("{stem}.{route}"),
@@ -109,15 +136,13 @@ impl Golden {
             )
         });
         let mut fixture_header = HashMap::new();
-        let mut expected = HashMap::new();
+        let mut expected = Vec::new();
         for line in text.lines().filter(|l| !l.starts_with('#')) {
-            let (value, key) = line
-                .split_once(' ')
-                .unwrap_or_else(|| panic!("{}: bad line {line:?}", path.display()));
-            if let Some(field) = key.strip_prefix("= ") {
-                fixture_header.insert(field.to_string(), value.to_string());
-            } else {
-                expected.insert(key.to_string(), value.to_string());
+            match line.split_once(" = ") {
+                Some((value, field)) => {
+                    fixture_header.insert(field.to_string(), value.to_string());
+                }
+                None => expected.push(line.to_string()),
             }
         }
         for (field, now) in &header {
@@ -141,16 +166,25 @@ impl Golden {
                 );
             }
         }
-        let cases: usize = fixture_header
-            .get("cases")
-            .and_then(|c| c.parse().ok())
-            .unwrap_or_else(|| panic!("{}: no `cases` header", path.display()));
-        assert_eq!(cases, expected.len(), "{}: case count", path.display());
+        let field = |f: &str| {
+            fixture_header
+                .get(f)
+                .cloned()
+                .unwrap_or_else(|| panic!("{}: no `{f}` header", path.display()))
+        };
+        assert_eq!(
+            field("cases").parse::<usize>().ok(),
+            Some(expected.len()),
+            "{}: case count",
+            path.display()
+        );
+        let expected_keys = field("keys");
         Golden {
             path,
             expected,
-            values: HashMap::new(),
-            mismatches: 0,
+            expected_keys,
+            cases: Vec::new(),
+            index: HashMap::new(),
         }
     }
 
@@ -158,50 +192,54 @@ impl Golden {
         self.record_value(key, &digest(shape, dtype, bits));
     }
 
+    /// Cases are matched to fixture lines by order; a repeated key must
+    /// repeat its value.
     pub fn record_value(&mut self, key: &str, value: &str) {
-        if let Some(previous) = self.values.get(key) {
-            assert_eq!(previous, value, "{key}: the same case gave different bits");
+        if let Some(&i) = self.index.get(key) {
+            assert_eq!(
+                self.cases[i].1, value,
+                "{key}: the same case gave different bits"
+            );
             return;
         }
-        match self.expected.get(key) {
-            None => panic!("{key}: no such case in {}", self.path.display()),
-            Some(want) if want != value => {
-                self.mismatches += 1;
-                if self.mismatches <= 20 {
-                    eprintln!("golden mismatch: {key}: fixture {want}, now {value}");
-                }
-            }
-            Some(_) => {}
+        if let Some(want) = self.expected.get(self.cases.len()).filter(|w| *w != value) {
+            eprintln!("golden mismatch: {key}: fixture {want}, now {value}");
         }
-        self.values.insert(key.to_string(), value.to_string());
+        self.index.insert(key.to_string(), self.cases.len());
+        self.cases.push((key.to_string(), value.to_string()));
     }
 
-    /// Every fixture case must have run with its recorded value.
+    /// The case list must be the captured one, then every value must equal
+    /// its fixture line.
     pub fn finish(self) {
-        let missing: Vec<&String> = self
-            .expected
-            .keys()
-            .filter(|k| !self.values.contains_key(*k))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "{}: {} fixture cases never ran, e.g. {:?}",
-            self.path.display(),
-            missing.len(),
-            &missing[..missing.len().min(5)]
+        let path = self.path.display();
+        assert_eq!(
+            self.cases.len(),
+            self.expected.len(),
+            "{path}: the gate ran {} cases, the fixture has {}; the case matrix changed",
+            self.cases.len(),
+            self.expected.len()
         );
         assert_eq!(
-            self.mismatches,
-            0,
-            "{}: {} of {} cases differ from the golden digests (first ones above)",
-            self.path.display(),
-            self.mismatches,
-            self.values.len()
+            keys_hash(self.cases.iter().map(|(k, _)| k)),
+            self.expected_keys,
+            "{path}: the case keys or their order changed since the capture"
+        );
+        let mismatches: Vec<_> = self
+            .cases
+            .iter()
+            .zip(&self.expected)
+            .filter(|((_, now), want)| now != *want)
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "{path}: {} of {} cases differ from the golden digests (listed above)",
+            mismatches.len(),
+            self.cases.len()
         );
         eprintln!(
-            "{}: {} cases equal the golden digests",
-            self.path.display(),
-            self.values.len()
+            "{path}: {} cases equal the golden digests",
+            self.cases.len()
         );
     }
 }

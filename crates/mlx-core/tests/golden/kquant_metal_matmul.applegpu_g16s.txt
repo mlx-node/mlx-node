@@ -1,2109 +1,2110 @@
-# Golden digests of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
-# <first 8 bytes of SHA-256 over dtype, shape and output bytes, or a value> <case>
+# Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
+# One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url.
 applegpu_g17s = machine
 applegpu_g16s = route
 false = nax
 2103 = cases
-bc76f66e32cd4863 gpu q3k Float32 t M=2 N=2048 K=1024
-8dfed6e92147bcce gpu q3k Float32 t M=2 N=136 K=768
-9919799d49f7ba51 gpu q3k Float32 t batched M=2
-7f345019c1c98224 gpu q3k Float32 t batched-aligned M=2
-1d98a1e6749e4099 gpu q3k Float32 t x-batched M=2
-9633a2d7dd79798e gpu q3k Float32 n M=2 K=256
-a3140f348b36b6ad gpu q3k Float32 n M=2 K=1024
-320d3c809e8217a4 gpu q3k Float32 t M=3 N=2048 K=1024
-eeb70cc2fd6d55cd gpu q3k Float32 t M=3 N=136 K=768
-0f456d8cd4b2884b gpu q3k Float32 t batched M=3
-ef42e06c33b4104e gpu q3k Float32 t batched-aligned M=3
-a21e1427bb6f927c gpu q3k Float32 t x-batched M=3
-fec61f61b5d3df0a gpu q3k Float32 n M=3 K=256
-4b66bf5aa8cb3f44 gpu q3k Float32 n M=3 K=1024
-ce53164844dee868 gpu q3k Float32 t M=4 N=2048 K=1024
-2ddb720d4041ba07 gpu q3k Float32 t M=4 N=136 K=768
-ab41ea09057b3ec7 gpu q3k Float32 t batched M=4
-6ff83f464dc072c7 gpu q3k Float32 t batched-aligned M=4
-bf8b53278c60306c gpu q3k Float32 t x-batched M=4
-cb4942129257d237 gpu q3k Float32 n M=4 K=256
-0e416904b57fd15a gpu q3k Float32 n M=4 K=1024
-39a7b2a6a2f53374 gpu q3k Float32 t M=5 N=2048 K=1024
-49a2d65a6e58801f gpu q3k Float32 t M=5 N=136 K=768
-adb057016890ea4f gpu q3k Float32 t batched M=5
-c65179ca24d019c8 gpu q3k Float32 t batched-aligned M=5
-a6e143b0138f0012 gpu q3k Float32 t x-batched M=5
-271571b2bd826015 gpu q3k Float32 n M=5 K=256
-1675f735b69211ce gpu q3k Float32 n M=5 K=1024
-c9885d34a846ad36 gpu q3k Float32 t M=6 N=2048 K=1024
-c5370cedf2bb9c45 gpu q3k Float32 t M=6 N=136 K=768
-beb7c122aaf0c9d0 gpu q3k Float32 t batched M=6
-7d29a71d8926e19c gpu q3k Float32 t batched-aligned M=6
-918eff57e163f69b gpu q3k Float32 t x-batched M=6
-b4d63fb04728b127 gpu q3k Float32 n M=6 K=256
-41baa4927e4ddeba gpu q3k Float32 n M=6 K=1024
-34eb2b9a4eba6889 gpu q3k Float32 t M=7 N=2048 K=1024
-c699fa8378d09544 gpu q3k Float32 t M=7 N=136 K=768
-dfc12a56d0ccd390 gpu q3k Float32 t batched M=7
-7ad9dce981216a4a gpu q3k Float32 t batched-aligned M=7
-a9b69aa68a9d3c40 gpu q3k Float32 t x-batched M=7
-f1d0902a9cee0130 gpu q3k Float32 n M=7 K=256
-0c5f1570eb46859f gpu q3k Float32 n M=7 K=1024
-0a63a11b8d0eecc1 gpu q3k Float32 t M=8 N=2048 K=1024
-c88f980307ceec5f gpu q3k Float32 t M=8 N=136 K=768
-20ce3b7d7af85657 gpu q3k Float32 t batched M=8
-ae20d1672d22b248 gpu q3k Float32 t batched-aligned M=8
-e8e03470c12a09ab gpu q3k Float32 t x-batched M=8
-ccb30467e543e76e gpu q3k Float32 n M=8 K=256
-4af7ab460a305ed1 gpu q3k Float32 n M=8 K=1024
-8762bcaa20f87284 gpu q3k Float16 t M=2 N=2048 K=1024
-c49b065165d66c85 gpu q3k Float16 t M=2 N=136 K=768
-89fea3354769ff65 gpu q3k Float16 t batched M=2
-6ef01e01050c3af8 gpu q3k Float16 t batched-aligned M=2
-c01de641cfba3264 gpu q3k Float16 t x-batched M=2
-d8ebb964fed8b982 gpu q3k Float16 n M=2 K=256
-6cd2028712659410 gpu q3k Float16 n M=2 K=1024
-f01902d4fb9ed89b gpu q3k Float16 t M=3 N=2048 K=1024
-c3aba3d7c3aa0372 gpu q3k Float16 t M=3 N=136 K=768
-646c9eb2f0a12ca3 gpu q3k Float16 t batched M=3
-0c97df026d2e0b63 gpu q3k Float16 t batched-aligned M=3
-b60496336de60b1a gpu q3k Float16 t x-batched M=3
-7e0a0cffca5da0f0 gpu q3k Float16 n M=3 K=256
-79afda604cded3fd gpu q3k Float16 n M=3 K=1024
-568fe20027231799 gpu q3k Float16 t M=4 N=2048 K=1024
-59624a3bd05f030a gpu q3k Float16 t M=4 N=136 K=768
-57992b8bae10e844 gpu q3k Float16 t batched M=4
-fba342e9ead7b5f1 gpu q3k Float16 t batched-aligned M=4
-f3381ee7de54c5dd gpu q3k Float16 t x-batched M=4
-75844ca92e70af66 gpu q3k Float16 n M=4 K=256
-04083b6d0cb442c1 gpu q3k Float16 n M=4 K=1024
-29e4f12def6a1166 gpu q3k Float16 t M=5 N=2048 K=1024
-e616ce3e68c137b6 gpu q3k Float16 t M=5 N=136 K=768
-93f6231effb6094b gpu q3k Float16 t batched M=5
-5be8a1760265dde2 gpu q3k Float16 t batched-aligned M=5
-6079d338e1faf351 gpu q3k Float16 t x-batched M=5
-2b621f2be64a466d gpu q3k Float16 n M=5 K=256
-e6f45126afe855ab gpu q3k Float16 n M=5 K=1024
-bd9413ea52371316 gpu q3k Float16 t M=6 N=2048 K=1024
-295c29549ede1b9a gpu q3k Float16 t M=6 N=136 K=768
-a35f1bcbf97f8fe0 gpu q3k Float16 t batched M=6
-7284c49e77745dfa gpu q3k Float16 t batched-aligned M=6
-4185dff6492055be gpu q3k Float16 t x-batched M=6
-4bee4300e5d7f60c gpu q3k Float16 n M=6 K=256
-6afdd7278df55f73 gpu q3k Float16 n M=6 K=1024
-faf753a11726eefc gpu q3k Float16 t M=7 N=2048 K=1024
-7acd283076f3efa5 gpu q3k Float16 t M=7 N=136 K=768
-567c6aed03e461fc gpu q3k Float16 t batched M=7
-50b35e5053ac04d5 gpu q3k Float16 t batched-aligned M=7
-baaaa46a53706947 gpu q3k Float16 t x-batched M=7
-64bc48fb53dc006c gpu q3k Float16 n M=7 K=256
-ac881aa3bb18b7b6 gpu q3k Float16 n M=7 K=1024
-0081c8497990ee67 gpu q3k Float16 t M=8 N=2048 K=1024
-2491d4272d1d4d88 gpu q3k Float16 t M=8 N=136 K=768
-c25c723baa6fe411 gpu q3k Float16 t batched M=8
-2972bc1265e7c319 gpu q3k Float16 t batched-aligned M=8
-96e1600c49446a6f gpu q3k Float16 t x-batched M=8
-9c56c206bd948c41 gpu q3k Float16 n M=8 K=256
-54404f724b6109a7 gpu q3k Float16 n M=8 K=1024
-781994454a1e7cf5 gpu q3k BFloat16 t M=2 N=2048 K=1024
-ca79ae2784df28dd gpu q3k BFloat16 t M=2 N=136 K=768
-8b053fc6956e91ba gpu q3k BFloat16 t batched M=2
-acbb37a736fdd38c gpu q3k BFloat16 t batched-aligned M=2
-d91dd6e77ea2db26 gpu q3k BFloat16 t x-batched M=2
-76430a326040d05b gpu q3k BFloat16 n M=2 K=256
-6e072be6433edce4 gpu q3k BFloat16 n M=2 K=1024
-2707dbc0fdf55a71 gpu q3k BFloat16 t M=3 N=2048 K=1024
-58d61bde2259a5cf gpu q3k BFloat16 t M=3 N=136 K=768
-ef409800c4f39843 gpu q3k BFloat16 t batched M=3
-f9a2d6bc8727da45 gpu q3k BFloat16 t batched-aligned M=3
-562b88a1c63d7b96 gpu q3k BFloat16 t x-batched M=3
-a0ba105510c0c2da gpu q3k BFloat16 n M=3 K=256
-0317368d654e3664 gpu q3k BFloat16 n M=3 K=1024
-57e062094f650a95 gpu q3k BFloat16 t M=4 N=2048 K=1024
-06970a03a1f5035e gpu q3k BFloat16 t M=4 N=136 K=768
-063531bbf8327868 gpu q3k BFloat16 t batched M=4
-f9b7b65e4f3c0bdd gpu q3k BFloat16 t batched-aligned M=4
-ee9a6f25416fb2b6 gpu q3k BFloat16 t x-batched M=4
-f2845bc7881d85e0 gpu q3k BFloat16 n M=4 K=256
-5be4124fb39e18e0 gpu q3k BFloat16 n M=4 K=1024
-d67d9b669d93811a gpu q3k BFloat16 t M=5 N=2048 K=1024
-57685a2471f03338 gpu q3k BFloat16 t M=5 N=136 K=768
-36ccc6e993979e54 gpu q3k BFloat16 t batched M=5
-f209c3e22e1d8678 gpu q3k BFloat16 t batched-aligned M=5
-eb0dcaf1a85b42eb gpu q3k BFloat16 t x-batched M=5
-ac830726225885b5 gpu q3k BFloat16 n M=5 K=256
-9b363f90025e21d7 gpu q3k BFloat16 n M=5 K=1024
-d6c933dc9b8cdbcc gpu q3k BFloat16 t M=6 N=2048 K=1024
-cef5f03d03007233 gpu q3k BFloat16 t M=6 N=136 K=768
-549205e9336ed110 gpu q3k BFloat16 t batched M=6
-3a026654e947ec1e gpu q3k BFloat16 t batched-aligned M=6
-1308ab6506c846ab gpu q3k BFloat16 t x-batched M=6
-ae7686f6388febe2 gpu q3k BFloat16 n M=6 K=256
-72d12d6cf3899aaa gpu q3k BFloat16 n M=6 K=1024
-7233f565102528bc gpu q3k BFloat16 t M=7 N=2048 K=1024
-7f7a216bd58a4471 gpu q3k BFloat16 t M=7 N=136 K=768
-6af5ca4729dc5704 gpu q3k BFloat16 t batched M=7
-9bc9ca562ed6ba5d gpu q3k BFloat16 t batched-aligned M=7
-b6e40ee699b950a7 gpu q3k BFloat16 t x-batched M=7
-702f9fac14a5d5ef gpu q3k BFloat16 n M=7 K=256
-fe8d57b6e67e1179 gpu q3k BFloat16 n M=7 K=1024
-dd75c372b7df72dc gpu q3k BFloat16 t M=8 N=2048 K=1024
-7fd968224454381e gpu q3k BFloat16 t M=8 N=136 K=768
-093d339754b493f6 gpu q3k BFloat16 t batched M=8
-9c3f4cc2ca9b83ee gpu q3k BFloat16 t batched-aligned M=8
-15431e2b661b610a gpu q3k BFloat16 t x-batched M=8
-bf5772d7c090c6bf gpu q3k BFloat16 n M=8 K=256
-4b7b856bdab40986 gpu q3k BFloat16 n M=8 K=1024
-43b50cc14bd2cb3e gpu q6k Float32 t M=2 N=2048 K=1024
-83de3acafddd9026 gpu q6k Float32 t M=2 N=136 K=768
-f5198bdc683be425 gpu q6k Float32 t batched M=2
-8b139c66a194b96b gpu q6k Float32 t batched-aligned M=2
-83a44355df5365ad gpu q6k Float32 t x-batched M=2
-843eda7a5795827b gpu q6k Float32 n M=2 K=256
-d9aa4747f831d221 gpu q6k Float32 n M=2 K=1024
-1c0b5d4afe582ca6 gpu q6k Float32 t M=3 N=2048 K=1024
-9d81988299eb6e40 gpu q6k Float32 t M=3 N=136 K=768
-b56d4a1020811124 gpu q6k Float32 t batched M=3
-53ac0674c194e2ec gpu q6k Float32 t batched-aligned M=3
-c29c3fde98f4c247 gpu q6k Float32 t x-batched M=3
-6b5858c261fe0e85 gpu q6k Float32 n M=3 K=256
-1cbedde06ccb05d9 gpu q6k Float32 n M=3 K=1024
-3994c2127e0bf1c8 gpu q6k Float32 t M=4 N=2048 K=1024
-0e9045d6bd2290cc gpu q6k Float32 t M=4 N=136 K=768
-07f35979969ff551 gpu q6k Float32 t batched M=4
-07f5f3a109c2c130 gpu q6k Float32 t batched-aligned M=4
-7b3e696d48676a13 gpu q6k Float32 t x-batched M=4
-0408d2a26f51652b gpu q6k Float32 n M=4 K=256
-9abfb719e4bb8866 gpu q6k Float32 n M=4 K=1024
-8f6529a57c06470c gpu q6k Float32 t M=5 N=2048 K=1024
-41a64fe2ca28e08e gpu q6k Float32 t M=5 N=136 K=768
-81f0f940af3168db gpu q6k Float32 t batched M=5
-dd724dee8da1a84c gpu q6k Float32 t batched-aligned M=5
-f4644789a6254466 gpu q6k Float32 t x-batched M=5
-f586d7e778310fa9 gpu q6k Float32 n M=5 K=256
-bdeb29358c9429ff gpu q6k Float32 n M=5 K=1024
-dc8f575a181a5261 gpu q6k Float32 t M=6 N=2048 K=1024
-8e1970e98331ddf7 gpu q6k Float32 t M=6 N=136 K=768
-db06f6d7ff0f3e65 gpu q6k Float32 t batched M=6
-ee4203c9c976a0ec gpu q6k Float32 t batched-aligned M=6
-8ab48ae0787e3638 gpu q6k Float32 t x-batched M=6
-1cd154c65016ef04 gpu q6k Float32 n M=6 K=256
-0eeda6438407b31d gpu q6k Float32 n M=6 K=1024
-9a85526c41531f58 gpu q6k Float32 t M=7 N=2048 K=1024
-28cd1c78dbb35b3a gpu q6k Float32 t M=7 N=136 K=768
-597606b0b81bc25c gpu q6k Float32 t batched M=7
-0dc705f162e8a9f4 gpu q6k Float32 t batched-aligned M=7
-2e66bfe297cbc126 gpu q6k Float32 t x-batched M=7
-4ef23acd41fd2bee gpu q6k Float32 n M=7 K=256
-2b204ed0311d255b gpu q6k Float32 n M=7 K=1024
-9b6fbead2d419f9b gpu q6k Float32 t M=8 N=2048 K=1024
-0fa9bede75523f7e gpu q6k Float32 t M=8 N=136 K=768
-45c29833900358bd gpu q6k Float32 t batched M=8
-e0b520c664c72337 gpu q6k Float32 t batched-aligned M=8
-bc4e35cee4f6b1c2 gpu q6k Float32 t x-batched M=8
-3fb098dee2acf5c7 gpu q6k Float32 n M=8 K=256
-423200555d8ac424 gpu q6k Float32 n M=8 K=1024
-3535b5d0075e9bd2 gpu q6k Float16 t M=2 N=2048 K=1024
-a6b9ef52dec664de gpu q6k Float16 t M=2 N=136 K=768
-e019be32e3b7093e gpu q6k Float16 t batched M=2
-76eebb7229e27b3f gpu q6k Float16 t batched-aligned M=2
-4c5ea09050dd3fcd gpu q6k Float16 t x-batched M=2
-df802115ba90a670 gpu q6k Float16 n M=2 K=256
-f526693d97a063cb gpu q6k Float16 n M=2 K=1024
-092223679b584bb1 gpu q6k Float16 t M=3 N=2048 K=1024
-23afd8dcfba5edbe gpu q6k Float16 t M=3 N=136 K=768
-bfcbe2dbd0116caa gpu q6k Float16 t batched M=3
-dfa4a27b4fa7fa7a gpu q6k Float16 t batched-aligned M=3
-96c8d3d1056ff5d6 gpu q6k Float16 t x-batched M=3
-0c5eda4114d2309d gpu q6k Float16 n M=3 K=256
-63e718ec95a2666a gpu q6k Float16 n M=3 K=1024
-44d489f7a662d869 gpu q6k Float16 t M=4 N=2048 K=1024
-ccfab76e2a67f4c5 gpu q6k Float16 t M=4 N=136 K=768
-f3d5c731ddad0252 gpu q6k Float16 t batched M=4
-57512f9fcb732962 gpu q6k Float16 t batched-aligned M=4
-272160752ffd91f2 gpu q6k Float16 t x-batched M=4
-320c2cb31f89d17b gpu q6k Float16 n M=4 K=256
-28cb3dfd2dfcbaa3 gpu q6k Float16 n M=4 K=1024
-94b176f251cb6964 gpu q6k Float16 t M=5 N=2048 K=1024
-e8c31707ba3de5e9 gpu q6k Float16 t M=5 N=136 K=768
-0f5a2fed4d4ef702 gpu q6k Float16 t batched M=5
-49d3c4c43cfcf329 gpu q6k Float16 t batched-aligned M=5
-f1946a5bf3344ce6 gpu q6k Float16 t x-batched M=5
-e8b8a1ec9c2995c1 gpu q6k Float16 n M=5 K=256
-4e709c80b8e95fc5 gpu q6k Float16 n M=5 K=1024
-d261c27176c01838 gpu q6k Float16 t M=6 N=2048 K=1024
-335aa6f2ddda9bda gpu q6k Float16 t M=6 N=136 K=768
-391f83f82a5d5253 gpu q6k Float16 t batched M=6
-16c700aff333682b gpu q6k Float16 t batched-aligned M=6
-45a3a913e4f1a94b gpu q6k Float16 t x-batched M=6
-b9a0d48137a81b1f gpu q6k Float16 n M=6 K=256
-64ff07a07ca07b19 gpu q6k Float16 n M=6 K=1024
-266baa438c1cc6e3 gpu q6k Float16 t M=7 N=2048 K=1024
-8708f892c045105b gpu q6k Float16 t M=7 N=136 K=768
-cc26ec4982441a13 gpu q6k Float16 t batched M=7
-bfc0129c287d1786 gpu q6k Float16 t batched-aligned M=7
-5a0a2c368d4a0e64 gpu q6k Float16 t x-batched M=7
-cf202dfe1cabfa1f gpu q6k Float16 n M=7 K=256
-84a40b9657bd9b3b gpu q6k Float16 n M=7 K=1024
-efeb158e6ef15f02 gpu q6k Float16 t M=8 N=2048 K=1024
-6943254510104db4 gpu q6k Float16 t M=8 N=136 K=768
-49a5cd51337dd43d gpu q6k Float16 t batched M=8
-7550933356b1a4c6 gpu q6k Float16 t batched-aligned M=8
-7af854d8721c7a24 gpu q6k Float16 t x-batched M=8
-e3ea5109c121a2f1 gpu q6k Float16 n M=8 K=256
-1e1bb81f013e455f gpu q6k Float16 n M=8 K=1024
-0b3222cc1db0ba6a gpu q6k BFloat16 t M=2 N=2048 K=1024
-c2be0d380aed6a9f gpu q6k BFloat16 t M=2 N=136 K=768
-17104a906f1ede5e gpu q6k BFloat16 t batched M=2
-cea6a014e8caf232 gpu q6k BFloat16 t batched-aligned M=2
-235b5ab22f923342 gpu q6k BFloat16 t x-batched M=2
-effc8e32910fc4e7 gpu q6k BFloat16 n M=2 K=256
-9f7e47a7566988e1 gpu q6k BFloat16 n M=2 K=1024
-40d44de8d7263a97 gpu q6k BFloat16 t M=3 N=2048 K=1024
-8b59c768ee5f8f1b gpu q6k BFloat16 t M=3 N=136 K=768
-38025dd2b189faff gpu q6k BFloat16 t batched M=3
-389def95a2fe07f4 gpu q6k BFloat16 t batched-aligned M=3
-cf52c9c1a89454a3 gpu q6k BFloat16 t x-batched M=3
-33299c532260294b gpu q6k BFloat16 n M=3 K=256
-971dc7905dc0a312 gpu q6k BFloat16 n M=3 K=1024
-3d59ec9188643fed gpu q6k BFloat16 t M=4 N=2048 K=1024
-a528799b22909b9d gpu q6k BFloat16 t M=4 N=136 K=768
-50d1ba4174712831 gpu q6k BFloat16 t batched M=4
-2fe2026968c61f12 gpu q6k BFloat16 t batched-aligned M=4
-2c33954fbcb78709 gpu q6k BFloat16 t x-batched M=4
-f22eff2ac6edcf12 gpu q6k BFloat16 n M=4 K=256
-3cb5a57069ae1e9c gpu q6k BFloat16 n M=4 K=1024
-61586af02e84ff93 gpu q6k BFloat16 t M=5 N=2048 K=1024
-9e5b19375f88369a gpu q6k BFloat16 t M=5 N=136 K=768
-214e9ee27f8e124b gpu q6k BFloat16 t batched M=5
-7e8803dab14439b7 gpu q6k BFloat16 t batched-aligned M=5
-5f2691fb8538fdcc gpu q6k BFloat16 t x-batched M=5
-33d9ca3e52b97c2a gpu q6k BFloat16 n M=5 K=256
-3a67c134a6c53d22 gpu q6k BFloat16 n M=5 K=1024
-8fd8c3c78fa4f189 gpu q6k BFloat16 t M=6 N=2048 K=1024
-a9e904deeaa4ef99 gpu q6k BFloat16 t M=6 N=136 K=768
-db118645795c458c gpu q6k BFloat16 t batched M=6
-156deb00e6ab8bf7 gpu q6k BFloat16 t batched-aligned M=6
-1c87fcafdc811573 gpu q6k BFloat16 t x-batched M=6
-e2c977c10ac7b2d4 gpu q6k BFloat16 n M=6 K=256
-829ed73dd65f2f4c gpu q6k BFloat16 n M=6 K=1024
-5147392bcd36545a gpu q6k BFloat16 t M=7 N=2048 K=1024
-f6bfada23ec99576 gpu q6k BFloat16 t M=7 N=136 K=768
-9fcb715d1d16a9bf gpu q6k BFloat16 t batched M=7
-7efce68ec4c93d06 gpu q6k BFloat16 t batched-aligned M=7
-78f24a3683a7b2eb gpu q6k BFloat16 t x-batched M=7
-73484ec196b4f356 gpu q6k BFloat16 n M=7 K=256
-774b9144754fb861 gpu q6k BFloat16 n M=7 K=1024
-ff837b78d9b61ba5 gpu q6k BFloat16 t M=8 N=2048 K=1024
-8557f98e9887e808 gpu q6k BFloat16 t M=8 N=136 K=768
-7260703c83d330e5 gpu q6k BFloat16 t batched M=8
-219fb189d3a6b2fc gpu q6k BFloat16 t batched-aligned M=8
-4f69e5b0deb41a32 gpu q6k BFloat16 t x-batched M=8
-1671c443ef60b4c0 gpu q6k BFloat16 n M=8 K=256
-597ebf059de6d58d gpu q6k BFloat16 n M=8 K=1024
-484d03628b2c3434 gpu q4k Float32 t M=2 N=2048 K=1024
-8e360e043dbe3e69 gpu q4k Float32 t M=2 N=136 K=768
-6e22406f73a43fa5 gpu q4k Float32 t batched M=2
-06fd8f5049412670 gpu q4k Float32 t batched-aligned M=2
-df7046829c55f848 gpu q4k Float32 t x-batched M=2
-daa2c173010b1957 gpu q4k Float32 n M=2 K=256
-b54cad9e2384d79d gpu q4k Float32 n M=2 K=1024
-cfa540ad79f90041 gpu q4k Float32 t M=3 N=2048 K=1024
-1d046622bb0011a8 gpu q4k Float32 t M=3 N=136 K=768
-f9e23e7bf1761ef6 gpu q4k Float32 t batched M=3
-a863ad720da9e376 gpu q4k Float32 t batched-aligned M=3
-4d03359c5244a776 gpu q4k Float32 t x-batched M=3
-f3315b7fb56f961b gpu q4k Float32 n M=3 K=256
-a402ce0aba6981c6 gpu q4k Float32 n M=3 K=1024
-8009ae86d415898d gpu q4k Float32 t M=4 N=2048 K=1024
-e3184ec18e7d0755 gpu q4k Float32 t M=4 N=136 K=768
-44ddd99d6215510e gpu q4k Float32 t batched M=4
-2cad7e14dd3067f6 gpu q4k Float32 t batched-aligned M=4
-0e74aa05ef011afe gpu q4k Float32 t x-batched M=4
-d505b11f996052d6 gpu q4k Float32 n M=4 K=256
-6b1b9623cd5caed4 gpu q4k Float32 n M=4 K=1024
-10e728bd34720f42 gpu q4k Float32 t M=5 N=2048 K=1024
-ea522c1a1efab26b gpu q4k Float32 t M=5 N=136 K=768
-d2e4f2c36f0a0dc9 gpu q4k Float32 t batched M=5
-11be8736e76ef5a4 gpu q4k Float32 t batched-aligned M=5
-e26adef17aec38e8 gpu q4k Float32 t x-batched M=5
-e1eb860ca04a0579 gpu q4k Float32 n M=5 K=256
-0252dfa362bf252a gpu q4k Float32 n M=5 K=1024
-cec70cc532d99756 gpu q4k Float32 t M=6 N=2048 K=1024
-773dc63d678d4161 gpu q4k Float32 t M=6 N=136 K=768
-75e6c9bf95a6ab1e gpu q4k Float32 t batched M=6
-a082b1b0500366be gpu q4k Float32 t batched-aligned M=6
-0997d55b907e56a5 gpu q4k Float32 t x-batched M=6
-4444538f9e00e947 gpu q4k Float32 n M=6 K=256
-a16801a0cbbf5d80 gpu q4k Float32 n M=6 K=1024
-8978160f84683a6e gpu q4k Float32 t M=7 N=2048 K=1024
-2c6f840749b66b22 gpu q4k Float32 t M=7 N=136 K=768
-edf4f14cbb92f2f2 gpu q4k Float32 t batched M=7
-e9317277ad38e672 gpu q4k Float32 t batched-aligned M=7
-581b0d74a24ea517 gpu q4k Float32 t x-batched M=7
-1f2ead87418ae8e3 gpu q4k Float32 n M=7 K=256
-62575e41204bd246 gpu q4k Float32 n M=7 K=1024
-c2a32eaf5cf97d9b gpu q4k Float32 t M=8 N=2048 K=1024
-f4521affe7082932 gpu q4k Float32 t M=8 N=136 K=768
-83429583194be75f gpu q4k Float32 t batched M=8
-df884305f6cf0024 gpu q4k Float32 t batched-aligned M=8
-fafe653ff0380008 gpu q4k Float32 t x-batched M=8
-c8a115094092fdd1 gpu q4k Float32 n M=8 K=256
-59dac8ef57b69b62 gpu q4k Float32 n M=8 K=1024
-c260621df68174a1 gpu q4k Float16 t M=2 N=2048 K=1024
-7fdb5a4fd4e4d2bf gpu q4k Float16 t M=2 N=136 K=768
-2aaea3cc18261f9d gpu q4k Float16 t batched M=2
-579ac008089b7d24 gpu q4k Float16 t batched-aligned M=2
-64b66d62379a231d gpu q4k Float16 t x-batched M=2
-16b11ebd5a18be82 gpu q4k Float16 n M=2 K=256
-3ddcebbb6f079ac5 gpu q4k Float16 n M=2 K=1024
-bf8c3016a69258c1 gpu q4k Float16 t M=3 N=2048 K=1024
-b65591edcb6aa825 gpu q4k Float16 t M=3 N=136 K=768
-c796b85d9226b146 gpu q4k Float16 t batched M=3
-00ea33fb2d8069cf gpu q4k Float16 t batched-aligned M=3
-5af11e20ffcbd4b7 gpu q4k Float16 t x-batched M=3
-1f0d2b96127ad753 gpu q4k Float16 n M=3 K=256
-747860081796db4b gpu q4k Float16 n M=3 K=1024
-dc1bd7abdc0eeda4 gpu q4k Float16 t M=4 N=2048 K=1024
-6754728e934d518a gpu q4k Float16 t M=4 N=136 K=768
-37bba7c824a72ea4 gpu q4k Float16 t batched M=4
-0d0c2e28aab8cd84 gpu q4k Float16 t batched-aligned M=4
-83b011c9fa157840 gpu q4k Float16 t x-batched M=4
-01a03b9521f3455e gpu q4k Float16 n M=4 K=256
-b9d1fdc06b9f87cb gpu q4k Float16 n M=4 K=1024
-ad54a684a940aaf2 gpu q4k Float16 t M=5 N=2048 K=1024
-7a9ac72015ab1a32 gpu q4k Float16 t M=5 N=136 K=768
-e94d41adc36802a1 gpu q4k Float16 t batched M=5
-1cba9b64ccbeeaa8 gpu q4k Float16 t batched-aligned M=5
-87f5f5f6027ae498 gpu q4k Float16 t x-batched M=5
-e16d74b8d0500361 gpu q4k Float16 n M=5 K=256
-c62d8f85e74f965c gpu q4k Float16 n M=5 K=1024
-b731a601ad8c72ad gpu q4k Float16 t M=6 N=2048 K=1024
-512cb0751d69474c gpu q4k Float16 t M=6 N=136 K=768
-1269afc7620d9c90 gpu q4k Float16 t batched M=6
-acd4d481dc702c59 gpu q4k Float16 t batched-aligned M=6
-5e379e69d2705223 gpu q4k Float16 t x-batched M=6
-80e75bc51be0a3db gpu q4k Float16 n M=6 K=256
-bdadc803c0304a4a gpu q4k Float16 n M=6 K=1024
-17288e3c76dffb11 gpu q4k Float16 t M=7 N=2048 K=1024
-0a4c8310964c8c14 gpu q4k Float16 t M=7 N=136 K=768
-60391ff8f272db3c gpu q4k Float16 t batched M=7
-4d5fefa23b89276b gpu q4k Float16 t batched-aligned M=7
-a8c38821e825bc2d gpu q4k Float16 t x-batched M=7
-2b928ddaf30442be gpu q4k Float16 n M=7 K=256
-a8216495ad4e7804 gpu q4k Float16 n M=7 K=1024
-16bff24c8dde03c3 gpu q4k Float16 t M=8 N=2048 K=1024
-73364648d2fc8525 gpu q4k Float16 t M=8 N=136 K=768
-1241cbd18fa5aef9 gpu q4k Float16 t batched M=8
-5254af5e978a2ca0 gpu q4k Float16 t batched-aligned M=8
-df2587e9842ccadf gpu q4k Float16 t x-batched M=8
-050b4f34fc480de2 gpu q4k Float16 n M=8 K=256
-ceffadcfdd2ddb44 gpu q4k Float16 n M=8 K=1024
-42e426cde7ec8b81 gpu q4k BFloat16 t M=2 N=2048 K=1024
-54c47f070ba7aedd gpu q4k BFloat16 t M=2 N=136 K=768
-5f75fd6e8ca31f69 gpu q4k BFloat16 t batched M=2
-5f5305ee7f924e59 gpu q4k BFloat16 t batched-aligned M=2
-fba371d2e6ba8714 gpu q4k BFloat16 t x-batched M=2
-4fb22b8e092ff878 gpu q4k BFloat16 n M=2 K=256
-c44459d6ed465fbe gpu q4k BFloat16 n M=2 K=1024
-e41d14e2218d2fed gpu q4k BFloat16 t M=3 N=2048 K=1024
-9fd494a5d252e93e gpu q4k BFloat16 t M=3 N=136 K=768
-6605eabe275ebe17 gpu q4k BFloat16 t batched M=3
-9d808b1163465212 gpu q4k BFloat16 t batched-aligned M=3
-c8d8adf47ffe0507 gpu q4k BFloat16 t x-batched M=3
-7d14d465a1ee394a gpu q4k BFloat16 n M=3 K=256
-8f3038a75a777abb gpu q4k BFloat16 n M=3 K=1024
-401cdac69b6ff2ca gpu q4k BFloat16 t M=4 N=2048 K=1024
-1b44cc7921dcf0d0 gpu q4k BFloat16 t M=4 N=136 K=768
-aab013e1a9b871f7 gpu q4k BFloat16 t batched M=4
-a179df9dc2503bc2 gpu q4k BFloat16 t batched-aligned M=4
-35754f933da83e94 gpu q4k BFloat16 t x-batched M=4
-a62ef652a87d9580 gpu q4k BFloat16 n M=4 K=256
-208261e4bf6e6ec3 gpu q4k BFloat16 n M=4 K=1024
-1b80e50be6226b66 gpu q4k BFloat16 t M=5 N=2048 K=1024
-b30b42d11f809d29 gpu q4k BFloat16 t M=5 N=136 K=768
-3cc1fb3b4959d609 gpu q4k BFloat16 t batched M=5
-399939253304b25a gpu q4k BFloat16 t batched-aligned M=5
-50ba6f28c3eed231 gpu q4k BFloat16 t x-batched M=5
-351d8c888f5c70a6 gpu q4k BFloat16 n M=5 K=256
-2691dff864408ae6 gpu q4k BFloat16 n M=5 K=1024
-2d1f2b621b00a3a9 gpu q4k BFloat16 t M=6 N=2048 K=1024
-d3509109bf864ce5 gpu q4k BFloat16 t M=6 N=136 K=768
-ba86ab5dad45438e gpu q4k BFloat16 t batched M=6
-23c5b5cf58e43299 gpu q4k BFloat16 t batched-aligned M=6
-152b6554af5fc4be gpu q4k BFloat16 t x-batched M=6
-ac16ac84dc8baa93 gpu q4k BFloat16 n M=6 K=256
-587e6533ad2f15c4 gpu q4k BFloat16 n M=6 K=1024
-5973e004198e9bc0 gpu q4k BFloat16 t M=7 N=2048 K=1024
-2eaa08269f703b4e gpu q4k BFloat16 t M=7 N=136 K=768
-ef0b73bb3f054021 gpu q4k BFloat16 t batched M=7
-02cd6238bcac7b81 gpu q4k BFloat16 t batched-aligned M=7
-e617b8e535be79f8 gpu q4k BFloat16 t x-batched M=7
-8556438147265736 gpu q4k BFloat16 n M=7 K=256
-7acd7b93997b391c gpu q4k BFloat16 n M=7 K=1024
-7b76ba71790433e6 gpu q4k BFloat16 t M=8 N=2048 K=1024
-5b44f9bb50f80d0e gpu q4k BFloat16 t M=8 N=136 K=768
-7a65791ad2ccdc7b gpu q4k BFloat16 t batched M=8
-364146406b7351bf gpu q4k BFloat16 t batched-aligned M=8
-47179450bcca0787 gpu q4k BFloat16 t x-batched M=8
-a5a5ee1925e02e2f gpu q4k BFloat16 n M=8 K=256
-559cc6ca99ce3b81 gpu q4k BFloat16 n M=8 K=1024
-723a85dfaf213f33 gpu q5k Float32 t M=2 N=2048 K=1024
-b8c7c052782636b2 gpu q5k Float32 t M=2 N=136 K=768
-98a14fcfa831c891 gpu q5k Float32 t batched M=2
-d0ad00a4046acf93 gpu q5k Float32 t batched-aligned M=2
-153647a5fe2d6024 gpu q5k Float32 t x-batched M=2
-09b9dc913f24f287 gpu q5k Float32 n M=2 K=256
-c773dd64bbbbf023 gpu q5k Float32 n M=2 K=1024
-ed249ed224d82976 gpu q5k Float32 t M=3 N=2048 K=1024
-21a65da33bfb8d44 gpu q5k Float32 t M=3 N=136 K=768
-7ec1ded6feda3abd gpu q5k Float32 t batched M=3
-29efa2b28dc4f34e gpu q5k Float32 t batched-aligned M=3
-b5b8f2bff39d8bc7 gpu q5k Float32 t x-batched M=3
-b0a278409a00c9e9 gpu q5k Float32 n M=3 K=256
-3672bfa6113eaf4d gpu q5k Float32 n M=3 K=1024
-9787e435e877e648 gpu q5k Float32 t M=4 N=2048 K=1024
-587fff06f45a1744 gpu q5k Float32 t M=4 N=136 K=768
-5f1b0919cf60b7f2 gpu q5k Float32 t batched M=4
-328287de082dee30 gpu q5k Float32 t batched-aligned M=4
-c4610c416e4e6b8a gpu q5k Float32 t x-batched M=4
-69473649febe9710 gpu q5k Float32 n M=4 K=256
-e995a094492974eb gpu q5k Float32 n M=4 K=1024
-8cc578506b81844e gpu q5k Float32 t M=5 N=2048 K=1024
-e8f12f1eadb2dcfe gpu q5k Float32 t M=5 N=136 K=768
-475c03999f428aea gpu q5k Float32 t batched M=5
-6e7f747e351b889f gpu q5k Float32 t batched-aligned M=5
-480996ec351de710 gpu q5k Float32 t x-batched M=5
-4029d84c706bafc9 gpu q5k Float32 n M=5 K=256
-cce77730575adfdf gpu q5k Float32 n M=5 K=1024
-82f7322ed5bca202 gpu q5k Float32 t M=6 N=2048 K=1024
-23f147f5ae51019f gpu q5k Float32 t M=6 N=136 K=768
-fa440bf9623bf66e gpu q5k Float32 t batched M=6
-113eaf57bcb48164 gpu q5k Float32 t batched-aligned M=6
-a3af9415440bd0c3 gpu q5k Float32 t x-batched M=6
-1525941a1a44a89f gpu q5k Float32 n M=6 K=256
-18cdbfef87878e41 gpu q5k Float32 n M=6 K=1024
-1ae93c0a2e9eb192 gpu q5k Float32 t M=7 N=2048 K=1024
-1b107145e7d74f33 gpu q5k Float32 t M=7 N=136 K=768
-6df8d9a90833d658 gpu q5k Float32 t batched M=7
-ba5050862d711dcb gpu q5k Float32 t batched-aligned M=7
-e5b350a1fc0eb5e9 gpu q5k Float32 t x-batched M=7
-e5a91f4cf36b7837 gpu q5k Float32 n M=7 K=256
-6939a2d87d5ce38f gpu q5k Float32 n M=7 K=1024
-20d4ae4822893f8c gpu q5k Float32 t M=8 N=2048 K=1024
-fe217f8d0a31c218 gpu q5k Float32 t M=8 N=136 K=768
-4c6bb4deed9567f6 gpu q5k Float32 t batched M=8
-75154c9e820b19ef gpu q5k Float32 t batched-aligned M=8
-499ba8aa7af6e35a gpu q5k Float32 t x-batched M=8
-b980f7db8e3719f9 gpu q5k Float32 n M=8 K=256
-61d0df09ae0214f9 gpu q5k Float32 n M=8 K=1024
-602f8cfc2d18efa1 gpu q5k Float16 t M=2 N=2048 K=1024
-1175bbe28aa1e70c gpu q5k Float16 t M=2 N=136 K=768
-6a780fe416ec7c9a gpu q5k Float16 t batched M=2
-26a0a0a603992207 gpu q5k Float16 t batched-aligned M=2
-92ef8c2658674f59 gpu q5k Float16 t x-batched M=2
-df2b893e5521974a gpu q5k Float16 n M=2 K=256
-065668d867a9e1cd gpu q5k Float16 n M=2 K=1024
-2b5cf04704ce35d2 gpu q5k Float16 t M=3 N=2048 K=1024
-66744a32f1e47b14 gpu q5k Float16 t M=3 N=136 K=768
-8f7b7aa239934715 gpu q5k Float16 t batched M=3
-da8c85fb3b6d7dce gpu q5k Float16 t batched-aligned M=3
-e3438134a59a3db4 gpu q5k Float16 t x-batched M=3
-60179afe4f392382 gpu q5k Float16 n M=3 K=256
-4f50e0736ed9c9f1 gpu q5k Float16 n M=3 K=1024
-0167c5f233ceecc9 gpu q5k Float16 t M=4 N=2048 K=1024
-dda5b57b4cd7dbfb gpu q5k Float16 t M=4 N=136 K=768
-843bfab28ff32e2f gpu q5k Float16 t batched M=4
-3d0da43d3451d5ac gpu q5k Float16 t batched-aligned M=4
-7f187dc3f1a7c3fd gpu q5k Float16 t x-batched M=4
-a797c041eafb7d3e gpu q5k Float16 n M=4 K=256
-58f6c37189dee5b6 gpu q5k Float16 n M=4 K=1024
-1d6adfb64678ae65 gpu q5k Float16 t M=5 N=2048 K=1024
-24f45735ae93631e gpu q5k Float16 t M=5 N=136 K=768
-02f86def24040415 gpu q5k Float16 t batched M=5
-aa01027f1a9333d2 gpu q5k Float16 t batched-aligned M=5
-5d94d37ca4c2f6a9 gpu q5k Float16 t x-batched M=5
-320631ef34e66389 gpu q5k Float16 n M=5 K=256
-ac23262ac51ddc1c gpu q5k Float16 n M=5 K=1024
-a6054a5e2a4f949c gpu q5k Float16 t M=6 N=2048 K=1024
-45d7fc9c89f26291 gpu q5k Float16 t M=6 N=136 K=768
-ebaf8335052bd624 gpu q5k Float16 t batched M=6
-8533ec8506dcec4a gpu q5k Float16 t batched-aligned M=6
-dcc3e3f98d861de1 gpu q5k Float16 t x-batched M=6
-3ec832b8476d4d15 gpu q5k Float16 n M=6 K=256
-9a19b311c76d4eed gpu q5k Float16 n M=6 K=1024
-e6c31a82dd6c0bdb gpu q5k Float16 t M=7 N=2048 K=1024
-89ec2af4a097256d gpu q5k Float16 t M=7 N=136 K=768
-21a236d4365b7020 gpu q5k Float16 t batched M=7
-9a61bd33559a30d9 gpu q5k Float16 t batched-aligned M=7
-c90587afecf5771c gpu q5k Float16 t x-batched M=7
-c2a1529ac8da3472 gpu q5k Float16 n M=7 K=256
-2c364aa4084827cc gpu q5k Float16 n M=7 K=1024
-38058b2b6e16b79a gpu q5k Float16 t M=8 N=2048 K=1024
-5d5c822b5351cf48 gpu q5k Float16 t M=8 N=136 K=768
-8ee239ef06688954 gpu q5k Float16 t batched M=8
-79d8160aa0fde94a gpu q5k Float16 t batched-aligned M=8
-c417a4aa3e6fa046 gpu q5k Float16 t x-batched M=8
-6b7f8ad8253af074 gpu q5k Float16 n M=8 K=256
-4396e3424b5878bd gpu q5k Float16 n M=8 K=1024
-5e85496212ef2cba gpu q5k BFloat16 t M=2 N=2048 K=1024
-964f7244463340e7 gpu q5k BFloat16 t M=2 N=136 K=768
-30a2b6215eddaf3f gpu q5k BFloat16 t batched M=2
-d962d54755bcbf07 gpu q5k BFloat16 t batched-aligned M=2
-10f4b858bef4ac1c gpu q5k BFloat16 t x-batched M=2
-1febe36500aa3407 gpu q5k BFloat16 n M=2 K=256
-dec1d1c0878cca80 gpu q5k BFloat16 n M=2 K=1024
-40b5af8ae612f3bf gpu q5k BFloat16 t M=3 N=2048 K=1024
-4df6ba34cb2babda gpu q5k BFloat16 t M=3 N=136 K=768
-2d14d5f99b8dedb7 gpu q5k BFloat16 t batched M=3
-8f7ae7f4010f22fb gpu q5k BFloat16 t batched-aligned M=3
-a7358ad4e59aa4a1 gpu q5k BFloat16 t x-batched M=3
-8aa0900f0e8b7c57 gpu q5k BFloat16 n M=3 K=256
-b014ca18c8710582 gpu q5k BFloat16 n M=3 K=1024
-7a22e2d4dfaa94f6 gpu q5k BFloat16 t M=4 N=2048 K=1024
-5a31770cf563a914 gpu q5k BFloat16 t M=4 N=136 K=768
-54da23c0f7f207a4 gpu q5k BFloat16 t batched M=4
-5774adcc31472234 gpu q5k BFloat16 t batched-aligned M=4
-533086063bc4048d gpu q5k BFloat16 t x-batched M=4
-a50a98a60adc6731 gpu q5k BFloat16 n M=4 K=256
-8a8811b5a2955369 gpu q5k BFloat16 n M=4 K=1024
-10757733e5f24430 gpu q5k BFloat16 t M=5 N=2048 K=1024
-5cb3f0f0d1ba2267 gpu q5k BFloat16 t M=5 N=136 K=768
-2e3289a506b85046 gpu q5k BFloat16 t batched M=5
-735c18379a2234f0 gpu q5k BFloat16 t batched-aligned M=5
-14c55d0be6eee1db gpu q5k BFloat16 t x-batched M=5
-29f57a81dc0eab82 gpu q5k BFloat16 n M=5 K=256
-5448744662b22408 gpu q5k BFloat16 n M=5 K=1024
-4ba0d9ad913c67c8 gpu q5k BFloat16 t M=6 N=2048 K=1024
-3a60b098bd6db577 gpu q5k BFloat16 t M=6 N=136 K=768
-664c6ae589608516 gpu q5k BFloat16 t batched M=6
-9fb810bc36799228 gpu q5k BFloat16 t batched-aligned M=6
-17197a9dec07625e gpu q5k BFloat16 t x-batched M=6
-860eec6d52765066 gpu q5k BFloat16 n M=6 K=256
-562faaa3c6458258 gpu q5k BFloat16 n M=6 K=1024
-950433eb0b4272a0 gpu q5k BFloat16 t M=7 N=2048 K=1024
-b8d9a2a9e57f1035 gpu q5k BFloat16 t M=7 N=136 K=768
-468e0b902bbebc08 gpu q5k BFloat16 t batched M=7
-b1b1cefe59b73cad gpu q5k BFloat16 t batched-aligned M=7
-153755f03a44dc23 gpu q5k BFloat16 t x-batched M=7
-30b5fa76035339d9 gpu q5k BFloat16 n M=7 K=256
-7df0644f556f950d gpu q5k BFloat16 n M=7 K=1024
-9adb4ac3ab711c42 gpu q5k BFloat16 t M=8 N=2048 K=1024
-31d9db1cb6427ad0 gpu q5k BFloat16 t M=8 N=136 K=768
-379619713e9edd9e gpu q5k BFloat16 t batched M=8
-0b80a7beb37230d5 gpu q5k BFloat16 t batched-aligned M=8
-5b321fa29a34b8e6 gpu q5k BFloat16 t x-batched M=8
-a2a425aae39d8fba gpu q5k BFloat16 n M=8 K=256
-1f6de633c70a6751 gpu q5k BFloat16 n M=8 K=1024
-5441e80b8af6b30c gpu iq4nl Float32 t M=2 N=2048 K=1024
-59cc5d1f02b45c56 gpu iq4nl Float32 t M=2 N=136 K=768
-d01ccba20f33341a gpu iq4nl Float32 t batched M=2
-9962ba4bdc2c5eca gpu iq4nl Float32 t batched-aligned M=2
-4527d0c3c5e42624 gpu iq4nl Float32 t x-batched M=2
-22dd907abf5377ce gpu iq4nl Float32 n M=2 K=256
-7cbed126f0b27769 gpu iq4nl Float32 n M=2 K=1024
-ba64c49f0a2d55d8 gpu iq4nl Float32 t M=3 N=2048 K=1024
-e62b64113c7875f5 gpu iq4nl Float32 t M=3 N=136 K=768
-bd16a356a83a865a gpu iq4nl Float32 t batched M=3
-38bd419fa0fd1e18 gpu iq4nl Float32 t batched-aligned M=3
-73d101f151a8c1cb gpu iq4nl Float32 t x-batched M=3
-7e29c0b403b6ffd1 gpu iq4nl Float32 n M=3 K=256
-2031b16faefed71c gpu iq4nl Float32 n M=3 K=1024
-a8d60c1cf4e65eec gpu iq4nl Float32 t M=4 N=2048 K=1024
-c5666a52367d074b gpu iq4nl Float32 t M=4 N=136 K=768
-56c5aa28a7631c46 gpu iq4nl Float32 t batched M=4
-7e3008a6b4e62b2f gpu iq4nl Float32 t batched-aligned M=4
-206ed08f00676b2e gpu iq4nl Float32 t x-batched M=4
-e5c0591ab89e366d gpu iq4nl Float32 n M=4 K=256
-b8f74723ff92b674 gpu iq4nl Float32 n M=4 K=1024
-ad92d2be9549dfdf gpu iq4nl Float32 t M=5 N=2048 K=1024
-c1c685ba9a177a07 gpu iq4nl Float32 t M=5 N=136 K=768
-85f1b4e508bdb3ae gpu iq4nl Float32 t batched M=5
-6aaa7375b4266a39 gpu iq4nl Float32 t batched-aligned M=5
-c62adb3cd7e2057d gpu iq4nl Float32 t x-batched M=5
-1c528936b8747b87 gpu iq4nl Float32 n M=5 K=256
-f278d4416161b9d2 gpu iq4nl Float32 n M=5 K=1024
-47713303c612ae3c gpu iq4nl Float32 t M=6 N=2048 K=1024
-0c4c9ae6e5c0c51f gpu iq4nl Float32 t M=6 N=136 K=768
-6fd65a010eef3dfc gpu iq4nl Float32 t batched M=6
-eb016258ed13d99f gpu iq4nl Float32 t batched-aligned M=6
-c4b4629fb965a250 gpu iq4nl Float32 t x-batched M=6
-a7a76340fad6f10c gpu iq4nl Float32 n M=6 K=256
-be5c9590a52f4c49 gpu iq4nl Float32 n M=6 K=1024
-cd01354c2a1aa9e7 gpu iq4nl Float32 t M=7 N=2048 K=1024
-655111990edf1604 gpu iq4nl Float32 t M=7 N=136 K=768
-0a75215c7882b4ad gpu iq4nl Float32 t batched M=7
-18f27d7d69a296b1 gpu iq4nl Float32 t batched-aligned M=7
-323759a047711d34 gpu iq4nl Float32 t x-batched M=7
-30726faae65f5d5a gpu iq4nl Float32 n M=7 K=256
-3734cc768939eb47 gpu iq4nl Float32 n M=7 K=1024
-f184eb0bcd604e2a gpu iq4nl Float32 t M=8 N=2048 K=1024
-9ec3d3f3d466245f gpu iq4nl Float32 t M=8 N=136 K=768
-b8ced277d7eb0fe9 gpu iq4nl Float32 t batched M=8
-e6d2da02bbbc2086 gpu iq4nl Float32 t batched-aligned M=8
-c2cdbee595ca8a29 gpu iq4nl Float32 t x-batched M=8
-448595fd8371e0ca gpu iq4nl Float32 n M=8 K=256
-a6aa65507a709e5b gpu iq4nl Float32 n M=8 K=1024
-3b9cf5de3f89d459 gpu iq4nl Float16 t M=2 N=2048 K=1024
-4d2bc933d82c4dc0 gpu iq4nl Float16 t M=2 N=136 K=768
-660a83e0bd64b90a gpu iq4nl Float16 t batched M=2
-6ae61ebcb349cb22 gpu iq4nl Float16 t batched-aligned M=2
-810d86bd4d139a79 gpu iq4nl Float16 t x-batched M=2
-48071011fda84f89 gpu iq4nl Float16 n M=2 K=256
-06cd9cccbf4388e5 gpu iq4nl Float16 n M=2 K=1024
-73219117a18707e1 gpu iq4nl Float16 t M=3 N=2048 K=1024
-585b28ec2dc6913a gpu iq4nl Float16 t M=3 N=136 K=768
-56bd098408793856 gpu iq4nl Float16 t batched M=3
-ae1b4e4487739830 gpu iq4nl Float16 t batched-aligned M=3
-d99321ba55d04bb3 gpu iq4nl Float16 t x-batched M=3
-9d86393c4c221cc0 gpu iq4nl Float16 n M=3 K=256
-d65cff33e5cc951a gpu iq4nl Float16 n M=3 K=1024
-e939ceaaafa8927c gpu iq4nl Float16 t M=4 N=2048 K=1024
-3a9a038919498bef gpu iq4nl Float16 t M=4 N=136 K=768
-7d314293997ae21d gpu iq4nl Float16 t batched M=4
-9c5a23520273c5bb gpu iq4nl Float16 t batched-aligned M=4
-bba76fccebca96c2 gpu iq4nl Float16 t x-batched M=4
-42ce3e9d24ae2901 gpu iq4nl Float16 n M=4 K=256
-576b2996c7b96d82 gpu iq4nl Float16 n M=4 K=1024
-0e3390539e1cd70b gpu iq4nl Float16 t M=5 N=2048 K=1024
-96e10d80dd6bf5ce gpu iq4nl Float16 t M=5 N=136 K=768
-c087caac26fd31ad gpu iq4nl Float16 t batched M=5
-5690012579f7d54f gpu iq4nl Float16 t batched-aligned M=5
-a1041486cff91782 gpu iq4nl Float16 t x-batched M=5
-85de9f3a3203e488 gpu iq4nl Float16 n M=5 K=256
-56bb348e8eecb719 gpu iq4nl Float16 n M=5 K=1024
-d3cc5f12c82564eb gpu iq4nl Float16 t M=6 N=2048 K=1024
-728e97fc8c68e0e7 gpu iq4nl Float16 t M=6 N=136 K=768
-83f596184a06c7ee gpu iq4nl Float16 t batched M=6
-b9230fa432888e3c gpu iq4nl Float16 t batched-aligned M=6
-d2af5159bb88a26e gpu iq4nl Float16 t x-batched M=6
-119eef4f48eaab79 gpu iq4nl Float16 n M=6 K=256
-7c0ba9ce50c999dd gpu iq4nl Float16 n M=6 K=1024
-85e82cdbf1efa1c4 gpu iq4nl Float16 t M=7 N=2048 K=1024
-b228a87f52fa87ea gpu iq4nl Float16 t M=7 N=136 K=768
-e0dbafb064e7d575 gpu iq4nl Float16 t batched M=7
-3c466ea6484372f5 gpu iq4nl Float16 t batched-aligned M=7
-df3afc3997fbc3ff gpu iq4nl Float16 t x-batched M=7
-2b229f22a7240c3c gpu iq4nl Float16 n M=7 K=256
-eb77bccccc710478 gpu iq4nl Float16 n M=7 K=1024
-d94360abf4a4eb4b gpu iq4nl Float16 t M=8 N=2048 K=1024
-c869093f58d34fe1 gpu iq4nl Float16 t M=8 N=136 K=768
-9b8068082f07a153 gpu iq4nl Float16 t batched M=8
-91916b86509eb6b3 gpu iq4nl Float16 t batched-aligned M=8
-7ee88bc474aa4588 gpu iq4nl Float16 t x-batched M=8
-c64c92e13e419710 gpu iq4nl Float16 n M=8 K=256
-264bb1566a049d7e gpu iq4nl Float16 n M=8 K=1024
-fb7fe1369e4efbe7 gpu iq4nl BFloat16 t M=2 N=2048 K=1024
-5d402824a489c076 gpu iq4nl BFloat16 t M=2 N=136 K=768
-bda5fa478984b2ad gpu iq4nl BFloat16 t batched M=2
-3df0511912c42ded gpu iq4nl BFloat16 t batched-aligned M=2
-4960a25b1294af61 gpu iq4nl BFloat16 t x-batched M=2
-8f6da477ba7cccd8 gpu iq4nl BFloat16 n M=2 K=256
-e162d365d98c5399 gpu iq4nl BFloat16 n M=2 K=1024
-65d39bdd6d35f020 gpu iq4nl BFloat16 t M=3 N=2048 K=1024
-01e6c7ab2098c2a7 gpu iq4nl BFloat16 t M=3 N=136 K=768
-589af557b324346d gpu iq4nl BFloat16 t batched M=3
-51b81e5ec4716622 gpu iq4nl BFloat16 t batched-aligned M=3
-a8c023e5f3ea35c7 gpu iq4nl BFloat16 t x-batched M=3
-703663c6b4d6d255 gpu iq4nl BFloat16 n M=3 K=256
-f95e20770a01cdff gpu iq4nl BFloat16 n M=3 K=1024
-3ae18df9a806856a gpu iq4nl BFloat16 t M=4 N=2048 K=1024
-ada04f96f1213002 gpu iq4nl BFloat16 t M=4 N=136 K=768
-a071bb77f5c2acd2 gpu iq4nl BFloat16 t batched M=4
-a298df1df59a208d gpu iq4nl BFloat16 t batched-aligned M=4
-2ff8a5170f2eeb19 gpu iq4nl BFloat16 t x-batched M=4
-de3bfb445ebfa0fe gpu iq4nl BFloat16 n M=4 K=256
-83920f5640d049cc gpu iq4nl BFloat16 n M=4 K=1024
-ab953e21544c1612 gpu iq4nl BFloat16 t M=5 N=2048 K=1024
-6a88ba622374bd62 gpu iq4nl BFloat16 t M=5 N=136 K=768
-8865397f95fa2b72 gpu iq4nl BFloat16 t batched M=5
-81bf63a92465b776 gpu iq4nl BFloat16 t batched-aligned M=5
-82e7182752eb88eb gpu iq4nl BFloat16 t x-batched M=5
-e59d8a8691788999 gpu iq4nl BFloat16 n M=5 K=256
-4d471870f6908f5e gpu iq4nl BFloat16 n M=5 K=1024
-48bff772a697a12d gpu iq4nl BFloat16 t M=6 N=2048 K=1024
-66add51b01d6e490 gpu iq4nl BFloat16 t M=6 N=136 K=768
-408e361969e1b206 gpu iq4nl BFloat16 t batched M=6
-cabb890e4e398c35 gpu iq4nl BFloat16 t batched-aligned M=6
-5e948e49b07bb454 gpu iq4nl BFloat16 t x-batched M=6
-89573fd97136f9c1 gpu iq4nl BFloat16 n M=6 K=256
-db3e84f375769972 gpu iq4nl BFloat16 n M=6 K=1024
-16d87a92c7252be3 gpu iq4nl BFloat16 t M=7 N=2048 K=1024
-88a5293ab7f07c19 gpu iq4nl BFloat16 t M=7 N=136 K=768
-664560e433296088 gpu iq4nl BFloat16 t batched M=7
-572efabfeee35ae3 gpu iq4nl BFloat16 t batched-aligned M=7
-b2e80b08e39dfb6e gpu iq4nl BFloat16 t x-batched M=7
-c24ebf0a55b65d68 gpu iq4nl BFloat16 n M=7 K=256
-a4fd763bf4eb5cb0 gpu iq4nl BFloat16 n M=7 K=1024
-941c3e751ca09a41 gpu iq4nl BFloat16 t M=8 N=2048 K=1024
-71efe4caf32d7657 gpu iq4nl BFloat16 t M=8 N=136 K=768
-27286c094c3e81ac gpu iq4nl BFloat16 t batched M=8
-fc1f3bf6f39fbae1 gpu iq4nl BFloat16 t batched-aligned M=8
-4c8e7da1c7e30d18 gpu iq4nl BFloat16 t x-batched M=8
-0a044be3b8e851aa gpu iq4nl BFloat16 n M=8 K=256
-8edb5471189e9219 gpu iq4nl BFloat16 n M=8 K=1024
-a210c1897281ad0b gpu iq4xs Float32 t M=2 N=2048 K=1024
-416bdd507d3f6034 gpu iq4xs Float32 t M=2 N=136 K=768
-0ab3010f2591f28a gpu iq4xs Float32 t batched M=2
-29793675f95ba474 gpu iq4xs Float32 t batched-aligned M=2
-1640860958d4ff91 gpu iq4xs Float32 t x-batched M=2
-b031e3eb2d4f818a gpu iq4xs Float32 n M=2 K=256
-c123cab501cf6d10 gpu iq4xs Float32 n M=2 K=1024
-a420690552bc774f gpu iq4xs Float32 t M=3 N=2048 K=1024
-c50b573a42d65f9c gpu iq4xs Float32 t M=3 N=136 K=768
-075f234e4f613a44 gpu iq4xs Float32 t batched M=3
-ca7c013d13a010c9 gpu iq4xs Float32 t batched-aligned M=3
-7cf13f6d7233c2f5 gpu iq4xs Float32 t x-batched M=3
-e2a09ba3ff32c83c gpu iq4xs Float32 n M=3 K=256
-a177a50257b5f0df gpu iq4xs Float32 n M=3 K=1024
-931ee630e8e6fdde gpu iq4xs Float32 t M=4 N=2048 K=1024
-3f68afbf26793f21 gpu iq4xs Float32 t M=4 N=136 K=768
-8a9bb112fa55c71b gpu iq4xs Float32 t batched M=4
-31cee822fd9e05aa gpu iq4xs Float32 t batched-aligned M=4
-3c90b89a15bd8405 gpu iq4xs Float32 t x-batched M=4
-596cd2b3532a111b gpu iq4xs Float32 n M=4 K=256
-fc96868c5a6b0a9d gpu iq4xs Float32 n M=4 K=1024
-4764907b50734564 gpu iq4xs Float32 t M=5 N=2048 K=1024
-7f79875c5203f937 gpu iq4xs Float32 t M=5 N=136 K=768
-3a8e58dc79cf6702 gpu iq4xs Float32 t batched M=5
-3639d4668d5c6db3 gpu iq4xs Float32 t batched-aligned M=5
-381c8e7b8ed9e283 gpu iq4xs Float32 t x-batched M=5
-7d0f7da99d125707 gpu iq4xs Float32 n M=5 K=256
-a65cbc41f9cb6a40 gpu iq4xs Float32 n M=5 K=1024
-71a6aef952509cfd gpu iq4xs Float32 t M=6 N=2048 K=1024
-f04ab74e23be88ab gpu iq4xs Float32 t M=6 N=136 K=768
-5f704c9c7fea7687 gpu iq4xs Float32 t batched M=6
-4cf8c19e2022f415 gpu iq4xs Float32 t batched-aligned M=6
-1df5b1f6a428da38 gpu iq4xs Float32 t x-batched M=6
-ba2dbdce594efcc6 gpu iq4xs Float32 n M=6 K=256
-af4ff0b7c36e41bc gpu iq4xs Float32 n M=6 K=1024
-08e26fa58b8869eb gpu iq4xs Float32 t M=7 N=2048 K=1024
-e2ed9601a51735b8 gpu iq4xs Float32 t M=7 N=136 K=768
-b1fd4035ccf5978f gpu iq4xs Float32 t batched M=7
-b34faf642ab4c97b gpu iq4xs Float32 t batched-aligned M=7
-5fab6d2c48180d08 gpu iq4xs Float32 t x-batched M=7
-64c1159934d8a956 gpu iq4xs Float32 n M=7 K=256
-794787310d16fb96 gpu iq4xs Float32 n M=7 K=1024
-d52c8df90c3f9449 gpu iq4xs Float32 t M=8 N=2048 K=1024
-f383f8889834ea30 gpu iq4xs Float32 t M=8 N=136 K=768
-8922afbdad3ffd61 gpu iq4xs Float32 t batched M=8
-5a9ae68c89b6ea38 gpu iq4xs Float32 t batched-aligned M=8
-15694f6c8dc5ac68 gpu iq4xs Float32 t x-batched M=8
-d61314754bec5799 gpu iq4xs Float32 n M=8 K=256
-5e5e5dc84351e27d gpu iq4xs Float32 n M=8 K=1024
-fe802a17afd973e4 gpu iq4xs Float16 t M=2 N=2048 K=1024
-0bf16dc4837a465c gpu iq4xs Float16 t M=2 N=136 K=768
-05a626c742e1e9b8 gpu iq4xs Float16 t batched M=2
-d64c708fdca55d7d gpu iq4xs Float16 t batched-aligned M=2
-2b0ebead9dc8be08 gpu iq4xs Float16 t x-batched M=2
-25fb7c3a3f49a26e gpu iq4xs Float16 n M=2 K=256
-a6444f957d58eb3b gpu iq4xs Float16 n M=2 K=1024
-96690d97b28ec2e8 gpu iq4xs Float16 t M=3 N=2048 K=1024
-186749d768faffb6 gpu iq4xs Float16 t M=3 N=136 K=768
-f7931b9b3c5b2278 gpu iq4xs Float16 t batched M=3
-39cb3bf5dab7980d gpu iq4xs Float16 t batched-aligned M=3
-4056b47cd133c419 gpu iq4xs Float16 t x-batched M=3
-085cfe619de4d3a3 gpu iq4xs Float16 n M=3 K=256
-3aef672d7d9412d8 gpu iq4xs Float16 n M=3 K=1024
-5e3a92bf26a9bb09 gpu iq4xs Float16 t M=4 N=2048 K=1024
-38761b19ea5976ff gpu iq4xs Float16 t M=4 N=136 K=768
-15ee31655e855f39 gpu iq4xs Float16 t batched M=4
-a8da8bfcc4514bc6 gpu iq4xs Float16 t batched-aligned M=4
-e8cad3a38db3b040 gpu iq4xs Float16 t x-batched M=4
-ed13ba7bbb7be59a gpu iq4xs Float16 n M=4 K=256
-07c384766f4c1a19 gpu iq4xs Float16 n M=4 K=1024
-bc9d6913324aa932 gpu iq4xs Float16 t M=5 N=2048 K=1024
-2ee3808ac9881069 gpu iq4xs Float16 t M=5 N=136 K=768
-e26a401f9aa2a2cf gpu iq4xs Float16 t batched M=5
-eadc39b62131b2ba gpu iq4xs Float16 t batched-aligned M=5
-6647cd6afed77371 gpu iq4xs Float16 t x-batched M=5
-71ec44a7085af9fc gpu iq4xs Float16 n M=5 K=256
-f27f183893a36db2 gpu iq4xs Float16 n M=5 K=1024
-c668d1bfcd0fcbf4 gpu iq4xs Float16 t M=6 N=2048 K=1024
-b778dfc1f081e2e0 gpu iq4xs Float16 t M=6 N=136 K=768
-c0f424eaa7824202 gpu iq4xs Float16 t batched M=6
-c0247cfbca8358c0 gpu iq4xs Float16 t batched-aligned M=6
-19ac9137c24cfeca gpu iq4xs Float16 t x-batched M=6
-e23807d0d86d9d0f gpu iq4xs Float16 n M=6 K=256
-0716f20ff0a3fff0 gpu iq4xs Float16 n M=6 K=1024
-8879ada52461d456 gpu iq4xs Float16 t M=7 N=2048 K=1024
-4ec89da90baba2df gpu iq4xs Float16 t M=7 N=136 K=768
-8a1b64ff865aa011 gpu iq4xs Float16 t batched M=7
-1b8e4bbedf66ff97 gpu iq4xs Float16 t batched-aligned M=7
-f4b81f6f022a10e3 gpu iq4xs Float16 t x-batched M=7
-b238d85f0f055a3f gpu iq4xs Float16 n M=7 K=256
-7ca137444ddbdbdf gpu iq4xs Float16 n M=7 K=1024
-bacc3008a3eadb53 gpu iq4xs Float16 t M=8 N=2048 K=1024
-4c4546a7dedecd42 gpu iq4xs Float16 t M=8 N=136 K=768
-60415ec3fef85d7f gpu iq4xs Float16 t batched M=8
-3148df546f1aa158 gpu iq4xs Float16 t batched-aligned M=8
-977457564744f156 gpu iq4xs Float16 t x-batched M=8
-0c610fb577f604b1 gpu iq4xs Float16 n M=8 K=256
-efe87098272e7dd4 gpu iq4xs Float16 n M=8 K=1024
-eec5bf6b4bf0b11b gpu iq4xs BFloat16 t M=2 N=2048 K=1024
-a9c1fc270950ca83 gpu iq4xs BFloat16 t M=2 N=136 K=768
-fa447303e6ebd028 gpu iq4xs BFloat16 t batched M=2
-c43e7e5970a93363 gpu iq4xs BFloat16 t batched-aligned M=2
-6e755e517eb2fa70 gpu iq4xs BFloat16 t x-batched M=2
-ed808eba94ae248c gpu iq4xs BFloat16 n M=2 K=256
-0c05e6eab5a0be98 gpu iq4xs BFloat16 n M=2 K=1024
-0728a0f94ec6ddbc gpu iq4xs BFloat16 t M=3 N=2048 K=1024
-f95b71308d580f4c gpu iq4xs BFloat16 t M=3 N=136 K=768
-9f00ad2dd60c2781 gpu iq4xs BFloat16 t batched M=3
-b1bf73cc70aa1877 gpu iq4xs BFloat16 t batched-aligned M=3
-53230ddc828ff440 gpu iq4xs BFloat16 t x-batched M=3
-85d212b78f84cc0e gpu iq4xs BFloat16 n M=3 K=256
-951291fc3e23db7a gpu iq4xs BFloat16 n M=3 K=1024
-1737723c4aa85bb8 gpu iq4xs BFloat16 t M=4 N=2048 K=1024
-e32bce8cea3948e2 gpu iq4xs BFloat16 t M=4 N=136 K=768
-a8bdf799e4d1bd72 gpu iq4xs BFloat16 t batched M=4
-8eeb247ad4ac817b gpu iq4xs BFloat16 t batched-aligned M=4
-c010ef8aa4064b34 gpu iq4xs BFloat16 t x-batched M=4
-eb0f8de8eab2a7f2 gpu iq4xs BFloat16 n M=4 K=256
-6a5797147f90026b gpu iq4xs BFloat16 n M=4 K=1024
-505d178a07797050 gpu iq4xs BFloat16 t M=5 N=2048 K=1024
-79efefc9fade87c2 gpu iq4xs BFloat16 t M=5 N=136 K=768
-9c86086bbf152025 gpu iq4xs BFloat16 t batched M=5
-c5ff57e9c2cacaa5 gpu iq4xs BFloat16 t batched-aligned M=5
-039141a3514fcc44 gpu iq4xs BFloat16 t x-batched M=5
-e9b1596f32115ddb gpu iq4xs BFloat16 n M=5 K=256
-9759009fba34df0e gpu iq4xs BFloat16 n M=5 K=1024
-33b5de60c0a12f95 gpu iq4xs BFloat16 t M=6 N=2048 K=1024
-83f1fa5b174d5b86 gpu iq4xs BFloat16 t M=6 N=136 K=768
-cfbe9200f95069a5 gpu iq4xs BFloat16 t batched M=6
-aae9672dde744569 gpu iq4xs BFloat16 t batched-aligned M=6
-809fdb3de2ee72e5 gpu iq4xs BFloat16 t x-batched M=6
-c86b91127eee9792 gpu iq4xs BFloat16 n M=6 K=256
-8098797a6b644527 gpu iq4xs BFloat16 n M=6 K=1024
-e7ed861d831c489a gpu iq4xs BFloat16 t M=7 N=2048 K=1024
-6a6cb542605e51dc gpu iq4xs BFloat16 t M=7 N=136 K=768
-deb501ed9d97d3f0 gpu iq4xs BFloat16 t batched M=7
-6c340e6862135f0c gpu iq4xs BFloat16 t batched-aligned M=7
-59a6c9d2c33ed0b3 gpu iq4xs BFloat16 t x-batched M=7
-428dfdcd9dbb8d35 gpu iq4xs BFloat16 n M=7 K=256
-811d0d2df803f406 gpu iq4xs BFloat16 n M=7 K=1024
-65a625eb2ffb6326 gpu iq4xs BFloat16 t M=8 N=2048 K=1024
-4b6ac2181421a39c gpu iq4xs BFloat16 t M=8 N=136 K=768
-e69da666574fad64 gpu iq4xs BFloat16 t batched M=8
-ffc78be977b75b88 gpu iq4xs BFloat16 t batched-aligned M=8
-282dd6ed109ccaf4 gpu iq4xs BFloat16 t x-batched M=8
-37ff855c886d9f36 gpu iq4xs BFloat16 n M=8 K=256
-5f7f67bdb3908231 gpu iq4xs BFloat16 n M=8 K=1024
-a87a5649ef865093 gpu iq3s Float32 t M=2 N=2048 K=1024
-91a62bfd5dc11370 gpu iq3s Float32 t M=2 N=136 K=768
-72cd5c4f71500488 gpu iq3s Float32 t batched M=2
-13cf2db601a8fce8 gpu iq3s Float32 t batched-aligned M=2
-641745dabf2a7f13 gpu iq3s Float32 t x-batched M=2
-b1c269c80f400584 gpu iq3s Float32 n M=2 K=256
-fc6613d9c82ec34d gpu iq3s Float32 n M=2 K=1024
-45fa782a2dc32aa0 gpu iq3s Float32 t M=3 N=2048 K=1024
-b88d5ff112020eb0 gpu iq3s Float32 t M=3 N=136 K=768
-b17527113152c0d4 gpu iq3s Float32 t batched M=3
-9d5ee78b4fbfaa37 gpu iq3s Float32 t batched-aligned M=3
-d3d982ef3c478047 gpu iq3s Float32 t x-batched M=3
-21f7dedb7ae0b7ce gpu iq3s Float32 n M=3 K=256
-a5e706c8c8215496 gpu iq3s Float32 n M=3 K=1024
-7be164ba245f4342 gpu iq3s Float32 t M=4 N=2048 K=1024
-5e632a25aae58ec0 gpu iq3s Float32 t M=4 N=136 K=768
-057c50f62517602c gpu iq3s Float32 t batched M=4
-c5e05d07d79c015f gpu iq3s Float32 t batched-aligned M=4
-d14e7f348657682c gpu iq3s Float32 t x-batched M=4
-5bba4826c993a15d gpu iq3s Float32 n M=4 K=256
-d76c806c024b9997 gpu iq3s Float32 n M=4 K=1024
-2d2feae4da411157 gpu iq3s Float32 t M=5 N=2048 K=1024
-aaae872dfb7921a3 gpu iq3s Float32 t M=5 N=136 K=768
-5702690730b97c0f gpu iq3s Float32 t batched M=5
-3cba2f685d7fe5b4 gpu iq3s Float32 t batched-aligned M=5
-702a886df2d949d9 gpu iq3s Float32 t x-batched M=5
-dae9012debf8190b gpu iq3s Float32 n M=5 K=256
-ee8544bab240eca6 gpu iq3s Float32 n M=5 K=1024
-f643c8241b0b847f gpu iq3s Float32 t M=6 N=2048 K=1024
-13d29bb4e454cfb4 gpu iq3s Float32 t M=6 N=136 K=768
-63ea9e6613edeac9 gpu iq3s Float32 t batched M=6
-01f9e847514f0777 gpu iq3s Float32 t batched-aligned M=6
-dc0ea943f657b30f gpu iq3s Float32 t x-batched M=6
-4c2ef35992428324 gpu iq3s Float32 n M=6 K=256
-ecda32faba8ba837 gpu iq3s Float32 n M=6 K=1024
-030d6ef3bd6fec73 gpu iq3s Float32 t M=7 N=2048 K=1024
-76cb970d4a0e7beb gpu iq3s Float32 t M=7 N=136 K=768
-83396d094e57ccce gpu iq3s Float32 t batched M=7
-9c00c836310691d4 gpu iq3s Float32 t batched-aligned M=7
-ecc6623ae90cf474 gpu iq3s Float32 t x-batched M=7
-bfcf5da449ccc07c gpu iq3s Float32 n M=7 K=256
-c635fb3047f75b78 gpu iq3s Float32 n M=7 K=1024
-9534160fa89f03bc gpu iq3s Float32 t M=8 N=2048 K=1024
-4cb72dce5c7cb93f gpu iq3s Float32 t M=8 N=136 K=768
-13f672b054f2acf9 gpu iq3s Float32 t batched M=8
-950c0d7db94620db gpu iq3s Float32 t batched-aligned M=8
-55c97f5e50a0bb20 gpu iq3s Float32 t x-batched M=8
-f92a30365cd6a7ab gpu iq3s Float32 n M=8 K=256
-cb65445cf099d084 gpu iq3s Float32 n M=8 K=1024
-85c179950d6bbd30 gpu iq3s Float16 t M=2 N=2048 K=1024
-d1627663a9841d0d gpu iq3s Float16 t M=2 N=136 K=768
-0e65fa525ab6aa36 gpu iq3s Float16 t batched M=2
-0e2a1f84dde89777 gpu iq3s Float16 t batched-aligned M=2
-9373091389e930cc gpu iq3s Float16 t x-batched M=2
-1b5ffec34d7fe8e4 gpu iq3s Float16 n M=2 K=256
-13685894ed3917be gpu iq3s Float16 n M=2 K=1024
-a87ceb94f7ee9bf9 gpu iq3s Float16 t M=3 N=2048 K=1024
-47ead63280f4b517 gpu iq3s Float16 t M=3 N=136 K=768
-9ab061b0fab8d341 gpu iq3s Float16 t batched M=3
-705025ddb4cd0cdc gpu iq3s Float16 t batched-aligned M=3
-e287df90548830cb gpu iq3s Float16 t x-batched M=3
-51a8ef01bc5152ed gpu iq3s Float16 n M=3 K=256
-a5b62e7fb134f25e gpu iq3s Float16 n M=3 K=1024
-eb6777c9d5449f32 gpu iq3s Float16 t M=4 N=2048 K=1024
-8d79887ddd7d02d3 gpu iq3s Float16 t M=4 N=136 K=768
-879052e4ea3e1679 gpu iq3s Float16 t batched M=4
-339350baf86cc758 gpu iq3s Float16 t batched-aligned M=4
-b02b4c223e5546e2 gpu iq3s Float16 t x-batched M=4
-99b360fdf9884abf gpu iq3s Float16 n M=4 K=256
-127499c01919f0be gpu iq3s Float16 n M=4 K=1024
-db4852350c557a47 gpu iq3s Float16 t M=5 N=2048 K=1024
-1a9a5913e3579824 gpu iq3s Float16 t M=5 N=136 K=768
-91fd152eedebb81a gpu iq3s Float16 t batched M=5
-04e5833ac3de8526 gpu iq3s Float16 t batched-aligned M=5
-86e60b8b84c3873b gpu iq3s Float16 t x-batched M=5
-5ed745f2d4f91b3e gpu iq3s Float16 n M=5 K=256
-f3c7ced50e0e4560 gpu iq3s Float16 n M=5 K=1024
-608c70bb97b7e682 gpu iq3s Float16 t M=6 N=2048 K=1024
-eace076fbe0f35a7 gpu iq3s Float16 t M=6 N=136 K=768
-ad00b0710f141b67 gpu iq3s Float16 t batched M=6
-3845ffbdf35fb121 gpu iq3s Float16 t batched-aligned M=6
-ee7c7875f66822aa gpu iq3s Float16 t x-batched M=6
-e48fd8248d3c8edd gpu iq3s Float16 n M=6 K=256
-ec727a42579da0d4 gpu iq3s Float16 n M=6 K=1024
-2086fc8172ec00be gpu iq3s Float16 t M=7 N=2048 K=1024
-2bbc8c5115b80f3b gpu iq3s Float16 t M=7 N=136 K=768
-340c9f4fe91fb9ee gpu iq3s Float16 t batched M=7
-043510a4164f9ec8 gpu iq3s Float16 t batched-aligned M=7
-3488b15ce0502597 gpu iq3s Float16 t x-batched M=7
-f001f6ba572b9395 gpu iq3s Float16 n M=7 K=256
-6e9ea488eec9d46b gpu iq3s Float16 n M=7 K=1024
-cb243de1dbcc3411 gpu iq3s Float16 t M=8 N=2048 K=1024
-be42247d91d57393 gpu iq3s Float16 t M=8 N=136 K=768
-90232fdaec6de760 gpu iq3s Float16 t batched M=8
-03367792990bf7e5 gpu iq3s Float16 t batched-aligned M=8
-8f1b6e578597e350 gpu iq3s Float16 t x-batched M=8
-c6fd7e2f1de8a0ea gpu iq3s Float16 n M=8 K=256
-04e061ccf5f69993 gpu iq3s Float16 n M=8 K=1024
-6f940bc4c3782f54 gpu iq3s BFloat16 t M=2 N=2048 K=1024
-88b605da1e670a1b gpu iq3s BFloat16 t M=2 N=136 K=768
-7e063e73625abd8e gpu iq3s BFloat16 t batched M=2
-b554af7247e77aad gpu iq3s BFloat16 t batched-aligned M=2
-425ec2d1632ee2ef gpu iq3s BFloat16 t x-batched M=2
-541b13b26f27d38e gpu iq3s BFloat16 n M=2 K=256
-e42336b1d137dfe9 gpu iq3s BFloat16 n M=2 K=1024
-f5a3d8b40f587611 gpu iq3s BFloat16 t M=3 N=2048 K=1024
-67123267a670ffa7 gpu iq3s BFloat16 t M=3 N=136 K=768
-668d469865d19331 gpu iq3s BFloat16 t batched M=3
-08de787e7dbb4dea gpu iq3s BFloat16 t batched-aligned M=3
-a496569cf3ab7019 gpu iq3s BFloat16 t x-batched M=3
-9ecf8e41fde5586d gpu iq3s BFloat16 n M=3 K=256
-6426b8bf3f0ebfd9 gpu iq3s BFloat16 n M=3 K=1024
-defcd4c5bac172fc gpu iq3s BFloat16 t M=4 N=2048 K=1024
-7e82da8edf345e1b gpu iq3s BFloat16 t M=4 N=136 K=768
-89cba1d223ef980c gpu iq3s BFloat16 t batched M=4
-bed8e2321cf539eb gpu iq3s BFloat16 t batched-aligned M=4
-8f7aeb08c900d7db gpu iq3s BFloat16 t x-batched M=4
-d87a3a3b39f775e0 gpu iq3s BFloat16 n M=4 K=256
-f49a482ead74485b gpu iq3s BFloat16 n M=4 K=1024
-95a9840286c188e5 gpu iq3s BFloat16 t M=5 N=2048 K=1024
-de161f3a30a746c2 gpu iq3s BFloat16 t M=5 N=136 K=768
-073b22f725c64250 gpu iq3s BFloat16 t batched M=5
-e43a22631c65a5b7 gpu iq3s BFloat16 t batched-aligned M=5
-3b275aae5aef2167 gpu iq3s BFloat16 t x-batched M=5
-266abb21c5ef72d7 gpu iq3s BFloat16 n M=5 K=256
-08c5969bbbf8953c gpu iq3s BFloat16 n M=5 K=1024
-5b5bee64c28761a2 gpu iq3s BFloat16 t M=6 N=2048 K=1024
-c9b6c17db70d3f39 gpu iq3s BFloat16 t M=6 N=136 K=768
-2128df848cdf6372 gpu iq3s BFloat16 t batched M=6
-f1ce87a8b3623a9a gpu iq3s BFloat16 t batched-aligned M=6
-b9e877f553ea9779 gpu iq3s BFloat16 t x-batched M=6
-4cdf5c6bc579841b gpu iq3s BFloat16 n M=6 K=256
-496307c443f5ba15 gpu iq3s BFloat16 n M=6 K=1024
-6ef7d5d32f49d095 gpu iq3s BFloat16 t M=7 N=2048 K=1024
-daacbbae0287466e gpu iq3s BFloat16 t M=7 N=136 K=768
-9acfbb410337e4d3 gpu iq3s BFloat16 t batched M=7
-3f46946318fa27bf gpu iq3s BFloat16 t batched-aligned M=7
-9df8bff50b92f6de gpu iq3s BFloat16 t x-batched M=7
-4c31a1ae9127b2bc gpu iq3s BFloat16 n M=7 K=256
-abc6a028e2ab2062 gpu iq3s BFloat16 n M=7 K=1024
-64a32ae0860efc8a gpu iq3s BFloat16 t M=8 N=2048 K=1024
-4dd9c123f4acfbdd gpu iq3s BFloat16 t M=8 N=136 K=768
-98eced7c14c7d498 gpu iq3s BFloat16 t batched M=8
-0122ab01034536ab gpu iq3s BFloat16 t batched-aligned M=8
-abd294a018552ecd gpu iq3s BFloat16 t x-batched M=8
-6130f48ea84cedd4 gpu iq3s BFloat16 n M=8 K=256
-e3b0c7c7a2a18ff1 gpu iq3s BFloat16 n M=8 K=1024
-319a4426f30a072a gpu q3k Float32 t M=1 N=2048 K=1024
-67015532cd6362e8 gpu q3k Float32 t M=1 N=136 K=768
-164c30e292d54333 gpu q3k Float32 t batched M=1
-50d7cdfbf5b86c1a gpu q3k Float32 t batched-aligned M=1
-0ad7eac810b4cd6a gpu q3k Float32 t x-batched M=1
-e8d092c5ccd04e9d gpu q3k Float32 n M=1 K=256
-51966a287307d047 gpu q3k Float32 n M=1 K=1024
-6b21b34c37a6d571 gpu q3k Float32 t M=9 N=2048 K=1024
-b5e34387b952df7f gpu q3k Float32 t M=9 N=136 K=768
-09afff7ff4dfadea gpu q3k Float32 t batched M=9
-e07c75eda89cb2db gpu q3k Float32 t batched-aligned M=9
-f1e13a8f2adaf744 gpu q3k Float32 t x-batched M=9
-8153501460952fe1 gpu q3k Float32 n M=9 K=256
-8f6698bf10ef52c5 gpu q3k Float32 n M=9 K=1024
-90cf2a08122087a8 gpu q3k Float32 t M=12 N=2048 K=1024
-cf608437a11a0ca8 gpu q3k Float32 t M=12 N=136 K=768
-7e8c739c4708f31c gpu q3k Float32 t batched M=12
-3b8fb6d98d8b2ef1 gpu q3k Float32 t batched-aligned M=12
-87a8e5592e6c5b63 gpu q3k Float32 t x-batched M=12
-80ef15e1aaf6e25f gpu q3k Float32 n M=12 K=256
-43052179a1d1eb9e gpu q3k Float32 n M=12 K=1024
-49d66785491caa08 gpu q3k Float32 t M=17 N=2048 K=1024
-bc3fdc65c41138fc gpu q3k Float32 t M=17 N=136 K=768
-9140e9c8d956fee6 gpu q3k Float32 t batched M=17
-29142ba04b969895 gpu q3k Float32 t batched-aligned M=17
-38ecde7cfc672119 gpu q3k Float32 t x-batched M=17
-e04fd27a49b0a71b gpu q3k Float32 n M=17 K=256
-0a6b963bef8f4458 gpu q3k Float32 n M=17 K=1024
-b01ecb05b1e41217 gpu q3k Float32 t M=24 N=2048 K=1024
-1f742fe28aaa5060 gpu q3k Float32 t M=24 N=136 K=768
-84ecaa718952c06f gpu q3k Float32 t batched M=24
-5a1cf1dbf0801a9c gpu q3k Float32 t batched-aligned M=24
-f30d8859d356bad6 gpu q3k Float32 t x-batched M=24
-3f0948fe003bcfae gpu q3k Float32 n M=24 K=256
-1c6db411b675ac17 gpu q3k Float32 n M=24 K=1024
-ccbf5be5c66f6746 gpu q3k Float32 t M=33 N=2048 K=1024
-c631c9c1d0f7bc35 gpu q3k Float32 t M=33 N=136 K=768
-bb30a04a88123e1a gpu q3k Float32 t batched M=33
-c7d2e6d7a366d7ae gpu q3k Float32 t batched-aligned M=33
-3048defdebd79430 gpu q3k Float32 t x-batched M=33
-a6ec75a23747f8f0 gpu q3k Float32 n M=33 K=256
-d92d44f46363066e gpu q3k Float32 n M=33 K=1024
-b8d5f1681853d7d8 gpu q3k Float32 t M=64 N=2048 K=1024
-382ed1510a3a8bc6 gpu q3k Float32 t M=64 N=136 K=768
-1dd4725b3cffdd2e gpu q3k Float32 t batched M=64
-f0b8c66a74e2ec93 gpu q3k Float32 t batched-aligned M=64
-0fbe91c98e48def0 gpu q3k Float32 t x-batched M=64
-163139e90b7b669a gpu q3k Float32 n M=64 K=256
-dd104bb1476a8db9 gpu q3k Float32 n M=64 K=1024
-dda29aa8a553cd11 gpu q3k Float32 t M=512 N=2048 K=1024
-d4cc4cc5eb9407b6 gpu q3k Float32 t M=512 N=136 K=768
-6d6ffbea9cb44009 gpu q3k Float16 t M=1 N=2048 K=1024
-304d1c6b0987cbf7 gpu q3k Float16 t M=1 N=136 K=768
-8ff8f9619a33c3c3 gpu q3k Float16 t batched M=1
-2e302b45fbfb121b gpu q3k Float16 t batched-aligned M=1
-91b1bd1f1678458b gpu q3k Float16 t x-batched M=1
-6df09c8a353e8c7b gpu q3k Float16 n M=1 K=256
-94ea850bfac3a7a5 gpu q3k Float16 n M=1 K=1024
-6c40f6209505f096 gpu q3k Float16 t M=9 N=2048 K=1024
-31ad17b07471d3bb gpu q3k Float16 t M=9 N=136 K=768
-4692f0a82ee5f128 gpu q3k Float16 t batched M=9
-6e40e67c66c3aad1 gpu q3k Float16 t batched-aligned M=9
-7522489dc5f58071 gpu q3k Float16 t x-batched M=9
-38019b792459cb13 gpu q3k Float16 n M=9 K=256
-7536357b63cfc127 gpu q3k Float16 n M=9 K=1024
-bb4b879a8d2e2212 gpu q3k Float16 t M=12 N=2048 K=1024
-fe1dccfbddd4aa67 gpu q3k Float16 t M=12 N=136 K=768
-65743d842d717460 gpu q3k Float16 t batched M=12
-6685932754b1db4c gpu q3k Float16 t batched-aligned M=12
-162456a75cf2e6c5 gpu q3k Float16 t x-batched M=12
-8a3b4834df08e489 gpu q3k Float16 n M=12 K=256
-e19d343174d00b3d gpu q3k Float16 n M=12 K=1024
-b3bc7bc59304e16c gpu q3k Float16 t M=17 N=2048 K=1024
-614c6f9de0968960 gpu q3k Float16 t M=17 N=136 K=768
-e4a2e523a9524499 gpu q3k Float16 t batched M=17
-3cd369de75f78e81 gpu q3k Float16 t batched-aligned M=17
-cf8e6278296c5616 gpu q3k Float16 t x-batched M=17
-ed2ca22cbfaa356e gpu q3k Float16 n M=17 K=256
-57289efbec49bb89 gpu q3k Float16 n M=17 K=1024
-2950dccbb1ed00dc gpu q3k Float16 t M=24 N=2048 K=1024
-175c171ebd0477c4 gpu q3k Float16 t M=24 N=136 K=768
-5951e95dfd90a620 gpu q3k Float16 t batched M=24
-92c65978538d6644 gpu q3k Float16 t batched-aligned M=24
-a6009f2ddc5f0bad gpu q3k Float16 t x-batched M=24
-6a3bad0e0f5ac7fd gpu q3k Float16 n M=24 K=256
-e700a32c9dbaf307 gpu q3k Float16 n M=24 K=1024
-d1135096021ff72a gpu q3k Float16 t M=33 N=2048 K=1024
-60c68b00f601eb78 gpu q3k Float16 t M=33 N=136 K=768
-320d1f76cd7d74da gpu q3k Float16 t batched M=33
-c4089afd4bf8e087 gpu q3k Float16 t batched-aligned M=33
-81cd8d3fbc441c3f gpu q3k Float16 t x-batched M=33
-34bd03a86bdfe774 gpu q3k Float16 n M=33 K=256
-16029e483465886e gpu q3k Float16 n M=33 K=1024
-e22495d66ccd54d2 gpu q3k Float16 t M=64 N=2048 K=1024
-033456c0ec080232 gpu q3k Float16 t M=64 N=136 K=768
-52b93171a5d271c8 gpu q3k Float16 t batched M=64
-3676ce1320f08af4 gpu q3k Float16 t batched-aligned M=64
-8a2a02a60522f745 gpu q3k Float16 t x-batched M=64
-fb54bb0ef305cd94 gpu q3k Float16 n M=64 K=256
-baa64a01d5e7f8ba gpu q3k Float16 n M=64 K=1024
-8b1fe3ce4dd63e13 gpu q3k Float16 t M=512 N=2048 K=1024
-6b5fcb7aea084b1d gpu q3k Float16 t M=512 N=136 K=768
-cf7c9fb7b3aee2cf gpu q3k BFloat16 t M=1 N=2048 K=1024
-fe0309a1b10eed42 gpu q3k BFloat16 t M=1 N=136 K=768
-686a43247ec5d697 gpu q3k BFloat16 t batched M=1
-cf98a79ea8413d57 gpu q3k BFloat16 t batched-aligned M=1
-be7b05238850f410 gpu q3k BFloat16 t x-batched M=1
-8fd1023462e63633 gpu q3k BFloat16 n M=1 K=256
-8031e89542ef7ee8 gpu q3k BFloat16 n M=1 K=1024
-3e05e5e69fb3c7f9 gpu q3k BFloat16 t M=9 N=2048 K=1024
-602c6700d588bd1f gpu q3k BFloat16 t M=9 N=136 K=768
-e5feefc9540c7885 gpu q3k BFloat16 t batched M=9
-2e7da8193639c619 gpu q3k BFloat16 t batched-aligned M=9
-e80730f2bcbc89cd gpu q3k BFloat16 t x-batched M=9
-8b66a128a02800da gpu q3k BFloat16 n M=9 K=256
-b5511ccf1d6bf8a5 gpu q3k BFloat16 n M=9 K=1024
-ffae3c2262a1c57d gpu q3k BFloat16 t M=12 N=2048 K=1024
-6a13d1a7f7716d00 gpu q3k BFloat16 t M=12 N=136 K=768
-0f50c5ebd1f86419 gpu q3k BFloat16 t batched M=12
-3e4de2bed9823ada gpu q3k BFloat16 t batched-aligned M=12
-59e40d95dc78a8c0 gpu q3k BFloat16 t x-batched M=12
-f276ee12084c3cb0 gpu q3k BFloat16 n M=12 K=256
-0ec6ed42a246482d gpu q3k BFloat16 n M=12 K=1024
-142df421a7208803 gpu q3k BFloat16 t M=17 N=2048 K=1024
-b63a6729988a0703 gpu q3k BFloat16 t M=17 N=136 K=768
-a1b8ea192c2cc5b1 gpu q3k BFloat16 t batched M=17
-8244d824c5b09fcd gpu q3k BFloat16 t batched-aligned M=17
-fff55d1c5c5cf8a3 gpu q3k BFloat16 t x-batched M=17
-b5179949eaa76ccc gpu q3k BFloat16 n M=17 K=256
-7f3d0211f0e79114 gpu q3k BFloat16 n M=17 K=1024
-6d5ce45ada68999e gpu q3k BFloat16 t M=24 N=2048 K=1024
-925fb919630369be gpu q3k BFloat16 t M=24 N=136 K=768
-70d2d83f94581cdf gpu q3k BFloat16 t batched M=24
-ad37ac88ad2a17c5 gpu q3k BFloat16 t batched-aligned M=24
-f2b83b02189bb3b0 gpu q3k BFloat16 t x-batched M=24
-46c8a0b39c568127 gpu q3k BFloat16 n M=24 K=256
-f14973f81983b895 gpu q3k BFloat16 n M=24 K=1024
-69eb00360f49d7f3 gpu q3k BFloat16 t M=33 N=2048 K=1024
-d2e26e2f8ba82770 gpu q3k BFloat16 t M=33 N=136 K=768
-ad23cc0825121342 gpu q3k BFloat16 t batched M=33
-7530d8593f10ebc6 gpu q3k BFloat16 t batched-aligned M=33
-e140a802c399e030 gpu q3k BFloat16 t x-batched M=33
-f0214e799b33b880 gpu q3k BFloat16 n M=33 K=256
-2868ce451d6687e8 gpu q3k BFloat16 n M=33 K=1024
-7aaeb1866786f578 gpu q3k BFloat16 t M=64 N=2048 K=1024
-0cab2af06454f002 gpu q3k BFloat16 t M=64 N=136 K=768
-274c128059f0922b gpu q3k BFloat16 t batched M=64
-9c0ae1f5402315bf gpu q3k BFloat16 t batched-aligned M=64
-15b2e9029b07c1c2 gpu q3k BFloat16 t x-batched M=64
-c6dbfd7a9bca2f72 gpu q3k BFloat16 n M=64 K=256
-e6785bd9ab4037c0 gpu q3k BFloat16 n M=64 K=1024
-5efb153e8abf3617 gpu q3k BFloat16 t M=512 N=2048 K=1024
-85f2040eca819b56 gpu q3k BFloat16 t M=512 N=136 K=768
-4655251a4d69b6e2 gpu q6k Float32 t M=1 N=2048 K=1024
-08fb328d0f5659bd gpu q6k Float32 t M=1 N=136 K=768
-de41223fefbb8202 gpu q6k Float32 t batched M=1
-5e464d10131d9f1a gpu q6k Float32 t batched-aligned M=1
-5380da3cc09d8912 gpu q6k Float32 t x-batched M=1
-40b479a97d6d1b5c gpu q6k Float32 n M=1 K=256
-ee75495cbe038dce gpu q6k Float32 n M=1 K=1024
-e0381037606f2a5c gpu q6k Float32 t M=9 N=2048 K=1024
-b833ca79bac02edb gpu q6k Float32 t M=9 N=136 K=768
-c092a185925ce190 gpu q6k Float32 t batched M=9
-a88c326da3b807c7 gpu q6k Float32 t batched-aligned M=9
-91e1db0d74c02e9c gpu q6k Float32 t x-batched M=9
-fec5929433c0a800 gpu q6k Float32 n M=9 K=256
-7a93f8cff9a6cd5f gpu q6k Float32 n M=9 K=1024
-0a14b178f48db406 gpu q6k Float32 t M=12 N=2048 K=1024
-2bdc269e225f497f gpu q6k Float32 t M=12 N=136 K=768
-51b572f794aeece1 gpu q6k Float32 t batched M=12
-b6c7b0d63756b9b4 gpu q6k Float32 t batched-aligned M=12
-eebe264261dbeafe gpu q6k Float32 t x-batched M=12
-602aaedb888e0fb4 gpu q6k Float32 n M=12 K=256
-4870d4d2317c7a4d gpu q6k Float32 n M=12 K=1024
-e5cfa7a3ac540827 gpu q6k Float32 t M=17 N=2048 K=1024
-30c057b45a759b95 gpu q6k Float32 t M=17 N=136 K=768
-69f4ae1cb005cd28 gpu q6k Float32 t batched M=17
-81b7532ee6d6d474 gpu q6k Float32 t batched-aligned M=17
-61bd93f800da971f gpu q6k Float32 t x-batched M=17
-5a5ae485b404cb59 gpu q6k Float32 n M=17 K=256
-df445c4ac3aade39 gpu q6k Float32 n M=17 K=1024
-4af23e0557cbef09 gpu q6k Float32 t M=24 N=2048 K=1024
-1867ffe93558bd2e gpu q6k Float32 t M=24 N=136 K=768
-455a8612f51cf239 gpu q6k Float32 t batched M=24
-5046bbbd9b1dac5d gpu q6k Float32 t batched-aligned M=24
-db4a6295358029ac gpu q6k Float32 t x-batched M=24
-abce49bbc2f4f868 gpu q6k Float32 n M=24 K=256
-bcaba5a85ea990bf gpu q6k Float32 n M=24 K=1024
-adafa93627ce00e1 gpu q6k Float32 t M=33 N=2048 K=1024
-c09549da147726eb gpu q6k Float32 t M=33 N=136 K=768
-ee74d7ab6c1246ac gpu q6k Float32 t batched M=33
-2ff8b73d46fd839f gpu q6k Float32 t batched-aligned M=33
-eded40997a5da69a gpu q6k Float32 t x-batched M=33
-9814ac35540cac24 gpu q6k Float32 n M=33 K=256
-cfd0c74aab2712a6 gpu q6k Float32 n M=33 K=1024
-94392666577a4d33 gpu q6k Float32 t M=64 N=2048 K=1024
-5ce14bfb7f61755b gpu q6k Float32 t M=64 N=136 K=768
-6120bd00fa10209d gpu q6k Float32 t batched M=64
-c2c50134da1f244c gpu q6k Float32 t batched-aligned M=64
-26a2d025eb916a8d gpu q6k Float32 t x-batched M=64
-23bebb32f91e7a86 gpu q6k Float32 n M=64 K=256
-e7e2ba3a16eb5525 gpu q6k Float32 n M=64 K=1024
-abc56dc3502443c4 gpu q6k Float32 t M=512 N=2048 K=1024
-71cf3722a38065ff gpu q6k Float32 t M=512 N=136 K=768
-23b11d1e587e0158 gpu q6k Float16 t M=1 N=2048 K=1024
-71bf45512fa84529 gpu q6k Float16 t M=1 N=136 K=768
-84a8bc9bd7143082 gpu q6k Float16 t batched M=1
-7b57d1537660fe0d gpu q6k Float16 t batched-aligned M=1
-0a864a396d5cf9ad gpu q6k Float16 t x-batched M=1
-9020b966382d5862 gpu q6k Float16 n M=1 K=256
-ed41daaa38fea54c gpu q6k Float16 n M=1 K=1024
-2c73a290d839d2bd gpu q6k Float16 t M=9 N=2048 K=1024
-e5895cc7c1d91a26 gpu q6k Float16 t M=9 N=136 K=768
-a57a4aad7d34fe8c gpu q6k Float16 t batched M=9
-af8d618e05408739 gpu q6k Float16 t batched-aligned M=9
-6432b86f1edf56c6 gpu q6k Float16 t x-batched M=9
-85e3f068461d3869 gpu q6k Float16 n M=9 K=256
-8f09a92171ec047f gpu q6k Float16 n M=9 K=1024
-dc8a52833b1db85f gpu q6k Float16 t M=12 N=2048 K=1024
-ee2d94f068efb563 gpu q6k Float16 t M=12 N=136 K=768
-27f768c2501fc2d5 gpu q6k Float16 t batched M=12
-6417a8e48de91dc0 gpu q6k Float16 t batched-aligned M=12
-f6e5631be03d1d12 gpu q6k Float16 t x-batched M=12
-bdaa4f23c4835b94 gpu q6k Float16 n M=12 K=256
-dd7921d4633da6f9 gpu q6k Float16 n M=12 K=1024
-30938bc7b4341544 gpu q6k Float16 t M=17 N=2048 K=1024
-95be02b5b0fb91c2 gpu q6k Float16 t M=17 N=136 K=768
-d29682fb8c75c8f1 gpu q6k Float16 t batched M=17
-a58020e5ada99240 gpu q6k Float16 t batched-aligned M=17
-d3e34f463d3cbf5b gpu q6k Float16 t x-batched M=17
-4d61597c51c96ffa gpu q6k Float16 n M=17 K=256
-629fc8f4a961bc84 gpu q6k Float16 n M=17 K=1024
-4873d14589d17f61 gpu q6k Float16 t M=24 N=2048 K=1024
-87e0562917ecfa15 gpu q6k Float16 t M=24 N=136 K=768
-850b0c7065449297 gpu q6k Float16 t batched M=24
-77a555851c7f6978 gpu q6k Float16 t batched-aligned M=24
-f09f90c4080c5762 gpu q6k Float16 t x-batched M=24
-b4290c42394be015 gpu q6k Float16 n M=24 K=256
-6ba6645be8776db5 gpu q6k Float16 n M=24 K=1024
-9d1e91363e025922 gpu q6k Float16 t M=33 N=2048 K=1024
-c0fe65a7b3b041fe gpu q6k Float16 t M=33 N=136 K=768
-0426367334abffd3 gpu q6k Float16 t batched M=33
-8b9e23f0130a6186 gpu q6k Float16 t batched-aligned M=33
-7019444092cbdc20 gpu q6k Float16 t x-batched M=33
-2d7649d1ac2f99fd gpu q6k Float16 n M=33 K=256
-e3f842e10ba1e6d4 gpu q6k Float16 n M=33 K=1024
-38d1d0bb2eee6ad5 gpu q6k Float16 t M=64 N=2048 K=1024
-a7831bf7b87327e8 gpu q6k Float16 t M=64 N=136 K=768
-a9890e002744135c gpu q6k Float16 t batched M=64
-9b838e5c0571abff gpu q6k Float16 t batched-aligned M=64
-169d80f7488a1635 gpu q6k Float16 t x-batched M=64
-0287181821083b47 gpu q6k Float16 n M=64 K=256
-f9566f46d66f0e24 gpu q6k Float16 n M=64 K=1024
-5cc67b2b9d3be8fd gpu q6k Float16 t M=512 N=2048 K=1024
-d7f09d19759a3c08 gpu q6k Float16 t M=512 N=136 K=768
-2eeca271193fd83e gpu q6k BFloat16 t M=1 N=2048 K=1024
-4b0d54532a67c958 gpu q6k BFloat16 t M=1 N=136 K=768
-c57b3cff0478961f gpu q6k BFloat16 t batched M=1
-2d638c0e1e622591 gpu q6k BFloat16 t batched-aligned M=1
-f2d697df528a63d4 gpu q6k BFloat16 t x-batched M=1
-29426f7f617a4f49 gpu q6k BFloat16 n M=1 K=256
-1b54fb03dd30bfb8 gpu q6k BFloat16 n M=1 K=1024
-713e0f47e70c3ff0 gpu q6k BFloat16 t M=9 N=2048 K=1024
-1431d65076cc861d gpu q6k BFloat16 t M=9 N=136 K=768
-efa1b5b5dd2b96d2 gpu q6k BFloat16 t batched M=9
-89e1536aa41564ce gpu q6k BFloat16 t batched-aligned M=9
-596d30e0325fbba6 gpu q6k BFloat16 t x-batched M=9
-562e029ef306cfb7 gpu q6k BFloat16 n M=9 K=256
-f3ae69fcfe40931e gpu q6k BFloat16 n M=9 K=1024
-6ab2238d4dc721f0 gpu q6k BFloat16 t M=12 N=2048 K=1024
-2fa3a72ae76469c3 gpu q6k BFloat16 t M=12 N=136 K=768
-aabd6140dce81df2 gpu q6k BFloat16 t batched M=12
-e32b1875939b4216 gpu q6k BFloat16 t batched-aligned M=12
-0ba5aa801abbdac7 gpu q6k BFloat16 t x-batched M=12
-3effc15aa6fb10ec gpu q6k BFloat16 n M=12 K=256
-bf98ce32c01f86e9 gpu q6k BFloat16 n M=12 K=1024
-e9859f2678bc6990 gpu q6k BFloat16 t M=17 N=2048 K=1024
-fea1404463a9e71e gpu q6k BFloat16 t M=17 N=136 K=768
-f03b015364641623 gpu q6k BFloat16 t batched M=17
-af4e4f14251421af gpu q6k BFloat16 t batched-aligned M=17
-2fefb072a5ea2208 gpu q6k BFloat16 t x-batched M=17
-8f9a14443e571500 gpu q6k BFloat16 n M=17 K=256
-c3a9c9497402b190 gpu q6k BFloat16 n M=17 K=1024
-3f797173623e9797 gpu q6k BFloat16 t M=24 N=2048 K=1024
-6b3873dc11f4ebdf gpu q6k BFloat16 t M=24 N=136 K=768
-2fc2a3a8c1b83777 gpu q6k BFloat16 t batched M=24
-f44f96f0714a2d25 gpu q6k BFloat16 t batched-aligned M=24
-24ad871a681c67dc gpu q6k BFloat16 t x-batched M=24
-fa1dbd95fbaf8bc5 gpu q6k BFloat16 n M=24 K=256
-d7080abf72676611 gpu q6k BFloat16 n M=24 K=1024
-df23c4c5b18ce10f gpu q6k BFloat16 t M=33 N=2048 K=1024
-8bef53210bcf2b8b gpu q6k BFloat16 t M=33 N=136 K=768
-3c0a6b30c22bae92 gpu q6k BFloat16 t batched M=33
-4870ba4d35c132a9 gpu q6k BFloat16 t batched-aligned M=33
-0e88b58776893ad9 gpu q6k BFloat16 t x-batched M=33
-7c08b2dd8f4a07f0 gpu q6k BFloat16 n M=33 K=256
-35d77d25c9971bec gpu q6k BFloat16 n M=33 K=1024
-a405c44d1ad0453a gpu q6k BFloat16 t M=64 N=2048 K=1024
-279160f3e44373d1 gpu q6k BFloat16 t M=64 N=136 K=768
-01e9814e4afbe20d gpu q6k BFloat16 t batched M=64
-45f0ba324a91492c gpu q6k BFloat16 t batched-aligned M=64
-d22a80a637618104 gpu q6k BFloat16 t x-batched M=64
-e0e3b950bccc8987 gpu q6k BFloat16 n M=64 K=256
-e8ed70b3ade4efda gpu q6k BFloat16 n M=64 K=1024
-66a35f4470c99543 gpu q6k BFloat16 t M=512 N=2048 K=1024
-e15fb1ec15f24b6e gpu q6k BFloat16 t M=512 N=136 K=768
-6eafa3e1c50139ed gpu q4k Float32 t M=1 N=2048 K=1024
-def16bf16464db37 gpu q4k Float32 t M=1 N=136 K=768
-c66fb876393bb184 gpu q4k Float32 t batched M=1
-6a5e2d212a1d7699 gpu q4k Float32 t batched-aligned M=1
-aef4ebbf75aa70d5 gpu q4k Float32 t x-batched M=1
-3d563b51fbb303f9 gpu q4k Float32 n M=1 K=256
-876400782ddec429 gpu q4k Float32 n M=1 K=1024
-20f0a52a2f46a0a7 gpu q4k Float32 t M=9 N=2048 K=1024
-ab45be2180e7391a gpu q4k Float32 t M=9 N=136 K=768
-790340badca647f9 gpu q4k Float32 t batched M=9
-6d37f46d2ff1d61e gpu q4k Float32 t batched-aligned M=9
-fb732a750285712b gpu q4k Float32 t x-batched M=9
-3b0a81a7ece50c0f gpu q4k Float32 n M=9 K=256
-62236ba4f747632a gpu q4k Float32 n M=9 K=1024
-c992d530c5180111 gpu q4k Float32 t M=12 N=2048 K=1024
-280c37384a456082 gpu q4k Float32 t M=12 N=136 K=768
-857ed4d9d6a6bfe8 gpu q4k Float32 t batched M=12
-ae42b91224e64fc3 gpu q4k Float32 t batched-aligned M=12
-bd7f74d91fe1c310 gpu q4k Float32 t x-batched M=12
-9d1f2da4b26b25b2 gpu q4k Float32 n M=12 K=256
-5cf387899bb4916b gpu q4k Float32 n M=12 K=1024
-539d8a3a9b7cdcc0 gpu q4k Float32 t M=17 N=2048 K=1024
-f352bca0114877d4 gpu q4k Float32 t M=17 N=136 K=768
-4caceb4b1e9a8724 gpu q4k Float32 t batched M=17
-0a073294fce674a6 gpu q4k Float32 t batched-aligned M=17
-3046676e936ef07b gpu q4k Float32 t x-batched M=17
-a2043cc0c11135e9 gpu q4k Float32 n M=17 K=256
-ea367feb69723b19 gpu q4k Float32 n M=17 K=1024
-3cb466f6b469d5d4 gpu q4k Float32 t M=24 N=2048 K=1024
-9bf4a59695a74ed8 gpu q4k Float32 t M=24 N=136 K=768
-584e950ddc61f9ea gpu q4k Float32 t batched M=24
-95ce736db55b167b gpu q4k Float32 t batched-aligned M=24
-5152c3e5c83dd7a8 gpu q4k Float32 t x-batched M=24
-9df592328c4847ef gpu q4k Float32 n M=24 K=256
-a59b4270a98d4e44 gpu q4k Float32 n M=24 K=1024
-7a8ca97adb1d8e55 gpu q4k Float32 t M=33 N=2048 K=1024
-3f369814e3aacd7b gpu q4k Float32 t M=33 N=136 K=768
-3f209a58ad160179 gpu q4k Float32 t batched M=33
-78c79ad67b46f7c1 gpu q4k Float32 t batched-aligned M=33
-3b0e1c5b508b4b0e gpu q4k Float32 t x-batched M=33
-a7af795f66d506ec gpu q4k Float32 n M=33 K=256
-7dbebbf43854043c gpu q4k Float32 n M=33 K=1024
-dcb496fef2d0e26b gpu q4k Float32 t M=64 N=2048 K=1024
-ef45967b8024e697 gpu q4k Float32 t M=64 N=136 K=768
-fa8e6972db2aa15d gpu q4k Float32 t batched M=64
-4b05a16bf3d6762c gpu q4k Float32 t batched-aligned M=64
-fd9200c318fec309 gpu q4k Float32 t x-batched M=64
-4670a6cc98bf1fb1 gpu q4k Float32 n M=64 K=256
-c5fc5a72060f010c gpu q4k Float32 n M=64 K=1024
-fb95f7defafe05c5 gpu q4k Float32 t M=512 N=2048 K=1024
-55442fb58161dff7 gpu q4k Float32 t M=512 N=136 K=768
-77f51a0140c5ec36 gpu q4k Float16 t M=1 N=2048 K=1024
-8f3d189dfea156be gpu q4k Float16 t M=1 N=136 K=768
-dc12cfb3d2bd3db8 gpu q4k Float16 t batched M=1
-68bc6a6abbda93e1 gpu q4k Float16 t batched-aligned M=1
-3f649d12ff5aa788 gpu q4k Float16 t x-batched M=1
-4b5e7b0275458701 gpu q4k Float16 n M=1 K=256
-ed50bdc360ee0cd4 gpu q4k Float16 n M=1 K=1024
-566dcd5fb3162e3c gpu q4k Float16 t M=9 N=2048 K=1024
-7c8415fb4b3e32d2 gpu q4k Float16 t M=9 N=136 K=768
-d8ccb81814c9a55b gpu q4k Float16 t batched M=9
-55830a19dbd6bcf9 gpu q4k Float16 t batched-aligned M=9
-386e13d1585d007e gpu q4k Float16 t x-batched M=9
-225e4daa18135252 gpu q4k Float16 n M=9 K=256
-583d6bb3badb037d gpu q4k Float16 n M=9 K=1024
-22e6af6fd9e7a58d gpu q4k Float16 t M=12 N=2048 K=1024
-3d2b7ef3f8f62046 gpu q4k Float16 t M=12 N=136 K=768
-5ac9b2ce1002a3cc gpu q4k Float16 t batched M=12
-e89a6dc36a59c2e3 gpu q4k Float16 t batched-aligned M=12
-aaaa46f8a46e64d5 gpu q4k Float16 t x-batched M=12
-155f23451de412f6 gpu q4k Float16 n M=12 K=256
-d44db877d49ea527 gpu q4k Float16 n M=12 K=1024
-e2d0d304bb8c627f gpu q4k Float16 t M=17 N=2048 K=1024
-2f2932dcc18339f7 gpu q4k Float16 t M=17 N=136 K=768
-d029982920f0a451 gpu q4k Float16 t batched M=17
-658d62137f99cacd gpu q4k Float16 t batched-aligned M=17
-15ec4963de970012 gpu q4k Float16 t x-batched M=17
-76df8d586a8bf966 gpu q4k Float16 n M=17 K=256
-10b7a5eec42930d7 gpu q4k Float16 n M=17 K=1024
-c9012ed11285a6cd gpu q4k Float16 t M=24 N=2048 K=1024
-a044d7abc6a3be7c gpu q4k Float16 t M=24 N=136 K=768
-04a54cfce92a1d2f gpu q4k Float16 t batched M=24
-fa6b7889616d7f99 gpu q4k Float16 t batched-aligned M=24
-c0dd32c2262c7afa gpu q4k Float16 t x-batched M=24
-7f1344c77bc17776 gpu q4k Float16 n M=24 K=256
-7af1f4a7afbbe681 gpu q4k Float16 n M=24 K=1024
-adfc2b98af2f5baa gpu q4k Float16 t M=33 N=2048 K=1024
-033a9b950241df0b gpu q4k Float16 t M=33 N=136 K=768
-4984e0ec470df150 gpu q4k Float16 t batched M=33
-35ea9edb51f739e7 gpu q4k Float16 t batched-aligned M=33
-09c8038c04b1fe70 gpu q4k Float16 t x-batched M=33
-34d698eaa231df79 gpu q4k Float16 n M=33 K=256
-00be5dfad099437a gpu q4k Float16 n M=33 K=1024
-9393ecf6548945a3 gpu q4k Float16 t M=64 N=2048 K=1024
-b061ba38754d1275 gpu q4k Float16 t M=64 N=136 K=768
-f06a119971b71e13 gpu q4k Float16 t batched M=64
-59217fe2ca8622d6 gpu q4k Float16 t batched-aligned M=64
-082a8e85d6bc0594 gpu q4k Float16 t x-batched M=64
-bd4526cef1d53eda gpu q4k Float16 n M=64 K=256
-3ab2663cde8eed77 gpu q4k Float16 n M=64 K=1024
-86052ff86a9c0d7d gpu q4k Float16 t M=512 N=2048 K=1024
-c9f701b7df4348ec gpu q4k Float16 t M=512 N=136 K=768
-07d30fc4257337cd gpu q4k BFloat16 t M=1 N=2048 K=1024
-61e755a9f4883da7 gpu q4k BFloat16 t M=1 N=136 K=768
-e0863344cff4f222 gpu q4k BFloat16 t batched M=1
-d7e82475ef68fd77 gpu q4k BFloat16 t batched-aligned M=1
-e3b87662881ae090 gpu q4k BFloat16 t x-batched M=1
-0cf666f1c4a9f7c3 gpu q4k BFloat16 n M=1 K=256
-216f7eab29f3de43 gpu q4k BFloat16 n M=1 K=1024
-5f475f505b93e8a2 gpu q4k BFloat16 t M=9 N=2048 K=1024
-41340477888a6cdf gpu q4k BFloat16 t M=9 N=136 K=768
-cd2cd54677544e84 gpu q4k BFloat16 t batched M=9
-5b9b72402428317c gpu q4k BFloat16 t batched-aligned M=9
-149ac1b36832bae7 gpu q4k BFloat16 t x-batched M=9
-835de83e2c327fa5 gpu q4k BFloat16 n M=9 K=256
-f267613e334871d9 gpu q4k BFloat16 n M=9 K=1024
-90e677233dedf386 gpu q4k BFloat16 t M=12 N=2048 K=1024
-005bdb274005f421 gpu q4k BFloat16 t M=12 N=136 K=768
-990e2d137d1de3c4 gpu q4k BFloat16 t batched M=12
-0630a8cfc4153976 gpu q4k BFloat16 t batched-aligned M=12
-d9a7abb5a039eb33 gpu q4k BFloat16 t x-batched M=12
-85983a6ede2f1440 gpu q4k BFloat16 n M=12 K=256
-74b48e915ff0a514 gpu q4k BFloat16 n M=12 K=1024
-6dfd90392c259056 gpu q4k BFloat16 t M=17 N=2048 K=1024
-9ffc86469f7caf29 gpu q4k BFloat16 t M=17 N=136 K=768
-1f1d5e7aa8cb0c97 gpu q4k BFloat16 t batched M=17
-a0b7ee60dc491a4a gpu q4k BFloat16 t batched-aligned M=17
-501ad34f5a538e2d gpu q4k BFloat16 t x-batched M=17
-5a66eab9070a8baa gpu q4k BFloat16 n M=17 K=256
-aa31aa519bbaf2e0 gpu q4k BFloat16 n M=17 K=1024
-a81c22c325690dd3 gpu q4k BFloat16 t M=24 N=2048 K=1024
-f8564222a7808a34 gpu q4k BFloat16 t M=24 N=136 K=768
-bcd8cc9032f39931 gpu q4k BFloat16 t batched M=24
-14649352f6f63a90 gpu q4k BFloat16 t batched-aligned M=24
-a78e0cf9c430e4bb gpu q4k BFloat16 t x-batched M=24
-60986e1d3b034ad7 gpu q4k BFloat16 n M=24 K=256
-06274c28c1d7742a gpu q4k BFloat16 n M=24 K=1024
-08e1d349616aaa7b gpu q4k BFloat16 t M=33 N=2048 K=1024
-6b16794567e4528d gpu q4k BFloat16 t M=33 N=136 K=768
-e9328854fa3ab00a gpu q4k BFloat16 t batched M=33
-5b8e35c17d1350d2 gpu q4k BFloat16 t batched-aligned M=33
-f5e1f66a374e61f3 gpu q4k BFloat16 t x-batched M=33
-c959b10ebfc3d501 gpu q4k BFloat16 n M=33 K=256
-5d85c84f2e2bc112 gpu q4k BFloat16 n M=33 K=1024
-4e21ae66e82382e1 gpu q4k BFloat16 t M=64 N=2048 K=1024
-b198716c5c1a6877 gpu q4k BFloat16 t M=64 N=136 K=768
-af6848cc4e29d17f gpu q4k BFloat16 t batched M=64
-2536bb66ee54d811 gpu q4k BFloat16 t batched-aligned M=64
-26b14b5e206377eb gpu q4k BFloat16 t x-batched M=64
-0f5379908e63a473 gpu q4k BFloat16 n M=64 K=256
-ba0c1e5af2eeb807 gpu q4k BFloat16 n M=64 K=1024
-291a83c974226e33 gpu q4k BFloat16 t M=512 N=2048 K=1024
-857595188d01a452 gpu q4k BFloat16 t M=512 N=136 K=768
-c639164760ccc823 gpu q5k Float32 t M=1 N=2048 K=1024
-c6ff479e8c76eae0 gpu q5k Float32 t M=1 N=136 K=768
-d37deee666b37e20 gpu q5k Float32 t batched M=1
-94c36f33609d4ada gpu q5k Float32 t batched-aligned M=1
-a74969113cebb5c5 gpu q5k Float32 t x-batched M=1
-b89ef2e92e544cc9 gpu q5k Float32 n M=1 K=256
-d63a7e331ba50f9d gpu q5k Float32 n M=1 K=1024
-cc53daa0c35bdf81 gpu q5k Float32 t M=9 N=2048 K=1024
-2c481403b997fff9 gpu q5k Float32 t M=9 N=136 K=768
-18029407978814ef gpu q5k Float32 t batched M=9
-24e481be21a596a9 gpu q5k Float32 t batched-aligned M=9
-9ce4cd878d6f6733 gpu q5k Float32 t x-batched M=9
-f29ca1f2466c1aa9 gpu q5k Float32 n M=9 K=256
-b548411cf18280d9 gpu q5k Float32 n M=9 K=1024
-75af60a11a6c07b4 gpu q5k Float32 t M=12 N=2048 K=1024
-3afe6d76495ede46 gpu q5k Float32 t M=12 N=136 K=768
-83718d79b55a1945 gpu q5k Float32 t batched M=12
-fa70dd4824d413f2 gpu q5k Float32 t batched-aligned M=12
-aeb8a50731510ecc gpu q5k Float32 t x-batched M=12
-f402e0daedb77540 gpu q5k Float32 n M=12 K=256
-2ba4ad317205747c gpu q5k Float32 n M=12 K=1024
-f67dacc2840304de gpu q5k Float32 t M=17 N=2048 K=1024
-e1032c7c8b41a40d gpu q5k Float32 t M=17 N=136 K=768
-2f0b38d1b740245e gpu q5k Float32 t batched M=17
-2ad0d5b4ae14d881 gpu q5k Float32 t batched-aligned M=17
-65f049c313daeed3 gpu q5k Float32 t x-batched M=17
-a75aca9ff921cb3d gpu q5k Float32 n M=17 K=256
-4f58911e49dda2f3 gpu q5k Float32 n M=17 K=1024
-0e07d9b6774db186 gpu q5k Float32 t M=24 N=2048 K=1024
-0efef48b35cbd6d7 gpu q5k Float32 t M=24 N=136 K=768
-01f3d3be97448fad gpu q5k Float32 t batched M=24
-dbc7867b72e6193b gpu q5k Float32 t batched-aligned M=24
-912e3027a417c8f9 gpu q5k Float32 t x-batched M=24
-3a5be547d0b8437f gpu q5k Float32 n M=24 K=256
-b84ca6246953c325 gpu q5k Float32 n M=24 K=1024
-8050cd8d171c5479 gpu q5k Float32 t M=33 N=2048 K=1024
-ffbe4ddee593e2af gpu q5k Float32 t M=33 N=136 K=768
-c8998e105040a7fa gpu q5k Float32 t batched M=33
-f50ea1280a8d0602 gpu q5k Float32 t batched-aligned M=33
-6a8e301553f4581b gpu q5k Float32 t x-batched M=33
-73f2df4d7e6a2d17 gpu q5k Float32 n M=33 K=256
-84ae560e0d11ba45 gpu q5k Float32 n M=33 K=1024
-2475184f764c5226 gpu q5k Float32 t M=64 N=2048 K=1024
-46799a2e1b3dd4bb gpu q5k Float32 t M=64 N=136 K=768
-cf2e4f4c6ab99472 gpu q5k Float32 t batched M=64
-f0a96f408eb9e872 gpu q5k Float32 t batched-aligned M=64
-800fecb8fd046ade gpu q5k Float32 t x-batched M=64
-89e91c1a98c2eea9 gpu q5k Float32 n M=64 K=256
-201476b6ae6c5f41 gpu q5k Float32 n M=64 K=1024
-4607acda0a6f600e gpu q5k Float32 t M=512 N=2048 K=1024
-53fbce309b40d159 gpu q5k Float32 t M=512 N=136 K=768
-87bfe8e20ca912cb gpu q5k Float16 t M=1 N=2048 K=1024
-f4b71147c09c942e gpu q5k Float16 t M=1 N=136 K=768
-a0db320693181b81 gpu q5k Float16 t batched M=1
-0969665b195750a2 gpu q5k Float16 t batched-aligned M=1
-43ffe28ca07d32ab gpu q5k Float16 t x-batched M=1
-6d514ff08ccdd427 gpu q5k Float16 n M=1 K=256
-800e99054711325f gpu q5k Float16 n M=1 K=1024
-26a0c103d378d976 gpu q5k Float16 t M=9 N=2048 K=1024
-90f25b1520d3c055 gpu q5k Float16 t M=9 N=136 K=768
-b85f204e15e474b9 gpu q5k Float16 t batched M=9
-004017e17f1c4793 gpu q5k Float16 t batched-aligned M=9
-4692f32f9d016b76 gpu q5k Float16 t x-batched M=9
-1a763c0847379030 gpu q5k Float16 n M=9 K=256
-ab8af4c21750307a gpu q5k Float16 n M=9 K=1024
-6a264cd3a7e5b72c gpu q5k Float16 t M=12 N=2048 K=1024
-b3c0839b7c0fd15c gpu q5k Float16 t M=12 N=136 K=768
-438899b5540dd183 gpu q5k Float16 t batched M=12
-83173449d60e11c2 gpu q5k Float16 t batched-aligned M=12
-74c20684b8d9338d gpu q5k Float16 t x-batched M=12
-db99a2d91b806533 gpu q5k Float16 n M=12 K=256
-3bd4dd894dbea443 gpu q5k Float16 n M=12 K=1024
-8c24dd048c5900fa gpu q5k Float16 t M=17 N=2048 K=1024
-cdb92f1734580eca gpu q5k Float16 t M=17 N=136 K=768
-89c83690b506e2e6 gpu q5k Float16 t batched M=17
-25d1f6f3b67621ec gpu q5k Float16 t batched-aligned M=17
-436e286eaee1da6a gpu q5k Float16 t x-batched M=17
-f11b57ecbe581a9c gpu q5k Float16 n M=17 K=256
-3c2f2bc3d52873da gpu q5k Float16 n M=17 K=1024
-94c533ff766bd80f gpu q5k Float16 t M=24 N=2048 K=1024
-98ec7ad69ac6c23f gpu q5k Float16 t M=24 N=136 K=768
-0d6f32b0a397783f gpu q5k Float16 t batched M=24
-05af34a605487aa8 gpu q5k Float16 t batched-aligned M=24
-9c8b95ae9fbe0157 gpu q5k Float16 t x-batched M=24
-1a706b2bb50efe04 gpu q5k Float16 n M=24 K=256
-4450d26758e28b67 gpu q5k Float16 n M=24 K=1024
-4b64ae45086d1db6 gpu q5k Float16 t M=33 N=2048 K=1024
-82be0f371cc0a647 gpu q5k Float16 t M=33 N=136 K=768
-06dccb9484cdd1fe gpu q5k Float16 t batched M=33
-a019b8164f767ae0 gpu q5k Float16 t batched-aligned M=33
-8cd917492bab3685 gpu q5k Float16 t x-batched M=33
-884e87f02107204e gpu q5k Float16 n M=33 K=256
-b78311d8531cdc2f gpu q5k Float16 n M=33 K=1024
-d42a0219c67951e4 gpu q5k Float16 t M=64 N=2048 K=1024
-a100a601288dcd81 gpu q5k Float16 t M=64 N=136 K=768
-56eae684932fdb9b gpu q5k Float16 t batched M=64
-d9fdc4aef768e18f gpu q5k Float16 t batched-aligned M=64
-90a7d44afee7732a gpu q5k Float16 t x-batched M=64
-e9d54b98bbeb96bd gpu q5k Float16 n M=64 K=256
-a66f285ec0582dd1 gpu q5k Float16 n M=64 K=1024
-0ec2ea2bccb2c713 gpu q5k Float16 t M=512 N=2048 K=1024
-b0d18e72052543f4 gpu q5k Float16 t M=512 N=136 K=768
-a17906904023ec34 gpu q5k BFloat16 t M=1 N=2048 K=1024
-7d6e50c7d33f6c3f gpu q5k BFloat16 t M=1 N=136 K=768
-eb0ce91ad644c7de gpu q5k BFloat16 t batched M=1
-f86b2dbf75600712 gpu q5k BFloat16 t batched-aligned M=1
-23718b42a87abeef gpu q5k BFloat16 t x-batched M=1
-ead88e13bdb42344 gpu q5k BFloat16 n M=1 K=256
-055cdc2e5c8e732c gpu q5k BFloat16 n M=1 K=1024
-09482886dc022017 gpu q5k BFloat16 t M=9 N=2048 K=1024
-25debf1e3e891d4d gpu q5k BFloat16 t M=9 N=136 K=768
-3cc5902301cc86a1 gpu q5k BFloat16 t batched M=9
-64b58a87c95a4c1c gpu q5k BFloat16 t batched-aligned M=9
-e80489c2516cc9b1 gpu q5k BFloat16 t x-batched M=9
-1e1e5af231dc880c gpu q5k BFloat16 n M=9 K=256
-87c16778f1d47358 gpu q5k BFloat16 n M=9 K=1024
-9eaa808c3d4e9420 gpu q5k BFloat16 t M=12 N=2048 K=1024
-8960aca42fcd26f6 gpu q5k BFloat16 t M=12 N=136 K=768
-673ca49decf1a183 gpu q5k BFloat16 t batched M=12
-7a7ec437d112dbfe gpu q5k BFloat16 t batched-aligned M=12
-d6e732846815ee9a gpu q5k BFloat16 t x-batched M=12
-faf8c2ef5d2aef33 gpu q5k BFloat16 n M=12 K=256
-eded60764297c95c gpu q5k BFloat16 n M=12 K=1024
-c83d885c9b6ee172 gpu q5k BFloat16 t M=17 N=2048 K=1024
-2bff22dd807fc09d gpu q5k BFloat16 t M=17 N=136 K=768
-87c7ed4111e1619b gpu q5k BFloat16 t batched M=17
-f5d6ae42d52fc36d gpu q5k BFloat16 t batched-aligned M=17
-0a979d499763e55f gpu q5k BFloat16 t x-batched M=17
-5e59f15ec1af04b5 gpu q5k BFloat16 n M=17 K=256
-45ff4d908ad19039 gpu q5k BFloat16 n M=17 K=1024
-967d8ccab108ac02 gpu q5k BFloat16 t M=24 N=2048 K=1024
-cb39992db534a0d5 gpu q5k BFloat16 t M=24 N=136 K=768
-0e33fd4a6bab8fde gpu q5k BFloat16 t batched M=24
-1d3b342abd5aac5b gpu q5k BFloat16 t batched-aligned M=24
-13f80981c3afd973 gpu q5k BFloat16 t x-batched M=24
-8df76fea5fe9cd69 gpu q5k BFloat16 n M=24 K=256
-6061d8c734b8abcf gpu q5k BFloat16 n M=24 K=1024
-a81bdb1118aab5f2 gpu q5k BFloat16 t M=33 N=2048 K=1024
-0cbd1c9c9af55112 gpu q5k BFloat16 t M=33 N=136 K=768
-6405dc175274352f gpu q5k BFloat16 t batched M=33
-eb91d725e6ebe752 gpu q5k BFloat16 t batched-aligned M=33
-3ab2b1198602b5ea gpu q5k BFloat16 t x-batched M=33
-eb0dbe36897030d2 gpu q5k BFloat16 n M=33 K=256
-8769fa6f5051adaa gpu q5k BFloat16 n M=33 K=1024
-29d2a7301781a0a3 gpu q5k BFloat16 t M=64 N=2048 K=1024
-9dcf2d07b6ea5739 gpu q5k BFloat16 t M=64 N=136 K=768
-d1a404647112c76f gpu q5k BFloat16 t batched M=64
-f0db092ae3aaf429 gpu q5k BFloat16 t batched-aligned M=64
-16f39cd1b45373ae gpu q5k BFloat16 t x-batched M=64
-699dff3cb6709e78 gpu q5k BFloat16 n M=64 K=256
-2634098cca3b8875 gpu q5k BFloat16 n M=64 K=1024
-e6ffd8cc8fe6cf25 gpu q5k BFloat16 t M=512 N=2048 K=1024
-d330f1d6d3e43cc4 gpu q5k BFloat16 t M=512 N=136 K=768
-789c2eb6947b8e6f gpu iq4nl Float32 t M=1 N=2048 K=1024
-d802b130c20b29bf gpu iq4nl Float32 t M=1 N=136 K=768
-e698cf671df206dc gpu iq4nl Float32 t batched M=1
-51b9ee0162dd1417 gpu iq4nl Float32 t batched-aligned M=1
-611bf37652068622 gpu iq4nl Float32 t x-batched M=1
-83636d3e56617251 gpu iq4nl Float32 n M=1 K=256
-e5ba5d1406134f40 gpu iq4nl Float32 n M=1 K=1024
-ce52a259954676b4 gpu iq4nl Float32 t M=9 N=2048 K=1024
-2357ed4916655534 gpu iq4nl Float32 t M=9 N=136 K=768
-2b9cd6016b28ad3a gpu iq4nl Float32 t batched M=9
-2ffe2856d006b5c2 gpu iq4nl Float32 t batched-aligned M=9
-394a4e5da2becc2a gpu iq4nl Float32 t x-batched M=9
-db924cd462e03296 gpu iq4nl Float32 n M=9 K=256
-7ab46964f82c54fc gpu iq4nl Float32 n M=9 K=1024
-a278ab779a19d0d7 gpu iq4nl Float32 t M=12 N=2048 K=1024
-6d77b8bad46f89e8 gpu iq4nl Float32 t M=12 N=136 K=768
-fe4313db1e0080d9 gpu iq4nl Float32 t batched M=12
-a7876abd735b8424 gpu iq4nl Float32 t batched-aligned M=12
-fce79ef0c466826e gpu iq4nl Float32 t x-batched M=12
-ca93e47e008f1229 gpu iq4nl Float32 n M=12 K=256
-520ebff4d33a28dc gpu iq4nl Float32 n M=12 K=1024
-02a7c1f01f72e224 gpu iq4nl Float32 t M=17 N=2048 K=1024
-fe2a7176d255a280 gpu iq4nl Float32 t M=17 N=136 K=768
-1348586b05abecf2 gpu iq4nl Float32 t batched M=17
-a73275f409969aa3 gpu iq4nl Float32 t batched-aligned M=17
-68904f01ba606805 gpu iq4nl Float32 t x-batched M=17
-4abbeac917013548 gpu iq4nl Float32 n M=17 K=256
-eb87749bc919d33f gpu iq4nl Float32 n M=17 K=1024
-fb6c0084192ea875 gpu iq4nl Float32 t M=24 N=2048 K=1024
-fe7758998b648e9d gpu iq4nl Float32 t M=24 N=136 K=768
-8da9dbfa07bac06b gpu iq4nl Float32 t batched M=24
-6b18e7c074b06bbc gpu iq4nl Float32 t batched-aligned M=24
-1785fb634b5c1e12 gpu iq4nl Float32 t x-batched M=24
-e44ebbc5a70ca82b gpu iq4nl Float32 n M=24 K=256
-c45c8ad2cba3ad93 gpu iq4nl Float32 n M=24 K=1024
-f2c5969ddee1c4ce gpu iq4nl Float32 t M=33 N=2048 K=1024
-5736113e44493c06 gpu iq4nl Float32 t M=33 N=136 K=768
-6652453a26abd4c1 gpu iq4nl Float32 t batched M=33
-2b9d35eaa5edbd81 gpu iq4nl Float32 t batched-aligned M=33
-b57c786742008628 gpu iq4nl Float32 t x-batched M=33
-d5e40f32770331eb gpu iq4nl Float32 n M=33 K=256
-42bd51e29ad8e204 gpu iq4nl Float32 n M=33 K=1024
-358b5ed449107c16 gpu iq4nl Float32 t M=64 N=2048 K=1024
-ab42eabcae00ecd6 gpu iq4nl Float32 t M=64 N=136 K=768
-6e68fd2589b9ba8d gpu iq4nl Float32 t batched M=64
-710ab15433a6f0ff gpu iq4nl Float32 t batched-aligned M=64
-9698cbc3e309a7d7 gpu iq4nl Float32 t x-batched M=64
-1631862ac78fba66 gpu iq4nl Float32 n M=64 K=256
-8d32ca1866590099 gpu iq4nl Float32 n M=64 K=1024
-35fbc8d9f83a5ef4 gpu iq4nl Float32 t M=512 N=2048 K=1024
-13d012ba69305284 gpu iq4nl Float32 t M=512 N=136 K=768
-dd65c66e97715a61 gpu iq4nl Float16 t M=1 N=2048 K=1024
-590b41f4917248a7 gpu iq4nl Float16 t M=1 N=136 K=768
-817116c236d4c292 gpu iq4nl Float16 t batched M=1
-48e229d60601593b gpu iq4nl Float16 t batched-aligned M=1
-4256de5fe0040263 gpu iq4nl Float16 t x-batched M=1
-7d65d9ffb3774aa1 gpu iq4nl Float16 n M=1 K=256
-03a86c6d72795131 gpu iq4nl Float16 n M=1 K=1024
-0b77332a965e94d8 gpu iq4nl Float16 t M=9 N=2048 K=1024
-d087e5207e23c29a gpu iq4nl Float16 t M=9 N=136 K=768
-f2478b0797509cdf gpu iq4nl Float16 t batched M=9
-e63a45b700b6661e gpu iq4nl Float16 t batched-aligned M=9
-6d5893cc0349870c gpu iq4nl Float16 t x-batched M=9
-684a24945d8047b8 gpu iq4nl Float16 n M=9 K=256
-ea43b25a5104e8d4 gpu iq4nl Float16 n M=9 K=1024
-9aafa37d33a5837e gpu iq4nl Float16 t M=12 N=2048 K=1024
-f54b234f1267c4dd gpu iq4nl Float16 t M=12 N=136 K=768
-cf3b642c66a7e21c gpu iq4nl Float16 t batched M=12
-44ac3cfd3b148d82 gpu iq4nl Float16 t batched-aligned M=12
-6fbbf45878f80004 gpu iq4nl Float16 t x-batched M=12
-91d44902c0f494f8 gpu iq4nl Float16 n M=12 K=256
-5c3d8acf943e64fc gpu iq4nl Float16 n M=12 K=1024
-a4f464c5f4ef0694 gpu iq4nl Float16 t M=17 N=2048 K=1024
-8fb69ef483f86839 gpu iq4nl Float16 t M=17 N=136 K=768
-32bd8b2890950a0c gpu iq4nl Float16 t batched M=17
-cbe5b36eb1b453e7 gpu iq4nl Float16 t batched-aligned M=17
-0f35d96f33b81acb gpu iq4nl Float16 t x-batched M=17
-1d392a85121a4e2a gpu iq4nl Float16 n M=17 K=256
-50bb42ff33cb99a4 gpu iq4nl Float16 n M=17 K=1024
-048104fd38bbc258 gpu iq4nl Float16 t M=24 N=2048 K=1024
-64821c752142af42 gpu iq4nl Float16 t M=24 N=136 K=768
-0c5448d46ac25795 gpu iq4nl Float16 t batched M=24
-c44d0c84a3e8ca6f gpu iq4nl Float16 t batched-aligned M=24
-63e79c7fae5420e7 gpu iq4nl Float16 t x-batched M=24
-4741be070eba14c2 gpu iq4nl Float16 n M=24 K=256
-eb72d46f09dde7bb gpu iq4nl Float16 n M=24 K=1024
-d3fbc95814ab08a3 gpu iq4nl Float16 t M=33 N=2048 K=1024
-6a60a3735dc8c71d gpu iq4nl Float16 t M=33 N=136 K=768
-8b543d6e29c1a3b8 gpu iq4nl Float16 t batched M=33
-f8f6619bd8546ce6 gpu iq4nl Float16 t batched-aligned M=33
-5603afd169136e19 gpu iq4nl Float16 t x-batched M=33
-5912aa1f9a1e101c gpu iq4nl Float16 n M=33 K=256
-b8d19d2ffe4ae7cf gpu iq4nl Float16 n M=33 K=1024
-7ce4942342915035 gpu iq4nl Float16 t M=64 N=2048 K=1024
-54a0f32373bbc8b7 gpu iq4nl Float16 t M=64 N=136 K=768
-e2a9dd063cca4fac gpu iq4nl Float16 t batched M=64
-8f830909980bbc5b gpu iq4nl Float16 t batched-aligned M=64
-4979b348690f473e gpu iq4nl Float16 t x-batched M=64
-3e21cc70a61d9421 gpu iq4nl Float16 n M=64 K=256
-684cc047eba00fcc gpu iq4nl Float16 n M=64 K=1024
-2bcc0aa68e273950 gpu iq4nl Float16 t M=512 N=2048 K=1024
-1d7cd4491b8a0ad0 gpu iq4nl Float16 t M=512 N=136 K=768
-68318b8a502d5e8a gpu iq4nl BFloat16 t M=1 N=2048 K=1024
-54b08f2dbb497f63 gpu iq4nl BFloat16 t M=1 N=136 K=768
-1ae3583988ed43b2 gpu iq4nl BFloat16 t batched M=1
-8c18ccdc5d62dfeb gpu iq4nl BFloat16 t batched-aligned M=1
-b1a482d02379a64a gpu iq4nl BFloat16 t x-batched M=1
-fb1c7c62cdcdc158 gpu iq4nl BFloat16 n M=1 K=256
-56009d0518f884c1 gpu iq4nl BFloat16 n M=1 K=1024
-208e9bc57ee2f4d5 gpu iq4nl BFloat16 t M=9 N=2048 K=1024
-8fed3d491e3f84d9 gpu iq4nl BFloat16 t M=9 N=136 K=768
-902f7f6cb19d98a8 gpu iq4nl BFloat16 t batched M=9
-3e161f3a47dda865 gpu iq4nl BFloat16 t batched-aligned M=9
-33d21128abac2021 gpu iq4nl BFloat16 t x-batched M=9
-9fdcd967522b297a gpu iq4nl BFloat16 n M=9 K=256
-16e22307e44d802f gpu iq4nl BFloat16 n M=9 K=1024
-d29174c426c62805 gpu iq4nl BFloat16 t M=12 N=2048 K=1024
-024c235318b1d877 gpu iq4nl BFloat16 t M=12 N=136 K=768
-aa624d116eaa3379 gpu iq4nl BFloat16 t batched M=12
-f8feb43f2d11b06d gpu iq4nl BFloat16 t batched-aligned M=12
-f718270c4561be57 gpu iq4nl BFloat16 t x-batched M=12
-c3d10a5881570967 gpu iq4nl BFloat16 n M=12 K=256
-0b957ebfe572ce50 gpu iq4nl BFloat16 n M=12 K=1024
-fcba32e335c13050 gpu iq4nl BFloat16 t M=17 N=2048 K=1024
-8fcaef0e1326849d gpu iq4nl BFloat16 t M=17 N=136 K=768
-306aefba18d54baa gpu iq4nl BFloat16 t batched M=17
-87dc4c8f859b2c5b gpu iq4nl BFloat16 t batched-aligned M=17
-ce6760c60a012409 gpu iq4nl BFloat16 t x-batched M=17
-9fed97e88934a9cc gpu iq4nl BFloat16 n M=17 K=256
-e3f14efa51357a55 gpu iq4nl BFloat16 n M=17 K=1024
-5a97a63b226b5547 gpu iq4nl BFloat16 t M=24 N=2048 K=1024
-e1c581d109246630 gpu iq4nl BFloat16 t M=24 N=136 K=768
-c7308e2b6079d15d gpu iq4nl BFloat16 t batched M=24
-eabcd3605bcc7140 gpu iq4nl BFloat16 t batched-aligned M=24
-57890b299a4406ec gpu iq4nl BFloat16 t x-batched M=24
-105f5d0fbdfed905 gpu iq4nl BFloat16 n M=24 K=256
-10e8d1ce7db7e766 gpu iq4nl BFloat16 n M=24 K=1024
-e5677b2eb3c89848 gpu iq4nl BFloat16 t M=33 N=2048 K=1024
-25afc6cf44224139 gpu iq4nl BFloat16 t M=33 N=136 K=768
-c4ed1cd20b26e676 gpu iq4nl BFloat16 t batched M=33
-ea2a4c74876da9cc gpu iq4nl BFloat16 t batched-aligned M=33
-018c36ce080013b7 gpu iq4nl BFloat16 t x-batched M=33
-aa04f8fe57039b81 gpu iq4nl BFloat16 n M=33 K=256
-846d37c75fc22098 gpu iq4nl BFloat16 n M=33 K=1024
-2e99e0d7f9650578 gpu iq4nl BFloat16 t M=64 N=2048 K=1024
-e18a340f82a538a1 gpu iq4nl BFloat16 t M=64 N=136 K=768
-3dc1357ee076f9d0 gpu iq4nl BFloat16 t batched M=64
-f0c7cf8f74213ccc gpu iq4nl BFloat16 t batched-aligned M=64
-a87712104990099e gpu iq4nl BFloat16 t x-batched M=64
-ba12da45affecaa5 gpu iq4nl BFloat16 n M=64 K=256
-57135a1bf1b5ea41 gpu iq4nl BFloat16 n M=64 K=1024
-e41a662758d4eadf gpu iq4nl BFloat16 t M=512 N=2048 K=1024
-5037d5a8ad4c0930 gpu iq4nl BFloat16 t M=512 N=136 K=768
-981e47f2c39bb22c gpu iq4xs Float32 t M=1 N=2048 K=1024
-af2a3f1bc5c9bcd9 gpu iq4xs Float32 t M=1 N=136 K=768
-fde2fd9825557ca2 gpu iq4xs Float32 t batched M=1
-0b3d70b93654b923 gpu iq4xs Float32 t batched-aligned M=1
-b843c5de508c18aa gpu iq4xs Float32 t x-batched M=1
-b9734d567768c28e gpu iq4xs Float32 n M=1 K=256
-60dd87654b6ff8fb gpu iq4xs Float32 n M=1 K=1024
-b21906b1e168e06f gpu iq4xs Float32 t M=9 N=2048 K=1024
-fb1171d2238ad16e gpu iq4xs Float32 t M=9 N=136 K=768
-d754d76f13e8a5d6 gpu iq4xs Float32 t batched M=9
-bcacfecce978d5da gpu iq4xs Float32 t batched-aligned M=9
-d17ef2bebe8aa286 gpu iq4xs Float32 t x-batched M=9
-63ed4b1329e5eeec gpu iq4xs Float32 n M=9 K=256
-bd3e0613cac4ca74 gpu iq4xs Float32 n M=9 K=1024
-b4f497b04e847324 gpu iq4xs Float32 t M=12 N=2048 K=1024
-7f55366e8be32955 gpu iq4xs Float32 t M=12 N=136 K=768
-08e7a4aad7b0fad0 gpu iq4xs Float32 t batched M=12
-f4541ac9b2d63c3f gpu iq4xs Float32 t batched-aligned M=12
-51e63b5c4111e47b gpu iq4xs Float32 t x-batched M=12
-fc1359d8b3ae10e2 gpu iq4xs Float32 n M=12 K=256
-ebc00a423395cd71 gpu iq4xs Float32 n M=12 K=1024
-faeb618e827d8a98 gpu iq4xs Float32 t M=17 N=2048 K=1024
-2669e27dd2c19085 gpu iq4xs Float32 t M=17 N=136 K=768
-78c6f78b084897a3 gpu iq4xs Float32 t batched M=17
-e9d41cd4b15f0cf9 gpu iq4xs Float32 t batched-aligned M=17
-c3477669ec77679f gpu iq4xs Float32 t x-batched M=17
-a2d8450693b0d20e gpu iq4xs Float32 n M=17 K=256
-a0ccbbd867314a40 gpu iq4xs Float32 n M=17 K=1024
-160f143d1c7acc19 gpu iq4xs Float32 t M=24 N=2048 K=1024
-b2efad73b6ed7c40 gpu iq4xs Float32 t M=24 N=136 K=768
-415acfae6f4981ab gpu iq4xs Float32 t batched M=24
-3e58a35fd485b472 gpu iq4xs Float32 t batched-aligned M=24
-54accc2f8c318429 gpu iq4xs Float32 t x-batched M=24
-21190d7fc8f4e4f4 gpu iq4xs Float32 n M=24 K=256
-a9f7850f2bcd8b78 gpu iq4xs Float32 n M=24 K=1024
-9fdd34ad93dea384 gpu iq4xs Float32 t M=33 N=2048 K=1024
-8e946c8a75f1972c gpu iq4xs Float32 t M=33 N=136 K=768
-78040500676e2070 gpu iq4xs Float32 t batched M=33
-19d7ef859cd6e78e gpu iq4xs Float32 t batched-aligned M=33
-6a8458468ca0f14c gpu iq4xs Float32 t x-batched M=33
-7f6f2ab5b67c0ab0 gpu iq4xs Float32 n M=33 K=256
-a8591f92b195f073 gpu iq4xs Float32 n M=33 K=1024
-87d782e4d3583eda gpu iq4xs Float32 t M=64 N=2048 K=1024
-1a41fe491d10dfd3 gpu iq4xs Float32 t M=64 N=136 K=768
-bc622b6320b3870f gpu iq4xs Float32 t batched M=64
-de5c1a083ae6b569 gpu iq4xs Float32 t batched-aligned M=64
-cc7131c73ee90169 gpu iq4xs Float32 t x-batched M=64
-b31639723f8e23fe gpu iq4xs Float32 n M=64 K=256
-dc62758e8ed20f31 gpu iq4xs Float32 n M=64 K=1024
-d09b2a7f40d57bd4 gpu iq4xs Float32 t M=512 N=2048 K=1024
-18435e6ef1e7154e gpu iq4xs Float32 t M=512 N=136 K=768
-4bcb6d614d1f8017 gpu iq4xs Float16 t M=1 N=2048 K=1024
-3b868422564a028b gpu iq4xs Float16 t M=1 N=136 K=768
-f85ff0a655d59558 gpu iq4xs Float16 t batched M=1
-e318578fa39b1d51 gpu iq4xs Float16 t batched-aligned M=1
-d5fb67b68c391b6d gpu iq4xs Float16 t x-batched M=1
-aa4285706d28d17d gpu iq4xs Float16 n M=1 K=256
-ff003fbcb1f5645b gpu iq4xs Float16 n M=1 K=1024
-b95177798276fd1e gpu iq4xs Float16 t M=9 N=2048 K=1024
-3e76b8cd9d2379e9 gpu iq4xs Float16 t M=9 N=136 K=768
-d70162a8c39402fe gpu iq4xs Float16 t batched M=9
-c45a531e83412243 gpu iq4xs Float16 t batched-aligned M=9
-583f142b3336ab53 gpu iq4xs Float16 t x-batched M=9
-bfa962af0ac57f71 gpu iq4xs Float16 n M=9 K=256
-2e6f567682a4f8b2 gpu iq4xs Float16 n M=9 K=1024
-1f3908b5f0e22c6b gpu iq4xs Float16 t M=12 N=2048 K=1024
-318369603a544b14 gpu iq4xs Float16 t M=12 N=136 K=768
-4f9fb30bcbf0b4c0 gpu iq4xs Float16 t batched M=12
-11887e3be9e70357 gpu iq4xs Float16 t batched-aligned M=12
-91f154ec6adc67c5 gpu iq4xs Float16 t x-batched M=12
-81f1ee957f0f7e84 gpu iq4xs Float16 n M=12 K=256
-225edb3074e8ab23 gpu iq4xs Float16 n M=12 K=1024
-61212bb3268a0e4e gpu iq4xs Float16 t M=17 N=2048 K=1024
-e282fbed41af95ae gpu iq4xs Float16 t M=17 N=136 K=768
-dc7f8f8284f99d8b gpu iq4xs Float16 t batched M=17
-87824cc31b48e24b gpu iq4xs Float16 t batched-aligned M=17
-a2507a198ca208e9 gpu iq4xs Float16 t x-batched M=17
-ff06bbefb223ab5f gpu iq4xs Float16 n M=17 K=256
-8f697fbd4370373a gpu iq4xs Float16 n M=17 K=1024
-1c19ab1ba7065116 gpu iq4xs Float16 t M=24 N=2048 K=1024
-2a8265c78da8b523 gpu iq4xs Float16 t M=24 N=136 K=768
-e749bfb8ee61e02b gpu iq4xs Float16 t batched M=24
-097f75185ba691a7 gpu iq4xs Float16 t batched-aligned M=24
-25f20e9884a2b7f4 gpu iq4xs Float16 t x-batched M=24
-bae634d5a7f18a54 gpu iq4xs Float16 n M=24 K=256
-ed88b53a9bcac14d gpu iq4xs Float16 n M=24 K=1024
-1aa876fbaeee6e5a gpu iq4xs Float16 t M=33 N=2048 K=1024
-19e002fa8768779d gpu iq4xs Float16 t M=33 N=136 K=768
-869facdf78a89288 gpu iq4xs Float16 t batched M=33
-b782c4a8eb28aeba gpu iq4xs Float16 t batched-aligned M=33
-d2c8512c4894da07 gpu iq4xs Float16 t x-batched M=33
-efea3f93be90b6de gpu iq4xs Float16 n M=33 K=256
-08c43751a72acb0f gpu iq4xs Float16 n M=33 K=1024
-ecdaa4fe857e4194 gpu iq4xs Float16 t M=64 N=2048 K=1024
-e2b7961bbee0ec6f gpu iq4xs Float16 t M=64 N=136 K=768
-27ffe17713555cdd gpu iq4xs Float16 t batched M=64
-5a8eb43ccb660988 gpu iq4xs Float16 t batched-aligned M=64
-d4566e85470e6c7d gpu iq4xs Float16 t x-batched M=64
-cd1fc89a8d798b46 gpu iq4xs Float16 n M=64 K=256
-2ba16e6144154b20 gpu iq4xs Float16 n M=64 K=1024
-370ba666b6f8ffa3 gpu iq4xs Float16 t M=512 N=2048 K=1024
-6a6e03de85e4e77c gpu iq4xs Float16 t M=512 N=136 K=768
-f66c27c1adffa996 gpu iq4xs BFloat16 t M=1 N=2048 K=1024
-4f047c2053f50db7 gpu iq4xs BFloat16 t M=1 N=136 K=768
-a5eecdd68bbdb63e gpu iq4xs BFloat16 t batched M=1
-56afdd09d0ec4ff1 gpu iq4xs BFloat16 t batched-aligned M=1
-b0dc1a12a1f69821 gpu iq4xs BFloat16 t x-batched M=1
-46eddb20a91f83b7 gpu iq4xs BFloat16 n M=1 K=256
-377a42d6fa6a08e6 gpu iq4xs BFloat16 n M=1 K=1024
-d7e0aecf2634fe00 gpu iq4xs BFloat16 t M=9 N=2048 K=1024
-7b5f1b4724e69258 gpu iq4xs BFloat16 t M=9 N=136 K=768
-6f8e626a1ecbba60 gpu iq4xs BFloat16 t batched M=9
-c197b356889932a4 gpu iq4xs BFloat16 t batched-aligned M=9
-2e863bfc9b58aea2 gpu iq4xs BFloat16 t x-batched M=9
-f5cb06ed3b16e2b7 gpu iq4xs BFloat16 n M=9 K=256
-5756915b645218d8 gpu iq4xs BFloat16 n M=9 K=1024
-88e6e1a8e077fe81 gpu iq4xs BFloat16 t M=12 N=2048 K=1024
-3c569dd72533f6d6 gpu iq4xs BFloat16 t M=12 N=136 K=768
-2b5dd397c0fd0d4c gpu iq4xs BFloat16 t batched M=12
-a5debaa0c965a66a gpu iq4xs BFloat16 t batched-aligned M=12
-ec0aec5a82405af3 gpu iq4xs BFloat16 t x-batched M=12
-2cce098cf9be6023 gpu iq4xs BFloat16 n M=12 K=256
-81d2c02c30c1b158 gpu iq4xs BFloat16 n M=12 K=1024
-3d42042e30085f31 gpu iq4xs BFloat16 t M=17 N=2048 K=1024
-289b9f05d28faba3 gpu iq4xs BFloat16 t M=17 N=136 K=768
-70b28ede0de859b8 gpu iq4xs BFloat16 t batched M=17
-d8aea372dc106f73 gpu iq4xs BFloat16 t batched-aligned M=17
-2990e4703713d14e gpu iq4xs BFloat16 t x-batched M=17
-e0ff648d88f1375d gpu iq4xs BFloat16 n M=17 K=256
-811aec06ea13123e gpu iq4xs BFloat16 n M=17 K=1024
-c6436d30a7783ab0 gpu iq4xs BFloat16 t M=24 N=2048 K=1024
-afdbf7cffda004ec gpu iq4xs BFloat16 t M=24 N=136 K=768
-60e9ab5681428217 gpu iq4xs BFloat16 t batched M=24
-f5911408279b3821 gpu iq4xs BFloat16 t batched-aligned M=24
-e60b538ff88d91a0 gpu iq4xs BFloat16 t x-batched M=24
-4ae3ab2dd564a46f gpu iq4xs BFloat16 n M=24 K=256
-60831f4fae0856e3 gpu iq4xs BFloat16 n M=24 K=1024
-abf54195785c770f gpu iq4xs BFloat16 t M=33 N=2048 K=1024
-21e9bcf9a1d62f49 gpu iq4xs BFloat16 t M=33 N=136 K=768
-4a4e430d2f4ddda2 gpu iq4xs BFloat16 t batched M=33
-15e7acab8df9a235 gpu iq4xs BFloat16 t batched-aligned M=33
-09e060d54d4401be gpu iq4xs BFloat16 t x-batched M=33
-bf9c44fbd28b2f21 gpu iq4xs BFloat16 n M=33 K=256
-0cbcaddf320785dc gpu iq4xs BFloat16 n M=33 K=1024
-69e7c306490d00e5 gpu iq4xs BFloat16 t M=64 N=2048 K=1024
-8cb09847f79c5310 gpu iq4xs BFloat16 t M=64 N=136 K=768
-00421c6145856273 gpu iq4xs BFloat16 t batched M=64
-39f2176a8004a70b gpu iq4xs BFloat16 t batched-aligned M=64
-7f223971a87f5404 gpu iq4xs BFloat16 t x-batched M=64
-ce7f95ef7ce3af27 gpu iq4xs BFloat16 n M=64 K=256
-12334df0c9b2b69f gpu iq4xs BFloat16 n M=64 K=1024
-5fd77859782bd2ef gpu iq4xs BFloat16 t M=512 N=2048 K=1024
-da9725a01d22edcf gpu iq4xs BFloat16 t M=512 N=136 K=768
-54f14f85df879094 gpu iq3s Float32 t M=1 N=2048 K=1024
-1c43f9ab8c4c42c4 gpu iq3s Float32 t M=1 N=136 K=768
-c86743c8b85ba22e gpu iq3s Float32 t batched M=1
-41809e8e9eda41c1 gpu iq3s Float32 t batched-aligned M=1
-84c656c0b941f39f gpu iq3s Float32 t x-batched M=1
-08e2f4ec6eb992b2 gpu iq3s Float32 n M=1 K=256
-fbf4071ce944614e gpu iq3s Float32 n M=1 K=1024
-39a06104c287288d gpu iq3s Float32 t M=9 N=2048 K=1024
-e1415efddc2d4f94 gpu iq3s Float32 t M=9 N=136 K=768
-51412a7ec8314e43 gpu iq3s Float32 t batched M=9
-75d913430052b7ea gpu iq3s Float32 t batched-aligned M=9
-898226b18ede1fc2 gpu iq3s Float32 t x-batched M=9
-1e055bea9a545813 gpu iq3s Float32 n M=9 K=256
-0f1579c46916a7c2 gpu iq3s Float32 n M=9 K=1024
-620acb9bdb7fe741 gpu iq3s Float32 t M=12 N=2048 K=1024
-f6bf8ef94c40369d gpu iq3s Float32 t M=12 N=136 K=768
-5a61626dc6137665 gpu iq3s Float32 t batched M=12
-3ff78a056419eca2 gpu iq3s Float32 t batched-aligned M=12
-d51c582e038297a8 gpu iq3s Float32 t x-batched M=12
-5e35f92be1d76c01 gpu iq3s Float32 n M=12 K=256
-e7c768352cfba90b gpu iq3s Float32 n M=12 K=1024
-c11dd763c267aae3 gpu iq3s Float32 t M=17 N=2048 K=1024
-1d0dea2be95e9968 gpu iq3s Float32 t M=17 N=136 K=768
-7f09ff66d6a592fb gpu iq3s Float32 t batched M=17
-f0750933ccc2158e gpu iq3s Float32 t batched-aligned M=17
-872473c68408cb76 gpu iq3s Float32 t x-batched M=17
-1705a9051acafa7a gpu iq3s Float32 n M=17 K=256
-57625fa9a463850e gpu iq3s Float32 n M=17 K=1024
-658e1298736c2ba4 gpu iq3s Float32 t M=24 N=2048 K=1024
-031a956fbeb84714 gpu iq3s Float32 t M=24 N=136 K=768
-b5a783f5a3cbb054 gpu iq3s Float32 t batched M=24
-0f01d61ad38e37b8 gpu iq3s Float32 t batched-aligned M=24
-7f73ece11f211a72 gpu iq3s Float32 t x-batched M=24
-eb25d5df8d50fbaa gpu iq3s Float32 n M=24 K=256
-97dff4a7c1e2855b gpu iq3s Float32 n M=24 K=1024
-8b4ed4e23878da5b gpu iq3s Float32 t M=33 N=2048 K=1024
-b2ed32bca1c1e18d gpu iq3s Float32 t M=33 N=136 K=768
-95ff65c25579e87f gpu iq3s Float32 t batched M=33
-7d040b664119457e gpu iq3s Float32 t batched-aligned M=33
-4dbebd8d9840f4be gpu iq3s Float32 t x-batched M=33
-563f06be308ad609 gpu iq3s Float32 n M=33 K=256
-97392768ba448230 gpu iq3s Float32 n M=33 K=1024
-56df06d8bbb0b19d gpu iq3s Float32 t M=64 N=2048 K=1024
-8da5cc6f217c80ac gpu iq3s Float32 t M=64 N=136 K=768
-a644311c5fbf73ad gpu iq3s Float32 t batched M=64
-3c7a4468c1ca92fc gpu iq3s Float32 t batched-aligned M=64
-bda2b0b1b2279f69 gpu iq3s Float32 t x-batched M=64
-1db7e6b4596927e2 gpu iq3s Float32 n M=64 K=256
-dbdd92f168e3e244 gpu iq3s Float32 n M=64 K=1024
-c407e9024cf99aa7 gpu iq3s Float32 t M=512 N=2048 K=1024
-390c609c95d373be gpu iq3s Float32 t M=512 N=136 K=768
-655acf01fdada504 gpu iq3s Float16 t M=1 N=2048 K=1024
-56e8435511b64282 gpu iq3s Float16 t M=1 N=136 K=768
-aba90a5392036d4c gpu iq3s Float16 t batched M=1
-4e7b69f497d7fe39 gpu iq3s Float16 t batched-aligned M=1
-1f41420c71b5fa03 gpu iq3s Float16 t x-batched M=1
-a53e4b816c6f8a8c gpu iq3s Float16 n M=1 K=256
-29b4c730aa9c0f09 gpu iq3s Float16 n M=1 K=1024
-b341d6b36c78708d gpu iq3s Float16 t M=9 N=2048 K=1024
-7aefa9cce2060739 gpu iq3s Float16 t M=9 N=136 K=768
-bcc93c7ec2a25f74 gpu iq3s Float16 t batched M=9
-3e033a1b2e2fcdc4 gpu iq3s Float16 t batched-aligned M=9
-91ad48f37877ba10 gpu iq3s Float16 t x-batched M=9
-f949a2b2cd0500d4 gpu iq3s Float16 n M=9 K=256
-d06fa6c42174f95e gpu iq3s Float16 n M=9 K=1024
-7b5e804efd0922e7 gpu iq3s Float16 t M=12 N=2048 K=1024
-7f8fc4fa3ccd1c6a gpu iq3s Float16 t M=12 N=136 K=768
-014db4d186a09daf gpu iq3s Float16 t batched M=12
-23a96de799235399 gpu iq3s Float16 t batched-aligned M=12
-a19675a8bb5162ca gpu iq3s Float16 t x-batched M=12
-3856077c325485b2 gpu iq3s Float16 n M=12 K=256
-b9ed6358c47e61cb gpu iq3s Float16 n M=12 K=1024
-d9a6959bacd25799 gpu iq3s Float16 t M=17 N=2048 K=1024
-3f375a00c750e2e6 gpu iq3s Float16 t M=17 N=136 K=768
-2acc5fa94499e246 gpu iq3s Float16 t batched M=17
-30f7d312f976872a gpu iq3s Float16 t batched-aligned M=17
-f69eefc8a93b5415 gpu iq3s Float16 t x-batched M=17
-36ec030f6f5cca3c gpu iq3s Float16 n M=17 K=256
-b32a0177bb462986 gpu iq3s Float16 n M=17 K=1024
-02a5689bb6e72711 gpu iq3s Float16 t M=24 N=2048 K=1024
-35d28a534c842b47 gpu iq3s Float16 t M=24 N=136 K=768
-89da168048ce70a4 gpu iq3s Float16 t batched M=24
-aa348a5c02cd6208 gpu iq3s Float16 t batched-aligned M=24
-d7345ef95666c946 gpu iq3s Float16 t x-batched M=24
-b52b85095e6c4cf4 gpu iq3s Float16 n M=24 K=256
-e3b9b443cb3b1702 gpu iq3s Float16 n M=24 K=1024
-b6830be66cb109db gpu iq3s Float16 t M=33 N=2048 K=1024
-3f90ab6e2af14c7c gpu iq3s Float16 t M=33 N=136 K=768
-16472cef291531f0 gpu iq3s Float16 t batched M=33
-cf55fa02d482512d gpu iq3s Float16 t batched-aligned M=33
-04eefae4c8ea688a gpu iq3s Float16 t x-batched M=33
-026915903abc1d9a gpu iq3s Float16 n M=33 K=256
-1a6f00f1922e5e10 gpu iq3s Float16 n M=33 K=1024
-93209b368177901b gpu iq3s Float16 t M=64 N=2048 K=1024
-cca718f6311ec06f gpu iq3s Float16 t M=64 N=136 K=768
-0ab16d691598122c gpu iq3s Float16 t batched M=64
-557025fd68d7ca51 gpu iq3s Float16 t batched-aligned M=64
-5618f403c0f05dcf gpu iq3s Float16 t x-batched M=64
-6a831ff841500724 gpu iq3s Float16 n M=64 K=256
-13e27c4be16b9430 gpu iq3s Float16 n M=64 K=1024
-6ce3f38b9179391f gpu iq3s Float16 t M=512 N=2048 K=1024
-220ab09960a9c760 gpu iq3s Float16 t M=512 N=136 K=768
-b78d853653f0d2b3 gpu iq3s BFloat16 t M=1 N=2048 K=1024
-68b2ef884162aaef gpu iq3s BFloat16 t M=1 N=136 K=768
-ba84f556fab6e68f gpu iq3s BFloat16 t batched M=1
-af0547e141b129e3 gpu iq3s BFloat16 t batched-aligned M=1
-db376a7b22d597c3 gpu iq3s BFloat16 t x-batched M=1
-f492e7195bab5e7c gpu iq3s BFloat16 n M=1 K=256
-5c2e2646f1fcd10b gpu iq3s BFloat16 n M=1 K=1024
-2b698d5517f0f9d6 gpu iq3s BFloat16 t M=9 N=2048 K=1024
-f7f8d9708ad8f027 gpu iq3s BFloat16 t M=9 N=136 K=768
-98d58367793daf2a gpu iq3s BFloat16 t batched M=9
-f8e26270ff70d292 gpu iq3s BFloat16 t batched-aligned M=9
-6f4529c68ea543cb gpu iq3s BFloat16 t x-batched M=9
-b1d3723c658c0125 gpu iq3s BFloat16 n M=9 K=256
-205cc86ffe6d50b9 gpu iq3s BFloat16 n M=9 K=1024
-bc7c8e31ef8e93a0 gpu iq3s BFloat16 t M=12 N=2048 K=1024
-58708937ccdf290c gpu iq3s BFloat16 t M=12 N=136 K=768
-a3cc6f16741d0297 gpu iq3s BFloat16 t batched M=12
-ae6670ef6f2dc9f9 gpu iq3s BFloat16 t batched-aligned M=12
-a6a1f41042ebad84 gpu iq3s BFloat16 t x-batched M=12
-af586b5c3c98ba56 gpu iq3s BFloat16 n M=12 K=256
-54f5e36be775cb62 gpu iq3s BFloat16 n M=12 K=1024
-dee74189d467e52f gpu iq3s BFloat16 t M=17 N=2048 K=1024
-9c615023d3a06d67 gpu iq3s BFloat16 t M=17 N=136 K=768
-94f74c16ffdbe922 gpu iq3s BFloat16 t batched M=17
-31561e4514574a53 gpu iq3s BFloat16 t batched-aligned M=17
-61bf76c65d87b1f8 gpu iq3s BFloat16 t x-batched M=17
-88569044fe57902a gpu iq3s BFloat16 n M=17 K=256
-16fcdc0d5283d0b9 gpu iq3s BFloat16 n M=17 K=1024
-e7737bdbb5fef06f gpu iq3s BFloat16 t M=24 N=2048 K=1024
-8cfc3384463e4333 gpu iq3s BFloat16 t M=24 N=136 K=768
-8da7cb057e7b7b59 gpu iq3s BFloat16 t batched M=24
-b562361620c4302a gpu iq3s BFloat16 t batched-aligned M=24
-8ba8b5c41970a5fc gpu iq3s BFloat16 t x-batched M=24
-cc142e92eae05000 gpu iq3s BFloat16 n M=24 K=256
-243d704b609af0d1 gpu iq3s BFloat16 n M=24 K=1024
-a31c32f4b4fe26f6 gpu iq3s BFloat16 t M=33 N=2048 K=1024
-c6310e904d9601d5 gpu iq3s BFloat16 t M=33 N=136 K=768
-8ca3d8d2cb027680 gpu iq3s BFloat16 t batched M=33
-09bb2da2409060f5 gpu iq3s BFloat16 t batched-aligned M=33
-f3d8d51d7ce922a1 gpu iq3s BFloat16 t x-batched M=33
-d6a446ddb26f2cc4 gpu iq3s BFloat16 n M=33 K=256
-b5592370167fd249 gpu iq3s BFloat16 n M=33 K=1024
-0257e4e949da54a2 gpu iq3s BFloat16 t M=64 N=2048 K=1024
-1dba202fc19c7960 gpu iq3s BFloat16 t M=64 N=136 K=768
-375563174da83c4d gpu iq3s BFloat16 t batched M=64
-c286e533c480475c gpu iq3s BFloat16 t batched-aligned M=64
-d17b9f489b1861dd gpu iq3s BFloat16 t x-batched M=64
-41cc5985a2169ed9 gpu iq3s BFloat16 n M=64 K=256
-ced9ad897324f678 gpu iq3s BFloat16 n M=64 K=1024
-fa38401f2ab932a4 gpu iq3s BFloat16 t M=512 N=2048 K=1024
-41cef189151ad37f gpu iq3s BFloat16 t M=512 N=136 K=768
-2355208ab4b8c64d gpu iq4nl Float32 t batched M=64 K=544
-8a51d25855443c24 gpu iq4nl Float16 t batched M=64 K=544
-8731981ce187e6e9 gpu iq4nl BFloat16 t batched M=64 K=544
+818b2f9870681bf0 = keys
+vHb2bjLN
+jf7W6SFH
+mRl5nUn3
+fzRQGcHJ
+HZih5nSe
+ljOi1915
+oxQPNIs2
+Mg08gJ6C
+7rcMwv1t
+D0VtjNSy
+70LgbDO0
+oh4UJ7tv
+_sYfYbXT
+S2a_WqjL
+zlMWSETe
+LdtyDUBB
+q0HqCQV7
+b_g_Rk3A
+v4tTJ4xg
+y0lCEpJX
+DkFpBLV_
+OaeypqL1
+SaLWWm5Y
+rbBXAWiQ
+xlF5yiTQ
+puFDsBOP
+JxVxsr2C
+FnX3NbaS
+yYhdNKhG
+xTcM7fK7
+vrfBIqrw
+fSmnHYkm
+kY7_V-Fj
+tNY_sEco
+Qbqkkn5N
+NOsrmk66
+xpn6g3jQ
+38EqVtDM
+etnc6YEh
+qbaapoqd
+8dCQKpzu
+DF8VcOtG
+CmOhG40O
+yI-YAwfO
+IM47fXr4
+riDRZy0i
+6OA0cMEq
+zLMEZ-VD
+SverRgow
+h2K8qiD4
+xJsGUWXW
+if6jNUdp
+bvAeAQUM
+wB3mQc-6
+2Ou5ZP7Y
+bNIChxJl
+8BkC1Pue
+w6uj18Oq
+ZGyesvCh
+DJffAm0u
+tgSWM23m
+fgoM_8pd
+ea_aYEze
+Vo_iACcj
+WWJKO9Bf
+V5kri64Q
+-6NC6erX
+8zge595U
+dYRMqS5w
+BAg7bQy0
+KeTxLe9q
+5hbOPmjB
+k_YjHv-2
+W-ihdgJl
+YHnTOOH6
+K2IfK-ZK
+5vRRJq_o
+vZQT6lI3
+KVwpVJ7e
+o18by_l_
+coTEnnd0
+QYXf9kkg
+S-5DAOXX
+av3XJ431
+-vdToRcm
+es0oMHbz
+Vnxq7QPk
+ULNeUFOs
+uqqkalNw
+ZLxI-1Pc
+rIgao7sY
+AIHISXmQ
+JJHUJy0d
+wlxyO6pv
+KXK8EmXn
+luFgDElE
+nFbCBr2U
+VEBPckth
+eBmURUoe
+ynmuJ4Tf
+iwU_xpVu
+rLs3pzb9
+2R3W536i
+dkMKMmBA
+bgcr5kM-
+JwfbwP31
+WNYb3iJZ
+70CYAMTz
+-aLWvIcn
+ViuIocY9
+oLoQVRDA
+Axc2jWVO
+V-BiCU9l
+BpcKA6H1
+BjUxu_gy
+-be2Xk88
+7ppvJUFv
+8oRbx4gd
+W-QST7Oe
+1n2bZp2T
+V2haJHHw
+NszG6ZOX
+8gnD4i4d
+6w3K8ahb
+rIMHJiJY
+mzY_kAJe
+1skz3JuM
+zvXwPQMA
+VJIF6TNu
+OgJmVOlH
+EwirZQbI
+rnaG9jiP
+ctEtbPOJ
+cjP1ZRAl
+f3oha9WK
+avXKRync
+m8nKVi7W
+tuQO5pm5
+cC-frBSl
+_o1XtuZ-
+3XXDcrff
+f9loIkRU
+CT0zl1S0
+nD9Mwsqb
+FUMeK2Yb
+v1dy18CQ
+S3uFa9q0
+Q7UMwUvS
+g946yv3d
+9RmL3Gg7
+ixOcZqGU
+g6RDVd9T
+hD7aeleV
+2apHR_gx
+HAtdSv5Y
+nYGYgpnr
+tW1KECCB
+U6wGdMGU
+wpw_3pj0
+a1hYwmH-
+HL7d4GzL
+OZTCEn4L
+DpBF1r0i
+B_NZeZaf
+B_XzoQnC
+ez5pbUhn
+BAjSom9R
+mr-3GeS7
+j2UppXwG
+QaZP4soo
+gfD5QK8x
+3XJN7o2h
+9GRHiaYl
+9YbX53gx
+vespNYyU
+3I9XWhga
+jhlw6YMx
+2wb21_8P
+7kIDycl2
+irSK4Hh-
+HNFUxlAW
+Du2mQ4QH
+moVSbEFT
+KM0ceNuz
+WXYGsLgb
+DccF8WLo
+Lma_4pfL
+TvI6zUH9
+KyBO0DEd
+m2--rS1B
+D6m-3nVS
+RcKYM5AD
+4LUgxmTH
+vE41zuT2
+P7CY3uKs
+QjIAVV2K
+NTW10Ade
+prnvUt7G
+4Bm-MuO3
+du67cini
+TF6gkFDd
+34AhFbqQ
+9SZpPZeg
+CSIjZ5tY
+I6_Y3Pul
+v8vi29AR
+36Sie0-n
+lsjT0QVv
+DF7aQRTS
+Y-cY7JWi
+RNSJ96Zi
+zPq3bipn
+89XHMd2t
+V1Evn8tz
+JyFgdS_9
+Mgwssx-J
+KMs9_S38
+lLF28lHL
+6MMXB7o9
+D1ov7U1O
+SdPExDz8
+8ZRqW_M0
+6Lih7Jwp
+TnCcgLjp
+0mHCcXbA
+M1qm8t3a
+OR-D-Cpd
+FscAr_Mz
+RaOpE-Tx
+uaDUgTeo
+ZP8HoHyg
+JmuqQ4wc
+hwj4ksBF
+zCbsSYJE
+v8ASnCh9
+WgosNo1K
+zyAt_hyr
+hKQLlle9
+7-sVjm7x
+aUMlRRAQ
+SaXNUTN9
+dVCTM1ax
+evhU2HIc
+4-pRCcEh
+Hhu4HwE-
+CzIizB2w
+wr4NOArt
+FxBKkG8e
+zqagFOjK
+I1tasi-S
+7_yOMpEP
+n35Hp1Zp
+QNRN6Ncm
+i1nHaO5f
+OAJd0rGJ
+OJ3vlaL-
+z1LJwaiU
+MymcUyJg
+lx3HkF3A
+PVnskYhk
+pSh5myKQ
+UNG6QXRx
+L-ICaWjG
+LDOVT7y3
+8i7_Ksbt
+PLWlcGmu
+YVhq8C6E
+nlsZN1-I
+IU6e4n-O
+fogD2rFE
+XyaR-4U4
+M9nKPlK5
+OmfBNKbF
+j9jDx4-k
+qekE3uqk
+2xGGRXlc
+FW3rAOar
+HIf8r9yB
+4sl3wQrH
+gp7XPdZf
+UUc5K802
+9r-toj7J
+n8txXR0W
+fvzmjsTJ
+ePJKNoOn
+c0hOwZa0
+d0uRRHVP
+_4N7eNm2
+hVf5jpiH
+cmBwPIPT
+IZ-xidOm
+T2nlsN60
+FnHEQ-9g
+WX6_BZ3m
+SE0DYoss
+jjYOBD2-
+biJAb3Ok
+Bv2PUElB
+33BGgpxV
+2qLBcwEL
+tUytniOE
+z6VArXn5
+HQRmIrsA
+-eI-e_F2
+qGOtcg2p
+TQM1nFJE
+8zFbf7Vv
+pALOCrpp
+gAmuhtQV
+4xhOwY59
+RN3ZnWIV
+LK1-FN0w
+DnSqBe8B
+1QWxH5lg
+axuWI81c
+EOcovTRy
+6lIsGh76
+0uTyw28K
+Eb6HNudu
+4mre8Xrs
+4euGDKBK
+AlLfo2K_
+zscMxTLZ
+dz3GPWeN
+debJv5Wm
+oIKxsFAD
+CZfVW5B-
+RERTj54A
+oWgBoMu_
+iXgWD4Ro
+LG-EB0m2
+7fTxTLuS
+6TFyd604
+WBsNdKJO
+Hy6th0GK
+YldeQSBL
+wqMur1z5
+9FIa_-cI
+g0KVgxlL
+34hDBfbP
+-v5lP_A4
+yKEVCUCS
+WdrI71e2
+wmBiHfaB
+f9taT9Tk
+Kq6jzBgm
+V5rACAib
+ZLZtYjea
+FrEevVoY
+Pdzru28H
+v4wwFqaS
+tlWR7ctq
+x5a4XZIm
+AOoz-y2A
+WvEeIP_L
+Hw0rlhJ6
+dHhgCBeW
+3BvXq9wO
+Z1RyjpNN
+N7unyCSn
+DQwuKKq4
+g7ARyfoV
+AaA7lSHz
+udH9wGuf
+rVSmhKlA
+eprHIBWr
+6U1BrcNo
+HLqbZMy-
+h_X19gJ6
+4W10uNBQ
+xi2PhedP
+tzGmAa2M
+USywdR1p
+Emmvx2IN
+rNTUgdxw
+XjeeadJw
+gOdbxRvg
+va3IA8Aw
+FyiOPHbf
+CkyDEJZM
+YDkf-PJy
+TV_vojuJ
+qMOIIegl
+K5KN2vME
+qCFkla1O
+Fr_yTI3e
+czZGSNL8
+EkHL0Y-l
+UlSvXpeK
+3yWH6YQs
+BQtPNPxI
+zv-tz90t
+QuQmzefs
+VMR_Bwun
+X3X9boyj
+X1MF7n-S
+-6Nx0ua6
+T7Irjgkv
+xERZ1u1G
+5B0U4iGN
+n9SUpdJS
+ZgXqvide
+nYCLEWNG
+yNit9H_-
+fRTUZaHu
+jzA4p1p3
+QBzaxptv
+G0TMeSHc
+qrAT4am4
+oXnfncJQ
+NXVPkz2o
+pi72Uqh9
+IIJh5L9u
+G4DlC-Yi
+swtC0R-A
+PMH7O0lZ
+OZk5JTME
+ULpvKMPu
+NR2MiI9c
+JpHf-GRA
+LR8rYhsA
+01CRCb-G
+uoarXa1F
+I8W1z1jk
+FStlVK9f
+rBashNyL
+WH5lM60v
+WXPgBBmO
+LqoIJp9w
+7wtzuz8F
+As1iOLys
+5he45TW-
+hVZDgUcm
+es17k5l7
+e3a6cXkE
+W0T5u1D4
+emV5GtLM
+NkFGQGtz
+RxeUULzK
+paXuGSXg
+VZzGypnO
+cjqF368h
+uMfAUngm
+mKFPz6gx
+0K0ApARq
+FTZHpf4t
+CbnckT8k
+x3PdZLu7
+7SSe0iTY
+IaZdozv7
+fsHe1v7a
+Ke-iso3E
+tbjyv_Od
+sKJ4QJoA
+NnK_phE-
+l4fkNeh3
+WH__BvRa
+XxsJGc9g
+MoKH3ggt
+xGEMQW5O
+aUc2Sf6-
+6ZWglEkp
+jMV4UGuB
+6PEvHq2y
+R1wDmZ9C
+bn90fjUb
+SAmW7DUd
+QCnYTHBr
+zOd3MFda
+gvcyLtW8
+I_FH9a5R
+-kQL-WI7
+ET6vV7y0
+o6-UFUQL
+FSWUGhpE
+GM2_74eH
+Guk8Ci6e
+GxBxRefX
+bfjZqQgz
+ulBQhi1x
+5bNQofwO
+5akfTPNr
+aTmi2H1c
+INSuSCKJ
+_iF_jQox
+TGu03u2V
+dRVMnoIL
+SZuoqnr2
+uYD32443
+YdDfCa4C
+YC-M_C0Y
+EXW74oqh
+angP5Bbs
+JqCgpgOZ
+ku-MJlhn
+3yuJPlUh
+BlZo2Gep
+K1zwRwTO
+ZnRKMvHk
+j3t6ojmT
+2oyF-ztt
+40OBNKWa
+YBea_k85
+T1Dgc27Z
+AWfF8jPO
+3aW1e0zX
+hDv6so_z
+PQ2kPTRR
+fxh9w_Gn
+p5fAQer7
+WPbDcYne
+HWrftkZ4
+JPRXNa6T
+Avht7yQE
+qgECfxqT
+XZTTfKTC
+MgYx7zTm
+rCMmKsUd
+pgVKXipP
+Rdf8nIny
+66-DNQUr
+hTPshQbc
+3MPj-Y2G
+PsgyuEdt
+mhmzEcdt
+5sMagt1s
+iewq9KCX
+IaI21DZb
+mmG9M1Wa
+yQWHr-z1
+wqFSmsja
+LDZKpAhI
+OAWLK24W
+XVyCK1NR
+juI57wZo
+edgWCqD9
+xBekqj5v
+a3-K2CU6
+Q5bjQktY
+XoVJYhLv
+lk9yREYz
+MKK2IV7d
+2WLVR1W8
+EPS4WL70
+H-vjZQCq
+3sHRwIeM
+QLWviuYS
+Tfa6NMsr
+LRTV-ZuN
+j3rn9AEP
+pzWK1OWa
+iqCQDw6L
+sBTKGMhx
+eiLi1N-q
+WjF3DPVj
+VNojwPfy
+V3StzDFH
+UzCGBjvE
+pQqYpgrc
+iogRtaKV
+EHV3M-Xy
+XLPw8NG6
+LjKJpQa4
+c1wYN5oi
+FMVdC-bu
+KfV6gdwO
+VEh0RmKy
+S6DZrZE8
+OmCwmL1t
+Zkxq5Ylg
+n7gQvDZ5
+Fxl6newH
+hg7sbVJ2
+Vi-qo8ZF
+lQQz6wtC
+uNmiqeV_
+Ro4LkCu-
+sbHO_lm3
+FTdV8DpE
+MLX6dgNT
+ffBkT1Vv
+mttKw6tx
+MdnbHLZC
+N5YZcT6e
+C4CnvrNy
+WzIfopo0
+oqQlquOd
+H23mM8cK
+VEHoC4r2
+WcxdHwK0
+0BzLog8z
+mWK6S9ws
+RSfQw8Xk
+It2Qer9T
+fL7RJvCy
+umTEnwot
+5itkETx4
+vRajVqg6
+OL1Bn6D9
+c9EB8VGo
+finAtAO2
+IDGxb67-
+qNYMHPTm
+xWZqUjZ9
+VsWqKKdj
+fjAIprTm
+IG7QjwBn
+5cBZGrie
+uPdHI_-S
+rZLSvpVJ
+wcaFupoX
+hfG05Qi9
+aqpzdbQm
+xirbPNfi
+HFKJNrh0
+8njUQWFh
+R3EzA8YS
+DEya5uXA
+b9ZaAQ7v
+6wFiWO0T
+xLRin7ll
+p6djQPrW
+vlyVkKUv
+zQE1TCoa
+ZVERmQ7f
+CnUhXHiC
+GPJ9fWmi
+MjdZoEdx
+MHJvquZf
+NzTMdok5
+8YTrC81g
+nsPT89Rm
+uM7Sd9fr
+5tLaAru8
+ws2-5ZXK
+RIWV_YNx
+pqplUHpw
+O5z13j-J
+TSvJM9gs
+ZgqD4L1k
+auYevLNJ
+gQ2GvU0T
+SAcQEf2o
+Bs2czL9D
+cyGRF6GH
+WFso7C3G
+Vr0JhAh5
+rhtORIdz
+2ZMhulXQ
+nYY5PEwi
+1lz_M-XM
+6TnOqq-o
+OpoDiRlJ
+fTFCk5l6
+nFojUgJz
+u6dvzOvK
+Qs4-nSSu
+V2splse5
+DjOQU54c
+luENgN1r
+wIfKrCb9
+VpABJXn3
+oQQUhs_5
+hd6fOjID
+Vrs0jo7s
+08xfEsgl
+co6X_Ixo
+g_WWGEoG
+uSMPpDKI
+0q9RWbuI
+EZ7vT0jq
+fAupzlDJ
+hegs2_Hv
+siiof1L6
+4NuvsGTn
+PEZupkhD
+3zr8OZf7
+KyKfIqck
+63e8zMxx
+2UNgq_Sk
+yGkJP1jT
+m4BoCC8H
+kZFrhlCe
+fuiLxHSq
+xkyS4T5B
+JkuxVmoE
+-3_hNp5O
+XUAoJKSJ
+vaX6R4mE
+PfBRGRLE
+SWCiWxKU
+j22kd7p8
+4WLTZdmM
+ZdOb3W01
+AebHqyCY
+WJr1V7Mk
+UbgeXsRx
+qMAj5fPq
+cDZjxrTW
+-V4gdwoB
+OuGN-agG
+raBPlvEh
+oHG7d_XC
+opjfHfWa
+L_ilFw8u
+3jv7RF6_
+g5IPVkDQ
+q5U-IVRM
+aoi6YiN0
+iGU5f5X6
+gb9jqSRl
+gucYJ1Lr
+5Z2KhpF4
+TUcYcPaQ
+SL_3cqaX
+Zq3VGwHW
+QI42GWnh
+yruJDk45
+XpSOSbB7
+iVc_2XE2
+2z6E83V2
+Fth6kscl
+iKUpOrfw
+ZkVg5DMp
+Vy76v-7j
+sugLCOOd
+wk6_ClW2
+pP12O_Tr
+lBw-dRyg
+ce_kyvMt
+JyhsCUw-
+_B879vOf
+TI59ocfj
+CgRL47jo
+jttUcRie
+ohDBiXKB
+QWvdUH0_
+CrMBDyWR
+KXk2dflb
+FkCGCVjU
+sDHj6y1P
+wSPKtQHP
+pCBpBVK8
+xQtXOkLW
+B18jTk9h
+ynwBPROg
+fPE_bXIz
+4qCbo_8y
+oXelAle1
+kx7mMOjm
+P2ivvyZ5
+ipuxEvpV
+Mc7oIv2e
+PJC4mhW9
+WWzSs1Mq
+_JaGjFpr
+R2SQe1Bz
+f3mHXFID
+Oo5Y3HnP
+NjnUZo1c
+OByOe47Z
+fQ99qZ0S
+ply8QfnL
+caau-VJQ
+8Eq3TiO-
+X3BMnH_q
+TPjBniAi
+HfWx9qQo
+ui29zllO
+r0_wt8Nu
+COJvpYuI
+4u2WAaUX
+sf1ANcz1
+s0-vZCq0
+X6ttLEgY
+ZMEVmTTY
+eUeHMQ0W
+1SyN-Qw_
+84P4iJg0
+iSKvva0_
+WprmjIm2
+FWlPbI3F
+1hMUdUvs
+Xl5dyENR
+_oAqF6_Z
+C_FtxIN6
+BaYmx0Lh
+1kxwj9yl
+Kw6-rZ3I
+Jft8Oj9J
+pkRPlX1Y
+lmkNl7KO
+GGdJ12j6
+95Mbmzxb
+Ocs79dq3
+QFa0fNEz
+CFz-YZ3k
+Ou9nLX2U
+XjqSvyap
+OHYbGepZ
+Fe4xZV6F
+qNqL_MRR
+6MrTo42z
+7RO6e7t7
+B8OEdm9M
+vJ1pEzJK
+LuOAismI
+4mpAH5qi
+6tw5tiEx
+ZkfNav7X
+cexEpwha
+8n8YOJOj
+xmjRv80P
+t3jfwfCB
+wPQk6qeC
+wCR8-8qD
+GayRN8JM
+4jgH0Nht
+BxbyD_Cj
+iHmtpSRh
+TsidqQur
+ihtk_4Za
+G45Lvt9m
+9LgfbwIq
+sjjYXw8F
+fKE3RE3b
+uswwCKPq
+TEVGp97e
+YEFew_74
+MUjfVG8a
+l3RXVkdE
+DGEPtXf2
+7-hwmCcu
+7sW_a0vw
+qcH8JwlQ
+-kRzA-br
+xD5-WXCp
+bnVeUX6y
+7YCOupSu
+DAXm6rWg
+Byig-U7G
+-VtxMI1Y
+nwCtLdYM
+sb9zzHCq
+UyMN3IKP
+hdISt4-E
+lRKR_D4j
+FzdyPEqo
+4yvOjOo5
+qL33meTR
+jusketSs
+wBDviqQG
+6w-N6Oqy
+aleXFH-Q
+UF0Xigd5
+ee_vyfre
+nIYIa78V
+xf9X6cLK
+A5FBo1FP
+6bFZbzIR
+l1kAn7o0
+M7XeYMCh
+g_H6WxdN
+z76SAPlQ
+qulnLd50
+gJ_bPeLu
+yGuREn7u
+gJh5emtk
+5-2GHYMc
+amy1QmBe
+3rUB7Z2X
+bDQOaGIT
+WabJ0sM-
+Qo39zZ27
+gR0NLfgD
+ZaYl6y_7
+S2rCGBQh
+5p2mZldP
+_8eL6Xe3
+KC3W7RCc
+N_-FXIht
+X39nvbOQ
+qHpWSe-G
+kaYr_V3B
+cs1cT3FQ
+E88ttgGo
+ZBdF2r8q
+scJpyA9A
+_GYT2cgu
+Rfp4Ki3D
+uI1f8RIC
+sXUnETFS
+nV7ni0-_
+09mC7zxH
+Iffe23rg
+pecGyMgh
+e-FkuiRf
+XmMqJarl
+BXxQ9iUX
+xeBdB9ec
+0U5_NIZX
+W7pIJsmT
+12yAbAJL
+LS_q5NpB
+qq6HLft5
+VwJpBzC5
+PLovaF1_
+cCqIbfLZ
+2ukBLev4
+7oVEurJA
+9kPIJBsL
+E9KbtORU
+Y-qeZhPt
+AfnoR1FP
+3A6pQ_ZX
+TC7zWZJC
+7Noy-rqL
+Aw1u871v
+dsuXDUoO
+gzltCU5X
+nADINjEG
+7MZiOukM
+v89dpEnM
+xjX7MEf3
+lTQWD6if
+TLctzlx8
+E_ZysFTy
+lQwNfblG
+Vcl_XlCg
+-SowNlzW
+y2VEXPCZ
+hcF5lQ1r
+0WJ2Y6mE
+DmX6Ulq2
+DiofhN3o
+k3MJE4np
+G1_-w01_
+E2hYlO05
+qHzrlPfu
+R-rWMoD0
+mrBhsPq4
+cFAl3bTN
+4offkFSI
+UajvAbxR
+pbYuf7E0
+62d3ydVE
+jXmIfd19
+h5BS5Oo-
+M5NQuvhs
+sCtMIj5V
+mbNg_fmI
+EnSZwBkZ
+20hSNQxV
+GppZE-NX
+kf0VLu3r
+BOWDOsPe
+huYLi4TD
+XtdF8tT5
+88fO1Q4O
+YIxwu5e3
+6s4Hb74P
+rQCwcQ8U
+OEX_vfNf
+7nx4dfZo
+5I_YJI08
+7HJ6Qled
+IIb8gXLs
+K7yMURW4
+NAyfT-kf
+BDUQpBZP
+NIixXOBQ
+8AH2ulcr
+bp6kiO7J
+yyQ94dvM
+vkIkfZHV
+kCMv2uxt
+AzZ3kpkL
+jxtuV4WX
+xv1-Lx3o
+BOBhzPX2
+b5QLxMN4
+iLYF2h5n
+fgY-c2Ja
+tVSvckfn
+Ql7C0WMu
+VBsTsm8n
+5CM2sdE3
+9aPYtA9Y
+ZxIyZ6Zw
+Zo1GmGXR
+CN54fn27
+pJZWnPOr
+ns-OQf3l
+ZCa4vz8O
+3vzUxbrB
+foLajt80
+icuh0iPv
+vtjiMhz1
+j3rrCMkA
+2Ho6Ozn3
+9JpILq10
+lamEAobB
+3hYfOjCn
+Bzsi9yXG
+5DoiYxxl
+Oydarlrv
+Jmq7IcXv
+CMWWm7v4
+W1vuZMKH
+ybbBfbcN
+ISjfhIzf
+8c6HqLNi
+ueh39VPq
+TN9ca8V5
+SWMHxEP1
+bvfV0y9J
+2qy7rgKH
+ms-7QQM3
+P0aUYxj6
+nfi_9QuS
+TDGhrpEn
+q8agKOKr
+ZKMq4IYO
+TdnBI_Ss
+mOztfBTH
+ASKrAQNF
+q9KUoBhV
+YTD0jqhM
+47DHx6Kh
+MZpEJvMK
+ZwFVMs1j
+Fkww4pLV
+UNfN-_W4
+CtfqyBC0
+6NCSxczQ
+UZZqKHMH
+ayGzTDem
+teNDh7lS
+Ca__f_Tf
+4Hx17aic
+8eE6jyra
+gVNQFGCV
+j2aYvxDv
+kM8qCBIg
+z2CEN6Ea
+foxznEcI
+O4-22Y2L
+h6jlWS5s
+gO8V4ar2
+QwUheaHR
+SdZnhUkc
+vD_cZcQR
+kUDpyNlW
+KRQroEuW
+OOzefPxn
+4E_Sekmw
+CmuWO--P
+sB7LBbHk
+H3Qv4oqq
+hOyqcYlS
+Whzx2_CA
+8w2IWdNW
+PwlI_gA7
+HG20EbZ1
+zL9b5cZv
+xjHJwdD3
+uzCgSogS
+x9Lm16Nm
+MEje_evX
+pux1ojdH
+2S1E9GNj
+uNXxaBhT
+OC7RUQo6
+HdRyWzz_
+8LjGanTi
+D76RyY5I
+FjE56Qt7
+3RBLsUdq
+3aKaqKVT
+1MxMxeuU
+bW_76py0
+ME0cawmH
+j_j5YZoz
+LjArRfv7
+kbG9HxZ4
+bfCcijU-
+lOqFC_rD
+bED2IJUF
+Ma0XsHRx
+RpLwqC7l
+bkDmfGbD
+dSJIncX1
+OAGbeSRZ
+dTY1e2PP
+u0uHmo0u
+_h3M-93U
+ZXQ9hC1x
+ZoWTJ1Sx
+FiRWp1zy
+ijtINN8I
+4Z00MXTQ
+s7x7xZME
+YUxvneCW
+5KLlI6lS
+PNNp3nX3
+z45ieCls
+7SyiLL-q
+Vyie--xJ
+KVDcy7Ht
+F1wXHr0E
+WVHpXf2Q
+ksZZeFON
+pgCfLdxf
+ajutDg9a
+5wCjLJ26
+0RNQlgIf
+YMaLAPYB
+Mg0fds19
+xAia_Uv4
+gc2NP7xE
+NL0DqGvf
+FgKeSDRl
+4iSV1mzN
+AzRWwOwI
+UrkxcaXS
+NnbOEyDw
+iioCpgUi
+-1S7DvMF
+uqZKAdXn
+ix_jzk3W
+a1_LeuoI
+z3yft7Ou
+_gMJobEO
+aGpDJH7F
+z5innqhB
+vnsFI4hQ
+j9ECNGLm
+gDHolULv
+PgXl5p-z
+YCxnANWI
+5f7vyVQM
+Ln2oGTY5
+6Acw8ry8
+i2ahKKAo
+tVEczx1r
+_648ImKh
+ahPRp_dx
+D1DF69H4
+Pk3ivtmC
+WeQNldx4
+8nbuEghM
+DsbtQqJG
+FC30Iacg
+tjpnKZiK
+objqGSws
+gkTYJMWw
+__VdHFxc
+tReZSeqn
+fz0CEfDn
+bVzkWtpo
+kl-5GWMD
+cNLYP5RY
+rTesiK0q
+8rg7Ahib
+Rsigs5xW
+8Ulz-BmD
+aesANg9J
+0uJuL4uo
+rSPMCCUS
+dTDYWT8Q
+4UCoAsOZ
+8CFOeZsz
+KGjORR1m
+eq6xhmeG
+DKsq8GRU
+J0wSgFnw
+nArh9UAj
+FbLpApsH
+xtv9epvK
+5nhb2atA
+XvsVPoq_
+hfIEDsqB
+RlUlGk1p
+CPsyjQ9W
+3kEiP--7
+XkZNEBMd
+U4DaPMCd
+QLR5qX1t
+7nVJXL4D
+4DgQN2Bv
+uDPKebrA
+wJKhhZJc
+qIwybaO4
+keHbDXTA
+_sWSlDPA
+epP4z_mm
+ChSxePSN
+K9wmniJf
+UbVy95Su
+tsew1jdW
+7r4mQmHb
+YCqu24iO
+SHDU0jF8
+5c-no6xU
+MMBXtFp1
+afSuHLAF
+gbdTLubW
+Yb2T-ADa
+WlrkhbQE
+30RcSsOq
+SvI-BVfL
+GGf_6TVY
+RVqGEvUc
+UEa7vZsd
+20pilTWA
+q85Ju8L0
+vKulqF6p
+ra-pNifO
+wJVJ2hR3
+7nTXq2wS
+L_i3PUb9
+7e1AmXpd
+mBSsNVQM
+z9DHSqsn
+lDkmZld6
+XOFL-39h
+YSC9APoQ
+wsUBNNof
+JqLQJeuR
+I767Mvke
+5-K6Ohbr
+q8Vtw1Ak
+cc83IqOA
+I7EdHlh-
+cb9FUS-o
+hKi8m9cU
+e1fRU3Zg
+CoZKOW1c
+kCC5Zjgt
+7UHaqjj-
+LHOikNg5
+5Ylcx8HZ
+pXpKrX00
+r41hjgVA
+ZDK4bx7f
+hePwaEYd
+jwmpIXHs
+3IpSgzsd
+7i2U8Gjv
+J_dowlAf
+ZBeo5I3p
+9uVjG-A9
+vapPI8SD
+3Xkh1GM9
+MJOLx7Q0
+lb4CtbD7
+0paC-4x1
+pYAg5a2p
+0-NPRj08
+TWFZfFHJ
+Yp_I9Klh
+SHPRRYnR
+h-BWKRfs
+hQsMcGVE
+d6VVhRx_
+8J-QxAgM
+tCkMQjlL
+a6ZkW-h3
+nR6RNj4C
+wP5lp7Ow
+BCY2czSr
+i54j8BMK
+cBlEQJLL
+LXZJ0awv
+4_hC4Quh
+ONHQuy7u
+p4Mb97hz
+qYkOACdE
+m4OOXAVx
+Fp2A90iK
+AocYGCEI
+-VZvRtZv
+XMZ7K507
+1_CdGXWa
+LuyicRk_
+Sw1UUypn
+xXs8_wR4
+LWOMDh5i
+8taX31KK
+KUJvf2F6
+G1T7A90w
+cT4PR-cM
+FDHWUHbM
+76G1td0r
+ieFTaqQV
+WW0w4DJf
+Vi4CnvMG
+865p_P5A
+arIjjU3H
+L6OnKudk
+qr1hQNzo
+4ysYdZOb
+C6WqgBq7
+Pv_BWqb7
+v5jOMsAf
+6YWfJni8
+_qFARGOp
+8DsBU2Rk
+r05PFCUU
+L--wcqXq
+j5oURD5X
+w6nJSXQC
+P3lxc2I-
+azhz3BH0
+L8KjqMG4
+9E-W8HFK
+JK2HGmgc
+-h29lfuv
+1wgKv3Jn
+3yPExbGM
+i-9TIQvP
+PAprMMIr
+SHC6TTXB
+Doi1h3aJ
+fAiy3Y9K
+Ndd9JcmX
+pAXETRrQ
+J5Fg8-RD
+AemBTkr7
+RfC6MkqR
+0iqApjdh
+4OO5ULzM
+6O1ws63k
+ZqNfRHDJ
+4V-x7BXy
+bq-j4cUB
+3vFr8WRk
+xm-4djk7
+al4tISod
+rvTrv3Wq
+PVY7Ufuz
+h2QAeC3e
+IPClKi9G
+q0W-IYDn
+eQNAutym
+bTf0bS_x
+-3MqdQKF
+OwqBp-zl
+YiNrpPdH
+yZLVMMUY
+KAw3OEpF
+hX7U2dam
+rkK5EiTm
+vX902R_h
+nR8tpLJr
+XPOHiZu0
+U52KOpt8
+81K8oBFI
+TKzrSx6a
+CgcylPzm
+MEZnbpNu
+ogQ8wMER
+6jZ_62ly
+PLRm9rRp
+m_SllpWn
+WE6VDdxh
+lc5zbbVb
+UVLD5cg9
+nfWSMoxI
+pZtCcKmN
+eoypetsd
+PzaYFOOq
+PyCaWK0W
+eMea1ntG
+Ow4cW1CL
+p695X2bV
+fb679DhU
+3LSW_vLQ
+70WWe4Ak
+-o5pctsq
+SwWha_PW
+_ZIAwxj-
+RnCmzJi_
+xfxacgYP
+-5X33vr-
+VUQvtYFh
+d_UaAUDF
+jz0Ynf6h
+3BLPs9K9
+aLxqarva
+P2SdEv9a
+S157AnVF
+7VC9w2Du
+Vm3NX7MW
+fIQV-0s-
+2My4GBTJ
+VYMKGdvW
+OG4T0Vhd
+Il5NqhgT
+WD1rs7rb
+Iuavb9nn
+PSt-8_j2
+WsmyzhAC
+6Jptw2pZ
+qqpG-KRu
+FV8jRR3k
+1E24d9Se
+4tDTBLuM
+Lyky3MGD
+0CmYKSDw
+ZY1iE3-Z
+FexJY96X
+dt-NWGqL
+ELel7sQp
+yQEu0RKF
+oETXq8aj
+BKVM_Okq
+-mt4iWFt
+wN0ywiYs
+fxNEx3vB
+evH0p6-7
+rfwrmK8v
+AzqblQJB
+SYTg7EcN
+Neqe21H3
+CcgDjASx
+NNaY6qIx
+AL5d-tCZ
+k5Ps9lSJ
+sGG6OHVN
+8GoRmXG3
+WSF_4sqG
+CCqOhda8
+vUUmzvHV
+OrJmPN6O
+hgUv-Gqc
+yfcBt99D
+B9MPxCVz
+YedVqfSI
+4IYzRM_0
+1-gkde9o
+47h2Yoga
+DPZm8cSp
+IW9-qynz
+X0dfUFuT
+QTQEd4iK
+zSzVRndU
+W5tyQCQo
+FJrBs2gy
+g13oPiwy
+8mdhPjNI
+kOZ3Iz3t
+AFvbJ0AF
+mQ4tE30d
+BjCoz8QV
+2aertaA5
+hZg6bt4v
+dLSOkV_w
+bf2QOSwl
+n_yGRp98
+Hx1eeqjL
+oLfuYNxJ
+UBrTT1pT
+WmbquQcK
+qjGqUZu6
+qBwiwyVp
+-FZCIqeA
+vNjMkDLz
+FGSTUvb2
+p44M-cQw
+YJhuHTsD
+BidMKMHX
+COHTSWFq
+axZ5RWfk
+6TKIVPo6
+W441wX0T
+9eH2ajdO
+yVmxDr_D
+XYXITy4r
+TiGuZugj
+sZhxbFwa
+r2hIzE4p
+JTa7Zu5U
+JrFLXiBj
+D1N5kI5j
+ugweWvLu
+KRqDyXQi
+hXWVGI0B
+xjkWR2DM
+xv9Hnox2
+033u5maz
+lMNvM2Cd
+p0lpETzr
+uJ7y6S5U
+1jp-Mxul
+zFPaoMNb
+LEgUA7mX
+GAKUB5eI
+JOSBviGl
+nOTNh41v
+8pyh8kZs
+tUhBHPGC
+da9goRps
+Ov5tdkle
+g3GNebVa
+-nDdSCTU
+rrilBzFR
+9ALg2u23
+K6StMXIF
+9n2swoQD
+4QMsfItB
+Lws40bdA
+KtDVtK4U
+ZfBJwxPa
+p1rKn_kh
+T1iRHknd
+DgfZtndN
+Dv70izXL
+AfPTvpdE
+28eGe3Lm
+kS4wJ6QX
+OlvlR9C4
+uEymJGlT
+gFDNjRcc
+_75N3uWT
+yJmOEFBA
+9Q6hKAqN
+ao4wFVP0
+c_LfTX5q
+hK5WDg0R
+JHUYT3ZM
+RnmaLhs9
+zy5PTGq5
+8KlvQI65
+gA_suP0E
+iekcGpjC
+IBR2tq5s
+Rges2gpv
+U_vOMJtA
+h7_o4gyp
+9LcRR8Cc
+oNsyBpMY
+CWlmWxlX
+Q__ijKB9
+bVFP8IzN
+gA6ZBUcR
+JqDBA9N4
+kPJbFSDT
+uF8gThXk
+AEAX4X8c
+RpLzL50B
+GnY8CEc3
+q4r0whdQ
+aiZM06fl
+s8CDm3wP
+Q4iZtVQN
+gxc0SdYO
+dMIGhLjZ
+25mi2RuA
+O9TdiU2-
+jCTdBIxZ
+zbkvFzRY
+icg2kLUG
+JdH287Z2
+Q24obq7h
+8RtX7L5Y
+PC8rw9Uo
+lMUz_3Zr
+mOx61prG
+DW8ysKOX
+Ba80pgVI
+nIuVrp--
+GnBrK7UO
+RFDSZ1ji
+S2SuRQht
+gr4PNxzA
+BtzLlITN
+oBm4Fk92
+jNkXSSur
+iE6H8CEH
+t4MR2FMc
+1CoCGcZ5
+oQCmASiN
+VurmhJMv
+2f3Ervdo
+kKfUSv7n
+6dVLmLvr
+pm8oXsBY
+DsLqK8yy
+sNGOcgUl
+oXkGkEAj
+fW5Qx9M_
+6wzpGtZE
+-Gstv3Vg
+I3GLQqh6
+6tiOE720
+BVzcLlyO
+CUgohtwC
+Jd6_Hj6J
+PMWQIwHM
+ZLWKh8la
+6ASJwlFs
+Hh5a8jHc
+h8FnePHU
+nqqAjD1O
+iWCspC_N
+Zzyknezx
+en7EN9ES
+1ucyhGgV
+-vjC710q
+7e1gdkKX
+yD2IXJtu
+K_8i3YB_
+h8ftQRHh
+9dauQtUv
+CpedSZdj
+XlnxXsGv
+Rf9NkIrR
+ln2MyrEI
+yzmZLbU0
+DjP9Smur
+HTs0Kr1a
+E_gJgcOv
+jfdv6l_p
+YGHYxzS4
+qBvbERiq
+DL0cnJr1
+ZAXcF1J0
+65HXJebr
+OrKxGYYC
+6w2-Nolw
+h2n6b1BR
+KdKnMBeB
+nc8tB7bq
+0aQEZHES
+8NsJKuOq
+FvOc0bRT
+aZ3_PLZw
+JjQJjMo7
+5v_YzI_m
+0zDx1tPk
+eJwutpR7
+2AKxMMIL
+5pjPZx3y
+UbnuAWLd
+YRvzdlIG
+g2NtPlZh
+5bpdFAYT
+zlKiWZVG
+I1ftSRZl
+K5zWAWso
+L_4oVtAG
+OUpOXaK-
+25JM1GLg
+erRpZPgs
+onird5oZ
+bXe4utRv
+_kMT2x4A
+p4dqvXNb
+_Oee8MRm
+ypPkfgCP
+Ug6_9NM6
+AqfB8B9y
+_ipxdtJV
+E0hYawWr
+pzJ19AmW
+aJBPAbpg
+SrvqyRcB
+64d0m8kZ
+-2wAhBku
+_ndYmYtk
+janb-ge6
+axjnwHSw
+F4X7Y0tc
+5E67xacM
+xFyK0suj
+8sWWnd7h
+VzYRPkRJ
+ZlJFOiar
+K5016qXt
+tXx4Z0IA
+1eQPMncD
+Qr1R4prY
+NYte1EkQ
+q0LqvK4A
+bmj9JYm5
+cQqxVDOm
+lpjLw-MJ
+FjGGKseP
+jTLKGGZZ
+NfvI2fg6
+E9ASumkw
+3WXGbpdx
+WQtB9JFy
+gXEWwjbU
+SOIp1gYB
+QlbeX-AE
+fWXZ_7N3
+A6hsbXJ5
+C3czKpZe
+0IflIH4j
+8keLB5dQ
+5jpFtwC2
+bViTzANJ
+aEoklF2A
+6kOyWlEE
+mq-jfTOl
+9UsjTxJn
+zztkLGan
+RKw8_TsU
+b7v0WHj4
+kdRJAsD0
+XD2Kz5Q-
+pPRkxfTv
+j7ae9IP4
+Mr2LKJCV
+y-WzbrG0
+DzXZbzO4
+HTkqhRIa
+ULtC_zPL
+BIEE_Ti7
+ZIIcdSFC
+DFRI1GrC
+xE0MhKPo
+Y-ecf65U
+R0G-Bw66
+63LUbwnd
+0_vJWBSr
+amCjc13I
+i1Q9binB
+-PZhm9hU
+VgOv0WkT
+WRKqH5oe
+uNGdL_5K
+fOSUI0KR
+VKDzI3O7
+4qndBjzK
+j4MJCZgL
+SXmzSGkP
+PiHMcKYd
+aEzAR-ug
+K8wKpo4n
+HXzUSRuK
+aDGLilAt
+VLCPLbtJ
+GuNYOYjt
+jBjM3F1i
+saSC0CN5
+-xx8Ys3N
+VgCdBRj4
+II6bxX7i
+j-09SR4_
+kC9_bLGd
+PhYfOkfd
+M9IRKKus
+n9zZZ1Ir
+FuIjB-RN
+0pF0xCbG
+AkwjUxix
+qmJNEW6q
+-P60Py0R
+9xgnDEVh
+w9EKWIFX
+C5V-v-Vy
+_Loy4zXB
+j8rvDhMm
+MGrvuhjV
+h9xMj4Wb
+zmdgxgoB
+n-2X6Ik0
+4_FO-lE1
+WpemOyJr
+4cWB0Qkk
+xzCOK2B5
+6rzTYFvM
+V4kLKZpE
+EF9dD73-
+EOjRzn23
+5Wd7LrPI
+Ja_Gz0Qi
+xO0c0gsm
+6ipMdIdt
+AYw2zggA
+qgT4_lcD
+hG03x1_C
+Lpng1_ll
+4Yo0D4Kl
+PcE1fuB2
+8MfPj3Qh
+qHcSEEmQ
+uhLaRa_-
+VxNaG_G1
+5BpmJ1jU
+UDfVqK1M
+mB5H8sOb
+ryo_G8XJ
+_eL9mCVV
+Cz1wuTZU
+uEPF3lCM
+uXNNVndo
+YN2HZUtv
+shkGseFo
+-xFx0iOK
+11TXbxPo
+vKz-zOl4
+0X7yvr6K
+Y-1LEynl
+vT4GE8rE
+tPSXsE6E
+f1U2bovj
+COekqtew
+9FQaybLW
+UeY7XEER
+_BNZ2LOu
+68AKQjOV
+-uthjoJ9
+JmnifdLB
+eMb3iwhI
+6dQc1LFf
+w0d2aex3
+othFBpOw
+oMy72Gcx
+Fg8UPRx6
+su-tc7bt
+QVrPrm9J
+PlijX9SF
+VKzML4wx
+IRkNf8j0
+qfeFDyvN
+n900rZPe
+jpRsinXx
+eAQFAGdu
+GdfvhZzW
+aoRYRoyg
+f28qtbZ8
+qFkfkrGV
+h9eC5NNY
+GkH-SR0Q
+vGIrYyCz
+3lwaCDrm
+zHExxz7p
+sxY5cj-O
+3GJ1jo7S
+0Jsqf0DV
+GENebvHn
+S8ttYU0f
+O4aEIlZK
+-F_wplXV
+4xhXj6Ob
+1ftntow5
+qkKFcG0o
+_wA_vLH1
+uVF3eYJ2
+Pna4zZ0j
+1wFiqMOU
+xFpTHoNB
+WD8UKzM2
+v6lirwrF
+Lm9WdoKk
+HzkItfDi
+MYNpYDpU
+T5-zC8vw
+EYh-O-nn
+kfFU7Grc
+gfHulX8P
+Il7bMHTo
+YSErsyaK
+4oL77UGv
+3H-PgoT5
+h4JMwxtI
+olB6GYyi
+_wa777Ij
+j2l_vUNw
+HBmrG6cG
+KoJlx42o
+50m_uO5h
+CX91GFum
+JfIOmISi
+uuY01afx
+7Yi1OpvK
+Gqh2-67u
+GeAC-odo
+hp-s33io
+t4LEqOso
+0shRLEiU
+7-o_k76Q
+CMQ3Uacq
+7Nqk_oV-
+4reWG77g
+J__hdxNV
+Wo60PMtm
+1FZuhUcO
+zR_Imo15
+K6FuYUQV
+NwumZrb4
+am4D3oXk
+9mwnwa3_
+TwR8IFP1
+pe7N1ou9
+Vq_dCdDs
+sNwaEqH2
+Ru3bIKkf
+N3pC1vpq
+1-CuzyY0
+e18bRyTm
+b45iah7L
+wZezVoiZ
+LoY7_JtY
+9csG7TsW
+V1aRW2RS
+iObhqOB3
+PFad1yUz
+K13Tl8D9
+pd66oMll
+7ArsWoJA
+LM4JjPm-
+gdLALDDB
+PUIELjAI
+KJufBdKP
+cLKO3g3o
+2K6jctwQ
+KZDkcDcT
+4P9kjYjx
+gRrsBuoT
+xkNtMKd4
+r9v3z_2g
+YOmrVoFC
+9ZEUCCeb
+5gtTj_iN
+SuOrLdVk
+YIMfT64I
+q_VBlXhc
+Iem8-aHW
+Sk5DDS9N
+Feesq435
+CeBg1U1E
+v5xE-9KL
+DLyt3zIH
+aefDBkkN
+jLCYR_ec
+AEIcYUWF
+OfIXaoAE
+fyI5cah_
+zn-V73zj
+EjNN8Mmy
+X9d4WXgr
+2pcloB0i
+VPFPhd-H
+HEP5q4xM
+yGdDyLhb
+QYCejp7a
+hMZWwLlB
+COL07G65
+-_QHHOlE
+OaBhBMKH
+4UFe_dwt
+UUEqfsgx
+ddkTQwBS
+iYImsY7e
+HgVb6ppU
+DxV5xGkW
+YgrLm9t_
+9r-O-UxA
+WmFibcYT
+P_eKBWQZ
+1RxYLgOC
+XjX5K-HX
+58doNSz7
+wR3XY8Jn
+HQ3qK-le
+fwn_Ztal
+8HUJM8zC
+hyRzxoQI
+FwWpBRrK
+V2JfqaRj
+ZY4SmHNs
+AxqVb764
+taeD9aPL
+DwHWGtOO
+f3Ps4R8h
+6yXV341Q
+l9_0p8Hi
+i07U4jh4
+su0yvKHB
+lf9lwlV5
+fQQLZkEZ
+Tb69jZhA
+Vj8GvjCK
+lzknaLpE
+Vt8G2Luw
+jaXMbyF8
+pkQxHF-_
+PHpEaMHK
+vaKwsbIn
+HbfmtFlp
+292S8Wjj
+xAfpAkz5
+OQxgnJXT
+ZVrPAf2t
+VuhDVRG2
+q6kKU5ID
+Tntp9JfX
+H0FCDHG1
+pT5LgWxv
+KbTHMKqc
+s0HWs2x4
+eu-pzOIG
+vMk8fsKi
+PgM6Gy4v
+ka1I83h3
+-Umiss0F
+0G-mxCF0
+e16ATv0J
+f4_E-jzN
+AU200Yag
+I6lt55kj
+oZZ1qLtR
+OFYHfDJU
+ue1jWMR-
+2aaVm6zS
+PzdaAMdQ
+KsxfqUSZ
+MPfTEvl2
+9p7vyKk7
+NuwDD29c
+syoBd7tG
+AqVom7bn
+NdKKU0yE
+idoWgEjO
+qjSKXALN
+1zRe-VZm
+tSuFCV5s
+47m0Q8s7
+toML5myx
+P5Crbirx
+Fkcs7ykV
+z1X6AtSC
+BO765Mjq
+AmkVkDq8
+Gm8A8ZIu
+kyCbNoF3
+zKcY9jEe
+CrFtaRWY
+VXAl_WjX
+Vhj0A8Dw
+aoMf-EFQ
+E-J8S-Fr
+bOPzi5F5
+IgqwmWCp
+t42FNlPw
+aLLviEFi
+uoT1Vvq2
+rwVH4UGx
+2zdqeyLV
+9JLnGVur
+XC4mRvH8
+K2mNVRfw
+9_jZcIrY
+mNWDZ3k9
+-OJicP9w
+b0Upxo6l
+sdNyPGWM
+IFzIb_5t
+vHyOMe-O
+WHCJN8zf
+o8xvFnQd
+rmZw728t
+pqH0EELr
+r1hrXDyY
+VPXja-d1
+3udBidRn
+nGFQI9Og
+lPdMFv_b
+MVYeRRRX
+Yb92xl2H
+iFaQRP5X
+FvzcDVKD
+53N727X-
+jPwzhEY-
+jafLBX57
+tWI2FiDE
+i6i1xBlw
+zBQukurg
+JD1wS2Ca
+oxwy9LT-
+xjEOkE2W
+jKPY0ssC
+CbstokCQ
+89jVHXzp
+1qRG3bJv
+tVkjcBZ_
+Alfk6Una
+HbogL8Gc
+N1VjF02o
+woblM8SA
+0XufSJsY
+QcxZhaIW
+ztmtiXMk
+-jhAHyq5
+Qc7xiRUa
+I1UgirS4
+ilHSWFVE
+hzGYHOGH

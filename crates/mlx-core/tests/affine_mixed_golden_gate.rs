@@ -9,13 +9,18 @@
 //! Shapes the native kernel does not take run MLX's promoted F32 graph, so
 //! bits alone cannot show the native kernel ran: the per-thread family
 //! counters must also match the expected routing. Ours takes the native
-//! kernel for 2..=8 rows only. Run all three generations after an MLX pin
-//! change:
+//! kernel for 2..=8 rows only; the promoted graph follows MLX's own
+//! generation, NAX and 'd'-class batch limits. Run every captured route after
+//! an MLX pin change:
 //!
 //! ```text
 //! cargo test -p mlx-core --release --test affine_mixed_golden_gate -- --ignored --nocapture
-//! MLX_METAL_GPU_ARCH=applegpu_g16s cargo test ...   # gen 16: same routing as gen 17
+//! MLX_METAL_GPU_ARCH=applegpu_g17d cargo test ...   # 'd' class qmv batch limits
+//! MLX_METAL_GPU_ARCH=applegpu_g17g cargo test ...   # base class
+//! MLX_METAL_GPU_ARCH=applegpu_g17p cargo test ...   # gen 17 without NAX
+//! MLX_METAL_GPU_ARCH=applegpu_g16s cargo test ...   # gen 16: no NAX
 //! MLX_METAL_GPU_ARCH=applegpu_g14s cargo test ...   # gen 14: no qmv_wide, all promoted
+//! MLX_METAL_GPU_ARCH=applegpu_g14d cargo test ...   # gen 14, 'd' class
 //! ```
 
 mod affine_mixed_support;

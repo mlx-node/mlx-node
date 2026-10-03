@@ -1,7 +1,7 @@
 # Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
 # One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url.
 applegpu_g17s = machine
-applegpu_g16s = route
+applegpu_g14d = route
 false = nax
 112 = cases
 1ba2f3c625b84c46 = keys
@@ -21,54 +21,54 @@ i3VC3IIB
 i3VC3IIB
 0tRWJvPY
 0tRWJvPY
-GPNJJsVr
-GPNJJsVr
+-2ISGe-Y
+-2ISGe-Y
 iZUNmtKT
 iZUNmtKT
-KmC0LS_O
-KmC0LS_O
+vEI5XZpo
+vEI5XZpo
 PPMY0xFw
 PPMY0xFw
 QDNaek-8
 QDNaek-8
 QDNaek-8
 QDNaek-8
-B1DGo6Lm
-B1DGo6Lm
-FpWeCNai
-FpWeCNai
-LPNEu0u0
-LPNEu0u0
-xDBGHLXZ
-xDBGHLXZ
-fhRS22LW
-fhRS22LW
+_kjUe2pw
+_kjUe2pw
+s0sGKQFd
+s0sGKQFd
+dv0igSR9
+dv0igSR9
+FIhfjhax
+FIhfjhax
+bi2IJpGl
+bi2IJpGl
 qS8sjC8Z
 qS8sjC8Z
-HsVpbFTY
-HsVpbFTY
-HsVpbFTY
-HsVpbFTY
-vV38kTyI
-vV38kTyI
-xy4RPg8n
-xy4RPg8n
-tO4ZzHkW
-tO4ZzHkW
-4zFG6mtI
-4zFG6mtI
-IzFSGpqR
-IzFSGpqR
+tzu-hsgg
+tzu-hsgg
+tzu-hsgg
+tzu-hsgg
+CWppfSFn
+CWppfSFn
+iVjrqEZh
+iVjrqEZh
+3Ljf31rv
+3Ljf31rv
+ar60g0v6
+ar60g0v6
+YIqRzM_8
+YIqRzM_8
 t2FQ8Y8H
 t2FQ8Y8H
 xUAznE03
 xUAznE03
 xUAznE03
 xUAznE03
-DS6PAwG3
-DS6PAwG3
-KzqAS95g
-KzqAS95g
+ezXdbi2P
+ezXdbi2P
+OxYNpeIa
+OxYNpeIa
 vpkqdS9o
 vpkqdS9o
 ltcKugQf
@@ -115,5 +115,5 @@ dkp3zJpR
 dkp3zJpR
 yhBDLoCw
 yhBDLoCw
-G4zZulKz
-G4zZulKz
+YFFaQ2X8
+YFFaQ2X8

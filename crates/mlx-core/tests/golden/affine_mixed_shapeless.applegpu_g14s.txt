@@ -1,118 +1,119 @@
-# Golden digests of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
-# <first 8 bytes of SHA-256 over dtype, shape and output bytes, or a value> <case>
+# Golden values of bridge outputs proven bit-identical to the MLX fork (pin 053e43fec).
+# One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url.
 applegpu_g17s = machine
 applegpu_g14s = route
 false = nax
 112 = cases
-6802af7be698064c N136 K768 M 3 -> 3 replay
-6802af7be698064c N136 K768 M 3 -> 3 eager
-12b9d6da5f692ed1 N136 K768 M 3 -> 8 replay
-12b9d6da5f692ed1 N136 K768 M 3 -> 8 eager
-c2321110266cc3ff N136 K768 M 8 -> 2 replay
-c2321110266cc3ff N136 K768 M 8 -> 2 eager
-34aeaae26ebc370d N136 K768 M 5 -> 1 replay
-34aeaae26ebc370d N136 K768 M 5 -> 1 eager
-020afca1dba49d10 N136 K768 M 2 -> 6 replay
-020afca1dba49d10 N136 K768 M 2 -> 6 eager
-020afca1dba49d10 N136 K768 M 1 -> 6 replay
-020afca1dba49d10 N136 K768 M 1 -> 6 eager
-8b7542dc82015e74 N136 K768 M 2 -> 12 replay
-8b7542dc82015e74 N136 K768 M 2 -> 12 eager
-d2d45626f3d89a28 N136 K768 M 12 -> 5 replay
-d2d45626f3d89a28 N136 K768 M 12 -> 5 eager
-fb621219ef9857ef N1000 K1024 M 3 -> 3 replay
-fb621219ef9857ef N1000 K1024 M 3 -> 3 eager
-89950d9ad29398c6 N1000 K1024 M 3 -> 8 replay
-89950d9ad29398c6 N1000 K1024 M 3 -> 8 eager
-bc42395d9a68ec90 N1000 K1024 M 8 -> 2 replay
-bc42395d9a68ec90 N1000 K1024 M 8 -> 2 eager
-3cf318d311705329 N1000 K1024 M 5 -> 1 replay
-3cf318d311705329 N1000 K1024 M 5 -> 1 eager
-40335a7a4fbc7c65 N1000 K1024 M 2 -> 6 replay
-40335a7a4fbc7c65 N1000 K1024 M 2 -> 6 eager
-40335a7a4fbc7c65 N1000 K1024 M 1 -> 6 replay
-40335a7a4fbc7c65 N1000 K1024 M 1 -> 6 eager
-fe48d47b6a70b528 N1000 K1024 M 2 -> 12 replay
-fe48d47b6a70b528 N1000 K1024 M 2 -> 12 eager
-b34b0629015d98f8 N1000 K1024 M 12 -> 5 replay
-b34b0629015d98f8 N1000 K1024 M 12 -> 5 eager
-76fd2281247d3603 N2048 K768 M 3 -> 3 replay
-76fd2281247d3603 N2048 K768 M 3 -> 3 eager
-14885f8e16b1f7e0 N2048 K768 M 3 -> 8 replay
-14885f8e16b1f7e0 N2048 K768 M 3 -> 8 eager
-6e2d882691a5e96e N2048 K768 M 8 -> 2 replay
-6e2d882691a5e96e N2048 K768 M 8 -> 2 eager
-a92f2c8c2f195616 N2048 K768 M 5 -> 1 replay
-a92f2c8c2f195616 N2048 K768 M 5 -> 1 eager
-b73bbe86c820b85f N2048 K768 M 2 -> 6 replay
-b73bbe86c820b85f N2048 K768 M 2 -> 6 eager
-b73bbe86c820b85f N2048 K768 M 1 -> 6 replay
-b73bbe86c820b85f N2048 K768 M 1 -> 6 eager
-096a697d216767be N2048 K768 M 2 -> 12 replay
-096a697d216767be N2048 K768 M 2 -> 12 eager
-8958eba84661dddd N2048 K768 M 12 -> 5 replay
-8958eba84661dddd N2048 K768 M 12 -> 5 eager
-dcb8dfdf5aefe319 N2560 K1024 M 3 -> 3 replay
-dcb8dfdf5aefe319 N2560 K1024 M 3 -> 3 eager
-6abeb4834bfac92f N2560 K1024 M 3 -> 8 replay
-6abeb4834bfac92f N2560 K1024 M 3 -> 8 eager
-608a91cccffcb2d7 N2560 K1024 M 8 -> 2 replay
-608a91cccffcb2d7 N2560 K1024 M 8 -> 2 eager
-b76150f18f072c37 N2560 K1024 M 5 -> 1 replay
-b76150f18f072c37 N2560 K1024 M 5 -> 1 eager
-c540339c4d373310 N2560 K1024 M 2 -> 6 replay
-c540339c4d373310 N2560 K1024 M 2 -> 6 eager
-c540339c4d373310 N2560 K1024 M 1 -> 6 replay
-c540339c4d373310 N2560 K1024 M 1 -> 6 eager
-0d2e8f0301b7424a N2560 K1024 M 2 -> 12 replay
-0d2e8f0301b7424a N2560 K1024 M 2 -> 12 eager
-3b160da5e21a2481 N2560 K1024 M 12 -> 5 replay
-3b160da5e21a2481 N2560 K1024 M 12 -> 5 eager
-be992a752f68f8f6 N96 K64 M 3 -> 3 replay
-be992a752f68f8f6 N96 K64 M 3 -> 3 eager
-96d70aba041fbfe7 N96 K64 M 3 -> 8 replay
-96d70aba041fbfe7 N96 K64 M 3 -> 8 eager
-95f74c52b39216fb N96 K64 M 8 -> 2 replay
-95f74c52b39216fb N96 K64 M 8 -> 2 eager
-e6524ce9fe939787 N96 K64 M 5 -> 1 replay
-e6524ce9fe939787 N96 K64 M 5 -> 1 eager
-1656e5e59cd3ebb5 N96 K64 M 2 -> 6 replay
-1656e5e59cd3ebb5 N96 K64 M 2 -> 6 eager
-1656e5e59cd3ebb5 N96 K64 M 1 -> 6 replay
-1656e5e59cd3ebb5 N96 K64 M 1 -> 6 eager
-a0427758099392da N96 K64 M 2 -> 12 replay
-a0427758099392da N96 K64 M 2 -> 12 eager
-41ea7b215bb04018 N96 K64 M 12 -> 5 replay
-41ea7b215bb04018 N96 K64 M 12 -> 5 eager
-c311e6b87ca65128 N96 K128 M 3 -> 3 replay
-c311e6b87ca65128 N96 K128 M 3 -> 3 eager
-f391dd217c02e497 N96 K128 M 3 -> 8 replay
-f391dd217c02e497 N96 K128 M 3 -> 8 eager
-ce16a4acf076e932 N96 K128 M 8 -> 2 replay
-ce16a4acf076e932 N96 K128 M 8 -> 2 eager
-f52dc48a67dceee2 N96 K128 M 5 -> 1 replay
-f52dc48a67dceee2 N96 K128 M 5 -> 1 eager
-1c68017020bc833a N96 K128 M 2 -> 6 replay
-1c68017020bc833a N96 K128 M 2 -> 6 eager
-1c68017020bc833a N96 K128 M 1 -> 6 replay
-1c68017020bc833a N96 K128 M 1 -> 6 eager
-e364582061e45df4 N96 K128 M 2 -> 12 replay
-e364582061e45df4 N96 K128 M 2 -> 12 eager
-443b93786c6d9834 N96 K128 M 12 -> 5 replay
-443b93786c6d9834 N96 K128 M 12 -> 5 eager
-86d7a56b9daab865 N512 K5120 M 3 -> 3 replay
-86d7a56b9daab865 N512 K5120 M 3 -> 3 eager
-bb78b5640b0a14ff N512 K5120 M 3 -> 8 replay
-bb78b5640b0a14ff N512 K5120 M 3 -> 8 eager
-c548ae849feb576a N512 K5120 M 8 -> 2 replay
-c548ae849feb576a N512 K5120 M 8 -> 2 eager
-7416a1c5c2aa76bb N512 K5120 M 5 -> 1 replay
-7416a1c5c2aa76bb N512 K5120 M 5 -> 1 eager
-764a77cc9a510f52 N512 K5120 M 2 -> 6 replay
-764a77cc9a510f52 N512 K5120 M 2 -> 6 eager
-764a77cc9a510f52 N512 K5120 M 1 -> 6 replay
-764a77cc9a510f52 N512 K5120 M 1 -> 6 eager
-ca10432e80b08ef4 N512 K5120 M 2 -> 12 replay
-ca10432e80b08ef4 N512 K5120 M 2 -> 12 eager
-60515a4365fc476f N512 K5120 M 12 -> 5 replay
-60515a4365fc476f N512 K5120 M 12 -> 5 eager
+1ba2f3c625b84c46 = keys
+aAKve-aY
+aAKve-aY
+ErnW2l9p
+ErnW2l9p
+wjIRECZs
+wjIRECZs
+NK6q4m68
+NK6q4m68
+Agr8oduk
+Agr8oduk
+Agr8oduk
+Agr8oduk
+i3VC3IIB
+i3VC3IIB
+0tRWJvPY
+0tRWJvPY
+-2ISGe-Y
+-2ISGe-Y
+iZUNmtKT
+iZUNmtKT
+vEI5XZpo
+vEI5XZpo
+PPMY0xFw
+PPMY0xFw
+QDNaek-8
+QDNaek-8
+QDNaek-8
+QDNaek-8
+_kjUe2pw
+_kjUe2pw
+s0sGKQFd
+s0sGKQFd
+dv0igSR9
+dv0igSR9
+FIhfjhax
+FIhfjhax
+bi2IJpGl
+bi2IJpGl
+qS8sjC8Z
+qS8sjC8Z
+tzu-hsgg
+tzu-hsgg
+tzu-hsgg
+tzu-hsgg
+CWppfSFn
+CWppfSFn
+iVjrqEZh
+iVjrqEZh
+3Ljf31rv
+3Ljf31rv
+ar60g0v6
+ar60g0v6
+YIqRzM_8
+YIqRzM_8
+t2FQ8Y8H
+t2FQ8Y8H
+xUAznE03
+xUAznE03
+xUAznE03
+xUAznE03
+DS6PAwG3
+DS6PAwG3
+OxYNpeIa
+OxYNpeIa
+vpkqdS9o
+vpkqdS9o
+ltcKugQf
+ltcKugQf
+lfdMUrOS
+lfdMUrOS
+5lJM6f6T
+5lJM6f6T
+Flbl5ZzT
+Flbl5ZzT
+Flbl5ZzT
+Flbl5ZzT
+oEJ3WAmT
+oEJ3WAmT
+Qep7IVuw
+Qep7IVuw
+wxHmuHym
+wxHmuHym
+85HdIXwC
+85HdIXwC
+zhakrPB2
+zhakrPB2
+9S3Eimfc
+9S3Eimfc
+HGgBcCC8
+HGgBcCC8
+HGgBcCC8
+HGgBcCC8
+42RYIGHk
+42RYIGHk
+RDuTeGxt
+RDuTeGxt
+htela52q
+htela52q
+u3i1ZAsK
+u3i1ZAsK
+xUiuhJ_r
+xUiuhJ_r
+dBahxcKq
+dBahxcKq
+dkp3zJpR
+dkp3zJpR
+dkp3zJpR
+dkp3zJpR
+yhBDLoCw
+yhBDLoCw
+YFFaQ2X8
+YFFaQ2X8
