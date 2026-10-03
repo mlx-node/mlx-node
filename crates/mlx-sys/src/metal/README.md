@@ -12,6 +12,10 @@ Organize them by their mathematical and storage contracts:
   top-10 routing, fixed shared-expert packing, 16 key / 48 value heads, and
   four-stream hyper-connection mixing. The dense projection kernels also
   retain mixer epilogues that divide by four.
+- `kquant/`: the ggml K-quant / IQ kernel headers (`kquant.h`,
+  `kquant_nax.h`). Not raw strings: `build.rs` turns each into a
+  `quantized_preamble::` function, and `mlx_kquant_metal.cpp` JIT-builds one
+  library per kernel from it, choosing kernels like MLX's affine dispatcher.
 - Add `qwen3_5/`, `lfm2/`, or `gemma4/` when a shader requires that family's
   semantics. Qwen3.5 currently uses `common/` recurrence and quantized kernels;
   LFM2 and Gemma4 have no family-specific shader includes here.

@@ -736,19 +736,17 @@ fn main() -> io::Result<()> {
     // the CMake build above actually enabled them.
     if build_metal {
         bridge.define("MLX_NODE_METAL_ENABLED", None);
-        // Custom quantized kernels reuse the vendored K-quant arithmetic even
-        // in the normal precompiled-metallib build, where MLX does not export
-        // its optional JIT preambles. Generate private copies from source so
-        // the helper kernels cannot drift from the linked quantization code.
+        // JIT-built bridge kernels need MLX's kernel headers as source text,
+        // which the precompiled-metallib build does not export. Generate
+        // private copies from the linked sources so they cannot drift.
         let preambles = out_dir_path.join("quantized-preambles");
         let script = mlx_dir.join("mlx/backend/metal/make_compiled_preamble.sh");
         for (source_name, name) in [
             ("utils", "utils"),
             ("steel/gemm/gemm", "gemm"),
             ("quantized_utils", "quantized_utils"),
-            ("kquant", "kquant"),
             ("steel/gemm/nax", "nax"),
-            ("kquant_nax", "kquant_nax"),
+            ("steel/gemm/gemm_nax", "gemm_nax"),
             ("steel/attn/kernels/steel_attention", "steel_attention"),
         ] {
             let status = Command::new("bash")
@@ -796,6 +794,35 @@ fn main() -> io::Result<()> {
                     .join(format!("mlx/backend/metal/kernels/{source_name}.h"))
                     .display()
             );
+        }
+        // The K-quant kernels are ours. They include no project headers, so the
+        // preamble is the file itself, in the generator's format.
+        for name in ["kquant", "kquant_nax"] {
+            let header = src_dir.join(format!("metal/kquant/{name}.h"));
+            let body: String = read_build_source(&header)?
+                .lines()
+                .filter(|line| {
+                    let line = line.trim_start();
+                    !(line.starts_with("#pragma once")
+                        || (line.starts_with("#include \"") && line.ends_with(".h\"")))
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            if body.contains(")preamble\"") {
+                return Err(io::Error::other(format!(
+                    "{} contains the preamble delimiter",
+                    header.display()
+                )));
+            }
+            let path = preambles.join(format!("{name}.cpp"));
+            let source = format!(
+                "namespace mlx::core::quantized_preamble {{\n\nconst char* {name}() {{\n  \
+                 return R\"preamble(\n#line 1 \"metal/kquant/{name}.h\"\n{body}\n)preamble\";\n}}\n\n}} \
+                 // namespace mlx::core::quantized_preamble\n"
+            );
+            std::fs::write(&path, source)
+                .map_err(|error| build_file_error("write K-quant preamble", &path, error))?;
+            bridge.file(path);
         }
     }
 
