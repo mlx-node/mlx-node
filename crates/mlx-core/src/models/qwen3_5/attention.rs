@@ -2280,75 +2280,191 @@ mod tests {
     /// Segmented SDPA equals concatenated K/V through MLX's vector SDPA only
     /// while it copies MLX's two-pass route and partition count
     /// (`sdpa_vector_uses_two_pass` / `sdpa_vector_partition_count` in
-    /// `mlx_segmented_sdpa_plan.h`). Totals on both sides of every boundary of
-    /// every device class, at 1..32 active simdgroups, fail here when the
-    /// linked MLX changes that policy. Run it under `MLX_METAL_GPU_ARCH` with
-    /// a 'd' and a base-class architecture too.
-    #[test]
-    #[ignore = "requires coordinated Metal GPU validation"]
+    /// `mlx_segmented_sdpa_plan.h`), because either one changes the reduction
+    /// order. Compares one single-chunk block per `(q_heads, kv_heads, rows)`
+    /// and total K/V length, against `[1, kv, 65600, 256]` cache slices.
     #[cfg(target_os = "macos")]
-    fn segmented_sdpa_reduction_policy_matches_mlx_vector_sdpa() -> Result<()> {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            return Ok(());
-        }
+    fn segmented_policy_cases(layouts: &[(i64, i64, i64)], totals: &[i64]) -> Result<usize> {
         const D: i64 = 256;
         const CAPACITY: i64 = 65_600;
+        let kv_max = layouts.iter().map(|l| l.1).max().unwrap_or(1);
         let base_k = MxArray::from_bfloat16(
-            &deterministic_bf16((2 * CAPACITY * D) as usize, 0x0f1e_2d3c),
-            &[1, 2, CAPACITY, D],
+            &deterministic_bf16((kv_max * CAPACITY * D) as usize, 0x0f1e_2d3c),
+            &[1, kv_max, CAPACITY, D],
         )?;
         let base_v = MxArray::from_bfloat16(
-            &deterministic_bf16((2 * CAPACITY * D) as usize, 0x4b5a_6978),
-            &[1, 2, CAPACITY, D],
+            &deterministic_bf16((kv_max * CAPACITY * D) as usize, 0x4b5a_6978),
+            &[1, kv_max, CAPACITY, D],
         )?;
         base_k.eval();
         base_v.eval();
         let mut checked = 0usize;
-        for (q_heads, kv_heads) in [(1_i64, 1_i64), (2, 1), (4, 1), (6, 1), (8, 2), (16, 2)] {
+        for &(q_heads, kv_heads, rows) in layouts {
             let gqa = q_heads / kv_heads;
             let max_q =
                 i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) });
-            let pk_all = base_k.slice(&[0, 0, 0, 0], &[1, kv_heads, CAPACITY, D])?;
-            let pv_all = base_v.slice(&[0, 0, 0, 0], &[1, kv_heads, CAPACITY, D])?;
-            for rows in 1_i64..=8 {
-                if segmented_verify_head_len(rows, max_q).is_none() {
-                    continue;
-                }
-                let q = MxArray::from_bfloat16(
-                    &deterministic_bf16((q_heads * rows * D) as usize, 0x1357_9bdf),
-                    &[1, q_heads, rows, D],
-                )?;
-                let nk = MxArray::from_bfloat16(
-                    &deterministic_bf16((kv_heads * rows * D) as usize, 0x2468_ace0),
-                    &[1, kv_heads, rows, D],
-                )?;
-                let nv = MxArray::from_bfloat16(
-                    &deterministic_bf16((kv_heads * rows * D) as usize, 0xfdb9_7531),
-                    &[1, kv_heads, rows, D],
-                )?;
-                for boundary in [
-                    1024_i64, 1025, 4096, 4097, 8192, 8193, 16384, 16385, 32768, 32769, 65536,
-                    65537,
-                ] {
-                    for total in [boundary - 1, boundary] {
-                        let prefix = total - rows;
-                        let pk = pk_all.slice(&[0, 0, 0, 0], &[1, kv_heads, prefix, D])?;
-                        let pv = pv_all.slice(&[0, 0, 0, 0], &[1, kv_heads, prefix, D])?;
-                        let got = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?
-                            .to_float32()?;
-                        let expected =
-                            segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?
-                                .to_float32()?;
-                        assert_eq!(
-                            got.as_ref(),
-                            expected.as_ref(),
-                            "gqa {gqa} ({q_heads}/{kv_heads}) rows {rows} total {total}"
-                        );
-                        checked += 1;
-                    }
-                }
+            assert!(max_q >= 1, "gqa {gqa}: no supported segmented query width");
+            assert!(
+                segmented_verify_head_len(rows, max_q).is_some(),
+                "gqa {gqa} rows {rows}: max_query_length {max_q} cannot cover the block"
+            );
+            let q = MxArray::from_bfloat16(
+                &deterministic_bf16((q_heads * rows * D) as usize, 0x1357_9bdf),
+                &[1, q_heads, rows, D],
+            )?;
+            let nk = MxArray::from_bfloat16(
+                &deterministic_bf16((kv_heads * rows * D) as usize, 0x2468_ace0),
+                &[1, kv_heads, rows, D],
+            )?;
+            let nv = MxArray::from_bfloat16(
+                &deterministic_bf16((kv_heads * rows * D) as usize, 0xfdb9_7531),
+                &[1, kv_heads, rows, D],
+            )?;
+            for &total in totals {
+                let prefix = total - rows;
+                let pk = base_k.slice(&[0, 0, 0, 0], &[1, kv_heads, prefix, D])?;
+                let pv = base_v.slice(&[0, 0, 0, 0], &[1, kv_heads, prefix, D])?;
+                let got = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?
+                    .to_float32()?;
+                let expected = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?
+                    .to_float32()?;
+                assert_eq!(
+                    got.as_ref(),
+                    expected.as_ref(),
+                    "gqa {gqa} ({q_heads}/{kv_heads}) rows {rows} total {total}"
+                );
+                checked += 1;
             }
         }
+        Ok(checked)
+    }
+
+    /// Every exact boundary of every device class's reduction policy, at
+    /// active simdgroups 1..8 (gqa x rows), plus the one-call verify routes.
+    /// Runs by default. Other device classes need a fresh process:
+    ///
+    /// ```text
+    /// MLX_METAL_GPU_ARCH=applegpu_g17d cargo test -p mlx-core --release --lib -- segmented_sdpa_policy_boundaries
+    /// MLX_METAL_GPU_ARCH=applegpu_g17g cargo test -p mlx-core --release --lib -- segmented_sdpa_policy_boundaries
+    /// ```
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn segmented_sdpa_policy_boundaries_match_mlx_vector_sdpa() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            assert!(
+                !crate::test_support::metal_required(),
+                "MLX_TEST_REQUIRE_METAL=1 but no Metal device"
+            );
+            eprintln!("SKIP segmented SDPA policy boundaries: no Metal device");
+            return Ok(());
+        }
+        // (q heads, kv heads, rows): active simdgroups 1, 2, 3, 4, 5, 6, 8;
+        // gqa 1 never takes the GQA two-pass route, the others do from 4096.
+        let layouts = [
+            (1_i64, 1_i64, 1_i64),
+            (1, 1, 2),
+            (1, 1, 3),
+            (2, 1, 2),
+            (1, 1, 5),
+            (6, 1, 1),
+            (8, 2, 2),
+        ];
+        let totals = [
+            1023_i64, 1024, 1025, 4095, 4096, 8192, 8193, 16383, 16384, 32768, 32769, 65535, 65536,
+            65537,
+        ];
+        let checked = segmented_policy_cases(&layouts, &totals)?;
+        assert_eq!(checked, layouts.len() * totals.len());
+
+        // One-call verify: 8 rows of the 27B layout (24 q / 4 kv heads), with
+        // the head and tail chunks on both sides of the 1024 and 8192 steps.
+        const D: i64 = 256;
+        const HQ: i64 = 24;
+        const HKV: i64 = 4;
+        let max_q = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) });
+        assert!(max_q >= 1, "gqa 6: no supported segmented query width");
+        let head_len = segmented_verify_head_len(8, max_q)
+            .ok_or_else(|| Error::from_reason("8 verify rows cannot be covered"))?;
+        let prefixes = [1000_i64, 1016, 1020, 6219, 8186, 8190];
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * 8200 * D) as usize, 0x1234_5678),
+            &[1, HKV, 8200, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * 8200 * D) as usize, 0x8765_4321),
+            &[1, HKV, 8200, D],
+        )?;
+        let q = MxArray::from_bfloat16(
+            &deterministic_bf16((HQ * 8 * D) as usize, 0x1357_9bdf),
+            &[1, HQ, 8, D],
+        )?;
+        let nk = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * 8 * D) as usize, 0x2468_ace0),
+            &[1, HKV, 8, D],
+        )?;
+        let nv = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * 8 * D) as usize, 0xfdb9_7531),
+            &[1, HKV, 8, D],
+        )?;
+        let mut seen = [0usize; 4];
+        let mut class_s = false;
+        for prefix in prefixes {
+            let (route, class) = device_verify_route(HQ, HKV, 8, prefix);
+            assert!(route >= 0, "no segmented route for prefix {prefix}");
+            seen[route as usize] += 1;
+            class_s |= class == b's';
+            let pk = nan_tailed_prefix(&base_k, prefix)?;
+            let pv = nan_tailed_prefix(&base_v, prefix)?;
+            let got = strict_segmented_for_test(&q, &pk, &pv, &nk, &nv)?.to_float32()?;
+            let concat =
+                segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?.to_float32()?;
+            assert_eq!(
+                got.as_ref(),
+                concat.as_ref(),
+                "one-call verify prefix {prefix} route {route}"
+            );
+        }
+        eprintln!(
+            "{checked} policy boundaries + {} verify blocks equal MLX's vector SDPA; \
+             verify routes one_pass={} unified={} split={}",
+            prefixes.len(),
+            seen[1],
+            seen[2],
+            seen[3]
+        );
+        if class_s && head_len > 0 {
+            for route in [VERIFY_ONE_PASS, VERIFY_UNIFIED, VERIFY_SPLIT] {
+                assert!(seen[route as usize] > 0, "verify route {route} never ran");
+            }
+        }
+        Ok(())
+    }
+
+    /// The exhaustive version: totals on both sides of every boundary for GQA
+    /// 1/2/4/6/8 at every coverable row count (1152 blocks). Run it under
+    /// `MLX_METAL_GPU_ARCH` with a 'd' and a base-class architecture too.
+    #[test]
+    #[ignore = "requires coordinated Metal GPU validation"]
+    #[cfg(target_os = "macos")]
+    fn segmented_sdpa_reduction_policy_matches_mlx_vector_sdpa() -> Result<()> {
+        assert!(
+            unsafe { mlx_sys::mlx_metal_is_available() },
+            "this GPU validation needs a Metal device"
+        );
+        let mut layouts = Vec::new();
+        for (q_heads, kv_heads) in [(1_i64, 1_i64), (2, 1), (4, 1), (6, 1), (8, 2), (16, 2)] {
+            for rows in 1_i64..=8 {
+                layouts.push((q_heads, kv_heads, rows));
+            }
+        }
+        let mut totals = Vec::new();
+        for boundary in [
+            1024_i64, 1025, 4096, 4097, 8192, 8193, 16384, 16385, 32768, 32769, 65536, 65537,
+        ] {
+            totals.extend([boundary - 1, boundary]);
+        }
+        let checked = segmented_policy_cases(&layouts, &totals)?;
+        assert!(checked >= 1152, "only {checked} policy cases ran");
         eprintln!("{checked} policy-boundary cases equal MLX's vector SDPA");
         Ok(())
     }
