@@ -16,6 +16,9 @@ Organize them by their mathematical and storage contracts:
   `kquant_nax.h`). Not raw strings: `build.rs` turns each into a
   `quantized_preamble::` function, and `mlx_kquant_metal.cpp` JIT-builds one
   library per kernel from it, choosing kernels like MLX's affine dispatcher.
+- `common/affine_qmv_wide_mixed.metal.inc` is a whole library source, not a
+  `metal_kernel` body: `mlx_affine_mixed_qmm.cpp` JIT-builds one library per
+  tile width from it (BF16 x with F32 affine sidecars).
 - Add `qwen3_5/`, `lfm2/`, or `gemma4/` when a shader requires that family's
   semantics. Qwen3.5 currently uses `common/` recurrence and quantized kernels;
   LFM2 and Gemma4 have no family-specific shader includes here.

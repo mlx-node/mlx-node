@@ -1,7 +1,7 @@
 #include "mlx_common.h"
+#include "mlx_affine_mixed_qmm.h"
 #include "mlx_kquant.h"
 #include "mlx_portable_qmm.h"
-#include "mlx/primitives.h"
 
 // ============================================================================
 // FUSED QWEN3 GENERATION
@@ -1337,7 +1337,7 @@ mlx_array* mlx_quantized_matmul(
 }
 
 // BF16 x times an affine projection with F32 scales/biases, BF16 result, no
-// F32 copy of x or of the result (the Metal primitive keeps F32 math). Null
+// F32 copy of x or of the result where the F32 path would run qmv_wide. Null
 // unless the operands have exactly that form; the caller then takes
 // mlx_quantized_matmul.
 mlx_array* mlx_quantized_matmul_affine_bf16(
@@ -1348,36 +1348,19 @@ mlx_array* mlx_quantized_matmul_affine_bf16(
     int group_size,
     int bits) {
     try {
-        if (!x || !w || !scales || !biases || !mlx::core::metal::is_available())
+        if (!x || !w || !scales || !biases)
             return nullptr;
-        const auto& xa = *reinterpret_cast<mlx::core::array*>(x);
-        const auto& wa = *reinterpret_cast<mlx::core::array*>(w);
-        const auto& sa = *reinterpret_cast<mlx::core::array*>(scales);
-        const auto& ba = *reinterpret_cast<mlx::core::array*>(biases);
-        if (group_size <= 0 || bits <= 0 || 32 % bits != 0 || xa.ndim() < 1 ||
-            xa.dtype() != mlx::core::bfloat16 || wa.ndim() != 2 ||
-            wa.dtype() != mlx::core::uint32 || sa.dtype() != mlx::core::float32 ||
-            ba.dtype() != mlx::core::float32 || sa.shape() != ba.shape() ||
-            sa.ndim() != 2)
+        auto out = mlx::core::affine_mixed::quantized_matmul(
+            *reinterpret_cast<mlx::core::array*>(x),
+            *reinterpret_cast<mlx::core::array*>(w),
+            *reinterpret_cast<mlx::core::array*>(scales),
+            *reinterpret_cast<mlx::core::array*>(biases),
+            group_size,
+            bits,
+            mlx::core::Device::gpu);
+        if (!out)
             return nullptr;
-        int k = xa.shape(-1);
-        int n = wa.shape(0);
-        if (k <= 0 || k % group_size != 0 || wa.shape(1) * (32 / bits) != k ||
-            sa.shape(0) != n || sa.shape(1) != k / group_size)
-            return nullptr;
-        auto shape = xa.shape();
-        shape.back() = n;
-        auto out = new mlx::core::array(
-            std::move(shape),
-            mlx::core::bfloat16,
-            std::make_shared<mlx::core::QuantizedMatmul>(
-                mlx::core::default_stream(mlx::core::Device::gpu),
-                group_size,
-                bits,
-                mlx::core::QuantizationMode::Affine,
-                true),
-            std::vector<mlx::core::array>{xa, wa, sa, ba});
-        return reinterpret_cast<mlx_array*>(out);
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(*out)));
     } catch (const std::exception& e) {
         std::cerr << "mlx_quantized_matmul_affine_bf16 error: " << e.what() << std::endl;
         return nullptr;
