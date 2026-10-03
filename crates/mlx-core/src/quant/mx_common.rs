@@ -32,7 +32,8 @@ pub(crate) fn log2_floor(x: f32) -> i32 {
     biased - 127
 }
 
-/// The E8M0 exponent MLX's Metal kernel stores for `x`, computed exactly.
+/// The E8M0 exponent `fp8_e8m0(x)` stores, computed exactly. Since upstream
+/// 02adf7b21 MLX's quantize raises it by one when it decodes below `x`.
 ///
 /// `fp8.h` takes `int(round(log2(x)))` through `metal::log2`, an
 /// approximation. Splitting `x` into `m * 2^e` with `m` in `[1, 2)` reaches the

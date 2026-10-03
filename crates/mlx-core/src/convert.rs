@@ -14453,7 +14453,8 @@ mod tests {
         // The E8M0 underflow boundary. `amax / 6` at 2^-126 is the smallest
         // normal f32 and gets byte 1; below that it is subnormal, Metal flushes
         // it, and the kernel's `scale == 0` branch writes 32 zero codes under
-        // byte 0 instead of dividing by 2^-127.
+        // byte 0 instead of dividing by 2^-127 — signed ones since upstream
+        // 02adf7b21.
         //
         // Every element here stays at or above its block scale, i.e. out of the
         // f32 subnormal range. An element BELOW the scale is a subnormal, and
@@ -14493,14 +14494,15 @@ mod tests {
     }
 
     /// The gate for the in-tree MXFP4 encoder: its `#[cfg(test)]` reference —
-    /// the shipping encoder with the search removed and nothing else — has to
-    /// write what `mlx_quantize` writes, byte for byte. That is what makes "the
-    /// search is the only difference from MLX" a measured claim.
+    /// the shipping encoder with the search replaced by MLX's round-up rule
+    /// (upstream 02adf7b21) and nothing else — has to write what
+    /// `mlx_quantize` writes, byte for byte. That is what makes "the search is
+    /// the only difference from MLX" a measured claim.
     #[test]
-    fn mxfp4_mlx_rounded_reference_is_bit_identical_to_mlx_quantize() {
+    fn mxfp4_round_up_reference_is_bit_identical_to_mlx_quantize() {
         let w = mxfp4_boundary_tensor();
         w.eval();
-        let (packed, scales) = crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(
+        let (packed, scales) = crate::quant::mxfp4_weight::quantize_mxfp4_mlx_round_up(
             &w,
             "test.mxfp4.boundary.weight",
         )
@@ -14515,14 +14517,14 @@ mod tests {
     /// not only the hand-picked boundaries — and the chunked path has to give
     /// the same bytes as a single-shot encode.
     #[test]
-    fn mxfp4_mlx_rounded_reference_is_bit_identical_on_a_random_tensor() {
+    fn mxfp4_round_up_reference_is_bit_identical_on_a_random_tensor() {
         for shape in [vec![512i64, 256], vec![48, 32, 64]] {
             let w = MxArray::random_normal(&shape, 0.0, 0.02, Some(DType::Float32))
                 .unwrap()
                 .astype(DType::BFloat16)
                 .unwrap();
             w.eval();
-            let (packed, scales) = crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(
+            let (packed, scales) = crate::quant::mxfp4_weight::quantize_mxfp4_mlx_round_up(
                 &w,
                 "test.mxfp4.random.weight",
             )
@@ -14627,7 +14629,7 @@ mod tests {
     /// model cache holding `qwen3.5-0.8b`.
     #[test]
     #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
-    fn mxfp4_mlx_rounded_reference_is_bit_identical_on_a_real_ffn_tensor() {
+    fn mxfp4_round_up_reference_is_bit_identical_on_a_real_ffn_tensor() {
         let cache = std::env::var("MLX_TEST_MODEL_CACHE_DIR")
             .expect("MLX_TEST_MODEL_CACHE_DIR must point at a model cache");
         let dir = std::path::Path::new(&cache).join("qwen3.5-0.8b");
@@ -14647,7 +14649,7 @@ mod tests {
                 };
                 w.eval();
                 let (packed, scales) =
-                    crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(w, &key).unwrap();
+                    crate::quant::mxfp4_weight::quantize_mxfp4_mlx_round_up(w, &key).unwrap();
                 let (packed_ref, scales_ref, _) = quantize_reference(w, 32, 4, "mxfp4");
                 assert_uint8_bit_exact(&scales, &scales_ref, &format!("{key} scales"));
                 assert_uint32_bit_exact(&packed, &packed_ref, &format!("{key} packed"));
@@ -14718,7 +14720,8 @@ mod tests {
         // written at all. `amax / 448` at 2^-126 is the smallest normal f32 and
         // gets byte 1; one binade below it is subnormal, which Metal flushes,
         // so the kernel takes its `scale == 0` branch and writes 32 zero codes
-        // under byte 0. A real Qwen3.5 GDN `in_proj_qkv` has 448 such blocks.
+        // under byte 0 — signed ones since upstream 02adf7b21. A real Qwen3.5
+        // GDN `in_proj_qkv` has 448 such blocks.
         for target_exp in [-126i32, -127, -131] {
             let amax = 448.0f32 * (target_exp as f32).exp2();
             rows.push(amax);
@@ -14842,14 +14845,16 @@ mod tests {
         }
     }
 
-    /// The gate for the in-tree MXFP8 encoder: its `#[cfg(test)]` reference —
-    /// the shipping encoder with the ceiling swapped back for MLX's rounding and
-    /// nothing else — has to write what `mlx_quantize` writes, byte for byte.
+    /// The gate for the in-tree MXFP8 encoder: since upstream 02adf7b21 MLX
+    /// rounds the E8M0 scale up, the same rule as the shipping ceiling, so its
+    /// `#[cfg(test)]` reference — the shipping encoder plus MLX's signed zero
+    /// codes in byte-0 blocks and nothing else — has to write what
+    /// `mlx_quantize` writes, byte for byte.
     #[test]
-    fn mxfp8_mlx_rounded_reference_is_bit_identical_to_mlx_quantize() {
+    fn mxfp8_round_up_reference_is_bit_identical_to_mlx_quantize() {
         let w = mxfp8_boundary_tensor();
         w.eval();
-        let (packed, scales) = crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(
+        let (packed, scales) = crate::quant::mxfp8_weight::quantize_mxfp8_mlx_round_up(
             &w,
             "test.mxfp8.boundary.weight",
         )
@@ -14864,14 +14869,14 @@ mod tests {
     /// hand-picked boundaries — and the chunked path has to give the same bytes
     /// as a single-shot encode.
     #[test]
-    fn mxfp8_mlx_rounded_reference_is_bit_identical_on_a_random_tensor() {
+    fn mxfp8_round_up_reference_is_bit_identical_on_a_random_tensor() {
         for shape in [vec![512i64, 256], vec![48, 32, 64]] {
             let w = MxArray::random_normal(&shape, 0.0, 0.02, Some(DType::Float32))
                 .unwrap()
                 .astype(DType::BFloat16)
                 .unwrap();
             w.eval();
-            let (packed, scales) = crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(
+            let (packed, scales) = crate::quant::mxfp8_weight::quantize_mxfp8_mlx_round_up(
                 &w,
                 "test.mxfp8.random.weight",
             )
@@ -15024,7 +15029,7 @@ mod tests {
     /// model cache holding `qwen3.5-0.8b`.
     #[test]
     #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
-    fn mxfp8_mlx_rounded_reference_is_bit_identical_on_real_checkpoint_tensors() {
+    fn mxfp8_round_up_reference_is_bit_identical_on_real_checkpoint_tensors() {
         let cache = std::env::var("MLX_TEST_MODEL_CACHE_DIR")
             .expect("MLX_TEST_MODEL_CACHE_DIR must point at a model cache");
         let dir = std::path::Path::new(&cache).join("qwen3.5-0.8b");
@@ -15060,20 +15065,23 @@ mod tests {
             };
             w.eval();
             let (packed, scales) =
-                crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(w, key).unwrap();
+                crate::quant::mxfp8_weight::quantize_mxfp8_mlx_round_up(w, key).unwrap();
             let (packed_ref, scales_ref, biases_ref) = quantize_reference(w, 32, 8, "mxfp8");
             assert!(biases_ref.is_none(), "mxfp8 must not emit biases");
             assert_uint8_bit_exact(&scales, &scales_ref, &format!("{key} scales"));
             assert_uint32_bit_exact(&packed, &packed_ref, &format!("{key} packed"));
-
-            let off = mxfp8_relative_error(w, &packed_ref, &scales_ref);
             let (packed_on, scales_on) =
                 crate::quant::mxfp8_weight::quantize_mxfp8(w, key).unwrap();
+            assert_uint8_bit_exact(&scales_on, &scales_ref, &format!("{key} shipping scales"));
+
+            let (packed_off, scales_off) =
+                crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(w, key).unwrap();
+            let off = mxfp8_relative_error(w, &packed_off, &scales_off);
             let on = mxfp8_relative_error(w, &packed_on, &scales_on);
             let (packed_search, scales_search) =
                 crate::quant::mxfp8_weight::quantize_mxfp8_best_of_two(w, key).unwrap();
             let searched = mxfp8_relative_error(w, &packed_search, &scales_search);
-            let saturating = scales_ref
+            let saturating = scales_off
                 .to_uint8()
                 .unwrap()
                 .iter()
@@ -17006,9 +17014,9 @@ mod tests {
     /// This test documents that MXFP8 (E8M0 per-group power-of-two scale,
     /// group_size 32) has materially worse round-trip error than affine
     /// 8-bit (per-group scale + bias, group_size 64) on the gate-shaped
-    /// tensor. The check is loose: we only require MXFP8 error to exceed
-    /// affine error by at least 5x. Tightening this further would risk
-    /// flakiness across MLX backend changes.
+    /// tensor. Since upstream 02adf7b21 MLX rounds the E8M0 scale up, so no
+    /// group clips and the gap is E4M3's own grid: measured 4.9x. The check
+    /// requires at least 4x.
     #[test]
     fn router_gate_shape_mxfp8_vs_affine_error() {
         // Router gate shape from Qwen3.6-35B-A3B MoE: 256 experts, hidden 2048.
@@ -17023,7 +17031,7 @@ mod tests {
             err_mxfp8 / err_affine.max(1e-9)
         );
         assert!(
-            err_mxfp8 > err_affine * 5.0,
+            err_mxfp8 > err_affine * 4.0,
             "expected MXFP8 error to be much larger than affine 8-bit on router-gate-shaped tensor; \
              got mxfp8={err_mxfp8}, affine8={err_affine}"
         );
@@ -21278,11 +21286,13 @@ mod tests {
             "affine-8 requant max|d|/amax {max_rel} exceeds the measured budget (0.8669%)"
         );
 
-        // ANTI-VACUITY: `mlx_quantize`'s own mxfp8 on this exact fixture blows
-        // the budget by ~10x, so the assertions above discriminate rather than
-        // always passing. This is MLX's rounded E8M0, which is what ruled mxfp8
-        // out here; convert's own encoder takes the ceiling and has never been
-        // measured against affine on mamba projections — see `fp8_to_affine8`.
+        // ANTI-VACUITY: `mlx_quantize`'s own mxfp8 on this exact fixture fails
+        // the budget, so the assertions above discriminate rather than always
+        // passing. Since upstream 02adf7b21 MLX rounds the E8M0 scale up, the
+        // same rule as convert's own encoder, so nothing clips any more: the
+        // remaining 2.96% rel RMS / 3.73% max is E4M3's own grid, still about
+        // 3x the affine budget. Through pin 053e43fec MLX rounded to nearest,
+        // clipped whole groups and missed by ~10x.
         let mxfp8_mode = std::ffi::CString::new("mxfp8").unwrap();
         let (mx_p, mx_s, mx_b) =
             quantize_with_optional_tiling(&reference, 32, 8, mxfp8_mode.as_c_str(), "mxfp8_anchor")
@@ -21308,12 +21318,12 @@ mod tests {
         let (mx_rel_rms, mx_max_rel) = rel_err(&mx_restored);
         println!("mxfp8 anchor: rel_rms={mx_rel_rms:.6} max|d|/amax={mx_max_rel:.6}");
         assert!(
-            mx_rel_rms > 0.030,
-            "the superseded mxfp8 path must FAIL the affine budget by a wide margin, got {mx_rel_rms}"
+            mx_rel_rms > 0.020,
+            "mxfp8 must FAIL the affine RMS budget by at least 2x, got {mx_rel_rms}"
         );
         assert!(
-            mx_max_rel > 0.10,
-            "the superseded mxfp8 path clips whole groups; expected max|d|/amax > 10%, got {mx_max_rel}"
+            mx_max_rel > 0.030,
+            "mxfp8 must FAIL the affine max|d|/amax budget by at least 2x, got {mx_max_rel}"
         );
     }
 

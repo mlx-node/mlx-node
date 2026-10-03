@@ -1,11 +1,13 @@
 //! MXFP4 weight encoding with a per-block E8M0 exponent search.
 //!
-//! MLX picks a block's E8M0 scale exponent by rounding `log2(amax / 6)` to
-//! nearest (`backend/metal/kernels/fp8.h`). Rounding down leaves the block's
-//! largest magnitude above E2M1's top code and clips it; rounding up keeps
-//! every value on the ladder but costs one binade of resolution for the other
-//! thirty-one. Neither wins for every block, so this encoder evaluates both and
-//! keeps the one with the lower squared error.
+//! MLX picks a block's E8M0 scale exponent with one fixed rule: through pin
+//! 053e43fec it rounded `log2(amax / 6)` to nearest, and since upstream
+//! 02adf7b21 it rounds up (`mx_scale_round_up` in
+//! `backend/metal/kernels/fp8.h`). Rounding down leaves the block's largest
+//! magnitude above E2M1's top code and clips it; rounding up keeps every value
+//! on the ladder but costs one binade of resolution for the other thirty-one.
+//! Neither wins for every block, so this encoder evaluates both and keeps the
+//! one with the lower squared error.
 //!
 //! Two candidates is the whole search space: E8M0 has no mantissa, so
 //! `floor(log2(amax / 6))` and its successor already contain nearest, floor and
@@ -15,10 +17,11 @@
 //! search — see `mxfp8_weight`.
 //!
 //! There is no way to turn the search off in production. A `#[cfg(test)]`
-//! `quantize_mxfp4_mlx_rounded` keeps MLX's rounding wired up, and
-//! `mxfp4_mlx_rounded_reference_is_bit_identical_to_mlx_quantize` pins that it
-//! still reproduces `mlx_quantize` byte for byte — so "the search is the only
-//! difference" stays a measured claim.
+//! `quantize_mxfp4_mlx_round_up` keeps MLX's current rule wired up, and
+//! `mxfp4_round_up_reference_is_bit_identical_to_mlx_quantize` pins that it
+//! reproduces `mlx_quantize` byte for byte — so "the search is the only
+//! difference" stays a measured claim. `quantize_mxfp4_mlx_rounded` keeps the
+//! old round-to-nearest rule as the baseline the search was measured against.
 
 use napi::bindgen_prelude::Result;
 
@@ -140,7 +143,7 @@ fn encode_one_block(block: &[f32], codes: &mut [u8], scratch: &mut [u8]) -> u8 {
     .clamp(E8M0_EXPONENT_MIN, E8M0_EXPONENT_MAX);
     if sibling != nearest {
         let byte = (sibling + 127) as u8;
-        // Strictly better only, so a tie keeps the byte MLX would emit.
+        // Strictly better only, so a tie keeps the rounded-to-nearest byte.
         if encode_block(block, e8m0_decode(byte), scratch) < best_error {
             best = byte;
             codes.copy_from_slice(scratch);
@@ -149,9 +152,9 @@ fn encode_one_block(block: &[f32], codes: &mut [u8], scratch: &mut [u8]) -> u8 {
     best
 }
 
-/// MLX's own choice of block byte: `log2(amax / 6)` rounded to nearest, no
-/// search — the first half of [`encode_one_block`] and nothing else. Not what
-/// ships; see the module docs.
+/// MLX's block byte through pin 053e43fec: `log2(amax / 6)` rounded to
+/// nearest, no search — the first half of [`encode_one_block`] and nothing
+/// else. Not what ships; see the module docs.
 #[cfg(test)]
 fn encode_one_block_mlx_rounded(block: &[f32], codes: &mut [u8]) -> u8 {
     let byte = match block_scale_target(block) {
@@ -161,6 +164,36 @@ fn encode_one_block_mlx_rounded(block: &[f32], codes: &mut [u8]) -> u8 {
         }
     };
     encode_block(block, e8m0_decode(byte), codes);
+    byte
+}
+
+/// MLX's block byte since upstream 02adf7b21: the rounded byte, raised by one
+/// when it decodes below `amax / 6` and is below 0xFE (`mx_scale_round_up`).
+/// Metal flushes a subnormal `amax / 6` to zero before that check, so byte 0
+/// is never raised. In a byte-0 block MLX now writes `w * 0`, so a negative
+/// element takes the negative-zero code.
+#[cfg(test)]
+fn encode_one_block_mlx_round_up(block: &[f32], codes: &mut [u8]) -> u8 {
+    let byte = match block_scale_target(block) {
+        Err(byte) => byte,
+        Ok(target) => {
+            let rounded =
+                (e8m0_exponent(target).clamp(E8M0_EXPONENT_MIN, E8M0_EXPONENT_MAX) + 127) as u8;
+            if rounded != 0 && rounded < 0xFE && e8m0_decode(rounded) < target {
+                rounded + 1
+            } else {
+                rounded
+            }
+        }
+    };
+    encode_block(block, e8m0_decode(byte), codes);
+    if byte == 0 {
+        for (value, code) in block.iter().zip(codes.iter_mut()) {
+            if value.is_sign_negative() {
+                *code |= 0x8;
+            }
+        }
+    }
     byte
 }
 
@@ -214,6 +247,14 @@ fn encode_rows_mlx_rounded(values: &[f32], packed: &mut Vec<u32>, scales: &mut V
     });
 }
 
+/// [`encode_rows_with`] under MLX's current round-up rule.
+#[cfg(test)]
+fn encode_rows_mlx_round_up(values: &[f32], packed: &mut Vec<u32>, scales: &mut Vec<u8>) {
+    encode_rows_with(values, packed, scales, |block, codes| {
+        encode_one_block_mlx_round_up(block, codes)
+    });
+}
+
 /// Quantize a 2-D dense or 3-D expert-stack weight to MXFP4 checkpoint storage.
 ///
 /// For source `weight[..., K]`, emits packed `Uint32 [..., K / 8]` with element
@@ -232,8 +273,8 @@ pub fn quantize_mxfp4(weight: &MxArray, key_for_error: &str) -> Result<(MxArray,
     )
 }
 
-/// MLX's own MXFP4 encoder, byte for byte — [`quantize_mxfp4`] with the search
-/// removed. See [`encode_one_block_mlx_rounded`] for why it is kept.
+/// MLX's MXFP4 encoder through pin 053e43fec — [`quantize_mxfp4`] with the
+/// search removed. See [`encode_one_block_mlx_rounded`].
 #[cfg(test)]
 pub(crate) fn quantize_mxfp4_mlx_rounded(
     weight: &MxArray,
@@ -245,6 +286,22 @@ pub(crate) fn quantize_mxfp4_mlx_rounded(
         VALUES_PER_WORD,
         key_for_error,
         encode_rows_mlx_rounded,
+    )
+}
+
+/// MLX's MXFP4 encoder since upstream 02adf7b21, byte for byte. See
+/// [`encode_one_block_mlx_round_up`].
+#[cfg(test)]
+pub(crate) fn quantize_mxfp4_mlx_round_up(
+    weight: &MxArray,
+    key_for_error: &str,
+) -> Result<(MxArray, MxArray)> {
+    quantize_mx(
+        weight,
+        MXFP4_MODE,
+        VALUES_PER_WORD,
+        key_for_error,
+        encode_rows_mlx_round_up,
     )
 }
 

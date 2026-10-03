@@ -1,10 +1,11 @@
 //! MXFP8 weight encoding with a ceiling E8M0 exponent.
 //!
-//! MLX picks a block's E8M0 scale exponent by rounding `log2(amax / 448)` to
-//! nearest (`backend/metal/kernels/fp8.h`). Rounding lands within a factor of
-//! sqrt(2) either side, so exactly half of all blocks get an exponent below
-//! their own maximum — and any exponent below it leaves that maximum past
-//! E4M3's top code, where the cast saturates it, by as much as 1.41x.
+//! Through pin 053e43fec MLX picked a block's E8M0 scale exponent by rounding
+//! `log2(amax / 448)` to nearest (`backend/metal/kernels/fp8.h`). Rounding
+//! lands within a factor of sqrt(2) either side, so exactly half of all blocks
+//! get an exponent below their own maximum — and any exponent below it leaves
+//! that maximum past E4M3's top code, where the cast saturates it, by as much
+//! as 1.41x.
 //!
 //! Taking the ceiling instead cannot saturate: `2^ceil(log2(amax / 448)) * 448`
 //! is at or above `amax` by construction. It costs at most one binade of
@@ -22,22 +23,22 @@
 //!
 //! The ceiling is also the rule everyone else uses for E8M0 — NVIDIA modelopt,
 //! vLLM, and CUTLASS, whose `float_ue8m0_t` conversion is Blackwell's
-//! `cvt.rp` (round toward +infinity) in silicon. MLX disagrees with itself
-//! here: `backend/cuda/quantized/fp_quantize.cu` builds the scale byte through
-//! `cutlass::float_ue8m0_t`, while Metal (`fp8.h`), the CPU helper
-//! (`backend/cpu/quantized.cpp`) and the portable fallback (`ops.cpp`) all
-//! round to nearest. Convert takes the default stream, so it is the Metal
-//! kernel this replaces.
+//! `cvt.rp` (round toward +infinity) in silicon. Upstream MLX 02adf7b21 moved
+//! Metal, the CPU helper and the portable fallback to the same rule, so this
+//! encoder's scale bytes are now `mlx_quantize`'s. The one difference left is
+//! a byte-0 block, where MLX writes `w * 0` and so a negative-zero code for a
+//! negative element; this encoder writes the positive zero code. Both decode
+//! to zero. `quantize_mxfp8_mlx_round_up` keeps MLX's bytes wired up and
+//! `mxfp8_round_up_reference_is_bit_identical_to_mlx_quantize` pins them.
 //!
 //! There is no way to turn the ceiling off in production. A `#[cfg(test)]`
-//! `quantize_mxfp8_mlx_rounded` keeps Metal's rounding wired up, and
-//! `mxfp8_mlx_rounded_reference_is_bit_identical_to_mlx_quantize` pins that it
-//! still reproduces `mlx_quantize` byte for byte.
+//! `quantize_mxfp8_mlx_rounded` keeps the old round-to-nearest rule wired up
+//! as the baseline the ceiling was measured against.
 
 use napi::bindgen_prelude::Result;
 
 use crate::array::MxArray;
-/// Only [`block_scale_byte_mlx_rounded`] still needs MLX's rounding rule.
+/// Only [`block_scale_byte_mlx_rounded`] still needs the round-to-nearest rule.
 #[cfg(test)]
 use crate::quant::mx_common::e8m0_exponent;
 use crate::quant::mx_common::{
@@ -147,8 +148,8 @@ fn block_scale_byte(block: &[f32]) -> u8 {
     }
 }
 
-/// MLX's own choice: `log2(amax / 448)` rounded to nearest. Not what ships —
-/// see the module docs. Also the second candidate
+/// MLX's choice through pin 053e43fec: `log2(amax / 448)` rounded to nearest.
+/// Not what ships — see the module docs. Also the second candidate
 /// [`quantize_mxfp8_best_of_two`] measures.
 #[cfg(test)]
 #[inline]
@@ -215,7 +216,7 @@ pub fn quantize_mxfp8(weight: &MxArray, key_for_error: &str) -> Result<(MxArray,
     )
 }
 
-/// MLX's own MXFP8 encoder, byte for byte — [`quantize_mxfp8`] with the
+/// MLX's MXFP8 encoder through pin 053e43fec — [`quantize_mxfp8`] with the
 /// rounding restored. See [`block_scale_byte_mlx_rounded`].
 #[cfg(test)]
 pub(crate) fn quantize_mxfp8_mlx_rounded(
@@ -229,6 +230,40 @@ pub(crate) fn quantize_mxfp8_mlx_rounded(
         key_for_error,
         |values, packed, scales| {
             encode_rows_with(values, packed, scales, block_scale_byte_mlx_rounded);
+        },
+    )
+}
+
+/// MLX's MXFP8 encoder since upstream 02adf7b21, byte for byte: the shipping
+/// ceiling, plus the negative-zero codes MLX writes for the negative elements
+/// of a byte-0 block.
+#[cfg(test)]
+pub(crate) fn quantize_mxfp8_mlx_round_up(
+    weight: &MxArray,
+    key_for_error: &str,
+) -> Result<(MxArray, MxArray)> {
+    quantize_mx(
+        weight,
+        MXFP8_MODE,
+        VALUES_PER_WORD,
+        key_for_error,
+        |values, packed, scales| {
+            for block in values.as_chunks::<{ MXFP8_GROUP_SIZE as usize }>().0 {
+                let byte = block_scale_byte(block);
+                scales.push(byte);
+                let start = packed.len();
+                pack_block(block, e8m0_decode(byte), packed);
+                if byte == 0 {
+                    let words = block.as_chunks::<{ VALUES_PER_WORD as usize }>().0;
+                    for (word, lanes) in packed[start..].iter_mut().zip(words) {
+                        for (lane, value) in lanes.iter().enumerate() {
+                            if value.is_sign_negative() {
+                                *word |= 0x80 << (8 * lane);
+                            }
+                        }
+                    }
+                }
+            }
         },
     )
 }
@@ -341,10 +376,9 @@ mod tests {
         assert_eq!(e4m3_magnitude(0x08), 2.0f32.powi(-6));
     }
 
-    /// The defect, stated as a test: MLX's rounding leaves the block maximum
-    /// past E4M3's top code on exactly half of all blocks, and the ceiling
-    /// never does. Both halves matter — a rule that never clips but is not
-    /// MLX's would fail the bit-identity gate instead.
+    /// The defect, stated as a test: round-to-nearest, MLX's rule through pin
+    /// 053e43fec, leaves the block maximum past E4M3's top code on exactly
+    /// half of all blocks, and the ceiling never does.
     ///
     /// Half is not a measurement, it is forced: rounding lands the exponent
     /// within sqrt(2) either side of `amax / 448`, and every landing below
@@ -402,7 +436,7 @@ mod tests {
         );
         assert!(
             (48.0..52.0).contains(&rounded_share),
-            "MLX's rounding saturates half the blocks by construction, got {rounded_share:.2}%"
+            "round-to-nearest saturates half the blocks by construction, got {rounded_share:.2}%"
         );
     }
 }
