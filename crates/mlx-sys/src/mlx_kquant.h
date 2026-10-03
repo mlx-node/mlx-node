@@ -152,4 +152,16 @@ private:
   Mode mode_;
 };
 
+// Test-only kernel-family counters, per calling thread (Metal primitives are
+// encoded on the thread that calls eval). Off unless a test enables them.
+namespace testing {
+inline thread_local bool counting = false;
+void record_family(std::string_view family);
+inline void record(std::string_view family) {
+  if (counting) {
+    record_family(family);
+  }
+}
+} // namespace testing
+
 } // namespace mlx::core::kquant

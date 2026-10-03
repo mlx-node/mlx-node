@@ -6,6 +6,7 @@
 #include "mlx/backend/cpu/copy.h"
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/ops.h"
+#include "mlx/transforms_impl.h"
 
 #include <numeric>
 #include <sstream>
@@ -205,17 +206,49 @@ std::pair<int, int> extract_matmul_dims(std::string_view tag, const array &x,
   return {w_inner_dims, w_outer_dims};
 }
 
-// broadcast_arrays with the last two axes of every input left alone.
+// MLX's broadcast_arrays(inputs, {-2, -1}, s), which ops.h does not export.
+// Under dynamic tracing it must emit BroadcastAxes nodes even for inputs whose
+// trace-time batch already matches, so a shapeless replay re-derives the batch
+// shape instead of keeping the traced one.
 std::vector<array> broadcast_batch(const std::vector<array> &inputs,
                                    StreamOrDevice s) {
-  auto shape = BroadcastAxes::output_shape(inputs, {-2, -1});
-  std::vector<array> outputs;
-  for (auto &in : inputs) {
+  const std::vector<int> ignore_axes = {-2, -1};
+  auto shape = BroadcastAxes::output_shape(inputs, ignore_axes);
+  auto out_shape_of = [&shape](const array &in) {
     auto out_shape = shape;
     out_shape[out_shape.size() - 2] = in.shape(-2);
     out_shape[out_shape.size() - 1] = in.shape(-1);
-    outputs.push_back(in.shape() == out_shape ? in
-                                              : broadcast_to(in, out_shape, s));
+    return out_shape;
+  };
+  std::vector<array> outputs;
+  if (!detail::in_dynamic_tracing()) {
+    for (auto &in : inputs) {
+      auto out_shape = out_shape_of(in);
+      if (in.shape() == out_shape) {
+        outputs.push_back(in);
+      } else {
+        outputs.push_back(
+            array(out_shape, in.dtype(),
+                  std::make_shared<Broadcast>(to_stream(s), out_shape), {in}));
+      }
+    }
+    return outputs;
+  }
+  std::vector<array> stop_grad_inputs;
+  for (auto &in : inputs) {
+    stop_grad_inputs.push_back(stop_gradient(in, s));
+  }
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    std::vector<array> p_inputs = {inputs[i]};
+    for (size_t j = 0; j < inputs.size(); ++j) {
+      if (j != i) {
+        p_inputs.push_back(stop_grad_inputs[j]);
+      }
+    }
+    outputs.push_back(
+        array(out_shape_of(inputs[i]), inputs[i].dtype(),
+              std::make_shared<BroadcastAxes>(to_stream(s), ignore_axes),
+              std::move(p_inputs)));
   }
   return outputs;
 }

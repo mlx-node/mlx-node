@@ -6,299 +6,124 @@
 //! mode string. When the pin moves to upstream MLX this file becomes a
 //! reference-dequantize test.
 //!
-//! Run: cargo test -p mlx-core --release --test kquant_fork_oracle_parity
+//! Both sides take an explicit device, so the tests are race-free under any
+//! `--test-threads`. The Metal tests count the kernel families the bridge
+//! dispatched on their own thread and require every family the device's
+//! generation can reach. Run all three generations:
+//!
+//!   cargo test -p mlx-core --release --test kquant_fork_oracle_parity
+//!   MLX_METAL_GPU_ARCH=applegpu_g16s cargo test -p mlx-core --release --test kquant_fork_oracle_parity
+//!   MLX_METAL_GPU_ARCH=applegpu_g14s cargo test -p mlx-core --release --test kquant_fork_oracle_parity
+//!
+//! The native run (gen 17 with NAX) reaches qmm_t_nax and qmv_sg8; g16s turns
+//! both off; g14s also turns qmv_wide off, so multi-row matvecs take qmv.
 
-use std::ffi::CString;
+mod kquant_support;
 
+use kquant_support::*;
 use mlx_core::array::{DType, MxArray};
-
-struct KQuant {
-    mode: &'static str,
-    bits: i32,
-    group_size: i32,
-    scales_signed: bool,
-    // Columns per 256 decoded values.
-    weight_cols: i64,
-    scales_cols: i64,
-    biases_cols: i64,
-}
-
-const KQUANTS: [KQuant; 7] = [
-    KQuant {
-        mode: "q3k",
-        bits: 3,
-        group_size: 16,
-        scales_signed: true,
-        weight_cols: 24,
-        scales_cols: 16,
-        biases_cols: 1,
-    },
-    KQuant {
-        mode: "q6k",
-        bits: 6,
-        group_size: 16,
-        scales_signed: true,
-        weight_cols: 48,
-        scales_cols: 16,
-        biases_cols: 1,
-    },
-    KQuant {
-        mode: "q4k",
-        bits: 4,
-        group_size: 32,
-        scales_signed: false,
-        weight_cols: 32,
-        scales_cols: 16,
-        biases_cols: 2,
-    },
-    KQuant {
-        mode: "q5k",
-        bits: 5,
-        group_size: 32,
-        scales_signed: false,
-        weight_cols: 40,
-        scales_cols: 16,
-        biases_cols: 2,
-    },
-    KQuant {
-        mode: "iq4nl",
-        bits: 4,
-        group_size: 32,
-        scales_signed: true,
-        weight_cols: 32,
-        scales_cols: 8,
-        biases_cols: 8,
-    },
-    KQuant {
-        mode: "iq4xs",
-        bits: 4,
-        group_size: 32,
-        scales_signed: true,
-        weight_cols: 32,
-        scales_cols: 8,
-        biases_cols: 1,
-    },
-    KQuant {
-        mode: "iq3s",
-        bits: 8,
-        group_size: 32,
-        scales_signed: true,
-        weight_cols: 64,
-        scales_cols: 8,
-        biases_cols: 1,
-    },
-];
-
-const DTYPES: [DType; 3] = [DType::Float32, DType::Float16, DType::BFloat16];
 
 /// Row counts that cross every dispatch boundary: qmv, qmv_wide nv2..8, the
 /// bfloat16 M = 8 sg8 kernel, the batch limit, split-K qmm, and NAX qmm.
-const MS: [i64; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 17, 24, 33, 64, 512];
+const MULTI_ROW: [i64; 7] = [2, 3, 4, 5, 6, 7, 8];
+const OTHER_ROWS: [i64; 8] = [1, 9, 12, 17, 24, 33, 64, 512];
 
-fn select(gpu: bool) -> bool {
-    let code = i32::from(gpu);
-    // SAFETY: plain global setters in the MLX FFI; tests run single-threaded.
+fn label(device: i32) -> &'static str {
+    if device == GPU { "gpu" } else { "cpu" }
+}
+
+fn fork_quantized_matmul(
+    x: &MxArray,
+    w: &Weights,
+    transpose: bool,
+    kq: &KQuant,
+    device: i32,
+) -> *mut mlx_sys::mlx_array {
+    let mode = mode_cstr(kq);
+    // SAFETY: every handle outlives the call.
     unsafe {
-        mlx_sys::mlx_set_default_device(code);
-        if mlx_sys::mlx_default_device() != code {
-            return false;
-        }
-        let stream = mlx_sys::mlx_default_stream(code);
-        mlx_sys::mlx_set_default_stream(stream);
-    }
-    true
-}
-
-fn lcg(state: &mut u32) -> u32 {
-    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-    *state
-}
-
-const HALF_SCALES: [u16; 6] = [0x3000, 0x2C00, 0x3400, 0x2E66, 0x3155, 0x2800];
-
-struct Weights {
-    w: MxArray,
-    scales: MxArray,
-    biases: MxArray,
-}
-
-/// `leading` precedes the packed axis, which expands to `packed` values.
-fn weights(kq: &KQuant, leading: &[i64], packed: i64, seed: u32) -> Weights {
-    assert_eq!(packed % 256, 0);
-    let rows: i64 = leading.iter().product();
-    let supers = packed / 256;
-    let shape = |cols: i64| {
-        let mut s = leading.to_vec();
-        s.push(cols * supers);
-        s
-    };
-    let mut st = seed;
-    let w: Vec<u32> = (0..rows * kq.weight_cols * supers)
-        .map(|_| lcg(&mut st))
-        .collect();
-    let scales_len = (rows * kq.scales_cols * supers) as usize;
-    let scales = if kq.scales_signed {
-        let v: Vec<i8> = (0..scales_len)
-            .map(|_| (lcg(&mut st) % 17) as i8 - 8)
-            .collect();
-        MxArray::from_int8(&v, &shape(kq.scales_cols))
-    } else {
-        let v: Vec<u8> = (0..scales_len).map(|_| (lcg(&mut st) % 64) as u8).collect();
-        MxArray::from_uint8(&v, &shape(kq.scales_cols))
-    }
-    .expect("scales");
-    let biases: Vec<u16> = (0..(rows * kq.biases_cols * supers) as usize)
-        .map(|i| HALF_SCALES[(i + seed as usize) % HALF_SCALES.len()])
-        .collect();
-    Weights {
-        w: MxArray::from_uint32(&w, &shape(kq.weight_cols)).expect("w"),
-        scales,
-        biases: MxArray::from_float16(&biases, &shape(kq.biases_cols)).expect("biases"),
-    }
-}
-
-/// 8-bit integers over 128: exact in all three activation dtypes.
-fn activation(shape: &[i64], seed: u32, dtype: DType) -> MxArray {
-    let n: i64 = shape.iter().product();
-    let mut st = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
-    let values: Vec<f32> = (0..n)
-        .map(|_| f32::from((lcg(&mut st) >> 24) as i8) / 128.0)
-        .collect();
-    match dtype {
-        DType::Float32 => MxArray::from_float32(&values, shape),
-        DType::Float16 => {
-            let bits: Vec<u16> = values
-                .iter()
-                .map(|&v| half::f16::from_f32(v).to_bits())
-                .collect();
-            MxArray::from_float16(&bits, shape)
-        }
-        DType::BFloat16 => {
-            let bits: Vec<u16> = values.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
-            MxArray::from_bfloat16(&bits, shape)
-        }
-        other => panic!("unsupported activation dtype {other:?}"),
-    }
-    .expect("activation")
-}
-
-fn eval(handle: *mut mlx_sys::mlx_array) -> Result<(), String> {
-    let mut buf = [0i8; 512];
-    let mut h = handle;
-    // SAFETY: `handle` is live; `buf` is the error sink.
-    let ok = unsafe { mlx_sys::mlx_eval_with_error(&mut h, 1, buf.as_mut_ptr(), buf.len()) };
-    if ok {
-        return Ok(());
-    }
-    let bytes: Vec<u8> = buf
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    Err(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Raw output bits; consumes the handle.
-fn read_bits(what: &str, h: *mut mlx_sys::mlx_array) -> (DType, Vec<u32>) {
-    assert!(!h.is_null(), "{what}: rejected at construction");
-    if let Err(e) = eval(h) {
-        // SAFETY: owned handle.
-        unsafe { mlx_sys::mlx_array_delete(h) };
-        panic!("{what}: {e}");
-    }
-    // SAFETY: `h` is live and evaluated.
-    let (len, code) = unsafe { (mlx_sys::mlx_array_size(h), mlx_sys::mlx_array_dtype(h)) };
-    let out = if code == DType::Float32 as i32 {
-        let mut v = vec![0f32; len];
-        // SAFETY: `v` holds `len` elements.
-        assert!(unsafe { mlx_sys::mlx_array_to_float32(h, v.as_mut_ptr(), len) });
-        (DType::Float32, v.iter().map(|x| x.to_bits()).collect())
-    } else {
-        let mut v = vec![0u16; len];
-        // SAFETY: `v` holds `len` elements.
-        assert!(unsafe { mlx_sys::mlx_array_to_uint16(h, v.as_mut_ptr(), len) });
-        let dtype = if code == DType::Float16 as i32 {
-            DType::Float16
-        } else {
-            DType::BFloat16
-        };
-        (dtype, v.into_iter().map(u32::from).collect())
-    };
-    // SAFETY: owned handle, not used afterwards.
-    unsafe { mlx_sys::mlx_array_delete(h) };
-    out
-}
-
-fn ptr(a: Option<&MxArray>) -> *mut mlx_sys::mlx_array {
-    a.map_or(std::ptr::null_mut(), |a| a.as_raw_ptr())
-}
-
-#[derive(Default)]
-struct Tally {
-    cases: usize,
-    nonzero: usize,
-}
-
-/// Both handles must evaluate to the same dtype and the same bits.
-fn assert_identical(
-    tally: &mut Tally,
-    what: &str,
-    ours: *mut mlx_sys::mlx_array,
-    fork: *mut mlx_sys::mlx_array,
-) {
-    let (ours_dtype, ours) = read_bits(&format!("{what} ours"), ours);
-    let (fork_dtype, fork) = read_bits(&format!("{what} fork"), fork);
-    assert_eq!(ours_dtype, fork_dtype, "{what}: dtype differs");
-    assert_eq!(ours.len(), fork.len(), "{what}: length differs");
-    if let Some(i) = (0..ours.len()).find(|&i| ours[i] != fork[i]) {
-        panic!(
-            "{what}: first difference at {i}: ours {:#x}, fork {:#x} ({} of {} differ)",
-            ours[i],
-            fork[i],
-            (0..ours.len()).filter(|&j| ours[j] != fork[j]).count(),
-            ours.len()
-        );
-    }
-    tally.cases += 1;
-    if ours.iter().any(|&b| b & 0x7fff_ffff != 0) {
-        tally.nonzero += 1;
+        mlx_sys::mlx_test_fork_kquant_quantized_matmul(
+            x.as_raw_ptr(),
+            w.w.as_raw_ptr(),
+            w.scales.as_raw_ptr(),
+            w.biases.as_raw_ptr(),
+            transpose,
+            kq.group_size,
+            kq.bits,
+            mode.as_ptr(),
+            device,
+        )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qmm_pair(tally: &mut Tally, what: &str, x: &MxArray, w: &Weights, transpose: bool, kq: &KQuant) {
-    let mode = CString::new(kq.mode).unwrap();
-    // SAFETY: every handle outlives the calls.
-    let (ours, fork) = unsafe {
-        (
-            mlx_sys::mlx_quantized_matmul(
-                x.as_raw_ptr(),
-                w.w.as_raw_ptr(),
-                w.scales.as_raw_ptr(),
-                w.biases.as_raw_ptr(),
-                transpose,
-                kq.group_size,
-                kq.bits,
-                mode.as_ptr(),
-            ),
-            mlx_sys::mlx_test_fork_kquant_quantized_matmul(
-                x.as_raw_ptr(),
-                w.w.as_raw_ptr(),
-                w.scales.as_raw_ptr(),
-                w.biases.as_raw_ptr(),
-                transpose,
-                kq.group_size,
-                kq.bits,
-                mode.as_ptr(),
-            ),
+fn fork_gather_qmm(
+    x: &MxArray,
+    w: &Weights,
+    lhs: Option<&MxArray>,
+    rhs: &MxArray,
+    transpose: bool,
+    sorted: bool,
+    kq: &KQuant,
+    device: i32,
+) -> *mut mlx_sys::mlx_array {
+    let mode = mode_cstr(kq);
+    // SAFETY: every handle outlives the call; null lhs means "derive from x".
+    unsafe {
+        mlx_sys::mlx_test_fork_kquant_gather_qmm(
+            x.as_raw_ptr(),
+            w.w.as_raw_ptr(),
+            w.scales.as_raw_ptr(),
+            w.biases.as_raw_ptr(),
+            ptr(lhs),
+            rhs.as_raw_ptr(),
+            transpose,
+            kq.group_size,
+            kq.bits,
+            mode.as_ptr(),
+            sorted,
+            device,
         )
-    };
-    assert_identical(tally, what, ours, fork);
+    }
+}
+
+fn fork_dequantize(w: &Weights, dtype: DType, kq: &KQuant, device: i32) -> *mut mlx_sys::mlx_array {
+    let mode = mode_cstr(kq);
+    // SAFETY: every handle outlives the call.
+    unsafe {
+        mlx_sys::mlx_test_fork_kquant_dequantize(
+            w.w.as_raw_ptr(),
+            w.scales.as_raw_ptr(),
+            w.biases.as_raw_ptr(),
+            kq.group_size,
+            kq.bits,
+            dtype as i32,
+            mode.as_ptr(),
+            device,
+        )
+    }
+}
+
+fn qmm_pair(
+    cases: &mut usize,
+    what: &str,
+    x: &MxArray,
+    w: &Weights,
+    transpose: bool,
+    kq: &KQuant,
+    device: i32,
+) {
+    assert_identical(
+        what,
+        quantized_matmul(x, w, transpose, kq, device),
+        fork_quantized_matmul(x, w, transpose, kq, device),
+    );
+    *cases += 1;
 }
 
 #[allow(clippy::too_many_arguments)]
 fn gather_pair(
-    tally: &mut Tally,
+    cases: &mut usize,
     what: &str,
     x: &MxArray,
     w: &Weights,
@@ -307,87 +132,22 @@ fn gather_pair(
     transpose: bool,
     sorted: bool,
     kq: &KQuant,
+    device: i32,
 ) {
-    let mode = CString::new(kq.mode).unwrap();
-    // SAFETY: every handle outlives the calls; null lhs means "derive from x".
-    let (ours, fork) = unsafe {
-        (
-            mlx_sys::mlx_gather_qmm(
-                x.as_raw_ptr(),
-                w.w.as_raw_ptr(),
-                w.scales.as_raw_ptr(),
-                w.biases.as_raw_ptr(),
-                ptr(lhs),
-                rhs.as_raw_ptr(),
-                transpose,
-                kq.group_size,
-                kq.bits,
-                mode.as_ptr(),
-                sorted,
-            ),
-            mlx_sys::mlx_test_fork_kquant_gather_qmm(
-                x.as_raw_ptr(),
-                w.w.as_raw_ptr(),
-                w.scales.as_raw_ptr(),
-                w.biases.as_raw_ptr(),
-                ptr(lhs),
-                rhs.as_raw_ptr(),
-                transpose,
-                kq.group_size,
-                kq.bits,
-                mode.as_ptr(),
-                sorted,
-            ),
-        )
-    };
-    assert_identical(tally, what, ours, fork);
+    assert_identical(
+        what,
+        gather_qmm(x, w, lhs, rhs, transpose, sorted, kq, device),
+        fork_gather_qmm(x, w, lhs, rhs, transpose, sorted, kq, device),
+    );
+    *cases += 1;
 }
 
-fn dequantize_pair(tally: &mut Tally, what: &str, w: &Weights, dtype: DType, kq: &KQuant) {
-    let mode = CString::new(kq.mode).unwrap();
-    // SAFETY: every handle outlives the calls.
-    let (ours, fork) = unsafe {
-        (
-            mlx_sys::mlx_dequantize(
-                w.w.as_raw_ptr(),
-                w.scales.as_raw_ptr(),
-                w.biases.as_raw_ptr(),
-                kq.group_size,
-                kq.bits,
-                dtype as i32,
-                mode.as_ptr(),
-            ),
-            mlx_sys::mlx_test_fork_kquant_dequantize(
-                w.w.as_raw_ptr(),
-                w.scales.as_raw_ptr(),
-                w.biases.as_raw_ptr(),
-                kq.group_size,
-                kq.bits,
-                dtype as i32,
-                mode.as_ptr(),
-            ),
-        )
-    };
-    assert_identical(tally, what, ours, fork);
-}
-
-fn indices(values: &[u32]) -> MxArray {
-    MxArray::from_uint32(values, &[values.len() as i64]).expect("indices")
-}
-
-/// The portable prefill tile is a separate kernel layered on top of the op and
-/// is gated by its own tests; keep it out of this comparison.
-fn disable_portable() {
-    // SAFETY: set before any MLX work in this single-threaded test binary.
-    unsafe { std::env::set_var("MLX_PORTABLE_KQUANT", "0") };
-}
-
-fn run_matmuls(tally: &mut Tally, gpu: bool, ms: &[i64]) {
-    let device = if gpu { "gpu" } else { "cpu" };
+fn run_matmuls(cases: &mut usize, device: i32, ms: &[i64]) {
+    let dev = label(device);
     for (ki, kq) in KQUANTS.iter().enumerate() {
         let seed = 0x1000 + ki as u32;
         // Transposed: (N, K) = aligned and fast-qmv, then unaligned N with
-        // K % 512 != 0, then a batched weight.
+        // K % 512 != 0, then batched weights.
         let wide = weights(kq, &[2048], 1024, seed);
         let odd = weights(kq, &[136], 768, seed + 1);
         let batched = weights(kq, &[2, 136], 768, seed + 2);
@@ -397,95 +157,123 @@ fn run_matmuls(tally: &mut Tally, gpu: bool, ms: &[i64]) {
         let n_short = weights(kq, &[256], 512, seed + 3);
         let n_deep = weights(kq, &[1024], 512, seed + 4);
         for dtype in DTYPES {
+            let m_ = kq.mode;
             for &m in ms {
-                if gpu || m <= 33 {
+                if device == GPU || m <= 33 {
                     let x = activation(&[m, 1024], seed + m as u32, dtype);
                     qmm_pair(
-                        tally,
-                        &format!("{device} {} {dtype:?} t M={m} N=2048 K=1024", kq.mode),
+                        cases,
+                        &format!("{dev} {m_} {dtype:?} t M={m} N=2048 K=1024"),
                         &x,
                         &wide,
                         true,
                         kq,
+                        device,
                     );
                 }
                 let x = activation(&[m, 768], seed + 7 + m as u32, dtype);
                 qmm_pair(
-                    tally,
-                    &format!("{device} {} {dtype:?} t M={m} N=136 K=768", kq.mode),
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} t M={m} N=136 K=768"),
                     &x,
                     &odd,
                     true,
                     kq,
+                    device,
                 );
-                if m <= 64 {
-                    let x = activation(&[2, m, 768], seed + 11 + m as u32, dtype);
-                    qmm_pair(
-                        tally,
-                        &format!("{device} {} {dtype:?} t batched M={m}", kq.mode),
-                        &x,
-                        &batched,
-                        true,
-                        kq,
-                    );
-                    let x = activation(&[2, m, 1024], seed + 23 + m as u32, dtype);
-                    qmm_pair(
-                        tally,
-                        &format!("{device} {} {dtype:?} t batched-aligned M={m}", kq.mode),
-                        &x,
-                        &batched_wide,
-                        true,
-                        kq,
-                    );
-                    let x = activation(&[3, m, 768], seed + 13 + m as u32, dtype);
-                    qmm_pair(
-                        tally,
-                        &format!("{device} {} {dtype:?} t x-batched M={m}", kq.mode),
-                        &x,
-                        &odd,
-                        true,
-                        kq,
-                    );
+                if m > 64 {
+                    continue;
                 }
-                if m <= 64 {
-                    let x = activation(&[m, 256], seed + 17 + m as u32, dtype);
-                    qmm_pair(
-                        tally,
-                        &format!("{device} {} {dtype:?} n M={m} K=256", kq.mode),
-                        &x,
-                        &n_short,
-                        false,
-                        kq,
-                    );
-                    let x = activation(&[m, 1024], seed + 19 + m as u32, dtype);
-                    qmm_pair(
-                        tally,
-                        &format!("{device} {} {dtype:?} n M={m} K=1024", kq.mode),
-                        &x,
-                        &n_deep,
-                        false,
-                        kq,
-                    );
-                }
+                let x = activation(&[2, m, 768], seed + 11 + m as u32, dtype);
+                qmm_pair(
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} t batched M={m}"),
+                    &x,
+                    &batched,
+                    true,
+                    kq,
+                    device,
+                );
+                let x = activation(&[2, m, 1024], seed + 23 + m as u32, dtype);
+                qmm_pair(
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} t batched-aligned M={m}"),
+                    &x,
+                    &batched_wide,
+                    true,
+                    kq,
+                    device,
+                );
+                let x = activation(&[3, m, 768], seed + 13 + m as u32, dtype);
+                qmm_pair(
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} t x-batched M={m}"),
+                    &x,
+                    &odd,
+                    true,
+                    kq,
+                    device,
+                );
+                let x = activation(&[m, 256], seed + 17 + m as u32, dtype);
+                qmm_pair(
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} n M={m} K=256"),
+                    &x,
+                    &n_short,
+                    false,
+                    kq,
+                    device,
+                );
+                let x = activation(&[m, 1024], seed + 19 + m as u32, dtype);
+                qmm_pair(
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} n M={m} K=1024"),
+                    &x,
+                    &n_deep,
+                    false,
+                    kq,
+                    device,
+                );
             }
         }
     }
 }
 
-fn run_gathers(tally: &mut Tally, gpu: bool) {
-    let device = if gpu { "gpu" } else { "cpu" };
+/// K = 544 is the one transposed K-quant reduction that is not a multiple of
+/// 64 (IQ4_NL's 32-value blocks), so on a NAX device it is the only shape that
+/// keeps qmm on the simdgroup `qmm_t`. The batched weight makes B = 2, which
+/// skips split-K.
+fn run_simdgroup_qmm_t(cases: &mut usize, device: i32) {
+    let kq = kquant("iq4nl");
+    let w = weights(kq, &[2, 136], 544, 0x1500);
+    for dtype in DTYPES {
+        let x = activation(&[2, 64, 544], 0x1501, dtype);
+        qmm_pair(
+            cases,
+            &format!("{} iq4nl {dtype:?} t batched M=64 K=544", label(device)),
+            &x,
+            &w,
+            true,
+            kq,
+            device,
+        );
+    }
+}
+
+fn run_gathers(cases: &mut usize, device: i32) {
+    let dev = label(device);
     const E: i64 = 8;
     for (ki, kq) in KQUANTS.iter().enumerate() {
         let seed = 0x2000 + ki as u32;
+        let m_ = kq.mode;
         let experts_t = weights(kq, &[E, 128], 512, seed);
         let experts_n = weights(kq, &[E, 256], 512, seed + 1);
         let experts_odd = weights(kq, &[E, 136], 768, seed + 2);
-        let mut st = seed;
-        let random: Vec<u32> = (0..32).map(|_| lcg(&mut st) % E as u32).collect();
+        let random = random_ids(seed, 32, E as u32);
         let mut sorted_ids = random.clone();
         sorted_ids.sort_unstable();
-        let lhs: Vec<u32> = (0..6).map(|_| lcg(&mut st) % 4).collect();
-        let rhs6: Vec<u32> = (0..6).map(|_| lcg(&mut st) % E as u32).collect();
+        let lhs = random_ids(seed + 9, 6, 4);
+        let rhs6 = random_ids(seed + 10, 6, E as u32);
         for dtype in DTYPES {
             // One row per token, experts on the right only: gather_qmv, and
             // with sorted indices the gather_qmm_rhs walk.
@@ -496,8 +284,8 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                 (false, &sorted_ids, "sorted-ids unsorted-flag"),
             ] {
                 gather_pair(
-                    tally,
-                    &format!("{device} {} {dtype:?} gather t {tag}", kq.mode),
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} gather t {tag}"),
                     &x,
                     &experts_t,
                     None,
@@ -505,12 +293,13 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                     true,
                     sorted,
                     kq,
+                    device,
                 );
             }
             let x = activation(&[32, 1, 768], seed + 4, dtype);
             gather_pair(
-                tally,
-                &format!("{device} {} {dtype:?} gather t odd unsorted", kq.mode),
+                cases,
+                &format!("{dev} {m_} {dtype:?} gather t odd unsorted"),
                 &x,
                 &experts_odd,
                 None,
@@ -518,10 +307,11 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                 true,
                 false,
                 kq,
+                device,
             );
             gather_pair(
-                tally,
-                &format!("{device} {} {dtype:?} gather t odd sorted", kq.mode),
+                cases,
+                &format!("{dev} {m_} {dtype:?} gather t odd sorted"),
                 &x,
                 &experts_odd,
                 None,
@@ -529,11 +319,12 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                 true,
                 true,
                 kq,
+                device,
             );
             let xn = activation(&[32, 1, 256], seed + 5, dtype);
             gather_pair(
-                tally,
-                &format!("{device} {} {dtype:?} gather n sorted", kq.mode),
+                cases,
+                &format!("{dev} {m_} {dtype:?} gather n sorted"),
                 &xn,
                 &experts_n,
                 None,
@@ -541,10 +332,11 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                 false,
                 true,
                 kq,
+                device,
             );
             gather_pair(
-                tally,
-                &format!("{device} {} {dtype:?} gather n unsorted", kq.mode),
+                cases,
+                &format!("{dev} {m_} {dtype:?} gather n unsorted"),
                 &xn,
                 &experts_n,
                 None,
@@ -552,13 +344,14 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                 false,
                 false,
                 kq,
+                device,
             );
             // Both index sets: vector and matrix kernels on either layout.
             for m in [1i64, 4, 33] {
                 let x = activation(&[4, m, 512], seed + 7 + m as u32, dtype);
                 gather_pair(
-                    tally,
-                    &format!("{device} {} {dtype:?} gather t lhs M={m}", kq.mode),
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} gather t lhs M={m}"),
                     &x,
                     &experts_t,
                     Some(&indices(&lhs)),
@@ -566,11 +359,12 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                     true,
                     false,
                     kq,
+                    device,
                 );
                 let x = activation(&[4, m, 256], seed + 9 + m as u32, dtype);
                 gather_pair(
-                    tally,
-                    &format!("{device} {} {dtype:?} gather n lhs M={m}", kq.mode),
+                    cases,
+                    &format!("{dev} {m_} {dtype:?} gather n lhs M={m}"),
                     &x,
                     &experts_n,
                     Some(&indices(&lhs)),
@@ -578,86 +372,177 @@ fn run_gathers(tally: &mut Tally, gpu: bool) {
                     false,
                     false,
                     kq,
+                    device,
                 );
             }
         }
     }
 }
 
-fn run_dequantize(tally: &mut Tally, gpu: bool) {
-    let device = if gpu { "gpu" } else { "cpu" };
+fn run_dequantize(cases: &mut usize, device: i32) {
+    let dev = label(device);
     for (ki, kq) in KQUANTS.iter().enumerate() {
         let flat = weights(kq, &[96], 1024, 0x3000 + ki as u32);
         let stacked = weights(kq, &[3, 40], 512, 0x3100 + ki as u32);
         for dtype in DTYPES {
-            dequantize_pair(
-                tally,
-                &format!("{device} {} {dtype:?} dequantize 2-D", kq.mode),
-                &flat,
-                dtype,
-                kq,
-            );
-            dequantize_pair(
-                tally,
-                &format!("{device} {} {dtype:?} dequantize 3-D", kq.mode),
-                &stacked,
-                dtype,
-                kq,
-            );
+            for (w, tag) in [(&flat, "2-D"), (&stacked, "3-D")] {
+                assert_identical(
+                    &format!("{dev} {} {dtype:?} dequantize {tag}", kq.mode),
+                    dequantize(w, dtype, kq, device),
+                    fork_dequantize(w, dtype, kq, device),
+                );
+                *cases += 1;
+            }
         }
     }
 }
 
-fn report(label: &str, tally: &Tally) {
-    println!(
-        "{label}: {} cases bit-identical ({} with a nonzero output)",
-        tally.cases, tally.nonzero
-    );
-    assert!(tally.cases > 0);
-    assert_eq!(
-        tally.nonzero, tally.cases,
-        "{label}: a degenerate all-zero case proves nothing"
-    );
+#[cfg(target_os = "macos")]
+fn require_metal() -> i32 {
+    let arch = gpu_gen();
+    assert!(arch > 0, "no Metal device: these macOS tests need one");
+    arch
 }
 
+fn expect_hit(families: &[&str]) {
+    for family in families {
+        let n = family_count(family);
+        println!("  {family:<20} {n}");
+        assert!(n > 0, "kernel family {family} never ran on this thread");
+    }
+}
+
+fn expect_absent(families: &[&str]) {
+    for family in families {
+        assert_eq!(
+            family_count(family),
+            0,
+            "kernel family {family} must not run here"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn metal_matmul_matches_fork_bitwise() {
-    disable_portable();
-    if !select(true) {
-        println!("no Metal device; skipped");
-        return;
+    let arch = require_metal();
+    let nax = nax_available();
+    println!("gpu gen {arch}, nax {nax}");
+    let mut cases = 0;
+
+    // Multi-row matvecs alone first, to see which kernel they take.
+    start_counting();
+    run_matmuls(&mut cases, GPU, &MULTI_ROW);
+    let multi_row_qmv = family_count("qmv") + family_count("qmv_fast");
+    let multi_row_wide = family_count("qmv_wide");
+    let multi_row_sg8 = family_count("qmv_sg8");
+    println!("multi-row: qmv {multi_row_qmv}, qmv_wide {multi_row_wide}, qmv_sg8 {multi_row_sg8}");
+    if arch >= 15 {
+        assert_eq!(
+            multi_row_qmv, 0,
+            "gen {arch}: multi-row matvecs must take qmv_wide"
+        );
+        assert!(multi_row_wide > 0);
+    } else {
+        assert!(
+            multi_row_qmv > 0,
+            "gen {arch}: multi-row matvecs must take qmv"
+        );
+        assert_eq!(multi_row_wide, 0);
     }
-    let mut tally = Tally::default();
-    run_matmuls(&mut tally, true, &MS);
-    report("metal quantized_matmul", &tally);
+    if arch >= 17 {
+        assert!(
+            multi_row_sg8 > 0,
+            "gen {arch}: bfloat16 M = 8 must take qmv_sg8"
+        );
+    }
+
+    start_counting();
+    run_matmuls(&mut cases, GPU, &MULTI_ROW);
+    run_matmuls(&mut cases, GPU, &OTHER_ROWS);
+    run_simdgroup_qmm_t(&mut cases, GPU);
+    println!("metal quantized_matmul: {cases} cases bit-identical");
+    expect_hit(&[
+        "qmv",
+        "qmv_fast",
+        "qmm_t",
+        "qmm_t_splitk",
+        "qmm_n",
+        "qvm",
+        "qvm_split_k",
+    ]);
+    if arch >= 15 {
+        expect_hit(&[
+            "qmv_wide",
+            "qmv_wide_nv2",
+            "qmv_wide_nv3",
+            "qmv_wide_nv4",
+            "qmv_wide_nv5",
+            "qmv_wide_nv6",
+            "qmv_wide_nv7",
+            "qmv_wide_nv8",
+        ]);
+    } else {
+        expect_absent(&["qmv_wide"]);
+    }
+    if arch >= 17 {
+        expect_hit(&["qmv_sg8"]);
+    } else {
+        expect_absent(&["qmv_sg8"]);
+    }
+    if nax {
+        expect_hit(&["qmm_t_nax"]);
+    } else {
+        expect_absent(&["qmm_t_nax"]);
+    }
+    stop_counting();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn metal_gather_and_dequantize_match_fork_bitwise() {
-    disable_portable();
-    if !select(true) {
-        println!("no Metal device; skipped");
-        return;
-    }
-    let mut gather = Tally::default();
-    run_gathers(&mut gather, true);
-    report("metal gather_qmm", &gather);
-    let mut deq = Tally::default();
-    run_dequantize(&mut deq, true);
-    report("metal dequantize", &deq);
+    require_metal();
+    start_counting();
+    let mut gather = 0;
+    run_gathers(&mut gather, GPU);
+    println!("metal gather_qmm: {gather} cases bit-identical");
+    let mut deq = 0;
+    run_dequantize(&mut deq, GPU);
+    println!("metal dequantize: {deq} cases bit-identical");
+    expect_hit(&[
+        "gather_qmv",
+        "gather_qmv_fast",
+        "gather_qmm_rhs_nt",
+        "gather_qmm_rhs_nn",
+        "gather_qvm",
+        "gather_qmm_t",
+        "gather_qmm_n",
+        "dequantize",
+    ]);
+    stop_counting();
 }
 
 #[test]
 fn cpu_matches_fork_bitwise() {
-    disable_portable();
-    assert!(select(false));
-    let mut mm = Tally::default();
-    run_matmuls(&mut mm, false, &[1, 2, 8, 9, 33]);
-    report("cpu quantized_matmul", &mm);
-    let mut gather = Tally::default();
-    run_gathers(&mut gather, false);
-    report("cpu gather_qmm", &gather);
-    let mut deq = Tally::default();
-    run_dequantize(&mut deq, false);
-    report("cpu dequantize", &deq);
+    start_counting();
+    let mut mm = 0;
+    run_matmuls(&mut mm, CPU, &[1, 2, 8, 9, 33]);
+    run_simdgroup_qmm_t(&mut mm, CPU);
+    println!("cpu quantized_matmul: {mm} cases bit-identical");
+    let mut gather = 0;
+    run_gathers(&mut gather, CPU);
+    println!("cpu gather_qmm: {gather} cases bit-identical");
+    let mut deq = 0;
+    run_dequantize(&mut deq, CPU);
+    println!("cpu dequantize: {deq} cases bit-identical");
+    // Nothing on this thread may have been encoded for Metal.
+    expect_absent(&[
+        "qmv",
+        "qmv_fast",
+        "qmm_t",
+        "qmm_n",
+        "gather_qmv",
+        "dequantize",
+    ]);
+    stop_counting();
 }

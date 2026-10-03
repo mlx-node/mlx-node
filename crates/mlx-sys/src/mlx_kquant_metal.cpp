@@ -94,6 +94,7 @@ MTL::ComputePipelineState *
 get_kernel(metal::Device &d, const std::string &kname, const std::string &func,
            Mode mode, const std::string &type, int group_size, int bits,
            Args... args) {
+  testing::record(func);
   return build_kernel(d, kname,
                       template_definition(kname, "kquant_" + func, type,
                                           group_size, bits, super_ratio(mode),
@@ -106,6 +107,7 @@ MTL::ComputePipelineState *
 get_nax_kernel(metal::Device &d, const std::string &kname,
                const std::string &func, Mode mode, const std::string &type,
                int group_size, int bits, Args... args) {
+  testing::record(func);
   return build_kernel(d, kname,
                       template_definition(kname, "kquant_" + func, type,
                                           group_size, bits, super_ratio(mode),
@@ -291,6 +293,9 @@ void qmv_wide(const Operands &o, int M, int N, int K) {
   concatenate(kname, mode_name(o.mode), "_qmv_wide_", type, "_gs_",
               o.group_size, "_b_", o.bits, "_nv_", vecs_per_tg, "_kl_", k_lanes,
               batched ? "_batch_1" : "_batch_0");
+  if (testing::counting) {
+    testing::record("qmv_wide_nv" + std::to_string(vecs_per_tg));
+  }
   auto kernel = get_kernel(o.d, kname, "qmv_wide", o.mode, type, o.group_size,
                            o.bits, vecs_per_tg, k_lanes, batched);
   auto &enc = metal::get_command_encoder(o.s);
@@ -755,6 +760,7 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
               align_N ? 't' : 'n', "_align_K_", align_K ? 't' : 'n');
 
   auto &enc = metal::get_command_encoder(s);
+  testing::record(transpose ? "gather_qmm_rhs_nt" : "gather_qmm_rhs_nn");
   auto kernel = build_kernel(
       d, kname,
       template_definition(kname, "kquant_gather_qmm_rhs", type, group_size,

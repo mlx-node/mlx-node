@@ -1789,7 +1789,7 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
 
     /// TEST-ONLY oracle: MLX's built-in K-quant path, which only the MLX fork
-    /// pin has. Removed with the move to upstream MLX.
+    /// pin has. Removed with the move to upstream MLX. `device`: 0 CPU, 1 GPU.
     pub fn mlx_test_fork_kquant_quantized_matmul(
         x: *mut mlx_array,
         w: *mut mlx_array,
@@ -1799,6 +1799,7 @@ unsafe extern "C-unwind" {
         group_size: i32,
         bits: i32,
         mode: *const std::os::raw::c_char,
+        device: i32,
     ) -> *mut mlx_array;
 
     /// TEST-ONLY oracle, see `mlx_test_fork_kquant_quantized_matmul`.
@@ -1814,6 +1815,7 @@ unsafe extern "C-unwind" {
         bits: i32,
         mode: *const std::os::raw::c_char,
         sorted_indices: bool,
+        device: i32,
     ) -> *mut mlx_array;
 
     /// TEST-ONLY oracle, see `mlx_test_fork_kquant_quantized_matmul`.
@@ -1825,7 +1827,75 @@ unsafe extern "C-unwind" {
         bits: i32,
         out_dtype: i32,
         mode: *const std::os::raw::c_char,
+        device: i32,
     ) -> *mut mlx_array;
+
+    /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
+    /// disabling resets this thread's counts.
+    pub fn mlx_test_kquant_counting(enable: bool);
+    /// TEST-ONLY: this thread's dispatch count for a kernel family
+    /// (e.g. `qmv_fast`, `qmv_wide_nv8`, `qmm_t_nax`, `gather_qmm_rhs_nt`).
+    pub fn mlx_test_kquant_family_count(family: *const std::os::raw::c_char) -> u64;
+    /// TEST-ONLY: the GPU generation the Metal dispatcher sees, -1 without Metal.
+    pub fn mlx_test_kquant_gpu_gen() -> i32;
+
+    /// TEST-ONLY: the bridge K-quant ops on an explicit device (0 CPU, 1 GPU).
+    pub fn mlx_test_kquant_quantized_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        device: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY, see `mlx_test_kquant_quantized_matmul`.
+    pub fn mlx_test_kquant_gather_qmm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        lhs_indices: *mut mlx_array,
+        rhs_indices: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        sorted_indices: bool,
+        device: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY, see `mlx_test_kquant_quantized_matmul`.
+    pub fn mlx_test_kquant_dequantize(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_dtype: i32,
+        mode: *const std::os::raw::c_char,
+        device: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY: shapeless-compiles the bridge K-quant matmul on `trace_x`,
+    /// then replays it on `x`; writes the replay and the eager result.
+    pub fn mlx_test_kquant_shapeless_replay(
+        trace_x: *mut mlx_array,
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        device: i32,
+        out_replay: *mut *mut mlx_array,
+        out_eager: *mut *mut mlx_array,
+    ) -> bool;
 
     // Gated Delta Recurrence Metal Kernel
     pub fn mlx_gated_delta_kernel(
