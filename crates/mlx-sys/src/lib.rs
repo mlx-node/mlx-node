@@ -1788,6 +1788,45 @@ unsafe extern "C-unwind" {
         sorted_indices: bool,
     ) -> *mut mlx_array;
 
+    /// TEST-ONLY oracle: MLX's built-in K-quant path, which only the MLX fork
+    /// pin has. Removed with the move to upstream MLX.
+    pub fn mlx_test_fork_kquant_quantized_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY oracle, see `mlx_test_fork_kquant_quantized_matmul`.
+    pub fn mlx_test_fork_kquant_gather_qmm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        lhs_indices: *mut mlx_array,
+        rhs_indices: *mut mlx_array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        sorted_indices: bool,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY oracle, see `mlx_test_fork_kquant_quantized_matmul`.
+    pub fn mlx_test_fork_kquant_dequantize(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_dtype: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
     // Gated Delta Recurrence Metal Kernel
     pub fn mlx_gated_delta_kernel(
         q: *mut mlx_array,
