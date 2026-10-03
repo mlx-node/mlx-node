@@ -2376,8 +2376,10 @@ mod tests {
         let checked = segmented_policy_cases(&layouts, &totals)?;
         assert_eq!(checked, layouts.len() * totals.len());
 
-        // One-call verify: 8 rows of the 27B layout (24 q / 4 kv heads), with
-        // the head and tail chunks on both sides of the 1024 and 8192 steps.
+        // One-call verify: 8 rows of the 27B layout (24 q / 4 kv heads). The
+        // head and tail chunks straddle each class's steps: 1024 ('s', 'd'
+        // two-pass), 4096 (base-class GQA two-pass), 8192 ('s' 128 -> 256) and
+        // 16384 ('d' 128 -> 512), so every class reaches every route.
         const D: i64 = 256;
         const HQ: i64 = 24;
         const HKV: i64 = 4;
@@ -2385,14 +2387,15 @@ mod tests {
         assert!(max_q >= 1, "gqa 6: no supported segmented query width");
         let head_len = segmented_verify_head_len(8, max_q)
             .ok_or_else(|| Error::from_reason("8 verify rows cannot be covered"))?;
-        let prefixes = [1000_i64, 1016, 1020, 6219, 8186, 8190];
+        let prefixes = [1000_i64, 1016, 1020, 4090, 6219, 8186, 8190, 16378];
+        const CAPACITY: i64 = 16_400;
         let base_k = MxArray::from_bfloat16(
-            &deterministic_bf16((HKV * 8200 * D) as usize, 0x1234_5678),
-            &[1, HKV, 8200, D],
+            &deterministic_bf16((HKV * CAPACITY * D) as usize, 0x1234_5678),
+            &[1, HKV, CAPACITY, D],
         )?;
         let base_v = MxArray::from_bfloat16(
-            &deterministic_bf16((HKV * 8200 * D) as usize, 0x8765_4321),
-            &[1, HKV, 8200, D],
+            &deterministic_bf16((HKV * CAPACITY * D) as usize, 0x8765_4321),
+            &[1, HKV, CAPACITY, D],
         )?;
         let q = MxArray::from_bfloat16(
             &deterministic_bf16((HQ * 8 * D) as usize, 0x1357_9bdf),
@@ -2406,13 +2409,30 @@ mod tests {
             &deterministic_bf16((HKV * 8 * D) as usize, 0xfdb9_7531),
             &[1, HKV, 8, D],
         )?;
+        let gqa = HQ / HKV;
+        let tail_len = 8 - head_len;
         let mut seen = [0usize; 4];
-        let mut class_s = false;
+        let mut class = 0u8;
         for prefix in prefixes {
-            let (route, class) = device_verify_route(HQ, HKV, 8, prefix);
-            assert!(route >= 0, "no segmented route for prefix {prefix}");
+            let (route, device_class) = device_verify_route(HQ, HKV, 8, prefix);
+            class = device_class;
+            let expected = if head_len == 0 {
+                VERIFY_SINGLE
+            } else {
+                verify_route(
+                    8,
+                    max_q,
+                    class_reduction(class, prefix + head_len, gqa, gqa * head_len),
+                    class_reduction(class, prefix + 8, gqa, gqa * tail_len),
+                    true,
+                )
+            };
+            assert_eq!(
+                route, expected,
+                "class '{}' prefix {prefix}: verify route",
+                class as char
+            );
             seen[route as usize] += 1;
-            class_s |= class == b's';
             let pk = nan_tailed_prefix(&base_k, prefix)?;
             let pv = nan_tailed_prefix(&base_v, prefix)?;
             let got = strict_segmented_for_test(&q, &pk, &pv, &nk, &nv)?.to_float32()?;
@@ -2425,17 +2445,24 @@ mod tests {
             );
         }
         eprintln!(
-            "{checked} policy boundaries + {} verify blocks equal MLX's vector SDPA; \
-             verify routes one_pass={} unified={} split={}",
+            "class '{}': {checked} policy boundaries + {} verify blocks equal MLX's vector \
+             SDPA; verify routes one_pass={} unified={} split={}",
+            class as char,
             prefixes.len(),
             seen[1],
             seen[2],
             seen[3]
         );
-        if class_s && head_len > 0 {
-            for route in [VERIFY_ONE_PASS, VERIFY_UNIFIED, VERIFY_SPLIT] {
-                assert!(seen[route as usize] > 0, "verify route {route} never ran");
-            }
+        assert!(
+            head_len > 0,
+            "8 rows fit one chunk (max_query_length {max_q})"
+        );
+        for route in [VERIFY_ONE_PASS, VERIFY_UNIFIED, VERIFY_SPLIT] {
+            assert!(
+                seen[route as usize] > 0,
+                "class '{}': verify route {route} never ran",
+                class as char
+            );
         }
         Ok(())
     }
@@ -2579,22 +2606,29 @@ mod tests {
         assert!(!verify_plan(8, 6, 0, caps, caps).0, "partitions < 32");
     }
 
-    /// Class-'s' vector-SDPA reduction policy (`mlx_segmented_sdpa_plan.h`), used to
-    /// predict the verify route independently of the C++ planner.
+    /// MLX's vector-SDPA reduction policy per device class
+    /// (`mlx_segmented_sdpa_plan.h`), used to predict the verify route
+    /// independently of the C++ planner: (two-pass, partitions).
     #[cfg(target_os = "macos")]
-    fn class_s_reduction(total: i64, active_simdgroups: i64) -> (bool, i64) {
-        if total < 1024 {
+    fn class_reduction(class: u8, total: i64, gqa: i64, active_simdgroups: i64) -> (bool, i64) {
+        let large = class == b'd' || class == b's';
+        if !((large && total >= 1024) || (gqa > 1 && total >= 4096)) {
             return (false, 32);
         }
-        let partitions = if total > 1024 && active_simdgroups > 4 {
-            match total {
+        let partitions = match class {
+            b's' if total > 1024 && active_simdgroups > 4 => match total {
                 ..=8192 => 128,
                 8193..=32768 => 256,
                 32769..=65536 => 512,
                 _ => 1024,
-            }
-        } else {
-            64
+            },
+            b's' => 64,
+            b'd' if active_simdgroups <= 2 && total > 8192 => 256,
+            b'd' if active_simdgroups >= 6 && (16384..65536).contains(&total) => 512,
+            b'd' if active_simdgroups >= 6 && total >= 65536 => 1024,
+            b'd' => 128,
+            _ if active_simdgroups >= 4 => 64,
+            _ => 32,
         };
         (true, partitions)
     }
@@ -2723,8 +2757,8 @@ mod tests {
                         verify_route(
                             rows,
                             max_q,
-                            class_s_reduction(prefix + head_len, gqa * head_len),
-                            class_s_reduction(prefix + rows, gqa * (rows - head_len)),
+                            class_reduction(b's', prefix + head_len, gqa, gqa * head_len),
+                            class_reduction(b's', prefix + rows, gqa, gqa * (rows - head_len)),
                             true,
                         )
                     };
