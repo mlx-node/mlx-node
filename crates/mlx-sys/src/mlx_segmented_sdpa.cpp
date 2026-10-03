@@ -103,11 +103,10 @@ MTL::ComputePipelineState *segmented_kernel(metal::Device &device,
   auto *lib = device.get_library("mlx_node_sdpa_segmented", [] {
     std::string source(kSegmentedSource);
     for (auto [kernel, fn] :
-         {std::pair{SegmentedKernel::one_pass, "sdpa_vector_segmented"},
-          std::pair{SegmentedKernel::two_pass_1,
-                    "sdpa_vector_segmented_2pass_1"},
+         {std::pair{SegmentedKernel::one_pass, "segmented_sdpa_one_pass"},
+          std::pair{SegmentedKernel::two_pass_1, "segmented_sdpa_2pass_1"},
           std::pair{SegmentedKernel::verify_two_pass_1,
-                    "sdpa_vector_segmented_verify_2pass_1"}}) {
+                    "segmented_sdpa_verify_2pass_1"}}) {
       const std::string instance = std::string(fn) + "<bfloat, 256, 256>";
       source += "\ntemplate [[host_name(\"" + std::string(kernel_name(kernel)) +
                 "\")]] [[kernel]] decltype(" + instance + ") " + instance +

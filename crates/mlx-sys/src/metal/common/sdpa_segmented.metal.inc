@@ -22,7 +22,7 @@ constant int verify_rows [[function_constant(28)]];
 constant constexpr float kFiniteMin = -metal::numeric_limits<float>::max();
 
 template <typename T, int D, int V = D>
-[[kernel]] void sdpa_vector_segmented(
+[[kernel]] void segmented_sdpa_one_pass(
     const device T* queries [[buffer(0)]],
     const device T* prefix_keys [[buffer(1)]],
     const device T* prefix_values [[buffer(2)]],
@@ -171,7 +171,7 @@ template <typename T, int D, int V = D>
 }
 
 template <typename T, int D, int V = D>
-[[kernel]] void sdpa_vector_segmented_2pass_1(
+[[kernel]] void segmented_sdpa_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* prefix_keys [[buffer(1)]],
     const device T* prefix_values [[buffer(2)]],
@@ -301,10 +301,10 @@ METAL_FUNC void sdpa_segmented_verify_update(
 // Causal first pass for a whole verify block: one threadgroup serves every
 // (query head, row) pair of one KV head, and each simdgroup applies each K/V
 // row it loads to two pairs. Per pair the key order, statements and causal
-// limit equal sdpa_vector_segmented_2pass_1 with q_seq_len = verify_rows, so
+// limit equal segmented_sdpa_2pass_1 with q_seq_len = verify_rows, so
 // the partials are bit-identical to that kernel at the same `blocks`.
 template <typename T, int D, int V = D>
-[[kernel]] void sdpa_vector_segmented_verify_2pass_1(
+[[kernel]] void segmented_sdpa_verify_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* prefix_keys [[buffer(1)]],
     const device T* prefix_values [[buffer(2)]],
