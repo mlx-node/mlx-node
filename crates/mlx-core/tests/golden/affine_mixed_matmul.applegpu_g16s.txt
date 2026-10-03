@@ -1,4 +1,4 @@
-# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, captured on pin 053e43fec.
+# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, re-captured on pin c23b1113f after upstream e7838d5e3 and 8056817bd.
 # One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url, then the route.
 applegpu_g17s = machine
 applegpu_g16s = route
@@ -44,7 +44,7 @@ XX0X7Q-O promoted
 NhxaN7Ll promoted
 4WMQiXgP promoted
 TISj9b5g promoted
-uMpvY60H promoted
+6c7BtY2u promoted
 NprGj3OP promoted
 gbg8Byl3 promoted
 -MjVx9DK promoted
@@ -87,9 +87,9 @@ SLQWejo0 promoted
 wZdG477f promoted
 CSNNUxSc promoted
 lp1mruwP promoted
-nlnRoJPW promoted
-QLT9ZP_7 promoted
-1jHf3ZZV promoted
+3wUMHCMS promoted
+rsSfHY-X promoted
+IgGIdCCf promoted
 MbJ9w1V- promoted
 QMziTPWU promoted
 1Gi8hcjl promoted
@@ -132,9 +132,9 @@ qaNowmrI promoted
 FSojZxS5 promoted
 MDzhWctg promoted
 0c8jcpYa promoted
-oG3rErti promoted
-pws9rrty promoted
-xD7mk3GW promoted
+ocSDWNQI promoted
+CiBtATwK promoted
+VN1AoSe- promoted
 nlU0lTbe promoted
 qT-SmFkk promoted
 eXpVZliw promoted
@@ -174,9 +174,9 @@ WxgutUp1 native
 QCdkP-Il promoted
 3xszM4MY promoted
 tWbVfRx2 promoted
-rwy9bWgQ promoted
-H4gJmEC8 promoted
-0gzEHCg2 promoted
+HPFeCFPY promoted
+bPBEkTML promoted
+MdcHnqZs promoted
 GgRxpyZE promoted
 VBsfcWZB promoted
 d-0tT3_p promoted
@@ -309,9 +309,9 @@ VQuJHWz9 native
 jSpdy-u2 promoted
 39k5F5VG promoted
 lQVUjd_N promoted
-NGApME12 promoted
-pIQuQK7s promoted
-4OCRfzIT promoted
+gnXsGxCT promoted
+Nz3Fon2l promoted
+qyYpK9Sp promoted
 1h-3j5lG promoted
 THQc2e0E promoted
 Tjb_PEcS promoted
@@ -357,9 +357,9 @@ EWZa2d_2 promoted
 5bP2h-ys promoted
 Pf-yAOMF promoted
 gpOr7HL4 promoted
-K6wH7Cum promoted
+oqYbLwHT promoted
 1gHXfDzr promoted
-Uo2ZRcLN promoted
+0KOWYcnl promoted
 X1X9qWDG promoted
 WVp6HDLZ promoted
 _MVT2kOR promoted
@@ -402,9 +402,9 @@ f_KQMMsx promoted
 JlT4rvov promoted
 Jd4q1j3P promoted
 BL6gDMg5 promoted
-pGz-uNQs promoted
-mDeXxOUz promoted
-KfUCTn7N promoted
+RBKou1_P promoted
+7GS8KYFp promoted
+iyZhHv8U promoted
 Qw8_5xC4 promoted
 xpF4k6s6 promoted
 HN7a5D3i promoted
@@ -447,9 +447,9 @@ ShMou3n_ promoted
 OoXca7pj promoted
 xcZ0UNoH promoted
 nCm-Yqxc promoted
-lKERKZvs promoted
-36jfjavI promoted
-ShOqE7H_ promoted
+ZtyA8u8L promoted
+eu6Mna_3 promoted
+0iLiPag6 promoted
 1roLAlUt promoted
 dHy5WnLl promoted
 2vuA7WqP promoted
@@ -489,9 +489,9 @@ q2rt8SH6 promoted
 YMJ5umaA promoted
 4X71fPO8 promoted
 AwlcFPUX promoted
-lpKa24bn promoted
-Fu3VhHzH promoted
-DGf39hVJ promoted
+qOK2-UOJ promoted
+PHJy-Sf0 promoted
+zQkEa1OR promoted
 m8cP0QQb promoted
 Z6_y3W9m promoted
 8PVsth-T promoted
@@ -537,7 +537,7 @@ GutgKXw7 promoted
 --zhExZI promoted
 dLs7NVYf promoted
 DcblYc4V promoted
-sM0k33UN promoted
+dNY-dSNR promoted
 OWpQTGli promoted
 K0RGiIPy promoted
 1NV5NTDS promoted
@@ -582,7 +582,7 @@ BNQDdef1 promoted
 gxy2rAyZ promoted
 rhN_Lvuu promoted
 -bTDKV3E promoted
-eiXR9_tU promoted
+mWHAtw71 promoted
 izLGUH4y promoted
 gtGq1Xsa promoted
 DzO89a8W promoted
@@ -624,9 +624,9 @@ b2HrgrGD promoted
 CjSwn3f_ promoted
 uT74Xr-q promoted
 erGk-YHL promoted
-dA-w4uB7 promoted
+k2wRjgI8 promoted
 hCdaxMsZ promoted
-0JTszbej promoted
+HajFvS2O promoted
 lofyo195 promoted
 FTxj8lvK promoted
 lBY0OwrW promoted
@@ -672,7 +672,7 @@ LJQafTnU promoted
 nTHtTQk3 promoted
 vnPw2eWA promoted
 ng0cZX6Z promoted
-DmihuEI4 promoted
+AD7YipS6 promoted
 _nu1W64T promoted
 KJVO6Ub8 promoted
 blpoWWIz promoted
@@ -717,9 +717,9 @@ aNKUCe8p promoted
 8_Jtv8hg promoted
 qIfdfyKW promoted
 0WxfzIrG promoted
-jX3PiXHO promoted
-9214fpyj promoted
-1mLThXCO promoted
+tAODuZld promoted
+bt-OfzdV promoted
+-nbSLQIs promoted
 5Awj_Y4j promoted
 nHkD9Nup promoted
 MHBTnlp5 promoted
@@ -762,9 +762,9 @@ ji6pPQ6b promoted
 HagF7mcj promoted
 57vBQC-o promoted
 pe3U1oWi promoted
-hGa-EAzp promoted
-LIKWfKr6 promoted
-TdDJjBu6 promoted
+LSCLNVbm promoted
+4ARe437s promoted
+coyyxWS_ promoted
 fiOyGmGx promoted
 1cgHRf98 promoted
 7OfDqSB4 promoted
@@ -804,9 +804,9 @@ qFsNDSWe promoted
 eYA7ZVPN promoted
 8cP6kcbH promoted
 M0FzvSfG promoted
--PcoHWqv promoted
-FJd2WdwY promoted
-HNuwGn_1 promoted
+ZaAhjs8e promoted
+WAHRuBrK promoted
+ezue9gwQ promoted
 eLbTOMKj promoted
 QpnKhnQq promoted
 wWxuajaU promoted
@@ -854,7 +854,7 @@ x2S1pJFk promoted
 sTMCAJvR promoted
 8PM_vnWw promoted
 HB4gGDG7 promoted
-amwFLr5C promoted
+A_AXXRwE promoted
 RhCDQIW_ promoted
 8Wq6LAPW promoted
 9eOCNn1P promoted
@@ -898,7 +898,7 @@ GbX2lTib promoted
 4OAqWtm2 promoted
 9P-tS9N_ promoted
 JppshFJj promoted
-TwnSIWsD promoted
+O0mAIgN3 promoted
 KyHGEeon promoted
 O_6o0mqs promoted
 NYgvcoN_ promoted
@@ -939,9 +939,9 @@ e_alKLEO promoted
 O_L9sz2a promoted
 MSD1sLXK promoted
 MUZrvHXQ promoted
-QxjJMD_u promoted
-U7__WUGf promoted
-7mGMlsZt promoted
+d1zyLBcF promoted
+e9GpoQ-W promoted
+JdzNAwoA promoted
 7hpGC4pF promoted
 xKG7zh_o promoted
 gtq6ly7U promoted
@@ -988,8 +988,8 @@ zp7oE1vr promoted
 9GS_1UzR promoted
 jTAK7DvM promoted
 Tl31rzwK promoted
-skNfFDW- promoted
-VV0hrnm- promoted
+lPCOSi-i promoted
+TElfdYjv promoted
 8HqyjbNk promoted
 wDHl8Hsm promoted
 bz2tA2Gm promoted
@@ -1032,16 +1032,16 @@ bZlSEkfz promoted
 YFjrFRhS promoted
 3ToDjrdP promoted
 EJaDM41z promoted
-ANmPV8Fw promoted
-OklZmQdO promoted
-_fCo04jp promoted
+dwfmVHiM promoted
+9bxo8Rn0 promoted
+uzIJmNqz promoted
 _tjdk9yv promoted
 PtIoe3lb promoted
 RGeIzZvc promoted
 pq7o76MN promoted
 lzwYNkzw promoted
 DhdQ4EHj promoted
-jAwXsHtE promoted
+HVRQFeNw promoted
 pZHE4SvA promoted
 iZijwUHG promoted
 kcMeup-I promoted
@@ -1077,9 +1077,9 @@ c273dn8m promoted
 93QVhtm5 promoted
 y8neC-UH promoted
 h06odhBt promoted
-n8SoPM_G promoted
-gXI86ZiK promoted
-kIOAPklw promoted
+G1NHH2Yf promoted
+4zvEXHFR promoted
+IQ_-h_2E promoted
 _enC5qvw promoted
 1NEiljgz promoted
 FF9jMLl1 promoted
@@ -1119,9 +1119,9 @@ rM4ce-ez promoted
 ynMtSb_Y promoted
 O0xgN4zv promoted
 FfAfPWlg promoted
-TKTBONZi promoted
-Bhq8gXAh promoted
-b65qcHV2 promoted
+eA-cw1gD promoted
+QyS44X0w promoted
+C9Pa51jp promoted
 nVEmvC2e promoted
 ry3Z_VRz promoted
 jb20ODEs promoted
@@ -1168,7 +1168,7 @@ QmNIxGCS promoted
 VZ8miVth promoted
 ffH83JWi promoted
 ucCQDvwU promoted
-H--Te85M promoted
+EJAoBnB2 promoted
 7kW4aXiv promoted
 JO_Ewkcu promoted
 GlBk-Aq- promoted
@@ -1254,9 +1254,9 @@ DFkEY_f9 promoted
 kupqVf3h promoted
 vp-gd1Op promoted
 OX1en5ru promoted
-zKAgyALp promoted
-SAtgSZ_T promoted
-qr4OMdlq promoted
+sEtfs-Cv promoted
+ze-EPQd1 promoted
+f5WgqOEK promoted
 alNqYrKN promoted
 85CDDcKu promoted
 JeP1_TRt promoted
@@ -1303,7 +1303,7 @@ QW4HGmUW promoted
 Ze1NMLOg promoted
 nu5laCJz promoted
 qrbxY5Jh promoted
-4Rp0Q9N9 promoted
+WXC7rBk9 promoted
 LEm-jrHy promoted
 AI-Sk-i7 promoted
 YEpHNTrZ promoted
@@ -1347,9 +1347,9 @@ aTI29Z1Q promoted
 LjsQCC_Z promoted
 VRPJGEjC promoted
 AQ5uG6LT promoted
-MdcdttzM promoted
-Leg5_24M promoted
-Sj38-go1 promoted
+4U58uDCn promoted
+Rwj6nt3a promoted
+UIojdVFK promoted
 zQW9tClw promoted
 -B3A-L6h promoted
 WwAZb-OU promoted
@@ -1392,9 +1392,9 @@ FdsRbjhE promoted
 KskrxN9M promoted
 FoqtxVd7 promoted
 NkEgeEeG promoted
-W0WIpXaq promoted
-bFz2GZvt promoted
-tdVEG4Ii promoted
+E3Cbzf7Y promoted
+4TouFaZ3 promoted
+Qt-FOoZs promoted
 uiPCeGqm promoted
 gA6JtG3r promoted
 ctGYoOVd promoted
@@ -1434,9 +1434,9 @@ RU5KSI7l promoted
 0whOaaP5 promoted
 452ndxgD promoted
 p5ORGags promoted
-nVWpHrSz promoted
-ZzlsY-2- promoted
-uiJek4iq promoted
+VAhKuGuJ promoted
+_SF_qXdq promoted
+Pd2MqeGW promoted
 VzMR6Lgi promoted
 KsjDwPMT promoted
 IIIBoENE promoted
@@ -1482,7 +1482,7 @@ nt2Daz7O promoted
 Ete55z68 promoted
 ikqr43aa promoted
 3nOKU9SV promoted
-jUj1z_xO promoted
+1BeD93z5 promoted
 WxJrKAE0 promoted
 kUHNUEh9 promoted
 edpxqYlf promoted
@@ -1524,9 +1524,9 @@ dCrv7qn- promoted
 rumtOWGj promoted
 2tcIwmIN promoted
 uD9A4pZs promoted
-fpC6ufmf promoted
-7mgmSSUR promoted
-lHY7CJSJ promoted
+jYcCOK4Q promoted
+9lspFIAw promoted
+oaSuELQC promoted
 -SG6u2fU promoted
 gx76M_HK promoted
 _POl_r5G promoted
