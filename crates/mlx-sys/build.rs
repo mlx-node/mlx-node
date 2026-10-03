@@ -3,114 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Port the reference's Metal residency and custom-kernel cache without changing
-/// the MLX gitlink. Derived host files live in OUT_DIR; the narrow replacements fail
-/// loudly if a future MLX update changes their integration points.
-#[deny(clippy::unwrap_used, clippy::expect_used)]
-fn metal_residency_overlay(manifest: &Path, mlx: &Path, out_dir: &Path) -> io::Result<PathBuf> {
-    let write_changed = |path: PathBuf, bytes: &[u8]| -> io::Result<()> {
-        match std::fs::read(&path) {
-            Ok(existing) if existing == bytes => return Ok(()),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(build_file_error("read overlay", &path, error)),
-        }
-        std::fs::write(&path, bytes)
-            .map_err(|error| build_file_error("write overlay", &path, error))
-    };
-    let root = out_dir.join("metal-residency");
-    let output = root.join("mlx/backend/metal");
-    std::fs::create_dir_all(&output)
-        .map_err(|error| build_file_error("create overlay directory", &output, error))?;
-    let source = mlx.join("mlx/backend/metal");
-    let port = manifest.join("metal-residency");
-    let replace = |text: &mut String, from: &str, to: &str| -> io::Result<()> {
-        if text.matches(from).count() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("MLX residency integration drift: {from}"),
-            ));
-        }
-        *text = text.replacen(from, to, 1);
-        Ok(())
-    };
-    for name in ["resident.h", "resident.cpp", "overlay.cmake"] {
-        println!("cargo:rerun-if-changed={}", port.join(name).display());
-    }
-    for name in ["resident.h", "resident.cpp"] {
-        let path = port.join(name);
-        let bytes = std::fs::read(&path)
-            .map_err(|error| build_file_error("read residency source", &path, error))?;
-        write_changed(output.join(name), &bytes)?;
-    }
-    for name in ["device.h", "device.cpp"] {
-        println!("cargo:rerun-if-changed={}", source.join(name).display());
-        let mut text = read_build_source(&source.join(name))?;
-        if name == "device.h" {
-            replace(
-                &mut text,
-                "  Device& device_;",
-                "  Device& device_;\n  ResidencySet& residency_set_;\n  uint64_t sets_attached_{0};",
-            )?;
-        } else {
-            replace(
-                &mut text,
-                "    : device_(d) {",
-                "    : device_(d), residency_set_(residency_set) {",
-            )?;
-            replace(
-                &mut text,
-                "  if (residency_set.mtl_residency_set()) {\n    queue_->addResidencySet(residency_set.mtl_residency_set());\n  }",
-                "  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
-            )?;
-            replace(
-                &mut text,
-                "void CommandEncoder::commit(\n    std::function<void()> completion,\n    const char* reason) {",
-                "void CommandEncoder::commit(\n    std::function<void()> completion,\n    const char* reason) {\n  // Metal fixes residency at commit, including sets created after this queue.\n  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
-            )?;
-        }
-        write_changed(output.join(name), text.as_bytes())?;
-    }
-    // The reference keys custom libraries by name, source and compile options.
-    // Compute that immutable key with the primitive, so cached graphs do not
-    // rescan the complete Metal source on every dispatch. Every CMake/bridge
-    // translation unit must see this same generated class layout.
-    let header = mlx.join("mlx/fast_primitives.h");
-    println!("cargo:rerun-if-changed={}", header.display());
-    let mut text = read_build_source(&header)?;
-    replace(
-        &mut text,
-        "#include <optional>",
-        "#include <cstdlib>\n#include <functional>\n#include <optional>",
-    )?;
-    replace(
-        &mut text,
-        "        compile_options_(compile_options) {}",
-        "        compile_options_(compile_options),\n        library_name_(hash_cache_enabled() ? name_ + \"_mlx_node_\" +\n            std::to_string(std::hash<std::string>{}(source_)) + \"_\" +\n            std::to_string(compile_options_) : std::string{}) {}",
-    )?;
-    replace(
-        &mut text,
-        "  CompileOptions::Data compile_options_;",
-        "  CompileOptions::Data compile_options_;\n  std::string library_name_;\n  static bool hash_cache_enabled() {\n    static const bool enabled = [] {\n      const char* value = std::getenv(\"MLX_METAL_HASH_KERNEL_CACHE\");\n      return value && std::string(value) == \"1\";\n    }();\n    return enabled;\n  }",
-    )?;
-    write_changed(root.join("mlx/fast_primitives.h"), text.as_bytes())?;
-    let kernel = source.join("custom_kernel.cpp");
-    println!("cargo:rerun-if-changed={}", kernel.display());
-    let mut text = read_build_source(&kernel)?;
-    replace(
-        &mut text,
-        "  {\n    // Clear kernels from the device library cache if needed",
-        "  // Process-start experiment; an empty key retains the original cache.\n  const bool hashed = !library_name_.empty();\n  if (!hashed) {\n    // Clear kernels from the device library cache if needed",
-    )?;
-    replace(
-        &mut text,
-        "      name_, compile_options_, [this] { return metal::utils() + source_; });",
-        "      hashed ? library_name_ : name_, compile_options_,\n      [this] { return metal::utils() + source_; });",
-    )?;
-    write_changed(output.join("custom_kernel.cpp"), text.as_bytes())?;
-    Ok(root)
-}
-
 fn build_file_error(action: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
@@ -422,19 +314,9 @@ fn main() -> io::Result<()> {
     };
 
     let mut cfg = cmake::Config::new(&mlx_dir);
-    let residency_overlay = build_metal
-        .then(|| metal_residency_overlay(&manifest_dir, &mlx_dir, &out_dir_path))
-        .transpose()?;
-    if let Some(overlay) = &residency_overlay {
-        cfg.define("MLX_NODE_RESIDENCY_OVERLAY", overlay);
-        cfg.define(
-            "CMAKE_PROJECT_INCLUDE",
-            manifest_dir.join("metal-residency/overlay.cmake"),
-        );
-    } else {
-        // Clear a cached include if this build directory switches to CPU-only.
-        cfg.define("CMAKE_PROJECT_INCLUDE", "");
-    }
+    // CMakeCache.txt from an older mlx-sys may still name the deleted
+    // metal-residency/overlay.cmake; configure fails until it is cleared.
+    cfg.define("CMAKE_PROJECT_INCLUDE", "");
     cfg.define("MLX_BUILD_TESTS", "OFF")
         .define("MLX_BUILD_EXAMPLES", "OFF")
         .define("MLX_BUILD_BENCHMARKS", "OFF")
@@ -714,11 +596,6 @@ fn main() -> io::Result<()> {
     let include_generated = dst.join("include");
 
     let mut bridge = cc::Build::new();
-    if let Some(overlay) = &residency_overlay {
-        // Device contains ResidencySet by value: all bridge code must see the
-        // same class layout as libmlx, before the original vendor headers.
-        bridge.include(overlay);
-    }
     bridge
         .cpp(true)
         .warnings(false)
