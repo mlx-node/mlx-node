@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_kquant.h"
 #include "mlx_qwen4_flags.h"
 #include <cstdlib>
 #include <cstring>
@@ -386,9 +387,11 @@ mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
     auto w = *reinterpret_cast<array *>(weight),
          s = *reinterpret_cast<array *>(scales),
          b = *reinterpret_cast<array *>(biases);
-    auto quant = mlx::core::string_to_quantization_mode(mode);
-    int ratio = mlx::core::quant_super_ratio(quant);
-    if (!ratio || input.ndim() != 3 || input.shape(1) != 1 ||
+    auto quant = mlx::core::kquant::parse_mode(mode);
+    if (!quant)
+      return nullptr;
+    int ratio = mlx::core::kquant::super_ratio(*quant);
+    if ( input.ndim() != 3 || input.shape(1) != 1 ||
         selected.dtype() != mlx::core::uint32 || w.ndim() != 2 ||
         w.shape(0) % experts || b.dtype() != mlx::core::float16)
       return nullptr;
@@ -438,7 +441,7 @@ mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
          {"GS", group},
          {"BITS", bits},
          {"SR", ratio},
-         {"HM", mlx::core::quant_has_sub_min(quant)},
+         {"HM", mlx::core::kquant::has_sub_min(*quant)},
          {"FAST", n % 8 == 0 && k % 512 == 0},
          {"WS", int(w.size() / experts)},
          {"SS", int(s.nbytes() / experts)},

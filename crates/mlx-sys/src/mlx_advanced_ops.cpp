@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_kquant.h"
 #include "mlx_portable_qmm.h"
 #include "mlx/primitives.h"
 
@@ -31,9 +32,14 @@ static array qwen_linear(
     std::optional<array> quant_biases = biases == nullptr
         ? std::nullopt
         : std::optional<array>(*biases);
-    auto result = quantized_matmul(
-        x, weight, *scales, quant_biases, true,
-        std::optional<int>(group_size), std::optional<int>(bits), mode);
+    auto kmode = mlx::core::kquant::parse_mode(mode);
+    auto result = kmode
+        ? mlx::core::kquant::quantized_matmul(
+              x, weight, *scales, quant_biases, true,
+              std::optional<int>(group_size), std::optional<int>(bits), *kmode)
+        : quantized_matmul(
+              x, weight, *scales, quant_biases, true,
+              std::optional<int>(group_size), std::optional<int>(bits), mode);
     return result.dtype() == x.dtype() ? result : astype(result, x.dtype());
   }
   return matmul(x, transpose(weight, {1, 0}));
@@ -684,6 +690,12 @@ void mlx_qwen3_forward_step(
         std::optional<array> gathered_biases = embedding_biases == nullptr
             ? std::nullopt
             : std::optional<array>(take(*embedding_biases, input_ids, 0));
+        if (auto kmode = mlx::core::kquant::parse_mode(quant_mode_str)) {
+            return mlx::core::kquant::dequantize(
+                gathered_weight, gathered_scales, gathered_biases,
+                std::optional<int>(quant_group_size),
+                std::optional<int>(quant_bits), *kmode, std::nullopt);
+        }
         return dequantize(
             gathered_weight, gathered_scales, gathered_biases,
             std::optional<int>(quant_group_size), std::optional<int>(quant_bits),
@@ -877,6 +889,11 @@ bool mlx_quantize(
         std::optional<int> gs = group_size > 0 ? std::optional<int>(group_size) : std::nullopt;
         std::optional<int> b = bits > 0 ? std::optional<int>(bits) : std::nullopt;
         std::string mode_str = (mode && mode[0]) ? std::string(mode) : "affine";
+        if (mlx::core::kquant::parse_mode(mode_str)) {
+            throw std::invalid_argument(
+                "[quantize] Quantization mode '" + mode_str +
+                "' can be read but not produced.");
+        }
 
         auto result = mlx::core::quantize(w_arr, gs, b, mode_str);
 
@@ -945,7 +962,10 @@ mlx_array* mlx_dequantize(
             dtype = to_mlx_dtype(out_dtype);
         }
 
-        auto result = mlx::core::dequantize(q_arr, s_arr, b_opt, gs, b, mode_str, std::nullopt, dtype);
+        auto kmode = mlx::core::kquant::parse_mode(mode_str);
+        auto result = kmode
+            ? mlx::core::kquant::dequantize(q_arr, s_arr, b_opt, gs, b, *kmode, dtype)
+            : mlx::core::dequantize(q_arr, s_arr, b_opt, gs, b, mode_str, std::nullopt, dtype);
 
         return reinterpret_cast<mlx_array*>(new array(std::move(result)));
     } catch (const std::exception& e) {
@@ -1296,13 +1316,16 @@ mlx_array* mlx_quantized_matmul(
 
         std::string mode_str(mode ? mode : "affine");
 
-        mlx::core::array result = mlx::core::quantized_matmul(
-            *x_arr, *w_arr, *scales_arr, biases_opt,
-            transpose,
-            std::optional<int>(group_size),
-            std::optional<int>(bits),
-            mode_str
-        );
+        auto kmode = mlx::core::kquant::parse_mode(mode_str);
+        mlx::core::array result = kmode
+            ? mlx::core::kquant::quantized_matmul(
+                  *x_arr, *w_arr, *scales_arr, biases_opt, transpose,
+                  std::optional<int>(group_size), std::optional<int>(bits),
+                  *kmode)
+            : mlx::core::quantized_matmul(
+                  *x_arr, *w_arr, *scales_arr, biases_opt, transpose,
+                  std::optional<int>(group_size), std::optional<int>(bits),
+                  mode_str);
         if (auto portable = mlx::core::portable_kquant_matmul(
                 *x_arr, *w_arr, *scales_arr, biases_opt, transpose, group_size, bits, mode_str))
             result = std::move(*portable);
@@ -1399,15 +1422,16 @@ mlx_array* mlx_gather_qmm(
 
         std::string mode_str(mode ? mode : "affine");
 
-        mlx::core::array result = mlx::core::gather_qmm(
-            *x_arr, *w_arr, *scales_arr, biases_opt,
-            lhs_opt, rhs_opt,
-            transpose,
-            std::optional<int>(group_size),
-            std::optional<int>(bits),
-            mode_str,
-            sorted_indices
-        );
+        auto kmode = mlx::core::kquant::parse_mode(mode_str);
+        mlx::core::array result = kmode
+            ? mlx::core::kquant::gather_qmm(
+                  *x_arr, *w_arr, *scales_arr, biases_opt, lhs_opt, rhs_opt,
+                  transpose, std::optional<int>(group_size),
+                  std::optional<int>(bits), *kmode, sorted_indices)
+            : mlx::core::gather_qmm(
+                  *x_arr, *w_arr, *scales_arr, biases_opt, lhs_opt, rhs_opt,
+                  transpose, std::optional<int>(group_size),
+                  std::optional<int>(bits), mode_str, sorted_indices);
         return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
     } catch (const std::exception& e) {
         std::cerr << "mlx_gather_qmm error: " << e.what() << std::endl;

@@ -1,5 +1,6 @@
 #include "mlx_portable_qmm.h"
 #include "mlx_common.h"
+#include "mlx_kquant.h"
 #include <map>
 
 #ifdef MLX_NODE_METAL_ENABLED
@@ -56,17 +57,18 @@ const std::string &portable_gemm() {
   return source;
 }
 MTL::ComputePipelineState *portable_pipeline(Dtype dtype, int gs, int bits,
-                                             const std::string &mode, int bm,
-                                             int bn, int bk) {
+                                             kquant::Mode mode, int bm, int bn,
+                                             int bk) {
   auto &device = metal::device(Device::gpu);
-  const auto quant = string_to_quantization_mode(mode);
   const std::string type = dtype == bfloat16 ? "bfloat16_t" : "half";
   const std::string spec =
       type + "," + std::to_string(gs) + "," + std::to_string(bits) + "," +
-      std::to_string(quant_super_ratio(quant)) + "," +
-      (quant_has_sub_min(quant) ? "true" : "false") + ",false,false," +
+      std::to_string(kquant::super_ratio(mode)) + "," +
+      (kquant::has_sub_min(mode) ? "true" : "false") + ",false,false," +
       std::to_string(bm) + "," + std::to_string(bk) + "," + std::to_string(bn);
-  const std::string name = "mlx_node_portable_" + mode + "_" + type + "_" +
+  const std::string name = "mlx_node_portable_" +
+                           std::string(kquant::mode_name(mode)) + "_" + type +
+                           "_" +
                            std::to_string(bm) + "_" + std::to_string(bn) + "_" +
                            std::to_string(bk);
   auto *library = device.get_library(name, [&] {
@@ -88,16 +90,15 @@ MTL::ComputePipelineState *portable_pipeline(Dtype dtype, int gs, int bits,
 
 class PortableKQuant : public fast::Custom {
 public:
-  PortableKQuant(Stream stream, int gs, int bits, std::string mode, int bm,
+  PortableKQuant(Stream stream, int gs, int bits, kquant::Mode mode, int bm,
                  int bn, int bk)
       : Custom(stream,
                [=](std::vector<array> inputs) {
-                 return std::vector<array>{
-                     quantized_matmul(inputs[0], inputs[1], inputs[2],
-                                      inputs[3], true, gs, bits, mode, stream)};
+                 return std::vector<array>{kquant::quantized_matmul(
+                     inputs[0], inputs[1], inputs[2], inputs[3], true, gs,
+                     bits, mode, stream)};
                }),
-        gs_(gs), bits_(bits), mode_(std::move(mode)), bm_(bm), bn_(bn),
-        bk_(bk) {}
+        gs_(gs), bits_(bits), mode_(mode), bm_(bm), bn_(bn), bk_(bk) {}
   void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
     throw std::runtime_error("PortableKQuant requires Metal");
   }
@@ -132,7 +133,7 @@ public:
 
 private:
   int gs_, bits_;
-  std::string mode_;
+  kquant::Mode mode_;
   int bm_, bn_, bk_;
 };
 } // namespace
@@ -154,8 +155,11 @@ std::optional<array> portable_kquant_matmul(const array &x, const array &w,
       x.size() / x.shape(-1) < 128 || w.shape(0) < 1024 ||
       !x.flags().row_contiguous || !w.flags().row_contiguous ||
       !scales.flags().row_contiguous || !biases->flags().row_contiguous ||
-      (x.dtype() != bfloat16 && x.dtype() != float16) ||
-      (mode != "q4k" && mode != "q5k" && mode != "q6k" && mode != "iq4xs"))
+      (x.dtype() != bfloat16 && x.dtype() != float16))
+    return std::nullopt;
+  const auto kmode = kquant::parse_mode(mode);
+  if (!kmode || (*kmode != kquant::Mode::Q4K && *kmode != kquant::Mode::Q5K &&
+                 *kmode != kquant::Mode::Q6K && *kmode != kquant::Mode::IQ4XS))
     return std::nullopt;
   if ((!setting || std::string(setting) != "1") && metal::is_nax_available())
     return std::nullopt;
@@ -176,7 +180,7 @@ std::optional<array> portable_kquant_matmul(const array &x, const array &w,
     if (found == capabilities.end()) {
       bool available = false;
       try {
-        portable_pipeline(x.dtype(), group_size, bits, mode, bm, bn, bk);
+        portable_pipeline(x.dtype(), group_size, bits, *kmode, bm, bn, bk);
         available = true;
         std::cerr << "[mlx] portable K-quant prefill enabled: " << key
                   << " (64x64x32, 16-bit inputs, FP32 accumulation)\n";
@@ -193,7 +197,7 @@ std::optional<array> portable_kquant_matmul(const array &x, const array &w,
   shape.back() = w.shape(0);
   return array(shape, x.dtype(),
                std::make_shared<PortableKQuant>(to_stream({}), group_size, bits,
-                                                mode, bm, bn, bk),
+                                                *kmode, bm, bn, bk),
                {x, w, scales, *biases});
 #else
   (void)x;

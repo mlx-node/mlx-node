@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_kquant.h"
 #include "mlx_qwen4_flags.h"
 #include <cstdlib>
 #ifdef MLX_NODE_METAL_ENABLED
@@ -364,10 +365,12 @@ mlx_array *mlx_qwen4_expert_prefill(mlx_array *x, mlx_array *ids,
          w = *reinterpret_cast<array *>(weight);
     auto s = *reinterpret_cast<array *>(scales),
          b = *reinterpret_cast<array *>(biases);
-    auto quant = mlx::core::string_to_quantization_mode(mode);
-    bool affine = quant == mlx::core::QuantizationMode::Affine;
-    int ratio = mlx::core::quant_super_ratio(quant);
-    bool has_min = mlx::core::quant_has_sub_min(quant);
+    auto quant = mlx::core::kquant::parse_mode(mode);
+    bool affine = std::string_view(mode) == "affine";
+    if (!affine && !quant)
+      return nullptr;
+    int ratio = quant ? mlx::core::kquant::super_ratio(*quant) : 0;
+    bool has_min = quant && mlx::core::kquant::has_sub_min(*quant);
     if (input.ndim() != 3 || input.shape(1) != 1 ||
         input.dtype() != mlx::core::bfloat16 || selected.ndim() != 1 ||
         selected.dtype() != mlx::core::uint32 || tiles.ndim() != 2 ||
