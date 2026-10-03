@@ -617,7 +617,8 @@ impl CandidateSelector {
         // reversing before argmax (which otherwise returns the first max).
         // This matches the host max_by walk for ordinary finite ties, but
         // host total_cmp distinguishes signed zero and ranks NaNs. MLX
-        // argmax skips NaNs and treats signed zeros as equal; the fused
+        // argmax treats signed zeros as equal and, since upstream a124ac096,
+        // returns the first NaN (here the last original NaN slot); the fused
         // kernel preserves these device-path semantics.
         let descending = MxArray::from_int32(
             &(0..self.top_k as i32).rev().collect::<Vec<_>>(),
@@ -2040,7 +2041,7 @@ mod tests {
             for position in 0..length {
                 for predecessor in 0..top_k {
                     let row = (position * top_k + predecessor) * top_k;
-                    match position % 6 {
+                    match position % 7 {
                         0 => {
                             values[row + 1] = 7.0;
                             values[row + top_k - 2] = 7.0; // last equal max wins
@@ -2055,6 +2056,8 @@ mod tests {
                             values[row + 1] = 0.0;
                         }
                         2 => {
+                            // A NaN beats every number, and the reverse walk
+                            // meets the last NaN slot first.
                             values[row..row + top_k].fill(f32::NAN);
                             values[row] = 3.0;
                             values[row + top_k / 2] = 3.0;
@@ -2064,10 +2067,16 @@ mod tests {
                             values[row + 1] = f32::INFINITY;
                             values[row + top_k - 2] = f32::INFINITY;
                         }
+                        5 => {
+                            // The walk meets 9.0 before the one NaN; the NaN
+                            // still wins.
+                            values[row + 1] = f32::NAN;
+                            values[row + top_k - 1] = 9.0;
+                        }
                         _ => {
-                            // Leave the row entirely -inf. Like an all-NaN
-                            // row, no value exceeds the initial -inf, so the
-                            // reverse walk retains the final slot.
+                            // Leave the row entirely -inf: no value exceeds
+                            // the initial -inf, so the reverse walk retains
+                            // the final slot.
                         }
                     }
                 }
@@ -2078,9 +2087,10 @@ mod tests {
             let expected_slots = [
                 top_k - 2,
                 top_k - 1,
-                top_k / 2,
+                top_k - 1,
                 top_k - 1,
                 top_k - 2,
+                1,
                 top_k - 1,
             ]
             .into_iter()
