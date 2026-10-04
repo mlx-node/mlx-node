@@ -386,11 +386,11 @@ void qvm_split_k(const Operands &o, int M, int N, int K) {
 
   constexpr int num_simdgroups = 2;
   constexpr int bk = 32;
-  // This grid drops any N % bn tail. Untransposed, N is the packed axis and
-  // whole super-blocks, a multiple of 256 for every mode but IQ4_NL (32).
+  // Round up: IQ4_NL allows N in 32s, and the kernel skips a simdgroup whose
+  // columns start at or past N.
   int bn = qvm_columns_per_simdgroup * num_simdgroups;
   MTL::Size group_dims(bk, num_simdgroups, 1);
-  MTL::Size grid_dims(M, N / bn, B);
+  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
   auto x_shape = x.shape();
   auto x_strides = x.strides();

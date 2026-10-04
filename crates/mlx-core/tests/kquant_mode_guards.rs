@@ -532,15 +532,23 @@ const HALF_SCALES: [u16; 6] = [0x3000, 0x2C00, 0x3400, 0x2E66, 0x3155, 0x2800];
 ///
 /// All three arrays hold a fixed number of entries per 256 decoded values, so
 /// the `KQUANTS` column counts scale linearly. IQ4_NL stores eight independent
-/// 32-value source blocks in that span, hence its eight bias entries.
+/// 32-value source blocks in that span, hence its eight bias entries, and is
+/// the one mode whose packed dim may be a multiple of 32 rather than of 256.
 fn filled_kquant_weights(kq: &KQuant, leading: &[i64], packed: i64) -> Weights {
-    assert_eq!(packed % K, 0, "packed dim must be whole super-blocks");
+    let cols = |per_super: i64| {
+        assert_eq!(
+            packed * per_super % K,
+            0,
+            "{} cannot pack {packed} values",
+            kq.mode
+        );
+        packed * per_super / K
+    };
     let rows: i64 = leading.iter().product();
-    let supers = packed / K;
     let (weight_cols, scales_cols, biases_cols) = (
-        kq.weight_cols * supers,
-        kq.scales_cols * supers,
-        kq.biases_cols * supers,
+        cols(kq.weight_cols),
+        cols(kq.scales_cols),
+        cols(kq.biases_cols),
     );
     let shape = |cols: i64| {
         let mut s = leading.to_vec();
@@ -1317,6 +1325,47 @@ fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
     }
 
     // leave the process on the CPU for whatever runs next
+    select(Device::Cpu);
+}
+
+/// Untransposed IQ4_NL may have any multiple of 32 output columns, but a
+/// `qvm_split_k` threadgroup covers 64, so its grid must round up: N = 32 and
+/// N = 96 once launched too few column groups and left output unwritten. Every
+/// other mode packs N in 256s and is always a multiple of 64.
+#[test]
+fn qvm_split_k_writes_every_iq4nl_output_column() {
+    if !select(Device::Gpu) {
+        eprintln!("skipping qvm_split_k_writes_every_iq4nl_output_column: no GPU device");
+        return;
+    }
+    let kq = KQUANTS.iter().find(|q| q.mode == "iq4nl").expect("iq4nl");
+    let family = |name: &str| {
+        let name = CString::new(name).expect("family");
+        // SAFETY: thread-local test hook reading a NUL-terminated name.
+        unsafe { mlx_sys::mlx_test_kquant_family_count(name.as_ptr()) }
+    };
+    for k in [1024i64, 2048] {
+        for n in [32i64, 64, 96, 128] {
+            let w = filled_kquant_weights(kq, &[k], n);
+            for m in [1i64, 3] {
+                let x = activation(&[m, k], 101 + (k + n + m) as u32, DType::Float32);
+                // SAFETY: thread-local test hook; enabling resets the counts.
+                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+                compare_devices(
+                    &format!("qvm_split_k iq4nl M={m} K={k} N={n}"),
+                    F32_DEEP_TOL,
+                    || qmm_of(kq, &x, &w, false),
+                );
+                let (split, plain) = (family("qvm_split_k"), family("qvm"));
+                // SAFETY: as above.
+                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                assert!(
+                    split > 0 && plain == 0,
+                    "M={m} K={k} N={n} must take qvm_split_k (qvm_split_k {split}, qvm {plain})"
+                );
+            }
+        }
+    }
     select(Device::Cpu);
 }
 
