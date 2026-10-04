@@ -88,6 +88,15 @@ array dequantize(const array &w, const array &scales,
                  std::optional<int> group_size, std::optional<int> bits,
                  Mode mode, std::optional<Dtype> dtype, StreamOrDevice s = {});
 
+// Every kernel the Metal dispatcher can request from paged_attn.metallib.
+// `nax` kernels are requested only when `metal::is_nax_available()`. Defined in
+// Metal builds only.
+struct KernelName {
+  std::string name;
+  bool nax;
+};
+std::vector<KernelName> metal_kernel_names();
+
 class KQuantMatmul : public UnaryPrimitive {
 public:
   KQuantMatmul(Stream stream, int group_size, int bits, Mode mode,

@@ -1,14 +1,13 @@
 // Metal dispatch for the K-quant primitives. The kernel choice, tile sizes and
 // launch geometry mirror MLX's affine dispatcher in
-// mlx/backend/metal/quantized.cpp; the kernels are JIT-built from
-// metal/kquant/{kquant,kquant_nax}.h.
+// mlx/backend/metal/quantized.cpp; the kernels are prebuilt into
+// paged_attn.metallib from metal/kquant/{kquant,kquant_nax}.metal.
 
 #include "mlx_kquant.h"
 #include "mlx_test_counters.h"
 
 #ifdef MLX_NODE_METAL_ENABLED
 
-#include "metal/common/quantized.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/reduce.h"
@@ -18,14 +17,12 @@
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/utils.h"
+#include "mlx_paged_metallib.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstdlib>
 #include <sstream>
-
-namespace mlx::core::quantized_preamble {
-const char *utils();
-}
 
 namespace mlx::core::kquant {
 
@@ -48,72 +45,186 @@ const char *type_string(Dtype dtype) {
   throw std::invalid_argument(msg.str());
 }
 
-// Same text as mlx::core::get_template_definition (bools stream as 0/1).
-template <typename... Args>
-std::string template_definition(const std::string &name,
-                                const std::string &func, Args... args) {
-  std::ostringstream s;
-  s << func << "<";
-  bool first = true;
-  auto add_arg = [&s, &first](const auto &arg) {
-    if (!first) {
-      s << ", ";
-    }
-    first = false;
-    s << arg;
+} // namespace
+
+// Kernel names, built the way kquant.metal / kquant_nax.metal instantiate
+// them. The dispatchers below and metal_kernel_names() share these builders
+// and parameter tables, so a name the dispatcher can request is a name the
+// coverage test checks against the metallib.
+namespace kernels {
+
+constexpr Mode kModes[] = {Mode::Q6K,   Mode::Q4K,   Mode::Q5K, Mode::Q3K,
+                           Mode::IQ4NL, Mode::IQ4XS, Mode::IQ3S};
+constexpr Dtype kTypes[] = {float32, float16, bfloat16};
+
+// qmv_wide tiles 2..8 input vectors (multi-row matvecs only) at 8 k-lanes.
+constexpr int kWideMinVectors = 2;
+constexpr int kWideMaxVectors = 8;
+constexpr int kWideKLanes = 8;
+constexpr int kSplitKSmall = 8;
+constexpr int kSplitKLarge = 32;
+
+struct Tile {
+  int bm, bn, bk, wm, wn;
+};
+constexpr Tile kNaxTile{64, 64, 64, 2, 2};
+constexpr Tile kRhsTile{16, 32, 32, 1, 2};
+
+// qmv_sg8 is bfloat16 only, for the modes kq_sg8::format decodes.
+constexpr Dtype kSg8Type = bfloat16;
+constexpr bool sg8_mode(Mode mode) {
+  return mode == Mode::Q4K || mode == Mode::Q5K || mode == Mode::Q6K ||
+         mode == Mode::IQ4XS;
+}
+
+std::string base(Mode mode, const char *family, Dtype type) {
+  std::string name;
+  concatenate(name, mode_name(mode), "_", family, "_", type_string(type),
+              "_gs_", default_group_size(mode), "_b_", default_bits(mode));
+  return name;
+}
+const char *batch(bool batched) { return batched ? "_batch_1" : "_batch_0"; }
+const char *aligned(bool aligned_n) {
+  return aligned_n ? "_alN_true" : "_alN_false";
+}
+
+std::string qmv(Mode m, Dtype t, bool fast, bool batched) {
+  return base(m, fast ? "qmv_fast" : "qmv", t) + batch(batched);
+}
+std::string qmv_wide(Mode m, Dtype t, int vecs_per_tg, bool batched) {
+  std::string name = base(m, "qmv_wide", t);
+  concatenate(name, "_nv_", vecs_per_tg, "_kl_", kWideKLanes, batch(batched));
+  return name;
+}
+std::string qmv_sg8(Mode m) { return base(m, "qmv_sg8", kSg8Type); }
+std::string qmv_sg8_prep(int group_size) {
+  std::string name;
+  concatenate(name, "kquant_qmv_sg8_prep_", type_string(kSg8Type), "_gs_",
+              group_size);
+  return name;
+}
+std::string qvm(Mode m, Dtype t, bool batched) {
+  return base(m, "qvm", t) + batch(batched);
+}
+std::string qvm_split_k(Mode m, Dtype t, int split_k) {
+  std::string name = base(m, "qvm_split_k", t);
+  concatenate(name, "_spk_", split_k);
+  return name;
+}
+std::string qmm_t_nax(Mode m, Dtype t, bool aligned_n, bool batched) {
+  std::string name = base(m, "qmm_t_nax", t);
+  concatenate(name, "_bm", kNaxTile.bm, "_bn", kNaxTile.bn, "_bk", kNaxTile.bk,
+              "_wm", kNaxTile.wm, "_wn", kNaxTile.wn, aligned(aligned_n),
+              batch(batched));
+  return name;
+}
+std::string qmm_t(Mode m, Dtype t, bool aligned_n, bool batched) {
+  return base(m, "qmm_t", t) + aligned(aligned_n) + batch(batched);
+}
+std::string qmm_n(Mode m, Dtype t, bool batched) {
+  return base(m, "qmm_n", t) + batch(batched);
+}
+std::string qmm_t_splitk(Mode m, Dtype t, bool aligned_n) {
+  return base(m, "qmm_t_splitk", t) + aligned(aligned_n);
+}
+std::string gather_qmm_t(Mode m, Dtype t, bool aligned_n) {
+  return base(m, "gather_qmm_t", t) + aligned(aligned_n);
+}
+std::string gather_qmm_n(Mode m, Dtype t) { return base(m, "gather_qmm_n", t); }
+std::string gather_qmv(Mode m, Dtype t, bool fast) {
+  return base(m, fast ? "gather_qmv_fast" : "gather_qmv", t);
+}
+std::string gather_qvm(Mode m, Dtype t) { return base(m, "gather_qvm", t); }
+std::string gather_qmm_rhs(Mode m, Dtype t, bool transpose) {
+  std::string name =
+      base(m, transpose ? "gather_qmm_rhs_nt" : "gather_qmm_rhs_nn", t);
+  concatenate(name, "_bm_", kRhsTile.bm, "_bn_", kRhsTile.bn, "_bk_",
+              kRhsTile.bk, "_wm_", kRhsTile.wm, "_wn_", kRhsTile.wn);
+  return name;
+}
+std::string dequantize(Mode m, Dtype t) { return base(m, "dequantize", t); }
+
+} // namespace kernels
+
+std::vector<KernelName> metal_kernel_names() {
+  using namespace kernels;
+  std::vector<KernelName> names;
+  auto add = [&names](std::string name, bool nax = false) {
+    names.push_back({std::move(name), nax});
   };
-  (add_arg(args), ...);
-  s << ">";
-  return "\ntemplate [[host_name(\"" + name + "\")]] [[kernel]] decltype(" +
-         s.str() + ") " + s.str() + ";\n";
-}
-
-MTL::ComputePipelineState *
-build_kernel(metal::Device &d, const std::string &kname,
-             const std::string &template_def, bool nax,
-             const std::string &hash_name = "",
-             const metal::MTLFCList &func_consts = {}) {
-  auto *lib = d.get_library("mlx_node_" + kname, [&] {
-    std::string source = quantized_preamble::utils();
-    if (nax) {
-      source += quantized_preamble::gemm_nax();
-      source += quantized_preamble::quantized_utils();
-      source += quantized_preamble::kquant_nax();
-    } else {
-      source += quantized_preamble::gemm();
-      source += quantized_preamble::quantized_utils();
-      source += quantized_preamble::kquant();
+  for (Dtype t : kTypes) {
+    for (Mode m : kModes) {
+      for (bool b : {false, true}) {
+        add(qmv(m, t, false, b));
+        add(qmv(m, t, true, b));
+        for (int v = kWideMinVectors; v <= kWideMaxVectors; ++v) {
+          add(qmv_wide(m, t, v, b));
+        }
+        add(qvm(m, t, b));
+        add(qmm_n(m, t, b));
+        for (bool a : {false, true}) {
+          add(qmm_t(m, t, a, b));
+          add(qmm_t_nax(m, t, a, b), true);
+        }
+      }
+      for (int split_k : {kSplitKSmall, kSplitKLarge}) {
+        add(qvm_split_k(m, t, split_k));
+      }
+      for (bool a : {false, true}) {
+        add(qmm_t_splitk(m, t, a));
+        add(gather_qmm_t(m, t, a));
+      }
+      add(gather_qmm_n(m, t));
+      add(gather_qmv(m, t, false));
+      add(gather_qmv(m, t, true));
+      add(gather_qvm(m, t));
+      add(gather_qmm_rhs(m, t, true));
+      add(gather_qmm_rhs(m, t, false));
+      add(dequantize(m, t));
     }
-    return source + template_def;
-  });
-  return d.get_kernel(kname, lib, hash_name, func_consts);
+  }
+  std::vector<int> prep_group_sizes;
+  for (Mode m : kModes) {
+    if (!sg8_mode(m)) {
+      continue;
+    }
+    add(qmv_sg8(m));
+    int gs = default_group_size(m);
+    if (std::find(prep_group_sizes.begin(), prep_group_sizes.end(), gs) ==
+        prep_group_sizes.end()) {
+      prep_group_sizes.push_back(gs);
+      add(qmv_sg8_prep(gs));
+    }
+  }
+  return names;
 }
 
-// `kquant_<func><T, group_size, bits, super_ratio, has_min, args...>`.
-template <typename... Args>
+namespace {
+
+// The prebuilt pipeline for `kname`. Function-constant kernels pass the
+// specialization in `hash_name` / `func_consts`.
 MTL::ComputePipelineState *
-get_kernel(metal::Device &d, const std::string &kname, const std::string &func,
-           Mode mode, const std::string &type, int group_size, int bits,
-           Args... args) {
-  bridge_testing::record(func);
-  return build_kernel(d, kname,
-                      template_definition(kname, "kquant_" + func, type,
-                                          group_size, bits, super_ratio(mode),
-                                          has_sub_min(mode), args...),
-                      false);
+load_kernel(metal::Device &d, const std::string &kname,
+            const std::string &hash_name = "",
+            const metal::MTLFCList &func_consts = {}) {
+  auto *lib = fast::paged::get_paged_attn_library(d);
+  try {
+    return d.get_kernel(kname, lib, hash_name, func_consts);
+  } catch (const std::exception &e) {
+    std::ostringstream msg;
+    msg << "[kquant] Cannot load K-quant kernel " << kname << " from "
+        << fast::paged::paged_attn_metallib_path().string()
+        << ". The metallib is stale or incomplete; rebuild it with `yarn "
+           "build:native`. "
+        << e.what();
+    throw std::runtime_error(msg.str());
+  }
 }
 
-template <typename... Args>
-MTL::ComputePipelineState *
-get_nax_kernel(metal::Device &d, const std::string &kname,
-               const std::string &func, Mode mode, const std::string &type,
-               int group_size, int bits, Args... args) {
-  bridge_testing::record(func);
-  return build_kernel(d, kname,
-                      template_definition(kname, "kquant_" + func, type,
-                                          group_size, bits, super_ratio(mode),
-                                          has_sub_min(mode), args...),
-                      true);
+MTL::ComputePipelineState *get_kernel(metal::Device &d, const char *family,
+                                      const std::string &kname) {
+  bridge_testing::record(family);
+  return load_kernel(d, kname);
 }
 
 inline array ensure_row_contiguous(const array &x, const Stream &s) {
@@ -246,14 +357,9 @@ void qmv(const Operands &o, int M, int N, int K) {
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  std::string type = type_string(o.x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), fast ? "_qmv_fast_" : "_qmv_", type,
-              "_gs_", o.group_size, "_b_", o.bits,
-              B > 1 ? "_batch_1" : "_batch_0");
-  auto kernel = get_kernel(o.d, kname, fast ? "qmv_fast" : "qmv", o.mode, type,
-                           o.group_size, o.bits, B > 1);
+  auto kernel = get_kernel(o.d, fast ? "qmv_fast" : "qmv",
+                           kernels::qmv(o.mode, o.x.dtype(), fast, B > 1));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -275,11 +381,10 @@ void qmv_wide(const Operands &o, int M, int N, int K) {
   // Each tile re-reads the weights: fewest tiles, then the smallest tile that
   // fills them. Up to 8 vectors per tile only when N is large enough that the
   // row dimension already saturates the GPU.
-  const int tile_cap = N >= 2048 ? 8 : 5;
+  const int tile_cap = N >= 2048 ? kernels::kWideMaxVectors : 5;
   int n_tiles = (M + tile_cap - 1) / tile_cap;
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
-  // The K-quant qmv_wide is instantiated at k_lanes 8 only.
-  constexpr int k_lanes = 8;
+  constexpr int k_lanes = kernels::kWideKLanes;
   constexpr int num_simdgroups = 2;
   int B = o.out.size() / M / N;
   bool batched = B > 1;
@@ -289,16 +394,12 @@ void qmv_wide(const Operands &o, int M, int N, int K) {
   MTL::Size grid_dims((M + vecs_per_tg - 1) / vecs_per_tg,
                       (N + rows_per_tg - 1) / rows_per_tg, B);
 
-  std::string type = type_string(o.x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), "_qmv_wide_", type, "_gs_",
-              o.group_size, "_b_", o.bits, "_nv_", vecs_per_tg, "_kl_", k_lanes,
-              batched ? "_batch_1" : "_batch_0");
   if (bridge_testing::counting) {
     bridge_testing::record("qmv_wide_nv" + std::to_string(vecs_per_tg));
   }
-  auto kernel = get_kernel(o.d, kname, "qmv_wide", o.mode, type, o.group_size,
-                           o.bits, vecs_per_tg, k_lanes, batched);
+  auto kernel =
+      get_kernel(o.d, "qmv_wide",
+                 kernels::qmv_wide(o.mode, o.x.dtype(), vecs_per_tg, batched));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -318,11 +419,10 @@ bool use_qmv_sg8(const Operands &o, int M, int N) {
   if (M != 8 || o.d.get_architecture_gen() < 17) {
     return false;
   }
-  if (o.mode != Mode::Q4K && o.mode != Mode::Q5K && o.mode != Mode::Q6K &&
-      o.mode != Mode::IQ4XS) {
+  if (!kernels::sg8_mode(o.mode)) {
     return false;
   }
-  return o.x.dtype() == bfloat16 && o.out.size() == size_t(8) * N &&
+  return o.x.dtype() == kernels::kSg8Type && o.out.size() == size_t(8) * N &&
          N % 32 == 0 && o.x.offset() % 8 == 0 && o.scales.offset() % 16 == 0 &&
          o.biases.offset() % 4 == 0;
 }
@@ -338,13 +438,7 @@ void qmv_sg8(const Operands &o, int N, int K) {
   enc.add_temporary(bt);
   enc.add_temporary(sums);
 
-  std::string type = type_string(o.x.dtype());
-  std::string prep_name;
-  concatenate(prep_name, "kquant_qmv_sg8_prep_", type, "_gs_", o.group_size);
-  auto prep = build_kernel(
-      o.d, prep_name,
-      template_definition(prep_name, "kquant_qmv_sg8_prep", type, o.group_size),
-      false);
+  auto prep = load_kernel(o.d, kernels::qmv_sg8_prep(o.group_size));
   enc.set_compute_pipeline_state(prep);
   enc.set_input_array(o.x, 0);
   enc.set_output_array(bt, 1);
@@ -353,11 +447,7 @@ void qmv_sg8(const Operands &o, int N, int K) {
   enc.dispatch_threadgroups(MTL::Size((K / 32 + 3) / 4, 1, 1),
                             MTL::Size(128, 1, 1));
 
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), "_qmv_sg8_", type, "_gs_", o.group_size,
-              "_b_", o.bits);
-  auto kernel =
-      get_kernel(o.d, kname, "qmv_sg8", o.mode, type, o.group_size, o.bits);
+  auto kernel = get_kernel(o.d, "qmv_sg8", kernels::qmv_sg8(o.mode));
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
   enc.set_input_array(bt, 3);
@@ -379,7 +469,7 @@ void qvm_split_k(const Operands &o, int M, int N, int K) {
   const auto &scales = o.scales;
   const auto &biases = o.biases;
 
-  int split_k = K > 8192 ? 32 : 8;
+  int split_k = K > 8192 ? kernels::kSplitKLarge : kernels::kSplitKSmall;
   int split_D = (K + split_k - 1) / split_k;
   int B = o.out.size() / M / N;
   B *= split_k;
@@ -428,12 +518,8 @@ void qvm_split_k(const Operands &o, int M, int N, int K) {
   intermediate.set_data(allocator::malloc(intermediate.nbytes()));
   enc.add_temporary(intermediate);
 
-  std::string type = type_string(x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), "_qvm_split_k_", type, "_gs_",
-              o.group_size, "_b_", o.bits, "_spk_", split_k);
-  auto kernel = get_kernel(o.d, kname, "qvm_split_k", o.mode, type,
-                           o.group_size, o.bits, split_k);
+  auto kernel = get_kernel(o.d, "qvm_split_k",
+                           kernels::qvm_split_k(o.mode, x.dtype(), split_k));
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, w, scales, biases);
   int c = 3;
@@ -469,12 +555,8 @@ void qvm(const Operands &o, int M, int N, int K) {
   MTL::Size group_dims(bk, num_simdgroups, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  std::string type = type_string(o.x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), "_qvm_", type, "_gs_", o.group_size,
-              "_b_", o.bits, B > 1 ? "_batch_1" : "_batch_0");
   auto kernel =
-      get_kernel(o.d, kname, "qvm", o.mode, type, o.group_size, o.bits, B > 1);
+      get_kernel(o.d, "qvm", kernels::qvm(o.mode, o.x.dtype(), B > 1));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -489,25 +571,15 @@ void qvm(const Operands &o, int M, int N, int K) {
 // The NAX family covers qmm with a transposed weight only.
 void qmm_nax(const Operands &o, int M, int N, int K) {
   int B = o.out.size() / M / N;
-  int wm = 2;
-  int wn = 2;
-  int bm = 64;
-  int bn = 64;
-  int bk = 64;
-  MTL::Size group_dims(32, wn, wm);
-  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+  constexpr auto tile = kernels::kNaxTile;
+  MTL::Size group_dims(32, tile.wn, tile.wm);
+  MTL::Size grid_dims((N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm,
+                      B);
 
-  bool aligned = N % 64 == 0;
-  bool batched = B > 1;
-  std::string type = type_string(o.x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), "_qmm_t_nax_", type, "_gs_",
-              o.group_size, "_b_", o.bits, "_bm", bm, "_bn", bn, "_bk", bk,
-              "_wm", wm, "_wn", wn, aligned ? "_alN_true" : "_alN_false",
-              batched ? "_batch_1" : "_batch_0");
+  bool aligned = N % tile.bn == 0;
   auto kernel =
-      get_nax_kernel(o.d, kname, "qmm_t_nax", o.mode, type, o.group_size,
-                     o.bits, aligned, batched, bm, bk, bn, wm, wn);
+      get_kernel(o.d, "qmm_t_nax",
+                 kernels::qmm_t_nax(o.mode, o.x.dtype(), aligned, B > 1));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -536,16 +608,12 @@ void qmm(const Operands &o, bool transpose, int M, int N, int K) {
 
   bool aligned = N % 32 == 0;
   bool batched = B > 1;
-  std::string type = type_string(o.x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), transpose ? "_qmm_t_" : "_qmm_n_", type,
-              "_gs_", o.group_size, "_b_", o.bits,
-              transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-              batched ? "_batch_1" : "_batch_0");
-  auto kernel = transpose ? get_kernel(o.d, kname, "qmm_t", o.mode, type,
-                                       o.group_size, o.bits, aligned, batched)
-                          : get_kernel(o.d, kname, "qmm_n", o.mode, type,
-                                       o.group_size, o.bits, batched);
+  auto kernel =
+      transpose
+          ? get_kernel(o.d, "qmm_t",
+                       kernels::qmm_t(o.mode, o.x.dtype(), aligned, batched))
+          : get_kernel(o.d, "qmm_n",
+                       kernels::qmm_n(o.mode, o.x.dtype(), batched));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -594,13 +662,8 @@ void qmm_splitk(const Operands &o, int M, int N, int K) {
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
   bool aligned = N % 32 == 0;
-  std::string type = type_string(o.x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), "_qmm_t_splitk_", type, "_gs_",
-              o.group_size, "_b_", o.bits,
-              aligned ? "_alN_true" : "_alN_false");
-  auto kernel = get_kernel(o.d, kname, "qmm_t_splitk", o.mode, type,
-                           o.group_size, o.bits, aligned);
+  auto kernel = get_kernel(o.d, "qmm_t_splitk",
+                           kernels::qmm_t_splitk(o.mode, o.x.dtype(), aligned));
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
   enc.set_input_array(o.x, 3);
@@ -629,16 +692,12 @@ void gather_qmm(const Operands &o, const array &lhs_indices,
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
   bool aligned = N % 32 == 0;
-  std::string type = type_string(o.x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode),
-              transpose ? "_gather_qmm_t_" : "_gather_qmm_n_", type, "_gs_",
-              o.group_size, "_b_", o.bits,
-              transpose ? (aligned ? "_alN_true" : "_alN_false") : "");
-  auto kernel = transpose ? get_kernel(o.d, kname, "gather_qmm_t", o.mode, type,
-                                       o.group_size, o.bits, aligned)
-                          : get_kernel(o.d, kname, "gather_qmm_n", o.mode, type,
-                                       o.group_size, o.bits);
+  auto kernel =
+      transpose
+          ? get_kernel(o.d, "gather_qmm_t",
+                       kernels::gather_qmm_t(o.mode, o.x.dtype(), aligned))
+          : get_kernel(o.d, "gather_qmm_n",
+                       kernels::gather_qmm_n(o.mode, o.x.dtype()));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -663,14 +722,9 @@ void gather_qmv(const Operands &o, const array &lhs_indices,
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  std::string type = type_string(o.x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
-  std::string kname;
-  concatenate(kname, mode_name(o.mode),
-              fast ? "_gather_qmv_fast_" : "_gather_qmv_", type, "_gs_",
-              o.group_size, "_b_", o.bits);
-  auto kernel = get_kernel(o.d, kname, fast ? "gather_qmv_fast" : "gather_qmv",
-                           o.mode, type, o.group_size, o.bits);
+  auto kernel = get_kernel(o.d, fast ? "gather_qmv_fast" : "gather_qmv",
+                           kernels::gather_qmv(o.mode, o.x.dtype(), fast));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -695,12 +749,8 @@ void gather_qvm(const Operands &o, const array &lhs_indices,
   MTL::Size group_dims(bk, num_simdgroups, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  std::string type = type_string(o.x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(o.mode), "_gather_qvm_", type, "_gs_",
-              o.group_size, "_b_", o.bits);
   auto kernel =
-      get_kernel(o.d, kname, "gather_qvm", o.mode, type, o.group_size, o.bits);
+      get_kernel(o.d, "gather_qvm", kernels::gather_qvm(o.mode, o.x.dtype()));
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -721,8 +771,8 @@ void gather_qvm(const Operands &o, const array &lhs_indices,
 // expert's weights across consecutive rows.
 void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
                     const array &biases_, const array &indices_, array &out,
-                    bool transpose, int group_size, int bits, Mode mode, int M,
-                    int N, int K, metal::Device &d, const Stream &s) {
+                    bool transpose, Mode mode, int M, int N, int K,
+                    metal::Device &d, const Stream &s) {
   array indices = ensure_row_contiguous(indices_, s);
   auto broadcast_with_indices = [&s, &indices](const array &x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
@@ -739,18 +789,12 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
   array w = ensure_row_contiguous(w_, s);
   array scales = ensure_row_contiguous(scales_, s);
 
-  int bm = 16, bn = 32, bk = 32;
-  int wm = 1, wn = 2;
-  const bool align_M = (M % bm) == 0;
-  const bool align_N = (N % bn) == 0;
-  const bool align_K = (K % bk) == 0;
+  constexpr auto tile = kernels::kRhsTile;
+  const bool align_M = (M % tile.bm) == 0;
+  const bool align_N = (N % tile.bn) == 0;
+  const bool align_K = (K % tile.bk) == 0;
 
-  std::string type = type_string(x.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(mode),
-              transpose ? "_gather_qmm_rhs_nt_" : "_gather_qmm_rhs_nn_", type,
-              "_gs_", group_size, "_b_", bits, "_bm_", bm, "_bn_", bn, "_bk_",
-              bk, "_wm_", wm, "_wn_", wn);
+  std::string kname = kernels::gather_qmm_rhs(mode, x.dtype(), transpose);
   metal::MTLFCList func_consts = {
       {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
@@ -762,16 +806,12 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
 
   auto &enc = metal::get_command_encoder(s);
   bridge_testing::record(transpose ? "gather_qmm_rhs_nt" : "gather_qmm_rhs_nn");
-  auto kernel = build_kernel(
-      d, kname,
-      template_definition(kname, "kquant_gather_qmm_rhs", type, group_size,
-                          bits, super_ratio(mode), has_sub_min(mode), bm, bn,
-                          bk, wm, wn, transpose),
-      false, hash_name, func_consts);
+  auto kernel = load_kernel(d, kname, hash_name, func_consts);
   enc.set_compute_pipeline_state(kernel);
 
-  MTL::Size group_dims(32, wn, wm);
-  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
+  MTL::Size group_dims(32, tile.wn, tile.wm);
+  MTL::Size grid_dims((N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm,
+                      1);
 
   int c = 0;
   enc.set_input_array(x, c++);
@@ -870,8 +910,8 @@ void KQuantGatherQMM::eval_gpu(const std::vector<array> &inputs, array &out) {
   // x and w are both walked in order, so the matmuls batch up and reuse the
   // loads of each expert's weights.
   if (M == 1 && B >= 16 && right_sorted_ && B / E >= 4) {
-    gather_qmm_rhs(x, w, scales, biases, rhs_indices, out, transpose_,
-                   group_size_, bits_, mode_, x.size() / K, N, K, d, s);
+    gather_qmm_rhs(x, w, scales, biases, rhs_indices, out, transpose_, mode_,
+                   x.size() / K, N, K, d, s);
     return;
   }
 
@@ -897,12 +937,8 @@ void KQuantDequantize::eval_gpu(const std::vector<array> &inputs, array &out) {
   auto scales = ensure_row_contiguous(inputs[1], s);
   auto biases = ensure_row_contiguous(inputs[2], s);
 
-  std::string type = type_string(out.dtype());
-  std::string kname;
-  concatenate(kname, mode_name(mode_), "_dequantize_", type, "_gs_",
-              group_size_, "_b_", bits_);
   auto kernel =
-      get_kernel(d, kname, "dequantize", mode_, type, group_size_, bits_);
+      get_kernel(d, "dequantize", kernels::dequantize(mode_, out.dtype()));
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, w, scales, biases);
   enc.set_output_array(out, 3);

@@ -85,17 +85,182 @@ fn macos_deployment_target() -> Option<String> {
         .or_else(default_macos_deployment_target)
 }
 
-/// Compile the paged-attention `.metal` sources into
-/// `<out_dir>/paged_attn.metallib`. The kernels live in
-/// `crates/mlx-paged-attn/metal/`. mlx-sys's own
-/// `mlx_paged_dispatch.cpp` resolves this metallib at runtime by
-/// looking next to the loaded binary (the .node addon copies it
-/// alongside `mlx.metallib` during the package-build step).
+/// One `.metal` → `.air` compile. `args` are every flag except the input,
+/// output and dependency-file paths.
+struct AirJob {
+    src: PathBuf,
+    air: PathBuf,
+    args: Vec<String>,
+}
+
+/// FNV-1a: stable across Rust releases, unlike `DefaultHasher`, so a stamp
+/// written by one toolchain still reads correctly under the next.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn command_stdout(cmd: &mut Command) -> Option<String> {
+    let output = cmd.output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Paths listed in a Make-format dependency file (`-MD -MF`), target excluded.
+fn depfile_paths(text: &str) -> Vec<PathBuf> {
+    let joined = text.replace("\\\n", " ");
+    let body = joined.split_once(": ").map_or("", |(_, deps)| deps);
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&' ') {
+            current.push(' ');
+            chars.next();
+        } else if c.is_whitespace() {
+            if !current.is_empty() {
+                paths.push(PathBuf::from(std::mem::take(&mut current)));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        paths.push(PathBuf::from(current));
+    }
+    paths
+}
+
+/// The stamp a job's `.air` was built from: toolchain, flags, and the content
+/// hash of the source and every header it included.
+fn air_stamp(job: &AirJob, toolchain: &str, deps: &[PathBuf]) -> Option<String> {
+    let mut stamp = format!("toolchain {toolchain}\nargs {}\n", job.args.join(" "));
+    for dep in deps {
+        let bytes = std::fs::read(dep).ok()?;
+        stamp.push_str(&format!("{:016x} {}\n", fnv1a(&bytes), dep.display()));
+    }
+    Some(stamp)
+}
+
+fn air_is_current(job: &AirJob, toolchain: &str) -> bool {
+    let stamp_path = job.air.with_extension("air.stamp");
+    let (Ok(stamp), true) = (std::fs::read_to_string(&stamp_path), job.air.exists()) else {
+        return false;
+    };
+    let deps: Vec<PathBuf> = stamp
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_once(' ').map(|(_, path)| PathBuf::from(path)))
+        .collect();
+    air_stamp(job, toolchain, &deps).as_deref() == Some(stamp.as_str())
+}
+
+fn compile_air(job: &AirJob, toolchain: &str) {
+    if air_is_current(job, toolchain) {
+        return;
+    }
+    let depfile = job.air.with_extension("air.d");
+    let stamp_path = job.air.with_extension("air.stamp");
+    let _ = std::fs::remove_file(&stamp_path);
+    let status = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal"])
+        .args(&job.args)
+        .arg("-c")
+        .arg(&job.src)
+        .arg("-o")
+        .arg(&job.air)
+        .arg("-MD")
+        .arg("-MF")
+        .arg(&depfile)
+        .status()
+        .expect("Failed to execute xcrun metal");
+    if !status.success() {
+        panic!(
+            "Metal compilation failed for {} ({}): exit code {:?}",
+            job.src.display(),
+            job.args.join(" "),
+            status.code()
+        );
+    }
+    // A missing stamp only costs a recompile next time.
+    if let Some(stamp) = std::fs::read_to_string(&depfile)
+        .ok()
+        .and_then(|text| air_stamp(job, toolchain, &depfile_paths(&text)))
+    {
+        let _ = std::fs::write(&stamp_path, stamp);
+    }
+}
+
+/// Dotted-version compare (`26.2` vs `26.0.1`), missing parts read as 0.
+fn version_at_least(version: &str, floor: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    let (a, b) = (parse(version), parse(floor));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    true
+}
+
+/// MLX's own NAX condition (`mlx/backend/metal/kernels/CMakeLists.txt`, with
+/// the `MLX_METAL_FORCE_NAX` that main() always passes): Metal language >= 4.0
+/// at the deployment target, and a macOS SDK >= 26.2. When it fails MLX
+/// defines MLX_METAL_NO_NAX and `is_nax_available()` is false, so the
+/// dispatcher never asks for the K-quant NAX kernels either.
+fn nax_kernels_enabled(deployment_target: Option<&str>) -> bool {
+    let sdk = command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-version"]));
+    if !sdk.is_some_and(|v| version_at_least(&v, "26.2")) {
+        return false;
+    }
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["-sdk", "macosx", "metal", "-E", "-x", "metal", "-P", "-"]);
+    if let Some(target) = deployment_target {
+        cmd.arg(format!("-mmacosx-version-min={target}"));
+    }
+    let Ok(mut child) = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(b"__METAL_VERSION__\n");
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| line.trim().parse::<u32>().ok())
+        .is_some_and(|version| version >= 400)
+}
+
+/// Build `<out_dir>/paged_attn.metallib`: the paged-attention kernels
+/// (`crates/mlx-paged-attn/metal/`) and the prebuilt K-quant kernels
+/// (`src/metal/kquant/`). `mlx_paged_dispatch.cpp` resolves it at runtime next
+/// to the loaded binary (the package build copies it beside `mlx.metallib`).
 ///
-/// Mirror of `crates/mlx-paged-attn/build.rs`'s metal-shader compile:
-/// same `xcrun -sdk macosx metal -O3 -ffast-math` invocation, same
-/// link step.
-fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+/// The K-quant `.air` files use MLX's own kernel flags (`-fno-fast-math`, no
+/// `-O`, no `-std`), which keep their bits equal to MLX's prebuilt kernels;
+/// the paged-attention flags (`-O3 -ffast-math`) would change them. The paged
+/// `.air` files link first so the library's min-OS stamp stays the floor, not
+/// the NAX files' 26.2.
+fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Path) -> PathBuf {
     let metal_src_dir = manifest_dir
         .parent()
         .expect("CARGO_MANIFEST_DIR has a parent")
@@ -114,60 +279,80 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    let metal_files = [
+    // Resolved once: it probes the host (`sw_vers`), not something per file.
+    let deployment_target = macos_deployment_target();
+    let min_os = |target: Option<&str>| target.map(|t| format!("-mmacosx-version-min={t}"));
+
+    let mut jobs = Vec::new();
+    for file in [
         "attention/paged_attention.metal",
         "cache/reshape_and_cache.metal",
         "cache/copy_blocks.metal",
-    ];
-
-    // Resolved once: it probes the host (`sw_vers`), not something per file.
-    let deployment_target = macos_deployment_target();
-
-    let mut air_files = Vec::new();
-    for file in &metal_files {
-        let src_path = metal_src_dir.join(file);
-        let air_name = file.replace('/', "_").replace(".metal", ".air");
-        let air_path = out_dir.join(&air_name);
-
-        let mut compile_cmd = Command::new("xcrun");
-        compile_cmd.args([
-            "-sdk",
-            "macosx",
-            "metal",
-            "-c",
-            src_path.to_str().unwrap(),
-            "-o",
-            air_path.to_str().unwrap(),
-            "-I",
-            metal_src_dir.to_str().unwrap(),
-            "-O3",
-            "-ffast-math",
-        ]);
-        // Pin the metallib's min-OS stamp when a floor is requested, matching
-        // what MLX's kernel CMake does for mlx.metallib. The metal driver
-        // reads MACOSX_DEPLOYMENT_TARGET from the environment too, but the
-        // explicit flag keeps the floor visible in the command line.
-        if let Some(target) = &deployment_target {
-            compile_cmd.arg(format!("-mmacosx-version-min={target}"));
-        }
-        let status = compile_cmd.status().expect("Failed to execute xcrun metal");
-        if !status.success() {
-            panic!(
-                "Metal compilation failed for {}: exit code {:?}",
-                file,
-                status.code()
-            );
-        }
-        air_files.push(air_path);
+    ] {
+        let mut args = vec![
+            "-I".to_string(),
+            metal_src_dir.display().to_string(),
+            "-O3".to_string(),
+            "-ffast-math".to_string(),
+        ];
+        args.extend(min_os(deployment_target.as_deref()));
+        jobs.push(AirJob {
+            src: metal_src_dir.join(file),
+            air: out_dir.join(file.replace('/', "_").replace(".metal", ".air")),
+            args,
+        });
     }
+
+    let kquant_dir = manifest_dir.join("src").join("metal").join("kquant");
+    let mut kquant_files = vec![("kquant", deployment_target.clone())];
+    if nax_kernels_enabled(deployment_target.as_deref()) {
+        let nax_target = match deployment_target.as_deref() {
+            Some(target) if version_at_least(target, "26.2") => target.to_string(),
+            _ => "26.2".to_string(),
+        };
+        kquant_files.push(("kquant_nax", Some(nax_target)));
+    }
+    for (name, target) in &kquant_files {
+        for dtype in 0..3 {
+            let mut args = vec![
+                "-x".to_string(),
+                "metal".to_string(),
+                "-fno-fast-math".to_string(),
+                format!("-DKQUANT_DTYPE={dtype}"),
+                "-I".to_string(),
+                mlx_dir.display().to_string(),
+            ];
+            args.extend(min_os(target.as_deref()));
+            jobs.push(AirJob {
+                src: kquant_dir.join(format!("{name}.metal")),
+                air: out_dir.join(format!("{name}_{dtype}.air")),
+                args,
+            });
+        }
+    }
+
+    let toolchain = [
+        command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "metal", "--version"])),
+        command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-path"])),
+        command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-version"])),
+    ]
+    .map(|part| part.unwrap_or_default())
+    .join(" | ")
+    .replace('\n', " ");
+    std::thread::scope(|scope| {
+        for job in &jobs {
+            let toolchain = &toolchain;
+            scope.spawn(move || compile_air(job, toolchain));
+        }
+    });
 
     let metallib_path = out_dir.join("paged_attn.metallib");
     let mut link_cmd = Command::new("xcrun");
     link_cmd.args(["-sdk", "macosx", "metallib"]);
-    for air in &air_files {
-        link_cmd.arg(air.to_str().unwrap());
+    for job in &jobs {
+        link_cmd.arg(&job.air);
     }
-    link_cmd.args(["-o", metallib_path.to_str().unwrap()]);
+    link_cmd.arg("-o").arg(&metallib_path);
     let status = link_cmd.status().expect("Failed to execute xcrun metallib");
     if !status.success() {
         panic!(
@@ -308,7 +493,11 @@ fn main() -> io::Result<()> {
     // not findable.
     let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     let paged_metallib_path = if build_metal {
-        Some(compile_paged_attn_metallib(&manifest_dir, &out_dir_path))
+        Some(compile_paged_attn_metallib(
+            &manifest_dir,
+            &mlx_dir,
+            &out_dir_path,
+        ))
     } else {
         None
     };
@@ -623,7 +812,6 @@ fn main() -> io::Result<()> {
             ("steel/gemm/gemm", "gemm"),
             ("quantized_utils", "quantized_utils"),
             ("steel/gemm/nax", "nax"),
-            ("steel/gemm/gemm_nax", "gemm_nax"),
             ("steel/attn/kernels/steel_attention", "steel_attention"),
         ] {
             let status = Command::new("bash")
@@ -655,8 +843,10 @@ fn main() -> io::Result<()> {
                     .display()
             );
         }
-        // The K-quant kernels are ours. They include no project headers, so the
-        // preamble is the file itself, in the generator's format.
+        // The K-quant headers as source text, for the custom kernels that
+        // reuse their decoders (the K-quant ops themselves run from the
+        // prebuilt paged_attn.metallib). They include no project headers, so
+        // the preamble is the file itself, in the generator's format.
         for name in ["kquant", "kquant_nax"] {
             let header = src_dir.join(format!("metal/kquant/{name}.h"));
             let body: String = read_build_source(&header)?

@@ -12,17 +12,21 @@ Organize them by their mathematical and storage contracts:
   top-10 routing, fixed shared-expert packing, 16 key / 48 value heads, and
   four-stream hyper-connection mixing. The dense projection kernels also
   retain mixer epilogues that divide by four.
-- `kquant/`: the ggml K-quant / IQ kernel headers (`kquant.h`,
-  `kquant_nax.h`). Not raw strings: `build.rs` turns each into a
-  `quantized_preamble::` function, and `mlx_kquant_metal.cpp` JIT-builds one
-  library per kernel from it, choosing kernels like MLX's affine dispatcher.
+- `kquant/`: the ggml K-quant / IQ kernels (`kquant.h`, `kquant_nax.h`) and
+  their instantiation lists (`kquant.metal`, `kquant_nax.metal`). `build.rs`
+  compiles the lists with MLX's kernel flags into `paged_attn.metallib`, and
+  `mlx_kquant_metal.cpp` loads every kernel from there (no JIT fallback),
+  choosing kernels like MLX's affine dispatcher. Its `kquant::kernels` name
+  builders must match the lists; `kquant_metallib_names` checks both ways.
+  `build.rs` also turns each header into a `quantized_preamble::` function for
+  the custom kernels that reuse its decoders.
 - `common/affine_qmv_wide_mixed.metal.inc` is a whole library source, not a
   `metal_kernel` body: `mlx_affine_mixed_qmm.cpp` JIT-builds one library per
   tile width from it (BF16 x with F32 affine sidecars).
 - `common/sdpa_segmented.metal.inc` is a whole library source too:
   `mlx_segmented_sdpa.cpp` JIT-builds the BF16 D=256 segmented SDPA kernels
   from it and reduces their partials with MLX's own `sdpa_vector_2pass_2`.
-- The three whole-library sources above (`kquant/`, `affine_qmv_wide_mixed`,
+- The three kernel families above (`kquant/`, `affine_qmv_wide_mixed`,
   `sdpa_segmented`) are guarded by `#[ignore]` golden-digest gates in
   `crates/mlx-core/tests/*_golden_gate.rs`, run on every MLX pin bump. A change
   here that moves output bits fails them too, and they have no capture mode

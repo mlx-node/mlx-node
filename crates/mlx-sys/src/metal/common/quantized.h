@@ -12,7 +12,6 @@ const char *gemm();
 const char *quantized_utils();
 const char *kquant();
 const char *nax();
-const char *gemm_nax();
 const char *kquant_nax();
 
 // Custom-kernel source comparisons run at every dispatch. Keep only the

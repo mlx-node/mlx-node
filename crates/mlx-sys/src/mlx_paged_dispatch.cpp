@@ -10,6 +10,7 @@
 // dispatched against different command queues.
 
 #include "mlx_paged_dispatch.h"
+#include "mlx_paged_metallib.h"
 
 #include <algorithm>
 #include <atomic>
@@ -55,23 +56,21 @@ constexpr int kNumThreads = 256;
 constexpr int kNumSimdLanes = 32;
 constexpr int kNumWarps = kNumThreads / kNumSimdLanes;
 
+} // namespace
+
 // =============================================================================
 // .metallib loading
 // =============================================================================
 //
-// The paged-attention kernels live in their own `.metallib`, separate
-// from MLX's `mlx.metallib`. mlx-sys/build.rs compiles
-// `crates/mlx-paged-attn/metal/*.metal` into
-// `<OUT_DIR>/paged_attn.metallib` and copies it next to the
-// crate-internal `mlx.metallib` so it ships in the same place.
-//
-// At runtime we call `Device::get_library(name, path)` once per
-// process; subsequent calls hit MLX's library cache. We use the
-// `path` overload (not the `builder` overload) so we feed Metal a
-// pre-compiled `.metallib` rather than re-compiling source at
-// runtime.
+// `paged_attn.metallib` holds the paged-attention kernels and the prebuilt
+// K-quant kernels (mlx_kquant_metal.cpp). mlx-sys/build.rs compiles it into
+// `<OUT_DIR>/paged_attn.metallib` and copies it next to the crate-internal
+// `mlx.metallib` so it ships in the same place. `Device::get_library(name,
+// path)` loads it once per process; later calls hit MLX's library cache.
 
+namespace {
 const std::string kPagedAttnLibraryName = "mlx_paged_attn";
+} // namespace
 
 // Resolve the path of the binary that contains this function, and look
 // for `paged_attn.metallib` next to it. Mirrors the colocated-library
@@ -132,6 +131,8 @@ MTL::Library* get_paged_attn_library(mlx::core::metal::Device& device) {
   });
   return device.get_library(kPagedAttnLibraryName, cached_path.string());
 }
+
+namespace {
 
 // =============================================================================
 // Kernel-name formatting (must match `MetalState::*_kernel_name` in
