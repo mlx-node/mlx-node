@@ -12,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -23,6 +24,7 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
+#include "mlx_paged_metallib.h"
 #include "mlx_segmented_sdpa.h"
 #include "mlx_test_counters.h"
 
@@ -80,9 +82,9 @@ SegmentedSdpaCapabilities capabilities(MTL::ComputePipelineState *pipeline,
           device->maxThreadgroupMemoryLength()};
 }
 
-const char *kSegmentedSource =
-#include "metal/common/sdpa_segmented.metal.inc"
-    ;
+constexpr SegmentedKernel kKernels[] = {SegmentedKernel::one_pass,
+                                        SegmentedKernel::two_pass_1,
+                                        SegmentedKernel::verify_two_pass_1};
 
 const char *kernel_name(SegmentedKernel kernel) {
   switch (kernel) {
@@ -94,27 +96,6 @@ const char *kernel_name(SegmentedKernel kernel) {
     return "mlx_node_sdpa_segmented_verify_2pass_1_bf16_256";
   }
   throw std::invalid_argument("unknown segmented SDPA kernel");
-}
-
-MTL::ComputePipelineState *segmented_kernel(metal::Device &device,
-                                            SegmentedKernel kernel,
-                                            const std::string &hash,
-                                            const metal::MTLFCList &constants) {
-  auto *lib = device.get_library("mlx_node_sdpa_segmented", [] {
-    std::string source(kSegmentedSource);
-    for (auto [kernel, fn] :
-         {std::pair{SegmentedKernel::one_pass, "segmented_sdpa_one_pass"},
-          std::pair{SegmentedKernel::two_pass_1, "segmented_sdpa_2pass_1"},
-          std::pair{SegmentedKernel::verify_two_pass_1,
-                    "segmented_sdpa_verify_2pass_1"}}) {
-      const std::string instance = std::string(fn) + "<bfloat, 256, 256>";
-      source += "\ntemplate [[host_name(\"" + std::string(kernel_name(kernel)) +
-                "\")]] [[kernel]] decltype(" + instance + ") " + instance +
-                ";\n";
-    }
-    return source;
-  });
-  return device.get_kernel(kernel_name(kernel), lib, hash, constants);
 }
 
 // MLX's own aggregation kernel: the partials must reduce exactly as MLX's
@@ -144,15 +125,9 @@ Pipelines get_pipelines(metal::Device &device, int query_length, int gqa_factor,
                                              gqa_factor * query_length,
                                              env::get_var("MLX_SDPA_BLOCKS", 0))
                : 32;
-  metal::MTLFCList constants = {{&causal, MTL::DataType::DataTypeBool, 22}};
-  if (two_pass) {
-    constants.emplace_back(&partitions, MTL::DataType::DataTypeInt, 26);
-  }
   const auto kernel =
       two_pass ? SegmentedKernel::two_pass_1 : SegmentedKernel::one_pass;
-  std::string hash = std::string(kernel_name(kernel)) +
-                     (causal ? "_c_" : "_nc_") + std::to_string(partitions);
-  auto *stage1 = segmented_kernel(device, kernel, hash, constants);
+  auto *stage1 = segmented_kernel(device, {kernel, causal, partitions, 0, 0});
   MTL::ComputePipelineState *stage2 = nullptr;
   if (two_pass) {
     stage2 = reduction_kernel(device);
@@ -174,24 +149,75 @@ Pipelines get_pipelines(metal::Device &device, int query_length, int gqa_factor,
 
 } // namespace
 
+MTL::ComputePipelineState *
+segmented_kernel(metal::Device &device,
+                 const SegmentedSpecialization &specialization) {
+  const auto &sp = specialization;
+  // Indices 22 and 26 are MLX's sdpa_vector.h do_causal and blocks.
+  metal::MTLFCList constants = {{&sp.causal, MTL::DataType::DataTypeBool, 22}};
+  std::string hash =
+      std::string(kernel_name(sp.kernel)) + (sp.causal ? "_c" : "_nc");
+  if (sp.kernel != SegmentedKernel::one_pass) {
+    constants.emplace_back(&sp.partitions, MTL::DataType::DataTypeInt, 26);
+    hash += "_" + std::to_string(sp.partitions);
+  }
+  if (sp.kernel == SegmentedKernel::verify_two_pass_1) {
+    constants.emplace_back(&sp.gqa, MTL::DataType::DataTypeInt, 27);
+    constants.emplace_back(&sp.rows, MTL::DataType::DataTypeInt, 28);
+    hash += "_g" + std::to_string(sp.gqa) + "_r" + std::to_string(sp.rows);
+  }
+  return fast::paged::get_prebuilt_kernel(
+      device, "segmented_sdpa", "segmented SDPA", kernel_name(sp.kernel), hash,
+      constants);
+}
+
+std::vector<std::string> metal_kernel_names() {
+  std::vector<std::string> names;
+  for (auto kernel : kKernels) {
+    names.emplace_back(kernel_name(kernel));
+  }
+  return names;
+}
+
+std::vector<SegmentedSpecialization> metal_kernel_specializations() {
+  // Every partition count the vector-SDPA policy returns without
+  // MLX_SDPA_BLOCKS, over the boundaries of every device class.
+  std::set<int> partitions;
+  for (char device_class : {'s', 'd', 'g'}) {
+    for (int length :
+         {1, 1024, 1025, 8192, 8193, 16384, 32768, 32769, 65536, 65537}) {
+      for (int simdgroups = 1; simdgroups <= 32 * 8; ++simdgroups) {
+        partitions.insert(
+            sdpa_vector_partition_count(device_class, length, simdgroups, 0));
+      }
+    }
+  }
+  std::vector<SegmentedSpecialization> out;
+  for (bool causal : {false, true}) {
+    out.push_back({SegmentedKernel::one_pass, causal, 32, 0, 0});
+    for (int p : partitions) {
+      out.push_back({SegmentedKernel::two_pass_1, causal, p, 0, 0});
+    }
+  }
+  for (int p : partitions) {
+    for (int gqa = 1; gqa <= 32; ++gqa) {
+      for (int rows = 2; rows <= 8; ++rows) {
+        out.push_back({SegmentedKernel::verify_two_pass_1, true, p, gqa, rows});
+      }
+    }
+  }
+  return out;
+}
+
 int segmented_max_query_length(metal::Device &device, int gqa_factor) {
   if (gqa_factor < 1 || gqa_factor > 32) {
     return 0;
   }
-  const bool causal = true;
   const int partitions = 64;
-  metal::MTLFCList constants = {{&causal, MTL::DataType::DataTypeBool, 22},
-                                {&partitions, MTL::DataType::DataTypeInt, 26}};
   auto *pipeline = segmented_kernel(
-      device, SegmentedKernel::two_pass_1,
-      std::string(kernel_name(SegmentedKernel::two_pass_1)) + "_caps",
-      constants);
-  metal::MTLFCList one_pass_constants = {
-      {&causal, MTL::DataType::DataTypeBool, 22}};
-  auto *one_pass = segmented_kernel(
-      device, SegmentedKernel::one_pass,
-      std::string(kernel_name(SegmentedKernel::one_pass)) + "_caps",
-      one_pass_constants);
+      device, {SegmentedKernel::two_pass_1, true, partitions, 0, 0});
+  auto *one_pass =
+      segmented_kernel(device, {SegmentedKernel::one_pass, true, 32, 0, 0});
   auto *reduction = reduction_kernel(device);
   const auto stage1 = capabilities(pipeline, device.mtl_device());
   const auto one_pass_caps = capabilities(one_pass, device.mtl_device());
@@ -247,18 +273,9 @@ VerifyDispatch plan_verify_dispatch(metal::Device &device, int head_rows,
   SegmentedSdpaLaunchPlan unified_plan{false, true, 0, 0, 0};
   if (head_reduction.two_pass && tail_reduction.two_pass &&
       head_reduction.partitions == tail_reduction.partitions) {
-    const bool causal = true;
     const int partitions = tail_reduction.partitions;
-    metal::MTLFCList constants = {{&causal, MTL::DataType::DataTypeBool, 22},
-                                  {&partitions, MTL::DataType::DataTypeInt, 26},
-                                  {&gqa, MTL::DataType::DataTypeInt, 27},
-                                  {&rows, MTL::DataType::DataTypeInt, 28}};
-    const std::string base = kernel_name(SegmentedKernel::verify_two_pass_1);
-    unified =
-        segmented_kernel(device, SegmentedKernel::verify_two_pass_1,
-                         base + "_c_" + std::to_string(partitions) + "_g" +
-                             std::to_string(gqa) + "_r" + std::to_string(rows),
-                         constants);
+    unified = segmented_kernel(device, {SegmentedKernel::verify_two_pass_1,
+                                        true, partitions, gqa, rows});
     unified_plan = plan_segmented_verify_launch(
         rows, gqa, partitions, capabilities(unified, device.mtl_device()),
         capabilities(tail.stage2, device.mtl_device()));

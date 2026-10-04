@@ -63,7 +63,8 @@ constexpr int kNumWarps = kNumThreads / kNumSimdLanes;
 // =============================================================================
 //
 // `paged_attn.metallib` holds the paged-attention kernels and the prebuilt
-// K-quant kernels (mlx_kquant_metal.cpp). mlx-sys/build.rs compiles it into
+// bridge kernels (mlx_kquant_metal.cpp, mlx_segmented_sdpa.cpp,
+// mlx_affine_mixed_qmm.cpp). mlx-sys/build.rs compiles it into
 // `<OUT_DIR>/paged_attn.metallib` and copies it next to the crate-internal
 // `mlx.metallib` so it ships in the same place. `Device::get_library(name,
 // path)` loads it once per process; later calls hit MLX's library cache.
@@ -130,6 +131,27 @@ MTL::Library* get_paged_attn_library(mlx::core::metal::Device& device) {
     cached_path = paged_attn_metallib_path();
   });
   return device.get_library(kPagedAttnLibraryName, cached_path.string());
+}
+
+MTL::ComputePipelineState* get_prebuilt_kernel(
+    mlx::core::metal::Device& device,
+    const char* tag,
+    const char* family,
+    const std::string& kname,
+    const std::string& hash_name,
+    const mlx::core::metal::MTLFCList& func_consts) {
+  auto* lib = get_paged_attn_library(device);
+  try {
+    return device.get_kernel(kname, lib, hash_name, func_consts);
+  } catch (const std::exception& e) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Cannot load " << family << " kernel " << kname
+        << " from " << paged_attn_metallib_path().string()
+        << ". The metallib is stale or incomplete; rebuild it with `yarn "
+           "build:native`. "
+        << e.what();
+    throw std::runtime_error(msg.str());
+  }
 }
 
 namespace {

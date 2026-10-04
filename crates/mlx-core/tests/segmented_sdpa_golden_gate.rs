@@ -1,5 +1,5 @@
 //! Pin-bump gate for the bridge's segmented SDPA kernels
-//! (`metal/common/sdpa_segmented.metal.inc`, JIT) and planners
+//! (`metal/segmented_sdpa/sdpa_segmented.metal`, prebuilt) and planners
 //! (`mlx_segmented_sdpa_plan.h`): every case must reproduce the digest in
 //! `tests/golden`, captured while the same cases were bit-identical to the
 //! MLX fork's segmented kernels and planners (fork commits 03914b9b3 and

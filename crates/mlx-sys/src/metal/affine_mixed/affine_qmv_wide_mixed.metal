@@ -1,6 +1,6 @@
 // BF16 x and output, F32 affine scales/biases, 8-bit group-32 weights,
-// transposed, 2 <= M rows. A whole library source (not a metal_kernel body):
-// mlx_affine_mixed_qmm.cpp appends one instantiation per vecs_per_tg.
+// transposed, 2 <= M rows. build.rs prebuilds the instantiations at the end
+// of this file into paged_attn.metallib.
 //
 // The arithmetic is MLX's affine qmv_wide (k_lanes 8) run on F32 x: each lane
 // walks every 8th group, decodes it in 8-value sub-chunks (scale * q + bias),
@@ -9,7 +9,7 @@
 // single rounding at the store differs from the F32 kernel, and that rounding
 // is the cast the promoted path applies to its F32 output. Changing the order
 // of any sum here breaks bit-identity with that path.
-R"(
+
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
@@ -95,4 +95,19 @@ template <int vecs_per_tg>
     }
   }
 }
-)"
+
+// Every tile width mlx_affine_mixed_qmm.cpp can request (vecs_per_tg 2..8).
+// The host names must match its qmv_wide_kernel_name() character for
+// character; bridge_metallib_names checks both directions.
+#define instantiate_qmv_wide_mixed(nv)                                      \
+  template [[host_name("mlx_node_affine_qmv_wide_mixed_q8g32_nv" #nv)]]    \
+  [[kernel]] decltype(affine_qmv_wide_mixed_q8g32<nv>)                     \
+      affine_qmv_wide_mixed_q8g32<nv>;
+
+instantiate_qmv_wide_mixed(2)
+instantiate_qmv_wide_mixed(3)
+instantiate_qmv_wide_mixed(4)
+instantiate_qmv_wide_mixed(5)
+instantiate_qmv_wide_mixed(6)
+instantiate_qmv_wide_mixed(7)
+instantiate_qmv_wide_mixed(8)

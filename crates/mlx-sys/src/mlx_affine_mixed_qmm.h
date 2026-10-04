@@ -13,6 +13,13 @@
 
 #include <optional>
 
+#ifdef MLX_NODE_METAL_ENABLED
+#include "mlx/backend/metal/device.h"
+
+#include <string>
+#include <vector>
+#endif
+
 namespace mlx::core::affine_mixed {
 
 // Nullopt unless x is BF16 [..., K], w is uint32 [N, K * bits / 32] and
@@ -21,6 +28,17 @@ std::optional<array> quantized_matmul(const array &x, const array &w,
                                       const array &scales, const array &biases,
                                       int group_size, int bits,
                                       StreamOrDevice s = {});
+
+#ifdef MLX_NODE_METAL_ENABLED
+// Every qmv_wide tile width (vectors per threadgroup) eval_gpu can request,
+// and the kernel name for one.
+std::vector<int> qmv_wide_widths();
+std::string qmv_wide_kernel_name(int vecs_per_tg);
+
+// The prebuilt qmv_wide pipeline for `vecs_per_tg` from paged_attn.metallib;
+// throws when it is missing.
+MTL::ComputePipelineState *qmv_wide_kernel(metal::Device &d, int vecs_per_tg);
+#endif
 
 class AffineMixedQmm : public UnaryPrimitive {
 public:

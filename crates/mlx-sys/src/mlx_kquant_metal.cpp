@@ -207,18 +207,8 @@ MTL::ComputePipelineState *
 load_kernel(metal::Device &d, const std::string &kname,
             const std::string &hash_name = "",
             const metal::MTLFCList &func_consts = {}) {
-  auto *lib = fast::paged::get_paged_attn_library(d);
-  try {
-    return d.get_kernel(kname, lib, hash_name, func_consts);
-  } catch (const std::exception &e) {
-    std::ostringstream msg;
-    msg << "[kquant] Cannot load K-quant kernel " << kname << " from "
-        << fast::paged::paged_attn_metallib_path().string()
-        << ". The metallib is stale or incomplete; rebuild it with `yarn "
-           "build:native`. "
-        << e.what();
-    throw std::runtime_error(msg.str());
-  }
+  return fast::paged::get_prebuilt_kernel(d, "kquant", "K-quant", kname,
+                                          hash_name, func_consts);
 }
 
 MTL::ComputePipelineState *get_kernel(metal::Device &d, const char *family,

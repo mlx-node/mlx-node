@@ -8,10 +8,12 @@
 #include "mlx/allocator.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx_paged_metallib.h"
 #include "mlx_test_counters.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <set>
 #include <string>
 #endif
 
@@ -64,15 +66,15 @@ void AffineMixedQmm::eval_cpu(const std::vector<array> &, array &) {
 
 namespace {
 
-const char *kQmvWideMixed =
-#include "metal/common/affine_qmv_wide_mixed.metal.inc"
-    ;
+// One past the most rows qmv_wide serves. On gen >= 15 MLX's F32 path runs
+// qmv_wide for 2..8 rows on every chip (its smallest qmv batch limit there is
+// 10, fork and upstream) unless MLX_QMM_SPLITK_MIN_M lowers that limit.
+constexpr int kQmvWideRowLimit = 9;
+// N from which a tile may hold 8 vectors.
+constexpr int kQmvWideWideN = 2048;
 
-// At most 8 rows. On gen >= 15 MLX's F32 path runs qmv_wide for 2..8 rows
-// on every chip (its smallest qmv batch limit there is 10, fork and upstream)
-// unless MLX_QMM_SPLITK_MIN_M lowers that limit.
 bool rows_take_qmv_wide(int M) {
-  int limit = 9;
+  int limit = kQmvWideRowLimit;
   if (const char *e = std::getenv("MLX_QMM_SPLITK_MIN_M")) {
     int v = std::atoi(e);
     if (v > 0) {
@@ -82,33 +84,29 @@ bool rows_take_qmv_wide(int M) {
   return M >= 2 && M < limit;
 }
 
+// MLX's affine qmv_wide tiling: fewest tiles, then the smallest tile that
+// fills them, up to 8 vectors only when N alone saturates the GPU.
+int qmv_wide_vecs_per_tg(int M, int N) {
+  const int tile_cap = N >= kQmvWideWideN ? 8 : 5;
+  int n_tiles = (M + tile_cap - 1) / tile_cap;
+  return (M + n_tiles - 1) / n_tiles;
+}
+
 void qmv_wide(const array &x, const array &w, const array &scales,
               const array &biases, array &out, int M, int N, int K,
               metal::Device &d, const Stream &s) {
   out.set_data(allocator::malloc(out.nbytes()));
-  // MLX's affine qmv_wide tiling: fewest tiles, then the smallest tile that
-  // fills them, up to 8 vectors only when N alone saturates the GPU.
-  const int tile_cap = N >= 2048 ? 8 : 5;
-  int n_tiles = (M + tile_cap - 1) / tile_cap;
-  int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+  int vecs_per_tg = qmv_wide_vecs_per_tg(M, N);
   constexpr int k_lanes = 8;
   constexpr int num_simdgroups = 2;
   int rows_per_tg = (32 / k_lanes) * num_simdgroups;
 
-  std::string kname =
-      "mlx_node_affine_qmv_wide_mixed_q8g32_nv" + std::to_string(vecs_per_tg);
   bridge_testing::record("affine_mixed_qmv_wide");
   if (bridge_testing::counting) {
     bridge_testing::record("affine_mixed_qmv_wide_nv" +
                            std::to_string(vecs_per_tg));
   }
-  auto *lib = d.get_library(kname, [&] {
-    std::string fn =
-        "affine_qmv_wide_mixed_q8g32<" + std::to_string(vecs_per_tg) + ">";
-    return std::string(kQmvWideMixed) + "\ntemplate [[host_name(\"" + kname +
-           "\")]] [[kernel]] decltype(" + fn + ") " + fn + ";\n";
-  });
-  auto *kernel = d.get_kernel(kname, lib);
+  auto *kernel = qmv_wide_kernel(d, vecs_per_tg);
 
   auto &enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
@@ -126,6 +124,26 @@ void qmv_wide(const array &x, const array &w, const array &scales,
 }
 
 } // namespace
+
+std::vector<int> qmv_wide_widths() {
+  std::set<int> widths;
+  for (int M = 2; M < kQmvWideRowLimit; ++M) {
+    for (int N : {kQmvWideWideN - 1, kQmvWideWideN}) {
+      widths.insert(qmv_wide_vecs_per_tg(M, N));
+    }
+  }
+  return {widths.begin(), widths.end()};
+}
+
+std::string qmv_wide_kernel_name(int vecs_per_tg) {
+  return "mlx_node_affine_qmv_wide_mixed_q8g32_nv" +
+         std::to_string(vecs_per_tg);
+}
+
+MTL::ComputePipelineState *qmv_wide_kernel(metal::Device &d, int vecs_per_tg) {
+  return fast::paged::get_prebuilt_kernel(d, "affine_mixed", "mixed-affine",
+                                          qmv_wide_kernel_name(vecs_per_tg));
+}
 
 // Mirrors the promoted graph: qmv_wide for 2..8 rows where MLX would run the
 // F32 qmv_wide for these operands; every other shape runs that graph itself

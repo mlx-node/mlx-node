@@ -251,15 +251,17 @@ fn nax_kernels_enabled(deployment_target: Option<&str>) -> bool {
 }
 
 /// Build `<out_dir>/paged_attn.metallib`: the paged-attention kernels
-/// (`crates/mlx-paged-attn/metal/`) and the prebuilt K-quant kernels
-/// (`src/metal/kquant/`). `mlx_paged_dispatch.cpp` resolves it at runtime next
-/// to the loaded binary (the package build copies it beside `mlx.metallib`).
+/// (`crates/mlx-paged-attn/metal/`) and the prebuilt bridge kernels: K-quant
+/// (`src/metal/kquant/`), segmented SDPA (`src/metal/segmented_sdpa/`) and
+/// mixed affine `qmv_wide` (`src/metal/affine_mixed/`).
+/// `mlx_paged_dispatch.cpp` resolves it at runtime next to the loaded binary
+/// (the package build copies it beside `mlx.metallib`).
 ///
-/// The K-quant `.air` files use MLX's own kernel flags (`-fno-fast-math`, no
-/// `-O`, no `-std`), which keep their bits equal to MLX's prebuilt kernels;
-/// the paged-attention flags (`-O3 -ffast-math`) would change them. The paged
-/// `.air` files link first so the library's min-OS stamp stays the floor, not
-/// the NAX files' 26.2.
+/// The bridge `.air` files use MLX's own kernel flags (`-fno-fast-math`, no
+/// `-O`, no `-std`), which keep their bits equal to MLX's prebuilt kernels and
+/// to the JIT builds they replace; the paged-attention flags (`-O3
+/// -ffast-math`) would change them. The paged `.air` files link first so the
+/// library's min-OS stamp stays the floor, and the NAX files (26.2) link last.
 fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Path) -> PathBuf {
     let metal_src_dir = manifest_dir
         .parent()
@@ -303,32 +305,51 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Pa
         });
     }
 
-    let kquant_dir = manifest_dir.join("src").join("metal").join("kquant");
-    let mut kquant_files = vec![("kquant", deployment_target.clone())];
+    let bridge_dir = manifest_dir.join("src").join("metal");
+    let kquant_jobs = |name: &str, target: Option<&str>| -> Vec<AirJob> {
+        (0..3)
+            .map(|dtype| {
+                let mut args = vec![
+                    "-x".to_string(),
+                    "metal".to_string(),
+                    "-fno-fast-math".to_string(),
+                    format!("-DKQUANT_DTYPE={dtype}"),
+                    "-I".to_string(),
+                    mlx_dir.display().to_string(),
+                ];
+                args.extend(min_os(target));
+                AirJob {
+                    src: bridge_dir.join("kquant").join(format!("{name}.metal")),
+                    air: out_dir.join(format!("{name}_{dtype}.air")),
+                    args,
+                }
+            })
+            .collect()
+    };
+    jobs.extend(kquant_jobs("kquant", deployment_target.as_deref()));
+    // Self-contained sources (no MLX headers), with the same flags.
+    for file in [
+        "segmented_sdpa/sdpa_segmented.metal",
+        "affine_mixed/affine_qmv_wide_mixed.metal",
+    ] {
+        let mut args = vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-fno-fast-math".to_string(),
+        ];
+        args.extend(min_os(deployment_target.as_deref()));
+        jobs.push(AirJob {
+            src: bridge_dir.join(file),
+            air: out_dir.join(file.replace('/', "_").replace(".metal", ".air")),
+            args,
+        });
+    }
     if nax_kernels_enabled(deployment_target.as_deref()) {
         let nax_target = match deployment_target.as_deref() {
             Some(target) if version_at_least(target, "26.2") => target.to_string(),
             _ => "26.2".to_string(),
         };
-        kquant_files.push(("kquant_nax", Some(nax_target)));
-    }
-    for (name, target) in &kquant_files {
-        for dtype in 0..3 {
-            let mut args = vec![
-                "-x".to_string(),
-                "metal".to_string(),
-                "-fno-fast-math".to_string(),
-                format!("-DKQUANT_DTYPE={dtype}"),
-                "-I".to_string(),
-                mlx_dir.display().to_string(),
-            ];
-            args.extend(min_os(target.as_deref()));
-            jobs.push(AirJob {
-                src: kquant_dir.join(format!("{name}.metal")),
-                air: out_dir.join(format!("{name}_{dtype}.air")),
-                args,
-            });
-        }
+        jobs.extend(kquant_jobs("kquant_nax", Some(&nax_target)));
     }
 
     let toolchain = [

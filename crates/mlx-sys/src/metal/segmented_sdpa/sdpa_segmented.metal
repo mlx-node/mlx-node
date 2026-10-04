@@ -1,6 +1,6 @@
 // Vector SDPA over two logically adjacent K/V segments (prefix cache rows,
-// then the rows the verify block just produced). A whole library source:
-// mlx_segmented_sdpa.cpp appends the BF16 D=256 instantiations.
+// then the rows the verify block just produced). build.rs prebuilds the BF16
+// D=256 instantiations at the end of this file into paged_attn.metallib.
 //
 // The score traversal and online-softmax update order equal MLX's
 // sdpa_vector / sdpa_vector_2pass_1 (sdpa_vector.h); only the address
@@ -8,7 +8,7 @@
 // in sdpa_vector_2pass_2's layout, and the caller reduces them with MLX's own
 // kernel. Changing any statement order here breaks bit-identity with
 // concatenated K/V through MLX's vector SDPA.
-R"(
+
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
@@ -420,4 +420,17 @@ template <typename T, int D, int V = D>
     }
   }
 }
-)"
+
+// Every kernel mlx_segmented_sdpa.cpp can request. The host names must match
+// its kernel_name() character for character; bridge_metallib_names
+// checks both directions. The function constants above are specialized when
+// the dispatcher builds each pipeline.
+template [[host_name("mlx_node_sdpa_segmented_bf16_256")]] [[kernel]]
+decltype(segmented_sdpa_one_pass<bfloat, 256, 256>)
+    segmented_sdpa_one_pass<bfloat, 256, 256>;
+template [[host_name("mlx_node_sdpa_segmented_2pass_1_bf16_256")]] [[kernel]]
+decltype(segmented_sdpa_2pass_1<bfloat, 256, 256>)
+    segmented_sdpa_2pass_1<bfloat, 256, 256>;
+template [[host_name("mlx_node_sdpa_segmented_verify_2pass_1_bf16_256")]] [[kernel]]
+decltype(segmented_sdpa_verify_2pass_1<bfloat, 256, 256>)
+    segmented_sdpa_verify_2pass_1<bfloat, 256, 256>;
