@@ -10,6 +10,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
+  assertAddonMinOs,
   assertMetallibComplete,
   assertMlxMetallibCarriesNax,
   assertPagedMetallibIntegrity,
@@ -78,6 +79,7 @@ export function resolvePayload(repoRoot: string): PayloadSource {
     }
     native[file] = path;
   }
+  checkAddonMinOs(native['mlx-core.darwin-arm64.node']!);
   checkMetallibPair(native['mlx.metallib']!, native['paged_attn.metallib']!);
 
   const wwwRoot = join(repoRoot, 'packages', 'dashboard', 'web');
@@ -105,6 +107,18 @@ export function resolvePayload(repoRoot: string): PayloadSource {
   }
 
   return { native, wwwRoot, appDir };
+}
+
+/**
+ * The addon's `LC_BUILD_VERSION` minos is at least the 26.2 floor, the gate
+ * `yarn build:native` applies: the Info.plist floor is derived from it.
+ */
+export function checkAddonMinOs(addonPath: string): void {
+  try {
+    assertAddonMinOs(readFileSync(addonPath), addonPath);
+  } catch (err) {
+    throw new PayloadError((err as Error).message, 'yarn build:native');
+  }
 }
 
 /**

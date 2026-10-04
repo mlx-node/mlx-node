@@ -2,3 +2,7 @@
 # MLX uses a shared Metal device/stream, so tests must run sequentially
 [env]
 RUST_TEST_THREADS = "1"
+# mlx-node's macOS floor (crates/mlx-sys/build.rs). Without it rustc and cc
+# target their own defaults (rustc links minos 11.0) while MLX is built at
+# 26.2. An explicitly set MACOSX_DEPLOYMENT_TARGET still wins.
+MACOSX_DEPLOYMENT_TARGET = "26.2"

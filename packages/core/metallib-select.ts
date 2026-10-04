@@ -734,3 +734,67 @@ export function assertMetallibFloor(
     );
   }
 }
+
+const MH_MAGIC_64 = 0xfeedfacf;
+const MACH_HEADER_64_BYTES = 32;
+const LC_BUILD_VERSION = 0x32;
+const PLATFORM_MACOS = 1;
+
+/**
+ * The minimum macOS of a thin 64-bit little-endian Mach-O: the `minos` of its
+ * one macOS `LC_BUILD_VERSION` (u32 at offset 12 of the command, nibbles
+ * `xxxx.yy.zz`), the same field `otool -l` and dyld read. Undefined for any
+ * other layout: another magic (a fat binary included), a load-command table
+ * that overruns the header's `sizeofcmds` or the buffer, or zero or several
+ * `LC_BUILD_VERSION` commands.
+ */
+export function parseMachOMinOs(binary: Buffer): string | undefined {
+  if (binary.byteLength < MACH_HEADER_64_BYTES || binary.readUInt32LE(0) !== MH_MAGIC_64) return undefined;
+  const ncmds = binary.readUInt32LE(16);
+  const end = MACH_HEADER_64_BYTES + binary.readUInt32LE(20);
+  if (end > binary.byteLength) return undefined;
+  let minos: number | undefined;
+  let offset = MACH_HEADER_64_BYTES;
+  for (let i = 0; i < ncmds; i++) {
+    if (offset + 8 > end) return undefined;
+    const cmd = binary.readUInt32LE(offset);
+    const cmdsize = binary.readUInt32LE(offset + 4);
+    if (cmdsize < 8 || cmdsize % 8 !== 0 || offset + cmdsize > end) return undefined;
+    if (cmd === LC_BUILD_VERSION) {
+      if (minos !== undefined || cmdsize < 24 || binary.readUInt32LE(offset + 8) !== PLATFORM_MACOS) {
+        return undefined;
+      }
+      minos = binary.readUInt32LE(offset + 12);
+    }
+    offset += cmdsize;
+  }
+  if (minos === undefined) return undefined;
+  const major = minos >>> 16;
+  const minor = (minos >>> 8) & 0xff;
+  const update = minos & 0xff;
+  return update === 0 ? `${major}.${minor}` : `${major}.${minor}.${update}`;
+}
+
+/**
+ * MLX's own macOS 26.2 availability checks compile to "always true" at a 26.2
+ * deployment target, so an addon whose `minos` is lower would load on macOS
+ * 26.1 and older and take paths those systems do not have — and the desktop
+ * packager would advertise that lower floor. A header this gate cannot read
+ * fails closed.
+ */
+export function assertAddonMinOs(addon: Buffer, path: string): void {
+  const minOs = parseMachOMinOs(addon);
+  if (minOs === undefined) {
+    throw new Error(
+      `[native addon gate] ${path}: not a thin 64-bit Mach-O with one macOS LC_BUILD_VERSION, so its ` +
+        `minimum macOS cannot be checked against ${MACOS_DEPLOYMENT_FLOOR}.`,
+    );
+  }
+  if (compareVersions(minOs, MACOS_DEPLOYMENT_FLOOR) < 0) {
+    throw new Error(
+      `[native addon gate] ${path} has minos ${minOs}, below mlx-node's macOS floor ` +
+        `${MACOS_DEPLOYMENT_FLOOR}. Rebuild with MACOSX_DEPLOYMENT_TARGET unset (.cargo/config.toml ` +
+        `sets ${MACOS_DEPLOYMENT_FLOOR}) or at ${MACOS_DEPLOYMENT_FLOOR} or newer.`,
+    );
+  }
+}

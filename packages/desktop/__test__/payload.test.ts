@@ -21,7 +21,7 @@ import {
   KQUANT_NAX_KERNEL_MARKERS,
   MLX_NAX_ONLY_MARKERS,
 } from '../../core/metallib-select.js';
-import { PayloadError, checkMetallibPair } from '../scripts/payload.js';
+import { PayloadError, checkAddonMinOs, checkMetallibPair } from '../scripts/payload.js';
 
 const PAGED_KERNELS = [
   'paged_attention_bfloat16_t_cache_bfloat16_t_hs128_bs16_nt256_nsl32_ps0',
@@ -126,5 +126,43 @@ describe('checkMetallibPair', () => {
   const built: [string, string] = [join(core, 'mlx.metallib'), join(core, 'paged_attn.metallib')];
   it.skipIf(!built.every((path) => existsSync(path)))('accepts the pair from `yarn build:native`', () => {
     expect(() => checkMetallibPair(...built)).not.toThrow();
+  });
+});
+
+describe('checkAddonMinOs', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'desktop-addon-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A thin arm64 Mach-O header with one LC_BUILD_VERSION (macOS, `minos`). */
+  function addon(major: number, minor: number): string {
+    const header = Buffer.alloc(32 + 24);
+    header.writeUInt32LE(0xfeedfacf, 0);
+    header.writeUInt32LE(0x0100000c, 4);
+    header.writeUInt32LE(8, 12);
+    header.writeUInt32LE(1, 16);
+    header.writeUInt32LE(24, 20);
+    header.writeUInt32LE(0x32, 32);
+    header.writeUInt32LE(24, 36);
+    header.writeUInt32LE(1, 40);
+    header.writeUInt32LE((major << 16) | (minor << 8), 44);
+    const path = join(dir, 'mlx-core.darwin-arm64.node');
+    writeFileSync(path, header);
+    return path;
+  }
+
+  it('rejects an addon linked below the 26.2 floor, which would lower LSMinimumSystemVersion', () => {
+    expect(() => checkAddonMinOs(addon(11, 0))).toThrow(PayloadError);
+    expect(() => checkAddonMinOs(addon(11, 0))).toThrow(/minos 11\.0, below/);
+    expect(() => checkAddonMinOs(addon(26, 2))).not.toThrow();
+  });
+
+  const built = join(import.meta.dirname, '..', '..', 'core', 'mlx-core.darwin-arm64.node');
+  it.skipIf(!existsSync(built))('accepts the addon from `yarn build:native`', () => {
+    expect(() => checkAddonMinOs(built)).not.toThrow();
   });
 });

@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 
 import {
+  MACOS_DEPLOYMENT_FLOOR,
   BASE_KERNEL_MARKERS,
   BRIDGE_KERNEL_MARKERS,
   KQUANT_KERNEL_MARKERS,
@@ -21,6 +22,7 @@ import {
   MIN_PAGED_METALLIB_BYTES,
   MLX_NAX_ONLY_MARKERS,
   NAX_KERNEL_MARKERS,
+  assertAddonMinOs,
   assertMetallibFloor,
   assertMetallibComplete,
   assertMetallibIntegrity,
@@ -30,6 +32,7 @@ import {
   extractBakedMetallibBinding,
   assertMlxMetallibCarriesNax,
   hostAppleTriple,
+  parseMachOMinOs,
   parseMetallibDeclaredSize,
   parseMetallibMinOs,
   profileDirName,
@@ -813,5 +816,82 @@ describe('assertMetallibComplete', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/** One load command: `cmd`, `cmdsize` = 8 + body, then `body`. */
+function loadCommand(cmd: number, body: Buffer): Buffer {
+  const command = Buffer.alloc(8 + body.byteLength);
+  command.writeUInt32LE(cmd, 0);
+  command.writeUInt32LE(command.byteLength, 4);
+  body.copy(command, 8);
+  return command;
+}
+
+/** `LC_BUILD_VERSION` with no tool entries: platform, minos, sdk 27.0, ntools 0. */
+function buildVersion(major: number, minor: number, update = 0, platform = 1): Buffer {
+  const body = Buffer.alloc(16);
+  body.writeUInt32LE(platform, 0);
+  body.writeUInt32LE((major << 16) | (minor << 8) | update, 4);
+  body.writeUInt32LE(27 << 16, 8);
+  return loadCommand(0x32, body);
+}
+
+/** A thin arm64 MH_BUNDLE header over `commands`, as rustc links the addon. */
+function machO(commands: Buffer[], magic = 0xfeedfacf): Buffer {
+  const table = Buffer.concat(commands);
+  const header = Buffer.alloc(32);
+  header.writeUInt32LE(magic, 0);
+  header.writeUInt32LE(0x0100000c, 4);
+  header.writeUInt32LE(8, 12);
+  header.writeUInt32LE(commands.length, 16);
+  header.writeUInt32LE(table.byteLength, 20);
+  return Buffer.concat([header, table]);
+}
+
+const LC_UUID = loadCommand(0x1b, Buffer.alloc(16));
+
+describe('parseMachOMinOs / assertAddonMinOs', () => {
+  it('reads minos from the macOS LC_BUILD_VERSION among other load commands', () => {
+    expect(parseMachOMinOs(machO([LC_UUID, buildVersion(26, 2)]))).toBe('26.2');
+    expect(parseMachOMinOs(machO([buildVersion(27, 0), LC_UUID]))).toBe('27.0');
+    expect(parseMachOMinOs(machO([buildVersion(26, 5, 2)]))).toBe('26.5.2');
+  });
+
+  it('accepts an addon at or above the floor and rejects one below it', () => {
+    expect(MACOS_DEPLOYMENT_FLOOR).toBe('26.2');
+    expect(() => assertAddonMinOs(machO([LC_UUID, buildVersion(26, 2)]), 'x.node')).not.toThrow();
+    expect(() => assertAddonMinOs(machO([buildVersion(27, 0)]), 'x.node')).not.toThrow();
+    // rustc's own default when MACOSX_DEPLOYMENT_TARGET does not reach it.
+    expect(() => assertAddonMinOs(machO([LC_UUID, buildVersion(11, 0)]), 'x.node')).toThrow(
+      /x\.node has minos 11\.0, below mlx-node's macOS floor 26\.2/,
+    );
+    expect(() => assertAddonMinOs(machO([buildVersion(26, 1, 9)]), 'x.node')).toThrow(/minos 26\.1\.9, below/);
+  });
+
+  it('fails closed on any layout it does not recognize', () => {
+    const layouts: Buffer[] = [
+      machO([buildVersion(26, 2)], 0xbebafeca), // fat (universal) magic
+      machO([buildVersion(26, 2)], 0xfeedface), // 32-bit
+      machO([LC_UUID]), // no LC_BUILD_VERSION
+      machO([buildVersion(26, 2), buildVersion(26, 2)]), // two
+      machO([buildVersion(26, 2, 0, 6)]), // Mac Catalyst, not macOS
+      machO([LC_UUID, buildVersion(26, 2)]).subarray(0, 60), // table cut short
+      machO([loadCommand(0x1b, Buffer.alloc(0)).fill(0, 4), buildVersion(26, 2)]), // cmdsize 0
+      Buffer.alloc(16),
+    ];
+    for (const binary of layouts) {
+      expect(parseMachOMinOs(binary)).toBeUndefined();
+      expect(() => assertAddonMinOs(binary, 'x.node')).toThrow(
+        /not a thin 64-bit Mach-O with one macOS LC_BUILD_VERSION/,
+      );
+    }
+  });
+
+  const addon = join(import.meta.dirname, '..', '..', 'packages', 'core', 'mlx-core.darwin-arm64.node');
+  it.skipIf(!existsSync(addon))('accepts the addon from `yarn build:native`', () => {
+    const binary = readFileSync(addon);
+    expect(compareVersions(parseMachOMinOs(binary) ?? '0', MACOS_DEPLOYMENT_FLOOR)).toBeGreaterThanOrEqual(0);
+    expect(() => assertAddonMinOs(binary, addon)).not.toThrow();
   });
 });

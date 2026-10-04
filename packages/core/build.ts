@@ -7,6 +7,7 @@ import { format } from 'vite-plus/fmt';
 
 import viteConfig from '../../vite.config';
 import {
+  assertAddonMinOs,
   assertMetallibFloor,
   assertMetallibIntegrity,
   assertPagedMetallibIntegrity,
@@ -70,6 +71,13 @@ for (const output of outputs) {
 
 await assertDeclarationCopiesMatch('after native generation');
 
+const metalBuild = process.platform === 'darwin' && process.env.MLX_DISABLE_METAL == null;
+if (metalBuild) {
+  const nodeOutput = outputs.find((output) => output.kind === 'node');
+  if (nodeOutput) {
+    assertAddonMinOs(await readFile(nodeOutput.path), nodeOutput.path);
+  }
+}
 await copyNativeAddon(outputs);
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
@@ -102,7 +110,7 @@ await copyNativeAddon(outputs);
 // The metallibs exist only on macOS (the Metal build). On the CUDA/Linux
 // build there is no Metal toolchain and no metallib to copy, so skip the
 // whole step (and its presence assert) on non-darwin platforms.
-if (process.platform === 'darwin' && process.env.MLX_DISABLE_METAL == null) {
+if (metalBuild) {
   await copyMetallibs(outputs);
 } else if (process.platform === 'darwin') {
   await removeMetallibsForCpuOnlyBuild();
