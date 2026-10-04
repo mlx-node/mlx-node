@@ -31,6 +31,21 @@ use napi::bindgen_prelude::*;
 use super::config::Qwen3_5Config;
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 
+/// Widest segmented SDPA query chunk this device supports for `gqa`; 0 when
+/// segmented SDPA is not supported here. Errors when its prebuilt kernels are
+/// missing from `paged_attn.metallib` (a packaging error, details on stderr),
+/// so a stale metallib cannot silently fall back to concatenated K/V.
+fn segmented_max_query_length(gqa: i64) -> Result<i64> {
+    let max_q = unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) };
+    if max_q < 0 {
+        return Err(Error::from_reason(
+            "segmented SDPA kernels are missing from paged_attn.metallib (stale or incomplete \
+             metallib; rebuild it with `yarn build:native`)",
+        ));
+    }
+    Ok(i64::from(max_q))
+}
+
 fn segmented_verify_sdpa(
     queries: &MxArray,
     prefix_keys: &MxArray,
@@ -89,7 +104,7 @@ fn verify_sdpa_without_kv_concat(
     {
         return fallback();
     }
-    let max_q = (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64;
+    let max_q = segmented_max_query_length(gqa)?;
     match segmented_verify_head_len(queries.shape_at(2)?, max_q) {
         Some(0) => {}
         Some(_) if causal => {}
@@ -350,21 +365,26 @@ impl Qwen3_5Attention {
     /// Unfused causal SDPA constructs its mask from host-side prefix lengths.
     /// Such a trace cannot be reused as the prefix grows. Keep
     /// shapeless replay only when every query chunk uses the fused primitive.
-    pub(crate) fn verify_can_be_shapeless(&self, seq_len: i64) -> bool {
+    pub(crate) fn verify_can_be_shapeless(&self, seq_len: i64) -> Result<bool> {
         if !unsafe { mlx_sys::mlx_metal_is_available() }
             || unsafe { mlx_sys::mlx_default_device() } != 1
             || self.num_kv_heads <= 0
             || self.num_heads % self.num_kv_heads != 0
         {
-            return false;
+            return Ok(false);
         }
         let gqa = i64::from(self.num_heads / self.num_kv_heads);
         let device_max_q = if self.head_dim == 256 {
-            (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64
+            segmented_max_query_length(gqa)?
         } else {
             0
         };
-        verify_shapeless_geometry(seq_len, gqa, self.head_dim, device_max_q)
+        Ok(verify_shapeless_geometry(
+            seq_len,
+            gqa,
+            self.head_dim,
+            device_max_q,
+        ))
     }
 
     pub(super) fn paged_attention_operand(
@@ -791,7 +811,7 @@ impl Qwen3_5Attention {
                 && self.head_dim == 256
                 && queries.dtype()? == DType::BFloat16;
             let device_max_q = if segmented_enabled {
-                (unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa as i32) }) as i64
+                segmented_max_query_length(gqa)?
             } else {
                 0
             };

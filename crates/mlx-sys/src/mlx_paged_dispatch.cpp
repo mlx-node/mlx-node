@@ -140,17 +140,23 @@ MTL::ComputePipelineState* get_prebuilt_kernel(
     const std::string& kname,
     const std::string& hash_name,
     const mlx::core::metal::MTLFCList& func_consts) {
-  auto* lib = get_paged_attn_library(device);
   try {
+    auto* lib = get_paged_attn_library(device);
     return device.get_kernel(kname, lib, hash_name, func_consts);
   } catch (const std::exception& e) {
+    std::string path;
+    try {
+      path = paged_attn_metallib_path().string();
+    } catch (const std::exception&) {
+      path = "paged_attn.metallib";
+    }
     std::ostringstream msg;
     msg << "[" << tag << "] Cannot load " << family << " kernel " << kname
-        << " from " << paged_attn_metallib_path().string()
+        << " from " << path
         << ". The metallib is stale or incomplete; rebuild it with `yarn "
            "build:native`. "
         << e.what();
-    throw std::runtime_error(msg.str());
+    throw PrebuiltKernelMissing(msg.str());
   }
 }
 

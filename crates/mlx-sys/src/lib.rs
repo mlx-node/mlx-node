@@ -729,7 +729,8 @@ unsafe extern "C-unwind" {
     // Segmented BF16 vector attention, with concatenated SDPA fallback for
     // unsupported pipeline capabilities. A causal block wider than one
     // supported query chunk is one call with no fallback. Null indicates a
-    // construction error (or an unavailable backend, which Rust checks before
+    // construction error, including prebuilt kernels missing from
+    // paged_attn.metallib (or an unavailable backend, which Rust checks before
     // calling).
     pub fn mlx_segmented_sdpa_forward(
         q: *mut mlx_array,
@@ -752,6 +753,12 @@ unsafe extern "C-unwind" {
         causal: bool,
     ) -> *mut mlx_array;
 
+    // Widest query chunk both segmented launches support for `gqa_factor`:
+    // 0 when segmented SDPA is not supported here (the caller takes
+    // concatenated SDPA), -1 when its prebuilt kernels are missing from
+    // paged_attn.metallib (a packaging error the caller must surface; message
+    // on stderr). The forward entry points return null for that error instead
+    // of falling back.
     pub fn mlx_segmented_sdpa_max_query_length(gqa_factor: i32) -> i32;
 
     pub fn mlx_segmented_sdpa_test_plan(

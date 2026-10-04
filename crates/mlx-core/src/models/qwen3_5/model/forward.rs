@@ -631,12 +631,15 @@ fn forward_dflash2_compiled(
     // the builder (SDPA verify-split geometry), while the prefix length stays
     // shapeless. The high tag namespaces these ids away from the C++-side
     // pointer-derived ids and the test range.
-    let shapeless_verify = inner.layers.iter().all(|layer| match &layer.attn {
-        crate::models::qwen3_5::decoder_layer::AttentionType::Linear(_) => true,
-        crate::models::qwen3_5::decoder_layer::AttentionType::Full(attention) => {
-            attention.verify_can_be_shapeless(seq_len)
+    let mut shapeless_verify = true;
+    for layer in &inner.layers {
+        if let crate::models::qwen3_5::decoder_layer::AttentionType::Full(attention) = &layer.attn
+            && !attention.verify_can_be_shapeless(seq_len)?
+        {
+            shapeless_verify = false;
+            break;
         }
-    });
+    }
     if !shapeless_verify {
         // Unfused causal attention bakes prefix-sized mask constants. Reusing
         // that graph as the prefix grows is invalid; specializing every prefix

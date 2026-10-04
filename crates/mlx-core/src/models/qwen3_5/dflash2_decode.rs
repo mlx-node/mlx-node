@@ -1308,7 +1308,7 @@ mod tests {
         for layer in &inner.layers {
             if let super::super::decoder_layer::AttentionType::Full(attention) = &layer.attn {
                 for seq_len in [1, 8] {
-                    assert_eq!(attention.verify_can_be_shapeless(seq_len), head_dim == 64);
+                    assert_eq!(attention.verify_can_be_shapeless(seq_len)?, head_dim == 64);
                 }
             }
         }

@@ -552,6 +552,8 @@ array segmented_sdpa(const array &q, const array &prefix_k,
   int max_query_length = 0;
   try {
     max_query_length = segmented_max_query_length(device, gqa);
+  } catch (const fast::paged::PrebuiltKernelMissing &) {
+    throw;
   } catch (const std::exception &) {
     if (require_segmented) {
       throw;
@@ -583,6 +585,8 @@ array segmented_sdpa(const array &q, const array &prefix_k,
       }
       return fallback();
     }
+  } catch (const fast::paged::PrebuiltKernelMissing &) {
+    throw;
   } catch (const std::exception &) {
     if (require_segmented) {
       throw;
@@ -632,11 +636,16 @@ mlx_segmented_sdpa_test_forward(mlx_array *q, mlx_array *prefix_k,
                                      causal, true);
 }
 
+// 0 when segmented SDPA is not supported here; -1 (message on stderr) when its
+// prebuilt kernels are missing from paged_attn.metallib.
 extern "C" int mlx_segmented_sdpa_max_query_length(int gqa_factor) {
   try {
     auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
     return mlx::core::segmented_sdpa::segmented_max_query_length(
         mlx::core::metal::device(stream.device), gqa_factor);
+  } catch (const mlx::core::fast::paged::PrebuiltKernelMissing &e) {
+    std::fprintf(stderr, "mlx_segmented_sdpa_max_query_length: %s\n", e.what());
+    return -1;
   } catch (const std::exception &) {
     return 0;
   }

@@ -55,9 +55,12 @@ All bridge `.air` files use MLX's own kernel flags (`-fno-fast-math`, no `-O`, n
 `-std`; K-quant NAX at a 26.2 minimum, built only under MLX's NAX condition), not
 the paged-attention flags. They link after the paged `.air` files, with the NAX
 files last, so the library keeps the deployment floor's min-OS stamp. There is no
-JIT fallback: a missing K-quant or mixed-affine kernel throws. A missing segmented
-SDPA kernel makes `mlx_segmented_sdpa_max_query_length` return 0, so Qwen3.5
-verify falls back to concatenated-K/V SDPA (slower). `kquant_metallib_names` and
+JIT fallback: a missing kernel throws `PrebuiltKernelMissing`. Segmented SDPA keeps
+it apart from "unsupported here": `mlx_segmented_sdpa_max_query_length` returns -1
+(not 0) and the forward returns null, so Qwen3.5 verify errors instead of falling
+back to concatenated K/V (`segmented_sdpa_missing_kernels`). The paged and MLX
+metallib gates also require the MTLB header's declared size (u64 at offset 16) to
+equal the file size, which catches a file cut after its name table. `kquant_metallib_names` and
 `bridge_metallib_names` check every name the dispatchers can build against the
 library, both ways, and build every pipeline, each segmented SDPA function-constant
 specialization included.

@@ -5,6 +5,7 @@
 // (defined in mlx_paged_dispatch.cpp).
 
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 
 #include "mlx/backend/metal/device.h"
@@ -18,10 +19,17 @@ std::filesystem::path paged_attn_metallib_path();
 // The library, loaded once per process and cached by MLX.
 MTL::Library* get_paged_attn_library(mlx::core::metal::Device& device);
 
+// paged_attn.metallib, or a prebuilt kernel in it, is missing or does not
+// load: a packaging error, never a capability answer.
+class PrebuiltKernelMissing : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 // A prebuilt bridge kernel from the library. Function-constant kernels pass
 // the specialization in `hash_name` / `func_consts`. There is no JIT fallback:
-// a kernel that is missing or does not load throws "[<tag>] Cannot load
-// <family> kernel <kname> from <path> ...".
+// a kernel that is missing or does not load throws PrebuiltKernelMissing
+// "[<tag>] Cannot load <family> kernel <kname> from <path> ...".
 MTL::ComputePipelineState* get_prebuilt_kernel(
     mlx::core::metal::Device& device,
     const char* tag,
