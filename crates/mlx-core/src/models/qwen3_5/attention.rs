@@ -2432,12 +2432,14 @@ mod tests {
         )?;
         let mut seen = [0usize; 4];
         let mut unified_eligible = 0usize;
+        let mut unified_launchable = 0usize;
         let mut class = 0u8;
         for prefix in prefixes {
             let (route, device_class) = device_verify_route(HQ, HKV, 8, prefix);
             class = device_class;
             let (expected, eligible) = predicted_verify_route(class, HQ, HKV, 8, prefix, max_q);
             unified_eligible += usize::from(eligible);
+            unified_launchable += usize::from(expected == VERIFY_UNIFIED);
             assert_eq!(
                 route, expected,
                 "class '{}' prefix {prefix}: verify route",
@@ -2446,7 +2448,12 @@ mod tests {
             seen[route as usize] += 1;
             let pk = nan_tailed_prefix(&base_k, prefix)?;
             let pv = nan_tailed_prefix(&base_v, prefix)?;
-            let got = strict_segmented_for_test(&q, &pk, &pv, &nk, &nv)?.to_float32()?;
+            let (got, dispatched) = strict_segmented_routed(&q, &pk, &pv, &nk, &nv)?;
+            assert_eq!(
+                dispatched, route,
+                "class '{}' prefix {prefix}: dispatched verify route",
+                class as char
+            );
             let concat =
                 segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, false)?.to_float32()?;
             assert_eq!(
@@ -2473,7 +2480,12 @@ mod tests {
             "class '{}': no prefix reaches the one-call route",
             class as char
         );
-        if seen[VERIFY_UNIFIED as usize] == 0 {
+        assert_eq!(
+            seen[VERIFY_UNIFIED as usize], unified_launchable,
+            "class '{}': one-call verify dispatches",
+            class as char
+        );
+        if unified_launchable == 0 {
             eprintln!(
                 "class '{}': this GPU cannot launch the one-call verify kernel; \
                  {unified_eligible} eligible blocks took the split route",
@@ -2671,9 +2683,8 @@ mod tests {
         (route, class as u8)
     }
 
-    /// The verify route MLX's policy predicts for a causal block, and whether
-    /// both chunks reduce alike. One dispatch then also needs the verify
-    /// pipeline's thread limit, which register pressure sets per GPU.
+    /// The verify route MLX's policy and this GPU's raw pipeline limits
+    /// predict for a causal block, and whether both chunks reduce alike.
     #[cfg(target_os = "macos")]
     fn predicted_verify_route(
         class: u8,
@@ -2692,22 +2703,92 @@ mod tests {
         let head = class_reduction(class, prefix + head_len, gqa, gqa * head_len);
         let tail = class_reduction(class, prefix + rows, gqa, gqa * (rows - head_len));
         let eligible = head.0 && tail.0 && head.1 == tail.1;
-        let launchable = eligible && {
-            let supported = unsafe {
-                mlx_sys::mlx_segmented_sdpa_test_device_verify_unified_supported(
-                    gqa as i32,
-                    rows as i32,
-                    tail.1 as i32,
-                )
-            };
-            assert!(
-                supported >= 0,
-                "verify pipeline gqa {gqa} rows {rows} partitions {}",
-                tail.1
-            );
-            supported == 1
-        };
+        let launchable = eligible && verify_unified_launchable(gqa, rows, tail.1);
         (verify_route(rows, max_q, head, tail, launchable), eligible)
+    }
+
+    /// Whether this GPU can serve a verify block in one dispatch, from the raw
+    /// limits of its pipelines rather than the C++ launch planner. The verify
+    /// kernel runs two (head, row) pairs per simdgroup (`PAIRS` in
+    /// sdpa_segmented.metal), so 32 * gqa * rows / 2 threads; MLX's reduction
+    /// kernel runs 1024.
+    #[cfg(target_os = "macos")]
+    fn verify_unified_launchable(gqa: i64, rows: i64, partitions: i64) -> bool {
+        const PAIRS_PER_SIMDGROUP: i64 = 2;
+        let mut limits = [0u64; 7];
+        let status = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_verify_pipeline_limits(
+                gqa as i32,
+                rows as i32,
+                partitions as i32,
+                limits.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            status, 0,
+            "verify pipeline limits gqa {gqa} rows {rows} partitions {partitions}"
+        );
+        let [
+            width,
+            max_threads,
+            static_memory,
+            reduce_width,
+            reduce_max_threads,
+            reduce_static_memory,
+            device_memory,
+        ] = limits;
+        let pairs = gqa * rows;
+        let threads = 32 * (pairs / PAIRS_PER_SIMDGROUP) as u64;
+        (2..=8).contains(&rows)
+            && (1..=32).contains(&gqa)
+            && pairs % PAIRS_PER_SIMDGROUP == 0
+            && partitions >= 32
+            && partitions % 32 == 0
+            && width == 32
+            && threads <= max_threads
+            && static_memory <= device_memory
+            && reduce_width == 32
+            && reduce_max_threads >= 1024
+            && reduce_static_memory <= device_memory
+    }
+
+    /// `strict_segmented_for_test` evaluated, and the verify route its
+    /// `eval_gpu` dispatched, from the bridge kernel counters.
+    #[cfg(target_os = "macos")]
+    fn strict_segmented_routed(
+        q: &MxArray,
+        pk: &MxArray,
+        pv: &MxArray,
+        nk: &MxArray,
+        nv: &MxArray,
+    ) -> Result<(napi::bindgen_prelude::Float32Array, i32)> {
+        let count = |family: &std::ffi::CStr| unsafe {
+            mlx_sys::mlx_test_kquant_family_count(family.as_ptr())
+        };
+        unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+        let out = strict_segmented_for_test(q, pk, pv, nk, nv).and_then(|o| o.to_float32());
+        let routes = [
+            c"segmented_sdpa_route_single",
+            c"segmented_sdpa_route_one_pass",
+            c"segmented_sdpa_route_unified",
+            c"segmented_sdpa_route_split",
+        ]
+        .map(count);
+        let verify_kernels = count(c"segmented_sdpa_verify_2pass_1");
+        unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+        let out = out?;
+        assert_eq!(
+            routes.iter().sum::<u64>(),
+            1,
+            "one verify dispatch, routes {routes:?}"
+        );
+        let route = routes.iter().position(|&n| n == 1).unwrap_or(0) as i32;
+        assert_eq!(
+            verify_kernels,
+            u64::from(route == VERIFY_UNIFIED),
+            "one-call verify kernel dispatches on route {route}"
+        );
+        Ok((out, route))
     }
 
     #[cfg(target_os = "macos")]
@@ -2822,7 +2903,11 @@ mod tests {
                 let pk = nan_tailed_prefix(&base_k, prefix)?;
                 let pv = nan_tailed_prefix(&base_v, prefix)?;
                 for (set, q) in queries.iter().enumerate() {
-                    let got = strict_segmented_for_test(q, &pk, &pv, &nk, &nv)?.to_float32()?;
+                    let (got, dispatched) = strict_segmented_routed(q, &pk, &pv, &nk, &nv)?;
+                    assert_eq!(
+                        dispatched, route,
+                        "dispatched route for rows={rows}, prefix={prefix}"
+                    );
                     let chunks = segmented_or_concat_split_for_test(q, &pk, &pv, &nk, &nv, true)?
                         .to_float32()?;
                     let concat = segmented_or_concat_split_for_test(q, &pk, &pv, &nk, &nv, false)?

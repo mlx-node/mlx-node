@@ -700,19 +700,33 @@ extern "C" int mlx_segmented_sdpa_test_device_verify_route(
   }
 }
 
-// Test-only: 1 when this GPU can serve a `rows` x `gqa` verify block in one
-// dispatch at `partitions`, 0 when it cannot, -1 on error.
-extern "C" int
-mlx_segmented_sdpa_test_device_verify_unified_supported(int gqa, int rows,
-                                                        int partitions) {
+// Test-only: the raw limits of the pipelines a one-call verify dispatches,
+// read from Metal without the launch planner. out[0..3] the verify kernel's
+// threadExecutionWidth, maxTotalThreadsPerThreadgroup and
+// staticThreadgroupMemoryLength, out[3..6] the same for MLX's reduction
+// kernel, out[6] the device's maxThreadgroupMemoryLength. -1 on error.
+extern "C" int mlx_segmented_sdpa_test_verify_pipeline_limits(int gqa, int rows,
+                                                              int partitions,
+                                                              uint64_t *out) {
   using namespace mlx::core;
   try {
+    if (out == nullptr) {
+      return -1;
+    }
     auto stream = default_stream(Device::gpu);
-    return segmented_sdpa::unified_verify_launch(metal::device(stream.device),
-                                                 rows, gqa, partitions)
-                   .plan.supported
-               ? 1
-               : 0;
+    auto &device = metal::device(stream.device);
+    auto *verify = segmented_sdpa::segmented_kernel(
+        device, {segmented_sdpa::SegmentedKernel::verify_two_pass_1, true,
+                 partitions, gqa, rows});
+    auto *reduction = segmented_sdpa::reduction_kernel(device);
+    out[0] = verify->threadExecutionWidth();
+    out[1] = verify->maxTotalThreadsPerThreadgroup();
+    out[2] = verify->staticThreadgroupMemoryLength();
+    out[3] = reduction->threadExecutionWidth();
+    out[4] = reduction->maxTotalThreadsPerThreadgroup();
+    out[5] = reduction->staticThreadgroupMemoryLength();
+    out[6] = device.mtl_device()->maxThreadgroupMemoryLength();
+    return 0;
   } catch (const std::exception &) {
     return -1;
   }
@@ -740,8 +754,8 @@ extern "C" int mlx_segmented_sdpa_test_device_verify_route(int, int, int, int,
   return -1;
 }
 
-extern "C" int mlx_segmented_sdpa_test_device_verify_unified_supported(int, int,
-                                                                       int) {
+extern "C" int mlx_segmented_sdpa_test_verify_pipeline_limits(int, int, int,
+                                                              uint64_t *) {
   return -1;
 }
 

@@ -809,10 +809,16 @@ unsafe extern "C-unwind" {
         out_device_class: *mut std::ffi::c_char,
     ) -> i32;
 
-    pub fn mlx_segmented_sdpa_test_device_verify_unified_supported(
+    /// TEST-ONLY: raw Metal limits of the one-call verify kernel and MLX's
+    /// reduction kernel, read without the launch planner: `out[0..7]` =
+    /// verify {thread execution width, max threads per threadgroup, static
+    /// threadgroup memory}, reduction {same three}, device max threadgroup
+    /// memory. -1 without Metal or on error.
+    pub fn mlx_segmented_sdpa_test_verify_pipeline_limits(
         gqa: i32,
         rows: i32,
         partitions: i32,
+        out: *mut u64,
     ) -> i32;
 
     /// TEST-ONLY, platform independent: FNV-1a 64 digests of the segmented
