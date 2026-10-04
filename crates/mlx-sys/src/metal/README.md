@@ -22,6 +22,11 @@ Organize them by their mathematical and storage contracts:
 - `common/sdpa_segmented.metal.inc` is a whole library source too:
   `mlx_segmented_sdpa.cpp` JIT-builds the BF16 D=256 segmented SDPA kernels
   from it and reduces their partials with MLX's own `sdpa_vector_2pass_2`.
+- The three whole-library sources above (`kquant/`, `affine_qmv_wide_mixed`,
+  `sdpa_segmented`) are guarded by `#[ignore]` golden-digest gates in
+  `crates/mlx-core/tests/*_golden_gate.rs`, run on every MLX pin bump. A change
+  here that moves output bits fails them too, and they have no capture mode
+  ([docs/mlx-fork.md](../../../../docs/mlx-fork.md)).
 - Add `qwen3_5/`, `lfm2/`, or `gemma4/` when a shader requires that family's
   semantics. Qwen3.5 currently uses `common/` recurrence and quantized kernels;
   LFM2 and Gemma4 have no family-specific shader includes here.

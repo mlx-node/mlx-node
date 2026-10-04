@@ -505,6 +505,9 @@ export MLX_QWEN4_ROUTE_REGISTER_RESULTS=1
 export MLX_QWEN4_WEIGHT_CACHE_GIB=63
 ```
 
+`MLX_METAL_HASH_KERNEL_CACHE` has no effect today: MLX now always keys custom
+kernels by a hash of their source ([mlx-fork.md](../mlx-fork.md)).
+
 Evidence: `register-reference-a` and `register-reference-b` under
 `~/Library/Caches/mlx-node/qwen4-reference-gap-20260917/`. The immutable addon
 SHA-256 is `c08e3947deecb7171db7122cac98ca88f46b764c737760f703da7ff598c50f0e`.
@@ -637,6 +640,10 @@ splits wired allocations across residency sets capped at 5% of the device's
 recommended working set, with a 64 MiB floor and at most 32 sets. Porting this
 behavior fixed the standard workload; selecting one set on the same new addon
 still timed out. `MLX_RESIDENCY_SET_MAX_PCT=0` is the one-set rollback.
+
+The overlay below is gone today: upstream MLX `09ebe730b` has the same design
+and the same `MLX_RESIDENCY_SET_MAX_PCT` / `MLX_RESIDENCY_DEBUG` variables
+([mlx-fork.md](../mlx-fork.md)).
 
 The overlay in `crates/mlx-sys/metal-residency` preserves allocation accounting,
 locking, oversized-allocation handling, and attachment of new sets to every
@@ -962,8 +969,9 @@ unpacked reference geometry 12.91–15.79, packed geometry 12.69–13.49. No dup
 mixer banks or associated residency change are added based on these results.
 
 The next backend port follows the reference's source/compile-option hashes
-as Metal library keys. `MLX_METAL_HASH_KERNEL_CACHE=1` selects it at process
-start. The immutable key is computed with the custom primitive, avoiding
+as Metal library keys. `MLX_METAL_HASH_KERNEL_CACHE=1` selected it at process
+start (removed since; upstream MLX now always hashes the kernel source). The
+immutable key is computed with the custom primitive, avoiding
 repeated source scans for retained compiled graphs. It is off by default and
 has no established throughput gain yet. This uses the parent-owned Metal
 overlay, with the same generated class header in CMake, the bridge and installed

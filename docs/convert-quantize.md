@@ -18,7 +18,7 @@ things and confusing them is the main source of drift here.
 | ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | **CONVERTER** | `crates/mlx-core/src/convert.rs`, `crates/mlx-core/src/utils/gguf.rs`, `crates/mlx-core/src/convert_gemma_import.rs`      | Picks per-key `{bits, group_size, mode}`, packs the bytes, writes the `quantization` block + per-tensor overrides                        |
 | **LOADER**    | `crates/mlx-core/src/engine/persistence.rs`, `crates/mlx-core/src/models/quant_dispatch.rs`, per-family `persistence.rs` | Parses that block, **rebuilds arrays that are not on disk**, fail-loud validates every dtype/shape before dispatch                       |
-| **KERNEL**    | `crates/mlx-sys/mlx/mlx/ops.cpp` → `backend/{metal,cpu}`                                                                  | Consumes `(weight, scales, biases, group_size, bits, mode)`; re-validates via `validate_mode_with_type` + `quantization_params_from_mode` |
+| **KERNEL**    | `crates/mlx-sys/mlx/mlx/ops.cpp` → `backend/{metal,cpu}`; K-quants: `crates/mlx-sys/src/mlx_kquant*.cpp` (not in MLX)      | Consumes `(weight, scales, biases, group_size, bits, mode)`; re-validates via `validate_mode_with_type` + `quantization_params_from_mode` |
 
 Three things the loader materializes that are **not bytes on disk**:
 
@@ -105,8 +105,8 @@ triple differs from the top-level one (`record_quant_override_if_non_default`,
 
 Nine formats. Only five are selectable by `--q-mode` (`VALID_QUANT_MODES`,
 `crates/mlx-core/src/convert.rs:1967`). `fp8_e4m3` is emitted only by the fixed Unsloth DGX map. The
-three ggml K-quants are **consume-only** — `mx.quantize` throws for them by name
-(`crates/mlx-sys/mlx/mlx/ops.cpp:5245`).
+three ggml K-quants are **consume-only** — the bridge's `mlx_quantize` throws for them by name
+before MLX sees them (`crates/mlx-sys/src/mlx_advanced_ops.cpp:892`).
 
 ### Master table
 
@@ -130,21 +130,23 @@ Shapes are for a dense `[N, K]` source weight; stacked experts add a leading `[E
 Defaults are declared in exactly three consistent places plus MLX itself:
 `packages/cli/src/commands/convert.ts:9` (display only — see gotchas),
 `crates/mlx-core/src/convert.rs:1995` (SafeTensors), `crates/mlx-core/src/utils/gguf.rs:2884` (GGUF),
-`crates/mlx-sys/mlx/mlx/ops.cpp:4586` (`quantization_params_from_mode`, which additionally owns
-q6k(16,6) / q4k(32,4) / q5k(32,5)).
+`crates/mlx-sys/mlx/mlx/ops.cpp:4809` (`quantization_params_from_mode`). The K-quant pairs
+q6k(16,6) / q4k(32,4) / q5k(32,5) live in the bridge (`default_group_size` / `default_bits`,
+`crates/mlx-sys/src/mlx_kquant.h`).
 
 ### affine
 
 ```
 decode:  w = scale * q + bias,   q ∈ [0, 2^bits - 1]  (unsigned)
-         multiply(w, scales) then add(biases)     ops.cpp:5361
-shapes:  wq.back()     = K * bits / 32            ops.cpp:5103
-         scales.back() = K / group_size           ops.cpp:5113 (both cast back to w.dtype())
-legal:   group_size ∈ {32, 64, 128},  bits ∈ {2,3,4,5,6,8}    ops.cpp:5059
+         multiply(w, scales) then add(biases)     ops.cpp:5462
+shapes:  wq.back()     = K * bits / 32            ops.cpp:5224
+         scales.back() = K / group_size           ops.cpp:5226 (both cast back to w.dtype())
+legal:   group_size ∈ {32, 64, 128},  bits ∈ {2,3,4,5,6,8}    ops.cpp:5172-5185
 ```
 
-Affine is the **only** mode exempt from the `(group_size, bits)` pinning gate at
-`crates/mlx-sys/mlx/mlx/ops.cpp:4661`.
+Affine is the **only** mode with no pinned `(group_size, bits)`. The float modes are pinned in
+`fp_quantize` / `fp_dequantize` (`crates/mlx-sys/mlx/mlx/ops.cpp:5242-5257`, `:5491-5506`), the
+K-quants in the bridge's `params_from_mode` (`crates/mlx-sys/src/mlx_kquant.cpp:90`).
 
 bpw = `bits + 2·(scale_dtype_bits / group_size)`. On `[4096, 4096]` = 16,777,216 weights, bf16
 companions:
@@ -160,9 +162,8 @@ companions:
 
 ### mxfp4 / mxfp8 / nvfp4 — float micro-scaling
 
-Two-array modes. `quant_weight_arrays()` returns 1 companion
-(`crates/mlx-sys/mlx/mlx/primitives.h:165`) and `validate_mode_with_type` throws
-"Biases must be null for quantization mode" at `crates/mlx-sys/mlx/mlx/ops.cpp:4744`.
+Two-array modes. `validate_mode_with_type` requires uint8 scales and throws
+"Biases must be null for quantization mode" (`crates/mlx-sys/mlx/mlx/ops.cpp:4871-4882`).
 
 ```
 w = scale * decode(code)                                   fp_quantized.h:139
@@ -177,7 +178,7 @@ scale   codec by GROUP_SIZE, not by mode:                  fp_quantized.h:30
 ```
 
 Output dtypes `{uint32, uint8}` are hard-coded in `fp_quantize`
-(`crates/mlx-sys/mlx/mlx/ops.cpp:5217`). bpw:
+(`crates/mlx-sys/mlx/mlx/ops.cpp:5340`). bpw:
 
 | mode  | bits | gs | weight bpw | scale bpw   | total     |
 | ----- | ---- | -- | ---------- | ----------- | --------- |
@@ -193,12 +194,15 @@ format contract — codec, group size, sidecar shapes, dtypes — and it is what
 writes and what every loader reads. The *block exponent* inside it is chosen in-tree,
 on every convert, with no flag: `crates/mlx-core/src/quant/mxfp4_weight.rs` evaluates
 both candidate E8M0 exponents per block and keeps the lower squared error, and
-`crates/mlx-core/src/quant/mxfp8_weight.rs` takes the ceiling instead of MLX's
-round-to-nearest. So an mxfp4/mxfp8 checkpoint from `mlx convert` is byte-compatible
-with mlx-lm and dequantizes identically, but is NOT byte-identical to what
-`mlx_quantize` would have written for the same weights — it is closer to them. MLX's
-own rounding survives only as a `#[cfg(test)]` reference, which per-format
-bit-identity tests pin against `mlx_quantize`. nvfp4 keeps MLX's encoder, and adds a pre-quantization
+`crates/mlx-core/src/quant/mxfp8_weight.rs` takes the ceiling. Since upstream `02adf7b21`
+MLX also rounds the E8M0 scale **up**, for both mxfp4 and mxfp8 (`mx_scale_round_up` in
+`crates/mlx-sys/mlx/mlx/backend/metal/kernels/fp8.h`; the same rule on CPU). So mxfp8 scale
+bytes from `mlx convert` equal `mlx_quantize`'s (in a block whose scale byte is 0, MLX writes a
+negative-zero code for a negative element; convert writes positive zero), while mxfp4 differs
+wherever the search picks the lower exponent. Both load in mlx-lm and dequantize identically.
+MLX's rule survives as a `#[cfg(test)]` reference (`quantize_mxfp{4,8}_mlx_round_up`), pinned
+byte for byte against `mlx_quantize` by `mxfp{4,8}_round_up_reference_is_bit_identical_to_mlx_quantize`.
+nvfp4 keeps MLX's encoder, and adds a pre-quantization
 power-of-two lift on dense FFNs (see `docs/cli.md`, "Data-free encoder tuning").
 
 **The MLX nvfp4 quantizer writes no global scale.** The DGX port does not carry Unsloth's calibrated
@@ -285,10 +289,11 @@ of `K` values with `K % 256 == 0`.
 reused only so the ~25 `.scales`/`.biases` "is quantized" sentinel sites keep working
 (`crates/mlx-core/src/utils/gguf_kquant.rs:22`).
 
-Decode (`KQScales::at`, identical in Metal `crates/mlx-sys/mlx/mlx/backend/metal/kernels/kquant.h:627`
-and CPU `crates/mlx-sys/mlx/mlx/backend/cpu/quantized.cpp:1132`). There are exactly **two** branches,
+Decode (`KQScales::at`, identical in Metal `crates/mlx-sys/src/metal/kquant/kquant.h:678`
+and CPU `crates/mlx-sys/src/mlx_kquant.cpp:513`). For these three modes there are **two** branches,
 selected by `has_min`, which is true for **both** q4k and q5k
-(`quant_has_sub_min`, `crates/mlx-sys/mlx/mlx/primitives.h:185`):
+(`has_sub_min`, `crates/mlx-sys/src/mlx_kquant.h:44`). The bridge also reads q3k and the IQ modes;
+their parameters are in the same header.
 
 ```
 has_min == true    (q4k AND q5k)          super_ratio = 8
@@ -312,13 +317,14 @@ Why this reuses MLX's affine kernel algebra:
 3. Sub-scales are stored **unpacked** rather than in ggml's 6-bit fields, which "keeps the affine
    kernel's per-group pointer walk intact" (`gguf_kquant.rs:432`) and costs exactly +0.125 bpw.
 4. Every row is a whole number of 256-value super-blocks, so a flat group index stays aligned as the
-   cursor runs off one row into the next (`kquant.h:604`).
+   cursor runs off one row into the next (`kquant.h:657`).
 
-It is a **copied kernel family, not the same binary**: `kquant.h`/`kquant.metal` are separate
-instantiations with two extra template params (`super_ratio`, `has_min`), and `QuantizedBlockLoader`
-generalises the affine loader's `static_assert(BCOLS <= group_size)`
-(`crates/mlx-sys/mlx/mlx/backend/metal/kernels/quantized.h:574`) into `group_steps`/`scale_step`
-because q6k's group of 16 is narrower than the BK=32 tile (`kquant.h:672`).
+It is a **copied kernel family, not the same binary**: `crates/mlx-sys/src/metal/kquant/kquant.h` is
+mlx-node's own source, JIT-compiled per kernel by `mlx_kquant_metal.cpp`, with two extra template
+params (`super_ratio`, `has_min`). Its `QuantizedBlockLoader` generalises the affine loader's
+`static_assert(BCOLS <= group_size)` (`crates/mlx-sys/mlx/mlx/backend/metal/kernels/quantized.h:582`)
+into `group_steps`/`scale_step` because q6k's group of 16 is narrower than the BK=32 tile
+(`kquant.h:730`).
 
 bpw = `bits + 8/scales_per_value + 16·per_group/256`:
 
@@ -331,13 +337,13 @@ bpw = `bits + 8/scales_per_value + 16·per_group/256`:
 Exactness vs llama.cpp: decode is float32 on both levels, so **q4k and q5k are bitwise identical**.
 **Q6_K is identical up to the sign of zero** — ggml subtracts 32 in integer arithmetic, the contract
 folds it into `bias = -32*scale`, and IEEE-754 gives `x + (-x) = +0.0` where ggml writes `-0.0`
-(`crates/mlx-sys/mlx/mlx/backend/cpu/quantized.cpp:1091`). A second divergence exists for a
+(`crates/mlx-sys/src/mlx_kquant.cpp:525`). A second divergence exists for a
 non-finite `d` (whole super-block NaN here vs signed infinities in ggml) but no real GGUF holds one.
 
-Consume-only is enforced by name: `quantize()` throws "can be read but not produced" for any mode
-with `quant_super_ratio > 0` (`crates/mlx-sys/mlx/mlx/ops.cpp:5245`); `dequantize()` routes to the
-`kq_dequantize` primitive at `crates/mlx-sys/mlx/mlx/ops.cpp:5575`; `kquant.metal:12` has no
-`quantize` instantiation.
+Consume-only is enforced by name: the bridge's `mlx_quantize` throws "can be read but not produced"
+for every K-quant mode (`crates/mlx-sys/src/mlx_advanced_ops.cpp:892`); dequantize routes to the
+bridge's `KQuantDequantize` primitive (`crates/mlx-sys/src/mlx_kquant.cpp:362`); there is no K-quant
+quantize kernel.
 
 ### ggml symmetric Q4_0 / Q8_0 — the derived-bias scheme
 
@@ -397,8 +403,10 @@ Because all nine formats share the triplet shape, dtypes are the only discrimina
 | `ensure_kquant_storage_resolves_kquant`   | int8 `.scales` (q6k) **or** u8 `.scales` + f16 `.biases` (q4k/q5k) but mode is not a K-quant          | `quant_dispatch.rs:307-334`                            |
 | `ensure_affine_biases_present`            | affine group has `.weight` + `.scales` but no `.biases`                                              | `quant_dispatch.rs:355-378`                            |
 | `resolve_kquant_group`                    | K-quant with wrong dtype or rank; `Ok(None)` **only** if `.scales` is absent                          | `quant_dispatch.rs:417-475`                            |
-| `validate_mode_with_type` (C++)           | affine w/o biases; K-quant wrong scales dtype / missing f16 biases; float modes with non-null biases   | `crates/mlx-sys/mlx/mlx/ops.cpp:4678-4749`             |
-| `quantization_params_from_mode` (C++)     | any non-affine mode whose `(gs, bits)` differ from the pinned pair                                    | `crates/mlx-sys/mlx/mlx/ops.cpp:4661-4671`                                    |
+| `validate_mode_with_type` (MLX)           | affine w/o biases; float modes with non-uint8 scales or non-null biases                             | `crates/mlx-sys/mlx/mlx/ops.cpp:4838-4888`             |
+| `kquant::validate_mode_with_type` (bridge) | K-quant wrong scales dtype / missing or non-f16 biases                                             | `crates/mlx-sys/src/mlx_kquant.cpp:56-88`              |
+| `fp_quantize` / `fp_dequantize` (MLX)     | float mode whose `(gs, bits)` differ from the pinned pair (quantize / dequantize only)               | `crates/mlx-sys/mlx/mlx/ops.cpp:5242-5257`, `:5491-5506` |
+| `kquant::params_from_mode` (bridge)       | K-quant whose `(gs, bits)` differ from the pinned pair                                               | `crates/mlx-sys/src/mlx_kquant.cpp:90-116`             |
 
 `ensure_affine_biases_present` is live in four families: gemma4 (6 non-test call sites —
 `crates/mlx-core/src/models/gemma4/persistence.rs:1361`, `:1390`, `:1586`, `:1850`, `:2140`, `:2205`),
@@ -1274,15 +1282,14 @@ what v1 cannot use:
   (`from_fp8(to_fp8(x·448/amax))·amax/448`). Divergence: modelopt's runtime scales activations
   **per-token dynamically**, while the exported `input_scale` is a fixed value — v1 keeps it as a
   static amax (same mechanics as `mlx calibrate`'s sites, minus the calibration pass).
-  These were **mxfp8 8/32** until the quantization-accuracy pass. MLX's `fp8.h` rounds the E8M0
-  block exponent to **nearest** rather than ceil, so a per-tensor-E4M3 source loses 6.1191%
-  relative RMS (20.96% max/amax) through MLX's mxfp8 versus **0.6366%** (0.87% max/amax) through
-  affine 8/32 — 9.6x better, measured on a seeded Gaussian `[256, 2688]` fixture in
-  `nemotron_fp8_to_affine8_requant_error_within_tolerance`. That measurement is against MLX's
-  encoder, which convert no longer uses for mxfp8: the in-tree ceiling encoder cannot saturate,
-  so the 6.1191% number does not describe today's mxfp8 and the affine-versus-mxfp8 margin here
-  is unmeasured. The decision stands until someone re-measures it — the load-side gate below
-  makes it two-sided, not a one-line swap. The on-disk consequences:
+  These were **mxfp8 8/32** until the quantization-accuracy pass. At the time MLX rounded the E8M0
+  block exponent to **nearest** and lost 6.1191% relative RMS (20.96% max/amax) on a
+  per-tensor-E4M3 source. Today convert and MLX (upstream `02adf7b21`) both round it up, and
+  mxfp8 still loses **2.964%** relative RMS (3.733% max/amax) versus **0.6366%** (0.8669%) for
+  affine 8/32 — about 4.7x better, measured on a seeded Gaussian `[256, 2688]` fixture in
+  `nemotron_fp8_to_affine8_requant_error_within_tolerance` (both values print with
+  `--nocapture`). What is left is E4M3's own element grid. The load-side gate below makes the
+  choice two-sided, not a one-line swap. The on-disk consequences:
   `.scales` U8 -> BF16, a NEW BF16 `.biases`, `.weight` unchanged, and the per-layer mode string
   `"mxfp8"` -> `"affine"`. A pre-pass checkpoint is rejected at load with a regenerate hint
   (`reject_legacy_mxfp8_mamba` / `require_affine_sidecars`) rather than silently running 6% off,
@@ -1732,7 +1739,7 @@ Two consequences worth naming:
 
 | # | Fact                                                                                                                                                                                                                  | Where                                                                       |
 | - | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 59 | **The K-quant arms in the SafeTensors converter are unreachable from any production path.** `VALID_QUANT_MODES` is `[affine, mxfp4, mxfp8, nvfp4, sym8]`, no recipe constructs a `Custom{mode:"q6k"}`, and the GGUF frontend restricts its modes to affine/mxfp8/mxfp4/nvfp4. They are defensive and unit-tested — but reading them as evidence that convert can emit or round-trip K-quants is wrong. | `crates/mlx-core/src/convert.rs:5910`, `:5711`, `:1967`, `crates/mlx-sys/mlx/mlx/ops.cpp:5245` |
+| 59 | **The K-quant arms in the SafeTensors converter are unreachable from any production path.** `VALID_QUANT_MODES` is `[affine, mxfp4, mxfp8, nvfp4, sym8]`, no recipe constructs a `Custom{mode:"q6k"}`, and the GGUF frontend restricts its modes to affine/mxfp8/mxfp4/nvfp4. They are defensive and unit-tested — but reading them as evidence that convert can emit or round-trip K-quants is wrong. | `crates/mlx-core/src/convert.rs:5910`, `:5711`, `:1967`, `crates/mlx-sys/src/mlx_advanced_ops.cpp:892` |
 | 60 | **`resolve_legacy_entry`'s `lm_head` clause in arm 4 is dead by construction** — `should_quantize` already excluded it at arm 1. The code says so: "kept for defense-in-depth". | `crates/mlx-core/src/convert.rs:6297`                                       |
 | 61 | **`VALID_MTP_QUANT_POLICIES` still lists `"drafter"`**, but the alias is normalized to `"split"` fourteen lines earlier, so that entry can never match. Two independent copies of the list (TS and Rust) can drift. | `crates/mlx-core/src/convert.rs:1960`, `:1977`, `packages/cli/src/commands/convert.ts:265` |
 | 62 | **`derived_symmetric_bias_bits` is `pub` production code with zero production callers** — it exists purely as the parity gate's test oracle. It looks like dead code to a linter, and deleting it removes the only check that the load-time reconstruction still reproduces the historical bytes. | `crates/mlx-core/src/utils/gguf.rs:743`                                     |

@@ -25,6 +25,12 @@ The bridge between MLX (C++) and the NAPI/Rust layer lives in `crates/mlx-sys/`.
 | `mlx_paged_dispatch.cpp`     | C++ paged-attention kernel dispatch                                                                                                                                                                            |
 | `mlx_paged_ops.cpp`          | `PagedKVWrite` / `PagedAttention` custom MLX ops (largest file in the bridge)                                                                                                                                  |
 | `mlx_paged_profile.cpp`      | Profile-run helpers for auto-sizing the block pool                                                                                                                                                             |
+| `mlx_kquant.*`               | GGUF K-quant / IQ primitives (`KQuantMatmul`, `KQuantGatherQMM`, `KQuantDequantize`): validation and CPU reference. MLX has no K-quant mode; see [mlx-fork.md](mlx-fork.md)                                    |
+| `mlx_kquant_metal.cpp`       | Metal dispatch for the K-quant primitives; JIT-builds kernels from `metal/kquant/`                                                                                                                             |
+| `mlx_affine_mixed_qmm.*`     | BF16-x × F32-sidecar affine matmul (`AffineMixedQmm`); native `qmv_wide` kernel for 2..8 rows                                                                                                                  |
+| `mlx_segmented_sdpa.*`       | Segmented verify SDPA (BF16, D=256) over prefix + new K/V; JIT kernels from `metal/common/sdpa_segmented.metal.inc`                                                                                            |
+| `mlx_segmented_sdpa_plan.h`  | Pure launch and route planning for segmented SDPA, shared with the tests                                                                                                                                       |
+| `mlx_test_*`                 | Test-only hooks (`mlx_test_kquant.cpp`, `mlx_test_affine_mixed.cpp`, `mlx_test_counters.h`): kernel-family counters and explicit-device entry points used by the golden gates. No production caller            |
 
 `crates/mlx-sys/src/lib.rs` is the FFI declaration root (~300 `pub fn` wrappers around `unsafe extern "C-unwind"` blocks).
 
@@ -37,7 +43,7 @@ Because the wrappers are `extern "C-unwind"`, a C++ function that lets an except
 | `crates/mlx-sys/cmake/switch-exhaustiveness.cmake`  | Injected into the vendored MLX build via `CMAKE_PROJECT_TOP_LEVEL_INCLUDES` from `crates/mlx-sys/build.rs` — **macOS only** |
 | `crates/mlx-core/vendor/ggml/ggml_kquant_ref.{c,h}` | ggml's own Q4_K/Q5_K/Q6_K decoders, vendored verbatim, compiled by `crates/mlx-core/build.rs` as the K-quant parity oracle  |
 
-**`switch-exhaustiveness.cmake` exists because `-w` is absolute in clang.** The `cmake` crate composes `CMAKE_CXX_FLAGS` through `cc` with warnings off, which appends `-w`; clang then drops every non-error diagnostic and keeps dropping it however late a `-W`/`-Werror=` flag appears. The file rewrites `-w` to `-Wno-everything` (same silence, but later flags can re-enable individual diagnostics) and then sets `-Werror=switch`. That makes a `switch` over `QuantizationMode` with no `default:` label a **compile error** when an enumerator is missing — which is the point: `QuantizationMode` is append-only and serialized by ordinal through `export.cpp`, so adding a mode must break the build rather than fall through silently. (`primitives.h` states the same contract: reordering or removing a mode reinterprets every previously exported graph as a different quantization format.)
+**`switch-exhaustiveness.cmake` exists because `-w` is absolute in clang.** The `cmake` crate composes `CMAKE_CXX_FLAGS` through `cc` with warnings off, which appends `-w`; clang then drops every non-error diagnostic and keeps dropping it however late a `-W`/`-Werror=` flag appears. The file rewrites `-w` to `-Wno-everything` (same silence, but later flags can re-enable individual diagnostics) and then sets `-Werror=switch`. That makes a `switch` over `QuantizationMode` with no `default:` label a **compile error** when an enumerator is missing — which is the point: `export.cpp` serializes an enum by its ordinal, so adding a mode must break the build rather than fall through silently. The guard covers MLX's own sources only. The bridge, including the K-quant `kquant::Mode` switches (`mlx_kquant.{h,cpp}`), is compiled by `cc` with warnings off (`build.rs`).
 
 Two limits of that guard, both deliberate and both worth knowing before trusting it:
 
@@ -99,7 +105,9 @@ locks per step. `crates/mlx-core/src/engine/compiled_lock.rs` is now only an
 `crates/mlx-sys/src/metal/` holds the JIT shader includes. Reusable quantized
 projections, routing helpers, normalization, rotary, convolution and Gated
 DeltaNet kernels live in `common/`; Qwen4's fixed routing/head geometry and
-hyper-connection fusions live in `qwen4/`. The
+hyper-connection fusions live in `qwen4/`; the GGUF K-quant / IQ kernel headers
+live in `kquant/`. [mlx-fork.md](mlx-fork.md) lists the golden gates that guard
+the K-quant, mixed-affine and segmented SDPA kernels on an MLX bump. The
 [kernel guide](../crates/mlx-sys/src/metal/README.md) records the layout and
 arithmetic contracts for new model callers. Family-specific dispatch and
 fallbacks remain in the C++ adapters.

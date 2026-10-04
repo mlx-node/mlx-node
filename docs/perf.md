@@ -77,10 +77,10 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_LFM2_FUSED_BATCH_DECODE`            | Opt-in (default off): LFM2 multi-row decode waves run one fused `[N,1]` forward instead of the default row-exact wave (per-row N=1 forwards, bit-identical to serial). Fused M=N GEMM tiles round differently than M=1 and the carried ShortConv state amplifies the ULP diff into occasional greedy near-tie flips                                  |
 | `MLX_BONSAI_HOIST_METADATA=1`            | Experimental, default off: materialize rotated PQ2 projection scales/biases in FP32 once at load. Rotated projections promote their transformed inputs to FP32 (the 16-bit residual stream a normal Prism load produces), so outputs propagate FP32; adds about 0.8 GB for Bonsai 2 27B. No stable speedup is claimed.                               |
 | `MLX_BONSAI_SHARE_HADAMARD=1`            | Experimental, default off: reuse identical signed Hadamard transforms within one paged Qwen3.5 decode step. Cache entries retain input/sign owners and are cleared on return or error; flat inference and prefill do not retain entries.                                                                                                             |
-| `MLX_QMM_SPLITK_MIN_M`                   | Diagnostic override for the quantized-matmul vector/GEMM dispatch boundary: quantized matvecs with M ≥ this many rows take the `qmm`/split-k path instead of `qmv_wide`. A/B tuning only; unset keeps the hardware-derived heuristic.                                                                                                                |
+| `MLX_QMM_SPLITK_MIN_M`                   | Diagnostic override for the quantized-matmul vector/GEMM boundary: M ≥ this many rows takes `qmm`/split-k instead of `qmv`/`qmv_wide`. Read by MLX's affine/fp path (fork patch, [mlx-fork.md](mlx-fork.md)) and by the K-quant and mixed-affine dispatchers. A/B tuning only; the golden gates refuse it.                                           |
 | `MLX_KQUANT_SMALL_M_BENCH=1`             | Body-level opt-in for the `#[ignore]`d `kquant_small_m_bench` integration test: exact-shape K/IQ small-M quantized-matmul timings (MLP + lm_head shapes, M sweep). Run `MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --test kquant_small_m_bench -- --ignored --test-threads=1 --nocapture` (serial — the two benches share the GPU).           |
-| `MLX_METAL_COMMAND_TRACE=1`              | Diagnostic only: log command completion intervals, submission reasons, resource capacities, barriers and host evaluation/backpressure spans. Logging perturbs timing; exclude traced rates from performance comparisons. See the [trace interpretation](research/splash-qwen38.md#command-trace).                                                    |
-| `MLX_METAL_OP_TRACE=1\|2\|3`             | Diagnostic: print one line per Metal primitive eval to stderr — `commit`/`kernel`/`synchronize` events with node counts (1), plus primitive names (2) and input→output dtypes (3). Zero cost when unset. Used to count dispatches per decode/verify cycle.                                                                                           |
+| `MLX_METAL_COMMAND_TRACE=1`              | Diagnostic only (fork patch): `[metal-command]` per command buffer, `[mlx-evaluation]` per eval, `[mlx-compiled]` per compiled-graph call (bridge). Logging perturbs timing; exclude traced rates from comparisons. See the [trace interpretation](research/splash-qwen38.md#command-trace).                                                         |
+| `MLX_METAL_OP_TRACE=1\|2\|3`             | Diagnostic (fork patch): a `[metal-eval] commit/finalize/sync: N ops` line per command-buffer boundary (1), plus `[metal-op] <primitive>` per Metal primitive eval (2), plus input→output dtypes (3). Zero cost when unset. Used to count dispatches per decode/verify cycle.                                                                        |
 
 Eligible Qwen/DFlash projection merges, fused GDN preparation/window convolution,
 fused draft convolution/top-16/greedy selection, segmented one-call verifier attention,
@@ -135,10 +135,12 @@ for the numerical checks, memory tradeoff, and measured limits.
 
 ### Memory pool
 
-| Var                   | Effect                                   |
-| --------------------- | ---------------------------------------- |
-| `MLX_CACHE_LIMIT_GB`  | Hard Metal pool ceiling                  |
-| `MLX_GPU_HEADROOM_GB` | Headroom term in the auto-sizing formula |
+| Var                         | Effect                                                                                                                                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_CACHE_LIMIT_GB`        | Hard Metal pool ceiling                                                                                                                                                                                         |
+| `MLX_GPU_HEADROOM_GB`       | Headroom term in the auto-sizing formula                                                                                                                                                                        |
+| `MLX_RESIDENCY_SET_MAX_PCT` | Upstream MLX: one residency set's size, as % of the recommended working set (default 5). Splits wired memory across sets, never changes how much is wired; `<= 0` or `>= 100` = one set (`mlx/utils.h:205-218`) |
+| `MLX_RESIDENCY_DEBUG=1`     | Upstream MLX: log each residency set as it is created                                                                                                                                                           |
 
 ## MTP speculative decoding
 
@@ -510,7 +512,7 @@ This path and its numerical regressions were not removed with the Metal shader.
 | FP8 E4M3 import            | Source `.weight_scale_inv` checkpoints are dequantized **before** expert stacking; no re-quantization after stacking                                                 |
 | Plain FP8 weights          | Unsloth DGX high class: `fp8_e4m3` raw U8 weights + per-output BF16 scales; current runtime dequantizes once to BF16 and runs A16 matmul/gather-mm (not native W8A8) |
 | FP8 KV cache               | Paged-adapter only — `KVCacheDType::Fp8` with per-layer scale management via `KvScaleManager`. FP8 KV is intentionally rejected by the flat-path attach.             |
-| ggml K-quants              | `--gguf-kquant` on a GGUF import; modes `q6k` / `q4k` / `q5k`. Consume-only — `quantize()` throws, since producing them needs ggml's `make_qkx2_quants` search       |
+| ggml K-quants              | `--gguf-kquant` on a GGUF import; modes `q6k` / `q4k` / `q5k`. Consume-only — the bridge's `mlx_quantize` throws; producing needs ggml's `make_qkx2_quants`          |
 | Symmetric ggml Q4_0 / Q8_0 | GGUF import, automatic. `w = d*(q - Z)` has no stored offset, so `.biases` is omitted and rebuilt from `symmetric_zero_point` in `config.json`                       |
 
 **K-quants are affine per sub-block**, which is why they need no new kernel family: `scale`/`bias` are computed by a two-level decode instead of a scalar load, and `qdot` / `qouter` / `dequantize` are unchanged.
@@ -542,12 +544,13 @@ a 64×64×32 SIMD tile (10 KiB threadgroup scratch). It does not dequantize or
 retain a dense model copy. Automatic selection requires at least 128 input
 rows, at least 1,024 output columns, contiguous operands, native q4k/q5k/q6k/iq4xs,
 and enough tiles to avoid replacing stock split-K arithmetic. Pipeline limits
-are checked on the actual device; unsupported compilation retains stock MLX.
+are checked on the actual device; unsupported compilation keeps the default
+K-quant matmul (`kquant::quantized_matmul`).
 Set `0` to roll back, or `1` to force the eligible path for qualification on
 an M5. NAX, decode, short verification, training, and unsupported formats keep
 their existing routes by default. See the [portable investigation](research/portable-inference/README.md).
 
-K-quant prefill is routed onto the NAX tensor op through a `nax_supports_mode()` allowlist in `metal/quantized.cpp`. **Do not gate this on `is_nax_available()`** — that is a device capability shared with matmul and SDPA. With the allowlist closed, K-quant `qmm_t` runs 3.40–3.49× the affine control; open, it is level with affine (`M=512 N=8192 K=8192`, bf16, M5 Max). That is removal of a penalty, not a win over affine — an A/A affine control on the same harness lands 0.53% off unity, which is the noise floor those deltas sit near.
+K-quant prefill takes mlx-node's own NAX kernel (`kquant_qmm_t_nax`, JIT from `metal/kquant/kquant_nax.h`) under the same gate as MLX's affine `qmm`: `is_nax_available()`, transposed weight, `K % 64 == 0`, and TF32 enabled or a non-F32 input (`crates/mlx-sys/src/mlx_kquant_metal.cpp:523-527`). Without the NAX kernel, K-quant `qmm_t` runs 3.40–3.49× the affine control; with it, it is level with affine (`M=512 N=8192 K=8192`, bf16, M5 Max; measured on the fork's kernel, which ours matches bit for bit). That is removal of a penalty, not a win over affine — an A/A affine control on the same harness lands 0.53% off unity, which is the noise floor those deltas sit near.
 
 `kquant_nax_bench` only means anything on `applegpu_g17s` / macOS ≥ 26.2; elsewhere both arms fall back to the same simdgroup kernel. `KQ_NAX_REQUIRE=1` turns its skip — and the NAX band inside `kquant_mode_guards` — into a hard failure.
 

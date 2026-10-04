@@ -71,7 +71,7 @@ export const BASE_KERNEL_MARKERS = [
 ] as const;
 
 /**
- * NAX gen-17 kernel names of the current MLX pin (c23b1113). Their absence on a
+ * NAX gen-17 kernel names of the current MLX pin (369fec31). Their absence on a
  * NAX-building host means a stale or NAX-less metallib was selected;
  * `steel_attention_dsplit` is absent from the previous pin (053e43fe).
  */

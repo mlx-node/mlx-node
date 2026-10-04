@@ -222,16 +222,17 @@ layer whose folded norm would fall into the subnormal band — where the fold st
 being exact — is skipped and warned about, with the rest of the model lifted
 normally.
 
-**MXFP4 — E8M0 exponent search.** MLX rounds `log2(amax / 6)` to nearest, which
-leaves the block maximum above E2M1's top code on roughly three blocks in five
-and clips it. Rounding the other way never clips but spends a binade of
-resolution on the other thirty-one values. The encoder tries both and keeps the
-lower squared error. E8M0 has no mantissa, so those two exponents are the entire
-candidate set. This needs an in-tree encoder: `mlx_quantize` takes its scales as
-output parameters only, so the tuned encoder — not MLX's — writes every MXFP4 and
-MXFP8 tensor the converter emits. MLX's own rounded encoder survives as a
-`#[cfg(test)]` reference, where two bit-identity tests pin it byte-for-byte
-against `mlx_quantize` and a third pins the production dispatch to the tuned one.
+**MXFP4 — E8M0 exponent search.** Rounding `log2(amax / 6)` to nearest (MLX's
+rule before upstream `02adf7b21`) leaves the block maximum above E2M1's top code
+on roughly three blocks in five and clips it. Rounding up (MLX's rule since)
+never clips but spends a binade of resolution on the other thirty-one values.
+The encoder tries both and keeps the lower squared error. E8M0 has no mantissa,
+so those two exponents are the entire candidate set. This needs an in-tree
+encoder: `mlx_quantize` takes its scales as output parameters only, so the tuned
+encoder — not MLX's — writes every MXFP4 and MXFP8 tensor the converter emits.
+MLX's current round-up rule survives as a `#[cfg(test)]` reference, where two
+bit-identity tests pin it byte-for-byte against `mlx_quantize` and a third pins
+the production dispatch to the tuned one.
 
 **MXFP8 — E8M0 exponent ceiling.** The same defect, the larger blast radius: on
 the fixed MXFP map MXFP8 carries 233 of the 401 quantized tensors — every
@@ -256,8 +257,9 @@ Run against the per-block optimum on real weights, the ceiling ties it to four
 decimals on every tensor while the search costs 55% more encode time
 (19.6s versus 30.4s over Qwen3.8-27B's 10.6 G MXFP8 elements). NVIDIA modelopt,
 vLLM and CUTLASS all take the ceiling for E8M0, and Blackwell's
-`cvt.rp.satfinite.ue8m0x2.f32` does it in hardware; MLX itself already ceils on
-its CUDA backend and rounds to nearest only on Metal and CPU.
+`cvt.rp.satfinite.ue8m0x2.f32` does it in hardware. MLX ceils on every backend
+since upstream `02adf7b21`, so MXFP8 scale bytes from convert now equal
+`mlx_quantize`'s.
 
 The NVFP4 lift and the two MX rules are mutually exclusive by construction. The
 lift is a provable no-op on MXFP4 and MXFP8 — E8M0 spans `2^±127` with no
@@ -313,11 +315,11 @@ relative error because the product lands in E4M3's subnormal band; **checkpoints
 converted before this change must be regenerated** — the loader rejects one that
 has no `.global_scale`. Ingest also re-quantizes the FP8 Mamba-2 projections to
 **affine 8-bit group-32** with the checkpoint's static `input_scale` threaded as
-`input_amax`. (These were mxfp8 8/32 until the quantization-accuracy pass: MLX
-rounds the E8M0 block exponent to NEAREST rather than ceil, which costs 6.1%
-relative RMS against a per-tensor-E4M3 source versus 0.64% for affine 8/32 —
-a 9.6x error reduction on the whole sequence-mixing backbone. Checkpoints
-converted before that pass are rejected at load with a regenerate hint.) No
+`input_amax`. (These were mxfp8 8/32 until the quantization-accuracy pass. On a
+per-tensor-E4M3 source, mxfp8 costs 2.96% relative RMS against 0.64% for affine
+8/32 — about 4.7x — even with the E8M0 exponent rounded up; with MLX's old
+round-to-nearest it was 6.1%. Checkpoints converted before that pass are
+rejected at load with a regenerate hint.) No
 re-quantization flags apply (`-q`/`--q-recipe` are rejected on this
 already-quantized source); the convert is a format/repack pass, not a recipe.
 One consequence: the output is no longer loadable by mlx-lm as plain nvfp4.
@@ -846,11 +848,11 @@ z-lab DFlash2 draft above remains manually installable for converted
 checkpoints). See `catalogRepo` in `packages/agent/src/catalog.ts` for why GGUF
 replaced the earlier MXFP4/NVFP4 split.
 
-> **CUDA caveat (measured):** the K-quant modes the GGUF import repacks into
-> (`q4k`/`q5k`/`q6k`) are not implemented in the CUDA backend yet —
-> `QuantizedMatmul`/`GatherQMM`/dequantize throw
-> `"Quantization mode … is not implemented on the CUDA backend"`
-> (`reject_kquant`). Linux inference on these defaults therefore lands with
+> **CUDA caveat:** the K-quant modes the GGUF import repacks into
+> (`q4k`/`q5k`/`q6k`) have no CUDA kernels yet — mlx-node's own K-quant
+> primitives throw `"… K-quant modes are not implemented on this GPU backend."`
+> on any GPU but Metal (`crates/mlx-sys/src/mlx_kquant_metal.cpp`). Linux
+> inference on these defaults therefore lands with
 > CUDA K-quant kernel support; today's DGX Spark path is to convert the GGUF
 > with the NVIDIA recipes (`mlx convert --q-recipe nvidia`, see
 > docs/cuda-poc-benchmark.md), which yields CUDA-executable affine/NVFP4

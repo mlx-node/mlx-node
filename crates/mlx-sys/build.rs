@@ -359,8 +359,8 @@ fn main() -> io::Result<()> {
         }
         // Upstream MLX only builds the NAX (gen-17 tensor-core) kernels when
         // the deployment floor is >= 26.2 and otherwise compiles the dispatch
-        // out via MLX_METAL_NO_NAX. The vendored fork branch
-        // (mlx-node/mlx#nax-macos-26-0-floor) adds MLX_METAL_FORCE_NAX to
+        // out via MLX_METAL_NO_NAX. A patch in the vendored fork
+        // (docs/mlx-fork.md) adds MLX_METAL_FORCE_NAX to
         // decouple kernel presence from the floor, so one published artifact
         // can keep a macOS 26.0 floor AND carry the NAX kernels. The NAX
         // kernels themselves still compile at -mmacosx-version-min=26.2 —
