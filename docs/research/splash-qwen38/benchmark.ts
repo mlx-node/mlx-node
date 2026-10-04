@@ -44,7 +44,6 @@ const cases: Case[] = [
 const environment = Object.fromEntries(
   [
     'MLX_QMM_SPLITK_MIN_M',
-    'MLX_METAL_OP_TRACE',
     'MLX_METAL_COMMAND_TRACE',
     'MLX_DFLASH2_PHASE_TIME',
     'MLX_MAX_OPS_PER_BUFFER',

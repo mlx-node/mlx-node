@@ -207,8 +207,11 @@ Draft and policy:
 ### Command trace
 
 `MLX_METAL_COMMAND_TRACE=1` logs `[metal-command]`, `[mlx-evaluation]` and
-`[mlx-compiled]` lines. The deleted `analyze-command-trace.mjs` unioned GPU
-intervals per benchmark window (commands, dispatches, barriers, gaps). Rules:
+`[mlx-compiled]` lines; `=2` adds a `[metal-op]` line per primitive, `=3` its
+dtypes. Each `[metal-command]` line counts `dispatches` and `primitives`
+(every `gpu::eval`, including no-dispatch ones, so `primitives ≥ dispatches`).
+The deleted `analyze-command-trace.mjs` unioned GPU intervals per benchmark
+window (commands, dispatches, barriers, gaps). Rules:
 logging perturbs timing; the eval wait holds real deferred GPU work, not CPU
 overhead; `resourceBytes` is not traffic; the `mlx-compiled` span is an upper
 bound on replay cost.

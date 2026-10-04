@@ -22,7 +22,7 @@ There are already some wild used inference implementations for your reference:
 - [docs/vllm-speculative-alignment.md](docs/vllm-speculative-alignment.md) — Speculative × paged KV vs vLLM: adopted laws, permanent divergences (with reopen triggers), and the remaining alignment ladder
 - [docs/paged-cache.md](docs/paged-cache.md) — Block-paged KV cache support matrix and parity gates
 - [docs/ffi-cpp.md](docs/ffi-cpp.md) — C++ FFI bridge, compiled Qwen3.5 forward paths, Metal shaders
-- [docs/mlx-fork.md](docs/mlx-fork.md) — The MLX submodule: the 6 fork patches and why each stays, what moved into mlx-node, how to bump the pin (golden gates)
+- [docs/mlx-fork.md](docs/mlx-fork.md) — The MLX submodule: the 5 fork patches and why each stays, what moved into mlx-node, how to bump the pin (golden gates)
 - [docs/perf.md](docs/perf.md) — Profiling, env-var inventory, GPU arch detection, quantization
 - [docs/cli.md](docs/cli.md) — `mlx download`, `mlx convert`, `mlx launch claude`
 - [docs/convert-quantize.md](docs/convert-quantize.md) — Convert/quantize internals: on-disk formats, recipe decision engine, GGUF import, provenance, gotchas
