@@ -26,7 +26,7 @@ The bridge between MLX (C++) and the NAPI/Rust layer lives in `crates/mlx-sys/`.
 | `mlx_paged_ops.cpp`          | `PagedKVWrite` / `PagedAttention` custom MLX ops (largest file in the bridge)                                                                                                                                  |
 | `mlx_paged_profile.cpp`      | Profile-run helpers for auto-sizing the block pool                                                                                                                                                             |
 | `mlx_kquant.*`               | GGUF K-quant / IQ primitives (`KQuantMatmul`, `KQuantGatherQMM`, `KQuantDequantize`): validation and CPU reference. MLX has no K-quant mode; see [mlx-fork.md](mlx-fork.md)                                    |
-| `mlx_kquant_metal.cpp`       | Metal dispatch for the K-quant primitives; JIT-builds kernels from `metal/kquant/`                                                                                                                             |
+| `mlx_kquant_metal.cpp`       | Metal dispatch for the K-quant primitives; loads the kernels prebuilt from `metal/kquant/*.metal` into `paged_attn.metallib`                                                                                   |
 | `mlx_affine_mixed_qmm.*`     | BF16-x × F32-sidecar affine matmul (`AffineMixedQmm`); native `qmv_wide` kernel for 2..8 rows                                                                                                                  |
 | `mlx_segmented_sdpa.*`       | Segmented verify SDPA (BF16, D=256) over prefix + new K/V; JIT kernels from `metal/common/sdpa_segmented.metal.inc`                                                                                            |
 | `mlx_segmented_sdpa_plan.h`  | Pure launch and route planning for segmented SDPA, shared with the tests                                                                                                                                       |
@@ -102,11 +102,12 @@ locks per step. `crates/mlx-core/src/engine/compiled_lock.rs` is now only an
 
 ## Metal shaders
 
-`crates/mlx-sys/src/metal/` holds the JIT shader includes. Reusable quantized
+`crates/mlx-sys/src/metal/` holds the JIT shader includes and the K-quant
+kernel sources. Reusable quantized
 projections, routing helpers, normalization, rotary, convolution and Gated
 DeltaNet kernels live in `common/`; Qwen4's fixed routing/head geometry and
-hyper-connection fusions live in `qwen4/`; the GGUF K-quant / IQ kernel headers
-live in `kquant/`. [mlx-fork.md](mlx-fork.md) lists the golden gates that guard
+hyper-connection fusions live in `qwen4/`; the GGUF K-quant / IQ kernels live
+in `kquant/` and are prebuilt into `paged_attn.metallib`. [mlx-fork.md](mlx-fork.md) lists the golden gates that guard
 the K-quant, mixed-affine and segmented SDPA kernels on an MLX bump. The
 [kernel guide](../crates/mlx-sys/src/metal/README.md) records the layout and
 arithmetic contracts for new model callers. Family-specific dispatch and
@@ -122,4 +123,4 @@ fallbacks remain in the C++ adapters.
 | `float8.metal`                    | FP8 type conversions and helpers      |
 | `utils.metal`                     | Common Metal utilities                |
 
-`crates/mlx-sys/build.rs` compiles `.metal` sources into `paged_attn.metallib` and copies both `paged_attn.metallib` and `mlx.metallib` into `target/<profile>/` and `target/<profile>/deps/` so integration tests discover them.
+`crates/mlx-sys/build.rs` compiles these sources and the K-quant kernels (`crates/mlx-sys/src/metal/kquant/{kquant,kquant_nax}.metal`, with MLX's kernel flags) into `paged_attn.metallib`, skips any `.air` whose flags, toolchain and included files are unchanged, and copies both `paged_attn.metallib` and `mlx.metallib` into `target/<profile>/` and `target/<profile>/deps/` so integration tests discover them.

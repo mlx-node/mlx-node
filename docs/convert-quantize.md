@@ -320,7 +320,8 @@ Why this reuses MLX's affine kernel algebra:
    cursor runs off one row into the next (`kquant.h:657`).
 
 It is a **copied kernel family, not the same binary**: `crates/mlx-sys/src/metal/kquant/kquant.h` is
-mlx-node's own source, JIT-compiled per kernel by `mlx_kquant_metal.cpp`, with two extra template
+mlx-node's own source, prebuilt into `paged_attn.metallib` (`kquant.metal`) and dispatched by
+`mlx_kquant_metal.cpp`, with two extra template
 params (`super_ratio`, `has_min`). Its `QuantizedBlockLoader` generalises the affine loader's
 `static_assert(BCOLS <= group_size)` (`crates/mlx-sys/mlx/mlx/backend/metal/kernels/quantized.h:582`)
 into `group_steps`/`scale_step` because q6k's group of 16 is narrower than the BK=32 tile

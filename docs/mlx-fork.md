@@ -33,19 +33,29 @@ The bridge also prints `[mlx-compiled]` lines under `MLX_METAL_COMMAND_TRACE=1`
 ## What lives in mlx-node instead
 
 These replace former fork patches and fork-only MLX APIs. They run as bridge
-primitives and JIT-built Metal libraries, from sources in `crates/mlx-sys/src/`.
+primitives over Metal libraries we build, from sources in `crates/mlx-sys/src/`:
+JIT-built at first use, except the K-quant kernels, which `build.rs` prebuilds
+into `paged_attn.metallib`.
 
-| feature                                                                                          | sources                                                                                                                              | JIT library                                                           | pin-bump gate                                                     |
+| feature                                                                                          | sources                                                                                                                              | Metal library                                                         | pin-bump gate                                                     |
 | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| GGUF K-quants `q3k q4k q5k q6k iq4nl iq4xs iq3s`: matmul, `gather_qmm`, dequantize (CPU + Metal) | `mlx_kquant.{h,cpp}` (ops, validation, CPU reference), `mlx_kquant_metal.cpp` (Metal dispatch), `metal/kquant/{kquant,kquant_nax}.h` | `mlx_node_<kernel>`                                                   | `kquant_golden_gate`                                              |
+| GGUF K-quants `q3k q4k q5k q6k iq4nl iq4xs iq3s`: matmul, `gather_qmm`, dequantize (CPU + Metal) | `mlx_kquant.{h,cpp}` (ops, validation, CPU reference), `mlx_kquant_metal.cpp` (Metal dispatch), `metal/kquant/{kquant,kquant_nax}.h` | prebuilt in `paged_attn.metallib` (`metal/kquant/*.metal`)            | `kquant_golden_gate`                                              |
 | BF16-x × F32-sidecar affine matmul; native `qmv_wide` for gs 32, 8 bits, 2..8 rows, gen ≥ 15     | `mlx_affine_mixed_qmm.{h,cpp}`, `metal/common/affine_qmv_wide_mixed.metal.inc`                                                       | `mlx_node_affine_qmv_wide_mixed_q8g32_nv<N>`                          | `affine_mixed_golden_gate`                                        |
 | Segmented verify SDPA (BF16, D=256) and its planners                                             | `mlx_segmented_sdpa.{h,cpp}`, `mlx_segmented_sdpa_plan.h`, `metal/common/sdpa_segmented.metal.inc`                                   | `mlx_node_sdpa_segmented`; stage 2 is MLX's own `sdpa_vector_2pass_2` | `segmented_sdpa_golden_gate`                                      |
 | D=256 full-SDPA probes `mlx_metal_d256_full_sdpa_{available,would_use}`                          | `mlx_stream.cpp`: a copy of upstream's `use_fallback` + `has_fused_kernel` (`mlx/backend/metal/scaled_dot_product_attention.cpp`)    | none                                                                  | `qwen35_d256_sdpa` (re-read the upstream predicate on every bump) |
 | Test-only hooks (counters, explicit-device entry points)                                         | `mlx_test_kquant.cpp`, `mlx_test_affine_mixed.cpp`, `mlx_test_counters.h`                                                            | -                                                                     | -                                                                 |
 
-The K-quant libraries also include MLX headers as source text (`utils`, `steel/gemm/gemm`,
-`quantized_utils`, `steel/gemm/gemm_nax`, ...). `build.rs` generates them from the
-pinned tree, so an MLX bump can change these kernels without any change in our files.
+These kernels include MLX headers (`utils`, `steel/gemm/gemm`, `quantized_utils`,
+`steel/gemm/gemm_nax`, ...) from the pinned tree: `build.rs` compiles the K-quant
+`.metal` files against them and generates the source-text preambles the JIT
+libraries use. An MLX bump can change these kernels without any change in our files.
+
+The K-quant `.air` files use MLX's own kernel flags (`-fno-fast-math`, no `-O`, no
+`-std`; NAX at a 26.2 minimum, built only under MLX's NAX condition), not the
+paged-attention flags, and link after the paged `.air` files so the library keeps
+the deployment floor's min-OS stamp. There is no JIT fallback: a missing kernel
+throws. `kquant_metallib_names` checks every name the dispatcher can build against
+the library, both ways.
 
 ## Removed, because upstream now has it
 
@@ -145,7 +155,9 @@ check (old vs new addon, 3072 tokens, deterministic per binary): Qwen3.8-27B mxf
 +0.06%, Qwen3.6-35B-A3B MoE mxfp4 −0.08%.
 
 **5. Metallib.** `packages/core/metallib-select.ts` names kernels that a healthy
-`mlx.metallib` from this pin must contain (`BASE_KERNEL_MARKERS`, `NAX_KERNEL_MARKERS`).
+`mlx.metallib` from this pin must contain (`BASE_KERNEL_MARKERS`, `NAX_KERNEL_MARKERS`),
+and the K-quant kernels `paged_attn.metallib` must contain (`KQUANT_KERNEL_MARKERS`,
+`KQUANT_NAX_KERNEL_MARKERS`).
 Update them when upstream renames or removes a kernel, then run
 `vp test __test__/core/metallib-select.test.ts`. `yarn build:native` runs the same
 check on the built file. The GEMM canaries in `crates/mlx-core/src/test_support.rs`
@@ -157,4 +169,5 @@ GEMM accuracy on this machine changed.
 `scripts/benchmark-model.ts` (decode and prefill), `docs/research/splash-qwen38/benchmark.ts`
 (DFlash2; compare ms per verify cycle when transcripts differ), and
 `crates/mlx-core/tests/qwen35_paged_prefill_operator_bench.rs` for D=256 prefill.
-The first run after a bump pays a one-time JIT compile for every changed kernel source.
+The first run after a bump pays a one-time JIT compile for every changed mixed-affine
+or segmented SDPA kernel source; the K-quant kernels are prebuilt.
