@@ -4,8 +4,8 @@
  * either change is ~19.5 MB or ~31.8 MB, well over the 10 MiB size floor, so
  * the floor alone would sign it into the bundle and the first GGUF K-quant
  * or mixed-affine matmul would throw. The payload check runs
- * the same marker gate `yarn build:native` does, and takes the NAX expectation
- * from the `mlx.metallib` it ships with, not from the packaging host.
+ * the same marker gate `yarn build:native` does: both libraries must carry
+ * their NAX kernels, which every Metal build at the 26.2 floor compiles.
  */
 
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -35,7 +35,7 @@ const PAGED_NAX = [...PAGED_BASE, ...KQUANT_NAX_KERNEL_MARKERS];
 
 /**
  * A complete MTLB container over the 10 MiB paged floor that names exactly
- * `kernels`: recognized header (min-OS 26.0), declared size = byte length.
+ * `kernels`: recognized header (min-OS 26.2), declared size = byte length.
  */
 function library(kernels: readonly string[], magic = 'MTLB'): Buffer {
   const header = Buffer.alloc(24);
@@ -45,6 +45,7 @@ function library(kernels: readonly string[], magic = 'MTLB'): Buffer {
   header.writeUInt16LE(9, 8);
   header[11] = 0x81;
   header.writeUInt16LE(26, 12);
+  header[14] = 2;
   const names = Buffer.from(['', ...kernels].join('\0') + '\0');
   const metallib = Buffer.concat([header, names, Buffer.alloc(11 * 1024 * 1024)]);
   metallib.writeBigUInt64LE(BigInt(metallib.byteLength), 16);
@@ -72,65 +73,53 @@ describe('checkMetallibPair', () => {
   }
 
   it('rejects a paged-only library above the size floor', () => {
-    for (const mlx of [MLX_BASE, MLX_NAX]) {
-      const [m, p] = pair(library(mlx), library(PAGED_KERNELS));
-      expect(() => checkMetallibPair(m, p)).toThrow(PayloadError);
-      expect(() => checkMetallibPair(m, p)).toThrow(/missing K-quant kernel/);
-    }
+    const [m, p] = pair(library(MLX_NAX), library(PAGED_KERNELS));
+    expect(() => checkMetallibPair(m, p)).toThrow(PayloadError);
+    expect(() => checkMetallibPair(m, p)).toThrow(/missing K-quant kernel/);
   });
 
   it('rejects a library with the K-quant kernels but not the segmented SDPA / mixed-affine ones', () => {
-    for (const [mlx, kquantNax] of [
-      [MLX_BASE, []],
-      [MLX_NAX, KQUANT_NAX_KERNEL_MARKERS],
-    ] as const) {
-      const paged = library([...PAGED_KERNELS, ...KQUANT_KERNEL_MARKERS, ...kquantNax]);
-      expect(() => checkMetallibPair(...pair(library(mlx), paged))).toThrow(
-        /missing segmented SDPA \/ mixed-affine kernel/,
-      );
-    }
+    const paged = library([...PAGED_KERNELS, ...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS]);
+    expect(() => checkMetallibPair(...pair(library(MLX_NAX), paged))).toThrow(
+      /missing segmented SDPA \/ mixed-affine kernel/,
+    );
   });
 
   it('rejects either file when it is shorter than its header declares', () => {
-    for (const [mlx, paged] of [
-      [MLX_BASE, PAGED_BASE],
-      [MLX_NAX, PAGED_NAX],
-    ] as const) {
-      expect(() => checkMetallibPair(...pair(library(mlx), truncated(library(paged))))).toThrow(/header declares/);
-      expect(() => checkMetallibPair(...pair(truncated(library(mlx)), library(paged)))).toThrow(/header declares/);
-    }
+    expect(() => checkMetallibPair(...pair(library(MLX_NAX), truncated(library(PAGED_NAX))))).toThrow(
+      /header declares/,
+    );
+    expect(() => checkMetallibPair(...pair(truncated(library(MLX_NAX)), library(PAGED_NAX)))).toThrow(
+      /header declares/,
+    );
   });
 
-  it('accepts a pair that agrees on NAX, either way', () => {
-    expect(() => checkMetallibPair(...pair(library(MLX_BASE), library(PAGED_BASE)))).not.toThrow();
+  it('accepts a pair that both carry NAX', () => {
     expect(() => checkMetallibPair(...pair(library(MLX_NAX), library(PAGED_NAX)))).not.toThrow();
   });
 
-  // A host probe that says "no NAX" (an older host, or a failed probe) would
-  // accept this pair; the artifacts say the build has NAX.
-  it('rejects a base-only paged library next to a NAX mlx.metallib', () => {
+  it('rejects a paged library without the K-quant NAX kernels', () => {
     expect(() => checkMetallibPair(...pair(library(MLX_NAX), library(PAGED_BASE)))).toThrow(
       KQUANT_NAX_KERNEL_MARKERS[0],
     );
   });
 
-  it('rejects a NAX paged library next to an mlx.metallib without NAX', () => {
-    expect(() => checkMetallibPair(...pair(library(MLX_BASE), library(PAGED_NAX)))).toThrow(
-      /carries K-quant NAX kernels but the mlx\.metallib/,
-    );
+  it('rejects an MLX_METAL_NO_NAX mlx.metallib', () => {
+    for (const paged of [PAGED_BASE, PAGED_NAX]) {
+      expect(() => checkMetallibPair(...pair(library(MLX_BASE), library(paged)))).toThrow(/has no NAX kernels/);
+    }
   });
 
-  it('fails closed when mlx.metallib does not say whether it has NAX', () => {
-    const cases: Buffer[] = [
-      library(MLX_NAX, 'NOPE'),
-      library(MLX_NAX_ONLY_MARKERS),
-      library([...BASE_KERNEL_MARKERS, MLX_NAX_ONLY_MARKERS[0]]),
-    ];
-    for (const mlx of cases) {
-      for (const paged of [PAGED_BASE, PAGED_NAX]) {
-        expect(() => checkMetallibPair(...pair(mlx, library(paged)))).toThrow(/cannot tell whether .* NAX/);
-      }
-    }
+  it('rejects an mlx.metallib with some NAX kernels, or no MTLB magic', () => {
+    expect(() =>
+      checkMetallibPair(...pair(library([...BASE_KERNEL_MARKERS, MLX_NAX_ONLY_MARKERS[0]]), library(PAGED_NAX))),
+    ).toThrow(/is missing NAX kernel/);
+    expect(() => checkMetallibPair(...pair(library(MLX_NAX_ONLY_MARKERS), library(PAGED_NAX)))).toThrow(
+      /missing the base MLX kernel/,
+    );
+    expect(() => checkMetallibPair(...pair(library(MLX_NAX, 'NOPE'), library(PAGED_NAX)))).toThrow(
+      /MTLB container magic/,
+    );
   });
 
   const core = join(import.meta.dirname, '..', '..', 'core');

@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import { readFile, writeFile, copyFile, stat, mkdir, rm } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,12 +11,11 @@ import {
   assertMetallibIntegrity,
   assertPagedMetallibIntegrity,
   hostAppleTriple,
-  mlxMetallibCarriesNax,
+  MACOS_DEPLOYMENT_FLOOR,
   profileDirName,
   resolveTargetRoot,
   selectMetallib,
   selectPagedMetallib,
-  shouldExpectNaxKernels,
 } from './metallib-select';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -165,20 +163,6 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   console.log(`Copied ${expectedName} -> ${dst}`);
 }
 
-// Probe the same inputs MLX's kernel CMake uses to decide whether the NAX
-// (M5 tensor-core) kernels are compiled on this host; the metallib gate then
-// requires them to be present. Any probe failure downgrades to the base gate
-// only — a broken Metal toolchain already fails the native build itself.
-function detectExpectNax(): boolean {
-  try {
-    const sdkVersion = execFileSync('xcrun', ['-sdk', 'macosx', '--show-sdk-version'], { encoding: 'utf-8' }).trim();
-    const hostVersion = execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
-    return shouldExpectNaxKernels(sdkVersion, hostVersion, process.env.MACOSX_DEPLOYMENT_TARGET);
-  } catch {
-    return false;
-  }
-}
-
 // Publish/release fail-closed switch (set as `MLX_METALLIB_STRICT=1` in the
 // CI workflow env — see .github/workflows/ci.yml). In strict mode the metallib
 // gates FAIL CLOSED: a Metal-enabled addon that bakes no METAL_PATH aborts the
@@ -191,19 +175,12 @@ function metallibStrictMode(): boolean {
   return v === '1' || v === 'true';
 }
 
-// The intended min-OS load floor for the artifacts we ship: an explicit
-// MACOSX_DEPLOYMENT_TARGET (what build.rs forwards to the MLX cmake build and
-// the paged-attn metal link), else the build host's macOS version (MLX's
-// cmake default). Undefined skips the floor gate — a broken sw_vers probe
-// must not fail an otherwise healthy build.
-function detectDeploymentFloor(): string | undefined {
+// The min-OS load floor build.rs compiled the metallibs for: an explicit
+// MACOSX_DEPLOYMENT_TARGET, else MACOS_DEPLOYMENT_FLOOR (a Metal build below
+// it fails in build.rs, so no lower floor reaches this gate).
+function detectDeploymentFloor(): string {
   const env = process.env.MACOSX_DEPLOYMENT_TARGET;
-  if (env !== undefined && env !== '') return env;
-  try {
-    return execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
-  } catch {
-    return undefined;
-  }
+  return env !== undefined && env !== '' ? env : MACOS_DEPLOYMENT_FLOOR;
 }
 
 async function copyMetallibs(outputs: Awaited<typeof task>) {
@@ -247,15 +224,13 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
   // would refuse to load on floor machines).
   const deploymentFloor = detectDeploymentFloor();
   const metallib = await readFile(picked.metallibPath);
-  assertMetallibIntegrity(metallib, { path: picked.metallibPath, expectNax: detectExpectNax() });
-  if (deploymentFloor !== undefined) {
-    assertMetallibFloor(metallib, {
-      path: picked.metallibPath,
-      deploymentFloor,
-      strict,
-      warn: (msg) => console.warn(msg),
-    });
-  }
+  assertMetallibIntegrity(metallib, { path: picked.metallibPath });
+  assertMetallibFloor(metallib, {
+    path: picked.metallibPath,
+    deploymentFloor,
+    strict,
+    warn: (msg) => console.warn(msg),
+  });
 
   for (const dest of destDirs) {
     const dst = join(dest, 'mlx.metallib');
@@ -272,19 +247,13 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     libDir: picked.libDir,
     warn: (msg) => console.warn(msg),
   });
-  // NAX in the paged library follows the mlx.metallib of the same build.
-  assertPagedMetallibIntegrity(paged.contents, {
+  assertPagedMetallibIntegrity(paged.contents, { path: paged.path });
+  assertMetallibFloor(paged.contents, {
     path: paged.path,
-    expectNax: mlxMetallibCarriesNax(metallib, picked.metallibPath),
+    deploymentFloor,
+    strict,
+    warn: (msg) => console.warn(msg),
   });
-  if (deploymentFloor !== undefined) {
-    assertMetallibFloor(paged.contents, {
-      path: paged.path,
-      deploymentFloor,
-      strict,
-      warn: (msg) => console.warn(msg),
-    });
-  }
   for (const dest of destDirs) {
     const dst = join(dest, 'paged_attn.metallib');
     await copyFile(paged.path, dst);

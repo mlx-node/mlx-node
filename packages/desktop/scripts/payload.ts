@@ -11,8 +11,8 @@ import { join } from 'node:path';
 
 import {
   assertMetallibComplete,
+  assertMlxMetallibCarriesNax,
   assertPagedMetallibIntegrity,
-  mlxMetallibCarriesNax,
 } from '../../core/metallib-select.js';
 
 /**
@@ -109,22 +109,19 @@ export function resolvePayload(repoRoot: string): PayloadSource {
 
 /**
  * `paged_attn.metallib` passes the same gate `yarn build:native` applies
- * (packages/core/metallib-select.ts): it holds the K-quant, segmented SDPA and
- * mixed-affine kernels, which have no JIT fallback, so an older library clears
- * any size floor and then throws on first use. Whether it must also hold the
- * K-quant NAX kernels follows the `mlx.metallib` it ships with — both come
- * from one native build — never the host doing the packaging. A pair that
- * disagrees, an `mlx.metallib` whose NAX status cannot be read, or either file
- * shorter than its MTLB header declares, fails.
+ * (packages/core/metallib-select.ts): it holds the K-quant (NAX included),
+ * segmented SDPA and mixed-affine kernels, which have no JIT fallback, so an
+ * older library clears any size floor and then throws on first use. An
+ * `mlx.metallib` without MLX's NAX kernels (an MLX_METAL_NO_NAX build), or
+ * either file shorter than its MTLB header declares, fails.
  */
 export function checkMetallibPair(mlxMetallibPath: string, pagedMetallibPath: string): void {
   try {
     const mlxMetallib = readFileSync(mlxMetallibPath);
-    const expectNax = mlxMetallibCarriesNax(mlxMetallib, mlxMetallibPath);
+    assertMlxMetallibCarriesNax(mlxMetallib, mlxMetallibPath);
     assertMetallibComplete(mlxMetallib, mlxMetallibPath);
     assertPagedMetallibIntegrity(readFileSync(pagedMetallibPath), {
       path: pagedMetallibPath,
-      expectNax,
       minBytes: MIN_BYTES['paged_attn.metallib'],
     });
   } catch (err) {

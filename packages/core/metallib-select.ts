@@ -27,9 +27,9 @@
 //      most recently (`invoked.timestamp` / build-script `output` /
 //      metallib mtime).
 //   3. Content gates run on the chosen metallib either way: minimum size +
-//      expected kernel names (including the current pin's NAX kernels on
-//      hosts where MLX builds them), plus a min-OS stamp check against the
-//      intended deployment floor. Failures abort the build loudly instead
+//      expected kernel names (the NAX kernels included: every Metal build
+//      carries them), plus a min-OS stamp check against the intended
+//      deployment floor. Failures abort the build loudly instead
 //      of shipping a broken pairing.
 //
 // Stale dirs are deliberately NOT deleted: they are live cargo cache for
@@ -45,6 +45,9 @@ export interface MetallibCandidate {
   /** Newest cargo activity observed for this build-script dir (ms). */
   rankMtimeMs: number;
 }
+
+/** `MACOS_DEPLOYMENT_TARGET_FLOOR` of `crates/mlx-sys/build.rs`. */
+export const MACOS_DEPLOYMENT_FLOOR = '26.2';
 
 /** Smallest healthy mlx.metallib observed is ~154 MB; anything far below is truncated. */
 export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
@@ -92,7 +95,7 @@ export const BRIDGE_KERNEL_MARKERS = [
   'mlx_node_affine_qmv_wide_mixed_q8g32_nv8',
 ] as const;
 
-/** The K-quant NAX kernels, built when MLX builds its own NAX kernels. */
+/** The K-quant NAX kernels. */
 export const KQUANT_NAX_KERNEL_MARKERS = [
   'q4k_qmm_t_nax_bfloat16_t_gs_32_b_4_bm64_bn64_bk64_wm2_wn2_alN_true_batch_0',
   'q6k_qmm_t_nax_float_gs_16_b_6_bm64_bn64_bk64_wm2_wn2_alN_false_batch_1',
@@ -111,9 +114,9 @@ export const BASE_KERNEL_MARKERS = [
 ] as const;
 
 /**
- * NAX gen-17 kernel names of the current MLX pin (369fec31). Their absence on a
- * NAX-building host means a stale or NAX-less metallib was selected;
- * `steel_attention_dsplit` is absent from the previous pin (053e43fe).
+ * NAX gen-17 kernel names of the current MLX pin (4be8a5709). Their absence
+ * means a stale or NAX-less metallib was selected; `steel_attention_dsplit` is
+ * absent from the previous pin (053e43fe).
  */
 export const NAX_KERNEL_MARKERS = ['affine_qmv_wide', 'steel_gemm_segmented_nax', 'steel_attention_dsplit'] as const;
 
@@ -422,18 +425,10 @@ export function selectPagedMetallib(opts: {
  * Hard gate before paged_attn.metallib is copied anywhere, mirroring
  * `assertMetallibIntegrity`: a truncated file (size floor and
  * {@link assertMetallibComplete}), a non-metallib container or a
- * library without the K-quant kernels (`expectNax`: and their NAX kernels) or
- * the segmented SDPA / mixed-affine kernels must fail the build loudly.
+ * library without the K-quant kernels (NAX included) or the segmented SDPA /
+ * mixed-affine kernels must fail the build loudly.
  */
-export function assertPagedMetallibIntegrity(
-  metallib: Buffer,
-  opts: {
-    path: string;
-    /** The mlx.metallib of the same build carries NAX kernels ({@link mlxMetallibCarriesNax}). */
-    expectNax: boolean;
-    minBytes?: number;
-  },
-): void {
+export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: string; minBytes?: number }): void {
   const minBytes = opts.minBytes ?? MIN_PAGED_METALLIB_BYTES;
   if (metallib.byteLength < minBytes) {
     throw new Error(
@@ -451,14 +446,13 @@ export function assertPagedMetallibIntegrity(
     );
   }
   assertMetallibComplete(metallib, opts.path);
-  const markers = opts.expectNax ? [...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS] : KQUANT_KERNEL_MARKERS;
-  const missing = markers.filter((name) => !metallib.includes(name));
+  const missing = [...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS].filter((name) => !metallib.includes(name));
   if (missing.length > 0) {
     throw new Error(
       `[build.ts metallib gate] ${opts.path} is missing K-quant kernel(s) ${missing.join(', ')} — ` +
         `mlx_kquant_metal.cpp loads them from this library and has no JIT fallback. It was built ` +
-        `by an older mlx-sys/build.rs, or by a build without the NAX kernels its mlx.metallib ` +
-        `carries. Re-run the native build; if it persists, remove the containing mlx-sys-*/out dir.`,
+        `by an older mlx-sys/build.rs. Re-run the native build; if it persists, remove the ` +
+        `containing mlx-sys-*/out dir.`,
     );
   }
   const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => !metallib.includes(name));
@@ -471,52 +465,45 @@ export function assertPagedMetallibIntegrity(
         `mlx-sys-*/out dir.`,
     );
   }
-  if (!opts.expectNax && metallib.includes(KQUANT_NAX_FAMILY)) {
-    throw new Error(
-      `[build.ts metallib gate] ${opts.path} carries K-quant NAX kernels but the mlx.metallib it ` +
-        `ships with has no NAX kernels — the two come from different native builds. Re-run the ` +
-        `native build; if it persists, remove the containing mlx-sys-*/out dir.`,
-    );
-  }
 }
-
-/** Every K-quant NAX kernel name contains this; no other paged_attn.metallib function does. */
-const KQUANT_NAX_FAMILY = '_qmm_t_nax_';
 
 /**
  * Function-name prefixes that only MLX's NAX kernel files instantiate
  * (`steel_gemm_fused_nax.metal`, `quantized_nax.metal`,
  * `steel_attention_nax.metal`). MLX compiles those files only under its NAX
- * condition, the same one build.rs uses for the K-quant NAX kernels, and no
- * other MLX kernel file mentions `nax`.
+ * condition, and no other MLX kernel file mentions `nax`.
  */
 export const MLX_NAX_ONLY_MARKERS = ['steel_gemm_fused_nax_', 'affine_qmm_t_nax_', 'steel_attention_dsplit_'] as const;
 
 /**
- * Whether a built mlx.metallib carries MLX's NAX kernels. mlx.metallib and
- * paged_attn.metallib come out of one native build under one NAX condition, so
- * this decides whether the paged library must carry the K-quant NAX kernels —
- * from the artifacts, not from whatever host checks them. Throws when it cannot
- * tell: not a metallib, not this pin's MLX kernels, or only some NAX markers.
+ * A built mlx.metallib must carry MLX's NAX kernels: with the 26.2 deployment
+ * floor every macOS Metal build compiles them, so their absence means MLX fell
+ * back to MLX_METAL_NO_NAX (a deployment target or SDK below 26.2) and the
+ * library would run without them on M5-class GPUs.
  */
-export function mlxMetallibCarriesNax(metallib: Buffer, path: string): boolean {
-  const cannotTell = (why: string) =>
+export function assertMlxMetallibCarriesNax(metallib: Buffer, path: string): void {
+  const fail = (why: string) =>
     new Error(
-      `[metallib gate] cannot tell whether ${path} carries NAX kernels: ${why}. Re-run the ` +
-        `native build; if it persists, remove the containing mlx-sys-*/out dir.`,
+      `[metallib gate] ${path} ${why}. Re-run the native build; if it persists, remove the ` +
+        `containing mlx-sys-*/out dir.`,
     );
   if (metallib.toString('latin1', 0, 4) !== 'MTLB') {
-    throw cannotTell('it does not start with the MTLB container magic');
+    throw fail('does not start with the MTLB container magic');
   }
   const missingBase = BASE_KERNEL_MARKERS.filter((name) => !metallib.includes(name));
   if (missingBase.length > 0) {
-    throw cannotTell(`it is missing the base MLX kernel(s) ${missingBase.join(', ')}`);
+    throw fail(`is missing the base MLX kernel(s) ${missingBase.join(', ')}`);
   }
-  const present = MLX_NAX_ONLY_MARKERS.filter((name) => metallib.includes(name));
-  if (present.length !== 0 && present.length !== MLX_NAX_ONLY_MARKERS.length) {
-    throw cannotTell(`it has NAX kernel(s) ${present.join(', ')} but not all of ${MLX_NAX_ONLY_MARKERS.join(', ')}`);
+  const missingNax = MLX_NAX_ONLY_MARKERS.filter((name) => !metallib.includes(name));
+  if (missingNax.length === MLX_NAX_ONLY_MARKERS.length) {
+    throw fail(
+      `has no NAX kernels (${MLX_NAX_ONLY_MARKERS.join(', ')}): MLX built it as MLX_METAL_NO_NAX, ` +
+        `which happens only below a 26.2 deployment target or macOS SDK`,
+    );
   }
-  return present.length !== 0;
+  if (missingNax.length > 0) {
+    throw fail(`is missing NAX kernel(s) ${missingNax.join(', ')}`);
+  }
 }
 
 export function profileDirName(opts: { profile?: string | undefined; release?: boolean | undefined }): string {
@@ -533,31 +520,6 @@ export function compareVersions(a: string, b: string): number {
     if (diff !== 0) return diff;
   }
   return 0;
-}
-
-/**
- * Mirror of the NAX condition in the vendored MLX's
- * `mlx/backend/metal/kernels/CMakeLists.txt` as configured by
- * `crates/mlx-sys/build.rs`. mlx-sys always passes `-DMLX_METAL_FORCE_NAX=ON`
- * (fork branch `nax-macos-26-0-floor`), which drops upstream's
- * deployment-target >= 26.2 clause, so NAX kernels are compiled iff the macOS
- * SDK is >= 26.2 AND the effective `CMAKE_OSX_DEPLOYMENT_TARGET` is >= 26.0
- * (below 26.0 the Metal language version falls under MSL 4.0 and the gate's
- * `MLX_METAL_VERSION GREATER_EQUAL 400` clause fails). The deployment target
- * defaults to the build host's macOS version when `MACOSX_DEPLOYMENT_TARGET`
- * is not set. The force-built NAX kernels internally compile against the
- * macOS 26.2 tensor-ops ABI while the metallib links (and load-gates) at the
- * floor; runtime dispatch still requires macOS 26.2 — kernel presence and
- * dispatch are deliberately decoupled so one 26.0-floor artifact serves
- * every macOS 26 host.
- */
-export function shouldExpectNaxKernels(
-  sdkVersion: string,
-  hostVersion: string,
-  deploymentTargetEnv: string | undefined,
-): boolean {
-  const effectiveTarget = deploymentTargetEnv && deploymentTargetEnv !== '' ? deploymentTargetEnv : hostVersion;
-  return compareVersions(sdkVersion, '26.2') >= 0 && compareVersions(effectiveTarget, '26.0') >= 0;
 }
 
 /**
@@ -614,10 +576,7 @@ export function collectMetallibCandidates(targetRoot: string, triple: string, pr
  * floor and {@link assertMetallibComplete}) or a stale-pin kernel inventory
  * must fail the build loudly, not ship to npm.
  */
-export function assertMetallibIntegrity(
-  metallib: Buffer,
-  opts: { path: string; expectNax: boolean; minBytes?: number },
-): void {
+export function assertMetallibIntegrity(metallib: Buffer, opts: { path: string; minBytes?: number }): void {
   const minBytes = opts.minBytes ?? MIN_METALLIB_BYTES;
   if (metallib.byteLength < minBytes) {
     throw new Error(
@@ -636,18 +595,16 @@ export function assertMetallibIntegrity(
         `this is not a healthy MLX kernel library for the vendored pin.`,
     );
   }
-  if (opts.expectNax) {
-    const missingNax = missing(NAX_KERNEL_MARKERS);
-    if (missingNax.length > 0) {
-      throw new Error(
-        `[build.ts metallib gate] ${opts.path} is missing NAX kernel(s) ${missingNax.join(', ')} ` +
-          `although this host builds them (SDK and deployment target >= 26.2). The metallib is ` +
-          `stale — most likely from an out-of-date mlx-sys-*/out dir of a previous MLX pin. ` +
-          `Re-run the native build; if it persists, remove the stale mlx-sys-* dirs under ` +
-          `target/*/release/build/.`,
-      );
-    }
+  const missingNax = missing(NAX_KERNEL_MARKERS);
+  if (missingNax.length > 0) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} is missing NAX kernel(s) ${missingNax.join(', ')}. ` +
+        `The metallib is stale — most likely from an out-of-date mlx-sys-*/out dir of a previous ` +
+        `MLX pin. Re-run the native build; if it persists, remove the stale mlx-sys-* dirs under ` +
+        `target/*/release/build/.`,
+    );
   }
+  assertMlxMetallibCarriesNax(metallib, opts.path);
 }
 
 /**

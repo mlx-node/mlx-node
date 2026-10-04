@@ -28,15 +28,14 @@ import {
   collectMetallibCandidates,
   compareVersions,
   extractBakedMetallibBinding,
+  assertMlxMetallibCarriesNax,
   hostAppleTriple,
-  mlxMetallibCarriesNax,
   parseMetallibDeclaredSize,
   parseMetallibMinOs,
   profileDirName,
   resolveTargetRoot,
   selectMetallib,
   selectPagedMetallib,
-  shouldExpectNaxKernels,
 } from '../../packages/core/metallib-select';
 
 const TRIPLE = 'aarch64-apple-darwin';
@@ -53,27 +52,6 @@ describe('compareVersions', () => {
     expect(compareVersions('26.5.2', '26.2')).toBeGreaterThan(0);
     expect(compareVersions('26', '26.0')).toBe(0);
     expect(compareVersions('15.0', '26.2')).toBeLessThan(0);
-  });
-});
-
-describe('shouldExpectNaxKernels', () => {
-  it('mirrors the forced-NAX cmake gate: SDK >= 26.2 AND effective deployment target >= 26.0', () => {
-    // deployment target defaults to the host version when the env is unset
-    expect(shouldExpectNaxKernels('26.5', '26.5.2', undefined)).toBe(true);
-    expect(shouldExpectNaxKernels('26.2', '26.2', undefined)).toBe(true);
-    // MLX_METAL_FORCE_NAX drops upstream's >= 26.2 floor clause: any
-    // macOS 26 target (MSL 4.0) builds the NAX kernels
-    expect(shouldExpectNaxKernels('26.5', '26.1', undefined)).toBe(true);
-    // SDK too old builds no NAX regardless of target
-    expect(shouldExpectNaxKernels('15.5', '26.5', undefined)).toBe(false);
-    // the published-artifact configuration: 26.0 floor still carries NAX
-    expect(shouldExpectNaxKernels('26.5', '26.5', '26.0')).toBe(true);
-    // a pre-26 floor drops MSL below 4.0, which fails the gate's
-    // MLX_METAL_VERSION >= 400 clause
-    expect(shouldExpectNaxKernels('26.5', '26.5', '15.0')).toBe(false);
-    expect(shouldExpectNaxKernels('26.5', '26.1', '26.2')).toBe(true);
-    // empty env behaves like unset
-    expect(shouldExpectNaxKernels('26.5', '26.5', '')).toBe(true);
   });
 });
 
@@ -547,83 +525,76 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
   );
 
   const pagedLibrary = (markers: readonly string[]) => metallibWith(markers);
-  const PREBUILT = [...KQUANT_KERNEL_MARKERS, ...BRIDGE_KERNEL_MARKERS];
+  const KQUANT = [...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS];
+  const PREBUILT = [...KQUANT, ...BRIDGE_KERNEL_MARKERS];
 
   it('integrity gate: rejects truncation via the size floor and non-MTLB content via the magic', () => {
     // An identically-truncated PAIR passes selection (byte-equal) — the
     // integrity gate is what catches it.
-    expect(() => assertPagedMetallibIntegrity(Buffer.from('MTLB tiny'), { path: 'x', expectNax: false })).toThrow(
+    expect(() => assertPagedMetallibIntegrity(Buffer.from('MTLB tiny'), { path: 'x' })).toThrow(
       new RegExp(`below the ${MIN_PAGED_METALLIB_BYTES}-byte floor`),
     );
-    expect(() =>
-      assertPagedMetallibIntegrity(Buffer.from('NOPE junk'), { path: 'x', expectNax: false, minBytes: 1 }),
-    ).toThrow(/MTLB container magic/);
-    expect(() =>
-      assertPagedMetallibIntegrity(pagedLibrary(PREBUILT), { path: 'x', expectNax: false, minBytes: 1 }),
-    ).not.toThrow();
+    expect(() => assertPagedMetallibIntegrity(Buffer.from('NOPE junk'), { path: 'x', minBytes: 1 })).toThrow(
+      /MTLB container magic/,
+    );
+    expect(() => assertPagedMetallibIntegrity(pagedLibrary(PREBUILT), { path: 'x', minBytes: 1 })).not.toThrow();
   });
 
   it('integrity gate: rejects a paged library without the prebuilt K-quant kernels', () => {
     // A pre-K-quant paged_attn.metallib: the paged kernels only.
     expect(() =>
-      assertPagedMetallibIntegrity(pagedLibrary(['paged_attention_bfloat16_t']), {
-        path: 'x',
-        expectNax: false,
-        minBytes: 1,
-      }),
-    ).toThrow(new RegExp(`missing K-quant kernel\\(s\\) ${KQUANT_KERNEL_MARKERS.join(', ')}`));
-    for (const dropped of KQUANT_KERNEL_MARKERS) {
-      const library = pagedLibrary(KQUANT_KERNEL_MARKERS.filter((name) => name !== dropped));
-      expect(() => assertPagedMetallibIntegrity(library, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
-        dropped,
-      );
+      assertPagedMetallibIntegrity(pagedLibrary(['paged_attention_bfloat16_t']), { path: 'x', minBytes: 1 }),
+    ).toThrow(new RegExp(`missing K-quant kernel\\(s\\) ${KQUANT.join(', ')}`));
+    for (const dropped of KQUANT) {
+      const library = pagedLibrary(PREBUILT.filter((name) => name !== dropped));
+      expect(() => assertPagedMetallibIntegrity(library, { path: 'x', minBytes: 1 })).toThrow(dropped);
     }
+  });
+
+  it('integrity gate: rejects a paged library without the K-quant NAX kernels', () => {
+    const withoutNax = pagedLibrary([...KQUANT_KERNEL_MARKERS, ...BRIDGE_KERNEL_MARKERS]);
+    expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', minBytes: 1 })).toThrow(
+      new RegExp(`missing K-quant kernel\\(s\\) ${KQUANT_NAX_KERNEL_MARKERS.join(', ')}`),
+    );
   });
 
   it('integrity gate: rejects a paged library without the segmented SDPA / mixed-affine kernels', () => {
     // The K-quant-only library of the previous build.
-    expect(() =>
-      assertPagedMetallibIntegrity(pagedLibrary(KQUANT_KERNEL_MARKERS), { path: 'x', expectNax: false, minBytes: 1 }),
-    ).toThrow(new RegExp(`missing segmented SDPA / mixed-affine kernel\\(s\\) ${BRIDGE_KERNEL_MARKERS.join(', ')}`));
+    expect(() => assertPagedMetallibIntegrity(pagedLibrary(KQUANT), { path: 'x', minBytes: 1 })).toThrow(
+      new RegExp(`missing segmented SDPA / mixed-affine kernel\\(s\\) ${BRIDGE_KERNEL_MARKERS.join(', ')}`),
+    );
     for (const dropped of BRIDGE_KERNEL_MARKERS) {
       const library = pagedLibrary(PREBUILT.filter((name) => name !== dropped));
-      expect(() => assertPagedMetallibIntegrity(library, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
-        dropped,
-      );
+      expect(() => assertPagedMetallibIntegrity(library, { path: 'x', minBytes: 1 })).toThrow(dropped);
     }
-  });
-
-  it('integrity gate: K-quant NAX kernels present exactly when the mlx.metallib has NAX', () => {
-    const withoutNax = pagedLibrary(PREBUILT);
-    expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: false, minBytes: 1 })).not.toThrow();
-    expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: true, minBytes: 1 })).toThrow(
-      KQUANT_NAX_KERNEL_MARKERS[0],
-    );
-    const withNax = pagedLibrary([...PREBUILT, ...KQUANT_NAX_KERNEL_MARKERS]);
-    expect(() => assertPagedMetallibIntegrity(withNax, { path: 'x', expectNax: true, minBytes: 1 })).not.toThrow();
-    expect(() => assertPagedMetallibIntegrity(withNax, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
-      /carries K-quant NAX kernels/,
-    );
   });
 });
 
-describe('mlxMetallibCarriesNax', () => {
+describe('assertMlxMetallibCarriesNax', () => {
   const lib = (names: readonly string[], magic = 'MTLB') => Buffer.from([magic, ...names].join('\0'));
 
-  it('reads NAX from the NAX-only kernel families', () => {
-    expect(mlxMetallibCarriesNax(lib(BASE_KERNEL_MARKERS), 'm')).toBe(false);
-    expect(mlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS]), 'm')).toBe(true);
+  it('accepts a library with every NAX-only kernel family', () => {
+    expect(() =>
+      assertMlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS]), 'm'),
+    ).not.toThrow();
   });
 
-  it('fails closed when it cannot tell', () => {
-    const cannotTell = /cannot tell whether m carries NAX kernels/;
-    expect(() => mlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS], 'NOPE'), 'm')).toThrow(
-      cannotTell,
+  it('rejects an MLX_METAL_NO_NAX library', () => {
+    expect(() => assertMlxMetallibCarriesNax(lib(BASE_KERNEL_MARKERS), 'm')).toThrow(
+      /m has no NAX kernels .*MLX_METAL_NO_NAX/,
     );
-    expect(() => mlxMetallibCarriesNax(lib(MLX_NAX_ONLY_MARKERS), 'm')).toThrow(cannotTell);
+  });
+
+  it('rejects a library with only some NAX kernels, no base kernels, or no MTLB magic', () => {
     for (const only of MLX_NAX_ONLY_MARKERS) {
-      expect(() => mlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, only]), 'm')).toThrow(cannotTell);
+      expect(() => assertMlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, only]), 'm')).toThrow(
+        /m is missing NAX kernel\(s\)/,
+      );
     }
+    expect(() => assertMlxMetallibCarriesNax(lib(MLX_NAX_ONLY_MARKERS), 'm')).toThrow(/missing the base MLX kernel/);
+    expect(() =>
+      assertMlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS], 'NOPE'), 'm'),
+    ).toThrow(/MTLB container magic/);
   });
 });
 
@@ -671,9 +642,9 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
     expect(parseMetallibMinOs(mtlbHeader(26, 0))).toBe('26.0');
     expect(parseMetallibMinOs(mtlbHeader(26, 2))).toBe('26.2');
     expect(parseMetallibMinOs(mtlbHeader(15, 0))).toBe('15.0');
-    // The exact header bytes of the shipped 26.0-floor artifacts.
-    const real = Buffer.from('4d544c420180020009000081' + '1a000000', 'hex');
-    expect(parseMetallibMinOs(real)).toBe('26.0');
+    // The exact header bytes of the shipped 26.2-floor artifacts.
+    const real = Buffer.from('4d544c420180020009000081' + '1a000200', 'hex');
+    expect(parseMetallibMinOs(real)).toBe('26.2');
   });
 
   it('reads minor and update as separate bytes, not one u16 minor', () => {
@@ -772,43 +743,43 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
 });
 
 describe('assertMetallibIntegrity', () => {
-  const healthy = metallibWith([...BASE_KERNEL_MARKERS, ...NAX_KERNEL_MARKERS]);
-  const stalePin = metallibWith(BASE_KERNEL_MARKERS);
+  const healthy = metallibWith([...BASE_KERNEL_MARKERS, ...NAX_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS]);
 
   it('rejects a truncated metallib via the minimum-size floor', () => {
-    expect(() => assertMetallibIntegrity(healthy, { path: 'x', expectNax: false })).toThrow(/below the .*-byte floor/);
+    expect(() => assertMetallibIntegrity(healthy, { path: 'x' })).toThrow(/below the .*-byte floor/);
   });
 
   it('rejects a metallib without the base kernel inventory', () => {
-    expect(() => assertMetallibIntegrity(metallibWith(['junk']), { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
+    expect(() => assertMetallibIntegrity(metallibWith(['junk']), { path: 'x', minBytes: 1 })).toThrow(
       /missing expected kernel/,
     );
   });
 
-  it('rejects the 053e43fe fork-pin inventory even without NAX', () => {
+  it('rejects the 053e43fe fork-pin inventory', () => {
     const forkPin = metallibWith(['steel_attention', 'sdpa_vector', 'sdpa_vector_segmented_verify_2pass_1', 'qmv_sg8']);
-    expect(() => assertMetallibIntegrity(forkPin, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
+    expect(() => assertMetallibIntegrity(forkPin, { path: 'x', minBytes: 1 })).toThrow(
       /missing expected kernel\(s\) sdpa_blocked_scale_copy, seq_gated_delta/,
     );
   });
 
-  it('rejects a previous-pin metallib when the host builds NAX kernels', () => {
-    expect(() => assertMetallibIntegrity(stalePin, { path: 'x', expectNax: true, minBytes: 1 })).toThrow(
+  it('rejects a previous-pin or NAX-less metallib', () => {
+    expect(() => assertMetallibIntegrity(metallibWith(BASE_KERNEL_MARKERS), { path: 'x', minBytes: 1 })).toThrow(
       /missing NAX kernel/,
     );
-    // ...but accepts it when NAX is legitimately not built on this host.
-    expect(() => assertMetallibIntegrity(stalePin, { path: 'x', expectNax: false, minBytes: 1 })).not.toThrow();
+    // The pin markers alone are not the NAX-only kernel families.
+    const noNax = metallibWith([...BASE_KERNEL_MARKERS, ...NAX_KERNEL_MARKERS]);
+    expect(() => assertMetallibIntegrity(noNax, { path: 'x', minBytes: 1 })).toThrow(/has no NAX kernels/);
   });
 
   it('accepts a current-pin metallib with NAX kernels', () => {
-    expect(() => assertMetallibIntegrity(healthy, { path: 'x', expectNax: true, minBytes: 1 })).not.toThrow();
+    expect(() => assertMetallibIntegrity(healthy, { path: 'x', minBytes: 1 })).not.toThrow();
   });
 });
 
 describe('assertMetallibComplete', () => {
   it('reads the declared size from the shipped header bytes', () => {
     // First 24 bytes of the 31,863,042-byte paged_attn.metallib.
-    const real = Buffer.from('4d544c4201800200090000811a000000' + '0231e60100000000', 'hex');
+    const real = Buffer.from('4d544c4201800200090000811a000200' + '0231e60100000000', 'hex');
     expect(parseMetallibDeclaredSize(real)).toBe(31_863_042);
     expect(parseMetallibDeclaredSize(mtlbHeader(26, 0, { platform: 0x9001 }))).toBeUndefined();
     expect(parseMetallibDeclaredSize(Buffer.from('MTLB'))).toBeUndefined();
@@ -835,13 +806,10 @@ describe('assertMetallibComplete', () => {
       writeFileSync(prefixPath, full.subarray(0, 4 * 1024 * 1024));
       const prefix = readFileSync(prefixPath);
       expect(BRIDGE_KERNEL_MARKERS.every((name) => prefix.includes(name))).toBe(true);
-      for (const expectNax of [false, true]) {
-        expect(() => assertPagedMetallibIntegrity(prefix, { path: prefixPath, expectNax })).toThrow(
-          new RegExp(`is ${prefix.byteLength} bytes but its header declares ${full.byteLength}`),
-        );
-      }
-      const expectNax = full.includes('_qmm_t_nax_');
-      expect(() => assertPagedMetallibIntegrity(full, { path: built, expectNax })).not.toThrow();
+      expect(() => assertPagedMetallibIntegrity(prefix, { path: prefixPath })).toThrow(
+        new RegExp(`is ${prefix.byteLength} bytes but its header declares ${full.byteLength}`),
+      );
+      expect(() => assertPagedMetallibIntegrity(full, { path: built })).not.toThrow();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
