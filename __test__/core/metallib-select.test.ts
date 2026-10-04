@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 
 import {
   BASE_KERNEL_MARKERS,
+  BRIDGE_KERNEL_MARKERS,
   KQUANT_KERNEL_MARKERS,
   KQUANT_NAX_KERNEL_MARKERS,
   MIN_PAGED_METALLIB_BYTES,
@@ -535,6 +536,7 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
   );
 
   const pagedLibrary = (markers: readonly string[]) => Buffer.from(['MTLB', ...markers].join('\0'));
+  const PREBUILT = [...KQUANT_KERNEL_MARKERS, ...BRIDGE_KERNEL_MARKERS];
 
   it('integrity gate: rejects truncation via the size floor and non-MTLB content via the magic', () => {
     // An identically-truncated PAIR passes selection (byte-equal) — the
@@ -546,7 +548,7 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
       assertPagedMetallibIntegrity(Buffer.from('NOPE junk'), { path: 'x', expectNax: false, minBytes: 1 }),
     ).toThrow(/MTLB container magic/);
     expect(() =>
-      assertPagedMetallibIntegrity(pagedLibrary(KQUANT_KERNEL_MARKERS), { path: 'x', expectNax: false, minBytes: 1 }),
+      assertPagedMetallibIntegrity(pagedLibrary(PREBUILT), { path: 'x', expectNax: false, minBytes: 1 }),
     ).not.toThrow();
   });
 
@@ -567,13 +569,26 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
     }
   });
 
+  it('integrity gate: rejects a paged library without the segmented SDPA / mixed-affine kernels', () => {
+    // The K-quant-only library of the previous build.
+    expect(() =>
+      assertPagedMetallibIntegrity(pagedLibrary(KQUANT_KERNEL_MARKERS), { path: 'x', expectNax: false, minBytes: 1 }),
+    ).toThrow(new RegExp(`missing segmented SDPA / mixed-affine kernel\\(s\\) ${BRIDGE_KERNEL_MARKERS.join(', ')}`));
+    for (const dropped of BRIDGE_KERNEL_MARKERS) {
+      const library = pagedLibrary(PREBUILT.filter((name) => name !== dropped));
+      expect(() => assertPagedMetallibIntegrity(library, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
+        dropped,
+      );
+    }
+  });
+
   it('integrity gate: K-quant NAX kernels present exactly when the mlx.metallib has NAX', () => {
-    const withoutNax = pagedLibrary(KQUANT_KERNEL_MARKERS);
+    const withoutNax = pagedLibrary(PREBUILT);
     expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: false, minBytes: 1 })).not.toThrow();
     expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: true, minBytes: 1 })).toThrow(
       KQUANT_NAX_KERNEL_MARKERS[0],
     );
-    const withNax = pagedLibrary([...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS]);
+    const withNax = pagedLibrary([...PREBUILT, ...KQUANT_NAX_KERNEL_MARKERS]);
     expect(() => assertPagedMetallibIntegrity(withNax, { path: 'x', expectNax: true, minBytes: 1 })).not.toThrow();
     expect(() => assertPagedMetallibIntegrity(withNax, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
       /carries K-quant NAX kernels/,

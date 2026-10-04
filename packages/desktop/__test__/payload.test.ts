@@ -1,8 +1,9 @@
 /**
- * `paged_attn.metallib` carries the K-quant kernels, and the addon has no JIT
- * fallback for them. A paged-only library from before that change is ~19.5 MB,
- * well over the 10 MiB size floor, so the floor alone would sign it into the
- * bundle and the first GGUF K-quant matmul would throw. The payload check runs
+ * `paged_attn.metallib` carries the K-quant, segmented SDPA and mixed-affine
+ * kernels, and the addon has no JIT fallback for them. A library from before
+ * either change is ~19.5 MB or ~31.8 MB, well over the 10 MiB size floor, so
+ * the floor alone would sign it into the bundle and the first GGUF K-quant
+ * or mixed-affine matmul would throw. The payload check runs
  * the same marker gate `yarn build:native` does, and takes the NAX expectation
  * from the `mlx.metallib` it ships with, not from the packaging host.
  */
@@ -15,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
   BASE_KERNEL_MARKERS,
+  BRIDGE_KERNEL_MARKERS,
   KQUANT_KERNEL_MARKERS,
   KQUANT_NAX_KERNEL_MARKERS,
   MLX_NAX_ONLY_MARKERS,
@@ -28,7 +30,7 @@ const PAGED_KERNELS = [
 ];
 const MLX_BASE = [...BASE_KERNEL_MARKERS];
 const MLX_NAX = [...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS];
-const PAGED_BASE = [...PAGED_KERNELS, ...KQUANT_KERNEL_MARKERS];
+const PAGED_BASE = [...PAGED_KERNELS, ...KQUANT_KERNEL_MARKERS, ...BRIDGE_KERNEL_MARKERS];
 const PAGED_NAX = [...PAGED_BASE, ...KQUANT_NAX_KERNEL_MARKERS];
 
 /** An MTLB container over the 10 MiB paged floor that names exactly `kernels`. */
@@ -59,6 +61,18 @@ describe('checkMetallibPair', () => {
       const [m, p] = pair(library(mlx), library(PAGED_KERNELS));
       expect(() => checkMetallibPair(m, p)).toThrow(PayloadError);
       expect(() => checkMetallibPair(m, p)).toThrow(/missing K-quant kernel/);
+    }
+  });
+
+  it('rejects a library with the K-quant kernels but not the segmented SDPA / mixed-affine ones', () => {
+    for (const [mlx, kquantNax] of [
+      [MLX_BASE, []],
+      [MLX_NAX, KQUANT_NAX_KERNEL_MARKERS],
+    ] as const) {
+      const paged = library([...PAGED_KERNELS, ...KQUANT_KERNEL_MARKERS, ...kquantNax]);
+      expect(() => checkMetallibPair(...pair(library(mlx), paged))).toThrow(
+        /missing segmented SDPA \/ mixed-affine kernel/,
+      );
     }
   });
 

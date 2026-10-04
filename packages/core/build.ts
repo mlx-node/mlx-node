@@ -95,7 +95,8 @@ await copyNativeAddon(outputs);
 // dispatch path used by `Qwen3Model` (where `use_paged_attention`
 // is on by default for the legacy `PagedKVCache` route and by
 // `use_block_paged_cache` on by default for the new vLLM-style path)
-// and for every GGUF K-quant kernel (prebuilt, no JIT fallback).
+// and for every GGUF K-quant, segmented SDPA and mixed-affine kernel
+// (prebuilt, no JIT fallback).
 // We FAIL the build if either is missing so a packaging regression
 // surfaces immediately rather than as a runtime throw at first use
 // in a published install.

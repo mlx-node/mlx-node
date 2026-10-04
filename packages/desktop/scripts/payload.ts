@@ -105,9 +105,10 @@ export function resolvePayload(repoRoot: string): PayloadSource {
 
 /**
  * `paged_attn.metallib` passes the same gate `yarn build:native` applies
- * (packages/core/metallib-select.ts): it holds the K-quant kernels, which have
- * no JIT fallback, so an older paged-only library clears any size floor and
- * then throws on the first GGUF K-quant matmul. Whether it must also hold the
+ * (packages/core/metallib-select.ts): it holds the K-quant, segmented SDPA and
+ * mixed-affine kernels, which have no JIT fallback, so an older library clears
+ * any size floor and then throws on first use (segmented SDPA instead falls
+ * back to the slower concatenated K/V). Whether it must also hold the
  * K-quant NAX kernels follows the `mlx.metallib` it ships with — both come
  * from one native build — never the host doing the packaging. A pair that
  * disagrees, or an `mlx.metallib` whose NAX status cannot be read, fails.

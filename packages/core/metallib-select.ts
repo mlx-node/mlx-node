@@ -51,7 +51,8 @@ export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
 
 /**
  * paged_attn.metallib holds the paged-attention kernels (~19.5 MB) and the
- * prebuilt K-quant kernels (~12 MB with NAX); a healthy build is ~31.8 MB.
+ * prebuilt bridge kernels (K-quant ~12 MB with NAX, segmented SDPA and mixed
+ * affine ~70 KB); a healthy build is ~31.9 MB.
  * A 4 MiB floor keeps generous headroom for future kernel trimming while
  * still catching a truncated or interrupted write.
  */
@@ -70,6 +71,25 @@ export const KQUANT_KERNEL_MARKERS = [
   'q5k_gather_qmm_rhs_nt_bfloat16_t_gs_32_b_5_bm_16_bn_32_bk_32_wm_1_wn_2',
   'q4k_qmv_sg8_bfloat16_t_gs_32_b_4',
   'kquant_qmv_sg8_prep_bfloat16_t_gs_16',
+] as const;
+
+/**
+ * Segmented SDPA (mlx_segmented_sdpa.cpp) and mixed BF16 x F32-sidecar affine
+ * `qmv_wide` (mlx_affine_mixed_qmm.cpp) kernels, also loaded from
+ * paged_attn.metallib with no JIT fallback: every one either dispatcher can
+ * request.
+ */
+export const BRIDGE_KERNEL_MARKERS = [
+  'mlx_node_sdpa_segmented_bf16_256',
+  'mlx_node_sdpa_segmented_2pass_1_bf16_256',
+  'mlx_node_sdpa_segmented_verify_2pass_1_bf16_256',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv2',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv3',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv4',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv5',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv6',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv7',
+  'mlx_node_affine_qmv_wide_mixed_q8g32_nv8',
 ] as const;
 
 /** The K-quant NAX kernels, built when MLX builds its own NAX kernels. */
@@ -401,8 +421,8 @@ export function selectPagedMetallib(opts: {
 /**
  * Hard gate before paged_attn.metallib is copied anywhere, mirroring
  * `assertMetallibIntegrity`: a truncated file, a non-metallib container or a
- * library without the K-quant kernels (`expectNax`: and their NAX kernels)
- * must fail the build loudly.
+ * library without the K-quant kernels (`expectNax`: and their NAX kernels) or
+ * the segmented SDPA / mixed-affine kernels must fail the build loudly.
  */
 export function assertPagedMetallibIntegrity(
   metallib: Buffer,
@@ -418,7 +438,7 @@ export function assertPagedMetallibIntegrity(
     throw new Error(
       `[build.ts metallib gate] ${opts.path} is ${metallib.byteLength} bytes, below the ` +
         `${minBytes}-byte floor of a healthy paged_attn.metallib (a healthy build is ` +
-        `~31.8 MB) — the file is truncated or the build was interrupted. Re-run ` +
+        `~31.9 MB) — the file is truncated or the build was interrupted. Re-run ` +
         `the native build; if it persists, remove the containing mlx-sys-*/out dir.`,
     );
   }
@@ -437,6 +457,16 @@ export function assertPagedMetallibIntegrity(
         `mlx_kquant_metal.cpp loads them from this library and has no JIT fallback. It was built ` +
         `by an older mlx-sys/build.rs, or by a build without the NAX kernels its mlx.metallib ` +
         `carries. Re-run the native build; if it persists, remove the containing mlx-sys-*/out dir.`,
+    );
+  }
+  const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => !metallib.includes(name));
+  if (missingBridge.length > 0) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} is missing segmented SDPA / mixed-affine kernel(s) ` +
+        `${missingBridge.join(', ')} — mlx_segmented_sdpa.cpp and mlx_affine_mixed_qmm.cpp load ` +
+        `them from this library and have no JIT fallback. It was built by an older ` +
+        `mlx-sys/build.rs. Re-run the native build; if it persists, remove the containing ` +
+        `mlx-sys-*/out dir.`,
     );
   }
   if (!opts.expectNax && metallib.includes(KQUANT_NAX_FAMILY)) {
