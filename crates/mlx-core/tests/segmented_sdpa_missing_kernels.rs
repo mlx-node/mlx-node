@@ -63,13 +63,23 @@ fn bf16(shape: &[i64]) -> MxArray {
     MxArray::from_bfloat16(&vec![0x3f80u16; len], shape).expect("bf16 array")
 }
 
+fn metal_required() -> bool {
+    std::env::var("MLX_TEST_REQUIRE_METAL").is_ok_and(|value| value.trim() == "1")
+}
+
 #[test]
 fn missing_segmented_kernels_are_a_hard_error() {
-    // SAFETY: nullary predicate.
-    assert!(
-        unsafe { mlx_sys::mlx_metal_is_available() },
-        "this test needs a Metal device"
-    );
+    // Not `mlx_metal_is_available()`: a Metal build returns true without a
+    // device, and the probe below reads a failed device init as 0.
+    // SAFETY: nullary probe that constructs the device and catches internally.
+    if unsafe { mlx_sys::mlx_gpu_architecture_gen() } <= 0 {
+        assert!(
+            !metal_required(),
+            "MLX_TEST_REQUIRE_METAL=1 but no Metal device"
+        );
+        eprintln!("skipping: no Metal device");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("segmented-missing-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let metallib = metallib_without_bridge_kernels(&dir);
