@@ -9,7 +9,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { assertPagedMetallibIntegrity, detectExpectNax } from '../../core/metallib-select.js';
+import { assertPagedMetallibIntegrity, mlxMetallibCarriesNax } from '../../core/metallib-select.js';
 
 /**
  * The three native files, which MUST end up in ONE directory together.
@@ -55,19 +55,26 @@ export class PayloadError extends Error {
  * normal state of a fresh checkout — not an exceptional one. The error has to say
  * what to run, or the next person guesses.
  */
-export function resolvePayload(repoRoot: string, opts: { expectNax?: boolean } = {}): PayloadSource {
+export function resolvePayload(repoRoot: string): PayloadSource {
   const nativeDir = join(repoRoot, 'packages', 'core');
   const native: Record<string, string> = {};
-  const expectNax = opts.expectNax ?? detectExpectNax();
 
   for (const file of NATIVE_FILES) {
     const path = join(nativeDir, file);
     if (!existsSync(path)) {
       throw new PayloadError(`Missing native artifact: ${path}`, 'yarn build:native');
     }
-    checkNativeArtifact(file, path, { expectNax });
+    const { size } = statSync(path);
+    const floor = MIN_BYTES[file] ?? 0;
+    if (size < floor) {
+      throw new PayloadError(
+        `${file} is ${size} bytes, under the ${floor}-byte floor — truncated or a placeholder`,
+        'yarn build:native',
+      );
+    }
     native[file] = path;
   }
+  checkMetallibPair(native['mlx.metallib']!, native['paged_attn.metallib']!);
 
   const wwwRoot = join(repoRoot, 'packages', 'dashboard', 'web');
   // index.html specifically: the directory survives a failed build, and an empty
@@ -97,27 +104,24 @@ export function resolvePayload(repoRoot: string, opts: { expectNax?: boolean } =
 }
 
 /**
- * Size floor for every native file. `paged_attn.metallib` also passes the same
- * gate `yarn build:native` applies (packages/core/metallib-select.ts): it holds
- * the K-quant kernels, which have no JIT fallback, so an older paged-only
- * library clears any size floor and then throws on the first GGUF K-quant
- * matmul. `expectNax`: this build also carries the K-quant NAX kernels.
+ * `paged_attn.metallib` passes the same gate `yarn build:native` applies
+ * (packages/core/metallib-select.ts): it holds the K-quant kernels, which have
+ * no JIT fallback, so an older paged-only library clears any size floor and
+ * then throws on the first GGUF K-quant matmul. Whether it must also hold the
+ * K-quant NAX kernels follows the `mlx.metallib` it ships with — both come
+ * from one native build — never the host doing the packaging. A pair that
+ * disagrees, or an `mlx.metallib` whose NAX status cannot be read, fails.
  */
-export function checkNativeArtifact(file: string, path: string, opts: { expectNax: boolean }): void {
-  const { size } = statSync(path);
-  const floor = MIN_BYTES[file] ?? 0;
-  if (size < floor) {
-    throw new PayloadError(
-      `${file} is ${size} bytes, under the ${floor}-byte floor — truncated or a placeholder`,
-      'yarn build:native',
-    );
-  }
-  if (file === 'paged_attn.metallib') {
-    try {
-      assertPagedMetallibIntegrity(readFileSync(path), { path, expectNax: opts.expectNax, minBytes: floor });
-    } catch (err) {
-      throw new PayloadError((err as Error).message, 'yarn build:native');
-    }
+export function checkMetallibPair(mlxMetallibPath: string, pagedMetallibPath: string): void {
+  try {
+    const expectNax = mlxMetallibCarriesNax(readFileSync(mlxMetallibPath), mlxMetallibPath);
+    assertPagedMetallibIntegrity(readFileSync(pagedMetallibPath), {
+      path: pagedMetallibPath,
+      expectNax,
+      minBytes: MIN_BYTES['paged_attn.metallib'],
+    });
+  } catch (err) {
+    throw new PayloadError((err as Error).message, 'yarn build:native');
   }
 }
 

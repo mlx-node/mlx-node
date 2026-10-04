@@ -9,6 +9,7 @@ import {
   KQUANT_KERNEL_MARKERS,
   KQUANT_NAX_KERNEL_MARKERS,
   MIN_PAGED_METALLIB_BYTES,
+  MLX_NAX_ONLY_MARKERS,
   NAX_KERNEL_MARKERS,
   assertMetallibFloor,
   assertMetallibIntegrity,
@@ -17,6 +18,7 @@ import {
   compareVersions,
   extractBakedMetallibBinding,
   hostAppleTriple,
+  mlxMetallibCarriesNax,
   parseMetallibMinOs,
   profileDirName,
   resolveTargetRoot,
@@ -565,7 +567,7 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
     }
   });
 
-  it('integrity gate: requires the K-quant NAX kernels only where this host builds them', () => {
+  it('integrity gate: K-quant NAX kernels present exactly when the mlx.metallib has NAX', () => {
     const withoutNax = pagedLibrary(KQUANT_KERNEL_MARKERS);
     expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: false, minBytes: 1 })).not.toThrow();
     expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: true, minBytes: 1 })).toThrow(
@@ -573,6 +575,29 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
     );
     const withNax = pagedLibrary([...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS]);
     expect(() => assertPagedMetallibIntegrity(withNax, { path: 'x', expectNax: true, minBytes: 1 })).not.toThrow();
+    expect(() => assertPagedMetallibIntegrity(withNax, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
+      /carries K-quant NAX kernels/,
+    );
+  });
+});
+
+describe('mlxMetallibCarriesNax', () => {
+  const lib = (names: readonly string[], magic = 'MTLB') => Buffer.from([magic, ...names].join('\0'));
+
+  it('reads NAX from the NAX-only kernel families', () => {
+    expect(mlxMetallibCarriesNax(lib(BASE_KERNEL_MARKERS), 'm')).toBe(false);
+    expect(mlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS]), 'm')).toBe(true);
+  });
+
+  it('fails closed when it cannot tell', () => {
+    const cannotTell = /cannot tell whether m carries NAX kernels/;
+    expect(() => mlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS], 'NOPE'), 'm')).toThrow(
+      cannotTell,
+    );
+    expect(() => mlxMetallibCarriesNax(lib(MLX_NAX_ONLY_MARKERS), 'm')).toThrow(cannotTell);
+    for (const only of MLX_NAX_ONLY_MARKERS) {
+      expect(() => mlxMetallibCarriesNax(lib([...BASE_KERNEL_MARKERS, only]), 'm')).toThrow(cannotTell);
+    }
   });
 });
 

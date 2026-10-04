@@ -11,12 +11,13 @@ import {
   assertMetallibFloor,
   assertMetallibIntegrity,
   assertPagedMetallibIntegrity,
-  detectExpectNax,
   hostAppleTriple,
+  mlxMetallibCarriesNax,
   profileDirName,
   resolveTargetRoot,
   selectMetallib,
   selectPagedMetallib,
+  shouldExpectNaxKernels,
 } from './metallib-select';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -163,6 +164,20 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   console.log(`Copied ${expectedName} -> ${dst}`);
 }
 
+// Probe the same inputs MLX's kernel CMake uses to decide whether the NAX
+// (M5 tensor-core) kernels are compiled on this host; the metallib gate then
+// requires them to be present. Any probe failure downgrades to the base gate
+// only — a broken Metal toolchain already fails the native build itself.
+function detectExpectNax(): boolean {
+  try {
+    const sdkVersion = execFileSync('xcrun', ['-sdk', 'macosx', '--show-sdk-version'], { encoding: 'utf-8' }).trim();
+    const hostVersion = execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
+    return shouldExpectNaxKernels(sdkVersion, hostVersion, process.env.MACOSX_DEPLOYMENT_TARGET);
+  } catch {
+    return false;
+  }
+}
+
 // Publish/release fail-closed switch (set as `MLX_METALLIB_STRICT=1` in the
 // CI workflow env — see .github/workflows/ci.yml). In strict mode the metallib
 // gates FAIL CLOSED: a Metal-enabled addon that bakes no METAL_PATH aborts the
@@ -256,7 +271,11 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     libDir: picked.libDir,
     warn: (msg) => console.warn(msg),
   });
-  assertPagedMetallibIntegrity(paged.contents, { path: paged.path, expectNax: detectExpectNax() });
+  // NAX in the paged library follows the mlx.metallib of the same build.
+  assertPagedMetallibIntegrity(paged.contents, {
+    path: paged.path,
+    expectNax: mlxMetallibCarriesNax(metallib, picked.metallibPath),
+  });
   if (deploymentFloor !== undefined) {
     assertMetallibFloor(paged.contents, {
       path: paged.path,
