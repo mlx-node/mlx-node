@@ -1804,6 +1804,18 @@ unsafe extern "C-unwind" {
     pub fn mlx_test_kquant_family_count(family: *const std::os::raw::c_char) -> u64;
     /// TEST-ONLY: the GPU generation the Metal dispatcher sees, -1 without Metal.
     pub fn mlx_test_kquant_gpu_gen() -> i32;
+    /// TEST-ONLY: checks `paged_attn.metallib` against every K-quant kernel
+    /// name the Metal dispatcher can build. `counts` (4 slots) receives base
+    /// names, NAX names, K-quant functions in the library and pipelines built;
+    /// `report` receives "missing <name>" / "unexpected <name>" lines.
+    /// `build_pipelines` also builds every pipeline this device can request.
+    /// False without Metal, on error, or when `len` is too small.
+    pub fn mlx_test_kquant_metallib_check(
+        build_pipelines: bool,
+        counts: *mut i64,
+        report: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
     /// TEST-ONLY: the Metal architecture name (NUL-terminated) of the hardware
     /// (`hardware`) or the one the dispatcher routes by (honours
     /// `MLX_METAL_GPU_ARCH`); false without Metal or when `len` is too small.

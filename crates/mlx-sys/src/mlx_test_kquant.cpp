@@ -12,6 +12,10 @@
 
 #ifdef MLX_NODE_METAL_ENABLED
 #include "mlx/backend/metal/device.h"
+#include "mlx_paged_metallib.h"
+
+#include <set>
+#include <sstream>
 #endif
 
 using mlx::core::array;
@@ -86,6 +90,86 @@ int32_t mlx_test_kquant_gpu_gen() {
   }
 #else
   return -1;
+#endif
+}
+
+// Checks paged_attn.metallib against kquant::metal_kernel_names(). `counts`
+// receives {base names, NAX names, K-quant functions in the library, pipelines
+// built}. `report` receives one line per missing name (one the dispatcher can
+// request on this device) and per unexpected K-quant function in the library.
+// `build_pipelines` also builds every required pipeline. False without Metal,
+// on error, or when `report` cannot hold the text.
+bool mlx_test_kquant_metallib_check(bool build_pipelines, int64_t *counts,
+                                    char *report, size_t len) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!counts || !report || len == 0 || !mlx::core::metal::is_available())
+      return false;
+    auto &d = mlx::core::metal::device(mlx::core::Device::gpu);
+    auto *lib = mlx::core::fast::paged::get_paged_attn_library(d);
+    bool nax = mlx::core::metal::is_nax_available();
+
+    std::set<std::string> in_library;
+    NS::Array *functions = lib->functionNames();
+    for (NS::UInteger i = 0; i < functions->count(); ++i) {
+      std::string name = functions->object<NS::String>(i)->utf8String();
+      auto prefix = name.substr(0, name.find('_'));
+      if (kquant::parse_mode(prefix) || name.rfind("kquant_", 0) == 0) {
+        in_library.insert(std::move(name));
+      }
+    }
+
+    std::ostringstream out;
+    std::set<std::string> known;
+    int64_t base = 0, nax_names = 0, built = 0;
+    for (const auto &k : kquant::metal_kernel_names()) {
+      known.insert(k.name);
+      (k.nax ? nax_names : base)++;
+      if (k.nax && !nax)
+        continue;
+      if (!in_library.count(k.name)) {
+        out << "missing " << k.name << "\n";
+        continue;
+      }
+      if (!build_pipelines)
+        continue;
+      if (k.name.find("_gather_qmm_rhs_") != std::string::npos) {
+        bool align = true;
+        mlx::core::metal::MTLFCList consts = {
+            {&align, MTL::DataType::DataTypeBool, 200},
+            {&align, MTL::DataType::DataTypeBool, 201},
+            {&align, MTL::DataType::DataTypeBool, 202},
+        };
+        d.get_kernel(k.name, lib, k.name + "_align_M_t_align_N_t_align_K_t",
+                     consts);
+      } else {
+        d.get_kernel(k.name, lib);
+      }
+      ++built;
+    }
+    for (const auto &name : in_library) {
+      if (!known.count(name))
+        out << "unexpected " << name << "\n";
+    }
+    counts[0] = base;
+    counts[1] = nax_names;
+    counts[2] = static_cast<int64_t>(in_library.size());
+    counts[3] = built;
+    std::string text = out.str();
+    if (text.size() + 1 > len)
+      return false;
+    std::memcpy(report, text.c_str(), text.size() + 1);
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "mlx_test_kquant_metallib_check: " << e.what() << std::endl;
+    return false;
+  }
+#else
+  (void)build_pipelines;
+  (void)counts;
+  (void)report;
+  (void)len;
+  return false;
 #endif
 }
 
