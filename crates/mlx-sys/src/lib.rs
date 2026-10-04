@@ -1816,6 +1816,22 @@ unsafe extern "C-unwind" {
         report: *mut std::ffi::c_char,
         len: usize,
     ) -> bool;
+    /// TEST-ONLY: checks `paged_attn.metallib` against the kernels the
+    /// segmented SDPA (`family` "segmented_sdpa") or mixed-affine
+    /// ("affine_mixed") dispatcher can request. `counts` (3 slots) receives
+    /// dispatcher names, the family's functions in the library and pipelines
+    /// built; `report` receives "missing <name>" / "unexpected <name>" lines.
+    /// `build_pipelines` also builds every pipeline the dispatcher can build,
+    /// each function-constant specialization included, when no name is
+    /// missing. False without Metal, for an unknown family, on error, or when
+    /// `len` is too small.
+    pub fn mlx_test_bridge_metallib_check(
+        family: *const std::ffi::c_char,
+        build_pipelines: bool,
+        counts: *mut i64,
+        report: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
     /// TEST-ONLY: the Metal architecture name (NUL-terminated) of the hardware
     /// (`hardware`) or the one the dispatcher routes by (honours
     /// `MLX_METAL_GPU_ARCH`); false without Metal or when `len` is too small.
