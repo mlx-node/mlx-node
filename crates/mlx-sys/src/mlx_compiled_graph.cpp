@@ -24,6 +24,7 @@
 #include <mutex>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 
 #include <algorithm>
@@ -95,7 +96,7 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
   }
   static const bool trace = [] {
     const char* v = std::getenv("MLX_METAL_COMMAND_TRACE");
-    return v && std::string(v) == "1";
+    return v && std::atoi(v) >= 1;
   }();
   const auto trace_start = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
