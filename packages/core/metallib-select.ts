@@ -420,7 +420,8 @@ export function selectPagedMetallib(opts: {
 
 /**
  * Hard gate before paged_attn.metallib is copied anywhere, mirroring
- * `assertMetallibIntegrity`: a truncated file, a non-metallib container or a
+ * `assertMetallibIntegrity`: a truncated file (size floor and
+ * {@link assertMetallibComplete}), a non-metallib container or a
  * library without the K-quant kernels (`expectNax`: and their NAX kernels) or
  * the segmented SDPA / mixed-affine kernels must fail the build loudly.
  */
@@ -449,6 +450,7 @@ export function assertPagedMetallibIntegrity(
         `containing mlx-sys-*/out dir.`,
     );
   }
+  assertMetallibComplete(metallib, opts.path);
   const markers = opts.expectNax ? [...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS] : KQUANT_KERNEL_MARKERS;
   const missing = markers.filter((name) => !metallib.includes(name));
   if (missing.length > 0) {
@@ -608,8 +610,9 @@ export function collectMetallibCandidates(targetRoot: string, triple: string, pr
 }
 
 /**
- * Hard gate before the metallib is copied anywhere: a truncated file or a
- * stale-pin kernel inventory must fail the build loudly, not ship to npm.
+ * Hard gate before the metallib is copied anywhere: a truncated file (size
+ * floor and {@link assertMetallibComplete}) or a stale-pin kernel inventory
+ * must fail the build loudly, not ship to npm.
  */
 export function assertMetallibIntegrity(
   metallib: Buffer,
@@ -624,6 +627,7 @@ export function assertMetallibIntegrity(
         `containing mlx-sys-*/out dir to force a clean MLX kernel build.`,
     );
   }
+  assertMetallibComplete(metallib, opts.path);
   const missing = (markers: readonly string[]) => markers.filter((name) => !metallib.includes(name));
   const missingBase = missing(BASE_KERNEL_MARKERS);
   if (missingBase.length > 0) {
@@ -673,11 +677,7 @@ export function assertMetallibIntegrity(
  * `xcrun air-vtool -show`, which prints PlatformMajor/Minor/Update.
  */
 export function parseMetallibMinOs(metallib: Buffer): string | undefined {
-  if (metallib.byteLength < 16) return undefined;
-  if (metallib.toString('latin1', 0, 4) !== 'MTLB') return undefined;
-  if (metallib.readUInt16LE(4) !== 0x8001) return undefined;
-  if (metallib.readUInt16LE(6) !== 2) return undefined;
-  if (metallib[10] !== 0x00 || metallib[11] !== 0x81) return undefined;
+  if (!isRecognizedMtlbHeader(metallib, 16)) return undefined;
   const major = metallib.readUInt16LE(12);
   const minor = metallib[14];
   const update = metallib[15];
@@ -685,6 +685,55 @@ export function parseMetallibMinOs(metallib: Buffer): string | undefined {
   // outside a generous bound means the offset no longer holds a version.
   if (major < 10 || major > 99) return undefined;
   return update === 0 ? `${major}.${minor}` : `${major}.${minor}.${update}`;
+}
+
+function isRecognizedMtlbHeader(metallib: Buffer, minBytes: number): boolean {
+  return (
+    metallib.byteLength >= minBytes &&
+    metallib.toString('latin1', 0, 4) === 'MTLB' &&
+    metallib.readUInt16LE(4) === 0x8001 &&
+    metallib.readUInt16LE(6) === 2 &&
+    metallib[10] === 0x00 &&
+    metallib[11] === 0x81
+  );
+}
+
+/**
+ * The total file size the MTLB container header declares: u64 LE at offset
+ * 16, in the layout {@link parseMetallibMinOs} recognizes. Validated equal to
+ * the file size on the shipped mlx.metallib (205,904,480 B) and
+ * paged_attn.metallib (31,863,042 B), the previous paged library, and small
+ * `xcrun metallib` builds at 15.0 / 26.0 / 26.2 floors. Undefined for any
+ * other layout.
+ */
+export function parseMetallibDeclaredSize(metallib: Buffer): number | undefined {
+  if (!isRecognizedMtlbHeader(metallib, 24)) return undefined;
+  const size = metallib.readBigUInt64LE(16);
+  return size <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(size) : undefined;
+}
+
+/**
+ * A metallib cut short after its function-name table still has the magic, a
+ * size above any floor and every kernel name, and Metal rejects it as a
+ * truncated module. The header's declared size must equal the file size; a
+ * header layout this gate does not know fails closed.
+ */
+export function assertMetallibComplete(metallib: Buffer, path: string): void {
+  const declared = parseMetallibDeclaredSize(metallib);
+  if (declared === undefined) {
+    throw new Error(
+      `[metallib gate] ${path}: unrecognized MTLB header layout, so its completeness cannot be ` +
+        `checked. The container format changed (new toolchain?); update ` +
+        `parseMetallibDeclaredSize to recognize the new layout.`,
+    );
+  }
+  if (declared !== metallib.byteLength) {
+    throw new Error(
+      `[metallib gate] ${path} is ${metallib.byteLength} bytes but its header declares ` +
+        `${declared} — the file is truncated or was not fully written. Re-run the native ` +
+        `build; if it persists, remove the containing mlx-sys-*/out dir.`,
+    );
+  }
 }
 
 /**

@@ -33,11 +33,26 @@ const MLX_NAX = [...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS];
 const PAGED_BASE = [...PAGED_KERNELS, ...KQUANT_KERNEL_MARKERS, ...BRIDGE_KERNEL_MARKERS];
 const PAGED_NAX = [...PAGED_BASE, ...KQUANT_NAX_KERNEL_MARKERS];
 
-/** An MTLB container over the 10 MiB paged floor that names exactly `kernels`. */
+/**
+ * A complete MTLB container over the 10 MiB paged floor that names exactly
+ * `kernels`: recognized header (min-OS 26.0), declared size = byte length.
+ */
 function library(kernels: readonly string[], magic = 'MTLB'): Buffer {
-  const names = Buffer.from([magic, ...kernels].join('\0') + '\0');
-  return Buffer.concat([names, Buffer.alloc(11 * 1024 * 1024)]);
+  const header = Buffer.alloc(24);
+  header.write(magic, 0, 'latin1');
+  header.writeUInt16LE(0x8001, 4);
+  header.writeUInt16LE(2, 6);
+  header.writeUInt16LE(9, 8);
+  header[11] = 0x81;
+  header.writeUInt16LE(26, 12);
+  const names = Buffer.from(['', ...kernels].join('\0') + '\0');
+  const metallib = Buffer.concat([header, names, Buffer.alloc(11 * 1024 * 1024)]);
+  metallib.writeBigUInt64LE(BigInt(metallib.byteLength), 16);
+  return metallib;
 }
+
+/** `metallib` cut to `bytes`, as an interrupted copy leaves it. */
+const truncated = (metallib: Buffer, bytes = 10.5 * 1024 * 1024) => metallib.subarray(0, bytes);
 
 describe('checkMetallibPair', () => {
   let dir: string;
@@ -73,6 +88,16 @@ describe('checkMetallibPair', () => {
       expect(() => checkMetallibPair(...pair(library(mlx), paged))).toThrow(
         /missing segmented SDPA \/ mixed-affine kernel/,
       );
+    }
+  });
+
+  it('rejects either file when it is shorter than its header declares', () => {
+    for (const [mlx, paged] of [
+      [MLX_BASE, PAGED_BASE],
+      [MLX_NAX, PAGED_NAX],
+    ] as const) {
+      expect(() => checkMetallibPair(...pair(library(mlx), truncated(library(paged))))).toThrow(/header declares/);
+      expect(() => checkMetallibPair(...pair(truncated(library(mlx)), library(paged)))).toThrow(/header declares/);
     }
   });
 

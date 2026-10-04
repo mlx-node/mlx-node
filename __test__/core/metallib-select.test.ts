@@ -1,4 +1,13 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,6 +22,7 @@ import {
   MLX_NAX_ONLY_MARKERS,
   NAX_KERNEL_MARKERS,
   assertMetallibFloor,
+  assertMetallibComplete,
   assertMetallibIntegrity,
   assertPagedMetallibIntegrity,
   collectMetallibCandidates,
@@ -20,6 +30,7 @@ import {
   extractBakedMetallibBinding,
   hostAppleTriple,
   mlxMetallibCarriesNax,
+  parseMetallibDeclaredSize,
   parseMetallibMinOs,
   profileDirName,
   resolveTargetRoot,
@@ -535,7 +546,7 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
     },
   );
 
-  const pagedLibrary = (markers: readonly string[]) => Buffer.from(['MTLB', ...markers].join('\0'));
+  const pagedLibrary = (markers: readonly string[]) => metallibWith(markers);
   const PREBUILT = [...KQUANT_KERNEL_MARKERS, ...BRIDGE_KERNEL_MARKERS];
 
   it('integrity gate: rejects truncation via the size floor and non-MTLB content via the magic', () => {
@@ -615,6 +626,13 @@ describe('mlxMetallibCarriesNax', () => {
     }
   });
 });
+
+/** A complete MTLB container naming `names`: recognized header, declared size = byte length. */
+function metallibWith(names: readonly string[]): Buffer {
+  const metallib = Buffer.concat([mtlbHeader(26, 0), Buffer.from(['', ...names, ''].join('\0'))]);
+  metallib.writeBigUInt64LE(BigInt(metallib.byteLength), 16);
+  return metallib;
+}
 
 /**
  * MTLB container header with the given min-OS stamp (u16 LE major @12,
@@ -754,23 +772,21 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
 });
 
 describe('assertMetallibIntegrity', () => {
-  const healthy = Buffer.from(['MTLB', ...BASE_KERNEL_MARKERS, ...NAX_KERNEL_MARKERS].join('\0'));
-  const stalePin = Buffer.from(['MTLB', ...BASE_KERNEL_MARKERS].join('\0'));
+  const healthy = metallibWith([...BASE_KERNEL_MARKERS, ...NAX_KERNEL_MARKERS]);
+  const stalePin = metallibWith(BASE_KERNEL_MARKERS);
 
   it('rejects a truncated metallib via the minimum-size floor', () => {
     expect(() => assertMetallibIntegrity(healthy, { path: 'x', expectNax: false })).toThrow(/below the .*-byte floor/);
   });
 
   it('rejects a metallib without the base kernel inventory', () => {
-    expect(() =>
-      assertMetallibIntegrity(Buffer.from('MTLB junk'), { path: 'x', expectNax: false, minBytes: 1 }),
-    ).toThrow(/missing expected kernel/);
+    expect(() => assertMetallibIntegrity(metallibWith(['junk']), { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
+      /missing expected kernel/,
+    );
   });
 
   it('rejects the 053e43fe fork-pin inventory even without NAX', () => {
-    const forkPin = Buffer.from(
-      ['MTLB', 'steel_attention', 'sdpa_vector', 'sdpa_vector_segmented_verify_2pass_1', 'qmv_sg8'].join('\0'),
-    );
+    const forkPin = metallibWith(['steel_attention', 'sdpa_vector', 'sdpa_vector_segmented_verify_2pass_1', 'qmv_sg8']);
     expect(() => assertMetallibIntegrity(forkPin, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
       /missing expected kernel\(s\) sdpa_blocked_scale_copy, seq_gated_delta/,
     );
@@ -786,5 +802,48 @@ describe('assertMetallibIntegrity', () => {
 
   it('accepts a current-pin metallib with NAX kernels', () => {
     expect(() => assertMetallibIntegrity(healthy, { path: 'x', expectNax: true, minBytes: 1 })).not.toThrow();
+  });
+});
+
+describe('assertMetallibComplete', () => {
+  it('reads the declared size from the shipped header bytes', () => {
+    // First 24 bytes of the 31,863,042-byte paged_attn.metallib.
+    const real = Buffer.from('4d544c4201800200090000811a000000' + '0231e60100000000', 'hex');
+    expect(parseMetallibDeclaredSize(real)).toBe(31_863_042);
+    expect(parseMetallibDeclaredSize(mtlbHeader(26, 0, { platform: 0x9001 }))).toBeUndefined();
+    expect(parseMetallibDeclaredSize(Buffer.from('MTLB'))).toBeUndefined();
+  });
+
+  it('rejects a file shorter or longer than its header declares, and an unknown layout', () => {
+    const full = metallibWith(BASE_KERNEL_MARKERS);
+    expect(() => assertMetallibComplete(full, 'x')).not.toThrow();
+    expect(() => assertMetallibComplete(full.subarray(0, full.byteLength - 1), 'x')).toThrow(/header declares/);
+    expect(() => assertMetallibComplete(Buffer.concat([full, Buffer.alloc(1)]), 'x')).toThrow(/header declares/);
+    expect(() => assertMetallibComplete(Buffer.from(['MTLB', ...BASE_KERNEL_MARKERS].join('\0')), 'x')).toThrow(
+      /unrecognized MTLB header layout/,
+    );
+  });
+
+  // Metal rejects this prefix as a truncated module, yet it keeps the magic,
+  // clears the 4 MiB floor and still holds every kernel name.
+  const built = join(import.meta.dirname, '..', '..', 'packages', 'core', 'paged_attn.metallib');
+  it.skipIf(!existsSync(built))('rejects the 4 MiB prefix of the built paged_attn.metallib', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'metallib-trunc-'));
+    try {
+      const full = readFileSync(built);
+      const prefixPath = join(dir, 'paged_attn.metallib');
+      writeFileSync(prefixPath, full.subarray(0, 4 * 1024 * 1024));
+      const prefix = readFileSync(prefixPath);
+      expect(BRIDGE_KERNEL_MARKERS.every((name) => prefix.includes(name))).toBe(true);
+      for (const expectNax of [false, true]) {
+        expect(() => assertPagedMetallibIntegrity(prefix, { path: prefixPath, expectNax })).toThrow(
+          new RegExp(`is ${prefix.byteLength} bytes but its header declares ${full.byteLength}`),
+        );
+      }
+      const expectNax = full.includes('_qmm_t_nax_');
+      expect(() => assertPagedMetallibIntegrity(full, { path: built, expectNax })).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
