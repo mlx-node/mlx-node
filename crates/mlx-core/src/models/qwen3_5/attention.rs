@@ -2399,7 +2399,8 @@ mod tests {
         // One-call verify: 8 rows of the 27B layout (24 q / 4 kv heads). The
         // head and tail chunks straddle each class's steps: 1024 ('s', 'd'
         // two-pass), 4096 (base-class GQA two-pass), 8192 ('s' 128 -> 256) and
-        // 16384 ('d' 128 -> 512), so every class reaches every route.
+        // 16384 ('d' 128 -> 512), so every class reaches every route its GPU
+        // can launch.
         const D: i64 = 256;
         const HQ: i64 = 24;
         const HKV: i64 = 4;
@@ -2429,24 +2430,14 @@ mod tests {
             &deterministic_bf16((HKV * 8 * D) as usize, 0xfdb9_7531),
             &[1, HKV, 8, D],
         )?;
-        let gqa = HQ / HKV;
-        let tail_len = 8 - head_len;
         let mut seen = [0usize; 4];
+        let mut unified_eligible = 0usize;
         let mut class = 0u8;
         for prefix in prefixes {
             let (route, device_class) = device_verify_route(HQ, HKV, 8, prefix);
             class = device_class;
-            let expected = if head_len == 0 {
-                VERIFY_SINGLE
-            } else {
-                verify_route(
-                    8,
-                    max_q,
-                    class_reduction(class, prefix + head_len, gqa, gqa * head_len),
-                    class_reduction(class, prefix + 8, gqa, gqa * tail_len),
-                    true,
-                )
-            };
+            let (expected, eligible) = predicted_verify_route(class, HQ, HKV, 8, prefix, max_q);
+            unified_eligible += usize::from(eligible);
             assert_eq!(
                 route, expected,
                 "class '{}' prefix {prefix}: verify route",
@@ -2477,7 +2468,19 @@ mod tests {
             head_len > 0,
             "8 rows fit one chunk (max_query_length {max_q})"
         );
-        for route in [VERIFY_ONE_PASS, VERIFY_UNIFIED, VERIFY_SPLIT] {
+        assert!(
+            unified_eligible > 0,
+            "class '{}': no prefix reaches the one-call route",
+            class as char
+        );
+        if seen[VERIFY_UNIFIED as usize] == 0 {
+            eprintln!(
+                "class '{}': this GPU cannot launch the one-call verify kernel; \
+                 {unified_eligible} eligible blocks took the split route",
+                class as char
+            );
+        }
+        for route in [VERIFY_ONE_PASS, VERIFY_SPLIT] {
             assert!(
                 seen[route as usize] > 0,
                 "class '{}': verify route {route} never ran",
@@ -2668,6 +2671,45 @@ mod tests {
         (route, class as u8)
     }
 
+    /// The verify route MLX's policy predicts for a causal block, and whether
+    /// both chunks reduce alike. One dispatch then also needs the verify
+    /// pipeline's thread limit, which register pressure sets per GPU.
+    #[cfg(target_os = "macos")]
+    fn predicted_verify_route(
+        class: u8,
+        q_heads: i64,
+        kv_heads: i64,
+        rows: i64,
+        prefix: i64,
+        max_q: i64,
+    ) -> (i32, bool) {
+        let gqa = q_heads / kv_heads;
+        let head_len = segmented_verify_head_len(rows, max_q)
+            .unwrap_or_else(|| panic!("{rows} rows cannot be covered at max_q {max_q}"));
+        if head_len == 0 {
+            return (VERIFY_SINGLE, false);
+        }
+        let head = class_reduction(class, prefix + head_len, gqa, gqa * head_len);
+        let tail = class_reduction(class, prefix + rows, gqa, gqa * (rows - head_len));
+        let eligible = head.0 && tail.0 && head.1 == tail.1;
+        let launchable = eligible && {
+            let supported = unsafe {
+                mlx_sys::mlx_segmented_sdpa_test_device_verify_unified_supported(
+                    gqa as i32,
+                    rows as i32,
+                    tail.1 as i32,
+                )
+            };
+            assert!(
+                supported >= 0,
+                "verify pipeline gqa {gqa} rows {rows} partitions {}",
+                tail.1
+            );
+            supported == 1
+        };
+        (verify_route(rows, max_q, head, tail, launchable), eligible)
+    }
+
     #[cfg(target_os = "macos")]
     fn strict_segmented_for_test(
         q: &MxArray,
@@ -2741,10 +2783,10 @@ mod tests {
         )?;
         let mut checked = 0usize;
         for rows in [6_i64, 7, 8] {
-            let Some(head_len) = segmented_verify_head_len(rows, max_q) else {
+            if segmented_verify_head_len(rows, max_q).is_none() {
                 eprintln!("SKIP rows={rows}: max_query_length={max_q} cannot cover the block");
                 continue;
-            };
+            }
             let q_bits = deterministic_bf16((HQ * rows * D) as usize, 0x1357_9bdf);
             // x8 adds 3 to every exponent: exact in BF16, sharper softmax.
             let q_sharp_bits: Vec<u16> = q_bits.iter().map(|&b| b + 0x0180).collect();
@@ -2762,6 +2804,7 @@ mod tests {
             )?;
             let mut seen = [0usize; 4];
             let mut class_s = false;
+            let mut unified_eligible = 0usize;
             for prefix in prefixes {
                 let (route, class) = device_verify_route(HQ, HKV, rows, prefix);
                 assert!(
@@ -2771,17 +2814,9 @@ mod tests {
                 seen[route as usize] += 1;
                 if class == b's' {
                     class_s = true;
-                    let expected = if head_len == 0 {
-                        VERIFY_SINGLE
-                    } else {
-                        verify_route(
-                            rows,
-                            max_q,
-                            class_reduction(b's', prefix + head_len, gqa, gqa * head_len),
-                            class_reduction(b's', prefix + rows, gqa, gqa * (rows - head_len)),
-                            true,
-                        )
-                    };
+                    let (expected, eligible) =
+                        predicted_verify_route(b's', HQ, HKV, rows, prefix, max_q);
+                    unified_eligible += usize::from(eligible);
                     assert_eq!(route, expected, "route for rows={rows}, prefix={prefix}");
                 }
                 let pk = nan_tailed_prefix(&base_k, prefix)?;
@@ -2811,7 +2846,8 @@ mod tests {
                 seen[0], seen[1], seen[2], seen[3]
             );
             if class_s {
-                for route in [VERIFY_ONE_PASS, VERIFY_UNIFIED, VERIFY_SPLIT] {
+                assert!(unified_eligible > 0, "rows={rows}: no one-call prefix");
+                for route in [VERIFY_ONE_PASS, VERIFY_SPLIT] {
                     assert!(
                         seen[route as usize] > 0,
                         "rows={rows} never took route {route}"

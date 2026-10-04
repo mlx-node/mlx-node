@@ -251,6 +251,24 @@ struct VerifyDispatch {
   SegmentedSdpaLaunchPlan unified_plan;
 };
 
+struct UnifiedVerifyLaunch {
+  MTL::ComputePipelineState *pipeline;
+  SegmentedSdpaLaunchPlan plan;
+};
+
+// Register pressure sets the verify pipeline's thread limit, so whether one
+// dispatch can serve the block depends on the GPU, not only on the policy.
+UnifiedVerifyLaunch unified_verify_launch(metal::Device &device, int rows,
+                                          int gqa, int partitions) {
+  auto *pipeline = segmented_kernel(device, {SegmentedKernel::verify_two_pass_1,
+                                             true, partitions, gqa, rows});
+  return {pipeline,
+          plan_segmented_verify_launch(
+              rows, gqa, partitions,
+              capabilities(pipeline, device.mtl_device()),
+              capabilities(reduction_kernel(device), device.mtl_device()))};
+}
+
 // Rows [0, head_rows) see prefix + new[..head_rows]; rows [head_rows, rows)
 // see prefix + all new rows: the chunks a two-call verify would dispatch.
 VerifyDispatch plan_verify_dispatch(metal::Device &device, int head_rows,
@@ -273,12 +291,10 @@ VerifyDispatch plan_verify_dispatch(metal::Device &device, int head_rows,
   SegmentedSdpaLaunchPlan unified_plan{false, true, 0, 0, 0};
   if (head_reduction.two_pass && tail_reduction.two_pass &&
       head_reduction.partitions == tail_reduction.partitions) {
-    const int partitions = tail_reduction.partitions;
-    unified = segmented_kernel(device, {SegmentedKernel::verify_two_pass_1,
-                                        true, partitions, gqa, rows});
-    unified_plan = plan_segmented_verify_launch(
-        rows, gqa, partitions, capabilities(unified, device.mtl_device()),
-        capabilities(tail.stage2, device.mtl_device()));
+    const auto launch =
+        unified_verify_launch(device, rows, gqa, tail_reduction.partitions);
+    unified = launch.pipeline;
+    unified_plan = launch.plan;
   }
   const auto route = select_segmented_verify_route(
       head_rows, head_reduction, tail_reduction, unified_plan.supported);
@@ -684,6 +700,24 @@ extern "C" int mlx_segmented_sdpa_test_device_verify_route(
   }
 }
 
+// Test-only: 1 when this GPU can serve a `rows` x `gqa` verify block in one
+// dispatch at `partitions`, 0 when it cannot, -1 on error.
+extern "C" int
+mlx_segmented_sdpa_test_device_verify_unified_supported(int gqa, int rows,
+                                                        int partitions) {
+  using namespace mlx::core;
+  try {
+    auto stream = default_stream(Device::gpu);
+    return segmented_sdpa::unified_verify_launch(metal::device(stream.device),
+                                                 rows, gqa, partitions)
+                   .plan.supported
+               ? 1
+               : 0;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
 #else
 
 extern "C" mlx_array *mlx_segmented_sdpa_forward(mlx_array *, mlx_array *,
@@ -703,6 +737,11 @@ extern "C" int mlx_segmented_sdpa_max_query_length(int) { return 0; }
 
 extern "C" int mlx_segmented_sdpa_test_device_verify_route(int, int, int, int,
                                                            char *) {
+  return -1;
+}
+
+extern "C" int mlx_segmented_sdpa_test_device_verify_unified_supported(int, int,
+                                                                       int) {
   return -1;
 }
 

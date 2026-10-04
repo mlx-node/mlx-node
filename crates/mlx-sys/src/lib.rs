@@ -809,6 +809,12 @@ unsafe extern "C-unwind" {
         out_device_class: *mut std::ffi::c_char,
     ) -> i32;
 
+    pub fn mlx_segmented_sdpa_test_device_verify_unified_supported(
+        gqa: i32,
+        rows: i32,
+        partitions: i32,
+    ) -> i32;
+
     /// TEST-ONLY, platform independent: FNV-1a 64 digests of the segmented
     /// planners and vector-SDPA policy over a fixed sweep for one device
     /// class, written to `out_digests[0..6]`; returns the number of inputs.
