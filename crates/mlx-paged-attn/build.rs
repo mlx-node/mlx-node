@@ -33,8 +33,8 @@ fn main() {
 /// pool construction), so the failure surfaces as an HTTP 500 from the
 /// server long after the app itself started. Measured: default
 /// `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
-/// `-mmacosx-version-min=26.0` = `air64_v28-apple-macosx26.0.0`.
-const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.0";
+/// `-mmacosx-version-min=26.2` = `air64_v28-apple-macosx26.2.0`.
+const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.2";
 
 /// The build host's macOS version as `(major, minor)`, via `sw_vers`.
 fn host_macos_version() -> Option<(u64, u64)> {
@@ -56,14 +56,12 @@ fn host_macos_version() -> Option<(u64, u64)> {
 }
 
 /// The floor applied when `MACOSX_DEPLOYMENT_TARGET` is unset: the project
-/// floor, never ABOVE the build host's own version — pinning 26.0 on macOS
-/// 14 or 15 (where a local source build is documented to work) would emit a
-/// metallib the host cannot load and an older SDK can reject. The floor only
-/// matters on hosts newer than it, so the unset fallback caps at the host
-/// version — the same rule `crates/mlx-sys/build.rs` applies.
+/// floor, never ABOVE the build host's own version, so an older host gets a
+/// metallib it can load — the same rule `crates/mlx-sys/build.rs` applies
+/// (whose Metal build then refuses a target below the floor).
 fn default_macos_deployment_target() -> Option<String> {
     let (major, minor) = host_macos_version()?;
-    if (major, minor) > (26, 0) {
+    if (major, minor) >= (26, 2) {
         Some(MACOS_DEPLOYMENT_TARGET_FLOOR.to_string())
     } else {
         Some(format!("{major}.{minor}"))

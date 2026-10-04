@@ -8,8 +8,7 @@
 
 // Only qmm_t: the one K-quant path that reaches NAX (a transposed weight, the
 // prefill shape). build.rs compiles this file per KQUANT_DTYPE like
-// kquant.metal, at a macOS 26.2 minimum (the tensor-ops ABI), and only when
-// MLX builds its own NAX kernels.
+// kquant.metal, at the deployment target (>= 26.2, the tensor-ops ABI).
 //
 // super_ratio is 256 / group_size, the number of sub-blocks a super-block's
 // (d, dmin) covers; has_min says whether the sub-scales interleave a minimum.

@@ -29,13 +29,11 @@ env:
   CARGO_INCREMENTAL: 1
   # Deployment floor of every macOS build product (metallib min-OS stamp,
   # libmlx, .node). Without it the floor silently tracks the runner image's
-  # macOS version and ratchets with runner updates. 26.0 keeps published
-  # binaries loading on all macOS 26 releases; the vendored MLX fork still
-  # builds the NAX kernels at this floor (MLX_METAL_FORCE_NAX, see
-  # crates/mlx-sys/build.rs) and runtime dispatch keeps pre-26.2 machines
-  # off them. Set on the whole workflow so test jobs exercise the same
+  # macOS version and ratchets with runner updates. 26.2 is the lowest target
+  # at which MLX builds its NAX kernels; crates/mlx-sys/build.rs fails a Metal
+  # build below it. Set on the whole workflow so test jobs exercise the same
   # floor the publish artifacts ship with.
-  MACOSX_DEPLOYMENT_TARGET: '26.0'
+  MACOSX_DEPLOYMENT_TARGET: '26.2'
   # Publish/release fail-closed switch for the metallib packaging gates in
   # packages/core/build.ts. The `build` job's `yarn build` produces the .node +
   # metallib artifacts the publish job ships, and every CI build can feed a

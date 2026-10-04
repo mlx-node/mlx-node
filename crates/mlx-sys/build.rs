@@ -23,27 +23,22 @@ fn metal_toolchain_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Deployment-target floor for the macOS build products when
-/// `MACOSX_DEPLOYMENT_TARGET` is unset.
+/// macOS deployment-target floor of the Metal build products.
 ///
-/// The project's floor is macOS 26.0: one published artifact carries the NAX
-/// kernels behind a runtime gate while the metallib links at the floor (see
-/// the `MLX_METAL_FORCE_NAX` block below). Leaving the default to the
-/// toolchains breaks that promise silently — MLX's CMake and `xcrun metal`
-/// both target the BUILD HOST, so a build on macOS 27 emits `air64_v29`
-/// shaders ("language version 4.1") that a macOS 26 host refuses to load at
-/// runtime while the rest of the app launches fine (measured: default
-/// `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
-/// `-mmacosx-version-min=26.0` = `air64_v28-apple-macosx26.0.0`). This MLX
-/// revision's kernels also fail to COMPILE against the newer default
-/// language version, so the floor is a build requirement, not a preference.
-const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.0";
+/// MLX builds its NAX (gen-17 tensor-core) kernels only at a deployment target
+/// of 26.2 or newer (`mlx/backend/metal/kernels/CMakeLists.txt`); below that it
+/// defines MLX_METAL_NO_NAX and silently ships without them, so a Metal build
+/// below the floor fails (`assert_nax_buildable`). The toolchains' own default
+/// is the BUILD HOST, which is never used: a build on macOS 27 emits
+/// `air64_v29` shaders ("language version 4.1") that a macOS 26 host refuses
+/// to load at runtime while the rest of the app launches fine (measured:
+/// default `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
+/// `-mmacosx-version-min=26.2` = `air64_v28-apple-macosx26.2.0`).
+const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.2";
 
 /// The build host's macOS version as `(major, minor)`, via `sw_vers`.
 fn host_macos_version() -> Option<(u64, u64)> {
-    // The absolute path survives build environments with a stripped PATH —
-    // a PATH lookup that fails here would silently drop the floor back to
-    // the toolchain default (the air64_v29 problem above).
+    // The absolute path survives build environments with a stripped PATH.
     let output = Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
         .output()
@@ -58,31 +53,81 @@ fn host_macos_version() -> Option<(u64, u64)> {
     Some((major, minor))
 }
 
-/// The floor applied when `MACOSX_DEPLOYMENT_TARGET` is unset: the project
-/// floor, never ABOVE the build host's own version. A local source build is
-/// documented to work on macOS 14 or newer — pinning 26.0 there emits
-/// binaries the host cannot run, and an older SDK can reject the future
-/// `-mmacosx-version-min` outright. The floor only matters on hosts NEWER
-/// than it (the air64_v29 case above), so capping the unset fallback at the
-/// host version loses nothing: macOS 27+ still gets 26.0, older hosts get
-/// exactly what their toolchain would have produced anyway.
-fn default_macos_deployment_target() -> Option<String> {
-    let (major, minor) = host_macos_version()?;
-    if (major, minor) > (26, 0) {
-        Some(MACOS_DEPLOYMENT_TARGET_FLOOR.to_string())
-    } else {
-        Some(format!("{major}.{minor}"))
+/// The deployment target of the macOS build products: `MACOSX_DEPLOYMENT_TARGET`
+/// when set (rustc and cc honor it for the Rust side too), else the floor —
+/// capped at an older build host's own version, so a CPU-only build
+/// (`MLX_DISABLE_METAL=1`) there still emits binaries the host can run. A Metal
+/// build on such a host then fails in `assert_nax_buildable`.
+fn macos_deployment_target() -> String {
+    if let Some(target) = env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        return target;
+    }
+    match host_macos_version().map(|(major, minor)| format!("{major}.{minor}")) {
+        Some(host) if !version_at_least(&host, MACOS_DEPLOYMENT_TARGET_FLOOR) => host,
+        _ => MACOS_DEPLOYMENT_TARGET_FLOOR.to_string(),
     }
 }
 
-/// Explicit deployment-target floor for the macOS build products. Setting
-/// `MACOSX_DEPLOYMENT_TARGET` (already honored by rustc and cc for the Rust
-/// side) overrides it for the CMake and metallib products too.
-fn macos_deployment_target() -> Option<String> {
-    env::var("MACOSX_DEPLOYMENT_TARGET")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(default_macos_deployment_target)
+/// Fails the build unless MLX's own NAX condition holds
+/// (`mlx/backend/metal/kernels/CMakeLists.txt`): deployment target >= 26.2,
+/// macOS SDK >= 26.2, and Metal language >= 4.0 at that target. When it does
+/// not, MLX defines MLX_METAL_NO_NAX and builds a working library without the
+/// NAX kernels, which nothing downstream would notice.
+fn assert_nax_buildable(deployment_target: &str) {
+    if !version_at_least(deployment_target, MACOS_DEPLOYMENT_TARGET_FLOOR) {
+        let source = if env::var("MACOSX_DEPLOYMENT_TARGET").is_ok_and(|v| !v.is_empty()) {
+            "MACOSX_DEPLOYMENT_TARGET"
+        } else {
+            "the build host's macOS version (MACOSX_DEPLOYMENT_TARGET is unset)"
+        };
+        panic!(
+            "macOS deployment target {deployment_target} (from {source}) is below mlx-node's \
+             floor {MACOS_DEPLOYMENT_TARGET_FLOOR}. MLX builds its NAX kernels only at \
+             {MACOS_DEPLOYMENT_TARGET_FLOOR} or newer and would otherwise build without them \
+             (MLX_METAL_NO_NAX). Set MACOSX_DEPLOYMENT_TARGET={MACOS_DEPLOYMENT_TARGET_FLOOR} \
+             (or newer), or MLX_DISABLE_METAL=1 for a CPU-only build."
+        );
+    }
+    let sdk = command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-version"]));
+    if !sdk
+        .as_deref()
+        .is_some_and(|v| version_at_least(v, MACOS_DEPLOYMENT_TARGET_FLOOR))
+    {
+        panic!(
+            "macOS SDK {} is below {MACOS_DEPLOYMENT_TARGET_FLOOR}: MLX would build without its \
+             NAX kernels (MLX_METAL_NO_NAX). Select an Xcode with the macOS \
+             {MACOS_DEPLOYMENT_TARGET_FLOOR} SDK or newer (`xcode-select`, `SDKROOT`).",
+            sdk.as_deref().unwrap_or("<unknown>")
+        );
+    }
+    let metal_version = (|| {
+        let mut child = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal", "-E", "-x", "metal", "-P", "-"])
+            .arg(format!("-mmacosx-version-min={deployment_target}"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        {
+            use std::io::Write;
+            child.stdin.take()?.write_all(b"__METAL_VERSION__\n").ok()?;
+        }
+        let output = child.wait_with_output().ok()?;
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .and_then(|line| line.trim().parse::<u32>().ok())
+    })();
+    if !metal_version.is_some_and(|version| version >= 400) {
+        panic!(
+            "Metal language version {metal_version:?} at -mmacosx-version-min={deployment_target} \
+             is below 4.0: MLX would build without its NAX kernels (MLX_METAL_NO_NAX)."
+        );
+    }
 }
 
 /// One `.metal` → `.air` compile. `args` are every flag except the input,
@@ -213,43 +258,6 @@ fn version_at_least(version: &str, floor: &str) -> bool {
     true
 }
 
-/// MLX's own NAX condition (`mlx/backend/metal/kernels/CMakeLists.txt`, with
-/// the `MLX_METAL_FORCE_NAX` that main() always passes): Metal language >= 4.0
-/// at the deployment target, and a macOS SDK >= 26.2. When it fails MLX
-/// defines MLX_METAL_NO_NAX and `is_nax_available()` is false, so the
-/// dispatcher never asks for the K-quant NAX kernels either.
-fn nax_kernels_enabled(deployment_target: Option<&str>) -> bool {
-    let sdk = command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "--show-sdk-version"]));
-    if !sdk.is_some_and(|v| version_at_least(&v, "26.2")) {
-        return false;
-    }
-    let mut cmd = Command::new("xcrun");
-    cmd.args(["-sdk", "macosx", "metal", "-E", "-x", "metal", "-P", "-"]);
-    if let Some(target) = deployment_target {
-        cmd.arg(format!("-mmacosx-version-min={target}"));
-    }
-    let Ok(mut child) = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-    else {
-        return false;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(b"__METAL_VERSION__\n");
-    }
-    let Ok(output) = child.wait_with_output() else {
-        return false;
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .and_then(|line| line.trim().parse::<u32>().ok())
-        .is_some_and(|version| version >= 400)
-}
-
 /// Build `<out_dir>/paged_attn.metallib`: the paged-attention kernels
 /// (`crates/mlx-paged-attn/metal/`) and the prebuilt bridge kernels: K-quant
 /// (`src/metal/kquant/`), segmented SDPA (`src/metal/segmented_sdpa/`) and
@@ -260,9 +268,13 @@ fn nax_kernels_enabled(deployment_target: Option<&str>) -> bool {
 /// The bridge `.air` files use MLX's own kernel flags (`-fno-fast-math`, no
 /// `-O`, no `-std`), which keep their bits equal to MLX's prebuilt kernels and
 /// to the JIT builds they replace; the paged-attention flags (`-O3
-/// -ffast-math`) would change them. The paged `.air` files link first so the
-/// library's min-OS stamp stays the floor, and the NAX files (26.2) link last.
-fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Path) -> PathBuf {
+/// -ffast-math`) would change them.
+fn compile_paged_attn_metallib(
+    manifest_dir: &Path,
+    mlx_dir: &Path,
+    out_dir: &Path,
+    deployment_target: &str,
+) -> PathBuf {
     let metal_src_dir = manifest_dir
         .parent()
         .expect("CARGO_MANIFEST_DIR has a parent")
@@ -281,9 +293,7 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Pa
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    // Resolved once: it probes the host (`sw_vers`), not something per file.
-    let deployment_target = macos_deployment_target();
-    let min_os = |target: Option<&str>| target.map(|t| format!("-mmacosx-version-min={t}"));
+    let min_os = format!("-mmacosx-version-min={deployment_target}");
 
     let mut jobs = Vec::new();
     for file in [
@@ -291,13 +301,13 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Pa
         "cache/reshape_and_cache.metal",
         "cache/copy_blocks.metal",
     ] {
-        let mut args = vec![
+        let args = vec![
             "-I".to_string(),
             metal_src_dir.display().to_string(),
             "-O3".to_string(),
             "-ffast-math".to_string(),
+            min_os.clone(),
         ];
-        args.extend(min_os(deployment_target.as_deref()));
         jobs.push(AirJob {
             src: metal_src_dir.join(file),
             air: out_dir.join(file.replace('/', "_").replace(".metal", ".air")),
@@ -306,18 +316,18 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Pa
     }
 
     let bridge_dir = manifest_dir.join("src").join("metal");
-    let kquant_jobs = |name: &str, target: Option<&str>| -> Vec<AirJob> {
+    let kquant_jobs = |name: &str| -> Vec<AirJob> {
         (0..3)
             .map(|dtype| {
-                let mut args = vec![
+                let args = vec![
                     "-x".to_string(),
                     "metal".to_string(),
                     "-fno-fast-math".to_string(),
                     format!("-DKQUANT_DTYPE={dtype}"),
                     "-I".to_string(),
                     mlx_dir.display().to_string(),
+                    min_os.clone(),
                 ];
-                args.extend(min_os(target));
                 AirJob {
                     src: bridge_dir.join("kquant").join(format!("{name}.metal")),
                     air: out_dir.join(format!("{name}_{dtype}.air")),
@@ -326,30 +336,24 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, mlx_dir: &Path, out_dir: &Pa
             })
             .collect()
     };
-    jobs.extend(kquant_jobs("kquant", deployment_target.as_deref()));
+    jobs.extend(kquant_jobs("kquant"));
+    jobs.extend(kquant_jobs("kquant_nax"));
     // Self-contained sources (no MLX headers), with the same flags.
     for file in [
         "segmented_sdpa/sdpa_segmented.metal",
         "affine_mixed/affine_qmv_wide_mixed.metal",
     ] {
-        let mut args = vec![
+        let args = vec![
             "-x".to_string(),
             "metal".to_string(),
             "-fno-fast-math".to_string(),
+            min_os.clone(),
         ];
-        args.extend(min_os(deployment_target.as_deref()));
         jobs.push(AirJob {
             src: bridge_dir.join(file),
             air: out_dir.join(file.replace('/', "_").replace(".metal", ".air")),
             args,
         });
-    }
-    if nax_kernels_enabled(deployment_target.as_deref()) {
-        let nax_target = match deployment_target.as_deref() {
-            Some(target) if version_at_least(target, "26.2") => target.to_string(),
-            _ => "26.2".to_string(),
-        };
-        jobs.extend(kquant_jobs("kquant_nax", Some(&nax_target)));
     }
 
     let toolchain = [
@@ -513,11 +517,18 @@ fn main() -> io::Result<()> {
     // `paged_attn_metallib_path` lookup will throw if the metallib is
     // not findable.
     let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Resolved once: it probes the host (`sw_vers`).
+    let deployment_target = is_macos.then(macos_deployment_target);
     let paged_metallib_path = if build_metal {
+        let deployment_target = deployment_target
+            .as_deref()
+            .expect("a Metal build targets macOS");
+        assert_nax_buildable(deployment_target);
         Some(compile_paged_attn_metallib(
             &manifest_dir,
             &mlx_dir,
             &out_dir_path,
+            deployment_target,
         ))
     } else {
         None
@@ -559,30 +570,12 @@ fn main() -> io::Result<()> {
                 "x86_64"
             },
         );
-        // Forward an explicit deployment-target floor as a -D define: a
-        // define overrides a stale CMAKE_OSX_DEPLOYMENT_TARGET already
-        // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache),
-        // which the environment variable alone cannot. When unset, MLX's
-        // CMakeLists defaults the floor to the build host's macOS version.
-        if let Some(deployment_target) = macos_deployment_target() {
-            cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
+        // A -D define overrides a stale CMAKE_OSX_DEPLOYMENT_TARGET already
+        // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache), which
+        // the environment variable alone cannot.
+        if let Some(deployment_target) = deployment_target.as_deref() {
+            cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
         }
-        // Upstream MLX only builds the NAX (gen-17 tensor-core) kernels when
-        // the deployment floor is >= 26.2 and otherwise compiles the dispatch
-        // out via MLX_METAL_NO_NAX. A patch in the vendored fork
-        // (docs/mlx-fork.md) adds MLX_METAL_FORCE_NAX to
-        // decouple kernel presence from the floor, so one published artifact
-        // can keep a macOS 26.0 floor AND carry the NAX kernels. The NAX
-        // kernels themselves still compile at -mmacosx-version-min=26.2 —
-        // they need the 26.2 tensor-ops ABI (lower targets select MPP's
-        // pre-26.2 compatibility intrinsics, which miscompute) — while the
-        // metallib links at the floor, so it loads on all of macOS 26.
-        // Runtime dispatch (`is_nax_available`: gpu gen >= 17 && macOS >=
-        // 26.2) keeps pre-26.2 machines from ever instantiating the
-        // 26.2-targeted functions. The option is inert when the floor is
-        // already >= 26.2 and when the SDK cannot build NAX (SDK < 26.2 or
-        // MSL < 4.0).
-        cfg.define("MLX_METAL_FORCE_NAX", "ON");
     }
 
     if target_os == "macos" {

@@ -58,7 +58,7 @@ env:
   RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
   # Must match ci.yml. Without it the deployment floor silently tracks the runner
   # image's macOS version and ratchets with runner updates.
-  MACOSX_DEPLOYMENT_TARGET: '26.0'
+  MACOSX_DEPLOYMENT_TARGET: '26.2'
   MLX_METALLIB_STRICT: '1'
   CARGO_TERM_COLOR: always
 
