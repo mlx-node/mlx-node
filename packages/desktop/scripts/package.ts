@@ -207,7 +207,7 @@ rmSync(join(resources, 'web'), { recursive: true, force: true });
 console.log(`addon will load from: ${bundledAddonPath(resources)}`);
 
 // Packager writes Electron's template floor (12.0). The addon is built with
-// MACOSX_DEPLOYMENT_TARGET=26.0 on release, so on macOS 12-15 the app would open
+// MACOSX_DEPLOYMENT_TARGET=26.2 on release, so on macOS 12-26.1 the app would open
 // and only then fail to dlopen it — which the supervisor treats as a crashed
 // sidecar and restarts forever. Must precede signing: editing Info.plist after a
 // signature invalidates it.

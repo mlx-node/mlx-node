@@ -8,24 +8,23 @@ MLX's public C++ API.
 ```
 ml-explore/mlx main  255328713 (2026-10-02)
         │
-        │  + 7 patches   fork main
+        │  + 6 patches   fork main
         ▼
-mlx-node/mlx         369fec314  ◄── gitlink at crates/mlx-sys/mlx
+mlx-node/mlx         4be8a5709  ◄── gitlink at crates/mlx-sys/mlx
 ```
 
 Commit hashes change on every rebase. Name a patch by its subject.
 
-## The 7 patches
+## The 6 patches
 
-| #   | commit      | patch                                                                                                                         | why it cannot live in mlx-node                                                                                                                                                                                              | upstream candidate |
-| --- | ----------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| 1   | `ceeb6e28a` | `MLX_METAL_FORCE_NAX` CMake option: build the NAX kernels into a metallib whose deployment floor is below macOS 26.2          | MLX's own `kernels/CMakeLists.txt` builds the NAX kernels only when the floor is ≥ 26.2. There is no public hook. `crates/mlx-sys/build.rs` sets the option ON so one artifact keeps a 26.0 floor and still has NAX kernels | no (packaging)     |
-| 2   | `732172e4f` | `MLX_METAL_OP_TRACE=1\|2\|3` per-primitive tracer                                                                             | Hooks the loop in `gpu::eval` (`mlx/backend/metal/eval.cpp`). MLX has no per-primitive callback                                                                                                                             | no (diagnostics)   |
-| 3   | `2b829d5fa` | `output_shapes` for `Slice`, `Split`, `Pad`, `Depends`, `AsStrided`, `CustomKernel`                                           | Shapeless compile asks every primitive for its output shapes; these threw. They are virtual methods of MLX's own classes, and `CustomKernel` must store its declared shapes. DFlash2's shapeless verify graph needs them    | yes                |
-| 4   | `ce5f992cd` | Array retention batched into one completion handler per command-buffer commit (was one ObjC block per primitive)              | Lives inside `CommandEncoder` and `gpu::eval`                                                                                                                                                                               | yes                |
-| 5   | `31cc2daed` | Affine/fp `qmv_wide` instantiated for 2..8 vectors per threadgroup, tile cap 8 when N ≥ 2048; `MLX_QMM_SPLITK_MIN_M` override | The instantiation lists are in MLX's prebuilt metallib and the choice is in MLX's `QuantizedMatmul::eval_gpu`. Moving it out means owning MLX's whole affine/fp dispatch. Per-row reduction order is unchanged              | not proposed       |
-| 6   | `c23b1113f` | `MLX_METAL_COMMAND_TRACE=1`: one `[metal-command]` JSON line per command buffer, one `[mlx-evaluation]` line per `eval`       | Lives inside `CommandEncoder::commit` (`mlx/backend/metal/device.cpp`) and `eval_impl` (`mlx/transforms.cpp`)                                                                                                               | no (diagnostics)   |
-| 7   | `369fec314` | Residency set: copy the `NSError` text before its autorelease pool drains                                                     | Fixes a use-after-free on the path that reports a failed residency-set creation (`mlx/backend/metal/resident.cpp`). It is an MLX bug                                                                                        | yes                |
+| #   | commit      | patch                                                                                                                         | why it cannot live in mlx-node                                                                                                                                                                                           | upstream candidate |
+| --- | ----------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------ |
+| 1   | `5823cad48` | `MLX_METAL_OP_TRACE=1\|2\|3` per-primitive tracer                                                                             | Hooks the loop in `gpu::eval` (`mlx/backend/metal/eval.cpp`). MLX has no per-primitive callback                                                                                                                          | no (diagnostics)   |
+| 2   | `92ad11185` | `output_shapes` for `Slice`, `Split`, `Pad`, `Depends`, `AsStrided`, `CustomKernel`                                           | Shapeless compile asks every primitive for its output shapes; these threw. They are virtual methods of MLX's own classes, and `CustomKernel` must store its declared shapes. DFlash2's shapeless verify graph needs them | yes                |
+| 3   | `ffdc69797` | Array retention batched into one completion handler per command-buffer commit (was one ObjC block per primitive)              | Lives inside `CommandEncoder` and `gpu::eval`                                                                                                                                                                            | yes                |
+| 4   | `c054fde1e` | Affine/fp `qmv_wide` instantiated for 2..8 vectors per threadgroup, tile cap 8 when N ≥ 2048; `MLX_QMM_SPLITK_MIN_M` override | The instantiation lists are in MLX's prebuilt metallib and the choice is in MLX's `QuantizedMatmul::eval_gpu`. Moving it out means owning MLX's whole affine/fp dispatch. Per-row reduction order is unchanged           | not proposed       |
+| 5   | `751aad851` | `MLX_METAL_COMMAND_TRACE=1`: one `[metal-command]` JSON line per command buffer, one `[mlx-evaluation]` line per `eval`       | Lives inside `CommandEncoder::commit` (`mlx/backend/metal/device.cpp`) and `eval_impl` (`mlx/transforms.cpp`)                                                                                                            | no (diagnostics)   |
+| 6   | `4be8a5709` | Residency set: copy the `NSError` text before its autorelease pool drains                                                     | Fixes a use-after-free on the path that reports a failed residency-set creation (`mlx/backend/metal/resident.cpp`). It is an MLX bug                                                                                     | yes                |
 
 The bridge also prints `[mlx-compiled]` lines under `MLX_METAL_COMMAND_TRACE=1`
 (`crates/mlx-sys/src/mlx_compiled_graph.cpp`). That part is ours, not a patch.
@@ -52,9 +51,10 @@ without any change in our files. The segmented SDPA and mixed-affine sources
 include no MLX headers.
 
 All bridge `.air` files use MLX's own kernel flags (`-fno-fast-math`, no `-O`, no
-`-std`; K-quant NAX at a 26.2 minimum, built only under MLX's NAX condition), not
-the paged-attention flags. They link after the paged `.air` files, with the NAX
-files last, so the library keeps the deployment floor's min-OS stamp. There is no
+`-std`), not the paged-attention flags. Every `.air` file compiles at the deployment
+target, 26.2 by default: the lowest one at which MLX builds its NAX kernels.
+`build.rs` fails a Metal build below it, or with a macOS SDK below 26.2, instead of
+letting MLX fall back to `MLX_METAL_NO_NAX`. There is no
 JIT fallback: a missing kernel throws `PrebuiltKernelMissing`. Segmented SDPA keeps
 it apart from "unsupported here": `mlx_segmented_sdpa_max_query_length` returns -1
 (not 0) and the forward returns null, so Qwen3.5 verify errors instead of falling
@@ -72,12 +72,13 @@ specialization included.
 | `crates/mlx-sys/metal-residency/` overlay                    | `09ebe730b` (#4211): same split into residency sets. `MLX_RESIDENCY_SET_MAX_PCT` (default 5) and `MLX_RESIDENCY_DEBUG`, `mlx/utils.h:205-218` |
 | custom-kernel hash overlay and `MLX_METAL_HASH_KERNEL_CACHE` | MLX always keys a custom kernel library as `name_<hash(source)>_<options>` (`mlx/backend/metal/custom_kernel.cpp:51`)                         |
 | D=256 NAX SDPA fork commits                                  | `714a7efcb` (#3842), `f99e916be` (#4416) and follow-ups                                                                                       |
+| `MLX_METAL_FORCE_NAX` (NAX kernels below a 26.2 floor)       | none needed: the floor is 26.2, where MLX builds the NAX kernels itself (`mlx/backend/metal/kernels/CMakeLists.txt`)                          |
 | GPU busy time (`gpu_total`) on `MLX_METAL_OP_TRACE` lines    | none. `MLX_METAL_COMMAND_TRACE` prints `gpuStart` / `gpuEnd` per command buffer                                                               |
 
 ## Bumping MLX
 
 ```
-fork    1. rebase the 7 patches on upstream main      work branch mlx-node/rebase-<date>
+fork    1. rebase the 6 patches on upstream main      work branch mlx-node/rebase-<date>
 parent  2. move the gitlink, fix API drift, yarn build:native
         3. golden gates, every route                  must be equal, or attributed
         4. dev suites                                 cargo test, vp test
@@ -90,8 +91,8 @@ fork    7. force-push it to fork main before the parent PR  (CI clones the gitli
 `git fetch origin me`, `git switch -c mlx-node/rebase-<date> origin/main`, then cherry-pick
 the patches in order from `git log --reverse origin/main..me/main`. Fork `main` carries the
 patch stack; it does not mirror upstream. Drop a patch only when upstream has the same
-change. Check that the standalone CMake build passes with `-DMLX_METAL_FORCE_NAX=ON` and
-`CMAKE_OSX_DEPLOYMENT_TARGET=26.0`. Step 7 is
+change. Check that the standalone CMake build passes with `CMAKE_OSX_DEPLOYMENT_TARGET=26.2`
+and builds the NAX kernels (no `NAX kernels require` warning). Step 7 is
 `git push --force-with-lease=main:<old me/main> me HEAD:main`.
 
 **2. Parent.** `git -C crates/mlx-sys/mlx checkout <new sha>`, then `yarn build:native`.
@@ -165,7 +166,8 @@ check (old vs new addon, 3072 tokens, deterministic per binary): Qwen3.8-27B mxf
 **5. Metallib.** `packages/core/metallib-select.ts` names kernels that a healthy
 `mlx.metallib` from this pin must contain (`BASE_KERNEL_MARKERS`, `NAX_KERNEL_MARKERS`),
 and the bridge kernels `paged_attn.metallib` must contain (`KQUANT_KERNEL_MARKERS`,
-`KQUANT_NAX_KERNEL_MARKERS`, `BRIDGE_KERNEL_MARKERS`).
+`KQUANT_NAX_KERNEL_MARKERS`, `BRIDGE_KERNEL_MARKERS`). An `mlx.metallib` without the
+NAX-only families (`MLX_NAX_ONLY_MARKERS`) fails too: it is an `MLX_METAL_NO_NAX` build.
 Update them when upstream renames or removes a kernel, then run
 `vp test __test__/core/metallib-select.test.ts`. `yarn build:native` runs the same
 check on the built file. The GEMM canaries in `crates/mlx-core/src/test_support.rs`

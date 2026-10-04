@@ -148,7 +148,7 @@ See [docs/training.md](docs/training.md) for GRPO, SFT, datasets, checkpointing,
 | macOS, Apple Silicon       | Metal   | Inference, training, and multimodal |
 | Linux aarch64, NVIDIA GB10 | CUDA    | Experimental, inference only        |
 
-The npm `darwin-arm64` binary has a macOS 26.0 deployment target. It does not load on macOS 15 or older. The binary contains NAX kernels for M5-class GPUs; MLX enables them on macOS 26.2 or newer. A local source build works on macOS 14 or newer and can set its deployment target with `MACOSX_DEPLOYMENT_TARGET`.
+The npm `darwin-arm64` binary has a macOS 26.2 deployment target. It does not load on macOS 26.1 or older. It contains NAX kernels for M5-class GPUs. A local source build needs the macOS 26.2 SDK or newer and a deployment target of at least 26.2 (the default; `MACOSX_DEPLOYMENT_TARGET` can raise it). A lower target fails the build, because MLX would build without its NAX kernels.
 
 ### CUDA preview
 

@@ -333,7 +333,7 @@ const ARGV_BUDGET = 128 * 1024;
 export function findMachOFiles(root: string): string[] {
   const files = listRegularFiles(root);
   let output = '';
-  for (let i = 0; i < files.length; ) {
+  for (let i = 0; i < files.length;) {
     const batch: string[] = [];
     let bytes = 0;
     while (i < files.length && (batch.length === 0 || bytes + files[i].length + 1 < ARGV_BUDGET)) {
@@ -515,9 +515,9 @@ export function main(argv: readonly string[], env: NodeJS.ProcessEnv): number {
   // 5. LSMinimumSystemVersion vs what the binaries actually demand.
   //
   // @electron/packager writes Electron's template floor (12.0) regardless of what
-  // the payload was built against. Release builds set MACOSX_DEPLOYMENT_TARGET=26.0,
-  // so the addon's LC_BUILD_VERSION says minos 26.0 and dyld refuses to map it on
-  // 12-15 -- but LaunchServices reads the plist, so the app OPENS there and only
+  // the payload was built against. Release builds set MACOSX_DEPLOYMENT_TARGET=26.2,
+  // so the addon's LC_BUILD_VERSION says minos 26.2 and dyld refuses to map it on
+  // 12-26.1 -- but LaunchServices reads the plist, so the app OPENS there and only
   // then fails to load the addon. The supervisor sees a dead sidecar and restarts
   // it, forever, with nothing naming the real cause.
   //

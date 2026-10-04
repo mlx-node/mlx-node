@@ -27,8 +27,8 @@ Load command 10
       cmd LC_MAIN
 `;
 
-/** The same, from a release build: MACOSX_DEPLOYMENT_TARGET=26.0 reaches minos. */
-const RELEASE_ADDON = ADDON.replace('minos 11.0', 'minos 26.0');
+/** The same, from a release build: MACOSX_DEPLOYMENT_TARGET=26.2 reaches minos. */
+const RELEASE_ADDON = ADDON.replace('minos 11.0', 'minos 26.2');
 
 /** A fat binary prints one LC_BUILD_VERSION block per slice, and they can differ. */
 const UNIVERSAL = `Architectures in the fat file: x are: x86_64 arm64
@@ -44,20 +44,20 @@ Load command 9
       cmd LC_BUILD_VERSION
   cmdsize 32
  platform 1
-    minos 26.0
+    minos 26.2
       sdk 26.5
 `;
 
 describe('parseMinOs', () => {
   it('reads the floor out of real otool output', () => {
     expect(parseMinOs(ADDON)).toBe('11.0');
-    expect(parseMinOs(RELEASE_ADDON)).toBe('26.0');
+    expect(parseMinOs(RELEASE_ADDON)).toBe('26.2');
   });
 
   it('takes the HIGHEST slice of a universal binary, not the first', () => {
     // The x86_64 block is printed first and says 12.0. Trusting it would ship an
     // app that claims to run on 12 while its arm64 slice needs 26.
-    expect(parseMinOs(UNIVERSAL)).toBe('26.0');
+    expect(parseMinOs(UNIVERSAL)).toBe('26.2');
   });
 
   it('is null when nothing carries LC_BUILD_VERSION', () => {
@@ -76,8 +76,8 @@ describe('parseMinOs', () => {
 
 describe('compareOsVersions', () => {
   it('orders numerically, not lexically', () => {
-    // The whole point: "26.0" < "9.0" as strings, and 26.0 is the release floor.
-    expect(compareOsVersions('26.0', '9.0')).toBeGreaterThan(0);
+    // The whole point: "26.2" < "9.0" as strings, and 26.2 is the release floor.
+    expect(compareOsVersions('26.2', '9.0')).toBeGreaterThan(0);
     expect(compareOsVersions('9.0', '12.0')).toBeLessThan(0);
   });
 
@@ -92,8 +92,8 @@ describe('maxOsVersion', () => {
   it('is the maximum, not the last', () => {
     // Every binary has to load, so the bundle runs only where the most demanding
     // one runs. Order of the probe list must not matter.
-    expect(maxOsVersion(['26.0', '12.0', '11.0'])).toBe('26.0');
-    expect(maxOsVersion(['11.0', '12.0', '26.0'])).toBe('26.0');
+    expect(maxOsVersion(['26.2', '12.0', '11.0'])).toBe('26.2');
+    expect(maxOsVersion(['11.0', '12.0', '26.2'])).toBe('26.2');
   });
 
   it('refuses an empty list instead of inventing a floor', () => {

@@ -200,7 +200,7 @@ Load command 9
       cmd LC_BUILD_VERSION
   cmdsize 32
  platform 1
-    minos 26.0
+    minos 26.2
       sdk 26.5
 `;
 
@@ -379,8 +379,8 @@ describe('parseMinosValues / maxVersion', () => {
   it('takes the HIGHEST slice of a universal binary, not the first', () => {
     // The x86_64 block prints first and says 12.0. Trusting it would advertise an
     // app that runs on 12 while its arm64 slice needs 26.
-    expect(parseMinosValues(OTOOL_MINOS_UNIVERSAL)).toStrictEqual(['12.0', '26.0']);
-    expect(maxVersion(parseMinosValues(OTOOL_MINOS_UNIVERSAL))).toBe('26.0');
+    expect(parseMinosValues(OTOOL_MINOS_UNIVERSAL)).toStrictEqual(['12.0', '26.2']);
+    expect(maxVersion(parseMinosValues(OTOOL_MINOS_UNIVERSAL))).toBe('26.2');
   });
 
   it('is empty when nothing carries LC_BUILD_VERSION', () => {
@@ -402,12 +402,12 @@ describe('parseMinosValues / maxVersion', () => {
 
 describe('compareVersions', () => {
   it('orders numerically, not lexically', () => {
-    // The whole point: "26.0" < "9.0" as strings, and 26.0 is the release floor.
+    // The whole point: "26.2" < "9.0" as strings, and 26.2 is the release floor.
     // `sort -V` would have handled it and was avoided as a GNU extension BSD sort
     // has only sometimes had.
-    expect(compareVersions('26.0', '9.0')).toBeGreaterThan(0);
+    expect(compareVersions('26.2', '9.0')).toBeGreaterThan(0);
     expect(compareVersions('9.0', '12.0')).toBeLessThan(0);
-    expect(maxVersion(['11.0', '26.0', '9.0', '12.0'])).toBe('26.0');
+    expect(maxVersion(['11.0', '26.2', '9.0', '12.0'])).toBe('26.2');
   });
 
   it('treats a missing component as zero', () => {
@@ -425,13 +425,13 @@ describe('checkMinOs', () => {
 
   it('fails in BOTH directions', () => {
     // Too low and the app launches where it cannot run — packager's 12.0 template
-    // against an addon built at 26.0, which is the bug this step was written for.
+    // against an addon built at 26.2, which is the bug this step was written for.
     // Too high and it refuses to launch where it could.
-    expect(checkMinOs('12.0', '26.0')).toStrictEqual({
+    expect(checkMinOs('12.0', '26.2')).toStrictEqual({
       note: 'FAIL',
-      message: 'declares 12.0 but its binaries demand 26.0',
+      message: 'declares 12.0 but its binaries demand 26.2',
     });
-    expect(checkMinOs('26.0', '12.0').note).toBe('FAIL');
+    expect(checkMinOs('26.2', '12.0').note).toBe('FAIL');
   });
 
   it('fails rather than guessing when either side is missing', () => {

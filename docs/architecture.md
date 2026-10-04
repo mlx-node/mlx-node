@@ -126,7 +126,7 @@ mlx-node/
 │
 ├── crates/
 │   ├── mlx-sys/                MLX C/C++ FFI bridge — see ffi-cpp.md
-│   │   └── mlx/                MLX submodule (our fork, 7 patches) — see mlx-fork.md
+│   │   └── mlx/                MLX submodule (our fork, 6 patches) — see mlx-fork.md
 │   ├── mlx-core/               All NAPI exports: models, training, ops, vision
 │   ├── mlx-paged-attn/         PagedAttention + Metal shaders — see paged-cache.md
 │   ├── mlx-db/                 SQLite training persistence
