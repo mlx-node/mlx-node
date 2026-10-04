@@ -117,7 +117,28 @@ that names the upstream commits and carries the accuracy table (example: `544b3a
 Upstream numeric changes in paths no gate covers show up here. The last bump
 moved: MX quantize scale rounding (`02adf7b21`, E8M0 now rounds up), `argmax` NaN rule
 (`a124ac096`), qmv batch limits and the qmv fast-path K alignment (`e7838d5e3`,
-`8056817bd`).
+`8056817bd`). Three more were checked and accepted:
+
+- `b400c6ced`: the Metal NVFP4 `fp_quantize` picks each 16-value scale group by SIMD
+  lane, not by grid x. Metal only. `mlx convert` runs every op on the CPU
+  (`CpuConvertGuard::enter_cpu`, `crates/mlx-core/src/convert.rs:3692`; GGUF import at
+  `crates/mlx-core/src/utils/gguf.rs:4540`), so convert output does not move:
+  qwen3.5-0.8b with `--q-mode nvfp4 --q-recipe qwen3_5` gives the same
+  `model.safetensors` from the old and new addon (sha256 `dcbf1db0…`). Published NVFP4
+  checkpoints are unaffected.
+- `56e026d8a`: affine and FP weights dequantize in float32 before the cast to the
+  activation type, in the tile loaders of `qmm_t`, `qmm_n`, `gather_qmm` and their NAX
+  versions. The vector kernels (`qmv`, `qvm`) already decode in float and do not move.
+- `365bd0fba`: `Sigmoid` uses `precise::exp`. The prebuilt metallib is built with
+  `-fno-fast-math`, so only a sigmoid inside an `mlx::core::compile` graph changes. The
+  hot ones are `mlx_sigmoid_mul_compiled` (`crates/mlx-sys/src/mlx_fused_ops.cpp:14`:
+  the Qwen3.5 attention gate and the GDN conv SiLU) and the compiled SwiGLU
+  (`crates/mlx-sys/src/mlx_qwen35_common.h:23`: MoE `switch_glu` and the quantized
+  `MLPVariant`).
+
+The last two are covered together, not per commit, by the bump's teacher-forced NLL
+check (old vs new addon, 3072 tokens, deterministic per binary): Qwen3.8-27B mxfp4
++0.06%, Qwen3.6-35B-A3B MoE mxfp4 −0.08%.
 
 **5. Metallib.** `packages/core/metallib-select.ts` names kernels that a healthy
 `mlx.metallib` from this pin must contain (`BASE_KERNEL_MARKERS`, `NAX_KERNEL_MARKERS`).
