@@ -85,6 +85,8 @@ parameter can compile silently with a wrong argument in its slot (this happened 
 **3. Golden gates.** They are `#[ignore]` and their fixtures belong to an M5 Max
 (`applegpu_g17s`); any other machine fails them by design. `MLX_METAL_GPU_ARCH` makes
 MLX and our dispatchers route as another GPU class. Fixtures: `crates/mlx-core/tests/golden/`.
+CI does not run them: run them locally on an M5 Max for every MLX bump and for every
+change to the K-quant, mixed-affine or segmented SDPA kernels.
 
 ```sh
 # "" = this machine (g17s); g17d / g17g = the other segmented SDPA classes
