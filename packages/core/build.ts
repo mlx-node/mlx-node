@@ -93,7 +93,8 @@ await copyNativeAddon(outputs);
 // MLX kernels, `paged_attn.metallib` for the paged-attention
 // dispatch path used by `Qwen3Model` (where `use_paged_attention`
 // is on by default for the legacy `PagedKVCache` route and by
-// `use_block_paged_cache` on by default for the new vLLM-style path).
+// `use_block_paged_cache` on by default for the new vLLM-style path)
+// and for every GGUF K-quant kernel (prebuilt, no JIT fallback).
 // We FAIL the build if either is missing so a packaging regression
 // surfaces immediately rather than as a runtime throw at first use
 // in a published install.
@@ -269,7 +270,7 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     libDir: picked.libDir,
     warn: (msg) => console.warn(msg),
   });
-  assertPagedMetallibIntegrity(paged.contents, { path: paged.path });
+  assertPagedMetallibIntegrity(paged.contents, { path: paged.path, expectNax: detectExpectNax() });
   if (deploymentFloor !== undefined) {
     assertMetallibFloor(paged.contents, {
       path: paged.path,

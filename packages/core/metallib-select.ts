@@ -50,13 +50,33 @@ export interface MetallibCandidate {
 export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
 
 /**
- * Every healthy paged_attn.metallib observed to date (8 samples across
- * debug/release profiles and old/new MLX pins) is exactly 19,490,342 bytes
- * (~19.5 MB) — the kernel set is ours (crates/mlx-paged-attn) and stable.
+ * paged_attn.metallib holds the paged-attention kernels (~19.5 MB) and the
+ * prebuilt K-quant kernels (~12 MB with NAX); a healthy build is ~31.8 MB.
  * A 4 MiB floor keeps generous headroom for future kernel trimming while
  * still catching a truncated or interrupted write.
  */
 export const MIN_PAGED_METALLIB_BYTES = 4 * 1024 * 1024;
+
+/**
+ * K-quant kernels mlx_kquant_metal.cpp loads from paged_attn.metallib (it has
+ * no JIT fallback): one per dtype, plus the function-constant sorted gather and
+ * the bfloat16-only sg8 pair. A metallib without them builds fine and then
+ * throws on the first GGUF K-quant matmul.
+ */
+export const KQUANT_KERNEL_MARKERS = [
+  'q4k_qmv_fast_float_gs_32_b_4_batch_0',
+  'q6k_qmm_t_float16_t_gs_16_b_6_alN_true_batch_0',
+  'iq3s_dequantize_bfloat16_t_gs_32_b_8',
+  'q5k_gather_qmm_rhs_nt_bfloat16_t_gs_32_b_5_bm_16_bn_32_bk_32_wm_1_wn_2',
+  'q4k_qmv_sg8_bfloat16_t_gs_32_b_4',
+  'kquant_qmv_sg8_prep_bfloat16_t_gs_16',
+] as const;
+
+/** The K-quant NAX kernels, built when MLX builds its own NAX kernels. */
+export const KQUANT_NAX_KERNEL_MARKERS = [
+  'q4k_qmm_t_nax_bfloat16_t_gs_32_b_4_bm64_bn64_bk64_wm2_wn2_alN_true_batch_0',
+  'q6k_qmm_t_nax_float_gs_16_b_6_bm64_bn64_bk64_wm2_wn2_alN_false_batch_1',
+] as const;
 
 /**
  * Kernel names present in every healthy mlx.metallib from the vendored MLX.
@@ -380,18 +400,20 @@ export function selectPagedMetallib(opts: {
 
 /**
  * Hard gate before paged_attn.metallib is copied anywhere, mirroring
- * `assertMetallibIntegrity`: a truncated file or a non-metallib container
- * must fail the build loudly. There is no kernel-name inventory here — the
- * paged-attn kernel set is small and ours — so the gate is the size floor
- * plus the MTLB container magic.
+ * `assertMetallibIntegrity`: a truncated file, a non-metallib container or a
+ * library without the K-quant kernels (`expectNax`: and their NAX kernels)
+ * must fail the build loudly.
  */
-export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: string; minBytes?: number }): void {
+export function assertPagedMetallibIntegrity(
+  metallib: Buffer,
+  opts: { path: string; expectNax: boolean; minBytes?: number },
+): void {
   const minBytes = opts.minBytes ?? MIN_PAGED_METALLIB_BYTES;
   if (metallib.byteLength < minBytes) {
     throw new Error(
       `[build.ts metallib gate] ${opts.path} is ${metallib.byteLength} bytes, below the ` +
-        `${minBytes}-byte floor of a healthy paged_attn.metallib (every observed healthy ` +
-        `build is ~19.5 MB) — the file is truncated or the build was interrupted. Re-run ` +
+        `${minBytes}-byte floor of a healthy paged_attn.metallib (a healthy build is ` +
+        `~31.8 MB) — the file is truncated or the build was interrupted. Re-run ` +
         `the native build; if it persists, remove the containing mlx-sys-*/out dir.`,
     );
   }
@@ -400,6 +422,16 @@ export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: str
       `[build.ts metallib gate] ${opts.path} does not start with the MTLB container magic — ` +
         `this is not a Metal library. Re-run the native build; if it persists, remove the ` +
         `containing mlx-sys-*/out dir.`,
+    );
+  }
+  const markers = opts.expectNax ? [...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS] : KQUANT_KERNEL_MARKERS;
+  const missing = markers.filter((name) => !metallib.includes(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} is missing K-quant kernel(s) ${missing.join(', ')} — ` +
+        `mlx_kquant_metal.cpp loads them from this library and has no JIT fallback. It was built ` +
+        `by an older mlx-sys/build.rs or without the NAX kernels this host builds. Re-run the ` +
+        `native build; if it persists, remove the containing mlx-sys-*/out dir.`,
     );
   }
 }

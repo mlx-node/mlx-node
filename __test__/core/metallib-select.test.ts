@@ -6,6 +6,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 
 import {
   BASE_KERNEL_MARKERS,
+  KQUANT_KERNEL_MARKERS,
+  KQUANT_NAX_KERNEL_MARKERS,
   MIN_PAGED_METALLIB_BYTES,
   NAX_KERNEL_MARKERS,
   assertMetallibFloor,
@@ -530,16 +532,47 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
     },
   );
 
+  const pagedLibrary = (markers: readonly string[]) => Buffer.from(['MTLB', ...markers].join('\0'));
+
   it('integrity gate: rejects truncation via the size floor and non-MTLB content via the magic', () => {
     // An identically-truncated PAIR passes selection (byte-equal) — the
     // integrity gate is what catches it.
-    expect(() => assertPagedMetallibIntegrity(Buffer.from('MTLB tiny'), { path: 'x' })).toThrow(
+    expect(() => assertPagedMetallibIntegrity(Buffer.from('MTLB tiny'), { path: 'x', expectNax: false })).toThrow(
       new RegExp(`below the ${MIN_PAGED_METALLIB_BYTES}-byte floor`),
     );
-    expect(() => assertPagedMetallibIntegrity(Buffer.from('NOPE junk'), { path: 'x', minBytes: 1 })).toThrow(
-      /MTLB container magic/,
+    expect(() =>
+      assertPagedMetallibIntegrity(Buffer.from('NOPE junk'), { path: 'x', expectNax: false, minBytes: 1 }),
+    ).toThrow(/MTLB container magic/);
+    expect(() =>
+      assertPagedMetallibIntegrity(pagedLibrary(KQUANT_KERNEL_MARKERS), { path: 'x', expectNax: false, minBytes: 1 }),
+    ).not.toThrow();
+  });
+
+  it('integrity gate: rejects a paged library without the prebuilt K-quant kernels', () => {
+    // A pre-K-quant paged_attn.metallib: the paged kernels only.
+    expect(() =>
+      assertPagedMetallibIntegrity(pagedLibrary(['paged_attention_bfloat16_t']), {
+        path: 'x',
+        expectNax: false,
+        minBytes: 1,
+      }),
+    ).toThrow(new RegExp(`missing K-quant kernel\\(s\\) ${KQUANT_KERNEL_MARKERS.join(', ')}`));
+    for (const dropped of KQUANT_KERNEL_MARKERS) {
+      const library = pagedLibrary(KQUANT_KERNEL_MARKERS.filter((name) => name !== dropped));
+      expect(() => assertPagedMetallibIntegrity(library, { path: 'x', expectNax: false, minBytes: 1 })).toThrow(
+        dropped,
+      );
+    }
+  });
+
+  it('integrity gate: requires the K-quant NAX kernels only where this host builds them', () => {
+    const withoutNax = pagedLibrary(KQUANT_KERNEL_MARKERS);
+    expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: false, minBytes: 1 })).not.toThrow();
+    expect(() => assertPagedMetallibIntegrity(withoutNax, { path: 'x', expectNax: true, minBytes: 1 })).toThrow(
+      KQUANT_NAX_KERNEL_MARKERS[0],
     );
-    expect(() => assertPagedMetallibIntegrity(Buffer.from('MTLB healthy'), { path: 'x', minBytes: 1 })).not.toThrow();
+    const withNax = pagedLibrary([...KQUANT_KERNEL_MARKERS, ...KQUANT_NAX_KERNEL_MARKERS]);
+    expect(() => assertPagedMetallibIntegrity(withNax, { path: 'x', expectNax: true, minBytes: 1 })).not.toThrow();
   });
 });
 
