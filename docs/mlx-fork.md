@@ -8,7 +8,7 @@ MLX's public C++ API.
 ```
 ml-explore/mlx main  255328713 (2026-10-02)
         │
-        │  + 7 patches   fork branch mlx-node/rebase-2026-10-03
+        │  + 7 patches   fork main
         ▼
 mlx-node/mlx         369fec314  ◄── gitlink at crates/mlx-sys/mlx
 ```
@@ -59,20 +59,22 @@ pinned tree, so an MLX bump can change these kernels without any change in our f
 ## Bumping MLX
 
 ```
-fork    1. rebase the 7 patches on upstream main      new branch mlx-node/rebase-<date>
+fork    1. rebase the 7 patches on upstream main      work branch mlx-node/rebase-<date>
 parent  2. move the gitlink, fix API drift, yarn build:native
         3. golden gates, every route                  must be equal, or attributed
         4. dev suites                                 cargo test, vp test
         5. metallib markers + canaries
         6. benches, ABBA against the old addon
-fork    7. push the fork branch before the parent PR  (CI clones the gitlink)
+fork    7. force-push it to fork main before the parent PR  (CI clones the gitlink)
 ```
 
 **1. Rebase.** In the fork clone (`origin` = ml-explore/mlx, `me` = mlx-node/mlx):
-`git fetch origin`, `git switch -c mlx-node/rebase-<date> origin/main`, then cherry-pick
-the 7 patches in order. Drop a patch only when upstream has the same change. Check that
-the standalone CMake build passes with `-DMLX_METAL_FORCE_NAX=ON` and
-`CMAKE_OSX_DEPLOYMENT_TARGET=26.0`.
+`git fetch origin me`, `git switch -c mlx-node/rebase-<date> origin/main`, then cherry-pick
+the patches in order from `git log --reverse origin/main..me/main`. Fork `main` carries the
+patch stack; it does not mirror upstream. Drop a patch only when upstream has the same
+change. Check that the standalone CMake build passes with `-DMLX_METAL_FORCE_NAX=ON` and
+`CMAKE_OSX_DEPLOYMENT_TARGET=26.0`. Step 7 is
+`git push --force-with-lease=main:<old me/main> me HEAD:main`.
 
 **2. Parent.** `git -C crates/mlx-sys/mlx checkout <new sha>`, then `yarn build:native`.
 Read the upstream diff for every MLX function the bridge calls. A new optional
