@@ -34,6 +34,7 @@
 //
 // Stale dirs are deliberately NOT deleted: they are live cargo cache for
 // other toolchains/branches, and deleting them forces a full MLX rebuild.
+import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync, type Stats } from 'node:fs';
 import { dirname, join, normalize } from 'node:path';
 
@@ -475,6 +476,23 @@ export function shouldExpectNaxKernels(
 ): boolean {
   const effectiveTarget = deploymentTargetEnv && deploymentTargetEnv !== '' ? deploymentTargetEnv : hostVersion;
   return compareVersions(sdkVersion, '26.2') >= 0 && compareVersions(effectiveTarget, '26.0') >= 0;
+}
+
+/**
+ * Probe the same inputs MLX's kernel CMake uses to decide whether the NAX
+ * (M5 tensor-core) kernels are compiled on this host; the metallib gates then
+ * require them (and the K-quant NAX kernels) to be present. Any probe failure
+ * downgrades to the base gate only — a broken Metal toolchain already fails
+ * the native build itself.
+ */
+export function detectExpectNax(): boolean {
+  try {
+    const sdkVersion = execFileSync('xcrun', ['-sdk', 'macosx', '--show-sdk-version'], { encoding: 'utf-8' }).trim();
+    const hostVersion = execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
+    return shouldExpectNaxKernels(sdkVersion, hostVersion, process.env.MACOSX_DEPLOYMENT_TARGET);
+  } catch {
+    return false;
+  }
 }
 
 /**

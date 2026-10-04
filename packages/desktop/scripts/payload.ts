@@ -6,8 +6,10 @@
  * discover after a 16-minute build and a notarization round trip.
  */
 
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+
+import { assertPagedMetallibIntegrity, detectExpectNax } from '../../core/metallib-select.js';
 
 /**
  * The three native files, which MUST end up in ONE directory together.
@@ -53,23 +55,17 @@ export class PayloadError extends Error {
  * normal state of a fresh checkout — not an exceptional one. The error has to say
  * what to run, or the next person guesses.
  */
-export function resolvePayload(repoRoot: string): PayloadSource {
+export function resolvePayload(repoRoot: string, opts: { expectNax?: boolean } = {}): PayloadSource {
   const nativeDir = join(repoRoot, 'packages', 'core');
   const native: Record<string, string> = {};
+  const expectNax = opts.expectNax ?? detectExpectNax();
 
   for (const file of NATIVE_FILES) {
     const path = join(nativeDir, file);
     if (!existsSync(path)) {
       throw new PayloadError(`Missing native artifact: ${path}`, 'yarn build:native');
     }
-    const { size } = statSync(path);
-    const floor = MIN_BYTES[file] ?? 0;
-    if (size < floor) {
-      throw new PayloadError(
-        `${file} is ${size} bytes, under the ${floor}-byte floor — truncated or a placeholder`,
-        'yarn build:native',
-      );
-    }
+    checkNativeArtifact(file, path, { expectNax });
     native[file] = path;
   }
 
@@ -98,6 +94,31 @@ export function resolvePayload(repoRoot: string): PayloadSource {
   }
 
   return { native, wwwRoot, appDir };
+}
+
+/**
+ * Size floor for every native file. `paged_attn.metallib` also passes the same
+ * gate `yarn build:native` applies (packages/core/metallib-select.ts): it holds
+ * the K-quant kernels, which have no JIT fallback, so an older paged-only
+ * library clears any size floor and then throws on the first GGUF K-quant
+ * matmul. `expectNax`: this build also carries the K-quant NAX kernels.
+ */
+export function checkNativeArtifact(file: string, path: string, opts: { expectNax: boolean }): void {
+  const { size } = statSync(path);
+  const floor = MIN_BYTES[file] ?? 0;
+  if (size < floor) {
+    throw new PayloadError(
+      `${file} is ${size} bytes, under the ${floor}-byte floor — truncated or a placeholder`,
+      'yarn build:native',
+    );
+  }
+  if (file === 'paged_attn.metallib') {
+    try {
+      assertPagedMetallibIntegrity(readFileSync(path), { path, expectNax: opts.expectNax, minBytes: floor });
+    } catch (err) {
+      throw new PayloadError((err as Error).message, 'yarn build:native');
+    }
+  }
 }
 
 /**
