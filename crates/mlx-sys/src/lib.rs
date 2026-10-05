@@ -779,6 +779,50 @@ unsafe extern "C-unwind" {
         out: *mut u32,
     ) -> i32;
 
+    // Strict test entry for the tensor-op (NAX) route of a causal verify
+    // block: null (message on stderr) when this device, block or Q layout
+    // cannot take it.
+    pub fn mlx_segmented_sdpa_test_forward_nax(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY: the tensor-op dispatch this device plans for a causal
+    /// block: `out[0..6]` = M, tile keys, stage-1 threads, threadgroup
+    /// bytes, partitions, the pipeline's maxTotalThreadsPerThreadgroup.
+    /// 1 supported, 0 unsupported (no NAX included), -1 without Metal / on
+    /// error.
+    pub fn mlx_segmented_sdpa_test_nax_plan(
+        q_heads: i32,
+        kv_heads: i32,
+        rows: i32,
+        total_length: i32,
+        out: *mut u32,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: the tensor-op planner over
+    /// synthetic pipeline limits; `out[0..5]` = M, tile keys, stage-1
+    /// threads, threadgroup bytes, partitions for `total_length` keys under
+    /// `blocks_override` (MLX_SDPA_BLOCKS, 0 = policy).
+    pub fn mlx_segmented_sdpa_test_verify_nax_plan(
+        rows: i32,
+        gqa_factor: i32,
+        total_length: i32,
+        blocks_override: i32,
+        stage1_width: usize,
+        stage1_max_threads: usize,
+        stage1_static_memory: usize,
+        device_max_memory: usize,
+        stage2_width: usize,
+        stage2_max_threads: usize,
+        stage2_static_memory: usize,
+        out: *mut u32,
+    ) -> i32;
+
     /// TEST-ONLY, platform independent: the tile planner over synthetic
     /// pipeline limits; `out` as `mlx_segmented_sdpa_test_tile_plan`, with
     /// the partition count for `total_length` keys under `blocks_override`

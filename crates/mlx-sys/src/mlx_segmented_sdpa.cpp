@@ -82,12 +82,17 @@ SegmentedSdpaCapabilities capabilities(MTL::ComputePipelineState *pipeline,
           device->maxThreadgroupMemoryLength()};
 }
 
-constexpr SegmentedKernel kKernels[] = {
-    SegmentedKernel::one_pass, SegmentedKernel::two_pass_1,
-    SegmentedKernel::verify_two_pass_1,
-    SegmentedKernel::verify_tile_two_pass_1};
+// Tile sizes plan_segmented_verify_tile_launch can return.
+constexpr int kTileSizes[] = {16, 32};
+// Tile sizes segmented_nax_tile_n can return, and the M values
+// sdpa_segmented_nax.metal instantiates (segmented_nax_m_supported).
+constexpr int kNaxTileSizes[] = {32, 64};
+constexpr int kNaxMs[] = {8, 16, 24, 32, 40, 48, 56, 64};
 
-const char *kernel_name(SegmentedKernel kernel) {
+// The function name of a kernel; the tensor-op kernel carries its template
+// shape (M, tile_n) in the name, the others are specialized by function
+// constants.
+std::string kernel_name(SegmentedKernel kernel, int m = 0, int tile_n = 0) {
   switch (kernel) {
   case SegmentedKernel::one_pass:
     return "mlx_node_sdpa_segmented_bf16_256";
@@ -97,21 +102,22 @@ const char *kernel_name(SegmentedKernel kernel) {
     return "mlx_node_sdpa_segmented_verify_2pass_1_bf16_256";
   case SegmentedKernel::verify_tile_two_pass_1:
     return "mlx_node_sdpa_segmented_verify_tile_2pass_1_bf16_256";
+  case SegmentedKernel::verify_nax_two_pass_1:
+    return "mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m" +
+           std::to_string(m) + "_n" + std::to_string(tile_n);
   }
   throw std::invalid_argument("unknown segmented SDPA kernel");
 }
 
-// Tile sizes plan_segmented_verify_tile_launch can return.
-constexpr int kTileSizes[] = {16, 32};
-
 // MLX_SDPA_VERIFY_TILE: 0 keeps the vector routes (A/B kill switch); N >= 1
-// takes the tile kernel from N keys (prefix + new rows); unset = the
-// measured crossover kSegmentedTileMinKeys.
+// takes a block kernel (tensor-op or tile) from N keys (prefix + new rows);
+// unset = the measured crossover kSegmentedTileMinKeys.
 bool tile_route_enabled(SegmentedTileMode mode, int total_length) {
   switch (mode) {
   case SegmentedTileMode::vector:
     return false;
   case SegmentedTileMode::tile:
+  case SegmentedTileMode::nax:
     return true;
   case SegmentedTileMode::from_env:
     break;
@@ -119,6 +125,22 @@ bool tile_route_enabled(SegmentedTileMode mode, int total_length) {
   const int min_keys =
       env::get_var("MLX_SDPA_VERIFY_TILE", kSegmentedTileMinKeys);
   return min_keys > 0 && total_length >= min_keys;
+}
+
+// MLX_SDPA_VERIFY_NAX=0 keeps the simdgroup-matrix tile kernel on a device
+// whose tensor op could serve the block (A/B kill switch). Read per call.
+bool nax_route_enabled(SegmentedTileMode mode) {
+  switch (mode) {
+  case SegmentedTileMode::vector:
+  case SegmentedTileMode::tile:
+    return false;
+  case SegmentedTileMode::nax:
+    return true;
+  case SegmentedTileMode::from_env:
+    break;
+  }
+  return metal::is_nax_available() &&
+         env::get_var("MLX_SDPA_VERIFY_NAX", 1) != 0;
 }
 
 // MLX's own aggregation kernel: the partials must reduce exactly as MLX's
@@ -151,7 +173,7 @@ Pipelines get_pipelines(metal::Device &device, int query_length, int gqa_factor,
   const auto kernel =
       two_pass ? SegmentedKernel::two_pass_1 : SegmentedKernel::one_pass;
   auto *stage1 =
-      segmented_kernel(device, {kernel, causal, partitions, 0, 0, 0});
+      segmented_kernel(device, {kernel, causal, partitions, 0, 0, 0, 0});
   MTL::ComputePipelineState *stage2 = nullptr;
   if (two_pass) {
     stage2 = reduction_kernel(device);
@@ -177,16 +199,21 @@ MTL::ComputePipelineState *
 segmented_kernel(metal::Device &device,
                  const SegmentedSpecialization &specialization) {
   const auto &sp = specialization;
-  std::string hash = kernel_name(sp.kernel);
+  const std::string name = kernel_name(sp.kernel, sp.m, sp.tile_n);
+  std::string hash = name;
   metal::MTLFCList constants;
+  if (sp.kernel == SegmentedKernel::verify_nax_two_pass_1) {
+    // The whole shape is in the function name.
+    return fast::paged::get_prebuilt_kernel(device, "segmented_sdpa",
+                                            "segmented SDPA", name);
+  }
   if (sp.kernel == SegmentedKernel::verify_tile_two_pass_1) {
     // The tile kernel takes its shape from buffers; only the tile size is
     // compiled in (index 29).
     constants.emplace_back(&sp.tile_n, MTL::DataType::DataTypeInt, 29);
     hash += "_t" + std::to_string(sp.tile_n);
     return fast::paged::get_prebuilt_kernel(
-        device, "segmented_sdpa", "segmented SDPA", kernel_name(sp.kernel),
-        hash, constants);
+        device, "segmented_sdpa", "segmented SDPA", name, hash, constants);
   }
   // Indices 22 and 26 are MLX's sdpa_vector.h do_causal and blocks.
   constants.emplace_back(&sp.causal, MTL::DataType::DataTypeBool, 22);
@@ -201,14 +228,22 @@ segmented_kernel(metal::Device &device,
     hash += "_g" + std::to_string(sp.gqa) + "_r" + std::to_string(sp.rows);
   }
   return fast::paged::get_prebuilt_kernel(
-      device, "segmented_sdpa", "segmented SDPA", kernel_name(sp.kernel), hash,
-      constants);
+      device, "segmented_sdpa", "segmented SDPA", name, hash, constants);
 }
 
 std::vector<std::string> metal_kernel_names() {
   std::vector<std::string> names;
-  for (auto kernel : kKernels) {
-    names.emplace_back(kernel_name(kernel));
+  for (auto kernel :
+       {SegmentedKernel::one_pass, SegmentedKernel::two_pass_1,
+        SegmentedKernel::verify_two_pass_1,
+        SegmentedKernel::verify_tile_two_pass_1}) {
+    names.push_back(kernel_name(kernel));
+  }
+  for (int m : kNaxMs) {
+    for (int tile_n : kNaxTileSizes) {
+      names.push_back(
+          kernel_name(SegmentedKernel::verify_nax_two_pass_1, m, tile_n));
+    }
   }
   return names;
 }
@@ -228,22 +263,31 @@ std::vector<SegmentedSpecialization> metal_kernel_specializations() {
   }
   std::vector<SegmentedSpecialization> out;
   for (bool causal : {false, true}) {
-    out.push_back({SegmentedKernel::one_pass, causal, 32, 0, 0, 0});
+    out.push_back({SegmentedKernel::one_pass, causal, 32, 0, 0, 0, 0});
     for (int p : partitions) {
-      out.push_back({SegmentedKernel::two_pass_1, causal, p, 0, 0, 0});
+      out.push_back({SegmentedKernel::two_pass_1, causal, p, 0, 0, 0, 0});
     }
   }
   for (int p : partitions) {
     for (int gqa = 1; gqa <= 32; ++gqa) {
       for (int rows = 2; rows <= 8; ++rows) {
         out.push_back(
-            {SegmentedKernel::verify_two_pass_1, true, p, gqa, rows, 0});
+            {SegmentedKernel::verify_two_pass_1, true, p, gqa, rows, 0, 0});
       }
     }
   }
   for (int tile_n : kTileSizes) {
     out.push_back(
-        {SegmentedKernel::verify_tile_two_pass_1, true, 0, 0, 0, tile_n});
+        {SegmentedKernel::verify_tile_two_pass_1, true, 0, 0, 0, tile_n, 0});
+  }
+  // The tensor-op pipelines build only where the op exists.
+  if (metal::is_nax_available()) {
+    for (int m : kNaxMs) {
+      for (int tile_n : kNaxTileSizes) {
+        out.push_back(
+            {SegmentedKernel::verify_nax_two_pass_1, true, 0, 0, 0, tile_n, m});
+      }
+    }
   }
   return out;
 }
@@ -254,13 +298,17 @@ int segmented_max_query_length(metal::Device &device, int gqa_factor) {
   }
   const int partitions = 64;
   auto *pipeline = segmented_kernel(
-      device, {SegmentedKernel::two_pass_1, true, partitions, 0, 0, 0});
-  auto *one_pass =
-      segmented_kernel(device, {SegmentedKernel::one_pass, true, 32, 0, 0, 0});
-  // Loaded here only so a metallib without the tile kernel is a packaging
-  // error (PrebuiltKernelMissing); the width below does not depend on it.
+      device, {SegmentedKernel::two_pass_1, true, partitions, 0, 0, 0, 0});
+  auto *one_pass = segmented_kernel(
+      device, {SegmentedKernel::one_pass, true, 32, 0, 0, 0, 0});
+  // Loaded here only so a metallib without the block kernels is a packaging
+  // error (PrebuiltKernelMissing); the width below does not depend on them.
   segmented_kernel(device, {SegmentedKernel::verify_tile_two_pass_1, true, 0, 0,
-                            0, kTileSizes[1]});
+                            0, kTileSizes[1], 0});
+  if (metal::is_nax_available()) {
+    segmented_kernel(device, {SegmentedKernel::verify_nax_two_pass_1, true, 0,
+                              0, 0, kNaxTileSizes[1], 48});
+  }
   auto *reduction = reduction_kernel(device);
   const auto stage1 = capabilities(pipeline, device.mtl_device());
   const auto one_pass_caps = capabilities(one_pass, device.mtl_device());
@@ -303,8 +351,9 @@ struct UnifiedVerifyLaunch {
 // dispatch can serve the block depends on the GPU, not only on the policy.
 UnifiedVerifyLaunch unified_verify_launch(metal::Device &device, int rows,
                                           int gqa, int partitions) {
-  auto *pipeline = segmented_kernel(device, {SegmentedKernel::verify_two_pass_1,
-                                             true, partitions, gqa, rows, 0});
+  auto *pipeline = segmented_kernel(
+      device,
+      {SegmentedKernel::verify_two_pass_1, true, partitions, gqa, rows, 0, 0});
   return {pipeline,
           plan_segmented_verify_launch(
               rows, gqa, partitions,
@@ -351,8 +400,64 @@ TileVerifyLaunch tile_verify_launch(metal::Device &device, int rows, int gqa,
     return launch;
   }
   launch.stage1 = segmented_kernel(
-      device, {SegmentedKernel::verify_tile_two_pass_1, true, 0, 0, 0, tile_n});
+      device,
+      {SegmentedKernel::verify_tile_two_pass_1, true, 0, 0, 0, tile_n, 0});
   launch.plan = plan_segmented_verify_tile_launch(
+      rows, gqa, capabilities(launch.stage1, mtl), c2);
+  if (launch.plan.supported && int(launch.plan.tile_n) != tile_n) {
+    launch.plan.supported = false;
+  }
+  launch.partitions = segmented_verify_tile_partitions(
+      total_length, tile_n, env::get_var("MLX_SDPA_BLOCKS", 0));
+  return launch;
+}
+
+struct NaxVerifyLaunch {
+  MTL::ComputePipelineState *stage1;
+  MTL::ComputePipelineState *stage2;
+  SegmentedSdpaNaxPlan plan;
+  int partitions;
+};
+
+// The tensor-op kernel reads the M = gqa * rows queries of one KV head as
+// one strided rank-2 tensor in head-major order (m = h * rows + r), which
+// needs the row stride to continue across heads; every seq stride it passes
+// as a tensor stride must fit an int.
+bool nax_q_layout(const array &q, const array &pk, const array &pv,
+                  const array &nk, const array &nv) {
+  constexpr int64_t kMax = std::numeric_limits<int>::max();
+  return q.strides(1) == int64_t{q.shape(2)} * q.strides(2) &&
+         q.strides(2) <= kMax && pk.strides(2) <= kMax &&
+         pv.strides(2) <= kMax && nk.strides(2) <= kMax &&
+         nv.strides(2) <= kMax;
+}
+
+// The tensor-op verify dispatch for a causal block of `rows` over
+// prefix_n + new_n keys; `plan.supported` is false when the device (no NAX),
+// pipeline or shape rules it out. M and the tile size are in the function
+// name, so both are chosen before the pipeline exists and confirmed against
+// the built pipeline. Partitions follow the tile kernel's policy at this
+// kernel's tile size.
+NaxVerifyLaunch nax_verify_launch(metal::Device &device, int rows, int gqa,
+                                  int total_length) {
+  auto *mtl = device.mtl_device();
+  auto *stage2 = reduction_kernel(device);
+  const auto c2 = capabilities(stage2, mtl);
+  NaxVerifyLaunch launch{nullptr, stage2, {false, 0, 0, 0, 0, 0}, 0};
+  const int64_t m = int64_t{rows} * gqa;
+  if (rows < 1 || gqa < 1 || !segmented_nax_m_supported(int(m)) ||
+      !metal::is_nax_available()) {
+    return launch;
+  }
+  const int tile_n = static_cast<int>(
+      segmented_nax_tile_n(c2.max_threadgroup_memory, 0, uint32_t(m)));
+  if (tile_n == 0) {
+    return launch;
+  }
+  launch.stage1 = segmented_kernel(device,
+                                   {SegmentedKernel::verify_nax_two_pass_1,
+                                    true, 0, 0, 0, tile_n, int(m)});
+  launch.plan = plan_segmented_verify_nax_launch(
       rows, gqa, capabilities(launch.stage1, mtl), c2);
   if (launch.plan.supported && int(launch.plan.tile_n) != tile_n) {
     launch.plan.supported = false;
@@ -526,10 +631,42 @@ void encode_unified_verify(metal::CommandEncoder &encoder,
                    q_heads, rows);
 }
 
-void encode_tile_verify(metal::CommandEncoder &encoder,
-                        const TileVerifyLaunch &launch, const array &q,
-                        const array &pk, const array &pv, const array &nk,
-                        const array &nv, float scale, array &out) {
+// One block-kernel dispatch (simdgroup-matrix tile or tensor-op): the two
+// kernels bind the same buffers and differ in pipeline, threads and scratch.
+struct BlockVerifyDispatch {
+  const char *counter;
+  MTL::ComputePipelineState *stage1;
+  MTL::ComputePipelineState *stage2;
+  uint32_t stage1_threads;
+  uint32_t stage2_threads;
+  uint32_t threadgroup_bytes;
+  int partitions;
+};
+
+BlockVerifyDispatch block_dispatch(const TileVerifyLaunch &launch) {
+  return {"segmented_sdpa_verify_tile_2pass_1",
+          launch.stage1,
+          launch.stage2,
+          launch.plan.stage1_threads,
+          launch.plan.stage2_threads,
+          launch.plan.threadgroup_bytes,
+          launch.partitions};
+}
+
+BlockVerifyDispatch block_dispatch(const NaxVerifyLaunch &launch) {
+  return {"segmented_sdpa_verify_nax_2pass_1",
+          launch.stage1,
+          launch.stage2,
+          launch.plan.stage1_threads,
+          launch.plan.stage2_threads,
+          launch.plan.threadgroup_bytes,
+          launch.partitions};
+}
+
+void encode_block_verify(metal::CommandEncoder &encoder,
+                         const BlockVerifyDispatch &launch, const array &q,
+                         const array &pk, const array &pv, const array &nk,
+                         const array &nv, float scale, array &out) {
   const int batch = q.shape(0);
   const int q_heads = q.shape(1);
   const int rows = q.shape(2);
@@ -543,7 +680,7 @@ void encode_tile_verify(metal::CommandEncoder &encoder,
   array maxs({}, float32, nullptr, {});
   add_reduction_temporaries(encoder, batch, q_heads, rows, partitions, partials,
                             sums, maxs);
-  bridge_testing::record("segmented_sdpa_verify_tile_2pass_1");
+  bridge_testing::record(launch.counter);
   encoder.set_compute_pipeline_state(launch.stage1);
   encoder.set_input_array(q, 0);
   encoder.set_input_array(pk, 1);
@@ -560,9 +697,9 @@ void encode_tile_verify(metal::CommandEncoder &encoder,
   encoder.set_bytes(gqa, 12);
   encoder.set_bytes(rows, 13);
   encoder.set_bytes(partitions, 14);
-  encoder.set_threadgroup_memory_length(launch.plan.threadgroup_bytes, 0);
+  encoder.set_threadgroup_memory_length(launch.threadgroup_bytes, 0);
   encoder.dispatch_threadgroups(MTL::Size(kv_heads, batch, partitions),
-                                MTL::Size(launch.plan.stage1_threads, 1, 1));
+                                MTL::Size(launch.stage1_threads, 1, 1));
   bridge_testing::record("segmented_sdpa_2pass_2");
   encoder.set_compute_pipeline_state(launch.stage2);
   encoder.set_input_array(partials, 0);
@@ -571,7 +708,7 @@ void encode_tile_verify(metal::CommandEncoder &encoder,
   encoder.set_output_array(out, 3);
   encoder.set_bytes(partitions, 4);
   encoder.dispatch_threadgroups(MTL::Size(batch * q_heads, rows, 1),
-                                MTL::Size(launch.plan.stage2_threads, 1, 1));
+                                MTL::Size(launch.stage2_threads, 1, 1));
 }
 
 class SegmentedSdpa final : public fast::Custom {
@@ -609,26 +746,45 @@ public:
     const int new_n = nk.shape(2);
     auto &out = outputs[0];
 
-    // A verify block (causal, one new row per query) takes the
-    // simdgroup-matrix kernel whenever this device can launch it. The
-    // partition count follows the real prefix, so a shapeless replay stays
-    // valid as the prefix grows.
+    // A verify block (causal, one new row per query) takes a block kernel
+    // whenever this device can launch one: the tensor-op kernel where NAX
+    // exists and Q is head-major contiguous, else the simdgroup-matrix tile
+    // kernel. The partition count follows the real prefix, so a shapeless
+    // replay stays valid as the prefix grows.
     if (causal_ && new_n == q_len &&
         tile_route_enabled(tile_mode_, prefix_n + new_n) && tile_aligned(q) &&
         tile_aligned(pk) && tile_aligned(pv) && tile_aligned(nk) &&
         tile_aligned(nv)) {
-      const auto launch =
-          tile_verify_launch(device, q_len, gqa, prefix_n + new_n);
-      if (launch.plan.supported) {
-        bridge_testing::record("segmented_sdpa_route_tile");
-        out.set_data(allocator::malloc(out.nbytes()));
-        encode_tile_verify(encoder, launch, q, pk, pv, nk, nv, scale_, out);
-        return;
+      if (nax_route_enabled(tile_mode_) && nax_q_layout(q, pk, pv, nk, nv)) {
+        const auto launch =
+            nax_verify_launch(device, q_len, gqa, prefix_n + new_n);
+        if (launch.plan.supported) {
+          bridge_testing::record("segmented_sdpa_route_nax");
+          out.set_data(allocator::malloc(out.nbytes()));
+          encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk,
+                              nv, scale_, out);
+          return;
+        }
+      }
+      if (tile_mode_ != SegmentedTileMode::nax) {
+        const auto launch =
+            tile_verify_launch(device, q_len, gqa, prefix_n + new_n);
+        if (launch.plan.supported) {
+          bridge_testing::record("segmented_sdpa_route_tile");
+          out.set_data(allocator::malloc(out.nbytes()));
+          encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk,
+                              nv, scale_, out);
+          return;
+        }
       }
     }
     if (tile_mode_ == SegmentedTileMode::tile) {
       throw std::runtime_error(
           "segmented SDPA tile route was required but is unsupported");
+    }
+    if (tile_mode_ == SegmentedTileMode::nax) {
+      throw std::runtime_error(
+          "segmented SDPA tensor-op route was required but is unsupported");
     }
 
     if (head_rows_ == 0) {
@@ -731,15 +887,23 @@ array segmented_sdpa(const array &q, const array &prefix_k,
     return segmented_fallback(inputs, scale, causal, stream)[0];
   };
   auto &device = metal::device(stream.device);
-  if (tile_mode == SegmentedTileMode::tile) {
-    // Forced tile route (tests): the block must be a verify block the device
-    // can tile; alignment is checked at eval time.
-    if (!causal || new_k.shape(2) != q_len ||
-        !tile_verify_launch(device, q_len, gqa,
-                            prefix_k.shape(2) + new_k.shape(2))
-             .plan.supported) {
+  if (tile_mode == SegmentedTileMode::tile ||
+      tile_mode == SegmentedTileMode::nax) {
+    // Forced block kernel (tests): the block must be a verify block the
+    // device can serve with it; alignment is checked at eval time.
+    const int total = prefix_k.shape(2) + new_k.shape(2);
+    const bool verify_block = causal && new_k.shape(2) == q_len;
+    if (tile_mode == SegmentedTileMode::tile &&
+        (!verify_block ||
+         !tile_verify_launch(device, q_len, gqa, total).plan.supported)) {
       throw std::invalid_argument(
           "segmented SDPA tile route does not support this block");
+    }
+    if (tile_mode == SegmentedTileMode::nax &&
+        (!verify_block || !nax_q_layout(q, prefix_k, prefix_v, new_k, new_v) ||
+         !nax_verify_launch(device, q_len, gqa, total).plan.supported)) {
+      throw std::invalid_argument(
+          "segmented SDPA tensor-op route does not support this block");
     }
     auto primitive =
         std::make_shared<SegmentedSdpa>(stream, scale, causal, 0, tile_mode);
@@ -881,6 +1045,49 @@ extern "C" int mlx_segmented_sdpa_test_tile_plan(int q_heads, int kv_heads,
   }
 }
 
+// Test-only: the tensor-op (NAX) route, or null (message on stderr) when
+// this device, block or Q layout cannot take it.
+extern "C" mlx_array *
+mlx_segmented_sdpa_test_forward_nax(mlx_array *q, mlx_array *prefix_k,
+                                    mlx_array *prefix_v, mlx_array *new_k,
+                                    mlx_array *new_v, float scale) {
+  return segmented_sdpa_forward_impl(
+      q, prefix_k, prefix_v, new_k, new_v, scale, true, true,
+      mlx::core::segmented_sdpa::SegmentedTileMode::nax);
+}
+
+// Test-only: the tensor-op dispatch this device plans for a causal block of
+// `rows` over `total_length` keys: out[0..6] = M, tile keys, stage-1
+// threads, threadgroup bytes, partitions, the pipeline's
+// maxTotalThreadsPerThreadgroup (0 when it did not build). 1 when supported,
+// 0 when not (no NAX on this device included), -1 on error.
+extern "C" int mlx_segmented_sdpa_test_nax_plan(int q_heads, int kv_heads,
+                                                int rows, int total_length,
+                                                uint32_t *out) {
+  using namespace mlx::core;
+  try {
+    if (out == nullptr || kv_heads < 1 || q_heads % kv_heads != 0) {
+      return -1;
+    }
+    auto stream = default_stream(Device::gpu);
+    auto &device = metal::device(stream.device);
+    const auto launch = segmented_sdpa::nax_verify_launch(
+        device, rows, q_heads / kv_heads, total_length);
+    out[0] = launch.plan.m;
+    out[1] = launch.plan.tile_n;
+    out[2] = launch.plan.stage1_threads;
+    out[3] = launch.plan.threadgroup_bytes;
+    out[4] = static_cast<uint32_t>(launch.partitions);
+    out[5] = launch.stage1 == nullptr
+                 ? 0
+                 : static_cast<uint32_t>(
+                       launch.stage1->maxTotalThreadsPerThreadgroup());
+    return launch.plan.supported ? 1 : 0;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
 // 0 when segmented SDPA is not supported here; -1 (message on stderr) when its
 // prebuilt kernels are missing from paged_attn.metallib.
 extern "C" int mlx_segmented_sdpa_max_query_length(int gqa_factor) {
@@ -946,7 +1153,7 @@ extern "C" int mlx_segmented_sdpa_test_verify_pipeline_limits(int gqa, int rows,
     auto &device = metal::device(stream.device);
     auto *verify = segmented_sdpa::segmented_kernel(
         device, {segmented_sdpa::SegmentedKernel::verify_two_pass_1, true,
-                 partitions, gqa, rows, 0});
+                 partitions, gqa, rows, 0, 0});
     auto *reduction = segmented_sdpa::reduction_kernel(device);
     out[0] = verify->threadExecutionWidth();
     out[1] = verify->maxTotalThreadsPerThreadgroup();
@@ -984,6 +1191,17 @@ mlx_segmented_sdpa_test_forward_tile(mlx_array *, mlx_array *, mlx_array *,
 
 extern "C" int mlx_segmented_sdpa_test_tile_plan(int, int, int, int,
                                                  uint32_t *) {
+  return -1;
+}
+
+extern "C" mlx_array *
+mlx_segmented_sdpa_test_forward_nax(mlx_array *, mlx_array *, mlx_array *,
+                                    mlx_array *, mlx_array *, float) {
+  return nullptr;
+}
+
+extern "C" int mlx_segmented_sdpa_test_nax_plan(int, int, int, int,
+                                                uint32_t *) {
   return -1;
 }
 
@@ -1075,6 +1293,32 @@ extern "C" int mlx_segmented_sdpa_test_verify_tile_plan(
     out[1] = plan.stage1_threads;
     out[2] = plan.threadgroup_bytes;
     out[3] = static_cast<uint32_t>(segmented_verify_tile_partitions(
+        total_length, static_cast<int>(plan.tile_n), blocks_override));
+  }
+  return plan.supported ? 1 : 0;
+}
+
+// Test-only, platform independent: the tensor-op planner over synthetic
+// pipeline limits. out[0..5] = M, tile keys, stage-1 threads, threadgroup
+// bytes and the partition count for `total_length` keys; 1 when supported,
+// else 0.
+extern "C" int mlx_segmented_sdpa_test_verify_nax_plan(
+    int rows, int gqa_factor, int total_length, int blocks_override,
+    size_t stage1_width, size_t stage1_max_threads, size_t stage1_static_memory,
+    size_t device_max_memory, size_t stage2_width, size_t stage2_max_threads,
+    size_t stage2_static_memory, uint32_t *out) {
+  using namespace mlx::core::segmented_sdpa;
+  SegmentedSdpaCapabilities c1{stage1_width, stage1_max_threads,
+                               stage1_static_memory, device_max_memory};
+  SegmentedSdpaCapabilities c2{stage2_width, stage2_max_threads,
+                               stage2_static_memory, device_max_memory};
+  auto plan = plan_segmented_verify_nax_launch(rows, gqa_factor, c1, c2);
+  if (out) {
+    out[0] = plan.m;
+    out[1] = plan.tile_n;
+    out[2] = plan.stage1_threads;
+    out[3] = plan.threadgroup_bytes;
+    out[4] = static_cast<uint32_t>(segmented_verify_tile_partitions(
         total_length, static_cast<int>(plan.tile_n), blocks_override));
   }
   return plan.supported ? 1 : 0;

@@ -15,11 +15,14 @@ enum class SegmentedKernel {
   two_pass_1,
   verify_two_pass_1,
   verify_tile_two_pass_1,
+  verify_nax_two_pass_1,
 };
 
-// One pipeline: a kernel and its function constants. `partitions` applies to
-// the vector two-pass kernels, `gqa` / `rows` to the vector verify kernel,
-// `tile_n` to the simdgroup-matrix verify kernel.
+// One pipeline: a kernel and its function constants or template shape.
+// `partitions` applies to the vector two-pass kernels, `gqa` / `rows` to the
+// vector verify kernel, `tile_n` to the simdgroup-matrix verify kernel (a
+// function constant) and, with `m`, to the tensor-op verify kernel (both
+// compiled into the function name).
 struct SegmentedSpecialization {
   SegmentedKernel kernel;
   bool causal;
@@ -27,16 +30,22 @@ struct SegmentedSpecialization {
   int gqa;
   int rows;
   int tile_n;
+  int m;
 };
 
-// How the verify block (causal, new rows == query rows) is served: the
-// simdgroup-matrix tile kernel when the device supports it, else the vector
-// routes. `from_env` reads MLX_SDPA_VERIFY_TILE: 0 disables the tile kernel,
-// N >= 1 takes it from N keys (unset: the measured crossover).
+// How the verify block (causal, new rows == query rows) is served. The
+// block kernels are the tensor-op (NAX) kernel on gen-17+ GPUs, else the
+// simdgroup-matrix tile kernel; below the key crossover, or where neither
+// can launch, the vector routes. `from_env` reads MLX_SDPA_VERIFY_TILE (0
+// disables both block kernels, N >= 1 takes them from N keys; unset: the
+// measured crossover) and MLX_SDPA_VERIFY_NAX (0 keeps the tile kernel on
+// NAX devices; unset or 1 prefers the tensor-op kernel). `tile` and `nax`
+// force one block kernel (tests).
 enum class SegmentedTileMode : int {
   from_env = -1,
   vector = 0,
   tile = 1,
+  nax = 2,
 };
 
 // The prebuilt pipeline from paged_attn.metallib; throws when it is missing.

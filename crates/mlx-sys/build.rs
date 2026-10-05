@@ -351,9 +351,12 @@ fn compile_paged_attn_metallib(
             min_os.clone(),
         ],
     });
-    // Self-contained sources (no MLX headers), with the same flags.
+    // Self-contained sources (no MLX headers), with the same flags. The
+    // tensor-op verify kernel includes MetalPerformancePrimitives from the
+    // SDK; `assert_nax_buildable` has already checked the deployment target.
     for file in [
         "segmented_sdpa/sdpa_segmented.metal",
+        "segmented_sdpa/sdpa_segmented_nax.metal",
         "affine_mixed/affine_qmv_wide_mixed.metal",
     ] {
         let args = vec![

@@ -2724,6 +2724,99 @@ mod tests {
         assert!(!tile_plan(8, 6, 1000, 0, caps, 32 * kib, (32, 512, 0)).0);
     }
 
+    /// Tensor-op planner over synthetic limits: (supported, M, tile keys,
+    /// threads, threadgroup bytes, partitions for `total` keys).
+    fn nax_plan(
+        rows: i32,
+        gqa: i32,
+        total: i32,
+        blocks_override: i32,
+        stage1: (usize, usize, usize),
+        device_memory: usize,
+        stage2: (usize, usize, usize),
+    ) -> (bool, u32, u32, u32, u32, u32) {
+        let mut out = [0u32; 5];
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_verify_nax_plan(
+                rows,
+                gqa,
+                total,
+                blocks_override,
+                stage1.0,
+                stage1.1,
+                stage1.2,
+                device_memory,
+                stage2.0,
+                stage2.1,
+                stage2.2,
+                out.as_mut_ptr(),
+            )
+        } == 1;
+        (supported, out[0], out[1], out[2], out[3], out[4])
+    }
+
+    /// The tensor-op verify kernel: 256 threads whatever M, M = gqa x rows a
+    /// compiled multiple of 8 up to 64, the scratch (fp32 scores + BF16
+    /// probabilities [M][tile_n], fp32 scale [M], two flags) within three
+    /// quarters of the device's threadgroup memory limit choosing 64 or 32
+    /// keys, and the tile kernel's partition policy at that tile size.
+    #[test]
+    fn segmented_verify_nax_planner_follows_device_limits() {
+        // The tensor-op pipeline reports 256 threads; MLX's reduction 1024.
+        let caps = (32, 256, 0);
+        let red = (32, 1024, 0);
+        let kib = 1024;
+        let scratch = |m: u32, n: u32| m * n * 6 + m * 4 + 8;
+        // 24 q heads / 4 kv heads, 8 rows: M = 48 -> 64 keys, 512 keys per
+        // partition.
+        assert_eq!(
+            nax_plan(8, 6, 32776, 0, caps, 32 * kib, red),
+            (true, 48, 64, 256, scratch(48, 64), 96)
+        );
+        assert_eq!(nax_plan(8, 6, 95, 0, caps, 32 * kib, red).5, 32);
+        assert_eq!(nax_plan(8, 6, 16392, 0, caps, 32 * kib, red).5, 64);
+        assert_eq!(nax_plan(8, 6, 1 << 20, 0, caps, 32 * kib, red).5, 1024);
+        assert_eq!(nax_plan(8, 6, 32776, 100, caps, 32 * kib, red).5, 128);
+        // M = 64 (gqa 8) exceeds the 64-key budget at 32 KiB: 32 keys and
+        // 256 keys per partition; M = 56 still fits 64 keys.
+        assert_eq!(
+            nax_plan(8, 8, 32776, 0, caps, 32 * kib, red),
+            (true, 64, 32, 256, scratch(64, 32), 160)
+        );
+        assert_eq!(nax_plan(7, 8, 1000, 0, caps, 32 * kib, red).2, 64);
+        assert_eq!(nax_plan(8, 8, 1000, 0, caps, 64 * kib, red).2, 64);
+        // 16 KiB: 64 keys up to M = 24, 32 keys to M = 56, nothing at 64;
+        // 8 KiB: 32 keys up to M = 24.
+        assert_eq!(nax_plan(4, 6, 1000, 0, caps, 16 * kib, red).2, 64);
+        assert_eq!(nax_plan(8, 6, 1000, 0, caps, 16 * kib, red).2, 32);
+        assert_eq!(nax_plan(7, 8, 1000, 0, caps, 16 * kib, red).2, 32);
+        assert!(!nax_plan(8, 8, 1000, 0, caps, 16 * kib, red).0);
+        assert!(!nax_plan(8, 6, 1000, 0, caps, 8 * kib, red).0);
+        assert_eq!(nax_plan(4, 6, 1000, 0, caps, 8 * kib, red).2, 32);
+        // Every compiled M: multiples of 8 from 8 (gqa 4 x 2) to 64.
+        for rows in 2..=8 {
+            for gqa in 1..=32 {
+                let m = rows * gqa;
+                let plan = nax_plan(rows, gqa, 1000, 0, caps, 32 * kib, red);
+                assert_eq!(plan.0, m % 8 == 0 && m <= 64, "rows={rows} gqa={gqa}");
+                if plan.0 {
+                    assert_eq!(plan.1, m as u32);
+                }
+            }
+        }
+        assert!(!nax_plan(1, 8, 1000, 0, caps, 32 * kib, red).0, "rows < 2");
+        // The pipeline's own limits rule: width, 256 threads, static memory.
+        assert!(!nax_plan(8, 6, 1000, 0, (16, 256, 0), 32 * kib, red).0);
+        assert!(!nax_plan(8, 6, 1000, 0, (32, 128, 0), 32 * kib, red).0);
+        assert!(nax_plan(8, 6, 1000, 0, (32, 1024, 0), 32 * kib, red).0);
+        assert_eq!(
+            nax_plan(8, 6, 1000, 0, (32, 256, 8 * kib), 32 * kib, red).2,
+            32
+        );
+        assert!(!nax_plan(8, 6, 1000, 0, (32, 256, 26 * kib), 32 * kib, red).0);
+        assert!(!nax_plan(8, 6, 1000, 0, caps, 32 * kib, (32, 512, 0)).0);
+    }
+
     /// `[B, H, prefix, D]` inputs for a verify block of `rows` over `prefix`
     /// keys from `[B, H, capacity, D]` caches with NaN past the prefix.
     #[cfg(target_os = "macos")]
@@ -2781,6 +2874,45 @@ mod tests {
         MxArray::from_handle(handle, "strict tile segmented SDPA test")
     }
 
+    #[cfg(target_os = "macos")]
+    fn strict_nax_for_test(c: &TileCase) -> Result<MxArray> {
+        let handle = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_forward_nax(
+                c.q.as_raw_ptr(),
+                c.pk.as_raw_ptr(),
+                c.pv.as_raw_ptr(),
+                c.nk.as_raw_ptr(),
+                c.nv.as_raw_ptr(),
+                0.0625,
+            )
+        };
+        MxArray::from_handle(handle, "strict tensor-op segmented SDPA test")
+    }
+
+    /// Whether this device plans the tensor-op kernel for a verify block of
+    /// `rows` over `total` keys at `q_heads` / `kv_heads`; `plan` receives
+    /// M, tile keys, threads, threadgroup bytes, partitions, pipeline max
+    /// threads.
+    #[cfg(target_os = "macos")]
+    fn nax_supported(
+        q_heads: i64,
+        kv_heads: i64,
+        rows: i64,
+        total: i64,
+        plan: &mut [u32; 6],
+    ) -> bool {
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_nax_plan(
+                q_heads as i32,
+                kv_heads as i32,
+                rows as i32,
+                total as i32,
+                plan.as_mut_ptr(),
+            )
+        };
+        supported == 1
+    }
+
     /// BF16 spacing at `x` (subnormals share the smallest normal spacing).
     fn bf16_ulp(x: f32) -> f32 {
         let exponent = x.abs().max(f32::from_bits(0x0080_0000)).log2().floor();
@@ -2805,11 +2937,14 @@ mod tests {
         (max_diff / ulp, sum / got.len() as f64 / f64::from(ulp))
     }
 
-    /// The tile route sums in another order (fp32 MMAs, BF16 P), so it is
-    /// not bit-identical to the vector route; it must stay within 2 BF16
-    /// ulps of it over every prefix boundary and block width, with random
-    /// and large-magnitude (peaked softmax) scores, on NaN-tailed caches
-    /// and the production [B, T, H, D] layout. Runs by default on Metal.
+    /// The block routes sum in another order (fp32 MMAs, BF16 P), so they
+    /// are not bit-identical to the vector route; each must stay within 2
+    /// BF16 ulps of it over every prefix boundary and block width, with
+    /// random and large-magnitude (peaked softmax) scores, on NaN-tailed
+    /// caches and the production [B, T, H, D] layout. The tensor-op (NAX)
+    /// route is checked on the same blocks wherever this device plans it
+    /// (gen-17+, M = gqa x rows <= 64) and must refuse a Q whose heads are
+    /// not contiguous with its rows. Runs by default on Metal.
     #[test]
     #[cfg(target_os = "macos")]
     fn segmented_verify_tile_matches_vector_route_within_tolerance() -> Result<()> {
@@ -2858,11 +2993,26 @@ mod tests {
         ];
         // gqa 6 tiles rows 4 and 8 (M % 8), gqa 8 every width 2..=8.
         let layouts: [(i64, Vec<i64>); 2] = [(24, vec![4, 8]), (32, (2..=8).collect())];
+        let mut nax_plan = [0u32; 6];
+        let nax_any = nax_supported(24, HKV, 8, 32_776, &mut nax_plan);
+        if nax_any {
+            eprintln!(
+                "nax plan 24/4 rows 8: m={} tile_n={} threads={} tg_bytes={} partitions@32776={} \
+                 pipeline_max_threads={}",
+                nax_plan[0], nax_plan[1], nax_plan[2], nax_plan[3], nax_plan[4], nax_plan[5]
+            );
+        } else {
+            eprintln!("nax route unsupported on this device; checking the tile route only");
+        }
         let mut worst = (0f32, 0f64);
+        let mut worst_nax = (0f32, 0f64);
         let mut checked = 0usize;
+        let mut checked_nax = 0usize;
         for (q_heads, rows_list) in &layouts {
             for &rows in rows_list {
                 for &prefix in &prefixes {
+                    let nax_here =
+                        nax_any && nax_supported(*q_heads, HKV, rows, prefix + rows, &mut nax_plan);
                     // Random, sharp (x8) and adversarial (x64: scores in
                     // the tens, a few keys own the softmax).
                     for (set, shift) in [0u16, 3, 6].into_iter().enumerate() {
@@ -2883,6 +3033,19 @@ mod tests {
                         worst.0 = worst.0.max(max_ulps);
                         worst.1 = worst.1.max(mean_ulps);
                         checked += 1;
+                        if nax_here {
+                            let nax = strict_nax_for_test(&c)?.to_float32()?;
+                            let (max_ulps, mean_ulps) = tile_error(nax.as_ref(), expected.as_ref());
+                            assert!(
+                                max_ulps <= 2.0 && mean_ulps <= 0.25,
+                                "nax q_heads={q_heads} rows={rows} prefix={prefix} set={set}: \
+                                 max {max_ulps} / mean {mean_ulps:.4} BF16 ulps of the output \
+                                 magnitude"
+                            );
+                            worst_nax.0 = worst_nax.0.max(max_ulps);
+                            worst_nax.1 = worst_nax.1.max(mean_ulps);
+                            checked_nax += 1;
+                        }
                     }
                 }
             }
@@ -2928,17 +3091,61 @@ mod tests {
             worst.0 = worst.0.max(max_ulps);
             worst.1 = worst.1.max(mean_ulps);
             checked += 1;
+            if nax_any {
+                // A [B, T, H, D] view interleaves the heads of a row: the
+                // tensor-op route refuses it (the production entry takes the
+                // tile kernel there) ...
+                assert!(
+                    strict_nax_for_test(&c).is_err(),
+                    "prefix={prefix}: the nax route accepted a Q with interleaved heads"
+                );
+                // ... and takes the contiguous [B, H, T, D] Q that RoPE
+                // produces in the verify path, with the same K/V views.
+                let q = MxArray::from_bfloat16(
+                    &deterministic_bf16((2 * 32 * 8 * D) as usize, 0x90a0_b0c0),
+                    &[2, 32, 8, D],
+                )?;
+                let c = TileCase {
+                    q,
+                    pk: c.pk,
+                    pv: c.pv,
+                    nk: c.nk,
+                    nv: c.nv,
+                };
+                let nax = strict_nax_for_test(&c)?.to_float32()?;
+                let expected =
+                    segmented_or_concat_split_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, true)?
+                        .to_float32()?;
+                let (max_ulps, mean_ulps) = tile_error(nax.as_ref(), expected.as_ref());
+                assert!(
+                    max_ulps <= 2.0 && mean_ulps <= 0.25,
+                    "nax production K/V layout prefix={prefix}: max {max_ulps} / mean \
+                     {mean_ulps:.4} BF16 ulps"
+                );
+                worst_nax.0 = worst_nax.0.max(max_ulps);
+                worst_nax.1 = worst_nax.1.max(mean_ulps);
+                checked_nax += 1;
+            }
         }
         eprintln!(
             "tile verify: {checked} blocks within tolerance; worst max {} / mean {:.4} BF16 ulps \
              of the output magnitude",
             worst.0, worst.1
         );
+        if nax_any {
+            assert!(checked_nax > 0, "nax supported but no block took it");
+            eprintln!(
+                "nax verify: {checked_nax} blocks within tolerance; worst max {} / mean {:.4} \
+                 BF16 ulps of the output magnitude",
+                worst_nax.0, worst_nax.1
+            );
+        }
         Ok(())
     }
 
-    /// The strict vector entry never dispatches the tile kernel; the tile
-    /// entry dispatches it exactly once per call (plus MLX's reduction).
+    /// The strict vector entry never dispatches a block kernel; the tile and
+    /// tensor-op entries each dispatch their own kernel exactly once per call
+    /// (plus MLX's reduction) and never the other's.
     #[test]
     #[cfg(target_os = "macos")]
     fn segmented_verify_tile_route_is_counted() -> Result<()> {
@@ -2973,19 +3180,44 @@ mod tests {
             count(c"segmented_sdpa_verify_tile_2pass_1"),
             count(c"segmented_sdpa_2pass_2"),
         ];
+        let tile_nax_counts = [
+            count(c"segmented_sdpa_route_nax"),
+            count(c"segmented_sdpa_verify_nax_2pass_1"),
+        ];
         unsafe { mlx_sys::mlx_test_kquant_counting(false) };
         tile?;
         assert_eq!(tile_counts, [1, 1, 1], "tile route counters");
-        // Its own counting window: the vector entry never reaches the tile.
+        assert_eq!(tile_nax_counts, [0, 0], "tile entry touched the nax route");
+        let mut nax_plan = [0u32; 6];
+        if nax_supported(24, 4, 8, 1008, &mut nax_plan) {
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let nax = strict_nax_for_test(&c).and_then(|o| o.to_float32());
+            let nax_counts = [
+                count(c"segmented_sdpa_route_nax"),
+                count(c"segmented_sdpa_verify_nax_2pass_1"),
+                count(c"segmented_sdpa_2pass_2"),
+                count(c"segmented_sdpa_route_tile"),
+                count(c"segmented_sdpa_verify_tile_2pass_1"),
+            ];
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            nax?;
+            assert_eq!(nax_counts, [1, 1, 1, 0, 0], "nax route counters");
+        } else {
+            eprintln!("nax route unsupported on this device; tile counters only");
+        }
+        // Its own counting window: the vector entry never reaches a block
+        // kernel.
         let (_, route) = strict_segmented_routed(&c.q, &c.pk, &c.pv, &c.nk, &c.nv)?;
         let after_vector = [
             count(c"segmented_sdpa_route_tile"),
             count(c"segmented_sdpa_verify_tile_2pass_1"),
+            count(c"segmented_sdpa_route_nax"),
+            count(c"segmented_sdpa_verify_nax_2pass_1"),
         ];
         assert_eq!(
             after_vector,
-            [0, 0],
-            "vector entry (route {route}) touched the tile route"
+            [0, 0, 0, 0],
+            "vector entry (route {route}) touched a block route"
         );
         Ok(())
     }
@@ -3342,11 +3574,12 @@ mod tests {
 
     /// The route is chosen from the real prefix at eval time, so one shapeless
     /// trace must stay exact while replays cross every route boundary. The
-    /// production entry takes the tile route from `kSegmentedTileMinKeys`
-    /// keys (rows 8 here; rows 6 and 7 are not multiples of 8 queries): the
-    /// replay must equal the eager production call bit for bit on either
-    /// side, and the vector chunks bit for bit on the vector routes or within
-    /// the tile tolerance on the tile route.
+    /// production entry takes a block kernel (tensor-op where NAX exists,
+    /// else the simdgroup tile) from `kSegmentedTileMinKeys` keys (rows 8
+    /// here; rows 6 and 7 are not multiples of 8 queries): the replay must
+    /// equal the eager production call bit for bit on either side, and the
+    /// vector chunks bit for bit on the vector routes or within the tile
+    /// tolerance on a block route.
     #[test]
     #[ignore = "requires coordinated Metal GPU validation"]
     #[cfg(target_os = "macos")]
@@ -3412,8 +3645,13 @@ mod tests {
                             out.ok_or_else(|| Error::from_reason("compiled invoke failed"))
                         })
                         .and_then(|out| out[0].to_float32());
+                // Either block kernel (tile or tensor-op) is held to the
+                // tile tolerance.
                 let tile_route = unsafe {
                     mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_route_tile".as_ptr())
+                        + mlx_sys::mlx_test_kquant_family_count(
+                            c"segmented_sdpa_route_nax".as_ptr(),
+                        )
                 } > 0;
                 unsafe { mlx_sys::mlx_test_kquant_counting(false) };
                 let compiled = compiled?;
@@ -3495,9 +3733,10 @@ mod tests {
         const D: i64 = 256;
         const SETS: usize = 4;
         const SAMPLES: usize = 24;
-        // Split chunks, the one-call vector route and the simdgroup-matrix
-        // tile route (skipped where this device cannot launch it).
-        const ROUTES: [&str; 3] = ["split", "one_call", "tile"];
+        // Split chunks, the one-call vector route, the simdgroup-matrix tile
+        // route and the tensor-op (NAX) route (each block route skipped where
+        // this device cannot launch it).
+        const ROUTES: [&str; 4] = ["split", "one_call", "tile", "nax"];
         let mut plan = [0u32; 5];
         let tile_supported = unsafe {
             mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, 4, 8, 32_776, plan.as_mut_ptr())
@@ -3507,7 +3746,17 @@ mod tests {
         } else {
             eprintln!("tile route unsupported on this device; timing the vector routes only");
         }
-        let routes = if tile_supported { 3 } else { 2 };
+        let mut nax_plan = [0u32; 6];
+        let nax_supported_here = tile_supported && nax_supported(24, 4, 8, 32_776, &mut nax_plan);
+        if nax_supported_here {
+            eprintln!(
+                "nax pipeline m={} tile_n={} maxTotalThreadsPerThreadgroup={}",
+                nax_plan[0], nax_plan[1], nax_plan[5]
+            );
+        } else {
+            eprintln!("nax route unsupported on this device");
+        }
+        let routes = 2 + usize::from(tile_supported) + usize::from(nax_supported_here);
         for prefix in [87_i64, 1024, 6219, 16384, 32768] {
             let mut cases = Vec::with_capacity(SETS);
             for i in 0..SETS {
@@ -3541,7 +3790,8 @@ mod tests {
                         segmented_or_concat_split_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, true)?
                     }
                     1 => strict_segmented_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv)?,
-                    _ => strict_tile_for_test(c)?,
+                    2 => strict_tile_for_test(c)?,
+                    _ => strict_nax_for_test(c)?,
                 };
                 MxArray::eval_arrays(&[&out])?;
                 Ok(out)
@@ -3550,12 +3800,13 @@ mod tests {
                 let before = run(i, 0)?.to_float32()?;
                 let after = run(i, 1)?.to_float32()?;
                 assert_eq!(before.as_ref(), after.as_ref(), "prefix={prefix}, set={i}");
-                if tile_supported {
-                    let tile = run(i, 2)?.to_float32()?;
-                    let (max_ulps, mean_ulps) = tile_error(tile.as_ref(), before.as_ref());
+                for route in 2..routes {
+                    let block = run(i, route)?.to_float32()?;
+                    let (max_ulps, mean_ulps) = tile_error(block.as_ref(), before.as_ref());
                     assert!(
                         max_ulps <= 2.0 && mean_ulps <= 0.25,
-                        "prefix={prefix}, set={i}: tile max {max_ulps} / mean {mean_ulps:.4} ulps"
+                        "prefix={prefix}, set={i}: {} max {max_ulps} / mean {mean_ulps:.4} ulps",
+                        ROUTES[route]
                     );
                 }
             }
@@ -3571,6 +3822,9 @@ mod tests {
                         tile_plan.as_mut_ptr(),
                     )
                 };
+            }
+            if nax_supported_here {
+                nax_supported(24, 4, 8, prefix + 8, &mut nax_plan);
             }
             for i in 0..SAMPLES {
                 // Rotate the order so no route is always the second reader of
@@ -3596,6 +3850,9 @@ mod tests {
             }
             if tile_supported {
                 line += &format!(" tile_partitions={}", tile_plan[3]);
+            }
+            if nax_supported_here {
+                line += &format!(" nax_partitions={}", nax_plan[4]);
             }
             eprintln!("{line}");
         }

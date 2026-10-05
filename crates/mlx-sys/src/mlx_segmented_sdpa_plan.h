@@ -261,6 +261,83 @@ inline int segmented_verify_tile_partitions(int total_length, int tile_n,
   return std::clamp(((wanted + 31) / 32) * 32, 32, 1024);
 }
 
+// Tensor-op verify kernel (segmented_sdpa_verify_nax_2pass_1): keys per
+// tile, threads and threadgroup bytes of one dispatch. M = rows * gqa is
+// compiled into the kernel; 256 threads (execution_simdgroups<8>) is the
+// op's structural constant.
+struct SegmentedSdpaNaxPlan {
+  bool supported;
+  uint32_t m;
+  uint32_t tile_n;
+  uint32_t stage1_threads;
+  uint32_t stage2_threads;
+  uint32_t threadgroup_bytes;
+};
+
+constexpr uint32_t kSegmentedNaxThreads = 256;
+
+// The M values sdpa_segmented_nax.metal instantiates: multiples of 8 up to
+// 64 (four softmax lanes per fused row within 256 threads).
+inline bool segmented_nax_m_supported(int m) {
+  return m >= 8 && m <= 64 && m % 8 == 0;
+}
+
+// fp32 scores [M][tile_n], BF16 probabilities [M][tile_n], fp32 previous
+// scale [M], two rescale flags.
+inline uint32_t segmented_nax_scratch_bytes(uint32_t m, uint32_t tile_n) {
+  return m * tile_n * 4 + m * tile_n * 2 + m * 4 + 8;
+}
+
+// Keys per tile: K and V are tensor operands read from device memory, so
+// only the softmax scratch bounds it. The largest of 64 and 32 whose scratch
+// stays within three quarters of the device limit wins (32 KiB: 64 keys up
+// to M = 48, 32 keys at M = 56 and 64).
+inline uint32_t segmented_nax_tile_n(size_t max_threadgroup_memory,
+                                     size_t static_threadgroup_memory,
+                                     uint32_t m) {
+  if (max_threadgroup_memory <= static_threadgroup_memory) {
+    return 0;
+  }
+  const size_t budget =
+      (max_threadgroup_memory - static_threadgroup_memory) / 4 * 3;
+  for (uint32_t tile_n : {64u, 32u}) {
+    if (segmented_nax_scratch_bytes(m, tile_n) <= budget) {
+      return tile_n;
+    }
+  }
+  return 0;
+}
+
+inline SegmentedSdpaNaxPlan
+plan_segmented_verify_nax_launch(int rows, int gqa_factor,
+                                 const SegmentedSdpaCapabilities &stage1,
+                                 const SegmentedSdpaCapabilities &stage2) {
+  SegmentedSdpaNaxPlan plan{false, 0, 0, 0, 0, 0};
+  const int64_t queries = int64_t{rows} * gqa_factor;
+  if (rows < 2 || rows > 8 || gqa_factor < 1 || gqa_factor > 32 ||
+      !segmented_nax_m_supported(static_cast<int>(queries)) ||
+      stage1.thread_execution_width != 32 ||
+      stage1.max_threads_per_threadgroup < kSegmentedNaxThreads ||
+      stage2.thread_execution_width != 32 ||
+      stage2.max_threads_per_threadgroup < 1024 ||
+      stage2.static_threadgroup_memory > stage2.max_threadgroup_memory) {
+    return plan;
+  }
+  const uint32_t m = static_cast<uint32_t>(queries);
+  const uint32_t tile_n = segmented_nax_tile_n(
+      stage1.max_threadgroup_memory, stage1.static_threadgroup_memory, m);
+  if (tile_n == 0) {
+    return plan;
+  }
+  plan.m = m;
+  plan.tile_n = tile_n;
+  plan.stage1_threads = kSegmentedNaxThreads;
+  plan.stage2_threads = 1024;
+  plan.threadgroup_bytes = segmented_nax_scratch_bytes(m, tile_n);
+  plan.supported = true;
+  return plan;
+}
+
 // The reduction order of a (head, row) pair depends only on the route and
 // partition count of the chunk that owns the row. One dispatch over the whole
 // block is therefore exact only when both chunks reduce the same way.

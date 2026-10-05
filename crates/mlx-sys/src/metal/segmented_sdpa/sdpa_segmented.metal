@@ -9,7 +9,8 @@
 // MLX's own kernel. Changing any statement order there breaks bit-identity
 // with concatenated K/V through MLX's vector SDPA. The simdgroup-matrix
 // verify kernel at the end is the exception: it writes the same partial
-// layout but reduces in tile order (fp32, not bit-identical).
+// layout but reduces in tile order (fp32, not bit-identical). Its tensor-op
+// sibling for gen-17+ GPUs is sdpa_segmented_nax.metal.
 
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>

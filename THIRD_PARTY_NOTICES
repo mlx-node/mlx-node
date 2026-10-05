@@ -12,7 +12,12 @@ runtime/metal/kernels/common/gguf_staged_tile.h,
 runtime/metal/kernels/common/split_reduce.h,
 runtime/metal/kernels/shared/gguf_linear.metal (the staged decode tile) and
 runtime/ops/LinearGguf.cpp (decodeSplits), with the per-format dequantization
-rewritten for mlx-node's weight layout. Splash's LICENSE is the Apache License,
+rewritten for mlx-node's weight layout. The tensor-op verify attention kernel
+in crates/mlx-sys/src/metal/segmented_sdpa/sdpa_segmented_nax.metal follows
+the matmul2d operand shapes and the page softmax of Splash's
+runtime/metal/kernels/common/paged_attention_tile.h, with the segmented
+(prefix / new) K/V addressing, causal limits and partial-tile handling
+written for mlx-node's two-pass layout. Splash's LICENSE is the Apache License,
 Version 2.0, whose copyright line it leaves as the template text:
 
    Copyright [yyyy] [name of copyright owner]
