@@ -33,12 +33,14 @@ interface DiscoveryMetadata {
 }
 
 /**
- * The Qwen3.5/Qwen3.8 discovery filter retains its XL policy. Gemma4 and Muse
- * accept all supported tensor formats, including Q4_0 QAT checkpoints.
- * Match the Unsloth Dynamic XL target names users download, while excluding
- * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
+ * The Qwen3.5/Qwen3.8 discovery filter admits the Unsloth Dynamic `Q*_K_XL`
+ * and `Q*_K_M` target names users download. Both mixes use the same ggml
+ * tensor types (Q3_K..Q6_K, IQ3_S, IQ4_NL, IQ4_XS, Q8_0, F32); only the
+ * per-tensor selection differs. Other variants and companion artifacts such as
+ * imatrix/mmproj/draft stay excluded. Gemma4 and Muse accept all supported
+ * tensor formats, including Q4_0 QAT checkpoints.
  */
-const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
+const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_(?:XL|M)\.gguf$/i;
 const BONSAI_PQ2_GGUF = /^ternary-bonsai-2-27b-pq2_0\.gguf$/i;
 // `mtp` joins the rule because the catalog ships MTP weights BESIDE a target
 // (Qwen3.8's `MTP/mtp-*.gguf`, Gemma's `mtp-*.gguf`) and nothing in the runtime
@@ -193,7 +195,7 @@ export interface DiscoveryScanOptions {
 
 /**
  * Scan `modelsDir` for chat-capable model subdirectories, Gemma4/Muse/Qwen4 GGUFs, and
- * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` files. GGUF files may live directly
+ * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` / `Q<number>_K_M.gguf` files. GGUF files may live directly
  * under `modelsDir` or one level inside a downloaded GGUF repository. Each is
  * registered by filename stem so quant variants remain independently selectable.
  *

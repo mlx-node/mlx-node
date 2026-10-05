@@ -102,7 +102,9 @@ describe('discoverLocalChatModels', () => {
     ['Ternary-Bonsai-2-27B-PQ2_0-extra.gguf', 'qwen35'],
     ['Ternary-Bonsai-2-27B-PQ2_0.gguf', 'qwen35moe'],
     ['Ternary-Bonsai-2-27B-PQ2_0-mmproj.gguf', 'qwen35'],
-    ['Qwen3.5-27B-Q4_K_M.gguf', 'qwen35'],
+    ['Qwen3.5-27B-Q4_K_S.gguf', 'qwen35'],
+    ['Qwen3.5-27B-Q4_0.gguf', 'qwen35'],
+    ['Qwen3.5-27B-UD-IQ2_M.gguf', 'qwen35'],
   ] as const)('does not widen the Bonsai gate to %s [%s]', async (name, architecture) => {
     const dir = join(tmp, `bonsai-reject-${name}`);
     mkdirSync(dir);
@@ -110,14 +112,17 @@ describe('discoverLocalChatModels', () => {
     await expect(discoverLocalChatModels(dir)).resolves.toEqual([]);
   });
 
-  it('keeps admitting dense Qwen3.5 Q*_K_XL GGUFs alongside the Bonsai name', async () => {
-    const dir = join(tmp, 'qwen35-xl-preserved');
-    mkdirSync(dir);
-    const gguf = join(dir, 'Qwen3.5-27B-Q4_K_XL.gguf');
-    writeFileSync(gguf, minimalGguf('qwen35'));
-    const models = await discoverLocalChatModels(dir);
-    expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
-  });
+  it.each(['Qwen3.5-27B-Q4_K_XL.gguf', 'Qwen3.8-27B-UD-Q4_K_M.gguf', 'Qwen3.5-27B-Q4_K_M.gguf'])(
+    'admits dense Qwen3.5 %s alongside the Bonsai name',
+    async (name) => {
+      const dir = join(tmp, `qwen35-admitted-${name}`);
+      mkdirSync(dir);
+      const gguf = join(dir, name);
+      writeFileSync(gguf, minimalGguf('qwen35'));
+      const models = await discoverLocalChatModels(dir);
+      expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
+    },
+  );
 
   it.skipIf(!canChmod)('reports an entry it could not evaluate via onEntryFailure', async () => {
     // config.json exists but cannot be opened (EACCES): the entry may be a

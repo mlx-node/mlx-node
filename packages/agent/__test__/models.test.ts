@@ -324,7 +324,7 @@ describe('discoverMlxModels', () => {
     }
   });
 
-  it('discovers every nested Q<number>_K_XL target by its direct GGUF path', async () => {
+  it('discovers every nested Q<number>_K_XL and Q<number>_K_M target by its direct GGUF path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-xl-gguf-'));
     try {
       const repo = join(root, 'qwen38-gguf');
@@ -347,7 +347,8 @@ describe('discoverMlxModels', () => {
       await Promise.all([
         writeFile(join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'), minimalGguf('qwen35')),
         writeFile(join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'), minimalGguf('qwen35')),
-        writeFile(join(repo, 'Qwen3.8-27B-Q4_K_M.gguf'), 'ordinary variant'),
+        writeFile(join(repo, 'Qwen3.8-27B-UD-Q4_K_M.gguf'), minimalGguf('qwen35')),
+        writeFile(join(repo, 'Qwen3.8-27B-Q4_K_S.gguf'), 'ordinary variant'),
         writeFile(join(repo, 'imatrix_unsloth.gguf'), 'imatrix'),
         writeFile(join(repo, 'mmproj-Q4_K_XL.gguf'), 'mmproj'),
         writeFile(join(repo, 'dflash-Q4_K_XL.gguf'), 'draft'),
@@ -361,12 +362,17 @@ describe('discoverMlxModels', () => {
           modelType: 'qwen3_5',
         },
         {
+          name: 'Qwen3.8-27B-UD-Q4_K_M',
+          path: join(repo, 'Qwen3.8-27B-UD-Q4_K_M.gguf'),
+          modelType: 'qwen3_5',
+        },
+        {
           name: 'Qwen3.8-27B-UD-Q4_K_XL',
           path: join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'),
           modelType: 'qwen3_5',
         },
       ]);
-      expect(discovered.map((model) => model.piModel.contextWindow)).toEqual([65536, 65536]);
+      expect(discovered.map((model) => model.piModel.contextWindow)).toEqual([65536, 65536, 65536]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
