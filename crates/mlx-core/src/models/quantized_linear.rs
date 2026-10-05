@@ -153,6 +153,16 @@ impl LinearProj {
         matches!(self, LinearProj::Quantized(ql) if ql.has_q_gate_block_layout())
     }
 
+    /// Zero-pad the rows to whole 64-row tiles and tile — see
+    /// [`QuantizedLinear::tile_kquant_layout_padded`]. `Ok(false)` on a dense
+    /// projection or when the quantized one is not eligible.
+    pub(crate) fn tile_kquant_layout_padded(&mut self) -> Result<bool> {
+        match self {
+            LinearProj::Quantized(ql) => ql.tile_kquant_layout_padded(),
+            LinearProj::Standard(_) => Ok(false),
+        }
+    }
+
     /// The per-tensor FP8 activation scale threaded onto the quantized backend
     /// at load time (`None` for a dense projection). Test-only read-back seam
     /// used to prove the loaders thread `PerLayerQuant::input_amax` onto the
@@ -606,6 +616,51 @@ pub fn try_build_kquant_quantized_linear(
     )))
 }
 
+/// [`try_build_kquant_quantized_linear`] followed by the Tiled64 repack
+/// ([`QuantizedLinear::tile_kquant_layout`]) when
+/// [`kquant_tiled_enabled`](crate::models::quant_dispatch::kquant_tiled_enabled)
+/// (a Metal host, `MLX_KQUANT_TILED` not `0`). When the projection did tile,
+/// its `key_prefix` is pushed onto `tiled`: the repack evaluates the tiled
+/// copies, so the loader's row-major `{key_prefix}.weight/.scales/.biases` in
+/// `params` are now dead weight it should drop with
+/// [`release_tiled_kquant_sources`] once the layer is installed — otherwise
+/// both layouts stay resident until the loader's map goes away and the load
+/// peak is twice the model (37 GB for an 18 GB Qwen3.8-27B). Projections that
+/// stay row-major are not recorded: those lazily mmapped originals still need
+/// the loader's final materialization pass.
+pub fn try_build_kquant_quantized_linear_tiled(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    mode: PerLayerMode,
+    family: &str,
+    tiled: &mut Vec<String>,
+) -> Result<Option<QuantizedLinear>> {
+    let Some(mut ql) = try_build_kquant_quantized_linear(params, key_prefix, mode, family)? else {
+        return Ok(None);
+    };
+    if crate::models::quant_dispatch::kquant_tiled_enabled() && ql.tile_kquant_layout()? {
+        tiled.push(key_prefix.to_string());
+    }
+    Ok(Some(ql))
+}
+
+/// Drop the row-major `.weight`/`.scales`/`.biases` of every prefix in
+/// `tiled` from the loader's `params` (see
+/// [`try_build_kquant_quantized_linear_tiled`]); the installed projections own
+/// the evaluated Tiled64 copies. Call it only after the layer's dense-fallback
+/// lookups are done, so a packed group whose peer is dense still fails loud
+/// through `params.get` instead of silently skipping. Clears `tiled`.
+pub fn release_tiled_kquant_sources(
+    params: &mut HashMap<String, MxArray>,
+    tiled: &mut Vec<String>,
+) {
+    for prefix in tiled.drain(..) {
+        for suffix in ["weight", "scales", "biases"] {
+            params.remove(&format!("{prefix}.{suffix}"));
+        }
+    }
+}
+
 /// Linear layer backed by a serialized quantized weight format.
 ///
 /// Affine, MX/NVFP, and native GGUF K/IQ modes use packed weights and MLX
@@ -760,9 +815,32 @@ impl QuantizedLinear {
     /// [`concat_rows`](Self::concat_rows) (both sides tiled, both `N % 64`)
     /// and [`slice_rows`](Self::slice_rows) at 64-aligned bounds.
     pub fn tile_kquant_layout(&mut self) -> Result<bool> {
+        self.tile_kquant_layout_impl(false)
+    }
+
+    /// [`tile_kquant_layout`](Self::tile_kquant_layout) for a projection whose
+    /// row count is not a whole number of tiles: the rows are first zero-padded
+    /// to the next multiple of 64 (`.weight`, `.scales`, `.biases` and any
+    /// linear `bias` all get zero rows), then tiled. A zero sub-scale with a
+    /// zero super-scale decodes to exactly 0 in every K-quant mode — q4k/q5k
+    /// `d*sc*q - dmin*m`, q6k/q3k `d*sc*(q-32)`, iq4xs/iq4nl `d*sc*grid[q]`
+    /// (`KQScales` in `mlx_kquant.cpp` / `kquant.h`) — so the padded rows
+    /// yield exactly-zero output columns and the real columns are untouched.
+    ///
+    /// The caller owns the consequence: `forward` returns the PADDED width and
+    /// [`packed_out_features`](LinearProj::packed_out_features) reports it, so
+    /// the consumer must slice its logical width off the output (the GDN
+    /// `in_proj_ba`, N = 2 * num_v_heads = 96 on Qwen3.8, pads to 128 so it
+    /// keeps merging with the tiled `in_proj_qkvz`). Same `Ok(false)` cases
+    /// as the unpadded form except `N % 64 != 0`.
+    pub fn tile_kquant_layout_padded(&mut self) -> Result<bool> {
+        self.tile_kquant_layout_impl(true)
+    }
+
+    fn tile_kquant_layout_impl(&mut self, pad_rows: bool) -> Result<bool> {
         use crate::models::quant_dispatch::{
-            KQUANT_TILED_SUFFIX, is_kquant_mode, kquant_tile_rows, kquant_tileable, parse_mode_str,
-            split_kquant_layout,
+            KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, is_kquant_mode, kquant_tile_rows,
+            kquant_tileable, parse_mode_str, split_kquant_layout,
         };
         let (base, already) = split_kquant_layout(&self.mode);
         if already {
@@ -788,7 +866,8 @@ impl QuantizedLinear {
         }
         let n = shape[0];
         let k = shape[1] * 32 / i64::from(self.bits);
-        if !kquant_tileable(n, k) {
+        let padded_n = (n + KQUANT_TILE_ROWS - 1) / KQUANT_TILE_ROWS * KQUANT_TILE_ROWS;
+        if !kquant_tileable(padded_n, k) || (padded_n != n && !pad_rows) {
             return Ok(false);
         }
         // Codes interleave per 32-value unit (`bits` words); the companions
@@ -804,13 +883,34 @@ impl QuantizedLinear {
             PerLayerMode::IQ4NL => 1,
             _ => 8,
         };
-        let weight = kquant_tile_rows(&self.weight, i64::from(self.bits))?;
-        let scales = kquant_tile_rows(&self.scales, super_ratio * per_group)?;
-        let biases = kquant_tile_rows(biases, per_group)?;
-        MxArray::eval_arrays_with_context(&[&weight, &scales, &biases], "tile_kquant_layout")?;
+        // Zero rows appended to a row-major `[n, cols]` array (`padded_n - n`
+        // of them); the identity when the row count is already whole tiles.
+        let pad = |a: &MxArray| -> Result<MxArray> {
+            if padded_n == n {
+                return Ok(a.clone());
+            }
+            let cols = a.shape()?[1];
+            let zeros = MxArray::zeros(&[padded_n - n, cols], Some(a.dtype()?))?;
+            MxArray::concatenate(a, &zeros, 0)
+        };
+        let weight = kquant_tile_rows(&pad(&self.weight)?, i64::from(self.bits))?;
+        let scales = kquant_tile_rows(&pad(&self.scales)?, super_ratio * per_group)?;
+        let biases = kquant_tile_rows(&pad(biases)?, per_group)?;
+        let bias = match (&self.bias, padded_n == n) {
+            (Some(b), false) => Some(MxArray::concatenate(
+                b,
+                &MxArray::zeros(&[padded_n - n], Some(b.dtype()?))?,
+                0,
+            )?),
+            (b, _) => b.clone(),
+        };
+        let mut pending = vec![&weight, &scales, &biases];
+        pending.extend(bias.as_ref());
+        MxArray::eval_arrays_with_context(&pending, "tile_kquant_layout")?;
         self.weight = weight;
         self.scales = scales;
         self.biases = Some(biases);
+        self.bias = bias;
         self.mode = format!("{base}{KQUANT_TILED_SUFFIX}");
         Ok(true)
     }
@@ -3140,6 +3240,110 @@ mod kquant_tiled_tests {
         assert!(odd.tile_kquant_layout().unwrap());
         assert!(!odd.finalize_packed_q_gate_block(4, 32).unwrap());
         assert!(!odd.has_q_gate_block_layout());
+    }
+
+    /// The GDN `in_proj_ba` case: a 96-row projection cannot tile as is, but
+    /// zero-padded to 128 rows it tiles, merges with a tiled 1024-row peer,
+    /// and the merged forward reproduces the all-row-major merge on the real
+    /// columns while the 32 padding columns are exactly zero — for the M = 1
+    /// decode, M = 8 verify and a prefill M.
+    #[test]
+    fn padded_rows_tile_merge_and_stay_invisible() {
+        let (n_qkvz, n_ba, k) = (1024i64, 96i64, 1024i64);
+        let (qkvz_rm, ba_rm) = (q4k(n_qkvz, k, 21), q4k(n_ba, k, 22));
+        let merged_rm = qkvz_rm.concat_rows(&ba_rm).unwrap().unwrap();
+
+        let (mut qkvz, mut ba) = (q4k(n_qkvz, k, 21), q4k(n_ba, k, 22));
+        assert!(qkvz.tile_kquant_layout().unwrap());
+        assert!(
+            !ba.tile_kquant_layout().unwrap(),
+            "96 rows are not whole tiles"
+        );
+        assert!(ba.tile_kquant_layout_padded().unwrap());
+        assert!(ba.is_kquant_tiled());
+        assert!(ba.tile_kquant_layout_padded().unwrap(), "idempotent");
+        let padded_n = 128i64;
+        assert_eq!(ba.get_weight().shape().unwrap().to_vec(), [padded_n, k / 8]);
+        assert_eq!(
+            ba.get_scales().shape().unwrap().to_vec(),
+            [padded_n, k / 16]
+        );
+        assert_eq!(
+            ba.get_biases().unwrap().shape().unwrap().to_vec(),
+            [padded_n, k / 128]
+        );
+        // The appended rows are zero bytes once untiled.
+        let untiled = kquant_untile_rows(ba.get_weight(), 4).unwrap();
+        let tail = bits_of(&untiled.slice_axis(0, n_ba, padded_n).unwrap());
+        assert!(tail.iter().all(|&b| b == 0), "padding codes must be zero");
+        assert_eq!(
+            bits_of(&untiled.slice_axis(0, 0, n_ba).unwrap()),
+            bits_of(ba_rm.get_weight()),
+            "the real rows must be untouched"
+        );
+
+        let merged = qkvz
+            .concat_rows(&ba)
+            .unwrap()
+            .expect("tiled qkvz + padded tiled ba merge");
+        assert!(merged.is_kquant_tiled());
+        assert_eq!(
+            merged.get_weight().shape().unwrap()[0],
+            n_qkvz + padded_n,
+            "merged N is the padded width"
+        );
+        for m in [1i64, 8, 64] {
+            let a = x(m, k, 200 + m as u32);
+            let out = merged.forward(&a).unwrap();
+            assert_eq!(
+                out.shape().unwrap().to_vec(),
+                [1, m, n_qkvz + padded_n],
+                "M={m}: forward returns the padded width"
+            );
+            let real = out.slice_axis(2, 0, n_qkvz + n_ba).unwrap();
+            let pad = out.slice_axis(2, n_qkvz + n_ba, n_qkvz + padded_n).unwrap();
+            assert!(
+                bits_of(&pad).iter().all(|&b| f32::from_bits(b) == 0.0),
+                "M={m}: padding columns must decode to exactly zero"
+            );
+            let reference = merged_rm.forward(&a).unwrap();
+            // Same rule as `tile_tags_mode_and_keeps_forward_values`: the
+            // prefill route (and the CPU reference) is the same kernel in
+            // both layouts; the GPU M=1 / M=8 routes change kernels.
+            if !gpu() || m == 64 {
+                assert_eq!(
+                    bits_of(&real),
+                    bits_of(&reference),
+                    "M={m}: padded+tiled merge differs from the row-major merge"
+                );
+            } else {
+                close(&real, &reference, 3e-2, &format!("M={m}"));
+            }
+            // The standalone padded ba agrees with its row-major self on the
+            // same terms, and its own padding is zero too.
+            let ba_out = ba.forward(&a).unwrap();
+            let ba_pad = ba_out.slice_axis(2, n_ba, padded_n).unwrap();
+            assert!(
+                bits_of(&ba_pad).iter().all(|&b| f32::from_bits(b) == 0.0),
+                "M={m}: standalone padding columns must be zero"
+            );
+            let ba_real = ba_out.slice_axis(2, 0, n_ba).unwrap();
+            let ba_ref = ba_rm.forward(&a).unwrap();
+            if !gpu() || m == 64 {
+                assert_eq!(bits_of(&ba_real), bits_of(&ba_ref), "M={m}: padded ba");
+            } else {
+                close(&ba_real, &ba_ref, 3e-2, &format!("M={m}: padded ba"));
+            }
+        }
+        // The padded ba is a whole-tile slice view of the merge.
+        let view = merged.slice_rows(n_qkvz, n_qkvz + padded_n).unwrap();
+        assert!(view.is_kquant_tiled());
+        let a = x(3, k, 300);
+        assert_eq!(
+            bits_of(&view.forward(&a).unwrap()),
+            bits_of(&ba.forward(&a).unwrap()),
+            "slice view of the padded rows differs from the padded ba"
+        );
     }
 }
 

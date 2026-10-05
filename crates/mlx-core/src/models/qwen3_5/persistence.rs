@@ -37,8 +37,8 @@ use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState};
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
-    PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,
+    PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint, release_tiled_kquant_sources,
+    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear_tiled,
     try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
     try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
@@ -1253,6 +1253,12 @@ fn missing_mtp_required_weights(
 }
 
 /// Apply weights directly to a Qwen35Inner (no locks needed).
+///
+/// Test seam over [`apply_weights_inner_with_residency`]. The production
+/// loader hands over its map by `&mut` so tiled K-quant sources can be
+/// released as layers install; the tests only read `params` afterwards, so
+/// they get a handle-level copy (every `MxArray` is a shared handle, no bytes
+/// move) and keep their own map intact.
 #[cfg(test)]
 fn apply_weights_inner(
     inner: &mut Qwen35Inner,
@@ -1265,9 +1271,10 @@ fn apply_weights_inner(
     _has_vision: bool,
     prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
 ) -> Result<()> {
+    let mut params = params.clone();
     apply_weights_inner_with_residency(
         inner,
-        params,
+        &mut params,
         config,
         quant_bits,
         quant_group_size,
@@ -1281,9 +1288,18 @@ fn apply_weights_inner(
 
 /// Production load variant that also returns every model-owned plain-E4M3
 /// BF16 reconstruction for eager materialization and resident accounting.
+///
+/// `params` is `&mut`: a K-quant projection repacked into the Tiled64 layout
+/// (`try_build_kquant_quantized_linear_tiled`) has its evaluated tiled copies
+/// owned by the model, so its row-major `.weight`/`.scales`/`.biases` are
+/// dropped from the map once the owning layer is installed
+/// (`release_tiled_kquant_sources`). Everything that stays row-major (dense,
+/// affine, mxfp, non-tileable K-quant, embedding, norms) remains for the
+/// caller's materialization pass. Count the checkpoint bytes BEFORE this call
+/// (the tiled copies have the same byte size as the released originals).
 fn apply_weights_inner_with_residency(
     inner: &mut Qwen35Inner,
-    params: &HashMap<String, MxArray>,
+    params: &mut HashMap<String, MxArray>,
     config: &Qwen3_5Config,
     quant_bits: i32,
     quant_group_size: i32,
@@ -1297,6 +1313,12 @@ fn apply_weights_inner_with_residency(
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
+    // The completeness gate at the end judges the CHECKPOINT, so it reads the
+    // key set as loaded, not the map after tiled sources were released.
+    let checkpoint_keys: std::collections::HashSet<String> = params.keys().cloned().collect();
+    // Prefixes whose Tiled64 repack made the map's row-major arrays redundant;
+    // drained into `release_tiled_kquant_sources` once their owner is installed.
+    let tiled_prefixes = std::cell::RefCell::new(Vec::<String>::new());
 
     // The family's activation dtype = the embedding's dequantized OUTPUT dtype,
     // which is NOT always the `.scales` dtype: MLX `dequantize` emits
@@ -1381,15 +1403,17 @@ fn apply_weights_inner_with_residency(
                 // layout for the `_t64` Metal kernels (MLX_KQUANT_TILED=0 keeps
                 // row-major). Done here, at the one place every qwen3_5
                 // projection is built, before the row merges: both halves of
-                // a merge then share the layout (or the merge is skipped).
-                try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5")?
-                    .map(|mut ql| {
-                        if crate::models::quant_dispatch::kquant_tiled_enabled() {
-                            ql.tile_kquant_layout()?;
-                        }
-                        Ok::<_, Error>(ql)
-                    })
-                    .transpose()?
+                // a merge then share the layout (the GDN pads its `in_proj_ba`
+                // to whole tiles itself, see `GatedDeltaNet::finalize_after_load`).
+                // Tiled prefixes are recorded so the layer loop can release
+                // the map's row-major originals once the layer is installed.
+                try_build_kquant_quantized_linear_tiled(
+                    params,
+                    prefix,
+                    plq.mode,
+                    "qwen3_5",
+                    &mut tiled_prefixes.borrow_mut(),
+                )?
             }
         };
         // Thread the per-tensor FP8 activation scale from the resolved
@@ -1531,6 +1555,7 @@ fn apply_weights_inner_with_residency(
     if let Some(ref mut head) = inner.lm_head {
         if let Some(ql) = try_build_ql(params, "lm_head")? {
             head.set_quantized(ql);
+            release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
             info!("Loaded quantized lm_head (mode-aware, quantized_matmul on forward)");
         } else if let Some(w) = params.get("lm_head.weight") {
             // Dense fallback (no `.scales`) — same stripped-quant-group
@@ -1903,6 +1928,10 @@ fn apply_weights_inner_with_residency(
         if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
             layer.set_post_attention_layernorm_weight(w, compute_dtype)?;
         }
+        // The layer owns its (tiled, merged) projections now: drop the map's
+        // row-major K-quant originals so the load peak stays one layer above
+        // the resident size instead of a whole second copy of the model.
+        release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
     }
 
     // MTP head — load `mtp.*` weights once the main per-layer weights
@@ -1940,25 +1969,27 @@ fn apply_weights_inner_with_residency(
     }
 
     // Validate mandatory weights
-    validate_mandatory_weights(params, config, inner.layers.len())?;
+    validate_mandatory_weights(&checkpoint_keys, config, inner.layers.len())?;
 
     Ok(plain_fp8_residency.into_inner())
 }
 
-/// Validate mandatory weights presence for `apply_weights_inner`.
+/// Validate mandatory weights presence for `apply_weights_inner`. `keys` is
+/// the checkpoint's key set as loaded (tiled K-quant sources leave the live
+/// map during installation, so the map itself is not the witness).
 fn validate_mandatory_weights(
-    params: &HashMap<String, MxArray>,
+    keys: &std::collections::HashSet<String>,
     config: &Qwen3_5Config,
     num_layers: usize,
 ) -> Result<()> {
     let mut missing_mandatory = Vec::new();
-    if !params.contains_key("embedding.weight") {
+    if !keys.contains("embedding.weight") {
         missing_mandatory.push("embedding.weight".to_string());
     }
-    if !params.contains_key("final_norm.weight") {
+    if !keys.contains("final_norm.weight") {
         missing_mandatory.push("final_norm.weight".to_string());
     }
-    if !config.tie_word_embeddings && !params.contains_key("lm_head.weight") {
+    if !config.tie_word_embeddings && !keys.contains("lm_head.weight") {
         missing_mandatory.push("lm_head.weight".to_string());
     }
 
@@ -1967,17 +1998,17 @@ fn validate_mandatory_weights(
 
     for i in 0..num_layers {
         let prefix = format!("layers.{}", i);
-        let has_attn = params.contains_key(&format!("{}.self_attn.q_proj.weight", prefix))
-            || params.contains_key(&format!("{}.self_attn.q_proj.scales", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.scales", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.scales", prefix));
+        let has_attn = keys.contains(&format!("{}.self_attn.q_proj.weight", prefix))
+            || keys.contains(&format!("{}.self_attn.q_proj.scales", prefix))
+            || keys.contains(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+            || keys.contains(&format!("{}.linear_attn.in_proj_qkvz.scales", prefix))
+            || keys.contains(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
+            || keys.contains(&format!("{}.linear_attn.in_proj_qkv.scales", prefix));
         if !has_attn {
             layers_missing_attn.push(i);
         }
-        let has_mlp = params.contains_key(&format!("{}.mlp.gate_proj.weight", prefix))
-            || params.contains_key(&format!("{}.mlp.gate_proj.scales", prefix));
+        let has_mlp = keys.contains(&format!("{}.mlp.gate_proj.weight", prefix))
+            || keys.contains(&format!("{}.mlp.gate_proj.scales", prefix));
         if !has_mlp {
             layers_missing_mlp.push(i);
         }
@@ -2300,10 +2331,23 @@ pub async fn load_with_thread(
                 let mut inner = Qwen35Inner::new(config.clone())?;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
+                // Deterministic weight-byte total of the text checkpoint for
+                // the cache-limit coordinator, taken BEFORE installation:
+                // `apply_weights_inner_with_residency` releases the row-major
+                // sources of Tiled64 K-quant projections from `params` as
+                // layers install (the model owns the same-sized tiled copies),
+                // so the map afterwards under-counts the resident weights.
+                // `saturating_add` guards against overflow on a corrupted
+                // checkpoint.
+                let text_weight_bytes: u64 = params
+                    .values()
+                    .map(|a| a.nbytes() as u64)
+                    .fold(0u64, |acc, v| acc.saturating_add(v));
+
                 // Apply weights (GPU finalize precompute reads now-resident pages).
                 let plain_fp8_residency = apply_weights_inner_with_residency(
                     &mut inner,
-                    &params,
+                    &mut params,
                     &config,
                     quant_bits,
                     quant_group_size,
@@ -2405,15 +2449,11 @@ pub async fn load_with_thread(
                     None => weights_resident,
                 };
                 // Deterministic weight-byte total for the cache-limit
-                // coordinator. Includes both text `params` and the
-                // separated `vision_params` (when present) so the
-                // cap covers the full materialized footprint.
-                // `saturating_add` guards against overflow on a
-                // corrupted checkpoint.
-                let mut weight_bytes: u64 = params
-                    .values()
-                    .map(|a| a.nbytes() as u64)
-                    .fold(0u64, |acc, v| acc.saturating_add(v));
+                // coordinator. Includes both text `params` (counted before
+                // installation, see `text_weight_bytes`) and the separated
+                // `vision_params` (when present) so the cap covers the full
+                // materialized footprint.
+                let mut weight_bytes: u64 = text_weight_bytes;
                 if let Some(ref vparams) = vision_params {
                     weight_bytes = vparams
                         .values()

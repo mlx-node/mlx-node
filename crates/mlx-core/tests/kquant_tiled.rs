@@ -542,6 +542,118 @@ fn tiled_is_refused_off_the_ported_routes() {
     println!("  tiled refused on transpose=false, partial tiles, 3-D, gather, dequantize");
 }
 
+/// Row-concatenate two weight sets (`[a; b]`).
+fn concat_rows(a: &Weights, b: &Weights) -> Weights {
+    let cat = |x: &MxArray, y: &MxArray| MxArray::concatenate(x, y, 0).expect("concat rows");
+    Weights {
+        w: cat(&a.w, &b.w),
+        scales: cat(&a.scales, &b.scales),
+        biases: cat(&a.biases, &b.biases),
+    }
+}
+
+/// `w` with `rows` zero rows appended to every array: zero codes, zero
+/// sub-scales, zero super-scales.
+fn zero_pad_rows(w: &Weights, rows: i64) -> Weights {
+    let pad = |a: &MxArray| {
+        let cols = a.shape().expect("shape")[1];
+        let zeros = MxArray::zeros(&[rows, cols], Some(a.dtype().expect("dtype"))).expect("zeros");
+        MxArray::concatenate(a, &zeros, 0).expect("pad rows")
+    };
+    Weights {
+        w: pad(&w.w),
+        scales: pad(&w.scales),
+        biases: pad(&w.biases),
+    }
+}
+
+/// The GDN in_proj merge at its Qwen3.8 width: the 96-row `in_proj_ba` is
+/// zero-padded to 128 rows so it tiles and row-merges with the tiled
+/// 16384-row `in_proj_qkvz` (one `_t64` dispatch instead of two). In every
+/// K-quant mode the padded rows must decode to exactly 0 (`d = 0`, `sc = 0`:
+/// `d*sc*q - dmin*m`, `d*sc*(q-32)`, `d*sc*grid[q]` are all 0) and the real
+/// columns must equal the unpadded row-major merge: bit-identical on the CPU
+/// reference and on the shared prefill kernel (N this wide never splits K),
+/// within the route tolerance where M = 1 / M = 8 change kernels with the
+/// layout.
+#[test]
+fn padded_merge_is_invisible_in_every_mode() {
+    let (k, n_qkvz, n_ba, pad) = (512i64, 16384i64, 96i64, 32i64);
+    let n_real = n_qkvz + n_ba;
+    let n_padded = n_real + pad;
+    for (ki, kq) in KQUANTS.iter().enumerate() {
+        let qkvz = weights(kq, &[n_qkvz], k, 0x8300 + ki as u32);
+        let ba = weights(kq, &[n_ba], k, 0x8400 + ki as u32);
+        let reference = concat_rows(&qkvz, &ba);
+        assert!(!kquant_tileable(n_real, k) && kquant_tileable(n_padded, k));
+        let padded = tiled(&concat_rows(&qkvz, &zero_pad_rows(&ba, pad)), kq);
+        for m in [1i64, 8, 64] {
+            let x = activation(&[m, k], 0x8500 + ki as u32 + m as u32, DType::BFloat16);
+            let what = format!("{} M={m}", kq.mode);
+            // CPU: the tiled reference reads the same arithmetic order, so the
+            // real columns are bit-identical and the padding is zero.
+            let (shape, _, cpu_tiled) = read_output(&what, qmm_tiled(&x, &padded, kq, CPU));
+            assert_eq!(shape, vec![m, n_padded], "{what}: padded output width");
+            let (_, _, cpu_ref) =
+                read_output(&what, quantized_matmul(&x, &reference, true, kq, CPU));
+            for row in 0..m as usize {
+                let ours = &cpu_tiled[row * n_padded as usize..(row + 1) * n_padded as usize];
+                let theirs = &cpu_ref[row * n_real as usize..(row + 1) * n_real as usize];
+                assert_eq!(
+                    &ours[..n_real as usize],
+                    theirs,
+                    "{what}: cpu real columns differ in row {row}"
+                );
+                assert!(
+                    ours[n_real as usize..].iter().all(|&b| bf16(b) == 0.0),
+                    "{what}: cpu padding columns are not zero in row {row}"
+                );
+            }
+            if gpu_gen() <= 0 {
+                continue;
+            }
+            // GPU: exactly one tiled dispatch, no row-major kernel.
+            start_counting();
+            let (_, _, ours) = read_output(&what, qmm_tiled(&x, &padded, kq, GPU));
+            let family = match m {
+                1 => "qmv_t64",
+                8 if nax_available() => "qmm_m8_nax_t64",
+                8 => "qmv_wide_t64",
+                _ if nax_available() => "qmm_t_nax_t64",
+                _ => "qmm_t_t64",
+            };
+            assert_eq!(family_count(family), 1, "{what}: must take {family}");
+            assert_no_row_major_route(&what);
+            stop_counting();
+            let (_, _, theirs) =
+                read_output(&what, quantized_matmul(&x, &reference, true, kq, GPU));
+            let mut real = Vec::with_capacity((m * n_real) as usize);
+            for row in 0..m as usize {
+                let ours = &ours[row * n_padded as usize..(row + 1) * n_padded as usize];
+                assert!(
+                    ours[n_real as usize..].iter().all(|&b| bf16(b) == 0.0),
+                    "{what}: gpu padding columns are not zero in row {row}"
+                );
+                real.extend_from_slice(&ours[..n_real as usize]);
+            }
+            if m == 64 {
+                assert_eq!(
+                    real, theirs,
+                    "{what}: padded tiled prefill differs from the row-major merge"
+                );
+            } else {
+                let (worst, peak) = worst_abs(&real, &cpu_ref);
+                let tol = if m == 8 { BF16_TILE_TOL } else { 1e-2 };
+                assert!(
+                    worst / peak < tol,
+                    "{what}: padded tiled route off the CPU reference by {worst} (peak {peak})"
+                );
+            }
+        }
+        println!("  {:<6} padded [16384; 96 -> 128] merge invisible", kq.mode);
+    }
+}
+
 /// (e) Twenty evaluations of the tiled M = 1 and M = 8 routes are
 /// byte-identical.
 #[cfg(target_os = "macos")]

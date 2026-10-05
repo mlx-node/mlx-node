@@ -338,6 +338,13 @@ impl GatedDeltaNet {
     /// keep working and no duplicate storage is retained. Incompatible pairs
     /// (mixed modes, split in_proj variants, special layouts) keep the
     /// unfused two-matmul path.
+    ///
+    /// A Tiled64 K-quant `in_proj_qkvz` (`QuantizedLinear::tile_kquant_layout`)
+    /// only merges with a tiled `in_proj_ba`, whose `2 * num_v_heads` rows (96
+    /// on Qwen3.8) are not whole tiles: it is zero-padded to the next tile
+    /// (128) and tiled here first. The padded rows decode to exactly-zero
+    /// output columns that `forward` drops (`split_ba_padded`), so the merge
+    /// stays one dispatch per layer with the numerics of the unpadded pair.
     pub fn finalize_after_load(&mut self) -> Result<()> {
         let mut derived = vec![&self.a_log, &self.qk_norm_w_q, &self.qk_norm_w_k];
         derived.extend(
@@ -354,6 +361,9 @@ impl GatedDeltaNet {
         match (&self.in_proj_qkvz, &self.in_proj_ba) {
             (LinearProj::Standard(_), LinearProj::Standard(_)) => {}
             (LinearProj::Quantized(_), LinearProj::Quantized(_)) => {
+                if self.in_proj_qkvz_ba_q.is_none() && self.ba_pads_to_tiled_qkvz() {
+                    self.in_proj_ba.tile_kquant_layout_padded()?;
+                }
                 if self.in_proj_qkvz_ba_q.is_none()
                     && let Some(merged) = self.in_proj_qkvz.concat_rows(&self.in_proj_ba)?
                 {
@@ -379,6 +389,35 @@ impl GatedDeltaNet {
         stacked_t.eval();
         self.in_proj_qkvz_ba_t = Some(stacked_t);
         Ok(())
+    }
+
+    /// Whether `in_proj_ba` should be zero-padded to whole tiles and tiled so
+    /// it can merge with `in_proj_qkvz`: both quantized in the same K-quant
+    /// mode, qkvz already Tiled64, ba still row-major.
+    fn ba_pads_to_tiled_qkvz(&self) -> bool {
+        use crate::models::quant_dispatch::split_kquant_layout;
+        match (&self.in_proj_qkvz, &self.in_proj_ba) {
+            (LinearProj::Quantized(qkvz), LinearProj::Quantized(ba)) => {
+                qkvz.is_kquant_tiled()
+                    && !ba.is_kquant_tiled()
+                    && split_kquant_layout(qkvz.mode()).0 == ba.mode()
+            }
+            _ => false,
+        }
+    }
+
+    /// `[B, T, >= 2 * num_v_heads]` -> `(b, a)`, each `[B, T, num_v_heads]`.
+    /// Columns past `2 * num_v_heads` are the exactly-zero outputs of the
+    /// Tiled64 row padding of `in_proj_ba` (see `finalize_after_load`) and
+    /// are dropped; an unpadded projection keeps the plain two-way split.
+    fn split_ba_padded(&self, ba: &MxArray) -> Result<(MxArray, MxArray)> {
+        let nv = self.num_v_heads as i64;
+        let parts = if ba.shape_at(2)? == 2 * nv {
+            ba.split_sections(&[nv], 2)?
+        } else {
+            ba.split_sections(&[nv, 2 * nv], 2)?
+        };
+        Ok((parts[0].clone(), parts[1].clone()))
     }
 
     /// Forward pass for GatedDeltaNet.
@@ -452,8 +491,7 @@ impl GatedDeltaNet {
             } else {
                 self.in_proj_ba.forward(x)?
             };
-            let ba_split = ba.split_sections(&[self.num_v_heads as i64], 2)?;
-            (ba_split[0].clone(), ba_split[1].clone())
+            self.split_ba_padded(&ba)?
         };
 
         // Apply mask before conv to prevent masked values leaking through convolution
@@ -1428,6 +1466,166 @@ mod tests {
             }
         }
         assert_eq!(cases, 32);
+        Ok(())
+    }
+
+    /// A random q4k `[n, k]` projection (uint8 (sc, m) scales, f16 (d, dmin));
+    /// the same seed gives the same bytes.
+    fn q4k(n: i64, k: i64, seed: u32) -> QuantizedLinear {
+        let mut st = seed;
+        let mut lcg = move || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            st
+        };
+        let words: Vec<u32> = (0..n * k / 8).map(|_| lcg()).collect();
+        let scales: Vec<u8> = (0..n * k / 16).map(|_| (lcg() % 48 + 1) as u8).collect();
+        let half_scales = [0x2800u16, 0x2c00, 0x3000, 0x3200];
+        let biases: Vec<u16> = (0..n * k / 128)
+            .map(|_| half_scales[(lcg() as usize) % half_scales.len()])
+            .collect();
+        QuantizedLinear::new(
+            MxArray::from_uint32(&words, &[n, k / 8]).unwrap(),
+            MxArray::from_uint8(&scales, &[n, k / 16]).unwrap(),
+            Some(MxArray::from_float16(&biases, &[n, k / 128]).unwrap()),
+            None,
+            32,
+            4,
+            "q4k".to_string(),
+        )
+    }
+
+    /// Kernel geometry on a 256-wide hidden (whole K-quant super-blocks) with
+    /// q4k in_proj_qkvz (16384 rows) and in_proj_ba (96 rows); `tile_qkvz`
+    /// repacks the qkvz into Tiled64 before it is installed, as the loader does.
+    fn quantized_in_proj_net(tile_qkvz: bool) -> GatedDeltaNet {
+        let hidden = 256i64;
+        let config = Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
+            vocab_size: 32,
+            hidden_size: hidden as i32,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            head_dim: 8,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 48,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(true),
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        };
+        // Deterministic dense sidecars so both nets share every weight.
+        let dense = |shape: &[i64], seed: u32| {
+            let n: i64 = shape.iter().product();
+            let mut st = seed;
+            let values: Vec<f32> = (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((st >> 16) as i32 - 32_768) as f32 / 32_768.0 * 0.3
+                })
+                .collect();
+            MxArray::from_float32(&values, shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap()
+        };
+        let mut net = GatedDeltaNet::new(&config).unwrap();
+        let mut qkvz = q4k(16384, hidden, 31);
+        if tile_qkvz {
+            assert!(qkvz.tile_kquant_layout().unwrap());
+        }
+        net.set_quantized_in_proj_qkvz(qkvz);
+        net.set_quantized_in_proj_ba(q4k(96, hidden, 32));
+        net.set_conv1d_weight(&dense(&[10240, 1, 4], 33), DType::BFloat16)
+            .unwrap();
+        net.set_norm_weight(&dense(&[128], 34), DType::BFloat16)
+            .unwrap();
+        net.set_out_proj_weight(&dense(&[hidden, 6144], 35))
+            .unwrap();
+        net.set_dt_bias(&dense(&[48], 36));
+        net.set_a_log(&dense(&[48], 37)).unwrap();
+        net.finalize_after_load().unwrap();
+        net
+    }
+
+    /// A Tiled64 `in_proj_qkvz` only merges with a tiled `in_proj_ba`, whose 96
+    /// rows are not whole tiles: `finalize_after_load` must zero-pad it to 128
+    /// rows, merge into one 16512-row projection, and `forward` must drop the
+    /// padding so the block reproduces the all-row-major merge for the M = 1
+    /// decode, the M = 8 verify and a 64-token prefill.
+    #[test]
+    fn tiled_qkvz_pads_and_merges_row_major_ba() -> Result<()> {
+        let reference = quantized_in_proj_net(false);
+        let tiled = quantized_in_proj_net(true);
+        let merged_rm = reference
+            .in_proj_qkvz_ba_q
+            .as_ref()
+            .expect("row-major pair merges");
+        assert_eq!(merged_rm.packed_out_features()?, 16384 + 96);
+        let merged_t = tiled
+            .in_proj_qkvz_ba_q
+            .as_ref()
+            .expect("tiled qkvz + padded ba must merge into one projection");
+        assert_eq!(merged_t.packed_out_features()?, 16384 + 128);
+        assert_eq!(tiled.in_proj_ba.packed_out_features()?, 128);
+        assert!(matches!(
+            &tiled.in_proj_ba,
+            LinearProj::Quantized(ql) if ql.is_kquant_tiled()
+        ));
+        assert!(matches!(
+            merged_t,
+            LinearProj::Quantized(ql) if ql.is_kquant_tiled()
+        ));
+        // SAFETY: nullary predicate that catches internally.
+        let gpu = unsafe { sys::mlx_metal_is_available() };
+        for t in [1i64, 8, 64] {
+            let mut st = 40 + t as u32;
+            let n = t * 256;
+            let values: Vec<f32> = (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((st >> 16) as i32 - 32_768) as f32 / 32_768.0
+                })
+                .collect();
+            let x = MxArray::from_float32(&values, &[1, t, 256])?.astype(DType::BFloat16)?;
+            let out_ref = reference.forward(&x, None, None, true)?;
+            let out = tiled.forward(&x, None, None, true)?;
+            assert_eq!(out.shape()?.as_ref(), &[1, t, 256]);
+            let diff = max_abs_diff(&out, &out_ref);
+            // T = 64 takes the prefill matmul, the same kernel in both
+            // layouts (and the CPU reference always is): bit-identical. The
+            // GPU M = 1 / M = 8 routes change kernels with the layout, so the
+            // in_proj differs at bf16 rounding and the block follows.
+            if !gpu || t == 64 {
+                assert_eq!(diff, 0.0, "T={t}: padded merge changed the block output");
+            } else {
+                let peak = out_ref
+                    .astype(DType::Float32)?
+                    .to_float32()?
+                    .iter()
+                    .fold(0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    diff <= 3e-2 * peak,
+                    "T={t}: padded merge off by {diff} of peak {peak}"
+                );
+            }
+        }
         Ok(())
     }
 }
