@@ -1,7 +1,7 @@
 //! Manual benchmark of the Tiled64 K-quant layout (`@t64`) against the
-//! row-major layout, on the Qwen3.8-27B shapes: M = 1 (today's `qmv`
-//! against `qmv_wide_t64` nv_1 at 8 and 4 k-lanes) and M = 8 (today's best
-//! route, `qmv_sg8` / default-mode `qmm_m8_nax`, against `qmm_m8_nax_t64`).
+//! row-major layout, on the Qwen3.8-27B shapes: M = 1 (row-major `qmv`
+//! against `qmv_t64`) and M = 8 (the row-major route, `qmv_sg8` for these
+//! modes, against `qmm_m8_nax_t64`).
 //! Samples interleave the layouts inside one process so both see the same
 //! clock state; the statistic is the median over `REPS` samples of a
 //! `BATCH`-matmul eval (host overhead paid once). Every matmul of a batch
@@ -165,29 +165,13 @@ fn modes() -> Vec<&'static str> {
 struct Arm<'a> {
     w: &'a Ring,
     mode: CString,
-    env: Option<(&'static str, &'static str)>,
-}
-
-fn set_env(env: Option<(&str, &str)>, on: bool) {
-    if let Some((k, v)) = env {
-        // SAFETY: single-threaded test process (RUST_TEST_THREADS=1).
-        unsafe {
-            if on {
-                std::env::set_var(k, v);
-            } else {
-                std::env::remove_var(k);
-            }
-        }
-    }
 }
 
 /// Interleaved medians of every arm; the first arm is the baseline.
 fn measure(x: &MxArray, kq: &KQuant, arms: &[Arm]) -> Vec<f64> {
     for _ in 0..WARMUP {
         for a in arms {
-            set_env(a.env, true);
             let _ = batch_ms(x, a.w, kq, &a.mode);
-            set_env(a.env, false);
         }
     }
     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
@@ -199,84 +183,10 @@ fn measure(x: &MxArray, kq: &KQuant, arms: &[Arm]) -> Vec<f64> {
         };
         for ai in order {
             let a = &arms[ai];
-            set_env(a.env, true);
             samples[ai].push(batch_ms(x, a.w, kq, &a.mode));
-            set_env(a.env, false);
         }
     }
     samples.iter_mut().map(|s| median(s)).collect()
-}
-
-/// M = 8 split-count sweep of the tensor-op kernel in both layouts on the
-/// two long-K shapes (`MLX_KQUANT_M8_SPLITS` forces the count).
-#[test]
-#[ignore = "manual Tiled64 M = 8 split sweep"]
-fn qwen38_m8_split_sweep() {
-    if std::env::var("MLX_KQUANT_TILED_BENCH").as_deref() != Ok("1") {
-        eprintln!("set MLX_KQUANT_TILED_BENCH=1 to run this benchmark");
-        return;
-    }
-    assert!(gpu_gen() > 0, "no Metal device");
-    let kq = kquant("q4k");
-    println!("\n  q4k M=8 tensor op, ms per matmul (DRAM-cold ring), by forced split count");
-    println!(
-        "  {:>6} {:>6} | {:>8} | {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8} {:>8} {:>8}",
-        "K", "N", "sg8", "rm s1", "rm s2", "rm s4", "rm s8", "t64 s1", "t64 s2", "t64 s4", "t64 s8"
-    );
-    for (si, &(k, n)) in [
-        (17408i64, 5120i64),
-        (5120, 5120),
-        (16384, 5120),
-        (5120, 17408),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let w = Ring::new(kq, n, k, 0x9300 + si as u32, false);
-        let t = Ring::new(kq, n, k, 0x9300 + si as u32, true);
-        let row = mode_cstr(kq);
-        let til = CString::new(format!("q4k{KQUANT_TILED_SUFFIX}")).unwrap();
-        let x8 = activation(&[8, k], 0x9400 + si as u32, DType::BFloat16);
-        let mut arms = vec![Arm {
-            w: &w,
-            mode: row.clone(),
-            env: None,
-        }];
-        let splits: [&'static str; 4] = ["1", "2", "4", "8"];
-        for s in splits {
-            arms.push(Arm {
-                w: &w,
-                mode: row.clone(),
-                env: Some(("MLX_KQUANT_M8_SPLITS", s)),
-            });
-        }
-        for s in splits {
-            arms.push(Arm {
-                w: &t,
-                mode: til.clone(),
-                env: Some(("MLX_KQUANT_M8_SPLITS", s)),
-            });
-        }
-        // Row-major arms need the tensor op forced on.
-        // SAFETY: single-threaded test process.
-        unsafe { std::env::set_var("MLX_KQUANT_M8_NAX", "1") };
-        let m = {
-            // The sg8 arm must see the switch off: measure it separately first.
-            // SAFETY: as above.
-            unsafe { std::env::remove_var("MLX_KQUANT_M8_NAX") };
-            let sg8 = measure(&x8, kq, &arms[..1]);
-            // SAFETY: as above.
-            unsafe { std::env::set_var("MLX_KQUANT_M8_NAX", "1") };
-            let rest = measure(&x8, kq, &arms[1..]);
-            // SAFETY: as above.
-            unsafe { std::env::remove_var("MLX_KQUANT_M8_NAX") };
-            [sg8, rest].concat()
-        };
-        println!(
-            "  {k:>6} {n:>6} | {:>8.4} | {:>8.4} {:>8.4} {:>8.4} {:>8.4} | {:>8.4} {:>8.4} {:>8.4} {:>8.4}",
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]
-        );
-    }
 }
 
 #[test]
@@ -294,91 +204,34 @@ fn qwen38_tiled_vs_row_major() {
     for mode in modes() {
         let kq = kquant(mode);
         println!(
-            "\n  {:<6} {:>6} {:>6} | {:>8} {:>8} {:>8} {:>8} {:>6} {:>6} {:>6} | {:>8} {:>8} {:>8} {:>6} {:>6}  (ms, DRAM-cold ring)",
-            "mode",
-            "K",
-            "N",
-            "M1 qmv",
-            "t64 row",
-            "t64 w8",
-            "t64 w4",
-            "r row",
-            "r w8",
-            "r w4",
-            "M8 best",
-            "M8 m8rm",
-            "M8 t64",
-            "r best",
-            "r m8rm"
+            "\n  {:<6} {:>6} {:>6} | {:>8} {:>8} {:>6} | {:>8} {:>8} {:>6}  (ms, DRAM-cold ring)",
+            "mode", "K", "N", "M1 qmv", "M1 t64", "ratio", "M8 sg8", "M8 t64", "ratio"
         );
         for (si, &(k, n)) in SHAPES.iter().enumerate() {
             let w = Ring::new(kq, n, k, 0x9000 + si as u32, false);
             let t = Ring::new(kq, n, k, 0x9000 + si as u32, true);
-            let row = mode_cstr(kq);
-            let til = CString::new(format!("{mode}{KQUANT_TILED_SUFFIX}")).unwrap();
+            let arms = [
+                Arm {
+                    w: &w,
+                    mode: mode_cstr(kq),
+                },
+                Arm {
+                    w: &t,
+                    mode: CString::new(format!("{mode}{KQUANT_TILED_SUFFIX}")).unwrap(),
+                },
+            ];
             let x1 = activation(&[1, k], 0x9100 + si as u32, DType::BFloat16);
-            let m1 = measure(
-                &x1,
-                kq,
-                &[
-                    Arm {
-                        w: &w,
-                        mode: row.clone(),
-                        env: None,
-                    },
-                    Arm {
-                        w: &t,
-                        mode: til.clone(),
-                        env: None,
-                    },
-                    Arm {
-                        w: &t,
-                        mode: til.clone(),
-                        env: Some(("MLX_KQUANT_TILED_QMV", "wide8")),
-                    },
-                    Arm {
-                        w: &t,
-                        mode: til.clone(),
-                        env: Some(("MLX_KQUANT_TILED_QMV", "wide4")),
-                    },
-                ],
-            );
+            let m1 = measure(&x1, kq, &arms);
             let x8 = activation(&[8, k], 0x9200 + si as u32, DType::BFloat16);
-            let m8 = measure(
-                &x8,
-                kq,
-                &[
-                    Arm {
-                        w: &w,
-                        mode: row.clone(),
-                        env: None,
-                    },
-                    Arm {
-                        w: &w,
-                        mode: row.clone(),
-                        env: Some(("MLX_KQUANT_M8_NAX", "1")),
-                    },
-                    Arm {
-                        w: &t,
-                        mode: til.clone(),
-                        env: None,
-                    },
-                ],
-            );
+            let m8 = measure(&x8, kq, &arms);
             println!(
-                "  {mode:<6} {k:>6} {n:>6} | {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>5.2}x {:>5.2}x {:>5.2}x | {:>8.4} {:>8.4} {:>8.4} {:>5.2}x {:>5.2}x",
+                "  {mode:<6} {k:>6} {n:>6} | {:>8.4} {:>8.4} {:>5.2}x | {:>8.4} {:>8.4} {:>5.2}x",
                 m1[0],
                 m1[1],
-                m1[2],
-                m1[3],
                 m1[0] / m1[1],
-                m1[0] / m1[2],
-                m1[0] / m1[3],
                 m8[0],
                 m8[1],
-                m8[2],
-                m8[0] / m8[2],
-                m8[1] / m8[2]
+                m8[0] / m8[1]
             );
         }
     }

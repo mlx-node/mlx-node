@@ -1,21 +1,22 @@
 //! The M = 8 bfloat16 K-quant matmul on the Metal 4 tensor op
 //! (`kquant_qmm_m8_nax`, kquant_m8_nax.h).
 //!
-//! `KQuantMatmul::eval_gpu` (mlx_kquant_metal.cpp) can send every transposed
-//! 8-row bfloat16 `quantized_matmul` with N % 64 == 0 and K % 32 == 0 there on
-//! a NAX host, before `qmv_sg8`. By default only q3k and iq4nl take it (the
-//! sg8 modes measured no faster); `MLX_KQUANT_M8_NAX=1` routes every mode and
-//! `=0` none. These tests force the route on so every mode's decode is
-//! checked. The kernel rounds every decoded weight once to half and sums K in
-//! fp32 in a split order fixed by the host, so it is checked against the CPU
-//! reference under the tile tolerance of `kquant_mode_guards.rs` and for
-//! byte-identical repeats.
+//! `KQuantMatmul::eval_gpu` (mlx_kquant_metal.cpp) sends a transposed 8-row
+//! bfloat16 `quantized_matmul` with N % 64 == 0 and K % 32 == 0 there on a
+//! NAX host: every mode in the Tiled64 layout (`@t64`, the layout the loader
+//! gives eligible linears), and row-major only q3k and iq4nl (the sg8 modes
+//! measured no faster than `qmv_sg8` row-major). These tests run every mode
+//! through the tiled route so every decode is checked. The kernel rounds
+//! every decoded weight once to half and sums K in fp32 in a split order
+//! fixed by the host, so it is checked against the CPU reference under the
+//! tile tolerance of `kquant_mode_guards.rs` and for byte-identical repeats.
 //!
 //!   cargo test -p mlx-core --release --test kquant_m8_nax -- --nocapture
 
 use std::ffi::CString;
 
 use mlx_core::array::MxArray;
+use mlx_core::models::quant_dispatch::{KQUANT_TILED_SUFFIX, kquant_tile_rows};
 
 #[derive(Clone, Copy)]
 struct Fmt {
@@ -127,12 +128,43 @@ fn bf16_rne(v: f32) -> u16 {
 
 struct Weights {
     fmt: Fmt,
+    /// Tiled64 (`@t64`) bytes; the mode string carries the tag.
+    tiled: bool,
     w: MxArray,
     scales: MxArray,
     biases: MxArray,
 }
 
 impl Weights {
+    /// The same weights in the Tiled64 order (`kquant_tiled.rs` does the
+    /// same permutation): codes per 32-value unit, scales per super-block,
+    /// biases per group.
+    fn tiled(&self) -> Self {
+        assert!(!self.tiled, "already tiled");
+        let per_group = if self.fmt.signed_scales { 1 } else { 2 };
+        let super_ratio = match self.fmt.mode {
+            "q6k" | "q3k" => 16,
+            "iq4nl" => 1,
+            _ => 8,
+        };
+        let t = Self {
+            fmt: self.fmt,
+            tiled: true,
+            w: kquant_tile_rows(&self.w, i64::from(self.fmt.bits)).expect("tile weight"),
+            scales: kquant_tile_rows(&self.scales, super_ratio * per_group).expect("tile scales"),
+            biases: kquant_tile_rows(&self.biases, per_group).expect("tile biases"),
+        };
+        t.w.eval();
+        t.scales.eval();
+        t.biases.eval();
+        t
+    }
+
+    fn mode(&self) -> CString {
+        let tag = if self.tiled { KQUANT_TILED_SUFFIX } else { "" };
+        CString::new(format!("{}{tag}", self.fmt.mode)).expect("mode")
+    }
+
     fn new(fmt: Fmt, n: i64, k: i64, seed: u32) -> Self {
         assert_eq!(k % 256, 0);
         let supers = k / 256;
@@ -162,6 +194,7 @@ impl Weights {
         .expect("scales");
         Self {
             fmt,
+            tiled: false,
             w: MxArray::from_uint32(&words, &[n, fmt.weight_cols * supers]).expect("weight"),
             scales,
             biases: MxArray::from_float16(&biases, &[n, fmt.biases_cols * supers]).expect("biases"),
@@ -229,7 +262,7 @@ fn bf16_x(bits: &[u16], k: i64) -> MxArray {
 }
 
 fn qmm(x: &MxArray, w: &Weights) -> *mut mlx_sys::mlx_array {
-    let mode = CString::new(w.fmt.mode).expect("mode");
+    let mode = w.mode();
     // SAFETY: every operand outlives the call.
     let h = unsafe {
         mlx_sys::mlx_quantized_matmul(
@@ -298,27 +331,15 @@ fn cpu_reference(x: &MxArray, w: &Weights) -> Vec<f32> {
     out
 }
 
-/// `MLX_KQUANT_M8_NAX`: "1" routes every mode, "0" none, unset the default
-/// modes. Tests run on one thread (RUST_TEST_THREADS=1 in .cargo/config).
-fn set_switch(value: Option<&str>) {
-    // SAFETY: single-threaded test process, see above.
-    unsafe {
-        match value {
-            Some(v) => std::env::set_var("MLX_KQUANT_M8_NAX", v),
-            None => std::env::remove_var("MLX_KQUANT_M8_NAX"),
-        }
-    }
-}
-
 /// Whether the M = 8 route can run here at all. Without it the Metal result
 /// still has to match the CPU, so the comparison runs either way.
 fn routes() -> bool {
     nax_available()
 }
 
-/// Every mode on every Qwen3.8 verify shape against the CPU reference, with
-/// the route observed through the kernel-family counter, no zero outputs,
-/// and the split count reported.
+/// Every mode on every Qwen3.8 verify shape, tiled, against the CPU
+/// reference (row-major), with the route observed through the kernel-family
+/// counter, no zero outputs, and the split count reported.
 #[test]
 fn m8_nax_matches_cpu_on_every_mode_and_shape() {
     if !select_gpu() {
@@ -326,18 +347,18 @@ fn m8_nax_matches_cpu_on_every_mode_and_shape() {
         return;
     }
     println!("  nax={} routes={}", nax_available(), routes());
-    set_switch(Some("1"));
     for (fi, fmt) in FORMATS.iter().enumerate() {
         let mut worst_rel = 0f32;
         for (si, &(k, n)) in SHAPES.iter().enumerate() {
             let w = Weights::new(*fmt, n, k, 0x8a_0000 + (fi * 16 + si) as u32);
+            let t = w.tiled();
             let heavy = si % 2 == 1;
             let xb = activation_bits(8, k, (fi * 64 + si) as u32, heavy);
             let x = bf16_x(&xb, k);
             let cpu = cpu_reference(&x, &w);
             counting(true);
-            let y = read_u16(qmm(&x, &w));
-            let (m8, sg8, wide) = (family("qmm_m8_nax"), family("qmv_sg8"), family("qmv_wide"));
+            let y = read_u16(qmm(&x, &t));
+            let (m8, wide) = (family("qmm_m8_nax_t64"), family("qmv_wide_t64"));
             let splits = [1u64, 2, 4, 8]
                 .into_iter()
                 .find(|s| family(&format!("qmm_m8_nax_splits{s}")) > 0)
@@ -346,11 +367,14 @@ fn m8_nax_matches_cpu_on_every_mode_and_shape() {
             let what = format!("{} K={k} N={n} heavy={heavy}", fmt.mode);
             if routes() {
                 assert!(
-                    m8 == 1 && sg8 == 0 && wide == 0,
-                    "{what}: must take qmm_m8_nax (m8 {m8}, sg8 {sg8}, wide {wide})"
+                    m8 == 1 && wide == 0,
+                    "{what}: must take qmm_m8_nax_t64 (m8 {m8}, wide {wide})"
                 );
             } else {
-                assert_eq!(m8, 0, "{what}: qmm_m8_nax ran without NAX");
+                assert!(
+                    m8 == 0 && wide == 1,
+                    "{what}: without NAX the tiled M=8 route is qmv_wide_t64"
+                );
             }
             assert_eq!(cpu.len(), y.len(), "{what}: output lengths differ");
             let peak = cpu.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -391,20 +415,19 @@ fn m8_nax_matches_cpu_on_every_mode_and_shape() {
             fmt.mode
         );
     }
-    set_switch(None);
 }
 
-/// Twenty evaluations of one matmul, on the split shapes, are byte-identical.
+/// Twenty evaluations of one tiled matmul, on the split shapes, are
+/// byte-identical.
 #[test]
 fn m8_nax_is_deterministic() {
     if !select_gpu() {
         eprintln!("skipping: no GPU device");
         return;
     }
-    set_switch(Some("1"));
     for (fi, fmt) in FORMATS.iter().enumerate() {
         for (k, n) in [(17408i64, 5120i64), (5120, 1024)] {
-            let w = Weights::new(*fmt, n, k, 0xde_0000 + fi as u32);
+            let w = Weights::new(*fmt, n, k, 0xde_0000 + fi as u32).tiled();
             let x = bf16_x(&activation_bits(8, k, 0x77 + fi as u32, true), k);
             counting(true);
             let first = read_u16(qmm(&x, &w));
@@ -427,20 +450,25 @@ fn m8_nax_is_deterministic() {
             );
         }
     }
-    set_switch(None);
 }
 
-/// Shapes and operands the kernel does not take stay on the old routes.
+/// Shapes and operands the kernel does not take stay on the old routes;
+/// row-major, only q3k and iq4nl reach it.
 #[test]
 fn m8_nax_leaves_every_other_case_alone() {
     if !select_gpu() {
         eprintln!("skipping: no GPU device");
         return;
     }
+    // (tensor op, sg8, qmv_wide) in the layout of `w`.
     let route = |what: &str, x: &MxArray, w: &Weights| -> (u64, u64, u64) {
         counting(true);
         let _ = read_u16(qmm(x, w));
-        let r = (family("qmm_m8_nax"), family("qmv_sg8"), family("qmv_wide"));
+        let r = if w.tiled {
+            (family("qmm_m8_nax_t64"), 0, family("qmv_wide_t64"))
+        } else {
+            (family("qmm_m8_nax"), family("qmv_sg8"), family("qmv_wide"))
+        };
         counting(false);
         println!("  {what:<40} m8_nax {} sg8 {} wide {}", r.0, r.1, r.2);
         r
@@ -450,44 +478,49 @@ fn m8_nax_leaves_every_other_case_alone() {
     let k = 1280i64;
     let xb = activation_bits(8, k, 5, false);
 
-    // Default: q3k goes to the tensor op, q4k stays on sg8.
+    // Row-major: q3k goes to the tensor op, q4k stays on sg8.
     let w4 = Weights::new(q4k, 2048, k, 2);
     let w3 = Weights::new(q3k, 2048, k, 3);
-    let (m8, sg8, _) = route("q4k M=8 N=2048 (default)", &bf16_x(&xb, k), &w4);
-    assert!(m8 == 0 && sg8 > 0, "q4k must keep qmv_sg8 by default");
-    let (m8, _, wide) = route("q3k M=8 N=2048 (default)", &bf16_x(&xb, k), &w3);
+    let (m8, sg8, _) = route("q4k M=8 N=2048 row-major", &bf16_x(&xb, k), &w4);
+    assert!(m8 == 0 && sg8 > 0, "row-major q4k must keep qmv_sg8");
+    let (m8, _, wide) = route("q3k M=8 N=2048 row-major", &bf16_x(&xb, k), &w3);
     if routes() {
-        assert!(m8 == 1 && wide == 0, "q3k must take qmm_m8_nax by default");
+        assert!(m8 == 1 && wide == 0, "row-major q3k must take qmm_m8_nax");
     } else {
         assert!(m8 == 0 && wide > 0, "q3k must stay on qmv_wide without NAX");
     }
 
-    // N % 64 == 32: no column tail, so the old routes take it.
-    set_switch(Some("1"));
-    let (m8, sg8, _) = route(
-        "q4k M=8 N=2080 (=1)",
-        &bf16_x(&xb, k),
-        &Weights::new(q4k, 2080, k, 1),
-    );
-    assert!(m8 == 0 && sg8 > 0, "N % 64 != 0 must fall back to qmv_sg8");
-    let (m8, sg8, _) = route("q4k M=8 N=2048 (=1)", &bf16_x(&xb, k), &w4);
+    // Tiled: every mode takes it.
+    let t4 = w4.tiled();
+    let (m8, _, wide) = route("q4k M=8 N=2048 tiled", &bf16_x(&xb, k), &t4);
     if routes() {
-        assert!(m8 == 1 && sg8 == 0, "MLX_KQUANT_M8_NAX=1 must route q4k");
+        assert!(m8 == 1 && wide == 0, "tiled q4k must take qmm_m8_nax_t64");
+    } else {
+        assert!(
+            m8 == 0 && wide > 0,
+            "tiled q4k must stay on qmv_wide_t64 without NAX"
+        );
     }
 
-    // Other row counts never reach it.
+    // N % 64 == 32: no column tail, so the old routes take it (such a weight
+    // cannot tile either).
+    let (m8, _, wide) = route(
+        "q3k M=8 N=2080 row-major",
+        &bf16_x(&xb, k),
+        &Weights::new(q3k, 2080, k, 1),
+    );
+    assert!(
+        m8 == 0 && wide > 0,
+        "N % 64 != 0 must fall back to qmv_wide"
+    );
+
+    // Other row counts never reach it, in either layout.
     for m in [7i64, 9] {
         let x = MxArray::from_bfloat16(&activation_bits(m, k, 9 + m as u32, false), &[m, k])
             .expect("x");
-        let (m8, _, _) = route(&format!("q4k M={m} N=2048 (=1)"), &x, &w4);
+        let (m8, _, _) = route(&format!("q3k M={m} N=2048 row-major"), &x, &w3);
         assert_eq!(m8, 0, "M={m} must not take qmm_m8_nax");
+        let (m8, _, _) = route(&format!("q4k M={m} N=2048 tiled"), &x, &t4);
+        assert_eq!(m8, 0, "M={m} must not take qmm_m8_nax_t64");
     }
-
-    set_switch(Some("0"));
-    let (m8, _, wide) = route("q3k M=8 N=2048 (=0)", &bf16_x(&xb, k), &w3);
-    assert!(
-        m8 == 0 && wide > 0,
-        "MLX_KQUANT_M8_NAX=0 must restore qmv_wide"
-    );
-    set_switch(None);
 }

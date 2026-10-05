@@ -243,7 +243,7 @@ plan_segmented_verify_tile_launch(int rows, int gqa_factor,
 // floor cost more than they save. The crossover differs per GPU, so each
 // process measures it once (mlx_segmented_sdpa.cpp) on a verify block of
 // the production shape at these key counts and selects with the function
-// below; MLX_SDPA_VERIFY_TILE overrides the result.
+// below.
 constexpr int kSegmentedCalibrationKeys[] = {256, 512, 1024, 2048, 4096};
 constexpr size_t kSegmentedCalibrationPoints =
     sizeof(kSegmentedCalibrationKeys) / sizeof(kSegmentedCalibrationKeys[0]);

@@ -1400,8 +1400,8 @@ fn apply_weights_inner_with_residency(
             | PerLayerMode::IQ4XS
             | PerLayerMode::IQ3S => {
                 // Repack eligible 2-D K-quant projections into the Tiled64
-                // layout for the `_t64` Metal kernels (MLX_KQUANT_TILED=0 keeps
-                // row-major). Done here, at the one place every qwen3_5
+                // layout for the `_t64` Metal kernels (a Metal host; other
+                // hosts stay row-major). Done here, at the one place every qwen3_5
                 // projection is built, before the row merges: both halves of
                 // a merge then share the layout (the GDN pads its `in_proj_ba`
                 // to whole tiles itself, see `GatedDeltaNet::finalize_after_load`).

@@ -22,9 +22,10 @@ Organize them by their mathematical and storage contracts:
   `build.rs` also turns each header into a `quantized_preamble::` function for
   the custom kernels that reuse its decoders. Two in-memory weight layouts
   (`mlx_kquant.h`): the on-disk row-major one, and `Tiled64` (mode suffix
-  `@t64`, set at load by `QuantizedLinear::tile_kquant_layout`, off with
-  `MLX_KQUANT_TILED=0`), where 64 rows interleave per 32-code unit and per
-  super-block so a 64-column threadgroup streams contiguous runs. Only the
+  `@t64`, set at load by `QuantizedLinear::tile_kquant_layout` for every 2-D
+  weight with N % 64 == 0 and K % 256 == 0 on a Metal host), where 64 rows
+  interleave per 32-code unit and per super-block so a 64-column threadgroup
+  streams contiguous runs. Only the
   `_t64` kernels (`qmv_t64`, `qmv_wide_t64`, `qmm_m8_nax_t64`,
   `qmm_t_nax_t64`, `qmm_t_t64`, `qmm_t_splitk_t64`) and the CPU reference
   read it; the dispatcher refuses it everywhere else (`kquant_tiled` tests).

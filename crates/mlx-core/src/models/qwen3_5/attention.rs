@@ -3311,10 +3311,6 @@ mod tests {
             return Ok(());
         }
         const D: i64 = 256;
-        if std::env::var_os("MLX_SDPA_VERIFY_TILE").is_some() {
-            eprintln!("SKIP block crossover: MLX_SDPA_VERIFY_TILE pins it");
-            return Ok(());
-        }
         let mut keys = [0i32; 8];
         let mut vector_s = [0f64; 8];
         let mut block_s = [0f64; 8];
@@ -3355,7 +3351,7 @@ mod tests {
         assert_eq!(
             min_keys,
             i64::from(result),
-            "effective crossover without override"
+            "effective crossover is the calibrated one"
         );
         let mut plan = [0u32; 5];
         if unsafe {

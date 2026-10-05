@@ -117,17 +117,8 @@ std::string kernel_name(SegmentedKernel kernel, int m = 0, int tile_n = 0) {
 // then (the vector routes serve every block).
 std::atomic<int> g_block_min_keys{0};
 
-// MLX_SDPA_VERIFY_TILE: unset (-1) = the calibrated crossover; 0 keeps the
-// vector routes (A/B kill switch); N >= 1 takes a block kernel from N keys.
-// Read per call.
-int block_min_keys_override() {
-  return env::get_var("MLX_SDPA_VERIFY_TILE", -1);
-}
-
 int effective_block_min_keys() {
-  const int override = block_min_keys_override();
-  return override >= 0 ? override
-                       : g_block_min_keys.load(std::memory_order_acquire);
+  return g_block_min_keys.load(std::memory_order_acquire);
 }
 
 bool tile_route_enabled(SegmentedTileMode mode, int total_length) {
@@ -137,23 +128,22 @@ bool tile_route_enabled(SegmentedTileMode mode, int total_length) {
   case SegmentedTileMode::tile:
   case SegmentedTileMode::nax:
     return true;
-  case SegmentedTileMode::from_env:
+  case SegmentedTileMode::automatic:
     break;
   }
   const int min_keys = effective_block_min_keys();
   return min_keys > 0 && total_length >= min_keys;
 }
 
-// MLX_SDPA_ROUTE_LOG=1 (or MLX_METAL_COMMAND_TRACE >= 1) prints the
-// calibration result once.
+// Under MLX_METAL_COMMAND_TRACE (any value >= 1, the fork's command-trace
+// diagnostic), the calibration result is printed once.
 bool route_log_enabled() {
-  static const bool enabled = env::get_var("MLX_SDPA_ROUTE_LOG", 0) == 1 ||
-                              env::get_var("MLX_METAL_COMMAND_TRACE", 0) >= 1;
+  static const bool enabled = env::get_var("MLX_METAL_COMMAND_TRACE", 0) >= 1;
   return enabled;
 }
 
-// MLX_SDPA_VERIFY_NAX=0 keeps the simdgroup-matrix tile kernel on a device
-// whose tensor op could serve the block (A/B kill switch). Read per call.
+// The tensor-op kernel serves the block wherever the device has one; the
+// simdgroup-matrix tile kernel is the fallback.
 bool nax_route_enabled(SegmentedTileMode mode) {
   switch (mode) {
   case SegmentedTileMode::vector:
@@ -161,11 +151,10 @@ bool nax_route_enabled(SegmentedTileMode mode) {
     return false;
   case SegmentedTileMode::nax:
     return true;
-  case SegmentedTileMode::from_env:
+  case SegmentedTileMode::automatic:
     break;
   }
-  return metal::is_nax_available() &&
-         env::get_var("MLX_SDPA_VERIFY_NAX", 1) != 0;
+  return metal::is_nax_available();
 }
 
 // MLX's own aggregation kernel: the partials must reduce exactly as MLX's
@@ -930,7 +919,7 @@ void measure_block_crossover(metal::Device &device, Stream stream,
   // The block kernel the production dispatch would take at the largest
   // count; the forced modes below bypass the key threshold.
   SegmentedTileMode block_mode = SegmentedTileMode::vector;
-  if (nax_route_enabled(SegmentedTileMode::from_env) &&
+  if (nax_route_enabled(SegmentedTileMode::automatic) &&
       nax_verify_launch(device, kCalibrationRows, gqa, max_keys)
           .plan.supported) {
     block_mode = SegmentedTileMode::nax;
@@ -1169,9 +1158,9 @@ array segmented_sdpa(const array &q, const array &prefix_k,
   }
   // A verify block may take a block kernel at eval time; the crossover it
   // compares against is measured here, on the graph-building thread, the
-  // first time a process reaches one (unless MLX_SDPA_VERIFY_TILE pins it).
-  if (tile_mode == SegmentedTileMode::from_env && causal &&
-      new_k.shape(2) == q_len && block_min_keys_override() < 0) {
+  // first time a process reaches one.
+  if (tile_mode == SegmentedTileMode::automatic && causal &&
+      new_k.shape(2) == q_len) {
     calibrate_block_min_keys(device, stream);
   }
   if (max_query_length >= 1 && q_len > max_query_length) {
@@ -1241,13 +1230,13 @@ mlx_segmented_sdpa_forward(mlx_array *q, mlx_array *prefix_k,
                            mlx_array *new_v, float scale, bool causal) {
   return segmented_sdpa_forward_impl(
       q, prefix_k, prefix_v, new_k, new_v, scale, causal, false,
-      mlx::core::segmented_sdpa::SegmentedTileMode::from_env);
+      mlx::core::segmented_sdpa::SegmentedTileMode::automatic);
 }
 
 // Test-only contract: never silently qualify the concatenated fallback, and
 // stay on the vector routes (bit-identical to MLX's vector SDPA) whatever
-// MLX_SDPA_VERIFY_TILE says. mlx_segmented_sdpa_test_forward_tile covers the
-// tile route.
+// the calibrated crossover says. mlx_segmented_sdpa_test_forward_tile and
+// _nax cover the block kernels.
 extern "C" mlx_array *
 mlx_segmented_sdpa_test_forward(mlx_array *q, mlx_array *prefix_k,
                                 mlx_array *prefix_v, mlx_array *new_k,
@@ -1391,17 +1380,14 @@ extern "C" int mlx_segmented_sdpa_test_device_verify_route(
 }
 
 // Test-only: the key count (prefix + new rows) from which the production
-// entry takes a block kernel: MLX_SDPA_VERIFY_TILE when set (0 = the block
-// kernels are off), else the calibrated crossover (measured now if this
+// entry takes a block kernel: the calibrated crossover (measured now if this
 // process has not yet). -1 without Metal or on error.
 extern "C" int mlx_segmented_sdpa_test_block_min_keys() {
   using namespace mlx::core;
   try {
     auto stream = default_stream(Device::gpu);
     auto &device = metal::device(stream.device);
-    if (segmented_sdpa::block_min_keys_override() < 0) {
-      segmented_sdpa::calibrate_block_min_keys(device, stream);
-    }
+    segmented_sdpa::calibrate_block_min_keys(device, stream);
     return segmented_sdpa::effective_block_min_keys();
   } catch (const std::exception &e) {
     std::fprintf(stderr, "mlx_segmented_sdpa_test_block_min_keys: %s\n",
@@ -1413,8 +1399,8 @@ extern "C" int mlx_segmented_sdpa_test_block_min_keys() {
 // Test-only: the calibration record (measured now if this process has not
 // yet): per point `keys`, `vector_seconds` and `block_seconds` (up to
 // `capacity` entries), the wall time of the whole calibration, the block
-// kernel it timed (0 none, 1 tile, 2 tensor-op) and the selected crossover
-// before any override. Returns the point count (0 when the measurement
+// kernel it timed (0 none, 1 tile, 2 tensor-op) and the selected crossover.
+// Returns the point count (0 when the measurement
 // failed and the ceiling was recorded; its message on stderr), -1 without
 // Metal or on error.
 extern "C" int mlx_segmented_sdpa_test_block_calibration(

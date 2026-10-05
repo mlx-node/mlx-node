@@ -155,11 +155,10 @@
 
 // The Tiled64 weight layout ("_t64", mlx_kquant.h): a 2-D weight read as
 // x @ w.T with N % 64 == 0, so the transposed, aligned, unbatched kernels
-// only. qmv_wide also gets nv_1 (M = 1 has no tiled qmv) and, for the M = 1
-// lane-map A/B, nv_1 at 4 k-lanes (8 rows per simdgroup).
-#define instantiate_kquant_wide_tiled(mode, type, vecs_per_tg, k_lanes, group_size, bits, super_ratio, has_min) \
+// only. M = 1 takes qmv_t64, so qmv_wide starts at nv_2.
+#define instantiate_kquant_wide_tiled(mode, type, vecs_per_tg, group_size, bits, super_ratio, has_min) \
   instantiate_kernel( \
-      #mode "_qmv_wide_t64_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_kl_" #k_lanes "_batch_0", \
+      #mode "_qmv_wide_t64_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_kl_8_batch_0", \
       kquant_qmv_wide, \
       type, \
       group_size, \
@@ -167,7 +166,7 @@
       super_ratio, \
       has_min, \
       vecs_per_tg, \
-      k_lanes, \
+      8, \
       0, \
       true)
 
@@ -178,15 +177,13 @@
   instantiate_kernel( \
       #mode "_qmv_t64_" #type "_gs_" #group_size "_b_" #bits "_ks_16", \
       kquant_qmv_t64, type, group_size, bits, super_ratio, has_min, 16) \
-  instantiate_kquant_wide_tiled(mode, type, 1, 8, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 1, 4, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 2, 8, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 3, 8, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 4, 8, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 5, 8, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 6, 8, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 7, 8, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_tiled(mode, type, 8, 8, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_tiled(mode, type, 2, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_tiled(mode, type, 3, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_tiled(mode, type, 4, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_tiled(mode, type, 5, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_tiled(mode, type, 6, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_tiled(mode, type, 7, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_tiled(mode, type, 8, group_size, bits, super_ratio, has_min) \
   instantiate_kernel( \
       #mode "_qmm_t_t64_" #type "_gs_" #group_size "_b_" #bits "_alN_true_batch_0", \
       kquant_qmm_t, type, group_size, bits, super_ratio, has_min, true, 0, 32, 32, 32, true) \

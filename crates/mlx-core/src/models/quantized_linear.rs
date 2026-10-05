@@ -619,7 +619,7 @@ pub fn try_build_kquant_quantized_linear(
 /// [`try_build_kquant_quantized_linear`] followed by the Tiled64 repack
 /// ([`QuantizedLinear::tile_kquant_layout`]) when
 /// [`kquant_tiled_enabled`](crate::models::quant_dispatch::kquant_tiled_enabled)
-/// (a Metal host, `MLX_KQUANT_TILED` not `0`). When the projection did tile,
+/// (a Metal host). When the projection did tile,
 /// its `key_prefix` is pushed onto `tiled`: the repack evaluates the tiled
 /// copies, so the loader's row-major `{key_prefix}.weight/.scales/.biases` in
 /// `params` are now dead weight it should drop with

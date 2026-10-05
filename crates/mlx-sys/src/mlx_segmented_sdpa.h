@@ -36,14 +36,12 @@ struct SegmentedSpecialization {
 // How the verify block (causal, new rows == query rows) is served. The
 // block kernels are the tensor-op (NAX) kernel on gen-17+ GPUs, else the
 // simdgroup-matrix tile kernel; below the key crossover, or where neither
-// can launch, the vector routes. `from_env` reads MLX_SDPA_VERIFY_TILE (0
-// disables both block kernels, N >= 1 takes them from N keys; unset: the
-// crossover this process measured on first use, see
-// calibrate_block_min_keys) and MLX_SDPA_VERIFY_NAX (0 keeps the tile kernel on
-// NAX devices; unset or 1 prefers the tensor-op kernel). `tile` and `nax`
-// force one block kernel (tests).
+// can launch, the vector routes. `automatic` (production) takes a block
+// kernel from the crossover this process measured on first use
+// (calibrate_block_min_keys). `vector`, `tile` and `nax` force one route
+// (tests).
 enum class SegmentedTileMode : int {
-  from_env = -1,
+  automatic = -1,
   vector = 0,
   tile = 1,
   nax = 2,

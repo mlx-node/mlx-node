@@ -744,7 +744,7 @@ unsafe extern "C-unwind" {
 
     // Strict test entry: null on unsupported segmented dispatch; no concat
     // fallback. Always the vector routes (bit-identical to MLX's vector
-    // SDPA), whatever MLX_SDPA_VERIFY_TILE says.
+    // SDPA), whatever the calibrated crossover says.
     pub fn mlx_segmented_sdpa_test_forward(
         q: *mut mlx_array,
         prefix_k: *mut mlx_array,
@@ -911,17 +911,16 @@ unsafe extern "C-unwind" {
     ) -> i32;
 
     /// TEST-ONLY: the key count (prefix + new rows) from which the production
-    /// segmented entry takes a block kernel: `MLX_SDPA_VERIFY_TILE` when set
-    /// (0 = block kernels off), else the crossover this process calibrated
-    /// (measured now if not yet). -1 without Metal or on error.
+    /// segmented entry takes a block kernel: the crossover this process
+    /// calibrated (measured now if not yet). -1 without Metal or on error.
     pub fn mlx_segmented_sdpa_test_block_min_keys() -> i32;
 
     /// TEST-ONLY: the crossover calibration record (measured now if not
     /// yet): per point `keys`, `vector_seconds`, `block_seconds` (up to
     /// `capacity`), the calibration's wall time, the block kernel timed
-    /// (0 none, 1 tile, 2 tensor-op) and the selected crossover before any
-    /// override. Returns the point count (0 when the measurement failed),
-    /// -1 without Metal or on error.
+    /// (0 none, 1 tile, 2 tensor-op) and the selected crossover. Returns the
+    /// point count (0 when the measurement failed), -1 without Metal or on
+    /// error.
     pub fn mlx_segmented_sdpa_test_block_calibration(
         keys: *mut i32,
         vector_seconds: *mut f64,

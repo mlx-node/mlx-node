@@ -277,19 +277,13 @@ pub fn split_kquant_layout(mode: &str) -> (&str, bool) {
     }
 }
 
-/// `MLX_KQUANT_TILED`: unset or anything but `0` tiles every eligible K-quant
-/// linear at load on a Metal host; `0` keeps the on-disk row-major layout
-/// (the A/B switch). Read once per process.
+/// Whether K-quant linears are tiled at load: only the `_t64` Metal kernels
+/// read the layout, so a Metal host. Read once per process.
 pub fn kquant_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if std::env::var("MLX_KQUANT_TILED").as_deref() == Ok("0") {
-            return false;
-        }
-        // SAFETY: nullary predicate that catches internally.
-        unsafe { mlx_sys::mlx_metal_is_available() }
-    })
+    // SAFETY: nullary predicate that catches internally.
+    *ENABLED.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() })
 }
 
 /// Whether a 2-D K-quant weight of `n` rows and `k` inputs may be tiled:

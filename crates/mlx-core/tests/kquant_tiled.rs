@@ -91,28 +91,6 @@ fn qmm_tiled(x: &MxArray, w: &Weights, kq: &KQuant, device: i32) -> *mut mlx_sys
     qmm_mode(x, w, true, kq, &tiled_mode(kq), device)
 }
 
-/// `MLX_KQUANT_M8_NAX`: "1" routes every row-major mode to the tensor op.
-fn set_m8_switch(value: Option<&str>) {
-    // SAFETY: single-threaded test process (RUST_TEST_THREADS=1 in .cargo/config).
-    unsafe {
-        match value {
-            Some(v) => std::env::set_var("MLX_KQUANT_M8_NAX", v),
-            None => std::env::remove_var("MLX_KQUANT_M8_NAX"),
-        }
-    }
-}
-
-/// `MLX_KQUANT_TILED_QMV`: the tiled M = 1 lane map (row | wide8 | wide4).
-fn set_qmv_route(value: Option<&str>) {
-    // SAFETY: as above.
-    unsafe {
-        match value {
-            Some(v) => std::env::set_var("MLX_KQUANT_TILED_QMV", v),
-            None => std::env::remove_var("MLX_KQUANT_TILED_QMV"),
-        }
-    }
-}
-
 /// `read_output` widens 16-bit outputs to u32 bit patterns; the activations
 /// here are bfloat16, so every output (CPU included) is bfloat16 bits.
 fn bf16(bits: u32) -> f32 {
@@ -283,62 +261,40 @@ fn qmv_wide_tiled_is_bit_identical() {
     }
 }
 
-/// M = 1: the default tiled matvec (qmv_t64, lane = row) is checked against
-/// the CPU reference; the qmv_wide_t64 nv_1 alternatives against the
-/// row-major qmv_wide nv_2 run on the same row twice (the per-vector
-/// arithmetic is independent of nv; bit-identical at 8 k-lanes) and the CPU.
+/// M = 1: the tiled matvec (qmv_t64, lane = row) is the only tiled M = 1
+/// route and is checked against the CPU reference.
 #[cfg(target_os = "macos")]
 #[test]
-fn qmv_m1_tiled_matches_row_major_and_cpu() {
+fn qmv_m1_tiled_matches_cpu() {
     assert!(gpu_gen() > 0, "no Metal device");
     for (ki, kq) in KQUANTS.iter().enumerate() {
         for (si, &(k, n)) in SHAPES.iter().enumerate().take(4) {
             let w = weights(kq, &[n], k, 0x7600 + (ki * 16 + si) as u32);
             let t = tiled(&w, kq);
             let x1 = activation(&[1, k], 0x7700 + (ki * 16 + si) as u32, DType::BFloat16);
-            let x2 = MxArray::concatenate(&x1, &x1, 0).unwrap();
             let (_, _, cpu) = read_output("cpu", quantized_matmul(&x1, &w, true, kq, CPU));
-            let (_, _, wide2) = read_output("nv2", quantized_matmul(&x2, &w, true, kq, GPU));
-            let row0 = &wide2[..n as usize];
-            for (route, family) in [
-                ("row", "qmv_t64"),
-                ("wide8", "qmv_wide_t64_nv1_kl8"),
-                ("wide4", "qmv_wide_t64_nv1_kl4"),
-            ] {
-                set_qmv_route(Some(route));
-                start_counting();
-                let (_, _, ours) = read_output("tiled", qmm_tiled(&x1, &t, kq, GPU));
-                let what = format!("{} K={k} N={n} M=1 route={route}", kq.mode);
-                assert_eq!(family_count(family), 1, "{what}: must take {family}");
-                assert_no_row_major_route(&what);
-                stop_counting();
-                if gpu_gen() >= 15 && route == "wide8" {
-                    assert_eq!(
-                        ours, row0,
-                        "{what}: differs from row-major qmv_wide nv_2 row 0"
-                    );
-                }
-                let (worst, peak) = worst_abs(&ours, &cpu);
-                assert!(
-                    worst / peak < 1e-2,
-                    "{what}: tiled M=1 off the CPU reference by {worst} (peak {peak})"
-                );
-            }
-            set_qmv_route(None);
+            start_counting();
+            let (_, _, ours) = read_output("tiled", qmm_tiled(&x1, &t, kq, GPU));
+            let what = format!("{} K={k} N={n} M=1", kq.mode);
+            assert_eq!(family_count("qmv_t64"), 1, "{what}: must take qmv_t64");
+            assert_no_row_major_route(&what);
+            stop_counting();
+            let (worst, peak) = worst_abs(&ours, &cpu);
+            assert!(
+                worst / peak < 1e-2,
+                "{what}: tiled M=1 off the CPU reference by {worst} (peak {peak})"
+            );
         }
-        println!(
-            "  {:<6} M=1 tiled: qmv_t64 ~cpu, qmv_wide_t64 == row-major row",
-            kq.mode
-        );
+        println!("  {:<6} M=1 tiled: qmv_t64 ~cpu", kq.mode);
     }
 }
 
-/// (b) M = 8: every tiled mode takes the tensor op; bit-identical to the
-/// row-major tensor op (same split count, same order) and within the tile
-/// tolerance of the CPU reference.
+/// (b) M = 8: every tiled mode takes the tensor op, within the tile
+/// tolerance of the CPU reference. q3k and iq4nl also take it row-major, and
+/// there the two layouts are bit-identical (same split count, same order).
 #[cfg(target_os = "macos")]
 #[test]
-fn m8_nax_tiled_is_bit_identical_and_matches_cpu() {
+fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
     assert!(gpu_gen() > 0, "no Metal device");
     if !nax_available() {
         eprintln!("skipping: no NAX tensor-op kernels on this host");
@@ -352,7 +308,6 @@ fn m8_nax_tiled_is_bit_identical_and_matches_cpu() {
             let x = activation(&[8, k], 0x7900 + (ki * 16 + si) as u32, DType::BFloat16);
             let what = format!("{} K={k} N={n} M=8", kq.mode);
 
-            set_m8_switch(None);
             start_counting();
             let (_, _, ours) = read_output("tiled", qmm_tiled(&x, &t, kq, GPU));
             assert_eq!(
@@ -367,21 +322,22 @@ fn m8_nax_tiled_is_bit_identical_and_matches_cpu() {
                 .unwrap_or(0);
             stop_counting();
 
-            set_m8_switch(Some("1"));
-            start_counting();
-            let (_, _, reference) =
-                read_output("row-major m8", quantized_matmul(&x, &w, true, kq, GPU));
-            assert_eq!(
-                family_count("qmm_m8_nax"),
-                1,
-                "{what}: reference must take qmm_m8_nax"
-            );
-            stop_counting();
-            set_m8_switch(None);
-            assert_eq!(
-                ours, reference,
-                "{what}: tiled m8_nax differs from row-major m8_nax"
-            );
+            if matches!(kq.mode, "q3k" | "iq4nl") {
+                start_counting();
+                let (_, _, reference) =
+                    read_output("row-major m8", quantized_matmul(&x, &w, true, kq, GPU));
+                assert_eq!(
+                    family_count("qmm_m8_nax"),
+                    1,
+                    "{what}: row-major {} must take qmm_m8_nax",
+                    kq.mode
+                );
+                stop_counting();
+                assert_eq!(
+                    ours, reference,
+                    "{what}: tiled m8_nax differs from row-major m8_nax"
+                );
+            }
 
             let (_, _, cpu) = read_output("cpu", quantized_matmul(&x, &w, true, kq, CPU));
             let (worst, peak) = worst_abs(&ours, &cpu);

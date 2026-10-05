@@ -105,13 +105,10 @@ std::string qmv_wide(Mode m, Dtype t, int vecs_per_tg, bool batched) {
 }
 // The Tiled64 layout ("_t64" family suffix, mlx_kquant.h): 2-D weights read
 // as x @ w.T with N % 64 == 0, so only the transposed, aligned, unbatched
-// kernels exist. qmv_wide_t64 also has nv_1 at 8 and 4 k-lanes: the M = 1
-// lane-map alternatives of qmv_t64 (MLX_KQUANT_TILED_QMV=wide8|wide4).
-constexpr int kTiledQmvMinVectors = 1;
-constexpr int kTiledQmvAltKLanes = 4;
-std::string qmv_wide_t64(Mode m, Dtype t, int vecs_per_tg, int k_lanes) {
+// kernels exist. M = 1 takes qmv_t64, so qmv_wide_t64 starts at nv_2.
+std::string qmv_wide_t64(Mode m, Dtype t, int vecs_per_tg) {
   std::string name = base(m, "qmv_wide_t64", t);
-  concatenate(name, "_nv_", vecs_per_tg, "_kl_", k_lanes, batch(false));
+  concatenate(name, "_nv_", vecs_per_tg, "_kl_", kWideKLanes, batch(false));
   return name;
 }
 // qmv_t64: the lane = row M = 1 matvec, 32 rows x k_splits simdgroups per
@@ -128,10 +125,16 @@ std::string qmv_t64(Mode m, Dtype t, int k_splits) {
   return name;
 }
 std::string qmv_sg8(Mode m) { return base(m, "qmv_sg8", kSg8Type); }
-// qmm_m8_nax: M = 8 bfloat16 on the tensor op, every mode; 64-column tiles
-// and at most 8 K splits (kquant_m8_nax.h).
+// qmm_m8_nax: M = 8 bfloat16 on the tensor op; 64-column tiles and at most
+// 8 K splits (kquant_m8_nax.h). Every mode in the Tiled64 layout; row-major
+// only the modes qmv_sg8 does not decode (q3k, iq4nl), where it measured
+// 1.1-1.4x of qmv_wide on the Qwen3.8 shapes on an M5 Max (the sg8 modes
+// only tie qmv_sg8 row-major, 0.85-1.0x).
 constexpr int kM8TileCols = 64;
 constexpr int kM8MaxSplits = 8;
+constexpr bool m8_nax_row_major_mode(Mode mode) {
+  return mode == Mode::Q3K || mode == Mode::IQ4NL;
+}
 std::string qmm_m8_nax(Mode m, bool tiled = false) {
   return base(m, tiled ? "qmm_m8_nax_t64" : "qmm_m8_nax", kSg8Type);
 }
@@ -224,10 +227,9 @@ std::vector<KernelName> metal_kernel_names() {
       add(gather_qmm_rhs(m, t, false));
       add(dequantize(m, t));
       // Tiled64: transposed, aligned, unbatched only.
-      for (int v = kTiledQmvMinVectors; v <= kWideMaxVectors; ++v) {
-        add(qmv_wide_t64(m, t, v, kWideKLanes));
+      for (int v = kWideMinVectors; v <= kWideMaxVectors; ++v) {
+        add(qmv_wide_t64(m, t, v));
       }
-      add(qmv_wide_t64(m, t, 1, kTiledQmvAltKLanes));
       for (int ks : kTiledQmvKSplits) {
         add(qmv_t64(m, t, ks));
       }
@@ -237,7 +239,9 @@ std::vector<KernelName> metal_kernel_names() {
     }
   }
   for (Mode m : kModes) {
-    add(qmm_m8_nax(m), true);
+    if (m8_nax_row_major_mode(m)) {
+      add(qmm_m8_nax(m), true);
+    }
     add(qmm_m8_nax(m, true), true);
   }
   std::vector<int> prep_group_sizes;
@@ -268,13 +272,11 @@ load_kernel(metal::Device &d, const std::string &kname,
                                           hash_name, func_consts);
 }
 
-// MLX_KQUANT_ROUTE_LOG=1 prints each distinct (kernel, M, N, K) the
-// dispatcher requests, once.
+// Under MLX_METAL_COMMAND_TRACE (any value >= 1, the fork's command-trace
+// diagnostic), prints each distinct (kernel, M, N, K) the dispatcher
+// requests, once.
 void log_route(const std::string &kname, int M, int N, int K) {
-  static const bool enabled = [] {
-    const char *e = std::getenv("MLX_KQUANT_ROUTE_LOG");
-    return e && e[0] == '1' && e[1] == '\0';
-  }();
+  static const bool enabled = env::get_var("MLX_METAL_COMMAND_TRACE", 0) >= 1;
   if (!enabled) {
     return;
   }
@@ -456,32 +458,9 @@ inline bool use_qmv_wide(metal::Device &d) {
   return d.get_architecture_gen() >= 15;
 }
 
-// The tiled M = 1 matvec: `row` (default) is qmv_t64, lane = row; `wide8` /
-// `wide4` are qmv_wide_t64 nv_1 at 4 rows x 8 k-lanes / 8 rows x 4 k-lanes
-// per simdgroup. MLX_KQUANT_TILED_QMV selects, read per call for the A/B
-// (kquant_tiled_bench.rs).
-enum class TiledQmv { Row, Wide8, Wide4 };
-TiledQmv tiled_qmv_route() {
-  const char *e = std::getenv("MLX_KQUANT_TILED_QMV");
-  if (e) {
-    std::string_view v(e);
-    if (v == "wide8") {
-      return TiledQmv::Wide8;
-    }
-    if (v == "wide4") {
-      return TiledQmv::Wide4;
-    }
-  }
-  return TiledQmv::Row;
-}
-int tiled_qmv_k_lanes(int vecs_per_tg) {
-  if (vecs_per_tg == 1 && tiled_qmv_route() == TiledQmv::Wide4) {
-    return kernels::kTiledQmvAltKLanes;
-  }
-  return kernels::kWideKLanes;
-}
-
-// Grid (M, N / 32) of 32 x k_splits threads (kquant_qmv_t64).
+// The tiled M = 1 matvec, lane = row: grid (M, N / 32) of 32 x k_splits
+// threads (kquant_qmv_t64). Measured against qmv_wide_t64 nv_1 at 8 and 4
+// k-lanes on the Qwen3.8 shapes; lane = row won.
 void qmv_t64(const Operands &o, int M, int N, int K) {
   constexpr int rows_per_tg = 32;
   const int k_splits = kernels::tiled_qmv_k_splits(K);
@@ -509,8 +488,7 @@ void qmv_wide(const Operands &o, int M, int N, int K) {
   const int tile_cap = N >= 2048 ? kernels::kWideMaxVectors : 5;
   int n_tiles = (M + tile_cap - 1) / tile_cap;
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
-  const int k_lanes = o.tiled ? tiled_qmv_k_lanes(vecs_per_tg)
-                              : kernels::kWideKLanes;
+  constexpr int k_lanes = kernels::kWideKLanes;
   constexpr int num_simdgroups = 2;
   int B = o.out.size() / M / N;
   bool batched = B > 1;
@@ -521,16 +499,12 @@ void qmv_wide(const Operands &o, int M, int N, int K) {
                       (N + rows_per_tg - 1) / rows_per_tg, B);
 
   if (bridge_testing::counting) {
-    std::string detail =
-        family_of("qmv_wide", o.tiled) + "_nv" + std::to_string(vecs_per_tg);
-    if (o.tiled) {
-      detail += "_kl" + std::to_string(k_lanes);
-    }
-    bridge_testing::record(detail);
+    bridge_testing::record(family_of("qmv_wide", o.tiled) + "_nv" +
+                           std::to_string(vecs_per_tg));
   }
   auto kernel = get_kernel(
       o.d, family_of("qmv_wide", o.tiled),
-      o.tiled ? kernels::qmv_wide_t64(o.mode, o.x.dtype(), vecs_per_tg, k_lanes)
+      o.tiled ? kernels::qmv_wide_t64(o.mode, o.x.dtype(), vecs_per_tg)
               : kernels::qmv_wide(o.mode, o.x.dtype(), vecs_per_tg, batched),
       M, N, K);
   auto &enc = metal::get_command_encoder(o.s);
@@ -651,15 +625,6 @@ int gpu_core_count(metal::Device &d) {
 // core and each partition would keep 512 inputs of whole 32-input units.
 int qmm_m8_nax_splits(int N, int K, int cores) {
   const int64_t tiles = N / kernels::kM8TileCols;
-  // MLX_KQUANT_M8_SPLITS forces a split count that divides the unit count
-  // (tuning only; read per call).
-  if (const char *e = std::getenv("MLX_KQUANT_M8_SPLITS")) {
-    int forced = std::atoi(e);
-    if (forced >= 1 && forced <= kernels::kM8MaxSplits &&
-        (K / 32) % forced == 0) {
-      return forced;
-    }
-  }
   int splits = 1;
   while (splits < kernels::kM8MaxSplits &&
          tiles * splits < int64_t(6) * cores && K / (2 * splits) >= 512 &&
@@ -669,47 +634,17 @@ int qmm_m8_nax_splits(int N, int K, int cores) {
   return splits;
 }
 
-// MLX_KQUANT_M8_NAX: unset routes the modes qmv_sg8 does not decode (q3k,
-// iq4nl), where the tensor op measured 1.1-1.4x of qmv_wide on the Qwen3.8
-// shapes on an M5 Max; the sg8 modes stay on qmv_sg8, which it only matches
-// (0.85-1.0x). 1 routes every mode, 0 none. Read per call so an A/B can
-// flip it (kquant_m8_nax_bench.rs).
-enum class M8Nax { Auto, Off, Force };
-M8Nax m8_nax_switch() {
-  const char *e = std::getenv("MLX_KQUANT_M8_NAX");
-  if (e && e[1] == '\0') {
-    if (e[0] == '0') {
-      return M8Nax::Off;
-    }
-    if (e[0] == '1') {
-      return M8Nax::Force;
-    }
-  }
-  return M8Nax::Auto;
-}
-bool m8_nax_default_mode(Mode mode) {
-  return mode == Mode::Q3K || mode == Mode::IQ4NL;
-}
-
 // Tensor-op M = 8 matmul on gen-17+ (is_nax_available): whole 64-column
 // tiles, whole 32-input units, no batch, aligned operands (x rows as 16-byte
-// tensor rows, scales as ushort pairs, biases as half2 pairs).
+// tensor rows, scales as ushort pairs, biases as half2 pairs). Every Tiled64
+// mode (1.18-1.40x of qmv_sg8 on the Qwen3.8 shapes); row-major only the
+// modes of kernels::m8_nax_row_major_mode.
 bool use_qmm_m8_nax(const Operands &o, int M, int N, int K) {
   if (M != 8 || !metal::is_nax_available()) {
     return false;
   }
-  switch (m8_nax_switch()) {
-  case M8Nax::Off:
+  if (!o.tiled && !kernels::m8_nax_row_major_mode(o.mode)) {
     return false;
-  case M8Nax::Auto:
-    // Tiled64 is the layout the tensor-op kernel was measured for (1.18-1.40x
-    // of qmv_sg8 on the Qwen3.8 shapes), so every tiled mode takes it.
-    if (!o.tiled && !m8_nax_default_mode(o.mode)) {
-      return false;
-    }
-    break;
-  case M8Nax::Force:
-    break;
   }
   return o.x.dtype() == kernels::kSg8Type && o.out.dtype() == kernels::kSg8Type &&
          o.out.size() == size_t(8) * N && N % kernels::kM8TileCols == 0 &&
@@ -1197,7 +1132,7 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
       qmm_m8_nax(o, N, K);
       return;
     }
-    if (M == 1 && tiled_qmv_route() == TiledQmv::Row) {
+    if (M == 1) {
       qmv_t64(o, M, N, K);
       return;
     }
