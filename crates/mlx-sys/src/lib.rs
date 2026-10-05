@@ -910,6 +910,38 @@ unsafe extern "C-unwind" {
         out: *mut u64,
     ) -> i32;
 
+    /// TEST-ONLY: the key count (prefix + new rows) from which the production
+    /// segmented entry takes a block kernel: `MLX_SDPA_VERIFY_TILE` when set
+    /// (0 = block kernels off), else the crossover this process calibrated
+    /// (measured now if not yet). -1 without Metal or on error.
+    pub fn mlx_segmented_sdpa_test_block_min_keys() -> i32;
+
+    /// TEST-ONLY: the crossover calibration record (measured now if not
+    /// yet): per point `keys`, `vector_seconds`, `block_seconds` (up to
+    /// `capacity`), the calibration's wall time, the block kernel timed
+    /// (0 none, 1 tile, 2 tensor-op) and the selected crossover before any
+    /// override. Returns the point count (0 when the measurement failed),
+    /// -1 without Metal or on error.
+    pub fn mlx_segmented_sdpa_test_block_calibration(
+        keys: *mut i32,
+        vector_seconds: *mut f64,
+        block_seconds: *mut f64,
+        capacity: usize,
+        out_elapsed_ms: *mut f64,
+        out_block_kernel: *mut i32,
+        out_result: *mut i32,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: the crossover selection over
+    /// per-point seconds (`select_segmented_block_min_keys`); -1 on null
+    /// input.
+    pub fn mlx_segmented_sdpa_test_select_block_min_keys(
+        keys: *const i32,
+        vector_seconds: *const f64,
+        block_seconds: *const f64,
+        count: usize,
+    ) -> i32;
+
     /// TEST-ONLY, platform independent: FNV-1a 64 digests of the segmented
     /// planners and vector-SDPA policy over a fixed sweep for one device
     /// class, written to `out_digests[0..6]`; returns the number of inputs.

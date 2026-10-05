@@ -7,10 +7,13 @@
 #ifdef MLX_NODE_METAL_ENABLED
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -109,9 +112,24 @@ std::string kernel_name(SegmentedKernel kernel, int m = 0, int tile_n = 0) {
   throw std::invalid_argument("unknown segmented SDPA kernel");
 }
 
-// MLX_SDPA_VERIFY_TILE: 0 keeps the vector routes (A/B kill switch); N >= 1
-// takes a block kernel (tensor-op or tile) from N keys (prefix + new rows);
-// unset = the measured crossover kSegmentedTileMinKeys.
+// Key count (prefix + new rows) from which a verify block takes a block
+// kernel, measured once per process by calibrate_block_min_keys; 0 until
+// then (the vector routes serve every block).
+std::atomic<int> g_block_min_keys{0};
+
+// MLX_SDPA_VERIFY_TILE: unset (-1) = the calibrated crossover; 0 keeps the
+// vector routes (A/B kill switch); N >= 1 takes a block kernel from N keys.
+// Read per call.
+int block_min_keys_override() {
+  return env::get_var("MLX_SDPA_VERIFY_TILE", -1);
+}
+
+int effective_block_min_keys() {
+  const int override = block_min_keys_override();
+  return override >= 0 ? override
+                       : g_block_min_keys.load(std::memory_order_acquire);
+}
+
 bool tile_route_enabled(SegmentedTileMode mode, int total_length) {
   switch (mode) {
   case SegmentedTileMode::vector:
@@ -122,9 +140,16 @@ bool tile_route_enabled(SegmentedTileMode mode, int total_length) {
   case SegmentedTileMode::from_env:
     break;
   }
-  const int min_keys =
-      env::get_var("MLX_SDPA_VERIFY_TILE", kSegmentedTileMinKeys);
+  const int min_keys = effective_block_min_keys();
   return min_keys > 0 && total_length >= min_keys;
+}
+
+// MLX_SDPA_ROUTE_LOG=1 (or MLX_METAL_COMMAND_TRACE >= 1) prints the
+// calibration result once.
+bool route_log_enabled() {
+  static const bool enabled = env::get_var("MLX_SDPA_ROUTE_LOG", 0) == 1 ||
+                              env::get_var("MLX_METAL_COMMAND_TRACE", 0) >= 1;
+  return enabled;
 }
 
 // MLX_SDPA_VERIFY_NAX=0 keeps the simdgroup-matrix tile kernel on a device
@@ -711,6 +736,339 @@ void encode_block_verify(metal::CommandEncoder &encoder,
                                 MTL::Size(launch.stage2_threads, 1, 1));
 }
 
+// The dispatcher: encodes the verify block or chunked segmented call for
+// `inputs` into `encoder`, allocating `out`. eval_gpu and the crossover
+// calibration share it, so the calibration times exactly the production
+// dispatch of each route.
+void encode_segmented_sdpa(metal::Device &device,
+                           metal::CommandEncoder &encoder, Stream stream,
+                           const std::vector<array> &inputs, array &out,
+                           float scale, bool causal, int head_rows,
+                           SegmentedTileMode tile_mode) {
+  validate_segmented_sdpa(inputs);
+  const auto &q = inputs[0];
+  const auto &pk = inputs[1];
+  const auto &pv = inputs[2];
+  const auto &nk = inputs[3];
+  const auto &nv = inputs[4];
+  const int q_len = q.shape(2);
+  const int q_heads = q.shape(1);
+  const int kv_heads = pk.shape(1);
+  const int gqa = q_heads / kv_heads;
+  const int prefix_n = pk.shape(2);
+  const int new_n = nk.shape(2);
+
+  // A verify block (causal, one new row per query) takes a block kernel
+  // whenever this device can launch one: the tensor-op kernel where NAX
+  // exists and Q is head-major contiguous, else the simdgroup-matrix tile
+  // kernel. The partition count follows the real prefix, so a shapeless
+  // replay stays valid as the prefix grows.
+  if (causal && new_n == q_len &&
+      tile_route_enabled(tile_mode, prefix_n + new_n) && tile_aligned(q) &&
+      tile_aligned(pk) && tile_aligned(pv) && tile_aligned(nk) &&
+      tile_aligned(nv)) {
+    if (nax_route_enabled(tile_mode) && nax_q_layout(q, pk, pv, nk, nv)) {
+      const auto launch =
+          nax_verify_launch(device, q_len, gqa, prefix_n + new_n);
+      if (launch.plan.supported) {
+        bridge_testing::record("segmented_sdpa_route_nax");
+        out.set_data(allocator::malloc(out.nbytes()));
+        encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk, nv,
+                            scale, out);
+        return;
+      }
+    }
+    if (tile_mode != SegmentedTileMode::nax) {
+      const auto launch =
+          tile_verify_launch(device, q_len, gqa, prefix_n + new_n);
+      if (launch.plan.supported) {
+        bridge_testing::record("segmented_sdpa_route_tile");
+        out.set_data(allocator::malloc(out.nbytes()));
+        encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk, nv,
+                            scale, out);
+        return;
+      }
+    }
+  }
+  if (tile_mode == SegmentedTileMode::tile) {
+    throw std::runtime_error(
+        "segmented SDPA tile route was required but is unsupported");
+  }
+  if (tile_mode == SegmentedTileMode::nax) {
+    throw std::runtime_error(
+        "segmented SDPA tensor-op route was required but is unsupported");
+  }
+
+  if (head_rows == 0) {
+    bridge_testing::record("segmented_sdpa_route_single");
+    auto pipelines =
+        get_pipelines(device, q_len, gqa, prefix_n + new_n, q_heads, kv_heads,
+                      causal, prefix_row_stride(pk, pv));
+    if (!pipelines.plan.supported) {
+      throw std::runtime_error("segmented SDPA pipeline capabilities "
+                               "changed after graph construction");
+    }
+    out.set_data(allocator::malloc(out.nbytes()));
+    encode_segmented_call(encoder, pipelines, q, 0, q_len, pk, pv, nk, nv,
+                          new_n, scale, out);
+    return;
+  }
+
+  if (new_n != q_len) {
+    throw std::runtime_error("segmented SDPA verify block shape changed "
+                             "after graph construction");
+  }
+  const auto dispatch =
+      plan_verify_dispatch(device, head_rows, q_len, gqa, prefix_n, q_heads,
+                           kv_heads, prefix_row_stride(pk, pv));
+  switch (dispatch.route) {
+  case SegmentedVerifyRoute::one_pass:
+    bridge_testing::record("segmented_sdpa_route_one_pass");
+    out.set_data(allocator::malloc(out.nbytes()));
+    encode_segmented_call(encoder, dispatch.tail, q, 0, q_len, pk, pv, nk, nv,
+                          new_n, scale, out);
+    return;
+  case SegmentedVerifyRoute::unified:
+    bridge_testing::record("segmented_sdpa_route_unified");
+    out.set_data(allocator::malloc(out.nbytes()));
+    encode_unified_verify(encoder, dispatch, q, pk, pv, nk, nv, scale, out);
+    return;
+  case SegmentedVerifyRoute::split: {
+    bridge_testing::record("segmented_sdpa_route_split");
+    const int tail_rows = q_len - head_rows;
+    array head_out({q.shape(0), q_heads, head_rows, kHeadDimension}, bfloat16,
+                   nullptr, {});
+    array tail_out({q.shape(0), q_heads, tail_rows, kHeadDimension}, bfloat16,
+                   nullptr, {});
+    head_out.set_data(allocator::malloc(head_out.nbytes()));
+    tail_out.set_data(allocator::malloc(tail_out.nbytes()));
+    encoder.add_temporary(head_out);
+    encoder.add_temporary(tail_out);
+    encode_segmented_call(encoder, dispatch.head, q, 0, head_rows, pk, pv, nk,
+                          nv, head_rows, scale, head_out);
+    encode_segmented_call(encoder, dispatch.tail, q, head_rows, tail_rows, pk,
+                          pv, nk, nv, new_n, scale, tail_out);
+    // Allocates `out`.
+    concatenate_gpu({head_out, tail_out}, out, 2, stream);
+    return;
+  }
+  case SegmentedVerifyRoute::single:
+    break;
+  }
+  throw std::runtime_error("segmented SDPA verify route is invalid");
+}
+
+// Crossover calibration: the production verify shape class (B = 1, rows 8,
+// 24 / 4 heads, D = 256, BF16) at each kSegmentedCalibrationKeys count, the
+// vector route against the best block kernel this device launches (tensor-op
+// where it exists, else the tile kernel). Each sample is one command buffer
+// holding exactly one route's dispatches, timed by the GPU's own start / end
+// stamps, so host scheduling is outside the measurement; the two routes
+// alternate and the order flips each repetition so a clock-state change
+// between samples cannot favour one of them, and the statistic is the
+// minimum of kCalibrationReps.
+constexpr int kCalibrationReps = 7;
+constexpr int kCalibrationWarmupPairs = 6;
+constexpr int kCalibrationRows = 8;
+constexpr int kCalibrationQHeads = 24;
+constexpr int kCalibrationKvHeads = 4;
+
+enum class CalibrationBlockKernel : int { none = 0, tile = 1, nax = 2 };
+
+struct BlockCalibration {
+  std::once_flag once;
+  int points = 0;
+  int keys[kSegmentedCalibrationPoints] = {};
+  double vector_seconds[kSegmentedCalibrationPoints] = {};
+  double block_seconds[kSegmentedCalibrationPoints] = {};
+  double elapsed_ms = 0.0;
+  // Fastest host encode of one dispatch per route (diagnostic).
+  double host_vector_seconds = 0.0;
+  double host_block_seconds = 0.0;
+  CalibrationBlockKernel block_kernel = CalibrationBlockKernel::none;
+  std::string error;
+  int result = 0;
+};
+
+BlockCalibration &block_calibration() {
+  static auto *calibration = new BlockCalibration;
+  return *calibration;
+}
+
+// GPU seconds of one route over `inputs`: the command buffer the encoder
+// holds receives only this route's dispatches and is committed and awaited
+// here. `host_seconds` receives the host encode time (diagnostic).
+double time_segmented_route(metal::Device &device, Stream stream,
+                            const std::vector<array> &inputs, int head_rows,
+                            SegmentedTileMode mode, double *host_seconds) {
+  auto &encoder = metal::get_command_encoder(stream);
+  auto buffer = NS::RetainPtr(encoder.get_command_buffer());
+  array out(inputs[0].shape(), bfloat16, nullptr, {});
+  const auto host_start = std::chrono::steady_clock::now();
+  encode_segmented_sdpa(device, encoder, stream, inputs, out, 0.0625f, true,
+                        head_rows, mode);
+  if (host_seconds) {
+    *host_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - host_start)
+                        .count();
+  }
+  encoder.synchronize();
+  return buffer->GPUEndTime() - buffer->GPUStartTime();
+}
+
+// Fills `c` (throws on any failure; the caller records the fallback).
+void measure_block_crossover(metal::Device &device, Stream stream,
+                             BlockCalibration &c) {
+  constexpr int gqa = kCalibrationQHeads / kCalibrationKvHeads;
+  const int head_rows = segmented_verify_head_rows(
+      kCalibrationRows, segmented_max_query_length(device, gqa));
+  if (head_rows < 0) {
+    throw std::runtime_error("the calibration block has no vector route");
+  }
+  const int max_keys =
+      kSegmentedCalibrationKeys[kSegmentedCalibrationPoints - 1];
+  // The block kernel the production dispatch would take at the largest
+  // count; the forced modes below bypass the key threshold.
+  SegmentedTileMode block_mode = SegmentedTileMode::vector;
+  if (nax_route_enabled(SegmentedTileMode::from_env) &&
+      nax_verify_launch(device, kCalibrationRows, gqa, max_keys)
+          .plan.supported) {
+    block_mode = SegmentedTileMode::nax;
+    c.block_kernel = CalibrationBlockKernel::nax;
+  } else if (tile_verify_launch(device, kCalibrationRows, gqa, max_keys)
+                 .plan.supported) {
+    block_mode = SegmentedTileMode::tile;
+    c.block_kernel = CalibrationBlockKernel::tile;
+  } else {
+    throw std::runtime_error("this device launches no block kernel");
+  }
+
+  // Fixed keys keep the process's random stream untouched. Each smaller
+  // prefix is a leading view of the largest, as a KV cache slice is.
+  const Shape q_shape{1, kCalibrationQHeads, kCalibrationRows, kHeadDimension};
+  const Shape kv_full{1, kCalibrationKvHeads, max_keys - kCalibrationRows,
+                      kHeadDimension};
+  const Shape kv_new{1, kCalibrationKvHeads, kCalibrationRows, kHeadDimension};
+  array q = random::normal(q_shape, bfloat16, random::key(0x5d9a7e51), stream);
+  array pk_full =
+      random::normal(kv_full, bfloat16, random::key(0x5d9a7e52), stream);
+  array pv_full =
+      random::normal(kv_full, bfloat16, random::key(0x5d9a7e53), stream);
+  array nk = random::normal(kv_new, bfloat16, random::key(0x5d9a7e54), stream);
+  array nv = random::normal(kv_new, bfloat16, random::key(0x5d9a7e55), stream);
+  eval({q, pk_full, pv_full, nk, nv});
+  // Nothing of the caller's is in flight on this thread's queue while the
+  // samples run.
+  metal::get_command_encoder(stream).synchronize();
+
+  std::vector<std::vector<array>> point_inputs;
+  for (size_t i = 0; i < kSegmentedCalibrationPoints; ++i) {
+    const int prefix = kSegmentedCalibrationKeys[i] - kCalibrationRows;
+    array pk = slice(pk_full, {0, 0, 0, 0},
+                     {1, kCalibrationKvHeads, prefix, kHeadDimension}, stream);
+    array pv = slice(pv_full, {0, 0, 0, 0},
+                     {1, kCalibrationKvHeads, prefix, kHeadDimension}, stream);
+    eval({pk, pv});
+    point_inputs.push_back({q, pk, pv, nk, nv});
+  }
+  double host_vector = std::numeric_limits<double>::infinity();
+  double host_block = std::numeric_limits<double>::infinity();
+  auto time_route = [&](size_t point, SegmentedTileMode mode) {
+    double host = 0.0;
+    const double gpu = time_segmented_route(device, stream, point_inputs[point],
+                                            head_rows, mode, &host);
+    auto &best = mode == SegmentedTileMode::vector ? host_vector : host_block;
+    best = std::min(best, host);
+    return gpu;
+  };
+  // An idle GPU starts in a low clock state and the first dispatch of each
+  // pipeline pays its load: a burst over the largest block, then one
+  // discarded pair per point, before any sample counts.
+  for (int warm = 0; warm < kCalibrationWarmupPairs; ++warm) {
+    time_route(kSegmentedCalibrationPoints - 1, SegmentedTileMode::vector);
+    time_route(kSegmentedCalibrationPoints - 1, block_mode);
+  }
+  c.points = 0;
+  for (size_t i = 0; i < kSegmentedCalibrationPoints; ++i) {
+    time_route(i, SegmentedTileMode::vector);
+    time_route(i, block_mode);
+    double best_vector = std::numeric_limits<double>::infinity();
+    double best_block = std::numeric_limits<double>::infinity();
+    for (int rep = 0; rep < kCalibrationReps; ++rep) {
+      if (rep % 2 == 0) {
+        best_vector =
+            std::min(best_vector, time_route(i, SegmentedTileMode::vector));
+        best_block = std::min(best_block, time_route(i, block_mode));
+      } else {
+        best_block = std::min(best_block, time_route(i, block_mode));
+        best_vector =
+            std::min(best_vector, time_route(i, SegmentedTileMode::vector));
+      }
+    }
+    c.keys[i] = kSegmentedCalibrationKeys[i];
+    c.vector_seconds[i] = best_vector;
+    c.block_seconds[i] = best_block;
+    ++c.points;
+  }
+  c.host_vector_seconds = host_vector;
+  c.host_block_seconds = host_block;
+  c.result = select_segmented_block_min_keys(c.keys, c.vector_seconds,
+                                             c.block_seconds, c.points);
+}
+
+void log_block_calibration(const BlockCalibration &c) {
+  if (!route_log_enabled()) {
+    return;
+  }
+  const char *kernel = c.block_kernel == CalibrationBlockKernel::nax ? "nax"
+                       : c.block_kernel == CalibrationBlockKernel::tile
+                           ? "tile"
+                           : "none";
+  std::string line = "[sdpa route] verify block kernel (" +
+                     std::string(kernel) + ") from " +
+                     std::to_string(c.result) + " keys; calibrated in " +
+                     std::to_string(c.elapsed_ms) + " ms";
+  for (int i = 0; i < c.points; ++i) {
+    line += "; " + std::to_string(c.keys[i]) + ": vector " +
+            std::to_string(c.vector_seconds[i] * 1e6) + " us, block " +
+            std::to_string(c.block_seconds[i] * 1e6) + " us";
+  }
+  line += "; host encode vector " +
+          std::to_string(c.host_vector_seconds * 1e6) + " us, block " +
+          std::to_string(c.host_block_seconds * 1e6) + " us";
+  if (!c.error.empty()) {
+    line += "; fallback: " + c.error;
+  }
+  std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+// Measures the crossover once per process on the calling thread's GPU
+// stream (the graph-building thread, never inside an eval). A failed
+// measurement keeps the block kernels to the ceiling count so a device the
+// calibration cannot time still routes.
+void calibrate_block_min_keys(metal::Device &device, Stream stream) {
+  auto &c = block_calibration();
+  std::call_once(c.once, [&] {
+    const auto started = std::chrono::steady_clock::now();
+    // The calibration dispatches must not count as the caller's.
+    const bool counting = bridge_testing::counting;
+    bridge_testing::counting = false;
+    try {
+      auto pool = metal::new_scoped_memory_pool();
+      measure_block_crossover(device, stream, c);
+    } catch (const std::exception &e) {
+      c.error = e.what();
+      c.result = kSegmentedBlockMinKeysCeiling;
+    }
+    bridge_testing::counting = counting;
+    c.elapsed_ms = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - started)
+                       .count();
+    g_block_min_keys.store(c.result, std::memory_order_release);
+    log_block_calibration(c);
+  });
+}
+
 class SegmentedSdpa final : public fast::Custom {
 public:
   SegmentedSdpa(Stream stream, float scale, bool causal, int head_rows,
@@ -729,121 +1087,10 @@ public:
 
   void eval_gpu(const std::vector<array> &inputs,
                 std::vector<array> &outputs) override {
-    validate_segmented_sdpa(inputs);
-    const auto &q = inputs[0];
-    const auto &pk = inputs[1];
-    const auto &pv = inputs[2];
-    const auto &nk = inputs[3];
-    const auto &nv = inputs[4];
     auto &stream = this->stream();
-    auto &device = metal::device(stream.device);
-    auto &encoder = metal::get_command_encoder(stream);
-    const int q_len = q.shape(2);
-    const int q_heads = q.shape(1);
-    const int kv_heads = pk.shape(1);
-    const int gqa = q_heads / kv_heads;
-    const int prefix_n = pk.shape(2);
-    const int new_n = nk.shape(2);
-    auto &out = outputs[0];
-
-    // A verify block (causal, one new row per query) takes a block kernel
-    // whenever this device can launch one: the tensor-op kernel where NAX
-    // exists and Q is head-major contiguous, else the simdgroup-matrix tile
-    // kernel. The partition count follows the real prefix, so a shapeless
-    // replay stays valid as the prefix grows.
-    if (causal_ && new_n == q_len &&
-        tile_route_enabled(tile_mode_, prefix_n + new_n) && tile_aligned(q) &&
-        tile_aligned(pk) && tile_aligned(pv) && tile_aligned(nk) &&
-        tile_aligned(nv)) {
-      if (nax_route_enabled(tile_mode_) && nax_q_layout(q, pk, pv, nk, nv)) {
-        const auto launch =
-            nax_verify_launch(device, q_len, gqa, prefix_n + new_n);
-        if (launch.plan.supported) {
-          bridge_testing::record("segmented_sdpa_route_nax");
-          out.set_data(allocator::malloc(out.nbytes()));
-          encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk,
-                              nv, scale_, out);
-          return;
-        }
-      }
-      if (tile_mode_ != SegmentedTileMode::nax) {
-        const auto launch =
-            tile_verify_launch(device, q_len, gqa, prefix_n + new_n);
-        if (launch.plan.supported) {
-          bridge_testing::record("segmented_sdpa_route_tile");
-          out.set_data(allocator::malloc(out.nbytes()));
-          encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk,
-                              nv, scale_, out);
-          return;
-        }
-      }
-    }
-    if (tile_mode_ == SegmentedTileMode::tile) {
-      throw std::runtime_error(
-          "segmented SDPA tile route was required but is unsupported");
-    }
-    if (tile_mode_ == SegmentedTileMode::nax) {
-      throw std::runtime_error(
-          "segmented SDPA tensor-op route was required but is unsupported");
-    }
-
-    if (head_rows_ == 0) {
-      bridge_testing::record("segmented_sdpa_route_single");
-      auto pipelines =
-          get_pipelines(device, q_len, gqa, prefix_n + new_n, q_heads, kv_heads,
-                        causal_, prefix_row_stride(pk, pv));
-      if (!pipelines.plan.supported) {
-        throw std::runtime_error("segmented SDPA pipeline capabilities "
-                                 "changed after graph construction");
-      }
-      out.set_data(allocator::malloc(out.nbytes()));
-      encode_segmented_call(encoder, pipelines, q, 0, q_len, pk, pv, nk, nv,
-                            new_n, scale_, out);
-      return;
-    }
-
-    if (new_n != q_len) {
-      throw std::runtime_error("segmented SDPA verify block shape changed "
-                               "after graph construction");
-    }
-    const auto dispatch =
-        plan_verify_dispatch(device, head_rows_, q_len, gqa, prefix_n, q_heads,
-                             kv_heads, prefix_row_stride(pk, pv));
-    switch (dispatch.route) {
-    case SegmentedVerifyRoute::one_pass:
-      bridge_testing::record("segmented_sdpa_route_one_pass");
-      out.set_data(allocator::malloc(out.nbytes()));
-      encode_segmented_call(encoder, dispatch.tail, q, 0, q_len, pk, pv, nk, nv,
-                            new_n, scale_, out);
-      return;
-    case SegmentedVerifyRoute::unified:
-      bridge_testing::record("segmented_sdpa_route_unified");
-      out.set_data(allocator::malloc(out.nbytes()));
-      encode_unified_verify(encoder, dispatch, q, pk, pv, nk, nv, scale_, out);
-      return;
-    case SegmentedVerifyRoute::split: {
-      bridge_testing::record("segmented_sdpa_route_split");
-      const int tail_rows = q_len - head_rows_;
-      array head_out({q.shape(0), q_heads, head_rows_, kHeadDimension},
-                     bfloat16, nullptr, {});
-      array tail_out({q.shape(0), q_heads, tail_rows, kHeadDimension}, bfloat16,
-                     nullptr, {});
-      head_out.set_data(allocator::malloc(head_out.nbytes()));
-      tail_out.set_data(allocator::malloc(tail_out.nbytes()));
-      encoder.add_temporary(head_out);
-      encoder.add_temporary(tail_out);
-      encode_segmented_call(encoder, dispatch.head, q, 0, head_rows_, pk, pv,
-                            nk, nv, head_rows_, scale_, head_out);
-      encode_segmented_call(encoder, dispatch.tail, q, head_rows_, tail_rows,
-                            pk, pv, nk, nv, new_n, scale_, tail_out);
-      // Allocates `out`.
-      concatenate_gpu({head_out, tail_out}, out, 2, stream);
-      return;
-    }
-    case SegmentedVerifyRoute::single:
-      break;
-    }
-    throw std::runtime_error("segmented SDPA verify route is invalid");
+    encode_segmented_sdpa(metal::device(stream.device),
+                          metal::get_command_encoder(stream), stream, inputs,
+                          outputs[0], scale_, causal_, head_rows_, tile_mode_);
   }
 
   std::vector<array> vjp(const std::vector<array> &, const std::vector<array> &,
@@ -919,6 +1166,13 @@ array segmented_sdpa(const array &q, const array &prefix_k,
       throw;
     }
     return fallback();
+  }
+  // A verify block may take a block kernel at eval time; the crossover it
+  // compares against is measured here, on the graph-building thread, the
+  // first time a process reaches one (unless MLX_SDPA_VERIFY_TILE pins it).
+  if (tile_mode == SegmentedTileMode::from_env && causal &&
+      new_k.shape(2) == q_len && block_min_keys_override() < 0) {
+    calibrate_block_min_keys(device, stream);
   }
   if (max_query_length >= 1 && q_len > max_query_length) {
     // No concat fallback: unfused SDPA over this block would bake the prefix
@@ -1136,6 +1390,74 @@ extern "C" int mlx_segmented_sdpa_test_device_verify_route(
   }
 }
 
+// Test-only: the key count (prefix + new rows) from which the production
+// entry takes a block kernel: MLX_SDPA_VERIFY_TILE when set (0 = the block
+// kernels are off), else the calibrated crossover (measured now if this
+// process has not yet). -1 without Metal or on error.
+extern "C" int mlx_segmented_sdpa_test_block_min_keys() {
+  using namespace mlx::core;
+  try {
+    auto stream = default_stream(Device::gpu);
+    auto &device = metal::device(stream.device);
+    if (segmented_sdpa::block_min_keys_override() < 0) {
+      segmented_sdpa::calibrate_block_min_keys(device, stream);
+    }
+    return segmented_sdpa::effective_block_min_keys();
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "mlx_segmented_sdpa_test_block_min_keys: %s\n",
+                 e.what());
+    return -1;
+  }
+}
+
+// Test-only: the calibration record (measured now if this process has not
+// yet): per point `keys`, `vector_seconds` and `block_seconds` (up to
+// `capacity` entries), the wall time of the whole calibration, the block
+// kernel it timed (0 none, 1 tile, 2 tensor-op) and the selected crossover
+// before any override. Returns the point count (0 when the measurement
+// failed and the ceiling was recorded; its message on stderr), -1 without
+// Metal or on error.
+extern "C" int mlx_segmented_sdpa_test_block_calibration(
+    int *keys, double *vector_seconds, double *block_seconds, size_t capacity,
+    double *out_elapsed_ms, int *out_block_kernel, int *out_result) {
+  using namespace mlx::core;
+  try {
+    auto stream = default_stream(Device::gpu);
+    auto &device = metal::device(stream.device);
+    segmented_sdpa::calibrate_block_min_keys(device, stream);
+    const auto &c = segmented_sdpa::block_calibration();
+    for (int i = 0; i < c.points && size_t(i) < capacity; ++i) {
+      if (keys) {
+        keys[i] = c.keys[i];
+      }
+      if (vector_seconds) {
+        vector_seconds[i] = c.vector_seconds[i];
+      }
+      if (block_seconds) {
+        block_seconds[i] = c.block_seconds[i];
+      }
+    }
+    if (out_elapsed_ms) {
+      *out_elapsed_ms = c.elapsed_ms;
+    }
+    if (out_block_kernel) {
+      *out_block_kernel = static_cast<int>(c.block_kernel);
+    }
+    if (out_result) {
+      *out_result = c.result;
+    }
+    if (!c.error.empty()) {
+      std::fprintf(stderr, "segmented SDPA crossover calibration: %s\n",
+                   c.error.c_str());
+    }
+    return c.points;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "mlx_segmented_sdpa_test_block_calibration: %s\n",
+                 e.what());
+    return -1;
+  }
+}
+
 // Test-only: the raw limits of the pipelines a one-call verify dispatches,
 // read from Metal without the launch planner. out[0..3] the verify kernel's
 // threadExecutionWidth, maxTotalThreadsPerThreadgroup and
@@ -1217,7 +1539,29 @@ extern "C" int mlx_segmented_sdpa_test_verify_pipeline_limits(int, int, int,
   return -1;
 }
 
+extern "C" int mlx_segmented_sdpa_test_block_min_keys() { return -1; }
+
+extern "C" int mlx_segmented_sdpa_test_block_calibration(int *, double *,
+                                                         double *, size_t,
+                                                         double *, int *,
+                                                         int *) {
+  return -1;
+}
+
 #endif
+
+// Test-only, platform independent: the crossover selection over measured
+// (or synthetic) per-point seconds; see select_segmented_block_min_keys.
+extern "C" int mlx_segmented_sdpa_test_select_block_min_keys(
+    const int *keys, const double *vector_seconds, const double *block_seconds,
+    size_t count) {
+  if (count > 0 && (keys == nullptr || vector_seconds == nullptr ||
+                    block_seconds == nullptr)) {
+    return -1;
+  }
+  return mlx::core::segmented_sdpa::select_segmented_block_min_keys(
+      keys, vector_seconds, block_seconds, count);
+}
 
 extern "C" int mlx_segmented_sdpa_test_plan(
     int query_length, int gqa_factor, bool two_pass, int partitions,

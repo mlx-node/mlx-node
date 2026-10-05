@@ -238,11 +238,47 @@ plan_segmented_verify_tile_launch(int rows, int gqa_factor,
   return plan;
 }
 
-// The vector route is as fast below this many keys (prefix + new rows):
-// the tile kernel's per-threadgroup prologue and 32-partition floor cost
-// more than they save. Measured crossover on M5 Max: equal at 1024, tile
-// 25% ahead at 2048.
-constexpr int kSegmentedTileMinKeys = 1024;
+// Below some key count (prefix + new rows) the vector route is as fast as a
+// block kernel: the block kernel's per-threadgroup prologue and 32-partition
+// floor cost more than they save. The crossover differs per GPU, so each
+// process measures it once (mlx_segmented_sdpa.cpp) on a verify block of
+// the production shape at these key counts and selects with the function
+// below; MLX_SDPA_VERIFY_TILE overrides the result.
+constexpr int kSegmentedCalibrationKeys[] = {256, 512, 1024, 2048, 4096};
+constexpr size_t kSegmentedCalibrationPoints =
+    sizeof(kSegmentedCalibrationKeys) / sizeof(kSegmentedCalibrationKeys[0]);
+constexpr int kSegmentedBlockMinKeysFloor = 256;
+constexpr int kSegmentedBlockMinKeysCeiling = 8192;
+
+// The block route must beat the vector route by this factor to take a key
+// count: at a tie the bit-exact vector route keeps the step, and the
+// crossover does not flip between processes on measurement noise.
+constexpr double kSegmentedBlockMinGain = 1.05;
+
+// The smallest measured key count from which the block route stays faster
+// than the vector route by kSegmentedBlockMinGain through the largest
+// measured count (a win followed by a loss is noise, not a crossover).
+// None: one past the largest count. Non-positive or NaN seconds count as a
+// loss. `keys` ascending; the result is clamped to [floor, ceiling].
+inline int select_segmented_block_min_keys(const int *keys,
+                                           const double *vector_seconds,
+                                           const double *block_seconds,
+                                           size_t count) {
+  if (count == 0) {
+    return kSegmentedBlockMinKeysCeiling;
+  }
+  int chosen = keys[count - 1] + 1;
+  for (size_t i = count; i-- > 0;) {
+    const double v = vector_seconds[i];
+    const double b = block_seconds[i];
+    if (!(v > 0.0) || !(b > 0.0) || !(b * kSegmentedBlockMinGain <= v)) {
+      break;
+    }
+    chosen = keys[i];
+  }
+  return std::clamp(chosen, kSegmentedBlockMinKeysFloor,
+                    kSegmentedBlockMinKeysCeiling);
+}
 
 // Contiguous key partitions of the tile kernel. MTLDevice does not report
 // the core count, so the count follows the work: about 8 tiles per

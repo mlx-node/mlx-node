@@ -3222,6 +3222,183 @@ mod tests {
         Ok(())
     }
 
+    /// The crossover selector over synthetic timings (pure, no GPU): the
+    /// smallest count from which the block route stays at least as fast
+    /// through the largest count; one past the largest when it never is; a
+    /// win followed by a loss is not a crossover; non-positive or NaN
+    /// timings lose; the result is clamped to [256, 8192].
+    #[test]
+    fn segmented_block_min_keys_selection_follows_timings() {
+        fn select(keys: &[i32], vector: &[f64], block: &[f64]) -> i32 {
+            assert_eq!(keys.len(), vector.len());
+            assert_eq!(keys.len(), block.len());
+            unsafe {
+                mlx_sys::mlx_segmented_sdpa_test_select_block_min_keys(
+                    keys.as_ptr(),
+                    vector.as_ptr(),
+                    block.as_ptr(),
+                    keys.len(),
+                )
+            }
+        }
+        let keys = [256, 512, 1024, 2048, 4096];
+        let vector = [10.0, 12.0, 20.0, 40.0, 80.0];
+        // Equal at 1024, block ahead above: 2048 (a tie keeps the exact
+        // vector route; the block route must win by kSegmentedBlockMinGain).
+        assert_eq!(
+            select(&keys, &vector, &[13.0, 14.0, 20.0, 30.0, 60.0]),
+            2048
+        );
+        // Ahead at 1024 by less than the required gain: still 2048.
+        assert_eq!(
+            select(&keys, &vector, &[13.0, 14.0, 19.5, 30.0, 60.0]),
+            2048
+        );
+        // Block ahead by the gain everywhere: the floor.
+        assert_eq!(select(&keys, &vector, &[9.0, 11.0, 19.0, 30.0, 60.0]), 256);
+        // Never ahead: one past the largest count.
+        assert_eq!(
+            select(&keys, &vector, &[11.0, 13.0, 21.0, 41.0, 81.0]),
+            4097
+        );
+        // Ahead at 512, behind at 1024: 2048 (a win followed by a loss).
+        assert_eq!(
+            select(&keys, &vector, &[11.0, 11.0, 21.0, 30.0, 60.0]),
+            2048
+        );
+        // A NaN or zero block sample is a loss at that point.
+        assert_eq!(
+            select(&keys, &vector, &[9.0, 11.0, f64::NAN, 30.0, 60.0]),
+            2048
+        );
+        assert_eq!(select(&keys, &vector, &[9.0, 11.0, 19.0, 30.0, 0.0]), 4097);
+        // So is a zero vector sample.
+        assert_eq!(
+            select(
+                &keys,
+                &[10.0, 12.0, 20.0, 0.0, 80.0],
+                &[9.0, 11.0, 19.0, 30.0, 60.0]
+            ),
+            4096
+        );
+        // Clamp below the floor and above the ceiling.
+        assert_eq!(select(&[64, 128], &[1.0, 2.0], &[0.5, 1.0]), 256);
+        assert_eq!(select(&[8192, 16384], &[1.0, 2.0], &[2.0, 3.0]), 8192);
+        assert_eq!(select(&[16384], &[1.0], &[0.5]), 8192);
+        assert_eq!(select(&[], &[], &[]), 8192);
+        assert_eq!(
+            unsafe {
+                mlx_sys::mlx_segmented_sdpa_test_select_block_min_keys(
+                    std::ptr::null(),
+                    vector.as_ptr(),
+                    vector.as_ptr(),
+                    keys.len(),
+                )
+            },
+            -1
+        );
+    }
+
+    /// This process calibrates the block-kernel crossover once on a
+    /// production-shaped verify block; the result lies in the clamp range
+    /// and the production entry switches exactly there: a rows-8 block over
+    /// `min_keys - 1` keys takes a vector route, over `min_keys` keys a block
+    /// kernel. Runs by default on Metal.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn segmented_block_crossover_is_calibrated_and_routes() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        const D: i64 = 256;
+        if std::env::var_os("MLX_SDPA_VERIFY_TILE").is_some() {
+            eprintln!("SKIP block crossover: MLX_SDPA_VERIFY_TILE pins it");
+            return Ok(());
+        }
+        let mut keys = [0i32; 8];
+        let mut vector_s = [0f64; 8];
+        let mut block_s = [0f64; 8];
+        let (mut elapsed_ms, mut kernel, mut result) = (0f64, 0i32, 0i32);
+        let points = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_block_calibration(
+                keys.as_mut_ptr(),
+                vector_s.as_mut_ptr(),
+                block_s.as_mut_ptr(),
+                keys.len(),
+                &mut elapsed_ms,
+                &mut kernel,
+                &mut result,
+            )
+        };
+        assert!(points >= 0, "calibration query failed");
+        let kernel_name = ["none", "tile", "nax"][kernel as usize];
+        eprintln!(
+            "block crossover: {result} keys ({kernel_name}), calibrated in {elapsed_ms:.3} ms"
+        );
+        for i in 0..points as usize {
+            eprintln!(
+                "  {:>5} keys: vector {:>8.2} us, block {:>8.2} us",
+                keys[i],
+                vector_s[i] * 1e6,
+                block_s[i] * 1e6
+            );
+        }
+        assert!(
+            (256..=8192).contains(&result),
+            "calibrated crossover {result} outside the clamp range"
+        );
+        assert!(
+            points == 0 || elapsed_ms < 100.0,
+            "calibration took {elapsed_ms:.3} ms"
+        );
+        let min_keys = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_test_block_min_keys() });
+        assert_eq!(
+            min_keys,
+            i64::from(result),
+            "effective crossover without override"
+        );
+        let mut plan = [0u32; 5];
+        if unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, 4, 8, min_keys as i32, plan.as_mut_ptr())
+        } != 1
+        {
+            eprintln!("SKIP route switch: this device cannot launch a block kernel");
+            return Ok(());
+        }
+        assert!(points > 0, "a device with a block kernel must calibrate");
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * min_keys * D) as usize, 0x7a7a),
+            &[1, 4, min_keys, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * min_keys * D) as usize, 0x7b7b),
+            &[1, 4, min_keys, D],
+        )?;
+        let count = |family: &std::ffi::CStr| unsafe {
+            mlx_sys::mlx_test_kquant_family_count(family.as_ptr())
+        };
+        for (prefix, expect_block) in [(min_keys - 9, false), (min_keys - 8, true)] {
+            let c = tile_case(&base_k, &base_v, 24, 8, prefix, 11, 0)?;
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let out = segmented_verify_sdpa(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, 0.0625, true)
+                .and_then(|o| o.to_float32());
+            let block = count(c"segmented_sdpa_route_tile") + count(c"segmented_sdpa_route_nax");
+            let vector = count(c"segmented_sdpa_route_single")
+                + count(c"segmented_sdpa_route_one_pass")
+                + count(c"segmented_sdpa_route_unified")
+                + count(c"segmented_sdpa_route_split");
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            out?;
+            assert_eq!(
+                (block, vector),
+                (u64::from(expect_block), u64::from(!expect_block)),
+                "routes at {} keys (crossover {min_keys})",
+                prefix + 8
+            );
+        }
+        Ok(())
+    }
+
     /// MLX's vector-SDPA reduction policy per device class
     /// (`mlx_segmented_sdpa_plan.h`), used to predict the verify route
     /// independently of the C++ planner: (two-pass, partitions).
@@ -3575,11 +3752,12 @@ mod tests {
     /// The route is chosen from the real prefix at eval time, so one shapeless
     /// trace must stay exact while replays cross every route boundary. The
     /// production entry takes a block kernel (tensor-op where NAX exists,
-    /// else the simdgroup tile) from `kSegmentedTileMinKeys` keys (rows 8
-    /// here; rows 6 and 7 are not multiples of 8 queries): the replay must
-    /// equal the eager production call bit for bit on either side, and the
-    /// vector chunks bit for bit on the vector routes or within the tile
-    /// tolerance on a block route.
+    /// else the simdgroup tile) from the key count this process calibrated
+    /// (`mlx_segmented_sdpa_test_block_min_keys`; rows 8 here; rows 6 and 7
+    /// are not multiples of 8 queries): the replay must equal the eager
+    /// production call bit for bit on either side, and the vector chunks bit
+    /// for bit on the vector routes or within the tile tolerance on a block
+    /// route.
     #[test]
     #[ignore = "requires coordinated Metal GPU validation"]
     #[cfg(target_os = "macos")]
@@ -3592,7 +3770,20 @@ mod tests {
         const HQ: i64 = 24;
         const HKV: i64 = 4;
         let max_q = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(6) });
-        let prefixes: Vec<i64> = (1010..=1030)
+        // Calibrates before any counting window opens below.
+        let block_min_keys =
+            i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_test_block_min_keys() });
+        assert!(block_min_keys >= 0, "block crossover query failed");
+        // Rows-8 prefixes straddling the crossover (totals min_keys - 10 ..=
+        // min_keys + 10), then the vector policy's own 8192 / 32768 steps.
+        let crossover_prefixes: Vec<i64> = if block_min_keys > 0 {
+            ((block_min_keys - 8 - 10).max(1)..=block_min_keys - 8 + 10).collect()
+        } else {
+            (1010..=1030).collect()
+        };
+        let prefixes: Vec<i64> = crossover_prefixes
+            .iter()
+            .copied()
             .chain(8180..=8195)
             .chain(32755..=32770)
             .collect();
@@ -3701,8 +3892,8 @@ mod tests {
                     plan.as_mut_ptr(),
                 )
             } == 1;
-            if tile_supported && std::env::var_os("MLX_SDPA_VERIFY_TILE").is_none() {
-                // Prefixes 1010..=1030 straddle the 1024-key crossover.
+            if tile_supported && block_min_keys > 0 {
+                // The crossover prefixes straddle `block_min_keys`.
                 assert!(seen_tile > 0, "rows={rows}: no replay took the tile route");
                 assert!(
                     seen[1] + seen[2] + seen[3] > 0,

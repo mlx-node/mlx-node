@@ -38,7 +38,8 @@ struct SegmentedSpecialization {
 // simdgroup-matrix tile kernel; below the key crossover, or where neither
 // can launch, the vector routes. `from_env` reads MLX_SDPA_VERIFY_TILE (0
 // disables both block kernels, N >= 1 takes them from N keys; unset: the
-// measured crossover) and MLX_SDPA_VERIFY_NAX (0 keeps the tile kernel on
+// crossover this process measured on first use, see
+// calibrate_block_min_keys) and MLX_SDPA_VERIFY_NAX (0 keeps the tile kernel on
 // NAX devices; unset or 1 prefers the tensor-op kernel). `tile` and `nax`
 // force one block kernel (tests).
 enum class SegmentedTileMode : int {
