@@ -25,7 +25,9 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <iostream>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -101,12 +103,38 @@ std::string qmv_wide(Mode m, Dtype t, int vecs_per_tg, bool batched) {
   concatenate(name, "_nv_", vecs_per_tg, "_kl_", kWideKLanes, batch(batched));
   return name;
 }
+// The Tiled64 layout ("_t64" family suffix, mlx_kquant.h): 2-D weights read
+// as x @ w.T with N % 64 == 0, so only the transposed, aligned, unbatched
+// kernels exist. qmv_wide_t64 also has nv_1 at 8 and 4 k-lanes: the M = 1
+// lane-map alternatives of qmv_t64 (MLX_KQUANT_TILED_QMV=wide8|wide4).
+constexpr int kTiledQmvMinVectors = 1;
+constexpr int kTiledQmvAltKLanes = 4;
+std::string qmv_wide_t64(Mode m, Dtype t, int vecs_per_tg, int k_lanes) {
+  std::string name = base(m, "qmv_wide_t64", t);
+  concatenate(name, "_nv_", vecs_per_tg, "_kl_", k_lanes, batch(false));
+  return name;
+}
+// qmv_t64: the lane = row M = 1 matvec, 32 rows x k_splits simdgroups per
+// threadgroup (kquant_qmv_t64 in kquant.h); 16 splits from
+// kTiledQmvLongK inputs on, where 8 leave the GPU short of threadgroups.
+constexpr int kTiledQmvKSplits[] = {8, 16};
+constexpr int kTiledQmvLongK = 8192;
+int tiled_qmv_k_splits(int K) {
+  return K >= kTiledQmvLongK ? kTiledQmvKSplits[1] : kTiledQmvKSplits[0];
+}
+std::string qmv_t64(Mode m, Dtype t, int k_splits) {
+  std::string name = base(m, "qmv_t64", t);
+  concatenate(name, "_ks_", k_splits);
+  return name;
+}
 std::string qmv_sg8(Mode m) { return base(m, "qmv_sg8", kSg8Type); }
 // qmm_m8_nax: M = 8 bfloat16 on the tensor op, every mode; 64-column tiles
 // and at most 8 K splits (kquant_m8_nax.h).
 constexpr int kM8TileCols = 64;
 constexpr int kM8MaxSplits = 8;
-std::string qmm_m8_nax(Mode m) { return base(m, "qmm_m8_nax", kSg8Type); }
+std::string qmm_m8_nax(Mode m, bool tiled = false) {
+  return base(m, tiled ? "qmm_m8_nax_t64" : "qmm_m8_nax", kSg8Type);
+}
 std::string qmv_sg8_prep(int group_size) {
   std::string name;
   concatenate(name, "kquant_qmv_sg8_prep_", type_string(kSg8Type), "_gs_",
@@ -121,21 +149,25 @@ std::string qvm_split_k(Mode m, Dtype t, int split_k) {
   concatenate(name, "_spk_", split_k);
   return name;
 }
-std::string qmm_t_nax(Mode m, Dtype t, bool aligned_n, bool batched) {
-  std::string name = base(m, "qmm_t_nax", t);
+std::string qmm_t_nax(Mode m, Dtype t, bool aligned_n, bool batched,
+                      bool tiled = false) {
+  std::string name = base(m, tiled ? "qmm_t_nax_t64" : "qmm_t_nax", t);
   concatenate(name, "_bm", kNaxTile.bm, "_bn", kNaxTile.bn, "_bk", kNaxTile.bk,
               "_wm", kNaxTile.wm, "_wn", kNaxTile.wn, aligned(aligned_n),
               batch(batched));
   return name;
 }
-std::string qmm_t(Mode m, Dtype t, bool aligned_n, bool batched) {
-  return base(m, "qmm_t", t) + aligned(aligned_n) + batch(batched);
+std::string qmm_t(Mode m, Dtype t, bool aligned_n, bool batched,
+                  bool tiled = false) {
+  return base(m, tiled ? "qmm_t_t64" : "qmm_t", t) + aligned(aligned_n) +
+         batch(batched);
 }
 std::string qmm_n(Mode m, Dtype t, bool batched) {
   return base(m, "qmm_n", t) + batch(batched);
 }
-std::string qmm_t_splitk(Mode m, Dtype t, bool aligned_n) {
-  return base(m, "qmm_t_splitk", t) + aligned(aligned_n);
+std::string qmm_t_splitk(Mode m, Dtype t, bool aligned_n, bool tiled = false) {
+  return base(m, tiled ? "qmm_t_splitk_t64" : "qmm_t_splitk", t) +
+         aligned(aligned_n);
 }
 std::string gather_qmm_t(Mode m, Dtype t, bool aligned_n) {
   return base(m, "gather_qmm_t", t) + aligned(aligned_n);
@@ -191,10 +223,22 @@ std::vector<KernelName> metal_kernel_names() {
       add(gather_qmm_rhs(m, t, true));
       add(gather_qmm_rhs(m, t, false));
       add(dequantize(m, t));
+      // Tiled64: transposed, aligned, unbatched only.
+      for (int v = kTiledQmvMinVectors; v <= kWideMaxVectors; ++v) {
+        add(qmv_wide_t64(m, t, v, kWideKLanes));
+      }
+      add(qmv_wide_t64(m, t, 1, kTiledQmvAltKLanes));
+      for (int ks : kTiledQmvKSplits) {
+        add(qmv_t64(m, t, ks));
+      }
+      add(qmm_t(m, t, true, false, true));
+      add(qmm_t_splitk(m, t, true, true));
+      add(qmm_t_nax(m, t, true, false, true), true);
     }
   }
   for (Mode m : kModes) {
     add(qmm_m8_nax(m), true);
+    add(qmm_m8_nax(m, true), true);
   }
   std::vector<int> prep_group_sizes;
   for (Mode m : kModes) {
@@ -224,9 +268,32 @@ load_kernel(metal::Device &d, const std::string &kname,
                                           hash_name, func_consts);
 }
 
-MTL::ComputePipelineState *get_kernel(metal::Device &d, const char *family,
-                                      const std::string &kname) {
+// MLX_KQUANT_ROUTE_LOG=1 prints each distinct (kernel, M, N, K) the
+// dispatcher requests, once.
+void log_route(const std::string &kname, int M, int N, int K) {
+  static const bool enabled = [] {
+    const char *e = std::getenv("MLX_KQUANT_ROUTE_LOG");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  if (!enabled) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::set<std::string> seen;
+  std::lock_guard<std::mutex> lock(mutex);
+  std::string key;
+  concatenate(key, kname, " M=", M, " N=", N, " K=", K);
+  if (seen.insert(key).second) {
+    std::cerr << "[kquant route] " << key << std::endl;
+  }
+}
+
+MTL::ComputePipelineState *get_kernel(metal::Device &d,
+                                      std::string_view family,
+                                      const std::string &kname, int M = 0,
+                                      int N = 0, int K = 0) {
   bridge_testing::record(family);
+  log_route(kname, M, N, K);
   return load_kernel(d, kname);
 }
 
@@ -351,7 +418,15 @@ struct Operands {
   Mode mode;
   metal::Device &d;
   const Stream &s;
+  // Tiled64 weight layout (mlx_kquant.h): routes only to the "_t64" kernels.
+  bool tiled = false;
 };
+
+// Kernel-family counter names carry the layout so a test can see that a
+// tiled tensor never reached a row-major kernel.
+std::string family_of(const char *family, bool tiled) {
+  return tiled ? std::string(family) + "_t64" : std::string(family);
+}
 
 void qmv(const Operands &o, int M, int N, int K) {
   int B = o.out.size() / M / N;
@@ -362,7 +437,8 @@ void qmv(const Operands &o, int M, int N, int K) {
 
   bool fast = N % bn == 0 && K % 512 == 0;
   auto kernel = get_kernel(o.d, fast ? "qmv_fast" : "qmv",
-                           kernels::qmv(o.mode, o.x.dtype(), fast, B > 1));
+                           kernels::qmv(o.mode, o.x.dtype(), fast, B > 1), M,
+                           N, K);
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -380,6 +456,52 @@ inline bool use_qmv_wide(metal::Device &d) {
   return d.get_architecture_gen() >= 15;
 }
 
+// The tiled M = 1 matvec: `row` (default) is qmv_t64, lane = row; `wide8` /
+// `wide4` are qmv_wide_t64 nv_1 at 4 rows x 8 k-lanes / 8 rows x 4 k-lanes
+// per simdgroup. MLX_KQUANT_TILED_QMV selects, read per call for the A/B
+// (kquant_tiled_bench.rs).
+enum class TiledQmv { Row, Wide8, Wide4 };
+TiledQmv tiled_qmv_route() {
+  const char *e = std::getenv("MLX_KQUANT_TILED_QMV");
+  if (e) {
+    std::string_view v(e);
+    if (v == "wide8") {
+      return TiledQmv::Wide8;
+    }
+    if (v == "wide4") {
+      return TiledQmv::Wide4;
+    }
+  }
+  return TiledQmv::Row;
+}
+int tiled_qmv_k_lanes(int vecs_per_tg) {
+  if (vecs_per_tg == 1 && tiled_qmv_route() == TiledQmv::Wide4) {
+    return kernels::kTiledQmvAltKLanes;
+  }
+  return kernels::kWideKLanes;
+}
+
+// Grid (M, N / 32) of 32 x k_splits threads (kquant_qmv_t64).
+void qmv_t64(const Operands &o, int M, int N, int K) {
+  constexpr int rows_per_tg = 32;
+  const int k_splits = kernels::tiled_qmv_k_splits(K);
+  if (bridge_testing::counting) {
+    bridge_testing::record("qmv_t64_ks" + std::to_string(k_splits));
+  }
+  auto kernel = get_kernel(o.d, "qmv_t64",
+                           kernels::qmv_t64(o.mode, o.x.dtype(), k_splits), M,
+                           N, K);
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.dispatch_threadgroups(MTL::Size(M, N / rows_per_tg, 1),
+                            MTL::Size(32, k_splits, 1));
+}
+
 void qmv_wide(const Operands &o, int M, int N, int K) {
   // Each tile re-reads the weights: fewest tiles, then the smallest tile that
   // fills them. Up to 8 vectors per tile only when N is large enough that the
@@ -387,7 +509,8 @@ void qmv_wide(const Operands &o, int M, int N, int K) {
   const int tile_cap = N >= 2048 ? kernels::kWideMaxVectors : 5;
   int n_tiles = (M + tile_cap - 1) / tile_cap;
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
-  constexpr int k_lanes = kernels::kWideKLanes;
+  const int k_lanes = o.tiled ? tiled_qmv_k_lanes(vecs_per_tg)
+                              : kernels::kWideKLanes;
   constexpr int num_simdgroups = 2;
   int B = o.out.size() / M / N;
   bool batched = B > 1;
@@ -398,11 +521,18 @@ void qmv_wide(const Operands &o, int M, int N, int K) {
                       (N + rows_per_tg - 1) / rows_per_tg, B);
 
   if (bridge_testing::counting) {
-    bridge_testing::record("qmv_wide_nv" + std::to_string(vecs_per_tg));
+    std::string detail =
+        family_of("qmv_wide", o.tiled) + "_nv" + std::to_string(vecs_per_tg);
+    if (o.tiled) {
+      detail += "_kl" + std::to_string(k_lanes);
+    }
+    bridge_testing::record(detail);
   }
-  auto kernel =
-      get_kernel(o.d, "qmv_wide",
-                 kernels::qmv_wide(o.mode, o.x.dtype(), vecs_per_tg, batched));
+  auto kernel = get_kernel(
+      o.d, family_of("qmv_wide", o.tiled),
+      o.tiled ? kernels::qmv_wide_t64(o.mode, o.x.dtype(), vecs_per_tg, k_lanes)
+              : kernels::qmv_wide(o.mode, o.x.dtype(), vecs_per_tg, batched),
+      M, N, K);
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -450,7 +580,7 @@ void qmv_sg8(const Operands &o, int N, int K) {
   enc.dispatch_threadgroups(MTL::Size((K / 32 + 3) / 4, 1, 1),
                             MTL::Size(128, 1, 1));
 
-  auto kernel = get_kernel(o.d, "qmv_sg8", kernels::qmv_sg8(o.mode));
+  auto kernel = get_kernel(o.d, "qmv_sg8", kernels::qmv_sg8(o.mode), 8, N, K);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
   enc.set_input_array(bt, 3);
@@ -521,6 +651,15 @@ int gpu_core_count(metal::Device &d) {
 // core and each partition would keep 512 inputs of whole 32-input units.
 int qmm_m8_nax_splits(int N, int K, int cores) {
   const int64_t tiles = N / kernels::kM8TileCols;
+  // MLX_KQUANT_M8_SPLITS forces a split count that divides the unit count
+  // (tuning only; read per call).
+  if (const char *e = std::getenv("MLX_KQUANT_M8_SPLITS")) {
+    int forced = std::atoi(e);
+    if (forced >= 1 && forced <= kernels::kM8MaxSplits &&
+        (K / 32) % forced == 0) {
+      return forced;
+    }
+  }
   int splits = 1;
   while (splits < kernels::kM8MaxSplits &&
          tiles * splits < int64_t(6) * cores && K / (2 * splits) >= 512 &&
@@ -563,7 +702,9 @@ bool use_qmm_m8_nax(const Operands &o, int M, int N, int K) {
   case M8Nax::Off:
     return false;
   case M8Nax::Auto:
-    if (!m8_nax_default_mode(o.mode)) {
+    // Tiled64 is the layout the tensor-op kernel was measured for (1.18-1.40x
+    // of qmv_sg8 on the Qwen3.8 shapes), so every tiled mode takes it.
+    if (!o.tiled && !m8_nax_default_mode(o.mode)) {
       return false;
     }
     break;
@@ -612,7 +753,8 @@ void qmm_m8_nax(const Operands &o, int N, int K) {
   if (bridge_testing::counting) {
     bridge_testing::record("qmm_m8_nax_splits" + std::to_string(splits));
   }
-  auto kernel = get_kernel(o.d, "qmm_m8_nax", kernels::qmm_m8_nax(o.mode));
+  auto kernel = get_kernel(o.d, family_of("qmm_m8_nax", o.tiled),
+                           kernels::qmm_m8_nax(o.mode, o.tiled), 8, N, K);
   auto &enc = metal::get_command_encoder(o.s);
   array partials = o.out;
   array counters = o.out;
@@ -753,9 +895,10 @@ void qmm_nax(const Operands &o, int M, int N, int K) {
                       B);
 
   bool aligned = N % tile.bn == 0;
-  auto kernel =
-      get_kernel(o.d, "qmm_t_nax",
-                 kernels::qmm_t_nax(o.mode, o.x.dtype(), aligned, B > 1));
+  auto kernel = get_kernel(
+      o.d, family_of("qmm_t_nax", o.tiled),
+      kernels::qmm_t_nax(o.mode, o.x.dtype(), aligned, B > 1, o.tiled), M, N,
+      K);
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -784,12 +927,13 @@ void qmm(const Operands &o, bool transpose, int M, int N, int K) {
 
   bool aligned = N % 32 == 0;
   bool batched = B > 1;
-  auto kernel =
-      transpose
-          ? get_kernel(o.d, "qmm_t",
-                       kernels::qmm_t(o.mode, o.x.dtype(), aligned, batched))
-          : get_kernel(o.d, "qmm_n",
-                       kernels::qmm_n(o.mode, o.x.dtype(), batched));
+  auto kernel = transpose
+      ? get_kernel(
+            o.d, family_of("qmm_t", o.tiled),
+            kernels::qmm_t(o.mode, o.x.dtype(), aligned, batched, o.tiled), M,
+            N, K)
+      : get_kernel(o.d, "qmm_n", kernels::qmm_n(o.mode, o.x.dtype(), batched),
+                   M, N, K);
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
@@ -838,8 +982,9 @@ void qmm_splitk(const Operands &o, int M, int N, int K) {
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
   bool aligned = N % 32 == 0;
-  auto kernel = get_kernel(o.d, "qmm_t_splitk",
-                           kernels::qmm_t_splitk(o.mode, o.x.dtype(), aligned));
+  auto kernel = get_kernel(
+      o.d, family_of("qmm_t_splitk", o.tiled),
+      kernels::qmm_t_splitk(o.mode, o.x.dtype(), aligned, o.tiled), M, N, K);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
   enc.set_input_array(o.x, 3);
@@ -1021,7 +1166,10 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
   auto &d = metal::device(s.device);
   out.set_data(allocator::malloc(out.nbytes()));
 
-  array x = ensure_row_contiguous_matrix(inputs[0], s);
+  const bool tiled = layout_ == Layout::Tiled64;
+  // The tiled kernels take x as one row-contiguous [M, K] (no batch strides).
+  array x = tiled ? ensure_row_contiguous(inputs[0], s)
+                  : ensure_row_contiguous_matrix(inputs[0], s);
   array w = ensure_row_contiguous_matrix(inputs[1], s);
   array scales = ensure_row_contiguous_matrix(inputs[2], s);
   array biases = ensure_row_contiguous_matrix(inputs[3], s);
@@ -1030,7 +1178,32 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
   int K = x.shape(-1);
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
-  Operands o{x, w, scales, biases, out, group_size_, bits_, mode_, d, s};
+  Operands o{x,     w,     scales, biases, out, group_size_,
+             bits_, mode_, d,      s,      tiled};
+
+  if (tiled) {
+    // quantized_matmul() admits Tiled64 only as a 2-D transposed weight; the
+    // routes below are the ported kernels, every other kernel reads the
+    // row-major layout and must not be reached.
+    if (!transpose_ || !non_batched) {
+      throw std::runtime_error(
+          "[quantized_matmul] The @t64 layout needs x @ w.T on a 2-D weight.");
+    }
+    if (M >= qmv_vector_limit(K, N, transpose_, d)) {
+      qmm_splitk(o, M, N, K);
+      return;
+    }
+    if (use_qmm_m8_nax(o, M, N, K)) {
+      qmm_m8_nax(o, N, K);
+      return;
+    }
+    if (M == 1 && tiled_qmv_route() == TiledQmv::Row) {
+      qmv_t64(o, M, N, K);
+      return;
+    }
+    qmv_wide(o, M, N, K);
+    return;
+  }
 
   if (M >= qmv_vector_limit(K, N, transpose_, d)) {
     int B = out.size() / M / N;

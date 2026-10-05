@@ -740,6 +740,86 @@ impl QuantizedLinear {
         }
     }
 
+    /// Repack a K-quant projection's `.weight`/`.scales`/`.biases` into the
+    /// 64-row interleaved `Tiled64` layout (`mlx_kquant.h`) and tag `mode`
+    /// with [`KQUANT_TILED_SUFFIX`](crate::models::quant_dispatch::KQUANT_TILED_SUFFIX),
+    /// so `forward` reaches the `_t64` Metal kernels: a 64-column
+    /// threadgroup then reads one contiguous run per 32-input step instead of
+    /// 64 rows K/2 bytes apart (1.18-1.40x on the Qwen3.8 M = 8 verify
+    /// shapes). The arrays keep their 2-D shape; the bytes are permuted in
+    /// place and the row-major originals are released.
+    ///
+    /// `Ok(true)` when tiled (or already tiled). `Ok(false)` leaves the
+    /// projection untouched: not a K-quant mode, a 3-D / expert weight,
+    /// `N % 64 != 0`, `K % 256 != 0`, or a projection with a transform or
+    /// non-native output layout (tile AFTER `finalize_packed_q_gate_block`
+    /// is not required — that permutes whole tiles when `head_dim % 64 == 0`,
+    /// see there).
+    ///
+    /// Row operations stay valid on a tiled projection only in whole tiles:
+    /// [`concat_rows`](Self::concat_rows) (both sides tiled, both `N % 64`)
+    /// and [`slice_rows`](Self::slice_rows) at 64-aligned bounds.
+    pub fn tile_kquant_layout(&mut self) -> Result<bool> {
+        use crate::models::quant_dispatch::{
+            KQUANT_TILED_SUFFIX, is_kquant_mode, kquant_tile_rows, kquant_tileable, parse_mode_str,
+            split_kquant_layout,
+        };
+        let (base, already) = split_kquant_layout(&self.mode);
+        if already {
+            return Ok(true);
+        }
+        let Some(mode) = parse_mode_str(Some(base)) else {
+            return Ok(false);
+        };
+        if !is_kquant_mode(mode)
+            || self.output_layout != QuantizedOutputLayout::Native
+            || self.hadamard.is_some()
+            || self.fp8_dequant_weight.is_some()
+            || self.s_w.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(biases) = self.biases.as_ref() else {
+            return Ok(false);
+        };
+        let shape = self.weight.shape()?;
+        if shape.len() != 2 || self.scales.ndim()? != 2 || biases.ndim()? != 2 {
+            return Ok(false);
+        }
+        let n = shape[0];
+        let k = shape[1] * 32 / i64::from(self.bits);
+        if !kquant_tileable(n, k) {
+            return Ok(false);
+        }
+        // Codes interleave per 32-value unit (`bits` words); the companions
+        // per 256-value super-block: q4k/q5k hold (sc, m) and (d, dmin) pairs,
+        // the rest one entry, over `super_ratio` groups (IQ4_NL: one).
+        let per_group = if matches!(mode, PerLayerMode::Q4K | PerLayerMode::Q5K) {
+            2
+        } else {
+            1
+        };
+        let super_ratio = match mode {
+            PerLayerMode::Q6K | PerLayerMode::Q3K => 16,
+            PerLayerMode::IQ4NL => 1,
+            _ => 8,
+        };
+        let weight = kquant_tile_rows(&self.weight, i64::from(self.bits))?;
+        let scales = kquant_tile_rows(&self.scales, super_ratio * per_group)?;
+        let biases = kquant_tile_rows(biases, per_group)?;
+        MxArray::eval_arrays_with_context(&[&weight, &scales, &biases], "tile_kquant_layout")?;
+        self.weight = weight;
+        self.scales = scales;
+        self.biases = Some(biases);
+        self.mode = format!("{base}{KQUANT_TILED_SUFFIX}");
+        Ok(true)
+    }
+
+    /// Whether the packed arrays are in the Tiled64 layout.
+    pub fn is_kquant_tiled(&self) -> bool {
+        crate::models::quant_dispatch::split_kquant_layout(&self.mode).1
+    }
+
     /// Cast affine-mode `scales`/`biases`/`bias` f16→f32 once at load. With
     /// bf16/f32 activations `quantized_matmul` promotes the whole call to f32
     /// anyway (`promote_types(bf16, f16)`), so the kernel receives f32
@@ -902,6 +982,17 @@ impl QuantizedLinear {
                 "QuantizedLinear::slice_rows out of range: [{start},{end}) of {:?}",
                 rows.to_vec()
             )));
+        }
+        // Tiled64 interleaves 64 rows per unit, so only whole tiles are a
+        // contiguous (and still tiled) row range.
+        if self.is_kquant_tiled() {
+            let tile = crate::models::quant_dispatch::KQUANT_TILE_ROWS;
+            if start % tile != 0 || end % tile != 0 {
+                return Err(Error::from_reason(format!(
+                    "QuantizedLinear::slice_rows on a {} projection needs {tile}-aligned bounds, got [{start},{end})",
+                    self.mode
+                )));
+            }
         }
         Ok(QuantizedLinear {
             weight: self.weight.slice_axis(0, start, end)?,
@@ -1066,10 +1157,17 @@ impl QuantizedLinear {
         if self.output_layout == QuantizedOutputLayout::QGateBlock {
             return Ok(true);
         }
-        let mode = crate::models::quant_dispatch::parse_mode_str(Some(&self.mode));
+        let (base_mode, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
+        let mode = crate::models::quant_dispatch::parse_mode_str(Some(base_mode));
         let row_permutable = self.mode == DEFAULT_QUANT_MODE
             || mode.is_some_and(crate::models::quant_dispatch::is_kquant_mode);
         if !row_permutable {
+            return Ok(false);
+        }
+        // On a Tiled64 projection the 2-D rows are tile-major, so a row
+        // permutation is only a tile permutation when it moves whole
+        // 64-aligned blocks: the q/gate reorder moves `head_dim`-row blocks.
+        if tiled && i64::from(head_dim) % crate::models::quant_dispatch::KQUANT_TILE_ROWS != 0 {
             return Ok(false);
         }
 
@@ -2836,6 +2934,212 @@ mod kquant_builder_tests {
         let mut p = kquant_params("l", PerLayerMode::Q4K);
         p.remove("l.biases");
         assert!(try_build_kquant_quantized_linear(&p, "l", PerLayerMode::Q4K, "test").is_err());
+    }
+}
+
+/// `tile_kquant_layout`: the Tiled64 repack keeps `forward` value-identical
+/// (bit-identical where the row-major route is the same kernel), tags the
+/// mode, refuses ineligible shapes, and keeps the whole-tile row operations
+/// (`concat_rows`, `slice_rows`, the q/gate block reorder) correct.
+#[cfg(test)]
+mod kquant_tiled_tests {
+    use super::*;
+    use crate::array::DType;
+    use crate::models::quant_dispatch::{KQUANT_TILED_SUFFIX, kquant_untile_rows};
+
+    fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    /// A random q4k `[n, k]` projection (uint8 (sc, m) scales, f16 (d, dmin)).
+    fn q4k(n: i64, k: i64, seed: u32) -> QuantizedLinear {
+        let mut st = seed;
+        let words: Vec<u32> = (0..n * k / 8).map(|_| lcg(&mut st)).collect();
+        let scales: Vec<u8> = (0..n * k / 16)
+            .map(|_| (lcg(&mut st) % 48 + 1) as u8)
+            .collect();
+        let half_scales = [0x2800u16, 0x2c00, 0x3000, 0x3200];
+        let biases: Vec<u16> = (0..n * k / 128)
+            .map(|_| half_scales[(lcg(&mut st) as usize) % half_scales.len()])
+            .collect();
+        QuantizedLinear::new(
+            MxArray::from_uint32(&words, &[n, k / 8]).unwrap(),
+            MxArray::from_uint8(&scales, &[n, k / 16]).unwrap(),
+            Some(MxArray::from_float16(&biases, &[n, k / 128]).unwrap()),
+            None,
+            32,
+            4,
+            "q4k".to_string(),
+        )
+    }
+
+    fn x(m: i64, k: i64, seed: u32) -> MxArray {
+        let mut st = seed;
+        let bits: Vec<u16> = (0..m * k)
+            .map(|_| {
+                let v = ((lcg(&mut st) >> 16) as i32 - 32_768) as f32 / 32_768.0;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        MxArray::from_bfloat16(&bits, &[1, m, k]).unwrap()
+    }
+
+    fn bits_of(a: &MxArray) -> Vec<u32> {
+        a.eval();
+        a.astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    fn close(a: &MxArray, b: &MxArray, rel: f32, what: &str) {
+        let (a, b) = (bits_of(a), bits_of(b));
+        assert_eq!(a.len(), b.len(), "{what}: lengths");
+        let peak = b.iter().fold(0f32, |m, &v| m.max(f32::from_bits(v).abs()));
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(&p, &q)| (f32::from_bits(p) - f32::from_bits(q)).abs())
+            .fold(0f32, f32::max);
+        assert!(worst / peak <= rel, "{what}: off by {worst} of peak {peak}");
+    }
+
+    fn gpu() -> bool {
+        // SAFETY: nullary predicate that catches internally.
+        unsafe { mlx_sys::mlx_metal_is_available() }
+    }
+
+    #[test]
+    fn tile_tags_mode_and_keeps_forward_values() {
+        let (n, k) = (256i64, 1024i64);
+        let row_major = q4k(n, k, 11);
+        let mut tiled = q4k(n, k, 11);
+        assert!(tiled.tile_kquant_layout().unwrap());
+        assert!(tiled.is_kquant_tiled());
+        assert_eq!(tiled.mode(), format!("q4k{KQUANT_TILED_SUFFIX}"));
+        assert!(tiled.tile_kquant_layout().unwrap(), "idempotent");
+        assert_eq!(
+            tiled.get_weight().shape().unwrap().to_vec(),
+            row_major.get_weight().shape().unwrap().to_vec(),
+            "the 2-D shape is kept"
+        );
+        // The bytes moved and untile restores them.
+        assert_ne!(bits_of(tiled.get_weight()), bits_of(row_major.get_weight()));
+        assert_eq!(
+            bits_of(&kquant_untile_rows(tiled.get_weight(), 4).unwrap()),
+            bits_of(row_major.get_weight())
+        );
+        assert_eq!(
+            bits_of(&kquant_untile_rows(tiled.get_biases().unwrap(), 2).unwrap()),
+            bits_of(row_major.get_biases().unwrap())
+        );
+        assert_eq!(
+            bits_of(&kquant_untile_rows(tiled.get_scales(), 16).unwrap()),
+            bits_of(row_major.get_scales())
+        );
+        for m in [1i64, 3, 8, 16, 64] {
+            let a = x(m, k, 100 + m as u32);
+            let ours = tiled.forward(&a).unwrap();
+            let reference = row_major.forward(&a).unwrap();
+            // The GPU M=3 (qmv_wide) and M>=16 (qmm) routes are the same
+            // kernel in both layouts; M=1 and M=8 change kernels on the
+            // GPU, and the CPU reference is always bit-identical.
+            let same_kernel = !gpu() || matches!(m, 3 | 16 | 64);
+            if same_kernel {
+                assert_eq!(
+                    bits_of(&ours),
+                    bits_of(&reference),
+                    "M={m}: not bit-identical"
+                );
+            } else {
+                close(&ours, &reference, 3e-2, &format!("M={m}"));
+            }
+        }
+    }
+
+    #[test]
+    fn tile_refuses_ineligible_projections() {
+        // N % 64 != 0.
+        let mut ql = q4k(96, 512, 1);
+        assert!(!ql.tile_kquant_layout().unwrap());
+        assert_eq!(ql.mode(), "q4k");
+        // (K % 256 != 0 exists only for IQ4_NL's 32-value blocks; the C++
+        // validator case is in tests/kquant_tiled.rs.)
+        // Not a K-quant mode.
+        let mut affine = QuantizedLinear::new(
+            MxArray::from_uint32(&[0u32; 128 * 64], &[128, 64]).unwrap(),
+            MxArray::from_float16(&[0x3c00u16; 128 * 8], &[128, 8]).unwrap(),
+            Some(MxArray::from_float16(&[0u16; 128 * 8], &[128, 8]).unwrap()),
+            None,
+            64,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        assert!(!affine.tile_kquant_layout().unwrap());
+        assert_eq!(affine.mode(), DEFAULT_QUANT_MODE);
+    }
+
+    #[test]
+    fn tiled_row_operations_stay_whole_tile() {
+        let k = 512i64;
+        let (mut a, mut b) = (q4k(128, k, 3), q4k(192, k, 4));
+        let (a_rm, b_rm) = (q4k(128, k, 3), q4k(192, k, 4));
+        assert!(a.tile_kquant_layout().unwrap());
+        // Mixed layouts never merge.
+        assert!(
+            a.concat_rows(&b).unwrap().is_none(),
+            "tiled + row-major must not merge"
+        );
+        assert!(b.tile_kquant_layout().unwrap());
+        let merged = a
+            .concat_rows(&b)
+            .unwrap()
+            .expect("two tiled projections merge");
+        assert!(merged.is_kquant_tiled());
+        let merged_rm = a_rm.concat_rows(&b_rm).unwrap().unwrap();
+        let xa = x(3, k, 5);
+        assert_eq!(
+            bits_of(&merged.forward(&xa).unwrap()),
+            bits_of(&merged_rm.forward(&xa).unwrap()),
+            "merged tiled forward differs"
+        );
+        // 64-aligned slices are valid tiled views, unaligned ones are refused.
+        let view = merged.slice_rows(128, 320).unwrap();
+        assert!(view.is_kquant_tiled());
+        assert_eq!(
+            bits_of(&view.forward(&xa).unwrap()),
+            bits_of(&b_rm.forward(&xa).unwrap()),
+            "tiled slice view differs from its source"
+        );
+        assert!(merged.slice_rows(32, 128).is_err());
+        assert!(merged.slice_rows(0, 100).is_err());
+    }
+
+    #[test]
+    fn tiled_q_gate_block_permutes_whole_tiles() {
+        // H=2 heads x D=64 -> 256 rows: the block reorder moves 64-row blocks.
+        let (heads, dim, k) = (2, 64, 512i64);
+        let n = i64::from(2 * heads * dim);
+        let mut tiled = q4k(n, k, 7);
+        let mut row_major = q4k(n, k, 7);
+        assert!(tiled.tile_kquant_layout().unwrap());
+        assert!(tiled.finalize_packed_q_gate_block(heads, dim).unwrap());
+        assert!(row_major.finalize_packed_q_gate_block(heads, dim).unwrap());
+        let xa = x(3, k, 8);
+        assert_eq!(
+            bits_of(&tiled.forward(&xa).unwrap()),
+            bits_of(&row_major.forward(&xa).unwrap()),
+            "q/gate block reorder on a tiled projection differs"
+        );
+        // D % 64 != 0 cannot be expressed as a tile permutation: left native.
+        let mut odd = q4k(i64::from(2 * 4 * 32), k, 9);
+        assert!(odd.tile_kquant_layout().unwrap());
+        assert!(!odd.finalize_packed_q_gate_block(4, 32).unwrap());
+        assert!(!odd.has_q_gate_block_layout());
     }
 }
 

@@ -57,6 +57,14 @@ kquant::Mode mode_of(const char *mode) {
   return *parsed;
 }
 
+// "q4k" or "q4k@t64".
+kquant::ModeLayout mode_layout_of(const char *mode) {
+  auto parsed = kquant::parse_mode_layout(mode ? mode : "");
+  if (!parsed)
+    throw std::invalid_argument("not a K-quant mode");
+  return *parsed;
+}
+
 mlx_array *wrap(array a) {
   return reinterpret_cast<mlx_array *>(new array(std::move(a)));
 }
@@ -207,9 +215,10 @@ mlx_array *mlx_test_kquant_quantized_matmul(mlx_array *x, mlx_array *w,
                                             int group_size, int bits,
                                             const char *mode, int32_t device) {
   try {
+    auto ml = mode_layout_of(mode);
     return wrap(kquant::quantized_matmul(
         ref(x), ref(w), ref(scales), opt(biases), transpose, group_size, bits,
-        mode_of(mode), device_of(device)));
+        ml.mode, device_of(device), ml.layout));
   } catch (const std::exception &e) {
     std::cerr << "mlx_test_kquant_quantized_matmul: " << e.what() << std::endl;
     return nullptr;
@@ -261,11 +270,12 @@ bool mlx_test_kquant_shapeless_replay(mlx_array *trace_x, mlx_array *x,
                                       mlx_array **out_replay,
                                       mlx_array **out_eager) {
   try {
-    auto kmode = mode_of(mode);
+    auto ml = mode_layout_of(mode);
     auto dev = device_of(device);
     auto fn = [=](const std::vector<array> &in) {
       return std::vector<array>{kquant::quantized_matmul(
-          in[0], in[1], in[2], in[3], transpose, group_size, bits, kmode, dev)};
+          in[0], in[1], in[2], in[3], transpose, group_size, bits, ml.mode,
+          dev, ml.layout)};
     };
     auto compiled = mlx::core::compile(fn, /* shapeless = */ true);
     auto traced = compiled({ref(trace_x), ref(w), ref(scales), ref(biases)});

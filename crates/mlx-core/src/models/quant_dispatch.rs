@@ -258,6 +258,83 @@ pub(crate) fn mode_to_str(mode: PerLayerMode) -> &'static str {
     }
 }
 
+/// The in-memory K-quant weight layout a `QuantizedLinear::mode` string
+/// carries after [`crate::models::quantized_linear::QuantizedLinear::tile_kquant_layout`]:
+/// `"q4k@t64"` means the packed `.weight`/`.scales`/`.biases` bytes are the
+/// 64-row interleaved `Tiled64` permutation (`mlx_kquant.h`), which only the
+/// `_t64` Metal kernels and the CPU reference read. The on-disk contract
+/// (`gguf_kquant.rs`) is unchanged; the tag never reaches config.json.
+pub const KQUANT_TILED_SUFFIX: &str = "@t64";
+/// Rows per Tiled64 tile; a tileable weight has `N % 64 == 0`.
+pub const KQUANT_TILE_ROWS: i64 = 64;
+
+/// Split a `QuantizedLinear` mode string into its bare mode and whether it
+/// carries the Tiled64 tag: `"q4k@t64"` -> `("q4k", true)`.
+pub fn split_kquant_layout(mode: &str) -> (&str, bool) {
+    match mode.strip_suffix(KQUANT_TILED_SUFFIX) {
+        Some(base) => (base, true),
+        None => (mode, false),
+    }
+}
+
+/// `MLX_KQUANT_TILED`: unset or anything but `0` tiles every eligible K-quant
+/// linear at load on a Metal host; `0` keeps the on-disk row-major layout
+/// (the A/B switch). Read once per process.
+pub fn kquant_tiled_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if std::env::var("MLX_KQUANT_TILED").as_deref() == Ok("0") {
+            return false;
+        }
+        // SAFETY: nullary predicate that catches internally.
+        unsafe { mlx_sys::mlx_metal_is_available() }
+    })
+}
+
+/// Whether a 2-D K-quant weight of `n` rows and `k` inputs may be tiled:
+/// whole 64-row tiles and whole 256-value super-blocks (`validate_tiled_layout`
+/// in `mlx_kquant.cpp` enforces the same).
+pub fn kquant_tileable(n: i64, k: i64) -> bool {
+    n > 0 && k > 0 && n % KQUANT_TILE_ROWS == 0 && k % 256 == 0
+}
+
+/// Permute a row-major `[N, cols]` K-quant array (weight, scales or biases)
+/// into the Tiled64 order: `[N/64][cols/unit][64][unit]`, kept as a 2-D
+/// `[N, cols]` array of the same dtype. `unit` is the columns one 32-value
+/// unit (weight: `bits` words) or one 256-value super-block (scales:
+/// `super_ratio * per_group` entries, biases: `per_group`) occupies. A pure
+/// permutation, so a lazy reshape + transpose + reshape; the result is
+/// materialised by the caller's eval.
+pub fn kquant_tile_rows(a: &MxArray, unit: i64) -> Result<MxArray> {
+    let shape = a.shape()?;
+    if shape.len() != 2 || shape[0] % KQUANT_TILE_ROWS != 0 || shape[1] % unit != 0 {
+        return Err(Error::from_reason(format!(
+            "kquant_tile_rows: cannot tile shape {:?} with unit {unit}",
+            shape.to_vec()
+        )));
+    }
+    let (n, cols) = (shape[0], shape[1]);
+    a.reshape(&[n / KQUANT_TILE_ROWS, KQUANT_TILE_ROWS, cols / unit, unit])?
+        .transpose(Some(&[0, 2, 1, 3]))?
+        .reshape(&[n, cols])
+}
+
+/// The inverse of [`kquant_tile_rows`]: Tiled64 bytes back to row-major.
+pub fn kquant_untile_rows(a: &MxArray, unit: i64) -> Result<MxArray> {
+    let shape = a.shape()?;
+    if shape.len() != 2 || shape[0] % KQUANT_TILE_ROWS != 0 || shape[1] % unit != 0 {
+        return Err(Error::from_reason(format!(
+            "kquant_untile_rows: cannot untile shape {:?} with unit {unit}",
+            shape.to_vec()
+        )));
+    }
+    let (n, cols) = (shape[0], shape[1]);
+    a.reshape(&[n / KQUANT_TILE_ROWS, cols / unit, KQUANT_TILE_ROWS, unit])?
+        .transpose(Some(&[0, 2, 1, 3]))?
+        .reshape(&[n, cols])
+}
+
 /// True when `mode` is one of the supported ggml K/IQ packed families.
 pub fn is_kquant_mode(mode: PerLayerMode) -> bool {
     matches!(

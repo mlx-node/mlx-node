@@ -66,29 +66,32 @@ struct Coef {
   float2 m;
 };
 
-// A unit is 32 consecutive k of one weight row: `bits` uint32 words.
+// A unit is 32 consecutive k of one weight row: `bits` uint32 words. `base`
+// is the row's unit 0 and `stride` the words between its units: `bits`
+// row-major, 64 * bits in the Tiled64 layout (mlx_kquant.h), where the 64
+// rows of a tile interleave per unit.
 template <Format F>
 struct Codes;
 
 template <>
 struct Codes<Q4K> {
   typedef uint4 W;
-  static W load(const device uint32_t* row, uint u) {
-    return *reinterpret_cast<const device uint4*>(row + u * 4);
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return *reinterpret_cast<const device uint4*>(base + u * stride);
   }
 };
 template <>
 struct Codes<IQ4XS> {
   typedef uint4 W;
-  static W load(const device uint32_t* row, uint u) {
-    return Codes<Q4K>::load(row, u);
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<Q4K>::load(base, u, stride);
   }
 };
 template <>
 struct Codes<IQ4NL> {
   typedef uint4 W;
-  static W load(const device uint32_t* row, uint u) {
-    return Codes<Q4K>::load(row, u);
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<Q4K>::load(base, u, stride);
   }
 };
 
@@ -98,8 +101,8 @@ struct Codes<Q5K> {
     uint4 a;
     uint b;
   };
-  static W load(const device uint32_t* row, uint u) {
-    const device uint32_t* s = row + u * 5;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint32_t* s = base + u * stride;
     return {uint4(s[0], s[1], s[2], s[3]), s[4]};
   }
 };
@@ -110,8 +113,9 @@ struct Codes<Q6K> {
     uint4 a;
     uint2 b;
   };
-  static W load(const device uint32_t* row, uint u) {
-    const device uint2* s = reinterpret_cast<const device uint2*>(row + u * 6);
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint2* s =
+        reinterpret_cast<const device uint2*>(base + u * stride);
     return {uint4(s[0], s[1]), s[2]};
   }
 };
@@ -122,8 +126,8 @@ struct Codes<Q3K> {
     uint2 a;
     uint b;
   };
-  static W load(const device uint32_t* row, uint u) {
-    const device uint32_t* s = row + u * 3;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint32_t* s = base + u * stride;
     return {uint2(s[0], s[1]), s[2]};
   }
 };
@@ -134,46 +138,122 @@ struct Codes<IQ3S> {
     uint4 a;
     uint4 b;
   };
-  static W load(const device uint32_t* row, uint u) {
-    const device uint4* s = reinterpret_cast<const device uint4*>(row + u * 8);
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    const device uint4* s =
+        reinterpret_cast<const device uint4*>(base + u * stride);
     return {s[0], s[1]};
   }
 };
 
-template <Format F>
-METAL_FUNC Coef coef(
-    const device uint8_t* scales,
-    const device half* biases,
+constant constexpr uint kTileRows = 64;
+
+// Row n's unit 0 and unit stride (words) in either layout.
+template <int bits, bool tiled>
+METAL_FUNC const device uint32_t* unit_base(
+    const device uint32_t* w,
     uint n,
-    uint K,
-    uint u) {
-  Coef c;
-  if constexpr (F == Q4K || F == Q5K) {
-    const uint sm = *reinterpret_cast<const device ushort*>(
-        scales + size_t(n) * (K / 16) + 2 * u);
-    const half2 d = *reinterpret_cast<const device half2*>(
-        biases + size_t(n) * (K / 128) + 2 * (u >> 3));
-    c.s = float2(float(d.x) * float(sm & 0xFFu));
-    c.m = float2(-(float(d.y) * float(sm >> 8)));
-  } else if constexpr (F == Q6K || F == Q3K) {
-    const uint sc = *reinterpret_cast<const device ushort*>(
-        scales + size_t(n) * (K / 16) + 2 * u);
-    const float d = float(biases[size_t(n) * (K / 256) + (u >> 3)]);
-    c.s = float2(
-        d * float(as_type<char>(uchar(sc & 0xFFu))),
-        d * float(as_type<char>(uchar(sc >> 8))));
-    c.m = float(-(F == Q6K ? 32 : 4)) * c.s;
-  } else if constexpr (F == IQ4NL) {
-    const float d = float(biases[size_t(n) * (K / 32) + u]);
-    c.s = float2(d * float(as_type<char>(scales[size_t(n) * (K / 32) + u])));
-    c.m = float2(0.0f);
-  } else {
-    const float d = float(biases[size_t(n) * (K / 256) + (u >> 3)]);
-    c.s = float2(d * float(as_type<char>(scales[size_t(n) * (K / 32) + u])));
-    c.m = F == IQ3S ? float(-128) * c.s : float2(0.0f);
+    uint K) {
+  if (tiled) {
+    return w + (size_t(n / kTileRows) * (K / 32) * kTileRows + n % kTileRows) *
+        bits;
   }
-  return c;
+  return w + size_t(n) * (K * bits / 32);
 }
+template <int bits, bool tiled>
+constexpr uint unit_stride() {
+  return tiled ? kTileRows * bits : bits;
+}
+
+// Element e of row n's per-unit or per-super-block companion of `per`
+// entries, in either layout: row-major [N][entries][per], tiled
+// [N/64][entries][64][per].
+template <bool tiled>
+METAL_FUNC size_t companion_index(
+    uint n,
+    uint entries_per_row,
+    uint e,
+    uint per) {
+  if (tiled) {
+    return (size_t(n / kTileRows) * entries_per_row * kTileRows + e * kTileRows +
+            n % kTileRows) *
+        per;
+  }
+  return size_t(n) * entries_per_row * per + size_t(e) * per;
+}
+
+// Row n's (scale, bias) coefficients per unit. A super-block's sub-scales
+// are contiguous bytes in both layouts (8 (sc, m) pairs, 16 int8 or 8 int8)
+// and its float16 super-scales one half2 / half, so both are loaded once per
+// super-block and decoded per unit; IQ4_NL has one group per super-block and
+// loads per unit. Same operations and order as KQScales (mlx_kquant.cpp).
+template <Format F, bool tiled>
+struct CoefCursor {
+  const device uint8_t* scales;
+  const device half* biases;
+  uint n;
+  uint K;
+  uint sb = ~0u;
+  uint4 sc = uint4(0u);
+  half2 d = half2(0.0h);
+
+  CoefCursor(
+      const device uint8_t* scales_,
+      const device half* biases_,
+      uint n_,
+      uint K_)
+      : scales(scales_), biases(biases_), n(n_), K(K_) {}
+
+  Coef at(uint u) {
+    Coef c;
+    if constexpr (F == IQ4NL) {
+      const float dd = float(biases[companion_index<tiled>(n, K / 32, u, 1)]);
+      c.s = float2(
+          dd * float(as_type<char>(scales[companion_index<tiled>(n, K / 32, u, 1)])));
+      c.m = float2(0.0f);
+      return c;
+    }
+    if ((u >> 3) != sb) {
+      sb = u >> 3;
+      if constexpr (F == Q4K || F == Q5K) {
+        d = *reinterpret_cast<const device half2*>(
+            biases + companion_index<tiled>(n, K / 256, sb, 2));
+        sc = *reinterpret_cast<const device uint4*>(
+            scales + companion_index<tiled>(n, K / 256, sb, 16));
+      } else if constexpr (F == Q6K || F == Q3K) {
+        d = half2(biases[companion_index<tiled>(n, K / 256, sb, 1)], 0.0h);
+        sc = *reinterpret_cast<const device uint4*>(
+            scales + companion_index<tiled>(n, K / 256, sb, 16));
+      } else {
+        d = half2(biases[companion_index<tiled>(n, K / 256, sb, 1)], 0.0h);
+        sc = uint4(
+            *reinterpret_cast<const device uint2*>(
+                scales + companion_index<tiled>(n, K / 256, sb, 8)),
+            0u,
+            0u);
+      }
+    }
+    const uint j = u & 7u;
+    if constexpr (F == Q4K || F == Q5K) {
+      const uint sm = (sc[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
+      c.s = float2(float(d.x) * float(sm & 0xFFu));
+      c.m = float2(-(float(d.y) * float(sm >> 8)));
+    } else if constexpr (F == Q6K || F == Q3K) {
+      // Two 16-groups per unit: int8 scales 2j, 2j + 1.
+      const uint pair = (sc[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
+      const float dd = float(d.x);
+      c.s = float2(
+          dd * float(as_type<char>(uchar(pair & 0xFFu))),
+          dd * float(as_type<char>(uchar(pair >> 8))));
+      c.m = float(-(F == Q6K ? 32 : 4)) * c.s;
+    } else {
+      const uint byte = (sc[j >> 2] >> (8 * (j & 3))) & 0xFFu;
+      const float dd = float(d.x);
+      c.s = float2(dd * float(as_type<char>(uchar(byte))));
+      c.m = F == IQ3S ? float(-128) * c.s : float2(0.0f);
+    }
+    return c;
+  }
+};
 
 // Codes 8j..8j+7 of a unit as bytes: the even ones in .x, the odd in .y.
 template <Format F>
@@ -320,8 +400,17 @@ METAL_FUNC void split_release(device atomic_uint* counter, uint thread_index) {
 
 // Grid (N / 64, splits) of 64 threads. x is [8][K] bfloat16, y [8][N];
 // partials [splits][8][N] fp32 and counters [N / 64] (zero before and after
-// each dispatch) are read only when splits > 1.
-template <typename T, int group_size, int bits, int super_ratio, bool has_min>
+// each dispatch) are read only when splits > 1. `tiled` reads the Tiled64
+// layout: a threadgroup's 64 columns are one tile, so each step's 64 code
+// units are one contiguous 64 * bits * 4-byte run. The arithmetic and its
+// order are the same, so the two layouts give identical bits.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    bool tiled = false>
 [[kernel, max_total_threads_per_threadgroup(64)]] void kquant_qmm_m8_nax(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -387,16 +476,20 @@ template <typename T, int group_size, int bits, int super_ratio, bool has_min>
   }
 
   // The codes and coefficients of a step are loaded during the step before.
-  const device uint32_t* row = w + size_t(n) * (K * bits / 32);
-  W cur = Codes<F>::load(row, step_begin);
-  Coef cc = coef<F>(scales, biases, n, K, step_begin);
+  // (Deeper prefetch was measured: 4 steps in flight cost 5-10% on the tiled
+  // Qwen3.8 shapes, from the extra registers.)
+  const device uint32_t* row = unit_base<bits, tiled>(w, n, K);
+  constexpr uint stride = unit_stride<bits, tiled>();
+  CoefCursor<F, tiled> coefs(scales, biases, n, K);
+  W cur = Codes<F>::load(row, step_begin, stride);
+  Coef cc = coefs.at(step_begin);
   for (uint step = step_begin; step < step_end; ++step) {
     threadgroup half* buf = my + (step & 1) * kStage;
     stage32<F>(cur, cc, tl, buf + simd_lane * kStep);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     if (step + 1 < step_end) {
-      cur = Codes<F>::load(row, step + 1);
-      cc = coef<F>(scales, biases, n, K, step + 1);
+      cur = Codes<F>::load(row, step + 1, stride);
+      cc = coefs.at(step + 1);
     }
     auto as = a.template slice<kStep, kRows>(int(step * kStep), 0);
     if (step & 1) {

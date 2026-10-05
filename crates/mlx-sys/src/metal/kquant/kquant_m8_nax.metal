@@ -4,11 +4,15 @@
 #include "mlx/backend/metal/kernels/utils.h"
 #include "kquant_m8_nax.h"
 
-// M = 8 bfloat16 only, so this file is compiled once (no KQUANT_DTYPE).
+// M = 8 bfloat16 only, so this file is compiled once (no KQUANT_DTYPE). Each
+// mode once per weight layout: row-major and Tiled64 ("_t64").
 #define instantiate_kquant_m8_nax(mode, group_size, bits, super_ratio, has_min) \
   instantiate_kernel( \
       #mode "_qmm_m8_nax_bfloat16_t_gs_" #group_size "_b_" #bits, \
-      kquant_qmm_m8_nax, bfloat16_t, group_size, bits, super_ratio, has_min)
+      kquant_qmm_m8_nax, bfloat16_t, group_size, bits, super_ratio, has_min) \
+  instantiate_kernel( \
+      #mode "_qmm_m8_nax_t64_bfloat16_t_gs_" #group_size "_b_" #bits, \
+      kquant_qmm_m8_nax, bfloat16_t, group_size, bits, super_ratio, has_min, true)
 
 instantiate_kquant_m8_nax(q6k, 16, 6, 16, false)
 instantiate_kquant_m8_nax(q4k, 32, 4, 8, true)

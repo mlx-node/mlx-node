@@ -339,7 +339,15 @@ impl Qwen3_5MTPModule {
                     | PerLayerMode::IQ4NL
                     | PerLayerMode::IQ4XS
                     | PerLayerMode::IQ3S => {
+                        // Tiled64 repack as in the dense loader's `try_build_ql`.
                         try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5_mtp")?
+                            .map(|mut ql| {
+                                if crate::models::quant_dispatch::kquant_tiled_enabled() {
+                                    ql.tile_kquant_layout()?;
+                                }
+                                Ok::<_, Error>(ql)
+                            })
+                            .transpose()?
                     }
                 })
             };

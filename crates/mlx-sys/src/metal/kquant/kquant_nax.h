@@ -218,6 +218,87 @@ struct KQScales {
   }
 };
 
+// --- Tiled64 layout (mlx_kquant.h; the same helpers as kquant.h) -----------
+MLX_MTL_CONST int KQ_TILE_ROWS = 64;
+
+template <int bits>
+METAL_FUNC const device uint8_t* kq_tiled_row(
+    const device uint32_t* w,
+    uint n,
+    uint units_per_row) {
+  return reinterpret_cast<const device uint8_t*>(w) +
+      (size_t(n / KQ_TILE_ROWS) * units_per_row * KQ_TILE_ROWS +
+       n % KQ_TILE_ROWS) *
+      (bits * 4);
+}
+
+template <int bits>
+METAL_FUNC constexpr size_t kq_tiled_unit_stride() {
+  return size_t(KQ_TILE_ROWS) * bits * 4;
+}
+
+template <typename U, int bits, int super_ratio, bool has_min>
+struct KQScalesTiled {
+  MLX_MTL_CONST int per_group = has_min ? 2 : 1;
+
+  const device uint8_t* scales;
+  const device float16_t* biases;
+  size_t group;
+
+  // Sub-scales sit per super-block: row r's super_ratio groups of
+  // super-block G are the contiguous bytes at ((tile * nsb + G) * 64 + r) *
+  // super_ratio * per_group, so one 16-byte load covers a super-block.
+  KQScalesTiled(
+      const device uint8_t* scales_,
+      const device float16_t* biases_,
+      int groups_per_row,
+      uint row,
+      size_t group_ = 0)
+      : scales(
+            scales_ +
+            (size_t(row / KQ_TILE_ROWS) * (groups_per_row / super_ratio) *
+                 KQ_TILE_ROWS +
+             row % KQ_TILE_ROWS) *
+                (super_ratio * per_group)),
+        biases(
+            biases_ +
+            (size_t(row / KQ_TILE_ROWS) * (groups_per_row / super_ratio) *
+                 KQ_TILE_ROWS +
+             row % KQ_TILE_ROWS) *
+                per_group),
+        group(group_) {}
+
+  void at(size_t g, thread U& scale, thread U& bias) const {
+    const size_t gi = group + g;
+    const device float16_t* d =
+        biases + (gi / super_ratio) * KQ_TILE_ROWS * per_group;
+    const device uint8_t* sc = scales +
+        (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
+        (gi % super_ratio) * per_group;
+    if constexpr (has_min) {
+      scale = static_cast<U>(d[0]) * static_cast<U>(sc[0]);
+      bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
+    } else {
+      scale = static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0]));
+      if constexpr (bits == 4) {
+        bias = static_cast<U>(0.0f);
+      } else {
+        bias = static_cast<U>(-(1 << (bits - 1))) * scale;
+      }
+    }
+  }
+
+  KQScalesTiled offset(size_t n) const {
+    KQScalesTiled c = *this;
+    c.group += n;
+    return c;
+  }
+
+  void advance(size_t n) {
+    group += n;
+  }
+};
+
 template <
     typename T,
     short BROWS,
@@ -228,11 +309,15 @@ template <
     short group_size,
     short bits,
     short super_ratio,
-    bool has_min>
+    bool has_min,
+    bool tiled = false>
 struct QuantizedBlockLoader {
   static_assert(
       bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
       "Template undefined for bits not in {3, 4, 5, 6, 8}");
+  static_assert(
+      !tiled || (reduction_dim == 1 && BCOLS % 32 == 0),
+      "Tiled64 loads whole 32-code units of a transposed weight.");
 
   MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
@@ -261,8 +346,15 @@ struct QuantizedBlockLoader {
   static_assert(
       (n_reads_per_scale * pack_factor) <= group_size,
       "A per-group run must not reach past its group.");
+  // A Tiled64 thread's reads stay inside one unit, so its source is contiguous.
+  static_assert(
+      !tiled || (n_reads * pack_factor) <= 32,
+      "A Tiled64 thread's reads must stay inside one 32-code unit.");
 
-  using scales_t = KQScales<float, bits, super_ratio, has_min>;
+  using scales_t = typename ConditionalType<
+      tiled,
+      KQScalesTiled<float, bits, super_ratio, has_min>,
+      KQScales<float, bits, super_ratio, has_min>>::type;
 
   const int src_ld;
   const int tile_stride;
@@ -297,7 +389,42 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_.offset(
-            bi * src_ld / group_size + (bj * pack_factor) / group_size)) {}
+            bi * src_ld / group_size + (bj * pack_factor) / group_size)) {
+    static_assert(!tiled, "the Tiled64 loader takes the whole tensor");
+  }
+
+  // Tiled64: the whole weight, its companions, K, the tile's first row
+  // (n0, a multiple of BROWS) and its first input (k0, a multiple of BCOLS).
+  QuantizedBlockLoader(
+      const device uint32_t* w,
+      const device uint8_t* scales_,
+      const device float16_t* biases_,
+      const int K,
+      const int n0,
+      const int k0,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(K),
+        tile_stride((BCOLS / 32) * kq_tiled_unit_stride<bits>()),
+        group_step_cnt(0),
+        group_stride(0),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(kq_tiled_row<bits>(w, n0 + bi, K / 32) +
+            size_t((k0 + bj * pack_factor) / 32) *
+                kq_tiled_unit_stride<bits>() +
+            ((bj * pack_factor) % 32) * bits / 8),
+        scales(
+            scales_,
+            biases_,
+            K / group_size,
+            n0 + bi,
+            (k0 + bj * pack_factor) / group_size) {
+    static_assert(tiled, "the row-major loader takes a pre-offset source");
+  }
 
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -381,7 +508,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool tiled = false>
 METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     KQScales<float, bits, super_ratio, has_min> scales,
@@ -394,7 +522,10 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    // Tiled64 only: the whole companions (`w` is then the whole weight too).
+    const device uint8_t* scales_tiled = nullptr,
+    const device float16_t* biases_tiled = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
   static_assert(BM % WM == 0, "BM should be divisible by WM");
@@ -421,7 +552,8 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
       group_size,
       bits,
       super_ratio,
-      has_min>;
+      has_min,
+      tiled>;
 
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -437,7 +569,14 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
-  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w = [&]() {
+    if constexpr (tiled) {
+      return loader_w_t(
+          w, scales_tiled, biases_tiled, K, y_col, 0, Ws, simd_gid, simd_lid);
+    } else {
+      return loader_w_t(wl, scales, K, Ws, simd_gid, simd_lid);
+    }
+  }();
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -628,7 +767,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool tiled = false>
 [[kernel]] void kquant_qmm_t_nax(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -650,6 +790,7 @@ template <
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(!(tiled && batched), "Tiled64 weights are 2-D");
   (void)lid;
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
@@ -685,7 +826,8 @@ template <
       BK,
       BN,
       WM,
-      WN>(
+      WN,
+      tiled>(
       w,
       KQScales<float, bits, super_ratio, has_min>(scales, biases),
       x,
@@ -697,5 +839,7 @@ template <
       tid,
       lid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      scales,
+      biases);
 }

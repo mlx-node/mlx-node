@@ -19,8 +19,38 @@ namespace mlx::core::kquant {
 
 enum class Mode { Q6K, Q4K, Q5K, Q3K, IQ4NL, IQ4XS, IQ3S };
 
+// In-memory layout of a 2-D K-quant weight and its companions.
+//
+//   RowMajor  .weight [N][K*bits/32], .scales [N][K/gs*pg], .biases
+//             [N][K/(gs*sr)*pg]: the on-disk contract (gguf_kquant.rs).
+//   Tiled64   the same bytes permuted so 64 consecutive rows interleave per
+//             32-code unit (codes) and per 256-value super-block
+//             (companions): .weight [N/64][K/32][64][bits] u32, .scales
+//             [N/64][K/256][64][sr*pg], .biases [N/64][K/256][64][pg]
+//             (IQ4_NL: sr = 1, so per 32-value block). A unit's bits are
+//             unchanged; only unit addresses move, so a 64-column
+//             threadgroup reads one contiguous 64*bits*4-byte run per step
+//             instead of 64 rows K/2 bytes apart, and a row's super-block
+//             scales stay one 16-byte load. The arrays keep
+//             their 2-D shape; the layout rides on the mode string as the
+//             "@t64" suffix (kTiledSuffix) so every consumer sees it. Only a
+//             transposed matmul (x @ w.T) on a 2-D weight with N % 64 == 0
+//             and K % 256 == 0 accepts it.
+enum class Layout { RowMajor, Tiled64 };
+constexpr int kTileRows = 64;
+constexpr std::string_view kTiledSuffix = "@t64";
+
+struct ModeLayout {
+  Mode mode;
+  Layout layout;
+};
+
+// The bare mode names only ("q4k"); a layout suffix is not a mode.
 std::optional<Mode> parse_mode(std::string_view mode);
+// "q4k" -> {Q4K, RowMajor}, "q4k@t64" -> {Q4K, Tiled64}.
+std::optional<ModeLayout> parse_mode_layout(std::string_view mode);
 const char *mode_name(Mode mode);
+const char *layout_suffix(Layout layout);
 
 // Groups one super-block spans; a super-block always covers
 // group_size * super_ratio == 256 values (IQ4_NL: one 32-value block).
@@ -74,7 +104,8 @@ constexpr int default_group_size(Mode mode) {
 array quantized_matmul(const array &x, const array &w, const array &scales,
                        const std::optional<array> &biases, bool transpose,
                        std::optional<int> group_size, std::optional<int> bits,
-                       Mode mode, StreamOrDevice s = {});
+                       Mode mode, StreamOrDevice s = {},
+                       Layout layout = Layout::RowMajor);
 
 array gather_qmm(const array &x, const array &w, const array &scales,
                  const std::optional<array> &biases,
@@ -100,9 +131,9 @@ std::vector<KernelName> metal_kernel_names();
 class KQuantMatmul : public UnaryPrimitive {
 public:
   KQuantMatmul(Stream stream, int group_size, int bits, Mode mode,
-               bool transpose)
+               bool transpose, Layout layout = Layout::RowMajor)
       : UnaryPrimitive(stream), group_size_(group_size), bits_(bits),
-        mode_(mode), transpose_(transpose) {}
+        mode_(mode), transpose_(transpose), layout_(layout) {}
 
   void eval_cpu(const std::vector<array> &inputs, array &out) override;
   void eval_gpu(const std::vector<array> &inputs, array &out) override;
@@ -116,6 +147,7 @@ private:
   int bits_;
   Mode mode_;
   bool transpose_;
+  Layout layout_;
 };
 
 class KQuantGatherQMM : public UnaryPrimitive {

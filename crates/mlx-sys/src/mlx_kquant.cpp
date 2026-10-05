@@ -31,6 +31,24 @@ std::optional<Mode> parse_mode(std::string_view mode) {
   return std::nullopt;
 }
 
+std::optional<ModeLayout> parse_mode_layout(std::string_view mode) {
+  Layout layout = Layout::RowMajor;
+  if (mode.size() > kTiledSuffix.size() &&
+      mode.substr(mode.size() - kTiledSuffix.size()) == kTiledSuffix) {
+    layout = Layout::Tiled64;
+    mode.remove_suffix(kTiledSuffix.size());
+  }
+  auto parsed = parse_mode(mode);
+  if (!parsed) {
+    return std::nullopt;
+  }
+  return ModeLayout{*parsed, layout};
+}
+
+const char *layout_suffix(Layout layout) {
+  return layout == Layout::Tiled64 ? "@t64" : "";
+}
+
 const char *mode_name(Mode mode) {
   switch (mode) {
   case Mode::Q6K:
@@ -268,12 +286,40 @@ array indices_or_default(std::optional<array> indices, const array &x,
                  s);
 }
 
+// The Tiled64 layout is a permutation of whole 64-row x 32-code units, so it
+// exists only for a 2-D weight with whole tiles and whole super-blocks, read
+// as x @ w.T.
+void validate_tiled_layout(std::string_view tag, const array &w, int bits,
+                           bool transpose) {
+  if (w.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] The " << kTiledSuffix
+        << " layout needs a 2-D weight but w.shape() == " << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (!transpose) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] The " << kTiledSuffix
+        << " layout is read as x @ w.T only (transpose=false given).";
+    throw std::invalid_argument(msg.str());
+  }
+  int N = w.shape(0);
+  int K = w.shape(1) * 32 / bits;
+  if (N % kTileRows != 0 || K % 256 != 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] The " << kTiledSuffix << " layout needs N % "
+        << kTileRows << " == 0 and K % 256 == 0 but w.shape() == " << w.shape()
+        << " expands to N=" << N << ", K=" << K << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
 } // namespace
 
 array quantized_matmul(const array &x, const array &w, const array &scales,
                        const std::optional<array> &biases, bool transpose,
                        std::optional<int> group_size_, std::optional<int> bits_,
-                       Mode mode, StreamOrDevice s) {
+                       Mode mode, StreamOrDevice s, Layout layout) {
   validate_mode_with_type("quantized_matmul", mode, scales, biases,
                           std::nullopt);
   auto [group_size, bits] =
@@ -282,6 +328,9 @@ array quantized_matmul(const array &x, const array &w, const array &scales,
       extract_matmul_dims("quantized_matmul", x, w, scales, *biases, transpose,
                           group_size, bits, mode);
   (void)w_inner;
+  if (layout == Layout::Tiled64) {
+    validate_tiled_layout("quantized_matmul", w, bits, transpose);
+  }
   auto dtype = x.dtype();
   if (!issubdtype(dtype, floating)) {
     std::ostringstream msg;
@@ -297,7 +346,7 @@ array quantized_matmul(const array &x, const array &w, const array &scales,
   out_shape.back() = w_outer;
   return array(std::move(out_shape), dtype,
                std::make_shared<KQuantMatmul>(to_stream(s), group_size, bits,
-                                              mode, transpose),
+                                              mode, transpose, layout),
                std::move(inputs));
 }
 
@@ -391,7 +440,7 @@ array dequantize(const array &w, const array &scales,
 bool KQuantMatmul::is_equivalent(const Primitive &other) const {
   const auto &o = static_cast<const KQuantMatmul &>(other);
   return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_ &&
-         transpose_ == o.transpose_;
+         transpose_ == o.transpose_ && layout_ == o.layout_;
 }
 
 std::vector<Shape>
@@ -643,12 +692,99 @@ void kq_qmm_t(T *result, const T *x, const uint32_t *w, const uint8_t *scales,
   }
 }
 
+// kq_qmm_t on the Tiled64 layout (mlx_kquant.h): the same decode and the same
+// float accumulation order per (m, n), only the addresses of a row's units,
+// sub-scales and super-scales change, so it is bit-identical to kq_qmm_t on
+// the row-major bytes.
+template <typename T, int bits, int group_size, int super_ratio, bool has_min,
+          bool nonlinear>
+void kq_qmm_t_tiled(T *result, const T *x, const uint32_t *w,
+                    const uint8_t *scales, const float16_t *biases, int M,
+                    int N, int K) {
+  constexpr int bitmask = (1 << bits) - 1;
+  constexpr int pack_factor = get_pack_factor(bits, 8);
+  constexpr int bytes_per_pack = get_bytes_per_pack(bits);
+  constexpr int packs_in_group = group_size / pack_factor;
+  constexpr int per_group = has_min ? 2 : 1;
+  constexpr size_t unit_bytes = size_t(bits) * 4;
+  const size_t units = size_t(K) / 32;
+  const size_t K_g = size_t(K) / group_size;
+  const size_t nsb = K_g / super_ratio;
+  const uint8_t *wb = reinterpret_cast<const uint8_t *>(w);
+
+  for (int m = 0; m < M; m++) {
+    for (int n = 0; n < N; n++) {
+      const size_t tile = size_t(n) / kTileRows;
+      const size_t r = size_t(n) % kTileRows;
+      const uint8_t *wtile = wb + (tile * units * kTileRows + r) * unit_bytes;
+      // Companions interleave per super-block: [N/64][nsb][64][sr * pg] and
+      // [N/64][nsb][64][pg].
+      const uint8_t *stile =
+          scales + (tile * nsb * kTileRows + r) * (super_ratio * per_group);
+      const float16_t *btile =
+          biases + (tile * nsb * kTileRows + r) * per_group;
+      const T *x_local = x;
+      float sum = 0;
+      for (size_t g = 0; g < K_g; g++) {
+        const float16_t *d = btile + (g / super_ratio) * kTileRows * per_group;
+        const uint8_t *sc = stile +
+                            (g / super_ratio) * kTileRows * super_ratio *
+                                per_group +
+                            (g % super_ratio) * per_group;
+        float scale;
+        float bias;
+        if constexpr (has_min) {
+          scale = static_cast<float>(d[0]) * static_cast<float>(sc[0]);
+          bias = -(static_cast<float>(d[1]) * static_cast<float>(sc[1]));
+        } else {
+          scale = static_cast<float>(d[0]) *
+                  static_cast<float>(static_cast<int8_t>(sc[0]));
+          bias = nonlinear ? 0.0f : -static_cast<float>(1 << (bits - 1)) * scale;
+        }
+        const size_t k0 = g * group_size;
+        const uint8_t *w_local = wtile + (k0 / 32) * kTileRows * unit_bytes +
+                                 (k0 % 32) * bits / 8;
+        for (int kw = 0; kw < packs_in_group; kw++) {
+          if constexpr (bits == 3 || bits == 5 || bits == 6) {
+            float wl[pack_factor];
+            extract_bits<float, bits>(w_local, wl);
+#pragma clang loop unroll(full)
+            for (int p = 0; p < pack_factor; p++) {
+              sum += static_cast<float>(x_local[p]) *
+                     kq_value<nonlinear>(wl[p], scale, bias);
+            }
+            w_local += bytes_per_pack;
+            x_local += pack_factor;
+          } else {
+            uint8_t wi = *w_local++;
+#pragma clang loop unroll(full)
+            for (int p = 0; p < pack_factor; p++) {
+              sum += static_cast<float>(*x_local++) *
+                     kq_value<nonlinear>(static_cast<float>(wi & bitmask),
+                                         scale, bias);
+              wi >>= bits;
+            }
+          }
+        }
+      }
+      *result = static_cast<T>(sum);
+      result++;
+    }
+    x += K;
+  }
+}
+
 template <typename T, int bits, int group_size, int super_ratio, bool has_min,
           bool nonlinear>
 void kq_qmm_dispatch_transpose(T *result, const T *x, const uint32_t *w,
                                const uint8_t *scales, const float16_t *biases,
-                               int M, int N, int K, bool transposed_w) {
-  if (transposed_w) {
+                               int M, int N, int K, bool transposed_w,
+                               Layout layout) {
+  if (layout == Layout::Tiled64) {
+    // quantized_matmul() admits Tiled64 with transpose only.
+    kq_qmm_t_tiled<T, bits, group_size, super_ratio, has_min, nonlinear>(
+        result, x, w, scales, biases, M, N, K);
+  } else if (transposed_w) {
     kq_qmm_t<T, bits, group_size, super_ratio, has_min, nonlinear>(
         result, x, w, scales, biases, M, N, K);
   } else {
@@ -660,35 +796,36 @@ void kq_qmm_dispatch_transpose(T *result, const T *x, const uint32_t *w,
 template <typename T>
 void kq_qmm_dispatch_mode(T *result, const T *x, const uint32_t *w,
                           const uint8_t *scales, const float16_t *biases, int M,
-                          int N, int K, Mode mode, bool transposed_w) {
+                          int N, int K, Mode mode, bool transposed_w,
+                          Layout layout = Layout::RowMajor) {
   switch (mode) {
   case Mode::Q6K:
     kq_qmm_dispatch_transpose<T, 6, 16, 16, false, false>(
-        result, x, w, scales, biases, M, N, K, transposed_w);
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   case Mode::Q4K:
     kq_qmm_dispatch_transpose<T, 4, 32, 8, true, false>(
-        result, x, w, scales, biases, M, N, K, transposed_w);
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   case Mode::Q5K:
     kq_qmm_dispatch_transpose<T, 5, 32, 8, true, false>(
-        result, x, w, scales, biases, M, N, K, transposed_w);
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   case Mode::Q3K:
     kq_qmm_dispatch_transpose<T, 3, 16, 16, false, false>(
-        result, x, w, scales, biases, M, N, K, transposed_w);
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   case Mode::IQ4NL:
     kq_qmm_dispatch_transpose<T, 4, 32, 1, false, true>(
-        result, x, w, scales, biases, M, N, K, transposed_w);
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   case Mode::IQ4XS:
     kq_qmm_dispatch_transpose<T, 4, 32, 8, false, true>(
-        result, x, w, scales, biases, M, N, K, transposed_w);
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   case Mode::IQ3S:
     kq_qmm_dispatch_transpose<T, 8, 32, 8, false, false>(
-        result, x, w, scales, biases, M, N, K, transposed_w);
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   }
 }
@@ -696,7 +833,7 @@ void kq_qmm_dispatch_mode(T *result, const T *x, const uint32_t *w,
 template <typename T>
 void kq_qmm_dispatch_typed(array &out, const array &x, const array &w,
                            const array &scales, const array &biases, Mode mode,
-                           bool transposed_w) {
+                           bool transposed_w, Layout layout) {
   int K = x.shape(-1);
   int M = x.ndim() > 1 ? x.shape(-2) : 1;
   int N = out.shape(-1);
@@ -717,24 +854,25 @@ void kq_qmm_dispatch_typed(array &out, const array &x, const array &w,
         w_ptr + elem_to_loc(i * w_els, w.shape(), w.strides()),
         scales_ptr + elem_to_loc(i * s_els, scales.shape(), scales.strides()),
         biases_ptr + elem_to_loc(i * b_els, biases.shape(), biases.strides()),
-        M, N, K, mode, transposed_w);
+        M, N, K, mode, transposed_w, layout);
   }
 }
 
 void kq_qmm_dispatch(array &out, const array &x, const array &w,
                      const array &scales, const array &biases, Mode mode,
-                     bool transposed_w) {
+                     bool transposed_w, Layout layout) {
   switch (x.dtype()) {
   case float32:
-    kq_qmm_dispatch_typed<float>(out, x, w, scales, biases, mode, transposed_w);
+    kq_qmm_dispatch_typed<float>(out, x, w, scales, biases, mode, transposed_w,
+                                 layout);
     break;
   case float16:
     kq_qmm_dispatch_typed<float16_t>(out, x, w, scales, biases, mode,
-                                     transposed_w);
+                                     transposed_w, layout);
     break;
   case bfloat16:
     kq_qmm_dispatch_typed<bfloat16_t>(out, x, w, scales, biases, mode,
-                                      transposed_w);
+                                      transposed_w, layout);
     break;
   default:
     break;
@@ -898,8 +1036,8 @@ void KQuantMatmul::eval_cpu(const std::vector<array> &inputs, array &out) {
       [out = array::unsafe_weak_copy(out), x = array::unsafe_weak_copy(x),
        w = array::unsafe_weak_copy(w), scales = array::unsafe_weak_copy(scales),
        biases = array::unsafe_weak_copy(biases), mode = mode_,
-       transpose = transpose_]() mutable {
-        kq_qmm_dispatch(out, x, w, scales, biases, mode, transpose);
+       transpose = transpose_, layout = layout_]() mutable {
+        kq_qmm_dispatch(out, x, w, scales, biases, mode, transpose, layout);
       });
 }
 

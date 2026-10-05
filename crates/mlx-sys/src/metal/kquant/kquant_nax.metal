@@ -30,11 +30,32 @@
       wm, \
       wn)
 
+// The Tiled64 layout ("_t64"): a 2-D weight with N % 64 == 0, so aligned and
+// unbatched only.
+#define instantiate_kquant_nax_tiled(mode, name, type, group_size, bits, super_ratio, has_min, bm, bn, bk, wm, wn) \
+  instantiate_kernel( \
+      #mode "_" #name "_t64_" #type "_gs_" #group_size "_b_" #bits "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_alN_true_batch_0", \
+      kquant_ ## name, \
+      type, \
+      group_size, \
+      bits, \
+      super_ratio, \
+      has_min, \
+      true, \
+      false, \
+      bm, \
+      bk, \
+      bn, \
+      wm, \
+      wn, \
+      true)
+
 #define instantiate_kquant_nax_all(mode, type, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, true, 1, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, true, 0, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, false, 1, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2) \
-  instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, false, 0, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2)
+  instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, false, 0, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2) \
+  instantiate_kquant_nax_tiled(mode, qmm_t_nax, type, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2)
 
 #define instantiate_kquant_nax_types(type) \
   instantiate_kquant_nax_all(q6k, type, 16, 6, 16, false) \

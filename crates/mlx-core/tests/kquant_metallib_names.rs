@@ -11,12 +11,16 @@
 
 use std::ffi::{CStr, c_char};
 
-/// 7 modes x 3 dtypes x 39 families, plus 4 bfloat16 qmv_sg8 kernels and the
-/// 2 sg8 prep kernels (group sizes 16 and 32).
-const BASE_NAMES: i64 = 7 * 3 * 39 + 4 + 2;
-/// 7 modes x 3 dtypes x qmm_t_nax {aligned, unaligned} x {batched, single},
-/// plus 7 bfloat16 qmm_m8_nax kernels.
-const NAX_NAMES: i64 = 7 * 3 * 4 + 7;
+/// 7 modes x 3 dtypes x (39 row-major families + 13 Tiled64 "_t64" families:
+/// qmv_t64 at 8 and 16 k-splits, qmv_wide nv 1..8 at 8 k-lanes, nv 1 at 4
+/// k-lanes, qmm_t, qmm_t_splitk),
+/// plus 4 bfloat16 qmv_sg8 kernels and the 2 sg8 prep kernels (group sizes
+/// 16 and 32).
+const BASE_NAMES: i64 = 7 * 3 * (39 + 13) + 4 + 2;
+/// 7 modes x 3 dtypes x (qmm_t_nax {aligned, unaligned} x {batched, single}
+/// plus the aligned, single Tiled64 qmm_t_nax_t64), plus 7 bfloat16
+/// qmm_m8_nax kernels per layout (row-major and Tiled64).
+const NAX_NAMES: i64 = 7 * 3 * (4 + 1) + 7 * 2;
 
 struct Check {
     base: i64,

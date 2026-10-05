@@ -962,6 +962,12 @@ mlx_array* mlx_dequantize(
             dtype = to_mlx_dtype(out_dtype);
         }
 
+        if (auto layout = mlx::core::kquant::parse_mode_layout(mode_str);
+            layout && layout->layout != mlx::core::kquant::Layout::RowMajor) {
+            throw std::invalid_argument(
+                "[dequantize] No dequantize for the " + std::string(mlx::core::kquant::kTiledSuffix) +
+                " K-quant layout; dequantize the row-major arrays.");
+        }
         auto kmode = mlx::core::kquant::parse_mode(mode_str);
         auto result = kmode
             ? mlx::core::kquant::dequantize(q_arr, s_arr, b_opt, gs, b, *kmode, dtype)
@@ -1316,16 +1322,19 @@ mlx_array* mlx_quantized_matmul(
 
         std::string mode_str(mode ? mode : "affine");
 
-        auto kmode = mlx::core::kquant::parse_mode(mode_str);
+        // "q4k" or "q4k@t64" (the Tiled64 weight layout, mlx_kquant.h).
+        auto kmode = mlx::core::kquant::parse_mode_layout(mode_str);
         mlx::core::array result = kmode
             ? mlx::core::kquant::quantized_matmul(
                   *x_arr, *w_arr, *scales_arr, biases_opt, transpose,
                   std::optional<int>(group_size), std::optional<int>(bits),
-                  *kmode)
+                  kmode->mode, {}, kmode->layout)
             : mlx::core::quantized_matmul(
                   *x_arr, *w_arr, *scales_arr, biases_opt, transpose,
                   std::optional<int>(group_size), std::optional<int>(bits),
                   mode_str);
+        // The portable prefill GEMM reads row-major bytes only (it parses the
+        // bare mode, so a tiled mode string never matches).
         if (auto portable = mlx::core::portable_kquant_matmul(
                 *x_arr, *w_arr, *scales_arr, biases_opt, transpose, group_size, bits, mode_str))
             result = std::move(*portable);
@@ -1405,6 +1414,12 @@ mlx_array* mlx_gather_qmm(
 
         std::string mode_str(mode ? mode : "affine");
 
+        if (auto layout = mlx::core::kquant::parse_mode_layout(mode_str);
+            layout && layout->layout != mlx::core::kquant::Layout::RowMajor) {
+            throw std::invalid_argument(
+                "[gather_qmm] No gather for the " + std::string(mlx::core::kquant::kTiledSuffix) +
+                " K-quant layout; experts stay row-major.");
+        }
         auto kmode = mlx::core::kquant::parse_mode(mode_str);
         mlx::core::array result = kmode
             ? mlx::core::kquant::gather_qmm(
