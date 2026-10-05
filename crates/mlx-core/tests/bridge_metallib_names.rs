@@ -12,13 +12,15 @@
 
 use std::ffi::{CStr, CString, c_char};
 
-/// one_pass, 2pass_1, verify_2pass_1.
-const SEGMENTED_NAMES: i64 = 3;
+/// one_pass, 2pass_1, verify_2pass_1, verify_tile_2pass_1.
+const SEGMENTED_NAMES: i64 = 4;
 /// Partition counts the vector-SDPA policy returns: 32, 64, 128, 256, 512, 1024.
 const PARTITIONS: i64 = 6;
+/// Tile sizes the tile planner returns: 16, 32.
+const TILE_SIZES: i64 = 2;
 /// one_pass x causal {false, true}; 2pass_1 x causal x partitions; causal
-/// verify x partitions x gqa 1..=32 x rows 2..=8.
-const SEGMENTED_PIPELINES: i64 = 2 + 2 * PARTITIONS + PARTITIONS * 32 * 7;
+/// verify x partitions x gqa 1..=32 x rows 2..=8; verify tile x tile sizes.
+const SEGMENTED_PIPELINES: i64 = 2 + 2 * PARTITIONS + PARTITIONS * 32 * 7 + TILE_SIZES;
 /// qmv_wide tile widths 2..=8.
 const AFFINE_MIXED_NAMES: i64 = 7;
 

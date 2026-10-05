@@ -2641,6 +2641,355 @@ mod tests {
         assert!(!verify_plan(8, 6, 0, caps, caps).0, "partitions < 32");
     }
 
+    /// Tile planner over synthetic limits: (supported, tile keys, threads,
+    /// threadgroup bytes, partitions for `total` keys).
+    fn tile_plan(
+        rows: i32,
+        gqa: i32,
+        total: i32,
+        blocks_override: i32,
+        stage1: (usize, usize, usize),
+        device_memory: usize,
+        stage2: (usize, usize, usize),
+    ) -> (bool, u32, u32, u32, u32) {
+        let mut out = [0u32; 4];
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_verify_tile_plan(
+                rows,
+                gqa,
+                total,
+                blocks_override,
+                stage1.0,
+                stage1.1,
+                stage1.2,
+                device_memory,
+                stage2.0,
+                stage2.1,
+                stage2.2,
+                out.as_mut_ptr(),
+            )
+        } == 1;
+        (supported, out[0], out[1], out[2], out[3])
+    }
+
+    /// The simdgroup-matrix verify kernel: 2 simdgroups per 8 queries of
+    /// M = gqa x rows, a K/V tile of `tile_n x (256 + 8)` BF16 within three
+    /// quarters of the device's threadgroup memory limit plus the score
+    /// exchange (simdgroups x 32 x tile_n / 4 floats), and contiguous
+    /// partitions of about 8 tiles (32..=1024, multiples of 32).
+    #[test]
+    fn segmented_verify_tile_planner_follows_device_limits() {
+        let caps = (32, 1024, 0);
+        let kib = 1024;
+        // 24 q heads / 4 kv heads, 8 rows: M = 48 -> 12 simdgroups.
+        assert_eq!(
+            tile_plan(8, 6, 32776, 0, caps, 32 * kib, caps),
+            (true, 32, 384, 32 * 264 * 2 + 12 * 32 * 8 * 4, 160)
+        );
+        assert_eq!(tile_plan(8, 6, 95, 0, caps, 32 * kib, caps).4, 32);
+        assert_eq!(tile_plan(8, 6, 6227, 0, caps, 32 * kib, caps).4, 32);
+        assert_eq!(tile_plan(8, 6, 16392, 0, caps, 32 * kib, caps).4, 96);
+        assert_eq!(tile_plan(8, 6, 1 << 20, 0, caps, 32 * kib, caps).4, 1024);
+        // MLX_SDPA_BLOCKS rounds up to 32, as the vector policy.
+        assert_eq!(tile_plan(8, 6, 32776, 100, caps, 32 * kib, caps).4, 128);
+        assert_eq!(tile_plan(8, 6, 32776, 4096, caps, 32 * kib, caps).4, 1024);
+        // The tile follows the memory limit: 16 KiB -> 16 keys; 32 keys is
+        // the ceiling (64 measured slower); 8 KiB fits nothing.
+        assert_eq!(tile_plan(8, 6, 32776, 0, caps, 16 * kib, caps).1, 16);
+        assert_eq!(tile_plan(8, 6, 32776, 0, caps, 64 * kib, caps).1, 32);
+        assert!(!tile_plan(8, 6, 32776, 0, caps, 8 * kib, caps).0);
+        // M must be a multiple of 8 and the block at least 2 rows.
+        assert!(tile_plan(4, 6, 1000, 0, caps, 32 * kib, caps).0);
+        assert!(!tile_plan(5, 6, 1000, 0, caps, 32 * kib, caps).0);
+        assert!(!tile_plan(1, 8, 1000, 0, caps, 32 * kib, caps).0);
+        assert!(tile_plan(2, 8, 1000, 0, caps, 32 * kib, caps).0);
+        // 32 x 8 = 256 queries need 64 simdgroups: over 1024 threads. Wider
+        // exchanges shrink the tile: 16 simdgroups (gqa 8) and 32 (gqa 16)
+        // take 16 keys.
+        assert!(!tile_plan(8, 32, 1000, 0, caps, 32 * kib, caps).0);
+        assert_eq!(
+            tile_plan(8, 16, 1000, 0, caps, 32 * kib, caps),
+            (true, 16, 1024, 16 * 264 * 2 + 32 * 32 * 4 * 4, 32)
+        );
+        assert_eq!(tile_plan(8, 8, 1000, 0, caps, 32 * kib, caps).1, 16);
+        assert_eq!(tile_plan(8, 8, 1000, 0, caps, 32 * kib, caps).2, 512);
+        // The pipeline's own limits rule: width, threads, static memory.
+        assert!(!tile_plan(8, 6, 1000, 0, (16, 1024, 0), 32 * kib, caps).0);
+        assert!(!tile_plan(8, 6, 1000, 0, (32, 256, 0), 32 * kib, caps).0);
+        assert_eq!(
+            tile_plan(8, 6, 1000, 0, (32, 1024, 12 * kib), 32 * kib, caps).1,
+            16
+        );
+        assert!(!tile_plan(8, 6, 1000, 0, (32, 1024, 26 * kib), 32 * kib, caps).0);
+        assert!(!tile_plan(8, 6, 1000, 0, caps, 32 * kib, (32, 512, 0)).0);
+    }
+
+    /// `[B, H, prefix, D]` inputs for a verify block of `rows` over `prefix`
+    /// keys from `[B, H, capacity, D]` caches with NaN past the prefix.
+    #[cfg(target_os = "macos")]
+    struct TileCase {
+        q: MxArray,
+        pk: MxArray,
+        pv: MxArray,
+        nk: MxArray,
+        nv: MxArray,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tile_case(
+        base_k: &MxArray,
+        base_v: &MxArray,
+        q_heads: i64,
+        rows: i64,
+        prefix: i64,
+        salt: u32,
+        exponent_shift: u16,
+    ) -> Result<TileCase> {
+        const D: i64 = 256;
+        let kv_heads = base_k.shape_at(1)?;
+        let mut q_bits = deterministic_bf16((q_heads * rows * D) as usize, salt);
+        // Adding to the exponent scales exactly: sharper softmax, larger
+        // score magnitudes and more running-max changes between tiles.
+        q_bits.iter_mut().for_each(|b| *b += exponent_shift << 7);
+        Ok(TileCase {
+            q: MxArray::from_bfloat16(&q_bits, &[1, q_heads, rows, D])?,
+            pk: nan_tailed_prefix(base_k, prefix)?,
+            pv: nan_tailed_prefix(base_v, prefix)?,
+            nk: MxArray::from_bfloat16(
+                &deterministic_bf16((kv_heads * rows * D) as usize, salt ^ 0x5a5a),
+                &[1, kv_heads, rows, D],
+            )?,
+            nv: MxArray::from_bfloat16(
+                &deterministic_bf16((kv_heads * rows * D) as usize, salt ^ 0xa5a5),
+                &[1, kv_heads, rows, D],
+            )?,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn strict_tile_for_test(c: &TileCase) -> Result<MxArray> {
+        let handle = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_forward_tile(
+                c.q.as_raw_ptr(),
+                c.pk.as_raw_ptr(),
+                c.pv.as_raw_ptr(),
+                c.nk.as_raw_ptr(),
+                c.nv.as_raw_ptr(),
+                0.0625,
+            )
+        };
+        MxArray::from_handle(handle, "strict tile segmented SDPA test")
+    }
+
+    /// BF16 spacing at `x` (subnormals share the smallest normal spacing).
+    fn bf16_ulp(x: f32) -> f32 {
+        let exponent = x.abs().max(f32::from_bits(0x0080_0000)).log2().floor();
+        2f32.powf(exponent - 7.0)
+    }
+
+    /// Max and mean |diff| in BF16 ulps of the output's magnitude (its
+    /// largest |expected|). The tile route rounds P to BF16, so its error
+    /// is absolute at that scale rather than relative per element.
+    fn tile_error(got: &[f32], expected: &[f32]) -> (f32, f64) {
+        assert_eq!(got.len(), expected.len());
+        let magnitude = expected.iter().fold(0f32, |m, e| m.max(e.abs()));
+        let ulp = bf16_ulp(magnitude);
+        let mut max_diff = 0f32;
+        let mut sum = 0f64;
+        for (&g, &e) in got.iter().zip(expected) {
+            assert!(g.is_finite(), "non-finite tile output {g}");
+            let diff = (g - e).abs();
+            max_diff = max_diff.max(diff);
+            sum += f64::from(diff);
+        }
+        (max_diff / ulp, sum / got.len() as f64 / f64::from(ulp))
+    }
+
+    /// The tile route sums in another order (fp32 MMAs, BF16 P), so it is
+    /// not bit-identical to the vector route; it must stay within 2 BF16
+    /// ulps of it over every prefix boundary and block width, with random
+    /// and large-magnitude (peaked softmax) scores, on NaN-tailed caches
+    /// and the production [B, T, H, D] layout. Runs by default on Metal.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn segmented_verify_tile_matches_vector_route_within_tolerance() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            assert!(
+                !crate::test_support::metal_required(),
+                "MLX_TEST_REQUIRE_METAL=1 but no Metal device"
+            );
+            eprintln!("SKIP tile verify tolerance: no Metal device");
+            return Ok(());
+        }
+        const D: i64 = 256;
+        const HKV: i64 = 4;
+        const CAPACITY: i64 = 32_768;
+        let mut plan = [0u32; 5];
+        let supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, HKV as i32, 8, 32_776, plan.as_mut_ptr())
+        };
+        if supported != 1 {
+            assert!(
+                !crate::test_support::metal_required(),
+                "MLX_TEST_REQUIRE_METAL=1 but the tile route is unsupported ({supported})"
+            );
+            eprintln!("SKIP tile verify tolerance: this device cannot launch the tile kernel");
+            return Ok(());
+        }
+        eprintln!(
+            "tile plan 24/4 rows 8: tile_n={} threads={} tg_bytes={} partitions@32776={} \
+             pipeline_max_threads={}",
+            plan[0], plan[1], plan[2], plan[3], plan[4]
+        );
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * CAPACITY * D) as usize, 0x1234_5678),
+            &[1, HKV, CAPACITY, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((HKV * CAPACITY * D) as usize, 0x8765_4321),
+            &[1, HKV, CAPACITY, D],
+        )?;
+        base_k.eval();
+        base_v.eval();
+        // The segmented primitive rejects an empty prefix (the Rust caller
+        // concatenates there), so prefix 0 has no tile route to compare.
+        let prefixes = [
+            1_i64, 7, 31, 32, 33, 87, 1023, 1024, 4095, 4096, 6219, 32768,
+        ];
+        // gqa 6 tiles rows 4 and 8 (M % 8), gqa 8 every width 2..=8.
+        let layouts: [(i64, Vec<i64>); 2] = [(24, vec![4, 8]), (32, (2..=8).collect())];
+        let mut worst = (0f32, 0f64);
+        let mut checked = 0usize;
+        for (q_heads, rows_list) in &layouts {
+            for &rows in rows_list {
+                for &prefix in &prefixes {
+                    // Random, sharp (x8) and adversarial (x64: scores in
+                    // the tens, a few keys own the softmax).
+                    for (set, shift) in [0u16, 3, 6].into_iter().enumerate() {
+                        let salt =
+                            0x1357_9bdf ^ (prefix as u32 * 31) ^ (rows as u32) ^ (set as u32);
+                        let c = tile_case(&base_k, &base_v, *q_heads, rows, prefix, salt, shift)?;
+                        let got = strict_tile_for_test(&c)?.to_float32()?;
+                        let expected = segmented_or_concat_split_for_test(
+                            &c.q, &c.pk, &c.pv, &c.nk, &c.nv, true,
+                        )?
+                        .to_float32()?;
+                        let (max_ulps, mean_ulps) = tile_error(got.as_ref(), expected.as_ref());
+                        assert!(
+                            max_ulps <= 2.0 && mean_ulps <= 0.25,
+                            "q_heads={q_heads} rows={rows} prefix={prefix} set={set}: \
+                             max {max_ulps} / mean {mean_ulps:.4} BF16 ulps of the output magnitude"
+                        );
+                        worst.0 = worst.0.max(max_ulps);
+                        worst.1 = worst.1.max(mean_ulps);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        // Production layout: [B, T, H, D] projections transposed into
+        // [B, H, T, D] views, batch 2, the prefix from a [B, P, H, D] cache.
+        for prefix in [87_i64, 4096, 32766] {
+            let q = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 32 * D) as usize, 0x90a0_b0c0),
+                &[2, 8, 32, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let nk = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 4 * D) as usize, 0xd0e0_f001),
+                &[2, 8, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let nv = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * 8 * 4 * D) as usize, 0x1234_abcd),
+                &[2, 8, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let pk = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * prefix * 4 * D) as usize, 0x1020_3040),
+                &[2, prefix, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let pv = MxArray::from_bfloat16(
+                &deterministic_bf16((2 * prefix * 4 * D) as usize, 0x5060_7080),
+                &[2, prefix, 4, D],
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+            let c = TileCase { q, pk, pv, nk, nv };
+            let got = strict_tile_for_test(&c)?.to_float32()?;
+            let expected =
+                segmented_or_concat_split_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, true)?
+                    .to_float32()?;
+            let (max_ulps, mean_ulps) = tile_error(got.as_ref(), expected.as_ref());
+            assert!(
+                max_ulps <= 2.0 && mean_ulps <= 0.25,
+                "production layout prefix={prefix}: max {max_ulps} / mean {mean_ulps:.4} BF16 ulps"
+            );
+            worst.0 = worst.0.max(max_ulps);
+            worst.1 = worst.1.max(mean_ulps);
+            checked += 1;
+        }
+        eprintln!(
+            "tile verify: {checked} blocks within tolerance; worst max {} / mean {:.4} BF16 ulps \
+             of the output magnitude",
+            worst.0, worst.1
+        );
+        Ok(())
+    }
+
+    /// The strict vector entry never dispatches the tile kernel; the tile
+    /// entry dispatches it exactly once per call (plus MLX's reduction).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn segmented_verify_tile_route_is_counted() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        const D: i64 = 256;
+        let mut plan = [0u32; 5];
+        if unsafe { mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, 4, 8, 1008, plan.as_mut_ptr()) }
+            != 1
+        {
+            eprintln!("SKIP tile route counters: this device cannot launch the tile kernel");
+            return Ok(());
+        }
+        let base_k = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * 1100 * D) as usize, 1),
+            &[1, 4, 1100, D],
+        )?;
+        let base_v = MxArray::from_bfloat16(
+            &deterministic_bf16((4 * 1100 * D) as usize, 2),
+            &[1, 4, 1100, D],
+        )?;
+        let c = tile_case(&base_k, &base_v, 24, 8, 1000, 3, 0)?;
+        let count = |family: &std::ffi::CStr| unsafe {
+            mlx_sys::mlx_test_kquant_family_count(family.as_ptr())
+        };
+        // Enabling the counters clears them.
+        unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+        let tile = strict_tile_for_test(&c).and_then(|o| o.to_float32());
+        let tile_counts = [
+            count(c"segmented_sdpa_route_tile"),
+            count(c"segmented_sdpa_verify_tile_2pass_1"),
+            count(c"segmented_sdpa_2pass_2"),
+        ];
+        unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+        tile?;
+        assert_eq!(tile_counts, [1, 1, 1], "tile route counters");
+        // Its own counting window: the vector entry never reaches the tile.
+        let (_, route) = strict_segmented_routed(&c.q, &c.pk, &c.pv, &c.nk, &c.nv)?;
+        let after_vector = [
+            count(c"segmented_sdpa_route_tile"),
+            count(c"segmented_sdpa_verify_tile_2pass_1"),
+        ];
+        assert_eq!(
+            after_vector,
+            [0, 0],
+            "vector entry (route {route}) touched the tile route"
+        );
+        Ok(())
+    }
+
     /// MLX's vector-SDPA reduction policy per device class
     /// (`mlx_segmented_sdpa_plan.h`), used to predict the verify route
     /// independently of the C++ planner: (two-pass, partitions).
@@ -2992,7 +3341,12 @@ mod tests {
     }
 
     /// The route is chosen from the real prefix at eval time, so one shapeless
-    /// trace must stay exact while replays cross every route boundary.
+    /// trace must stay exact while replays cross every route boundary. The
+    /// production entry takes the tile route from `kSegmentedTileMinKeys`
+    /// keys (rows 8 here; rows 6 and 7 are not multiples of 8 queries): the
+    /// replay must equal the eager production call bit for bit on either
+    /// side, and the vector chunks bit for bit on the vector routes or within
+    /// the tile tolerance on the tile route.
     #[test]
     #[ignore = "requires coordinated Metal GPU validation"]
     #[cfg(target_os = "macos")]
@@ -3045,28 +3399,50 @@ mod tests {
                 )?])
             };
             let mut seen = [0usize; 4];
+            let mut seen_tile = 0usize;
             for &prefix in &prefixes {
                 let pk = nan_tailed_prefix(&base_k, prefix)?;
                 let pv = nan_tailed_prefix(&base_v, prefix)?;
+                // Enabling the counters clears them; the replay evaluates on
+                // this thread.
+                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
                 let compiled =
-                    invoke_compiled_graph(fn_id, &[&q, &pk, &pv, &nk, &nv], 1, true, &mut builder)?
-                        .ok_or_else(|| Error::from_reason("compiled invoke failed"))?;
-                let compiled = compiled[0].to_float32()?;
-                let eager = strict_segmented_for_test(&q, &pk, &pv, &nk, &nv)?.to_float32()?;
+                    invoke_compiled_graph(fn_id, &[&q, &pk, &pv, &nk, &nv], 1, true, &mut builder)
+                        .and_then(|out| {
+                            out.ok_or_else(|| Error::from_reason("compiled invoke failed"))
+                        })
+                        .and_then(|out| out[0].to_float32());
+                let tile_route = unsafe {
+                    mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_route_tile".as_ptr())
+                } > 0;
+                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                let compiled = compiled?;
+                let eager =
+                    segmented_verify_sdpa(&q, &pk, &pv, &nk, &nv, 0.0625, true)?.to_float32()?;
                 let chunks = segmented_or_concat_split_for_test(&q, &pk, &pv, &nk, &nv, true)?
                     .to_float32()?;
                 let (route, _) = device_verify_route(HQ, HKV, rows, prefix);
-                seen[route.max(0) as usize] += 1;
                 assert_eq!(
                     compiled.as_ref(),
                     eager.as_ref(),
-                    "rows={rows}, prefix={prefix}, route={route}"
+                    "compiled vs eager: rows={rows}, prefix={prefix}, tile={tile_route}"
                 );
-                assert_eq!(
-                    compiled.as_ref(),
-                    chunks.as_ref(),
-                    "rows={rows}, prefix={prefix}, route={route}"
-                );
+                if tile_route {
+                    seen_tile += 1;
+                    let (max_ulps, mean_ulps) = tile_error(compiled.as_ref(), chunks.as_ref());
+                    assert!(
+                        max_ulps <= 2.0 && mean_ulps <= 0.25,
+                        "rows={rows}, prefix={prefix}: tile replay max {max_ulps} / mean \
+                         {mean_ulps:.4} ulps"
+                    );
+                } else {
+                    seen[route.max(0) as usize] += 1;
+                    assert_eq!(
+                        compiled.as_ref(),
+                        chunks.as_ref(),
+                        "rows={rows}, prefix={prefix}, route={route}"
+                    );
+                }
             }
             assert_eq!(
                 builds.get(),
@@ -3074,9 +3450,27 @@ mod tests {
                 "rows={rows}: the prefix must stay out of the trace key"
             );
             eprintln!(
-                "rows={rows} replay routes one_pass={} unified={} split={}",
+                "rows={rows} replay routes one_pass={} unified={} split={} tile={seen_tile}",
                 seen[1], seen[2], seen[3]
             );
+            let mut plan = [0u32; 5];
+            let tile_supported = unsafe {
+                mlx_sys::mlx_segmented_sdpa_test_tile_plan(
+                    HQ as i32,
+                    HKV as i32,
+                    rows as i32,
+                    2048,
+                    plan.as_mut_ptr(),
+                )
+            } == 1;
+            if tile_supported && std::env::var_os("MLX_SDPA_VERIFY_TILE").is_none() {
+                // Prefixes 1010..=1030 straddle the 1024-key crossover.
+                assert!(seen_tile > 0, "rows={rows}: no replay took the tile route");
+                assert!(
+                    seen[1] + seen[2] + seen[3] > 0,
+                    "rows={rows}: no replay took a vector route"
+                );
+            }
         }
         Ok(())
     }
@@ -3101,7 +3495,20 @@ mod tests {
         const D: i64 = 256;
         const SETS: usize = 4;
         const SAMPLES: usize = 24;
-        for prefix in [87_i64, 6219, 32768] {
+        // Split chunks, the one-call vector route and the simdgroup-matrix
+        // tile route (skipped where this device cannot launch it).
+        const ROUTES: [&str; 3] = ["split", "one_call", "tile"];
+        let mut plan = [0u32; 5];
+        let tile_supported = unsafe {
+            mlx_sys::mlx_segmented_sdpa_test_tile_plan(24, 4, 8, 32_776, plan.as_mut_ptr())
+        } == 1;
+        if tile_supported {
+            eprintln!("tile pipeline maxTotalThreadsPerThreadgroup={}", plan[4]);
+        } else {
+            eprintln!("tile route unsupported on this device; timing the vector routes only");
+        }
+        let routes = if tile_supported { 3 } else { 2 };
+        for prefix in [87_i64, 1024, 6219, 16384, 32768] {
             let mut cases = Vec::with_capacity(SETS);
             for i in 0..SETS {
                 let salt = 0x1234_5678u32.wrapping_add(i as u32 * 29);
@@ -3125,53 +3532,72 @@ mod tests {
                     &deterministic_bf16((4 * 8 * D) as usize, salt ^ 0x78),
                     &[1, 4, 8, D],
                 )?;
-                cases.push((q, pk, pv, nk, nv));
+                cases.push(TileCase { q, pk, pv, nk, nv });
             }
-            let run = |i: usize, one_call: bool| -> Result<MxArray> {
-                let (q, pk, pv, nk, nv) = &cases[i % SETS];
-                let out = if one_call {
-                    strict_segmented_for_test(q, pk, pv, nk, nv)?
-                } else {
-                    segmented_or_concat_split_for_test(q, pk, pv, nk, nv, true)?
+            let run = |i: usize, route: usize| -> Result<MxArray> {
+                let c = &cases[i % SETS];
+                let out = match route {
+                    0 => {
+                        segmented_or_concat_split_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv, true)?
+                    }
+                    1 => strict_segmented_for_test(&c.q, &c.pk, &c.pv, &c.nk, &c.nv)?,
+                    _ => strict_tile_for_test(c)?,
                 };
                 MxArray::eval_arrays(&[&out])?;
                 Ok(out)
             };
             for i in 0..SETS * 2 {
-                let before = run(i, false)?.to_float32()?;
-                let after = run(i, true)?.to_float32()?;
+                let before = run(i, 0)?.to_float32()?;
+                let after = run(i, 1)?.to_float32()?;
                 assert_eq!(before.as_ref(), after.as_ref(), "prefix={prefix}, set={i}");
+                if tile_supported {
+                    let tile = run(i, 2)?.to_float32()?;
+                    let (max_ulps, mean_ulps) = tile_error(tile.as_ref(), before.as_ref());
+                    assert!(
+                        max_ulps <= 2.0 && mean_ulps <= 0.25,
+                        "prefix={prefix}, set={i}: tile max {max_ulps} / mean {mean_ulps:.4} ulps"
+                    );
+                }
             }
-            let mut split_ms = Vec::with_capacity(SAMPLES);
-            let mut one_call_ms = Vec::with_capacity(SAMPLES);
+            let mut ms = vec![Vec::with_capacity(SAMPLES); routes];
+            let mut tile_plan = [0u32; 5];
+            if tile_supported {
+                unsafe {
+                    mlx_sys::mlx_segmented_sdpa_test_tile_plan(
+                        24,
+                        4,
+                        8,
+                        (prefix + 8) as i32,
+                        tile_plan.as_mut_ptr(),
+                    )
+                };
+            }
             for i in 0..SAMPLES {
-                // Alternate order so the candidate is not always the second
-                // reader of a just-warmed prefix. Rotate four independent KV sets.
-                for one_call in if i % 2 == 0 {
-                    [false, true]
-                } else {
-                    [true, false]
-                } {
+                // Rotate the order so no route is always the second reader of
+                // a just-warmed prefix. Rotate four independent KV sets.
+                for k in 0..routes {
+                    let route = (k + i) % routes;
                     let started = Instant::now();
-                    let out = run(i, one_call)?;
-                    let ms = started.elapsed().as_secs_f64() * 1e3;
-                    if one_call {
-                        one_call_ms.push(ms);
-                    } else {
-                        split_ms.push(ms);
-                    }
+                    let out = run(i, route)?;
+                    ms[route].push(started.elapsed().as_secs_f64() * 1e3);
                     drop(out);
                 }
             }
-            split_ms.sort_by(f64::total_cmp);
-            one_call_ms.sort_by(f64::total_cmp);
-            eprintln!(
-                "segmented prefix={prefix} q=8 hq=24 hkv=4 sets={SETS} samples={SAMPLES} split_min_ms={:.4} split_median_ms={:.4} one_call_min_ms={:.4} one_call_median_ms={:.4}",
-                split_ms[0],
-                split_ms[SAMPLES / 2],
-                one_call_ms[0],
-                one_call_ms[SAMPLES / 2]
-            );
+            let mut line =
+                format!("segmented prefix={prefix} q=8 hq=24 hkv=4 sets={SETS} samples={SAMPLES}");
+            for (route, samples) in ms.iter_mut().enumerate() {
+                samples.sort_by(f64::total_cmp);
+                line += &format!(
+                    " {0}_min_ms={1:.4} {0}_median_ms={2:.4}",
+                    ROUTES[route],
+                    samples[0],
+                    samples[SAMPLES / 2]
+                );
+            }
+            if tile_supported {
+                line += &format!(" tile_partitions={}", tile_plan[3]);
+            }
+            eprintln!("{line}");
         }
         Ok(())
     }

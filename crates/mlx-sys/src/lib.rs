@@ -742,7 +742,9 @@ unsafe extern "C-unwind" {
         causal: bool,
     ) -> *mut mlx_array;
 
-    // Strict test entry: null on unsupported segmented dispatch; no concat fallback.
+    // Strict test entry: null on unsupported segmented dispatch; no concat
+    // fallback. Always the vector routes (bit-identical to MLX's vector
+    // SDPA), whatever MLX_SDPA_VERIFY_TILE says.
     pub fn mlx_segmented_sdpa_test_forward(
         q: *mut mlx_array,
         prefix_k: *mut mlx_array,
@@ -752,6 +754,49 @@ unsafe extern "C-unwind" {
         scale: f32,
         causal: bool,
     ) -> *mut mlx_array;
+
+    // Strict test entry for the simdgroup-matrix tile route of a causal
+    // verify block: null (message on stderr) when this device or block
+    // cannot take it.
+    pub fn mlx_segmented_sdpa_test_forward_tile(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY: the tile dispatch this device plans for a causal block:
+    /// `out[0..5]` = tile keys, stage-1 threads, threadgroup bytes,
+    /// partitions, the tile pipeline's maxTotalThreadsPerThreadgroup.
+    /// 1 supported, 0 unsupported, -1 without Metal / on error.
+    pub fn mlx_segmented_sdpa_test_tile_plan(
+        q_heads: i32,
+        kv_heads: i32,
+        rows: i32,
+        total_length: i32,
+        out: *mut u32,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: the tile planner over synthetic
+    /// pipeline limits; `out` as `mlx_segmented_sdpa_test_tile_plan`, with
+    /// the partition count for `total_length` keys under `blocks_override`
+    /// (MLX_SDPA_BLOCKS, 0 = policy).
+    pub fn mlx_segmented_sdpa_test_verify_tile_plan(
+        rows: i32,
+        gqa_factor: i32,
+        total_length: i32,
+        blocks_override: i32,
+        stage1_width: usize,
+        stage1_max_threads: usize,
+        stage1_static_memory: usize,
+        device_max_memory: usize,
+        stage2_width: usize,
+        stage2_max_threads: usize,
+        stage2_static_memory: usize,
+        out: *mut u32,
+    ) -> i32;
 
     // Widest query chunk both segmented launches support for `gqa_factor`:
     // 0 when segmented SDPA is not supported here (the caller takes
