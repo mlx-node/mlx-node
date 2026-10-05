@@ -1,0 +1,30 @@
+mlx-node contains the third-party material below, which keeps its own license.
+
+Splash (https://github.com/incoai/splash)
+
+The M = 8 K-quant tensor-op kernel in
+crates/mlx-sys/src/metal/kquant/kquant_m8_nax.h (compiled into
+paged_attn.metallib by crates/mlx-sys/src/metal/kquant/kquant_m8_nax.metal)
+and its host-side K split rule in crates/mlx-sys/src/mlx_kquant_metal.cpp
+(qmm_m8_nax_splits) are ported from Splash's
+runtime/metal/kernels/common/gguf_staged.h,
+runtime/metal/kernels/common/gguf_staged_tile.h,
+runtime/metal/kernels/common/split_reduce.h,
+runtime/metal/kernels/shared/gguf_linear.metal (the staged decode tile) and
+runtime/ops/LinearGguf.cpp (decodeSplits), with the per-format dequantization
+rewritten for mlx-node's weight layout. Splash's LICENSE is the Apache License,
+Version 2.0, whose copyright line it leaves as the template text:
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

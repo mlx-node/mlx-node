@@ -1,7 +1,7 @@
 // Metal dispatch for the K-quant primitives. The kernel choice, tile sizes and
 // launch geometry mirror MLX's affine dispatcher in
 // mlx/backend/metal/quantized.cpp; the kernels are prebuilt into
-// paged_attn.metallib from metal/kquant/{kquant,kquant_nax}.metal.
+// paged_attn.metallib from metal/kquant/{kquant,kquant_nax,kquant_m8_nax}.metal.
 
 #include "mlx_kquant.h"
 #include "mlx_test_counters.h"
@@ -19,10 +19,15 @@
 #include "mlx/utils.h"
 #include "mlx_paged_metallib.h"
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 
 namespace mlx::core::kquant {
 
@@ -97,6 +102,11 @@ std::string qmv_wide(Mode m, Dtype t, int vecs_per_tg, bool batched) {
   return name;
 }
 std::string qmv_sg8(Mode m) { return base(m, "qmv_sg8", kSg8Type); }
+// qmm_m8_nax: M = 8 bfloat16 on the tensor op, every mode; 64-column tiles
+// and at most 8 K splits (kquant_m8_nax.h).
+constexpr int kM8TileCols = 64;
+constexpr int kM8MaxSplits = 8;
+std::string qmm_m8_nax(Mode m) { return base(m, "qmm_m8_nax", kSg8Type); }
 std::string qmv_sg8_prep(int group_size) {
   std::string name;
   concatenate(name, "kquant_qmv_sg8_prep_", type_string(kSg8Type), "_gs_",
@@ -182,6 +192,9 @@ std::vector<KernelName> metal_kernel_names() {
       add(gather_qmm_rhs(m, t, false));
       add(dequantize(m, t));
     }
+  }
+  for (Mode m : kModes) {
+    add(qmm_m8_nax(m), true);
   }
   std::vector<int> prep_group_sizes;
   for (Mode m : kModes) {
@@ -446,6 +459,179 @@ void qmv_sg8(const Operands &o, int N, int K) {
   enc.set_bytes(K, 6);
   enc.set_bytes(N, 7);
   enc.dispatch_threadgroups(MTL::Size(N / 32, 1, 1), MTL::Size(128, 1, 1));
+}
+
+// GPU cores from the IORegistry `gpu-core-count` of the accelerator entry
+// behind the Metal device (its registry ID, or an ancestor up to 4 levels;
+// the first IOAccelerator service as the fallback). Metal itself does not
+// expose the count. When nothing publishes it, 8: the smallest Apple
+// silicon GPUs have 7 to 10, so the split rule errs towards fewer splits.
+int gpu_core_count(metal::Device &d) {
+  static const int cores = [&d]() {
+    int count = 0;
+    auto read = [&count](io_registry_entry_t entry) {
+      if (!entry) {
+        return false;
+      }
+      CFTypeRef value = IORegistryEntryCreateCFProperty(
+          entry, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+      if (value) {
+        int64_t number = 0;
+        if (CFGetTypeID(value) == CFNumberGetTypeID() &&
+            CFNumberGetValue(static_cast<CFNumberRef>(value),
+                             kCFNumberSInt64Type, &number) &&
+            number > 0 && number <= 4096) {
+          count = static_cast<int>(number);
+        }
+        CFRelease(value);
+      }
+      return count != 0;
+    };
+    io_registry_entry_t entry = IOServiceGetMatchingService(
+        kIOMainPortDefault,
+        IORegistryEntryIDMatching(d.mtl_device()->registryID()));
+    for (int depth = 0; entry && depth < 4 && !read(entry); ++depth) {
+      io_registry_entry_t parent = MACH_PORT_NULL;
+      if (IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent) !=
+          KERN_SUCCESS) {
+        parent = MACH_PORT_NULL;
+      }
+      IOObjectRelease(entry);
+      entry = parent;
+    }
+    if (entry) {
+      IOObjectRelease(entry);
+    }
+    if (!count) {
+      io_registry_entry_t accelerator = IOServiceGetMatchingService(
+          kIOMainPortDefault, IOServiceMatching("IOAccelerator"));
+      if (accelerator) {
+        read(accelerator);
+        IOObjectRelease(accelerator);
+      }
+    }
+    return count ? count : 8;
+  }();
+  return cores;
+}
+
+// K splits of an M = 8 tensor-op dispatch (Splash LinearGguf.cpp
+// decodeSplits, staged tier {6 threadgroups per core, 512 inputs per
+// partition}): doubles while the grid holds fewer than 6 threadgroups per
+// core and each partition would keep 512 inputs of whole 32-input units.
+int qmm_m8_nax_splits(int N, int K, int cores) {
+  const int64_t tiles = N / kernels::kM8TileCols;
+  int splits = 1;
+  while (splits < kernels::kM8MaxSplits &&
+         tiles * splits < int64_t(6) * cores && K / (2 * splits) >= 512 &&
+         (K / 32) % (2 * splits) == 0) {
+    splits *= 2;
+  }
+  return splits;
+}
+
+// MLX_KQUANT_M8_NAX: unset routes the modes qmv_sg8 does not decode (q3k,
+// iq4nl), where the tensor op measured 1.1-1.4x of qmv_wide on the Qwen3.8
+// shapes on an M5 Max; the sg8 modes stay on qmv_sg8, which it only matches
+// (0.85-1.0x). 1 routes every mode, 0 none. Read per call so an A/B can
+// flip it (kquant_m8_nax_bench.rs).
+enum class M8Nax { Auto, Off, Force };
+M8Nax m8_nax_switch() {
+  const char *e = std::getenv("MLX_KQUANT_M8_NAX");
+  if (e && e[1] == '\0') {
+    if (e[0] == '0') {
+      return M8Nax::Off;
+    }
+    if (e[0] == '1') {
+      return M8Nax::Force;
+    }
+  }
+  return M8Nax::Auto;
+}
+bool m8_nax_default_mode(Mode mode) {
+  return mode == Mode::Q3K || mode == Mode::IQ4NL;
+}
+
+// Tensor-op M = 8 matmul on gen-17+ (is_nax_available): whole 64-column
+// tiles, whole 32-input units, no batch, aligned operands (x rows as 16-byte
+// tensor rows, scales as ushort pairs, biases as half2 pairs).
+bool use_qmm_m8_nax(const Operands &o, int M, int N, int K) {
+  if (M != 8 || !metal::is_nax_available()) {
+    return false;
+  }
+  switch (m8_nax_switch()) {
+  case M8Nax::Off:
+    return false;
+  case M8Nax::Auto:
+    if (!m8_nax_default_mode(o.mode)) {
+      return false;
+    }
+    break;
+  case M8Nax::Force:
+    break;
+  }
+  return o.x.dtype() == kernels::kSg8Type && o.out.dtype() == kernels::kSg8Type &&
+         o.out.size() == size_t(8) * N && N % kernels::kM8TileCols == 0 &&
+         K % 32 == 0 && o.x.offset() % 8 == 0 && o.scales.offset() % 2 == 0 &&
+         o.biases.offset() % 2 == 0;
+}
+
+// The split-K arrival counters of a stream: one uint32 per 64-column tile,
+// zero between dispatches (the last arriver of a tile resets its counter).
+// Bound as an output so the encoder orders dispatches that share them; each
+// stream has its own because MLX fences outputs per stream only.
+array m8_nax_counters(const Stream &s, int tiles) {
+  static std::mutex mutex;
+  static std::unordered_map<int, array> by_stream;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = by_stream.find(s.index);
+  if (it != by_stream.end() && it->second.size() >= size_t(tiles)) {
+    return it->second;
+  }
+  auto &enc = metal::get_command_encoder(s);
+  int size = std::max(tiles, 4096);
+  array zero(uint32_t(0), uint32);
+  array counters({size}, uint32, nullptr, {});
+  fill_gpu(zero, counters, s);
+  enc.add_temporary(zero);
+  if (it != by_stream.end()) {
+    enc.add_temporary(it->second);
+    it->second = counters;
+  } else {
+    by_stream.emplace(s.index, counters);
+  }
+  return counters;
+}
+
+// One dispatch: grid (N / 64, splits) of 64 threads. Splits > 1 publish fp32
+// partials [splits][8][N] in a temporary; the last-arriving partition of a
+// tile sums them in split order (kquant_m8_nax.h).
+void qmm_m8_nax(const Operands &o, int N, int K) {
+  const int tiles = N / kernels::kM8TileCols;
+  const int splits = qmm_m8_nax_splits(N, K, gpu_core_count(o.d));
+  if (bridge_testing::counting) {
+    bridge_testing::record("qmm_m8_nax_splits" + std::to_string(splits));
+  }
+  auto kernel = get_kernel(o.d, "qmm_m8_nax", kernels::qmm_m8_nax(o.mode));
+  auto &enc = metal::get_command_encoder(o.s);
+  array partials = o.out;
+  array counters = o.out;
+  if (splits > 1) {
+    partials = array({splits * 8 * N}, float32, nullptr, {});
+    partials.set_data(allocator::malloc(partials.nbytes()));
+    enc.add_temporary(partials);
+    counters = m8_nax_counters(o.s, tiles);
+  }
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_output_array(partials, 5);
+  enc.set_output_array(counters, 6);
+  enc.set_bytes(K, 7);
+  enc.set_bytes(N, 8);
+  enc.set_bytes(splits, 9);
+  enc.dispatch_threadgroups(MTL::Size(tiles, splits, 1), MTL::Size(64, 1, 1));
 }
 
 // The K-quant qvm kernels tile 32 / pack_factor packs per thread, so a
@@ -859,6 +1045,10 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
   if (transpose_) {
     // MLX routes K of 64 or 128 to qmv_quad, which has no K-quant kernel;
     // only IQ4_NL (32-value blocks) can reach those K, and qmv covers it.
+    if (use_qmm_m8_nax(o, M, N, K)) {
+      qmm_m8_nax(o, N, K);
+      return;
+    }
     if (use_qmv_sg8(o, M, N)) {
       qmv_sg8(o, N, K);
       return;

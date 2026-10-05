@@ -338,6 +338,19 @@ fn compile_paged_attn_metallib(
     };
     jobs.extend(kquant_jobs("kquant"));
     jobs.extend(kquant_jobs("kquant_nax"));
+    // bfloat16-only M = 8 tensor-op kernels: one compile, no KQUANT_DTYPE.
+    jobs.push(AirJob {
+        src: bridge_dir.join("kquant").join("kquant_m8_nax.metal"),
+        air: out_dir.join("kquant_m8_nax.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-fno-fast-math".to_string(),
+            "-I".to_string(),
+            mlx_dir.display().to_string(),
+            min_os.clone(),
+        ],
+    });
     // Self-contained sources (no MLX headers), with the same flags.
     for file in [
         "segmented_sdpa/sdpa_segmented.metal",
@@ -758,6 +771,8 @@ fn main() -> io::Result<()> {
         if build_metal {
             println!("cargo:rustc-link-lib=framework=Metal");
             println!("cargo:rustc-link-lib=framework=QuartzCore");
+            // GPU core count for the K-quant split rule (mlx_kquant_metal.cpp).
+            println!("cargo:rustc-link-lib=framework=IOKit");
         }
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=Accelerate");

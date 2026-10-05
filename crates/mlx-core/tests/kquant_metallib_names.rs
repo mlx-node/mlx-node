@@ -14,8 +14,9 @@ use std::ffi::{CStr, c_char};
 /// 7 modes x 3 dtypes x 39 families, plus 4 bfloat16 qmv_sg8 kernels and the
 /// 2 sg8 prep kernels (group sizes 16 and 32).
 const BASE_NAMES: i64 = 7 * 3 * 39 + 4 + 2;
-/// 7 modes x 3 dtypes x qmm_t_nax {aligned, unaligned} x {batched, single}.
-const NAX_NAMES: i64 = 7 * 3 * 4;
+/// 7 modes x 3 dtypes x qmm_t_nax {aligned, unaligned} x {batched, single},
+/// plus 7 bfloat16 qmm_m8_nax kernels.
+const NAX_NAMES: i64 = 7 * 3 * 4 + 7;
 
 struct Check {
     base: i64,
