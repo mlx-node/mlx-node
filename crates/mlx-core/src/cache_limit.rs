@@ -120,6 +120,22 @@
 //! idle sweeper — drains only when the whole process is idle for
 //! `idleClearCacheMs`). The decode-loop `clear_cache()` fired every 256
 //! steps is untouched.
+//!
+//! ## Decode-time ceiling (turn-scoped, see [`decode_cache_limit`])
+//!
+//! The load-time cap above is a *safety* ceiling (tens of GB on a big
+//! host). A speculative decode loop needs nothing like that: each verify
+//! cycle allocates a few dozen MiB of short-lived outputs and frees them
+//! before the next cycle, so the free-pool only has to be large enough to
+//! hand the next cycle its buffers back. Anything beyond that is resident
+//! memory the process holds for no benefit until the next 256-token
+//! `clear_cache()`. [`CacheLimitCoordinator::push_decode_limit`] lowers
+//! the ceiling for the lifetime of a guard; the effective cap is
+//! `min(load-time cap, min(active decode caps))`, recomputed on every
+//! push/pop and on every model register/unregister, so a concurrent load
+//! on another thread can never be clobbered by a stale "restore previous
+//! value" write. An explicit `MLX_CACHE_LIMIT_GB` pin still trumps the
+//! decode cap (the operator asked for that exact value).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -168,6 +184,15 @@ struct CoordState {
     /// Private paged-KV pools allocate outside MLX's freelist counters but
     /// consume the same unified-memory working-set budget.
     pools: HashMap<u64, u64>,
+    /// `guard_id -> cap_bytes`: turn-scoped decode ceilings pushed by
+    /// running decode loops. The smallest live entry caps the effective
+    /// limit; an empty map means "load-time cap only".
+    decode_limits: HashMap<u64, u64>,
+    /// Cap MLX had before the first decode limit was applied while NO
+    /// load-time cap was computable (no model or pool registered). Restored
+    /// when the last decode limit pops so a decode cap never outlives its
+    /// turn on an otherwise unmanaged allocator.
+    decode_restore: Option<usize>,
     /// Most recent cap we actually pushed through `set_cache_limit`. Used
     /// so `recompute_locked` can short-circuit when the cap did not
     /// change — avoids log spam on every register/unregister.
@@ -191,9 +216,41 @@ impl CacheLimitCoordinator {
                 next_id: 1,
                 profiles: HashMap::new(),
                 pools: HashMap::new(),
+                decode_limits: HashMap::new(),
+                decode_restore: None,
                 last_applied: None,
             }),
         }
+    }
+
+    /// Lower the process-wide ceiling to at most `cap_bytes` for the
+    /// lifetime of the returned guard (a running decode loop). Multiple
+    /// live guards compose by `min`; the load-time cap is never exceeded.
+    /// A `cap_bytes` of 0 is ignored (treated as "no decode cap") because a
+    /// zero ceiling would make every `free` release its buffer immediately.
+    pub fn push_decode_limit(&self, cap_bytes: u64) -> DecodeCacheLimitGuard {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        if cap_bytes > 0 {
+            state.decode_limits.insert(id, cap_bytes);
+            recompute_locked(&mut state);
+        }
+        DecodeCacheLimitGuard { id }
+    }
+
+    fn pop_decode_limit(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.decode_limits.remove(&id).is_some() {
+            recompute_locked(&mut state);
+        }
+    }
+
+    /// Smallest live decode cap, if any. Test/diagnostic accessor.
+    #[cfg(test)]
+    fn active_decode_limit(&self) -> Option<u64> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.decode_limits.values().copied().min()
     }
 
     /// Register a model's weight-byte footprint and return an RAII
@@ -379,6 +436,67 @@ impl Drop for CacheLimitGuard {
     }
 }
 
+/// RAII token from [`CacheLimitCoordinator::push_decode_limit`]. Dropping
+/// it removes the turn's ceiling and recomputes the effective cap, so the
+/// load-time ceiling is back in force the moment the decode loop ends.
+#[must_use = "dropping the guard immediately lifts the decode-time ceiling"]
+pub struct DecodeCacheLimitGuard {
+    id: u64,
+}
+
+impl Drop for DecodeCacheLimitGuard {
+    fn drop(&mut self) {
+        coordinator().pop_decode_limit(self.id);
+    }
+}
+
+/// Smallest decode-time free-pool ceiling (bytes) that still lets a
+/// speculative decode loop reuse every buffer it frees.
+///
+/// `transient_bytes` is the caller's estimate of the short-lived bytes one
+/// verify/propose cycle allocates and frees (logits, per-layer tapes, one
+/// layer's scratch, two-pass attention partials — see
+/// `qwen3_5::dflash2_decode::dflash2_cycle_transient`).
+///
+/// ```text
+/// cap = max(2 × transient, DECODE_CACHE_LIMIT_FLOOR)
+/// ```
+///
+///   * `2×` — `BufferCache::reuse_from_cache` only hands back a buffer
+///     whose size is in `[size, min(2·size, size + 2 pages))`, and the
+///     sizes jitter with the accepted-draft count, so the pool must hold
+///     the previous cycle's buffers while the current cycle's slightly
+///     different sizes also land in it. One cycle's worth would evict
+///     buffers the very next cycle wants. For contexts long enough to have
+///     attention partials this puts the cap at or above the unbounded
+///     pool's own end-of-turn size (Qwen3.8-27B: 525 MiB cap vs 340 MiB
+///     measured at 6 K, 2.0 GiB vs 360 MiB at 32 K), i.e. the ceiling then
+///     binds nothing — by design, since a 128 MiB cap at 6 K measured
+///     +1.2% mean / +0.6% paired median and a 256 MiB cap could not be
+///     resolved within ±1% in the time available, while the memory it
+///     would return there is only tens of MiB.
+///   * floor [`DECODE_CACHE_LIMIT_FLOOR`] (128 MiB) — the cap measured for
+///     Qwen3.8-27B DFlash2 at a 1 K prompt (transient estimate ≈ 46 MiB,
+///     no partials): in-process ABAB, 4 pairs, ms/cycle −0.8% mean / −3.7%
+///     paired median vs the unbounded pool, identical output hashes, equal
+///     Metal command-buffer counts (no allocation storm), end-of-turn pool
+///     1.2 GiB → ≈ 190 MiB. That 1.2 GiB is dead weight: the draft's
+///     sliding-window context grows every cycle until it is full, and
+///     `reuse_from_cache` never matches a grown request to the smaller
+///     buffer it just freed, so those pile up until the 256-token
+///     `clear_cache()`. Small geometries whose estimate falls under the
+///     floor are still safe: it is tiny next to any load-time cap.
+///
+/// Pure function; see the unit tests for the contract.
+pub fn decode_cache_limit(transient_bytes: u64) -> u64 {
+    transient_bytes
+        .saturating_mul(2)
+        .max(DECODE_CACHE_LIMIT_FLOOR)
+}
+
+/// Floor for [`decode_cache_limit`], see its docs.
+pub const DECODE_CACHE_LIMIT_FLOOR: u64 = 128 << 20;
+
 /// Access the process-wide coordinator, initializing it on first use.
 pub fn coordinator() -> &'static CacheLimitCoordinator {
     static INSTANCE: OnceLock<CacheLimitCoordinator> = OnceLock::new();
@@ -449,7 +567,8 @@ fn recompute_locked(state: &mut CoordState) {
                     // unchanged ensures the next register/unregister
                     // call retries instead of silently treating the
                     // failure as a stable applied state.
-                    if apply_limit(bytes, &format!("env {}={}", CACHE_LIMIT_ENV, trimmed)) {
+                    if apply_limit(bytes, &format!("env {}={}", CACHE_LIMIT_ENV, trimmed)).is_some()
+                    {
                         state.last_applied = Some(bytes);
                     }
                 }
@@ -466,11 +585,76 @@ fn recompute_locked(state: &mut CoordState) {
         }
     }
 
-    // Empty coordinator → nothing to cap. Do NOT reset the last-applied
-    // cap: the allocator state the prior cap was protecting is gone, so
-    // the cap costs nothing; resetting just churns logs.
-    if state.profiles.is_empty() && state.pools.is_empty() {
+    let base = load_time_cap_locked(state);
+    let has_base = base.is_some();
+    let decode = state.decode_limits.values().copied().min();
+
+    let (limit, source) = match (base, decode) {
+        // Empty coordinator and no decode loop → nothing to cap. Do NOT
+        // reset the last-applied cap: the allocator state the prior cap
+        // was protecting is gone, so the cap costs nothing; resetting
+        // just churns logs. The one exception is a decode cap that was
+        // applied on an unmanaged allocator: lift it back to what MLX had.
+        (None, None) => match state.decode_restore.take() {
+            Some(prev) => (
+                prev as u64,
+                String::from("decode cap lifted, no load-time cap"),
+            ),
+            None => return,
+        },
+        (Some((cap, source)), None) => {
+            state.decode_restore = None;
+            (cap, source)
+        }
+        (Some((cap, source)), Some(decode)) => {
+            state.decode_restore = None;
+            if decode < cap {
+                (
+                    decode,
+                    format!(
+                        "decode ({:.0} MiB, live_decode_guards={}) under {source}",
+                        decode as f64 / (1u64 << 20) as f64,
+                        state.decode_limits.len(),
+                    ),
+                )
+            } else {
+                (cap, source)
+            }
+        }
+        (None, Some(decode)) => (
+            decode,
+            format!(
+                "decode ({:.0} MiB, live_decode_guards={}, no load-time cap)",
+                decode as f64 / (1u64 << 20) as f64,
+                state.decode_limits.len(),
+            ),
+        ),
+    };
+
+    let bytes = limit as usize;
+    if state.last_applied == Some(bytes) {
         return;
+    }
+
+    // Same fallible-FFI contract as the env-override branch: only memoize
+    // `last_applied` when `apply_limit` confirms the cap was actually
+    // pushed through the FFI. A failed call leaves `last_applied`
+    // untouched so a later register/unregister retries.
+    if let Some(prev) = apply_limit(bytes, &source) {
+        if !has_base && decode.is_some() && state.decode_restore.is_none() {
+            state.decode_restore = Some(prev);
+        }
+        state.last_applied = Some(bytes);
+    }
+}
+
+/// The load-time (model + pool budget) cap and its log `source`, or `None`
+/// when nothing is registered / every registered total is zero — in which
+/// case there is nothing to budget against and the caller leaves the
+/// allocator alone.
+fn load_time_cap_locked(state: &CoordState) -> Option<(u64, String)> {
+    if state.profiles.is_empty() && state.pools.is_empty() {
+        return None;
     }
     // Sum (not max) across live weight-byte totals: each caller
     // registered its own per-model footprint, so summing gives the
@@ -492,19 +676,13 @@ fn recompute_locked(state: &mut CoordState) {
         // happen in a synthetic test that registers a zero). Skip
         // rather than set a zero ceiling that would deadlock the
         // allocator.
-        return;
+        return None;
     }
 
     let wired = WiredLimitContext::get_max_working_set_size() as u64;
     let limit = compute_cache_limit(summed_weights, summed_pools, wired);
-
     if limit == 0 {
-        return;
-    }
-
-    let bytes = limit as usize;
-    if state.last_applied == Some(bytes) {
-        return;
+        return None;
     }
 
     // Build the `source` string so the operator can reconstruct the
@@ -532,14 +710,7 @@ fn recompute_locked(state: &mut CoordState) {
             state.profiles.len(),
         )
     };
-
-    // Same fallible-FFI contract as the env-override branch: only memoize
-    // `last_applied` when `apply_limit` confirms the cap was actually
-    // pushed through the FFI. A failed call leaves `last_applied`
-    // untouched so a later register/unregister retries.
-    if apply_limit(bytes, &source) {
-        state.last_applied = Some(bytes);
-    }
+    Some((limit, source))
 }
 
 /// Estimate the Metal driver's own overhead footprint for the given
@@ -600,11 +771,11 @@ fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
     (wired - reserved).max(MIN_FREELIST_BYTES)
 }
 
-/// Push a freshly computed cap through `set_cache_limit`. Returns `true`
-/// when the FFI succeeded so the caller can update `last_applied`; `false`
-/// indicates the FFI caught a C++ exception (degraded Metal) and the cap
-/// was NOT applied — the caller MUST leave `last_applied` untouched so
-/// the next register/unregister cycle retries.
+/// Push a freshly computed cap through `set_cache_limit`. Returns the
+/// previous cap when the FFI succeeded so the caller can update
+/// `last_applied`; `None` indicates the FFI caught a C++ exception
+/// (degraded Metal) and the cap was NOT applied — the caller MUST leave
+/// `last_applied` untouched so the next register/unregister cycle retries.
 ///
 /// Logging:
 ///   - success → `info!` with the new cap, source, and previous cap.
@@ -612,26 +783,26 @@ fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
 ///     failure reason instead of having to reason about a silent retry
 ///     loop.
 #[must_use]
-fn apply_limit(bytes: usize, source: &str) -> bool {
+fn apply_limit(bytes: usize, source: &str) -> Option<usize> {
     match set_cache_limit(bytes as f64) {
         Ok(prev) => {
             info!(
-                "[cache_limit] cache pool cap set to {:.1} GB ({}); previous = {:.1} GB",
+                "[cache_limit] cache pool cap set to {:.2} GB ({}); previous = {:.2} GB",
                 bytes as f64 / ONE_GIB,
                 source,
                 prev / ONE_GIB,
             );
-            true
+            Some(prev as usize)
         }
         Err(err) => {
             warn!(
-                "[cache_limit] set_cache_limit({:.1} GB, {}) FAILED ({}); cap NOT applied, will \
+                "[cache_limit] set_cache_limit({:.2} GB, {}) FAILED ({}); cap NOT applied, will \
                  retry on next register/unregister",
                 bytes as f64 / ONE_GIB,
                 source,
                 err,
             );
-            false
+            None
         }
     }
 }
@@ -965,6 +1136,60 @@ mod tests {
         // Negative → rejected → default 10% applies.
         let cap = compute_cache_limit(36 * GB, 0, 96 * GB);
         approx_eq_gb(cap, 45.6);
+    }
+
+    // ── decode-time ceiling policy ────────────────────────────────
+
+    #[test]
+    fn decode_cache_limit_is_twice_the_transient_above_the_floor() {
+        // 100 MiB transient → 200 MiB (previous cycle's buffers stay
+        // resident while the current cycle allocates).
+        assert_eq!(decode_cache_limit(100u64 << 20), 200u64 << 20);
+        assert_eq!(decode_cache_limit(300u64 << 20), 600u64 << 20);
+    }
+
+    #[test]
+    fn decode_cache_limit_floors_small_transients() {
+        // 46 MiB (Qwen3.8-27B short-prompt estimate) × 2 = 92 MiB < floor.
+        assert_eq!(decode_cache_limit(46u64 << 20), DECODE_CACHE_LIMIT_FLOOR);
+        assert_eq!(decode_cache_limit(0), DECODE_CACHE_LIMIT_FLOOR);
+        // Exactly at the knee: 64 MiB × 2 == floor; one byte more lifts it.
+        assert_eq!(decode_cache_limit(64u64 << 20), DECODE_CACHE_LIMIT_FLOOR);
+        assert_eq!(
+            decode_cache_limit((64u64 << 20) + 1),
+            DECODE_CACHE_LIMIT_FLOOR + 2
+        );
+    }
+
+    #[test]
+    fn decode_cache_limit_never_overflows() {
+        assert_eq!(decode_cache_limit(u64::MAX), u64::MAX);
+        assert_eq!(decode_cache_limit(u64::MAX / 2 + 1), u64::MAX);
+    }
+
+    #[test]
+    fn decode_limit_guards_compose_by_min_and_lift_on_drop() {
+        let _lock = POOL_LOCK.lock().unwrap();
+        let coord = coordinator();
+        assert_eq!(coord.active_decode_limit(), None);
+        let a = coord.push_decode_limit(256 << 20);
+        assert_eq!(coord.active_decode_limit(), Some(256 << 20));
+        let b = coord.push_decode_limit(128 << 20);
+        assert_eq!(coord.active_decode_limit(), Some(128 << 20));
+        drop(b);
+        assert_eq!(coord.active_decode_limit(), Some(256 << 20));
+        drop(a);
+        assert_eq!(coord.active_decode_limit(), None);
+    }
+
+    #[test]
+    fn decode_limit_of_zero_is_ignored() {
+        let _lock = POOL_LOCK.lock().unwrap();
+        let coord = coordinator();
+        let guard = coord.push_decode_limit(0);
+        assert_eq!(coord.active_decode_limit(), None);
+        drop(guard);
+        assert_eq!(coord.active_decode_limit(), None);
     }
 
     // ── overhead / headroom helper sanity ─────────────────────────
