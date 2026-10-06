@@ -2095,12 +2095,12 @@ pub async fn load_with_thread(
 
                 let mut config = parse_config(&raw)?;
                 // The flat full-attention K/V format: the load option wins
-                // over a `kv_format` key in config.json; an unknown config
-                // value is a load error rather than a silent BF16.
-                let config_kv_format =
-                    crate::transformer::KvFormat::parse(config.kv_format.as_deref())
-                        .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
-                let kv_format = kv_format.unwrap_or(config_kv_format);
+                // over a `kv_format` key in config.json, and both over the
+                // geometry default (`Qwen3_5Config::kv_format`); an unknown
+                // config value is a load error rather than a silent BF16.
+                crate::transformer::KvFormat::parse(config.kv_format.as_deref())
+                    .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
+                let kv_format = kv_format.unwrap_or_else(|| config.kv_format());
                 config.kv_format = Some(kv_format.as_str().to_string());
                 if kv_format == crate::transformer::KvFormat::Int8 {
                     info!("Qwen3.5 flat full-attention K/V cache format: int8 (per-row scales)");
