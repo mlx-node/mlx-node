@@ -94,6 +94,16 @@ impl RMSNorm {
         self.weight.clone()
     }
 
+    /// The weight (scale) parameter, borrowed.
+    pub fn weight(&self) -> &MxArray {
+        &self.weight
+    }
+
+    /// The epsilon exactly as [`Self::forward`] hands it to `fast::rms_norm`.
+    pub fn eps_f32(&self) -> f32 {
+        self.eps as f32
+    }
+
     /// Set the weight (scale) parameter
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
         let shape = weight.shape()?;

@@ -801,6 +801,26 @@ unsafe extern "C-unwind" {
     /// Null (message on stderr) on error.
     pub fn mlx_kv_int8_dequantize_rows(q: *mut mlx_array, s: *mut mlx_array) -> *mut mlx_array;
 
+    /// Fused Q/K RMSNorm + partial RoPE in one dispatch, bit-identical to
+    /// `fast::rms_norm` then `fast::rope(traditional = false)` on the
+    /// `[B, H, T, D]` transpose. `q` `[B, T, HQ, D]`, `k` `[B, T, HK, D]`
+    /// (any strides, contiguous last axis), `wq` / `wk` `[D]`, `offsets`
+    /// int32 `[B]`. Outputs `[B, HQ, T, D]` and `[B, HK, T, D]`. Returns
+    /// false (message on stderr) without Metal or on a contract violation.
+    pub fn mlx_qk_norm_rope(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        wq: *mut mlx_array,
+        wk: *mut mlx_array,
+        offsets: *mut mlx_array,
+        eps: f32,
+        base: f32,
+        scale: f32,
+        rope_dims: i32,
+        out_q: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+    ) -> bool;
+
     // Strict test entry: null on unsupported segmented dispatch; no concat
     // fallback. Always the vector routes (bit-identical to MLX's vector
     // SDPA), whatever the calibrated crossover says.

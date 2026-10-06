@@ -839,6 +839,55 @@ impl Qwen3_5Attention {
         }
     }
 
+    /// `rope(q_norm(q))`, `rope(k_norm(k))` in one Metal dispatch
+    /// (`mlx_qk_norm_rope`), from `[B, T, H, D]` inputs (any strides) to the
+    /// `[B, H, T, D]` layout the verify attention reads. Bit-identical to
+    /// `fast::rms_norm` + `fast::rope` (gated by `fused_qk_norm_rope_eq`).
+    /// `None` on a contract miss (non-Metal, M-RoPE checkpoint, traditional
+    /// rope, differing eps, unsupported dtype/dims); callers keep the four-op
+    /// chain.
+    pub(crate) fn fused_qk_norm_rope(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        offsets: &MxArray,
+    ) -> Option<(MxArray, MxArray)> {
+        static METAL: OnceLock<bool> = OnceLock::new();
+        let metal = *METAL.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() });
+        if !metal
+            || self.mrope.is_some()
+            || self.rope.traditional
+            || self.q_norm.eps_f32() != self.k_norm.eps_f32()
+        {
+            return None;
+        }
+        let mut out_q = std::ptr::null_mut();
+        let mut out_k = std::ptr::null_mut();
+        // SAFETY: every handle is a live array for the call; the outputs are
+        // owned handles or stay null when the call reports false.
+        let ok = unsafe {
+            mlx_sys::mlx_qk_norm_rope(
+                queries.handle.0,
+                keys.handle.0,
+                self.q_norm.weight().handle.0,
+                self.k_norm.weight().handle.0,
+                offsets.handle.0,
+                self.q_norm.eps_f32(),
+                self.rope.base,
+                self.rope.scale,
+                self.rope.dims,
+                &mut out_q,
+                &mut out_k,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        let q = MxArray::from_handle(out_q, "qk_norm_rope:q").ok()?;
+        let k = MxArray::from_handle(out_k, "qk_norm_rope:k").ok()?;
+        Some((q, k))
+    }
+
     /// Compiled-verify forward for the DFlash2 flat-cache path.
     ///
     /// Identical math to [`Self::forward`] with `mask = None`,
@@ -888,19 +937,28 @@ impl Qwen3_5Attention {
             self.num_kv_heads as i64,
             self.head_dim as i64,
         ])?;
-        let queries = self.q_norm.forward(&queries)?;
-        let keys = self.k_norm.forward(&keys)?;
+        // One dispatch for q_norm + k_norm + rope(q) + rope(k), bit-identical
+        // to the four-op chain below (its fallback).
+        let (queries, new_keys) = match self.fused_qk_norm_rope(&queries, &keys, io.rope_offsets) {
+            Some(fused) => fused,
+            None => {
+                let queries = self.q_norm.forward(&queries)?;
+                let keys = self.k_norm.forward(&keys)?;
 
-        // RoPE rotates along axis -2: feed [B, H, T, D] directly and keep
-        // that layout — the eager path's round-trip back to [B, T, H, D]
-        // only exists to satisfy the KVCache write order, which lives in
-        // the caller here.
-        let queries = self
-            .rope
-            .forward_with_offsets(&queries.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
-        let new_keys = self
-            .rope
-            .forward_with_offsets(&keys.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
+                // RoPE rotates along axis -2: feed [B, H, T, D] directly
+                // and keep that layout — the eager path's round-trip back
+                // to [B, T, H, D] only exists to satisfy the KVCache write
+                // order, which lives in the caller here.
+                let queries = self.rope.forward_with_offsets(
+                    &queries.transpose(Some(&[0, 2, 1, 3]))?,
+                    io.rope_offsets,
+                )?;
+                let new_keys = self
+                    .rope
+                    .forward_with_offsets(&keys.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
+                (queries, new_keys)
+            }
+        };
         let new_values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
         let (prefix_keys, prefix_values) = match io.prefix {
@@ -5220,6 +5278,87 @@ mod tests {
             native_gate.to_uint16_native()?,
             "block-order Q4_K gates must be bit-identical to native per-head splitting"
         );
+        Ok(())
+    }
+
+    /// Gate for `fused_qk_norm_rope`: the one-dispatch kernel must equal
+    /// `fast::rms_norm` -> transpose -> `fast::rope(offsets)` bit-for-bit on
+    /// random BF16 data, over block rows 1..=8, several position offsets,
+    /// the Qwen3.8 head counts (24 q / 4 kv) and a smaller pair, with the
+    /// strided `[B, T, H, D]` views the verify path hands it (q is a split of
+    /// the q/gate projection, k a split of the merged k/v projection).
+    #[test]
+    fn fused_qk_norm_rope_eq() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let d = 256i64;
+        let rot = 64;
+        for (hq, hk) in [(24i64, 4i64), (4, 2)] {
+            let mut cfg = tiny_cfg();
+            cfg.head_dim = d as i32;
+            cfg.num_heads = hq as i32;
+            cfg.num_kv_heads = hk as i32;
+            cfg.partial_rotary_factor = rot as f64 / d as f64;
+            cfg.rope_theta = 10_000_000.0;
+            let mut attn = Qwen3_5Attention::new(&cfg)?;
+            assert_eq!(attn.rope.dims, rot);
+            let wq = MxArray::random_normal(&[d], 1.0, 0.25, Some(DType::BFloat16))?;
+            let wk = MxArray::random_normal(&[d], 1.0, 0.25, Some(DType::BFloat16))?;
+            attn.q_norm.set_weight(&wq)?;
+            attn.k_norm.set_weight(&wk)?;
+            for t in 1..=8i64 {
+                for offset in [0i32, 1, 7, 4096, 32_480] {
+                    let offsets = MxArray::from_int32(&[offset], &[1])?;
+                    // Strided views: q = first half of a [B, T, 2*hq*d] row,
+                    // k = first hk*d of a [B, T, 2*hk*d] row.
+                    let qg = MxArray::random_normal(
+                        &[1, t, 2 * hq * d],
+                        0.0,
+                        2.0,
+                        Some(DType::BFloat16),
+                    )?;
+                    let q = qg.split_sections(&[hq * d], 2)?[0].reshape(&[1, t, hq, d])?;
+                    let kv = MxArray::random_normal(
+                        &[1, t, 2 * hk * d],
+                        0.0,
+                        2.0,
+                        Some(DType::BFloat16),
+                    )?;
+                    let k = kv.split_sections(&[hk * d], 2)?[0].reshape(&[1, t, hk, d])?;
+
+                    let (fq, fk) = attn
+                        .fused_qk_norm_rope(&q, &k, &offsets)
+                        .expect("fused qk norm+rope must take this contract");
+                    let rq = attn.rope.forward_with_offsets(
+                        &attn.q_norm.forward(&q)?.transpose(Some(&[0, 2, 1, 3]))?,
+                        &offsets,
+                    )?;
+                    let rk = attn.rope.forward_with_offsets(
+                        &attn.k_norm.forward(&k)?.transpose(Some(&[0, 2, 1, 3]))?,
+                        &offsets,
+                    )?;
+                    for (name, fused, reference) in [("q", &fq, &rq), ("k", &fk, &rk)] {
+                        assert_eq!(fused.dtype()?, DType::BFloat16);
+                        assert_eq!(fused.shape()?.as_ref(), reference.shape()?.as_ref());
+                        let a = fused.astype(DType::Float32)?.to_float32()?;
+                        let b = reference.astype(DType::Float32)?.to_float32()?;
+                        let mismatches = a
+                            .as_ref()
+                            .iter()
+                            .zip(b.as_ref().iter())
+                            .filter(|(x, y)| x.to_bits() != y.to_bits())
+                            .count();
+                        assert_eq!(
+                            mismatches,
+                            0,
+                            "{name}: hq={hq} hk={hk} t={t} offset={offset}: {mismatches} of {} elements differ",
+                            a.len()
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -42,6 +42,7 @@ measure fixed-length decode, not answer quality.
 | `0b164eac`              | Evaluate GDN derived constants at load. A persistent compiled tape replays any lazy constant it captured on every cycle (+96 dispatches)                                                                     | yes   |
 | `0f7e1da5`              | Draft is affine Q4/g64 only (selector projection keeps checkpoint precision; target head shared). Resident draft 3.58 -> 1.18 GiB                                                                            | no    |
 | `0326f2ad`              | `sg8`: simdgroup-matrix K-quant matvec for exactly M=8 rows (q4k/q5k/q6k/iq4xs, BF16, aligned, N%32==0) on GPU gen >= 17. Splash `0x4300\|q` code-to-BF16 trick. ~1 ULP on 0.02-0.1% of outputs, same argmax | no    |
+| (stage 2, this PR)      | `qk_norm_rope`: one `fast::metal_kernel` per FA verify layer for q_norm + k_norm + rope(q) + rope(k) (plus the strided-input and partial-rotary copies those ops made). Dispatches/cycle 1197 -> 1095 (short, int8 KV); hash and 275 cycles unchanged; +2..4% tok/s in ABBA (noise +-5%)         | yes   |
 
 Result vs `04ce9b2b` (5-8 ABBA fresh-process pairs, clock-matched):
 
@@ -148,6 +149,7 @@ Kernels (ratio > 1 = faster than baseline):
 | Forced split-K at M=8                                                                                        | -16/-38/-6%, outputs changed                                                         |
 | BM16 NAX for K/IQ verify                                                                                     | 16x64 tile silently gave zero accumulators (fake speedup); 16x128 slower than vector |
 | K/IQ residual epilogue / SwiGLU epilogue                                                                     | +1.7/+1.1% (noise) / -4..-17% (register pressure)                                    |
+| SwiGLU store epilogue on `qmm_m8_nax_t64` (Splash `_a` gate then `_g` up, fp32 silu, up rounded to BF16 first) | Oct 2026, M5 Max, M=8, K=5120, N=17408/proj, Tiled64, DRAM-cold, 21 interleaved samples x 3 runs. ms/block today (merged gate\|up + compiled swiglu) vs A (gate + up `_g`): q4k 0.222-0.239 vs 0.224-0.235, q5k 0.259-0.293 vs 0.264-0.275, q6k 0.294-0.317 vs 0.294-0.323, iq4xs 0.227-0.245 vs 0.228-0.238; A/today 0.92-1.05x with no stable sign. today ~= merged-only ~= two separate matmuls, so the standalone swiglu is <= 1% of the block: no SwiGLU fusion (store epilogue, or a down_proj prologue that would recompute it per tile) can reach +3%. Exactness: 97.5-99.7% equal, max 3 BF16 ulps vs the chain. Removed |
 | Native Metal chunked GDN (BT32)                                                                              | outputs changed, +3.5/-37/-34%                                                       |
 | Four-column GDN E48 Qwen override                                                                            | chain -3%, synchronized +4%, model mixed; removed (Qwen4 route kept)                 |
 | Persistent draft attention ring                                                                              | 10.5% slower                                                                         |
