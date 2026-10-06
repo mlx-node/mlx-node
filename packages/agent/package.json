@@ -54,7 +54,7 @@
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/server": "workspace:*",
-    "typebox": "1.3.23"
+    "typebox": "1.3.36"
   },
   "devDependencies": {
     "@types/node": "^26.4.0"
