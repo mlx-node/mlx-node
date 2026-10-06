@@ -164,7 +164,7 @@ pub async fn capture_teacher_logits(
 /// would otherwise report a finite, plausible number measured on the wrong
 /// text.
 ///
-/// `kv_format` (`"bf16"` default, `"int8"`) selects the dense qwen3_5
+/// `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the dense qwen3_5
 /// candidate's flat K/V cache format, so the int8 cache can be scored against
 /// the same teacher cache as the BF16 one.
 #[napi]

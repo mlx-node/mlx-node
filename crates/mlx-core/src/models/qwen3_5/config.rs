@@ -230,11 +230,12 @@ pub struct Qwen3_5Config {
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
 
-    /// Element format of the flat full-attention K/V cache: `"bf16"` (the
-    /// default) or `"int8"` (per-(token, head) symmetric int8 rows with one
-    /// fp32 scale each — half the K/V memory and read bandwidth; see
-    /// `crate::array::kv_int8`). Set from the `kvFormat` load option; the
-    /// paged cache ignores it.
+    /// Element format of the flat full-attention K/V cache: `"int8"`
+    /// (per-(token, head) symmetric int8 rows with one fp32 scale each —
+    /// half the K/V memory and read bandwidth; see `crate::array::kv_int8`)
+    /// or `"bf16"`. Unset: int8 where the int8 kernels serve the geometry
+    /// (Metal, head 256), else BF16 — see `kv_format()`. Set from the
+    /// `kvFormat` load option; the paged cache ignores it.
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
@@ -296,10 +297,19 @@ impl Qwen3_5Config {
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
     }
 
-    /// Element format of the flat full-attention K/V cache (`kv_format`);
-    /// an unparseable value is BF16 — persistence rejects it at load.
+    /// Element format of the flat full-attention K/V cache. An explicit
+    /// `kv_format` wins (an unparseable value is BF16 — persistence rejects
+    /// it at load); otherwise int8, Splash's default, wherever the int8
+    /// segmented kernels serve the geometry (Metal, `head_dim` 256), and
+    /// BF16 elsewhere so no geometry falls onto the dequantizing fallback.
     pub fn kv_format(&self) -> crate::transformer::KvFormat {
-        crate::transformer::KvFormat::parse(self.kv_format.as_deref()).unwrap_or_default()
+        use crate::transformer::KvFormat;
+        match self.kv_format.as_deref() {
+            Some(value) if !value.trim().is_empty() => {
+                KvFormat::parse(Some(value)).unwrap_or_default()
+            }
+            _ => KvFormat::default_for_geometry(i64::from(self.head_dim)),
+        }
     }
 
     /// Number of full-attention layers (i.e. layers that use

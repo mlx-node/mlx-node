@@ -374,10 +374,10 @@ pub struct Qwen3_5GenerationConfig {
 pub struct Qwen35LoadOptions {
     /// External z-lab DFlash2 checkpoint directory.
     pub draft_model_path: Option<String>,
-    /// Element format of the flat full-attention K/V cache: `'bf16'` (the
-    /// default) or `'int8'` (per-token symmetric int8 rows with one fp32
-    /// scale each — half the K/V memory and read bandwidth). The block-paged
-    /// cache ignores it.
+    /// Element format of the flat full-attention K/V cache: `'int8'`
+    /// (per-token symmetric int8 rows with one fp32 scale each — half the
+    /// K/V memory and read bandwidth) or `'bf16'`. Unset: int8 on Metal with
+    /// 256-wide heads, BF16 elsewhere. The block-paged cache ignores it.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
     pub kv_format: Option<String>,
 }

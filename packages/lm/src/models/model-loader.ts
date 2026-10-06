@@ -61,10 +61,11 @@ export interface LoadModelOptions {
   draftModelPath?: string;
   /**
    * Flat full-attention K/V cache format for dense `qwen3_5` targets:
-   * `'bf16'` (the default) or `'int8'` — per-token symmetric int8 rows with
-   * one fp32 scale each, halving K/V memory and read bandwidth at a small,
-   * measured quality cost. The block-paged cache ignores it; other model
-   * families reject it.
+   * `'int8'` — per-token symmetric int8 rows with one fp32 scale each,
+   * halving K/V memory and read bandwidth at a small, measured quality
+   * cost — or `'bf16'`. Unset: int8 on Metal with 256-wide heads (the
+   * geometry the int8 kernels serve), bf16 elsewhere. The block-paged cache
+   * ignores it; other model families reject it.
    */
   kvFormat?: 'int8' | 'bf16';
 }

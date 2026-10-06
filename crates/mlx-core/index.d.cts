@@ -5174,11 +5174,12 @@ export interface Qwen35Config {
    */
   qwen35GgufGdnLayout?: string | undefined;
   /**
-   * Element format of the flat full-attention K/V cache: `"bf16"` (the
-   * default) or `"int8"` (per-(token, head) symmetric int8 rows with one
-   * fp32 scale each — half the K/V memory and read bandwidth; see
-   * `crate::array::kv_int8`). Set from the `kvFormat` load option; the
-   * paged cache ignores it.
+   * Element format of the flat full-attention K/V cache: `"int8"`
+   * (per-(token, head) symmetric int8 rows with one fp32 scale each —
+   * half the K/V memory and read bandwidth; see `crate::array::kv_int8`)
+   * or `"bf16"`. Unset: int8 where the int8 kernels serve the geometry
+   * (Metal, head 256), else BF16 — see `kv_format()`. Set from the
+   * `kvFormat` load option; the paged cache ignores it.
    */
   kvFormat?: string | undefined;
 }
@@ -5218,10 +5219,10 @@ export interface Qwen35LoadOptions {
   /** External z-lab DFlash2 checkpoint directory. */
   draftModelPath?: string;
   /**
-   * Element format of the flat full-attention K/V cache: `'bf16'` (the
-   * default) or `'int8'` (per-token symmetric int8 rows with one fp32
-   * scale each — half the K/V memory and read bandwidth). The block-paged
-   * cache ignores it.
+   * Element format of the flat full-attention K/V cache: `'int8'`
+   * (per-token symmetric int8 rows with one fp32 scale each — half the
+   * K/V memory and read bandwidth) or `'bf16'`. Unset: int8 on Metal with
+   * 256-wide heads, BF16 elsewhere. The block-paged cache ignores it.
    */
   kvFormat?: 'int8' | 'bf16' | undefined;
 }
@@ -5725,7 +5726,7 @@ export interface SchedulerStats {
  * would otherwise report a finite, plausible number measured on the wrong
  * text.
  *
- * `kv_format` (`"bf16"` default, `"int8"`) selects the dense qwen3_5
+ * `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the dense qwen3_5
  * candidate's flat K/V cache format, so the int8 cache can be scored against
  * the same teacher cache as the BF16 one.
  */

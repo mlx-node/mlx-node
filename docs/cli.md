@@ -595,18 +595,18 @@ kl_topk          0.13782  (K=512, teacher tail mass 0.04045)
 top1_agreement   77.64%
 ```
 
-| Flag            | Purpose                                                                   |
-| --------------- | ------------------------------------------------------------------------- |
-| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)              |
-| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                    |
-| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)             |
-| `--cache`       | Teacher cache directory (required in both modes)                          |
-| `--rows`        | Dataset rows to capture (default `64`)                                    |
-| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                          |
-| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary) |
-| `--logit-chunk` | Positions per head projection (default `64`)                              |
-| `--kv-format`   | Candidate flat K/V cache format: `bf16` (default) or `int8` (dense qwen3_5) |
-| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting      |
+| Flag            | Purpose                                                                                                                            |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)                                                                       |
+| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                                                                             |
+| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)                                                                      |
+| `--cache`       | Teacher cache directory (required in both modes)                                                                                   |
+| `--rows`        | Dataset rows to capture (default `64`)                                                                                             |
+| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                                                                                   |
+| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary)                                                          |
+| `--logit-chunk` | Positions per head projection (default `64`)                                                                                       |
+| `--kv-format`   | Candidate flat K/V cache format, `int8` or `bf16` (dense qwen3_5; unset = the load default, int8 on Metal at head 256)             |
+| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting                                                               |
 
 **Reading the numbers.** `nll`, `perplexity` and `top1_agreement` are exact over
 the full vocabulary. `kl_topk` is a KL over a `K+1`-way partition: one term per

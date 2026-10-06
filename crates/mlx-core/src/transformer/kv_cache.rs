@@ -25,6 +25,21 @@ impl KvFormat {
         }
     }
 
+    /// The format a cache takes when none is requested: int8 (Splash's
+    /// default) where the int8 segmented SDPA kernels serve the geometry —
+    /// the Metal device and a 256-wide head — and BF16 everywhere else, so a
+    /// geometry the kernels do not cover never lands on the dequantizing
+    /// fallback by default.
+    pub fn default_for_geometry(head_dim: i64) -> Self {
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if metal && head_dim == 256 {
+            Self::Int8
+        } else {
+            Self::Bf16
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bf16 => "bf16",
