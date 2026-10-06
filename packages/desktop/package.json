@@ -31,7 +31,7 @@
   },
   "devDependencies": {
     "@electron/notarize": "3.1.1",
-    "@electron/osx-sign": "2.7.0",
+    "@electron/osx-sign": "2.7.1",
     "@electron/packager": "20.3.0",
     "@napi-rs/image": "1.14.0",
     "@types/node": "catalog:",

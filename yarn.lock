@@ -763,7 +763,22 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@electron/osx-sign@npm:2.7.0, @electron/osx-sign@npm:^2.2.0":
+"@electron/osx-sign@npm:2.7.1":
+  version: 2.7.1
+  resolution: "@electron/osx-sign@npm:2.7.1"
+  dependencies:
+    debug: "npm:^4.3.4"
+    isbinaryfile: "npm:^4.0.8"
+    plist: "npm:^3.0.5"
+    semver: "npm:^7.7.1"
+  bin:
+    electron-osx-flat: bin/electron-osx-flat.mjs
+    electron-osx-sign: bin/electron-osx-sign.mjs
+  checksum: 10c0/18b452fa26f1021ac7f5280e824fc1dcb61df5d7230139548f7b0184e07035c4403c07a188b698dba16bf4c5fd418e52f5ebb07da6a207e44933fb1d83ed7c9c
+  languageName: node
+  linkType: hard
+
+"@electron/osx-sign@npm:^2.2.0":
   version: 2.7.0
   resolution: "@electron/osx-sign@npm:2.7.0"
   dependencies:
@@ -1626,7 +1641,7 @@ __metadata:
   resolution: "@mlx-node/desktop@workspace:packages/desktop"
   dependencies:
     "@electron/notarize": "npm:3.1.1"
-    "@electron/osx-sign": "npm:2.7.0"
+    "@electron/osx-sign": "npm:2.7.1"
     "@electron/packager": "npm:20.3.0"
     "@mlx-node/dashboard": "workspace:*"
     "@mlx-node/lm": "workspace:*"
