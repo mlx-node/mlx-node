@@ -4191,10 +4191,11 @@ fn tile_kquant_weights_for_disk(
             continue;
         }
         let per_group = i64::from(kq.scale_bytes_per_group);
+        let per_super = i64::from(kq.bias_entries_per_super_block);
         let super_ratio = i64::from(kq.super_ratio);
         let tiled_weight = kquant_tile_rows(weight, i64::from(kq.bits))?;
         let tiled_scales = kquant_tile_rows(scales, super_ratio * per_group)?;
-        let tiled_biases = kquant_tile_rows(biases, per_group)?;
+        let tiled_biases = kquant_tile_rows(biases, per_super)?;
         MxArray::eval_arrays_with_context(
             &[&tiled_weight, &tiled_scales, &tiled_biases],
             "tile_kquant_weights_for_disk",

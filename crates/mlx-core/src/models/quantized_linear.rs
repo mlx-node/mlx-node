@@ -715,11 +715,12 @@ pub fn row_major_kquant_arrays(
         )));
     };
     let per_group = i64::from(kq.scale_bytes_per_group);
+    let per_super = i64::from(kq.bias_entries_per_super_block);
     let super_ratio = i64::from(kq.super_ratio);
     Ok(Some((
         kquant_untile_rows(weight, i64::from(kq.bits))?,
         kquant_untile_rows(scales, super_ratio * per_group)?,
-        Some(kquant_untile_rows(biases, per_group)?),
+        Some(kquant_untile_rows(biases, per_super)?),
     )))
 }
 
@@ -3229,6 +3230,65 @@ mod kquant_tiled_tests {
     fn gpu() -> bool {
         // SAFETY: nullary predicate that catches internally.
         unsafe { mlx_sys::mlx_metal_is_available() }
+    }
+
+    /// Tiling and un-tiling round-trip every K-quant mode's three arrays
+    /// bit for bit. `.scales` moves in `super_ratio * scale_bytes_per_group`
+    /// units and `.biases` in `bias_entries_per_super_block` units; the two
+    /// differ for most modes, so a shared unit silently misplaces every
+    /// super-block's `d` (or fails on widths the wrong unit does not divide).
+    #[test]
+    fn tile_and_untile_round_trip_every_kquant_mode() {
+        use crate::models::quant_dispatch::{
+            KQUANT_MODES, KQuantLayout, kquant_mode_params, mode_to_str,
+        };
+        let (n, k) = (128i64, 5120i64);
+        for mode in KQUANT_MODES {
+            let kq = kquant_mode_params(mode).unwrap();
+            let mut st = 0x5eed_0000u32 ^ (mode as u32);
+            let weight_cols = k * i64::from(kq.bits) / 32;
+            let scale_cols = k / i64::from(kq.group_size) * i64::from(kq.scale_bytes_per_group);
+            let bias_cols = k / 256 * i64::from(kq.bias_entries_per_super_block);
+            let words: Vec<u32> = (0..n * weight_cols).map(|_| lcg(&mut st)).collect();
+            let scales: Vec<u8> = (0..n * scale_cols).map(|_| lcg(&mut st) as u8).collect();
+            let biases: Vec<u16> = (0..n * bias_cols)
+                .map(|_| 0x2800 + (lcg(&mut st) % 0x0c00) as u16)
+                .collect();
+            let row_major = QuantizedLinear::new(
+                MxArray::from_uint32(&words, &[n, weight_cols]).unwrap(),
+                MxArray::from_uint8(&scales, &[n, scale_cols]).unwrap(),
+                Some(MxArray::from_float16(&biases, &[n, bias_cols]).unwrap()),
+                None,
+                kq.group_size,
+                kq.bits,
+                mode_to_str(mode).to_string(),
+            );
+            let mut tiled = QuantizedLinear::new(
+                row_major.get_weight().clone(),
+                row_major.get_scales().clone(),
+                row_major.get_biases().cloned(),
+                None,
+                kq.group_size,
+                kq.bits,
+                mode_to_str(mode).to_string(),
+            );
+            assert!(tiled.tile_kquant_layout().unwrap(), "{mode:?} tiles");
+            let params = HashMap::from([
+                ("p.weight".to_string(), tiled.get_weight().clone()),
+                ("p.scales".to_string(), tiled.get_scales().clone()),
+                ("p.biases".to_string(), tiled.get_biases().unwrap().clone()),
+            ]);
+            let (w, s, b) = row_major_kquant_arrays(&params, "p", mode, KQuantLayout::Tiled64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(bits_of(&w), bits_of(row_major.get_weight()), "{mode:?} weight");
+            assert_eq!(bits_of(&s), bits_of(row_major.get_scales()), "{mode:?} scales");
+            assert_eq!(
+                bits_of(b.as_ref().unwrap()),
+                bits_of(row_major.get_biases().unwrap()),
+                "{mode:?} biases"
+            );
+        }
     }
 
     /// `row_major_kquant_arrays` (the un-tile step the MTPLX draft-head

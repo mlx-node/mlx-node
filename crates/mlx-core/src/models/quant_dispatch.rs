@@ -468,24 +468,26 @@ pub fn kquant_untile_rows(a: &MxArray, unit: i64) -> Result<MxArray> {
 
 /// True when `mode` is one of the supported ggml K/IQ packed families.
 pub fn is_kquant_mode(mode: PerLayerMode) -> bool {
-    matches!(
-        mode,
-        PerLayerMode::Q6K
-            | PerLayerMode::Q4K
-            | PerLayerMode::Q5K
-            | PerLayerMode::Q2K
-            | PerLayerMode::Q3K
-            | PerLayerMode::IQ4NL
-            | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S
-            | PerLayerMode::IQ2XXS
-            | PerLayerMode::IQ2XS
-            | PerLayerMode::IQ2S
-            | PerLayerMode::IQ3XXS
-            | PerLayerMode::IQ1S
-            | PerLayerMode::IQ1M
-    )
+    KQUANT_MODES.contains(&mode)
 }
+
+/// Every K-quant mode (the three-array `.weight/.scales/.biases` contract).
+pub const KQUANT_MODES: [PerLayerMode; 14] = [
+    PerLayerMode::Q6K,
+    PerLayerMode::Q4K,
+    PerLayerMode::Q5K,
+    PerLayerMode::Q2K,
+    PerLayerMode::Q3K,
+    PerLayerMode::IQ4NL,
+    PerLayerMode::IQ4XS,
+    PerLayerMode::IQ3S,
+    PerLayerMode::IQ2XXS,
+    PerLayerMode::IQ2XS,
+    PerLayerMode::IQ2S,
+    PerLayerMode::IQ3XXS,
+    PerLayerMode::IQ1S,
+    PerLayerMode::IQ1M,
+];
 
 /// True when the resolved quantization settings reference sym8 anywhere
 /// (top-level default mode OR any per-layer override).

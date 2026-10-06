@@ -1065,10 +1065,11 @@ impl QuantizedLinear {
             return Ok(false);
         }
         let per_group = i64::from(kq.scale_bytes_per_group);
+        let per_super = i64::from(kq.bias_entries_per_super_block);
         let super_ratio = i64::from(kq.super_ratio);
         let weight = kquant_tile_rows(&self.weight, i64::from(self.bits))?;
         let scales = kquant_tile_rows(&self.scales, super_ratio * per_group)?;
-        let biases = kquant_tile_rows(biases, per_group)?;
+        let biases = kquant_tile_rows(biases, per_super)?;
         MxArray::eval_arrays_with_context(&[&weight, &scales, &biases], "tile_kquant_layout")?;
         self.weight = weight;
         self.scales = scales;
