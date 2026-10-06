@@ -22,13 +22,14 @@
 //   KQ_LINEAR    scale * code + bias on the packed integer code (q2k..q6k)
 //   KQ_CODEBOOK  scale * table[code], the 16-entry IQ4_NL grid (iq4nl, iq4xs)
 //   KQ_INT8      scale * int8: the code is the signed value offset by 128
-//                (iq3s), so the affine rule applies with bias = -128 * scale
+//                (iq3s8, the legacy expanded IQ3_S import), so the affine
+//                rule applies with bias = -128 * scale
 //   KQ_GRID_*    scale * signed grid magnitude: `.weight` holds the ggml grid
-//                indices (and IQ2_XS's sign indices / IQ2_S's sign bytes),
-//                `.scales` the rest of the group's native bytes (kquant_grid.h
-//                lists each layout), `.biases` the super-block d. One kind per
-//                format, since the formats share no byte layout; kq_is_grid
-//                is the family test.
+//                indices (and IQ2_XS's sign indices / IQ2_S's and IQ3_S's
+//                sign bytes), `.scales` the rest of the group's native bytes
+//                (kquant_grid.h lists each layout), `.biases` the super-block
+//                d. One kind per format, since the formats share no byte
+//                layout; kq_is_grid is the family test.
 KQ_MODE_CONST KQ_LINEAR = 0;
 KQ_MODE_CONST KQ_CODEBOOK = 1;
 KQ_MODE_CONST KQ_INT8 = 2;
@@ -38,11 +39,12 @@ KQ_MODE_CONST KQ_GRID_IQ2S = 5;
 KQ_MODE_CONST KQ_GRID_IQ3XXS = 6;
 KQ_MODE_CONST KQ_GRID_IQ1S = 7;
 KQ_MODE_CONST KQ_GRID_IQ1M = 8;
+KQ_MODE_CONST KQ_GRID_IQ3S = 9;
 
 // Whether `kind` is one of the grid formats.
 template <int kind>
 constexpr bool kq_is_grid() {
-  return kind >= KQ_GRID_IQ2XXS && kind <= KQ_GRID_IQ1M;
+  return kind >= KQ_GRID_IQ2XXS && kind <= KQ_GRID_IQ3S;
 }
 
 // Whether the dot / dequantize helpers apply the IQ4_NL codebook.
@@ -64,6 +66,7 @@ constexpr bool kq_affine_zero_point() {
 //   IQ2_XXS 4  the sign / scale word        IQ3_XXS 4  the sign / scale word
 //   IQ2_XS  1  the two scale nibbles        IQ1_S   2  the qh halfword
 //   IQ2_S   2  the qh byte, the scale byte  IQ1_M   3  qh (2), the scale byte
+//   IQ3_S   2  the qh byte, the scale nibble (in its own byte)
 // The Tiled64 companion stride per super-block is
 // super_ratio * kq_scale_bytes_per_group<..>().
 template <bool has_min, int kind>
@@ -75,6 +78,7 @@ constexpr int kq_scale_bytes_per_group() {
       : kind == KQ_GRID_IQ3XXS        ? 4
       : kind == KQ_GRID_IQ1S          ? 2
       : kind == KQ_GRID_IQ1M          ? 3
+      : kind == KQ_GRID_IQ3S          ? 2
                                       : 1;
 }
 

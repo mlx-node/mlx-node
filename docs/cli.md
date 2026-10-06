@@ -381,8 +381,9 @@ The first load creates an application cache, preserving supported quantized weig
 in packed form and preparing the media companion in the same transaction.
 Supported source types are F32/F16/BF16, the affine blocks Q4_0, Q4_1, Q5_0,
 Q5_1 and Q8_0, MXFP4, the K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
-IQ3_S, IQ4_NL and IQ4_XS, and the grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
-IQ2_S and IQ3_XXS (so every Unsloth `UD-IQ*` / `UD-Q2_K_XL` mix loads).
+IQ4_NL and IQ4_XS, and the grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+IQ2_S, IQ3_XXS and IQ3_S (so every Unsloth `UD-IQ*` / `UD-Q2_K_XL` mix loads
+at ggml's byte size).
 Later loads reuse it. `MLX_NATIVE_GGUF_CACHE_DIR` overrides the cache directory;
 source files are not modified. Changes to the source, companion, or tokenizer
 assets invalidate the cache. A directory with multiple text GGUFs requires an
@@ -446,11 +447,11 @@ mlx convert --input ./model.gguf --output ./model-mlx
 
 Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, the affine
 blocks Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and MXFP4 source types directly, plus the
-ggml K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS and the
-grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS behind
+ggml K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and the
+grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S behind
 `--gguf-kquant`.
 
-#### K-quants (Q2_K .. Q6_K, IQ3_S, IQ4_NL, IQ4_XS, IQ1_*, IQ2_*, IQ3_XXS)
+#### K-quants (Q2_K .. Q6_K, IQ4_NL, IQ4_XS, IQ1_*, IQ2_*, IQ3_XXS, IQ3_S)
 
 ```bash
 mlx convert --input ./model-UD-Q6_K_XL.gguf --output ./model-mlx --gguf-kquant
@@ -472,7 +473,6 @@ Q2_K        the same at 16-value groups  (sc, m are the two nibbles of one byte)
 Q6_K        y = d*sc[j]*(q-32)          ->  scale = d*sc[j]   bias = -32*d*sc[j]
 Q3_K        y = d*sc[j]*(q-4)           ->  scale = d*sc[j]   bias = -4*d*sc[j]
 IQ4_NL/XS   y = d*sc[j]*grid[q]         ->  the 16-entry codebook, no bias
-IQ3_S       y = d*sc[j]*v               ->  v the signed grid value, stored as a byte
 ```
 
 The grid formats are not affine and keep ggml's native words: `.weight` holds
@@ -484,6 +484,7 @@ reference), bit-identical to `dequantize_row_*`:
 ```
 IQ2_XXS/XS/S  y = d*(1+2*sc)/8 * (+-grid8[idx][j])    sc a nibble per 32 (XXS) or 16 (XS, S)
 IQ3_XXS       y = d*(1+2*sc)/4 * (+-grid4[idx][j])
+IQ3_S         y = d*(1+2*sc)   * (+-grid4[idx][j])    9-bit idx (qh), one sign bit per value
 IQ1_S/M       y = d*(2*sc+1) * (grid[idx][j] +- 1/8)  computed as d*(2*sc+1)/8 * (8*g +- 1)
 ```
 
@@ -498,6 +499,7 @@ IQ1_S/M       y = d*(2*sc+1) * (grid[idx][j] +- 1/8)  computed as d*(2*sc+1)/8 *
 | IQ2_XS | 2.3125 bpw | 2.3125 | native words, exact parity          |
 | IQ2_S  | 2.5625 bpw | 2.5625 | native words, exact parity          |
 | IQ3_XXS | 3.0625 bpw | 3.0625 | native words, exact parity        |
+| IQ3_S  | 3.5625 bpw | 3.4375 | +4 B/256 for whole-byte scale nibbles |
 | IQ1_S  | 1.5625 bpw | 1.5625 | native words, exact parity          |
 | IQ1_M  | 1.8125 bpw | 1.7500 | +2 B/256 for the explicit f16 `d`   |
 

@@ -369,6 +369,10 @@ mlx_array *mlx_qwen4_expert_prefill(mlx_array *x, mlx_array *ids,
     bool affine = std::string_view(mode) == "affine";
     if (!affine && !quant)
       return nullptr;
+    if (quant) {
+      // ("iq3s", bits 8) is the legacy expanded import (mlx_kquant.h).
+      quant = mlx::core::kquant::resolve_mode(*quant, bits);
+    }
     int ratio = quant ? mlx::core::kquant::super_ratio(*quant) : 0;
     bool has_min = quant && mlx::core::kquant::has_sub_min(*quant);
     if (input.ndim() != 3 || input.shape(1) != 1 ||

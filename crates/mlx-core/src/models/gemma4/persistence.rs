@@ -19,7 +19,8 @@ use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    kquant_mode_params, load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
+    kquant_mode_params_for_scales, load_quant_settings_from_disk, merge_per_layer,
+    resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -1469,7 +1470,11 @@ fn resolve_packed_embed_params<'a>(
             // non-K-quant mode, which this arm has already excluded — the `else`
             // keeps that unreachable-today branch fail-closed instead of
             // defaulting a future K-quant family to the wrong bit width.
-            let Some(kq) = kquant_mode_params(plq.mode) else {
+            let Some(kq) = scales
+                .dtype()
+                .ok()
+                .and_then(|dt| kquant_mode_params_for_scales(plq.mode, dt))
+            else {
                 return Err(Error::from_reason(format!(
                     "gemma4 {key} load: quant mode {:?} reached the K-quant embedding arm but has \
                      no K-quant FFI parameters — refusing to load",

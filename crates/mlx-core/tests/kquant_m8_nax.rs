@@ -30,7 +30,7 @@ struct Fmt {
     biases_cols: i64,
 }
 
-const FORMATS: [Fmt; 14] = [
+const FORMATS: [Fmt; 15] = [
     Fmt {
         mode: "q4k",
         bits: 4,
@@ -85,13 +85,23 @@ const FORMATS: [Fmt; 14] = [
         scales_cols: 8,
         biases_cols: 8,
     },
+    // The legacy expanded IQ3_S import (int8 codes).
     Fmt {
-        mode: "iq3s",
+        mode: "iq3s8",
         bits: 8,
         group_size: 32,
         signed_scales: true,
         weight_cols: 64,
         scales_cols: 8,
+        biases_cols: 1,
+    },
+    Fmt {
+        mode: "iq3s",
+        bits: 3,
+        group_size: 32,
+        signed_scales: false,
+        weight_cols: 24,
+        scales_cols: 16,
         biases_cols: 1,
     },
     Fmt {
@@ -165,7 +175,7 @@ impl Fmt {
     fn is_grid(&self) -> bool {
         matches!(
             self.mode,
-            "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m"
+            "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m" | "iq3s"
         )
     }
 }
@@ -573,8 +583,7 @@ fn m8_nax_leaves_every_other_case_alone() {
         assert!(m8 == 0 && wide > 0, "q3k must stay on qmv_wide without NAX");
     }
     // q2k has no sg8 decode either, so row-major it takes the tensor op too.
-    let q2k = FORMATS[7];
-    assert_eq!(q2k.mode, "q2k");
+    let q2k = *FORMATS.iter().find(|f| f.mode == "q2k").expect("q2k");
     let w2 = Weights::new(q2k, 2048, k, 4);
     let (m8, sg8, wide) = route("q2k M=8 N=2048 row-major", &bf16_x(&xb, k), &w2);
     assert_eq!(sg8, 0, "q2k has no qmv_sg8 kernel");

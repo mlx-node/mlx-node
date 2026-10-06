@@ -84,7 +84,7 @@ struct KQuant {
     biases_cols: i64,
 }
 
-const KQUANTS: [KQuant; 14] = [
+const KQUANTS: [KQuant; 15] = [
     KQuant {
         mode: "q2k",
         bits: 2,
@@ -148,8 +148,10 @@ const KQUANTS: [KQuant; 14] = [
         scales_cols: 8,
         biases_cols: 1,
     },
+    // The legacy expanded IQ3_S import (int8 codes); the bridge reaches it
+    // from ("iq3s", bits 8) too (kquant::resolve_mode, mlx_kquant.h).
     KQuant {
-        mode: "iq3s",
+        mode: "iq3s8",
         bits: 8,
         group_size: 32,
         scales_signed: true,
@@ -159,6 +161,15 @@ const KQUANTS: [KQuant; 14] = [
     },
     // The grid formats (gguf_kquant.rs): `bits` native grid-index words per
     // 32-value unit, `scales_cols` companion bytes per 8 units, one d.
+    KQuant {
+        mode: "iq3s",
+        bits: 3,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 24,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
     KQuant {
         mode: "iq2xxs",
         bits: 1,
@@ -218,7 +229,7 @@ const KQUANTS: [KQuant; 14] = [
 fn is_grid(kq: &KQuant) -> bool {
     matches!(
         kq.mode,
-        "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m"
+        "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m" | "iq3s"
     )
 }
 
@@ -987,6 +998,57 @@ fn quantize_rejects_every_kquant_mode_on_every_device() {
                 quantize(&x, kq.group_size, kq.bits, kq.mode),
             );
         }
+    }
+}
+
+/// Artifacts converted before the packed IQ3_S form hand the bridge
+/// `("iq3s", bits 8)` with int8 sub-scales and byte codes; it must read them
+/// as the legacy `iq3s8` contract, bit for bit, on both devices — and must
+/// not take the packed `iq3s` for its bits or its scales dtype.
+#[test]
+fn iq3s_with_eight_bits_is_the_legacy_iq3s8_contract() {
+    let legacy = KQUANTS.iter().find(|k| k.mode == "iq3s8").expect("iq3s8");
+    let packed = KQUANTS.iter().find(|k| k.mode == "iq3s").expect("iq3s");
+    assert_eq!((legacy.bits, packed.bits), (8, 3));
+    let (w, scales, biases) = filled_kquant_weights(legacy, &[N], K_DEEP);
+    for device in [Device::Cpu, Device::Gpu] {
+        if !select(device) {
+            continue;
+        }
+        let what = format!("iq3s bits=8 {}", device.label());
+        let ours = expect_f32(
+            &format!("{what} dequantize"),
+            dequantize_handle(&w, &scales, Some(&biases), 32, 8, "iq3s"),
+        );
+        let reference = expect_f32(
+            &format!("{what} dequantize iq3s8"),
+            dequantize_handle(&w, &scales, Some(&biases), 32, 8, "iq3s8"),
+        );
+        assert_eq!(ours, reference, "{what}: dequantize differs from iq3s8");
+        assert!(reference.iter().any(|v| *v != 0.0), "{what}: all zero");
+        for m in [1i64, 8] {
+            let x = activation(&[m, K_DEEP], 0x135 + m as u32, DType::BFloat16);
+            let ours = expect_f32(
+                &format!("{what} qmm M={m}"),
+                quantized_matmul_handle(&x, &w, &scales, Some(&biases), true, 32, 8, "iq3s"),
+            );
+            let reference = expect_f32(
+                &format!("{what} qmm M={m} iq3s8"),
+                quantized_matmul_handle(&x, &w, &scales, Some(&biases), true, 32, 8, "iq3s8"),
+            );
+            assert_eq!(ours, reference, "{what} M={m}: matmul differs from iq3s8");
+        }
+        // The packed contract's bits with the legacy arrays, and the legacy
+        // bits with packed (uint8) scales, are both refused.
+        expect_rejected(
+            &format!("{what} bits=3 on legacy arrays"),
+            dequantize(&w, &scales, Some(&biases), 32, 3, "iq3s"),
+        );
+        let (pw, pscales, pbiases) = filled_kquant_weights(packed, &[N], K_DEEP);
+        expect_rejected(
+            &format!("{what} bits=8 on packed arrays"),
+            dequantize(&pw, &pscales, Some(&pbiases), 32, 8, "iq3s"),
+        );
     }
 }
 

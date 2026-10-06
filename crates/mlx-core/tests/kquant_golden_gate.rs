@@ -31,16 +31,24 @@ use mlx_core::array::MxArray;
 const MULTI_ROW: [i64; 7] = [2, 3, 4, 5, 6, 7, 8];
 const OTHER_ROWS: [i64; 8] = [1, 9, 12, 17, 24, 33, 64, 512];
 
-/// The modes in the captured case matrix. q2k and the six grid formats
+/// The modes in the captured case matrix. q2k and the seven grid formats
 /// landed after the capture; the digests pin the seven captured modes and
 /// the later ones are covered by kquant_tiled / kquant_m8_nax /
 /// kquant_mode_guards against the CPU reference (and kquant_ggml_parity
-/// against ggml) until the next pin bump re-captures the goldens.
+/// against ggml) until the next pin bump re-captures the goldens. The
+/// expanded IQ3_S import was captured under its then mode name `iq3s`; it
+/// is the bridge's `iq3s8` now, so its keys keep the captured label
+/// (`captured_label`).
 fn captured_modes() -> impl Iterator<Item = (usize, &'static KQuant)> {
     KQUANTS
         .iter()
         .filter(|kq| kq.mode != "q2k" && !kq.is_grid())
         .enumerate()
+}
+
+/// The mode name a case key carries: the name at capture time.
+fn captured_label(kq: &KQuant) -> &'static str {
+    if kq.mode == "iq3s8" { "iq3s" } else { kq.mode }
 }
 
 fn label(device: i32) -> &'static str {
@@ -100,7 +108,7 @@ fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
         let n_short = weights(kq, &[256], 512, seed + 3);
         let n_deep = weights(kq, &[1024], 512, seed + 4);
         for dtype in DTYPES {
-            let m_ = kq.mode;
+            let m_ = captured_label(kq);
             for &m in ms {
                 if device == GPU || m <= 33 {
                     let x = activation(&[m, 1024], seed + m as u32, dtype);
@@ -216,7 +224,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
     const E: i64 = 8;
     for (ki, kq) in captured_modes() {
         let seed = 0x2000 + ki as u32;
-        let m_ = kq.mode;
+        let m_ = captured_label(kq);
         let experts_t = weights(kq, &[E, 128], 512, seed);
         let experts_n = weights(kq, &[E, 256], 512, seed + 1);
         let experts_odd = weights(kq, &[E, 136], 768, seed + 2);
@@ -344,7 +352,7 @@ fn run_dequantize(g: &mut Golden, cases: &mut usize, device: i32) {
         let stacked = weights(kq, &[3, 40], 512, 0x3100 + ki as u32);
         for dtype in DTYPES {
             for (w, tag) in [(&flat, "2-D"), (&stacked, "3-D")] {
-                let what = format!("{dev} {} {dtype:?} dequantize {tag}", kq.mode);
+                let what = format!("{dev} {} {dtype:?} dequantize {tag}", captured_label(kq));
                 let (shape, out_dtype, bits) = read_output(&what, dequantize(w, dtype, kq, device));
                 g.record_bits(&what, &shape, out_dtype, &bits);
                 *cases += 1;

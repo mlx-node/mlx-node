@@ -70,7 +70,7 @@ export const MIN_PAGED_METALLIB_BYTES = 4 * 1024 * 1024;
 export const KQUANT_KERNEL_MARKERS = [
   'q4k_qmv_fast_float_gs_32_b_4_batch_0',
   'q6k_qmm_t_float16_t_gs_16_b_6_alN_true_batch_0',
-  'iq3s_dequantize_bfloat16_t_gs_32_b_8',
+  'iq3s_dequantize_bfloat16_t_gs_32_b_3',
   'q5k_gather_qmm_rhs_nt_bfloat16_t_gs_32_b_5_bm_16_bn_32_bk_32_wm_1_wn_2',
   'q4k_qmv_sg8_bfloat16_t_gs_32_b_4',
   'kquant_qmv_sg8_prep_bfloat16_t_gs_16',

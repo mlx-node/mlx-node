@@ -41,7 +41,8 @@ enum Format : int {
   Q3K,
   IQ4NL,
   IQ4XS,
-  IQ3S,
+  // The legacy expanded IQ3_S import (8-bit signed codes, KQ_INT8).
+  IQ3S8,
   Q2K,
   IQ2XXS,
   IQ2XS,
@@ -49,6 +50,7 @@ enum Format : int {
   IQ3XXS,
   IQ1S,
   IQ1M,
+  IQ3S,
   Unsupported
 };
 
@@ -61,6 +63,7 @@ constexpr int grid_kind() {
       : F == IQ3XXS  ? KQ_GRID_IQ3XXS
       : F == IQ1S    ? KQ_GRID_IQ1S
       : F == IQ1M    ? KQ_GRID_IQ1M
+      : F == IQ3S    ? KQ_GRID_IQ3S
                      : -1;
 }
 
@@ -89,6 +92,9 @@ constexpr Format format() {
     }
     if (kind == KQ_GRID_IQ1M && bits == 1) {
       return IQ1M;
+    }
+    if (kind == KQ_GRID_IQ3S && bits == 3) {
+      return IQ3S;
     }
   }
   if (group_size == 32 && super_ratio == 8 && bits == 4) {
@@ -119,7 +125,7 @@ constexpr Format format() {
   }
   if (group_size == 32 && super_ratio == 8 && bits == 8 && !has_min &&
       kind == KQ_INT8) {
-    return IQ3S;
+    return IQ3S8;
   }
   return Unsupported;
 }
@@ -132,7 +138,7 @@ constexpr uint sb_scale_bytes() {
   if constexpr (is_grid<F>()) {
     return 8 * kq_scale_bytes_per_group<false, grid_kind<F>()>();
   }
-  return F == Q2K ? 32 : (F == IQ4XS || F == IQ3S || F == IQ4NL ? 8 : 16);
+  return F == Q2K ? 32 : (F == IQ4XS || F == IQ3S8 || F == IQ4NL ? 8 : 16);
 }
 
 constant constexpr int8_t kIQ4[16] = {
@@ -212,7 +218,7 @@ struct Codes<Q3K> {
 };
 
 template <>
-struct Codes<IQ3S> {
+struct Codes<IQ3S8> {
   struct W {
     uint4 a;
     uint4 b;
@@ -233,7 +239,7 @@ struct Codes<Q2K> {
   }
 };
 
-// The grid formats: the unit's one or two `.weight` words; the companion
+// The grid formats: the unit's one to three `.weight` words; the companion
 // bytes (`.sc`) are filled in by CoefCursor::companion, which knows the
 // `.scales` layout (kquant_grid.h lists the per-format fields).
 #define KQ_M8_GRID_CODES(F)                                              \
@@ -245,6 +251,7 @@ struct Codes<Q2K> {
       W w;                                                               \
       w.w0 = s[0];                                                       \
       w.w1 = kq_grid_words<grid_kind<F>()>() > 1 ? s[1] : 0u;            \
+      w.w2 = kq_grid_words<grid_kind<F>()>() > 2 ? s[2] : 0u;            \
       w.sc = 0u;                                                         \
       return w;                                                          \
     }                                                                    \
@@ -255,6 +262,7 @@ KQ_M8_GRID_CODES(IQ2S)
 KQ_M8_GRID_CODES(IQ3XXS)
 KQ_M8_GRID_CODES(IQ1S)
 KQ_M8_GRID_CODES(IQ1M)
+KQ_M8_GRID_CODES(IQ3S)
 #undef KQ_M8_GRID_CODES
 
 constant constexpr uint kTileRows = 64;
@@ -405,7 +413,7 @@ struct CoefCursor {
       const uint byte = (sc[j >> 2] >> (8 * (j & 3))) & 0xFFu;
       const float dd = float(d.x);
       c.s = float2(kq_shift_scale<scale_shift>(dd * float(as_type<char>(uchar(byte)))));
-      c.m = F == IQ3S ? float(-128) * c.s : float2(0.0f);
+      c.m = F == IQ3S8 ? float(-128) * c.s : float2(0.0f);
     }
     return c;
   }
@@ -494,7 +502,7 @@ METAL_FUNC uint2 bytes8<Q2K>(uint2 w, ushort j) {
 }
 
 template <>
-METAL_FUNC uint2 bytes8<IQ3S>(Codes<IQ3S>::W w, ushort j) {
+METAL_FUNC uint2 bytes8<IQ3S8>(Codes<IQ3S8>::W w, ushort j) {
   const uint4 h = j < 2 ? w.a : w.b;
   const uint w0 = h[2 * (j & 1)];
   const uint w1 = h[2 * (j & 1) + 1];

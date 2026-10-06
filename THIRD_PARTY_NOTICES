@@ -17,13 +17,14 @@ bytes8<Q2K> and the CoefCursor Q2K arm) and the QuantKind notion of
 crates/mlx-sys/src/metal/kquant/kquant_mode.h (KQ_LINEAR / KQ_CODEBOOK /
 KQ_INT8 / KQ_GRID) follow Splash's FmtQ2K, quant_spread2 and QuantKind in
 runtime/metal/kernels/common/quant_formats.h. The IQ1_S / IQ1_M / IQ2_XXS /
-IQ2_XS / IQ2_S / IQ3_XXS grid decode in
+IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S grid decode in
 crates/mlx-sys/src/metal/kquant/kquant_grid.h (and its C++ twin in
 crates/mlx-sys/src/mlx_kquant.cpp) — the 7-bit sign index expansion
-(kq_signs7), the per-chunk grid index / sign / scale extraction, the IQ1
+(kq_signs7), the per-chunk grid index / sign / scale extraction (IQ3_S's
+two 9th index bits per chunk and per-element sign bits), the IQ1
 "code - 9" delta form and the power-of-two scale shift — follows Splash's
-FmtIQ2XXS, FmtIQ2XS, FmtIQ2S, FmtIQ3XXS, FmtIQ1S, FmtIQ1M, quant_signs7,
-quant_iq1_codes and the QuantGrid arm of dequant32 in
+FmtIQ2XXS, FmtIQ2XS, FmtIQ2S, FmtIQ3XXS, FmtIQ3S, FmtIQ1S, FmtIQ1M,
+quant_signs7, quant_iq1_codes and the QuantGrid arm of dequant32 in
 runtime/metal/kernels/common/quant_formats.h and
 runtime/metal/kernels/common/gguf_staged.h, with the byte fetch rewritten for
 mlx-node's three-array layout. The tensor-op verify attention kernel
@@ -62,9 +63,9 @@ Version 2.0, whose copyright line it leaves as the template text:
 
 ggml / llama.cpp (https://github.com/ggml-org/llama.cpp)
 
-The IQ1 / IQ2 / IQ3_XXS grid tables in
+The IQ1 / IQ2 / IQ3 grid tables in
 crates/mlx-sys/src/metal/kquant/kquant_grid_tables.h (iq2xxs_grid,
-iq2xs_grid, iq2s_grid, iq3xxs_grid, iq1s_grid_gpu; read by the Metal kernels
+iq2xs_grid, iq2s_grid, iq3xxs_grid, iq3s_grid, iq1s_grid_gpu; read by the Metal kernels
 and the C++ CPU reference) and the K-quant parity oracle in
 crates/mlx-core/vendor/ggml/ (ggml_kquant_ref.{h,c}, ggml_grid_tables.inc,
 ggml_quants_upstream.inc: the block structs, grid tables and

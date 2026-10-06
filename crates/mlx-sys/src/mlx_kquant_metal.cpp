@@ -63,7 +63,7 @@ namespace kernels {
 constexpr Mode kModes[] = {Mode::Q6K,    Mode::Q4K,   Mode::Q5K,  Mode::Q3K,
                            Mode::IQ4NL,  Mode::IQ4XS, Mode::IQ3S, Mode::Q2K,
                            Mode::IQ2XXS, Mode::IQ2XS, Mode::IQ2S, Mode::IQ3XXS,
-                           Mode::IQ1S,   Mode::IQ1M};
+                           Mode::IQ1S,   Mode::IQ1M,  Mode::IQ3S8};
 constexpr Dtype kTypes[] = {float32, float16, bfloat16};
 
 // qmv_wide tiles 2..8 input vectors (multi-row matvecs only) at 8 k-lanes.
@@ -131,7 +131,8 @@ std::string qmv_sg8(Mode m) { return base(m, "qmv_sg8", kSg8Type); }
 // 8 K splits (kquant_m8_nax.h). Every mode in the Tiled64 layout; row-major
 // only the modes qmv_sg8 does not decode (q3k, q2k, iq4nl and the grid
 // formats), where it measured 1.1-1.4x of qmv_wide on the Qwen3.8 shapes on
-// an M5 Max (the sg8 modes only tie qmv_sg8 row-major, 0.85-1.0x).
+// an M5 Max (the sg8 modes only tie qmv_sg8 row-major, 0.85-1.0x). The
+// legacy iq3s8 stays on qmv_wide row-major, as it always has.
 constexpr int kM8TileCols = 64;
 constexpr int kM8MaxSplits = 8;
 constexpr bool m8_nax_row_major_mode(Mode mode) {

@@ -23,13 +23,14 @@ pub struct KQuant {
 }
 
 impl KQuant {
-    /// A grid format (IQ1 / IQ2 / IQ3_XXS): `.scales` holds native companion
+    /// A grid format (IQ1 / IQ2 / IQ3): `.scales` holds native companion
     /// bytes (sign indices, qh, scale nibbles), so a fixture fills them with
-    /// whole random bytes rather than small sub-scales.
+    /// whole random bytes rather than small sub-scales. (IQ3_S's scale byte
+    /// is read as a nibble, so any byte is a valid field.)
     pub fn is_grid(&self) -> bool {
         matches!(
             self.mode,
-            "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m"
+            "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m" | "iq3s"
         )
     }
 
@@ -58,7 +59,7 @@ impl KQuant {
     }
 }
 
-pub const KQUANTS: [KQuant; 14] = [
+pub const KQUANTS: [KQuant; 15] = [
     KQuant {
         mode: "q2k",
         bits: 2,
@@ -122,8 +123,10 @@ pub const KQUANTS: [KQuant; 14] = [
         scales_cols: 8,
         biases_cols: 1,
     },
+    // The legacy expanded IQ3_S import (int8 codes); the bridge reaches it
+    // from ("iq3s", bits 8) too (kquant::resolve_mode, mlx_kquant.h).
     KQuant {
-        mode: "iq3s",
+        mode: "iq3s8",
         bits: 8,
         group_size: 32,
         scales_signed: true,
@@ -133,6 +136,15 @@ pub const KQUANTS: [KQuant; 14] = [
     },
     // The grid formats (gguf_kquant.rs): `bits` words per 32-value unit of
     // native grid indices, `scales_cols` companion bytes per 8 units.
+    KQuant {
+        mode: "iq3s",
+        bits: 3,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 24,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
     KQuant {
         mode: "iq2xxs",
         bits: 1,

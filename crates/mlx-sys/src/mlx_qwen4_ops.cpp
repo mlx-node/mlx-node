@@ -390,6 +390,8 @@ mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
     auto quant = mlx::core::kquant::parse_mode(mode);
     if (!quant)
       return nullptr;
+    // ("iq3s", bits 8) is the legacy expanded import (mlx_kquant.h).
+    quant = mlx::core::kquant::resolve_mode(*quant, bits);
     int ratio = mlx::core::kquant::super_ratio(*quant);
     if ( input.ndim() != 3 || input.shape(1) != 1 ||
         selected.dtype() != mlx::core::uint32 || w.ndim() != 2 ||

@@ -8,7 +8,7 @@
 //   * `ggml_e8m0_to_fp32_half` (ggml-impl.h) and `kvalues_mxfp4`
 //     (ggml-common.h, `kvalues_fp4`) are copied beside the decoders that use
 //     them, with `GGML_E8M0_TO_FP32_HALF` mapped onto the copy
-//   * the IQ1 / IQ2 / IQ3_XXS grid tables of ggml-common.h are included from
+//   * the IQ1 / IQ2 / IQ3 grid tables of ggml-common.h are included from
 //     ggml_grid_tables.inc (verbatim data; GGML_TABLE_BEGIN/END expanded)
 // Nothing inside a function body was reordered, retyped or simplified.
 // Built as C with -ffp-contract=off by crates/mlx-core/build.rs; contraction
@@ -45,12 +45,16 @@ _Static_assert(sizeof(block_iq2_s) == GGML_IQ2S_BLOCK_BYTES, "iq2_s block size")
 _Static_assert(sizeof(block_iq3_xxs) == GGML_IQ3XXS_BLOCK_BYTES, "iq3_xxs block size");
 _Static_assert(sizeof(block_iq1_s) == GGML_IQ1S_BLOCK_BYTES, "iq1_s block size");
 _Static_assert(sizeof(block_iq1_m) == GGML_IQ1M_BLOCK_BYTES, "iq1_m block size");
+_Static_assert(sizeof(block_iq3_s) == GGML_IQ3S_BLOCK_BYTES, "iq3_s block size");
 _Static_assert(offsetof(block_iq2_xs, scales) == 66, "iq2_xs scales");
 _Static_assert(offsetof(block_iq2_s, qh) == 66, "iq2_s qh");
 _Static_assert(offsetof(block_iq2_s, scales) == 74, "iq2_s scales");
 _Static_assert(offsetof(block_iq1_s, qh) == 34, "iq1_s qh");
 _Static_assert(offsetof(block_iq1_m, qh) == 32, "iq1_m qh");
 _Static_assert(offsetof(block_iq1_m, scales) == 48, "iq1_m scales");
+_Static_assert(offsetof(block_iq3_s, qh) == 66, "iq3_s qh");
+_Static_assert(offsetof(block_iq3_s, signs) == 74, "iq3_s signs");
+_Static_assert(offsetof(block_iq3_s, scales) == 106, "iq3_s scales");
 
 // The grid tables (ggml-common.h), verbatim data.
 #include "ggml_grid_tables.inc"
@@ -384,6 +388,48 @@ void dequantize_row_iq3_xxs(const block_iq3_xxs * GGML_RESTRICT x, float * GGML_
                 y += 8;
             }
             qs += 8;
+        }
+    }
+}
+
+// ===== ggml-quants.c:2607 ====================================================
+void dequantize_row_iq3_s(const block_iq3_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t * qs = x[i].qs;
+        const uint8_t * qh = x[i].qh;
+        const uint8_t * signs = x[i].signs;
+
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const float db1 = d * (1 + 2*(x[i].scales[ib32/2] & 0xf));
+            const float db2 = d * (1 + 2*(x[i].scales[ib32/2] >>  4));
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[0] << (8-2*l)) & 256)));
+                const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[0] << (7-2*l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j+0] = db1 * grid1[j] * (signs[l] & kmask_iq2xs[j+0] ? -1.f : 1.f);
+                    y[j+4] = db1 * grid2[j] * (signs[l] & kmask_iq2xs[j+4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 8;
+            signs += 4;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[1] << (8-2*l)) & 256)));
+                const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[1] << (7-2*l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j+0] = db2 * grid1[j] * (signs[l] & kmask_iq2xs[j+0] ? -1.f : 1.f);
+                    y[j+4] = db2 * grid2[j] * (signs[l] & kmask_iq2xs[j+4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qh += 2;
+            qs += 8;
+            signs += 4;
         }
     }
 }

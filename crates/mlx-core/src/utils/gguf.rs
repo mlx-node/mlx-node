@@ -5928,7 +5928,11 @@ pub async fn convert_gguf_to_safetensors(
 /// bytes, no marker) is never aliased by a v6 reader — both load correctly,
 /// each by its own config, but the bump makes a fresh cache take the
 /// permute-free path.
-const QWEN35_NATIVE_CACHE_FORMAT: u32 = 6;
+///
+/// v7: IQ3_S is imported packed (3 words per 32-value unit, in-kernel grid)
+/// instead of expanded to int8 codes. A v6 entry still loads through the
+/// legacy `iq3s`/bits-8 contract; the bump re-imports it at native size.
+const QWEN35_NATIVE_CACHE_FORMAT: u32 = 7;
 const NATIVE_GGUF_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
 
 fn native_gguf_cache_candidates_from(
@@ -13656,9 +13660,10 @@ mod tests {
     #[test]
     fn native_cache_format_is_bumped_for_the_tiled_layout() {
         // v5 caches hold row-major K-quant bytes with no `layout` marker; v6
-        // ones hold tiled bytes WITH it. The format is part of the directory
-        // key, so neither reader ever opens the other's entry by accident.
-        assert_eq!(QWEN35_NATIVE_CACHE_FORMAT, 6);
+        // ones hold tiled bytes WITH it; v7 ones hold packed IQ3_S. The
+        // format is part of the directory key, so no reader ever opens an
+        // older entry by accident.
+        assert_eq!(QWEN35_NATIVE_CACHE_FORMAT, 7);
         let root = std::env::temp_dir().join(format!(
             "mlx-node-native-cache-format-{}",
             std::process::id()
@@ -13671,7 +13676,7 @@ mod tests {
         .unwrap();
         assert!(
             !qwen35_native_cache_is_current(&root, "abc", "def", "bf16"),
-            "a v5 marker must not satisfy the v6 reader"
+            "a v5 marker must not satisfy the current reader"
         );
         fs::remove_dir_all(&root).ok();
     }

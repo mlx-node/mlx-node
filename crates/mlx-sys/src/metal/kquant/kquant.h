@@ -1,7 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
-// ggml K-quant (Q2_K / Q3_K / Q4_K / Q5_K / Q6_K), IQ (IQ4_NL / IQ4_XS /
-// IQ3_S) and grid (IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS) kernels.
+// ggml K-quant (Q2_K / Q3_K / Q4_K / Q5_K / Q6_K), IQ (IQ4_NL / IQ4_XS, and
+// the legacy expanded IQ3_S import iq3s8) and grid (IQ1_S / IQ1_M / IQ2_XXS /
+// IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S) kernels.
 //
 // Every K-quant sub-block is algebraically affine -- value = scale * q + bias
 // -- so this is quantized.h with a single substitution: the per-group scalar
@@ -15,7 +16,7 @@
 // through a grid table, sign bits and a per-group scale (kquant_grid.h), so
 // every kernel has a KQ_GRID arm that decodes a unit (or an 8-value chunk of
 // it) to fp32 registers and then runs the same dot / stage as the affine
-// path on those values. `bits` is then the unit's `.weight` words (1 or 2),
+// path on those values. `bits` is then the unit's `.weight` words (1 to 3),
 // not a code width.
 #include <metal_simdgroup>
 #include <metal_stdlib>

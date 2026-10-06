@@ -90,8 +90,10 @@ const IQ4NL: Fmt = Fmt {
     scales_cols: 8,
     biases_cols: 8,
 };
-const IQ3S: Fmt = Fmt {
-    mode: "iq3s",
+// The legacy expanded IQ3_S import; the packed `iq3s` is a grid mode and
+// takes qmm_m8_nax at M = 8 instead.
+const IQ3S8: Fmt = Fmt {
+    mode: "iq3s8",
     bits: 8,
     group_size: 32,
     signed_scales: true,
@@ -596,7 +598,7 @@ fn sg8_leaves_every_other_case_on_qmv_wide() {
         println!("  qmv_wide bits  {what}");
     };
 
-    for fmt in [Q3K, IQ4NL, IQ3S, Q2K] {
+    for fmt in [Q3K, IQ4NL, IQ3S8, Q2K] {
         let w = Weights::new(fmt, &[], n, k, 0x0dd + fmt.bits as u32);
         let x = bf16_x(&activation_bits(8, k, 3, false), &[8, k]);
         same(

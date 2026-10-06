@@ -690,7 +690,7 @@ pub fn row_major_kquant_arrays(
     mode: PerLayerMode,
     layout: KQuantLayout,
 ) -> Result<Option<(MxArray, MxArray, Option<MxArray>)>> {
-    use crate::models::quant_dispatch::{kquant_mode_params, kquant_untile_rows};
+    use crate::models::quant_dispatch::{kquant_mode_params_for_scales, kquant_untile_rows};
     let Some(weight) = params.get(&format!("{prefix}.weight")) else {
         return Ok(None);
     };
@@ -703,7 +703,9 @@ pub fn row_major_kquant_arrays(
     if layout == KQuantLayout::RowMajor {
         return Ok(Some((weight.clone(), scales.clone(), biases.cloned())));
     }
-    let Some(kq) = kquant_mode_params(mode) else {
+    // The `.scales` dtype picks the legacy expanded IQ3_S contract when the
+    // artifact predates the packed form.
+    let Some(kq) = kquant_mode_params_for_scales(mode, scales.dtype()?) else {
         return Err(Error::from_reason(format!(
             "row_major_kquant_arrays: '{prefix}' declares the Tiled64 layout but mode {mode:?} \
              is not a K-quant mode"
@@ -919,7 +921,7 @@ impl QuantizedLinear {
 
     fn tile_kquant_layout_impl(&mut self, pad_rows: bool) -> Result<bool> {
         use crate::models::quant_dispatch::{
-            KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kquant_mode_params, kquant_tile_rows,
+            KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kquant_mode_params_for_scales, kquant_tile_rows,
             kquant_tileable, parse_mode_str, split_kquant_layout,
         };
         let (base, already) = split_kquant_layout(&self.mode);
@@ -929,10 +931,20 @@ impl QuantizedLinear {
         let Some(mode) = parse_mode_str(Some(base)) else {
             return Ok(false);
         };
-        // `None` for every non-K-quant mode.
-        let Some(kq) = kquant_mode_params(mode) else {
+        // `None` for every non-K-quant mode. The `.scales` dtype picks the
+        // legacy expanded IQ3_S contract (`iq3s8`) for an artifact that
+        // predates the packed form; its `bits` must agree with the
+        // projection's.
+        let Some(kq) = kquant_mode_params_for_scales(mode, self.scales.dtype()?) else {
             return Ok(false);
         };
+        if kq.bits != self.bits {
+            return Err(Error::from_reason(format!(
+                "tile_kquant_layout: {base} projection carries bits={} but the {} contract its \
+                 .scales dtype selects has bits={} — config/tensor disagreement",
+                self.bits, kq.mode_str, kq.bits
+            )));
+        }
         if self.output_layout != QuantizedOutputLayout::Native
             || self.hadamard.is_some()
             || self.fp8_dequant_weight.is_some()
@@ -3281,8 +3293,16 @@ mod kquant_tiled_tests {
             let (w, s, b) = row_major_kquant_arrays(&params, "p", mode, KQuantLayout::Tiled64)
                 .unwrap()
                 .unwrap();
-            assert_eq!(bits_of(&w), bits_of(row_major.get_weight()), "{mode:?} weight");
-            assert_eq!(bits_of(&s), bits_of(row_major.get_scales()), "{mode:?} scales");
+            assert_eq!(
+                bits_of(&w),
+                bits_of(row_major.get_weight()),
+                "{mode:?} weight"
+            );
+            assert_eq!(
+                bits_of(&s),
+                bits_of(row_major.get_scales()),
+                "{mode:?} scales"
+            );
             assert_eq!(
                 bits_of(b.as_ref().unwrap()),
                 bits_of(row_major.get_biases().unwrap()),

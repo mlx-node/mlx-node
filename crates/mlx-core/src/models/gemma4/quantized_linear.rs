@@ -1035,7 +1035,7 @@ impl QuantizedLinear {
     /// projection untouched.
     pub fn tile_kquant_layout(&mut self) -> Result<bool> {
         use crate::models::quant_dispatch::{
-            KQUANT_TILED_SUFFIX, kquant_mode_params, kquant_tile_rows, kquant_tileable,
+            KQUANT_TILED_SUFFIX, kquant_mode_params_for_scales, kquant_tile_rows, kquant_tileable,
             parse_mode_str, split_kquant_layout,
         };
         let (base, already) = split_kquant_layout(&self.mode);
@@ -1045,9 +1045,18 @@ impl QuantizedLinear {
         let Some(mode) = parse_mode_str(Some(base)) else {
             return Ok(false);
         };
-        let Some(kq) = kquant_mode_params(mode) else {
+        // The `.scales` dtype picks the legacy expanded IQ3_S contract for an
+        // artifact that predates the packed form (quant_dispatch).
+        let Some(kq) = kquant_mode_params_for_scales(mode, self.scales.dtype()?) else {
             return Ok(false);
         };
+        if kq.bits != self.bits {
+            return Err(Error::from_reason(format!(
+                "tile_kquant_layout: {base} projection carries bits={} but the contract its \
+                 .scales dtype selects has bits={} — config/tensor disagreement",
+                self.bits, kq.bits
+            )));
+        }
         if self.fp8_dequant_weight.is_some() || self.s_w.is_some() || self.decode_sidecars.is_some()
         {
             return Ok(false);

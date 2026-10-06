@@ -63,7 +63,23 @@
 //!                     1.8125 bpw (ggml 1.75: ggml hides d inside the scale
 //!                     words; the contract's mandatory f16 d costs 2 B per
 //!                     256 values)
+//!     iq3s    bits=3  .weight = qs[8 ib32..] (words 0, 1: the 8 low index
+//!                               bytes), signs[4 ib32..] (word 2: one sign
+//!                               bit per element)
+//!                     .scales 2 B  = qh[ib32] (the 8 ninth index bits), then
+//!                                    the unit's 4-bit scale (ggml's nibble
+//!                                    (ib32 & 1) of scales[ib32 / 2]) in the
+//!                                    low nibble of its own byte
+//!                     3.5625 bpw (ggml 3.4375: ggml packs two units' scale
+//!                     nibbles in one byte; the contract's whole-byte
+//!                     companion costs 4 B per 256 values)
 //! ```
+//!
+//! (Artifacts converted before the packed iq3s form carry every IQ3_S value
+//! expanded to a signed 8-bit code under `mode: "iq3s", bits: 8`; the loader
+//! still reads those (`quant_dispatch::kquant_mode_params_for_scales`), the
+//! bridge resolving (`iq3s`, bits 8) to its `iq3s8` mode. Nothing writes that
+//! form any more.)
 //!
 //! with `g` the logical group index `v / group_size` and `G` the super-block
 //! index `v / 256`. `.biases` holds `d`, which is a SCALE, not a bias; the name
@@ -139,7 +155,7 @@ pub const KQUANT_FORMATS: [KQuantFormat; 14] = [
 
 impl KQuantFormat {
     /// Bit width of one code; for the grid formats the `.weight` words per
-    /// 32-value unit (1 or 2), which is what the kernels' `bits` means there.
+    /// 32-value unit (1 to 3), which is what the kernels' `bits` means there.
     pub fn bits(self) -> usize {
         match self {
             Self::Q2K => 2,
@@ -148,12 +164,10 @@ impl KQuantFormat {
             Self::Q5K => 5,
             Self::Q6K => 6,
             Self::IQ4NL | Self::IQ4XS => 4,
-            // IQ3_S is losslessly expanded from its grid indices/signs into one
-            // signed grid value per weight. It remains integer packed and is
-            // never reconstructed as a floating-point matrix.
-            Self::IQ3S => 8,
             Self::IQ2XXS | Self::IQ1S | Self::IQ1M => 1,
             Self::IQ2XS | Self::IQ2S | Self::IQ3XXS => 2,
+            // Two index words and one sign word per unit.
+            Self::IQ3S => 3,
         }
     }
 
@@ -272,7 +286,13 @@ impl KQuantFormat {
     pub fn is_grid(self) -> bool {
         matches!(
             self,
-            Self::IQ2XXS | Self::IQ2XS | Self::IQ2S | Self::IQ3XXS | Self::IQ1S | Self::IQ1M
+            Self::IQ2XXS
+                | Self::IQ2XS
+                | Self::IQ2S
+                | Self::IQ3XXS
+                | Self::IQ1S
+                | Self::IQ1M
+                | Self::IQ3S
         )
     }
 
@@ -287,7 +307,7 @@ impl KQuantFormat {
         match self {
             Self::IQ2XXS | Self::IQ3XXS => 4,
             Self::IQ2XS => 1,
-            Self::IQ2S | Self::IQ1S => 2,
+            Self::IQ2S | Self::IQ1S | Self::IQ3S => 2,
             Self::IQ1M => 3,
             _ if self.has_min() => 2,
             _ => 1,
@@ -457,12 +477,11 @@ const IQ4XS_SCALES_H_OFFSET: usize = 2;
 const IQ4XS_SCALES_L_OFFSET: usize = 4;
 const IQ4XS_QS_OFFSET: usize = 8;
 
-// ggml-common.h:415 — IQ3_S field offsets.
-const IQ3S_D_OFFSET: usize = 0;
-const IQ3S_QS_OFFSET: usize = 2;
-const IQ3S_QH_OFFSET: usize = 66;
-const IQ3S_SIGNS_OFFSET: usize = 74;
-const IQ3S_SCALES_OFFSET: usize = 106;
+// ggml-common.h:415 — IQ3_S field offsets. d leads the block.
+const IQ3S_QS_OFFSET: usize = 2; // u8 qs[64]: 8 index bytes per unit
+const IQ3S_QH_OFFSET: usize = 66; // u8 qh[8]: one byte per unit
+const IQ3S_SIGNS_OFFSET: usize = 74; // u8 signs[32]: 4 bytes per unit
+const IQ3S_SCALES_OFFSET: usize = 106; // u8 scales[4]: a nibble per unit
 
 // ggml-common.h:378-437 — the grid formats' field offsets. Every one but
 // IQ1_M leads with the f16 d.
@@ -509,91 +528,11 @@ pub fn iq1m_unit_scales(blk: &[u8], ib: usize) -> u8 {
     ((sc >> (6 * (ib % 2))) & 0x3f) as u8
 }
 
-// Canonical 512-entry iq3s_grid from ggml-common.h, encoded as the little-
-// endian table bytes. Keeping the compressed textual representation here
-// avoids a noisy 512-element literal while the OnceLock makes its decode a
-// one-time conversion cost, never an inference-time operation.
-const IQ3S_GRID_BASE64: &str = concat!(
-    "AQEBAQMBAQEFAQEBCwEBAQ8BAQEBAwEBAwMBAQUDAQEJAwEBDQMBAQEFAQEDBQEBCwUBAQcHAQEBCQEBBQkBAQsJAQEPCQEBAwsB",
-    "AQcLAQEBDQEBBQ0BAQMPAQEJDwEBDw8BAQEBAwEDAQMBBQEDAQkBAwEBAwMBAwMDAQsDAwEBBQMBBwUDAQ8FAwEDBwMBCwcDAQkJ",
-    "AwEDDQMBCw0DAQUPAwEBAQUBAwEFAQsBBQEPAQUBAQMFAQcDBQENAwUBAwUFAQsFBQEBBwUBCQcFAQUJBQELCQUBDwkFAQMLBQEH",
-    "CwUBAQ8FAQcPBQEHAQcBAwMHAQsDBwEBBQcBBQUHAQMHBwEHBwcBDQcHAQkJBwEBCwcBBQsHAQ8NBwEDDwcBCw8HAQEBCQEHAwkB",
-    "DwMJAQMFCQEJBQkBBQcJAQEJCQEHCQkBAwsJAQEPCQEFAQsBCQELAQEFCwEFBQsBDQULAQcHCwEDCQsBCwkLAQ8JCwENDQsBBw8L",
-    "AQ0BDQEDAw0BBwMNAQMHDQEFCw0BAw8NAQEBDwEFAQ8BCQEPAQEFDwEFBQ8BDQUPAQcHDwEBCw8BCQsPAQEBAQMDAQEDBQEBAwkB",
-    "AQMBAwEDAwMBAwcDAQMLAwEDDwMBAwEFAQMFBQEDAwcBAwkHAQMNBwEDCQsBAw0LAQMDDQEDBQ8BAwEBAwMDAQMDBwEDAw0BAwMB",
-    "AwMDCQMDAwMFAwMBBwMDBwcDAwMJAwMBCwMDBQsDAwEPAwMNDwMDAQEFAwUDBQMLAwUDDwMFAwEFBQMJBQUDBQcFAwEJBQMHCQUD",
-    "CwsFAwENBQMFDwUDAwEHAwkBBwMPAQcDAQMHAwcDBwMDBQcDDwUHAwEHBwMJBwcDAwkHAwUNBwMBDwcDBwEJAwsBCQMFAwkDCQMJ",
-    "AwMHCQMHBwkDBQkJAw0JCQMBCwkDCQsJAwMBCwMBAwsDBwMLAwMFCwMBBwsDBQcLAwMLCwMBBQ0DCQUNAw8FDQMJCQ0DDQkNAwMB",
-    "DwMHAQ8DAQMPAwUDDwMDBQ8DCwcPAwMJDwMFDQ8DAQ8PAwEBAQUDAQEFBwEBBQsBAQUPAQEFAQMBBQUDAQUJAwEFDQMBBQMFAQUH",
-    "BQEFDwUBBQEHAQUFBwEFAwkBBQcJAQULCQEFAQsBBQULAQUPDQEFAQ8BBQcPAQULDwEFAQEDBQUBAwUBAwMFBwMDBQ8DAwUFBQMF",
-    "CwUDBQMHAwUJBwMFBQkDBQMLAwUDAQUFCQEFBQ8BBQUDBQUFBwUFBQEHBQUPBwUFAwkFBQcLBQUPCwUFAw8FBQkPBQUBAQcFBQEH",
-    "BQsBBwUDAwcFBQUHBQkFBwUDBwcFBwcHBQUJBwUBCwcFDQ0HBQMBCQUPAQkFAQUJBQcFCQUFBwkFCwcJBQMJCQUFDwkFCw8JBQkB",
-    "CwUDAwsFBQULBQ8HCwUBCQsFBwsLBQEPCwUBAQ0FBQENBQ8BDQUDBQ0FCwsNBQMNDQULAQ8FAwMPBQ0FDwUBBw8FBwkPBQELDwUF",
-    "AQEHAwMBBwcDAQcLAwEHDwMBBwUFAQcDBwEHBwcBBwsHAQcFCQEHCQkBBw8JAQcDCwEHBw0BBwMPAQcDAQMHBwEDBwsBAwcJAwMH",
-    "AwUDBwcFAwcBCQMHAQ0DBwUPAwcNDwMHAQEFBwUDBQcBBQUHBQcFBwkHBQcBCwUHAwEHBwEDBwcJAwcHAwUHBwcFBwcPBQcHAQcH",
-    "BwMJBwcHCQcHDwkHBwsLBwcHDwcHBwEJBwMDCQcNAwkHBQUJBwMHCQcFCwkHAQ0JBwkNCQcDAQsHAQMLBwUDCwcLBQsHBQcLBwkJ",
-    "CwcNCwsHBw8LBw0DDQcDCQ0HAwEPBwcBDwcBBQ8HBQUPBwsHDwcBAQEJCQEBCQUDAQkBBQEJCQUBCQ8FAQkFBwEJAwkBCQELAQkB",
-    "DwEJBQEDCQ8BAwkDAwMJBwMDCQUFAwkBBwMJCwcDCQcJAwkDCwMJCwsDCQMBBQkHAQUJAQMFCQsDBQkDBQUJBwcFCQEJBQkPCwUJ",
-    "BQ0FCQEPBQkJAQcJAwMHCQcDBwkBBQcJBQUHCQMHBwkLBwcJAQEJCQUBCQkJBQkJDwcJCQEJCQkDDwkJCwELCQ8BCwkDBQsJBQ0L",
-    "CQcDDQkJBw0JAQ0NCQEDDwkLAw8JAQcPCQcJDwkDCw8JBQEBCwEDAQsJAwELBQUBCwEJAQsJCQELDwkBCwULAQsNDQELCQ8BCwMB",
-    "AwsHAQMLCwEDCwUDAwsDBQMLBQcDCwUPAwsBAQULAwMFCwcFBQsBBwULDQcFCwcLBQsFAQcLDwEHCwEDBwsPBQcLCQkHCwMLBwsL",
-    "DQcLBw8HCwMBCQsJAQkLAQUJCwUHCQsNCQkLBQMLCw0FCwsDCwsLBwsLCwUJDQsFAQ8LCQEPCwUFDwsDAwENBwMBDQsDAQ0DBwEN",
-    "BwcBDQENAQ0BAQMNAQUDDQ8FAw0JDQMNBQMFDQkHBQ0FCQUNCwsFDQUNBQ0BDwUNAQEHDQkDBw0DBQcNAQkHDQsFCQ0HCQkNBQ0J",
-    "DQEBCw0HAQsNCQcLDQENCw0LAQ0NAQkNDQMDDw0HAw8NAQEBDwkBAQ8PAQEPAQUBDwUFAQ8NBwEPAQkBDwkLAQ8FDQEPBQEDDwMD",
-    "Aw8JBQMPBwkDDwsJAw8DAQUPCQEFDwEDBQ8NAwUPAwUFDwEHBQ8DCwUPBQEHDwUHBw8LBwcPBwsHDwMBCQ8LAQkPBwMJDwEFCQ8B",
-    "CwkPBQULDwUJCw8FAQ0PAwcNDwEBDw8="
-);
-
-fn iq3s_grid() -> &'static [u8] {
-    use std::sync::OnceLock;
-    static GRID: OnceLock<Vec<u8>> = OnceLock::new();
-    GRID.get_or_init(|| {
-        fn sextet(b: u8) -> Option<u8> {
-            match b {
-                b'A'..=b'Z' => Some(b - b'A'),
-                b'a'..=b'z' => Some(b - b'a' + 26),
-                b'0'..=b'9' => Some(b - b'0' + 52),
-                b'+' => Some(62),
-                b'/' => Some(63),
-                _ => None,
-            }
-        }
-        let mut out = Vec::with_capacity(512 * 4);
-        let mut acc = 0u32;
-        let mut bits = 0u32;
-        for b in IQ3S_GRID_BASE64.bytes() {
-            let Some(v) = sextet(b) else { continue };
-            acc = (acc << 6) | u32::from(v);
-            bits += 6;
-            while bits >= 8 {
-                bits -= 8;
-                out.push((acc >> bits) as u8);
-                acc &= (1u32 << bits).wrapping_sub(1);
-            }
-        }
-        assert_eq!(out.len(), 512 * 4, "embedded iq3s_grid is corrupt");
-        out
-    })
-}
-
-fn iq3s_value(blk: &[u8], group: usize, position: usize) -> i8 {
-    let pair = group / 2;
-    let parity = group % 2;
-    let chunk = position / 8;
-    let in_chunk = position % 8;
-    let half = in_chunk / 4;
-    let lane = in_chunk % 4;
-    let q_index = IQ3S_QS_OFFSET + pair * 16 + parity * 8 + chunk * 2 + half;
-    let qh = blk[IQ3S_QH_OFFSET + pair * 2 + parity];
-    let grid_index = usize::from(blk[q_index]) | (usize::from((qh >> (2 * chunk + half)) & 1) << 8);
-    let grid = iq3s_grid();
-    let magnitude = grid[grid_index * 4 + lane] as i8;
-    let signs = blk[IQ3S_SIGNS_OFFSET + pair * 8 + parity * 4 + chunk];
-    if signs & (1 << in_chunk) != 0 {
-        -magnitude
-    } else {
-        magnitude
-    }
+/// IQ3_S's 4-bit scale of unit `ib`: nibble `ib % 2` of `scales[ib / 2]`
+/// (`dequantize_row_iq3_s`: `d * (1 + 2*(scales[ib32/2] & 0xf))` for the even
+/// unit, `>> 4` for the odd one).
+pub fn iq3s_unit_scale(blk: &[u8], ib: usize) -> u8 {
+    (blk[IQ3S_SCALES_OFFSET + ib / 2] >> (4 * (ib % 2))) & 0x0f
 }
 
 /// Expand ggml's packed 6-bit Q3_K scale table to sixteen signed sub-scales.
@@ -733,15 +672,13 @@ fn reserve_rows<T>(dst: &mut Vec<T>, rows: usize, cols: usize, what: &str) -> Re
 ///
 /// The destination still grows to the full repacked tensor — only the *source*
 /// is streamed. Nothing here reconstructs a floating-point weight matrix; the
-/// output remains integer-packed. IQ3_S deliberately expands its grid/sign
-/// representation to signed 8-bit codes so MLX can use its generic integer
-/// matmul kernels directly.
+/// output remains integer-packed.
 pub struct KQuantRepacker {
     format: KQuantFormat,
     k: usize,
     rows: usize,
     weight: Vec<u32>,
-    /// Signed sub-scales for q3k/q6k/iq4/iq3s; empty for the rest.
+    /// Signed sub-scales for q3k/q6k/iq4; empty for the rest.
     scales_i8: Vec<i8>,
     /// q2k/q4k/q5k `(sc, m)` pairs and the grid formats' companion bytes;
     /// empty for the signed formats.
@@ -918,25 +855,6 @@ impl KQuantRepacker {
                             }
                         }
                     }
-                    KQuantFormat::IQ3S => {
-                        self.biases.push(u16::from_le_bytes([
-                            blk[IQ3S_D_OFFSET],
-                            blk[IQ3S_D_OFFSET + 1],
-                        ]));
-                        for group in 0..8 {
-                            let packed_scale = blk[IQ3S_SCALES_OFFSET + group / 2];
-                            let nibble = if group % 2 == 0 {
-                                packed_scale & 0x0f
-                            } else {
-                                packed_scale >> 4
-                            };
-                            self.scales_i8.push((1 + 2 * nibble) as i8);
-                            for position in 0..32 {
-                                let signed = i16::from(iq3s_value(blk, group, position));
-                                packer.push((signed + 128) as u32, bits);
-                            }
-                        }
-                    }
                     // The grid formats keep their native words (module docs):
                     // `.weight` the grid-index words, `.scales` the rest.
                     // d leads every block but IQ1_M's.
@@ -991,6 +909,17 @@ impl KQuantRepacker {
                             let qh = IQ1M_QH_OFFSET + 2 * ib;
                             self.scales_u8.extend_from_slice(&blk[qh..qh + 2]);
                             self.scales_u8.push(iq1m_unit_scales(blk, ib));
+                        }
+                    }
+                    KQuantFormat::IQ3S => {
+                        self.biases.push(u16::from_le_bytes([blk[0], blk[1]]));
+                        for ib in 0..8 {
+                            let at = IQ3S_QS_OFFSET + 8 * ib;
+                            packer.push(le_u32(blk, at), 32);
+                            packer.push(le_u32(blk, at + 4), 32);
+                            packer.push(le_u32(blk, IQ3S_SIGNS_OFFSET + 4 * ib), 32);
+                            self.scales_u8.push(blk[IQ3S_QH_OFFSET + ib]);
+                            self.scales_u8.push(iq3s_unit_scale(blk, ib));
                         }
                     }
                 }
@@ -1069,7 +998,8 @@ mod tests {
 
     /// The grid formats keep ggml's bytes: `.weight` + `.scales` + `.biases`
     /// per 256 values equal the ggml block, except IQ1_M's 2 extra bytes for
-    /// the f16 `d` the contract makes explicit.
+    /// the f16 `d` the contract makes explicit and IQ3_S's 4 for its scale
+    /// nibbles stored one per byte.
     #[test]
     fn grid_formats_keep_ggml_bytes_per_block() {
         for (format, extra) in [
@@ -1079,6 +1009,7 @@ mod tests {
             (KQuantFormat::IQ3XXS, 0),
             (KQuantFormat::IQ1S, 0),
             (KQuantFormat::IQ1M, 2),
+            (KQuantFormat::IQ3S, 4),
         ] {
             let k = QK_K;
             let ours =

@@ -47,6 +47,8 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     return Mode::IQ1S;
   if (mode == "iq1m")
     return Mode::IQ1M;
+  if (mode == "iq3s8")
+    return Mode::IQ3S8;
   return std::nullopt;
 }
 
@@ -98,13 +100,15 @@ const char *mode_name(Mode mode) {
     return "iq1s";
   case Mode::IQ1M:
     return "iq1m";
+  case Mode::IQ3S8:
+    return "iq3s8";
   }
   throw std::invalid_argument("[kquant] Unknown quantization mode.");
 }
 
 namespace {
 
-// Q6_K and the IQ4 / IQ3_S modes carry signed sub-block scales; q2k/q4k/q5k
+// Q6_K and the IQ4 / iq3s8 modes carry signed sub-block scales; q2k/q4k/q5k
 // unsigned (sc, m) and the grid formats unsigned companion bytes.
 void validate_mode_with_type(std::string_view tag, Mode mode,
                              const array &scales,
@@ -354,7 +358,8 @@ void validate_tiled_layout(std::string_view tag, const array &w, int bits,
 array quantized_matmul(const array &x, const array &w, const array &scales,
                        const std::optional<array> &biases, bool transpose,
                        std::optional<int> group_size_, std::optional<int> bits_,
-                       Mode mode, StreamOrDevice s, Layout layout) {
+                       Mode mode_, StreamOrDevice s, Layout layout) {
+  const Mode mode = resolve_mode(mode_, bits_);
   validate_mode_with_type("quantized_matmul", mode, scales, biases,
                           std::nullopt);
   auto [group_size, bits] =
@@ -390,7 +395,8 @@ array gather_qmm(const array &x, const array &w, const array &scales,
                  std::optional<array> lhs_indices_,
                  std::optional<array> rhs_indices_, bool transpose,
                  std::optional<int> group_size_, std::optional<int> bits_,
-                 Mode mode, bool sorted_indices, StreamOrDevice s) {
+                 Mode mode_, bool sorted_indices, StreamOrDevice s) {
+  const Mode mode = resolve_mode(mode_, bits_);
   if (!lhs_indices_ && !rhs_indices_) {
     return quantized_matmul(x, w, scales, biases, transpose, group_size_, bits_,
                             mode, s);
@@ -446,7 +452,8 @@ array gather_qmm(const array &x, const array &w, const array &scales,
 array dequantize(const array &w, const array &scales,
                  const std::optional<array> &biases,
                  std::optional<int> group_size_, std::optional<int> bits_,
-                 Mode mode, std::optional<Dtype> dtype, StreamOrDevice s) {
+                 Mode mode_, std::optional<Dtype> dtype, StreamOrDevice s) {
+  const Mode mode = resolve_mode(mode_, bits_);
   validate_mode_with_type("dequantize", mode, scales, biases, dtype);
   auto out_type = dtype.value_or(bfloat16);
   auto [group_size, bits] =
@@ -930,8 +937,12 @@ void kq_qmm_dispatch_mode(T *result, const T *x, const uint32_t *w,
     kq_qmm_dispatch_transpose<T, 4, 32, 8, false, Kind::Codebook, 0>(
         result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
-  case Mode::IQ3S:
+  case Mode::IQ3S8:
     kq_qmm_dispatch_transpose<T, 8, 32, 8, false, Kind::Int8, 0>(
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
+    break;
+  case Mode::IQ3S:
+    kq_qmm_dispatch_transpose<T, 3, 32, 8, false, Kind::GridIQ3S, 0>(
         result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   case Mode::Q2K:
@@ -1155,9 +1166,13 @@ void kq_dequantize_typed(array &out, const array &w, const array &scales,
     kq_dequantize<T, 4, 32, 8, false, Kind::Codebook, 0>(
         out_ptr, w_ptr, scales_ptr, biases_ptr, size);
     break;
-  case Mode::IQ3S:
+  case Mode::IQ3S8:
     kq_dequantize<T, 8, 32, 8, false, Kind::Int8, 0>(out_ptr, w_ptr, scales_ptr,
                                                      biases_ptr, size);
+    break;
+  case Mode::IQ3S:
+    kq_dequantize<T, 3, 32, 8, false, Kind::GridIQ3S, 0>(
+        out_ptr, w_ptr, scales_ptr, biases_ptr, size);
     break;
   case Mode::Q2K:
     kq_dequantize<T, 2, 16, 16, true, Kind::Linear, 0>(

@@ -1,10 +1,10 @@
-// The grid K-quant formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS):
-// one decode for the Metal kernels and the C++ CPU reference, so the two
-// cannot drift. Compiles as Metal (constant tables, `thread` pointers) and
-// as C++ (mlx_kquant.cpp); requires kquant_mode.h before it.
+// The grid K-quant formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+// IQ3_S): one decode for the Metal kernels and the C++ CPU reference, so the
+// two cannot drift. Compiles as Metal (constant tables, `thread` pointers)
+// and as C++ (mlx_kquant.cpp); requires kquant_mode.h before it.
 //
 // Ported from Splash (incoai/splash, Apache-2.0; THIRD_PARTY_NOTICES):
-// FmtIQ2XXS / FmtIQ2XS / FmtIQ2S / FmtIQ3XXS / FmtIQ1S / FmtIQ1M,
+// FmtIQ2XXS / FmtIQ2XS / FmtIQ2S / FmtIQ3XXS / FmtIQ3S / FmtIQ1S / FmtIQ1M,
 // quant_signs7 and quant_iq1_codes of
 // runtime/metal/kernels/common/quant_formats.h and the QuantGrid arm of
 // gguf_staged.h's dequant32, with the byte fetch rewritten for mlx-node's
@@ -38,6 +38,13 @@
 //            sc 4 B  the scales_and_signs word: 7-bit sign index of elements
 //                    8l..8l+7 at bits 7l, 4-bit scale at bits 28..31
 //            value   d * (1 + 2 sc) / 4 * +-grid[idx][j]
+//   IQ3_S    bits 3  (w0, w1) = qs[8 ib32 ..]: byte t the low 8 index bits of
+//                    4-element entry t (elements 4t..4t+3); w2 = signs[4 ib32
+//                    ..]: byte c the sign bits of elements 8c..8c+7
+//            sc 2 B  qh[ib32] (bit t the 9th index bit of entry t), then the
+//                    unit's 4-bit scale (ggml's nibble (ib32 & 1) of
+//                    scales[ib32 / 2], in the low nibble of its own byte)
+//            value   d * (1 + 2 sc) * +-grid[idx][j]   (no power-of-two shift)
 //   IQ1_S    bits 1  w0 = qs[4 ib ..]: byte l the low 8 index bits of entry l
 //            sc 2 B  qh[ib]: bits 3l..3l+2 the high index bits of entry l,
 //                    bits 12..14 the 3-bit scale, bit 15 the delta sign
@@ -50,9 +57,9 @@
 //            value   d * (2 sc + 1) * (grid[idx][j] +- 1/8)
 //
 // A chunk is 8 consecutive elements 8c..8c+7 of a unit (c = 0..3): one
-// 8-element grid entry (IQ1 / IQ2) or two 4-element ones (IQ3_XXS), one sign
-// byte and one scale, so kq_grid_decode8 is the natural quantum of every
-// kernel and kq_grid_decode32 four of them.
+// 8-element grid entry (IQ1 / IQ2) or two 4-element ones (IQ3_XXS, IQ3_S),
+// one sign byte and one scale, so kq_grid_decode8 is the natural quantum of
+// every kernel and kq_grid_decode32 four of them.
 #pragma once
 
 #include "kquant_grid_tables.h"
@@ -74,7 +81,8 @@ constexpr int kq_grid_words() {
   return (kind == KQ_GRID_IQ2XXS || kind == KQ_GRID_IQ1S ||
           kind == KQ_GRID_IQ1M)
       ? 1
-      : 2;
+      : kind == KQ_GRID_IQ3S ? 3
+                             : 2;
 }
 
 // The eight signs of a 7-bit sign index: its bits, and as bit 7 their
@@ -84,12 +92,13 @@ inline uint32_t kq_signs7(uint32_t index) {
   return index | ((uint32_t(KQ_POPCOUNT(index)) & 1u) << 7);
 }
 
-// One unit's words and its companion bytes packed little-endian into `sc`
-// (at most 4 bytes: IQ1_M's three, the sign / scale words of IQ2_XXS and
-// IQ3_XXS).
+// One unit's words (w2 is IQ3_S's sign word, 0 for the others) and its
+// companion bytes packed little-endian into `sc` (at most 4 bytes: IQ1_M's
+// three, the sign / scale words of IQ2_XXS and IQ3_XXS).
 struct KQGridUnit {
   uint32_t w0;
   uint32_t w1;
+  uint32_t w2;
   uint32_t sc;
 };
 
@@ -126,6 +135,7 @@ inline KQGridUnit kq_grid_load(
   KQGridUnit u;
   u.w0 = w[0];
   u.w1 = kq_grid_words<kind>() > 1 ? w[1] : 0u;
+  u.w2 = kq_grid_words<kind>() > 2 ? w[2] : 0u;
   u.sc = kq_grid_companion<kind>(sc);
   return u;
 }
@@ -140,6 +150,7 @@ constexpr uint32_t kq_grid_entries() {
       : kind == KQ_GRID_IQ2XS  ? 512u
       : kind == KQ_GRID_IQ2S   ? 1024u
       : kind == KQ_GRID_IQ3XXS ? 256u
+      : kind == KQ_GRID_IQ3S   ? 512u
                                : 2048u; // IQ1_S / IQ1_M
 }
 template <int kind>
@@ -163,6 +174,8 @@ struct KQGridConstTables {
   inline uint32_t grid32(uint32_t idx) const {
     if constexpr (kind == KQ_GRID_IQ3XXS) {
       return kq_iq3xxs_grid[idx];
+    } else if constexpr (kind == KQ_GRID_IQ3S) {
+      return kq_iq3s_grid[idx];
     } else {
       return kq_iq1s_grid_gpu[idx];
     }
@@ -215,14 +228,32 @@ inline void kq_grid_decode8(
     uint32_t c,
     KQ_THREAD float* out,
     Tables tables) {
-  if constexpr (kind == KQ_GRID_IQ3XXS) {
+  if constexpr (kind == KQ_GRID_IQ3XXS || kind == KQ_GRID_IQ3S) {
+    // Two 4-element entries (2c, 2c + 1): their low index bytes are the
+    // halfword c of (w0, w1). IQ3_XXS reads the chunk's 7-bit sign index and
+    // the scale nibble out of its sign / scale word; IQ3_S (Splash's
+    // FmtIQ3S) the chunk's sign byte out of w2, the two 9th index bits out of
+    // the qh byte and the scale nibble out of the second companion byte.
     const uint32_t word = c < 2 ? u.w0 : u.w1;
     const uint32_t hw = (word >> (16u * (c & 1u))) & 0xFFFFu;
-    const uint32_t signs = kq_signs7((u.sc >> (7u * c)) & 127u);
-    const float s = kq_shift_scale<scale_shift>(
-        d * float(1u + 2u * (u.sc >> 28)));
-    const uint32_t g1 = tables.template grid32<kind>(hw & 0xFFu);
-    const uint32_t g2 = tables.template grid32<kind>(hw >> 8);
+    uint32_t signs;
+    uint32_t idx1;
+    uint32_t idx2;
+    uint32_t nib;
+    if constexpr (kind == KQ_GRID_IQ3S) {
+      signs = (u.w2 >> (8u * c)) & 0xFFu;
+      idx1 = (hw & 0xFFu) | (((u.sc >> (2u * c)) & 1u) << 8);
+      idx2 = (hw >> 8) | (((u.sc >> (2u * c + 1u)) & 1u) << 8);
+      nib = (u.sc >> 8) & 0xFu;
+    } else {
+      signs = kq_signs7((u.sc >> (7u * c)) & 127u);
+      idx1 = hw & 0xFFu;
+      idx2 = hw >> 8;
+      nib = u.sc >> 28;
+    }
+    const float s = kq_shift_scale<scale_shift>(d * float(1u + 2u * nib));
+    const uint32_t g1 = tables.template grid32<kind>(idx1);
+    const uint32_t g2 = tables.template grid32<kind>(idx2);
     for (uint32_t j = 0; j < 4; ++j) {
       const float v1 = s * float((g1 >> (8u * j)) & 0xFFu);
       const float v2 = s * float((g2 >> (8u * j)) & 0xFFu);

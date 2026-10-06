@@ -661,7 +661,10 @@ fn validate_mtp_bits(bits: i32, mode: PerLayerMode, context: &str) -> Result<()>
         | PerLayerMode::Q4K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS => bits == 4,
-        PerLayerMode::Mxfp8 | PerLayerMode::Sym8 | PerLayerMode::IQ3S => bits == 8,
+        PerLayerMode::Mxfp8 | PerLayerMode::Sym8 => bits == 8,
+        // Packed IQ3_S is 3 words per 32-value unit; artifacts converted
+        // before the packed form carry the expanded int8 codes at 8.
+        PerLayerMode::IQ3S => matches!(bits, 3 | 8),
         PerLayerMode::Q6K => bits == 6,
         PerLayerMode::Q5K => bits == 5,
         PerLayerMode::Q3K => bits == 3,
@@ -689,7 +692,8 @@ fn parse_mtp_bits(
     let Some(value) = value else {
         return Ok(match mode {
             PerLayerMode::Mxfp4 | PerLayerMode::Nvfp4 => 4,
-            PerLayerMode::Mxfp8 | PerLayerMode::Sym8 | PerLayerMode::IQ3S => 8,
+            PerLayerMode::Mxfp8 | PerLayerMode::Sym8 => 8,
+            PerLayerMode::IQ3S => 3,
             PerLayerMode::Q4K | PerLayerMode::IQ4NL | PerLayerMode::IQ4XS => 4,
             PerLayerMode::Q6K => 6,
             PerLayerMode::Q5K => 5,
@@ -3336,6 +3340,7 @@ mod tests {
             (PerLayerMode::Q6K, 6),
             (PerLayerMode::IQ4NL, 4),
             (PerLayerMode::IQ4XS, 4),
+            (PerLayerMode::IQ3S, 3),
             (PerLayerMode::IQ3S, 8),
         ] {
             assert!(

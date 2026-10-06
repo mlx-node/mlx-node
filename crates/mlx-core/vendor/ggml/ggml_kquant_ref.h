@@ -20,15 +20,17 @@
 //                            dequantize_row_iq2_xs  :2516-2539
 //                            dequantize_row_iq2_s   :2543-2571
 //                            dequantize_row_iq3_xxs :2575-2603
+//                            dequantize_row_iq3_s   :2607-2646
 //                            dequantize_row_iq1_s   :2650-2673
 //                            dequantize_row_iq1_m   :2675-2723
 //   ggml/src/ggml-common.h   block_iq2_xxs :378-384, block_iq2_xs :387-392,
 //                            block_iq2_s :395-401, block_iq3_xxs :404-410,
+//                            block_iq3_s :414-421,
 //                            block_iq1_s :424-429, block_iq1_m :432-437,
 //                            iq1m_scale_t :440-444, IQ1S_DELTA :1132, and the
 //                            grid tables (ggml_grid_tables.inc)
 //
-// The thirteen ggml-quants.c spans are checked in verbatim next door in
+// The fourteen ggml-quants.c spans are checked in verbatim next door in
 // ggml_quants_upstream.inc, and the provenance guard
 // `vendored_ggml_reference_is_verbatim` in
 // crates/mlx-core/tests/kquant_ggml_parity.rs diffs this file against them on
@@ -152,6 +154,17 @@ typedef struct {
     uint8_t qs[3*QK_K/8];
 } block_iq3_xxs;
 
+// ggml-common.h:414-421
+// 3.4375 bpw
+#define IQ3S_N_SCALE QK_K/64
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK_K/4];
+    uint8_t qh[QK_K/32];
+    uint8_t signs[QK_K/8];
+    uint8_t scales[IQ3S_N_SCALE];
+} block_iq3_s;
+
 // ggml-common.h:424-429
 // 1.5625 bpw
 typedef struct {
@@ -190,6 +203,7 @@ typedef union {
 #define GGML_IQ2XS_BLOCK_BYTES 74
 #define GGML_IQ2S_BLOCK_BYTES 82
 #define GGML_IQ3XXS_BLOCK_BYTES 98
+#define GGML_IQ3S_BLOCK_BYTES 110
 #define GGML_IQ1S_BLOCK_BYTES 50
 #define GGML_IQ1M_BLOCK_BYTES 56
 
@@ -240,13 +254,15 @@ void dequantize_row_q5_0(const block_q5_0 *x, float *y, int64_t k);
 void dequantize_row_mxfp4(const block_mxfp4 *x, float *y, int64_t k);
 void dequantize_row_q2_K(const block_q2_K *x, float *y, int64_t k);
 
-// ggml-quants.c:2488 / :2516 / :2543 / :2575 / :2650 / :2675 — verbatim. The
-// grid tables they index (iq2xxs_grid .. iq1s_grid, ksigns_iq2xs, kmask_iq2xs)
-// are the verbatim ggml-common.h data in ggml_grid_tables.inc.
+// ggml-quants.c:2488 / :2516 / :2543 / :2575 / :2607 / :2650 / :2675 —
+// verbatim. The grid tables they index (iq2xxs_grid .. iq1s_grid,
+// ksigns_iq2xs, kmask_iq2xs) are the verbatim ggml-common.h data in
+// ggml_grid_tables.inc.
 void dequantize_row_iq2_xxs(const block_iq2_xxs *x, float *y, int64_t k);
 void dequantize_row_iq2_xs(const block_iq2_xs *x, float *y, int64_t k);
 void dequantize_row_iq2_s(const block_iq2_s *x, float *y, int64_t k);
 void dequantize_row_iq3_xxs(const block_iq3_xxs *x, float *y, int64_t k);
+void dequantize_row_iq3_s(const block_iq3_s *x, float *y, int64_t k);
 void dequantize_row_iq1_s(const block_iq1_s *x, float *y, int64_t k);
 void dequantize_row_iq1_m(const block_iq1_m *x, float *y, int64_t k);
 

@@ -76,10 +76,11 @@ impl Tensor {
                 GgufTensorType::Q5K => (180, 256),
                 GgufTensorType::Q6K => (210, 256),
                 GgufTensorType::IQ4NL => (19, 32),
-                GgufTensorType::IQ3S => (266, 256),
                 GgufTensorType::IQ4XS => (138, 256),
                 // The grid formats keep ggml's bytes (gguf_kquant.rs); IQ1_M
-                // adds the 2-byte f16 d the contract makes explicit.
+                // adds the 2-byte f16 d the contract makes explicit, IQ3_S
+                // the 4 bytes of its scale nibbles stored one per byte.
+                GgufTensorType::IQ3S => (114, 256),
                 GgufTensorType::IQ2XXS => (66, 256),
                 GgufTensorType::IQ2XS => (74, 256),
                 GgufTensorType::IQ2S => (82, 256),

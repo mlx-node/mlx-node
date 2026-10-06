@@ -174,8 +174,15 @@ pub enum PerLayerMode {
     /// ggml IQ4_XS: IQ4_NL codes with signed sub-scales under a 256-value
     /// float16 super-scale.
     IQ4XS,
-    /// ggml IQ3_S: grid/sign codes losslessly expanded to signed integer
-    /// magnitudes and packed at eight bits; no floating weight is materialized.
+    /// ggml IQ3_S: 3.4375 bpw grid format, packed (`bits` = 3 words per
+    /// 32-value unit: two of grid-index bytes, one of sign bits; `.scales`
+    /// the unit's qh byte and scale nibble). Mode string `"iq3s"`.
+    ///
+    /// Artifacts converted before the packed form carry the same mode string
+    /// with `bits: 8` and every value expanded to a signed int8 code; the
+    /// loader recognises those by their int8 `.scales`
+    /// ([`kquant_mode_params_for_scales`]) and the bridge reads
+    /// (`iq3s`, bits 8) through its legacy `iq3s8` mode.
     IQ3S,
     /// ggml IQ2_XXS: 2.0625 bpw grid format. `.weight` keeps the native
     /// grid-index words (one per 32-value unit, `bits` = 1), `.scales` the
@@ -738,7 +745,8 @@ pub enum KQuantKind {
     Linear,
     /// `scale * table[code]` on a 16-entry non-linear codebook (iq4nl/iq4xs).
     Codebook,
-    /// `scale * int8` on a code expanded to a signed byte (iq3s).
+    /// `scale * int8` on a code expanded to a signed byte (the legacy
+    /// `iq3s8` import of IQ3_S).
     Int8,
     /// `scale * signed grid magnitude` (the IQ1/IQ2/IQ3_XXS grids): `.weight`
     /// holds the native grid-index words, `.scales` the unit's other native
@@ -773,9 +781,19 @@ pub struct KQuantModeParams {
     pub kind: KQuantKind,
     /// Power-of-two exponent applied to every decoded scale in fp32
     /// (`scale *= 2^scale_shift`, exact): 0 for the affine / codebook / int8
-    /// modes, -3 for IQ2_* / IQ1_* and -2 for IQ3_XXS (`kquant_grid.h`).
+    /// modes and IQ3_S, -3 for IQ2_* / IQ1_* and -2 for IQ3_XXS
+    /// (`kquant_grid.h`).
     pub scale_shift: i32,
 }
+
+/// The legacy expanded IQ3_S contract: eight-bit signed codes under the
+/// `iq3s` mode string, `bits: 8`, int8 `.scales` holding `1 + 2 sc`. Kept so
+/// artifacts converted before the packed form (`kquant_mode_params(IQ3S)`)
+/// still load. The mode string stays `iq3s`: the bridge resolves
+/// (`iq3s`, bits 8) to its `iq3s8` mode (`kquant::resolve_mode`,
+/// mlx_kquant.h), so every caller keeps handing it the config's bits.
+pub const KQUANT_IQ3S_LEGACY_PARAMS: KQuantModeParams =
+    KQuantModeParams::new("iq3s", 8, 32, 8, false, KQuantKind::Int8);
 
 impl KQuantModeParams {
     const fn new(
@@ -834,7 +852,7 @@ pub fn kquant_mode_params(mode: PerLayerMode) -> Option<KQuantModeParams> {
         PerLayerMode::Q3K => KQuantModeParams::new("q3k", 3, 16, 16, false, Linear),
         PerLayerMode::IQ4NL => KQuantModeParams::new("iq4nl", 4, 32, 1, false, Codebook),
         PerLayerMode::IQ4XS => KQuantModeParams::new("iq4xs", 4, 32, 8, false, Codebook),
-        PerLayerMode::IQ3S => KQuantModeParams::new("iq3s", 8, 32, 8, false, Int8),
+        PerLayerMode::IQ3S => KQuantModeParams::grid("iq3s", 3, 2, 0),
         PerLayerMode::IQ2XXS => KQuantModeParams::grid("iq2xxs", 1, 4, -3),
         PerLayerMode::IQ2XS => KQuantModeParams::grid("iq2xs", 2, 1, -3),
         PerLayerMode::IQ2S => KQuantModeParams::grid("iq2s", 2, 2, -3),
@@ -843,6 +861,21 @@ pub fn kquant_mode_params(mode: PerLayerMode) -> Option<KQuantModeParams> {
         PerLayerMode::IQ1M => KQuantModeParams::grid("iq1m", 1, 3, -3),
         _ => return None,
     })
+}
+
+/// [`kquant_mode_params`] for the arrays actually on disk: the one place the
+/// legacy expanded IQ3_S import is told apart from the packed form. Both sit
+/// under `mode: "iq3s"`; the legacy one has int8 `.scales` (its `1 + 2 sc`
+/// sub-scales) where the packed one has uint8 companion bytes, so the
+/// `.scales` dtype decides. Every other mode has one contract.
+pub fn kquant_mode_params_for_scales(
+    mode: PerLayerMode,
+    scales_dtype: DType,
+) -> Option<KQuantModeParams> {
+    if mode == PerLayerMode::IQ3S && scales_dtype == DType::Int8 {
+        return Some(KQUANT_IQ3S_LEGACY_PARAMS);
+    }
+    kquant_mode_params(mode)
 }
 
 /// Resolve and validate a K-quant `.weight`/`.scales`/`.biases` group under
@@ -872,20 +905,24 @@ pub fn resolve_kquant_group(
     expected_ndim: usize,
     family: &str,
 ) -> Result<Option<KQuantGroup>> {
+    if kquant_mode_params(mode).is_none() {
+        return Err(Error::from_reason(format!(
+            "{family}: K-quant builder called for non-K-quant mode {mode:?} at '{key_prefix}'"
+        )));
+    }
+    let Some(scales) = params.get(&format!("{key_prefix}.scales")) else {
+        return Ok(None);
+    };
+    // The legacy expanded IQ3_S import is told apart by its int8 `.scales`.
     let Some(KQuantModeParams {
         mode_str,
         bits,
         group_size,
         scales_dtype,
         ..
-    }) = kquant_mode_params(mode)
+    }) = kquant_mode_params_for_scales(mode, scales.dtype()?)
     else {
-        return Err(Error::from_reason(format!(
-            "{family}: K-quant builder called for non-K-quant mode {mode:?} at '{key_prefix}'"
-        )));
-    };
-    let Some(scales) = params.get(&format!("{key_prefix}.scales")) else {
-        return Ok(None);
+        unreachable!("kquant_mode_params(mode) is Some");
     };
     let Some(weight) = params.get(&format!("{key_prefix}.weight")) else {
         return Err(Error::from_reason(format!(
@@ -1097,10 +1134,12 @@ fn parse_bits(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Resul
         | Some(PerLayerMode::Q4K)
         | Some(PerLayerMode::IQ4NL)
         | Some(PerLayerMode::IQ4XS) => bits == 4,
-        Some(PerLayerMode::Mxfp8)
-        | Some(PerLayerMode::Fp8E4m3)
-        | Some(PerLayerMode::Sym8)
-        | Some(PerLayerMode::IQ3S) => bits == 8,
+        Some(PerLayerMode::Mxfp8) | Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => {
+            bits == 8
+        }
+        // 3 words per unit packed; 8 is the legacy expanded import, which
+        // the loader still reads (`kquant_mode_params_for_scales`).
+        Some(PerLayerMode::IQ3S) => bits == 3 || bits == 8,
         Some(PerLayerMode::Q2K)
         | Some(PerLayerMode::IQ2XS)
         | Some(PerLayerMode::IQ2S)
@@ -1117,8 +1156,8 @@ fn parse_bits(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Resul
         return Err(Error::from_reason(format!(
             "Invalid {context}={bits} for mode {mode:?}; affine supports bits 2, 3, 4, 5, 6, or 8, \
              while mxfp4/nvfp4/q4k require 4, mxfp8/fp8_e4m3/sym8 require 8, q6k requires 6, q5k requires 5, \
-             q3k requires 3, q2k/iq2xs/iq2s/iq3xxs require 2 and iq2xxs/iq1s/iq1m require 1 (the \
-             grid formats' words per 32-value unit)"
+             q3k requires 3, q2k/iq2xs/iq2s/iq3xxs require 2, iq3s 3 (or 8 for the legacy expanded \
+             import) and iq2xxs/iq1s/iq1m require 1 (the grid formats' words per 32-value unit)"
         )));
     }
     Ok(bits)
@@ -2298,12 +2337,12 @@ mod tests {
             (
                 PerLayerMode::IQ3S,
                 "iq3s",
-                8,
+                3,
                 32,
                 8,
-                1,
-                DType::Int8,
-                Int8,
+                2,
+                DType::Uint8,
+                Grid,
                 0,
             ),
             (
@@ -2402,7 +2441,8 @@ mod tests {
             );
             if kind == Grid {
                 // The grid formats keep ggml's bytes per 256 values (IQ1_M +2
-                // for the explicit f16 d), as gguf_kquant.rs lays them out.
+                // for the explicit f16 d, IQ3_S +4 for its whole-byte scale
+                // nibbles), as gguf_kquant.rs lays them out.
                 let bytes = kq.bits * 32 + 8 * kq.scale_bytes_per_group + 2;
                 let ggml = match mode {
                     PerLayerMode::IQ2XXS => 66,
@@ -2410,6 +2450,8 @@ mod tests {
                     PerLayerMode::IQ2S => 82,
                     PerLayerMode::IQ3XXS => 98,
                     PerLayerMode::IQ1S => 50,
+                    // ggml's 110 + 4: the scale nibbles stored one per byte.
+                    PerLayerMode::IQ3S => 110 + 4,
                     _ => 56 + 2,
                 };
                 assert_eq!(bytes, ggml, "{mode:?} bytes per super-block");
@@ -3072,6 +3114,98 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `mode: "iq3s"` names two on-disk contracts: the packed grid form
+    /// (uint32 `[N, 3K/32]`, uint8 `[N, 2K/32]` companions, bits 3) and the
+    /// legacy expanded import (uint32 `[N, K/4]`, int8 `[N, K/32]`, bits 8)
+    /// of artifacts converted before it. The resolver tells them apart by the
+    /// `.scales` dtype and hands the legacy one on with bits 8 (which the
+    /// bridge resolves to its `iq3s8` mode), so old artifacts keep loading;
+    /// `parse_bits` admits both widths.
+    #[test]
+    fn legacy_expanded_iq3s_artifacts_resolve_to_iq3s8() {
+        let k = 256i64;
+        let biases = MxArray::from_float16(&[half::f16::from_f32(0.5).to_bits()], &[1, 1]).unwrap();
+        let packed = HashMap::from([
+            (
+                "l.weight".to_string(),
+                MxArray::from_uint32(&vec![0u32; (3 * k / 32) as usize], &[1, 3 * k / 32]).unwrap(),
+            ),
+            (
+                "l.scales".to_string(),
+                MxArray::from_uint8(&vec![0u8; (2 * k / 32) as usize], &[1, 2 * k / 32]).unwrap(),
+            ),
+            ("l.biases".to_string(), biases.clone()),
+        ]);
+        let g = resolve_kquant_group(
+            &packed,
+            "l",
+            PerLayerMode::IQ3S,
+            KQuantLayout::RowMajor,
+            2,
+            "t",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((g.bits, g.group_size, g.mode_str), (3, 32, "iq3s"));
+        assert_eq!(g.scales.dtype().unwrap(), DType::Uint8);
+
+        let legacy = HashMap::from([
+            (
+                "l.weight".to_string(),
+                MxArray::from_uint32(&vec![0u32; (k / 4) as usize], &[1, k / 4]).unwrap(),
+            ),
+            (
+                "l.scales".to_string(),
+                MxArray::from_float32(&vec![1.0; (k / 32) as usize], &[1, k / 32])
+                    .unwrap()
+                    .astype(DType::Int8)
+                    .unwrap(),
+            ),
+            ("l.biases".to_string(), biases),
+        ]);
+        let g = resolve_kquant_group(
+            &legacy,
+            "l",
+            PerLayerMode::IQ3S,
+            KQuantLayout::RowMajor,
+            2,
+            "t",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((g.bits, g.group_size, g.mode_str), (8, 32, "iq3s"));
+        assert_eq!(g.scales.dtype().unwrap(), DType::Int8);
+        assert_eq!(
+            kquant_mode_params_for_scales(PerLayerMode::IQ3S, DType::Int8),
+            Some(KQUANT_IQ3S_LEGACY_PARAMS)
+        );
+        assert_eq!(
+            kquant_mode_params_for_scales(PerLayerMode::IQ3S, DType::Uint8),
+            kquant_mode_params(PerLayerMode::IQ3S)
+        );
+        // Only IQ3_S has a second contract.
+        assert_eq!(
+            kquant_mode_params_for_scales(PerLayerMode::Q4K, DType::Int8),
+            kquant_mode_params(PerLayerMode::Q4K)
+        );
+
+        // The config entry of either artifact parses: bits 3 (packed) and 8
+        // (legacy) are both admitted, anything else is not.
+        for (bits, ok) in [(3, true), (8, true), (2, false), (4, false)] {
+            let got = parse_bits(&serde_json::json!(bits), Some(PerLayerMode::IQ3S), "bits");
+            assert_eq!(got.is_ok(), ok, "iq3s bits={bits}");
+        }
+        let cfg = serde_json::json!({
+            "mode": "q4k",
+            "layers.0.mlp.up_proj": { "bits": 8, "group_size": 32, "mode": "iq3s" },
+            "layers.0.mlp.down_proj": { "bits": 3, "group_size": 32, "mode": "iq3s" }
+        });
+        let (_, per_layer) = parse_quant_block(Some(&cfg), 4).unwrap();
+        assert_eq!(per_layer["layers.0.mlp.up_proj"].bits, 8);
+        assert_eq!(per_layer["layers.0.mlp.up_proj"].mode, PerLayerMode::IQ3S);
+        assert_eq!(per_layer["layers.0.mlp.down_proj"].bits, 3);
     }
 
     /// A tileable q4k group: 64 rows x 256 inputs (32 packed words, 16

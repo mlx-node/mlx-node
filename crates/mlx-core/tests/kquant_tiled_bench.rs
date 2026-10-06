@@ -42,11 +42,11 @@ const SHAPES: [(i64, i64); 6] = [
 ];
 
 /// The modes a UD-Q4_K_M Qwen3.8 GGUF carries, plus q2k (the 2-bit K-quant,
-/// measured next to q4k) and the six grid formats of the Unsloth UD-IQ* /
+/// measured next to q4k) and the seven grid formats of the Unsloth UD-IQ* /
 /// UD-Q2_K_XL mixes (their decode is table lookups, so the question is
-/// whether M = 1 stays bandwidth-bound at 1.56-3.06 bpw).
-const MODES: [&str; 10] = [
-    "q4k", "q5k", "q6k", "q2k", "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq1s", "iq1m",
+/// whether M = 1 stays bandwidth-bound at 1.56-3.56 bpw).
+const MODES: [&str; 11] = [
+    "q4k", "q5k", "q6k", "q2k", "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq1s", "iq1m", "iq3s",
 ];
 /// Prefill row counts: one NAX tile of rows, and a long prompt.
 const PREFILL_ROWS: [i64; 2] = [64, 2048];

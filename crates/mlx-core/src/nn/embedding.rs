@@ -877,8 +877,9 @@ mod tests {
     /// (its integer `.scales` fail affine's floating-scale check), so a K-quant
     /// embedding could not load end-to-end. Q4_K is the exact UD-Q4_K_XL input
     /// embedding format; Q6_K covers the tied-head-capable symmetric layout;
-    /// IQ2_XXS and IQ1_M cover the grid formats (the Unsloth UD-IQ* mixes'
-    /// `token_embd`), whose `.weight` is native grid-index words.
+    /// IQ2_XXS, IQ1_M and IQ3_S cover the grid formats (the Unsloth UD-IQ*
+    /// mixes' `token_embd`), whose `.weight` is native grid-index words
+    /// (IQ3_S: three words per unit, the third its sign bits).
     /// Q2_K is the 2-bit mix's `token_embd` candidate (two 16-value groups per
     /// 32-code unit, (sc, m) nibble pairs). All groups are built through the
     /// production repacker from synthetic ggml super-block bytes, so the whole
@@ -897,6 +898,7 @@ mod tests {
             (KQuantFormat::Q2K, 16, 2),
             (KQuantFormat::IQ2XXS, 32, 1),
             (KQuantFormat::IQ1M, 32, 1),
+            (KQuantFormat::IQ3S, 32, 3),
         ] {
             let mode = fmt.mlx_mode();
             let block_bytes = fmt.block_bytes();
@@ -936,7 +938,7 @@ mod tests {
                         blocks[base + 82] = 0x00;
                         blocks[base + 83] = 0x30; // dmin = f16 0.125
                     }
-                    KQuantFormat::IQ2XXS => {
+                    KQuantFormat::IQ2XXS | KQuantFormat::IQ3S => {
                         blocks[base] = 0x00;
                         blocks[base + 1] = 0x34; // d = f16 0.25
                     }

@@ -2,8 +2,8 @@
 
 // ggml K-quant and IQ formats, read-only. Each sub-block is affine
 // (value = scale * code + bias), a 16-entry codebook, or (the grid formats
-// IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS) a signed grid lookup,
-// under a float16 super-block scale. `scales` holds the integer sub-block
+// IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S) a signed grid
+// lookup, under a float16 super-block scale. `scales` holds the integer sub-block
 // scales (int8, or interleaved uint8 (sc, m) pairs for q2k/q4k/q5k; the grid
 // formats' per-unit companion bytes, uint8); `biases` holds the float16
 // super-block d (and dmin for q2k/q4k/q5k) -- a scale, not a bias.
@@ -31,6 +31,7 @@ enum class Mode {
   Q3K,
   IQ4NL,
   IQ4XS,
+  // ggml IQ3_S in its packed grid form (mode string "iq3s", bits 3).
   IQ3S,
   Q2K,
   IQ2XXS,
@@ -38,14 +39,19 @@ enum class Mode {
   IQ2S,
   IQ3XXS,
   IQ1S,
-  IQ1M
+  IQ1M,
+  // The legacy IQ3_S import: every value expanded to a signed 8-bit code
+  // (mode string "iq3s8", bits 8). Artifacts converted before the packed
+  // form carry `mode: "iq3s", bits: 8`; resolve_mode maps them here, so
+  // they keep loading. Nothing produces this form any more.
+  IQ3S8
 };
 
 // How a mode's codes turn into values. Mirrors KQ_LINEAR .. KQ_GRID_IQ1M in
 // metal/kquant/kquant_mode.h (same values) and quant_dispatch::KQuantKind.
 //   Linear    scale * code + bias on the packed integer code
 //   Codebook  scale * table[code], the 16-entry IQ4_NL grid
-//   Int8      scale * int8 (iq3s: the grid value expanded to a byte)
+//   Int8      scale * int8 (iq3s8: the grid value expanded to a byte)
 //   Grid*     scale * signed grid magnitude, one kind per grid format since
 //             they share no byte layout (metal/kquant/kquant_grid.h)
 enum class Kind : int {
@@ -57,11 +63,12 @@ enum class Kind : int {
   GridIQ2S = 5,
   GridIQ3XXS = 6,
   GridIQ1S = 7,
-  GridIQ1M = 8
+  GridIQ1M = 8,
+  GridIQ3S = 9
 };
 
 constexpr bool is_grid(Kind kind) {
-  return kind >= Kind::GridIQ2XXS && kind <= Kind::GridIQ1M;
+  return kind >= Kind::GridIQ2XXS && kind <= Kind::GridIQ3S;
 }
 
 // In-memory layout of a 2-D K-quant weight and its companions.
@@ -93,6 +100,14 @@ struct ModeLayout {
 
 // The bare mode names only ("q4k"); a layout suffix is not a mode.
 std::optional<Mode> parse_mode(std::string_view mode);
+// The mode the caller's (mode, bits) pair names: `mode` itself, except that
+// IQ3S with bits == 8 is the legacy expanded import IQ3S8 (the on-disk
+// `mode: "iq3s", bits: 8` of artifacts converted before the packed form).
+// Every entry point resolves through here before validating `bits`.
+constexpr Mode resolve_mode(Mode mode, std::optional<int> bits) {
+  return (mode == Mode::IQ3S && bits.has_value() && *bits == 8) ? Mode::IQ3S8
+                                                                 : mode;
+}
 // "q4k" -> {Q4K, RowMajor}, "q4k@t64" -> {Q4K, Tiled64}.
 std::optional<ModeLayout> parse_mode_layout(std::string_view mode);
 const char *mode_name(Mode mode);
@@ -110,6 +125,7 @@ constexpr int super_ratio(Mode mode) {
   case Mode::Q5K:
   case Mode::IQ4XS:
   case Mode::IQ3S:
+  case Mode::IQ3S8:
   case Mode::IQ2XXS:
   case Mode::IQ2XS:
   case Mode::IQ2S:
@@ -137,7 +153,7 @@ constexpr Kind kind(Mode mode) {
   case Mode::IQ4NL:
   case Mode::IQ4XS:
     return Kind::Codebook;
-  case Mode::IQ3S:
+  case Mode::IQ3S8:
     return Kind::Int8;
   case Mode::Q6K:
   case Mode::Q4K:
@@ -157,6 +173,8 @@ constexpr Kind kind(Mode mode) {
     return Kind::GridIQ1S;
   case Mode::IQ1M:
     return Kind::GridIQ1M;
+  case Mode::IQ3S:
+    return Kind::GridIQ3S;
   }
   return Kind::Linear;
 }
@@ -167,7 +185,8 @@ constexpr bool is_grid(Mode mode) { return is_grid(kind(mode)); }
 // exactly (scale *= 2^scale_shift): ggml's `d * (0.5 + sc) * 0.25` (IQ2_*),
 // `* 0.5` (IQ3_XXS) and `d * (2 sc + 1) * (g +- 1/8)` (IQ1_*) become
 // `d * (1 + 2 sc) * 2^shift` times an integer, bit for bit. 0 for every
-// affine / codebook / int8 mode.
+// affine / codebook / int8 mode and for IQ3_S, whose ggml scale is
+// `d * (1 + 2 sc)` as written.
 constexpr int scale_shift(Mode mode) {
   switch (mode) {
   case Mode::IQ2XXS:
@@ -186,8 +205,8 @@ constexpr int scale_shift(Mode mode) {
 // Bytes of `.scales` per group: an (sc, m) pair, one sub-scale, or the grid
 // format's companion bytes (kquant_grid.h: IQ2_XXS / IQ3_XXS the sign-scale
 // word, IQ2_XS the scale nibbles, IQ2_S qh + scales, IQ1_S the qh halfword,
-// IQ1_M qh + scales). The per-super-block companion stride is
-// super_ratio * scale_bytes_per_group.
+// IQ1_M qh + scales, IQ3_S qh + the scale nibble). The per-super-block
+// companion stride is super_ratio * scale_bytes_per_group.
 constexpr int scale_bytes_per_group(Mode mode) {
   switch (mode) {
   case Mode::IQ2XXS:
@@ -197,6 +216,7 @@ constexpr int scale_bytes_per_group(Mode mode) {
     return 1;
   case Mode::IQ2S:
   case Mode::IQ1S:
+  case Mode::IQ3S:
     return 2;
   case Mode::IQ1M:
     return 3;
@@ -211,12 +231,12 @@ constexpr int bias_entries_per_super_block(Mode mode) {
 }
 
 // `.scales` dtype: the (sc, m) modes and the grid formats carry unsigned
-// bytes, the symmetric K-quants and IQ4 / IQ3_S signed sub-scales.
+// bytes, the symmetric K-quants and IQ4 / iq3s8 signed sub-scales.
 inline Dtype scales_dtype(Mode mode) {
   return (has_sub_min(mode) || is_grid(mode)) ? uint8 : int8;
 }
 
-// For the grid formats `bits` is the unit's `.weight` word count (1 or 2),
+// For the grid formats `bits` is the unit's `.weight` word count (1 to 3),
 // not a code width: every unit is 32 values whatever the index width.
 constexpr int default_bits(Mode mode) {
   switch (mode) {
@@ -229,13 +249,14 @@ constexpr int default_bits(Mode mode) {
   case Mode::Q5K:
     return 5;
   case Mode::Q3K:
+  case Mode::IQ3S:
     return 3;
   case Mode::Q2K:
   case Mode::IQ2XS:
   case Mode::IQ2S:
   case Mode::IQ3XXS:
     return 2;
-  case Mode::IQ3S:
+  case Mode::IQ3S8:
     return 8;
   case Mode::IQ2XXS:
   case Mode::IQ1S:

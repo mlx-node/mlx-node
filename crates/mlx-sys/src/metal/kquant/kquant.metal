@@ -14,9 +14,10 @@
 //
 // q6k/q3k are symmetric sub-blocks of 16, q2k an asymmetric sub-block of 16,
 // q4k/q5k asymmetric sub-blocks of 32; the IQ modes carry a codebook (iq4nl,
-// iq4xs) or int8 values (iq3s); the grid modes (iq1s, iq1m, iq2xxs, iq2xs,
-// iq2s, iq3xxs) grid indices whose `bits` is the unit's word count and whose
-// scale carries the 2^shift of kquant_grid.h. super_ratio is 256 /
+// iq4xs) or int8 values (iq3s8, the legacy expanded IQ3_S import); the grid
+// modes (iq1s, iq1m, iq2xxs, iq2xs, iq2s, iq3xxs, iq3s) grid indices whose
+// `bits` is the unit's word count and whose scale carries the 2^shift of
+// kquant_grid.h. super_ratio is 256 /
 // group_size, the number of sub-blocks a super-block's (d, dmin) covers.
 //
 // There is no quantize: K-quants are only ever consumed, and producing one
@@ -229,13 +230,14 @@
   instantiate_kquant_modes(q2k, type, 16, 2, 16, true, KQ_LINEAR, 0) \
   instantiate_kquant_modes(iq4nl, type, 32, 4, 1, false, KQ_CODEBOOK, 0) \
   instantiate_kquant_modes(iq4xs, type, 32, 4, 8, false, KQ_CODEBOOK, 0) \
-  instantiate_kquant_modes(iq3s, type, 32, 8, 8, false, KQ_INT8, 0) \
+  instantiate_kquant_modes(iq3s8, type, 32, 8, 8, false, KQ_INT8, 0) \
   instantiate_kquant_modes(iq2xxs, type, 32, 1, 8, false, KQ_GRID_IQ2XXS, -3) \
   instantiate_kquant_modes(iq2xs, type, 32, 2, 8, false, KQ_GRID_IQ2XS, -3) \
   instantiate_kquant_modes(iq2s, type, 32, 2, 8, false, KQ_GRID_IQ2S, -3) \
   instantiate_kquant_modes(iq3xxs, type, 32, 2, 8, false, KQ_GRID_IQ3XXS, -2) \
   instantiate_kquant_modes(iq1s, type, 32, 1, 8, false, KQ_GRID_IQ1S, -3) \
-  instantiate_kquant_modes(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3)
+  instantiate_kquant_modes(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3) \
+  instantiate_kquant_modes(iq3s, type, 32, 3, 8, false, KQ_GRID_IQ3S, 0)
 
 #if KQUANT_DTYPE == 0
 instantiate_kquant_types(float)
@@ -245,7 +247,8 @@ instantiate_kquant_types(float16_t)
 instantiate_kquant_types(bfloat16_t)
 
 // M = 8 simdgroup-matrix qmv: bfloat16 only, and only the modes kq_sg8::format
-// decodes (q2k, q3k, iq4nl and iq3s take qmm_m8_nax or qmv_wide).
+// decodes (q2k, q3k, iq4nl, iq3s8 and the grid modes take qmm_m8_nax or
+// qmv_wide).
 instantiate_kquant(q6k, qmv_sg8, bfloat16_t, 16, 6, 16, false, KQ_LINEAR, 0)
 instantiate_kquant(q4k, qmv_sg8, bfloat16_t, 32, 4, 8, true, KQ_LINEAR, 0)
 instantiate_kquant(q5k, qmv_sg8, bfloat16_t, 32, 5, 8, true, KQ_LINEAR, 0)
