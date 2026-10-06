@@ -7,6 +7,7 @@ pub(crate) mod dflash2;
 pub(crate) mod dflash2_decode;
 pub mod gated_delta;
 pub mod gated_delta_net;
+pub(crate) mod gdn_blob;
 pub(crate) mod gdn_checkpoint_store;
 pub(crate) mod gdn_sidecar;
 pub use crate::models::int8_gemm;

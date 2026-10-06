@@ -348,6 +348,41 @@ pub(crate) fn replay_mtp_snapshot_to(
     Ok(())
 }
 
+/// The full-attention half of [`replay_mtp_snapshot_to`] on the flat path:
+/// rewind every K/V offset to `snapshot_offset + steps`. Linear layers are
+/// left alone — the caller has committed them through the packed GDN blobs.
+pub(crate) fn rewind_full_attention_to(
+    caches: &mut [Qwen3_5LayerCache],
+    snap: &[Qwen3_5LayerSnapshot],
+    steps: usize,
+    context: &str,
+) -> Result<()> {
+    if caches.len() != snap.len() {
+        return Err(Error::from_reason(format!(
+            "{context}: length mismatch (caches {}, snapshot {})",
+            caches.len(),
+            snap.len(),
+        )));
+    }
+    for (idx, (cache, snap)) in caches.iter_mut().zip(snap.iter()).enumerate() {
+        match (cache, snap) {
+            (
+                Qwen3_5LayerCache::FullAttention(kv),
+                Qwen3_5LayerSnapshot::FullAttention { offset },
+            ) => {
+                kv.trim(*offset + steps as i32);
+            }
+            (Qwen3_5LayerCache::Linear(_), Qwen3_5LayerSnapshot::Linear { .. }) => {}
+            _ => {
+                return Err(Error::from_reason(format!(
+                    "{context}: layer {idx} snapshot kind does not match its cache slot",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Snapshot every layer's cache in one shot. Production snapshots go through
 /// [`snapshot_all_mtp`], which is paged-aware; this stays as the round-trip
 /// oracle `restore_all` is paired with.

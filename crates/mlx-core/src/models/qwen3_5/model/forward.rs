@@ -868,19 +868,21 @@ fn forward_dflash2_compiled(
                     ));
                 };
                 cursor += fa_arrays;
-                match kv_format {
-                    KvFormat::Bf16 => {
-                        kvc.update_and_fetch(&block[0], &block[1])?;
-                    }
-                    KvFormat::Int8 => {
-                        kvc.append_quantized(&crate::array::kv_int8::Int8KvRows {
+                // One store dispatch per layer (rows + scales), in place.
+                kvc.store_block(&match kv_format {
+                    KvFormat::Bf16 => crate::transformer::kv_cache::KvBlock::Bf16 {
+                        keys: block[0].clone(),
+                        values: block[1].clone(),
+                    },
+                    KvFormat::Int8 => crate::transformer::kv_cache::KvBlock::Int8(
+                        crate::array::kv_int8::Int8KvRows {
                             keys: block[0].clone(),
                             values: block[1].clone(),
                             key_scales: block[2].clone(),
                             value_scales: block[3].clone(),
-                        })?;
-                    }
-                }
+                        },
+                    ),
+                })?;
             }
         }
         Ok(())

@@ -21,8 +21,10 @@ use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 use crate::transformer::paged_policy::live_prefill_headroom;
 
 use super::dflash2::DFlash2ContextCache;
+use super::gdn_blob::GdnStateBlobs;
 use super::layer_cache::{
-    Qwen3_5LayerCache, Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp,
+    Qwen3_5LayerCache, Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, rewind_full_attention_to,
+    snapshot_all_mtp,
 };
 use super::model::{PREFILL_STEP_SIZE, Qwen35Inner};
 
@@ -44,6 +46,17 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     /// — the token provenance [`Self::commit`] materializes once the verify
     /// graph has been forced (post-acceptance read = plain copy, no sync).
     verified_ids_device: Option<MxArray>,
+    /// Packed GDN state of every linear layer (the per-layer cache slots are
+    /// views of it) — the pre-verify state the fused commit replays from.
+    /// `None` keeps the per-layer replay path.
+    gdn_blobs: Option<GdnStateBlobs>,
+}
+
+/// Packed GDN state is on unless `MLX_DFLASH2_GDN_BLOB=0` (A/B switch).
+fn dflash2_gdn_blob_enabled() -> bool {
+    std::env::var("MLX_DFLASH2_GDN_BLOB")
+        .ok()
+        .is_none_or(|value| value.trim() != "0")
 }
 
 fn reusable_dflash2_prefix(
@@ -572,14 +585,32 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
-        replay_mtp_snapshot_to(
-            caches,
-            &snapshot,
-            &tape,
-            keep,
-            false,
-            "Qwen3.8 DFlash2 commit",
-        )?;
+        // Packed path: every linear layer's replay (plus its conv rebuild)
+        // in one fused primitive from the pre-verify blobs; the full-attention
+        // offsets rewind as before. A declined kernel drops back to the
+        // per-layer replay for the rest of the turn.
+        let next_blobs = match &self.gdn_blobs {
+            Some(blobs) => blobs.commit(&tape, keep)?,
+            None => None,
+        };
+        match next_blobs {
+            Some(next) => {
+                next.apply_views(caches)?;
+                rewind_full_attention_to(caches, &snapshot, keep, "Qwen3.8 DFlash2 commit")?;
+                self.gdn_blobs = Some(next);
+            }
+            None => {
+                self.gdn_blobs = None;
+                replay_mtp_snapshot_to(
+                    caches,
+                    &snapshot,
+                    &tape,
+                    keep,
+                    false,
+                    "Qwen3.8 DFlash2 commit",
+                )?;
+            }
+        }
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 
@@ -668,6 +699,23 @@ impl DsparkBackend for Qwen35Inner {
             .config
             .target_layers
             .clone();
+        // Pack the prefill's per-layer GDN states once per turn (two concats);
+        // every cycle's commit then rewrites the blobs in one fused primitive
+        // and re-points the per-layer slots at them. The DFlash2 stepper
+        // always runs on the flat caches (see the `paged = false` snapshots).
+        let gdn_blobs = match &mut self.caches {
+            Some(caches) if dflash2_gdn_blob_enabled() => {
+                let blobs = GdnStateBlobs::pack(caches)?;
+                match &blobs {
+                    Some(blobs) => blobs.apply_views(caches)?,
+                    None => tracing::debug!(
+                        "Qwen3.8 DFlash2: GDN state not packable; per-layer commit path"
+                    ),
+                }
+                blobs
+            }
+            _ => None,
+        };
         Ok(Qwen35DFlash2Stepper {
             inner: self,
             context: state.context,
@@ -678,6 +726,7 @@ impl DsparkBackend for Qwen35Inner {
             tapped: None,
             verified_ids: None,
             verified_ids_device: None,
+            gdn_blobs,
         })
     }
 }

@@ -21,7 +21,19 @@ in crates/mlx-sys/src/metal/segmented_sdpa/sdpa_segmented_nax.metal follows
 the matmul2d operand shapes and the page softmax of Splash's
 runtime/metal/kernels/common/paged_attention_tile.h, with the segmented
 (prefix / new) K/V addressing, causal limits and partial-tile handling
-written for mlx-node's two-pass layout. Splash's LICENSE is the Apache License,
+written for mlx-node's two-pass layout. The DFlash2 commit structure — the
+packed per-layer GDN state blobs with current/next parity
+(crates/mlx-core/src/models/qwen3_5/gdn_blob.rs), the all-layer GDN commit
+kernel with the conv carry folded in
+(crates/mlx-sys/src/metal/common/gdn_commit.metal.inc,
+crates/mlx-sys/src/mlx_gdn_commit.cpp) and the one-dispatch KV row store
+(crates/mlx-sys/src/metal/common/kv_store_rows.metal.inc,
+crates/mlx-sys/src/mlx_kv_store.cpp) — follows Splash's
+runtime/metal/kernels/decode/gdn.metal (verify_gdn_commit, gdn_conv_carry),
+runtime/ops/GDN.cpp, runtime/ops/StateLayout.hpp and
+runtime/metal/kernels/common/paged_store_row.h, with the arithmetic kept
+as mlx-node's per-token bf16 replay and the flat (non-paged) cache layout.
+Splash's LICENSE is the Apache License,
 Version 2.0, whose copyright line it leaves as the template text:
 
    Copyright [yyyy] [name of copyright owner]

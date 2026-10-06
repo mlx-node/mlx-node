@@ -2145,6 +2145,41 @@ unsafe extern "C-unwind" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
+    // Fused DFlash2 GDN commit over every linear layer: replays `keep`
+    // recorded tokens of each layer's tape into the packed recurrent blob
+    // `[L, Hv, Dv, Dk]` and conv blob `[L, K-1, W]` (bit-identical to the
+    // per-layer `mlx_gated_delta_replay` + conv rebuild) in a few dispatches.
+    // The result is written in place into the spare `rec_next` / `conv_next`
+    // blobs (ping-pong); `k`/`v`/`g`/`beta`/`qkv` point at `layers` per-layer
+    // tape arrays.
+    pub fn mlx_gdn_commit_all(
+        rec_in: *mut mlx_array,
+        conv_in: *mut mlx_array,
+        rec_next: *mut mlx_array,
+        conv_next: *mut mlx_array,
+        layers: i32,
+        k: *const *mut mlx_array,
+        v: *const *mut mlx_array,
+        g: *const *mut mlx_array,
+        beta: *const *mut mlx_array,
+        qkv: *const *mut mlx_array,
+        keep: i32,
+        out_rec: *mut *mut mlx_array,
+        out_conv: *mut *mut mlx_array,
+    ) -> bool;
+
+    // In-place KV row store: one dispatch writes `tensors` row blocks
+    // (`src[i]`, `[B, H, T(, D)]`) into the matching flat cache buffers
+    // (`dst[i]`) at row `offset`; `out[i]` are the cache handles to adopt
+    // (same buffers). A bit copy, equal to one slice_update per tensor.
+    pub fn mlx_kv_store_rows(
+        tensors: i32,
+        dst: *const *mut mlx_array,
+        src: *const *mut mlx_array,
+        offset: i32,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+
     // Fused DFlash2 grouped dynamic causal conv: one elementwise dispatch
     // reproducing the pad/slice/add/mul/add chain bit-exactly (per-op dtype
     // rounding preserved inside the kernel).
