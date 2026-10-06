@@ -6,7 +6,8 @@
 
 // M = 8 bfloat16 only, so this file is compiled once (no KQUANT_DTYPE). Every
 // mode in the Tiled64 layout ("_t64"); row-major only the modes the
-// dispatcher routes there (kernels::m8_nax_row_major_mode: q3k, q2k, iq4nl).
+// dispatcher routes there (kernels::m8_nax_row_major_mode: q3k, q2k, iq4nl
+// and the six grid modes, none of which qmv_sg8 decodes).
 // (group_size, bits, super_ratio, has_min, kind, scale_shift) per mode as in
 // kquant.metal.
 #define instantiate_kquant_m8_nax_tiled(mode, group_size, bits, super_ratio, has_min, kind, shift) \
@@ -28,4 +29,10 @@ instantiate_kquant_m8_nax(q2k, 16, 2, 16, true, KQ_LINEAR, 0)
 instantiate_kquant_m8_nax(iq4nl, 32, 4, 1, false, KQ_CODEBOOK, 0)
 instantiate_kquant_m8_nax_tiled(iq4xs, 32, 4, 8, false, KQ_CODEBOOK, 0)
 instantiate_kquant_m8_nax_tiled(iq3s, 32, 8, 8, false, KQ_INT8, 0)
+instantiate_kquant_m8_nax(iq2xxs, 32, 1, 8, false, KQ_GRID_IQ2XXS, -3)
+instantiate_kquant_m8_nax(iq2xs, 32, 2, 8, false, KQ_GRID_IQ2XS, -3)
+instantiate_kquant_m8_nax(iq2s, 32, 2, 8, false, KQ_GRID_IQ2S, -3)
+instantiate_kquant_m8_nax(iq3xxs, 32, 2, 8, false, KQ_GRID_IQ3XXS, -2)
+instantiate_kquant_m8_nax(iq1s, 32, 1, 8, false, KQ_GRID_IQ1S, -3)
+instantiate_kquant_m8_nax(iq1m, 32, 1, 8, false, KQ_GRID_IQ1M, -3)
 // clang-format on

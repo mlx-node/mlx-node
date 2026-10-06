@@ -20,6 +20,7 @@ fn build_ggml_kquant_reference() {
     let dir = "vendor/ggml";
     println!("cargo:rerun-if-changed={dir}/ggml_kquant_ref.c");
     println!("cargo:rerun-if-changed={dir}/ggml_kquant_ref.h");
+    println!("cargo:rerun-if-changed={dir}/ggml_grid_tables.inc");
     cc::Build::new()
         .file(format!("{dir}/ggml_kquant_ref.c"))
         .include(dir)

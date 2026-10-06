@@ -380,8 +380,9 @@ loads Google's QAT checkpoint without a separate conversion command.
 The first load creates an application cache, preserving supported quantized weights
 in packed form and preparing the media companion in the same transaction.
 Supported source types are F32/F16/BF16, the affine blocks Q4_0, Q4_1, Q5_0,
-Q5_1 and Q8_0, MXFP4, and the K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
-IQ3_S, IQ4_NL and IQ4_XS.
+Q5_1 and Q8_0, MXFP4, the K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+IQ3_S, IQ4_NL and IQ4_XS, and the grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+IQ2_S and IQ3_XXS (so every Unsloth `UD-IQ*` / `UD-Q2_K_XL` mix loads).
 Later loads reuse it. `MLX_NATIVE_GGUF_CACHE_DIR` overrides the cache directory;
 source files are not modified. Changes to the source, companion, or tokenizer
 assets invalidate the cache. A directory with multiple text GGUFs requires an
@@ -445,10 +446,11 @@ mlx convert --input ./model.gguf --output ./model-mlx
 
 Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, the affine
 blocks Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and MXFP4 source types directly, plus the
-ggml K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL and IQ4_XS behind
+ggml K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS and the
+grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS behind
 `--gguf-kquant`.
 
-#### K-quants (Q2_K .. Q6_K, IQ3_S, IQ4_NL, IQ4_XS)
+#### K-quants (Q2_K .. Q6_K, IQ3_S, IQ4_NL, IQ4_XS, IQ1_*, IQ2_*, IQ3_XXS)
 
 ```bash
 mlx convert --input ./model-UD-Q6_K_XL.gguf --output ./model-mlx --gguf-kquant
@@ -473,6 +475,18 @@ IQ4_NL/XS   y = d*sc[j]*grid[q]         ->  the 16-entry codebook, no bias
 IQ3_S       y = d*sc[j]*v               ->  v the signed grid value, stored as a byte
 ```
 
+The grid formats are not affine and keep ggml's native words: `.weight` holds
+the grid-index words of each 32-value unit, `.scales` the unit's sign indices /
+`qh` / scale nibbles, `.biases` the f16 `d`, and the kernels look the values up
+in ggml's grid tables (`kquant_grid.h`, the same source for Metal and the CPU
+reference), bit-identical to `dequantize_row_*`:
+
+```
+IQ2_XXS/XS/S  y = d*(1+2*sc)/8 * (+-grid8[idx][j])    sc a nibble per 32 (XXS) or 16 (XS, S)
+IQ3_XXS       y = d*(1+2*sc)/4 * (+-grid4[idx][j])
+IQ1_S/M       y = d*(2*sc+1) * (grid[idx][j] +- 1/8)  computed as d*(2*sc+1)/8 * (8*g +- 1)
+```
+
 | source | mlx-node   | ggml   | note                                |
 | ------ | ---------- | ------ | ----------------------------------- |
 | Q6_K   | 6.5625 bpw | 6.5625 | exact parity                        |
@@ -480,6 +494,12 @@ IQ3_S       y = d*sc[j]*v               ->  v the signed grid value, stored as a
 | Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason                 |
 | Q2_K   | 3.1250 bpw | 2.6250 | +0.5 for unpacked (sc, m) nibbles   |
 | Q3_K   | 3.5625 bpw | 3.4375 | +0.125 for unpacked sub-scales      |
+| IQ2_XXS | 2.0625 bpw | 2.0625 | native words, exact parity        |
+| IQ2_XS | 2.3125 bpw | 2.3125 | native words, exact parity          |
+| IQ2_S  | 2.5625 bpw | 2.5625 | native words, exact parity          |
+| IQ3_XXS | 3.0625 bpw | 3.0625 | native words, exact parity        |
+| IQ1_S  | 1.5625 bpw | 1.5625 | native words, exact parity          |
+| IQ1_M  | 1.8125 bpw | 1.7500 | +2 B/256 for the explicit f16 `d`   |
 
 The sub-scales are stored unpacked rather than in ggml's 6-bit (4-bit for Q2_K)
 packing: packing would preserve the exact ggml density but breaks the affine
@@ -491,9 +511,7 @@ matvec kernel. The codes themselves stay at their ggml width.
 there is nothing for a re-quantizer to act on. The combination is rejected
 upfront rather than silently ignored.
 
-Producing K-quants is not supported; they are consume-only. The IQ1 / IQ2 and
-IQ3_XXS grid formats (the experts of the Unsloth `UD-Q2_K_XL` and `UD-IQ*` mixes)
-are not imported yet.
+Producing K-quants is not supported; they are consume-only.
 
 #### MXFP4
 

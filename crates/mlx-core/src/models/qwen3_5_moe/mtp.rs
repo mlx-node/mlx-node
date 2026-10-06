@@ -370,7 +370,13 @@ impl Qwen3_5MoeMTPModule {
                 | PerLayerMode::Q2K
                 | PerLayerMode::IQ4NL
                 | PerLayerMode::IQ4XS
-                | PerLayerMode::IQ3S => None,
+                | PerLayerMode::IQ3S
+                | PerLayerMode::IQ2XXS
+                | PerLayerMode::IQ2XS
+                | PerLayerMode::IQ2S
+                | PerLayerMode::IQ3XXS
+                | PerLayerMode::IQ1S
+                | PerLayerMode::IQ1M => None,
             }
         };
         let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
@@ -396,7 +402,13 @@ impl Qwen3_5MoeMTPModule {
                 | PerLayerMode::Q2K
                 | PerLayerMode::IQ4NL
                 | PerLayerMode::IQ4XS
-                | PerLayerMode::IQ3S => None,
+                | PerLayerMode::IQ3S
+                | PerLayerMode::IQ2XXS
+                | PerLayerMode::IQ2XS
+                | PerLayerMode::IQ2S
+                | PerLayerMode::IQ3XXS
+                | PerLayerMode::IQ1S
+                | PerLayerMode::IQ1M => None,
             }
         };
 

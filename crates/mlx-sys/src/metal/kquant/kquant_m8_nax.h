@@ -19,6 +19,7 @@
 #include <metal_stdlib>
 
 #include "kquant_mode.h"
+#include "kquant_grid.h"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -33,10 +34,63 @@ constant constexpr ushort kThreads = 64;
 constant constexpr uint kStage = kCols * kStep;
 constant constexpr uint kTableEntries = 256;
 
-enum Format : int { Q4K, Q5K, Q6K, Q3K, IQ4NL, IQ4XS, IQ3S, Q2K, Unsupported };
+enum Format : int {
+  Q4K,
+  Q5K,
+  Q6K,
+  Q3K,
+  IQ4NL,
+  IQ4XS,
+  IQ3S,
+  Q2K,
+  IQ2XXS,
+  IQ2XS,
+  IQ2S,
+  IQ3XXS,
+  IQ1S,
+  IQ1M,
+  Unsupported
+};
+
+// The kquant_mode.h kind of a grid format, -1 for the others.
+template <Format F>
+constexpr int grid_kind() {
+  return F == IQ2XXS ? KQ_GRID_IQ2XXS
+      : F == IQ2XS   ? KQ_GRID_IQ2XS
+      : F == IQ2S    ? KQ_GRID_IQ2S
+      : F == IQ3XXS  ? KQ_GRID_IQ3XXS
+      : F == IQ1S    ? KQ_GRID_IQ1S
+      : F == IQ1M    ? KQ_GRID_IQ1M
+                     : -1;
+}
+
+template <Format F>
+constexpr bool is_grid() {
+  return grid_kind<F>() >= 0;
+}
 
 template <int group_size, int bits, int super_ratio, bool has_min, int kind>
 constexpr Format format() {
+  if (group_size == 32 && super_ratio == 8 && !has_min) {
+    if (kind == KQ_GRID_IQ2XXS && bits == 1) {
+      return IQ2XXS;
+    }
+    if (kind == KQ_GRID_IQ2XS && bits == 2) {
+      return IQ2XS;
+    }
+    if (kind == KQ_GRID_IQ2S && bits == 2) {
+      return IQ2S;
+    }
+    if (kind == KQ_GRID_IQ3XXS && bits == 2) {
+      return IQ3XXS;
+    }
+    if (kind == KQ_GRID_IQ1S && bits == 1) {
+      return IQ1S;
+    }
+    if (kind == KQ_GRID_IQ1M && bits == 1) {
+      return IQ1M;
+    }
+  }
   if (group_size == 32 && super_ratio == 8 && bits == 4) {
     if (has_min && kind == KQ_LINEAR) {
       return Q4K;
@@ -75,6 +129,9 @@ constexpr Format format() {
 // super-block (one byte per 32-value block instead).
 template <Format F>
 constexpr uint sb_scale_bytes() {
+  if constexpr (is_grid<F>()) {
+    return 8 * kq_scale_bytes_per_group<false, grid_kind<F>()>();
+  }
   return F == Q2K ? 32 : (F == IQ4XS || F == IQ3S || F == IQ4NL ? 8 : 16);
 }
 
@@ -176,6 +233,30 @@ struct Codes<Q2K> {
   }
 };
 
+// The grid formats: the unit's one or two `.weight` words; the companion
+// bytes (`.sc`) are filled in by CoefCursor::companion, which knows the
+// `.scales` layout (kquant_grid.h lists the per-format fields).
+#define KQ_M8_GRID_CODES(F)                                              \
+  template <>                                                            \
+  struct Codes<F> {                                                      \
+    typedef KQGridUnit W;                                                \
+    static W load(const device uint32_t* base, uint u, uint stride) {    \
+      const device uint32_t* s = base + u * stride;                      \
+      W w;                                                               \
+      w.w0 = s[0];                                                       \
+      w.w1 = kq_grid_words<grid_kind<F>()>() > 1 ? s[1] : 0u;            \
+      w.sc = 0u;                                                         \
+      return w;                                                          \
+    }                                                                    \
+  };
+KQ_M8_GRID_CODES(IQ2XXS)
+KQ_M8_GRID_CODES(IQ2XS)
+KQ_M8_GRID_CODES(IQ2S)
+KQ_M8_GRID_CODES(IQ3XXS)
+KQ_M8_GRID_CODES(IQ1S)
+KQ_M8_GRID_CODES(IQ1M)
+#undef KQ_M8_GRID_CODES
+
 constant constexpr uint kTileRows = 64;
 
 // Row n's unit 0 and unit stride (words) in either layout.
@@ -238,8 +319,29 @@ struct CoefCursor {
       uint K_)
       : scales(scales_), biases(biases_), n(n_), K(K_) {}
 
+  // Grid formats: the unit's companion bytes, packed little-endian (the
+  // super-block's 8 companion runs are contiguous in both layouts).
+  uint companion(uint u) const {
+    static_assert(is_grid<F>(), "grid formats only");
+    constexpr uint per = sb_scale_bytes<F>();
+    return kq_grid_companion<grid_kind<F>()>(
+        scales + companion_index<tiled>(n, K / 256, u >> 3, per) +
+        (u & 7u) * (per / 8));
+  }
+
   Coef at(uint u) {
     Coef c;
+    if constexpr (is_grid<F>()) {
+      // The super-block d alone; the per-unit scale lives in the companion
+      // bytes and kq_grid_decode8 applies it.
+      if ((u >> 3) != sb) {
+        sb = u >> 3;
+        d = half2(biases[companion_index<tiled>(n, K / 256, sb, 1)], 0.0h);
+      }
+      c.s = float2(float(d.x));
+      c.m = float2(0.0f);
+      return c;
+    }
     if constexpr (F == IQ4NL) {
       const float dd = float(biases[companion_index<tiled>(n, K / 32, u, 1)]);
       c.s = float2(kq_shift_scale<scale_shift>(
@@ -404,13 +506,45 @@ METAL_FUNC uint2 bytes8<IQ3S>(Codes<IQ3S>::W w, ushort j) {
 }
 
 // One lane's unit as 32 half values at dst, each rounded once from fp32.
+// Threadgroup entries of a grid format's table (1 for the unused width and
+// for the other formats).
 template <Format F>
+constexpr uint grid_tl64() {
+  return is_grid<F>() && kq_grid_entries_are_u64<grid_kind<F>()>()
+      ? kq_grid_entries<grid_kind<F>()>()
+      : 1u;
+}
+template <Format F>
+constexpr uint grid_tl32() {
+  return is_grid<F>() && !kq_grid_entries_are_u64<grid_kind<F>()>()
+      ? kq_grid_entries<grid_kind<F>()>()
+      : 1u;
+}
+
+template <Format F, int scale_shift>
 METAL_FUNC void stage32(
     typename Codes<F>::W w,
     Coef c,
     threadgroup const half2* tl,
-    threadgroup half* dst) {
-  if constexpr (F == IQ4XS || F == IQ4NL) {
+    threadgroup half* dst,
+    KQGridTgTables grid) {
+  if constexpr (is_grid<F>()) {
+    // Splash's QuantGrid arm of dequant32: grid magnitude times the group
+    // scale, then the sign, each value rounded once to half. The grid is
+    // read from the threadgroup copy: against the constant tables it
+    // measured 1.8x (IQ2_XXS, 0.219 -> 0.123 ms), 2.1x (IQ2_S) and 2.7x
+    // (IQ1_M) faster on the tiled Qwen3.8 shapes, the lanes' divergent
+    // indices serializing in the constant cache.
+    float v[kStep];
+    kq_grid_decode32<grid_kind<F>(), scale_shift>(w, c.s.x, v, grid);
+#pragma unroll
+    for (ushort j = 0; j < 4; ++j) {
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j) =
+          half4(v[8 * j], v[8 * j + 1], v[8 * j + 2], v[8 * j + 3]);
+      *reinterpret_cast<threadgroup half4*>(dst + 8 * j + 4) =
+          half4(v[8 * j + 4], v[8 * j + 5], v[8 * j + 6], v[8 * j + 7]);
+    }
+  } else if constexpr (F == IQ4XS || F == IQ4NL) {
     const float s = c.s.x;
 #pragma unroll
     for (ushort j = 0; j < 4; ++j) {
@@ -506,6 +640,8 @@ template <
 
   threadgroup half stage[2 * 2 * kStage];
   threadgroup half2 tl[codebook ? kTableEntries : 1];
+  threadgroup uint64_t grid64[grid_tl64<F>()];
+  threadgroup uint32_t grid32[grid_tl32<F>()];
   threadgroup uint arrival;
 
   const uint tid = simd_group * 32 + simd_lane;
@@ -515,6 +651,11 @@ template <
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  if constexpr (is_grid<F>()) {
+    kq_grid_stage_table<grid_kind<F>()>(grid64, grid32, tid, kThreads);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const KQGridTgTables grid{grid64, grid32};
 
   const uint K = in_vec_size;
   const uint N = out_vec_size;
@@ -555,13 +696,19 @@ template <
   CoefCursor<F, tiled, scale_shift> coefs(scales, biases, n, K);
   W cur = Codes<F>::load(row, step_begin, stride);
   Coef cc = coefs.at(step_begin);
+  if constexpr (is_grid<F>()) {
+    cur.sc = coefs.companion(step_begin);
+  }
   for (uint step = step_begin; step < step_end; ++step) {
     threadgroup half* buf = my + (step & 1) * kStage;
-    stage32<F>(cur, cc, tl, buf + simd_lane * kStep);
+    stage32<F, scale_shift>(cur, cc, tl, buf + simd_lane * kStep, grid);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     if (step + 1 < step_end) {
       cur = Codes<F>::load(row, step + 1, stride);
       cc = coefs.at(step + 1);
+      if constexpr (is_grid<F>()) {
+        cur.sc = coefs.companion(step + 1);
+      }
     }
     auto as = a.template slice<kStep, kRows>(int(step * kStep), 0);
     if (step & 1) {

@@ -51,8 +51,8 @@ if constexpr(HOIST_ZERO) {
 uint wr32=tid/2,wk32=(tid%2)*32;
 PackedGroup32<BITS> pg,pu;
 float gs,gb,us,ub;
-KQScales<float,BITS,8,true> gscale(sgs,bg, (wr+wr32)*(K/32)+wk32/32);
-KQScales<float,BITS,8,true> uscale(sus,bu, (wr+wr32)*(K/32)+wk32/32);
+KQScales<float,BITS,8,true,KQ_LINEAR,0> gscale(sgs,bg, (wr+wr32)*(K/32)+wk32/32);
+KQScales<float,BITS,8,true,KQ_LINEAR,0> uscale(sus,bu, (wr+wr32)*(K/32)+wk32/32);
 if constexpr(PREFETCH) {
  gscale.at(0,gs,gb);uscale.at(0,us,ub);
  pg.prefetch(gp+wr32*(K*BP/VP)+wk32*BP/VP,gs,gb);
@@ -63,9 +63,9 @@ for(int base=0;base<K;base+=BK) {
   if constexpr(PREFETCH) {
     pg.store(Gs+wr32*PAD+wk32);pu.store(Us+wr32*PAD+wk32);
   } else {
-  using Loader=QuantizedBlockLoader<T,BN,BK,PAD,true,128,32,BITS,8,true>;
-  Loader gl(gp+base*BP/VP,KQScales<float,BITS,8,true>(sgs,bg,wr*(K/32)+base/32),K,Gs,sg,lane);
-  Loader ul(up+base*BP/VP,KQScales<float,BITS,8,true>(sus,bu,wr*(K/32)+base/32),K,Us,sg,lane);
+  using Loader=QuantizedBlockLoader<T,BN,BK,PAD,true,128,32,BITS,8,true,KQ_LINEAR,0>;
+  Loader gl(gp+base*BP/VP,KQScales<float,BITS,8,true,KQ_LINEAR,0>(sgs,bg,wr*(K/32)+base/32),K,Gs,sg,lane);
+  Loader ul(up+base*BP/VP,KQScales<float,BITS,8,true,KQ_LINEAR,0>(sus,bu,wr*(K/32)+base/32),K,Us,sg,lane);
   gl.load_unsafe(); ul.load_unsafe();
   }
   if constexpr(HOIST_ZERO) {

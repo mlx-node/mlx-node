@@ -371,7 +371,13 @@ pub(crate) mod recipe {
             | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S => {
+            | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => {
                 return Err(Error::from_reason(format!(
                     "Qwen vision source mode {mode:?} is not a uniform packed mode supported by the dense vision sanitizer; dequantize the vision tower before conversion"
                 )));
@@ -7503,16 +7509,7 @@ fn validate_existing_quantized_entry(
         // including the interleave factor of 2 the q4k/q5k `(sc, m)` / `(d, dmin)`
         // pairs carry, so the generic affine shape check below cannot describe
         // them — this arm validates in full and returns.
-        "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs" | "iq3s" => {
-            let format = match entry.mode.as_str() {
-                "q3k" => KQuantFormat::Q3K,
-                "q4k" => KQuantFormat::Q4K,
-                "q5k" => KQuantFormat::Q5K,
-                "q6k" => KQuantFormat::Q6K,
-                "iq4nl" => KQuantFormat::IQ4NL,
-                "iq4xs" => KQuantFormat::IQ4XS,
-                _ => KQuantFormat::IQ3S,
-            };
+        mode if let Some(format) = KQuantFormat::from_mlx_mode(mode) => {
             validate_existing_kquant_entry(weight, scales, weights, prefix, entry, format)?;
             return Ok(());
         }

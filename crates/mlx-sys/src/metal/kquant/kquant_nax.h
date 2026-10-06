@@ -18,6 +18,7 @@
 #include <metal_stdlib>
 
 #include "kquant_mode.h"
+#include "kquant_grid.h"
 
 using namespace metal;
 using namespace mlx::steel;
@@ -52,10 +53,12 @@ MLX_MTL_CONST int8_t kIQ4NLValuesNAX[16] = {
 
 template <typename U, int N, int bits, bool nonlinear, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
+  // bits == 1 is the grid formats' one-word unit (kquant_grid.h); their
+  // callers take the KQ_GRID arm and never reach the code paths below.
   static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
-          bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+      bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == 5 ||
+          bits == 6 || bits == 8,
+      "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
 
   if constexpr (nonlinear) {
     for (int i = 0; i < N; i++) {
@@ -155,6 +158,19 @@ inline void dequantize_to(
   }
 }
 
+// The same grid-unit view as kquant.h's (the two headers are separate JIT
+// preambles, so each carries its own copy).
+struct KQGridMeta {
+  const device uint8_t* sc;
+  float d;
+};
+
+template <int kind>
+METAL_FUNC KQGridUnit kq_grid_unit(const device uint8_t* wunit, KQGridMeta m) {
+  return kq_grid_load<kind>(
+      reinterpret_cast<const device uint32_t*>(wunit), m.sc);
+}
+
 // The same decode as kquant.h's kq_decode_group (the two headers are
 // separate JIT preambles, so each carries its own copy).
 template <typename U, int bits, bool has_min, int kind, int scale_shift>
@@ -201,8 +217,11 @@ inline void kq_decode_group(
 // same float32 conversions, so the two decodes agree bitwise.
 template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScales {
-  // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k.
+  // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k,
+  // the companion bytes of a grid unit; super-scale entries per super-block:
+  // (d, dmin) or d.
   MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
+  MLX_MTL_CONST int per_super = has_min ? 2 : 1;
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -217,10 +236,16 @@ struct KQScales {
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
     kq_decode_group<U, bits, has_min, kind, scale_shift>(
-        biases + (gi / super_ratio) * per_group,
+        biases + (gi / super_ratio) * per_super,
         scales + gi * per_group,
         scale,
         bias);
+  }
+
+  KQGridMeta grid_meta(size_t g) const {
+    const size_t gi = group + g;
+    return KQGridMeta{
+        scales + gi * per_group, static_cast<float>(biases[gi / super_ratio])};
   }
 
   // A view whose group 0 is this view's group n.
@@ -255,6 +280,7 @@ METAL_FUNC constexpr size_t kq_tiled_unit_stride() {
 template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScalesTiled {
   MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
+  MLX_MTL_CONST int per_super = has_min ? 2 : 1;
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -281,17 +307,25 @@ struct KQScalesTiled {
             (size_t(row / KQ_TILE_ROWS) * (groups_per_row / super_ratio) *
                  KQ_TILE_ROWS +
              row % KQ_TILE_ROWS) *
-                per_group),
+                per_super),
         group(group_) {}
 
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
     const device float16_t* d =
-        biases + (gi / super_ratio) * KQ_TILE_ROWS * per_group;
+        biases + (gi / super_ratio) * KQ_TILE_ROWS * per_super;
     const device uint8_t* sc = scales +
         (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
         (gi % super_ratio) * per_group;
     kq_decode_group<U, bits, has_min, kind, scale_shift>(d, sc, scale, bias);
+  }
+
+  KQGridMeta grid_meta(size_t g) const {
+    const size_t gi = group + g;
+    return KQGridMeta{
+        scales + (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
+            (gi % super_ratio) * per_group,
+        static_cast<float>(biases[(gi / super_ratio) * KQ_TILE_ROWS])};
   }
 
   KQScalesTiled offset(size_t n) const {
@@ -320,10 +354,12 @@ template <
     int scale_shift,
     bool tiled = false>
 struct QuantizedBlockLoader {
+  // bits == 1 is the grid formats' one-word unit (kquant_grid.h); their
+  // callers take the KQ_GRID arm and never reach the code paths below.
   static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
-          bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+      bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == 5 ||
+          bits == 6 || bits == 8,
+      "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
   static_assert(
       !tiled || (reduction_dim == 1 && BCOLS % 32 == 0),
       "Tiled64 loads whole 32-code units of a transposed weight.");
@@ -435,11 +471,32 @@ struct QuantizedBlockLoader {
     static_assert(tiled, "the row-major loader takes a pre-offset source");
   }
 
+  // Grid formats: a thread's reads are 8, 16 or 32 values inside one unit
+  // (static_assert above), so decode the unit's chunks they cover.
+  void load_grid() const {
+    constexpr int values = n_reads * pack_factor;
+    static_assert(values % 8 == 0 && values <= 32, "whole chunks of one unit");
+    const int in_unit = (bj * pack_factor) % 32;
+    const KQGridMeta m = scales.grid_meta(0);
+    const KQGridUnit u = kq_grid_unit<kind>(src - in_unit * bits / 8, m);
+    for (int c = 0; c < values / 8; c++) {
+      float v[8];
+      kq_grid_decode8<kind, scale_shift>(u, m.d, uint(in_unit / 8 + c), v);
+      for (int i = 0; i < 8; i++) {
+        dst[c * 8 + i] = static_cast<T>(v[i]);
+      }
+    }
+  }
+
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
 
+    if constexpr (kq_is_grid<kind>()) {
+      load_grid();
+      return;
+    }
     int k = 0;
     for (int i = 0; i < n_steps_per_read; i++) {
       float scale;
@@ -472,6 +529,10 @@ struct QuantizedBlockLoader {
       return;
     }
 
+    if constexpr (kq_is_grid<kind>()) {
+      load_grid();
+      return;
+    }
     int k = 0;
     for (int i = 0; i < n_steps_per_read; i++) {
       float scale;

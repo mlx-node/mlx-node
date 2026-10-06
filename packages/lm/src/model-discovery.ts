@@ -33,16 +33,17 @@ interface DiscoveryMetadata {
 }
 
 /**
- * The Qwen3.5/Qwen3.8 discovery filter admits the Unsloth Dynamic `Q*_K_XL`
- * and `Q*_K_M` target names users download, `UD-Q2_K_XL` included. The mixes
- * draw on the importable ggml tensor types (Q2_K..Q6_K, IQ3_S, IQ4_NL, IQ4_XS,
- * Q8_0, F32); only the per-tensor selection differs. (The UD-Q2_K_XL mix also
- * carries IQ2_XS / IQ2_S experts, which the grid-format import stage adds.)
- * Other variants and companion artifacts such as imatrix/mmproj/draft stay
- * excluded. Gemma4 and Muse accept all supported tensor formats, including
- * Q4_0 QAT checkpoints.
+ * The Qwen3.5/Qwen3.8 discovery filter admits the Unsloth Dynamic target names
+ * users download: `Q*_K_XL` / `Q*_K_M` (`UD-Q2_K_XL` included) and the `UD-IQ*`
+ * mixes `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ2_M`, `IQ3_XXS`,
+ * `IQ3_S`, `IQ3_M`, `IQ4_XS`, `IQ4_NL`. Every ggml tensor type those mixes
+ * draw on is importable (Q2_K..Q6_K, IQ4_NL, IQ4_XS, IQ3_S, the IQ1 / IQ2 /
+ * IQ3_XXS grid formats, Q8_0, F32); only the per-tensor selection differs.
+ * Other variants (`Q4_0`, `Q*_K_S`) and companion artifacts such as
+ * imatrix/mmproj/draft stay excluded. Gemma4 and Muse accept all supported
+ * tensor formats, including Q4_0 QAT checkpoints.
  */
-const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_(?:XL|M)\.gguf$/i;
+const QWEN35_XL_GGUF = /(?:^|[-_.])(?:Q\d+_K_(?:XL|M)|IQ(?:1_[SM]|2_(?:XXS|XS|S|M)|3_(?:XXS|S|M)|4_(?:XS|NL)))\.gguf$/i;
 const BONSAI_PQ2_GGUF = /^ternary-bonsai-2-27b-pq2_0\.gguf$/i;
 // `mtp` joins the rule because the catalog ships MTP weights BESIDE a target
 // (Qwen3.8's `MTP/mtp-*.gguf`, Gemma's `mtp-*.gguf`) and nothing in the runtime
@@ -197,7 +198,7 @@ export interface DiscoveryScanOptions {
 
 /**
  * Scan `modelsDir` for chat-capable model subdirectories, Gemma4/Muse/Qwen4 GGUFs, and
- * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` / `Q<number>_K_M.gguf` files. GGUF files may live directly
+ * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` / `Q<number>_K_M.gguf` / `UD-IQ*.gguf` files. GGUF files may live directly
  * under `modelsDir` or one level inside a downloaded GGUF repository. Each is
  * registered by filename stem so quant variants remain independently selectable.
  *

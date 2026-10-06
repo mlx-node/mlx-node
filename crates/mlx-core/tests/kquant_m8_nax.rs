@@ -4,7 +4,7 @@
 //! `KQuantMatmul::eval_gpu` (mlx_kquant_metal.cpp) sends a transposed 8-row
 //! bfloat16 `quantized_matmul` with N % 64 == 0 and K % 32 == 0 there on a
 //! NAX host: every mode in the Tiled64 layout (`@t64`, the layout the loader
-//! gives eligible linears), and row-major only q3k, q2k and iq4nl (the sg8 modes
+//! gives eligible linears), and row-major only q3k, q2k, iq4nl and the grid formats (the sg8 modes
 //! measured no faster than `qmv_sg8` row-major). These tests run every mode
 //! through the tiled route so every decode is checked. The kernel rounds
 //! every decoded weight once to half and sums K in fp32 in a split order
@@ -30,7 +30,7 @@ struct Fmt {
     biases_cols: i64,
 }
 
-const FORMATS: [Fmt; 8] = [
+const FORMATS: [Fmt; 14] = [
     Fmt {
         mode: "q4k",
         bits: 4,
@@ -103,7 +103,72 @@ const FORMATS: [Fmt; 8] = [
         scales_cols: 32,
         biases_cols: 2,
     },
+    // The grid formats: `bits` native grid-index words per 32-value unit,
+    // `scales_cols` companion bytes per 8 units, one d (gguf_kquant.rs).
+    Fmt {
+        mode: "iq2xxs",
+        bits: 1,
+        group_size: 32,
+        signed_scales: false,
+        weight_cols: 8,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    Fmt {
+        mode: "iq2xs",
+        bits: 2,
+        group_size: 32,
+        signed_scales: false,
+        weight_cols: 16,
+        scales_cols: 8,
+        biases_cols: 1,
+    },
+    Fmt {
+        mode: "iq2s",
+        bits: 2,
+        group_size: 32,
+        signed_scales: false,
+        weight_cols: 16,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    Fmt {
+        mode: "iq3xxs",
+        bits: 2,
+        group_size: 32,
+        signed_scales: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    Fmt {
+        mode: "iq1s",
+        bits: 1,
+        group_size: 32,
+        signed_scales: false,
+        weight_cols: 8,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    Fmt {
+        mode: "iq1m",
+        bits: 1,
+        group_size: 32,
+        signed_scales: false,
+        weight_cols: 8,
+        scales_cols: 24,
+        biases_cols: 1,
+    },
 ];
+
+impl Fmt {
+    fn is_grid(&self) -> bool {
+        matches!(
+            self.mode,
+            "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m"
+        )
+    }
+}
 
 /// (K, N): the Qwen3.8-27B verify projections.
 const SHAPES: [(i64, i64); 6] = [
@@ -150,18 +215,24 @@ impl Weights {
     /// biases per group.
     fn tiled(&self) -> Self {
         assert!(!self.tiled, "already tiled");
-        let per_group = if self.fmt.signed_scales { 1 } else { 2 };
         let super_ratio = match self.fmt.mode {
             "q6k" | "q3k" | "q2k" => 16,
             "iq4nl" => 1,
             _ => 8,
+        };
+        // `.scales` bytes per group and `.biases` entries per super-block.
+        let per_group = self.fmt.scales_cols * self.fmt.group_size / 256;
+        let per_super = if self.fmt.mode == "iq4nl" {
+            1
+        } else {
+            self.fmt.biases_cols
         };
         let t = Self {
             fmt: self.fmt,
             tiled: true,
             w: kquant_tile_rows(&self.w, i64::from(self.fmt.bits)).expect("tile weight"),
             scales: kquant_tile_rows(&self.scales, super_ratio * per_group).expect("tile scales"),
-            biases: kquant_tile_rows(&self.biases, per_group).expect("tile biases"),
+            biases: kquant_tile_rows(&self.biases, per_super).expect("tile biases"),
         };
         t.w.eval();
         t.scales.eval();
@@ -186,6 +257,9 @@ impl Weights {
                 let r = lcg(&mut st) >> 8;
                 if fmt.signed_scales {
                     ((r % 64) as i32 - 32) as i8 as u8
+                } else if fmt.is_grid() {
+                    // Native companion bytes: any bit pattern is valid.
+                    r as u8
                 } else {
                     (r % 64) as u8
                 }
@@ -462,7 +536,7 @@ fn m8_nax_is_deterministic() {
 }
 
 /// Shapes and operands the kernel does not take stay on the old routes;
-/// row-major, only q3k, q2k and iq4nl reach it.
+/// row-major, only q3k, q2k, iq4nl and the grid formats reach it.
 #[test]
 fn m8_nax_leaves_every_other_case_alone() {
     if !select_gpu() {
@@ -508,6 +582,31 @@ fn m8_nax_leaves_every_other_case_alone() {
         assert!(m8 == 1 && wide == 0, "row-major q2k must take qmm_m8_nax");
     } else {
         assert!(m8 == 0 && wide > 0, "q2k must stay on qmv_wide without NAX");
+    }
+
+    // The grid formats have no sg8 decode either: row-major they take the
+    // tensor op like q2k.
+    for fmt in FORMATS.iter().filter(|f| f.is_grid()) {
+        let wg = Weights::new(*fmt, 2048, k, 5);
+        let (m8, sg8, wide) = route(
+            &format!("{} M=8 N=2048 row-major", fmt.mode),
+            &bf16_x(&xb, k),
+            &wg,
+        );
+        assert_eq!(sg8, 0, "{} has no qmv_sg8 kernel", fmt.mode);
+        if routes() {
+            assert!(
+                m8 == 1 && wide == 0,
+                "row-major {} must take qmm_m8_nax",
+                fmt.mode
+            );
+        } else {
+            assert!(
+                m8 == 0 && wide > 0,
+                "{} must stay on qmv_wide without NAX",
+                fmt.mode
+            );
+        }
     }
 
     // Tiled: every mode takes it.

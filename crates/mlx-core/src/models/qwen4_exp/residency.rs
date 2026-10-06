@@ -78,6 +78,14 @@ impl Tensor {
                 GgufTensorType::IQ4NL => (19, 32),
                 GgufTensorType::IQ3S => (266, 256),
                 GgufTensorType::IQ4XS => (138, 256),
+                // The grid formats keep ggml's bytes (gguf_kquant.rs); IQ1_M
+                // adds the 2-byte f16 d the contract makes explicit.
+                GgufTensorType::IQ2XXS => (66, 256),
+                GgufTensorType::IQ2XS => (74, 256),
+                GgufTensorType::IQ2S => (82, 256),
+                GgufTensorType::IQ3XXS => (98, 256),
+                GgufTensorType::IQ1S => (50, 256),
+                GgufTensorType::IQ1M => (58, 256),
                 GgufTensorType::PQ2_0 => {
                     return Err(err("Qwen4 does not support PQ2_0 tensor residency"));
                 }

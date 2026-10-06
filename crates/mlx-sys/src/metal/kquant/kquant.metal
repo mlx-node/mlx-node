@@ -14,8 +14,10 @@
 //
 // q6k/q3k are symmetric sub-blocks of 16, q2k an asymmetric sub-block of 16,
 // q4k/q5k asymmetric sub-blocks of 32; the IQ modes carry a codebook (iq4nl,
-// iq4xs) or int8 values (iq3s). super_ratio is 256 / group_size, the number
-// of sub-blocks a super-block's (d, dmin) covers.
+// iq4xs) or int8 values (iq3s); the grid modes (iq1s, iq1m, iq2xxs, iq2xs,
+// iq2s, iq3xxs) grid indices whose `bits` is the unit's word count and whose
+// scale carries the 2^shift of kquant_grid.h. super_ratio is 256 /
+// group_size, the number of sub-blocks a super-block's (d, dmin) covers.
 //
 // There is no quantize: K-quants are only ever consumed, and producing one
 // needs ggml's make_qkx2_quants search. There is no qmv_quad either: the
@@ -227,7 +229,13 @@
   instantiate_kquant_modes(q2k, type, 16, 2, 16, true, KQ_LINEAR, 0) \
   instantiate_kquant_modes(iq4nl, type, 32, 4, 1, false, KQ_CODEBOOK, 0) \
   instantiate_kquant_modes(iq4xs, type, 32, 4, 8, false, KQ_CODEBOOK, 0) \
-  instantiate_kquant_modes(iq3s, type, 32, 8, 8, false, KQ_INT8, 0)
+  instantiate_kquant_modes(iq3s, type, 32, 8, 8, false, KQ_INT8, 0) \
+  instantiate_kquant_modes(iq2xxs, type, 32, 1, 8, false, KQ_GRID_IQ2XXS, -3) \
+  instantiate_kquant_modes(iq2xs, type, 32, 2, 8, false, KQ_GRID_IQ2XS, -3) \
+  instantiate_kquant_modes(iq2s, type, 32, 2, 8, false, KQ_GRID_IQ2S, -3) \
+  instantiate_kquant_modes(iq3xxs, type, 32, 2, 8, false, KQ_GRID_IQ3XXS, -2) \
+  instantiate_kquant_modes(iq1s, type, 32, 1, 8, false, KQ_GRID_IQ1S, -3) \
+  instantiate_kquant_modes(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3)
 
 #if KQUANT_DTYPE == 0
 instantiate_kquant_types(float)

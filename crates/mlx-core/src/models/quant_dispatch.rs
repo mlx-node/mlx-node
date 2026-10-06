@@ -177,6 +177,27 @@ pub enum PerLayerMode {
     /// ggml IQ3_S: grid/sign codes losslessly expanded to signed integer
     /// magnitudes and packed at eight bits; no floating weight is materialized.
     IQ3S,
+    /// ggml IQ2_XXS: 2.0625 bpw grid format. `.weight` keeps the native
+    /// grid-index words (one per 32-value unit, `bits` = 1), `.scales` the
+    /// unit's sign / scale word, `.biases` the f16 super-block `d`; decoded
+    /// in-kernel through the ggml grid (`kquant_grid.h`). Mode string
+    /// `"iq2xxs"`.
+    IQ2XXS,
+    /// ggml IQ2_XS: 2.3125 bpw grid format (two words per unit, one scale
+    /// byte). Mode string `"iq2xs"`.
+    IQ2XS,
+    /// ggml IQ2_S: 2.5625 bpw grid format (index + sign words, qh + scale
+    /// bytes). Mode string `"iq2s"`.
+    IQ2S,
+    /// ggml IQ3_XXS: 3.0625 bpw grid format (two index words, one sign /
+    /// scale word). Mode string `"iq3xxs"`.
+    IQ3XXS,
+    /// ggml IQ1_S: 1.5625 bpw grid format (one index word, the qh halfword).
+    /// Mode string `"iq1s"`.
+    IQ1S,
+    /// ggml IQ1_M: 1.75 bpw grid format (one index word, qh + scale bytes;
+    /// `d` reassembled into `.biases`). Mode string `"iq1m"`.
+    IQ1M,
 }
 
 /// Per-layer quantization metadata parsed from `config.json`.
@@ -226,6 +247,12 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
         Some("iq4nl") => Some(PerLayerMode::IQ4NL),
         Some("iq4xs") => Some(PerLayerMode::IQ4XS),
         Some("iq3s") => Some(PerLayerMode::IQ3S),
+        Some("iq2xxs") => Some(PerLayerMode::IQ2XXS),
+        Some("iq2xs") => Some(PerLayerMode::IQ2XS),
+        Some("iq2s") => Some(PerLayerMode::IQ2S),
+        Some("iq3xxs") => Some(PerLayerMode::IQ3XXS),
+        Some("iq1s") => Some(PerLayerMode::IQ1S),
+        Some("iq1m") => Some(PerLayerMode::IQ1M),
         _ => None,
     }
 }
@@ -261,6 +288,12 @@ pub(crate) fn mode_to_str(mode: PerLayerMode) -> &'static str {
         PerLayerMode::IQ4NL => "iq4nl",
         PerLayerMode::IQ4XS => "iq4xs",
         PerLayerMode::IQ3S => "iq3s",
+        PerLayerMode::IQ2XXS => "iq2xxs",
+        PerLayerMode::IQ2XS => "iq2xs",
+        PerLayerMode::IQ2S => "iq2s",
+        PerLayerMode::IQ3XXS => "iq3xxs",
+        PerLayerMode::IQ1S => "iq1s",
+        PerLayerMode::IQ1M => "iq1m",
     }
 }
 
@@ -347,6 +380,12 @@ pub fn is_kquant_mode(mode: PerLayerMode) -> bool {
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
             | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M
     )
 }
 
@@ -571,8 +610,11 @@ pub enum KQuantKind {
     Codebook,
     /// `scale * int8` on a code expanded to a signed byte (iq3s).
     Int8,
-    /// `scale * signed grid magnitude` (the IQ1/IQ2/IQ3_XXS grids, reserved
-    /// for the grid stage; no mode uses it yet).
+    /// `scale * signed grid magnitude` (the IQ1/IQ2/IQ3_XXS grids): `.weight`
+    /// holds the native grid-index words, `.scales` the unit's other native
+    /// bytes. The C++ / Metal sides key one kind per grid format
+    /// (`KQ_GRID_IQ2XXS` ..); here `(bits, scale_bytes_per_group,
+    /// scale_shift)` identify the format.
     Grid,
 }
 
@@ -594,11 +636,14 @@ pub struct KQuantModeParams {
     /// `super_ratio * scale_bytes_per_group`; a grid mode that keeps extra
     /// per-group metadata in `.scales` raises this.
     pub scale_bytes_per_group: i32,
+    /// `.biases` entries per super-block: 2 for the `(d, dmin)` modes, else
+    /// 1. The Tiled64 companion unit of `.biases`.
+    pub bias_entries_per_super_block: i32,
     pub scales_dtype: DType,
     pub kind: KQuantKind,
     /// Power-of-two exponent applied to every decoded scale in fp32
-    /// (`scale *= 2^scale_shift`, exact): 0 for every current mode; the grid
-    /// stage uses -3 for IQ2_* / IQ1_* and -2 for IQ3_XXS.
+    /// (`scale *= 2^scale_shift`, exact): 0 for the affine / codebook / int8
+    /// modes, -3 for IQ2_* / IQ1_* and -2 for IQ3_XXS (`kquant_grid.h`).
     pub scale_shift: i32,
 }
 
@@ -617,9 +662,27 @@ impl KQuantModeParams {
             group_size,
             super_ratio,
             scale_bytes_per_group: if has_min { 2 } else { 1 },
+            bias_entries_per_super_block: if has_min { 2 } else { 1 },
             scales_dtype: if has_min { DType::Uint8 } else { DType::Int8 },
             kind,
             scale_shift: 0,
+        }
+    }
+
+    /// A grid format: `bits` words of grid indices per 32-value unit,
+    /// `scale_bytes` companion bytes per unit (uint8), one `d` per
+    /// super-block, every scale carrying `2^scale_shift`.
+    const fn grid(mode_str: &'static str, bits: i32, scale_bytes: i32, scale_shift: i32) -> Self {
+        Self {
+            mode_str,
+            bits,
+            group_size: 32,
+            super_ratio: 8,
+            scale_bytes_per_group: scale_bytes,
+            bias_entries_per_super_block: 1,
+            scales_dtype: DType::Uint8,
+            kind: KQuantKind::Grid,
+            scale_shift,
         }
     }
 
@@ -642,6 +705,12 @@ pub fn kquant_mode_params(mode: PerLayerMode) -> Option<KQuantModeParams> {
         PerLayerMode::IQ4NL => KQuantModeParams::new("iq4nl", 4, 32, 1, false, Codebook),
         PerLayerMode::IQ4XS => KQuantModeParams::new("iq4xs", 4, 32, 8, false, Codebook),
         PerLayerMode::IQ3S => KQuantModeParams::new("iq3s", 8, 32, 8, false, Int8),
+        PerLayerMode::IQ2XXS => KQuantModeParams::grid("iq2xxs", 1, 4, -3),
+        PerLayerMode::IQ2XS => KQuantModeParams::grid("iq2xs", 2, 1, -3),
+        PerLayerMode::IQ2S => KQuantModeParams::grid("iq2s", 2, 2, -3),
+        PerLayerMode::IQ3XXS => KQuantModeParams::grid("iq3xxs", 2, 4, -2),
+        PerLayerMode::IQ1S => KQuantModeParams::grid("iq1s", 1, 2, -3),
+        PerLayerMode::IQ1M => KQuantModeParams::grid("iq1m", 1, 3, -3),
         _ => return None,
     })
 }
@@ -792,7 +861,7 @@ fn parse_explicit_mode(value: Option<&Value>, context: &str) -> Result<Option<Pe
         Error::from_reason(format!(
             "Unknown quantization mode '{mode}' at {context}; supported modes are affine, \
              mxfp4, mxfp8, nvfp4, fp8_e4m3, sym8, q2k, q3k, q4k, q5k, q6k, \
-             iq4nl, iq4xs, and iq3s"
+             iq4nl, iq4xs, iq3s, iq2xxs, iq2xs, iq2s, iq3xxs, iq1s, and iq1m"
         ))
     })
 }
@@ -858,7 +927,13 @@ fn parse_bits(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Resul
         | Some(PerLayerMode::Fp8E4m3)
         | Some(PerLayerMode::Sym8)
         | Some(PerLayerMode::IQ3S) => bits == 8,
-        Some(PerLayerMode::Q2K) => bits == 2,
+        Some(PerLayerMode::Q2K)
+        | Some(PerLayerMode::IQ2XS)
+        | Some(PerLayerMode::IQ2S)
+        | Some(PerLayerMode::IQ3XXS) => bits == 2,
+        Some(PerLayerMode::IQ2XXS) | Some(PerLayerMode::IQ1S) | Some(PerLayerMode::IQ1M) => {
+            bits == 1
+        }
         Some(PerLayerMode::Q3K) => bits == 3,
         Some(PerLayerMode::Q6K) => bits == 6,
         Some(PerLayerMode::Q5K) => bits == 5,
@@ -868,7 +943,8 @@ fn parse_bits(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Resul
         return Err(Error::from_reason(format!(
             "Invalid {context}={bits} for mode {mode:?}; affine supports bits 2, 3, 4, 5, 6, or 8, \
              while mxfp4/nvfp4/q4k require 4, mxfp8/fp8_e4m3/sym8 require 8, q6k requires 6, q5k requires 5, \
-             q3k requires 3, and q2k requires 2"
+             q3k requires 3, q2k/iq2xs/iq2s/iq3xxs require 2 and iq2xxs/iq1s/iq1m require 1 (the \
+             grid formats' words per 32-value unit)"
         )));
     }
     Ok(bits)
@@ -896,15 +972,21 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
         | Some(PerLayerMode::Q5K)
         | Some(PerLayerMode::IQ4NL)
         | Some(PerLayerMode::IQ4XS)
-        | Some(PerLayerMode::IQ3S) => group_size == 32,
+        | Some(PerLayerMode::IQ3S)
+        | Some(PerLayerMode::IQ2XXS)
+        | Some(PerLayerMode::IQ2XS)
+        | Some(PerLayerMode::IQ2S)
+        | Some(PerLayerMode::IQ3XXS)
+        | Some(PerLayerMode::IQ1S)
+        | Some(PerLayerMode::IQ1M) => group_size == 32,
         Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => false,
         Some(PerLayerMode::Affine) | None => matches!(group_size, 32 | 64 | 128),
     };
     if !valid {
         return Err(Error::from_reason(format!(
             "Invalid {context}={group_size} for mode {mode:?}; affine supports 32, 64, or 128, \
-             mxfp4/mxfp8/q4k/q5k/iq4nl/iq4xs/iq3s require 32, nvfp4/q6k/q3k/q2k require 16, and \
-             fp8_e4m3/sym8 require null"
+             mxfp4/mxfp8/q4k/q5k/iq4nl/iq4xs/iq3s and the grid formats require 32, \
+             nvfp4/q6k/q3k/q2k require 16, and fp8_e4m3/sym8 require null"
         )));
     }
     Ok(group_size)
@@ -1133,6 +1215,12 @@ fn parse_per_layer_entries(
                     | PerLayerMode::IQ4NL
                     | PerLayerMode::IQ4XS
                     | PerLayerMode::IQ3S
+                    | PerLayerMode::IQ2XXS
+                    | PerLayerMode::IQ2XS
+                    | PerLayerMode::IQ2S
+                    | PerLayerMode::IQ3XXS
+                    | PerLayerMode::IQ1S
+                    | PerLayerMode::IQ1M
             ) =>
             {
                 32
@@ -1381,6 +1469,12 @@ pub fn merge_per_layer(
             PerLayerMode::IQ4NL => 7,
             PerLayerMode::Q3K => 6,
             PerLayerMode::Q2K => 6,
+            PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => 6,
             PerLayerMode::Affine => 5,
             PerLayerMode::Fp8E4m3 => 4,
             PerLayerMode::Sym8 => 3,
@@ -1493,7 +1587,13 @@ pub(crate) fn build_non_moe_ql(
         | PerLayerMode::Q3K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => try_build_kquant_quantized_linear(params, base, plq.mode, family)?,
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => try_build_kquant_quantized_linear(params, base, plq.mode, family)?,
     })
 }
 
@@ -1668,7 +1768,13 @@ pub(crate) fn plq_to_packed_params(
         | PerLayerMode::Q3K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => {
             return Err(Error::from_reason(format!(
                 "{family}: '{ctx}' resolved to K-quant ({:?}), but the packed embedding / \
                  quant-info path does not support ggml K-quants — a K-quant GGUF import keeps \
@@ -1837,6 +1943,17 @@ mod tests {
             PerLayerMode::Q6K,
             PerLayerMode::Q4K,
             PerLayerMode::Q5K,
+            PerLayerMode::Q2K,
+            PerLayerMode::Q3K,
+            PerLayerMode::IQ4NL,
+            PerLayerMode::IQ4XS,
+            PerLayerMode::IQ3S,
+            PerLayerMode::IQ2XXS,
+            PerLayerMode::IQ2XS,
+            PerLayerMode::IQ2S,
+            PerLayerMode::IQ3XXS,
+            PerLayerMode::IQ1S,
+            PerLayerMode::IQ1M,
         ] {
             let encoded = mode_to_str(mode);
             assert_eq!(
@@ -1856,13 +1973,65 @@ mod tests {
     #[test]
     fn kquant_mode_params_pins_the_ffi_contract() {
         use KQuantKind::*;
-        // (mode, bits, group_size, super_ratio, scale bytes per group, scales dtype, kind)
+        // (mode, bits, group_size, super_ratio, scale bytes per group, scales dtype, kind,
+        //  scale_shift): kquant_mode.h's instantiation table (kquant.metal) and
+        // kquant::scale_bytes_per_group / scale_shift in mlx_kquant.h.
         let table = [
-            (PerLayerMode::Q6K, "q6k", 6, 16, 16, 1, DType::Int8, Linear),
-            (PerLayerMode::Q4K, "q4k", 4, 32, 8, 2, DType::Uint8, Linear),
-            (PerLayerMode::Q5K, "q5k", 5, 32, 8, 2, DType::Uint8, Linear),
-            (PerLayerMode::Q2K, "q2k", 2, 16, 16, 2, DType::Uint8, Linear),
-            (PerLayerMode::Q3K, "q3k", 3, 16, 16, 1, DType::Int8, Linear),
+            (
+                PerLayerMode::Q6K,
+                "q6k",
+                6,
+                16,
+                16,
+                1,
+                DType::Int8,
+                Linear,
+                0,
+            ),
+            (
+                PerLayerMode::Q4K,
+                "q4k",
+                4,
+                32,
+                8,
+                2,
+                DType::Uint8,
+                Linear,
+                0,
+            ),
+            (
+                PerLayerMode::Q5K,
+                "q5k",
+                5,
+                32,
+                8,
+                2,
+                DType::Uint8,
+                Linear,
+                0,
+            ),
+            (
+                PerLayerMode::Q2K,
+                "q2k",
+                2,
+                16,
+                16,
+                2,
+                DType::Uint8,
+                Linear,
+                0,
+            ),
+            (
+                PerLayerMode::Q3K,
+                "q3k",
+                3,
+                16,
+                16,
+                1,
+                DType::Int8,
+                Linear,
+                0,
+            ),
             (
                 PerLayerMode::IQ4NL,
                 "iq4nl",
@@ -1872,6 +2041,7 @@ mod tests {
                 1,
                 DType::Int8,
                 Codebook,
+                0,
             ),
             (
                 PerLayerMode::IQ4XS,
@@ -1882,10 +2052,88 @@ mod tests {
                 1,
                 DType::Int8,
                 Codebook,
+                0,
             ),
-            (PerLayerMode::IQ3S, "iq3s", 8, 32, 8, 1, DType::Int8, Int8),
+            (
+                PerLayerMode::IQ3S,
+                "iq3s",
+                8,
+                32,
+                8,
+                1,
+                DType::Int8,
+                Int8,
+                0,
+            ),
+            (
+                PerLayerMode::IQ2XXS,
+                "iq2xxs",
+                1,
+                32,
+                8,
+                4,
+                DType::Uint8,
+                Grid,
+                -3,
+            ),
+            (
+                PerLayerMode::IQ2XS,
+                "iq2xs",
+                2,
+                32,
+                8,
+                1,
+                DType::Uint8,
+                Grid,
+                -3,
+            ),
+            (
+                PerLayerMode::IQ2S,
+                "iq2s",
+                2,
+                32,
+                8,
+                2,
+                DType::Uint8,
+                Grid,
+                -3,
+            ),
+            (
+                PerLayerMode::IQ3XXS,
+                "iq3xxs",
+                2,
+                32,
+                8,
+                4,
+                DType::Uint8,
+                Grid,
+                -2,
+            ),
+            (
+                PerLayerMode::IQ1S,
+                "iq1s",
+                1,
+                32,
+                8,
+                2,
+                DType::Uint8,
+                Grid,
+                -3,
+            ),
+            (
+                PerLayerMode::IQ1M,
+                "iq1m",
+                1,
+                32,
+                8,
+                3,
+                DType::Uint8,
+                Grid,
+                -3,
+            ),
         ];
-        for (mode, mode_str, bits, group_size, super_ratio, per_group, scales_dtype, kind) in table
+        for (mode, mode_str, bits, group_size, super_ratio, per_group, scales_dtype, kind, shift) in
+            table
         {
             let kq = kquant_mode_params(mode).unwrap_or_else(|| panic!("{mode:?} is a K-quant"));
             assert_eq!(kq.mode_str, mode_str);
@@ -1903,7 +2151,28 @@ mod tests {
             );
             assert_eq!(kq.scales_dtype, scales_dtype, "{mode:?} scales dtype");
             assert_eq!(kq.kind, kind, "{mode:?} kind");
-            assert_eq!(kq.scale_shift, 0, "no current mode shifts its scales");
+            assert_eq!(kq.scale_shift, shift, "{mode:?} scale shift");
+            // `.biases`: (d, dmin) for the has_min modes, d alone otherwise.
+            let has_min = per_group == 2 && kind == Linear;
+            assert_eq!(
+                kq.bias_entries_per_super_block,
+                if has_min { 2 } else { 1 },
+                "{mode:?} bias entries per super-block"
+            );
+            if kind == Grid {
+                // The grid formats keep ggml's bytes per 256 values (IQ1_M +2
+                // for the explicit f16 d), as gguf_kquant.rs lays them out.
+                let bytes = kq.bits * 32 + 8 * kq.scale_bytes_per_group + 2;
+                let ggml = match mode {
+                    PerLayerMode::IQ2XXS => 66,
+                    PerLayerMode::IQ2XS => 74,
+                    PerLayerMode::IQ2S => 82,
+                    PerLayerMode::IQ3XXS => 98,
+                    PerLayerMode::IQ1S => 50,
+                    _ => 56 + 2,
+                };
+                assert_eq!(bytes, ggml, "{mode:?} bytes per super-block");
+            }
             // A super-block is 256 values (IQ4_NL: its 32-value block).
             let block = if mode == PerLayerMode::IQ4NL { 32 } else { 256 };
             assert_eq!(

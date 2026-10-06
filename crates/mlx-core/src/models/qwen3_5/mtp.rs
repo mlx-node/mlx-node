@@ -355,7 +355,13 @@ impl Qwen3_5MTPModule {
                     | PerLayerMode::Q2K
                     | PerLayerMode::IQ4NL
                     | PerLayerMode::IQ4XS
-                    | PerLayerMode::IQ3S => {
+                    | PerLayerMode::IQ3S
+                    | PerLayerMode::IQ2XXS
+                    | PerLayerMode::IQ2XS
+                    | PerLayerMode::IQ2S
+                    | PerLayerMode::IQ3XXS
+                    | PerLayerMode::IQ1S
+                    | PerLayerMode::IQ1M => {
                         // Tiled64 repack as in the dense loader's `try_build_ql`,
                         // recording the prefix for the post-install release.
                         try_build_kquant_quantized_linear_tiled(

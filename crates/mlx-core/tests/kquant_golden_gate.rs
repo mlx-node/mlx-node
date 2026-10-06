@@ -31,12 +31,16 @@ use mlx_core::array::MxArray;
 const MULTI_ROW: [i64; 7] = [2, 3, 4, 5, 6, 7, 8];
 const OTHER_ROWS: [i64; 8] = [1, 9, 12, 17, 24, 33, 64, 512];
 
-/// The modes in the captured case matrix. q2k landed after the capture; the
-/// digests pin the seven captured modes and q2k is covered by
-/// kquant_tiled / kquant_m8_nax / kquant_mode_guards against the CPU
-/// reference until the next pin bump re-captures the goldens.
+/// The modes in the captured case matrix. q2k and the six grid formats
+/// landed after the capture; the digests pin the seven captured modes and
+/// the later ones are covered by kquant_tiled / kquant_m8_nax /
+/// kquant_mode_guards against the CPU reference (and kquant_ggml_parity
+/// against ggml) until the next pin bump re-captures the goldens.
 fn captured_modes() -> impl Iterator<Item = (usize, &'static KQuant)> {
-    KQUANTS.iter().filter(|kq| kq.mode != "q2k").enumerate()
+    KQUANTS
+        .iter()
+        .filter(|kq| kq.mode != "q2k" && !kq.is_grid())
+        .enumerate()
 }
 
 fn label(device: i32) -> &'static str {

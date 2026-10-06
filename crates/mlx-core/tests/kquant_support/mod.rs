@@ -22,7 +22,43 @@ pub struct KQuant {
     pub biases_cols: i64,
 }
 
-pub const KQUANTS: [KQuant; 8] = [
+impl KQuant {
+    /// A grid format (IQ1 / IQ2 / IQ3_XXS): `.scales` holds native companion
+    /// bytes (sign indices, qh, scale nibbles), so a fixture fills them with
+    /// whole random bytes rather than small sub-scales.
+    pub fn is_grid(&self) -> bool {
+        matches!(
+            self.mode,
+            "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m"
+        )
+    }
+
+    /// Groups per super-block (IQ4_NL: one 32-value block).
+    pub fn super_ratio(&self) -> i64 {
+        match self.mode {
+            "q6k" | "q3k" | "q2k" => 16,
+            "iq4nl" => 1,
+            _ => 8,
+        }
+    }
+
+    /// `.scales` bytes per group (the Tiled64 companion unit is
+    /// `super_ratio * scale_bytes_per_group`).
+    pub fn scale_bytes_per_group(&self) -> i64 {
+        self.scales_cols * i64::from(self.group_size) / 256
+    }
+
+    /// `.biases` entries per super-block (the Tiled64 companion unit).
+    pub fn bias_entries_per_super_block(&self) -> i64 {
+        if self.mode == "iq4nl" {
+            1
+        } else {
+            self.biases_cols
+        }
+    }
+}
+
+pub const KQUANTS: [KQuant; 14] = [
     KQuant {
         mode: "q2k",
         bits: 2,
@@ -95,6 +131,62 @@ pub const KQUANTS: [KQuant; 8] = [
         scales_cols: 8,
         biases_cols: 1,
     },
+    // The grid formats (gguf_kquant.rs): `bits` words per 32-value unit of
+    // native grid indices, `scales_cols` companion bytes per 8 units.
+    KQuant {
+        mode: "iq2xxs",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq2xs",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 8,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq2s",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq3xxs",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq1s",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq1m",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 24,
+        biases_cols: 1,
+    },
 ];
 
 pub fn kquant(mode: &str) -> &'static KQuant {
@@ -147,6 +239,13 @@ pub fn weights(kq: &KQuant, leading: &[i64], packed: i64, seed: u32) -> Weights 
             .map(|_| (lcg(&mut st) % 17) as i8 - 8)
             .collect();
         MxArray::from_int8(&v, &shape(sc))
+    } else if kq.is_grid() {
+        // Native companion bytes: every bit pattern is a valid index / sign /
+        // scale field.
+        let v: Vec<u8> = (0..scales_len)
+            .map(|_| (lcg(&mut st) >> 24) as u8)
+            .collect();
+        MxArray::from_uint8(&v, &shape(sc))
     } else {
         let v: Vec<u8> = (0..scales_len).map(|_| (lcg(&mut st) % 64) as u8).collect();
         MxArray::from_uint8(&v, &shape(sc))

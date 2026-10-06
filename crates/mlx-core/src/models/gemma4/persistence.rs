@@ -1446,7 +1446,13 @@ fn resolve_packed_embed_params<'a>(
         | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => {
             // Real gemma4 UD GGUFs ship `token_embd` as a K-quant (e.g. Q6_K).
             // A K-quant group is a uint32 `.weight`, integer sub-block `.scales`
             // (int8 for Q6_K, uint8 for Q4_K/Q5_K), and a MANDATORY float16
@@ -1536,7 +1542,13 @@ fn build_gemma_ql(
         | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => {
             try_build_kquant_quantized_linear(params, prefix, plq.mode, "gemma4")?
         }
     })
@@ -1572,7 +1584,13 @@ fn build_gemma_qsl(
         | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => {
             try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "gemma4")?
         }
         PerLayerMode::Sym8 => {

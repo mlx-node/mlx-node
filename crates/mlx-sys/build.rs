@@ -880,12 +880,26 @@ fn main() -> io::Result<()> {
         // prebuilt paged_attn.metallib). Their one project include, the
         // per-mode traits in kquant_mode.h, is inlined in place so each
         // preamble stays self-contained, in the generator's format.
-        let mode_header = src_dir.join("metal/kquant/kquant_mode.h");
-        let mode_body: String = read_build_source(&mode_header)?
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("#pragma once"))
-            .map(|line| format!("{line}\n"))
-            .collect();
+        // kquant_mode.h, the grid tables and kquant_grid.h (in that order:
+        // the grid decode needs the mode traits and the tables before it).
+        let inlined_body = |name: &str| -> io::Result<String> {
+            let header = src_dir.join(format!("metal/kquant/{name}.h"));
+            Ok(read_build_source(&header)?
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("#pragma once")
+                        && !(trimmed.starts_with("#include \"") && trimmed.ends_with(".h\""))
+                })
+                .map(|line| format!("{line}\n"))
+                .collect())
+        };
+        let mode_body = format!(
+            "{}{}{}",
+            inlined_body("kquant_mode")?,
+            inlined_body("kquant_grid_tables")?,
+            inlined_body("kquant_grid")?
+        );
         for name in ["kquant", "kquant_nax"] {
             let header = src_dir.join(format!("metal/kquant/{name}.h"));
             let body: String = read_build_source(&header)?

@@ -876,9 +876,11 @@ impl QuantizedLinear {
         // Codes interleave per 32-value unit (`bits` words); the companions
         // per super-block: `scale_bytes_per_group` entries per group over
         // `super_ratio` groups for `.scales` (q2k/q4k/q5k: (sc, m) pairs; the
-        // rest one byte; IQ4_NL: one group), `scale_bytes_per_group` entries
-        // for `.biases` ((d, dmin) pairs or d alone).
+        // grid formats their companion bytes; the rest one byte; IQ4_NL: one
+        // group), `bias_entries_per_super_block` entries for `.biases`
+        // ((d, dmin) pairs or d alone).
         let per_group = i64::from(kq.scale_bytes_per_group);
+        let per_super = i64::from(kq.bias_entries_per_super_block);
         let super_ratio = i64::from(kq.super_ratio);
         // Zero rows appended to a row-major `[n, cols]` array (`padded_n - n`
         // of them); the identity when the row count is already whole tiles.
@@ -892,7 +894,7 @@ impl QuantizedLinear {
         };
         let weight = kquant_tile_rows(&pad(&self.weight)?, i64::from(self.bits))?;
         let scales = kquant_tile_rows(&pad(&self.scales)?, super_ratio * per_group)?;
-        let biases = kquant_tile_rows(&pad(biases)?, per_group)?;
+        let biases = kquant_tile_rows(&pad(biases)?, per_super)?;
         let bias = match (&self.bias, padded_n == n) {
             (Some(b), false) => Some(MxArray::concatenate(
                 b,

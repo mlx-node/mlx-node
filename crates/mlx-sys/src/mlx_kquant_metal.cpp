@@ -60,8 +60,10 @@ const char *type_string(Dtype dtype) {
 // coverage test checks against the metallib.
 namespace kernels {
 
-constexpr Mode kModes[] = {Mode::Q6K,   Mode::Q4K,   Mode::Q5K,  Mode::Q3K,
-                           Mode::IQ4NL, Mode::IQ4XS, Mode::IQ3S, Mode::Q2K};
+constexpr Mode kModes[] = {Mode::Q6K,    Mode::Q4K,   Mode::Q5K,  Mode::Q3K,
+                           Mode::IQ4NL,  Mode::IQ4XS, Mode::IQ3S, Mode::Q2K,
+                           Mode::IQ2XXS, Mode::IQ2XS, Mode::IQ2S, Mode::IQ3XXS,
+                           Mode::IQ1S,   Mode::IQ1M};
 constexpr Dtype kTypes[] = {float32, float16, bfloat16};
 
 // qmv_wide tiles 2..8 input vectors (multi-row matvecs only) at 8 k-lanes.
@@ -127,13 +129,14 @@ std::string qmv_t64(Mode m, Dtype t, int k_splits) {
 std::string qmv_sg8(Mode m) { return base(m, "qmv_sg8", kSg8Type); }
 // qmm_m8_nax: M = 8 bfloat16 on the tensor op; 64-column tiles and at most
 // 8 K splits (kquant_m8_nax.h). Every mode in the Tiled64 layout; row-major
-// only the modes qmv_sg8 does not decode (q3k, q2k, iq4nl), where it measured
-// 1.1-1.4x of qmv_wide on the Qwen3.8 shapes on an M5 Max (the sg8 modes
-// only tie qmv_sg8 row-major, 0.85-1.0x).
+// only the modes qmv_sg8 does not decode (q3k, q2k, iq4nl and the grid
+// formats), where it measured 1.1-1.4x of qmv_wide on the Qwen3.8 shapes on
+// an M5 Max (the sg8 modes only tie qmv_sg8 row-major, 0.85-1.0x).
 constexpr int kM8TileCols = 64;
 constexpr int kM8MaxSplits = 8;
 constexpr bool m8_nax_row_major_mode(Mode mode) {
-  return mode == Mode::Q3K || mode == Mode::IQ4NL || mode == Mode::Q2K;
+  return mode == Mode::Q3K || mode == Mode::IQ4NL || mode == Mode::Q2K ||
+         is_grid(mode);
 }
 std::string qmm_m8_nax(Mode m, bool tiled = false) {
   return base(m, tiled ? "qmm_m8_nax_t64" : "qmm_m8_nax", kSg8Type);
@@ -1232,7 +1235,10 @@ void KQuantDequantize::eval_gpu(const std::vector<array> &inputs, array &out) {
   enc.set_output_array(out, 3);
 
   constexpr int uint8_per_uint32 = 4;
-  int packs_per_int = (bits_ == 3 || bits_ == 5) ? 8
+  // Values one thread decodes: a pack of the affine stream, or an 8-value
+  // chunk of a grid unit (kquant_dequantize's KQ_GRID arm).
+  int packs_per_int = is_grid(mode_)             ? 8
+                      : (bits_ == 3 || bits_ == 5) ? 8
                       : bits_ == 6               ? 4
                                                  : 8 / bits_;
   size_t nthreads = out.size() / packs_per_int;

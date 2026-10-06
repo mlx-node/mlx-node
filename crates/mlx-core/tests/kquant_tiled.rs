@@ -31,27 +31,16 @@ const SHAPES: [(i64, i64); 6] = [
 /// decoded weight to half and reassociates the K sum across splits.
 const BF16_TILE_TOL: f32 = 3e-2;
 
-fn per_group(kq: &KQuant) -> i64 {
-    if kq.scales_signed { 1 } else { 2 }
-}
-
-/// Groups per super-block (IQ4_NL: one 32-value block).
-fn super_ratio(kq: &KQuant) -> i64 {
-    match kq.mode {
-        "q6k" | "q3k" | "q2k" => 16,
-        "iq4nl" => 1,
-        _ => 8,
-    }
-}
-
 /// The same bytes in the Tiled64 order: codes per unit, companions per
-/// super-block.
+/// super-block (`.scales`: super_ratio * bytes per group; `.biases`: its
+/// entries per super-block).
 fn tiled(w: &Weights, kq: &KQuant) -> Weights {
-    let pg = per_group(kq);
     let t = Weights {
         w: kquant_tile_rows(&w.w, i64::from(kq.bits)).expect("tile weight"),
-        scales: kquant_tile_rows(&w.scales, super_ratio(kq) * pg).expect("tile scales"),
-        biases: kquant_tile_rows(&w.biases, pg).expect("tile biases"),
+        scales: kquant_tile_rows(&w.scales, kq.super_ratio() * kq.scale_bytes_per_group())
+            .expect("tile scales"),
+        biases: kquant_tile_rows(&w.biases, kq.bias_entries_per_super_block())
+            .expect("tile biases"),
     };
     t.w.eval();
     t.scales.eval();
@@ -143,11 +132,10 @@ fn tile_round_trip_restores_bytes() {
         assert!(kquant_tileable(n, k));
         let w = weights(kq, &[n], k, 0x7100 + ki as u32);
         let t = tiled(&w, kq);
-        let pg = per_group(kq);
         let back = [
             kquant_untile_rows(&t.w, i64::from(kq.bits)).unwrap(),
-            kquant_untile_rows(&t.scales, super_ratio(kq) * pg).unwrap(),
-            kquant_untile_rows(&t.biases, pg).unwrap(),
+            kquant_untile_rows(&t.scales, kq.super_ratio() * kq.scale_bytes_per_group()).unwrap(),
+            kquant_untile_rows(&t.biases, kq.bias_entries_per_super_block()).unwrap(),
         ];
         let originals = [&w.w, &w.scales, &w.biases];
         for (i, (b, o)) in back.iter().zip(originals).enumerate() {
@@ -187,8 +175,8 @@ fn tile_round_trip_restores_bytes() {
         let units = k / 32;
         let u = i64::from(kq.bits);
         let cols = units * u;
-        // Row 65, unit 3, word 1 -> tile 1, unit 3, row-in-tile 1.
-        let (row, unit, word) = (65i64, 3i64, 1i64);
+        // Row 65, unit 3, its last word -> tile 1, unit 3, row-in-tile 1.
+        let (row, unit, word) = (65i64, 3i64, u - 1);
         let src = (row * cols + unit * u + word) as usize;
         let dst = ((((row / 64) * units + unit) * 64 + row % 64) * u + word) as usize;
         assert_eq!(moved[dst], orig[src], "{}: tiled address differs", kq.mode);
@@ -290,8 +278,9 @@ fn qmv_m1_tiled_matches_cpu() {
 }
 
 /// (b) M = 8: every tiled mode takes the tensor op, within the tile
-/// tolerance of the CPU reference. q3k, q2k and iq4nl also take it row-major,
-/// and there the two layouts are bit-identical (same split count, same order).
+/// tolerance of the CPU reference. q3k, q2k, iq4nl and the grid formats also
+/// take it row-major, and there the two layouts are bit-identical (same split
+/// count, same order).
 #[cfg(target_os = "macos")]
 #[test]
 fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
@@ -322,7 +311,7 @@ fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
                 .unwrap_or(0);
             stop_counting();
 
-            if matches!(kq.mode, "q3k" | "q2k" | "iq4nl") {
+            if matches!(kq.mode, "q3k" | "q2k" | "iq4nl") || kq.is_grid() {
                 start_counting();
                 let (_, _, reference) =
                     read_output("row-major m8", quantized_matmul(&x, &w, true, kq, GPU));

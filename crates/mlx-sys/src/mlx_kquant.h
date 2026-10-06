@@ -1,9 +1,11 @@
 #pragma once
 
 // ggml K-quant and IQ formats, read-only. Each sub-block is affine
-// (value = scale * code + bias) or a 16-entry codebook, under a float16
-// super-block scale. `scales` holds the integer sub-block scales (int8, or
-// interleaved uint8 (sc, m) pairs for q2k/q4k/q5k); `biases` holds the float16
+// (value = scale * code + bias), a 16-entry codebook, or (the grid formats
+// IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS) a signed grid lookup,
+// under a float16 super-block scale. `scales` holds the integer sub-block
+// scales (int8, or interleaved uint8 (sc, m) pairs for q2k/q4k/q5k; the grid
+// formats' per-unit companion bytes, uint8); `biases` holds the float16
 // super-block d (and dmin for q2k/q4k/q5k) -- a scale, not a bias.
 //
 // Per-mode traits (super_ratio, has_sub_min, kind, scale_shift,
@@ -22,15 +24,45 @@
 
 namespace mlx::core::kquant {
 
-enum class Mode { Q6K, Q4K, Q5K, Q3K, IQ4NL, IQ4XS, IQ3S, Q2K };
+enum class Mode {
+  Q6K,
+  Q4K,
+  Q5K,
+  Q3K,
+  IQ4NL,
+  IQ4XS,
+  IQ3S,
+  Q2K,
+  IQ2XXS,
+  IQ2XS,
+  IQ2S,
+  IQ3XXS,
+  IQ1S,
+  IQ1M
+};
 
-// How a mode's codes turn into values. Mirrors KQ_LINEAR .. KQ_GRID in
-// metal/kquant/kquant_mode.h and quant_dispatch::KQuantKind.
+// How a mode's codes turn into values. Mirrors KQ_LINEAR .. KQ_GRID_IQ1M in
+// metal/kquant/kquant_mode.h (same values) and quant_dispatch::KQuantKind.
 //   Linear    scale * code + bias on the packed integer code
 //   Codebook  scale * table[code], the 16-entry IQ4_NL grid
 //   Int8      scale * int8 (iq3s: the grid value expanded to a byte)
-//   Grid      scale * signed grid magnitude (IQ1/IQ2/IQ3_XXS; reserved)
-enum class Kind : int { Linear = 0, Codebook = 1, Int8 = 2, Grid = 3 };
+//   Grid*     scale * signed grid magnitude, one kind per grid format since
+//             they share no byte layout (metal/kquant/kquant_grid.h)
+enum class Kind : int {
+  Linear = 0,
+  Codebook = 1,
+  Int8 = 2,
+  GridIQ2XXS = 3,
+  GridIQ2XS = 4,
+  GridIQ2S = 5,
+  GridIQ3XXS = 6,
+  GridIQ1S = 7,
+  GridIQ1M = 8
+};
+
+constexpr bool is_grid(Kind kind) {
+  return kind >= Kind::GridIQ2XXS && kind <= Kind::GridIQ1M;
+}
 
 // In-memory layout of a 2-D K-quant weight and its companions.
 //
@@ -39,8 +71,9 @@ enum class Kind : int { Linear = 0, Codebook = 1, Int8 = 2, Grid = 3 };
 //   Tiled64   the same bytes permuted so 64 consecutive rows interleave per
 //             32-code unit (codes) and per 256-value super-block
 //             (companions): .weight [N/64][K/32][64][bits] u32, .scales
-//             [N/64][K/256][64][sr*pg], .biases [N/64][K/256][64][pg]
-//             (IQ4_NL: sr = 1, so per 32-value block). A unit's bits are
+//             [N/64][K/256][64][sr*pg], .biases [N/64][K/256][64][ps]
+//             (pg = scale_bytes_per_group, ps = bias_entries_per_super_block;
+//             IQ4_NL: sr = 1, so per 32-value block). A unit's bits are
 //             unchanged; only unit addresses move, so a 64-column
 //             threadgroup reads one contiguous 64*bits*4-byte run per step
 //             instead of 64 rows K/2 bytes apart, and a row's super-block
@@ -77,6 +110,12 @@ constexpr int super_ratio(Mode mode) {
   case Mode::Q5K:
   case Mode::IQ4XS:
   case Mode::IQ3S:
+  case Mode::IQ2XXS:
+  case Mode::IQ2XS:
+  case Mode::IQ2S:
+  case Mode::IQ3XXS:
+  case Mode::IQ1S:
+  case Mode::IQ1M:
     return 8;
   case Mode::IQ4NL:
     return 1;
@@ -106,21 +145,79 @@ constexpr Kind kind(Mode mode) {
   case Mode::Q3K:
   case Mode::Q2K:
     return Kind::Linear;
+  case Mode::IQ2XXS:
+    return Kind::GridIQ2XXS;
+  case Mode::IQ2XS:
+    return Kind::GridIQ2XS;
+  case Mode::IQ2S:
+    return Kind::GridIQ2S;
+  case Mode::IQ3XXS:
+    return Kind::GridIQ3XXS;
+  case Mode::IQ1S:
+    return Kind::GridIQ1S;
+  case Mode::IQ1M:
+    return Kind::GridIQ1M;
   }
   return Kind::Linear;
 }
 
-// Power-of-two exponent every decoded scale is multiplied by, in fp32 and
-// exactly (scale *= 2^scale_shift). 0 for every current mode; the grid stage
-// uses -3 for IQ2_* / IQ1_* and -2 for IQ3_XXS.
-constexpr int scale_shift(Mode) { return 0; }
+constexpr bool is_grid(Mode mode) { return is_grid(kind(mode)); }
 
-// Bytes of `.scales` per group: an (sc, m) pair or one sub-scale. The
-// per-super-block companion stride is super_ratio * scale_bytes_per_group.
+// Power-of-two exponent every decoded scale is multiplied by, in fp32 and
+// exactly (scale *= 2^scale_shift): ggml's `d * (0.5 + sc) * 0.25` (IQ2_*),
+// `* 0.5` (IQ3_XXS) and `d * (2 sc + 1) * (g +- 1/8)` (IQ1_*) become
+// `d * (1 + 2 sc) * 2^shift` times an integer, bit for bit. 0 for every
+// affine / codebook / int8 mode.
+constexpr int scale_shift(Mode mode) {
+  switch (mode) {
+  case Mode::IQ2XXS:
+  case Mode::IQ2XS:
+  case Mode::IQ2S:
+  case Mode::IQ1S:
+  case Mode::IQ1M:
+    return -3;
+  case Mode::IQ3XXS:
+    return -2;
+  default:
+    return 0;
+  }
+}
+
+// Bytes of `.scales` per group: an (sc, m) pair, one sub-scale, or the grid
+// format's companion bytes (kquant_grid.h: IQ2_XXS / IQ3_XXS the sign-scale
+// word, IQ2_XS the scale nibbles, IQ2_S qh + scales, IQ1_S the qh halfword,
+// IQ1_M qh + scales). The per-super-block companion stride is
+// super_ratio * scale_bytes_per_group.
 constexpr int scale_bytes_per_group(Mode mode) {
+  switch (mode) {
+  case Mode::IQ2XXS:
+  case Mode::IQ3XXS:
+    return 4;
+  case Mode::IQ2XS:
+    return 1;
+  case Mode::IQ2S:
+  case Mode::IQ1S:
+    return 2;
+  case Mode::IQ1M:
+    return 3;
+  default:
+    return has_sub_min(mode) ? 2 : 1;
+  }
+}
+
+// Entries of `.biases` per super-block: (d, dmin) or d alone.
+constexpr int bias_entries_per_super_block(Mode mode) {
   return has_sub_min(mode) ? 2 : 1;
 }
 
+// `.scales` dtype: the (sc, m) modes and the grid formats carry unsigned
+// bytes, the symmetric K-quants and IQ4 / IQ3_S signed sub-scales.
+inline Dtype scales_dtype(Mode mode) {
+  return (has_sub_min(mode) || is_grid(mode)) ? uint8 : int8;
+}
+
+// For the grid formats `bits` is the unit's `.weight` word count (1 or 2),
+// not a code width: every unit is 32 values whatever the index width.
 constexpr int default_bits(Mode mode) {
   switch (mode) {
   case Mode::Q6K:
@@ -134,9 +231,16 @@ constexpr int default_bits(Mode mode) {
   case Mode::Q3K:
     return 3;
   case Mode::Q2K:
+  case Mode::IQ2XS:
+  case Mode::IQ2S:
+  case Mode::IQ3XXS:
     return 2;
   case Mode::IQ3S:
     return 8;
+  case Mode::IQ2XXS:
+  case Mode::IQ1S:
+  case Mode::IQ1M:
+    return 1;
   }
   return 0;
 }

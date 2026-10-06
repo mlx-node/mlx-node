@@ -16,8 +16,19 @@
 //                            dequantize_row_q5_0   :500-524
 //                            dequantize_row_mxfp4  :569-587
 //                            dequantize_row_q2_K   :961-991
+//                            dequantize_row_iq2_xxs :2488-2512
+//                            dequantize_row_iq2_xs  :2516-2539
+//                            dequantize_row_iq2_s   :2543-2571
+//                            dequantize_row_iq3_xxs :2575-2603
+//                            dequantize_row_iq1_s   :2650-2673
+//                            dequantize_row_iq1_m   :2675-2723
+//   ggml/src/ggml-common.h   block_iq2_xxs :378-384, block_iq2_xs :387-392,
+//                            block_iq2_s :395-401, block_iq3_xxs :404-410,
+//                            block_iq1_s :424-429, block_iq1_m :432-437,
+//                            iq1m_scale_t :440-444, IQ1S_DELTA :1132, and the
+//                            grid tables (ggml_grid_tables.inc)
 //
-// The seven ggml-quants.c spans are checked in verbatim next door in
+// The thirteen ggml-quants.c spans are checked in verbatim next door in
 // ggml_quants_upstream.inc, and the provenance guard
 // `vendored_ggml_reference_is_verbatim` in
 // crates/mlx-core/tests/kquant_ggml_parity.rs diffs this file against them on
@@ -106,6 +117,68 @@ typedef struct {
     uint8_t qs[QK_MXFP4/2];
 } block_mxfp4;
 
+// ggml-common.h:378-384
+// (Almost) "true" 2-bit quantization.
+// Due to the need to use blocks as per ggml design, it ends up using
+// 2.0625 bpw because of the 16-bit scale for each block of 256.
+typedef struct {
+    ggml_half d;
+    uint16_t qs[QK_K/8];
+} block_iq2_xxs;
+
+// ggml-common.h:387-392
+// 2.3125 bpw quants
+typedef struct {
+    ggml_half d;
+    uint16_t qs[QK_K/8];
+    uint8_t  scales[QK_K/32];
+} block_iq2_xs;
+
+// ggml-common.h:395-401
+// 2.5625 bpw quants
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK_K/4];
+    uint8_t qh[QK_K/32];
+    uint8_t scales[QK_K/32];
+} block_iq2_s;
+
+// ggml-common.h:404-410
+// (Almost) "true" 3-bit quantization.
+// Due to the need to use blocks as per ggml design, it ends up using
+// 3.0625 bpw because of the 16-bit scale for each block of 256.
+typedef struct {
+    ggml_half d;
+    uint8_t qs[3*QK_K/8];
+} block_iq3_xxs;
+
+// ggml-common.h:424-429
+// 1.5625 bpw
+typedef struct {
+    ggml_half d;
+    uint8_t  qs[QK_K/8];
+    uint16_t qh[QK_K/32];
+} block_iq1_s;
+
+// ggml-common.h:432-437
+// 1.75 bpw
+typedef struct {
+    uint8_t  qs[QK_K/8];      // grid index, low 8 bits
+    uint8_t  qh[QK_K/16];     // grid index, high 3 bits + grid shift bit (for two groups of 8)
+    uint8_t  scales[QK_K/32]; // 3-bit block scales (4-bit if QK_K == 64)
+} block_iq1_m;
+
+// ggml-common.h:440-444
+// Used by IQ1_M quants
+typedef union {
+    ggml_half f16;
+    uint16_t  u16;
+} iq1m_scale_t;
+
+// ggml-common.h:1131-1132
+#define NGRID_IQ1S 2048
+#define IQ1S_DELTA 0.125f
+
 // Byte layouts the repacker indexes into. Asserted in ggml_kquant_ref.c.
 #define GGML_Q2K_BLOCK_BYTES 84
 #define GGML_Q5_0_BLOCK_BYTES 22
@@ -113,6 +186,12 @@ typedef struct {
 #define GGML_Q4K_BLOCK_BYTES 144
 #define GGML_Q5K_BLOCK_BYTES 176
 #define GGML_Q6K_BLOCK_BYTES 210
+#define GGML_IQ2XXS_BLOCK_BYTES 66
+#define GGML_IQ2XS_BLOCK_BYTES 74
+#define GGML_IQ2S_BLOCK_BYTES 82
+#define GGML_IQ3XXS_BLOCK_BYTES 98
+#define GGML_IQ1S_BLOCK_BYTES 50
+#define GGML_IQ1M_BLOCK_BYTES 56
 
 #define GGML_Q4K_D_OFFSET       0
 #define GGML_Q4K_DMIN_OFFSET    2
@@ -160,6 +239,16 @@ void dequantize_row_q6_K(const block_q6_K *x, float *y, int64_t k);
 void dequantize_row_q5_0(const block_q5_0 *x, float *y, int64_t k);
 void dequantize_row_mxfp4(const block_mxfp4 *x, float *y, int64_t k);
 void dequantize_row_q2_K(const block_q2_K *x, float *y, int64_t k);
+
+// ggml-quants.c:2488 / :2516 / :2543 / :2575 / :2650 / :2675 — verbatim. The
+// grid tables they index (iq2xxs_grid .. iq1s_grid, ksigns_iq2xs, kmask_iq2xs)
+// are the verbatim ggml-common.h data in ggml_grid_tables.inc.
+void dequantize_row_iq2_xxs(const block_iq2_xxs *x, float *y, int64_t k);
+void dequantize_row_iq2_xs(const block_iq2_xs *x, float *y, int64_t k);
+void dequantize_row_iq2_s(const block_iq2_s *x, float *y, int64_t k);
+void dequantize_row_iq3_xxs(const block_iq3_xxs *x, float *y, int64_t k);
+void dequantize_row_iq1_s(const block_iq1_s *x, float *y, int64_t k);
+void dequantize_row_iq1_m(const block_iq1_m *x, float *y, int64_t k);
 
 // ggml-impl.h:477 — verbatim (`ggml_e8m0_to_fp32_half`), exported so the
 // parity gate can state the E8M0 decode it compares against.

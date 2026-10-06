@@ -16,7 +16,17 @@ rewritten for mlx-node's weight layout; its Q2_K decode (Codes<Q2K>,
 bytes8<Q2K> and the CoefCursor Q2K arm) and the QuantKind notion of
 crates/mlx-sys/src/metal/kquant/kquant_mode.h (KQ_LINEAR / KQ_CODEBOOK /
 KQ_INT8 / KQ_GRID) follow Splash's FmtQ2K, quant_spread2 and QuantKind in
-runtime/metal/kernels/common/quant_formats.h. The tensor-op verify attention kernel
+runtime/metal/kernels/common/quant_formats.h. The IQ1_S / IQ1_M / IQ2_XXS /
+IQ2_XS / IQ2_S / IQ3_XXS grid decode in
+crates/mlx-sys/src/metal/kquant/kquant_grid.h (and its C++ twin in
+crates/mlx-sys/src/mlx_kquant.cpp) — the 7-bit sign index expansion
+(kq_signs7), the per-chunk grid index / sign / scale extraction, the IQ1
+"code - 9" delta form and the power-of-two scale shift — follows Splash's
+FmtIQ2XXS, FmtIQ2XS, FmtIQ2S, FmtIQ3XXS, FmtIQ1S, FmtIQ1M, quant_signs7,
+quant_iq1_codes and the QuantGrid arm of dequant32 in
+runtime/metal/kernels/common/quant_formats.h and
+runtime/metal/kernels/common/gguf_staged.h, with the byte fetch rewritten for
+mlx-node's three-array layout. The tensor-op verify attention kernel
 in crates/mlx-sys/src/metal/segmented_sdpa/sdpa_segmented_nax.metal follows
 the matmul2d operand shapes and the page softmax of Splash's
 runtime/metal/kernels/common/paged_attention_tile.h, with the segmented
@@ -49,3 +59,36 @@ Version 2.0, whose copyright line it leaves as the template text:
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+ggml / llama.cpp (https://github.com/ggml-org/llama.cpp)
+
+The IQ1 / IQ2 / IQ3_XXS grid tables in
+crates/mlx-sys/src/metal/kquant/kquant_grid_tables.h (iq2xxs_grid,
+iq2xs_grid, iq2s_grid, iq3xxs_grid, iq1s_grid_gpu; read by the Metal kernels
+and the C++ CPU reference) and the K-quant parity oracle in
+crates/mlx-core/vendor/ggml/ (ggml_kquant_ref.{h,c}, ggml_grid_tables.inc,
+ggml_quants_upstream.inc: the block structs, grid tables and
+dequantize_row_* decoders, copied verbatim; test-only) are from ggml's
+ggml/src/ggml-common.h and ggml/src/ggml-quants.c, under the MIT License:
+
+   MIT License
+
+   Copyright (c) 2023-2026 The ggml authors
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.

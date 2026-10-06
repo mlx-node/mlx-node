@@ -104,7 +104,8 @@ describe('discoverLocalChatModels', () => {
     ['Ternary-Bonsai-2-27B-PQ2_0-mmproj.gguf', 'qwen35'],
     ['Qwen3.5-27B-Q4_K_S.gguf', 'qwen35'],
     ['Qwen3.5-27B-Q4_0.gguf', 'qwen35'],
-    ['Qwen3.5-27B-UD-IQ2_M.gguf', 'qwen35'],
+    ['Qwen3.5-27B-UD-IQ5_M.gguf', 'qwen35'],
+    ['Qwen3.5-27B-UD-IQ2_L.gguf', 'qwen35'],
   ] as const)('does not widen the Bonsai gate to %s [%s]', async (name, architecture) => {
     const dir = join(tmp, `bonsai-reject-${name}`);
     mkdirSync(dir);
@@ -118,6 +119,15 @@ describe('discoverLocalChatModels', () => {
     'Qwen3.5-27B-Q4_K_M.gguf',
     // The Unsloth 2-bit mix: Q2_K joined the importable types.
     'Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf',
+    // The Unsloth UD-IQ* mixes: every grid format imports now.
+    'Qwen3.6-35B-A3B-UD-IQ1_S.gguf',
+    'Qwen3.6-35B-A3B-UD-IQ1_M.gguf',
+    'Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf',
+    'Qwen3.6-35B-A3B-UD-IQ2_M.gguf',
+    'Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf',
+    'Qwen3.6-35B-A3B-UD-IQ3_S.gguf',
+    'Qwen3.6-35B-A3B-UD-IQ4_XS.gguf',
+    'Qwen3.6-35B-A3B-UD-IQ4_NL.gguf',
   ])('admits dense Qwen3.5 %s alongside the Bonsai name', async (name) => {
     const dir = join(tmp, `qwen35-admitted-${name}`);
     mkdirSync(dir);

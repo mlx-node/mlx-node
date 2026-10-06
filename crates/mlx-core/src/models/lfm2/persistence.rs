@@ -78,7 +78,13 @@ fn build_lfm2_qsl(
         | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => {
             try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "lfm2_moe")?
         }
         // FAIL-LOUD: the 3-D stacked experts have no sym8 dispatch
@@ -138,7 +144,13 @@ fn build_lfm2_gate_ql(
         | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => {
             try_build_kquant_quantized_linear(params, prefix, plq.mode, "lfm2_moe")?
         }
         // FAIL-LOUD: the router gate is deliberately kept affine-8 by convert

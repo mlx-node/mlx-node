@@ -620,7 +620,13 @@ fn apply_weights_moe_inner_with_residency(
             | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S => {
+            | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => {
                 try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5_moe")?
             }
         };
@@ -699,7 +705,13 @@ fn apply_weights_moe_inner_with_residency(
             | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S => {
+            | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => {
                 try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "qwen3_5_moe")?
             }
             // Per-expert 3-D stacked projections route through gather_qmm,

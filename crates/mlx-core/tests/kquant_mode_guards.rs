@@ -84,7 +84,7 @@ struct KQuant {
     biases_cols: i64,
 }
 
-const KQUANTS: [KQuant; 8] = [
+const KQUANTS: [KQuant; 14] = [
     KQuant {
         mode: "q2k",
         bits: 2,
@@ -157,7 +157,70 @@ const KQUANTS: [KQuant; 8] = [
         scales_cols: 8,
         biases_cols: 1,
     },
+    // The grid formats (gguf_kquant.rs): `bits` native grid-index words per
+    // 32-value unit, `scales_cols` companion bytes per 8 units, one d.
+    KQuant {
+        mode: "iq2xxs",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq2xs",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 8,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq2s",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq3xxs",
+        bits: 2,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq1s",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq1m",
+        bits: 1,
+        group_size: 32,
+        scales_signed: false,
+        weight_cols: 8,
+        scales_cols: 24,
+        biases_cols: 1,
+    },
 ];
+
+fn is_grid(kq: &KQuant) -> bool {
+    matches!(
+        kq.mode,
+        "iq2xxs" | "iq2xs" | "iq2s" | "iq3xxs" | "iq1s" | "iq1m"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // tolerances
@@ -574,6 +637,13 @@ fn filled_kquant_weights(kq: &KQuant, leading: &[i64], packed: i64) -> Weights {
             .map(|_| (lcg(&mut st) % 17) as i8 - 8)
             .collect();
         MxArray::from_int8(&v, &shape(scales_cols))
+    } else if is_grid(kq) {
+        // Native companion bytes (sign indices, qh, scale nibbles): every
+        // bit pattern is valid.
+        let v: Vec<u8> = (0..scales_len)
+            .map(|_| (lcg(&mut st) >> 24) as u8)
+            .collect();
+        MxArray::from_uint8(&v, &shape(scales_cols))
     } else {
         // q4k/q5k interleave (sc, m), both 6-bit unsigned.
         let v: Vec<u8> = (0..scales_len).map(|_| (lcg(&mut st) % 64) as u8).collect();

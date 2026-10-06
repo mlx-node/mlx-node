@@ -1,5 +1,8 @@
 //! K-quant parity gate: MLX's CPU Q2_K / Q4_K / Q5_K / Q6_K decode against
-//! ggml's own decoders, plus the Q5_0 (affine) and MXFP4 (`mxfp4`) imports.
+//! ggml's own decoders, plus the Q5_0 (affine) and MXFP4 (`mxfp4`) imports
+//! and the six grid formats (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ1_S /
+//! IQ1_M, see `grid_...`), which are repacked losslessly and decoded
+//! bitwise.
 //!
 //! Q2_K shares Q4_K's two-level `(sc, m)` decode at 16-value groups and is
 //! compared strictly bitwise like it. Q5_0 is the symmetric affine import at
@@ -54,8 +57,8 @@ use std::path::PathBuf;
 use mlx_core::array::MxArray;
 use mlx_core::utils::gguf::{derived_symmetric_bias_bits, mxfp4_repack_block, q5_0_repack_block};
 use mlx_core::utils::gguf_kquant::{
-    KQuantArrays, KQuantFormat, KQuantScales, QK_K, get_scale_min_k4, q2k_code, q2k_scale_min,
-    q4k_code, q5k_code, q6k_code, repack_kquant,
+    KQuantArrays, KQuantFormat, KQuantScales, QK_K, get_scale_min_k4, iq1m_d_bits,
+    iq1m_unit_scales, q2k_code, q2k_scale_min, q4k_code, q5k_code, q6k_code, repack_kquant,
 };
 
 // ---------------------------------------------------------------------------
@@ -75,6 +78,18 @@ unsafe extern "C" {
     fn dequantize_row_q5_0(x: *const u8, y: *mut f32, k: i64);
     /// `ggml-quants.c:569`
     fn dequantize_row_mxfp4(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2488`
+    fn dequantize_row_iq2_xxs(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2516`
+    fn dequantize_row_iq2_xs(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2543`
+    fn dequantize_row_iq2_s(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2575`
+    fn dequantize_row_iq3_xxs(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2650`
+    fn dequantize_row_iq1_s(x: *const u8, y: *mut f32, k: i64);
+    /// `ggml-quants.c:2675`
+    fn dequantize_row_iq1_m(x: *const u8, y: *mut f32, k: i64);
     /// `ggml-impl.h:477`
     fn ggml_ref_e8m0_to_fp32_half(x: u8) -> f32;
     /// `ggml-quants.c:880`
@@ -2010,11 +2025,320 @@ fn mxfp4_repack_is_lossless_and_decodes_bitwise_above_e8m0_two() {
 }
 
 // ---------------------------------------------------------------------------
+// The grid formats — IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ1_S / IQ1_M
+// ---------------------------------------------------------------------------
+//
+// `.weight` keeps the native grid-index words, `.scales` the unit's other
+// native bytes and `.biases` the f16 d (gguf_kquant.rs), so the repack is a
+// byte permutation: the lossless check reads every ggml field back out of
+// the three arrays. The decode (kquant_grid.h, shared by the CPU reference
+// and the Metal kernels) computes `d * (1 + 2 sc) * 2^shift` where ggml
+// computes `d * (0.5 + sc) * 0.25` (IQ2), `* 0.5` (IQ3_XXS) or
+// `d * (2 sc + 1) * (g +- 1/8)` (IQ1): the same products up to an exact
+// power-of-two scaling, so every value is compared strictly bitwise.
+//
+// Every byte of a block but d is random (every index, sign and scale field
+// is valid), and d walks the finite halves plus the degenerate corners
+// (zero, subnormal, smallest normal, largest, negative); IQ1_M's d is
+// written into the nibbles of its scale words as ggml stores it.
+
+/// d for block `b` of a grid run: the corners first, then random finite halves.
+fn grid_super_scale(rng: &mut Lcg, b: usize) -> u16 {
+    match b % 64 {
+        0 => 0x0000, // +0
+        1 => 0x8000, // -0
+        2 => 0x0001, // smallest subnormal
+        3 => 0x03FF, // largest subnormal
+        4 => 0x0400, // smallest normal, 2^-14
+        5 => 0x7BFF, // largest finite, 65504
+        6 => 0xFBFF, // -65504
+        7 => 0xBC00, // -1
+        _ => random_finite_half(rng, 1, 30),
+    }
+}
+
+fn ggml_grid_decode(format: KQuantFormat, rows: &[u8], k: usize, nrows: usize) -> Vec<f32> {
+    let mut out = vec![0f32; nrows * k];
+    let row_bytes = format.row_bytes(k);
+    for r in 0..nrows {
+        // SAFETY: `rows` is a BlockBuf (8-byte aligned) of whole rows; `out`
+        // holds k floats per row.
+        unsafe {
+            let x = rows[r * row_bytes..].as_ptr();
+            let y = out[r * k..].as_mut_ptr();
+            match format {
+                KQuantFormat::IQ2XXS => dequantize_row_iq2_xxs(x, y, k as i64),
+                KQuantFormat::IQ2XS => dequantize_row_iq2_xs(x, y, k as i64),
+                KQuantFormat::IQ2S => dequantize_row_iq2_s(x, y, k as i64),
+                KQuantFormat::IQ3XXS => dequantize_row_iq3_xxs(x, y, k as i64),
+                KQuantFormat::IQ1S => dequantize_row_iq1_s(x, y, k as i64),
+                KQuantFormat::IQ1M => dequantize_row_iq1_m(x, y, k as i64),
+                other => panic!("{other:?} is not a grid format"),
+            }
+        }
+    }
+    out
+}
+
+/// What the lossless check expects per unit `ib` of a block: the `.weight`
+/// words and the `.scales` bytes, straight from the ggml fields.
+fn grid_unit_fields(format: KQuantFormat, blk: &[u8], ib: usize) -> (Vec<u32>, Vec<u8>) {
+    let w32 = |at: usize| u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]]);
+    match format {
+        KQuantFormat::IQ2XXS => (vec![w32(2 + 8 * ib)], blk[6 + 8 * ib..10 + 8 * ib].to_vec()),
+        KQuantFormat::IQ2XS => (vec![w32(2 + 8 * ib), w32(6 + 8 * ib)], vec![blk[66 + ib]]),
+        KQuantFormat::IQ2S => (
+            vec![w32(2 + 4 * ib), w32(34 + 4 * ib)],
+            vec![blk[66 + ib], blk[74 + ib]],
+        ),
+        KQuantFormat::IQ3XXS => (
+            vec![w32(2 + 8 * ib), w32(6 + 8 * ib)],
+            blk[66 + 4 * ib..70 + 4 * ib].to_vec(),
+        ),
+        KQuantFormat::IQ1S => (
+            vec![w32(2 + 4 * ib)],
+            blk[34 + 2 * ib..36 + 2 * ib].to_vec(),
+        ),
+        KQuantFormat::IQ1M => {
+            let sc = |i: usize| u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]);
+            let unit = ((sc(ib / 2) >> (6 * (ib % 2))) & 0x3f) as u8;
+            (
+                vec![w32(4 * ib)],
+                vec![blk[32 + 2 * ib], blk[33 + 2 * ib], unit],
+            )
+        }
+        other => panic!("{other:?} is not a grid format"),
+    }
+}
+
+struct GridRun {
+    values: usize,
+    mismatches: Vec<String>,
+    /// Per 8-value chunk: the 8-bit sign pattern and the scale field seen.
+    signs_seen: BTreeMap<u8, u64>,
+    scales_seen: BTreeMap<u8, u64>,
+    /// IQ1: both delta signs.
+    deltas_seen: [u64; 2],
+    nonzero: u64,
+}
+
+fn grid_run(format: KQuantFormat) -> GridRun {
+    pin_cpu_stream();
+    const ROWS: usize = 6;
+    const K: usize = 2048;
+    let nb = ROWS * K / QK_K;
+    let bb = format.block_bytes();
+    let mut rng = Lcg(0x9A1D_0000 ^ u64::from(format.gguf_type()));
+    let mut buf = BlockBuf::zeroed(nb * bb);
+    for b in 0..nb {
+        let blk = &mut buf.bytes_mut()[b * bb..(b + 1) * bb];
+        for byte in blk.iter_mut() {
+            *byte = rng.next() as u8;
+        }
+        let d = grid_super_scale(&mut rng, b);
+        if format == KQuantFormat::IQ1M {
+            // d lives in the top nibble of each of the four scale halfwords.
+            for i in 0..4 {
+                let at = 48 + 2 * i;
+                let sc = u16::from_le_bytes([blk[at], blk[at + 1]]) & 0x0FFF;
+                let sc = sc | (((d >> (4 * i)) & 0xF) << 12);
+                blk[at..at + 2].copy_from_slice(&sc.to_le_bytes());
+            }
+        } else {
+            blk[0..2].copy_from_slice(&d.to_le_bytes());
+        }
+    }
+
+    // Repack with the production repacker and read every field back.
+    let arrays = repack_kquant(format, buf.bytes(), ROWS, K).expect("repack");
+    let KQuantScales::Unsigned(scales) = &arrays.scales else {
+        panic!("{format:?}: grid companions must be unsigned bytes");
+    };
+    let wcols = format.weight_cols(K);
+    let scols = format.scales_cols(K);
+    let bcols = format.biases_cols(K);
+    assert_eq!(arrays.weight.len(), ROWS * wcols);
+    assert_eq!(scales.len(), ROWS * scols);
+    assert_eq!(arrays.biases.len(), ROWS * bcols);
+    let sbpg = format.scale_bytes_per_group();
+    let per_sb = K / QK_K;
+    let mut signs_seen = BTreeMap::new();
+    let mut scales_seen = BTreeMap::new();
+    let mut deltas_seen = [0u64; 2];
+    for b in 0..nb {
+        let (row, sb) = (b / per_sb, b % per_sb);
+        let blk = &buf.bytes()[b * bb..(b + 1) * bb];
+        let want_d = if format == KQuantFormat::IQ1M {
+            iq1m_d_bits(blk)
+        } else {
+            u16::from_le_bytes([blk[0], blk[1]])
+        };
+        assert_eq!(
+            arrays.biases[row * bcols + sb],
+            want_d,
+            "block {b}: .biases lost d"
+        );
+        for ib in 0..8 {
+            let (ww, ss) = grid_unit_fields(format, blk, ib);
+            let g = sb * 8 + ib;
+            let w_at = row * wcols + g * format.bits();
+            assert_eq!(
+                &arrays.weight[w_at..w_at + format.bits()],
+                &ww[..],
+                "{format:?} block {b} unit {ib}: .weight words"
+            );
+            let s_at = row * scols + g * sbpg;
+            assert_eq!(
+                &scales[s_at..s_at + sbpg],
+                &ss[..],
+                "{format:?} block {b} unit {ib}: .scales bytes"
+            );
+            if format == KQuantFormat::IQ1M {
+                assert_eq!(iq1m_unit_scales(blk, ib), ss[2]);
+            }
+            // Coverage: the sign byte / 7-bit index and the scale field of
+            // every chunk, as ggml reads them.
+            for c in 0..4 {
+                let (sign, scale, delta) = match format {
+                    KQuantFormat::IQ2XXS | KQuantFormat::IQ3XXS => {
+                        let sw = u32::from_le_bytes([ss[0], ss[1], ss[2], ss[3]]);
+                        (((sw >> (7 * c)) & 127) as u8, (sw >> 28) as u8, None)
+                    }
+                    KQuantFormat::IQ2XS => {
+                        let e = (ww[c / 2] >> (16 * (c % 2))) & 0xFFFF;
+                        ((e >> 9) as u8, (ss[0] >> (4 * (c / 2))) & 0xF, None)
+                    }
+                    KQuantFormat::IQ2S => (
+                        ((ww[1] >> (8 * c)) & 0xFF) as u8,
+                        (ss[1] >> (4 * (c / 2))) & 0xF,
+                        None,
+                    ),
+                    KQuantFormat::IQ1S => {
+                        let qh = u16::from_le_bytes([ss[0], ss[1]]);
+                        (0, ((qh >> 12) & 7) as u8, Some((qh >> 15) & 1))
+                    }
+                    _ => {
+                        let qh = u16::from_le_bytes([ss[0], ss[1]]);
+                        (
+                            0,
+                            (ss[2] >> (3 * (c / 2))) & 7,
+                            Some((qh >> (4 * c + 3)) & 1),
+                        )
+                    }
+                };
+                *signs_seen.entry(sign).or_default() += 1;
+                *scales_seen.entry(scale).or_default() += 1;
+                if let Some(dl) = delta {
+                    deltas_seen[dl as usize] += 1;
+                }
+            }
+        }
+    }
+
+    let reference = ggml_grid_decode(format, buf.bytes(), K, ROWS);
+    let ours = mlx_decode(format, &arrays, ROWS, K);
+    assert_eq!(ours.len(), reference.len());
+    let mut mismatches = Vec::new();
+    let mut nonzero = 0u64;
+    for (i, (&mine, &theirs)) in ours.iter().zip(&reference).enumerate() {
+        if theirs != 0.0 {
+            nonzero += 1;
+        }
+        if mine.to_bits() != theirs.to_bits() && mismatches.len() < 16 {
+            mismatches.push(format!(
+                "value {i} (row {}, k {}): ggml {theirs:?} (0x{:08x}) vs mlx {mine:?} (0x{:08x})",
+                i / K,
+                i % K,
+                theirs.to_bits(),
+                mine.to_bits()
+            ));
+        }
+    }
+    GridRun {
+        values: ours.len(),
+        mismatches,
+        signs_seen,
+        scales_seen,
+        deltas_seen,
+        nonzero,
+    }
+}
+
+fn assert_grid(format: KQuantFormat, sign_space: usize, scale_space: usize, deltas: bool) {
+    let run = grid_run(format);
+    println!(
+        "{}: {} values, {} nonzero, {} sign patterns, {} scale values, deltas {:?}",
+        format.mlx_mode(),
+        run.values,
+        run.nonzero,
+        run.signs_seen.len(),
+        run.scales_seen.len(),
+        run.deltas_seen
+    );
+    assert!(
+        run.mismatches.is_empty(),
+        "{} decode disagrees with ggml:\n{}",
+        format.mlx_mode(),
+        run.mismatches.join("\n")
+    );
+    assert!(
+        run.nonzero * 10 > run.values as u64 * 8,
+        "{format:?}: mostly zero"
+    );
+    assert_eq!(
+        run.signs_seen.len(),
+        sign_space,
+        "{format:?}: every sign pattern must appear"
+    );
+    assert_eq!(
+        run.scales_seen.len(),
+        scale_space,
+        "{format:?}: every scale field value must appear"
+    );
+    if deltas {
+        assert!(
+            run.deltas_seen.iter().all(|&n| n > 0),
+            "{format:?}: both delta signs must appear"
+        );
+    }
+}
+
+#[test]
+fn iq2xxs_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ2XXS, 128, 16, false);
+}
+
+#[test]
+fn iq2xs_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ2XS, 128, 16, false);
+}
+
+#[test]
+fn iq2s_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ2S, 256, 16, false);
+}
+
+#[test]
+fn iq3xxs_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ3XXS, 128, 16, false);
+}
+
+#[test]
+fn iq1s_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ1S, 1, 8, true);
+}
+
+#[test]
+fn iq1m_repack_is_lossless_and_decodes_bitwise() {
+    assert_grid(KQuantFormat::IQ1M, 1, 8, true);
+}
+
+// ---------------------------------------------------------------------------
 // Provenance guard — the in-tree port of the scratchpad's check_verbatim.py
 // ---------------------------------------------------------------------------
 
-/// The seven ggml spans the vendored reference must reproduce verbatim.
-const SPANS: [(&str, usize, usize); 7] = [
+/// The thirteen ggml spans the vendored reference must reproduce verbatim.
+const SPANS: [(&str, usize, usize); 13] = [
     ("get_scale_min_k4", 880, 887),
     ("dequantize_row_q4_K", 1529, 1551),
     ("dequantize_row_q5_K", 1731, 1756),
@@ -2022,6 +2346,12 @@ const SPANS: [(&str, usize, usize); 7] = [
     ("dequantize_row_q5_0", 500, 524),
     ("dequantize_row_mxfp4", 569, 587),
     ("dequantize_row_q2_K", 961, 991),
+    ("dequantize_row_iq2_xxs", 2488, 2512),
+    ("dequantize_row_iq2_xs", 2516, 2539),
+    ("dequantize_row_iq2_s", 2543, 2571),
+    ("dequantize_row_iq3_xxs", 2575, 2603),
+    ("dequantize_row_iq1_s", 2650, 2673),
+    ("dequantize_row_iq1_m", 2675, 2723),
 ];
 
 /// The three sanctioned edits, applied to both sides so only real drift shows.

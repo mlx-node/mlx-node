@@ -418,7 +418,9 @@ mlx_array *mlx_qwen4_expert_prefill(mlx_array *x, mlx_array *ids,
          {"BITS", bits},
          {"AFFINE", affine},
          {"SR", ratio},
-         {"HM", has_min}},
+         {"HM", has_min},
+         {"KIND", quant ? static_cast<int>(mlx::core::kquant::kind(*quant)) : 0},
+         {"SHIFT", quant ? mlx::core::kquant::scale_shift(*quant) : 0}},
         std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
     return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
   } catch (const std::exception &e) {

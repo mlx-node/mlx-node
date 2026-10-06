@@ -12,17 +12,18 @@
 use std::ffi::{CStr, c_char};
 
 /// The modes kquant.metal instantiates: q6k, q4k, q5k, q3k, q2k, iq4nl, iq4xs,
-/// iq3s.
-const MODES: i64 = 8;
-/// 8 modes x 3 dtypes x (39 row-major families + 11 Tiled64 "_t64" families:
+/// iq3s and the six grid formats iq2xxs, iq2xs, iq2s, iq3xxs, iq1s, iq1m.
+const MODES: i64 = 14;
+/// 14 modes x 3 dtypes x (39 row-major families + 11 Tiled64 "_t64" families:
 /// qmv_t64 at 8 and 16 k-splits, qmv_wide nv 2..8, qmm_t, qmm_t_splitk),
 /// plus 4 bfloat16 qmv_sg8 kernels and the 2 sg8 prep kernels (group sizes
 /// 16 and 32).
 const BASE_NAMES: i64 = MODES * 3 * (39 + 11) + 4 + 2;
-/// 8 modes x 3 dtypes x (qmm_t_nax {aligned, unaligned} x {batched, single}
+/// 14 modes x 3 dtypes x (qmm_t_nax {aligned, unaligned} x {batched, single}
 /// plus the aligned, single Tiled64 qmm_t_nax_t64), plus the bfloat16
-/// qmm_m8_nax kernels: 8 Tiled64 and 3 row-major (q3k, q2k, iq4nl).
-const NAX_NAMES: i64 = MODES * 3 * (4 + 1) + MODES + 3;
+/// qmm_m8_nax kernels: 14 Tiled64 and 9 row-major (q3k, q2k, iq4nl and the
+/// six grid formats).
+const NAX_NAMES: i64 = MODES * 3 * (4 + 1) + MODES + 9;
 
 struct Check {
     base: i64,

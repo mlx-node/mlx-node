@@ -18,8 +18,8 @@ METAL_FUNC void quantized_expert_gate_up(
     size_t row = size_t(expert) * M + first;
     auto gw = (const device uchar*)wg + row * (H * BP / PACK) + lane * 2 * BP;
     auto uw = (const device uchar*)wu + row * (H * BP / PACK) + lane * 2 * BP;
-    auto gs = KQScales<float,BITS,8,true>(sg, bg, row * (H / 32) + lane / (32 / VP));
-    auto us = KQScales<float,BITS,8,true>(su, bu, row * (H / 32) + lane / (32 / VP));
+    auto gs = KQScales<float,BITS,8,true,KQ_LINEAR,0>(sg, bg, row * (H / 32) + lane / (32 / VP));
+    auto us = KQScales<float,BITS,8,true,KQ_LINEAR,0>(su, bu, row * (H / 32) + lane / (32 / VP));
     auto input = x + size_t(assignment / TOP) * H + lane * VP;
     for (int k = 0; k < H; k += BLOCK) {
       float values[VP];

@@ -42,22 +42,22 @@ const SHAPES: [(i64, i64); 6] = [
 ];
 
 /// The modes a UD-Q4_K_M Qwen3.8 GGUF carries, plus q2k (the 2-bit K-quant,
-/// measured next to q4k).
-const MODES: [&str; 4] = ["q4k", "q5k", "q6k", "q2k"];
+/// measured next to q4k) and the six grid formats of the Unsloth UD-IQ* /
+/// UD-Q2_K_XL mixes (their decode is table lookups, so the question is
+/// whether M = 1 stays bandwidth-bound at 1.56-3.06 bpw).
+const MODES: [&str; 10] = [
+    "q4k", "q5k", "q6k", "q2k", "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq1s", "iq1m",
+];
 /// Prefill row counts: one NAX tile of rows, and a long prompt.
 const PREFILL_ROWS: [i64; 2] = [64, 2048];
 
 fn tiled(w: &Weights, kq: &KQuant) -> Weights {
-    let pg = if kq.scales_signed { 1 } else { 2 };
-    let sr = match kq.mode {
-        "q6k" | "q3k" | "q2k" => 16,
-        "iq4nl" => 1,
-        _ => 8,
-    };
     let t = Weights {
         w: kquant_tile_rows(&w.w, i64::from(kq.bits)).expect("tile weight"),
-        scales: kquant_tile_rows(&w.scales, sr * pg).expect("tile scales"),
-        biases: kquant_tile_rows(&w.biases, pg).expect("tile biases"),
+        scales: kquant_tile_rows(&w.scales, kq.super_ratio() * kq.scale_bytes_per_group())
+            .expect("tile scales"),
+        biases: kquant_tile_rows(&w.biases, kq.bias_entries_per_super_block())
+            .expect("tile biases"),
     };
     t.w.eval();
     t.scales.eval();
@@ -100,6 +100,8 @@ fn eval_all(hs: &mut [*mut mlx_sys::mlx_array]) {
 struct Ring {
     copies: Vec<Weights>,
     next: std::cell::Cell<usize>,
+    /// Bytes one matmul streams (`.weight` + `.scales` + `.biases`).
+    bytes: usize,
 }
 
 impl Ring {
@@ -127,6 +129,7 @@ impl Ring {
         Self {
             copies,
             next: std::cell::Cell::new(0),
+            bytes,
         }
     }
 
@@ -209,8 +212,8 @@ fn qwen38_tiled_vs_row_major() {
     for mode in modes() {
         let kq = kquant(mode);
         println!(
-            "\n  {:<6} {:>6} {:>6} | {:>8} {:>8} {:>6} | {:>8} {:>8} {:>6}  (ms, DRAM-cold ring)",
-            "mode", "K", "N", "M1 qmv", "M1 t64", "ratio", "M8 sg8", "M8 t64", "ratio"
+            "\n  {:<6} {:>6} {:>6} | {:>8} {:>8} {:>6} {:>7} | {:>8} {:>8} {:>6}  (ms, DRAM-cold ring; GB/s = weight bytes / M1 t64 ms)",
+            "mode", "K", "N", "M1 qmv", "M1 t64", "ratio", "GB/s", "M8 sg8", "M8 t64", "ratio"
         );
         for (si, &(k, n)) in SHAPES.iter().enumerate() {
             let w = Ring::new(kq, n, k, 0x9000 + si as u32, false);
@@ -230,10 +233,11 @@ fn qwen38_tiled_vs_row_major() {
             let x8 = activation(&[8, k], 0x9200 + si as u32, DType::BFloat16);
             let m8 = measure(&x8, kq, &arms);
             println!(
-                "  {mode:<6} {k:>6} {n:>6} | {:>8.4} {:>8.4} {:>5.2}x | {:>8.4} {:>8.4} {:>5.2}x",
+                "  {mode:<6} {k:>6} {n:>6} | {:>8.4} {:>8.4} {:>5.2}x {:>7.1} | {:>8.4} {:>8.4} {:>5.2}x",
                 m1[0],
                 m1[1],
                 m1[0] / m1[1],
+                t.bytes as f64 / 1e6 / m1[1],
                 m8[0],
                 m8[1],
                 m8[0] / m8[1]

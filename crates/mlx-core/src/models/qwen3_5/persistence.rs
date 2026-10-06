@@ -664,7 +664,11 @@ fn validate_mtp_bits(bits: i32, mode: PerLayerMode, context: &str) -> Result<()>
         PerLayerMode::Q6K => bits == 6,
         PerLayerMode::Q5K => bits == 5,
         PerLayerMode::Q3K => bits == 3,
-        PerLayerMode::Q2K => bits == 2,
+        PerLayerMode::Q2K | PerLayerMode::IQ2XS | PerLayerMode::IQ2S | PerLayerMode::IQ3XXS => {
+            bits == 2
+        }
+        // The grid formats' `bits` is the `.weight` words per 32-value unit.
+        PerLayerMode::IQ2XXS | PerLayerMode::IQ1S | PerLayerMode::IQ1M => bits == 1,
         PerLayerMode::Fp8E4m3 => false,
     };
     if !valid {
@@ -689,7 +693,10 @@ fn parse_mtp_bits(
             PerLayerMode::Q6K => 6,
             PerLayerMode::Q5K => 5,
             PerLayerMode::Q3K => 3,
-            PerLayerMode::Q2K => 2,
+            PerLayerMode::Q2K | PerLayerMode::IQ2XS | PerLayerMode::IQ2S | PerLayerMode::IQ3XXS => {
+                2
+            }
+            PerLayerMode::IQ2XXS | PerLayerMode::IQ1S | PerLayerMode::IQ1M => 1,
             _ => absent_default,
         });
     };
@@ -712,7 +719,13 @@ fn parse_mtp_group_size(
             | PerLayerMode::Q5K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S => 32,
+            | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => 32,
             PerLayerMode::Sym8 => -1,
             _ => absent_default,
         });
@@ -736,7 +749,13 @@ fn parse_mtp_group_size(
         | PerLayerMode::Q5K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => group_size == 32,
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => group_size == 32,
         PerLayerMode::Sym8 | PerLayerMode::Fp8E4m3 => false,
     };
     if !valid {
@@ -1401,7 +1420,13 @@ fn apply_weights_inner_with_residency(
             | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S => {
+            | PerLayerMode::IQ3S
+            | PerLayerMode::IQ2XXS
+            | PerLayerMode::IQ2XS
+            | PerLayerMode::IQ2S
+            | PerLayerMode::IQ3XXS
+            | PerLayerMode::IQ1S
+            | PerLayerMode::IQ1M => {
                 // Repack eligible 2-D K-quant projections into the Tiled64
                 // layout for the `_t64` Metal kernels (a Metal host; other
                 // hosts stay row-major). Done here, at the one place every qwen3_5

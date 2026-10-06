@@ -70,7 +70,13 @@
   instantiate_kquant_nax_all(q2k, type, 16, 2, 16, true, KQ_LINEAR, 0) \
   instantiate_kquant_nax_all(iq4nl, type, 32, 4, 1, false, KQ_CODEBOOK, 0) \
   instantiate_kquant_nax_all(iq4xs, type, 32, 4, 8, false, KQ_CODEBOOK, 0) \
-  instantiate_kquant_nax_all(iq3s, type, 32, 8, 8, false, KQ_INT8, 0)
+  instantiate_kquant_nax_all(iq3s, type, 32, 8, 8, false, KQ_INT8, 0) \
+  instantiate_kquant_nax_all(iq2xxs, type, 32, 1, 8, false, KQ_GRID_IQ2XXS, -3) \
+  instantiate_kquant_nax_all(iq2xs, type, 32, 2, 8, false, KQ_GRID_IQ2XS, -3) \
+  instantiate_kquant_nax_all(iq2s, type, 32, 2, 8, false, KQ_GRID_IQ2S, -3) \
+  instantiate_kquant_nax_all(iq3xxs, type, 32, 2, 8, false, KQ_GRID_IQ3XXS, -2) \
+  instantiate_kquant_nax_all(iq1s, type, 32, 1, 8, false, KQ_GRID_IQ1S, -3) \
+  instantiate_kquant_nax_all(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3)
 
 #if KQUANT_DTYPE == 0
 instantiate_kquant_nax_types(float)

@@ -73,9 +73,15 @@ pub enum GgufTensorType {
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    IQ2XXS = 16,
+    IQ2XS = 17,
+    IQ3XXS = 18,
+    IQ1S = 19,
     IQ4NL = 20,
     IQ3S = 21,
+    IQ2S = 22,
     IQ4XS = 23,
+    IQ1M = 29,
     BF16 = 30,
     MXFP4 = 39,
     PQ2_0 = 142,
@@ -96,9 +102,15 @@ impl GgufTensorType {
             12 => Some(Self::Q4K),
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
+            16 => Some(Self::IQ2XXS),
+            17 => Some(Self::IQ2XS),
+            18 => Some(Self::IQ3XXS),
+            19 => Some(Self::IQ1S),
             20 => Some(Self::IQ4NL),
             21 => Some(Self::IQ3S),
+            22 => Some(Self::IQ2S),
             23 => Some(Self::IQ4XS),
+            29 => Some(Self::IQ1M),
             30 => Some(Self::BF16),
             39 => Some(Self::MXFP4),
             142 => Some(Self::PQ2_0),
@@ -137,6 +149,15 @@ impl GgufTensorType {
             Self::Q6K => 210,
             Self::IQ4NL => 18,
             Self::IQ4XS => 136,
+            // The grid formats (ggml-common.h:378-437): f16 d + the grid
+            // index / sign / scale words for 256 values (IQ1_M hides d in
+            // its scale words).
+            Self::IQ2XXS => 66,
+            Self::IQ2XS => 74,
+            Self::IQ2S => 82,
+            Self::IQ3XXS => 98,
+            Self::IQ1S => 50,
+            Self::IQ1M => 56,
             Self::PQ2_0 => 34,
         }
     }
@@ -160,7 +181,13 @@ impl GgufTensorType {
             | Self::Q5K
             | Self::Q6K
             | Self::IQ3S
-            | Self::IQ4XS => 256,
+            | Self::IQ4XS
+            | Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ2S
+            | Self::IQ3XXS
+            | Self::IQ1S
+            | Self::IQ1M => 256,
         }
     }
 
@@ -204,6 +231,12 @@ impl GgufTensorType {
             Self::IQ4NL => Some(KQuantFormat::IQ4NL),
             Self::IQ3S => Some(KQuantFormat::IQ3S),
             Self::IQ4XS => Some(KQuantFormat::IQ4XS),
+            Self::IQ2XXS => Some(KQuantFormat::IQ2XXS),
+            Self::IQ2XS => Some(KQuantFormat::IQ2XS),
+            Self::IQ2S => Some(KQuantFormat::IQ2S),
+            Self::IQ3XXS => Some(KQuantFormat::IQ3XXS),
+            Self::IQ1S => Some(KQuantFormat::IQ1S),
+            Self::IQ1M => Some(KQuantFormat::IQ1M),
             Self::F32
             | Self::F16
             | Self::BF16
@@ -218,7 +251,7 @@ impl GgufTensorType {
     }
 
     /// Every type `from_u32` recognizes, for the header rejection message.
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 24] = [
         Self::F32,
         Self::F16,
         Self::Q4_0,
@@ -231,9 +264,15 @@ impl GgufTensorType {
         Self::Q4K,
         Self::Q5K,
         Self::Q6K,
+        Self::IQ2XXS,
+        Self::IQ2XS,
+        Self::IQ3XXS,
+        Self::IQ1S,
         Self::IQ4NL,
         Self::IQ3S,
+        Self::IQ2S,
         Self::IQ4XS,
+        Self::IQ1M,
         Self::BF16,
         Self::MXFP4,
         Self::PQ2_0,
@@ -266,6 +305,12 @@ impl GgufTensorType {
             Self::IQ4NL => "IQ4_NL",
             Self::IQ3S => "IQ3_S",
             Self::IQ4XS => "IQ4_XS",
+            Self::IQ2XXS => "IQ2_XXS",
+            Self::IQ2XS => "IQ2_XS",
+            Self::IQ2S => "IQ2_S",
+            Self::IQ3XXS => "IQ3_XXS",
+            Self::IQ1S => "IQ1_S",
+            Self::IQ1M => "IQ1_M",
             Self::BF16 => "BF16",
             Self::MXFP4 => "MXFP4",
             Self::PQ2_0 => "PQ2_0",
@@ -961,7 +1006,13 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
         | GgufTensorType::Q3K
         | GgufTensorType::IQ4NL
         | GgufTensorType::IQ4XS
-        | GgufTensorType::IQ3S => None,
+        | GgufTensorType::IQ3S
+        | GgufTensorType::IQ2XXS
+        | GgufTensorType::IQ2XS
+        | GgufTensorType::IQ2S
+        | GgufTensorType::IQ3XXS
+        | GgufTensorType::IQ1S
+        | GgufTensorType::IQ1M => None,
     }
 }
 
@@ -3214,7 +3265,13 @@ impl SourceQuantProfile {
             | GgufTensorType::Q6K
             | GgufTensorType::IQ4NL
             | GgufTensorType::IQ4XS
-            | GgufTensorType::IQ3S => ty.k_quant_format().map(Self::k_quant),
+            | GgufTensorType::IQ3S
+            | GgufTensorType::IQ2XXS
+            | GgufTensorType::IQ2XS
+            | GgufTensorType::IQ2S
+            | GgufTensorType::IQ3XXS
+            | GgufTensorType::IQ1S
+            | GgufTensorType::IQ1M => ty.k_quant_format().map(Self::k_quant),
         }
     }
 

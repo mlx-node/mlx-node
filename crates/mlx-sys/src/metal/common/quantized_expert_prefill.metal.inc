@@ -36,9 +36,9 @@ for (int base=0; base<K; base+=BK) {
       for (int v=0; v<VP; ++v) Ws[row*PAD+kcol+pack*VP+v]=C(values[v]);
     }
   } else {
-    using Loader=QuantizedBlockLoader<C,BN,BK,PAD,true,128,GS,BITS,SR,HM>;
+    using Loader=QuantizedBlockLoader<C,BN,BK,PAD,true,128,GS,BITS,SR,HM,KIND,SHIFT>;
     Loader loader(packed+base*BP/VP,
-      KQScales<float,BITS,SR,HM>((const device uint8_t*)scales,biases,
+      KQScales<float,BITS,SR,HM,KIND,SHIFT>((const device uint8_t*)scales,biases,
         (size_t(expert)*N+col)*(K/GS)+base/GS), K,Ws,sg,lane);
     loader.load_unsafe();
   }
