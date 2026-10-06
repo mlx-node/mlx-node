@@ -877,18 +877,30 @@ fn main() -> io::Result<()> {
         }
         // The K-quant headers as source text, for the custom kernels that
         // reuse their decoders (the K-quant ops themselves run from the
-        // prebuilt paged_attn.metallib). They include no project headers, so
-        // the preamble is the file itself, in the generator's format.
+        // prebuilt paged_attn.metallib). Their one project include, the
+        // per-mode traits in kquant_mode.h, is inlined in place so each
+        // preamble stays self-contained, in the generator's format.
+        let mode_header = src_dir.join("metal/kquant/kquant_mode.h");
+        let mode_body: String = read_build_source(&mode_header)?
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("#pragma once"))
+            .map(|line| format!("{line}\n"))
+            .collect();
         for name in ["kquant", "kquant_nax"] {
             let header = src_dir.join(format!("metal/kquant/{name}.h"));
             let body: String = read_build_source(&header)?
                 .lines()
-                .filter(|line| {
-                    let line = line.trim_start();
-                    !(line.starts_with("#pragma once")
-                        || (line.starts_with("#include \"") && line.ends_with(".h\"")))
+                .filter(|line| !line.trim_start().starts_with("#pragma once"))
+                .map(|line| {
+                    let trimmed = line.trim_start();
+                    if trimmed == "#include \"kquant_mode.h\"" {
+                        mode_body.clone()
+                    } else if trimmed.starts_with("#include \"") && trimmed.ends_with(".h\"") {
+                        String::new()
+                    } else {
+                        format!("{line}\n")
+                    }
                 })
-                .map(|line| format!("{line}\n"))
                 .collect();
             if body.contains(")preamble\"") {
                 return Err(io::Error::other(format!(

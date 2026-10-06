@@ -103,36 +103,51 @@ triple differs from the top-level one (`record_quant_override_if_non_default`,
 
 ## Quantization modes & on-disk formats
 
-Nine formats. Only five are selectable by `--q-mode` (`VALID_QUANT_MODES`,
+Only five modes are selectable by `--q-mode` (`VALID_QUANT_MODES`,
 `crates/mlx-core/src/convert.rs:1967`). `fp8_e4m3` is emitted only by the fixed Unsloth DGX map. The
-three ggml K-quants are **consume-only** — the bridge's `mlx_quantize` throws for them by name
-before MLX sees them (`crates/mlx-sys/src/mlx_advanced_ops.cpp:892`).
+ggml K/IQ modes (q2k, q3k, q4k, q5k, q6k, iq4nl, iq4xs, iq3s) are **consume-only** — the bridge's
+`mlx_quantize` throws for them by name before MLX sees them
+(`crates/mlx-sys/src/mlx_advanced_ops.cpp:892`). Their per-mode traits — `(group_size, bits,
+super_ratio, has_min, kind, scale_shift, scale_bytes_per_group)` — are declared once per side:
+`kquant::Mode` + the `constexpr` trait functions in `crates/mlx-sys/src/mlx_kquant.h`, the Metal
+kernel template parameters via `crates/mlx-sys/src/metal/kquant/kquant_mode.h`, and
+`quant_dispatch::kquant_mode_params` (`KQuantModeParams`) in Rust; `kind` (linear / codebook /
+int8 / grid) picks the value rule and `scale_shift` a power of two every decoded scale carries
+(0 for every mode today; the grid formats will use it).
 
 ### Master table
 
 Shapes are for a dense `[N, K]` source weight; stacked experts add a leading `[E, …]` to every array.
 
-| mode              | `.weight`            | `.scales`             | `.biases`                     | bpw                              | default bits / gs   | mlx-lm loadable         | direction                       |
-| ----------------- | -------------------- | --------------------- | ----------------------------- | -------------------------------- | ------------------- | ----------------------- | ------------------------------- |
-| **affine**        | u32 `[N, K·b/32]`    | _wdtype_ `[N, K/gs]`  | _wdtype_ `[N, K/gs]`          | `b + 2·16/gs` → 4/64 = **4.500** | **4 / 64**          | yes                     | produce + consume               |
-| **mxfp4**         | u32 `[N, K/8]`       | u8 `[N, K/32]`        | must be absent                | **4.250**                        | **4 / 32** (pinned) | yes                     | produce + consume               |
-| **mxfp8**         | u32 `[N, K/4]`       | u8 `[N, K/32]`        | must be absent                | **8.250**                        | **8 / 32** (pinned) | yes                     | produce + consume               |
-| **nvfp4**         | u32 `[N, K/8]`       | u8 (E4M3) `[N, K/16]` | must be absent                | **4.500**                        | **4 / 16** (pinned) | yes                     | produce + consume               |
-| **fp8_e4m3**      | u8 `[N, K]` raw E4M3 | bf16 `[N, 1]`         | must be absent                | `8 + 16/K` = **8.0039** @ K=4096 | 8 / `null`          | no — KeyError + null gs | DGX map only                    |
-| **sym8**          | **int8** `[N, K]`    | **f32 `[N]`**         | error if present              | `8 + 32/K` = **8.0078** @ K=4096 | 8 / `null`          | no — by design          | produce + consume, **M5+ only** |
-| **q6k**           | u32 `[N, K·6/32]`    | **int8** `[N, K/16]`  | f16 `[N, K/256]`              | **6.5625** (= ggml)              | 6 / 16 (pinned)     | no                      | **consume only**                |
-| **q4k**           | u32 `[N, K/8]`       | u8 `[N, 2K/32]`       | f16 `[N, 2K/256]`             | **4.6250** (ggml 4.500)          | 4 / 32 (pinned)     | no                      | **consume only**                |
-| **q5k**           | u32 `[N, 5K/32]`     | u8 `[N, 2K/32]`       | f16 `[N, 2K/256]`             | **5.6250** (ggml 5.500)          | 5 / 32 (pinned)     | no                      | **consume only**                |
-| **Q4_0 → affine** | u32 `[N, K/8]`       | f16 `[N, K/32]`       | **omitted, derived `-8·s`**   | **4.500** (= ggml)               | 4 / 32              | no — missing `.biases`  | GGUF source only                |
-| **Q8_0 → affine** | u32 `[N, K/4]`       | f16 `[N, K/32]`       | **omitted, derived `-128·s`** | **8.500** (= ggml)               | 8 / 32              | no                      | GGUF source only                |
-| **Q4_1 → affine** | u32 `[N, K/8]`       | f16 `[N, K/32]`       | f16 `[N, K/32]` (ggml `m`)    | **5.000** (= ggml)               | 4 / 32              | yes                     | GGUF source only                |
+| mode              | `.weight`            | `.scales`             | `.biases`                     | bpw                                                             | default bits / gs   | mlx-lm loadable         | direction                       |
+| ----------------- | -------------------- | --------------------- | ----------------------------- | --------------------------------------------------------------- | ------------------- | ----------------------- | ------------------------------- |
+| **affine**        | u32 `[N, K·b/32]`    | _wdtype_ `[N, K/gs]`  | _wdtype_ `[N, K/gs]`          | `b + 2·16/gs` → 4/64 = **4.500**                                | **4 / 64**          | yes                     | produce + consume               |
+| **mxfp4**         | u32 `[N, K/8]`       | u8 `[N, K/32]`        | must be absent                | **4.250**                                                       | **4 / 32** (pinned) | yes                     | produce + consume               |
+| **mxfp8**         | u32 `[N, K/4]`       | u8 `[N, K/32]`        | must be absent                | **8.250**                                                       | **8 / 32** (pinned) | yes                     | produce + consume               |
+| **nvfp4**         | u32 `[N, K/8]`       | u8 (E4M3) `[N, K/16]` | must be absent                | **4.500**                                                       | **4 / 16** (pinned) | yes                     | produce + consume               |
+| **fp8_e4m3**      | u8 `[N, K]` raw E4M3 | bf16 `[N, 1]`         | must be absent                | `8 + 16/K` = **8.0039** @ K=4096                                | 8 / `null`          | no — KeyError + null gs | DGX map only                    |
+| **sym8**          | **int8** `[N, K]`    | **f32 `[N]`**         | error if present              | `8 + 32/K` = **8.0078** @ K=4096                                | 8 / `null`          | no — by design          | produce + consume, **M5+ only** |
+| **q6k**           | u32 `[N, K·6/32]`    | **int8** `[N, K/16]`  | f16 `[N, K/256]`              | **6.5625** (= ggml)                                             | 6 / 16 (pinned)     | no                      | **consume only**                |
+| **q4k**           | u32 `[N, K/8]`       | u8 `[N, 2K/32]`       | f16 `[N, 2K/256]`             | **4.6250** (ggml 4.500)                                         | 4 / 32 (pinned)     | no                      | **consume only**                |
+| **q5k**           | u32 `[N, 5K/32]`     | u8 `[N, 2K/32]`       | f16 `[N, 2K/256]`             | **5.6250** (ggml 5.500)                                         | 5 / 32 (pinned)     | no                      | **consume only**                |
+| **q2k**           | u32 `[N, K/16]`      | u8 `[N, 2K/16]`       | f16 `[N, 2K/256]`             | **3.1250** (ggml 2.625)                                         | 2 / 16 (pinned)     | no                      | **consume only**                |
+| **q3k**           | u32 `[N, 3K/32]`     | **int8** `[N, K/16]`  | f16 `[N, K/256]`              | **3.5625** (ggml 3.4375)                                        | 3 / 16 (pinned)     | no                      | **consume only**                |
+| **iq4nl**         | u32 `[N, K/8]`       | **int8** `[N, K/32]`  | f16 `[N, K/32]`               | **4.750** (ggml 4.500)                                          | 4 / 32 (pinned)     | no                      | **consume only**                |
+| **iq4xs**         | u32 `[N, K/8]`       | **int8** `[N, K/32]`  | f16 `[N, K/256]`              | **4.3125** (ggml 4.250)                                         | 4 / 32 (pinned)     | no                      | **consume only**                |
+| **iq3s**          | u32 `[N, K/4]`       | **int8** `[N, K/32]`  | f16 `[N, K/256]`              | **8.3125** (ggml 3.4375; codes stored as bytes)                 | 8 / 32 (pinned)     | no                      | **consume only**                |
+| **Q4_0 → affine** | u32 `[N, K/8]`       | f16 `[N, K/32]`       | **omitted, derived `-8·s`**   | **4.500** (= ggml)                                              | 4 / 32              | no — missing `.biases`  | GGUF source only                |
+| **Q5_0 → affine** | u32 `[N, 5K/32]`     | f16 `[N, K/32]`       | **omitted, derived `-16·s`**  | **5.500** (= ggml)                                              | 5 / 32              | no — missing `.biases`  | GGUF source only                |
+| **Q8_0 → affine** | u32 `[N, K/4]`       | f16 `[N, K/32]`       | **omitted, derived `-128·s`** | **8.500** (= ggml)                                              | 8 / 32              | no                      | GGUF source only                |
+| **Q4_1 → affine** | u32 `[N, K/8]`       | f16 `[N, K/32]`       | f16 `[N, K/32]` (ggml `m`)    | **5.000** (= ggml)                                              | 4 / 32              | yes                     | GGUF source only                |
+| **Q5_1 → affine** | u32 `[N, 5K/32]`     | f16 `[N, K/32]`       | f16 `[N, K/32]` (ggml `m`)    | **6.000** (= ggml)                                              | 5 / 32              | yes                     | GGUF source only                |
+| **MXFP4 → mxfp4** | u32 `[N, K/8]`       | u8 (E8M0) `[N, K/32]` | must be absent                | **4.250** (= ggml)                                              | 4 / 32 (pinned)     | yes                     | GGUF source only                |
 
 Defaults are declared in exactly three consistent places plus MLX itself:
 `packages/cli/src/commands/convert.ts:9` (display only — see gotchas),
 `crates/mlx-core/src/convert.rs:1995` (SafeTensors), `crates/mlx-core/src/utils/gguf.rs:2884` (GGUF),
 `crates/mlx-sys/mlx/mlx/ops.cpp:4809` (`quantization_params_from_mode`). The K-quant pairs
-q6k(16,6) / q4k(32,4) / q5k(32,5) live in the bridge (`default_group_size` / `default_bits`,
-`crates/mlx-sys/src/mlx_kquant.h`).
+q6k(16,6) / q4k(32,4) / q5k(32,5) / q2k(16,2) / q3k(16,3) / iq4nl(32,4) / iq4xs(32,4) / iq3s(32,8)
+live in the bridge (`default_group_size` / `default_bits`, `crates/mlx-sys/src/mlx_kquant.h`).
 
 ### affine
 
@@ -335,7 +350,8 @@ bpw = `bits + 8/scales_per_value + 16·per_group/256`:
 | q4k  | 4      | 2·8/32 = 0.5 | 2·16/256 = 0.125 | **4.6250** | 128+16+4 = **148** | 144 B      | 4.5000   | +0.125 |
 | q5k  | 5      | 0.5          | 0.125            | **5.6250** | 160+16+4 = **180** | 176 B      | 5.5000   | +0.125 |
 
-Exactness vs llama.cpp: decode is float32 on both levels, so **q4k and q5k are bitwise identical**.
+Exactness vs llama.cpp: decode is float32 on both levels, so **q2k, q4k and q5k are bitwise
+identical** (`crates/mlx-core/tests/kquant_ggml_parity.rs`).
 **Q6_K is identical up to the sign of zero** — ggml subtracts 32 in integer arithmetic, the contract
 folds it into `bias = -32*scale`, and IEEE-754 gives `x + (-x) = +0.0` where ggml writes `-0.0`
 (`crates/mlx-sys/src/mlx_kquant.cpp:525`). A second divergence exists for a
@@ -709,21 +725,33 @@ config-write `?` at `:3215` / `:3178`.
 
 ### Source-type routing
 
-Nine types are recognized (`GgufTensorType`, `crates/mlx-core/src/utils/gguf.rs:42`). Anything else is
-a **hard error at header parse** — the whole file is refused even if one tensor uses an unlisted type.
+Eighteen types are recognized (`GgufTensorType`, `crates/mlx-core/src/utils/gguf.rs:63`; the
+rejection message lists them from `GgufTensorType::ALL`). Anything else is a **hard error at header
+parse** — the whole file is refused even if one tensor uses an unlisted type. The IQ1 / IQ2 and
+IQ3_XXS grid formats are the notable absentees (the Unsloth `UD-Q2_K_XL` and `UD-IQ*` mixes carry
+them in their experts).
 
-| ggml type (id)  | block | `type_size` | route                                 | mlx-node bytes / 4096-col row | ggml bytes | Δ     |
-| --------------- | ----- | ----------- | ------------------------------------- | ----------------------------- | ---------- | ----- |
-| F32 (0)         | 1     | 4           | dense (`:597`)                        | —                             | —          | —     |
-| F16 (1)         | 1     | 2           | dense (`:604`)                        | —                             | —          | —     |
-| BF16 (30)       | 1     | 2           | dense (`:611`)                        | —                             | —          | —     |
-| Q4_0 (2)        | 32    | 18          | affine repack (`:808`)                | 512·4 + 128·2 = **2304**      | 2304       | **0** |
-| Q4_1 (3)        | 32    | 20          | affine repack (`:831`)                | 2048+256+256 = **2560**       | 2560       | **0** |
-| Q8_0 (8)        | 32    | 34          | affine repack (`:854`)                | 1024·4 + 256 = **4352**       | 4352       | **0** |
-| Q4_K (12)       | 256   | 144         | K-quant repack, needs `--gguf-kquant` | 2048+256+64 = **2368**        | 2304       | +64   |
-| Q5_K (13)       | 256   | 176         | K-quant repack, needs `--gguf-kquant` | 2560+256+64 = **2880**        | 2816       | +64   |
-| Q6_K (14)       | 256   | 210         | K-quant repack **or** BF16 dequant    | 3072+256+32 = **3360**        | 3360       | **0** |
-| everything else | —     | —           | **rejected at `:530`**                | —                             | —          | —     |
+| ggml type (id)  | block | `type_size` | route                                                          | mlx-node bytes / 4096-col row | ggml bytes | Δ      |
+| --------------- | ----- | ----------- | -------------------------------------------------------------- | ----------------------------- | ---------- | ------ |
+| F32 (0)         | 1     | 4           | dense (`:597`)                                                 | —                             | —          | —      |
+| F16 (1)         | 1     | 2           | dense (`:604`)                                                 | —                             | —          | —      |
+| BF16 (30)       | 1     | 2           | dense (`:611`)                                                 | —                             | —          | —      |
+| Q4_0 (2)        | 32    | 18          | affine repack (`:808`)                                         | 512·4 + 128·2 = **2304**      | 2304       | **0**  |
+| Q4_1 (3)        | 32    | 20          | affine repack (`:831`)                                         | 2048+256+256 = **2560**       | 2560       | **0**  |
+| Q5_0 (6)        | 32    | 22          | affine repack, derived `-16·s`                                 | 640·4 + 128·2 = **2816**      | 2816       | **0**  |
+| Q5_1 (7)        | 32    | 24          | affine repack                                                  | 2560+256+256 = **3072**       | 3072       | **0**  |
+| Q8_0 (8)        | 32    | 34          | affine repack (`:854`)                                         | 1024·4 + 256 = **4352**       | 4352       | **0**  |
+| MXFP4 (39)      | 32    | 17          | `mxfp4` repack (uint8 E8M0 scales)                             | 2048 + 128 = **2176**         | 2176       | **0**  |
+| Q2_K (10)       | 256   | 84          | K-quant repack, needs `--gguf-kquant`                          | 1024+512+64 = **1600**        | 1344       | +256   |
+| Q3_K (11)       | 256   | 110         | K-quant repack, needs `--gguf-kquant`                          | 1536+256+32 = **1824**        | 1760       | +64    |
+| Q4_K (12)       | 256   | 144         | K-quant repack, needs `--gguf-kquant`                          | 2048+256+64 = **2368**        | 2304       | +64    |
+| Q5_K (13)       | 256   | 176         | K-quant repack, needs `--gguf-kquant`                          | 2560+256+64 = **2880**        | 2816       | +64    |
+| Q6_K (14)       | 256   | 210         | K-quant repack **or** BF16 dequant                             | 3072+256+32 = **3360**        | 3360       | **0**  |
+| IQ4_NL (20)     | 32    | 18          | K-quant repack, needs `--gguf-kquant`                          | 2048+128+256 = **2432**       | 2304       | +128   |
+| IQ4_XS (23)     | 256   | 136         | K-quant repack, needs `--gguf-kquant`                          | 2048+128+32 = **2208**        | 2176       | +32    |
+| IQ3_S (21)      | 256   | 110         | K-quant repack (int8 codes), needs `--gguf-kquant`             | 4096+128+32 = **4256**        | 1760       | +2496  |
+| PQ2_0 (142)     | 128   | 34          | affine repack (Prism)                                          | —                             | —          | —      |
+| everything else | —     | —           | **rejected at header parse**                                   | —                             | —          | —      |
 
 `block_size()` (`:99`), `k_quant_format()` (`:127`) and `SourceQuantProfile::for_gguf_type` (`:1902`)
 are all `_`-free exhaustive matches, so adding a type forces every routing site to be updated.

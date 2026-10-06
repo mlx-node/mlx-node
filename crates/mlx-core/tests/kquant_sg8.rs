@@ -99,6 +99,15 @@ const IQ3S: Fmt = Fmt {
     scales_cols: 8,
     biases_cols: 1,
 };
+const Q2K: Fmt = Fmt {
+    mode: "q2k",
+    bits: 2,
+    group_size: 16,
+    signed_scales: false,
+    weight_cols: 16,
+    scales_cols: 32,
+    biases_cols: 2,
+};
 
 const ROUTED: [Fmt; 4] = [Q4K, Q5K, Q6K, IQ4XS];
 
@@ -587,7 +596,7 @@ fn sg8_leaves_every_other_case_on_qmv_wide() {
         println!("  qmv_wide bits  {what}");
     };
 
-    for fmt in [Q3K, IQ4NL, IQ3S] {
+    for fmt in [Q3K, IQ4NL, IQ3S, Q2K] {
         let w = Weights::new(fmt, &[], n, k, 0x0dd + fmt.bits as u32);
         let x = bf16_x(&activation_bits(8, k, 3, false), &[8, k]);
         same(

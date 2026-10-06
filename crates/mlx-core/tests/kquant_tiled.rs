@@ -38,7 +38,7 @@ fn per_group(kq: &KQuant) -> i64 {
 /// Groups per super-block (IQ4_NL: one 32-value block).
 fn super_ratio(kq: &KQuant) -> i64 {
     match kq.mode {
-        "q6k" | "q3k" => 16,
+        "q6k" | "q3k" | "q2k" => 16,
         "iq4nl" => 1,
         _ => 8,
     }
@@ -290,8 +290,8 @@ fn qmv_m1_tiled_matches_cpu() {
 }
 
 /// (b) M = 8: every tiled mode takes the tensor op, within the tile
-/// tolerance of the CPU reference. q3k and iq4nl also take it row-major, and
-/// there the two layouts are bit-identical (same split count, same order).
+/// tolerance of the CPU reference. q3k, q2k and iq4nl also take it row-major,
+/// and there the two layouts are bit-identical (same split count, same order).
 #[cfg(target_os = "macos")]
 #[test]
 fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
@@ -322,7 +322,7 @@ fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
                 .unwrap_or(0);
             stop_counting();
 
-            if matches!(kq.mode, "q3k" | "iq4nl") {
+            if matches!(kq.mode, "q3k" | "q2k" | "iq4nl") {
                 start_counting();
                 let (_, _, reference) =
                     read_output("row-major m8", quantized_matmul(&x, &w, true, kq, GPU));

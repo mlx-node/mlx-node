@@ -839,7 +839,7 @@ impl QuantizedLinear {
 
     fn tile_kquant_layout_impl(&mut self, pad_rows: bool) -> Result<bool> {
         use crate::models::quant_dispatch::{
-            KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, is_kquant_mode, kquant_tile_rows,
+            KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kquant_mode_params, kquant_tile_rows,
             kquant_tileable, parse_mode_str, split_kquant_layout,
         };
         let (base, already) = split_kquant_layout(&self.mode);
@@ -849,8 +849,11 @@ impl QuantizedLinear {
         let Some(mode) = parse_mode_str(Some(base)) else {
             return Ok(false);
         };
-        if !is_kquant_mode(mode)
-            || self.output_layout != QuantizedOutputLayout::Native
+        // `None` for every non-K-quant mode.
+        let Some(kq) = kquant_mode_params(mode) else {
+            return Ok(false);
+        };
+        if self.output_layout != QuantizedOutputLayout::Native
             || self.hadamard.is_some()
             || self.fp8_dequant_weight.is_some()
             || self.s_w.is_some()
@@ -871,18 +874,12 @@ impl QuantizedLinear {
             return Ok(false);
         }
         // Codes interleave per 32-value unit (`bits` words); the companions
-        // per 256-value super-block: q4k/q5k hold (sc, m) and (d, dmin) pairs,
-        // the rest one entry, over `super_ratio` groups (IQ4_NL: one).
-        let per_group = if matches!(mode, PerLayerMode::Q4K | PerLayerMode::Q5K) {
-            2
-        } else {
-            1
-        };
-        let super_ratio = match mode {
-            PerLayerMode::Q6K | PerLayerMode::Q3K => 16,
-            PerLayerMode::IQ4NL => 1,
-            _ => 8,
-        };
+        // per super-block: `scale_bytes_per_group` entries per group over
+        // `super_ratio` groups for `.scales` (q2k/q4k/q5k: (sc, m) pairs; the
+        // rest one byte; IQ4_NL: one group), `scale_bytes_per_group` entries
+        // for `.biases` ((d, dmin) pairs or d alone).
+        let per_group = i64::from(kq.scale_bytes_per_group);
+        let super_ratio = i64::from(kq.super_ratio);
         // Zero rows appended to a row-major `[n, cols]` array (`padded_n - n`
         // of them); the identity when the row count is already whole tiles.
         let pad = |a: &MxArray| -> Result<MxArray> {

@@ -112,17 +112,20 @@ describe('discoverLocalChatModels', () => {
     await expect(discoverLocalChatModels(dir)).resolves.toEqual([]);
   });
 
-  it.each(['Qwen3.5-27B-Q4_K_XL.gguf', 'Qwen3.8-27B-UD-Q4_K_M.gguf', 'Qwen3.5-27B-Q4_K_M.gguf'])(
-    'admits dense Qwen3.5 %s alongside the Bonsai name',
-    async (name) => {
-      const dir = join(tmp, `qwen35-admitted-${name}`);
-      mkdirSync(dir);
-      const gguf = join(dir, name);
-      writeFileSync(gguf, minimalGguf('qwen35'));
-      const models = await discoverLocalChatModels(dir);
-      expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
-    },
-  );
+  it.each([
+    'Qwen3.5-27B-Q4_K_XL.gguf',
+    'Qwen3.8-27B-UD-Q4_K_M.gguf',
+    'Qwen3.5-27B-Q4_K_M.gguf',
+    // The Unsloth 2-bit mix: Q2_K joined the importable types.
+    'Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf',
+  ])('admits dense Qwen3.5 %s alongside the Bonsai name', async (name) => {
+    const dir = join(tmp, `qwen35-admitted-${name}`);
+    mkdirSync(dir);
+    const gguf = join(dir, name);
+    writeFileSync(gguf, minimalGguf('qwen35'));
+    const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
+  });
 
   it.skipIf(!canChmod)('reports an entry it could not evaluate via onEntryFailure', async () => {
     // config.json exists but cannot be opened (EACCES): the entry may be a

@@ -1,7 +1,9 @@
 //! Manual benchmark of the Tiled64 K-quant layout (`@t64`) against the
 //! row-major layout, on the Qwen3.8-27B shapes: M = 1 (row-major `qmv`
-//! against `qmv_t64`) and M = 8 (the row-major route, `qmv_sg8` for these
-//! modes, against `qmm_m8_nax_t64`).
+//! against `qmv_t64`), M = 8 (the row-major route, `qmv_sg8` for the sg8
+//! modes and `qmm_m8_nax` for q2k, against `qmm_m8_nax_t64`) and, with
+//! `MLX_KQUANT_TILED_BENCH_PREFILL=1`, the prefill rows `PREFILL_ROWS`
+//! (`qmm_t_nax` / `qmm_t_splitk` in both layouts).
 //! Samples interleave the layouts inside one process so both see the same
 //! clock state; the statistic is the median over `REPS` samples of a
 //! `BATCH`-matmul eval (host overhead paid once). Every matmul of a batch
@@ -39,13 +41,16 @@ const SHAPES: [(i64, i64); 6] = [
     (5120, 16384),
 ];
 
-/// The modes a UD-Q4_K_M Qwen3.8 GGUF carries.
-const MODES: [&str; 3] = ["q4k", "q5k", "q6k"];
+/// The modes a UD-Q4_K_M Qwen3.8 GGUF carries, plus q2k (the 2-bit K-quant,
+/// measured next to q4k).
+const MODES: [&str; 4] = ["q4k", "q5k", "q6k", "q2k"];
+/// Prefill row counts: one NAX tile of rows, and a long prompt.
+const PREFILL_ROWS: [i64; 2] = [64, 2048];
 
 fn tiled(w: &Weights, kq: &KQuant) -> Weights {
     let pg = if kq.scales_signed { 1 } else { 2 };
     let sr = match kq.mode {
-        "q6k" | "q3k" => 16,
+        "q6k" | "q3k" | "q2k" => 16,
         "iq4nl" => 1,
         _ => 8,
     };
@@ -233,6 +238,18 @@ fn qwen38_tiled_vs_row_major() {
                 m8[1],
                 m8[0] / m8[1]
             );
+            if std::env::var("MLX_KQUANT_TILED_BENCH_PREFILL").as_deref() == Ok("1") {
+                for rows in PREFILL_ROWS {
+                    let xp = activation(&[rows, k], 0x9300 + si as u32, DType::BFloat16);
+                    let mp = measure(&xp, kq, &arms);
+                    println!(
+                        "  {mode:<6} {k:>6} {n:>6} | prefill M={rows:<5} row-major {:>8.4} t64 {:>8.4} {:>5.2}x",
+                        mp[0],
+                        mp[1],
+                        mp[0] / mp[1]
+                    );
+                }
+            }
         }
     }
 }

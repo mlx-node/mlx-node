@@ -352,6 +352,7 @@ impl Qwen3_5MTPModule {
                     | PerLayerMode::Q4K
                     | PerLayerMode::Q5K
                     | PerLayerMode::Q3K
+                    | PerLayerMode::Q2K
                     | PerLayerMode::IQ4NL
                     | PerLayerMode::IQ4XS
                     | PerLayerMode::IQ3S => {

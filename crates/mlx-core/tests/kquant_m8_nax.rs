@@ -4,7 +4,7 @@
 //! `KQuantMatmul::eval_gpu` (mlx_kquant_metal.cpp) sends a transposed 8-row
 //! bfloat16 `quantized_matmul` with N % 64 == 0 and K % 32 == 0 there on a
 //! NAX host: every mode in the Tiled64 layout (`@t64`, the layout the loader
-//! gives eligible linears), and row-major only q3k and iq4nl (the sg8 modes
+//! gives eligible linears), and row-major only q3k, q2k and iq4nl (the sg8 modes
 //! measured no faster than `qmv_sg8` row-major). These tests run every mode
 //! through the tiled route so every decode is checked. The kernel rounds
 //! every decoded weight once to half and sums K in fp32 in a split order
@@ -30,7 +30,7 @@ struct Fmt {
     biases_cols: i64,
 }
 
-const FORMATS: [Fmt; 7] = [
+const FORMATS: [Fmt; 8] = [
     Fmt {
         mode: "q4k",
         bits: 4,
@@ -94,6 +94,15 @@ const FORMATS: [Fmt; 7] = [
         scales_cols: 8,
         biases_cols: 1,
     },
+    Fmt {
+        mode: "q2k",
+        bits: 2,
+        group_size: 16,
+        signed_scales: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 2,
+    },
 ];
 
 /// (K, N): the Qwen3.8-27B verify projections.
@@ -143,7 +152,7 @@ impl Weights {
         assert!(!self.tiled, "already tiled");
         let per_group = if self.fmt.signed_scales { 1 } else { 2 };
         let super_ratio = match self.fmt.mode {
-            "q6k" | "q3k" => 16,
+            "q6k" | "q3k" | "q2k" => 16,
             "iq4nl" => 1,
             _ => 8,
         };
@@ -453,7 +462,7 @@ fn m8_nax_is_deterministic() {
 }
 
 /// Shapes and operands the kernel does not take stay on the old routes;
-/// row-major, only q3k and iq4nl reach it.
+/// row-major, only q3k, q2k and iq4nl reach it.
 #[test]
 fn m8_nax_leaves_every_other_case_alone() {
     if !select_gpu() {
@@ -488,6 +497,17 @@ fn m8_nax_leaves_every_other_case_alone() {
         assert!(m8 == 1 && wide == 0, "row-major q3k must take qmm_m8_nax");
     } else {
         assert!(m8 == 0 && wide > 0, "q3k must stay on qmv_wide without NAX");
+    }
+    // q2k has no sg8 decode either, so row-major it takes the tensor op too.
+    let q2k = FORMATS[7];
+    assert_eq!(q2k.mode, "q2k");
+    let w2 = Weights::new(q2k, 2048, k, 4);
+    let (m8, sg8, wide) = route("q2k M=8 N=2048 row-major", &bf16_x(&xb, k), &w2);
+    assert_eq!(sg8, 0, "q2k has no qmv_sg8 kernel");
+    if routes() {
+        assert!(m8 == 1 && wide == 0, "row-major q2k must take qmm_m8_nax");
+    } else {
+        assert!(m8 == 0 && wide > 0, "q2k must stay on qmv_wide without NAX");
     }
 
     // Tiled: every mode takes it.

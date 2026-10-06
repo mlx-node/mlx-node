@@ -1443,6 +1443,7 @@ fn resolve_packed_embed_params<'a>(
         | PerLayerMode::Q4K
         | PerLayerMode::Q5K
         | PerLayerMode::Q3K
+        | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
         | PerLayerMode::IQ3S => {
@@ -1461,13 +1462,14 @@ fn resolve_packed_embed_params<'a>(
             // non-K-quant mode, which this arm has already excluded — the `else`
             // keeps that unreachable-today branch fail-closed instead of
             // defaulting a future K-quant family to the wrong bit width.
-            let Some((mode_str, _, _, want_scales)) = kquant_mode_params(plq.mode) else {
+            let Some(kq) = kquant_mode_params(plq.mode) else {
                 return Err(Error::from_reason(format!(
                     "gemma4 {key} load: quant mode {:?} reached the K-quant embedding arm but has \
                      no K-quant FFI parameters — refusing to load",
                     plq.mode
                 )));
             };
+            let (mode_str, want_scales) = (kq.mode_str, kq.scales_dtype);
             // Fail closed on any storage that contradicts the resolved K-quant
             // mode, mirroring the affine/mxfp8 arms: the `.biases` super-block
             // scale is required and holds a raw ggml f16 `d` bit pattern, and
@@ -1531,6 +1533,7 @@ fn build_gemma_ql(
         | PerLayerMode::Q4K
         | PerLayerMode::Q5K
         | PerLayerMode::Q3K
+        | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
         | PerLayerMode::IQ3S => {
@@ -1566,6 +1569,7 @@ fn build_gemma_qsl(
         | PerLayerMode::Q4K
         | PerLayerMode::Q5K
         | PerLayerMode::Q3K
+        | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
         | PerLayerMode::IQ3S => {

@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
-// ggml K-quant (Q6_K / Q4_K / Q5_K) kernels.
+// ggml K-quant (Q2_K / Q3_K / Q4_K / Q5_K / Q6_K) and IQ (IQ4_NL / IQ4_XS /
+// IQ3_S) kernels.
 //
 // Every K-quant sub-block is algebraically affine -- value = scale * q + bias
 // -- so this is quantized.h with a single substitution: the per-group scalar
@@ -11,6 +12,8 @@
 // they take (scale, bias) by value and never see a K-quant.
 #include <metal_simdgroup>
 #include <metal_stdlib>
+
+#include "kquant_mode.h"
 
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
@@ -639,8 +642,39 @@ inline void dequantize_to(
   }
 }
 
+// (scale, bias) of the group whose super-scale(s) start at `d` and whose
+// sub-scale entries start at `sc`, in either layout. `kind` picks the zero
+// point rule, `scale_shift` the power of two every scale carries (0 today:
+// kq_shift_scale is then the identity and the bits are the pre-trait ones).
+template <typename U, int bits, bool has_min, int kind, int scale_shift>
+inline void kq_decode_group(
+    const device float16_t* d,
+    const device uint8_t* sc,
+    thread U& scale,
+    thread U& bias) {
+  if constexpr (has_min) {
+    scale = kq_shift_scale<scale_shift>(
+        static_cast<U>(d[0]) * static_cast<U>(sc[0]));
+    bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
+  } else {
+    // as_type is a bit reinterpretation, so this reads the ggml sub-scale as
+    // signed exactly the way the CPU reference's static_cast<int8_t> does.
+    scale = kq_shift_scale<scale_shift>(
+        static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0])));
+    if constexpr (kq_affine_zero_point<kind>()) {
+      bias = static_cast<U>(-(1 << (bits - 1))) * scale;
+    } else {
+      // IQ4_NL / IQ4_XS apply the non-linear codebook in the dot/dequant
+      // helper (and a grid mode its signed magnitudes): no affine zero point.
+      bias = static_cast<U>(0.0f);
+    }
+  }
+}
+
 // Decodes one group's (scale, bias) from the two K-quant scale levels.
 //
+//   q2k  scale = d[2 * (g / 16)]     * sc[2 * g]
+//        bias  = -(d[2 * (g / 16) + 1] * sc[2 * g + 1])
 //   q6k  scale = d[g / 16] * int8(sc[g])
 //        bias  = -32 * scale                          (symmetric, q - 32)
 //   q4k
@@ -660,10 +694,10 @@ inline void dequantize_to(
 //
 // Mirrors KQScales in mlx_kquant.cpp (CPU reference): same operand order and the
 // same float32 conversions, so the two decodes agree bitwise.
-template <typename U, int bits, int super_ratio, bool has_min>
+template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScales {
   // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k.
-  MLX_MTL_CONST int per_group = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -677,23 +711,11 @@ struct KQScales {
 
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
-    const device float16_t* d = biases + (gi / super_ratio) * per_group;
-    const device uint8_t* sc = scales + gi * per_group;
-    if constexpr (has_min) {
-      scale = static_cast<U>(d[0]) * static_cast<U>(sc[0]);
-      bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
-    } else {
-      // as_type is a bit reinterpretation, so this reads the ggml sub-scale as
-      // signed exactly the way the CPU reference's static_cast<int8_t> does.
-      scale = static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0]));
-      if constexpr (bits == 4) {
-        // IQ4_NL / IQ4_XS apply the non-linear codebook in the dot/dequant
-        // helper, so there is no affine zero point.
-        bias = static_cast<U>(0.0f);
-      } else {
-        bias = static_cast<U>(-(1 << (bits - 1))) * scale;
-      }
-    }
+    kq_decode_group<U, bits, has_min, kind, scale_shift>(
+        biases + (gi / super_ratio) * per_group,
+        scales + gi * per_group,
+        scale,
+        bias);
   }
 
   // A view whose group 0 is this view's group n.
@@ -733,9 +755,9 @@ METAL_FUNC constexpr size_t kq_tiled_unit_stride() {
 
 // KQScales for one row of a Tiled64 tensor: the same decode, with the 64-row
 // interleave folded into the stride between groups.
-template <typename U, int bits, int super_ratio, bool has_min>
+template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScalesTiled {
-  MLX_MTL_CONST int per_group = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -743,7 +765,8 @@ struct KQScalesTiled {
 
   // Sub-scales sit per super-block: row r's super_ratio groups of
   // super-block G are the contiguous bytes at ((tile * nsb + G) * 64 + r) *
-  // super_ratio * per_group, so one 16-byte load covers a super-block.
+  // super_ratio * per_group, so one 16-byte load (32 for q2k) covers a
+  // super-block.
   KQScalesTiled(
       const device uint8_t* scales_,
       const device float16_t* biases_,
@@ -771,17 +794,7 @@ struct KQScalesTiled {
     const device uint8_t* sc = scales +
         (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
         (gi % super_ratio) * per_group;
-    if constexpr (has_min) {
-      scale = static_cast<U>(d[0]) * static_cast<U>(sc[0]);
-      bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
-    } else {
-      scale = static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0]));
-      if constexpr (bits == 4) {
-        bias = static_cast<U>(0.0f);
-      } else {
-        bias = static_cast<U>(-(1 << (bits - 1))) * scale;
-      }
-    }
+    kq_decode_group<U, bits, has_min, kind, scale_shift>(d, sc, scale, bias);
   }
 
   KQScalesTiled offset(size_t n) const {
@@ -806,11 +819,14 @@ template <
     short bits,
     short super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     bool tiled = false>
 struct QuantizedBlockLoader {
   static_assert(
-      bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
-      "Template undefined for bits not in {3, 4, 5, 6, 8}");
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
   // Tiled64 interleaves rows per 32-code unit along K, so it only loads the
   // transposed (reduction_dim == 1) tile, in whole units.
   static_assert(
@@ -839,8 +855,8 @@ struct QuantizedBlockLoader {
 
   using scales_t = typename ConditionalType<
       tiled,
-      KQScalesTiled<float, bits, super_ratio, has_min>,
-      KQScales<float, bits, super_ratio, has_min>>::type;
+      KQScalesTiled<float, bits, super_ratio, has_min, kind, scale_shift>,
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>>::type;
 
   const int src_ld;
   const int tile_stride;
@@ -921,7 +937,7 @@ struct QuantizedBlockLoader {
     float bias;
     scales.at(0, scale, bias);
     for (int i = 0; i < n_reads; i++) {
-      dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
+      dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
     }
   }
@@ -949,7 +965,7 @@ struct QuantizedBlockLoader {
     float bias;
     scales.at(0, scale, bias);
     for (int i = 0; i < n_reads; i++) {
-      dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
+      dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
           (device uint8_t*)(src + i * bytes_per_pack),
           scale,
           bias,
@@ -976,10 +992,17 @@ struct QuantizedBlockLoader {
 };
 
 
-template <typename T, int group_size, int bits, int super_ratio, bool has_min>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    int kind,
+    int scale_shift>
 METAL_FUNC void kquant_qmv_fast_impl(
     const device uint32_t* w,
-    KQScales<float, bits, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
     const device T* x,
     device T* y,
     const constant int& in_vec_size,
@@ -987,13 +1010,18 @@ METAL_FUNC void kquant_qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = 2;
+  // A 2-bit pack is already 16 values, a whole q2k group; two would make a
+  // thread span two groups (quantized.h's qmv_fast makes the same choice).
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
+  static_assert(
+      values_per_thread <= group_size,
+      "a qmv thread's values must stay inside one scale group");
   constexpr int scale_step_per_thread = group_size / values_per_thread;
 
   const device uint8_t* ws = (const device uint8_t*)w;
@@ -1023,7 +1051,7 @@ METAL_FUNC void kquant_qmv_fast_impl(
       U s;
       U b;
       scales.at(row * in_vec_size_g, s, b);
-      result[row] += qdot<U, values_per_thread, bits, bits == 4 && !has_min>(wl, x_thread, s, b, sum);
+      result[row] += qdot<U, values_per_thread, bits, kq_codebook<kind>()>(wl, x_thread, s, b, sum);
     }
 
     ws += block_size * bytes_per_pack / pack_factor;
@@ -1039,10 +1067,17 @@ METAL_FUNC void kquant_qmv_fast_impl(
   }
 }
 
-template <typename T, int group_size, int bits, int super_ratio, bool has_min>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    int kind,
+    int scale_shift>
 METAL_FUNC void kquant_qmv_impl(
     const device uint32_t* w,
-    KQScales<float, bits, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
     const device T* x,
     device T* y,
     const constant int& in_vec_size,
@@ -1100,7 +1135,7 @@ METAL_FUNC void kquant_qmv_impl(
         U b;
         scales.at(row * in_vec_size_g, s, b);
         result[row] +=
-            qdot<U, values_per_thread, bits, bits == 4 && !has_min>(wl, x_thread, s, b, sum);
+            qdot<U, values_per_thread, bits, kq_codebook<kind>()>(wl, x_thread, s, b, sum);
       }
 
       ws += block_size * bytes_per_pack / pack_factor;
@@ -1123,7 +1158,7 @@ METAL_FUNC void kquant_qmv_impl(
         U s;
         U b;
         scales.at(row * in_vec_size_g, s, b);
-        result[row] += qdot_safe<U, values_per_thread, bits, bits == 4 && !has_min>(
+        result[row] += qdot_safe<U, values_per_thread, bits, kq_codebook<kind>()>(
             wl, x_thread, s, b, sum, remaining);
       }
     }
@@ -1158,7 +1193,7 @@ METAL_FUNC void kquant_qmv_impl(
         U b;
         scales.at(row * in_vec_size_g, s, b);
         result[row] +=
-            qdot<U, values_per_thread, bits, bits == 4 && !has_min>(wl, x_thread, s, b, sum);
+            qdot<U, values_per_thread, bits, kq_codebook<kind>()>(wl, x_thread, s, b, sum);
       }
 
       ws += block_size * bytes_per_pack / pack_factor;
@@ -1179,7 +1214,7 @@ METAL_FUNC void kquant_qmv_impl(
         U s;
         U b;
         scales.at(row * in_vec_size_g, s, b);
-        result[row] += qdot_safe<U, values_per_thread, bits, bits == 4 && !has_min>(
+        result[row] += qdot_safe<U, values_per_thread, bits, kq_codebook<kind>()>(
             wl, x_thread, s, b, sum, remaining);
       }
     }
@@ -1206,6 +1241,8 @@ template <
     int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     int vecs_per_tg,
     int k_lanes,
     bool tiled = false>
@@ -1243,8 +1280,8 @@ METAL_FUNC void kquant_qmv_wide_impl(
       : (const device uint8_t*)w + row * in_vec_size_w;
   using scales_t = typename ConditionalType<
       tiled,
-      KQScalesTiled<U, bits, super_ratio, has_min>,
-      KQScales<U, bits, super_ratio, has_min>>::type;
+      KQScalesTiled<U, bits, super_ratio, has_min, kind, scale_shift>,
+      KQScales<U, bits, super_ratio, has_min, kind, scale_shift>>::type;
   scales_t srow = [&]() {
     if constexpr (tiled) {
       return scales_t(scales, biases, in_vec_size_g, row);
@@ -1274,7 +1311,7 @@ METAL_FUNC void kquant_qmv_wide_impl(
               (k0 % 32) * bits / 8
           : wrow + k0 * bits / 8;
       U w_dq[sub];
-      dequantize<U, sub, bits, bits == 4 && !has_min>(
+      dequantize<U, sub, bits, kq_codebook<kind>()>(
           wc, scale, bias, w_dq);
 #pragma unroll
       for (int v = 0; v < vecs_per_tg; v++) {
@@ -1332,6 +1369,8 @@ template <
     int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     int k_splits>
 [[kernel]] void kquant_qmv_t64(
     const device uint32_t* w [[buffer(0)]],
@@ -1346,7 +1385,7 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(group_size == 32 || group_size == 16, "a unit is 1 or 2 groups");
   constexpr int rows_per_tg = SIMD_SIZE;
-  constexpr bool nonlinear = bits == 4 && !has_min;
+  constexpr bool nonlinear = kq_codebook<kind>();
   constexpr int groups_per_unit = 32 / group_size;
   typedef float U;
 
@@ -1360,7 +1399,7 @@ template <
   const int u_end = min(u_begin + per, units);
 
   const device uint8_t* wrow = kq_tiled_row<bits>(w, row, units);
-  KQScalesTiled<U, bits, super_ratio, has_min> srow(
+  KQScalesTiled<U, bits, super_ratio, has_min, kind, scale_shift> srow(
       scales, biases, K / group_size, row);
   x += tid.x * K;
 
@@ -1404,10 +1443,12 @@ template <
     const int group_size,
     const int bits,
     int super_ratio,
-    bool has_min>
+    bool has_min,
+    int kind,
+    int scale_shift>
 METAL_FUNC void kquant_qvm_impl(
     const device uint32_t* w,
-    KQScales<float, bits, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
     const device T* x,
     device T* y,
     const int in_vec_size,
@@ -1468,7 +1509,7 @@ METAL_FUNC void kquant_qvm_impl(
       w_local = *((device vec_w*)ws);
 #pragma clang loop unroll(full)
       for (int g = 0; g < groups_per_step; g++) {
-        qouter<U, group_size, bits, bits == 4 && !has_min>(
+        qouter<U, group_size, bits, kq_codebook<kind>()>(
             (thread uint8_t*)&w_local + g * bytes_per_group,
             x_local,
             scale[g],
@@ -1491,7 +1532,7 @@ METAL_FUNC void kquant_qvm_impl(
 
 #pragma clang loop unroll(full)
       for (int g = 0; g < groups_per_step; g++) {
-        qouter<U, group_size, bits, bits == 4 && !has_min>(
+        qouter<U, group_size, bits, kq_codebook<kind>()>(
             (thread uint8_t*)&w_local + g * bytes_per_group,
             x_local,
             scale[g],
@@ -1520,7 +1561,7 @@ METAL_FUNC void kquant_qvm_impl(
     }
 #pragma clang loop unroll(full)
     for (int g = 0; g < groups_per_step; g++) {
-      qouter<U, group_size, bits, bits == 4 && !has_min>(
+      qouter<U, group_size, bits, kq_codebook<kind>()>(
           (thread uint8_t*)&w_local + g * bytes_per_group,
           x_local,
           scale[g],
@@ -1550,6 +1591,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
@@ -1557,7 +1600,7 @@ template <
     bool tiled = false>
 METAL_FUNC void kquant_qmm_t_impl(
     const device uint32_t* w,
-    KQScales<float, bits, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
     const device T* x,
     device T* y,
     threadgroup T* Xs,
@@ -1603,6 +1646,8 @@ METAL_FUNC void kquant_qmm_t_impl(
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       tiled>;
 
   // Set the block
@@ -1702,12 +1747,14 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
 METAL_FUNC void kquant_qmm_n_impl(
     const device uint32_t* w,
-    KQScales<float, bits, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
     const device T* x,
     device T* y,
     threadgroup T* Xs,
@@ -1747,7 +1794,9 @@ METAL_FUNC void kquant_qmm_n_impl(
       group_size,
       bits,
       super_ratio,
-      has_min>;
+      has_min,
+      kind,
+      scale_shift>;
 
   auto wl = (const device uint8_t*)w;
 
@@ -1933,6 +1982,8 @@ template <
     int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     bool batched>
 [[kernel]] void kquant_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
@@ -1972,9 +2023,9 @@ template <
         b_strides,
         tid);
   }
-  kquant_qmv_fast_impl<T, group_size, bits, super_ratio, has_min>(
+  kquant_qmv_fast_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       in_vec_size,
@@ -1990,6 +2041,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     bool batched>
 [[kernel]] void kquant_qmv(
     const device uint32_t* w [[buffer(0)]],
@@ -2029,9 +2082,9 @@ template <
         b_strides,
         tid);
   }
-  kquant_qmv_impl<T, group_size, bits, super_ratio, has_min>(
+  kquant_qmv_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       in_vec_size,
@@ -2047,6 +2100,8 @@ template <
     int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     int vecs_per_tg,
     int k_lanes,
     bool batched,
@@ -2096,6 +2151,8 @@ template <
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       vecs_per_tg,
       k_lanes,
       tiled>(
@@ -2118,6 +2175,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     bool batched>
 [[kernel]] void kquant_qvm(
     const device uint32_t* w [[buffer(0)]],
@@ -2157,9 +2216,9 @@ template <
         b_strides,
         tid);
   }
-  kquant_qvm_impl<T, group_size, bits, super_ratio, has_min>(
+  kquant_qvm_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       in_vec_size,
@@ -2176,6 +2235,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     int split_k = 32>
 [[kernel]] void kquant_qvm_split_k(
     const device uint32_t* w [[buffer(0)]],
@@ -2222,9 +2283,9 @@ template <
   // The in_vec_stride is the full K dimension, not the partition size
   int in_vec_stride = (split_k - 1) * in_vec_size + final_block_size;
 
-  kquant_qvm_impl<T, group_size, bits, super_ratio, has_min>(
+  kquant_qvm_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       in_vec_size_adj,
@@ -2241,6 +2302,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const bool batched,
     const int BM = 32,
@@ -2300,13 +2363,15 @@ template <
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       aligned_N,
       BM,
       BK,
       BN,
       tiled>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       Xs,
@@ -2330,6 +2395,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
@@ -2375,13 +2442,15 @@ template <
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       aligned_N,
       BM,
       BK,
       BN,
       tiled>(
       (const device uint32_t*)wl,
-      KQScales<float, bits, super_ratio, has_min>(
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(
           scales, biases, k_start / group_size),
       x,
       y,
@@ -2406,6 +2475,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     const bool batched,
     const int BM = 32,
     const int BK = 32,
@@ -2458,9 +2529,9 @@ template <
         tid);
   }
 
-  kquant_qmm_n_impl<T, group_size, bits, super_ratio, has_min, BM, BK, BN>(
+  kquant_qmm_n_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift, BM, BK, BN>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       Xs,
@@ -2479,7 +2550,9 @@ template <
     int group_size,
     int bits,
     int super_ratio,
-    bool has_min>
+    bool has_min,
+    int kind,
+    int scale_shift>
 [[kernel]] void kquant_gather_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -2528,9 +2601,9 @@ template <
       s_strides,
       b_strides,
       tid);
-  kquant_qmv_fast_impl<T, group_size, bits, super_ratio, has_min>(
+  kquant_qmv_fast_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       in_vec_size,
@@ -2545,7 +2618,9 @@ template <
     int group_size,
     int bits,
     int super_ratio,
-    bool has_min>
+    bool has_min,
+    int kind,
+    int scale_shift>
 [[kernel]] void kquant_gather_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -2594,9 +2669,9 @@ template <
       s_strides,
       b_strides,
       tid);
-  kquant_qmv_impl<T, group_size, bits, super_ratio, has_min>(
+  kquant_qmv_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       in_vec_size,
@@ -2611,7 +2686,9 @@ template <
     int group_size,
     int bits,
     int super_ratio,
-    bool has_min>
+    bool has_min,
+    int kind,
+    int scale_shift>
 [[kernel]] void kquant_gather_qvm(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -2660,9 +2737,9 @@ template <
       s_strides,
       b_strides,
       tid);
-  kquant_qvm_impl<T, group_size, bits, super_ratio, has_min>(
+  kquant_qvm_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       in_vec_size,
@@ -2679,6 +2756,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
@@ -2745,12 +2824,14 @@ template <
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       aligned_N,
       BM,
       BK,
       BN>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       Xs,
@@ -2771,6 +2852,8 @@ template <
     const int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
@@ -2831,9 +2914,9 @@ template <
       s_strides,
       b_strides,
       tid);
-  kquant_qmm_n_impl<T, group_size, bits, super_ratio, has_min, BM, BK, BN>(
+  kquant_qmm_n_impl<T, group_size, bits, super_ratio, has_min, kind, scale_shift, BM, BK, BN>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       Xs,
@@ -2853,6 +2936,8 @@ template <
     int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     int BM,
     int BN,
     int BK,
@@ -2901,7 +2986,9 @@ template <
       group_size,
       bits,
       super_ratio,
-      has_min>;
+      has_min,
+      kind,
+      scale_shift>;
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
@@ -2934,7 +3021,7 @@ template <
   x += y_row_long * K;
   y += y_row_long * N + y_col_long;
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
-  KQScales<float, bits, super_ratio, has_min> sb(
+  KQScales<float, bits, super_ratio, has_min, kind, scale_shift> sb(
       scales,
       biases,
       transpose ? y_col_long * K_g : size_t(y_col / group_size));
@@ -3053,7 +3140,9 @@ template <
     const int group_size,
     const int bits,
     int super_ratio,
-    bool has_min>
+    bool has_min,
+    int kind,
+    int scale_shift>
 [[kernel]] void kquant_dequantize(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -3071,13 +3160,13 @@ template <
   // Decode in float and round once on the store, as kq_dequantize does.
   float scale;
   float bias;
-  KQScales<float, bits, super_ratio, has_min>(scales, biases).at(gindex, scale, bias);
+  KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases).at(gindex, scale, bias);
 
   out += oindex;
   w += offset * bytes_per_pack;
 
   float values[pack_factor];
-  dequantize<float, pack_factor, bits, bits == 4 && !has_min>(
+  dequantize<float, pack_factor, bits, kq_codebook<kind>()>(
       w, scale, bias, values);
 #pragma clang loop unroll(full)
   for (int i = 0; i < pack_factor; i++) {
@@ -3105,15 +3194,22 @@ namespace kq_sg8 {
 
 enum Format : int { Q4K, Q5K, IQ4XS, Q6K, Unsupported };
 
-template <int group_size, int bits, int super_ratio, bool has_min>
+template <int group_size, int bits, int super_ratio, bool has_min, int kind>
 constexpr Format format() {
   if (group_size == 32 && super_ratio == 8 && bits == 4) {
-    return has_min ? Q4K : IQ4XS;
+    if (has_min && kind == KQ_LINEAR) {
+      return Q4K;
+    }
+    if (!has_min && kind == KQ_CODEBOOK) {
+      return IQ4XS;
+    }
   }
-  if (group_size == 32 && super_ratio == 8 && bits == 5 && has_min) {
+  if (group_size == 32 && super_ratio == 8 && bits == 5 && has_min &&
+      kind == KQ_LINEAR) {
     return Q5K;
   }
-  if (group_size == 16 && super_ratio == 16 && bits == 6 && !has_min) {
+  if (group_size == 16 && super_ratio == 16 && bits == 6 && !has_min &&
+      kind == KQ_LINEAR) {
     return Q6K;
   }
   return Unsupported;
@@ -3309,7 +3405,14 @@ template <typename T, int group_size>
 
 // Grid: N / 32 threadgroups of 4 simdgroups. Each super-block's codes and
 // scales are loaded one iteration ahead (the last iteration re-reads its own).
-template <typename T, int group_size, int bits, int super_ratio, bool has_min>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    int kind,
+    int scale_shift>
 [[kernel, max_total_threads_per_threadgroup(128)]] void kquant_qmv_sg8(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -3324,7 +3427,7 @@ template <typename T, int group_size, int bits, int super_ratio, bool has_min>
     uint lane [[thread_index_in_simdgroup]],
     uint tid [[thread_index_in_threadgroup]]) {
   using namespace kq_sg8;
-  constexpr Format F = format<group_size, bits, super_ratio, has_min>();
+  constexpr Format F = format<group_size, bits, super_ratio, has_min, kind>();
   static_assert(F != Unsupported, "no simdgroup-matrix decode for this mode");
   static_assert(is_same_v<T, bfloat>, "the MMA operands are bfloat16");
   typedef typename Codes<F>::W W;

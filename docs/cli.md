@@ -379,7 +379,9 @@ loads Google's QAT checkpoint without a separate conversion command.
 
 The first load creates an application cache, preserving supported quantized weights
 in packed form and preparing the media companion in the same transaction.
-Supported K formats are Q3_K, Q4_K, Q5_K, and Q6_K.
+Supported source types are F32/F16/BF16, the affine blocks Q4_0, Q4_1, Q5_0,
+Q5_1 and Q8_0, MXFP4, and the K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+IQ3_S, IQ4_NL and IQ4_XS.
 Later loads reuse it. `MLX_NATIVE_GGUF_CACHE_DIR` overrides the cache directory;
 source files are not modified. Changes to the source, companion, or tokenizer
 assets invalidate the cache. A directory with multiple text GGUFs requires an
@@ -441,11 +443,12 @@ when present, DFlash. It checks loading and generation, not performance targets.
 mlx convert --input ./model.gguf --output ./model-mlx
 ```
 
-Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, Q4_0, Q4_1 and
-Q8_0 source types directly, plus the ggml K-quants Q6_K, Q4_K and Q5_K behind
+Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, the affine
+blocks Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and MXFP4 source types directly, plus the
+ggml K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL and IQ4_XS behind
 `--gguf-kquant`.
 
-#### K-quants (Q6_K, Q4_K, Q5_K)
+#### K-quants (Q2_K .. Q6_K, IQ3_S, IQ4_NL, IQ4_XS)
 
 ```bash
 mlx convert --input ./model-UD-Q6_K_XL.gguf --output ./model-mlx --gguf-kquant
@@ -463,34 +466,53 @@ two-level decode:
 
 ```
 Q4_K/Q5_K   y = d*sc[j]*q - dmin*m[j]   ->  scale = d*sc[j]   bias = -dmin*m[j]
+Q2_K        the same at 16-value groups  (sc, m are the two nibbles of one byte)
 Q6_K        y = d*sc[j]*(q-32)          ->  scale = d*sc[j]   bias = -32*d*sc[j]
+Q3_K        y = d*sc[j]*(q-4)           ->  scale = d*sc[j]   bias = -4*d*sc[j]
+IQ4_NL/XS   y = d*sc[j]*grid[q]         ->  the 16-entry codebook, no bias
+IQ3_S       y = d*sc[j]*v               ->  v the signed grid value, stored as a byte
 ```
 
-| source | mlx-node   | ggml   | note                           |
-| ------ | ---------- | ------ | ------------------------------ |
-| Q6_K   | 6.5625 bpw | 6.5625 | exact parity                   |
-| Q4_K   | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales |
-| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason            |
+| source | mlx-node   | ggml   | note                                |
+| ------ | ---------- | ------ | ----------------------------------- |
+| Q6_K   | 6.5625 bpw | 6.5625 | exact parity                        |
+| Q4_K   | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales      |
+| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason                 |
+| Q2_K   | 3.1250 bpw | 2.6250 | +0.5 for unpacked (sc, m) nibbles   |
+| Q3_K   | 3.5625 bpw | 3.4375 | +0.125 for unpacked sub-scales      |
 
-The sub-scales are stored unpacked rather than in ggml's 6-bit packing: packing
-would preserve the exact 4.5 bpw but breaks the affine pointer-walk contract and
-puts a divergent branch in the innermost loop of the matvec kernel.
+The sub-scales are stored unpacked rather than in ggml's 6-bit (4-bit for Q2_K)
+packing: packing would preserve the exact ggml density but breaks the affine
+pointer-walk contract and puts a divergent branch in the innermost loop of the
+matvec kernel. The codes themselves stay at their ggml width.
 
 `--gguf-kquant` cannot be combined with `--quantize`, `--q-recipe`, `--q-mxfp` or
 `--imatrix-path` — the blocks are imported bit-for-bit and never dequantized, so
 there is nothing for a re-quantizer to act on. The combination is rejected
 upfront rather than silently ignored.
 
-Producing K-quants is not supported; they are consume-only. IQ4_XS is a 16-entry
-non-uniform codebook rather than a scale/bias grid, does not share the kernel
-shape, and is not supported.
+Producing K-quants is not supported; they are consume-only. The IQ1 / IQ2 and
+IQ3_XXS grid formats (the experts of the Unsloth `UD-Q2_K_XL` and `UD-IQ*` mixes)
+are not imported yet.
 
-#### Symmetric formats (Q4_0, Q8_0)
+#### MXFP4
+
+ggml's MXFP4 block (one E8M0 shared exponent, 32 E2M1 codes) is the OCP MX
+format MLX decodes natively, so it lands on MLX's `mxfp4` mode without
+`--gguf-kquant`: the importer un-interleaves ggml's nibble halves into MLX's
+code order and copies the exponent byte into the uint8 `.scales`; there are no
+`.biases`. The decode is bit-identical to llama.cpp's for every exponent code
+from 2 up (the only codes real weights use); `config.json` names each tensor
+`{bits: 4, group_size: 32, mode: "mxfp4"}`, and 3-D MoE expert stacks take the
+existing `mxfp4` gather path.
+
+#### Symmetric formats (Q4_0, Q5_0, Q8_0)
 
 ggml stores these as `w = d * (q - Z)` — one f16 scale per 32 weights, with the
-offset derived rather than stored. MLX's affine format is `w = scale * q + bias`,
-so the import used to write a `.biases` array whose every entry was `-Z * scale`:
-0.5 bpw of pure redundancy, 681 MB on Gemma-4-12B-QAT.
+offset derived rather than stored (Z = 8, 16, 128). MLX's affine format is
+`w = scale * q + bias`, so the import used to write a `.biases` array whose
+every entry was `-Z * scale`: 0.5 bpw of pure redundancy, 681 MB on
+Gemma-4-12B-QAT.
 
 The converter now records `symmetric_zero_point` in `config.json` and leaves the
 companion off disk; the loader rebuilds it before any layer is constructed. The

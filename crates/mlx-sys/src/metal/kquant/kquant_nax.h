@@ -1,6 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
-// ggml K-quant (Q6_K / Q4_K / Q5_K) kernels on the NAX tensor-op path.
+// ggml K-quant and IQ kernels on the NAX tensor-op path.
 //
 // This is quantized_nax.h with the same substitution kquant.h makes to
 // quantized.h: the per-group scalar load `s = scales[g]; b = biases[g]`
@@ -16,6 +16,8 @@
 // its solution, applied to the K-quant decode.
 #include <metal_simdgroup>
 #include <metal_stdlib>
+
+#include "kquant_mode.h"
 
 using namespace metal;
 using namespace mlx::steel;
@@ -153,6 +155,29 @@ inline void dequantize_to(
   }
 }
 
+// The same decode as kquant.h's kq_decode_group (the two headers are
+// separate JIT preambles, so each carries its own copy).
+template <typename U, int bits, bool has_min, int kind, int scale_shift>
+inline void kq_decode_group(
+    const device float16_t* d,
+    const device uint8_t* sc,
+    thread U& scale,
+    thread U& bias) {
+  if constexpr (has_min) {
+    scale = kq_shift_scale<scale_shift>(
+        static_cast<U>(d[0]) * static_cast<U>(sc[0]));
+    bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
+  } else {
+    scale = kq_shift_scale<scale_shift>(
+        static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0])));
+    if constexpr (kq_affine_zero_point<kind>()) {
+      bias = static_cast<U>(-(1 << (bits - 1))) * scale;
+    } else {
+      bias = static_cast<U>(0.0f);
+    }
+  }
+}
+
 // Decodes one group's (scale, bias) from the two K-quant scale levels.
 //
 //   q6k  scale = d[g / 16] * int8(sc[g])
@@ -174,10 +199,10 @@ inline void dequantize_to(
 //
 // Mirrors KQScales in mlx_kquant.cpp (CPU reference): same operand order and the
 // same float32 conversions, so the two decodes agree bitwise.
-template <typename U, int bits, int super_ratio, bool has_min>
+template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScales {
   // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k.
-  MLX_MTL_CONST int per_group = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -191,21 +216,11 @@ struct KQScales {
 
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
-    const device float16_t* d = biases + (gi / super_ratio) * per_group;
-    const device uint8_t* sc = scales + gi * per_group;
-    if constexpr (has_min) {
-      scale = static_cast<U>(d[0]) * static_cast<U>(sc[0]);
-      bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
-    } else {
-      // as_type is a bit reinterpretation, so this reads the ggml sub-scale as
-      // signed exactly the way the CPU reference's static_cast<int8_t> does.
-      scale = static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0]));
-      if constexpr (bits == 4) {
-        bias = static_cast<U>(0.0f);
-      } else {
-        bias = static_cast<U>(-(1 << (bits - 1))) * scale;
-      }
-    }
+    kq_decode_group<U, bits, has_min, kind, scale_shift>(
+        biases + (gi / super_ratio) * per_group,
+        scales + gi * per_group,
+        scale,
+        bias);
   }
 
   // A view whose group 0 is this view's group n.
@@ -237,9 +252,9 @@ METAL_FUNC constexpr size_t kq_tiled_unit_stride() {
   return size_t(KQ_TILE_ROWS) * bits * 4;
 }
 
-template <typename U, int bits, int super_ratio, bool has_min>
+template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScalesTiled {
-  MLX_MTL_CONST int per_group = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -247,7 +262,8 @@ struct KQScalesTiled {
 
   // Sub-scales sit per super-block: row r's super_ratio groups of
   // super-block G are the contiguous bytes at ((tile * nsb + G) * 64 + r) *
-  // super_ratio * per_group, so one 16-byte load covers a super-block.
+  // super_ratio * per_group, so one 16-byte load (32 for q2k) covers a
+  // super-block.
   KQScalesTiled(
       const device uint8_t* scales_,
       const device float16_t* biases_,
@@ -275,17 +291,7 @@ struct KQScalesTiled {
     const device uint8_t* sc = scales +
         (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
         (gi % super_ratio) * per_group;
-    if constexpr (has_min) {
-      scale = static_cast<U>(d[0]) * static_cast<U>(sc[0]);
-      bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
-    } else {
-      scale = static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0]));
-      if constexpr (bits == 4) {
-        bias = static_cast<U>(0.0f);
-      } else {
-        bias = static_cast<U>(-(1 << (bits - 1))) * scale;
-      }
-    }
+    kq_decode_group<U, bits, has_min, kind, scale_shift>(d, sc, scale, bias);
   }
 
   KQScalesTiled offset(size_t n) const {
@@ -310,11 +316,14 @@ template <
     short bits,
     short super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     bool tiled = false>
 struct QuantizedBlockLoader {
   static_assert(
-      bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
-      "Template undefined for bits not in {3, 4, 5, 6, 8}");
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
   static_assert(
       !tiled || (reduction_dim == 1 && BCOLS % 32 == 0),
       "Tiled64 loads whole 32-code units of a transposed weight.");
@@ -353,8 +362,8 @@ struct QuantizedBlockLoader {
 
   using scales_t = typename ConditionalType<
       tiled,
-      KQScalesTiled<float, bits, super_ratio, has_min>,
-      KQScales<float, bits, super_ratio, has_min>>::type;
+      KQScalesTiled<float, bits, super_ratio, has_min, kind, scale_shift>,
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>>::type;
 
   const int src_ld;
   const int tile_stride;
@@ -437,7 +446,7 @@ struct QuantizedBlockLoader {
       float bias;
       scales.at(i, scale, bias);
       for (int j = 0; j < n_reads_per_scale; j++) {
-        dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
+        dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
             src + k * bytes_per_pack, scale, bias, dst + k * pack_factor);
         k++;
       }
@@ -469,7 +478,7 @@ struct QuantizedBlockLoader {
       float bias;
       scales.at(i, scale, bias);
       for (int j = 0; j < n_reads_per_scale; j++) {
-        dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
+        dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
             (device uint8_t*)(src + k * bytes_per_pack),
             scale,
             bias,
@@ -503,6 +512,8 @@ template <
     const int bits,
     const int super_ratio,
     const bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const int BM = 64,
     const int BK = 64,
@@ -512,7 +523,7 @@ template <
     bool tiled = false>
 METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     const device uint32_t* w,
-    KQScales<float, bits, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
     const device T* x,
     device T* y,
     threadgroup T* Ws,
@@ -553,6 +564,8 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       tiled>;
 
   // Set the block
@@ -761,6 +774,8 @@ template <
     const int bits,
     const int super_ratio,
     const bool has_min,
+    int kind,
+    int scale_shift,
     const bool aligned_N,
     const bool batched,
     const int BM = 64,
@@ -821,6 +836,8 @@ template <
       bits,
       super_ratio,
       has_min,
+      kind,
+      scale_shift,
       aligned_N,
       BM,
       BK,
@@ -829,7 +846,7 @@ template <
       WN,
       tiled>(
       w,
-      KQScales<float, bits, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
       x,
       y,
       Ws,

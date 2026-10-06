@@ -65,8 +65,12 @@ impl Tensor {
                 GgufTensorType::F32 => (4, 1),
                 GgufTensorType::F16 | GgufTensorType::BF16 => (2, 1),
                 GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => (20, 32),
-                GgufTensorType::Q5_1 => (24, 32),
+                GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => (24, 32),
                 GgufTensorType::Q8_0 => (36, 32),
+                // E8M0 scale byte + 16 nibble bytes, no biases.
+                GgufTensorType::MXFP4 => (17, 32),
+                // 64 code bytes + 32 unpacked (sc, m) bytes + (d, dmin).
+                GgufTensorType::Q2K => (100, 256),
                 GgufTensorType::Q3K => (114, 256),
                 GgufTensorType::Q4K => (148, 256),
                 GgufTensorType::Q5K => (180, 256),

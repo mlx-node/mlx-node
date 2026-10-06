@@ -64,7 +64,9 @@ MTL::ComputePipelineState *portable_pipeline(Dtype dtype, int gs, int bits,
   const std::string spec =
       type + "," + std::to_string(gs) + "," + std::to_string(bits) + "," +
       std::to_string(kquant::super_ratio(mode)) + "," +
-      (kquant::has_sub_min(mode) ? "true" : "false") + ",false,false," +
+      (kquant::has_sub_min(mode) ? "true" : "false") + "," +
+      std::to_string(static_cast<int>(kquant::kind(mode))) + "," +
+      std::to_string(kquant::scale_shift(mode)) + ",false,false," +
       std::to_string(bm) + "," + std::to_string(bk) + "," + std::to_string(bn);
   const std::string name = "mlx_node_portable_" +
                            std::string(kquant::mode_name(mode)) + "_" + type +

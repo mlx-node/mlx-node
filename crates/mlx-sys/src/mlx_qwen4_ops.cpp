@@ -421,13 +421,13 @@ mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
         uint expert = ids[row];
         if (expert >= E) return;
         const device uint32_t* weights = w + size_t(expert) * WS;
-        auto scale = KQScales<float,BITS,SR,HM>((const device uint8_t*)scales + size_t(expert)*SS,
+        auto scale = KQScales<float,BITS,SR,HM,KIND,SHIFT>((const device uint8_t*)scales + size_t(expert)*SS,
           biases + size_t(expert)*BS);
         auto input = x + size_t(row)*K;
         auto output = out + size_t(row)*N;
         uint3 tile = uint3(0,threadgroup_position_in_grid.y,0);
-        if (FAST) kquant_qmv_fast_impl<T,GS,BITS,SR,HM>(weights,scale,input,output,K,N,tile,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
-        else kquant_qmv_impl<T,GS,BITS,SR,HM>(weights,scale,input,output,K,N,tile,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+        if (FAST) kquant_qmv_fast_impl<T,GS,BITS,SR,HM,KIND,SHIFT>(weights,scale,input,output,K,N,tile,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+        else kquant_qmv_impl<T,GS,BITS,SR,HM,KIND,SHIFT>(weights,scale,input,output,K,N,tile,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
       )",
           header);
     }();
@@ -442,6 +442,8 @@ mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
          {"BITS", bits},
          {"SR", ratio},
          {"HM", mlx::core::kquant::has_sub_min(*quant)},
+         {"KIND", static_cast<int>(mlx::core::kquant::kind(*quant))},
+         {"SHIFT", mlx::core::kquant::scale_shift(*quant)},
          {"FAST", n % 8 == 0 && k % 512 == 0},
          {"WS", int(w.size() / experts)},
          {"SS", int(s.nbytes() / experts)},

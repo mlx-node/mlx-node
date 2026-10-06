@@ -18,6 +18,8 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 
+#include "kquant_mode.h"
+
 using namespace metal;
 using namespace mpp::tensor_ops;
 
@@ -31,29 +33,49 @@ constant constexpr ushort kThreads = 64;
 constant constexpr uint kStage = kCols * kStep;
 constant constexpr uint kTableEntries = 256;
 
-enum Format : int { Q4K, Q5K, Q6K, Q3K, IQ4NL, IQ4XS, IQ3S, Unsupported };
+enum Format : int { Q4K, Q5K, Q6K, Q3K, IQ4NL, IQ4XS, IQ3S, Q2K, Unsupported };
 
-template <int group_size, int bits, int super_ratio, bool has_min>
+template <int group_size, int bits, int super_ratio, bool has_min, int kind>
 constexpr Format format() {
   if (group_size == 32 && super_ratio == 8 && bits == 4) {
-    return has_min ? Q4K : IQ4XS;
+    if (has_min && kind == KQ_LINEAR) {
+      return Q4K;
+    }
+    if (!has_min && kind == KQ_CODEBOOK) {
+      return IQ4XS;
+    }
   }
-  if (group_size == 32 && super_ratio == 8 && bits == 5 && has_min) {
-    return Q5K;
+  if (kind == KQ_LINEAR) {
+    if (group_size == 32 && super_ratio == 8 && bits == 5 && has_min) {
+      return Q5K;
+    }
+    if (group_size == 16 && super_ratio == 16 && bits == 6 && !has_min) {
+      return Q6K;
+    }
+    if (group_size == 16 && super_ratio == 16 && bits == 3 && !has_min) {
+      return Q3K;
+    }
+    if (group_size == 16 && super_ratio == 16 && bits == 2 && has_min) {
+      return Q2K;
+    }
   }
-  if (group_size == 16 && super_ratio == 16 && bits == 6 && !has_min) {
-    return Q6K;
-  }
-  if (group_size == 16 && super_ratio == 16 && bits == 3 && !has_min) {
-    return Q3K;
-  }
-  if (group_size == 32 && super_ratio == 1 && bits == 4 && !has_min) {
+  if (group_size == 32 && super_ratio == 1 && bits == 4 && !has_min &&
+      kind == KQ_CODEBOOK) {
     return IQ4NL;
   }
-  if (group_size == 32 && super_ratio == 8 && bits == 8 && !has_min) {
+  if (group_size == 32 && super_ratio == 8 && bits == 8 && !has_min &&
+      kind == KQ_INT8) {
     return IQ3S;
   }
   return Unsupported;
+}
+
+// Bytes of sub-scale companions one 256-value super-block holds in `.scales`:
+// super_ratio * scale_bytes_per_group (kquant_mode.h). IQ4_NL has none per
+// super-block (one byte per 32-value block instead).
+template <Format F>
+constexpr uint sb_scale_bytes() {
+  return F == Q2K ? 32 : (F == IQ4XS || F == IQ3S || F == IQ4NL ? 8 : 16);
 }
 
 constant constexpr int8_t kIQ4[16] = {
@@ -145,6 +167,15 @@ struct Codes<IQ3S> {
   }
 };
 
+template <>
+struct Codes<Q2K> {
+  // 32 codes x 2 bits: one 8-byte unit (Splash FmtQ2K's Payload).
+  typedef uint2 W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return *reinterpret_cast<const device uint2*>(base + u * stride);
+  }
+};
+
 constant constexpr uint kTileRows = 64;
 
 // Row n's unit 0 and unit stride (words) in either layout.
@@ -182,18 +213,22 @@ METAL_FUNC size_t companion_index(
 }
 
 // Row n's (scale, bias) coefficients per unit. A super-block's sub-scales
-// are contiguous bytes in both layouts (8 (sc, m) pairs, 16 int8 or 8 int8)
-// and its float16 super-scales one half2 / half, so both are loaded once per
-// super-block and decoded per unit; IQ4_NL has one group per super-block and
-// loads per unit. Same operations and order as KQScales (mlx_kquant.cpp).
-template <Format F, bool tiled>
+// are contiguous bytes in both layouts (8 or 16 (sc, m) pairs, 16 int8 or 8
+// int8: sb_scale_bytes) and its float16 super-scales one half2 / half, so
+// both are loaded once per super-block and decoded per unit; IQ4_NL has one
+// group per super-block and loads per unit. Same operations and order as
+// KQScales (mlx_kquant.cpp); `scale_shift` applies to every scale as there.
+template <Format F, bool tiled, int scale_shift = 0>
 struct CoefCursor {
   const device uint8_t* scales;
   const device half* biases;
   uint n;
   uint K;
   uint sb = ~0u;
+  // The super-block's sub-scale bytes: sc the first 16, sc2 the next 16
+  // (Q2K only).
   uint4 sc = uint4(0u);
+  uint4 sc2 = uint4(0u);
   half2 d = half2(0.0h);
 
   CoefCursor(
@@ -207,8 +242,8 @@ struct CoefCursor {
     Coef c;
     if constexpr (F == IQ4NL) {
       const float dd = float(biases[companion_index<tiled>(n, K / 32, u, 1)]);
-      c.s = float2(
-          dd * float(as_type<char>(scales[companion_index<tiled>(n, K / 32, u, 1)])));
+      c.s = float2(kq_shift_scale<scale_shift>(
+          dd * float(as_type<char>(scales[companion_index<tiled>(n, K / 32, u, 1)]))));
       c.m = float2(0.0f);
       return c;
     }
@@ -219,6 +254,14 @@ struct CoefCursor {
             biases + companion_index<tiled>(n, K / 256, sb, 2));
         sc = *reinterpret_cast<const device uint4*>(
             scales + companion_index<tiled>(n, K / 256, sb, 16));
+      } else if constexpr (F == Q2K) {
+        // (d, dmin) and 16 (sc, m) byte pairs: 32 bytes, two uint4.
+        d = *reinterpret_cast<const device half2*>(
+            biases + companion_index<tiled>(n, K / 256, sb, 2));
+        const device uint4* p = reinterpret_cast<const device uint4*>(
+            scales + companion_index<tiled>(n, K / 256, sb, 32));
+        sc = p[0];
+        sc2 = p[1];
       } else if constexpr (F == Q6K || F == Q3K) {
         d = half2(biases[companion_index<tiled>(n, K / 256, sb, 1)], 0.0h);
         sc = *reinterpret_cast<const device uint4*>(
@@ -235,20 +278,31 @@ struct CoefCursor {
     const uint j = u & 7u;
     if constexpr (F == Q4K || F == Q5K) {
       const uint sm = (sc[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
-      c.s = float2(float(d.x) * float(sm & 0xFFu));
+      c.s = float2(kq_shift_scale<scale_shift>(float(d.x) * float(sm & 0xFFu)));
       c.m = float2(-(float(d.y) * float(sm >> 8)));
+    } else if constexpr (F == Q2K) {
+      // Two 16-groups per unit: word j holds (sc, m) of group 2j in its low
+      // half and of group 2j + 1 in its high half (Splash FmtQ2K::coef).
+      const uint pairs = j < 4 ? sc[j] : sc2[j - 4];
+      const float dd = float(d.x);
+      const float mm = float(d.y);
+      c.s = float2(
+          kq_shift_scale<scale_shift>(dd * float(pairs & 0xFFu)),
+          kq_shift_scale<scale_shift>(dd * float((pairs >> 16) & 0xFFu)));
+      c.m = float2(
+          -(mm * float((pairs >> 8) & 0xFFu)), -(mm * float(pairs >> 24)));
     } else if constexpr (F == Q6K || F == Q3K) {
       // Two 16-groups per unit: int8 scales 2j, 2j + 1.
       const uint pair = (sc[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
       const float dd = float(d.x);
       c.s = float2(
-          dd * float(as_type<char>(uchar(pair & 0xFFu))),
-          dd * float(as_type<char>(uchar(pair >> 8))));
+          kq_shift_scale<scale_shift>(dd * float(as_type<char>(uchar(pair & 0xFFu)))),
+          kq_shift_scale<scale_shift>(dd * float(as_type<char>(uchar(pair >> 8)))));
       c.m = float(-(F == Q6K ? 32 : 4)) * c.s;
     } else {
       const uint byte = (sc[j >> 2] >> (8 * (j & 3))) & 0xFFu;
       const float dd = float(d.x);
-      c.s = float2(dd * float(as_type<char>(uchar(byte))));
+      c.s = float2(kq_shift_scale<scale_shift>(dd * float(as_type<char>(uchar(byte)))));
       c.m = F == IQ3S ? float(-128) * c.s : float2(0.0f);
     }
     return c;
@@ -322,6 +376,18 @@ METAL_FUNC uint2 bytes8<Q3K>(Codes<Q3K>::W w, ushort j) {
       ((v << 6) & 0x7000000u);
   const uint odd = ((v >> 3) & 7u) | ((v >> 1) & 0x700u) |
       ((v << 1) & 0x70000u) | ((v << 3) & 0x7000000u);
+  return uint2(even, odd);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<Q2K>(uint2 w, ushort j) {
+  // Codes 8j.. are the 16 bits at 16j: code i at bit 2i of v (Splash
+  // quant_spread2, split into the even / odd byte lanes).
+  const uint v = (w[j >> 1] >> (16 * (j & 1))) & 0xFFFFu;
+  const uint even = (v & 3u) | ((v << 4) & 0x300u) | ((v << 8) & 0x30000u) |
+      ((v << 12) & 0x3000000u);
+  const uint odd = ((v >> 2) & 3u) | ((v << 2) & 0x300u) |
+      ((v << 6) & 0x30000u) | ((v << 10) & 0x3000000u);
   return uint2(even, odd);
 }
 
@@ -410,6 +476,8 @@ template <
     int bits,
     int super_ratio,
     bool has_min,
+    int kind,
+    int scale_shift,
     bool tiled = false>
 [[kernel, max_total_threads_per_threadgroup(64)]] void kquant_qmm_m8_nax(
     const device uint32_t* w [[buffer(0)]],
@@ -426,8 +494,12 @@ template <
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   using namespace kq_m8;
-  constexpr Format F = format<group_size, bits, super_ratio, has_min>();
+  constexpr Format F = format<group_size, bits, super_ratio, has_min, kind>();
   static_assert(F != Unsupported, "no M = 8 NAX decode for this mode");
+  static_assert(
+      sb_scale_bytes<F>() ==
+          (F == IQ4NL ? 8 : super_ratio * kq_scale_bytes_per_group<has_min, kind>()),
+      "the super-block companion stride must match kquant_mode.h");
   static_assert(is_same_v<T, bfloat>, "the tensor-op A operand is bfloat16");
   constexpr bool codebook = F == IQ4XS || F == IQ4NL;
   typedef typename Codes<F>::W W;
@@ -480,7 +552,7 @@ template <
   // Qwen3.8 shapes, from the extra registers.)
   const device uint32_t* row = unit_base<bits, tiled>(w, n, K);
   constexpr uint stride = unit_stride<bits, tiled>();
-  CoefCursor<F, tiled> coefs(scales, biases, n, K);
+  CoefCursor<F, tiled, scale_shift> coefs(scales, biases, n, K);
   W cur = Codes<F>::load(row, step_begin, stride);
   Coef cc = coefs.at(step_begin);
   for (uint step = step_begin; step < step_end; ++step) {

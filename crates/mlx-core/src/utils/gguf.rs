@@ -65,8 +65,10 @@ pub enum GgufTensorType {
     F16 = 1,
     Q4_0 = 2,
     Q4_1 = 3,
+    Q5_0 = 6,
     Q5_1 = 7,
     Q8_0 = 8,
+    Q2K = 10,
     Q3K = 11,
     Q4K = 12,
     Q5K = 13,
@@ -75,6 +77,7 @@ pub enum GgufTensorType {
     IQ3S = 21,
     IQ4XS = 23,
     BF16 = 30,
+    MXFP4 = 39,
     PQ2_0 = 142,
 }
 
@@ -85,8 +88,10 @@ impl GgufTensorType {
             1 => Some(Self::F16),
             2 => Some(Self::Q4_0),
             3 => Some(Self::Q4_1),
+            6 => Some(Self::Q5_0),
             7 => Some(Self::Q5_1),
             8 => Some(Self::Q8_0),
+            10 => Some(Self::Q2K),
             11 => Some(Self::Q3K),
             12 => Some(Self::Q4K),
             13 => Some(Self::Q5K),
@@ -95,6 +100,7 @@ impl GgufTensorType {
             21 => Some(Self::IQ3S),
             23 => Some(Self::IQ4XS),
             30 => Some(Self::BF16),
+            39 => Some(Self::MXFP4),
             142 => Some(Self::PQ2_0),
             _ => None,
         }
@@ -110,9 +116,16 @@ impl GgufTensorType {
             Self::F16 | Self::BF16 => 2,
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
+            // f16 scale + 4 bytes of high bits + 16 nibble bytes.
+            Self::Q5_0 => 22,
             // f16 scale + f16 bias + 4 bytes of high bits + 16 nibble bytes.
             Self::Q5_1 => 24,
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
+            // One E8M0 shared exponent + 16 bytes of E2M1 nibbles.
+            Self::MXFP4 => 17,
+            // 16 (sc, min) nibble pairs + 64 bytes of 2-bit codes + f16 d +
+            // f16 dmin for 256 values.
+            Self::Q2K => 84,
             Self::Q3K | Self::IQ3S => 110,
             // f16 d + f16 dmin + 12 packed 6-bit (sub-scale, min) pairs +
             // 128 nibble bytes for 256 values.
@@ -138,10 +151,16 @@ impl GgufTensorType {
     pub(crate) fn block_size(&self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 => 32,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::MXFP4 => 32,
             Self::IQ4NL => 32,
             Self::PQ2_0 => 128,
-            Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ3S | Self::IQ4XS => 256,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::IQ3S
+            | Self::IQ4XS => 256,
         }
     }
 
@@ -159,8 +178,15 @@ impl GgufTensorType {
     fn is_mlx_affine_quantized(&self) -> bool {
         matches!(
             self,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 | Self::PQ2_0
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::PQ2_0
         )
+    }
+
+    /// Whether the blocks repack into MLX's native `mxfp4` pair
+    /// (`weight`, uint8 E8M0 `scales`, no biases): ggml's MXFP4 is the OCP
+    /// MX block MLX already decodes, only with its nibbles interleaved.
+    fn is_mlx_mxfp4_quantized(&self) -> bool {
+        matches!(self, Self::MXFP4)
     }
 
     /// The repacker format for the ggml K-quants, `None` for everything else.
@@ -170,6 +196,7 @@ impl GgufTensorType {
     /// affine or the dense reader and decode to garbage.
     pub(crate) fn k_quant_format(&self) -> Option<KQuantFormat> {
         match self {
+            Self::Q2K => Some(KQuantFormat::Q2K),
             Self::Q4K => Some(KQuantFormat::Q4K),
             Self::Q5K => Some(KQuantFormat::Q5K),
             Self::Q6K => Some(KQuantFormat::Q6K),
@@ -182,20 +209,56 @@ impl GgufTensorType {
             | Self::BF16
             | Self::Q4_0
             | Self::Q4_1
+            | Self::Q5_0
             | Self::Q5_1
             | Self::Q8_0
+            | Self::MXFP4
             | Self::PQ2_0 => None,
         }
     }
 
-    fn name(&self) -> &'static str {
+    /// Every type `from_u32` recognizes, for the header rejection message.
+    const ALL: [Self; 18] = [
+        Self::F32,
+        Self::F16,
+        Self::Q4_0,
+        Self::Q4_1,
+        Self::Q5_0,
+        Self::Q5_1,
+        Self::Q8_0,
+        Self::Q2K,
+        Self::Q3K,
+        Self::Q4K,
+        Self::Q5K,
+        Self::Q6K,
+        Self::IQ4NL,
+        Self::IQ3S,
+        Self::IQ4XS,
+        Self::BF16,
+        Self::MXFP4,
+        Self::PQ2_0,
+    ];
+
+    /// `"F32(0), F16(1), ..."`: the recognized types, from `ALL`, so the
+    /// rejection message cannot fall behind `from_u32`.
+    fn recognized_list() -> String {
+        Self::ALL
+            .iter()
+            .map(|t| format!("{}({})", t.name(), *t as u32))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
             Self::Q5_1 => "Q5_1",
             Self::Q8_0 => "Q8_0",
+            Self::Q2K => "Q2_K",
             Self::Q3K => "Q3_K",
             Self::Q4K => "Q4_K",
             Self::Q5K => "Q5_K",
@@ -204,6 +267,7 @@ impl GgufTensorType {
             Self::IQ3S => "IQ3_S",
             Self::IQ4XS => "IQ4_XS",
             Self::BF16 => "BF16",
+            Self::MXFP4 => "MXFP4",
             Self::PQ2_0 => "PQ2_0",
         }
     }
@@ -635,9 +699,11 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
             Some(t) => t,
             None => {
                 return Err(Error::from_reason(format!(
-                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q5_1(7), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30), PQ2_0(142) are recognized. \
+                    "Tensor '{}' has unsupported GGUF type {} — only {} are recognized. \
                      Other K-quant and IQ formats require dequantization before conversion.",
-                    name, type_u32
+                    name,
+                    type_u32,
+                    GgufTensorType::recognized_list()
                 )));
             }
         };
@@ -876,14 +942,19 @@ fn load_q6k_tensor_bf16(
 pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
     match ty {
         GgufTensorType::Q4_0 => Some(8),
+        // Q5_0 is `d * (q - 16)`: Q5_1's container without the minimum.
+        GgufTensorType::Q5_0 => Some(16),
         GgufTensorType::Q8_0 => Some(128),
         // Q5_1 stores a real per-block minimum beside its scale, like Q4_1.
+        // MXFP4 has no offset at all (an E2M1 code under a shared exponent).
         GgufTensorType::Q5_1
         | GgufTensorType::Q4_1
+        | GgufTensorType::MXFP4
         | GgufTensorType::PQ2_0
         | GgufTensorType::F32
         | GgufTensorType::F16
         | GgufTensorType::BF16
+        | GgufTensorType::Q2K
         | GgufTensorType::Q4K
         | GgufTensorType::Q5K
         | GgufTensorType::Q6K
@@ -904,12 +975,87 @@ pub fn derived_symmetric_bias_bits(scale_bits: u16, zero_point: i32) -> u16 {
     half::f16::from_f32(-(zero_point as f32) * scale).to_bits()
 }
 
-/// Load a quantized tensor (Q4_0, Q4_1, Q5_1, Q8_0) into its MLX affine companions.
+/// Pack 32 codes of `bits` width into `words` as MLX's LSB-first stream: bit
+/// `b` of code `i` lands at absolute bit `i * bits + b`. `words` must hold
+/// exactly `32 * bits / 32 == bits` words.
+fn pack_block_codes_lsb_first(codes: &[u32; 32], bits: u32, words: &mut [u32]) {
+    debug_assert_eq!(
+        words.len(),
+        bits as usize,
+        "a 32-code block is `bits` words"
+    );
+    words.fill(0);
+    let mut acc: u64 = 0;
+    let mut pending: u32 = 0;
+    let mut word = 0usize;
+    for &code in codes {
+        acc |= u64::from(code) << pending;
+        pending += bits;
+        while pending >= 32 {
+            words[word] = acc as u32;
+            acc >>= 32;
+            pending -= 32;
+            word += 1;
+        }
+    }
+    debug_assert_eq!(pending, 0);
+    debug_assert_eq!(word, words.len());
+}
+
+/// The 32 codes of a ggml `block_q5_0` / `block_q5_1` payload: value `j`
+/// (0..16) is the LOW nibble of `qs[j]` plus bit `j` of `qh`, value `j + 16`
+/// the HIGH nibble plus bit `j + 16` (`dequantize_row_q5_0`: `xh_0 = ((qh >> j)
+/// << 4) & 0x10`, `xh_1 = (qh >> (j + 12)) & 0x10`).
+fn q5_block_codes(qh: u32, qs: &[u8]) -> [u32; 32] {
+    let mut codes = [0u32; 32];
+    for j in 0..16 {
+        codes[j] = u32::from(qs[j] & 0x0F) | (((qh >> j) & 1) << 4);
+        codes[j + 16] = u32::from(qs[j] >> 4) | (((qh >> (j + 16)) & 1) << 4);
+    }
+    codes
+}
+
+/// Repack one ggml `block_q5_0` (22 bytes: f16 `d`, u32 `qh`, 16 nibble
+/// bytes) into its five LSB-first 5-bit words; returns the raw `d` bits. The
+/// value is `d * (q - 16)`, so the group is MLX affine at 5 bits with the
+/// symmetric zero point 16 and no stored `.biases` (see
+/// [`symmetric_zero_point`]).
+pub fn q5_0_repack_block(block: &[u8], words: &mut [u32; 5]) -> u16 {
+    let d = u16::from_le_bytes([block[0], block[1]]);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let codes = q5_block_codes(qh, &block[6..22]);
+    pack_block_codes_lsb_first(&codes, 5, words);
+    d
+}
+
+/// Repack one ggml `block_mxfp4` (17 bytes: u8 E8M0 `e`, 16 nibble bytes)
+/// into its four LSB-first 4-bit words; returns `e`, which becomes the uint8
+/// `.scales` entry of MLX's native `mxfp4` mode. ggml stores value `j`
+/// (0..16) in the LOW nibble of `qs[j]` and value `j + 16` in the HIGH nibble
+/// (`dequantize_row_mxfp4`); MLX reads the 32 codes in order, so the two
+/// halves are un-interleaved here. The codes themselves are the same E2M1
+/// index both sides decode through the same 16-entry table (ggml's
+/// `kvalues_mxfp4` is MLX's `FP4_LUT` doubled, against a half-weight E8M0).
+pub fn mxfp4_repack_block(block: &[u8], words: &mut [u32; 4]) -> u8 {
+    let e = block[0];
+    let qs = &block[1..17];
+    let mut codes = [0u32; 32];
+    for j in 0..16 {
+        codes[j] = u32::from(qs[j] & 0x0F);
+        codes[j + 16] = u32::from(qs[j] >> 4);
+    }
+    pack_block_codes_lsb_first(&codes, 4, words);
+    e
+}
+
+/// Load a quantized tensor (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, MXFP4) into its MLX
+/// companions.
 ///
 /// Q4_1 and Q5_1 yield the `(weight, scales, biases)` triplet its stored per-block
-/// minimum requires. Q4_0 and Q8_0 yield `(weight, scales)` only: their offset
-/// is the constant `-Z * scale`, so it is reconstructed at load instead of
-/// stored (see [`symmetric_zero_point`]).
+/// minimum requires. Q4_0, Q5_0 and Q8_0 yield `(weight, scales)` only: their
+/// offset is the constant `-Z * scale`, so it is reconstructed at load instead
+/// of stored (see [`symmetric_zero_point`]). MXFP4 yields `(weight, uint8
+/// scales)` for MLX's native `mxfp4` mode, which has no offset at all.
 #[cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 fn load_quantized_tensor(
     reader: &mut (impl Read + Seek),
@@ -931,8 +1077,8 @@ fn load_quantized_tensor(
     // 5 whole words — the same LSB-first bitstream MLX's own writer produces,
     // which is why the codes cross over unchanged.
     let words_per_block: usize = match tensor.tensor_type {
-        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 4, // 32 x 4-bit = 128 bits
-        GgufTensorType::Q5_1 => 5,                        // 32 x 5-bit = 160 bits
+        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 | GgufTensorType::MXFP4 => 4, // 32 x 4-bit
+        GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => 5, // 32 x 5-bit = 160 bits
         GgufTensorType::Q8_0 => 8,                        // 32 x 8-bit = 256 bits
         GgufTensorType::PQ2_0 => 8,
         other => {
@@ -1008,6 +1154,8 @@ fn load_quantized_tensor(
     // Only the asymmetric format fills this; the symmetric ones reconstruct
     // their offset from the scale at load and never allocate the array.
     let mut biases: Vec<u16> = Vec::new(); // f16
+    // MXFP4 only: the per-block E8M0 exponent, MLX's uint8 `mxfp4` scale.
+    let mut e8m0_scales: Vec<u8> = Vec::new();
 
     let abs_offset = gguf.data_offset + tensor.offset;
     reader.seek(SeekFrom::Start(abs_offset)).map_err(|e| {
@@ -1085,6 +1233,36 @@ fn load_quantized_tensor(
                     }
                     weights_packed[base + k] = packed;
                 }
+            }
+        }
+        GgufTensorType::Q5_0 => {
+            // Block: 2 bytes f16 scale (d), 4 bytes of high bits, 16 nibble
+            // bytes: Q5_1's container minus the minimum. `d * (q - 16)` is
+            // MLX affine at 5 bits with the derived bias `-16 * d`.
+            for i in 0..n_blocks {
+                let block = &raw[i * type_size..(i + 1) * type_size];
+                let mut words = [0u32; 5];
+                scales[i] = q5_0_repack_block(block, &mut words);
+                let base = i * words_per_block;
+                weights_packed[base..base + 5].copy_from_slice(&words);
+            }
+        }
+        GgufTensorType::MXFP4 => {
+            // Block: 1 byte E8M0 exponent, 16 nibble bytes. MLX's `mxfp4`
+            // mode reads the same E2M1 codes under the same exponent.
+            e8m0_scales.try_reserve_exact(sb_elements).map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to allocate E8M0 scales for tensor '{}': {e}",
+                    tensor.name
+                ))
+            })?;
+            e8m0_scales.resize(sb_elements, 0);
+            for i in 0..n_blocks {
+                let block = &raw[i * type_size..(i + 1) * type_size];
+                let mut words = [0u32; 4];
+                e8m0_scales[i] = mxfp4_repack_block(block, &mut words);
+                let base = i * words_per_block;
+                weights_packed[base..base + 4].copy_from_slice(&words);
             }
         }
         GgufTensorType::Q5_1 => {
@@ -1189,7 +1367,11 @@ fn load_quantized_tensor(
     let sb_i64_shape: Vec<i64> = sb_shape.to_vec();
 
     let weight_arr = MxArray::from_uint32(&weights_packed, &w_i64_shape)?;
-    let scales_arr = MxArray::from_float16(&scales, &sb_i64_shape)?;
+    let scales_arr = if tensor.tensor_type.is_mlx_mxfp4_quantized() {
+        MxArray::from_uint8(&e8m0_scales, &sb_i64_shape)?
+    } else {
+        MxArray::from_float16(&scales, &sb_i64_shape)?
+    };
 
     // Strip .weight suffix for prefix, then add .scales/.biases
     let name = &tensor.name;
@@ -1199,7 +1381,9 @@ fn load_quantized_tensor(
         (name.clone(), weight_arr),
         (format!("{prefix}.scales"), scales_arr),
     ];
-    if symmetric_zero_point(tensor.tensor_type).is_none() {
+    if symmetric_zero_point(tensor.tensor_type).is_none()
+        && !tensor.tensor_type.is_mlx_mxfp4_quantized()
+    {
         out.push((
             format!("{prefix}.biases"),
             MxArray::from_float16(&biases, &sb_i64_shape)?,
@@ -1433,7 +1617,9 @@ pub fn load_gguf_tensors<P: AsRef<Path>>(
                     tensor.tensor_type.name(),
                 )));
             }
-        } else if tensor.tensor_type.is_mlx_affine_quantized() {
+        } else if tensor.tensor_type.is_mlx_affine_quantized()
+            || tensor.tensor_type.is_mlx_mxfp4_quantized()
+        {
             let triplet = load_quantized_tensor(&mut reader, gguf, tensor)?;
             for (name, arr) in triplet {
                 weights.insert(name, arr);
@@ -2999,9 +3185,19 @@ impl SourceQuantProfile {
             // loader needs to rebuild the omitted `.biases`.
             GgufTensorType::Q4_0 => Some(Self::affine(4).symmetric(ty)),
             GgufTensorType::Q4_1 => Some(Self::affine(4)),
-            // 5-bit codes with a stored per-block minimum, like Q4_1.
+            // 5-bit codes: Q5_0 symmetric about 16, Q5_1 with a stored
+            // per-block minimum, like Q4_1.
+            GgufTensorType::Q5_0 => Some(Self::affine(5).symmetric(ty)),
             GgufTensorType::Q5_1 => Some(Self::affine(5)),
             GgufTensorType::Q8_0 => Some(Self::affine(8).symmetric(ty)),
+            // MLX's native OCP MX block: 4-bit E2M1 codes under a uint8 E8M0
+            // scale per 32 values, no biases.
+            GgufTensorType::MXFP4 => Some(Self {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4",
+                symmetric_zero_point: None,
+            }),
             GgufTensorType::PQ2_0 => Some(Self {
                 bits: 2,
                 group_size: 128,
@@ -3011,7 +3207,8 @@ impl SourceQuantProfile {
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
             // here; `k_quant_format` stays the only type -> format mapping.
-            GgufTensorType::Q3K
+            GgufTensorType::Q2K
+            | GgufTensorType::Q3K
             | GgufTensorType::Q4K
             | GgufTensorType::Q5K
             | GgufTensorType::Q6K
@@ -6452,7 +6649,7 @@ async fn prepare_native_gguf_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::gguf_kquant::{QK_K, repack_kquant};
+    use crate::utils::gguf_kquant::{QK_K, q2k_code, repack_kquant};
 
     struct GemmaNativeTestDir(PathBuf);
 
@@ -10601,6 +10798,146 @@ mod tests {
         assert_eq!(
             derived_symmetric_bias_bits(scale_bits, 128),
             half::f16::from_f32(-64.0).to_bits()
+        );
+    }
+
+    /// Q5_0 is Q5_1's container without the minimum: the same 5-bit codes
+    /// (low nibble + bit `j`, high nibble + bit `j + 16`) land in the LSB-first
+    /// stream, `d` is the f16 scale, and the offset `-16 * d` is derived like
+    /// Q4_0's `-8 * d`, so no `.biases` is written.
+    #[test]
+    fn q5_0_import_round_trips_codes_and_omits_the_derived_bias() {
+        let scale_bits = half::f16::from_f32(0.5).to_bits();
+        let codes: Vec<u8> = (0..32u32).map(|v| ((v * 7 + 3) % 32) as u8).collect();
+        let mut block = [0u8; 22];
+        block[..2].copy_from_slice(&scale_bits.to_le_bytes());
+        let mut qh = 0u32;
+        for j in 0..16 {
+            block[6 + j] = (codes[j] & 0x0F) | ((codes[j + 16] & 0x0F) << 4);
+            qh |= u32::from(codes[j] >> 4) << j;
+            qh |= u32::from(codes[j + 16] >> 4) << (j + 16);
+        }
+        block[2..6].copy_from_slice(&qh.to_le_bytes());
+        let weights = load_single_affine_block(GgufTensorType::Q5_0, &block, "q50");
+
+        let weight = weights.get("test.weight").expect("packed weight");
+        assert_eq!(weight.shape().unwrap().to_vec(), vec![1, 5]);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().to_vec();
+        let want: Vec<u32> = codes.iter().map(|&c| u32::from(c)).collect();
+        assert_eq!(unpack_lsb_codes(&packed, 5, 32), want);
+        assert_eq!(
+            weights
+                .get("test.scales")
+                .unwrap()
+                .to_uint16_native()
+                .unwrap(),
+            vec![scale_bits]
+        );
+        assert!(
+            !weights.contains_key("test.biases"),
+            "Q5_0 is `d * (q - 16)` — its offset is derived, not stored"
+        );
+        assert_eq!(symmetric_zero_point(GgufTensorType::Q5_0), Some(16));
+        assert_eq!(
+            derived_symmetric_bias_bits(scale_bits, 16),
+            half::f16::from_f32(-8.0).to_bits()
+        );
+    }
+
+    /// MXFP4 lands on MLX's native `mxfp4` mode: the E2M1 codes un-interleaved
+    /// into the LSB-first stream, the E8M0 exponent as the uint8 `.scales`,
+    /// and no `.biases` at all.
+    #[test]
+    fn mxfp4_import_un_interleaves_codes_and_keeps_the_e8m0_scale() {
+        let codes: Vec<u8> = (0..32u32).map(|v| ((v * 5 + 1) % 16) as u8).collect();
+        let mut block = [0u8; 17];
+        block[0] = 127; // 2^0
+        for j in 0..16 {
+            block[1 + j] = codes[j] | (codes[j + 16] << 4);
+        }
+        let weights = load_single_affine_block(GgufTensorType::MXFP4, &block, "mxfp4");
+
+        let weight = weights.get("test.weight").expect("packed weight");
+        assert_eq!(weight.shape().unwrap().to_vec(), vec![1, 4]);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().to_vec();
+        let want: Vec<u32> = codes.iter().map(|&c| u32::from(c)).collect();
+        assert_eq!(unpack_lsb_codes(&packed, 4, 32), want);
+        let scales = weights.get("test.scales").expect("E8M0 scales");
+        assert_eq!(scales.dtype().unwrap(), DType::Uint8);
+        assert_eq!(scales.shape().unwrap().to_vec(), vec![1, 1]);
+        assert!(!weights.contains_key("test.biases"), "mxfp4 has no biases");
+
+        // The published profile is MLX's pinned mxfp4 triple, named per tensor
+        // (`requires_explicit_entry`: the mode is not affine).
+        let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", GgufTensorType::MXFP4)]);
+        let quant = preserved_source_quantization(&gguf, false)
+            .unwrap()
+            .expect("an MXFP4 tensor must publish a quantization block");
+        let entry = &quant["language_model.model.layers.0.mlp.down_proj"];
+        assert_eq!(entry["bits"], serde_json::json!(4));
+        assert_eq!(entry["group_size"], serde_json::json!(32));
+        assert_eq!(entry["mode"], serde_json::json!("mxfp4"));
+        assert!(entry.get(SYMMETRIC_ZERO_POINT_KEY).is_none());
+        let (_, _, _, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64)
+                .expect("the published block must parse");
+        assert_eq!(
+            per_layer["layers.0.mlp.down_proj"].mode,
+            crate::models::quant_dispatch::PerLayerMode::Mxfp4
+        );
+    }
+
+    /// Q2_K goes through the K-quant repacker like Q4_K: a `.weight` of 2-bit
+    /// codes, uint8 `(sc, m)` nibble pairs in `.scales`, `(d, dmin)` in
+    /// `.biases`, published as the pinned `q2k` 2/16 triple.
+    #[test]
+    fn q2_k_import_repacks_through_the_kquant_contract() {
+        let mut block = [0u8; 84];
+        for (j, byte) in block[..16].iter_mut().enumerate() {
+            *byte = (j as u8) | (((15 - j) as u8) << 4); // sc = j, m = 15 - j
+        }
+        for (i, byte) in block[16..80].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(37);
+        }
+        block[80..82].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+        block[82..84].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
+        let weights = load_single_kquant_block(GgufTensorType::Q2K, &block);
+
+        let weight = weights.get("blk.0.ffn_down.weight").expect("packed weight");
+        assert_eq!(weight.shape().unwrap().to_vec(), vec![1, 16]);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().to_vec();
+        let want: Vec<u32> = (0..256).map(|v| q2k_code(&block, v)).collect();
+        assert_eq!(unpack_lsb_codes(&packed, 2, 256), want);
+        let scales = weights.get("blk.0.ffn_down.scales").expect("scales");
+        assert_eq!(scales.dtype().unwrap(), DType::Uint8);
+        assert_eq!(scales.shape().unwrap().to_vec(), vec![1, 32]);
+        let pairs = scales.to_uint8().unwrap();
+        for j in 0..16 {
+            assert_eq!((pairs[2 * j], pairs[2 * j + 1]), (j as u8, 15 - j as u8));
+        }
+        let biases = weights.get("blk.0.ffn_down.biases").expect("biases");
+        assert_eq!(
+            biases.to_uint16_native().unwrap(),
+            vec![
+                half::f16::from_f32(0.25).to_bits(),
+                half::f16::from_f32(0.125).to_bits()
+            ]
+        );
+
+        let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", GgufTensorType::Q2K)]);
+        let quant = preserved_source_quantization(&gguf, true)
+            .unwrap()
+            .expect("a Q2_K tensor must publish a quantization block");
+        let entry = &quant["language_model.model.layers.0.mlp.down_proj"];
+        assert_eq!(entry["bits"], serde_json::json!(2));
+        assert_eq!(entry["group_size"], serde_json::json!(16));
+        assert_eq!(entry["mode"], serde_json::json!("q2k"));
+        let (_, _, _, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64)
+                .expect("the published block must parse");
+        assert_eq!(
+            per_layer["layers.0.mlp.down_proj"].mode,
+            crate::models::quant_dispatch::PerLayerMode::Q2K
         );
     }
 

@@ -84,7 +84,16 @@ struct KQuant {
     biases_cols: i64,
 }
 
-const KQUANTS: [KQuant; 7] = [
+const KQUANTS: [KQuant; 8] = [
+    KQuant {
+        mode: "q2k",
+        bits: 2,
+        group_size: 16,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 2,
+    },
     KQuant {
         mode: "q3k",
         bits: 3,

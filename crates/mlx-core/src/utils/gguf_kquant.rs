@@ -19,6 +19,14 @@
 //!     .biases f16   [N, 2*K/256] (d, dmin) interleaved at 2G, 2G+1
 //!     decode  scale = .biases[2*(g >> 3)]       * .scales[2g]       (d    * sc)
 //!             bias  = -(.biases[2*(g >> 3) + 1] * .scales[2g + 1])  (dmin * m)
+//!
+//!   q2k  bits=2 group_size=16   (q4k's two-level (sc, m) at 16 values)
+//!     .weight uint32[N, K*2/32]  LSB-first 2-bit stream, code in [0, 3]
+//!     .scales uint8 [N, 2*K/16]  (sc, m)   the low / high nibble of ggml's
+//!                                scale byte, unpacked, at 2g, 2g+1
+//!     .biases f16   [N, 2*K/256] (d, dmin) interleaved at 2G, 2G+1
+//!     decode  scale = .biases[2*(g >> 4)]       * .scales[2g]
+//!             bias  = -(.biases[2*(g >> 4) + 1] * .scales[2g + 1])
 //! ```
 //!
 //! with `g` the logical group index `v / group_size` and `G` the super-block
@@ -59,6 +67,7 @@ pub const QK_K: usize = 256;
 /// the existing converter and runtime metadata.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KQuantFormat {
+    Q2K,
     Q3K,
     Q4K,
     Q5K,
@@ -72,6 +81,7 @@ impl KQuantFormat {
     /// Bit width of one code.
     pub fn bits(self) -> usize {
         match self {
+            Self::Q2K => 2,
             Self::Q3K => 3,
             Self::Q4K => 4,
             Self::Q5K => 5,
@@ -88,7 +98,7 @@ impl KQuantFormat {
     pub fn group_size(self) -> usize {
         match self {
             Self::Q4K | Self::Q5K => 32,
-            Self::Q3K | Self::Q6K => 16,
+            Self::Q2K | Self::Q3K | Self::Q6K => 16,
             Self::IQ4NL | Self::IQ4XS | Self::IQ3S => 32,
         }
     }
@@ -97,13 +107,20 @@ impl KQuantFormat {
     pub fn block_size(self) -> usize {
         match self {
             Self::IQ4NL => 32,
-            Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ4XS | Self::IQ3S => QK_K,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::IQ4XS
+            | Self::IQ3S => QK_K,
         }
     }
 
-    /// Size of one ggml super-block in bytes. `ggml-common.h:326/344/361`.
+    /// Size of one ggml super-block in bytes. `ggml-common.h:300/326/344/361`.
     pub fn block_bytes(self) -> usize {
         match self {
+            Self::Q2K => 84,
             Self::Q3K | Self::IQ3S => 110,
             Self::Q4K => 144,
             Self::Q5K => 176,
@@ -116,6 +133,7 @@ impl KQuantFormat {
     /// The `mode` string MLX's quantized ops dispatch on.
     pub fn mlx_mode(self) -> &'static str {
         match self {
+            Self::Q2K => "q2k",
             Self::Q3K => "q3k",
             Self::Q4K => "q4k",
             Self::Q5K => "q5k",
@@ -126,9 +144,10 @@ impl KQuantFormat {
         }
     }
 
-    /// GGUF tensor type id. `ggml.h` `GGML_TYPE_Q4_K` / `Q5_K` / `Q6_K`.
+    /// GGUF tensor type id. `ggml.h` `GGML_TYPE_Q2_K` .. `GGML_TYPE_IQ4_XS`.
     pub fn gguf_type(self) -> u32 {
         match self {
+            Self::Q2K => 10,
             Self::Q3K => 11,
             Self::Q4K => 12,
             Self::Q5K => 13,
@@ -139,9 +158,25 @@ impl KQuantFormat {
         }
     }
 
-    /// Whether `.scales` is signed int8 rather than uint8 (q4k/q5k).
+    /// Whether `.scales` is signed int8 rather than uint8. The formats with a
+    /// per-group minimum (q2k/q4k/q5k) store unsigned `(sc, m)` pairs.
     pub fn scales_are_signed(self) -> bool {
-        !matches!(self, Self::Q4K | Self::Q5K)
+        !self.has_min()
+    }
+
+    /// Whether every sub-scale pairs with a sub-minimum (`d*sc*q - dmin*m`).
+    pub fn has_min(self) -> bool {
+        matches!(self, Self::Q2K | Self::Q4K | Self::Q5K)
+    }
+
+    /// Groups one 256-value super-block spans (IQ4_NL: its 32-value block).
+    pub fn super_ratio(self) -> usize {
+        self.block_size() / self.group_size()
+    }
+
+    /// Bytes of `.scales` per group: an `(sc, m)` pair or one sub-scale.
+    pub fn scale_bytes_per_group(self) -> usize {
+        if self.has_min() { 2 } else { 1 }
     }
 
     /// `.weight` columns for a row of `k` values.
@@ -149,25 +184,17 @@ impl KQuantFormat {
         k * self.bits() / 32
     }
 
-    /// `.scales` columns for a row of `k` values. q6k stores one sub-scale per
-    /// 16 values; q4k/q5k store a (sc, m) pair per 32.
+    /// `.scales` columns for a row of `k` values: one sub-scale per group, or
+    /// an `(sc, m)` pair per group for the formats with a minimum.
     pub fn scales_cols(self, k: usize) -> usize {
-        match self {
-            Self::Q3K | Self::Q6K => k / 16,
-            Self::Q4K | Self::Q5K => 2 * (k / 32),
-            Self::IQ4NL | Self::IQ4XS | Self::IQ3S => k / 32,
-        }
+        (k / self.group_size()) * self.scale_bytes_per_group()
     }
 
-    /// `.biases` columns for a row of `k` values. q6k stores `d`; q4k/q5k store
-    /// the `(d, dmin)` pair.
+    /// `.biases` columns for a row of `k` values: `d` per super-block (per
+    /// 32-value block for IQ4_NL), or the `(d, dmin)` pair for the formats
+    /// with a minimum.
     pub fn biases_cols(self, k: usize) -> usize {
-        match self {
-            Self::Q3K | Self::Q6K => k / QK_K,
-            Self::Q4K | Self::Q5K => 2 * (k / QK_K),
-            Self::IQ4NL => k / 32,
-            Self::IQ4XS | Self::IQ3S => k / QK_K,
-        }
+        (k / self.block_size()) * self.scale_bytes_per_group()
     }
 
     /// Bytes one row of `k` values occupies in the GGUF payload. `k` is assumed
@@ -183,7 +210,8 @@ impl KQuantFormat {
 pub enum KQuantScales {
     /// q6k: ggml's signed int8 sub-scales, verbatim.
     Signed(Vec<i8>),
-    /// q4k/q5k: `(sc, m)` pairs unpacked out of ggml's 6-bit fields.
+    /// q4k/q5k: `(sc, m)` pairs unpacked out of ggml's 6-bit fields; q2k: the
+    /// same pairs out of its 4-bit nibbles.
     Unsigned(Vec<u8>),
 }
 
@@ -273,6 +301,12 @@ const Q6K_QL_OFFSET: usize = 0;
 const Q6K_QH_OFFSET: usize = 128;
 const Q6K_SCALES_OFFSET: usize = 192;
 const Q6K_D_OFFSET: usize = 208;
+
+// ggml-common.h:300 — block_q2_K field offsets.
+const Q2K_SCALES_OFFSET: usize = 0;
+const Q2K_QS_OFFSET: usize = 16;
+const Q2K_D_OFFSET: usize = 80;
+const Q2K_DMIN_OFFSET: usize = 82;
 
 // ggml-common.h:315 — block_q3_K field offsets.
 const Q3K_HMASK_OFFSET: usize = 0;
@@ -412,6 +446,26 @@ fn q3k_scales(blk: &[u8]) -> [i8; 16] {
     out
 }
 
+/// Q2_K code at logical index `v`. `dequantize_row_q2_K` walks the
+/// super-block as two 128-value halves of 32 bytes each; inside a half the
+/// four 32-value groups are the 2-bit fields at shift `2j` of the same 32
+/// bytes, the first 16 values of a group from `q[l]` and the next 16 from
+/// `q[l + 16]` -- which is just `q[lane]` for `lane` in 0..32.
+pub fn q2k_code(blk: &[u8], v: usize) -> u32 {
+    let half = v / 128;
+    let in_half = v % 128;
+    let shift = 2 * (in_half / 32);
+    let lane = in_half % 32;
+    u32::from((blk[Q2K_QS_OFFSET + half * 32 + lane] >> shift) & 0x03)
+}
+
+/// Q2_K `(sc, m)` of group `j`: the low and high nibble of `scales[j]`
+/// (`dequantize_row_q2_K`: `dl = d * (sc & 0xF); ml = min * (sc >> 4)`).
+pub fn q2k_scale_min(blk: &[u8], j: usize) -> (u8, u8) {
+    let byte = blk[Q2K_SCALES_OFFSET + j];
+    (byte & 0x0f, byte >> 4)
+}
+
 /// Q3_K code at logical index `v`, shifted from ggml's signed [-4, 3] grid to
 /// the shared unsigned 3-bit stream [0, 7].
 pub fn q3k_code(blk: &[u8], v: usize) -> u32 {
@@ -520,9 +574,9 @@ pub struct KQuantRepacker {
     k: usize,
     rows: usize,
     weight: Vec<u32>,
-    /// Signed sub-scales for q3k/q6k/iq formats; empty for q4k/q5k.
+    /// Signed sub-scales for q3k/q6k/iq formats; empty for q2k/q4k/q5k.
     scales_i8: Vec<i8>,
-    /// q4k/q5k `.scales`; empty for every symmetric/non-linear format.
+    /// q2k/q4k/q5k `.scales`; empty for every symmetric/non-linear format.
     scales_u8: Vec<u8>,
     biases: Vec<u16>,
 }
@@ -596,6 +650,28 @@ impl KQuantRepacker {
                 let blk = &blocks[start..start + block_bytes];
 
                 match format {
+                    KQuantFormat::Q2K => {
+                        // .biases[2G] = d, .biases[2G+1] = dmin — raw f16 bits.
+                        self.biases.push(u16::from_le_bytes([
+                            blk[Q2K_D_OFFSET],
+                            blk[Q2K_D_OFFSET + 1],
+                        ]));
+                        self.biases.push(u16::from_le_bytes([
+                            blk[Q2K_DMIN_OFFSET],
+                            blk[Q2K_DMIN_OFFSET + 1],
+                        ]));
+                        // .scales[2g] = sc, .scales[2g+1] = m: the two nibbles
+                        // of ggml's scale byte, unpacked so the has_min decode
+                        // reads them exactly like q4k's pairs (0.5 bpw).
+                        for j in 0..QK_K / 16 {
+                            let (sc, m) = q2k_scale_min(blk, j);
+                            self.scales_u8.push(sc);
+                            self.scales_u8.push(m);
+                        }
+                        for v in 0..QK_K {
+                            packer.push(q2k_code(blk, v), bits);
+                        }
+                    }
                     KQuantFormat::Q3K => {
                         self.biases.push(u16::from_le_bytes([
                             blk[Q3K_D_OFFSET],
@@ -739,6 +815,7 @@ mod tests {
     #[test]
     fn repack_shapes_follow_the_array_contract() {
         for (format, k) in [
+            (KQuantFormat::Q2K, 512),
             (KQuantFormat::Q3K, 256),
             (KQuantFormat::Q4K, 256),
             (KQuantFormat::Q5K, 512),
@@ -790,6 +867,7 @@ mod tests {
     #[test]
     fn chunked_repack_equals_whole_tensor_repack() {
         for (format, k) in [
+            (KQuantFormat::Q2K, 768),
             (KQuantFormat::Q3K, 512),
             (KQuantFormat::Q4K, 512),
             (KQuantFormat::Q5K, 256),

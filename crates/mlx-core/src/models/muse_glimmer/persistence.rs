@@ -88,6 +88,7 @@ pub(super) fn build_projection(
             | PerLayerMode::Q5K
             | PerLayerMode::Q6K
             | PerLayerMode::Q3K
+            | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
             | PerLayerMode::IQ3S => {

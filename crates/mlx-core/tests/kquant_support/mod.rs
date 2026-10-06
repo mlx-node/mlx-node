@@ -22,7 +22,16 @@ pub struct KQuant {
     pub biases_cols: i64,
 }
 
-pub const KQUANTS: [KQuant; 7] = [
+pub const KQUANTS: [KQuant; 8] = [
+    KQuant {
+        mode: "q2k",
+        bits: 2,
+        group_size: 16,
+        scales_signed: false,
+        weight_cols: 16,
+        scales_cols: 32,
+        biases_cols: 2,
+    },
     KQuant {
         mode: "q3k",
         bits: 3,

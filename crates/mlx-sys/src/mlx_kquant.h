@@ -3,8 +3,13 @@
 // ggml K-quant and IQ formats, read-only. Each sub-block is affine
 // (value = scale * code + bias) or a 16-entry codebook, under a float16
 // super-block scale. `scales` holds the integer sub-block scales (int8, or
-// interleaved uint8 (sc, m) pairs for q4k/q5k); `biases` holds the float16
-// super-block d (and dmin for q4k/q5k) -- a scale, not a bias.
+// interleaved uint8 (sc, m) pairs for q2k/q4k/q5k); `biases` holds the float16
+// super-block d (and dmin for q2k/q4k/q5k) -- a scale, not a bias.
+//
+// Per-mode traits (super_ratio, has_sub_min, kind, scale_shift,
+// scale_bytes_per_group) are the single C++ description of a mode; the Metal
+// side mirrors them per kernel instantiation (metal/kquant/kquant_mode.h) and
+// the Rust side in quant_dispatch::kquant_mode_params.
 
 #include "mlx/array.h"
 #include "mlx/primitives.h"
@@ -17,7 +22,15 @@
 
 namespace mlx::core::kquant {
 
-enum class Mode { Q6K, Q4K, Q5K, Q3K, IQ4NL, IQ4XS, IQ3S };
+enum class Mode { Q6K, Q4K, Q5K, Q3K, IQ4NL, IQ4XS, IQ3S, Q2K };
+
+// How a mode's codes turn into values. Mirrors KQ_LINEAR .. KQ_GRID in
+// metal/kquant/kquant_mode.h and quant_dispatch::KQuantKind.
+//   Linear    scale * code + bias on the packed integer code
+//   Codebook  scale * table[code], the 16-entry IQ4_NL grid
+//   Int8      scale * int8 (iq3s: the grid value expanded to a byte)
+//   Grid      scale * signed grid magnitude (IQ1/IQ2/IQ3_XXS; reserved)
+enum class Kind : int { Linear = 0, Codebook = 1, Int8 = 2, Grid = 3 };
 
 // In-memory layout of a 2-D K-quant weight and its companions.
 //
@@ -58,6 +71,7 @@ constexpr int super_ratio(Mode mode) {
   switch (mode) {
   case Mode::Q6K:
   case Mode::Q3K:
+  case Mode::Q2K:
     return 16;
   case Mode::Q4K:
   case Mode::Q5K:
@@ -70,13 +84,41 @@ constexpr int super_ratio(Mode mode) {
   return 0;
 }
 
-// q4k/q5k interleave a minimum with every scale at both levels.
+// q2k/q4k/q5k interleave a minimum with every scale at both levels.
 constexpr bool has_sub_min(Mode mode) {
-  return mode == Mode::Q4K || mode == Mode::Q5K;
+  return mode == Mode::Q4K || mode == Mode::Q5K || mode == Mode::Q2K;
 }
 
 constexpr bool uses_iq4nl_grid(Mode mode) {
   return mode == Mode::IQ4NL || mode == Mode::IQ4XS;
+}
+
+constexpr Kind kind(Mode mode) {
+  switch (mode) {
+  case Mode::IQ4NL:
+  case Mode::IQ4XS:
+    return Kind::Codebook;
+  case Mode::IQ3S:
+    return Kind::Int8;
+  case Mode::Q6K:
+  case Mode::Q4K:
+  case Mode::Q5K:
+  case Mode::Q3K:
+  case Mode::Q2K:
+    return Kind::Linear;
+  }
+  return Kind::Linear;
+}
+
+// Power-of-two exponent every decoded scale is multiplied by, in fp32 and
+// exactly (scale *= 2^scale_shift). 0 for every current mode; the grid stage
+// uses -3 for IQ2_* / IQ1_* and -2 for IQ3_XXS.
+constexpr int scale_shift(Mode) { return 0; }
+
+// Bytes of `.scales` per group: an (sc, m) pair or one sub-scale. The
+// per-super-block companion stride is super_ratio * scale_bytes_per_group.
+constexpr int scale_bytes_per_group(Mode mode) {
+  return has_sub_min(mode) ? 2 : 1;
 }
 
 constexpr int default_bits(Mode mode) {
@@ -91,6 +133,8 @@ constexpr int default_bits(Mode mode) {
     return 5;
   case Mode::Q3K:
     return 3;
+  case Mode::Q2K:
+    return 2;
   case Mode::IQ3S:
     return 8;
   }
@@ -98,7 +142,8 @@ constexpr int default_bits(Mode mode) {
 }
 
 constexpr int default_group_size(Mode mode) {
-  return (mode == Mode::Q6K || mode == Mode::Q3K) ? 16 : 32;
+  return (mode == Mode::Q6K || mode == Mode::Q3K || mode == Mode::Q2K) ? 16
+                                                                       : 32;
 }
 
 array quantized_matmul(const array &x, const array &w, const array &scales,

@@ -664,6 +664,7 @@ fn validate_mtp_bits(bits: i32, mode: PerLayerMode, context: &str) -> Result<()>
         PerLayerMode::Q6K => bits == 6,
         PerLayerMode::Q5K => bits == 5,
         PerLayerMode::Q3K => bits == 3,
+        PerLayerMode::Q2K => bits == 2,
         PerLayerMode::Fp8E4m3 => false,
     };
     if !valid {
@@ -688,6 +689,7 @@ fn parse_mtp_bits(
             PerLayerMode::Q6K => 6,
             PerLayerMode::Q5K => 5,
             PerLayerMode::Q3K => 3,
+            PerLayerMode::Q2K => 2,
             _ => absent_default,
         });
     };
@@ -705,7 +707,7 @@ fn parse_mtp_group_size(
     let Some(value) = value else {
         return Ok(match mode {
             PerLayerMode::Mxfp4 | PerLayerMode::Mxfp8 => 32,
-            PerLayerMode::Nvfp4 | PerLayerMode::Q6K | PerLayerMode::Q3K => 16,
+            PerLayerMode::Nvfp4 | PerLayerMode::Q6K | PerLayerMode::Q3K | PerLayerMode::Q2K => 16,
             PerLayerMode::Q4K
             | PerLayerMode::Q5K
             | PerLayerMode::IQ4NL
@@ -729,7 +731,7 @@ fn parse_mtp_group_size(
         PerLayerMode::Affine => matches!(group_size, 32 | 64 | 128),
         PerLayerMode::Mxfp4 | PerLayerMode::Mxfp8 => group_size == 32,
         PerLayerMode::Nvfp4 => group_size == 16,
-        PerLayerMode::Q6K | PerLayerMode::Q3K => group_size == 16,
+        PerLayerMode::Q6K | PerLayerMode::Q3K | PerLayerMode::Q2K => group_size == 16,
         PerLayerMode::Q4K
         | PerLayerMode::Q5K
         | PerLayerMode::IQ4NL
@@ -1396,6 +1398,7 @@ fn apply_weights_inner_with_residency(
             | PerLayerMode::Q4K
             | PerLayerMode::Q5K
             | PerLayerMode::Q3K
+            | PerLayerMode::Q2K
             | PerLayerMode::IQ4NL
             | PerLayerMode::IQ4XS
             | PerLayerMode::IQ3S => {

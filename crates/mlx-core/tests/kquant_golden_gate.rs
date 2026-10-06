@@ -31,6 +31,14 @@ use mlx_core::array::MxArray;
 const MULTI_ROW: [i64; 7] = [2, 3, 4, 5, 6, 7, 8];
 const OTHER_ROWS: [i64; 8] = [1, 9, 12, 17, 24, 33, 64, 512];
 
+/// The modes in the captured case matrix. q2k landed after the capture; the
+/// digests pin the seven captured modes and q2k is covered by
+/// kquant_tiled / kquant_m8_nax / kquant_mode_guards against the CPU
+/// reference until the next pin bump re-captures the goldens.
+fn captured_modes() -> impl Iterator<Item = (usize, &'static KQuant)> {
+    KQUANTS.iter().filter(|kq| kq.mode != "q2k").enumerate()
+}
+
 fn label(device: i32) -> &'static str {
     if device == GPU { "gpu" } else { "cpu" }
 }
@@ -75,7 +83,7 @@ fn gather_case(
 
 fn run_matmuls(g: &mut Golden, cases: &mut usize, device: i32, ms: &[i64]) {
     let dev = label(device);
-    for (ki, kq) in KQUANTS.iter().enumerate() {
+    for (ki, kq) in captured_modes() {
         let seed = 0x1000 + ki as u32;
         // Transposed: (N, K) = aligned and fast-qmv, then unaligned N with
         // K % 512 != 0, then batched weights.
@@ -202,7 +210,7 @@ fn run_simdgroup_qmm_t(g: &mut Golden, cases: &mut usize, device: i32) {
 fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
     let dev = label(device);
     const E: i64 = 8;
-    for (ki, kq) in KQUANTS.iter().enumerate() {
+    for (ki, kq) in captured_modes() {
         let seed = 0x2000 + ki as u32;
         let m_ = kq.mode;
         let experts_t = weights(kq, &[E, 128], 512, seed);
@@ -327,7 +335,7 @@ fn run_gathers(g: &mut Golden, cases: &mut usize, device: i32) {
 
 fn run_dequantize(g: &mut Golden, cases: &mut usize, device: i32) {
     let dev = label(device);
-    for (ki, kq) in KQUANTS.iter().enumerate() {
+    for (ki, kq) in captured_modes() {
         let flat = weights(kq, &[96], 1024, 0x3000 + ki as u32);
         let stacked = weights(kq, &[3, 40], 512, 0x3100 + ki as u32);
         for dtype in DTYPES {
