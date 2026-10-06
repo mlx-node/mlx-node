@@ -19,6 +19,15 @@
 // 256 threads = execution_simdgroups<8> is a structural constant: the op is
 // undefined for any other count. build.rs prebuilds the instantiations at
 // the end of this file into paged_attn.metallib.
+//
+// INT8 K/V (KV = int8_t, Splash's target KV format): the int8 rows are
+// matmul2d operands directly (bfloat x int8 -> float is a supported pair);
+// one fp32 scale per (token, head) multiplies the key's column of S before
+// the softmax and the value's softmax weight before P V, as Splash's page
+// softmax does (paged_attention_tile.h). Both segments carry the same
+// element type, so one running P V accumulator serves prefix and new rows.
+// The scale buffers are bound for every instantiation; the BF16 ones never
+// read them.
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
@@ -40,14 +49,14 @@ struct BoolTag {
 
 } // namespace sdpa_nax
 
-template <typename T, int D, int M, int N>
+template <typename T, int D, int M, int N, typename KV = T>
 [[kernel, max_total_threads_per_threadgroup(256)]] void
 segmented_sdpa_verify_nax_2pass_1(
     device T* queries [[buffer(0)]],
-    device T* prefix_keys [[buffer(1)]],
-    device T* prefix_values [[buffer(2)]],
-    device T* new_keys [[buffer(3)]],
-    device T* new_values [[buffer(4)]],
+    device KV* prefix_keys [[buffer(1)]],
+    device KV* prefix_values [[buffer(2)]],
+    device KV* new_keys [[buffer(3)]],
+    device KV* new_values [[buffer(4)]],
     device T* out [[buffer(5)]],
     device float* sums [[buffer(6)]],
     device float* maxs [[buffer(7)]],
@@ -58,6 +67,11 @@ segmented_sdpa_verify_nax_2pass_1(
     const constant int& gqa [[buffer(12)]],
     const constant int& rows [[buffer(13)]],
     const constant int& partitions [[buffer(14)]],
+    const device float* prefix_key_scales [[buffer(15)]],
+    const device float* prefix_value_scales [[buffer(16)]],
+    const device float* new_key_scales [[buffer(17)]],
+    const device float* new_value_scales [[buffer(18)]],
+    const constant long* scale_strides [[buffer(19)]],
     threadgroup float* scratch [[threadgroup(0)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
@@ -68,6 +82,7 @@ segmented_sdpa_verify_nax_2pass_1(
                 "per row");
   static_assert(N % (4 * kLanesPerRow) == 0, "keys per lane are float4s");
   constexpr int KPL = N / kLanesPerRow;
+  constexpr bool quantized = is_same<KV, int8_t>::value;
 
   // Threadgroup memory, set by the host (segmented_nax_scratch_bytes): fp32
   // scores [M][N], BF16 probabilities [M][N], fp32 previous scale [M], two
@@ -108,7 +123,7 @@ segmented_sdpa_verify_nax_2pass_1(
   auto s0 = s_tensor.template slice<N, M>(0, 0);
   auto p_tensor = tensor(pt, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto p0 = p_tensor.template slice<N, M>(0, 0);
-  auto kv_type = tensor(static_cast<device T*>(nullptr),
+  auto kv_type = tensor(static_cast<device KV*>(nullptr),
                         dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto kv0 = kv_type.template slice<D, N>(0, 0);
 
@@ -141,8 +156,12 @@ segmented_sdpa_verify_nax_2pass_1(
   // O = O * scale + P V. A full tile (rem == N) takes static slices; a
   // partial one keeps the dynamic extents {D, rem} so the op reads nothing
   // past them (a static slice reads all N rows whatever the extents).
-  auto process = [&](device T* k_ptr, int k_seq_stride, device T* v_ptr,
-                     int v_seq_stride, int k0, int rem, auto tag) {
+  // `k_scales` / `v_scales` point at the segment's first scale (token stride
+  // 1); int8 only.
+  auto process = [&](device KV* k_ptr, int k_seq_stride, device KV* v_ptr,
+                     int v_seq_stride, const device float* k_scales,
+                     const device float* v_scales, int k0, int rem,
+                     auto tag) {
     constexpr bool full = decltype(tag)::value;
     auto kt = tensor(k_ptr, dextents<int, 2>{D, rem},
                      array<int, 2>{1, k_seq_stride});
@@ -172,6 +191,17 @@ segmented_sdpa_verify_nax_2pass_1(
         sc[4 * j + 3] = v.w;
       }
       const int visible = min(rem, limit - k0);
+      // Key scales: one per column, only where the tile holds a key (the
+      // scale array ends with the segment).
+      float vs[KPL];
+      if (quantized) {
+#pragma unroll
+        for (int j = 0; j < KPL; ++j) {
+          const bool present = c0 + j < rem;
+          sc[j] *= present ? k_scales[c0 + j] : 1.0f;
+          vs[j] = present ? v_scales[c0 + j] : 0.0f;
+        }
+      }
       float tile_max = kFiniteMin;
 #pragma unroll
       for (int j = 0; j < KPL; ++j) {
@@ -185,16 +215,25 @@ segmented_sdpa_verify_nax_2pass_1(
       const float ref = new_max == kFiniteMin ? 0.0f : new_max;
       const float factor = fast::exp2(row_max - ref);
       // P in BF16 for the matmul; the row sum uses the same rounded weights.
+      // INT8: the stored P carries the value scale (so P V dequantizes V),
+      // while the row sum takes the unscaled fp32 weights, as Splash does.
       float local_sum = 0;
       threadgroup vec<T, 4>* p4 =
           reinterpret_cast<threadgroup vec<T, 4>*>(pt + m * N + c0);
 #pragma unroll
       for (int j = 0; j < KPL / 4; ++j) {
-        const vec<T, 4> p = vec<T, 4>(fast::exp2(
+        const float4 e = fast::exp2(
             float4(sc[4 * j], sc[4 * j + 1], sc[4 * j + 2], sc[4 * j + 3]) -
-            ref));
-        p4[j] = p;
-        local_sum += float(p.x) + float(p.y) + float(p.z) + float(p.w);
+            ref);
+        if (quantized) {
+          p4[j] = vec<T, 4>(
+              e * float4(vs[4 * j], vs[4 * j + 1], vs[4 * j + 2], vs[4 * j + 3]));
+          local_sum += e.x + e.y + e.z + e.w;
+        } else {
+          const vec<T, 4> p = vec<T, 4>(e);
+          p4[j] = p;
+          local_sum += float(p.x) + float(p.y) + float(p.z) + float(p.w);
+        }
       }
       local_sum += simd_shuffle_xor(local_sum, ushort(1));
       local_sum += simd_shuffle_xor(local_sum, ushort(2));
@@ -236,32 +275,41 @@ segmented_sdpa_verify_nax_2pass_1(
     ++tile;
   };
 
-  device T* pk = prefix_keys + batch_idx * strides[3] +
+  device KV* pk = prefix_keys + batch_idx * strides[3] +
       kv_head_idx * strides[4];
-  device T* pv_ = prefix_values + batch_idx * strides[6] +
+  device KV* pv_ = prefix_values + batch_idx * strides[6] +
       kv_head_idx * strides[7];
+  const device float* pks = prefix_key_scales +
+      batch_idx * scale_strides[0] + kv_head_idx * scale_strides[1];
+  const device float* pvs = prefix_value_scales +
+      batch_idx * scale_strides[2] + kv_head_idx * scale_strides[3];
   const int prefix_end = min(kend, prefix_n);
   int k0 = kstart;
   for (; k0 + N <= prefix_end; k0 += N) {
     process(pk + long(k0) * strides[5], int(strides[5]),
-            pv_ + long(k0) * strides[8], int(strides[8]), k0, N,
-            BoolTag<true>{});
+            pv_ + long(k0) * strides[8], int(strides[8]), pks + k0, pvs + k0,
+            k0, N, BoolTag<true>{});
   }
   if (k0 < prefix_end) {
     process(pk + long(k0) * strides[5], int(strides[5]),
-            pv_ + long(k0) * strides[8], int(strides[8]), k0,
-            prefix_end - k0, BoolTag<false>{});
+            pv_ + long(k0) * strides[8], int(strides[8]), pks + k0, pvs + k0,
+            k0, prefix_end - k0, BoolTag<false>{});
   }
-  device T* nk = new_keys + batch_idx * strides[9] +
+  device KV* nk = new_keys + batch_idx * strides[9] +
       kv_head_idx * strides[10];
-  device T* nv = new_values + batch_idx * strides[12] +
+  device KV* nv = new_values + batch_idx * strides[12] +
       kv_head_idx * strides[13];
+  const device float* nks = new_key_scales + batch_idx * scale_strides[4] +
+      kv_head_idx * scale_strides[5];
+  const device float* nvs = new_value_scales + batch_idx * scale_strides[6] +
+      kv_head_idx * scale_strides[7];
   // At most 8 new rows: one partial tile.
   k0 = max(kstart, prefix_n);
   if (k0 < kend) {
     process(nk + long(k0 - prefix_n) * strides[11], int(strides[11]),
-            nv + long(k0 - prefix_n) * strides[14], int(strides[14]), k0,
-            kend - k0, BoolTag<false>{});
+            nv + long(k0 - prefix_n) * strides[14], int(strides[14]),
+            nks + (k0 - prefix_n), nvs + (k0 - prefix_n), k0, kend - k0,
+            BoolTag<false>{});
   }
 
   // Partials [B, Hq, rows, partitions, D]: the head-major rows of this KV
@@ -288,12 +336,17 @@ segmented_sdpa_verify_nax_2pass_1(
 }
 
 // Every (M, N) the host can request (mlx_segmented_sdpa.cpp kernel_name);
-// bridge_metallib_names checks both directions.
+// bridge_metallib_names checks both directions. Each shape has a BF16 and an
+// INT8 K/V form.
 #define instantiate_sdpa_nax(m, n)                                           \
   template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256" \
                        "_m" #m "_n" #n)]] [[kernel]]                         \
   decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, m, n>)             \
-      segmented_sdpa_verify_nax_2pass_1<bfloat, 256, m, n>;
+      segmented_sdpa_verify_nax_2pass_1<bfloat, 256, m, n>;                  \
+  template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256" \
+                       "_m" #m "_n" #n)]] [[kernel]]                         \
+  decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, m, n, int8_t>)     \
+      segmented_sdpa_verify_nax_2pass_1<bfloat, 256, m, n, int8_t>;
 
 instantiate_sdpa_nax(8, 32)
 instantiate_sdpa_nax(8, 64)

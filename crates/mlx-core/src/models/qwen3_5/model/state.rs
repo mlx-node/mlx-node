@@ -3,15 +3,7 @@
 use super::*;
 
 pub(super) fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
-    (0..config.num_layers as usize)
-        .map(|i| {
-            if config.is_linear_layer(i) {
-                Qwen3_5LayerCache::new_linear()
-            } else {
-                Qwen3_5LayerCache::new_full_attention()
-            }
-        })
-        .collect()
+    Qwen3_5LayerCache::fresh_layer_caches(config)
 }
 
 /// Create the profiler owned by a paged-MTP turn before its prefill starts.

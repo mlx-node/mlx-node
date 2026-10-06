@@ -12,19 +12,22 @@
 
 use std::ffi::{CStr, CString, c_char};
 
-/// Tensor-op verify kernels: M in {8, 16, ..., 64} x tile sizes {32, 64}.
-const NAX_KERNELS: i64 = 8 * 2;
-/// one_pass, 2pass_1, verify_2pass_1, verify_tile_2pass_1, and the tensor-op
-/// kernels (each shape is its own function).
-const SEGMENTED_NAMES: i64 = 4 + NAX_KERNELS;
+/// Tensor-op verify kernels: M in {8, 16, ..., 64} x tile sizes {32, 64},
+/// in a BF16 and an int8 K/V form each.
+const NAX_KERNELS: i64 = 8 * 2 * 2;
+/// one_pass, 2pass_1, verify_2pass_1, verify_tile_2pass_1 (BF16); one_pass,
+/// 2pass_1, verify_tile_2pass_1 (int8 K/V); and the tensor-op kernels (each
+/// shape is its own function).
+const SEGMENTED_NAMES: i64 = 4 + 3 + NAX_KERNELS;
 /// Partition counts the vector-SDPA policy returns: 32, 64, 128, 256, 512, 1024.
 const PARTITIONS: i64 = 6;
 /// Tile sizes the tile planner returns: 16, 32.
 const TILE_SIZES: i64 = 2;
-/// one_pass x causal {false, true}; 2pass_1 x causal x partitions; causal
-/// verify x partitions x gqa 1..=32 x rows 2..=8; verify tile x tile sizes.
-/// The tensor-op pipelines are built only where the op exists.
-const SEGMENTED_PIPELINES: i64 = 2 + 2 * PARTITIONS + PARTITIONS * 32 * 7 + TILE_SIZES;
+/// Per K/V format: one_pass x causal {false, true}; 2pass_1 x causal x
+/// partitions; verify tile x tile sizes. BF16 only: causal verify x
+/// partitions x gqa 1..=32 x rows 2..=8. The tensor-op pipelines are built
+/// only where the op exists.
+const SEGMENTED_PIPELINES: i64 = 2 * (2 + 2 * PARTITIONS + TILE_SIZES) + PARTITIONS * 32 * 7;
 /// qmv_wide tile widths 2..=8.
 const AFFINE_MIXED_NAMES: i64 = 7;
 

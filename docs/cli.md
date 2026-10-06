@@ -605,6 +605,7 @@ top1_agreement   77.64%
 | `--seq`         | Tokens kept per row (default `512`, minimum `2`)                          |
 | `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary) |
 | `--logit-chunk` | Positions per head projection (default `64`)                              |
+| `--kv-format`   | Candidate flat K/V cache format: `bf16` (default) or `int8` (dense qwen3_5) |
 | `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting      |
 
 **Reading the numbers.** `nll`, `perplexity` and `top1_agreement` are exact over

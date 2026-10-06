@@ -13,6 +13,7 @@ use crate::models::qwen3_5::decoder_layer::compute_layer_kinds;
 fn tiny_cfg() -> Qwen3_5Config {
     Qwen3_5Config {
         qwen35_gguf_gdn_layout: None,
+        kv_format: None,
         vocab_size: 1024,
         hidden_size: 64,
         num_layers: 8,

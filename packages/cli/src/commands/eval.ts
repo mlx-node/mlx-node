@@ -35,6 +35,8 @@ export interface EvalScoreOptions {
   cache: string;
   /** Positions per head projection (default 64). */
   logitChunk?: number;
+  /** Flat full-attention K/V cache format of the candidate (dense qwen3_5): 'bf16' (default) or 'int8'. */
+  kvFormat?: 'int8' | 'bf16';
 }
 
 const DEFAULT_LOGIT_CHUNK = 64;
@@ -68,7 +70,12 @@ export async function evalCache(opts: EvalCacheOptions): Promise<number> {
 
 /** Teacher-force a candidate over the cached token ids and report its quality. */
 export async function evalScore(opts: EvalScoreOptions): Promise<EvalReport> {
-  return scoreAgainstTeacher(resolve(opts.model), resolve(opts.cache), opts.logitChunk ?? DEFAULT_LOGIT_CHUNK);
+  return scoreAgainstTeacher(
+    resolve(opts.model),
+    resolve(opts.cache),
+    opts.logitChunk ?? DEFAULT_LOGIT_CHUNK,
+    opts.kvFormat ?? null,
+  );
 }
 
 /**
@@ -115,6 +122,8 @@ Cache Arguments:
 Score Arguments:
   --model <path>        Candidate checkpoint to score
   --cache <dir>         Teacher cache directory
+  --kv-format <fmt>     Candidate K/V cache format: bf16 (default) or int8
+                        (dense qwen3_5 flat cache only)
   --json                Emit the report as one JSON object
 
 Shared Arguments:
@@ -168,6 +177,7 @@ export async function run(argv: string[]) {
       seq: { type: 'string' },
       'top-k': { type: 'string' },
       'logit-chunk': { type: 'string' },
+      'kv-format': { type: 'string' },
       json: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -229,9 +239,14 @@ export async function run(argv: string[]) {
       }
       const modelPath = resolve(args.model);
       requireModelDir('--model', modelPath);
-      const report = await evalScore({ model: modelPath, cache: args.cache, logitChunk });
+      const kvFormat = args['kv-format'];
+      if (kvFormat !== undefined && kvFormat !== 'bf16' && kvFormat !== 'int8') {
+        console.error(`Error: --kv-format must be bf16 or int8, got "${kvFormat}"`);
+        process.exit(1);
+      }
+      const report = await evalScore({ model: modelPath, cache: args.cache, logitChunk, kvFormat });
       if (args.json) {
-        console.log(JSON.stringify({ model: modelPath, ...report }));
+        console.log(JSON.stringify({ model: modelPath, kvFormat: kvFormat ?? 'bf16', ...report }));
         return;
       }
       console.log(formatReport(modelPath, report));

@@ -894,7 +894,7 @@ impl Qwen35Inner {
     /// later verify silently replays the stale constants.
     pub(super) fn erase_compiled_verifies(&self) {
         crate::compiled_graph::erase_compiled_graphs_matching(
-            0xFFFF_FFFF_FFFF_FF00,
+            forward::COMPILED_VERIFY_ERASE_MASK,
             forward::COMPILED_VERIFY_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
         );
     }

@@ -374,6 +374,12 @@ pub struct Qwen3_5GenerationConfig {
 pub struct Qwen35LoadOptions {
     /// External z-lab DFlash2 checkpoint directory.
     pub draft_model_path: Option<String>,
+    /// Element format of the flat full-attention K/V cache: `'bf16'` (the
+    /// default) or `'int8'` (per-token symmetric int8 rows with one fp32
+    /// scale each — half the K/V memory and read bandwidth). The block-paged
+    /// cache ignores it.
+    #[napi(ts_type = "'int8' | 'bf16' | undefined")]
+    pub kv_format: Option<String>,
 }
 
 /// Generation result
@@ -570,7 +576,15 @@ impl Qwen3_5Model {
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
     pub async fn load(path: String, options: Option<Qwen35LoadOptions>) -> Result<Qwen3_5Model> {
-        let draft_model_path = options.and_then(|options| options.draft_model_path);
+        let options = options.unwrap_or_default();
+        let draft_model_path = options.draft_model_path;
+        // Rejected here, before any weight is touched.
+        let kv_format = options
+            .kv_format
+            .as_deref()
+            .map(|value| crate::transformer::KvFormat::parse(Some(value)))
+            .transpose()
+            .map_err(|message| Error::from_reason(format!("Qwen3.5 load: {message}")))?;
         let source = std::path::Path::new(&path);
         if source.is_file()
             && source
@@ -579,9 +593,14 @@ impl Qwen3_5Model {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
         {
             let cache = crate::utils::gguf::prepare_qwen35_native_gguf(source).await?;
-            return persistence::load_with_thread(&cache.to_string_lossy(), draft_model_path).await;
+            return persistence::load_with_thread(
+                &cache.to_string_lossy(),
+                draft_model_path,
+                kv_format,
+            )
+            .await;
         }
-        persistence::load_with_thread(&path, draft_model_path).await
+        persistence::load_with_thread(&path, draft_model_path, kv_format).await
     }
 
     /// Generate text from a prompt token sequence.

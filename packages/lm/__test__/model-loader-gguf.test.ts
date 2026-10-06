@@ -67,6 +67,21 @@ describe('standalone GGUF model detection', () => {
     );
   });
 
+  it('passes kvFormat to the dense Qwen3.5 loader alongside the draft path', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen35');
+    const loaded = {} as Qwen35Model;
+    const loadSpy = vi.spyOn(Qwen35Model, 'load').mockResolvedValue(loaded);
+    await expect(loadModel(modelPath, { kvFormat: 'int8', autoLoadDraft: false })).resolves.toBe(loaded);
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: undefined, kvFormat: 'int8' });
+    await loadModel(modelPath, { kvFormat: 'bf16', draftModelPath: '/draft' });
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: '/draft', kvFormat: 'bf16' });
+  });
+
+  it('rejects kvFormat for other model families', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen35moe');
+    await expect(loadModel(modelPath, { kvFormat: 'int8' })).rejects.toThrow('only supported by dense qwen3_5');
+  });
+
   it('detects Qwen3.8-Flash-Next as its own architecture', async () => {
     const { modelPath } = await writeStandaloneGguf('qwen4exp');
     expect(await detectModelType(modelPath)).toBe('qwen4_exp');

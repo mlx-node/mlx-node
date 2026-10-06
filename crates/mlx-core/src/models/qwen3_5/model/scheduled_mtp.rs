@@ -143,10 +143,20 @@ pub(crate) fn seeded_inner(seed: u64) -> Qwen35Inner {
 
 #[cfg(test)]
 pub(crate) fn seeded_inner_with_attention_head_dim(seed: u64, head_dim: i32) -> Qwen35Inner {
+    seeded_inner_with_config(seed, |config| config.head_dim = head_dim)
+}
+
+/// The seeded fixture with `adjust` applied to the tiny config before the
+/// model is built (head dim, hidden size, cache format, ...).
+#[cfg(test)]
+pub(crate) fn seeded_inner_with_config(
+    seed: u64,
+    adjust: impl FnOnce(&mut Qwen3_5Config),
+) -> Qwen35Inner {
     // Tests run serially because MLX owns one shared device and PRNG.
     unsafe { mlx_sys::mlx_seed(seed) };
     let mut config = super::paged_construction_tests::tiny_paged_forward_cfg();
-    config.head_dim = head_dim;
+    adjust(&mut config);
     config.n_mtp_layers = 1;
     config.vocab_size = 16;
     let mut inner = Qwen35Inner::new(config).unwrap();

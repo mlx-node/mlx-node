@@ -9,10 +9,14 @@ use crate::models::forward as fwd;
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// High tag on compiled-verify `fn_id`s. The low byte carries the verify
-/// length; bits 8..31 carry the per-instance `model_id`. `Qwen35Inner`'s Drop
-/// erases `COMPILED_VERIFY_TAG | model_id << 8` under mask `...FF00` so an
-/// unload releases the tapes' captured weights.
+/// length; bits 8..31 carry the per-instance `model_id`; bit 32 is set for
+/// an int8 K/V cache (`COMPILED_VERIFY_INT8_BIT`: the tape's FA inputs and
+/// outputs differ). `Qwen35Inner`'s Drop erases `COMPILED_VERIFY_TAG |
+/// model_id << 8` under mask `...FFFE_FFFF_FF00` so an unload releases the
+/// tapes' captured weights in either format.
 pub(crate) const COMPILED_VERIFY_TAG: u64 = 0xD51A_3500_0000_0000;
+pub(crate) const COMPILED_VERIFY_INT8_BIT: u64 = 1 << 32;
+pub(crate) const COMPILED_VERIFY_ERASE_MASK: u64 = 0xFFFF_FFFE_FFFF_FF00;
 
 #[cfg(test)]
 thread_local! {
@@ -551,9 +555,11 @@ fn forward_dflash2_compiled(
         Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
     )>,
 > {
+    use crate::models::qwen3_5::attention::{VerifyKvOut, VerifyPrefix};
     use crate::models::qwen3_5::decoder_layer::{DecoderLayer, LayerVerifyIo, VerifyResidual};
     use crate::models::qwen3_5::gated_delta::GdnKernelTape;
     use crate::models::qwen3_5::gated_delta_net::GdnLayerTape;
+    use crate::transformer::KvFormat;
 
     if inner.dflash2_compiled_verify_disabled {
         return Ok(None);
@@ -578,9 +584,12 @@ fn forward_dflash2_compiled(
 
     // Gather graph inputs in the contract order. The shared RoPE base is the
     // full-attention offset — the flat verify invariant (asserted by
-    // `flat_attention_frontier`) is that every FA cache agrees on it.
+    // `flat_attention_frontier`) is that every FA cache agrees on it. Every
+    // FA cache must also share one KV format: BF16 slots pass 2 arrays, int8
+    // slots 4 (rows + scales); the format is part of the tape id.
     let mut rope_base: Option<i32> = None;
-    let mut per_layer_state: Vec<MxArray> = Vec::with_capacity(2 * caches.len());
+    let mut kv_format: Option<KvFormat> = None;
+    let mut per_layer_state: Vec<MxArray> = Vec::with_capacity(4 * caches.len());
     let mut fa_prefix_offsets: Vec<Option<i32>> = Vec::with_capacity(caches.len());
     for (layer, cache) in inner.layers.iter().zip(caches.iter()) {
         match (&layer.attn, cache) {
@@ -611,13 +620,33 @@ fn forward_dflash2_compiled(
                     None => rope_base = Some(offset),
                     _ => {}
                 }
-                per_layer_state.push(keys.slice_axis(2, 0, offset as i64)?);
-                per_layer_state.push(values.slice_axis(2, 0, offset as i64)?);
+                match kv_format {
+                    Some(format) if format != kvc.format() => return Ok(None),
+                    None => kv_format = Some(kvc.format()),
+                    _ => {}
+                }
+                match kvc.format() {
+                    KvFormat::Bf16 => {
+                        per_layer_state.push(keys.slice_axis(2, 0, offset as i64)?);
+                        per_layer_state.push(values.slice_axis(2, 0, offset as i64)?);
+                    }
+                    KvFormat::Int8 => {
+                        let Some(view) = kvc.int8_view() else {
+                            return Ok(None);
+                        };
+                        per_layer_state.extend(view.arrays().into_iter().cloned());
+                    }
+                }
                 fa_prefix_offsets.push(Some(offset));
             }
             _ => return Ok(None),
         }
     }
+    let kv_format = kv_format.unwrap_or_default();
+    let fa_arrays: usize = match kv_format {
+        KvFormat::Bf16 => 2,
+        KvFormat::Int8 => 4,
+    };
     let rope_offsets = MxArray::from_int32(&[rope_base.unwrap_or(0)], &[1])?;
     let mut inputs: Vec<MxArray> = Vec::with_capacity(2 + per_layer_state.len());
     inputs.push(input_ids.clone());
@@ -626,7 +655,7 @@ fn forward_dflash2_compiled(
 
     let n_linear = inner.layers.iter().filter(|l| l.is_linear()).count();
     let n_fa = inner.layers.len() - n_linear;
-    let n_outputs = 1 + tap_layers.len() + 6 * n_linear + 2 * n_fa;
+    let n_outputs = 1 + tap_layers.len() + 6 * n_linear + fa_arrays * n_fa;
     // Per-(model, L) id: the verify length decides every host-int branch in
     // the builder (SDPA verify-split geometry), while the prefix length stays
     // shapeless. The high tag namespaces these ids away from the C++-side
@@ -646,8 +675,13 @@ fn forward_dflash2_compiled(
         // would retain an unbounded set of full-model traces. Use eager verify.
         return Ok(None);
     }
-    let fn_id =
-        COMPILED_VERIFY_TAG | ((inner.model_id & 0x00FF_FFFF) << 8) | (seq_len as u64 & 0xFF);
+    let fn_id = COMPILED_VERIFY_TAG
+        | ((inner.model_id & 0x00FF_FFFF) << 8)
+        | (seq_len as u64 & 0xFF)
+        | match kv_format {
+            KvFormat::Bf16 => 0,
+            KvFormat::Int8 => COMPILED_VERIFY_INT8_BIT,
+        };
 
     let layers = &mut inner.layers;
     let embedding = &inner.embedding;
@@ -674,7 +708,7 @@ fn forward_dflash2_compiled(
                 }
             }
         };
-        let mut extras: Vec<MxArray> = Vec::with_capacity(6 * n_linear + 2 * n_fa);
+        let mut extras: Vec<MxArray> = Vec::with_capacity(6 * n_linear + fa_arrays * n_fa);
         for (index, layer) in layers.iter_mut().enumerate() {
             let input = match &pending {
                 Some((h, delta)) => VerifyResidual::Pending { h, delta },
@@ -701,13 +735,25 @@ fn forward_dflash2_compiled(
                 let GdnLayerTape { kernel, qkv, .. } = tape;
                 let GdnKernelTape { q, k, v, g, beta } = kernel;
                 extras.extend([q, k, v, g, beta, qkv]);
+                cursor += 2;
             } else {
                 let mut out_kv = None;
                 {
+                    let prefix = match kv_format {
+                        KvFormat::Bf16 => VerifyPrefix::Bf16 {
+                            keys: &graph_inputs[cursor],
+                            values: &graph_inputs[cursor + 1],
+                        },
+                        KvFormat::Int8 => VerifyPrefix::Int8 {
+                            keys: &graph_inputs[cursor],
+                            values: &graph_inputs[cursor + 1],
+                            key_scales: &graph_inputs[cursor + 2],
+                            value_scales: &graph_inputs[cursor + 3],
+                        },
+                    };
                     let mut io = LayerVerifyIo::FullAttention(
                         crate::models::qwen3_5::attention::AttentionVerifyIo {
-                            prefix_keys: &graph_inputs[cursor],
-                            prefix_values: &graph_inputs[cursor + 1],
+                            prefix,
                             rope_offsets,
                             out_kv: &mut out_kv,
                         },
@@ -719,13 +765,23 @@ fn forward_dflash2_compiled(
                     }
                     pending = Some((h, delta));
                 }
-                let (new_k, new_v) = out_kv.ok_or_else(|| {
-                    Error::from_reason("compiled verify: attention layer produced no kv block")
-                })?;
-                extras.push(new_k);
-                extras.push(new_v);
+                match out_kv {
+                    Some(VerifyKvOut::Bf16(new_k, new_v)) if kv_format == KvFormat::Bf16 => {
+                        extras.push(new_k);
+                        extras.push(new_v);
+                    }
+                    Some(VerifyKvOut::Int8(rows)) if kv_format == KvFormat::Int8 => {
+                        extras.extend(rows.arrays().into_iter().cloned());
+                    }
+                    _ => {
+                        return Err(Error::from_reason(
+                            "compiled verify: attention layer produced no kv block in the \
+                             cache's format",
+                        ));
+                    }
+                }
+                cursor += fa_arrays;
             }
-            cursor += 2;
         }
         let (h, delta) =
             pending.ok_or_else(|| Error::from_reason("compiled verify: model has no layers"))?;
@@ -801,14 +857,30 @@ fn forward_dflash2_compiled(
                 let kvc = caches[index].as_kv_cache_mut().ok_or_else(|| {
                     Error::from_reason("compiled verify: attention cache kind mismatch")
                 })?;
-                let (Some(new_k), Some(new_v)) = (outputs.get(cursor), outputs.get(cursor + 1))
-                else {
+                if kvc.format() != kv_format {
+                    return Err(Error::from_reason(
+                        "compiled verify: attention cache format changed mid-invoke",
+                    ));
+                }
+                let Some(block) = outputs.get(cursor..cursor + fa_arrays) else {
                     return Err(Error::from_reason(
                         "compiled verify: output arity shortfall",
                     ));
                 };
-                cursor += 2;
-                kvc.update_and_fetch(new_k, new_v)?;
+                cursor += fa_arrays;
+                match kv_format {
+                    KvFormat::Bf16 => {
+                        kvc.update_and_fetch(&block[0], &block[1])?;
+                    }
+                    KvFormat::Int8 => {
+                        kvc.append_quantized(&crate::array::kv_int8::Int8KvRows {
+                            keys: block[0].clone(),
+                            values: block[1].clone(),
+                            key_scales: block[2].clone(),
+                            value_scales: block[3].clone(),
+                        })?;
+                    }
+                }
             }
         }
         Ok(())

@@ -262,7 +262,8 @@ pub async fn calibrate_activation_amax_raw(
         // dedicated model thread via a command.
         "qwen3_5" => {
             let model =
-                crate::models::qwen3_5::persistence::load_with_thread(&model_path, None).await?;
+                crate::models::qwen3_5::persistence::load_with_thread(&model_path, None, None)
+                    .await?;
             prefill_and_persist(&model_path, || async {
                 crate::model_thread::send_and_await(&model.thread, |reply| {
                     Qwen35FamilyCommand::CalibratePrefillRaw {

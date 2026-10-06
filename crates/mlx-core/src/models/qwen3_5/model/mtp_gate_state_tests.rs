@@ -10,6 +10,7 @@ use crate::models::qwen3_5::config::Qwen3_5Config;
 fn tiny_cfg() -> Qwen3_5Config {
     Qwen3_5Config {
         qwen35_gguf_gdn_layout: None,
+        kv_format: None,
         vocab_size: 1024,
         hidden_size: 64,
         num_layers: 2,

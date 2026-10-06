@@ -79,6 +79,7 @@ async fn qwen38_dflash2_perf() {
         target,
         Some(Qwen35LoadOptions {
             draft_model_path: Some(draft),
+            kv_format: None,
         }),
     )
     .await

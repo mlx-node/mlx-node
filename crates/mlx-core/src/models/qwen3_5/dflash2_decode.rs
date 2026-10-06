@@ -16,6 +16,7 @@ use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{generated_capacity_hint, kv_capacity_round_up};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::stream::{Stream, StreamContext, WiredLimitContext};
+use crate::transformer::KvFormat;
 use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 use crate::transformer::paged_policy::live_prefill_headroom;
 
@@ -141,12 +142,20 @@ fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> 
         .map(|headroom| headroom.saturating_sub(DFLASH2_KV_HEADROOM_RESERVE_BYTES) / 10 * 9)
 }
 
-fn kv_row_bytes(full_attention_layers: usize, kv_heads: i32, head_dim: i32, dtype: DType) -> u64 {
+/// Bytes one token row costs across every full-attention K and V tensor:
+/// `head_dim x activation bytes` per (layer, head, tensor) for BF16 rows,
+/// `head_dim + 4` (int8 row plus its fp32 scale) for the int8 format.
+fn kv_row_bytes(
+    full_attention_layers: usize,
+    kv_heads: i32,
+    head_dim: i32,
+    dtype: DType,
+    format: KvFormat,
+) -> u64 {
     (full_attention_layers as u64)
         .saturating_mul(2)
         .saturating_mul(kv_heads.max(0) as u64)
-        .saturating_mul(head_dim.max(0) as u64)
-        .saturating_mul(dtype.byte_size() as u64)
+        .saturating_mul(format.row_bytes(i64::from(head_dim), dtype.byte_size() as u64))
 }
 
 /// Target rows to reserve for one DFlash2 turn: the whole turn
@@ -666,12 +675,13 @@ impl Qwen35Inner {
         ))
     }
 
-    /// K/V element type the target's full-attention caches hold or will be
-    /// allocated with: activations follow the embedding output dtype.
+    /// Activation element type the target's full-attention caches hold (BF16
+    /// format) or quantize from (int8 format): the embedding output dtype,
+    /// or the allocated BF16 buffer's own.
     fn dflash2_target_kv_dtype(&self) -> Result<DType> {
         let allocated = self.caches.iter().flatten().find_map(|cache| match cache {
-            Qwen3_5LayerCache::FullAttention(kv) => kv.keys_ref(),
-            Qwen3_5LayerCache::Linear(_) => None,
+            Qwen3_5LayerCache::FullAttention(kv) if kv.format() == KvFormat::Bf16 => kv.keys_ref(),
+            _ => None,
         });
         match allocated {
             Some(keys) => keys.dtype(),
@@ -680,6 +690,19 @@ impl Qwen35Inner {
                 .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
                 .dtype(),
         }
+    }
+
+    /// Row format of the target's full-attention caches (every FA slot
+    /// shares the config's format).
+    fn dflash2_target_kv_format(&self) -> KvFormat {
+        self.caches
+            .iter()
+            .flatten()
+            .find_map(|cache| match cache {
+                Qwen3_5LayerCache::FullAttention(kv) => Some(kv.format()),
+                Qwen3_5LayerCache::Linear(_) => None,
+            })
+            .unwrap_or_else(|| self.config.kv_format())
     }
 
     /// Size every flat full-attention cache for this turn so decode never
@@ -700,6 +723,7 @@ impl Qwen35Inner {
             self.config.num_kv_heads,
             self.config.head_dim,
             self.dflash2_target_kv_dtype()?,
+            self.dflash2_target_kv_format(),
         );
         let budget_bytes = dflash2_kv_budget_bytes(dflash2_memory_snapshot());
         let rows = dflash2_kv_reserve_rows(
@@ -1075,17 +1099,7 @@ mod tests {
     }
 
     fn reset_flat_fixture(inner: &mut Qwen35Inner) {
-        inner.caches = Some(
-            (0..inner.config.num_layers as usize)
-                .map(|index| {
-                    if inner.config.is_linear_layer(index) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
+        inner.caches = Some(Qwen3_5LayerCache::fresh_layer_caches(&inner.config));
         inner.dflash2_context = None;
         inner.dflash2_turn_state = None;
     }
@@ -1095,10 +1109,15 @@ mod tests {
     }
 
     fn tiny_dflash_inner_with_attention_head_dim(seed: u64, head_dim: i32) -> Qwen35Inner {
+        tiny_dflash_inner_with_config(seed, |config| config.head_dim = head_dim)
+    }
+
+    fn tiny_dflash_inner_with_config(
+        seed: u64,
+        adjust: impl FnOnce(&mut super::super::config::Qwen3_5Config),
+    ) -> Qwen35Inner {
         unsafe { mlx_sys::mlx_seed(seed) };
-        let mut inner = super::super::model::scheduled_mtp::seeded_inner_with_attention_head_dim(
-            seed, head_dim,
-        );
+        let mut inner = super::super::model::scheduled_mtp::seeded_inner_with_config(seed, adjust);
         inner.paged_adapter = None;
 
         // The shared scheduled fixture deliberately installs a constant head;
@@ -1343,17 +1362,192 @@ mod tests {
         Ok(())
     }
 
+    /// The fixture at the production head dim (256) with its full-attention
+    /// caches in the int8 format: the only geometry the int8 segmented
+    /// kernels serve, so both the compiled and the eager verify read int8
+    /// rows.
+    fn tiny_int8_dflash_inner(seed: u64) -> Qwen35Inner {
+        // The DFlash2 fixture needs hidden % head_dim == 0 (its conv groups);
+        // the format lives in the caches (`reset_flat_fixture` rebuilds them
+        // from the config).
+        tiny_dflash_inner_with_config(seed, |config| {
+            config.head_dim = 256;
+            config.hidden_size = 256;
+            config.kv_format = Some("int8".to_string());
+        })
+    }
+
+    /// Int8 K/V: the compiled verify (int8 prefix + scales as graph inputs,
+    /// the block quantized inside the graph) equals the eager verify (the
+    /// cache quantizes on write) bit for bit — logits, taps and GDN tape —
+    /// and the caches hold identical int8 rows and scales afterwards.
+    #[test]
+    fn compiled_int8_verify_matches_eager_int8_verify_bitwise() -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!("SKIP compiled_int8_verify: Metal must be the default device");
+            return Ok(());
+        }
+        assert!(std::env::var_os("MLX_DISABLE_COMPILE").is_none());
+        let mut inner = tiny_int8_dflash_inner(0xDFA5_1E78);
+        let tap_layers: Vec<usize> = (0..inner.layers.len()).collect();
+        let run = |inner: &mut Qwen35Inner, ids: &[i32]| -> Result<Vec<(Vec<i64>, Vec<u32>)>> {
+            reset_flat_fixture(inner);
+            for cache in inner.caches.as_ref().expect("caches") {
+                if let Qwen3_5LayerCache::FullAttention(kv) = cache {
+                    assert_eq!(
+                        kv.format(),
+                        KvFormat::Int8,
+                        "fixture caches follow the config"
+                    );
+                }
+            }
+            let stream = Stream::generation();
+            let _ctx = StreamContext::new(stream);
+            let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4, 5, 6], 0, stream)?;
+            prefill_logits.eval();
+            inner.dflash2_turn_state = Some(state);
+            let input = MxArray::from_int32(ids, &[1, ids.len() as i64])?;
+            let (logits, taps, tape) = super::super::model::forward_dflash2_with_taps(
+                inner,
+                &input,
+                &tap_layers,
+                true,
+                super::super::model::DFlash2LogitsSpan::All,
+            )?;
+            let mut arrays = vec![&logits];
+            arrays.extend(taps.iter());
+            for layer in tape.iter().flatten() {
+                let k = &layer.kernel;
+                arrays.extend([&k.q, &k.k, &k.v, &k.g, &k.beta, &layer.qkv]);
+            }
+            let mut cache_arrays = Vec::new();
+            for cache in inner.caches.as_ref().expect("caches") {
+                if let Qwen3_5LayerCache::FullAttention(kv) = cache {
+                    let view = kv.int8_view().expect("int8 cache allocated");
+                    assert_eq!(view.len()?, 6 + ids.len() as i64);
+                    cache_arrays.push(view);
+                }
+            }
+            assert!(
+                !cache_arrays.is_empty(),
+                "the fixture has full-attention layers"
+            );
+            for view in &cache_arrays {
+                arrays.extend(view.arrays());
+            }
+            array_fingerprints(arrays)
+        };
+        for ids in [vec![5, 6, 7, 8, 9, 10, 11, 12], vec![9, 3, 14, 2, 6, 11]] {
+            Qwen35Inner::take_dflash2_compiled_test_counts();
+            inner.dflash2_compiled_verify_disabled = false;
+            let compiled = run(&mut inner, &ids)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts().0,
+                1,
+                "the compiled int8 verify must run (rows {})",
+                ids.len()
+            );
+            assert!(
+                !inner.dflash2_compiled_verify_disabled,
+                "the int8 compiled verify must not fall back"
+            );
+            inner.dflash2_compiled_verify_disabled = true;
+            let eager = run(&mut inner, &ids)?;
+            assert_eq!(Qwen35Inner::take_dflash2_compiled_test_counts(), (0, 0));
+            assert_eq!(compiled.len(), eager.len());
+            for (index, (a, b)) in compiled.iter().zip(eager.iter()).enumerate() {
+                assert_eq!(a.0, b.0, "output {index} shape (rows {})", ids.len());
+                assert_eq!(
+                    a.1,
+                    b.1,
+                    "verify output {index} differs (rows {})",
+                    ids.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Int8 K/V through the whole retained-prefix DFlash2 trace (eight-row
+    /// verifies with every keep width, rewinds, draft-window wraps and a
+    /// one-row continuation): the compiled shapeless tape is built once per
+    /// sequence length and replays bit-identically as the int8 prefix grows.
+    #[test]
+    fn compiled_int8_verifier_state_and_continuation_repeat_for_every_keep() -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!(
+                "SKIP int8 retained-prefix verifier regression: Metal must be the default device"
+            );
+            return Ok(());
+        }
+        assert!(std::env::var_os("MLX_DISABLE_COMPILE").is_none());
+        let mut inner = tiny_int8_dflash_inner(0xDFA5_1E79);
+        for layer in &inner.layers {
+            if let super::super::decoder_layer::AttentionType::Full(attention) = &layer.attn {
+                for seq_len in [1, 8] {
+                    assert!(attention.verify_can_be_shapeless(seq_len)?);
+                }
+            }
+        }
+        Qwen35Inner::take_dflash2_compiled_test_counts();
+        for keep in 1..=8 {
+            let expected = run_retained_prefix_trace(&mut inner, keep)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts(),
+                (5, 2 * usize::from(keep == 1)),
+                "int8 compiled verifier route: keep={keep}"
+            );
+            assert!(!inner.dflash2_compiled_verify_disabled);
+            let actual = run_retained_prefix_trace(&mut inner, keep)?;
+            assert_eq!(
+                Qwen35Inner::take_dflash2_compiled_test_counts(),
+                (5, 0),
+                "int8 compiled replay must survive a cache reset: keep={keep}"
+            );
+            assert_trace_eq(
+                &actual,
+                &expected,
+                &format!("repeated int8 retained prefix keep={keep}"),
+            );
+            // The trace's target-cache fingerprint covers int8 rows AND
+            // scales (collect_arrays includes the scale buffers).
+            let fa_layers = inner.config.full_attention_layer_count();
+            assert!(
+                expected.target_cache.len() >= 4 * fa_layers,
+                "int8 caches contribute rows and scales to the fingerprint"
+            );
+        }
+        Ok(())
+    }
+
     const GIB: u64 = 1024 * 1024 * 1024;
     const QWEN38_ROW_BYTES: u64 = 64 * 1024;
 
     #[test]
     fn kv_row_bytes_counts_every_full_attention_layer_and_dtype() {
-        assert_eq!(kv_row_bytes(16, 4, 256, DType::BFloat16), QWEN38_ROW_BYTES);
         assert_eq!(
-            kv_row_bytes(16, 4, 256, DType::Float32),
+            kv_row_bytes(16, 4, 256, DType::BFloat16, KvFormat::Bf16),
+            QWEN38_ROW_BYTES
+        );
+        assert_eq!(
+            kv_row_bytes(16, 4, 256, DType::Float32, KvFormat::Bf16),
             2 * QWEN38_ROW_BYTES
         );
-        assert_eq!(kv_row_bytes(0, 4, 256, DType::BFloat16), 0);
+        assert_eq!(kv_row_bytes(0, 4, 256, DType::BFloat16, KvFormat::Bf16), 0);
+        // int8: one byte per element plus one fp32 scale per row, whatever
+        // the activation dtype.
+        assert_eq!(
+            kv_row_bytes(16, 4, 256, DType::BFloat16, KvFormat::Int8),
+            16 * 2 * 4 * (256 + 4)
+        );
+        assert_eq!(
+            kv_row_bytes(16, 4, 256, DType::Float32, KvFormat::Int8),
+            kv_row_bytes(16, 4, 256, DType::BFloat16, KvFormat::Int8)
+        );
     }
 
     #[test]

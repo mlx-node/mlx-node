@@ -28,7 +28,7 @@ pub mod rotating_kv_cache;
 // Re-export all public types
 pub use attention::{Attention, QKVResult};
 pub use block::TransformerBlock;
-pub use kv_cache::KVCache;
+pub use kv_cache::{KVCache, KvFormat};
 pub use kv_cache_spec::{
     AttentionKind, KVCacheCoordinator, KVCacheCoordinatorError, KVCacheDType, KVCacheGroup,
     KVCachePhysicalLayout, KVCacheSpecError, LayerKVCacheRoute, LayerKVCacheSpec,

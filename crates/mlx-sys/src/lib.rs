@@ -742,6 +742,65 @@ unsafe extern "C-unwind" {
         causal: bool,
     ) -> *mut mlx_array;
 
+    /// Segmented attention over INT8 K/V rows with one fp32 scale per
+    /// (token, head): `*_k` / `*_v` int8 `[B, Hkv, n, 256]`, `*_ks` / `*_vs`
+    /// float32 `[B, Hkv, n]` (token stride 1). Never falls back to the
+    /// dequantizing concat (a compiled trace over it would bake the prefix
+    /// length): null (message on stderr) when no segmented launch serves
+    /// the block.
+    pub fn mlx_segmented_sdpa_int8_forward(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        prefix_ks: *mut mlx_array,
+        prefix_vs: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        new_ks: *mut mlx_array,
+        new_vs: *mut mlx_array,
+        scale: f32,
+        causal: bool,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY int8 entry with a forced route: `mode` -1 automatic, 0
+    /// vector, 1 tile, 2 nax. Null (message on stderr) when that route
+    /// cannot serve the block.
+    pub fn mlx_segmented_sdpa_int8_test_forward(
+        q: *mut mlx_array,
+        prefix_k: *mut mlx_array,
+        prefix_v: *mut mlx_array,
+        prefix_ks: *mut mlx_array,
+        prefix_vs: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        new_ks: *mut mlx_array,
+        new_vs: *mut mlx_array,
+        scale: f32,
+        causal: bool,
+        mode: i32,
+    ) -> *mut mlx_array;
+
+    /// Per-row symmetric int8 KV quantization: BF16 `[B, H, N, 256]` ->
+    /// int8 rows (`out_q`) + fp32 scales `[B, H, N]` (`out_s`), scale =
+    /// max|x| / 127, q = clamp(rint(x * 127 / max), -127, 127). 0 on
+    /// success, -1 (message on stderr) on error.
+    pub fn mlx_kv_int8_quantize_rows(
+        x: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> i32;
+
+    /// TEST-ONLY: the quantizer built from MLX ops (same arithmetic).
+    pub fn mlx_kv_int8_quantize_rows_reference(
+        x: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> i32;
+
+    /// int8 rows `[B, H, N, 256]` x fp32 scales `[B, H, N]` -> BF16 rows.
+    /// Null (message on stderr) on error.
+    pub fn mlx_kv_int8_dequantize_rows(q: *mut mlx_array, s: *mut mlx_array) -> *mut mlx_array;
+
     // Strict test entry: null on unsupported segmented dispatch; no concat
     // fallback. Always the vector routes (bit-identical to MLX's vector
     // SDPA), whatever the calibrated crossover says.

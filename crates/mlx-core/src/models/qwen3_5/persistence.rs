@@ -2057,6 +2057,7 @@ fn validate_mandatory_weights(
 pub async fn load_with_thread(
     model_path: &str,
     draft_model_path: Option<String>,
+    kv_format: Option<crate::transformer::KvFormat>,
 ) -> Result<Qwen3_5Model> {
     let model_assets_path = model_path.to_string();
     let model_path = model_assets_path.clone();
@@ -2090,6 +2091,17 @@ pub async fn load_with_thread(
                     .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
 
                 let mut config = parse_config(&raw)?;
+                // The flat full-attention K/V format: the load option wins
+                // over a `kv_format` key in config.json; an unknown config
+                // value is a load error rather than a silent BF16.
+                let config_kv_format =
+                    crate::transformer::KvFormat::parse(config.kv_format.as_deref())
+                        .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
+                let kv_format = kv_format.unwrap_or(config_kv_format);
+                config.kv_format = Some(kv_format.as_str().to_string());
+                if kv_format == crate::transformer::KvFormat::Int8 {
+                    info!("Qwen3.5 flat full-attention K/V cache format: int8 (per-row scales)");
+                }
 
                 let prism_config =
                     crate::quant::prism_hadamard::PrismHadamardConfig::from_config(&raw)?;
@@ -2754,6 +2766,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
         qwen35_gguf_gdn_layout: raw
             .get("qwen35_gguf_gdn_layout")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        kv_format: raw
+            .get("kv_format")
             .and_then(Value::as_str)
             .map(str::to_string),
     })
@@ -3475,6 +3491,7 @@ mod tests {
     fn no_mtp_layer_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 4,
@@ -3722,6 +3739,7 @@ mod tests {
 
         let cfg = Qwen3_5Config {
             qwen35_gguf_gdn_layout: Some("tiled".to_string()),
+            kv_format: None,
             vocab_size: 256,
             hidden_size: 1024,
             num_layers: 2,

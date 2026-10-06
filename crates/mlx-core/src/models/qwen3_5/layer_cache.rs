@@ -1,8 +1,9 @@
 use crate::array::MxArray;
-use crate::transformer::KVCache;
+use crate::transformer::{KVCache, KvFormat};
 use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
+use super::config::Qwen3_5Config;
 
 /// Mixed cache type for Qwen3.5 layers.
 ///
@@ -19,9 +20,32 @@ impl Qwen3_5LayerCache {
         Self::Linear(ArraysCache::new(2)) // 2 slots: conv_state, recurrent_state
     }
 
-    /// Create a cache for a full attention layer.
+    /// Create a cache for a full attention layer (BF16 rows).
     pub fn new_full_attention() -> Self {
         Self::FullAttention(KVCache::new())
+    }
+
+    /// Create a cache for a full attention layer holding rows in `format`.
+    pub fn new_full_attention_with(format: KvFormat) -> Self {
+        Self::FullAttention(KVCache::with_format(format))
+    }
+
+    /// The per-layer cache slot for decoder layer `index` of `config`: a
+    /// GDN state cache for linear layers, a full-attention K/V cache in the
+    /// config's KV format otherwise.
+    pub fn for_layer(config: &Qwen3_5Config, index: usize) -> Self {
+        if config.is_linear_layer(index) {
+            Self::new_linear()
+        } else {
+            Self::new_full_attention_with(config.kv_format())
+        }
+    }
+
+    /// One cache slot per decoder layer of `config` (see [`Self::for_layer`]).
+    pub fn fresh_layer_caches(config: &Qwen3_5Config) -> Vec<Self> {
+        (0..config.num_layers.max(0) as usize)
+            .map(|index| Self::for_layer(config, index))
+            .collect()
     }
 
     /// Get as mutable ArraysCache, or None if this is a full-attention cache.
@@ -78,6 +102,12 @@ impl Qwen3_5LayerCache {
                 }
                 if let Some(v) = c.values_ref() {
                     out.push(v);
+                }
+                if let Some(ks) = c.key_scales_ref() {
+                    out.push(ks);
+                }
+                if let Some(vs) = c.value_scales_ref() {
+                    out.push(vs);
                 }
             }
         }

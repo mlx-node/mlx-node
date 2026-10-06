@@ -37,17 +37,31 @@ fn eval_guard() -> &'static tokio::sync::Mutex<()> {
 
 /// Pick the loader and model-thread command by `model_type`, then run one eval
 /// request on that model's thread. Both families carry the same request type.
-async fn run_on_model(model_path: &str, request: EvalRequest) -> Result<EvalOutcome> {
+async fn run_on_model(
+    model_path: &str,
+    request: EvalRequest,
+    kv_format: Option<&str>,
+) -> Result<EvalOutcome> {
+    let format = kv_format
+        .map(|value| crate::transformer::KvFormat::parse(Some(value)))
+        .transpose()
+        .map_err(|message| Error::from_reason(format!("mlx eval: {message}")))?;
     match read_model_type(model_path)?.as_str() {
         "qwen3_5" => {
             let model =
-                crate::models::qwen3_5::persistence::load_with_thread(model_path, None).await?;
+                crate::models::qwen3_5::persistence::load_with_thread(model_path, None, format)
+                    .await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
                 Qwen35FamilyCommand::EvalTeacherForced { request, reply }
             })
             .await
         }
         "qwen3_5_moe" => {
+            if format.is_some_and(|f| f != crate::transformer::KvFormat::Bf16) {
+                return Err(Error::from_reason(
+                    "mlx eval: kv_format applies to dense qwen3_5 only",
+                ));
+            }
             let model =
                 crate::models::qwen3_5_moe::persistence::load_with_thread(model_path).await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
@@ -129,6 +143,7 @@ pub async fn capture_teacher_logits(
             logit_chunk,
             cache_dir: PathBuf::from(cache_dir),
         },
+        None,
     )
     .await?;
 
@@ -148,11 +163,16 @@ pub async fn capture_teacher_logits(
 /// width. Score reads its token ids FROM THE CACHE, so a tokenizer mismatch
 /// would otherwise report a finite, plausible number measured on the wrong
 /// text.
+///
+/// `kv_format` (`"bf16"` default, `"int8"`) selects the dense qwen3_5
+/// candidate's flat K/V cache format, so the int8 cache can be scored against
+/// the same teacher cache as the BF16 one.
 #[napi]
 pub async fn score_against_teacher(
     model_path: String,
     cache_dir: String,
     logit_chunk: u32,
+    kv_format: Option<String>,
 ) -> Result<EvalReport> {
     let _lock = eval_guard()
         .try_lock()
@@ -167,6 +187,7 @@ pub async fn score_against_teacher(
             logit_chunk,
             identity,
         },
+        kv_format.as_deref(),
     )
     .await?;
 

@@ -5173,6 +5173,14 @@ export interface Qwen35Config {
    * value head h to key head h % Hk without permuting packed weights.
    */
   qwen35GgufGdnLayout?: string | undefined;
+  /**
+   * Element format of the flat full-attention K/V cache: `"bf16"` (the
+   * default) or `"int8"` (per-(token, head) symmetric int8 rows with one
+   * fp32 scale each — half the K/V memory and read bandwidth; see
+   * `crate::array::kv_int8`). Set from the `kvFormat` load option; the
+   * paged cache ignores it.
+   */
+  kvFormat?: string | undefined;
 }
 
 /**
@@ -5209,6 +5217,13 @@ export interface Qwen35GenerationResult {
 export interface Qwen35LoadOptions {
   /** External z-lab DFlash2 checkpoint directory. */
   draftModelPath?: string;
+  /**
+   * Element format of the flat full-attention K/V cache: `'bf16'` (the
+   * default) or `'int8'` (per-token symmetric int8 rows with one fp32
+   * scale each — half the K/V memory and read bandwidth). The block-paged
+   * cache ignores it.
+   */
+  kvFormat?: 'int8' | 'bf16' | undefined;
 }
 
 /**
@@ -5709,11 +5724,16 @@ export interface SchedulerStats {
  * width. Score reads its token ids FROM THE CACHE, so a tokenizer mismatch
  * would otherwise report a finite, plausible number measured on the wrong
  * text.
+ *
+ * `kv_format` (`"bf16"` default, `"int8"`) selects the dense qwen3_5
+ * candidate's flat K/V cache format, so the int8 cache can be scored against
+ * the same teacher cache as the BF16 one.
  */
 export declare function scoreAgainstTeacher(
   modelPath: string,
   cacheDir: string,
   logitChunk: number,
+  kvFormat?: string | undefined | null,
 ): Promise<EvalReport>;
 
 /** Enable or disable profiling globally. */

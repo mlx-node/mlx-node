@@ -249,6 +249,21 @@ overlay by default and enables the embedded draft only when
 - **Memory** — the draft loads alongside the target (~6.9 GB extra for the bf16 DSpark 12B draft; ~0.8 GB for an assistant). Both variants run on the flat KV-cache path; a target config that explicitly enables `use_block_paged_cache` is rejected at load.
 - `draftModelPath` is supported by gemma4 and dense qwen3_5; other families reject it.
 
+### Int8 K/V cache (`kvFormat: 'int8'`, dense qwen3_5)
+
+`loadModel(path, { kvFormat: 'int8' })` stores the flat full-attention K/V
+cache as per-(token, head) symmetric int8 rows with one fp32 scale each
+(Splash's target KV format: `scale = max|x| / 127`, quantized on write).
+Rows are read as int8 by the segmented SDPA kernels (the DFlash2 / MTP verify
+block kernels take int8 operands straight into `matmul2d`; the AR decode row
+uses the int8 vector kernels), while prefill chunks after the first dequantize
+the cached prefix to a BF16 temporary for MLX's fused causal SDPA. Halves
+the K/V memory (Qwen3.8-27B at 32K: ~1.0 GB saved) and the verify's K/V read
+bandwidth; the quality cost is int8 rounding (measured: teacher-forced KL and
+top-1 agreement unchanged within noise, DFlash2 acceptance unchanged).
+Default stays `bf16`; the block-paged cache ignores the option. `mlx eval
+score --kv-format int8` scores the int8 cache against the same teacher cache.
+
 ## Server-side sessions
 
 The HTTP endpoints `/v1/responses` and `/v1/messages` live in `@mlx-node/server` (`packages/server/src/endpoints/`). Both route through a per-model `SessionRegistry` (`packages/server/src/session-registry.ts`) that owns the `ChatSession` lifetimes — clients pass `previous_response_id` and the registry handles resume vs. cold-start replay internally.

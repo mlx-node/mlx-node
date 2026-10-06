@@ -59,6 +59,14 @@ export interface LoadModelOptions {
    * this option.
    */
   draftModelPath?: string;
+  /**
+   * Flat full-attention K/V cache format for dense `qwen3_5` targets:
+   * `'bf16'` (the default) or `'int8'` — per-token symmetric int8 rows with
+   * one fp32 scale each, halving K/V memory and read bandwidth at a small,
+   * measured quality cost. The block-paged cache ignores it; other model
+   * families reject it.
+   */
+  kvFormat?: 'int8' | 'bf16';
 }
 
 type NativeModelClass = abstract new (...args: never[]) => object;
@@ -110,7 +118,9 @@ const LOADER_BINDINGS = {
     load: (modelPath: string, options?: LoadModelOptions) =>
       Qwen35Model.load(
         modelPath,
-        options?.draftModelPath === undefined ? null : { draftModelPath: options.draftModelPath },
+        options?.draftModelPath === undefined && options?.kvFormat === undefined
+          ? null
+          : { draftModelPath: options.draftModelPath, kvFormat: options.kvFormat },
       ),
     nativeModelClass: NativeQwen35Model,
   },
@@ -198,6 +208,12 @@ function dispatchLoad(
   if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
     throw new Error(
       `draftModelPath (speculative-decoding draft) is only supported by gemma4 and qwen3_5 models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  if (options?.kvFormat !== undefined && modelType !== 'qwen3_5') {
+    throw new Error(
+      `kvFormat (flat K/V cache format) is only supported by dense qwen3_5 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

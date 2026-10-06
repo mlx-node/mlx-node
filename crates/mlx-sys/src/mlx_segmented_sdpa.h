@@ -16,7 +16,25 @@ enum class SegmentedKernel {
   verify_two_pass_1,
   verify_tile_two_pass_1,
   verify_nax_two_pass_1,
+  // INT8 K/V with per-row fp32 scales (Splash's target KV format). The
+  // unified verify kernel has no int8 form (see sdpa_segmented.metal).
+  one_pass_int8,
+  two_pass_1_int8,
+  verify_tile_two_pass_1_int8,
+  verify_nax_two_pass_1_int8,
 };
+
+inline bool segmented_kernel_is_int8(SegmentedKernel kernel) {
+  switch (kernel) {
+  case SegmentedKernel::one_pass_int8:
+  case SegmentedKernel::two_pass_1_int8:
+  case SegmentedKernel::verify_tile_two_pass_1_int8:
+  case SegmentedKernel::verify_nax_two_pass_1_int8:
+    return true;
+  default:
+    return false;
+  }
+}
 
 // One pipeline: a kernel and its function constants or template shape.
 // `partitions` applies to the vector two-pass kernels, `gqa` / `rows` to the
@@ -67,6 +85,17 @@ array segmented_sdpa(const array &q, const array &prefix_k,
                      const array &prefix_v, const array &new_k,
                      const array &new_v, float scale, bool causal,
                      bool require_segmented, SegmentedTileMode tile_mode);
+
+// The same attention over INT8 K/V rows with one fp32 scale per (token,
+// head): `*_k` / `*_v` are int8 `[B, Hkv, n, 256]`, `*_ks` / `*_vs` float32
+// `[B, Hkv, n]` (token stride 1). The fallback dequantizes to BF16 and runs
+// MLX's SDPA over the concatenation.
+array segmented_sdpa_int8(const array &q, const array &prefix_k,
+                          const array &prefix_v, const array &prefix_ks,
+                          const array &prefix_vs, const array &new_k,
+                          const array &new_v, const array &new_ks,
+                          const array &new_vs, float scale, bool causal,
+                          bool require_segmented, SegmentedTileMode tile_mode);
 
 // Widest query chunk both segmented launches support for `gqa_factor`.
 int segmented_max_query_length(metal::Device &device, int gqa_factor);

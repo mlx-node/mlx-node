@@ -2585,6 +2585,7 @@ mod tests {
     fn three_layer_tiny_draft() -> super::DFlash2Model {
         let target = super::super::config::Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 64,
             num_layers: 4,

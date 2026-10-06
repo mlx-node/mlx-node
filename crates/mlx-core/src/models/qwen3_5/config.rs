@@ -229,6 +229,15 @@ pub struct Qwen3_5Config {
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
+
+    /// Element format of the flat full-attention K/V cache: `"bf16"` (the
+    /// default) or `"int8"` (per-(token, head) symmetric int8 rows with one
+    /// fp32 scale each — half the K/V memory and read bandwidth; see
+    /// `crate::array::kv_int8`). Set from the `kvFormat` load option; the
+    /// paged cache ignores it.
+    #[serde(default)]
+    #[napi(ts_type = "string | undefined")]
+    pub kv_format: Option<String>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -285,6 +294,12 @@ impl Qwen3_5Config {
             return true;
         }
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
+    }
+
+    /// Element format of the flat full-attention K/V cache (`kv_format`);
+    /// an unparseable value is BF16 — persistence rejects it at load.
+    pub fn kv_format(&self) -> crate::transformer::KvFormat {
+        crate::transformer::KvFormat::parse(self.kv_format.as_deref()).unwrap_or_default()
     }
 
     /// Number of full-attention layers (i.e. layers that use
@@ -367,6 +382,7 @@ mod tests {
     fn gdn_state_bytes_follow_the_real_conv_and_recurrent_shapes() {
         let config = Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 16,
             num_layers: 4,

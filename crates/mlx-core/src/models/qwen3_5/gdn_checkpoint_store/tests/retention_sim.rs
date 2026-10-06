@@ -750,6 +750,7 @@ fn dense_0_8b() -> Qwen3_5Config {
 fn small_config_shell() -> Qwen3_5Config {
     Qwen3_5Config {
         qwen35_gguf_gdn_layout: None,
+        kv_format: None,
         vocab_size: 32,
         hidden_size: 16,
         num_layers: 8,

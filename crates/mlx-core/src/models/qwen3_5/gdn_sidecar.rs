@@ -703,15 +703,7 @@ pub(crate) fn decode_caches(
     let conv_shape = geo.conv_shape();
     let rec_shape = geo.recurrent_shape();
 
-    let mut caches: Vec<Qwen3_5LayerCache> = (0..config.num_layers.max(0) as usize)
-        .map(|i| {
-            if config.is_linear_layer(i) {
-                Qwen3_5LayerCache::new_linear()
-            } else {
-                Qwen3_5LayerCache::new_full_attention()
-            }
-        })
-        .collect();
+    let mut caches: Vec<Qwen3_5LayerCache> = Qwen3_5LayerCache::fresh_layer_caches(config);
 
     for (ordinal, &layer_idx) in layers.iter().enumerate() {
         let Some(blob) = tensors.get(ordinal) else {
@@ -745,6 +737,7 @@ mod tests {
     fn config() -> Qwen3_5Config {
         Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 16,
             num_layers: 8,

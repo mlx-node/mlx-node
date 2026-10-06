@@ -1159,6 +1159,7 @@ mod tests {
     fn kernel_geometry_net_with(weight: impl Fn(&[i64]) -> MxArray) -> GatedDeltaNet {
         let config = Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 64,
             num_layers: 4,
@@ -1501,6 +1502,7 @@ mod tests {
         let hidden = 256i64;
         let config = Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: hidden as i32,
             num_layers: 4,

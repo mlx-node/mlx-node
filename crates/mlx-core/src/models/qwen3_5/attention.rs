@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::kv_int8::{Int8KvRows, segmented_sdpa_int8};
 use crate::array::{DType, MxArray};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -13,6 +14,7 @@ use crate::models::paddleocr_vl::language::{
 };
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+use crate::transformer::KvFormat;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 #[cfg(test)]
 use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
@@ -215,20 +217,45 @@ pub struct Qwen3_5Attention {
     kv_proj: Option<(LinearProj, i64)>,
 }
 
+/// The K/V prefix a compiled verify forward reads: views into the flat
+/// `KVCache` buffers in the cache's format.
+pub(crate) enum VerifyPrefix<'a> {
+    /// BF16 `[B, Hkv, P, D]` keys and values.
+    Bf16 {
+        keys: &'a MxArray,
+        values: &'a MxArray,
+    },
+    /// int8 `[B, Hkv, P, D]` keys and values with their fp32 `[B, Hkv, P]`
+    /// scales (`KVCache::int8_view`).
+    Int8 {
+        keys: &'a MxArray,
+        values: &'a MxArray,
+        key_scales: &'a MxArray,
+        value_scales: &'a MxArray,
+    },
+}
+
+/// The post-RoPE K/V block a compiled verify forward emits, in the layout the
+/// cache stores: BF16 rows, or int8 rows plus scales (quantized inside the
+/// graph, so the verify attention reads the new rows in the same format as
+/// the prefix and the cache write is a plain slice assignment).
+pub(crate) enum VerifyKvOut {
+    Bf16(MxArray, MxArray),
+    Int8(Int8KvRows),
+}
+
 /// IO bundle for [`Qwen3_5Attention::forward_verify`] (the compiled DFlash2
 /// verify path): the graph reads position and the K/V prefix as array inputs
 /// and returns the post-RoPE block through `out_kv`, so nothing host-baked —
 /// cache offsets, prefix lengths, write bounds — enters the traced region.
 pub(crate) struct AttentionVerifyIo<'a> {
-    /// Live K prefix `[B, Hkv, P, D]` — a view into the flat KVCache buffer.
-    pub prefix_keys: &'a MxArray,
-    /// Live V prefix `[B, Hkv, P, D]`.
-    pub prefix_values: &'a MxArray,
+    /// Live K/V prefix views into the flat KVCache buffers.
+    pub prefix: VerifyPrefix<'a>,
     /// Per-batch RoPE position of this block's first row, `[B] int32`.
     pub rope_offsets: &'a MxArray,
-    /// Receives `(new_k, new_v)` `[B, Hkv, T, D]` post-RoPE — the layout
-    /// `KVCache::update_and_fetch` would store.
-    pub out_kv: &'a mut Option<(MxArray, MxArray)>,
+    /// Receives the post-RoPE `[B, Hkv, T, D]` block in the cache's format —
+    /// what `KVCache::update_and_fetch` / `append_quantized` store.
+    pub out_kv: &'a mut Option<VerifyKvOut>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -654,6 +681,21 @@ impl Qwen3_5Attention {
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
+        // An int8 cache quantizes the block on write and reads the int8 rows
+        // through its own kernels; see `forward_int8_cached`.
+        if cache
+            .as_deref()
+            .is_some_and(|c| c.format() == KvFormat::Int8)
+        {
+            let c = cache.ok_or_else(|| Error::from_reason("int8 KV cache vanished"))?;
+            let output = self.forward_int8_cached(&queries, &keys, &values, mask, c, seq_len)?;
+            let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+            let output =
+                output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+            let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+            return self.o_proj.forward(&gated_output);
+        }
+
         // Update KV cache (expects [B, H, T, D])
         let (keys, values) = if let Some(c) = cache {
             c.update_and_fetch(&keys, &values)?
@@ -738,6 +780,65 @@ impl Qwen3_5Attention {
         self.o_proj.forward(&gated_output)
     }
 
+    /// SDPA of `queries` `[B, Hq, T, D]` over an int8 `KVCache` after
+    /// appending the BF16 block `keys` / `values` `[B, Hkv, T, D]` to it
+    /// (quantized on write). Returns `[B, Hq, T, D]`.
+    ///
+    /// Readers by block shape:
+    ///   * `T == 1` (AR decode, MTP draft step) and `2..=8` without a mask
+    ///     (eager MTP / DFlash2 verify): the segmented int8 kernels read the
+    ///     int8 rows directly — prefix `[0, P)` and the block's own rows as
+    ///     the "new" segment, causal for a block.
+    ///   * anything else (prefill chunks, explicit masks): the cached prefix
+    ///     is dequantized to a BF16 temporary (one pass per layer per chunk)
+    ///     and MLX's fused SDPA runs over `concat(prefix, fresh block)`; the
+    ///     block's own rows stay BF16 there.
+    ///
+    /// An empty prefix has no int8 segment to bind, so it also takes the
+    /// BF16 route (the first prefill chunk, a one-token prompt's first step).
+    fn forward_int8_cached(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        mask: Option<&MxArray>,
+        cache: &mut KVCache,
+        seq_len: i64,
+    ) -> Result<MxArray> {
+        let prefix_len = cache.get_offset() as i64;
+        let all = cache.update_and_fetch_int8(keys, values)?;
+        let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+        let segmented = mask.is_none()
+            && prefix_len > 0
+            && (1..=8).contains(&seq_len)
+            && (1..=32).contains(&gqa)
+            && self.head_dim == 256
+            && queries.dtype()? == DType::BFloat16
+            && unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if segmented {
+            let prefix = all.slice_tokens(0, prefix_len)?;
+            let new = all.slice_tokens(prefix_len, prefix_len + seq_len)?;
+            return segmented_sdpa_int8(queries, &prefix, &new, self.scale, seq_len > 1);
+        }
+        let (k, v) = if prefix_len > 0 {
+            let (pk, pv) = all.slice_tokens(0, prefix_len)?.dequantize()?;
+            (
+                MxArray::concatenate(&pk, keys, 2)?,
+                MxArray::concatenate(&pv, values, 2)?,
+            )
+        } else {
+            (keys.clone(), values.clone())
+        };
+        if let Some(m) = mask {
+            scaled_dot_product_attention(queries, &k, &v, self.scale as f64, Some(m))
+        } else if seq_len > 1 {
+            scaled_dot_product_attention_causal(queries, &k, &v, self.scale as f64)
+        } else {
+            scaled_dot_product_attention(queries, &k, &v, self.scale as f64, None)
+        }
+    }
+
     /// Compiled-verify forward for the DFlash2 flat-cache path.
     ///
     /// Identical math to [`Self::forward`] with `mask = None`,
@@ -801,7 +902,36 @@ impl Qwen3_5Attention {
             .rope
             .forward_with_offsets(&keys.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
         let new_values = values.transpose(Some(&[0, 2, 1, 3]))?;
-        *io.out_kv = Some((new_keys.clone(), new_values.clone()));
+
+        let (prefix_keys, prefix_values) = match io.prefix {
+            VerifyPrefix::Bf16 { keys, values } => (keys, values),
+            VerifyPrefix::Int8 {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } => {
+                // Quantize the block inside the graph: the cache stores
+                // exactly these rows, and the verify attention reads them
+                // in the same int8 form as the prefix (one operand type per
+                // kernel, as Splash's store-then-attend order).
+                let new = Int8KvRows::quantize(&new_keys, &new_values)?;
+                let prefix = Int8KvRows {
+                    keys: keys.clone(),
+                    values: values.clone(),
+                    key_scales: key_scales.clone(),
+                    value_scales: value_scales.clone(),
+                };
+                let output = segmented_sdpa_int8(&queries, &prefix, &new, self.scale, true)?;
+                *io.out_kv = Some(VerifyKvOut::Int8(new));
+                let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+                let output =
+                    output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+                let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+                return self.o_proj.forward(&gated_output);
+            }
+        };
+        *io.out_kv = Some(VerifyKvOut::Bf16(new_keys.clone(), new_values.clone()));
 
         let output = if seq_len > 1 {
             let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
@@ -817,7 +947,7 @@ impl Qwen3_5Attention {
             };
             // Segmented attention serves the whole block in one call.
             let one_call = segmented_enabled
-                && io.prefix_keys.shape_at(2)? > 0
+                && prefix_keys.shape_at(2)? > 0
                 && segmented_verify_head_len(seq_len, device_max_q).is_some();
             // Otherwise the same qL·gqa verify-split as `forward` — see its
             // comment for the threadgroup-limit rationale — but the head
@@ -845,8 +975,8 @@ impl Qwen3_5Attention {
                 let head_new_v = new_values.slice_axis(2, 0, head_len)?;
                 let out_head = verify_sdpa_without_kv_concat(
                     &q_parts[0],
-                    io.prefix_keys,
-                    io.prefix_values,
+                    prefix_keys,
+                    prefix_values,
                     &head_new_k,
                     &head_new_v,
                     self.scale,
@@ -854,8 +984,8 @@ impl Qwen3_5Attention {
                 )?;
                 let out_tail = verify_sdpa_without_kv_concat(
                     &q_parts[1],
-                    io.prefix_keys,
-                    io.prefix_values,
+                    prefix_keys,
+                    prefix_values,
                     &new_keys,
                     &new_values,
                     self.scale,
@@ -865,8 +995,8 @@ impl Qwen3_5Attention {
             } else {
                 verify_sdpa_without_kv_concat(
                     &queries,
-                    io.prefix_keys,
-                    io.prefix_values,
+                    prefix_keys,
+                    prefix_values,
                     &new_keys,
                     &new_values,
                     self.scale,
@@ -876,8 +1006,8 @@ impl Qwen3_5Attention {
         } else {
             verify_sdpa_without_kv_concat(
                 &queries,
-                io.prefix_keys,
-                io.prefix_values,
+                prefix_keys,
+                prefix_values,
                 &new_keys,
                 &new_values,
                 self.scale,
@@ -2024,6 +2154,9 @@ impl Qwen3_5Attention {
         )
     }
 }
+
+#[cfg(test)]
+mod kv_int8_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4597,9 +4730,10 @@ mod tests {
         Ok(())
     }
 
-    fn tiny_cfg() -> Qwen3_5Config {
+    pub(super) fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 32,
             hidden_size: 32,
             num_layers: 1,

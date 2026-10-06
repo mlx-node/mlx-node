@@ -682,6 +682,7 @@ mod tests {
         // makes layer 3 a full-attention layer; n_mtp_layers=1.
         Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 4,

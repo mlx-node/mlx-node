@@ -37,15 +37,28 @@ namespace {
 
 constexpr int kHeadDimension = 256;
 
+// Inputs are {q, pk, pv, nk, nv} (BF16 K/V) or {q, pk, pv, nk, nv, pks,
+// pvs, nks, nvs} (int8 K/V with per-row fp32 scales).
+constexpr size_t kBf16Inputs = 5;
+constexpr size_t kInt8Inputs = 9;
+
+bool quantized_inputs(const std::vector<array> &inputs) {
+  return inputs.size() == kInt8Inputs;
+}
+
 void validate_segmented_sdpa(const std::vector<array> &inputs) {
-  if (inputs.size() != 5) {
-    throw std::invalid_argument("segmented_sdpa expects five inputs");
+  if (inputs.size() != kBf16Inputs && inputs.size() != kInt8Inputs) {
+    throw std::invalid_argument("segmented_sdpa expects five or nine inputs");
   }
-  for (const auto &input : inputs) {
-    if (input.ndim() != 4 || input.dtype() != bfloat16 ||
+  const bool quantized = quantized_inputs(inputs);
+  const Dtype kv_dtype = quantized ? int8 : bfloat16;
+  for (size_t i = 0; i < kBf16Inputs; ++i) {
+    const auto &input = inputs[i];
+    if (input.ndim() != 4 || input.dtype() != (i == 0 ? bfloat16 : kv_dtype) ||
         input.strides(-1) != 1) {
-      throw std::invalid_argument("segmented_sdpa requires rank-4 BF16 inputs "
-                                  "with contiguous head dimension");
+      throw std::invalid_argument(
+          "segmented_sdpa requires rank-4 BF16 queries and BF16 or int8 K/V "
+          "with contiguous head dimension");
     }
   }
   const auto &q = inputs[0];
@@ -66,12 +79,41 @@ void validate_segmented_sdpa(const std::vector<array> &inputs) {
       int64_t(pk.shape(2)) + nk.shape(2) > std::numeric_limits<int>::max()) {
     throw std::invalid_argument("unsupported segmented_sdpa shape");
   }
+  if (quantized) {
+    // Scales: float32 [B, Hkv, n] with token stride 1, one per K/V row.
+    for (size_t i = kBf16Inputs; i < kInt8Inputs; ++i) {
+      const auto &s = inputs[i];
+      const auto &rows = inputs[i - 4];
+      if (s.ndim() != 3 || s.dtype() != float32 || s.strides(2) != 1 ||
+          s.shape(0) != rows.shape(0) || s.shape(1) != rows.shape(1) ||
+          s.shape(2) != rows.shape(2)) {
+        throw std::invalid_argument(
+            "segmented_sdpa int8 scales must be float32 [B, Hkv, n] with a "
+            "contiguous token axis matching their K/V rows");
+      }
+    }
+  }
+}
+
+// int8 rows x their per-row scale -> BF16 (fallback and tests only).
+array dequantize_rows(const array &rows, const array &scales, Stream stream) {
+  return astype(
+      multiply(astype(rows, float32, stream), expand_dims(scales, -1, stream),
+               stream),
+      bfloat16, stream);
 }
 
 std::vector<array> segmented_fallback(std::vector<array> inputs, float scale,
                                       bool causal, Stream stream) {
-  auto keys = concatenate({inputs[1], inputs[3]}, 2, stream);
-  auto values = concatenate({inputs[2], inputs[4]}, 2, stream);
+  array pk = inputs[1], pv = inputs[2], nk = inputs[3], nv = inputs[4];
+  if (quantized_inputs(inputs)) {
+    pk = dequantize_rows(pk, inputs[5], stream);
+    pv = dequantize_rows(pv, inputs[6], stream);
+    nk = dequantize_rows(nk, inputs[7], stream);
+    nv = dequantize_rows(nv, inputs[8], stream);
+  }
+  auto keys = concatenate({pk, nk}, 2, stream);
+  auto values = concatenate({pv, nv}, 2, stream);
   return {fast::scaled_dot_product_attention(
       inputs[0], keys, values, scale, causal ? "causal" : "", std::nullopt,
       std::nullopt, false, stream)};
@@ -108,8 +150,34 @@ std::string kernel_name(SegmentedKernel kernel, int m = 0, int tile_n = 0) {
   case SegmentedKernel::verify_nax_two_pass_1:
     return "mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m" +
            std::to_string(m) + "_n" + std::to_string(tile_n);
+  case SegmentedKernel::one_pass_int8:
+    return "mlx_node_sdpa_segmented_int8_256";
+  case SegmentedKernel::two_pass_1_int8:
+    return "mlx_node_sdpa_segmented_2pass_1_int8_256";
+  case SegmentedKernel::verify_tile_two_pass_1_int8:
+    return "mlx_node_sdpa_segmented_verify_tile_2pass_1_int8_256";
+  case SegmentedKernel::verify_nax_two_pass_1_int8:
+    return "mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m" +
+           std::to_string(m) + "_n" + std::to_string(tile_n);
   }
   throw std::invalid_argument("unknown segmented SDPA kernel");
+}
+
+// The BF16 or int8 form of each kernel family.
+SegmentedKernel one_pass_kernel(bool quantized) {
+  return quantized ? SegmentedKernel::one_pass_int8 : SegmentedKernel::one_pass;
+}
+SegmentedKernel two_pass_1_kernel(bool quantized) {
+  return quantized ? SegmentedKernel::two_pass_1_int8
+                   : SegmentedKernel::two_pass_1;
+}
+SegmentedKernel tile_kernel(bool quantized) {
+  return quantized ? SegmentedKernel::verify_tile_two_pass_1_int8
+                   : SegmentedKernel::verify_tile_two_pass_1;
+}
+SegmentedKernel nax_kernel(bool quantized) {
+  return quantized ? SegmentedKernel::verify_nax_two_pass_1_int8
+                   : SegmentedKernel::verify_nax_two_pass_1;
 }
 
 // Key count (prefix + new rows) from which a verify block takes a block
@@ -175,7 +243,8 @@ struct Pipelines {
 
 Pipelines get_pipelines(metal::Device &device, int query_length, int gqa_factor,
                         int total_length, int q_heads, int kv_heads,
-                        bool causal, int64_t prefix_row_stride) {
+                        bool causal, int64_t prefix_row_stride,
+                        bool quantized = false) {
   const char device_class = device.get_architecture().back();
   const bool two_pass =
       sdpa_vector_uses_two_pass(device_class, total_length, q_heads, kv_heads);
@@ -184,8 +253,8 @@ Pipelines get_pipelines(metal::Device &device, int query_length, int gqa_factor,
                                              gqa_factor * query_length,
                                              env::get_var("MLX_SDPA_BLOCKS", 0))
                : 32;
-  const auto kernel =
-      two_pass ? SegmentedKernel::two_pass_1 : SegmentedKernel::one_pass;
+  const auto kernel = two_pass ? two_pass_1_kernel(quantized)
+                               : one_pass_kernel(quantized);
   auto *stage1 =
       segmented_kernel(device, {kernel, causal, partitions, 0, 0, 0, 0});
   MTL::ComputePipelineState *stage2 = nullptr;
@@ -216,12 +285,14 @@ segmented_kernel(metal::Device &device,
   const std::string name = kernel_name(sp.kernel, sp.m, sp.tile_n);
   std::string hash = name;
   metal::MTLFCList constants;
-  if (sp.kernel == SegmentedKernel::verify_nax_two_pass_1) {
+  if (sp.kernel == SegmentedKernel::verify_nax_two_pass_1 ||
+      sp.kernel == SegmentedKernel::verify_nax_two_pass_1_int8) {
     // The whole shape is in the function name.
     return fast::paged::get_prebuilt_kernel(device, "segmented_sdpa",
                                             "segmented SDPA", name);
   }
-  if (sp.kernel == SegmentedKernel::verify_tile_two_pass_1) {
+  if (sp.kernel == SegmentedKernel::verify_tile_two_pass_1 ||
+      sp.kernel == SegmentedKernel::verify_tile_two_pass_1_int8) {
     // The tile kernel takes its shape from buffers; only the tile size is
     // compiled in (index 29).
     constants.emplace_back(&sp.tile_n, MTL::DataType::DataTypeInt, 29);
@@ -232,7 +303,8 @@ segmented_kernel(metal::Device &device,
   // Indices 22 and 26 are MLX's sdpa_vector.h do_causal and blocks.
   constants.emplace_back(&sp.causal, MTL::DataType::DataTypeBool, 22);
   hash += sp.causal ? "_c" : "_nc";
-  if (sp.kernel != SegmentedKernel::one_pass) {
+  if (sp.kernel != SegmentedKernel::one_pass &&
+      sp.kernel != SegmentedKernel::one_pass_int8) {
     constants.emplace_back(&sp.partitions, MTL::DataType::DataTypeInt, 26);
     hash += "_" + std::to_string(sp.partitions);
   }
@@ -250,13 +322,16 @@ std::vector<std::string> metal_kernel_names() {
   for (auto kernel :
        {SegmentedKernel::one_pass, SegmentedKernel::two_pass_1,
         SegmentedKernel::verify_two_pass_1,
-        SegmentedKernel::verify_tile_two_pass_1}) {
+        SegmentedKernel::verify_tile_two_pass_1, SegmentedKernel::one_pass_int8,
+        SegmentedKernel::two_pass_1_int8,
+        SegmentedKernel::verify_tile_two_pass_1_int8}) {
     names.push_back(kernel_name(kernel));
   }
-  for (int m : kNaxMs) {
-    for (int tile_n : kNaxTileSizes) {
-      names.push_back(
-          kernel_name(SegmentedKernel::verify_nax_two_pass_1, m, tile_n));
+  for (bool quantized : {false, true}) {
+    for (int m : kNaxMs) {
+      for (int tile_n : kNaxTileSizes) {
+        names.push_back(kernel_name(nax_kernel(quantized), m, tile_n));
+      }
     }
   }
   return names;
@@ -276,10 +351,12 @@ std::vector<SegmentedSpecialization> metal_kernel_specializations() {
     }
   }
   std::vector<SegmentedSpecialization> out;
-  for (bool causal : {false, true}) {
-    out.push_back({SegmentedKernel::one_pass, causal, 32, 0, 0, 0, 0});
-    for (int p : partitions) {
-      out.push_back({SegmentedKernel::two_pass_1, causal, p, 0, 0, 0, 0});
+  for (bool quantized : {false, true}) {
+    for (bool causal : {false, true}) {
+      out.push_back({one_pass_kernel(quantized), causal, 32, 0, 0, 0, 0});
+      for (int p : partitions) {
+        out.push_back({two_pass_1_kernel(quantized), causal, p, 0, 0, 0, 0});
+      }
     }
   }
   for (int p : partitions) {
@@ -290,16 +367,18 @@ std::vector<SegmentedSpecialization> metal_kernel_specializations() {
       }
     }
   }
-  for (int tile_n : kTileSizes) {
-    out.push_back(
-        {SegmentedKernel::verify_tile_two_pass_1, true, 0, 0, 0, tile_n, 0});
+  for (bool quantized : {false, true}) {
+    for (int tile_n : kTileSizes) {
+      out.push_back({tile_kernel(quantized), true, 0, 0, 0, tile_n, 0});
+    }
   }
   // The tensor-op pipelines build only where the op exists.
   if (metal::is_nax_available()) {
-    for (int m : kNaxMs) {
-      for (int tile_n : kNaxTileSizes) {
-        out.push_back(
-            {SegmentedKernel::verify_nax_two_pass_1, true, 0, 0, 0, tile_n, m});
+    for (bool quantized : {false, true}) {
+      for (int m : kNaxMs) {
+        for (int tile_n : kNaxTileSizes) {
+          out.push_back({nax_kernel(quantized), true, 0, 0, 0, tile_n, m});
+        }
       }
     }
   }
@@ -396,7 +475,7 @@ bool tile_aligned(const array &a) {
 // or shape rules it out. The tile size comes from the pipeline built at the
 // device's tile size, so the capabilities and the function constant agree.
 TileVerifyLaunch tile_verify_launch(metal::Device &device, int rows, int gqa,
-                                    int total_length) {
+                                    int total_length, bool quantized = false) {
   auto *mtl = device.mtl_device();
   auto *stage2 = reduction_kernel(device);
   const auto c2 = capabilities(stage2, mtl);
@@ -414,8 +493,7 @@ TileVerifyLaunch tile_verify_launch(metal::Device &device, int rows, int gqa,
     return launch;
   }
   launch.stage1 = segmented_kernel(
-      device,
-      {SegmentedKernel::verify_tile_two_pass_1, true, 0, 0, 0, tile_n, 0});
+      device, {tile_kernel(quantized), true, 0, 0, 0, tile_n, 0});
   launch.plan = plan_segmented_verify_tile_launch(
       rows, gqa, capabilities(launch.stage1, mtl), c2);
   if (launch.plan.supported && int(launch.plan.tile_n) != tile_n) {
@@ -453,7 +531,7 @@ bool nax_q_layout(const array &q, const array &pk, const array &pv,
 // the built pipeline. Partitions follow the tile kernel's policy at this
 // kernel's tile size.
 NaxVerifyLaunch nax_verify_launch(metal::Device &device, int rows, int gqa,
-                                  int total_length) {
+                                  int total_length, bool quantized = false) {
   auto *mtl = device.mtl_device();
   auto *stage2 = reduction_kernel(device);
   const auto c2 = capabilities(stage2, mtl);
@@ -468,9 +546,8 @@ NaxVerifyLaunch nax_verify_launch(metal::Device &device, int rows, int gqa,
   if (tile_n == 0) {
     return launch;
   }
-  launch.stage1 = segmented_kernel(device,
-                                   {SegmentedKernel::verify_nax_two_pass_1,
-                                    true, 0, 0, 0, tile_n, int(m)});
+  launch.stage1 = segmented_kernel(
+      device, {nax_kernel(quantized), true, 0, 0, 0, tile_n, int(m)});
   launch.plan = plan_segmented_verify_nax_launch(
       rows, gqa, capabilities(launch.stage1, mtl), c2);
   if (launch.plan.supported && int(launch.plan.tile_n) != tile_n) {
@@ -486,13 +563,14 @@ NaxVerifyLaunch nax_verify_launch(metal::Device &device, int rows, int gqa,
 VerifyDispatch plan_verify_dispatch(metal::Device &device, int head_rows,
                                     int rows, int gqa, int prefix_n,
                                     int q_heads, int kv_heads,
-                                    int64_t prefix_row_stride) {
+                                    int64_t prefix_row_stride,
+                                    bool quantized = false) {
   const int tail_rows = rows - head_rows;
   auto head =
       get_pipelines(device, head_rows, gqa, prefix_n + head_rows, q_heads,
-                    kv_heads, head_rows > 1, prefix_row_stride);
+                    kv_heads, head_rows > 1, prefix_row_stride, quantized);
   auto tail = get_pipelines(device, tail_rows, gqa, prefix_n + rows, q_heads,
-                            kv_heads, true, prefix_row_stride);
+                            kv_heads, true, prefix_row_stride, quantized);
   if (!head.plan.supported || !tail.plan.supported) {
     throw std::runtime_error(
         "segmented SDPA verify chunk launch is unsupported");
@@ -501,7 +579,9 @@ VerifyDispatch plan_verify_dispatch(metal::Device &device, int head_rows,
   const auto tail_reduction = reduction_plan(tail);
   MTL::ComputePipelineState *unified = nullptr;
   SegmentedSdpaLaunchPlan unified_plan{false, true, 0, 0, 0};
-  if (head_reduction.two_pass && tail_reduction.two_pass &&
+  // The unified kernel exists for bit-identity with the split route; int8
+  // has none and takes the split route.
+  if (!quantized && head_reduction.two_pass && tail_reduction.two_pass &&
       head_reduction.partitions == tail_reduction.partitions) {
     const auto launch =
         unified_verify_launch(device, rows, gqa, tail_reduction.partitions);
@@ -520,6 +600,43 @@ std::vector<int64_t> segmented_strides(const array &q, const array &pk,
           pk.strides(1), pk.strides(2), pv.strides(0), pv.strides(1),
           pv.strides(2), nk.strides(0), nk.strides(1), nk.strides(2),
           nv.strides(0), nv.strides(1), nv.strides(2)};
+}
+
+// The int8 scale operands of one dispatch: the four scale arrays and their
+// {batch, head} strides. BF16 dispatches bind the K/V arrays in their place
+// (the kernels never read them) so every buffer slot is bound.
+struct ScaleOperands {
+  const array *pks;
+  const array *pvs;
+  const array *nks;
+  const array *nvs;
+  std::vector<int64_t> strides;
+};
+
+ScaleOperands scale_operands(const std::vector<array> &inputs) {
+  if (quantized_inputs(inputs)) {
+    const auto &pks = inputs[5];
+    const auto &pvs = inputs[6];
+    const auto &nks = inputs[7];
+    const auto &nvs = inputs[8];
+    return {&pks,
+            &pvs,
+            &nks,
+            &nvs,
+            {pks.strides(0), pks.strides(1), pvs.strides(0), pvs.strides(1),
+             nks.strides(0), nks.strides(1), nvs.strides(0), nvs.strides(1)}};
+  }
+  return {&inputs[1], &inputs[2], &inputs[3], &inputs[4],
+          std::vector<int64_t>(8, 0)};
+}
+
+void bind_scales(metal::CommandEncoder &encoder, const ScaleOperands &scales,
+                 int first_buffer) {
+  encoder.set_input_array(*scales.pks, first_buffer);
+  encoder.set_input_array(*scales.pvs, first_buffer + 1);
+  encoder.set_input_array(*scales.nks, first_buffer + 2);
+  encoder.set_input_array(*scales.nvs, first_buffer + 3);
+  encoder.set_vector_bytes(scales.strides, first_buffer + 4);
 }
 
 void add_reduction_temporaries(metal::CommandEncoder &encoder, int batch,
@@ -559,7 +676,8 @@ void encode_segmented_call(metal::CommandEncoder &encoder,
                            const Pipelines &pipelines, const array &q,
                            int q_row0, int q_rows, const array &pk,
                            const array &pv, const array &nk, const array &nv,
-                           int new_n, float scale, array &out) {
+                           const ScaleOperands &scales, int new_n, float scale,
+                           array &out) {
   const int batch = q.shape(0);
   const int q_heads = q.shape(1);
   const int kv_heads = pk.shape(1);
@@ -582,6 +700,7 @@ void encode_segmented_call(metal::CommandEncoder &encoder,
     encoder.set_vector_bytes(strides, 9);
     encoder.set_bytes(scale, 10);
     encoder.set_bytes(q_heads, 11);
+    bind_scales(encoder, scales, 12);
     encoder.dispatch_threadgroups(
         MTL::Size(batch * q_heads, q_rows, 1),
         MTL::Size(pipelines.plan.stage1_threads, 1, 1));
@@ -602,6 +721,7 @@ void encode_segmented_call(metal::CommandEncoder &encoder,
   encoder.set_bytes(new_n, 9);
   encoder.set_vector_bytes(strides, 10);
   encoder.set_bytes(scale, 11);
+  bind_scales(encoder, scales, 15);
   encoder.dispatch_threadgroups(MTL::Size(kv_heads, batch, partitions),
                                 MTL::Size(32, gqa, q_rows));
   encode_reduction(encoder, pipelines, partials, sums, maxs, out, batch,
@@ -680,7 +800,8 @@ BlockVerifyDispatch block_dispatch(const NaxVerifyLaunch &launch) {
 void encode_block_verify(metal::CommandEncoder &encoder,
                          const BlockVerifyDispatch &launch, const array &q,
                          const array &pk, const array &pv, const array &nk,
-                         const array &nv, float scale, array &out) {
+                         const array &nv, const ScaleOperands &scales,
+                         float scale, array &out) {
   const int batch = q.shape(0);
   const int q_heads = q.shape(1);
   const int rows = q.shape(2);
@@ -711,6 +832,7 @@ void encode_block_verify(metal::CommandEncoder &encoder,
   encoder.set_bytes(gqa, 12);
   encoder.set_bytes(rows, 13);
   encoder.set_bytes(partitions, 14);
+  bind_scales(encoder, scales, 15);
   encoder.set_threadgroup_memory_length(launch.threadgroup_bytes, 0);
   encoder.dispatch_threadgroups(MTL::Size(kv_heads, batch, partitions),
                                 MTL::Size(launch.stage1_threads, 1, 1));
@@ -740,41 +862,48 @@ void encode_segmented_sdpa(metal::Device &device,
   const auto &pv = inputs[2];
   const auto &nk = inputs[3];
   const auto &nv = inputs[4];
+  const bool quantized = quantized_inputs(inputs);
+  const auto scales = scale_operands(inputs);
   const int q_len = q.shape(2);
   const int q_heads = q.shape(1);
   const int kv_heads = pk.shape(1);
   const int gqa = q_heads / kv_heads;
   const int prefix_n = pk.shape(2);
   const int new_n = nk.shape(2);
+  if (quantized) {
+    bridge_testing::record("segmented_sdpa_int8");
+  }
 
   // A verify block (causal, one new row per query) takes a block kernel
   // whenever this device can launch one: the tensor-op kernel where NAX
   // exists and Q is head-major contiguous, else the simdgroup-matrix tile
   // kernel. The partition count follows the real prefix, so a shapeless
-  // replay stays valid as the prefix grows.
+  // replay stays valid as the prefix grows. The crossover was calibrated on
+  // BF16; int8 reads half the bytes per key, so it favours the block kernels
+  // at least as much.
   if (causal && new_n == q_len &&
       tile_route_enabled(tile_mode, prefix_n + new_n) && tile_aligned(q) &&
       tile_aligned(pk) && tile_aligned(pv) && tile_aligned(nk) &&
       tile_aligned(nv)) {
     if (nax_route_enabled(tile_mode) && nax_q_layout(q, pk, pv, nk, nv)) {
       const auto launch =
-          nax_verify_launch(device, q_len, gqa, prefix_n + new_n);
+          nax_verify_launch(device, q_len, gqa, prefix_n + new_n, quantized);
       if (launch.plan.supported) {
         bridge_testing::record("segmented_sdpa_route_nax");
         out.set_data(allocator::malloc(out.nbytes()));
         encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk, nv,
-                            scale, out);
+                            scales, scale, out);
         return;
       }
     }
     if (tile_mode != SegmentedTileMode::nax) {
       const auto launch =
-          tile_verify_launch(device, q_len, gqa, prefix_n + new_n);
+          tile_verify_launch(device, q_len, gqa, prefix_n + new_n, quantized);
       if (launch.plan.supported) {
         bridge_testing::record("segmented_sdpa_route_tile");
         out.set_data(allocator::malloc(out.nbytes()));
         encode_block_verify(encoder, block_dispatch(launch), q, pk, pv, nk, nv,
-                            scale, out);
+                            scales, scale, out);
         return;
       }
     }
@@ -792,14 +921,14 @@ void encode_segmented_sdpa(metal::Device &device,
     bridge_testing::record("segmented_sdpa_route_single");
     auto pipelines =
         get_pipelines(device, q_len, gqa, prefix_n + new_n, q_heads, kv_heads,
-                      causal, prefix_row_stride(pk, pv));
+                      causal, prefix_row_stride(pk, pv), quantized);
     if (!pipelines.plan.supported) {
       throw std::runtime_error("segmented SDPA pipeline capabilities "
                                "changed after graph construction");
     }
     out.set_data(allocator::malloc(out.nbytes()));
     encode_segmented_call(encoder, pipelines, q, 0, q_len, pk, pv, nk, nv,
-                          new_n, scale, out);
+                          scales, new_n, scale, out);
     return;
   }
 
@@ -809,13 +938,13 @@ void encode_segmented_sdpa(metal::Device &device,
   }
   const auto dispatch =
       plan_verify_dispatch(device, head_rows, q_len, gqa, prefix_n, q_heads,
-                           kv_heads, prefix_row_stride(pk, pv));
+                           kv_heads, prefix_row_stride(pk, pv), quantized);
   switch (dispatch.route) {
   case SegmentedVerifyRoute::one_pass:
     bridge_testing::record("segmented_sdpa_route_one_pass");
     out.set_data(allocator::malloc(out.nbytes()));
     encode_segmented_call(encoder, dispatch.tail, q, 0, q_len, pk, pv, nk, nv,
-                          new_n, scale, out);
+                          scales, new_n, scale, out);
     return;
   case SegmentedVerifyRoute::unified:
     bridge_testing::record("segmented_sdpa_route_unified");
@@ -834,9 +963,9 @@ void encode_segmented_sdpa(metal::Device &device,
     encoder.add_temporary(head_out);
     encoder.add_temporary(tail_out);
     encode_segmented_call(encoder, dispatch.head, q, 0, head_rows, pk, pv, nk,
-                          nv, head_rows, scale, head_out);
+                          nv, scales, head_rows, scale, head_out);
     encode_segmented_call(encoder, dispatch.tail, q, head_rows, tail_rows, pk,
-                          pv, nk, nv, new_n, scale, tail_out);
+                          pv, nk, nv, scales, new_n, scale, tail_out);
     // Allocates `out`.
     concatenate_gpu({head_out, tail_out}, out, 2, stream);
     return;
@@ -1108,13 +1237,18 @@ private:
 
 } // namespace
 
-array segmented_sdpa(const array &q, const array &prefix_k,
-                     const array &prefix_v, const array &new_k,
-                     const array &new_v, float scale, bool causal,
-                     bool require_segmented, SegmentedTileMode tile_mode) {
+namespace {
+
+array segmented_sdpa_impl(std::vector<array> inputs, float scale, bool causal,
+                          bool require_segmented, SegmentedTileMode tile_mode) {
   auto stream = default_stream(Device::gpu);
-  std::vector<array> inputs = {q, prefix_k, prefix_v, new_k, new_v};
   validate_segmented_sdpa(inputs);
+  const auto &q = inputs[0];
+  const auto &prefix_k = inputs[1];
+  const auto &prefix_v = inputs[2];
+  const auto &new_k = inputs[3];
+  const auto &new_v = inputs[4];
+  const bool quantized = quantized_inputs(inputs);
   const int q_len = q.shape(2);
   const int q_heads = q.shape(1);
   const int kv_heads = prefix_k.shape(1);
@@ -1130,14 +1264,16 @@ array segmented_sdpa(const array &q, const array &prefix_k,
     const int total = prefix_k.shape(2) + new_k.shape(2);
     const bool verify_block = causal && new_k.shape(2) == q_len;
     if (tile_mode == SegmentedTileMode::tile &&
-        (!verify_block ||
-         !tile_verify_launch(device, q_len, gqa, total).plan.supported)) {
+        (!verify_block || !tile_verify_launch(device, q_len, gqa, total,
+                                              quantized)
+                               .plan.supported)) {
       throw std::invalid_argument(
           "segmented SDPA tile route does not support this block");
     }
     if (tile_mode == SegmentedTileMode::nax &&
         (!verify_block || !nax_q_layout(q, prefix_k, prefix_v, new_k, new_v) ||
-         !nax_verify_launch(device, q_len, gqa, total).plan.supported)) {
+         !nax_verify_launch(device, q_len, gqa, total, quantized)
+              .plan.supported)) {
       throw std::invalid_argument(
           "segmented SDPA tensor-op route does not support this block");
     }
@@ -1172,7 +1308,7 @@ array segmented_sdpa(const array &q, const array &prefix_k,
     }
     plan_verify_dispatch(device, head_rows, q_len, gqa, prefix_k.shape(2),
                          q_heads, kv_heads,
-                         prefix_row_stride(prefix_k, prefix_v));
+                         prefix_row_stride(prefix_k, prefix_v), quantized);
     auto primitive = std::make_shared<SegmentedSdpa>(stream, scale, causal,
                                                      head_rows, tile_mode);
     return array(q.shape(), bfloat16, primitive, std::move(inputs));
@@ -1180,7 +1316,7 @@ array segmented_sdpa(const array &q, const array &prefix_k,
   try {
     auto pipelines = get_pipelines(
         device, q_len, gqa, prefix_k.shape(2) + new_k.shape(2), q_heads,
-        kv_heads, causal, prefix_row_stride(prefix_k, prefix_v));
+        kv_heads, causal, prefix_row_stride(prefix_k, prefix_v), quantized);
     if (!pipelines.plan.supported) {
       if (require_segmented) {
         throw std::runtime_error(
@@ -1199,6 +1335,27 @@ array segmented_sdpa(const array &q, const array &prefix_k,
   auto primitive =
       std::make_shared<SegmentedSdpa>(stream, scale, causal, 0, tile_mode);
   return array(q.shape(), bfloat16, primitive, std::move(inputs));
+}
+
+} // namespace
+
+array segmented_sdpa(const array &q, const array &prefix_k,
+                     const array &prefix_v, const array &new_k,
+                     const array &new_v, float scale, bool causal,
+                     bool require_segmented, SegmentedTileMode tile_mode) {
+  return segmented_sdpa_impl({q, prefix_k, prefix_v, new_k, new_v}, scale,
+                             causal, require_segmented, tile_mode);
+}
+
+array segmented_sdpa_int8(const array &q, const array &prefix_k,
+                          const array &prefix_v, const array &prefix_ks,
+                          const array &prefix_vs, const array &new_k,
+                          const array &new_v, const array &new_ks,
+                          const array &new_vs, float scale, bool causal,
+                          bool require_segmented, SegmentedTileMode tile_mode) {
+  return segmented_sdpa_impl({q, prefix_k, prefix_v, new_k, new_v, prefix_ks,
+                              prefix_vs, new_ks, new_vs},
+                             scale, causal, require_segmented, tile_mode);
 }
 
 } // namespace mlx::core::segmented_sdpa
@@ -1222,6 +1379,28 @@ mlx_array *segmented_sdpa_forward_impl(
   }
 }
 
+mlx_array *segmented_sdpa_int8_forward_impl(
+    mlx_array *q, mlx_array *prefix_k, mlx_array *prefix_v,
+    mlx_array *prefix_ks, mlx_array *prefix_vs, mlx_array *new_k,
+    mlx_array *new_v, mlx_array *new_ks, mlx_array *new_vs, float scale,
+    bool causal, bool require_segmented,
+    mlx::core::segmented_sdpa::SegmentedTileMode tile_mode) {
+  try {
+    auto result = mlx::core::segmented_sdpa::segmented_sdpa_int8(
+        *reinterpret_cast<array *>(q), *reinterpret_cast<array *>(prefix_k),
+        *reinterpret_cast<array *>(prefix_v),
+        *reinterpret_cast<array *>(prefix_ks),
+        *reinterpret_cast<array *>(prefix_vs),
+        *reinterpret_cast<array *>(new_k), *reinterpret_cast<array *>(new_v),
+        *reinterpret_cast<array *>(new_ks), *reinterpret_cast<array *>(new_vs),
+        scale, causal, require_segmented, tile_mode);
+    return reinterpret_cast<mlx_array *>(new array(std::move(result)));
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "mlx_segmented_sdpa_int8_forward: %s\n", e.what());
+    return nullptr;
+  }
+}
+
 } // namespace
 
 extern "C" mlx_array *
@@ -1231,6 +1410,40 @@ mlx_segmented_sdpa_forward(mlx_array *q, mlx_array *prefix_k,
   return segmented_sdpa_forward_impl(
       q, prefix_k, prefix_v, new_k, new_v, scale, causal, false,
       mlx::core::segmented_sdpa::SegmentedTileMode::automatic);
+}
+
+// INT8 K/V (per-row fp32 scales) production entry. The int8 primitive never
+// qualifies the dequantizing concat fallback silently: a compiled verify
+// trace over it would bake the prefix length, so an unsupported launch is an
+// error (null, message on stderr) and the Rust caller stays eager.
+extern "C" mlx_array *mlx_segmented_sdpa_int8_forward(
+    mlx_array *q, mlx_array *prefix_k, mlx_array *prefix_v,
+    mlx_array *prefix_ks, mlx_array *prefix_vs, mlx_array *new_k,
+    mlx_array *new_v, mlx_array *new_ks, mlx_array *new_vs, float scale,
+    bool causal) {
+  return segmented_sdpa_int8_forward_impl(
+      q, prefix_k, prefix_v, prefix_ks, prefix_vs, new_k, new_v, new_ks,
+      new_vs, scale, causal, true,
+      mlx::core::segmented_sdpa::SegmentedTileMode::automatic);
+}
+
+// Test-only int8 entry with a forced route: `mode` is SegmentedTileMode
+// (-1 automatic, 0 vector, 1 tile, 2 nax); null (message on stderr) when the
+// route cannot serve the block.
+extern "C" mlx_array *mlx_segmented_sdpa_int8_test_forward(
+    mlx_array *q, mlx_array *prefix_k, mlx_array *prefix_v,
+    mlx_array *prefix_ks, mlx_array *prefix_vs, mlx_array *new_k,
+    mlx_array *new_v, mlx_array *new_ks, mlx_array *new_vs, float scale,
+    bool causal, int mode) {
+  using mlx::core::segmented_sdpa::SegmentedTileMode;
+  if (mode < -1 || mode > 2) {
+    std::fprintf(stderr, "mlx_segmented_sdpa_int8_test_forward: bad mode %d\n",
+                 mode);
+    return nullptr;
+  }
+  return segmented_sdpa_int8_forward_impl(
+      q, prefix_k, prefix_v, prefix_ks, prefix_vs, new_k, new_v, new_ks,
+      new_vs, scale, causal, true, static_cast<SegmentedTileMode>(mode));
 }
 
 // Test-only contract: never silently qualify the concatenated fallback, and
@@ -1488,6 +1701,22 @@ extern "C" mlx_array *mlx_segmented_sdpa_test_forward(mlx_array *, mlx_array *,
                                                       mlx_array *, mlx_array *,
                                                       mlx_array *, float,
                                                       bool) {
+  return nullptr;
+}
+
+extern "C" mlx_array *
+mlx_segmented_sdpa_int8_forward(mlx_array *, mlx_array *, mlx_array *,
+                                mlx_array *, mlx_array *, mlx_array *,
+                                mlx_array *, mlx_array *, mlx_array *, float,
+                                bool) {
+  return nullptr;
+}
+
+extern "C" mlx_array *
+mlx_segmented_sdpa_int8_test_forward(mlx_array *, mlx_array *, mlx_array *,
+                                     mlx_array *, mlx_array *, mlx_array *,
+                                     mlx_array *, mlx_array *, mlx_array *,
+                                     float, bool, int) {
   return nullptr;
 }
 

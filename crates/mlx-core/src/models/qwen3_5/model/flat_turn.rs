@@ -440,16 +440,7 @@ impl Qwen35Inner {
                     cache.reset();
                 }
             }
-            let new_caches = (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect();
-            self.caches = Some(new_caches);
+            self.caches = Some(Qwen3_5LayerCache::fresh_layer_caches(&self.config));
             tokens.clone()
         };
 
@@ -472,16 +463,7 @@ impl Qwen35Inner {
                     cache.reset();
                 }
             }
-            let new_caches = (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect();
-            self.caches = Some(new_caches);
+            self.caches = Some(Qwen3_5LayerCache::fresh_layer_caches(&self.config));
             let tokens = if has_images {
                 expanded_tokens.clone()
             } else {
@@ -1830,16 +1812,7 @@ impl Qwen35Inner {
                     cache.reset();
                 }
             }
-            let new_caches = (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect();
-            self.caches = Some(new_caches);
+            self.caches = Some(Qwen3_5LayerCache::fresh_layer_caches(&self.config));
             tokens.clone()
         };
 
@@ -1854,16 +1827,7 @@ impl Qwen35Inner {
                     cache.reset();
                 }
             }
-            let new_caches = (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect();
-            self.caches = Some(new_caches);
+            self.caches = Some(Qwen3_5LayerCache::fresh_layer_caches(&self.config));
             let tokens = if has_images {
                 expanded_tokens.clone()
             } else {
