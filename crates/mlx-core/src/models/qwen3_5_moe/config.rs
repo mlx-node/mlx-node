@@ -207,7 +207,9 @@ impl Qwen3_5MoeConfig {
             persist_paged_cache: None,
             n_mtp_layers: self.n_mtp_layers,
             qwen35_gguf_gdn_layout: self.qwen35_gguf_gdn_layout.clone(),
-            kv_format: None,
+            // The MoE caches are built BF16 explicitly; pin the dense view to
+            // the same so `kv_format()` never advertises a format they lack.
+            kv_format: Some("bf16".to_string()),
         }
     }
 

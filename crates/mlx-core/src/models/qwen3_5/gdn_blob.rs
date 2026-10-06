@@ -105,6 +105,11 @@ impl GdnStateBlobs {
         tape: &[Option<GdnLayerTape>],
         keep: usize,
     ) -> Result<Option<Self>> {
+        // Nothing kept: the per-layer path clones the pre-verify state, so
+        // decline rather than hand the kernel a zero-length window.
+        if keep == 0 {
+            return Ok(None);
+        }
         let keep = i32::try_from(keep)
             .map_err(|_| Error::from_reason("GDN blob commit keep is too large"))?;
         let mut k = Vec::with_capacity(self.layers.len());

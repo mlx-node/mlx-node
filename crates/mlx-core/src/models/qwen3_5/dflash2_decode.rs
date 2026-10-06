@@ -595,8 +595,10 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         };
         match next_blobs {
             Some(next) => {
-                next.apply_views(caches)?;
+                // Rewind first: a failure here leaves the linear slots on the
+                // pre-commit blobs, consistent with `self.gdn_blobs`.
                 rewind_full_attention_to(caches, &snapshot, keep, "Qwen3.8 DFlash2 commit")?;
+                next.apply_views(caches)?;
                 self.gdn_blobs = Some(next);
             }
             None => {
