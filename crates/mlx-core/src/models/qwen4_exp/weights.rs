@@ -706,6 +706,21 @@ impl Store {
     }
     fn index_safe(&mut self, dir: &Path) -> Result<()> {
         let root = dir.canonicalize().map_err(err)?;
+        // This store reads packed K-quant rows directly off the file (row
+        // windows, no `QuantizedLinear`), so an artifact whose linears were
+        // written in the 64-row tiled layout would decode garbage. Refuse by
+        // the config marker before indexing anything.
+        if let Ok(raw) = fs::read(dir.join("config.json"))
+            && let Ok(config) = serde_json::from_slice::<serde_json::Value>(&raw)
+            && let Some(key) =
+                crate::models::quant_dispatch::config_declares_tiled_kquant_layout(&config)
+        {
+            return Err(err(format!(
+                "Qwen4 safetensors store cannot read '{key}': the checkpoint stores K-quant \
+                 linears in the 64-row tiled layout (quantization entry layout=t64), which this \
+                 row-window reader does not decode; load the GGUF source instead"
+            )));
+        }
         let index = dir.join("model.safetensors.index.json");
         let files = if index.exists() {
             let v: serde_json::Value =

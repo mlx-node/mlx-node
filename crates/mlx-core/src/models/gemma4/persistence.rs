@@ -28,12 +28,11 @@ use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
     PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,
-    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
-    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
-    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
-    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
-    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
+    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_switch_linear,
+    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
+    try_build_quantized_linear, try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
 
 /// Conventional in-checkpoint location for an external Gemma4 speculative
@@ -1377,6 +1376,8 @@ fn resolve_packed_embed_params<'a>(
     scales: &MxArray,
     biases: Option<&'a MxArray>,
 ) -> Result<PackedEmbedParams<'a>> {
+    // An embedding table is row-gathered; the converter never tiles it.
+    crate::models::quant_dispatch::ensure_row_major_kquant_layout(plq, key, "gemma4")?;
     let scales_uint8 = scales.dtype().ok() == Some(DType::Uint8);
     match plq.mode {
         PerLayerMode::Mxfp8 => {
@@ -1517,10 +1518,24 @@ fn resolve_packed_embed_params<'a>(
     }
 }
 
+#[cfg(test)]
 fn build_gemma_ql(
     params: &HashMap<String, MxArray>,
     prefix: &str,
     plq: PerLayerQuant,
+) -> Result<Option<super::quantized_linear::QuantizedLinear>> {
+    build_gemma_ql_tiled(params, prefix, plq, &mut Vec::new())
+}
+
+/// [`build_gemma_ql`] recording, in `tiled`, the prefixes whose K-quant group
+/// was repacked into the Tiled64 layout here (a `t64` checkpoint tensor is
+/// built tiled as-is and not recorded), so the loader can drop their row-major
+/// map entries with `release_tiled_kquant_sources` once the layer is built.
+fn build_gemma_ql_tiled(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    plq: PerLayerQuant,
+    tiled: &mut Vec<String>,
 ) -> Result<Option<super::quantized_linear::QuantizedLinear>> {
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
@@ -1549,7 +1564,12 @@ fn build_gemma_ql(
         | PerLayerMode::IQ3XXS
         | PerLayerMode::IQ1S
         | PerLayerMode::IQ1M => {
-            try_build_kquant_quantized_linear(params, prefix, plq.mode, "gemma4")?
+            // Tiled64 for the `_t64` Metal kernels (the Gemma4 UD GGUFs are
+            // K-quant throughout; DSpark verify at M = 1 + L hits the
+            // `qmv_wide_t64` / `qmm_m8_nax_t64` routes).
+            super::quantized_linear::try_build_kquant_quantized_linear_tiled(
+                params, prefix, plq.mode, plq.layout, "gemma4", tiled,
+            )?
         }
     })
 }
@@ -1590,9 +1610,9 @@ fn build_gemma_qsl(
         | PerLayerMode::IQ2S
         | PerLayerMode::IQ3XXS
         | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => {
-            try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "gemma4")?
-        }
+        | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
+            params, prefix, plq.mode, plq.layout, "gemma4",
+        )?,
         PerLayerMode::Sym8 => {
             return Err(Error::from_reason(format!(
                 "sym8 expert layer '{prefix}': 3-D switch (expert) tensors cannot be sym8 \
@@ -1602,10 +1622,40 @@ fn build_gemma_qsl(
     })
 }
 
-/// Apply sanitized weights to a Gemma4Inner.
+/// Apply sanitized weights to a Gemma4Inner (test entry: hands the production
+/// loader a handle-level clone of the map, which it takes by `&mut`).
+#[cfg(test)]
 fn apply_weights(
     inner: &mut Gemma4Inner,
     params: &HashMap<String, MxArray>,
+    config: &Gemma4Config,
+    quant_bits: i32,
+    quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+) -> Result<PlainFp8Residency> {
+    let mut params = params.clone();
+    apply_weights_mut(
+        inner,
+        &mut params,
+        config,
+        quant_bits,
+        quant_group_size,
+        top_level_mode,
+        per_layer_quant,
+    )
+}
+
+/// Apply sanitized weights to a Gemma4Inner.
+///
+/// `params` is `&mut` for the same reason as the dense qwen3_5 loader's: a 2-D
+/// K-quant projection repacked into the Tiled64 layout at load has its
+/// row-major sources released from the map once its layer is installed
+/// (`release_tiled_kquant_sources`); experts and embeddings stay row-major and
+/// untouched. Count the checkpoint bytes BEFORE this call.
+fn apply_weights_mut(
+    inner: &mut Gemma4Inner,
+    params: &mut HashMap<String, MxArray>,
     config: &Gemma4Config,
     quant_bits: i32,
     quant_group_size: i32,
@@ -1646,9 +1696,15 @@ fn apply_weights(
     // the flat path only; paged is simply unvalidated) — a rationale that
     // does not transfer here.
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
-    let try_build_ql = |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedLinear>> {
+    // Prefixes whose Tiled64 repack made the map's row-major arrays redundant;
+    // drained into `release_tiled_kquant_sources` once their owner is installed.
+    let tiled_prefixes = std::cell::RefCell::new(Vec::<String>::new());
+    let try_build_ql = |params: &HashMap<String, MxArray>,
+                        prefix: &str|
+     -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-        let quantized = build_gemma_ql(params, prefix, plq)?;
+        let quantized =
+            build_gemma_ql_tiled(params, prefix, plq, &mut tiled_prefixes.borrow_mut())?;
         if let Some(linear) = quantized.as_ref() {
             plain_fp8_residency
                 .borrow_mut()
@@ -1657,11 +1713,12 @@ fn apply_weights(
         Ok(quantized)
     };
     // Helper for expert-batched (switch) quantized linears used by MoE layers.
-    let try_build_qsl =
-        |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
-            let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-            build_gemma_qsl(params, prefix, plq)
-        };
+    let try_build_qsl = |params: &HashMap<String, MxArray>,
+                         prefix: &str|
+     -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
+        let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
+        build_gemma_qsl(params, prefix, plq)
+    };
 
     // Embedding. Q8 / Q4 affine checkpoints carry `.scales` (+ `.biases`)
     // companions alongside `.weight` with a packed-last-dim shape, so the
@@ -1736,7 +1793,7 @@ fn apply_weights(
     if !config.tie_word_embeddings
         && let Some(ref mut head) = inner.lm_head
     {
-        if let Some(ql) = try_build_ql("lm_head")? {
+        if let Some(ql) = try_build_ql(params, "lm_head")? {
             head.set_quantized(ql);
         } else if let Some(w) = params.get("lm_head.weight") {
             ensure_dense_weight_floating("lm_head.weight", w)?;
@@ -1811,7 +1868,7 @@ fn apply_weights(
                 ple.embed_tokens_per_layer.load_weight(w)?;
                 info!("PLE embed_tokens_per_layer loaded");
             }
-            if let Some(ql) = try_build_ql("per_layer_model_projection")? {
+            if let Some(ql) = try_build_ql(params, "per_layer_model_projection")? {
                 ple.per_layer_model_projection.set_quantized(ql);
                 info!("PLE per_layer_model_projection loaded (quantized)");
             } else if let Some(w) = params.get("per_layer_model_projection.weight") {
@@ -1837,14 +1894,14 @@ fn apply_weights(
         // (int8 `.weight` whose `.scales` was stripped) makes `try_build_ql`
         // return `Ok(None)`, and the int8 bytes must NEVER reach the dense
         // bf16 route.
-        if let Some(ql) = try_build_ql(&format!("{}.q_proj", attn_prefix))? {
+        if let Some(ql) = try_build_ql(params, &format!("{}.q_proj", attn_prefix))? {
             layer.self_attn.set_quantized_q_proj(ql);
         } else if let Some(w) = params.get(&format!("{}.q_proj.weight", attn_prefix)) {
             ensure_dense_weight_floating(&format!("{}.q_proj.weight", attn_prefix), w)?;
             layer.self_attn.set_q_proj_weight(w)?;
         }
 
-        if let Some(ql) = try_build_ql(&format!("{}.k_proj", attn_prefix))? {
+        if let Some(ql) = try_build_ql(params, &format!("{}.k_proj", attn_prefix))? {
             layer.self_attn.set_quantized_k_proj(ql);
         } else if let Some(w) = params.get(&format!("{}.k_proj.weight", attn_prefix)) {
             ensure_dense_weight_floating(&format!("{}.k_proj.weight", attn_prefix), w)?;
@@ -1855,7 +1912,7 @@ fn apply_weights(
         // k_eq_v only applies to global (full attention) layers when attention_k_eq_v is set.
         let layer_k_eq_v = config.attention_k_eq_v && config.is_global_layer(i);
         if !layer_k_eq_v {
-            if let Some(ql) = try_build_ql(&format!("{}.v_proj", attn_prefix))? {
+            if let Some(ql) = try_build_ql(params, &format!("{}.v_proj", attn_prefix))? {
                 layer.self_attn.set_quantized_v_proj(ql);
             } else if let Some(w) = params.get(&format!("{}.v_proj.weight", attn_prefix)) {
                 ensure_dense_weight_floating(&format!("{}.v_proj.weight", attn_prefix), w)?;
@@ -1863,7 +1920,7 @@ fn apply_weights(
             }
         }
 
-        if let Some(ql) = try_build_ql(&format!("{}.o_proj", attn_prefix))? {
+        if let Some(ql) = try_build_ql(params, &format!("{}.o_proj", attn_prefix))? {
             layer.self_attn.set_quantized_o_proj(ql);
         } else if let Some(w) = params.get(&format!("{}.o_proj.weight", attn_prefix)) {
             ensure_dense_weight_floating(&format!("{}.o_proj.weight", attn_prefix), w)?;
@@ -1902,9 +1959,9 @@ fn apply_weights(
         // sidecars unchecked when gate was dense.
         let mlp_prefix = format!("{}.mlp", prefix);
 
-        let ql_gate = try_build_ql(&format!("{}.gate_proj", mlp_prefix))?;
-        let ql_up = try_build_ql(&format!("{}.up_proj", mlp_prefix))?;
-        let ql_down = try_build_ql(&format!("{}.down_proj", mlp_prefix))?;
+        let ql_gate = try_build_ql(params, &format!("{}.gate_proj", mlp_prefix))?;
+        let ql_up = try_build_ql(params, &format!("{}.up_proj", mlp_prefix))?;
+        let ql_down = try_build_ql(params, &format!("{}.down_proj", mlp_prefix))?;
         match (ql_gate, ql_up, ql_down) {
             (Some(ql_gate), Some(ql_up), Some(ql_down)) => {
                 layer.set_quantized_dense_mlp(ql_gate, ql_up, ql_down);
@@ -1992,14 +2049,14 @@ fn apply_weights(
         // the norm below remains dense.
         if layer.has_ple() {
             let gate_prefix = format!("{}.per_layer_input_gate", prefix);
-            if let Some(ql) = try_build_ql(&gate_prefix)? {
+            if let Some(ql) = try_build_ql(params, &gate_prefix)? {
                 layer.set_per_layer_input_gate_quantized(ql)?;
             } else if let Some(w) = params.get(&format!("{}.weight", gate_prefix)) {
                 ensure_dense_weight_floating(&format!("{}.weight", gate_prefix), w)?;
                 layer.set_per_layer_input_gate_weight(w)?;
             }
             let projection_prefix = format!("{}.per_layer_projection", prefix);
-            if let Some(ql) = try_build_ql(&projection_prefix)? {
+            if let Some(ql) = try_build_ql(params, &projection_prefix)? {
                 layer.set_per_layer_projection_quantized(ql)?;
             } else if let Some(w) = params.get(&format!("{}.weight", projection_prefix)) {
                 ensure_dense_weight_floating(&format!("{}.weight", projection_prefix), w)?;
@@ -2079,7 +2136,7 @@ fn apply_weights(
                 // to `ensure_int8_storage_resolves_sym8` (it probes only
                 // `{base}.weight`), so the install-time guard is the only
                 // dtype gate on that path.
-                if let Some(qsl) = try_build_qsl(&gate_up_prefix)? {
+                if let Some(qsl) = try_build_qsl(params, &gate_up_prefix)? {
                     layer.set_moe_gate_up_proj_quantized(qsl)?;
                 } else if let Some(w) = params.get(&format!("{}.weight", gate_up_prefix)) {
                     // mlx-lm fused dense format
@@ -2094,7 +2151,7 @@ fn apply_weights(
             {
                 let down_prefix = format!("{}.experts.down_proj", prefix);
                 // Same dtype-guard rationale as gate_up_proj above.
-                if let Some(qsl) = try_build_qsl(&down_prefix)? {
+                if let Some(qsl) = try_build_qsl(params, &down_prefix)? {
                     layer.set_moe_down_proj_quantized(qsl)?;
                 } else if let Some(w) = params.get(&format!("{}.weight", down_prefix)) {
                     // mlx-lm fused dense format
@@ -2120,7 +2177,15 @@ fn apply_weights(
                 layer.set_post_feedforward_layernorm_2_weight(w)?;
             }
         }
+        // The layer owns its tiled projections now; drop the map's row-major
+        // originals (mirrors the dense qwen3_5 loader's layer loop).
+        super::quantized_linear::release_tiled_kquant_sources(
+            params,
+            &mut tiled_prefixes.borrow_mut(),
+        );
     }
+    // The lm_head / PLE projection built above the loop.
+    super::quantized_linear::release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
 
     info!("All weights applied successfully");
     Ok(plain_fp8_residency.into_inner())
@@ -2780,10 +2845,19 @@ impl Gemma4Inner {
         // the forward gathers across shards.
         maybe_shard_ple_embedding(&mut inner, &mut params, path)?;
 
+        // Checkpoint byte total of the text map BEFORE installation:
+        // `apply_weights_mut` releases the row-major sources of Tiled64
+        // K-quant projections from `params` (the model owns same-sized tiled
+        // copies), so the map afterwards under-counts the resident weights.
+        let text_params_bytes: u64 = params
+            .values()
+            .map(|a| a.nbytes() as u64)
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+
         // Apply weights
-        let plain_fp8_residency = apply_weights(
+        let plain_fp8_residency = apply_weights_mut(
             &mut inner,
-            &params,
+            &mut params,
             &config,
             quant_bits,
             quant_group_size,
@@ -2964,10 +3038,7 @@ impl Gemma4Inner {
         // is dropped at end-of-function, then fold in model-owned arrays that
         // were created or moved outside that map. `saturating_add` guards
         // against overflow on a corrupted checkpoint.
-        let mut weight_bytes: u64 = params
-            .values()
-            .map(|a| a.nbytes() as u64)
-            .fold(0u64, |acc, v| acc.saturating_add(v));
+        let mut weight_bytes: u64 = text_params_bytes;
         // Plain E4M3 linears retain their serialized Uint8 weight + scales
         // (already counted through `params`) and also own a reconstructed BF16
         // weight for the A16 matmul fallback. Count that additional resident
@@ -3980,6 +4051,7 @@ mod tests {
                 group_size: 32,
                 mode: PerLayerMode::Mxfp4,
                 input_amax: None,
+                layout: Default::default(),
             },
         )]);
         let stats = widen_bf16_affine_text_qmm_sidecars(
@@ -4135,6 +4207,7 @@ mod tests {
             group_size: 32,
             mode,
             input_amax: None,
+            layout: Default::default(),
         };
         let per_layer_quant = HashMap::from([
             ("layers.0.self_attn.k_proj".into(), plq(PerLayerMode::Mxfp4)),
@@ -5330,6 +5403,7 @@ mod tests {
                 group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
                 mode: PerLayerMode::Fp8E4m3,
                 input_amax: None,
+                layout: Default::default(),
             },
         )]);
 
@@ -5413,6 +5487,7 @@ mod tests {
                 group_size: 64,
                 mode: PerLayerMode::Affine,
                 input_amax: None,
+                layout: Default::default(),
             },
         );
 
@@ -5673,6 +5748,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
             input_amax: None,
+            layout: Default::default(),
         };
         per_layer_quant.insert("layers.0.experts.switch_glu.gate_proj".to_string(), mxfp8);
         per_layer_quant.insert("layers.0.experts.switch_glu.up_proj".to_string(), mxfp8);
@@ -6270,6 +6346,7 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Mxfp8,
             input_amax: None,
+            layout: Default::default(),
         };
         let packed = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .expect("mxfp8 with affine-default bits must resolve, not error");
@@ -6300,6 +6377,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
             input_amax: None,
+            layout: Default::default(),
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()
@@ -6323,6 +6401,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let packed =
             resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
@@ -6345,6 +6424,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
             input_amax: None,
+            layout: Default::default(),
         };
         // `.err()` (not `expect_err`) so the success type needs no `Debug` bound
         // (`PackedEmbedParams` holds `Option<&MxArray>`, and `MxArray: !Debug`).
@@ -6369,6 +6449,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()
@@ -6395,6 +6476,7 @@ mod tests {
             group_size: 16,
             mode: PerLayerMode::Q6K,
             input_amax: None,
+            layout: Default::default(),
         };
         let packed =
             resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
@@ -6417,6 +6499,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Q4K,
             input_amax: None,
+            layout: Default::default(),
         };
         let packed =
             resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
@@ -6439,6 +6522,7 @@ mod tests {
             group_size: 16,
             mode: PerLayerMode::Q6K,
             input_amax: None,
+            layout: Default::default(),
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()
@@ -6462,6 +6546,7 @@ mod tests {
             group_size: 16,
             mode: PerLayerMode::Q6K,
             input_amax: None,
+            layout: Default::default(),
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
             .err()
@@ -6496,6 +6581,7 @@ mod tests {
                     group_size,
                     mode,
                     input_amax: None,
+                    layout: Default::default(),
                 };
                 let err = resolve_packed_embed_params(
                     "embed_tokens",
@@ -6533,6 +6619,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp4,
             input_amax: None,
+            layout: Default::default(),
         };
         let err = build_gemma_ql(&dense_params, dense_prefix, stale)
             .err()
@@ -6548,6 +6635,7 @@ mod tests {
             group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
             mode: PerLayerMode::Fp8E4m3,
             input_amax: None,
+            layout: Default::default(),
         };
         let ql = build_gemma_ql(&dense_params, dense_prefix, explicit_fp8)
             .expect("well-formed Gemma plain-FP8 QL must load")

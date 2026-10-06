@@ -39,7 +39,7 @@ pub use crate::quant::fp8_weight::{FP8_E4M3_BITS, FP8_E4M3_GROUP_SIZE, FP8_E4M3_
 // `PerLayerMode` and `PerLayerQuant` are family-neutral types shared with
 // `qwen3_5_moe` and `gemma4`; they live in `crate::models::quant_dispatch`
 // so the three families don't cross-import from each other.
-pub use crate::models::quant_dispatch::{PerLayerMode, PerLayerQuant};
+pub use crate::models::quant_dispatch::{KQuantLayout, PerLayerMode, PerLayerQuant};
 
 /// A linear projection that can be either standard or quantized.
 ///
@@ -594,17 +594,26 @@ pub fn try_build_sym8_quantized_linear(
 /// so the dense, expert, and gemma4 K-quant builders cannot drift. `forward`
 /// threads the resolved mode string into `mlx_quantized_matmul`, which does the
 /// two-level scale decode from `scales`/`biases`.
+///
+/// `layout` is the checkpoint's declared byte order for the tensor
+/// (`PerLayerQuant::layout`): under the `t64` marker the arrays are used as
+/// they are and the projection's mode carries the
+/// [`KQUANT_TILED_SUFFIX`](crate::models::quant_dispatch::KQUANT_TILED_SUFFIX)
+/// tag from the start; `resolve_kquant_group` has validated the shape.
 pub fn try_build_kquant_quantized_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     mode: PerLayerMode,
+    layout: KQuantLayout,
     family: &str,
 ) -> Result<Option<QuantizedLinear>> {
-    let Some(group) =
-        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 2, family)?
+    let Some(group) = crate::models::quant_dispatch::resolve_kquant_group(
+        params, key_prefix, mode, layout, 2, family,
+    )?
     else {
         return Ok(None);
     };
+    let mode_string = group.mode_string();
     Ok(Some(QuantizedLinear::new(
         group.weight,
         group.scales,
@@ -612,14 +621,15 @@ pub fn try_build_kquant_quantized_linear(
         None,
         group.group_size,
         group.bits,
-        group.mode_str.to_string(),
+        mode_string,
     )))
 }
 
 /// [`try_build_kquant_quantized_linear`] followed by the Tiled64 repack
 /// ([`QuantizedLinear::tile_kquant_layout`]) when
 /// [`kquant_tiled_enabled`](crate::models::quant_dispatch::kquant_tiled_enabled)
-/// (a Metal host). When the projection did tile,
+/// (a Metal host) and the checkpoint stored the tensor row-major. When the
+/// projection did tile here,
 /// its `key_prefix` is pushed onto `tiled`: the repack evaluates the tiled
 /// copies, so the loader's row-major `{key_prefix}.weight/.scales/.biases` in
 /// `params` are now dead weight it should drop with
@@ -628,26 +638,95 @@ pub fn try_build_kquant_quantized_linear(
 /// peak is twice the model (37 GB for an 18 GB Qwen3.8-27B). Projections that
 /// stay row-major are not recorded: those lazily mmapped originals still need
 /// the loader's final materialization pass.
+///
+/// A tensor the checkpoint already stores tiled (`layout == Tiled64`, the
+/// `"layout": "t64"` config marker) is built tiled directly — no permute and
+/// no second copy. Its mmapped arrays are materialized here and the prefix is
+/// recorded in `tiled` all the same, so the loader releases the map entries
+/// once the layer is installed: the row merges that follow (`concat_rows` for
+/// q|k|v, gate|up, qkvz|ba) evaluate a merged copy and drop the per-projection
+/// arrays, and an original left in the map would keep that copy's source
+/// resident until the loader returns (measured: 21.6 GB peak instead of
+/// 17.0 GB on Qwen3.8-27B). Eager per-projection evaluation is the same work
+/// the loader's final chunked pass would do, three small arrays at a time.
 pub fn try_build_kquant_quantized_linear_tiled(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     mode: PerLayerMode,
+    layout: KQuantLayout,
     family: &str,
     tiled: &mut Vec<String>,
 ) -> Result<Option<QuantizedLinear>> {
-    let Some(mut ql) = try_build_kquant_quantized_linear(params, key_prefix, mode, family)? else {
+    let Some(mut ql) = try_build_kquant_quantized_linear(params, key_prefix, mode, layout, family)?
+    else {
         return Ok(None);
     };
-    if crate::models::quant_dispatch::kquant_tiled_enabled() && ql.tile_kquant_layout()? {
-        tiled.push(key_prefix.to_string());
+    match layout {
+        KQuantLayout::Tiled64 => {
+            ql.eval_packed_arrays("kquant t64 load")?;
+            tiled.push(key_prefix.to_string());
+        }
+        KQuantLayout::RowMajor => {
+            if crate::models::quant_dispatch::kquant_tiled_enabled() && ql.tile_kquant_layout()? {
+                tiled.push(key_prefix.to_string());
+            }
+        }
     }
     Ok(Some(ql))
 }
 
-/// Drop the row-major `.weight`/`.scales`/`.biases` of every prefix in
-/// `tiled` from the loader's `params` (see
-/// [`try_build_kquant_quantized_linear_tiled`]); the installed projections own
-/// the evaluated Tiled64 copies. Call it only after the layer's dense-fallback
+/// Row-major copies of a K-quant group's packed arrays as stored under
+/// `prefix` in `params`, undoing the Tiled64 permutation when `layout` says
+/// the checkpoint stored them tiled (the identity otherwise). For the readers
+/// that consume packed bytes row-wise — dequantize for the MTPLX draft head,
+/// row gathers — which the `_t64` kernels do not serve.
+///
+/// `Ok(None)` when `{prefix}.weight` is absent. Returns
+/// `(weight, scales, Option<biases>)`; the arrays are lazy views the caller
+/// evaluates as part of its own graph.
+pub fn row_major_kquant_arrays(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    mode: PerLayerMode,
+    layout: KQuantLayout,
+) -> Result<Option<(MxArray, MxArray, Option<MxArray>)>> {
+    use crate::models::quant_dispatch::{kquant_mode_params, kquant_untile_rows};
+    let Some(weight) = params.get(&format!("{prefix}.weight")) else {
+        return Ok(None);
+    };
+    let Some(scales) = params.get(&format!("{prefix}.scales")) else {
+        return Err(Error::from_reason(format!(
+            "row_major_kquant_arrays: '{prefix}.scales' missing"
+        )));
+    };
+    let biases = params.get(&format!("{prefix}.biases"));
+    if layout == KQuantLayout::RowMajor {
+        return Ok(Some((weight.clone(), scales.clone(), biases.cloned())));
+    }
+    let Some(kq) = kquant_mode_params(mode) else {
+        return Err(Error::from_reason(format!(
+            "row_major_kquant_arrays: '{prefix}' declares the Tiled64 layout but mode {mode:?} \
+             is not a K-quant mode"
+        )));
+    };
+    let Some(biases) = biases else {
+        return Err(Error::from_reason(format!(
+            "row_major_kquant_arrays: '{prefix}.biases' missing on a Tiled64 K-quant group"
+        )));
+    };
+    let per_group = i64::from(kq.scale_bytes_per_group);
+    let super_ratio = i64::from(kq.super_ratio);
+    Ok(Some((
+        kquant_untile_rows(weight, i64::from(kq.bits))?,
+        kquant_untile_rows(scales, super_ratio * per_group)?,
+        Some(kquant_untile_rows(biases, per_group)?),
+    )))
+}
+
+/// Drop the `.weight`/`.scales`/`.biases` of every prefix in `tiled` from the
+/// loader's `params` (see [`try_build_kquant_quantized_linear_tiled`]); the
+/// installed projections own the evaluated Tiled64 arrays (a permuted copy,
+/// or the checkpoint's own `t64` arrays materialized). Call it only after the layer's dense-fallback
 /// lookups are done, so a packed group whose peer is dense still fails loud
 /// through `params.get` instead of silently skipping. Clears `tiled`.
 pub fn release_tiled_kquant_sources(
@@ -917,6 +996,16 @@ impl QuantizedLinear {
     /// Whether the packed arrays are in the Tiled64 layout.
     pub fn is_kquant_tiled(&self) -> bool {
         crate::models::quant_dispatch::split_kquant_layout(&self.mode).1
+    }
+
+    /// Materialize the packed `.weight`/`.scales`/`.biases` (and linear bias)
+    /// now — for a projection built straight from lazily mmapped checkpoint
+    /// arrays whose map entries the loader is about to release.
+    pub fn eval_packed_arrays(&self, context: &str) -> Result<()> {
+        let mut pending = vec![&self.weight, &self.scales];
+        pending.extend(self.biases.as_ref());
+        pending.extend(self.bias.as_ref());
+        MxArray::eval_arrays_with_context(&pending, context)
     }
 
     /// Cast affine-mode `scales`/`biases`/`bias` f16→f32 once at load. With
@@ -1865,14 +1954,19 @@ pub fn try_build_fp8_e4m3_quantized_switch_linear(
 /// Fail-loud contract mirrors [`try_build_kquant_quantized_linear`]: `Ok(None)`
 /// only when `.scales` is absent; every partial/malformed group is `Err`.
 /// `forward` threads the resolved mode string into `mlx_gather_qmm`.
+///
+/// `layout` must be `RowMajor`: experts are gathered row-wise and the Tiled64
+/// marker on a 3-D stack is rejected by `resolve_kquant_group`.
 pub fn try_build_kquant_quantized_switch_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     mode: PerLayerMode,
+    layout: KQuantLayout,
     family: &str,
 ) -> Result<Option<QuantizedSwitchLinear>> {
-    let Some(group) =
-        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 3, family)?
+    let Some(group) = crate::models::quant_dispatch::resolve_kquant_group(
+        params, key_prefix, mode, layout, 3, family,
+    )?
     else {
         return Ok(None);
     };
@@ -3002,9 +3096,10 @@ mod kquant_builder_tests {
             (PerLayerMode::Q5K, "q5k", 5, 32),
         ] {
             let p = kquant_params("proj", mode);
-            let ql = try_build_kquant_quantized_linear(&p, "proj", mode, "test")
-                .expect("well-formed K-quant group builds")
-                .expect("scales present => Some");
+            let ql =
+                try_build_kquant_quantized_linear(&p, "proj", mode, KQuantLayout::RowMajor, "test")
+                    .expect("well-formed K-quant group builds")
+                    .expect("scales present => Some");
             assert_eq!(ql.mode(), want_mode);
             assert_eq!(ql.bits, want_bits);
             assert_eq!(ql.group_size, want_gs);
@@ -3022,17 +3117,41 @@ mod kquant_builder_tests {
         let mut p = kquant_params("l", PerLayerMode::Q6K);
         p.remove("l.scales");
         assert!(matches!(
-            try_build_kquant_quantized_linear(&p, "l", PerLayerMode::Q6K, "test"),
+            try_build_kquant_quantized_linear(
+                &p,
+                "l",
+                PerLayerMode::Q6K,
+                KQuantLayout::RowMajor,
+                "test"
+            ),
             Ok(None)
         ));
 
         let mut p = kquant_params("l", PerLayerMode::Q4K);
         p.remove("l.weight");
-        assert!(try_build_kquant_quantized_linear(&p, "l", PerLayerMode::Q4K, "test").is_err());
+        assert!(
+            try_build_kquant_quantized_linear(
+                &p,
+                "l",
+                PerLayerMode::Q4K,
+                KQuantLayout::RowMajor,
+                "test"
+            )
+            .is_err()
+        );
 
         let mut p = kquant_params("l", PerLayerMode::Q4K);
         p.remove("l.biases");
-        assert!(try_build_kquant_quantized_linear(&p, "l", PerLayerMode::Q4K, "test").is_err());
+        assert!(
+            try_build_kquant_quantized_linear(
+                &p,
+                "l",
+                PerLayerMode::Q4K,
+                KQuantLayout::RowMajor,
+                "test"
+            )
+            .is_err()
+        );
     }
 }
 
@@ -3110,6 +3229,98 @@ mod kquant_tiled_tests {
     fn gpu() -> bool {
         // SAFETY: nullary predicate that catches internally.
         unsafe { mlx_sys::mlx_metal_is_available() }
+    }
+
+    /// `row_major_kquant_arrays` (the un-tile step the MTPLX draft-head
+    /// dequantize takes) restores a Tiled64 group's bytes exactly, and is the
+    /// identity on a row-major one; `try_build_kquant_quantized_linear_tiled`
+    /// builds a `t64` group tiled without recording it for release.
+    #[test]
+    fn row_major_arrays_untile_a_t64_group_and_the_builder_honours_the_marker() {
+        let (n, k) = (128i64, 512i64);
+        let row_major = q4k(n, k, 5);
+        let mut tiled = q4k(n, k, 5);
+        assert!(tiled.tile_kquant_layout().unwrap());
+        let as_params = |ql: &QuantizedLinear| -> HashMap<String, MxArray> {
+            HashMap::from([
+                ("p.weight".to_string(), ql.get_weight().clone()),
+                ("p.scales".to_string(), ql.get_scales().clone()),
+                ("p.biases".to_string(), ql.get_biases().unwrap().clone()),
+            ])
+        };
+        let tiled_params = as_params(&tiled);
+        let (w, s, b) =
+            row_major_kquant_arrays(&tiled_params, "p", PerLayerMode::Q4K, KQuantLayout::Tiled64)
+                .unwrap()
+                .unwrap();
+        assert_eq!(bits_of(&w), bits_of(row_major.get_weight()));
+        assert_eq!(bits_of(&s), bits_of(row_major.get_scales()));
+        assert_eq!(
+            bits_of(b.as_ref().unwrap()),
+            bits_of(row_major.get_biases().unwrap())
+        );
+        // Identity on a row-major group.
+        let rm_params = as_params(&row_major);
+        let (w, _, _) =
+            row_major_kquant_arrays(&rm_params, "p", PerLayerMode::Q4K, KQuantLayout::RowMajor)
+                .unwrap()
+                .unwrap();
+        assert_eq!(bits_of(&w), bits_of(row_major.get_weight()));
+        // Absent weight → None.
+        assert!(
+            row_major_kquant_arrays(
+                &HashMap::new(),
+                "p",
+                PerLayerMode::Q4K,
+                KQuantLayout::Tiled64
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Builder under the marker: tiled mode without a permute, the arrays
+        // are the map's own (materialized), and the prefix is recorded so the
+        // loader releases the map entries like a load-time tile.
+        let mut recorded = Vec::new();
+        let built = try_build_kquant_quantized_linear_tiled(
+            &tiled_params,
+            "p",
+            PerLayerMode::Q4K,
+            KQuantLayout::Tiled64,
+            "test",
+            &mut recorded,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recorded, vec!["p".to_string()]);
+        assert_eq!(built.mode(), format!("q4k{KQUANT_TILED_SUFFIX}"));
+        assert_eq!(bits_of(built.get_weight()), bits_of(tiled.get_weight()));
+        // Same forward as the load-time-tiled projection, bit for bit.
+        for m in [1i64, 8, 64] {
+            let input = x(m, k, 77);
+            assert_eq!(
+                bits_of(&built.forward(&input).unwrap()),
+                bits_of(&tiled.forward(&input).unwrap()),
+                "M={m}"
+            );
+        }
+        // The same bytes misdeclared row-major would decode garbage: on a
+        // row-major build the mode is bare and the forward differs.
+        let misdeclared = try_build_kquant_quantized_linear(
+            &tiled_params,
+            "p",
+            PerLayerMode::Q4K,
+            KQuantLayout::RowMajor,
+            "test",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(misdeclared.mode(), "q4k");
+        let input = x(8, k, 78);
+        assert_ne!(
+            bits_of(&misdeclared.forward(&input).unwrap()),
+            bits_of(&tiled.forward(&input).unwrap())
+        );
     }
 
     #[test]

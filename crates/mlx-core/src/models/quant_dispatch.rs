@@ -34,7 +34,7 @@ use tracing::warn;
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{
     LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
-    NVFP4_GROUP_SIZE, QuantizedLinear, try_build_kquant_quantized_linear,
+    NVFP4_GROUP_SIZE, QuantizedLinear, try_build_kquant_quantized_linear_tiled,
     try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
     try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
@@ -224,6 +224,101 @@ pub struct PerLayerQuant {
     pub group_size: i32,
     pub mode: PerLayerMode,
     pub input_amax: Option<f32>,
+    /// The on-disk byte order of a K-quant tensor's packed arrays, from the
+    /// per-tensor `"layout"` config field (see [`KQuantLayout`]). `RowMajor`
+    /// for every non-K-quant mode and for every K-quant tensor the config does
+    /// not mark; the loader then tiles eligible projections itself.
+    pub layout: KQuantLayout,
+}
+
+impl PerLayerQuant {
+    /// The same quantization (bits, group_size, mode, amax) regardless of the
+    /// on-disk byte order: a row-major and a Tiled64 copy of one tensor decode
+    /// to the same values, so comparisons that ask "is this the same
+    /// quantization?" (merge decisions, source-vs-target reuse) go through
+    /// here rather than `==`.
+    pub fn same_quantization(&self, other: &PerLayerQuant) -> bool {
+        self.bits == other.bits
+            && self.group_size == other.group_size
+            && self.mode == other.mode
+            && self.input_amax == other.input_amax
+    }
+
+    /// `self` with its layout replaced.
+    pub fn with_layout(mut self, layout: KQuantLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+}
+
+/// The byte order of a K-quant tensor's packed `.weight`/`.scales`/`.biases`
+/// arrays, both on disk and in the loaded `QuantizedLinear`.
+///
+/// `Tiled64` is the 64-row interleaved permutation (`mlx_kquant.h`,
+/// `[N/64][K/32][64][unit]` codes with per-super-block companions) that the
+/// `_t64` Metal kernels and the CPU reference read. A checkpoint records it per
+/// tensor as `"layout": "t64"` in its `quantization` entry — the `mode` string
+/// stays the bare ggml mode so readers that do not know the field still parse
+/// the entry (and reject the bytes through their own shape checks, since a
+/// tiled array has the same 2-D shape). In memory the layout rides on the
+/// `QuantizedLinear::mode` string as the [`KQUANT_TILED_SUFFIX`] tag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum KQuantLayout {
+    /// ggml's row-major order, one row's codes then the next.
+    #[default]
+    RowMajor,
+    /// The 64-row tile permutation; only valid for a 2-D tensor with
+    /// `N % 64 == 0` and `K % 256 == 0` ([`kquant_tileable`]).
+    Tiled64,
+}
+
+/// The per-tensor `quantization` entry field that names a tensor's byte
+/// order, and the only value it takes today.
+pub const KQUANT_LAYOUT_KEY: &str = "layout";
+pub const KQUANT_LAYOUT_T64: &str = "t64";
+
+impl KQuantLayout {
+    /// The config value for this layout: `Some("t64")` for `Tiled64`, `None`
+    /// for row-major (the field is omitted, not written as a default string).
+    pub fn config_value(self) -> Option<&'static str> {
+        match self {
+            Self::RowMajor => None,
+            Self::Tiled64 => Some(KQUANT_LAYOUT_T64),
+        }
+    }
+
+    /// The in-memory mode-string suffix: `"@t64"` or `""`.
+    pub fn mode_suffix(self) -> &'static str {
+        match self {
+            Self::RowMajor => "",
+            Self::Tiled64 => KQUANT_TILED_SUFFIX,
+        }
+    }
+}
+
+/// Scan a config's `quantization` / `quantization_config` block for a tensor
+/// entry that declares the Tiled64 byte order; returns the first such key.
+///
+/// For readers that consume packed K-quant bytes row-wise and have no un-tile
+/// step (`mlx convert` re-reading a converted directory, the qwen4_exp
+/// row-window store): they must refuse such an artifact loudly rather than
+/// read tiled bytes as rows. Does not validate the block otherwise.
+pub fn config_declares_tiled_kquant_layout(raw: &Value) -> Option<String> {
+    for alias in ["quantization", "quantization_config"] {
+        let Some(block) = raw.get(alias).and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, entry) in block {
+            if entry
+                .get(KQUANT_LAYOUT_KEY)
+                .and_then(Value::as_str)
+                .is_some_and(|v| v == KQUANT_LAYOUT_T64)
+            {
+                return Some(key.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Decode a `quantization.mode` string into a `PerLayerMode`.
@@ -301,8 +396,10 @@ pub(crate) fn mode_to_str(mode: PerLayerMode) -> &'static str {
 /// carries after [`crate::models::quantized_linear::QuantizedLinear::tile_kquant_layout`]:
 /// `"q4k@t64"` means the packed `.weight`/`.scales`/`.biases` bytes are the
 /// 64-row interleaved `Tiled64` permutation (`mlx_kquant.h`), which only the
-/// `_t64` Metal kernels and the CPU reference read. The on-disk contract
-/// (`gguf_kquant.rs`) is unchanged; the tag never reaches config.json.
+/// `_t64` Metal kernels and the CPU reference read. The tag never reaches
+/// config.json: a checkpoint that stores the tiled bytes says so with the
+/// per-tensor `"layout": "t64"` field instead ([`KQuantLayout`]), and the
+/// loader turns that into this tag when it builds the projection.
 pub const KQUANT_TILED_SUFFIX: &str = "@t64";
 /// Rows per Tiled64 tile; a tileable weight has `N % 64 == 0`.
 pub const KQUANT_TILE_ROWS: i64 = 64;
@@ -316,8 +413,9 @@ pub fn split_kquant_layout(mode: &str) -> (&str, bool) {
     }
 }
 
-/// Whether K-quant linears are tiled at load: only the `_t64` Metal kernels
-/// read the layout, so a Metal host. Read once per process.
+/// Whether row-major K-quant linears are tiled at load: only the `_t64` Metal
+/// kernels read the layout, so a Metal host. (A checkpoint whose bytes are
+/// already stored `t64` is tiled regardless.) Read once per process.
 pub fn kquant_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -418,6 +516,22 @@ pub fn has_kquant_mode(
     per_layer: &HashMap<String, PerLayerQuant>,
 ) -> bool {
     top_level_mode.is_some_and(is_kquant_mode) || per_layer.values().any(|p| is_kquant_mode(p.mode))
+}
+
+/// Fail-loud guard for the tensors that are read row-wise and never tiled —
+/// embedding tables (row gathers, tied lm_head) and anything else that hands
+/// its packed bytes to a row-major reader. A `t64` marker on such a key is a
+/// mislabelled checkpoint: the converter never emits it there, and reading
+/// tiled bytes as rows decodes garbage with no shape error.
+pub fn ensure_row_major_kquant_layout(plq: PerLayerQuant, key: &str, family: &str) -> Result<()> {
+    if plq.layout != KQuantLayout::RowMajor {
+        return Err(Error::from_reason(format!(
+            "{family}: '{key}' declares {KQUANT_LAYOUT_KEY}={KQUANT_LAYOUT_T64}, but this tensor \
+             is read row-wise (embedding gather / tied head) and is never stored tiled — \
+             mislabelled quantization metadata, refusing to load"
+        )));
+    }
+    Ok(())
 }
 
 /// Fail-loud guard for the DENSE (unquantized) weight fallbacks of
@@ -597,7 +711,21 @@ pub struct KQuantGroup {
     pub biases: MxArray,
     pub bits: i32,
     pub group_size: i32,
+    /// The bare ggml mode (`"q4k"`); see [`Self::mode_string`] for the string
+    /// a `QuantizedLinear` is built with.
     pub mode_str: &'static str,
+    /// The byte order the arrays are already in (the checkpoint's declared
+    /// layout, validated against the shape).
+    pub layout: KQuantLayout,
+}
+
+impl KQuantGroup {
+    /// The `QuantizedLinear::mode` string for these arrays: the bare mode plus
+    /// the [`KQUANT_TILED_SUFFIX`] tag when the checkpoint stored them tiled, so
+    /// the projection reaches the `_t64` kernels without a load-time permute.
+    pub fn mode_string(&self) -> String {
+        format!("{}{}", self.mode_str, self.layout.mode_suffix())
+    }
 }
 
 /// How a K-quant mode's codes turn into values, mirroring `kquant::Kind` in
@@ -726,10 +854,19 @@ pub fn kquant_mode_params(mode: PerLayerMode) -> Option<KQuantModeParams> {
 /// (`weight` uint32; `scales` int8 for Q6_K / uint8 for Q4_K/Q5_K; `biases`
 /// float16), or a rank mismatch (`expected_ndim` is 2 for dense projections, 3
 /// for stacked experts). A silent fallback would decode garbage.
+///
+/// `layout` is the checkpoint's declared byte order for this tensor
+/// (`PerLayerQuant::layout`). This is the one place every family's K-quant
+/// builder passes through, so the Tiled64 marker is validated here: it is only
+/// legal on a 2-D weight whose shape is [`kquant_tileable`] — a 3-D expert
+/// stack or an odd width under the marker is a corrupt or mislabelled
+/// checkpoint and fails loud (reading tiled bytes row-wise, or vice versa,
+/// decodes garbage with no shape error).
 pub fn resolve_kquant_group(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     mode: PerLayerMode,
+    layout: KQuantLayout,
     expected_ndim: usize,
     family: &str,
 ) -> Result<Option<KQuantGroup>> {
@@ -777,11 +914,43 @@ pub fn resolve_kquant_group(
             "{family} {mode_str} layer '{key_prefix}': expected float16 .biases (ggml `d`), got {b_dtype:?}"
         )));
     }
-    let w_ndim = weight.shape()?.len();
+    let w_shape = weight.shape()?;
+    let w_ndim = w_shape.len();
     if w_ndim != expected_ndim {
         return Err(Error::from_reason(format!(
             "{family} {mode_str} layer '{key_prefix}': expected {expected_ndim}-D packed .weight, got {w_ndim}-D"
         )));
+    }
+    if layout == KQuantLayout::Tiled64 {
+        if w_ndim != 2 {
+            return Err(Error::from_reason(format!(
+                "{family} {mode_str} layer '{key_prefix}': config declares \
+                 {KQUANT_LAYOUT_KEY}={KQUANT_LAYOUT_T64} but the packed .weight is {w_ndim}-D; \
+                 the Tiled64 layout exists only for 2-D linears (experts stay row-major) — \
+                 corrupt or hand-edited quantization metadata, refusing to load"
+            )));
+        }
+        let n = w_shape[0];
+        let k = w_shape[1] * 32 / i64::from(bits);
+        if !kquant_tileable(n, k) {
+            return Err(Error::from_reason(format!(
+                "{family} {mode_str} layer '{key_prefix}': config declares \
+                 {KQUANT_LAYOUT_KEY}={KQUANT_LAYOUT_T64} but the packed .weight expands to \
+                 N={n}, K={k}; the Tiled64 layout needs N % {KQUANT_TILE_ROWS} == 0 and \
+                 K % 256 == 0 — corrupt or hand-edited quantization metadata, refusing to load"
+            )));
+        }
+        let s_shape = scales.shape()?;
+        let b_shape = biases.shape()?;
+        if s_shape.len() != 2 || b_shape.len() != 2 || s_shape[0] != n || b_shape[0] != n {
+            return Err(Error::from_reason(format!(
+                "{family} {mode_str} layer '{key_prefix}': config declares \
+                 {KQUANT_LAYOUT_KEY}={KQUANT_LAYOUT_T64} but .scales {:?} / .biases {:?} are not \
+                 2-D companions of the {n}-row .weight — refusing to load",
+                s_shape.to_vec(),
+                b_shape.to_vec()
+            )));
+        }
     }
     Ok(Some(KQuantGroup {
         weight: weight.clone(),
@@ -790,6 +959,7 @@ pub fn resolve_kquant_group(
         bits,
         group_size,
         mode_str,
+        layout,
     }))
 }
 
@@ -812,6 +982,8 @@ pub fn default_per_layer_quant(
         // Fallback default for layers without an explicit override never
         // carries a calibrated activation scale.
         input_amax: None,
+        // The Tiled64 marker is per tensor; nothing inherits it.
+        layout: KQuantLayout::RowMajor,
     }
 }
 
@@ -1035,6 +1207,35 @@ fn parse_input_amax(
     Ok(Some(cast))
 }
 
+/// Validate a per-tensor `layout` field: `"t64"` on a K-quant mode is the
+/// Tiled64 byte order; absent is row-major. Any other value, or the field on a
+/// non-K-quant mode, is rejected — a layout the reader does not know means it
+/// does not know the byte order either, and guessing row-major would decode
+/// garbage with no shape error.
+fn parse_layout(value: Option<&Value>, mode: PerLayerMode, context: &str) -> Result<KQuantLayout> {
+    let Some(value) = value else {
+        return Ok(KQuantLayout::RowMajor);
+    };
+    let layout = value.as_str().ok_or_else(|| {
+        Error::from_reason(format!(
+            "Invalid {context}: expected the string \"{KQUANT_LAYOUT_T64}\", got {value}"
+        ))
+    })?;
+    if layout != KQUANT_LAYOUT_T64 {
+        return Err(Error::from_reason(format!(
+            "Invalid {context}='{layout}': the only known K-quant byte order is \
+             \"{KQUANT_LAYOUT_T64}\" (omit the field for row-major)"
+        )));
+    }
+    if !is_kquant_mode(mode) {
+        return Err(Error::from_reason(format!(
+            "Invalid {context}: {KQUANT_LAYOUT_T64} describes the 64-row tiled order of a ggml \
+             K-quant tensor, got mode {mode:?}"
+        )));
+    }
+    Ok(KQuantLayout::Tiled64)
+}
+
 /// Validate a `symmetric_zero_point` field and return the zero point it names.
 ///
 /// Legal only on `mode: "affine"`, and only at the one value the algebra
@@ -1181,6 +1382,7 @@ fn parse_per_layer_entries(
             || child.contains_key("group_size")
             || child.contains_key("mode")
             || child.contains_key("input_amax")
+            || child.contains_key(KQUANT_LAYOUT_KEY)
             || child.contains_key(SYMMETRIC_ZERO_POINT_KEY);
         if !looks_quantized {
             // Compatibility: unrelated nested metadata objects with no quant
@@ -1250,6 +1452,11 @@ fn parse_per_layer_entries(
             bits,
             &format!("{context}.{SYMMETRIC_ZERO_POINT_KEY}"),
         )?;
+        let layout = parse_layout(
+            child.get(KQUANT_LAYOUT_KEY),
+            mode,
+            &format!("{context}.{KQUANT_LAYOUT_KEY}"),
+        )?;
         let normalized = normalize_per_layer_key(key);
         zero_points.insert(normalized.clone(), zero_point);
         per_layer.insert(
@@ -1259,6 +1466,7 @@ fn parse_per_layer_entries(
                 group_size,
                 mode,
                 input_amax,
+                layout,
             },
         );
     }
@@ -1297,9 +1505,23 @@ pub fn parse_quant_block(
                 .to_string(),
         ));
     }
+    reject_top_level_layout(obj)?;
     top_level_symmetric_zero_point(obj, top_level_mode)?;
     let per_layer = parse_per_layer_overrides(obj, fallback_group_size)?;
     Ok((top_level_mode, per_layer))
+}
+
+/// The Tiled64 marker is a per-tensor statement about one array's bytes; a
+/// block-level `layout` would claim it for tensors whose shapes cannot carry
+/// it (embeddings, odd widths, expert stacks). Reject rather than inherit.
+fn reject_top_level_layout(obj: Option<&serde_json::Map<String, Value>>) -> Result<()> {
+    if obj.is_some_and(|q| q.contains_key(KQUANT_LAYOUT_KEY)) {
+        return Err(Error::from_reason(format!(
+            "Invalid top-level quantization.{KQUANT_LAYOUT_KEY}: the K-quant byte order is \
+             declared per tensor, never for the whole block"
+        )));
+    }
+    Ok(())
 }
 
 /// Extract numeric defaults plus fallible mode metadata from an already
@@ -1338,6 +1560,7 @@ pub fn parse_quant_settings(
                 .to_string(),
         ));
     }
+    reject_top_level_layout(obj)?;
     top_level_symmetric_zero_point(obj, top_level_mode)?;
     let per_layer = parse_per_layer_overrides(obj, group_size)?;
     Ok((bits, group_size, top_level_mode, per_layer))
@@ -1593,7 +1816,22 @@ pub(crate) fn build_non_moe_ql(
         | PerLayerMode::IQ2S
         | PerLayerMode::IQ3XXS
         | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => try_build_kquant_quantized_linear(params, base, plq.mode, family)?,
+        | PerLayerMode::IQ1M => {
+            // Tiled64 for the `_t64` Metal kernels: a `t64` checkpoint tensor
+            // is built tiled as-is; a row-major one is permuted here. These
+            // loaders (lfm2, k2_horizon) take the map by `&`, so the permuted
+            // projection's row-major source stays in the map until the loader
+            // drops it (a load-time transient, not a resident cost); the
+            // converter's on-disk `t64` layout avoids the permute entirely.
+            try_build_kquant_quantized_linear_tiled(
+                params,
+                base,
+                plq.mode,
+                plq.layout,
+                family,
+                &mut Vec::new(),
+            )?
+        }
     })
 }
 
@@ -1819,6 +2057,7 @@ pub(crate) fn load_embedding_affine_or_bf16(
             ))
         })?;
         let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
+        ensure_row_major_kquant_layout(plq, base, family)?;
         // Rejects sym8/fp8_e4m3/K-quants (descriptive Errs): the packed
         // embedding backend feeds `mlx_dequantize`/`mlx_quantized_matmul`,
         // which have no pack for those storage classes.
@@ -2681,6 +2920,7 @@ mod tests {
                 group_size: 64,
                 mode: PerLayerMode::Sym8,
                 input_amax: None,
+                layout: Default::default(),
             },
         );
         assert!(has_sym8_mode(None, &overrides));
@@ -2762,6 +3002,7 @@ mod tests {
                 group_size: 32,
                 mode: PerLayerMode::Q4K,
                 input_amax: None,
+                layout: Default::default(),
             },
         );
         assert!(has_kquant_mode(None, &overrides));
@@ -2775,13 +3016,13 @@ mod tests {
         let mut p = kquant_group_params("l", PerLayerMode::Q6K);
         p.remove("l.scales");
         assert!(matches!(
-            resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t"),
+            resolve_kquant_group(&p, "l", PerLayerMode::Q6K, KQuantLayout::RowMajor, 2, "t"),
             Ok(None)
         ));
 
         // Well-formed → Some carrying the mode's fixed bits/group/mode string.
         let p = kquant_group_params("l", PerLayerMode::Q4K);
-        let g = resolve_kquant_group(&p, "l", PerLayerMode::Q4K, 2, "t")
+        let g = resolve_kquant_group(&p, "l", PerLayerMode::Q4K, KQuantLayout::RowMajor, 2, "t")
             .unwrap()
             .unwrap();
         assert_eq!((g.bits, g.group_size, g.mode_str), (4, 32, "q4k"));
@@ -2789,24 +3030,220 @@ mod tests {
         // .scales present but .weight missing → Err.
         let mut p = kquant_group_params("l", PerLayerMode::Q6K);
         p.remove("l.weight");
-        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t").is_err());
+        assert!(
+            resolve_kquant_group(&p, "l", PerLayerMode::Q6K, KQuantLayout::RowMajor, 2, "t")
+                .is_err()
+        );
 
         // Mandatory .biases missing → Err (K-quants always carry `d`).
         let mut p = kquant_group_params("l", PerLayerMode::Q6K);
         p.remove("l.biases");
-        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t").is_err());
+        assert!(
+            resolve_kquant_group(&p, "l", PerLayerMode::Q6K, KQuantLayout::RowMajor, 2, "t")
+                .is_err()
+        );
 
         // Wrong scales dtype for the mode (q6k wants int8; hand it uint8) → Err.
         let p = kquant_group_params("l", PerLayerMode::Q4K);
-        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t").is_err());
+        assert!(
+            resolve_kquant_group(&p, "l", PerLayerMode::Q6K, KQuantLayout::RowMajor, 2, "t")
+                .is_err()
+        );
 
         // Wrong rank (dense expects 2-D, ask for 3-D) → Err.
         let p = kquant_group_params("l", PerLayerMode::Q6K);
-        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 3, "t").is_err());
+        assert!(
+            resolve_kquant_group(&p, "l", PerLayerMode::Q6K, KQuantLayout::RowMajor, 3, "t")
+                .is_err()
+        );
 
         // Non-K-quant mode into the K-quant resolver → Err.
         let p = kquant_group_params("l", PerLayerMode::Q6K);
-        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Affine, 2, "t").is_err());
+        assert!(
+            resolve_kquant_group(
+                &p,
+                "l",
+                PerLayerMode::Affine,
+                KQuantLayout::RowMajor,
+                2,
+                "t"
+            )
+            .is_err()
+        );
+    }
+
+    /// A tileable q4k group: 64 rows x 256 inputs (32 packed words, 16
+    /// `(sc, m)` bytes, 2 `(d, dmin)` halves per row).
+    fn tileable_q4k_group(prefix: &str) -> HashMap<String, MxArray> {
+        let weight = MxArray::from_uint32(&vec![0u32; 64 * 32], &[64, 32]).unwrap();
+        let scales = MxArray::from_float32(&vec![1.0; 64 * 16], &[64, 16])
+            .unwrap()
+            .astype(DType::Uint8)
+            .unwrap();
+        let biases =
+            MxArray::from_float16(&vec![half::f16::from_f32(0.5).to_bits(); 64 * 2], &[64, 2])
+                .unwrap();
+        HashMap::from([
+            (format!("{prefix}.weight"), weight),
+            (format!("{prefix}.scales"), scales),
+            (format!("{prefix}.biases"), biases),
+        ])
+    }
+
+    #[test]
+    fn resolve_kquant_group_validates_the_tiled_marker_against_the_shape() {
+        // Tileable shape under the marker: carried through as `q4k@t64`.
+        let p = tileable_q4k_group("l");
+        let g = resolve_kquant_group(&p, "l", PerLayerMode::Q4K, KQuantLayout::Tiled64, 2, "t")
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.layout, KQuantLayout::Tiled64);
+        assert_eq!(g.mode_string(), format!("q4k{KQUANT_TILED_SUFFIX}"));
+        // Same group without the marker: bare mode.
+        let g = resolve_kquant_group(&p, "l", PerLayerMode::Q4K, KQuantLayout::RowMajor, 2, "t")
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.mode_string(), "q4k");
+
+        // One row (N % 64 != 0) under the marker → Err naming the marker.
+        let p = kquant_group_params("l", PerLayerMode::Q4K);
+        let Err(err) =
+            resolve_kquant_group(&p, "l", PerLayerMode::Q4K, KQuantLayout::Tiled64, 2, "t")
+        else {
+            panic!("one row under the marker must be refused");
+        };
+        assert!(err.reason.contains("layout=t64"), "{}", err.reason);
+        assert!(err.reason.contains("N % 64"), "{}", err.reason);
+
+        // A 3-D expert stack under the marker → Err (experts stay row-major).
+        let weight = MxArray::from_uint32(&vec![0u32; 2 * 64 * 32], &[2, 64, 32]).unwrap();
+        let scales = MxArray::from_float32(&vec![1.0; 2 * 64 * 16], &[2, 64, 16])
+            .unwrap()
+            .astype(DType::Uint8)
+            .unwrap();
+        let biases = MxArray::from_float16(
+            &vec![half::f16::from_f32(0.5).to_bits(); 2 * 64 * 2],
+            &[2, 64, 2],
+        )
+        .unwrap();
+        let p = HashMap::from([
+            ("e.weight".to_string(), weight),
+            ("e.scales".to_string(), scales),
+            ("e.biases".to_string(), biases),
+        ]);
+        let Err(err) =
+            resolve_kquant_group(&p, "e", PerLayerMode::Q4K, KQuantLayout::Tiled64, 3, "t")
+        else {
+            panic!("a 3-D stack under the marker must be refused");
+        };
+        assert!(err.reason.contains("2-D linears"), "{}", err.reason);
+        // ... and row-major experts are unaffected.
+        assert!(
+            resolve_kquant_group(&p, "e", PerLayerMode::Q4K, KQuantLayout::RowMajor, 3, "t")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn layout_marker_parses_per_tensor_only_on_kquant_modes() {
+        // Round trip: `"layout": "t64"` on a K-quant entry → Tiled64; absent →
+        // RowMajor; the two differ as `PerLayerQuant`s but agree on
+        // `same_quantization`.
+        let cfg = serde_json::json!({
+            "bits": 4, "group_size": 32, "mode": "q4k",
+            "model.layers.0.mlp.down_proj": {"bits": 4, "group_size": 32, "mode": "q4k", "layout": "t64"},
+            "model.layers.0.mlp.up_proj": {"bits": 4, "group_size": 32, "mode": "q4k"},
+            "model.layers.0.mlp.gate_proj": {"bits": 6, "group_size": 16, "mode": "q6k", "layout": "t64"},
+        });
+        let (top, per_layer) = parse_quant_block(Some(&cfg), 32).unwrap();
+        assert_eq!(top, Some(PerLayerMode::Q4K));
+        let down = per_layer["layers.0.mlp.down_proj"];
+        let up = per_layer["layers.0.mlp.up_proj"];
+        assert_eq!(down.layout, KQuantLayout::Tiled64);
+        assert_eq!(up.layout, KQuantLayout::RowMajor);
+        assert_ne!(down, up);
+        assert!(down.same_quantization(&up));
+        assert_eq!(
+            per_layer["layers.0.mlp.gate_proj"].layout,
+            KQuantLayout::Tiled64
+        );
+        assert_eq!(down.with_layout(KQuantLayout::RowMajor), up);
+        assert_eq!(KQuantLayout::Tiled64.config_value(), Some("t64"));
+        assert_eq!(KQuantLayout::RowMajor.config_value(), None);
+        // `parse_quant_settings` (the disk-backed loaders) agrees.
+        let (_, _, _, per_layer2) = parse_quant_settings(Some(&cfg), 4, 32).unwrap();
+        assert_eq!(
+            per_layer2["layers.0.mlp.down_proj"].layout,
+            KQuantLayout::Tiled64
+        );
+        // The scan helper the row-wise readers refuse on.
+        assert!(
+            config_declares_tiled_kquant_layout(&serde_json::json!({ "quantization": cfg }))
+                .is_some()
+        );
+        assert!(
+            config_declares_tiled_kquant_layout(&serde_json::json!({
+                "quantization": {"bits": 4, "group_size": 32, "mode": "q4k",
+                    "model.layers.0.mlp.up_proj": {"bits": 4, "group_size": 32, "mode": "q4k"}}
+            }))
+            .is_none()
+        );
+
+        // Rejections: the marker on a non-K-quant mode, an unknown layout
+        // string, a non-string value, and a block-level layout.
+        for (bad, needle) in [
+            (
+                serde_json::json!({"model.layers.0.mlp.up_proj": {"bits": 4, "group_size": 64, "mode": "affine", "layout": "t64"}}),
+                "got mode Affine",
+            ),
+            (
+                serde_json::json!({"model.layers.0.mlp.up_proj": {"bits": 4, "group_size": 32, "mode": "q4k", "layout": "t32"}}),
+                "only known K-quant byte order",
+            ),
+            (
+                serde_json::json!({"model.layers.0.mlp.up_proj": {"bits": 4, "group_size": 32, "mode": "q4k", "layout": 64}}),
+                "expected the string",
+            ),
+            (
+                serde_json::json!({"bits": 4, "group_size": 32, "mode": "q4k", "layout": "t64"}),
+                "declared per tensor",
+            ),
+        ] {
+            let err = parse_quant_block(Some(&bad), 32).unwrap_err();
+            assert!(err.reason.contains(needle), "{bad}: {}", err.reason);
+            let err = parse_quant_settings(Some(&bad), 4, 32).unwrap_err();
+            assert!(err.reason.contains(needle), "{bad}: {}", err.reason);
+        }
+        // A `layout`-only child still counts as a quantization entry (and then
+        // fails for lacking bits), rather than being skipped as metadata.
+        let err = parse_quant_block(
+            Some(&serde_json::json!({"model.layers.0.mlp.up_proj": {"layout": "t64"}})),
+            32,
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("integer bits"), "{}", err.reason);
+    }
+
+    #[test]
+    fn row_major_guard_refuses_the_marker_on_embeddings() {
+        let plq = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Q4K,
+            input_amax: None,
+            layout: KQuantLayout::Tiled64,
+        };
+        let err = ensure_row_major_kquant_layout(plq, "embedding", "qwen3_5").unwrap_err();
+        assert!(err.reason.contains("read row-wise"), "{}", err.reason);
+        assert!(
+            ensure_row_major_kquant_layout(
+                plq.with_layout(KQuantLayout::RowMajor),
+                "embedding",
+                "x"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3016,6 +3453,7 @@ mod tests {
             group_size,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         }
     }
 
@@ -3025,6 +3463,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
             input_amax: None,
+            layout: Default::default(),
         }
     }
 
@@ -3034,6 +3473,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp4,
             input_amax: None,
+            layout: Default::default(),
         }
     }
 

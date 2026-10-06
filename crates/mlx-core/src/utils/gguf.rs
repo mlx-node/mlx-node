@@ -30,7 +30,9 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
+use crate::models::quant_dispatch::{
+    KQUANT_LAYOUT_KEY, KQuantLayout, SYMMETRIC_ZERO_POINT_KEY, kquant_tile_rows, kquant_tileable,
+};
 use crate::quant::prism_hadamard::PrismHadamardConfig;
 use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales};
 use crate::utils::safetensors::save_safetensors;
@@ -3217,6 +3219,12 @@ struct SourceQuantProfile {
     /// symmetric Q4_0 tensor and an asymmetric Q4_1 tensor no longer collapse
     /// onto one profile and a file holding both is described per tensor.
     symmetric_zero_point: Option<i32>,
+    /// The byte order the converter WROTE the packed arrays in. `Tiled64` for
+    /// the 2-D K-quant linears `tile_kquant_weights_for_disk` permuted before
+    /// the save, emitted as the per-tensor `"layout": "t64"` field; the mode
+    /// string stays the bare ggml mode. Never set from the GGUF type alone —
+    /// it is a property of the written tensor, not of the source block.
+    layout: KQuantLayout,
 }
 
 impl SourceQuantProfile {
@@ -3248,12 +3256,14 @@ impl SourceQuantProfile {
                 group_size: 32,
                 mode: "mxfp4",
                 symmetric_zero_point: None,
+                layout: KQuantLayout::RowMajor,
             }),
             GgufTensorType::PQ2_0 => Some(Self {
                 bits: 2,
                 group_size: 128,
                 mode: "affine",
                 symmetric_zero_point: None,
+                layout: KQuantLayout::RowMajor,
             }),
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
@@ -3281,6 +3291,7 @@ impl SourceQuantProfile {
             group_size: 32,
             mode: "affine",
             symmetric_zero_point: None,
+            layout: KQuantLayout::RowMajor,
         }
     }
 
@@ -3298,15 +3309,29 @@ impl SourceQuantProfile {
             group_size: format.group_size() as i32,
             mode: format.mlx_mode(),
             symmetric_zero_point: None,
+            layout: KQuantLayout::RowMajor,
         }
+    }
+
+    /// This profile with its written byte order set.
+    fn with_layout(self, layout: KQuantLayout) -> Self {
+        Self { layout, ..self }
+    }
+
+    /// Whether the written tensor is a K-quant group `tile_kquant_weights_for_disk`
+    /// may permute: the mode is a ggml K/IQ mode (the layout is decided from
+    /// the array shape, not here).
+    fn is_k_quant(self) -> bool {
+        crate::models::quant_dispatch::parse_mode_str(Some(self.mode))
+            .is_some_and(crate::models::quant_dispatch::is_kquant_mode)
     }
 
     /// Whether a tensor with this profile has to be named explicitly in the
     /// config instead of relying on the top-level triple. Affine at group 32 is
     /// the only shape a generic default can reproduce; the K-quant modes carry
-    /// ggml geometry no default supplies.
+    /// ggml geometry no default supplies, and a tiled tensor must say so.
     fn requires_explicit_entry(self) -> bool {
-        self.mode != "affine" || self.group_size != 32
+        self.mode != "affine" || self.group_size != 32 || self.layout != KQuantLayout::RowMajor
     }
 
     fn to_json(self) -> serde_json::Value {
@@ -3320,17 +3345,26 @@ impl SourceQuantProfile {
                 serde_json::json!(zero_point),
             );
         }
+        // Per tensor only: `preserved_source_quantization` never promotes a
+        // tiled profile to the block-level default.
+        if let Some(layout) = self.layout.config_value() {
+            obj.insert(KQUANT_LAYOUT_KEY.to_string(), serde_json::json!(layout));
+        }
         serde_json::Value::Object(obj)
     }
 
     fn describe(self) -> String {
+        let tiled = match self.layout {
+            KQuantLayout::RowMajor => "",
+            KQuantLayout::Tiled64 => ", 64-row tiled",
+        };
         match self.symmetric_zero_point {
             Some(zero_point) => format!(
-                "{}-bit {} (group_size {}, symmetric zero point {zero_point})",
+                "{}-bit {} (group_size {}, symmetric zero point {zero_point}{tiled})",
                 self.bits, self.mode, self.group_size
             ),
             None => format!(
-                "{}-bit {} (group_size {})",
+                "{}-bit {} (group_size {}{tiled})",
                 self.bits, self.mode, self.group_size
             ),
         }
@@ -3658,7 +3692,8 @@ fn validate_prism_supplied_config(
     }
     for key in ["quantization", "quantization_config"] {
         if let Some(supplied_quant) = supplied.get(key) {
-            let expected = preserved_source_quantization(gguf, true)?;
+            let expected =
+                preserved_source_quantization(gguf, true, &std::collections::BTreeSet::new())?;
             if expected.as_ref() != Some(supplied_quant) {
                 return Err(Error::from_reason(format!(
                     "supplied config.json field '{key}' conflicts with the PQ2_0 source quantization"
@@ -4034,14 +4069,173 @@ fn apply_gemma4_attention_geometry(
     }
 }
 
+/// Whether a config (supplied or synthesized) ties the output head to the
+/// embedding table: `tie_word_embeddings` at the top level or under
+/// `text_config` (the multimodal Gemma4 / Muse shape). Missing means untied.
+fn config_ties_word_embeddings(config: &serde_json::Value) -> bool {
+    config
+        .get("tie_word_embeddings")
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|text| text.get("tie_word_embeddings"))
+        })
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The last path component of a 2-D K-quant linear the converter may store in
+/// the Tiled64 layout. An allowlist rather than "every 2-D K-quant tensor":
+/// the tiled bytes are only readable through a `QuantizedLinear` built by the
+/// family loaders' shared K-quant builder, so only the projections known to
+/// take that route qualify. Left row-major on purpose:
+///   * embeddings / tied heads (`embed_tokens`, `token_embd`, `embedding`,
+///     `embed_tokens_per_layer`): row gathers and `Embedding::as_linear`;
+///   * router gates (`mlp.gate`, `shared_expert_gate`, `feed_forward.gate`):
+///     `N = num_experts`, not worth a layout;
+///   * GDN `in_proj_b` / `in_proj_a` (`N = num_v_heads`, never whole tiles —
+///     the loader pads and tiles the merged pair itself);
+///   * 3-D expert stacks (`switch_mlp.*`): gathered row-wise, excluded by rank
+///     before the name is consulted.
+const KQUANT_TILED_DISK_PROJECTIONS: [&str; 13] = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_qkvz",
+    "out_proj",
+    "fc",
+    "per_layer_model_projection",
+];
+
+/// Whether a converted tensor (HF-named `prefix`, the key without `.weight`)
+/// is a projection the converter may store tiled; `lm_head` only when untied
+/// (a tied checkpoint reads the embedding table as its head, and a loader
+/// that drops `lm_head.*` under `tie_word_embeddings` never sees the marker).
+fn kquant_tiled_disk_candidate(prefix: &str, tie_word_embeddings: bool) -> bool {
+    let last = prefix.rsplit('.').next().unwrap_or(prefix);
+    if last == "lm_head" {
+        return !tie_word_embeddings;
+    }
+    KQUANT_TILED_DISK_PROJECTIONS.contains(&last)
+}
+
+/// Permute every eligible 2-D K-quant group in `weights` into the Tiled64
+/// layout (`kquant_tile_rows`, a CPU reshape/transpose on the already-repacked
+/// arrays) before the save, and return the config-normalized prefixes that
+/// were tiled so `preserved_source_quantization` can mark them
+/// `"layout": "t64"`.
+///
+/// Eligibility: the prefix is a [`kquant_tiled_disk_candidate`], its profile
+/// is a K-quant mode, the group is complete (`.weight` uint32 2-D, `.scales`,
+/// `.biases` 2-D), and the shape is [`kquant_tileable`] (`N % 64 == 0`,
+/// `K % 256 == 0`). Odd widths are NOT padded on disk: the loader keeps its
+/// pad-at-load merge for those (`in_proj_ba`). A tensor left row-major loads
+/// exactly as before (permute-at-load on Metal), so a checkpoint may mix both.
+///
+/// The arrays are evaluated here, one group at a time, so the tiled copy and
+/// its row-major source coexist only per tensor — the converter already holds
+/// the whole repacked model, and the save drains the map afterwards.
+fn tile_kquant_weights_for_disk(
+    weights: &mut HashMap<String, MxArray>,
+    profiles: &std::collections::BTreeMap<String, SourceQuantProfile>,
+    tie_word_embeddings: bool,
+) -> Result<std::collections::BTreeSet<String>> {
+    use crate::models::quant_dispatch::{kquant_mode_params, parse_mode_str};
+    let mut tiled = std::collections::BTreeSet::new();
+    let weight_keys: Vec<String> = weights
+        .keys()
+        .filter(|key| key.ends_with(".weight"))
+        .cloned()
+        .collect();
+    for weight_key in weight_keys {
+        let prefix = &weight_key[..weight_key.len() - ".weight".len()];
+        if !kquant_tiled_disk_candidate(prefix, tie_word_embeddings) {
+            continue;
+        }
+        let normalized = super::normalize_override_key(prefix);
+        let Some(profile) = profiles.get(&normalized) else {
+            continue;
+        };
+        if !profile.is_k_quant() {
+            continue;
+        }
+        let Some(kq) = parse_mode_str(Some(profile.mode)).and_then(kquant_mode_params) else {
+            continue;
+        };
+        let scales_key = format!("{prefix}.scales");
+        let biases_key = format!("{prefix}.biases");
+        let (Some(weight), Some(scales), Some(biases)) = (
+            weights.get(&weight_key),
+            weights.get(&scales_key),
+            weights.get(&biases_key),
+        ) else {
+            continue;
+        };
+        let w_shape = weight.shape()?;
+        if weight.dtype()? != DType::Uint32
+            || w_shape.len() != 2
+            || scales.ndim()? != 2
+            || biases.ndim()? != 2
+        {
+            continue;
+        }
+        let n = w_shape[0];
+        let k = w_shape[1] * 32 / i64::from(kq.bits);
+        if !kquant_tileable(n, k) {
+            continue;
+        }
+        let per_group = i64::from(kq.scale_bytes_per_group);
+        let super_ratio = i64::from(kq.super_ratio);
+        let tiled_weight = kquant_tile_rows(weight, i64::from(kq.bits))?;
+        let tiled_scales = kquant_tile_rows(scales, super_ratio * per_group)?;
+        let tiled_biases = kquant_tile_rows(biases, per_group)?;
+        MxArray::eval_arrays_with_context(
+            &[&tiled_weight, &tiled_scales, &tiled_biases],
+            "tile_kquant_weights_for_disk",
+        )?;
+        weights.insert(weight_key.clone(), tiled_weight);
+        weights.insert(scales_key, tiled_scales);
+        weights.insert(biases_key, tiled_biases);
+        tiled.insert(normalized);
+    }
+    if !tiled.is_empty() {
+        info!(
+            "Stored {} K-quant projections in the 64-row tiled layout (config layout=t64)",
+            tiled.len()
+        );
+    }
+    Ok(tiled)
+}
+
+/// The `quantization` block describing the written tensors.
+///
+/// `tiled` names the config-normalized prefixes `tile_kquant_weights_for_disk`
+/// permuted (empty for a secondary output or a conversion that re-quantizes);
+/// those entries carry `"layout": "t64"`. The layout never reaches the
+/// block-level default — it is a per-tensor fact, and the default stays what a
+/// reader that ignores the field expects.
 fn preserved_source_quantization(
     gguf: &GgufFile,
     import_k_quants: bool,
+    tiled: &std::collections::BTreeSet<String>,
 ) -> Result<Option<serde_json::Value>> {
-    let profiles = source_quantization_profiles(gguf, import_k_quants)?;
+    let mut profiles = source_quantization_profiles(gguf, import_k_quants)?;
+    for (prefix, profile) in profiles.iter_mut() {
+        if tiled.contains(prefix) {
+            *profile = profile.with_layout(KQuantLayout::Tiled64);
+        }
+    }
     let mut profile_counts = HashMap::<SourceQuantProfile, usize>::new();
     for &profile in profiles.values() {
-        *profile_counts.entry(profile).or_default() += 1;
+        *profile_counts
+            .entry(profile.with_layout(KQuantLayout::RowMajor))
+            .or_default() += 1;
     }
 
     if profiles.is_empty() {
@@ -4055,7 +4249,9 @@ fn preserved_source_quantization(
         .ok_or_else(|| {
             Error::from_reason("non-empty source quantization profiles imply a profile count")
         })?;
-    let mixed = profiles.values().any(|&profile| profile != default_profile);
+    let mixed = profiles
+        .values()
+        .any(|&profile| profile.with_layout(KQuantLayout::RowMajor) != default_profile);
 
     let mut quant = serde_json::Map::new();
     quant.insert("bits".to_string(), serde_json::json!(default_profile.bits));
@@ -4309,12 +4505,18 @@ fn prepare_muse_secondary_config(
         .is_some_and(|value| !value.is_null());
 
     if !profiles.is_empty() {
-        let companion_quantization = preserved_source_quantization(gguf, import_k_quants)?
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "Muse-Glimmer companion has quantized profiles but no quantization metadata",
-                )
-            })?;
+        // Secondary outputs are written row-major (no tiling pass), so no
+        // entry carries a layout.
+        let companion_quantization = preserved_source_quantization(
+            gguf,
+            import_k_quants,
+            &std::collections::BTreeSet::new(),
+        )?
+        .ok_or_else(|| {
+            Error::from_reason(
+                "Muse-Glimmer companion has quantized profiles but no quantization metadata",
+            )
+        })?;
         // The two aliases name one block, so it is built once and written to
         // both: a target carrying only `quantization` must not gain a
         // `quantization_config` that describes a different checkpoint, and the
@@ -5464,6 +5666,32 @@ pub async fn convert_gguf_to_safetensors(
         .map(|arr| arr.size().unwrap_or(0) as i64)
         .sum();
 
+    // Store the eligible 2-D K-quant linears in the 64-row tiled layout the
+    // `_t64` Metal kernels read, so the loader builds them without its
+    // per-load permutation (and its transient second copy). Only the primary
+    // output: the marker lives in config.json, which only the primary writes
+    // (a secondary output's tensors stay row-major and load exactly as
+    // before). Never under `--quantize`: that branch writes a
+    // `build_quantization_object` block that knows nothing about the marker.
+    // The prism PQ2_0 path carries no K-quant tensors and keeps its exact
+    // config comparison.
+    let tiled_kquant_prefixes =
+        if is_primary_model && import_k_quants && !do_quantize && prism_contract.is_none() {
+            let profiles = source_quantization_profiles(&gguf, import_k_quants)?;
+            let tie_word_embeddings = if src_config.exists() {
+                let data = fs::read_to_string(&src_config)
+                    .map_err(|e| Error::from_reason(format!("Failed to read config.json: {e}")))?;
+                let supplied: serde_json::Value = serde_json::from_str(&data)
+                    .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?;
+                config_ties_word_embeddings(&supplied)
+            } else {
+                config_ties_word_embeddings(&extract_config(&gguf.metadata))
+            };
+            tile_kquant_weights_for_disk(&mut weights, &profiles, tie_word_embeddings)?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+
     // Save SafeTensors
     let safetensors_path = output_dir.join(safetensors_filename);
     info!("Saving to {}", safetensors_path.display());
@@ -5596,7 +5824,9 @@ pub async fn convert_gguf_to_safetensors(
             );
             config_json["quantization"] = quant_obj.clone();
             config_json["quantization_config"] = quant_obj;
-        } else if let Some(quant_obj) = preserved_source_quantization(&gguf, import_k_quants)? {
+        } else if let Some(quant_obj) =
+            preserved_source_quantization(&gguf, import_k_quants, &tiled_kquant_prefixes)?
+        {
             // Source Q4_0/Q4_1/Q5_1/Q8_0 tensors were losslessly repacked into MLX
             // affine groups of 32, and imported K-quants keep ggml's own
             // geometry. Record that even without an extra quantize request;
@@ -5612,7 +5842,9 @@ pub async fn convert_gguf_to_safetensors(
             .map_err(|e| Error::from_reason(format!("Failed to write config.json: {e}")))?;
         if do_quantize {
             info!("Wrote config.json with quantization metadata");
-        } else if preserved_source_quantization(&gguf, import_k_quants)?.is_some() {
+        } else if preserved_source_quantization(&gguf, import_k_quants, &tiled_kquant_prefixes)?
+            .is_some()
+        {
             info!("Wrote config.json with preserved GGUF source quantization metadata");
         } else if src_config.exists() {
             info!("Copied config.json from source directory");
@@ -5688,7 +5920,14 @@ pub async fn convert_gguf_to_safetensors(
 /// they are never expanded into a dense floating-point weight tensor. Native
 /// F32 norms/biases are narrowed to BF16 so they do not promote inference
 /// activations away from the model's BF16 execution/cache dtype.
-const QWEN35_NATIVE_CACHE_FORMAT: u32 = 5;
+///
+/// v6: the primary conversion stores eligible 2-D K-quant linears in the
+/// 64-row tiled layout (`tile_kquant_weights_for_disk`, config `layout=t64`).
+/// The format is part of the cache directory key, so a v5 entry (row-major
+/// bytes, no marker) is never aliased by a v6 reader — both load correctly,
+/// each by its own config, but the bump makes a fresh cache take the
+/// permute-free path.
+const QWEN35_NATIVE_CACHE_FORMAT: u32 = 6;
 const NATIVE_GGUF_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
 
 fn native_gguf_cache_candidates_from(
@@ -9745,7 +9984,7 @@ mod tests {
         gguf.metadata
             .insert("gemma4.expert_count".into(), GgufMetaValue::Uint32(2));
 
-        let quant = preserved_source_quantization(&gguf, true)
+        let quant = preserved_source_quantization(&gguf, true, &std::collections::BTreeSet::new())
             .unwrap()
             .expect("a Q5_1 tensor must publish a quantization block");
         let entry = &quant["language_model.model.layers.0.experts.down_proj"];
@@ -10927,7 +11166,7 @@ mod tests {
         // The published profile is MLX's pinned mxfp4 triple, named per tensor
         // (`requires_explicit_entry`: the mode is not affine).
         let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", GgufTensorType::MXFP4)]);
-        let quant = preserved_source_quantization(&gguf, false)
+        let quant = preserved_source_quantization(&gguf, false, &std::collections::BTreeSet::new())
             .unwrap()
             .expect("an MXFP4 tensor must publish a quantization block");
         let entry = &quant["language_model.model.layers.0.mlp.down_proj"];
@@ -10982,7 +11221,7 @@ mod tests {
         );
 
         let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", GgufTensorType::Q2K)]);
-        let quant = preserved_source_quantization(&gguf, true)
+        let quant = preserved_source_quantization(&gguf, true, &std::collections::BTreeSet::new())
             .unwrap()
             .expect("a Q2_K tensor must publish a quantization block");
         let entry = &quant["language_model.model.layers.0.mlp.down_proj"];
@@ -11061,7 +11300,7 @@ mod tests {
             ("blk.0.attn_k.weight", GgufTensorType::Q4_0),
             ("blk.0.ffn_down.weight", GgufTensorType::Q4_1),
         ]);
-        let quant = preserved_source_quantization(&gguf, false)
+        let quant = preserved_source_quantization(&gguf, false, &std::collections::BTreeSet::new())
             .unwrap()
             .unwrap();
 
@@ -11693,6 +11932,7 @@ mod tests {
             group_size,
             mode: top_mode.unwrap_or(PerLayerMode::Affine),
             input_amax: None,
+            layout: Default::default(),
         };
         assert_eq!(
             muse_projection_quant("layers.0.self_attn.q_proj", &overrides, default).mode,
@@ -12020,7 +12260,7 @@ mod tests {
         let primary =
             parse_gguf(input.to_string_lossy().into_owned()).expect("parse Muse main GGUF");
         assert!(
-            preserved_source_quantization(&primary, true)
+            preserved_source_quantization(&primary, true, &std::collections::BTreeSet::new())
                 .expect("primary source quantization")
                 .is_none(),
             "ANTI-VACUITY: the primary GGUF must be entirely dense, or the conversion takes \
@@ -12904,7 +13144,7 @@ mod tests {
             alignment: GGUF_DEFAULT_ALIGNMENT,
             data_offset: 0,
         };
-        let quant = preserved_source_quantization(&gguf, false)
+        let quant = preserved_source_quantization(&gguf, false, &std::collections::BTreeSet::new())
             .unwrap()
             .unwrap();
         assert_eq!(quant["bits"], 4);
@@ -13239,7 +13479,9 @@ mod tests {
             ("blk.0.attn_k.weight", GgufTensorType::Q4_0),
             ("blk.0.ffn_down.weight", GgufTensorType::Q4K),
         ]);
-        let quant = preserved_source_quantization(&gguf, true).unwrap().unwrap();
+        let quant = preserved_source_quantization(&gguf, true, &std::collections::BTreeSet::new())
+            .unwrap()
+            .unwrap();
 
         // The modal profile stays the top-level fallback.
         assert_eq!(quant["bits"], 4);
@@ -13279,7 +13521,9 @@ mod tests {
             ("blk.0.attn_qkv.weight", GgufTensorType::Q4K),
             ("blk.0.attn_gate.weight", GgufTensorType::Q4K),
         ]);
-        let quant = preserved_source_quantization(&gguf, true).unwrap().unwrap();
+        let quant = preserved_source_quantization(&gguf, true, &std::collections::BTreeSet::new())
+            .unwrap()
+            .unwrap();
         let (bits, group_size, top_level_mode, per_layer) =
             crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64).unwrap();
         let default = crate::models::quant_dispatch::default_per_layer_quant(
@@ -13312,7 +13556,10 @@ mod tests {
         // is named whether or not this particular file happens to look uniform.
         for (format, tensor_type) in k_quant_cases() {
             let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", tensor_type)]);
-            let quant = preserved_source_quantization(&gguf, true).unwrap().unwrap();
+            let quant =
+                preserved_source_quantization(&gguf, true, &std::collections::BTreeSet::new())
+                    .unwrap()
+                    .unwrap();
             let expected = serde_json::json!({
                 "bits": format.bits(),
                 "group_size": format.group_size(),
@@ -13336,6 +13583,374 @@ mod tests {
     }
 
     #[test]
+    fn tiled_prefixes_are_marked_per_tensor_and_never_promoted_to_the_default() {
+        // Two tensors, same q4k profile: one tiled, one not. The tiled one
+        // carries `layout: "t64"`, the other does not, and the block default
+        // (which a reader that ignores the field falls back to) stays bare.
+        let gguf = source_quant_fixture(&[
+            ("blk.0.ffn_down.weight", GgufTensorType::Q4K),
+            ("blk.0.ffn_up.weight", GgufTensorType::Q4K),
+        ]);
+        let tiled = std::collections::BTreeSet::from([
+            "language_model.model.layers.0.mlp.down_proj".to_string(),
+        ]);
+        let quant = preserved_source_quantization(&gguf, true, &tiled)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            quant["language_model.model.layers.0.mlp.down_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "q4k", "layout": "t64" })
+        );
+        assert_eq!(
+            quant["language_model.model.layers.0.mlp.up_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "q4k" })
+        );
+        assert!(quant.get(KQUANT_LAYOUT_KEY).is_none(), "{quant}");
+        assert_eq!(quant["mode"], "q4k");
+        // The emitted block parses back with the layout on exactly that tensor.
+        let (_, per_layer) =
+            crate::models::quant_dispatch::parse_quant_block(Some(&quant), 32).unwrap();
+        assert_eq!(
+            per_layer["layers.0.mlp.down_proj"].layout,
+            KQuantLayout::Tiled64
+        );
+        assert_eq!(
+            per_layer["layers.0.mlp.up_proj"].layout,
+            KQuantLayout::RowMajor
+        );
+    }
+
+    #[test]
+    fn tiled_disk_candidates_exclude_embeddings_gates_and_tied_heads() {
+        for ok in [
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.3.mlp.down_proj",
+            "model.layers.1.linear_attn.in_proj_qkv",
+            "model.layers.1.linear_attn.in_proj_z",
+            "model.layers.1.linear_attn.out_proj",
+            "model.language_model.layers.0.self_attn.gate_proj",
+            "per_layer_model_projection",
+            "mtp.fc",
+        ] {
+            assert!(kquant_tiled_disk_candidate(ok, true), "{ok}");
+        }
+        for excluded in [
+            "model.embed_tokens",
+            "token_embd",
+            "embedding",
+            "embed_tokens_per_layer",
+            "model.layers.0.mlp.gate",
+            "model.layers.0.mlp.shared_expert_gate",
+            "model.layers.0.feed_forward.gate",
+            "model.layers.1.linear_attn.in_proj_b",
+            "model.layers.1.linear_attn.in_proj_a",
+            "model.layers.0.mlp.switch_mlp.down_proj.x",
+        ] {
+            assert!(!kquant_tiled_disk_candidate(excluded, false), "{excluded}");
+        }
+        assert!(kquant_tiled_disk_candidate("lm_head", false));
+        assert!(!kquant_tiled_disk_candidate("lm_head", true));
+    }
+
+    #[test]
+    fn native_cache_format_is_bumped_for_the_tiled_layout() {
+        // v5 caches hold row-major K-quant bytes with no `layout` marker; v6
+        // ones hold tiled bytes WITH it. The format is part of the directory
+        // key, so neither reader ever opens the other's entry by accident.
+        assert_eq!(QWEN35_NATIVE_CACHE_FORMAT, 6);
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-native-cache-format-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(".complete"),
+            "format=5\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n",
+        )
+        .unwrap();
+        assert!(
+            !qwen35_native_cache_is_current(&root, "abc", "def", "bf16"),
+            "a v5 marker must not satisfy the v6 reader"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Convert a Q4_K GGUF with one tileable linear (128 x 512) and one that
+    /// is not (8 x 256), then prove the on-disk tiled artifact is the same
+    /// model as the legacy row-major import: config marks exactly the tiled
+    /// tensor, the stored bytes are `kquant_tile_rows` of the row-major
+    /// repack, the loader builds the `t64` tensor without permuting, and the
+    /// forward of (a) the on-disk tiled projection is bit-identical to (b) a
+    /// row-major import tiled at load, for M in {1, 8, 64}.
+    #[tokio::test]
+    async fn k_quant_convert_stores_tileable_linears_tiled_and_loads_them_bit_identically() {
+        use crate::models::quant_dispatch::{
+            KQuantLayout, PerLayerMode, kquant_tile_rows, parse_quant_block,
+        };
+        use crate::models::quantized_linear::{
+            try_build_kquant_quantized_linear, try_build_kquant_quantized_linear_tiled,
+        };
+
+        let (down_rows, down_k) = (128usize, 512usize);
+        let (q_rows, q_k) = (8usize, 256usize);
+        // Finite, well-conditioned blocks: random bytes would put NaN/inf in
+        // the f16 `d`/`dmin`, and NaN never compares bit-equal.
+        let block_for = |seed: u64| -> [u8; 144] {
+            let bytes = lcg_bytes(seed, 256 + 16);
+            let mut codes = [0u8; 256];
+            for (c, b) in codes.iter_mut().zip(&bytes[..256]) {
+                *c = b & 0x0f;
+            }
+            let mut sc = [0u8; 8];
+            let mut m = [0u8; 8];
+            for i in 0..8 {
+                sc[i] = 1 + (bytes[256 + i] % 60);
+                m[i] = bytes[264 + i] % 60;
+            }
+            pack_q4k_block(&codes, &sc, &m, 0.01 + (seed % 7) as f32 * 0.001, 0.002)
+        };
+        let payload = |rows: usize, k: usize, seed: u64| -> Vec<u8> {
+            let mut out = Vec::with_capacity(rows * k / 256 * 144);
+            for i in 0..rows * k / 256 {
+                out.extend_from_slice(&block_for(seed.wrapping_add(i as u64 * 7919)));
+            }
+            out
+        };
+        let down_payload = payload(down_rows, down_k, 11);
+        let q_payload = payload(q_rows, q_k, 23);
+        let norm = 1.0f32.to_le_bytes();
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("llama".to_string()),
+            )],
+            &[
+                (
+                    "blk.0.ffn_down.weight",
+                    &[down_k as u64, down_rows as u64],
+                    GgufTensorType::Q4K,
+                    &down_payload,
+                ),
+                (
+                    "blk.0.attn_q.weight",
+                    &[q_k as u64, q_rows as u64],
+                    GgufTensorType::Q4K,
+                    &q_payload,
+                ),
+                ("output_norm.weight", &[1], GgufTensorType::F32, &norm),
+            ],
+        );
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-kquant-tiled-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("model.gguf");
+        fs::write(&input, data).unwrap();
+        let output = root.join("output");
+
+        convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(true),
+            native_qwen35_layout: None,
+        })
+        .await
+        .unwrap();
+
+        // Config: exactly the tileable tensor is marked.
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["quantization"]["language_model.model.layers.0.mlp.down_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "q4k", "layout": "t64" })
+        );
+        assert_eq!(
+            config["quantization"]["language_model.model.layers.0.self_attn.q_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "q4k" })
+        );
+        assert_eq!(config["quantization"]["mode"], "q4k");
+        assert_eq!(config["quantization"], config["quantization_config"]);
+        let (_, per_layer) = parse_quant_block(config.get("quantization"), 32).unwrap();
+        assert_eq!(
+            per_layer["layers.0.mlp.down_proj"].layout,
+            KQuantLayout::Tiled64
+        );
+        assert_eq!(
+            per_layer["layers.0.self_attn.q_proj"].layout,
+            KQuantLayout::RowMajor
+        );
+
+        // Bytes: the stored arrays are the row-major repack, tile-permuted.
+        let gguf = parse_gguf(&input).unwrap();
+        let row_major = load_gguf_tensors(
+            &input,
+            &gguf,
+            GgufLoadOptions {
+                verbose: false,
+                import_k_quants: true,
+            },
+        )
+        .unwrap();
+        let on_disk =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+                .unwrap();
+        let read_u32 = |a: &MxArray| -> Vec<u32> {
+            let view = a.astype(DType::Uint32).unwrap();
+            view.eval();
+            let n = view.size().unwrap();
+            (0..n as usize)
+                .map(|i| view.item_at_uint32(i).unwrap())
+                .collect()
+        };
+        let read_bits = |a: &MxArray| -> Vec<u32> {
+            // Compare companions by their float32 widening (exact for int8 /
+            // uint8 / f16 bit patterns that are finite).
+            let f = a.to_float32().unwrap();
+            f.iter().map(|v| v.to_bits()).collect()
+        };
+        let disk =
+            |suffix: &str| on_disk[&format!("model.layers.0.mlp.down_proj.{suffix}")].clone();
+        let rm = |suffix: &str| row_major[&format!("blk.0.ffn_down.{suffix}")].clone();
+        assert_eq!(
+            read_u32(&disk("weight")),
+            read_u32(&kquant_tile_rows(&rm("weight"), 4).unwrap())
+        );
+        assert_eq!(
+            read_bits(&disk("scales")),
+            read_bits(&kquant_tile_rows(&rm("scales"), 8 * 2).unwrap())
+        );
+        assert_eq!(
+            read_bits(&disk("biases")),
+            read_bits(&kquant_tile_rows(&rm("biases"), 2).unwrap())
+        );
+        assert_ne!(
+            read_u32(&disk("weight")),
+            read_u32(&rm("weight")),
+            "the tiled bytes must actually differ from row-major"
+        );
+        // The non-tileable tensor is stored row-major, untouched.
+        assert_eq!(
+            read_u32(&on_disk["model.layers.0.self_attn.q_proj.weight"]),
+            read_u32(&row_major["blk.0.attn_q.weight"])
+        );
+
+        // Loader: (a) on-disk tiled, built under the marker — no permute, but
+        // recorded for the map release like (b), the legacy row-major import
+        // tiled at load.
+        let mut tiled_a = Vec::new();
+        let a = try_build_kquant_quantized_linear_tiled(
+            &on_disk,
+            "model.layers.0.mlp.down_proj",
+            PerLayerMode::Q4K,
+            KQuantLayout::Tiled64,
+            "test",
+            &mut tiled_a,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tiled_a, vec!["model.layers.0.mlp.down_proj".to_string()]);
+        assert!(a.is_kquant_tiled());
+        assert_eq!(a.mode(), "q4k@t64");
+        let mut tiled_b = Vec::new();
+        let b = try_build_kquant_quantized_linear_tiled(
+            &row_major,
+            "blk.0.ffn_down",
+            PerLayerMode::Q4K,
+            KQuantLayout::RowMajor,
+            "test",
+            &mut tiled_b,
+        )
+        .unwrap()
+        .unwrap();
+        // Plain row-major (no tiling at all) as the numeric cross-check.
+        let c = try_build_kquant_quantized_linear(
+            &row_major,
+            "blk.0.ffn_down",
+            PerLayerMode::Q4K,
+            KQuantLayout::RowMajor,
+            "test",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!c.is_kquant_tiled());
+        // Misdeclaring the tiled artifact as row-major, or the row-major one
+        // as tiled with a non-tileable shape, must fail loud, not decode.
+        let Err(misdeclared) = try_build_kquant_quantized_linear(
+            &on_disk,
+            "model.layers.0.self_attn.q_proj",
+            PerLayerMode::Q4K,
+            KQuantLayout::Tiled64,
+            "test",
+        ) else {
+            panic!("a non-tileable shape under the marker must be refused");
+        };
+        assert!(
+            misdeclared.reason.contains("layout=t64"),
+            "{}",
+            misdeclared.reason
+        );
+
+        for m in [1i64, 8, 64] {
+            let x: Vec<f32> = (0..(m as usize) * down_k)
+                .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+                .collect();
+            let x = MxArray::from_float32(&x, &[m, down_k as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let ya = a.forward(&x).unwrap();
+            let yb = b.forward(&x).unwrap();
+            let yc = c.forward(&x).unwrap();
+            MxArray::eval_arrays(&[&ya, &yb, &yc]).unwrap();
+            assert_eq!(ya.shape().unwrap().as_ref(), &[m, down_rows as i64]);
+            let (va, vb, vc) = (
+                ya.to_float32().unwrap(),
+                yb.to_float32().unwrap(),
+                yc.to_float32().unwrap(),
+            );
+            assert!(
+                va.iter().all(|v| v.is_finite()),
+                "M={m}: tiled forward produced non-finite output"
+            );
+            assert_eq!(
+                va.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                vb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "M={m}: on-disk tiled vs load-time tiled must be bit-identical"
+            );
+            // Different kernels (and accumulation order) on each side; the
+            // bf16 outputs agree to about an ulp. Absolute + relative budget.
+            let worst = va
+                .iter()
+                .zip(vc.iter())
+                .map(|(p, q)| (p - q).abs() / (0.05 + 0.02 * q.abs()))
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 1.0,
+                "M={m}: tiled vs plain row-major diverge (worst budget ratio {worst})"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn k_quant_source_metadata_is_absent_without_the_import() {
         // With the import off the loader rejected Q4_K / Q5_K and dequantized
         // the Gemma4 Q6_K embedding to BF16, so no K-quant tensor survives to
@@ -13343,7 +13958,7 @@ mod tests {
         for (_, tensor_type) in k_quant_cases() {
             let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", tensor_type)]);
             assert!(
-                preserved_source_quantization(&gguf, false)
+                preserved_source_quantization(&gguf, false, &std::collections::BTreeSet::new())
                     .unwrap()
                     .is_none(),
                 "{}",
@@ -13358,10 +13973,11 @@ mod tests {
             ("blk.0.ffn_down.weight", GgufTensorType::Q4_0),
             ("blk.0.ffn_down.weight", GgufTensorType::Q4K),
         ]);
-        let message = preserved_source_quantization(&gguf, true)
-            .unwrap_err()
-            .reason
-            .clone();
+        let message =
+            preserved_source_quantization(&gguf, true, &std::collections::BTreeSet::new())
+                .unwrap_err()
+                .reason
+                .clone();
         assert!(
             message.contains("4-bit affine (group_size 32, symmetric zero point 8)"),
             "{message}"

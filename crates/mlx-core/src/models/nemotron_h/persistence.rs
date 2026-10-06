@@ -265,6 +265,7 @@ fn modelopt_mode(algo: &str, key: &str) -> Result<PerLayerQuant> {
             group_size: 16,
             mode: PerLayerMode::Nvfp4,
             input_amax: None,
+            layout: Default::default(),
         }),
         // NVIDIA's per-tensor E4M3 weights are ingested as affine 8-bit
         // group-32, not MLX mxfp8 — see convert::recipe::fp8_to_affine8.
@@ -273,6 +274,7 @@ fn modelopt_mode(algo: &str, key: &str) -> Result<PerLayerQuant> {
             group_size: 32,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         }),
         "MIXED_PRECISION" => Err(Error::from_reason(format!(
             "quantization override '{key}': 'MIXED_PRECISION' is the top-level container, not a layer mode"
@@ -1809,6 +1811,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
             input_amax: Some(1.0),
+            layout: Default::default(),
         };
         for proj in ["in_proj", "out_proj"] {
             let mut per_layer = HashMap::new();

@@ -181,10 +181,12 @@ pub fn try_build_kquant_quantized_switch_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     mode: PerLayerMode,
+    layout: KQuantLayout,
     family: &str,
 ) -> Result<Option<QuantizedSwitchLinear>> {
-    let Some(group) =
-        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 3, family)?
+    let Some(group) = crate::models::quant_dispatch::resolve_kquant_group(
+        params, key_prefix, mode, layout, 3, family,
+    )?
     else {
         return Ok(None);
     };
@@ -222,7 +224,10 @@ pub const NVFP4_MODE: &str = "nvfp4";
 // Re-export PerLayerMode/PerLayerQuant from the family-neutral
 // `quant_dispatch` module so gemma4 doesn't reach into the qwen3_5 internals
 // for these shared types.
-pub use crate::models::quant_dispatch::{PerLayerMode, PerLayerQuant};
+pub use crate::models::quant_dispatch::{KQuantLayout, PerLayerMode, PerLayerQuant};
+// The map-release half of the Tiled64 load contract is family-neutral (it
+// only removes `{prefix}.weight/.scales/.biases` keys), so share it.
+pub use crate::models::quantized_linear::release_tiled_kquant_sources;
 
 /// A linear projection that can be either standard or quantized.
 pub enum LinearProj {
@@ -586,17 +591,23 @@ pub fn try_build_sym8_quantized_linear(
 /// qwen3_5 reference: `Ok(None)` only when `.scales` is absent; every partial
 /// group is `Err`. Validation is delegated to the family-neutral
 /// [`resolve_kquant_group`](crate::models::quant_dispatch::resolve_kquant_group).
+///
+/// `layout` is the checkpoint's declared byte order (`PerLayerQuant::layout`);
+/// a `t64` tensor is built with the tiled mode tag directly, no permute.
 pub fn try_build_kquant_quantized_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     mode: PerLayerMode,
+    layout: KQuantLayout,
     family: &str,
 ) -> Result<Option<QuantizedLinear>> {
-    let Some(group) =
-        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 2, family)?
+    let Some(group) = crate::models::quant_dispatch::resolve_kquant_group(
+        params, key_prefix, mode, layout, 2, family,
+    )?
     else {
         return Ok(None);
     };
+    let mode_string = group.mode_string();
     Ok(Some(QuantizedLinear::new(
         group.weight,
         group.scales,
@@ -604,8 +615,44 @@ pub fn try_build_kquant_quantized_linear(
         None,
         group.group_size,
         group.bits,
-        group.mode_str.to_string(),
+        mode_string,
     )))
+}
+
+/// [`try_build_kquant_quantized_linear`] followed by the Tiled64 repack
+/// ([`QuantizedLinear::tile_kquant_layout`]) on a Metal host when the
+/// checkpoint stored the tensor row-major; the gemma4-local twin of
+/// `crate::models::quantized_linear::try_build_kquant_quantized_linear_tiled`
+/// with the same `tiled` contract (prefixes whose row-major map entries the
+/// loader should drop with `release_tiled_kquant_sources`). A `t64` tensor is
+/// built tiled directly, materialized, and recorded too (see the shared twin
+/// for why the map entry must go).
+pub fn try_build_kquant_quantized_linear_tiled(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    mode: PerLayerMode,
+    layout: KQuantLayout,
+    family: &str,
+    tiled: &mut Vec<String>,
+) -> Result<Option<QuantizedLinear>> {
+    let Some(mut ql) = try_build_kquant_quantized_linear(params, key_prefix, mode, layout, family)?
+    else {
+        return Ok(None);
+    };
+    match layout {
+        KQuantLayout::Tiled64 => {
+            let mut pending = vec![&ql.weight, &ql.scales];
+            pending.extend(ql.biases.as_ref());
+            MxArray::eval_arrays_with_context(&pending, "kquant t64 load")?;
+            tiled.push(key_prefix.to_string());
+        }
+        KQuantLayout::RowMajor => {
+            if crate::models::quant_dispatch::kquant_tiled_enabled() && ql.tile_kquant_layout()? {
+                tiled.push(key_prefix.to_string());
+            }
+        }
+    }
+    Ok(Some(ql))
 }
 
 /// Linear layer backed by a serialized quantized weight format.
@@ -972,9 +1019,67 @@ impl QuantizedLinear {
     }
 
     /// Quantization mode discriminator string ("affine", "mxfp8", "mxfp4",
-    /// "nvfp4", "fp8_e4m3", or "sym8").
+    /// "nvfp4", "fp8_e4m3", "sym8", or a native K/IQ mode, optionally with the
+    /// `@t64` Tiled64 layout tag).
     pub fn mode(&self) -> &str {
         &self.mode
+    }
+
+    /// Repack a K-quant projection into the 64-row `Tiled64` layout and tag
+    /// `mode` with `@t64` so `forward_qmm` reaches the `_t64` Metal kernels.
+    /// gemma4-local port of
+    /// `crate::models::quantized_linear::QuantizedLinear::tile_kquant_layout`
+    /// (unpadded form only: Gemma4 has no merged odd-width projection).
+    /// `Ok(true)` when tiled or already tiled; `Ok(false)` leaves a
+    /// non-K-quant, non-2-D, odd-shaped, sym8, FP8, or decode-sidecar
+    /// projection untouched.
+    pub fn tile_kquant_layout(&mut self) -> Result<bool> {
+        use crate::models::quant_dispatch::{
+            KQUANT_TILED_SUFFIX, kquant_mode_params, kquant_tile_rows, kquant_tileable,
+            parse_mode_str, split_kquant_layout,
+        };
+        let (base, already) = split_kquant_layout(&self.mode);
+        if already {
+            return Ok(true);
+        }
+        let Some(mode) = parse_mode_str(Some(base)) else {
+            return Ok(false);
+        };
+        let Some(kq) = kquant_mode_params(mode) else {
+            return Ok(false);
+        };
+        if self.fp8_dequant_weight.is_some() || self.s_w.is_some() || self.decode_sidecars.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(biases) = self.biases.as_ref() else {
+            return Ok(false);
+        };
+        let shape = self.weight.shape()?;
+        if shape.len() != 2 || self.scales.ndim()? != 2 || biases.ndim()? != 2 {
+            return Ok(false);
+        }
+        let n = shape[0];
+        let k = shape[1] * 32 / i64::from(self.bits);
+        if !kquant_tileable(n, k) {
+            return Ok(false);
+        }
+        let per_group = i64::from(kq.scale_bytes_per_group);
+        let super_ratio = i64::from(kq.super_ratio);
+        let weight = kquant_tile_rows(&self.weight, i64::from(self.bits))?;
+        let scales = kquant_tile_rows(&self.scales, super_ratio * per_group)?;
+        let biases = kquant_tile_rows(biases, per_group)?;
+        MxArray::eval_arrays_with_context(&[&weight, &scales, &biases], "tile_kquant_layout")?;
+        self.weight = weight;
+        self.scales = scales;
+        self.biases = Some(biases);
+        self.mode = format!("{base}{KQUANT_TILED_SUFFIX}");
+        Ok(true)
+    }
+
+    /// Whether the packed arrays are in the Tiled64 layout.
+    pub fn is_kquant_tiled(&self) -> bool {
+        crate::models::quant_dispatch::split_kquant_layout(&self.mode).1
     }
 
     /// Additional model-owned bytes created by the plain-E4M3 correctness
@@ -1516,3 +1621,182 @@ mod affine_dtype_tests {
 #[cfg(test)]
 #[path = "recorded_qmv.rs"]
 mod recorded_qmv_tests;
+
+/// The gemma4-local Tiled64 port: `tile_kquant_layout` tags the mode and
+/// keeps the forward bit-identical to the shared `QuantizedLinear`'s tiled
+/// forward (same kernels, same bytes); the gemma4 K-quant builders honour the
+/// on-disk `t64` marker and tile row-major groups at load on Metal.
+#[cfg(test)]
+mod kquant_tiled_tests {
+    use super::*;
+    use crate::models::quant_dispatch::{KQUANT_TILED_SUFFIX, kquant_tile_rows};
+
+    fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    /// A random q4k `[n, k]` group as the three map entries under `prefix`.
+    fn q4k_params(prefix: &str, n: i64, k: i64, seed: u32) -> HashMap<String, MxArray> {
+        let mut st = seed;
+        let words: Vec<u32> = (0..n * k / 8).map(|_| lcg(&mut st)).collect();
+        let scales: Vec<u8> = (0..n * k / 16)
+            .map(|_| (lcg(&mut st) % 48 + 1) as u8)
+            .collect();
+        let halves = [0x2800u16, 0x2c00, 0x3000, 0x3200];
+        let biases: Vec<u16> = (0..n * k / 128)
+            .map(|_| halves[(lcg(&mut st) as usize) % halves.len()])
+            .collect();
+        HashMap::from([
+            (
+                format!("{prefix}.weight"),
+                MxArray::from_uint32(&words, &[n, k / 8]).unwrap(),
+            ),
+            (
+                format!("{prefix}.scales"),
+                MxArray::from_uint8(&scales, &[n, k / 16]).unwrap(),
+            ),
+            (
+                format!("{prefix}.biases"),
+                MxArray::from_float16(&biases, &[n, k / 128]).unwrap(),
+            ),
+        ])
+    }
+
+    fn bits_of(a: &MxArray) -> Vec<u32> {
+        a.eval();
+        a.astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    fn x(m: i64, k: i64, seed: u32) -> MxArray {
+        let mut st = seed;
+        let bits: Vec<u16> = (0..m * k)
+            .map(|_| {
+                let v = ((lcg(&mut st) >> 16) as i32 - 32_768) as f32 / 32_768.0;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        MxArray::from_bfloat16(&bits, &[1, m, k]).unwrap()
+    }
+
+    #[test]
+    fn gemma4_tile_matches_the_shared_projection_and_honours_the_marker() {
+        let (n, k) = (128i64, 512i64);
+        let params = q4k_params("p", n, k, 3);
+        // SAFETY: nullary predicate that catches internally.
+        let metal = unsafe { sys::mlx_metal_is_available() };
+
+        // Row-major group through the gemma4 tiled builder: tiled on Metal
+        // (and recorded for release), row-major elsewhere.
+        let mut recorded = Vec::new();
+        let gemma = try_build_kquant_quantized_linear_tiled(
+            &params,
+            "p",
+            PerLayerMode::Q4K,
+            KQuantLayout::RowMajor,
+            "gemma4",
+            &mut recorded,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gemma.is_kquant_tiled(), metal);
+        assert_eq!(recorded, if metal { vec!["p".to_string()] } else { vec![] });
+        // The shared projection, tiled the same way.
+        let shared = crate::models::quantized_linear::try_build_kquant_quantized_linear_tiled(
+            &params,
+            "p",
+            PerLayerMode::Q4K,
+            KQuantLayout::RowMajor,
+            "shared",
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gemma.mode(), shared.mode());
+        assert_eq!(bits_of(gemma.get_weight()), bits_of(shared.get_weight()));
+
+        // Explicit tile is idempotent and tags the mode.
+        let mut explicit = try_build_kquant_quantized_linear(
+            &params,
+            "p",
+            PerLayerMode::Q4K,
+            KQuantLayout::RowMajor,
+            "gemma4",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(explicit.mode(), "q4k");
+        assert!(explicit.tile_kquant_layout().unwrap());
+        assert!(explicit.tile_kquant_layout().unwrap(), "idempotent");
+        assert_eq!(explicit.mode(), format!("q4k{KQUANT_TILED_SUFFIX}"));
+        assert_eq!(
+            bits_of(explicit.get_weight()),
+            bits_of(&kquant_tile_rows(&params["p.weight"], 4).unwrap())
+        );
+
+        // On-disk tiled bytes under the marker: built tiled (no permute) and
+        // recorded for the map release like a load-time tile.
+        let tiled_params = HashMap::from([
+            ("t.weight".to_string(), explicit.get_weight().clone()),
+            ("t.scales".to_string(), explicit.scales.clone()),
+            ("t.biases".to_string(), explicit.biases.clone().unwrap()),
+        ]);
+        let mut recorded = Vec::new();
+        let marked = try_build_kquant_quantized_linear_tiled(
+            &tiled_params,
+            "t",
+            PerLayerMode::Q4K,
+            KQuantLayout::Tiled64,
+            "gemma4",
+            &mut recorded,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recorded, vec!["t".to_string()]);
+        assert_eq!(marked.mode(), format!("q4k{KQUANT_TILED_SUFFIX}"));
+
+        // Forwards: gemma4 tiled == shared tiled == marker-built, bit for bit,
+        // at the DSpark verify widths (M = 1 + L <= 9) and prefill.
+        for m in [1i64, 2, 5, 9, 64] {
+            let input = x(m, k, 41);
+            let want = bits_of(&shared.forward(&input).unwrap());
+            assert_eq!(
+                bits_of(&gemma.forward(&input).unwrap()),
+                want,
+                "M={m} gemma"
+            );
+            assert_eq!(
+                bits_of(&explicit.forward(&input).unwrap()),
+                want,
+                "M={m} explicit"
+            );
+            assert_eq!(
+                bits_of(&marked.forward(&input).unwrap()),
+                want,
+                "M={m} marked"
+            );
+        }
+
+        // Ineligible shapes stay untouched: odd rows, non-K-quant.
+        let mut odd = try_build_kquant_quantized_linear(
+            &q4k_params("o", 8, 256, 9),
+            "o",
+            PerLayerMode::Q4K,
+            KQuantLayout::RowMajor,
+            "gemma4",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!odd.tile_kquant_layout().unwrap());
+        assert_eq!(odd.mode(), "q4k");
+        let mut affine =
+            try_build_quantized_linear(&q4k_params("a", 64, 256, 1), "a", 32, 4).unwrap();
+        assert!(!affine.tile_kquant_layout().unwrap());
+    }
+}

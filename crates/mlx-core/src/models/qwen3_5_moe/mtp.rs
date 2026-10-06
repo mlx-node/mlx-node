@@ -972,12 +972,14 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
 
         let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
@@ -1050,6 +1052,7 @@ mod tests {
                 group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
                 mode: PerLayerMode::Fp8E4m3,
                 input_amax: None,
+                layout: Default::default(),
             },
         )]);
         let err = mtp
@@ -1224,6 +1227,7 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         if let Err(err) = mtp.apply_weights(
             &q_params,
@@ -1436,12 +1440,14 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         // Empty override table — MTP keys are never recorded here, so
         // `effective_plq_for` must take the gate-default fallback.
@@ -1571,12 +1577,14 @@ mod tests {
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         };
 
         // (a) affine quantized fc → Quantized (mode "affine").
@@ -1596,6 +1604,7 @@ mod tests {
                     group_size: 32,
                     mode: PerLayerMode::Affine,
                     input_amax: None,
+                    layout: Default::default(),
                 },
             );
             if !apply_fc_or_skip(
@@ -1638,6 +1647,7 @@ mod tests {
                     group_size: MXFP8_GROUP_SIZE,
                     mode: PerLayerMode::Mxfp8,
                     input_amax: None,
+                    layout: Default::default(),
                 },
             );
             if !apply_fc_or_skip(

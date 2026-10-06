@@ -1335,6 +1335,7 @@ mod tests {
             group_size: 128,
             mode: PerLayerMode::Affine,
             input_amax: None,
+            layout: Default::default(),
         }
     }
 
@@ -1910,6 +1911,7 @@ mod tests {
                 group_size: 64,
                 mode: PerLayerMode::Affine,
                 input_amax: None,
+                layout: Default::default(),
             },
         )]);
         assert!(

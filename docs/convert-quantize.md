@@ -384,6 +384,41 @@ for every K-quant mode (`crates/mlx-sys/src/mlx_advanced_ops.cpp:892`); dequanti
 bridge's `KQuantDequantize` primitive (`crates/mlx-sys/src/mlx_kquant.cpp:362`); there is no K-quant
 quantize kernel.
 
+### Tiled layout
+
+<a id="tiled-layout"></a>
+
+The GGUF importer writes eligible 2-D K-quant linears in the 64-row tiled byte order the
+`_t64` Metal kernels read (`[N/64][K/32][64][unit]` codes with per-super-block companions,
+`mlx_kquant.h`), and marks each one in `config.json`:
+
+```json
+"language_model.model.layers.0.mlp.down_proj": { "bits": 4, "group_size": 32, "mode": "q4k", "layout": "t64" }
+```
+
+Rules (`tile_kquant_weights_for_disk`, `gguf.rs`):
+
+- Per tensor, never at the block level; the `mode` string stays the bare ggml mode so a reader
+  that does not know the field still parses the entry.
+- Only the primary output (`model.safetensors`), only with `--gguf-kquant`, never under
+  `--quantize`. Secondary outputs (mmproj / DFlash draft) stay row-major.
+- Only the known linear projections (`q/k/v/o_proj`, `gate/up/down_proj`, GDN
+  `in_proj_qkv/z`, `out_proj`, `fc`, `per_layer_model_projection`, untied `lm_head`) with
+  `N % 64 == 0` and `K % 256 == 0`. Embeddings, tied heads, router gates, `in_proj_a/b`,
+  3-D expert stacks and odd widths stay row-major; odd widths are not padded on disk (the
+  GDN loader pads `in_proj_ba` at load). A checkpoint may mix both.
+- The native GGUF cache format is v6 for this; v5 entries (row-major) are not aliased and
+  still load, permuting at load.
+
+Loader side: `PerLayerQuant::layout` (`KQuantLayout::{RowMajor, Tiled64}`) is validated in
+`resolve_kquant_group` against the shape (a `t64` marker on a 3-D stack or an odd width
+fails loud), and the `QuantizedLinear` is built with the `@t64` mode tag directly. Row-wise
+readers must un-tile or refuse: the MTPLX draft-head dequantize un-tiles
+(`row_major_kquant_arrays`), embeddings refuse the marker
+(`ensure_row_major_kquant_layout`), `mlx convert` on a converted directory refuses
+(`config_declares_tiled_kquant_layout`; re-convert from the GGUF), and the qwen4_exp
+row-window store refuses.
+
 ### ggml symmetric Q4_0 / Q8_0 — the derived-bias scheme
 
 ```

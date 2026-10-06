@@ -81,10 +81,14 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_KQUANT_SMALL_M_BENCH=1`             | Body-level opt-in for the `#[ignore]`d `kquant_small_m_bench` integration test: exact-shape K/IQ small-M quantized-matmul timings (MLP + lm_head shapes, M sweep). Run `MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --test kquant_small_m_bench -- --ignored --test-threads=1 --nocapture` (serial — the two benches share the GPU).           |
 | `MLX_METAL_COMMAND_TRACE=1\|2\|3`        | Diagnostic (fork patch); any value ≥ 1 enables it. 1: `[metal-command]` per command buffer (with `dispatches`, `primitives`), `[mlx-evaluation]` per eval, `[mlx-compiled]` per compiled call. 2: plus `[metal-op] <primitive>` per primitive. 3: plus dtypes. Perturbs timing. See [trace interpretation](research/splash-qwen38.md#command-trace). |
 
-Three Metal routes added with the tiled K-quant work are fixed, with no switch: 2-D
-K-quant weights with N % 64 == 0 and K % 256 == 0 are permuted at load into the
-64-row tiled layout (`@t64` mode suffix; the on-disk format is unchanged, and 3-D
-expert weights, embeddings and odd widths stay row-major on the row-major kernels);
+Three Metal routes added with the tiled K-quant work are fixed: 2-D K-quant weights
+with N % 64 == 0 and K % 256 == 0 run in the 64-row tiled layout (`@t64` mode
+suffix). The GGUF importer now stores eligible linears tiled on disk and marks each
+one `"layout": "t64"` in its `quantization` entry (the mode string stays bare, see
+[convert-quantize.md](convert-quantize.md#tiled-layout)), so such a checkpoint loads
+with no permute; a row-major (legacy or secondary-output) K-quant tensor is still
+permuted at load on a Metal host. 3-D expert weights, embeddings,
+router gates and odd widths stay row-major on the row-major kernels;
 an M=8 K-quant matmul (the DFlash2 verify block) takes the tensor-op kernel for
 every tiled weight and, row-major, for Q3_K and IQ4_NL only, with the K split count
 derived from the IORegistry GPU core count; and a DFlash2 verify attention block

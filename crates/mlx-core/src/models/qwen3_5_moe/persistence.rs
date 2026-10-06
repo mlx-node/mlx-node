@@ -22,8 +22,8 @@ use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    has_kquant_mode, has_sym8_mode, mode_to_str, normalize_per_layer_key, parse_quant_settings,
-    resolve_default_mode, select_quantization_block,
+    ensure_row_major_kquant_layout, has_kquant_mode, has_sym8_mode, mode_to_str,
+    normalize_per_layer_key, parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes,
@@ -41,13 +41,13 @@ use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
-    is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_fp8_e4m3_quantized_linear,
-    try_build_fp8_e4m3_quantized_switch_linear, try_build_kquant_quantized_linear,
-    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
-    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
-    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
-    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
-    try_build_sym8_quantized_linear,
+    is_mxfp8_checkpoint, is_quantized_checkpoint, release_tiled_kquant_sources,
+    try_build_fp8_e4m3_quantized_linear, try_build_fp8_e4m3_quantized_switch_linear,
+    try_build_kquant_quantized_linear_tiled, try_build_kquant_quantized_switch_linear,
+    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
+    try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
 
 /// Sanitize weights from HuggingFace format.
@@ -522,9 +522,12 @@ fn apply_weights_moe_inner(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
 ) -> Result<()> {
+    // The production loader takes the map by `&mut` to release Tiled64
+    // sources; tests keep their map, so hand it a handle-level clone.
+    let mut params = params.clone();
     apply_weights_moe_inner_with_residency(
         inner,
-        params,
+        &mut params,
         config,
         quant_bits,
         quant_group_size,
@@ -535,9 +538,13 @@ fn apply_weights_moe_inner(
     .map(drop)
 }
 
+/// `params` is `&mut` for the same reason as the dense loader's: a 2-D
+/// K-quant projection repacked into the Tiled64 layout at load has its
+/// row-major sources released from the map once its layer is installed
+/// (`release_tiled_kquant_sources`); experts stay row-major and untouched.
 fn apply_weights_moe_inner_with_residency(
     inner: &mut Qwen35MoeInner,
-    params: &HashMap<String, MxArray>,
+    params: &mut HashMap<String, MxArray>,
     config: &Qwen3_5MoeConfig,
     quant_bits: i32,
     quant_group_size: i32,
@@ -556,6 +563,9 @@ fn apply_weights_moe_inner_with_residency(
     let checkpoint_has_sym8 = has_sym8_mode(top_level_mode, per_layer_quant);
     let checkpoint_has_kquant = has_kquant_mode(top_level_mode, per_layer_quant);
     let is_quantized = is_quantized_checkpoint(params);
+    // The completeness gate at the end judges the CHECKPOINT, so it reads the
+    // key set as loaded, not the map after tiled sources were released.
+    let checkpoint_keys: std::collections::HashSet<String> = params.keys().cloned().collect();
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
     // The model's actual compute dtype is whatever the embedding emits —
@@ -576,6 +586,9 @@ fn apply_weights_moe_inner_with_residency(
         .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
         .unwrap_or(crate::array::DType::BFloat16);
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
+    // Prefixes whose Tiled64 repack made the map's row-major arrays redundant;
+    // drained into `release_tiled_kquant_sources` once their owner is installed.
+    let tiled_prefixes = std::cell::RefCell::new(Vec::<String>::new());
 
     // Helper: dispatch by per-layer mode (mxfp4 / mxfp8 / nvfp4 / affine /
     // sym8).
@@ -627,7 +640,17 @@ fn apply_weights_moe_inner_with_residency(
             | PerLayerMode::IQ3XXS
             | PerLayerMode::IQ1S
             | PerLayerMode::IQ1M => {
-                try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5_moe")?
+                // Tiled64 for the `_t64` Metal kernels on the dense (non-expert)
+                // projections, as in the dense qwen3_5 loader; a `t64`
+                // checkpoint tensor is built tiled as-is.
+                try_build_kquant_quantized_linear_tiled(
+                    params,
+                    prefix,
+                    plq.mode,
+                    plq.layout,
+                    "qwen3_5_moe",
+                    &mut tiled_prefixes.borrow_mut(),
+                )?
             }
         };
         // Thread the per-tensor FP8 activation scale from the resolved
@@ -711,9 +734,13 @@ fn apply_weights_moe_inner_with_residency(
             | PerLayerMode::IQ2S
             | PerLayerMode::IQ3XXS
             | PerLayerMode::IQ1S
-            | PerLayerMode::IQ1M => {
-                try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "qwen3_5_moe")?
-            }
+            | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
+                params,
+                prefix,
+                plq.mode,
+                plq.layout,
+                "qwen3_5_moe",
+            )?,
             // Per-expert 3-D stacked projections route through gather_qmm,
             // which has no sym8 pack. Sym8 reaches a switch prefix two ways
             // (`effective_plq_for`: direct per-layer entry, else the
@@ -768,6 +795,7 @@ fn apply_weights_moe_inner_with_residency(
         // would misdecode them (a repacked `token_embd` is q6k/q4k/q5k, not
         // affine). Mirrors the linear/switch builders' guard.
         ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5_moe")?;
+        ensure_row_major_kquant_layout(plq, "embedding", "qwen3_5_moe")?;
         ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5_moe")?;
         // Dense/MoE flat, paged, MTP, and VLM consumers now carry `Embedding`
         // itself and dispatch lookup/projection through its packed-aware APIs.
@@ -823,6 +851,7 @@ fn apply_weights_moe_inner_with_residency(
     if is_quantized {
         if let Some(ql) = try_build_ql(params, "lm_head")? {
             inner.lm_head = Some(crate::models::quantized_linear::LinearProj::Quantized(ql));
+            release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
         } else if let Some(ref mut head) = inner.lm_head
             && let Some(w) = params.get("lm_head.weight")
         {
@@ -1343,6 +1372,9 @@ fn apply_weights_moe_inner_with_residency(
         if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
             layer.set_post_attention_layernorm_weight(w)?;
         }
+        // The layer owns its tiled projections now; drop the map's row-major
+        // originals (see the dense loader's layer loop).
+        release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
     }
 
     // MTP head — present only when the checkpoint shipped `mtp.*`
@@ -1415,17 +1447,20 @@ fn apply_weights_moe_inner_with_residency(
         }
     }
 
-    // Verify mandatory weights
+    // Verify mandatory weights. Judged on the CHECKPOINT's key set (captured
+    // before installation): the layer loop released the row-major sources of
+    // tiled K-quant projections from `params`, so the live map under-reports.
+    let params = &checkpoint_keys;
     let mut missing_mandatory = Vec::new();
-    if !params.contains_key("embedding.weight") {
+    if !params.contains("embedding.weight") {
         missing_mandatory.push("embedding.weight".to_string());
     }
-    if !params.contains_key("final_norm.weight") {
+    if !params.contains("final_norm.weight") {
         missing_mandatory.push("final_norm.weight".to_string());
     }
     if !config.tie_word_embeddings
-        && !params.contains_key("lm_head.weight")
-        && !params.contains_key("lm_head.scales")
+        && !params.contains("lm_head.weight")
+        && !params.contains("lm_head.scales")
     {
         missing_mandatory.push("lm_head.weight".to_string());
     }
@@ -1436,20 +1471,20 @@ fn apply_weights_moe_inner_with_residency(
 
     for i in 0..num_layers {
         let prefix = format!("layers.{}", i);
-        let has_attn = params.contains_key(&format!("{}.self_attn.q_proj.weight", prefix))
-            || params.contains_key(&format!("{}.self_attn.q_proj.scales", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.scales", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
-            || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.scales", prefix));
+        let has_attn = params.contains(&format!("{}.self_attn.q_proj.weight", prefix))
+            || params.contains(&format!("{}.self_attn.q_proj.scales", prefix))
+            || params.contains(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+            || params.contains(&format!("{}.linear_attn.in_proj_qkvz.scales", prefix))
+            || params.contains(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
+            || params.contains(&format!("{}.linear_attn.in_proj_qkv.scales", prefix));
         if !has_attn {
             layers_missing_attn.push(i);
         }
-        let has_mlp = params.contains_key(&format!("{}.mlp.gate_proj.weight", prefix))
-            || params.contains_key(&format!("{}.mlp.gate.weight", prefix))
-            || params.contains_key(&format!("{}.mlp.gate.scales", prefix))
-            || params.contains_key(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
-            || params.contains_key(&format!("{}.mlp.switch_mlp.gate_proj.scales", prefix));
+        let has_mlp = params.contains(&format!("{}.mlp.gate_proj.weight", prefix))
+            || params.contains(&format!("{}.mlp.gate.weight", prefix))
+            || params.contains(&format!("{}.mlp.gate.scales", prefix))
+            || params.contains(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+            || params.contains(&format!("{}.mlp.switch_mlp.gate_proj.scales", prefix));
         if !has_mlp {
             layers_missing_mlp.push(i);
         }
@@ -1935,7 +1970,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                 // Apply weights directly to inner (no locks)
                 let plain_fp8_residency = apply_weights_moe_inner_with_residency(
                     &mut inner,
-                    &params,
+                    &mut params,
                     &config,
                     quant_bits,
                     quant_group_size,
@@ -2780,6 +2815,7 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Q4K,
             input_amax: None,
+            layout: Default::default(),
         };
         let per_layer_quant = HashMap::from([(qkv_prefix, q4k), (b_prefix, q4k)]);
 
@@ -2892,6 +2928,7 @@ mod tests {
                 group_size,
                 mode: PerLayerMode::Affine,
                 input_amax: None,
+                layout: Default::default(),
             },
         );
 
@@ -3151,6 +3188,7 @@ mod tests {
                     group_size: 32,
                     mode: PerLayerMode::Q4K,
                     input_amax: None,
+                    layout: Default::default(),
                 },
             );
         }
@@ -3390,6 +3428,7 @@ mod tests {
                 group_size: 32,
                 mode: PerLayerMode::Mxfp8,
                 input_amax: Some(AMAX),
+                layout: Default::default(),
             },
         );
 
@@ -3484,6 +3523,7 @@ mod tests {
                 group_size: MXFP8_GROUP_SIZE,
                 mode: PerLayerMode::Mxfp8,
                 input_amax: None,
+                layout: Default::default(),
             },
         );
         per_layer_quant.insert(
@@ -3493,6 +3533,7 @@ mod tests {
                 group_size: MXFP8_GROUP_SIZE,
                 mode: PerLayerMode::Mxfp8,
                 input_amax: Some(2.0),
+                layout: Default::default(),
             },
         );
 

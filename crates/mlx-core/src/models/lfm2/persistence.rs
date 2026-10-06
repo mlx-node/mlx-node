@@ -84,9 +84,9 @@ fn build_lfm2_qsl(
         | PerLayerMode::IQ2S
         | PerLayerMode::IQ3XXS
         | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => {
-            try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "lfm2_moe")?
-        }
+        | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
+            params, prefix, plq.mode, plq.layout, "lfm2_moe",
+        )?,
         // FAIL-LOUD: the 3-D stacked experts have no sym8 dispatch
         // (`gather_qmm` has no sym8 pack). Convert force-emits affine-8
         // per-layer overrides for experts under a sym8 default, so resolving
@@ -151,7 +151,9 @@ fn build_lfm2_gate_ql(
         | PerLayerMode::IQ3XXS
         | PerLayerMode::IQ1S
         | PerLayerMode::IQ1M => {
-            try_build_kquant_quantized_linear(params, prefix, plq.mode, "lfm2_moe")?
+            // The router gate is a small 2-D linear (N = num_experts), never
+            // tileable; the plain builder honours a (never emitted) marker.
+            try_build_kquant_quantized_linear(params, prefix, plq.mode, plq.layout, "lfm2_moe")?
         }
         // FAIL-LOUD: the router gate is deliberately kept affine-8 by convert
         // (it force-emits a per-layer override for `*.feed_forward.gate` under
@@ -2872,12 +2874,14 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Mxfp4,
             input_amax: None,
+            layout: Default::default(),
         };
         let explicit_fp8 = PerLayerQuant {
             bits: 8,
             group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
             mode: PerLayerMode::Fp8E4m3,
             input_amax: None,
+            layout: Default::default(),
         };
         let dense_prefix = "layers.0.self_attn.q_proj";
         let dense_params = HashMap::from([
