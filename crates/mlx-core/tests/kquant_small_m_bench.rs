@@ -14,6 +14,7 @@ use std::ffi::CString;
 use std::time::Instant;
 
 use mlx_core::array::MxArray;
+use mlx_core::models::quant_dispatch::kquant_tile_rows;
 
 const N: i64 = 17_408;
 const K: i64 = 5_120;
@@ -224,10 +225,27 @@ fn qwen38_lm_head_small_m_qmm() {
     w.eval();
     sc.eval();
     bi.eval();
-    println!("\n  lm_head BF16 x, N={LN}, K={K}, q6k");
+    // The same weights in the Tiled64 layout: scales tile per super-block
+    // (16 groups x 1 byte), biases per super-block (1 entry), codes per
+    // 32-value unit (`bits` words).
+    let tiled = Format {
+        mode: "q6k@t64",
+        ..format
+    };
+    let tw = kquant_tile_rows(&w, i64::from(format.bits)).expect("tile weight");
+    let tsc = kquant_tile_rows(&sc, 16).expect("tile scales");
+    let tbi = kquant_tile_rows(&bi, 1).expect("tile biases");
+    tw.eval();
+    tsc.eval();
+    tbi.eval();
+    println!("\n  lm_head BF16 x, N={LN}, K={K}, q6k: row-major | t64 (ms)");
     for m in [1i64, 4, 5, 6, 7, 8, 9, 12] {
         let x = activation(m, 0x9090 + m as u32);
-        println!("  M={m:>2}: {:.4} ms", measure(&x, &w, &sc, &bi, format));
+        println!(
+            "  M={m:>2}: {:.4} | {:.4}",
+            measure(&x, &w, &sc, &bi, format),
+            measure(&x, &tw, &tsc, &tbi, tiled)
+        );
     }
 }
 
@@ -262,5 +280,98 @@ fn qwen38_dominant_small_m_qmm() {
             "  {:<8} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>12.1}",
             format.mode, m1, m2, m4, m6, gb_s
         );
+    }
+}
+
+/// The DFlash2 draft's affine Q4/group-64 projections at the verify widths:
+/// MLX's own `quantized_matmul` route (M < 13 takes `qmv`, one threadgroup
+/// per row), on draft-sized shapes. Eight matmuls per eval over a ring of
+/// eight weight copies (DRAM-cold, launch latency amortised), as
+/// `kquant_tiled_bench` does. If M=7/8 costs well over M=1, the draft
+/// re-reads its weights per row and an 8-row kernel is the lever.
+#[test]
+#[ignore = "manual exact-shape affine small-M microbenchmark"]
+fn draft_affine_q4_small_m_qmm() {
+    if std::env::var("MLX_KQUANT_SMALL_M_BENCH").as_deref() != Ok("1") {
+        eprintln!("set MLX_KQUANT_SMALL_M_BENCH=1 to run this benchmark");
+        return;
+    }
+    if !select_gpu() {
+        eprintln!("skipping: no GPU device");
+        return;
+    }
+    const GROUP: i64 = 64;
+    const RING: usize = 8;
+    for (n, k) in [(27_648i64, 5_120i64), (5_120, 13_824), (7_168, 5_120)] {
+        let format = Format {
+            mode: "affine",
+            bits: 4,
+            group_size: GROUP as i32,
+            scales_cols: k / GROUP,
+            biases_cols: k / GROUP,
+            signed_scales: false,
+        };
+        let ring: Vec<(MxArray, MxArray, MxArray)> = (0..RING)
+            .map(|i| {
+                let mut state = 0xa44e_0000u32 + i as u32;
+                let weight: Vec<u32> = (0..n * k / 8).map(|_| lcg(&mut state)).collect();
+                let scales: Vec<u16> = (0..n * k / GROUP)
+                    .map(|_| half::bf16::from_f32(0.01).to_bits())
+                    .collect();
+                let w = MxArray::from_uint32(&weight, &[n, k / 8]).expect("weight");
+                let sc = MxArray::from_bfloat16(&scales, &[n, k / GROUP]).expect("scales");
+                let bi = MxArray::from_bfloat16(&scales, &[n, k / GROUP]).expect("biases");
+                w.eval();
+                sc.eval();
+                bi.eval();
+                (w, sc, bi)
+            })
+            .collect();
+        let bytes = (n * k / 2 + 2 * n * k / GROUP * 2) as f64;
+        println!(
+            "\n  draft affine Q4/g64, N={n}, K={k}, {:.0} MB, {RING} matmuls per eval",
+            bytes / 1e6
+        );
+        for m in [1i64, 4, 7, 8, 12, 16] {
+            let mut st = 0x7777u32;
+            let x: Vec<u16> = (0..m * k)
+                .map(|_| {
+                    half::bf16::from_f32(((lcg(&mut st) >> 16) as i32 - 32_768) as f32 / 32_768.0)
+                        .to_bits()
+                })
+                .collect();
+            let x = MxArray::from_bfloat16(&x, &[m, k]).expect("x");
+            let batch = |ring: &[(MxArray, MxArray, MxArray)]| -> f64 {
+                let mut handles: Vec<_> = ring
+                    .iter()
+                    .map(|(w, sc, bi)| qmm(&x, w, sc, bi, format))
+                    .collect();
+                let mut error = [0i8; 512];
+                let started = Instant::now();
+                let ok = unsafe {
+                    mlx_sys::mlx_eval_with_error(
+                        handles.as_mut_ptr(),
+                        handles.len(),
+                        error.as_mut_ptr(),
+                        error.len(),
+                    )
+                };
+                let elapsed = started.elapsed().as_secs_f64();
+                assert!(ok, "affine qmm eval failed");
+                for h in handles {
+                    drop_array(h);
+                }
+                elapsed / RING as f64
+            };
+            for _ in 0..WARMUP {
+                batch(&ring);
+            }
+            let mut samples: Vec<f64> = (0..REPS).map(|_| batch(&ring)).collect();
+            let ms = median_ms(&mut samples);
+            println!(
+                "  M={m:>2}: {ms:.4} ms/matmul  {:.0} GB/s",
+                bytes / (ms / 1e3) / 1e9
+            );
+        }
     }
 }

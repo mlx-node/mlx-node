@@ -57,13 +57,6 @@ impl KvFormat {
     }
 }
 
-/// The fused KV row store is on unless `MLX_DFLASH2_KV_STORE=0`.
-pub(crate) fn fused_kv_store_enabled() -> bool {
-    std::env::var("MLX_DFLASH2_KV_STORE")
-        .ok()
-        .is_none_or(|value| value.trim() != "0")
-}
-
 /// One layer's block of new rows in the cache's element format, for
 /// [`KVCache::store_block`].
 pub(crate) enum KvBlock {
@@ -339,17 +332,15 @@ impl KVCache {
         let offsets = [plan.offset; 4];
         // SAFETY: every pointer is a live array handle for the call; `out`
         // receives owned handles (same buffers as `dst`) or stays null.
-        // `MLX_DFLASH2_KV_STORE=0` keeps the slice_update path (A/B switch).
-        let ok = fused_kv_store_enabled()
-            && unsafe {
-                mlx_sys::mlx_kv_store_rows(
-                    plan.dst.len() as i32,
-                    plan.dst.as_ptr(),
-                    plan.src.as_ptr(),
-                    offsets.as_ptr(),
-                    out.as_mut_ptr(),
-                )
-            };
+        let ok = unsafe {
+            mlx_sys::mlx_kv_store_rows(
+                plan.dst.len() as i32,
+                plan.dst.as_ptr(),
+                plan.src.as_ptr(),
+                offsets.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
         if !ok {
             return self.store_block_unfused(block);
         }
@@ -361,7 +352,7 @@ impl KVCache {
     /// buffers through an address table). Falls back to per-cache stores
     /// when the batched primitive declines (no residency sets, no Metal).
     pub(crate) fn store_blocks(entries: &mut [(&mut KVCache, KvBlock)]) -> Result<()> {
-        if !fused_kv_store_enabled() || entries.len() <= 1 {
+        if entries.len() <= 1 {
             for (cache, block) in entries.iter_mut() {
                 cache.store_block(block)?;
             }
@@ -905,11 +896,8 @@ mod tests {
                         unsafe { mlx_sys::mlx_test_kquant_family_count(c"kv_store_rows".as_ptr()) };
                     unsafe { mlx_sys::mlx_test_kquant_counting(false) };
                     // One table dispatch where residency sets exist; otherwise
-                    // the per-layer fallback (or slice_update when the env
-                    // switch disables the fused store, which records nothing).
-                    let expected = if !fused_kv_store_enabled() {
-                        0
-                    } else if unsafe { mlx_sys::mlx_kv_store_batched_available() } {
+                    // the per-layer fallback.
+                    let expected = if unsafe { mlx_sys::mlx_kv_store_batched_available() } {
                         1
                     } else {
                         layers as u64

@@ -1044,8 +1044,7 @@ impl DraftKvWindow {
         let mut out: [*mut sys::mlx_array; 2] = [std::ptr::null_mut(); 2];
         // SAFETY: every pointer is a live array handle for the call; `out`
         // receives owned handles (same buffers as `dst`) or stays null.
-        let fused = crate::transformer::kv_cache::fused_kv_store_enabled()
-            && unsafe { sys::mlx_metal_is_available() }
+        let fused = unsafe { sys::mlx_metal_is_available() }
             && unsafe {
                 sys::mlx_kv_store_rows(
                     2,
