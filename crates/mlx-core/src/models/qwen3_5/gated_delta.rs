@@ -166,6 +166,142 @@ fn gated_delta_kernel(
     Ok((y, new_state))
 }
 
+/// The layer tail the fused GDN step folds into the recurrence dispatch.
+pub(crate) struct GdnTail<'a> {
+    /// Gate `[B, T, Hv * Dv]` (the `z` split of the input projection; its
+    /// rows may be strided).
+    pub z: &'a MxArray,
+    /// Gated-norm weight `[Dv]`.
+    pub norm_weight: &'a MxArray,
+    pub eps: f32,
+    /// Where the new state is written: a `[B, Hv, Dv, Dk]` f32 view whose
+    /// buffer the returned state shares (the DFlash2 spare blob row).
+    pub state_dst: Option<&'a MxArray>,
+}
+
+/// One dispatch: [`gated_delta_kernel`] over every value column of a head,
+/// then `rms_norm(y) * w` and `sigmoid(z) * z * normed` on the window rows,
+/// bit-identical to the unfused chain. Returns the gated output
+/// `[B, T, Hv * Dv]` and the new state `[B, Hv, Dv, Dk]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_fused_step(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    tail: &GdnTail<'_>,
+) -> Result<(MxArray, MxArray)> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_gdn_fused_step(
+            q.as_raw_ptr(),
+            k.as_raw_ptr(),
+            v.as_raw_ptr(),
+            g.as_raw_ptr(),
+            beta.as_raw_ptr(),
+            state.as_raw_ptr(),
+            tail.z.as_raw_ptr(),
+            tail.norm_weight.as_raw_ptr(),
+            tail.eps,
+            tail.state_dst
+                .map(MxArray::as_raw_ptr)
+                .unwrap_or(std::ptr::null_mut()),
+            &mut out,
+            &mut out_state,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "Fused GDN step kernel declined (check stderr for details)",
+        ));
+    }
+    Ok((
+        MxArray::from_handle(out, "gdn_fused_step:out")?,
+        MxArray::from_handle(out_state, "gdn_fused_step:state")?,
+    ))
+}
+
+/// The `gdn_prepare` inputs of one window: the post-mask pre-conv `qkv`
+/// `[1, T, W]`, the `a` / `b` gate projections `[1, T, Hv]`, the f32
+/// tap-major conv weight `[W, 4]`, the bf16 history `[3, W]`, and the f32
+/// per-head `-exp(a_log)` scale and `dt_bias`.
+pub(crate) struct GdnPrologue<'a> {
+    pub qkv: &'a MxArray,
+    pub a: &'a MxArray,
+    pub b: &'a MxArray,
+    pub conv: &'a MxArray,
+    pub history: &'a MxArray,
+    pub scale: &'a MxArray,
+    pub dt_bias: &'a MxArray,
+    /// Where the next history `[3, W]` is written: a view whose buffer the
+    /// returned history shares (the DFlash2 spare conv blob row).
+    pub history_dst: Option<&'a MxArray>,
+}
+
+/// Everything the complete fused layer core emits besides the gated output
+/// and the new state: the kernel tape and the next conv history `[3, W]`.
+pub(crate) struct GdnCompleteOut {
+    pub out: MxArray,
+    pub state: MxArray,
+    pub tape: GdnKernelTape,
+    pub history: MxArray,
+}
+
+/// One dispatch for the whole GDN core of a window: `gdn_prepare` (conv +
+/// SiLU + q/k norm + gates), the recurrence, the gated RMSNorm and the z
+/// gate — bit-identical to `gdn_prepare` followed by
+/// [`gated_delta_fused_step`]. `None` when the kernel is off-contract
+/// (B = 1, Dk = Dv = 128, T <= 16, compact tiled heads `hv % Hk`).
+pub(crate) fn gated_delta_fused_complete(
+    prologue: &GdnPrologue<'_>,
+    state: &MxArray,
+    tail: &GdnTail<'_>,
+) -> Option<GdnCompleteOut> {
+    let mut outputs = [std::ptr::null_mut(); 8];
+    let ok = unsafe {
+        sys::mlx_gdn_fused_complete(
+            prologue.qkv.as_raw_ptr(),
+            prologue.a.as_raw_ptr(),
+            prologue.b.as_raw_ptr(),
+            prologue.conv.as_raw_ptr(),
+            prologue.history.as_raw_ptr(),
+            prologue.scale.as_raw_ptr(),
+            prologue.dt_bias.as_raw_ptr(),
+            state.as_raw_ptr(),
+            tail.z.as_raw_ptr(),
+            tail.norm_weight.as_raw_ptr(),
+            tail.eps,
+            tail.state_dst
+                .map(MxArray::as_raw_ptr)
+                .unwrap_or(std::ptr::null_mut()),
+            prologue
+                .history_dst
+                .map(MxArray::as_raw_ptr)
+                .unwrap_or(std::ptr::null_mut()),
+            outputs.as_mut_ptr(),
+        )
+    };
+    if !ok {
+        return None;
+    }
+    let take = |i: usize, name: &str| MxArray::from_handle(outputs[i], name).ok();
+    Some(GdnCompleteOut {
+        out: take(0, "gdn_fused_complete:out")?,
+        state: take(1, "gdn_fused_complete:state")?,
+        tape: GdnKernelTape {
+            q: take(2, "gdn_fused_complete:q")?,
+            k: take(3, "gdn_fused_complete:k")?,
+            v: take(4, "gdn_fused_complete:v")?,
+            g: take(5, "gdn_fused_complete:decay")?,
+            beta: take(6, "gdn_fused_complete:beta")?,
+        },
+        history: take(7, "gdn_fused_complete:history")?,
+    })
+}
+
 /// Fused accepted-prefix replay for the eager-MTP GDN tape.
 ///
 /// ONE Metal dispatch replays `accepted_steps` tokens of the recorded verify
@@ -761,53 +897,18 @@ pub(crate) fn gated_delta_update_with_tape(
         return gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask);
     }
 
-    // The fused gate and precomputed gdn_prepare outputs both supply the
-    // exp-space decay consumed by the per-step kernel and its ops fallback.
-    let (beta, g) = match precomputed_gates {
-        Some((decay, beta)) => (beta.clone(), decay.clone()),
-        None => match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
-            Ok((beta_flat, g_flat)) => {
-                let seq_len = b.shape_at(1)?;
-                let beta = beta_flat.reshape(&[batch, seq_len, num_v_heads])?;
-                let g = g_flat.reshape(&[batch, seq_len, num_v_heads])?;
-                (beta, g)
-            }
-            Err(_) => (Activations::sigmoid(b)?, compute_g(a_log, a, dt_bias)?),
-        },
-    };
-
-    // Standard checkpoints group each key head contiguously and need
-    // repeat-interleave. GGUF Qwen3.5 keeps the value-major tiled order; the
-    // per-step Metal kernel consumes those compact heads directly and maps
-    // value head `hv` to key head `hv % Hk`, avoiding an activation copy.
-    let (q, k) = if num_v_heads != num_k_heads && !tiled_gqa {
-        if num_k_heads == 0 {
-            return Err(Error::from_reason(
-                "GatedDelta: num_k_heads is 0, cannot compute GQA repeat factor",
-            ));
-        }
-        if num_v_heads % num_k_heads != 0 {
-            return Err(Error::from_reason(format!(
-                "GatedDelta: num_v_heads ({}) must be divisible by num_k_heads ({})",
-                num_v_heads, num_k_heads
-            )));
-        }
-        let repeat_factor = num_v_heads / num_k_heads;
-        let q_expanded = q.repeat(repeat_factor as i32, 2)?; // [B, T, Hv, Dk]
-        let k_expanded = k.repeat(repeat_factor as i32, 2)?; // [B, T, Hv, Dk]
-        (q_expanded, k_expanded)
-    } else {
-        (q.clone(), k.clone())
-    };
-
-    // Initialize state if not provided: [B, Hv, Dv, Dk]. The recurrent state
-    // is carried in f32 end to end (Splash / mlx-lm parity): the kernels keep
-    // the state in `StT` = the carried dtype, so this is the one place that
-    // fixes it. `y` stays in the activation dtype.
-    let initial_state = match state {
-        Some(s) => s.clone(),
-        None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?,
-    };
+    let (q, k, g, beta, initial_state) = kernel_inputs(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        tiled_gqa,
+        precomputed_gates,
+    )?;
 
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
     if k_dim % 32 == 0
@@ -840,6 +941,137 @@ pub(crate) fn gated_delta_update_with_tape(
         (q, k)
     };
     gated_delta_ops(&ops_q, &ops_k, v, &g, &beta, &initial_state, mask)
+}
+
+/// The exact per-step kernel inputs: `(q, k, g, beta, state)` — gates in
+/// exp space (precomputed by `gdn_prepare` or the fused gating kernel), q/k
+/// repeat-expanded for standard GQA checkpoints (tiled GGUF heads stay
+/// compact; the kernels map value head `hv` to key head `hv % Hk`), and an
+/// f32 zero state when none is carried yet.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn kernel_inputs(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state: Option<&MxArray>,
+    tiled_gqa: bool,
+    precomputed_gates: Option<(&MxArray, &MxArray)>,
+) -> Result<(MxArray, MxArray, MxArray, MxArray, MxArray)> {
+    let batch = q.shape_at(0)?;
+    let num_k_heads = q.shape_at(2)?;
+    let num_v_heads = v.shape_at(2)?;
+    let v_dim = v.shape_at(3)?;
+    let k_dim = q.shape_at(3)?;
+    let (beta, g) = match precomputed_gates {
+        Some((decay, beta)) => (beta.clone(), decay.clone()),
+        None => match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
+            Ok((beta_flat, g_flat)) => {
+                let seq_len = b.shape_at(1)?;
+                let beta = beta_flat.reshape(&[batch, seq_len, num_v_heads])?;
+                let g = g_flat.reshape(&[batch, seq_len, num_v_heads])?;
+                (beta, g)
+            }
+            Err(_) => (Activations::sigmoid(b)?, compute_g(a_log, a, dt_bias)?),
+        },
+    };
+    let (q, k) = if num_v_heads != num_k_heads && !tiled_gqa {
+        if num_k_heads == 0 {
+            return Err(Error::from_reason(
+                "GatedDelta: num_k_heads is 0, cannot compute GQA repeat factor",
+            ));
+        }
+        if num_v_heads % num_k_heads != 0 {
+            return Err(Error::from_reason(format!(
+                "GatedDelta: num_v_heads ({}) must be divisible by num_k_heads ({})",
+                num_v_heads, num_k_heads
+            )));
+        }
+        let repeat_factor = num_v_heads / num_k_heads;
+        (
+            q.repeat(repeat_factor as i32, 2)?,
+            k.repeat(repeat_factor as i32, 2)?,
+        )
+    } else {
+        (q.clone(), k.clone())
+    };
+    // The recurrent state is carried in f32 end to end (Splash / mlx-lm
+    // parity): the kernels keep the state in `StT` = the carried dtype, so
+    // this is the one place that fixes it. `y` stays in the activation dtype.
+    let initial_state = match state {
+        Some(s) => s.clone(),
+        None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?,
+    };
+    Ok((q, k, g, beta, initial_state))
+}
+
+/// [`gated_delta_update_with_tape`] with the layer tail (gated RMSNorm and
+/// z gate) folded into the recurrence dispatch. Returns the gated
+/// `[B, T, Hv * Dv]` output and the new state, or `None` when the fused
+/// kernel is off-contract (then the caller runs the unfused chain): Metal,
+/// unmasked, bf16 activations with Dv = 128, Dk a multiple of 32, T <= 32.
+/// Records the same `(q, k, v, g, beta)` tape as the unfused path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_update_fused(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state: Option<&MxArray>,
+    mask: Option<&MxArray>,
+    use_kernel: bool,
+    tiled_gqa: bool,
+    precomputed_gates: Option<(&MxArray, &MxArray)>,
+    tail: GdnTail<'_>,
+    tape_sink: Option<&mut Option<GdnKernelTape>>,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !use_kernel
+        || mask.is_some()
+        || !crate::engine::persistence::compiled_forward_backend_available()
+        || v.shape_at(3)? != 128
+        || q.shape_at(3)? % 32 != 0
+        || !(1..=32).contains(&v.shape_at(1)?)
+        || [q, k, v, tail.z, tail.norm_weight]
+            .iter()
+            .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+        || state.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
+    {
+        return Ok(None);
+    }
+    let (q, k, g, beta, initial_state) = kernel_inputs(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        tiled_gqa,
+        precomputed_gates,
+    )?;
+    if beta.dtype()? != DType::BFloat16 || g.dtype()? != DType::Float32 {
+        return Ok(None);
+    }
+    let Ok(result) = gated_delta_fused_step(&q, &k, v, &g, &beta, &initial_state, &tail) else {
+        return Ok(None);
+    };
+    if let Some(sink) = tape_sink {
+        *sink = Some(GdnKernelTape {
+            q,
+            k,
+            v: v.clone(),
+            g,
+            beta,
+        });
+    }
+    Ok(Some(result))
 }
 
 #[cfg(test)]
@@ -1034,6 +1266,575 @@ mod tests {
             y_ulps, 0,
             "windowed y rows must equal the AR chain's (max {y_ulps} ulps)"
         );
+    }
+
+    /// The unfused tail exactly as `GatedDeltaNet::forward` runs it:
+    /// `fast::rms_norm(y) * w` per head, then the compiled
+    /// `sigmoid(z) * z * normed`.
+    fn unfused_tail(y: &MxArray, z: &MxArray, w: &MxArray, eps: f32) -> MxArray {
+        let (b, t, hv, dv) = (
+            y.shape_at(0).unwrap(),
+            y.shape_at(1).unwrap(),
+            y.shape_at(2).unwrap(),
+            y.shape_at(3).unwrap(),
+        );
+        let mut norm = crate::nn::RMSNormGated::new(dv as u32, Some(eps as f64)).unwrap();
+        norm.set_weight(w).unwrap();
+        norm.forward(y, Some(&z.reshape(&[b, t, hv, dv]).unwrap()))
+            .unwrap()
+            .reshape(&[b, t, hv * dv])
+            .unwrap()
+    }
+
+    /// Production-like gate: in_proj magnitudes, both sigmoid branches.
+    fn rand_gate(shape: &[i64]) -> MxArray {
+        MxArray::random_normal(shape, 0.0, 2.0, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    /// The fused step must equal the unfused chain — per-step kernel, then
+    /// `fast::rms_norm`, then the compiled z gate — bit for bit on the
+    /// production geometry: f32 state, bf16 gated output, T = 1 (AR) and the
+    /// verify window, `z` as the strided split view the projection yields,
+    /// and GQA heads (compact tiled and expanded).
+    #[test]
+    fn fused_tail_matches_unfused_chain_bit_for_bit() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        let (hv, dk, dv) = (48i64, 128i64, 128i64);
+        for (b, hk, t, strided) in [
+            (1i64, 16i64, 1i64, true),
+            (1, 16, 8, true),
+            (1, 16, 8, false),
+            (1, 48, 5, true),
+            (2, 16, 3, true),
+            (1, 16, 32, false),
+        ] {
+            let (mut tape, state0) = tape_and_state(b, hk, hv, dk, dv, t);
+            if strided {
+                // The conv-prep path hands `v` over as a strided view of the
+                // conv output (a reshape of its value-channel slice); the
+                // kernel copies it contiguous before binding.
+                tape.v = rand_bf16(&[b, t, 2 * hk * dk + hv * dv])
+                    .slice_axis(2, 2 * hk * dk, 2 * hk * dk + hv * dv)
+                    .unwrap()
+                    .reshape(&[b, t, hv, dv])
+                    .unwrap();
+            }
+            let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+            let z = if strided {
+                rand_gate(&[b, t, 2 * hk * dk + 2 * hv * dv + 96])
+                    .slice_axis(2, 2 * hk * dk + hv * dv, 2 * hk * dk + 2 * hv * dv)
+                    .unwrap()
+            } else {
+                rand_gate(&[b, t, hv * dv])
+            };
+            let (y, state_ref) = gated_delta_kernel(
+                &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, None,
+            )
+            .unwrap();
+            let out_ref = unfused_tail(&y, &z, &w, 1e-6);
+            let tail = GdnTail {
+                z: &z,
+                norm_weight: &w,
+                eps: 1e-6,
+                state_dst: None,
+            };
+            let (out, state) = gated_delta_fused_step(
+                &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, &tail,
+            )
+            .unwrap();
+            MxArray::eval_arrays(&[&out, &state, &out_ref, &state_ref]).unwrap();
+            assert_eq!(out.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(out.shape().unwrap().as_ref(), [b, t, hv * dv]);
+            let state_ulps = max_ulps(&state_ref, &state);
+            let out_ulps = max_ulps(&out_ref, &out);
+            eprintln!(
+                "FUSED_TAIL b={b} hk={hk} t={t} strided={strided} state_ulps={state_ulps} out_ulps={out_ulps}"
+            );
+            assert_eq!(state_ulps, 0, "state b={b} hk={hk} t={t}");
+            assert_eq!(
+                out_ulps, 0,
+                "gated output b={b} hk={hk} t={t} strided={strided}"
+            );
+        }
+    }
+
+    /// With a `state_dst`, the new state lands in that buffer (the DFlash2
+    /// spare blob row) and the returned state is that same memory.
+    #[test]
+    fn fused_tail_writes_state_into_destination() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        let (b, hk, hv, dk, dv, t) = (1i64, 16i64, 48i64, 128i64, 128i64, 8i64);
+        let (tape, state0) = tape_and_state(b, hk, hv, dk, dv, t);
+        let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+        let z = rand_gate(&[b, t, hv * dv]);
+        // A row of a larger blob, as the stepper hands it over.
+        let blob = MxArray::zeros(&[3, hv, dv, dk], Some(DType::Float32)).unwrap();
+        blob.eval();
+        let dst = blob.slice_axis(0, 1, 2).unwrap();
+        dst.eval();
+        let (_, state_ref) = gated_delta_kernel(
+            &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, None,
+        )
+        .unwrap();
+        let tail = GdnTail {
+            z: &z,
+            norm_weight: &w,
+            eps: 1e-6,
+            state_dst: Some(&dst),
+        };
+        let (out, state) = gated_delta_fused_step(
+            &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, &tail,
+        )
+        .unwrap();
+        MxArray::eval_arrays(&[&out, &state, &state_ref]).unwrap();
+        assert_eq!(max_ulps(&state_ref, &state), 0);
+        assert_eq!(
+            max_ulps(&state_ref, &dst),
+            0,
+            "destination row holds the state"
+        );
+        assert_eq!(max_ulps(&state_ref, &blob.slice_axis(0, 1, 2).unwrap()), 0);
+        let untouched = blob
+            .slice_axis(0, 0, 1)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum(None, Some(false))
+            .unwrap();
+        untouched.eval();
+        assert_eq!(
+            untouched.item_at_float32(0).unwrap(),
+            0.0,
+            "other rows untouched"
+        );
+    }
+
+    /// `gated_delta_update_fused` (the layer entry point, gates computed by
+    /// the fused gating kernel) equals `gated_delta_update` + the unfused
+    /// tail, records the same tape, and declines off-contract shapes.
+    #[test]
+    fn fused_update_matches_unfused_update_and_tape() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        let (b, hk, hv, dk, dv, t) = (1i64, 16i64, 48i64, 128i64, 128i64, 8i64);
+        let (tape, state0) = tape_and_state(b, hk, hv, dk, dv, t);
+        let a = rand_bf16(&[b, t, hv]);
+        let bb = rand_bf16(&[b, t, hv]);
+        let a_log = rand_f32(&[hv]);
+        let dt_bias = rand_f32(&[hv]);
+        let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+        let z = rand_gate(&[b, t, hv * dv]);
+        let mut ref_sink = None;
+        let (y, state_ref) = gated_delta_update_with_tape(
+            &tape.q,
+            &tape.k,
+            &tape.v,
+            &a,
+            &bb,
+            &a_log,
+            &dt_bias,
+            Some(&state0),
+            None,
+            true,
+            true,
+            None,
+            Some(&mut ref_sink),
+        )
+        .unwrap();
+        let out_ref = unfused_tail(&y, &z, &w, 1e-6);
+        let mut sink = None;
+        let (out, state) = gated_delta_update_fused(
+            &tape.q,
+            &tape.k,
+            &tape.v,
+            &a,
+            &bb,
+            &a_log,
+            &dt_bias,
+            Some(&state0),
+            None,
+            true,
+            true,
+            None,
+            GdnTail {
+                z: &z,
+                norm_weight: &w,
+                eps: 1e-6,
+                state_dst: None,
+            },
+            Some(&mut sink),
+        )
+        .unwrap()
+        .expect("production geometry takes the fused step");
+        MxArray::eval_arrays(&[&out, &state, &out_ref, &state_ref]).unwrap();
+        assert_eq!(max_ulps(&state_ref, &state), 0);
+        assert_eq!(max_ulps(&out_ref, &out), 0);
+        let (r, f) = (ref_sink.unwrap(), sink.unwrap());
+        for (x, y) in [
+            (&r.q, &f.q),
+            (&r.k, &f.k),
+            (&r.v, &f.v),
+            (&r.g, &f.g),
+            (&r.beta, &f.beta),
+        ] {
+            assert_eq!(max_ulps(x, y), 0, "tape differs");
+        }
+        // Off-contract: Dv != 128 declines (caller runs the unfused chain).
+        let (small, s_small) = tape_and_state(1, 4, 4, 64, 64, 2);
+        let declined = gated_delta_update_fused(
+            &small.q,
+            &small.k,
+            &small.v,
+            &rand_bf16(&[1, 2, 4]),
+            &rand_bf16(&[1, 2, 4]),
+            &rand_f32(&[4]),
+            &rand_f32(&[4]),
+            Some(&s_small),
+            None,
+            true,
+            false,
+            None,
+            GdnTail {
+                z: &rand_gate(&[1, 2, 256]),
+                norm_weight: &rand_bf16(&[64]),
+                eps: 1e-6,
+                state_dst: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(declined.is_none());
+    }
+
+    /// The complete kernel (prep folded in) must equal `gdn_prepare` followed
+    /// by the fused step on every output — gated out, state, the whole tape
+    /// and the conv history — bit for bit, with the split-view strides the
+    /// projection yields and a history that is a view of a packed blob row.
+    #[test]
+    fn fused_complete_matches_prepare_then_step_bit_for_bit() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        let (hk, hv, dk, dv) = (16i64, 48i64, 128i64, 128i64);
+        let w_dim = 2 * hk * dk + hv * dv;
+        let conv = MxArray::random_normal(&[w_dim, 4], 0.0, 0.2, Some(DType::Float32)).unwrap();
+        let scale = MxArray::random_normal(&[hv], -0.5, 0.2, Some(DType::Float32)).unwrap();
+        let dt = rand_f32(&[hv]);
+        let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+        for t in [1i64, 3, 8, 16] {
+            // qkvz | ba as the merged projection emits them, then split.
+            let qkvz = rand_gate(&[1, t, w_dim + hv * dv]);
+            let qkv = qkvz.slice_axis(2, 0, w_dim).unwrap();
+            let z = qkvz.slice_axis(2, w_dim, w_dim + hv * dv).unwrap();
+            let ba = rand_bf16(&[1, t, 2 * hv + 32]);
+            let b = ba.slice_axis(2, 0, hv).unwrap();
+            let a = ba.slice_axis(2, hv, 2 * hv).unwrap();
+            let blob = rand_bf16(&[5, 3, w_dim]);
+            let history = blob
+                .slice_axis(0, 2, 3)
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            let state0 = rand_f32(&[1, hv, dv, dk]);
+
+            let mut prepared = [std::ptr::null_mut(); 6];
+            assert!(unsafe {
+                sys::mlx_qwen4_gdn_prepare(
+                    qkv.handle.0,
+                    a.handle.0,
+                    b.handle.0,
+                    conv.handle.0,
+                    history.handle.0,
+                    scale.handle.0,
+                    dt.handle.0,
+                    true,
+                    true,
+                    prepared.as_mut_ptr(),
+                )
+            });
+            let p: Vec<MxArray> = prepared
+                .iter()
+                .map(|&h| MxArray::from_handle(h, "prepare").unwrap())
+                .collect();
+            let tail = GdnTail {
+                z: &z,
+                norm_weight: &w,
+                eps: 1e-6,
+                state_dst: None,
+            };
+            let (out_ref, state_ref) =
+                gated_delta_fused_step(&p[0], &p[1], &p[2], &p[3], &p[4], &state0, &tail).unwrap();
+            let complete = gated_delta_fused_complete(
+                &GdnPrologue {
+                    qkv: &qkv,
+                    a: &a,
+                    b: &b,
+                    conv: &conv,
+                    history: &history,
+                    scale: &scale,
+                    dt_bias: &dt,
+                    history_dst: None,
+                },
+                &state0,
+                &tail,
+            )
+            .expect("production geometry takes the complete kernel");
+            let pairs = [
+                ("out", &out_ref, &complete.out),
+                ("state", &state_ref, &complete.state),
+                ("q", &p[0], &complete.tape.q),
+                ("k", &p[1], &complete.tape.k),
+                ("v", &p[2], &complete.tape.v),
+                ("decay", &p[3], &complete.tape.g),
+                ("beta", &p[4], &complete.tape.beta),
+                ("history", &p[5], &complete.history),
+            ];
+            let mut all: Vec<&MxArray> = Vec::new();
+            for (_, a, b) in &pairs {
+                all.push(a);
+                all.push(b);
+            }
+            MxArray::eval_arrays(&all).unwrap();
+            for (name, a, b) in &pairs {
+                assert_eq!(
+                    a.shape().unwrap().as_ref(),
+                    b.shape().unwrap().as_ref(),
+                    "{name} T={t}"
+                );
+                assert_eq!(a.dtype().unwrap(), b.dtype().unwrap(), "{name} T={t}");
+                let ulps = max_ulps(a, b);
+                eprintln!("FUSED_COMPLETE T={t} {name}: {ulps} ulps");
+                assert_eq!(ulps, 0, "{name} differs at T={t}");
+            }
+        }
+        // T = 17 is past the prepared-row budget: declines.
+        let t = 17i64;
+        let qkv = rand_bf16(&[1, t, w_dim]);
+        let a = rand_bf16(&[1, t, hv]);
+        assert!(
+            gated_delta_fused_complete(
+                &GdnPrologue {
+                    qkv: &qkv,
+                    a: &a,
+                    b: &a,
+                    conv: &conv,
+                    history: &rand_bf16(&[3, w_dim]),
+                    scale: &scale,
+                    dt_bias: &dt,
+                    history_dst: None,
+                },
+                &rand_f32(&[1, hv, dv, dk]),
+                &GdnTail {
+                    z: &rand_bf16(&[1, t, hv * dv]),
+                    norm_weight: &w,
+                    eps: 1e-6,
+                    state_dst: None,
+                },
+            )
+            .is_none()
+        );
+    }
+
+    /// Manual kernel microbench: the fused step against the unfused chain
+    /// at the Qwen3.8 geometry, one layer per sample (median of 48 layers'
+    /// worth of dispatches). `MLX_GDN_FUSED_BENCH=1 cargo test -p mlx-core
+    /// --release --lib gated_delta::tests::fused_tail_bench -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn fused_tail_bench() {
+        if !unsafe { sys::mlx_metal_is_available() }
+            || std::env::var_os("MLX_GDN_FUSED_BENCH").is_none()
+        {
+            return;
+        }
+        let (b, hk, hv, dk, dv) = (1i64, 16i64, 48i64, 128i64, 128i64);
+        let layers = 48usize;
+        for t in [1i64, 8] {
+            let inputs: Vec<_> = (0..layers)
+                .map(|_| {
+                    let (tape, state0) = tape_and_state(b, hk, hv, dk, dv, t);
+                    let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+                    let z = rand_gate(&[b, t, 2 * hk * dk + 2 * hv * dv + 96])
+                        .slice_axis(2, 2 * hk * dk + hv * dv, 2 * hk * dk + 2 * hv * dv)
+                        .unwrap();
+                    (tape, state0, w, z)
+                })
+                .collect();
+            let mut roots = Vec::new();
+            for (tape, state0, w, z) in &inputs {
+                roots.extend([tape.q.clone(), tape.k.clone(), tape.v.clone()]);
+                roots.extend([tape.g.clone(), tape.beta.clone(), state0.clone()]);
+                roots.extend([w.clone(), z.clone()]);
+            }
+            MxArray::eval_arrays(&roots.iter().collect::<Vec<_>>()).unwrap();
+            let run = |fused: bool| -> f64 {
+                let mut samples = Vec::new();
+                for rep in 0..13 {
+                    let start = std::time::Instant::now();
+                    let mut outs = Vec::new();
+                    for (tape, state0, w, z) in &inputs {
+                        let (o, s) = if fused {
+                            gated_delta_fused_step(
+                                &tape.q,
+                                &tape.k,
+                                &tape.v,
+                                &tape.g,
+                                &tape.beta,
+                                state0,
+                                &GdnTail {
+                                    z,
+                                    norm_weight: w,
+                                    eps: 1e-6,
+                                    state_dst: None,
+                                },
+                            )
+                            .unwrap()
+                        } else {
+                            let (y, s) = gated_delta_kernel(
+                                &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, state0, None,
+                            )
+                            .unwrap();
+                            (unfused_tail(&y, z, w, 1e-6), s)
+                        };
+                        outs.push(o);
+                        outs.push(s);
+                    }
+                    MxArray::eval_arrays(&outs.iter().collect::<Vec<_>>()).unwrap();
+                    if rep >= 3 {
+                        samples.push(start.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                samples.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                samples[samples.len() / 2]
+            };
+            for _ in 0..2 {
+                let unfused = run(false);
+                let fused = run(true);
+                eprintln!(
+                    "GDN_FUSED_BENCH T={t} {layers} layers: unfused {unfused:.3} ms, fused {fused:.3} ms, ratio {:.3}",
+                    fused / unfused
+                );
+            }
+        }
+    }
+
+    /// Manual kernel microbench: the complete kernel against `gdn_prepare`
+    /// plus the fused step, 48 layers per sample (same switch and
+    /// invocation as [`fused_tail_bench`]).
+    #[test]
+    #[ignore]
+    fn fused_complete_bench() {
+        if !unsafe { sys::mlx_metal_is_available() }
+            || std::env::var_os("MLX_GDN_FUSED_BENCH").is_none()
+        {
+            return;
+        }
+        let (hk, hv, dk, dv) = (16i64, 48i64, 128i64, 128i64);
+        let w_dim = 2 * hk * dk + hv * dv;
+        let layers = 48usize;
+        for t in [1i64, 8] {
+            let inputs: Vec<_> = (0..layers)
+                .map(|_| {
+                    let qkvz = rand_gate(&[1, t, w_dim + hv * dv]);
+                    let ba = rand_bf16(&[1, t, 2 * hv + 32]);
+                    (
+                        qkvz.slice_axis(2, 0, w_dim).unwrap(),
+                        qkvz.slice_axis(2, w_dim, w_dim + hv * dv).unwrap(),
+                        ba.slice_axis(2, hv, 2 * hv).unwrap(),
+                        ba.slice_axis(2, 0, hv).unwrap(),
+                        MxArray::random_normal(&[w_dim, 4], 0.0, 0.2, Some(DType::Float32))
+                            .unwrap(),
+                        rand_bf16(&[3, w_dim]),
+                        MxArray::random_normal(&[hv], -0.5, 0.2, Some(DType::Float32)).unwrap(),
+                        rand_f32(&[hv]),
+                        rand_f32(&[1, hv, dv, dk]),
+                        rand_bf16(&[dv]).add_scalar(1.0).unwrap(),
+                    )
+                })
+                .collect();
+            let mut roots: Vec<&MxArray> = Vec::new();
+            for i in &inputs {
+                roots.extend([&i.0, &i.1, &i.2, &i.3, &i.4, &i.5, &i.6, &i.7, &i.8, &i.9]);
+            }
+            MxArray::eval_arrays(&roots).unwrap();
+            let run = |complete: bool| -> f64 {
+                let mut samples = Vec::new();
+                for rep in 0..13 {
+                    let start = std::time::Instant::now();
+                    let mut outs = Vec::new();
+                    for (qkv, z, a, b, conv, history, scale, dt, state0, w) in &inputs {
+                        let tail = GdnTail {
+                            z,
+                            norm_weight: w,
+                            eps: 1e-6,
+                            state_dst: None,
+                        };
+                        let prologue = GdnPrologue {
+                            qkv,
+                            a,
+                            b,
+                            conv,
+                            history,
+                            scale,
+                            dt_bias: dt,
+                            history_dst: None,
+                        };
+                        if complete {
+                            let c = gated_delta_fused_complete(&prologue, state0, &tail).unwrap();
+                            outs.extend([c.out, c.state, c.history]);
+                        } else {
+                            let mut prepared = [std::ptr::null_mut(); 6];
+                            assert!(unsafe {
+                                sys::mlx_qwen4_gdn_prepare(
+                                    qkv.handle.0,
+                                    a.handle.0,
+                                    b.handle.0,
+                                    conv.handle.0,
+                                    history.handle.0,
+                                    scale.handle.0,
+                                    dt.handle.0,
+                                    true,
+                                    true,
+                                    prepared.as_mut_ptr(),
+                                )
+                            });
+                            let p: Vec<MxArray> = prepared
+                                .iter()
+                                .map(|&h| MxArray::from_handle(h, "prepare").unwrap())
+                                .collect();
+                            let (o, s) = gated_delta_fused_step(
+                                &p[0], &p[1], &p[2], &p[3], &p[4], state0, &tail,
+                            )
+                            .unwrap();
+                            outs.extend([o, s, p[5].clone()]);
+                        }
+                    }
+                    MxArray::eval_arrays(&outs.iter().collect::<Vec<_>>()).unwrap();
+                    if rep >= 3 {
+                        samples.push(start.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                samples.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                samples[samples.len() / 2]
+            };
+            for _ in 0..2 {
+                let chain = run(false);
+                let complete = run(true);
+                eprintln!(
+                    "GDN_COMPLETE_BENCH T={t} {layers} layers: prepare+step {chain:.3} ms, complete {complete:.3} ms, ratio {:.3}",
+                    complete / chain
+                );
+            }
+        }
     }
 
     /// Diagnostic: does a per-step T=1 kernel loop (= AR decode) match

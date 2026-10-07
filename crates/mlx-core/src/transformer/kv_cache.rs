@@ -58,7 +58,7 @@ impl KvFormat {
 }
 
 /// The fused KV row store is on unless `MLX_DFLASH2_KV_STORE=0`.
-fn fused_kv_store_enabled() -> bool {
+pub(crate) fn fused_kv_store_enabled() -> bool {
     std::env::var("MLX_DFLASH2_KV_STORE")
         .ok()
         .is_none_or(|value| value.trim() != "0")
@@ -71,6 +71,15 @@ pub(crate) enum KvBlock {
     Bf16 { keys: MxArray, values: MxArray },
     /// Quantized rows plus scales.
     Int8(Int8KvRows),
+}
+
+/// One cache's share of a fused row store: the (cache, block) handle pairs
+/// and the row the block lands on.
+struct StorePlan {
+    dst: Vec<*mut mlx_sys::mlx_array>,
+    src: Vec<*mut mlx_sys::mlx_array>,
+    offset: i32,
+    seq_len: i32,
 }
 
 /// Key-Value cache for efficient transformer inference.
@@ -325,6 +334,81 @@ impl KVCache {
     /// [`Self::append_quantized`]), which stays the fallback when the fused
     /// store declines (no Metal, a geometry it does not serve).
     pub(crate) fn store_block(&mut self, block: &KvBlock) -> Result<()> {
+        let plan = self.plan_store(block)?;
+        let mut out: [*mut mlx_sys::mlx_array; 4] = [std::ptr::null_mut(); 4];
+        let offsets = [plan.offset; 4];
+        // SAFETY: every pointer is a live array handle for the call; `out`
+        // receives owned handles (same buffers as `dst`) or stays null.
+        // `MLX_DFLASH2_KV_STORE=0` keeps the slice_update path (A/B switch).
+        let ok = fused_kv_store_enabled()
+            && unsafe {
+                mlx_sys::mlx_kv_store_rows(
+                    plan.dst.len() as i32,
+                    plan.dst.as_ptr(),
+                    plan.src.as_ptr(),
+                    offsets.as_ptr(),
+                    out.as_mut_ptr(),
+                )
+            };
+        if !ok {
+            return self.store_block_unfused(block);
+        }
+        self.adopt_store(&out[..plan.dst.len()], plan.seq_len)
+    }
+
+    /// [`Self::store_block`] for several caches at once: every block of every
+    /// cache lands in ONE store dispatch (the Metal primitive reads the
+    /// buffers through an address table). Falls back to per-cache stores
+    /// when the batched primitive declines (no residency sets, no Metal).
+    pub(crate) fn store_blocks(entries: &mut [(&mut KVCache, KvBlock)]) -> Result<()> {
+        if !fused_kv_store_enabled() || entries.len() <= 1 {
+            for (cache, block) in entries.iter_mut() {
+                cache.store_block(block)?;
+            }
+            return Ok(());
+        }
+        let mut plans = Vec::with_capacity(entries.len());
+        for (cache, block) in entries.iter_mut() {
+            plans.push(cache.plan_store(block)?);
+        }
+        let mut dst = Vec::new();
+        let mut src = Vec::new();
+        let mut offsets = Vec::new();
+        for plan in &plans {
+            dst.extend_from_slice(&plan.dst);
+            src.extend_from_slice(&plan.src);
+            offsets.extend(std::iter::repeat_n(plan.offset, plan.dst.len()));
+        }
+        let mut out: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); dst.len()];
+        // SAFETY: as in `store_block`; `out` receives one owned handle per
+        // `dst` entry or stays null.
+        let ok = unsafe {
+            mlx_sys::mlx_kv_store_rows(
+                dst.len() as i32,
+                dst.as_ptr(),
+                src.as_ptr(),
+                offsets.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if !ok {
+            for (cache, block) in entries.iter_mut() {
+                cache.store_block(block)?;
+            }
+            return Ok(());
+        }
+        let mut cursor = 0;
+        for ((cache, _), plan) in entries.iter_mut().zip(&plans) {
+            cache.adopt_store(&out[cursor..cursor + plan.dst.len()], plan.seq_len)?;
+            cursor += plan.dst.len();
+        }
+        Ok(())
+    }
+
+    /// Grow for `block` and gather the store's (cache, rows) handle pairs:
+    /// K, V and, for int8, their scales. The pointers stay valid while the
+    /// cache and block are untouched.
+    fn plan_store(&mut self, block: &KvBlock) -> Result<StorePlan> {
         let (keys, values) = match block {
             KvBlock::Bf16 { keys, values } => (keys, values),
             KvBlock::Int8(rows) => (&rows.keys, &rows.values),
@@ -348,7 +432,7 @@ impl KVCache {
             }
         };
         let seq_len = keys.shape_at(2)? as i32;
-        let prev = self.offset;
+        let offset = self.offset;
         self.ensure_rows(
             keys.shape_at(0)?,
             keys.shape_at(1)?,
@@ -358,8 +442,8 @@ impl KVCache {
             k_dtype,
             v_dtype,
         )?;
-        let mut dst: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(4);
-        let mut src: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(4);
+        let mut dst = Vec::with_capacity(4);
+        let mut src = Vec::with_capacity(4);
         let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values) else {
             return Err(Error::from_reason(
                 "KV cache buffers missing after buffer update",
@@ -376,34 +460,32 @@ impl KVCache {
             dst.extend([ks.as_raw_ptr(), vs.as_raw_ptr()]);
             src.extend([rows.key_scales.as_raw_ptr(), rows.value_scales.as_raw_ptr()]);
         }
-        let mut out: [*mut mlx_sys::mlx_array; 4] = [std::ptr::null_mut(); 4];
-        // SAFETY: every pointer is a live array handle for the call; `out`
-        // receives owned handles (same buffers as `dst`) or stays null.
-        // `MLX_DFLASH2_KV_STORE=0` keeps the slice_update path (A/B switch).
-        let ok = fused_kv_store_enabled()
-            && unsafe {
-                mlx_sys::mlx_kv_store_rows(
-                    dst.len() as i32,
-                    dst.as_ptr(),
-                    src.as_ptr(),
-                    prev,
-                    out.as_mut_ptr(),
-                )
-            };
-        if !ok {
-            return match block {
-                KvBlock::Bf16 { keys, values } => self.update_and_fetch(keys, values).map(|_| ()),
-                KvBlock::Int8(rows) => self.append_quantized(rows).map(|_| ()),
-            };
-        }
+        Ok(StorePlan {
+            dst,
+            src,
+            offset,
+            seq_len,
+        })
+    }
+
+    /// Replace the buffer handles with the store primitive's outputs (same
+    /// buffers) and advance the offset.
+    fn adopt_store(&mut self, out: &[*mut mlx_sys::mlx_array], seq_len: i32) -> Result<()> {
         self.keys = Some(MxArray::from_handle(out[0], "kv_store_rows:keys")?);
         self.values = Some(MxArray::from_handle(out[1], "kv_store_rows:values")?);
-        if dst.len() == 4 {
+        if out.len() == 4 {
             self.key_scales = Some(MxArray::from_handle(out[2], "kv_store_rows:key_scales")?);
             self.value_scales = Some(MxArray::from_handle(out[3], "kv_store_rows:value_scales")?);
         }
         self.offset += seq_len;
         Ok(())
+    }
+
+    fn store_block_unfused(&mut self, block: &KvBlock) -> Result<()> {
+        match block {
+            KvBlock::Bf16 { keys, values } => self.update_and_fetch(keys, values).map(|_| ()),
+            KvBlock::Int8(rows) => self.append_quantized(rows).map(|_| ()),
+        }
     }
 
     /// Int8 format: views of rows `[0:offset]` (keys, values, scales), or
@@ -761,6 +843,117 @@ mod tests {
             &after.slice_axis(2, 20, 28).unwrap(),
             &block.keys
         ));
+    }
+
+    /// Sixteen layers' blocks stored by ONE batched dispatch leave every
+    /// cache byte-identical (buffers, offsets, capacities) to sixteen
+    /// single-layer stores — BF16 and int8, with the verify's transposed
+    /// values view, differing per-cache offsets and a growth boundary.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn store_blocks_matches_single_layer_stores() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let (b, h, d, layers) = (1i64, 2i64, 256i64, 16usize);
+        for format in [KvFormat::Bf16, KvFormat::Int8] {
+            let make = |t: i64| {
+                let keys = rand_bf16(&[b, h, t, d]);
+                let values = rand_bf16(&[b, t, h, d])
+                    .transpose(Some(&[0, 2, 1, 3]))
+                    .unwrap();
+                match format {
+                    KvFormat::Bf16 => KvBlock::Bf16 { keys, values },
+                    KvFormat::Int8 => KvBlock::Int8(Int8KvRows::quantize(&keys, &values).unwrap()),
+                }
+            };
+            let clone_block = |block: &KvBlock| match block {
+                KvBlock::Bf16 { keys, values } => KvBlock::Bf16 {
+                    keys: keys.clone(),
+                    values: values.clone(),
+                },
+                KvBlock::Int8(rows) => KvBlock::Int8(rows.clone()),
+            };
+            let mut single: Vec<KVCache> =
+                (0..layers).map(|_| KVCache::with_format(format)).collect();
+            let mut batched: Vec<KVCache> =
+                (0..layers).map(|_| KVCache::with_format(format)).collect();
+            // Prefill lengths differ per layer so the offsets differ; the
+            // third block crosses a 256-row step for the longer caches.
+            for (step, trim_to) in [(0i64, None), (8, Some(3)), (8, None), (8, None)] {
+                let mut entries = Vec::with_capacity(layers);
+                for (layer, cache) in batched.iter_mut().enumerate() {
+                    let rows = if step == 0 { 240 + layer as i64 } else { step };
+                    let block = make(rows);
+                    single[layer].store_block(&clone_block(&block)).unwrap();
+                    entries.push((cache, block));
+                }
+                if step > 0 {
+                    unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+                }
+                KVCache::store_blocks(&mut entries).unwrap();
+                for cache in &batched {
+                    let mut arrays = Vec::new();
+                    arrays.extend(cache.keys_ref());
+                    arrays.extend(cache.values_ref());
+                    arrays.extend(cache.key_scales_ref());
+                    arrays.extend(cache.value_scales_ref());
+                    MxArray::eval_arrays(&arrays).unwrap();
+                }
+                if step > 0 {
+                    let stores =
+                        unsafe { mlx_sys::mlx_test_kquant_family_count(c"kv_store_rows".as_ptr()) };
+                    unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                    // One table dispatch where residency sets exist; otherwise
+                    // the per-layer fallback (or slice_update when the env
+                    // switch disables the fused store, which records nothing).
+                    let expected = if !fused_kv_store_enabled() {
+                        0
+                    } else if unsafe { mlx_sys::mlx_kv_store_batched_available() } {
+                        1
+                    } else {
+                        layers as u64
+                    };
+                    assert_eq!(
+                        stores, expected,
+                        "{format:?}: KvStoreRows dispatches for all layers"
+                    );
+                }
+                if let Some(back) = trim_to {
+                    for (s, bt) in single.iter_mut().zip(batched.iter_mut()) {
+                        s.trim(s.get_offset() - back);
+                        bt.trim(bt.get_offset() - back);
+                    }
+                }
+            }
+            for (layer, (s, bt)) in single.iter().zip(&batched).enumerate() {
+                assert_eq!(
+                    s.get_offset(),
+                    bt.get_offset(),
+                    "{format:?} layer {layer} offset"
+                );
+                assert_eq!(
+                    s.capacity().unwrap(),
+                    bt.capacity().unwrap(),
+                    "{format:?} layer {layer} capacity"
+                );
+                let pairs = [
+                    (s.keys_ref(), bt.keys_ref()),
+                    (s.values_ref(), bt.values_ref()),
+                    (s.key_scales_ref(), bt.key_scales_ref()),
+                    (s.value_scales_ref(), bt.value_scales_ref()),
+                ];
+                for (i, (r, f)) in pairs.into_iter().enumerate() {
+                    match (r, f) {
+                        (Some(r), Some(f)) => {
+                            assert!(bits_equal(r, f), "{format:?} layer {layer} buffer {i}")
+                        }
+                        (None, None) => {}
+                        _ => panic!("{format:?} layer {layer} buffer {i} presence differs"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -2188,17 +2188,79 @@ unsafe extern "C-unwind" {
         out_conv: *mut *mut mlx_array,
     ) -> bool;
 
+    // True when both arrays are evaluated and are the same bytes of the same
+    // buffer (offset, size and shape equal).
+    pub fn mlx_array_aliases(a: *const mlx_array, b: *const mlx_array) -> bool;
+
+    // Fused GDN step for one window: the per-step recurrence over every
+    // value column of a head in one threadgroup, then the gated RMSNorm and
+    // `sigmoid(z) * z * norm(y)` on the window rows — bit-identical to the
+    // per-step kernel -> fast::rms_norm -> compiled swiglu chain. `z` is
+    // `[B, T, Hv * Dv]` read through its strides; `state_dst` (nullable)
+    // is a `[B, Hv, Dv, Dk]` f32 view the new state is written into (its
+    // buffer becomes `out_state`). Returns false when off-contract.
+    pub fn mlx_gdn_fused_step(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        state_dst: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    // The complete fused GDN layer core: `qwen4_gdn_prepare` (conv + SiLU +
+    // q/k norm + gates) + recurrence + gated RMSNorm + z gate in one
+    // dispatch (B = 1, Dk = Dv = 128, T <= 16, value head hv on key head
+    // hv % Hk). `outputs[8]`: out, state, q, k, v, decay, beta,
+    // next_history — bit-identical to `mlx_qwen4_gdn_prepare` followed by
+    // `mlx_gdn_fused_step`. `history_dst` (nullable) is a `[3, W]` bf16 view
+    // next_history is written into. Returns false when off-contract.
+    pub fn mlx_gdn_fused_complete(
+        qkv: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        state_dst: *mut mlx_array,
+        history_dst: *mut mlx_array,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
+
     // In-place KV row store: one dispatch writes `tensors` row blocks
     // (`src[i]`, `[B, H, T(, D)]`) into the matching flat cache buffers
-    // (`dst[i]`) at row `offset`; `out[i]` are the cache handles to adopt
-    // (same buffers). A bit copy, equal to one slice_update per tensor.
+    // (`dst[i]`) at row `offsets[i]`; `out[i]` are the cache handles to
+    // adopt (same buffers). A bit copy, equal to one slice_update per
+    // tensor. More than one layer's tensors need residency sets (quiet
+    // `false` otherwise).
     pub fn mlx_kv_store_rows(
         tensors: i32,
         dst: *const *mut mlx_array,
         src: *const *mut mlx_array,
-        offset: i32,
+        offsets: *const i32,
         out: *mut *mut mlx_array,
     ) -> bool;
+
+    // Whether `mlx_kv_store_rows` can store several layers in one dispatch
+    // (Metal device with residency sets).
+    pub fn mlx_kv_store_batched_available() -> bool;
+
+    // Row counts `M < limit` of an affine quantized matmul `x @ W^T`
+    // (`W` `[n, k]` at `bits`) take MLX's per-row `qmv_fast` route on this
+    // device, so the output bits do not depend on `n`; 0 when the shape
+    // would not take that route or without Metal.
+    pub fn mlx_affine_qmv_fast_limit(k: i32, n: i32, bits: i32) -> i32;
 
     // Fused DFlash2 grouped dynamic causal conv: one elementwise dispatch
     // reproducing the pad/slice/add/mul/add chain bit-exactly (per-op dtype

@@ -1709,6 +1709,10 @@ impl QuantizedLinear {
         &self.mode
     }
 
+    pub fn bits(&self) -> i32 {
+        self.bits
+    }
+
     /// Test-scope accessor for the sym8 operands
     /// `(w_nk [N,K] checkpoint, s_w [N])`.
     /// Used by the routing/parity unit tests to call the reference kernels with

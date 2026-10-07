@@ -11,12 +11,15 @@ pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 /// High tag on compiled-verify `fn_id`s. The low byte carries the verify
 /// length; bits 8..31 carry the per-instance `model_id`; bit 32 is set for
 /// an int8 K/V cache (`COMPILED_VERIFY_INT8_BIT`: the tape's FA inputs and
-/// outputs differ). `Qwen35Inner`'s Drop erases `COMPILED_VERIFY_TAG |
-/// model_id << 8` under mask `...FFFE_FFFF_FF00` so an unload releases the
-/// tapes' captured weights in either format.
+/// outputs differ); bit 33 when the GDN layers write their window-final
+/// state into caller buffers (`COMPILED_VERIFY_DST_BIT`: extra inputs).
+/// `Qwen35Inner`'s Drop erases `COMPILED_VERIFY_TAG | model_id << 8` under
+/// mask `...FFFC_FFFF_FF00` so an unload releases the tapes' captured
+/// weights in every variant.
 pub(crate) const COMPILED_VERIFY_TAG: u64 = 0xD51A_3500_0000_0000;
 pub(crate) const COMPILED_VERIFY_INT8_BIT: u64 = 1 << 32;
-pub(crate) const COMPILED_VERIFY_ERASE_MASK: u64 = 0xFFFF_FFFE_FFFF_FF00;
+pub(crate) const COMPILED_VERIFY_DST_BIT: u64 = 1 << 33;
+pub(crate) const COMPILED_VERIFY_ERASE_MASK: u64 = 0xFFFF_FFFC_FFFF_FF00;
 
 #[cfg(test)]
 thread_local! {
@@ -402,12 +405,18 @@ pub(crate) enum DFlash2LogitsSpan {
 /// residuals in the companion checkpoint's declared order and optionally
 /// records the GDN recurrence tape needed to roll a speculative verify block
 /// back to its accepted prefix.
+///
+/// `gdn_dst`, one recurrent-state and one conv-history view per linear layer
+/// in layer order (the DFlash2 spare blob rows), makes the compiled verify
+/// write each layer's window-final state there and report it as the tape's
+/// `final_state` / `final_conv`; the eager path ignores it.
 pub(crate) fn forward_dflash2_with_taps(
     inner: &mut Qwen35Inner,
     input_ids: &MxArray,
     tap_layers: &[usize],
     record_tape: bool,
     logits_span: DFlash2LogitsSpan,
+    gdn_dst: Option<&crate::models::qwen3_5::gdn_blob::GdnDestinations>,
 ) -> Result<(
     MxArray,
     Vec<MxArray>,
@@ -418,7 +427,7 @@ pub(crate) fn forward_dflash2_with_taps(
     // covers the speculative-verify shape (B=1, tape recorded, all-rows
     // logits); anything else stays on the eager path below.
     if record_tape && matches!(logits_span, DFlash2LogitsSpan::All) {
-        match forward_dflash2_compiled(inner, input_ids, tap_layers) {
+        match forward_dflash2_compiled(inner, input_ids, tap_layers, gdn_dst) {
             Ok(Some(out)) => return Ok(out),
             Ok(None) => {}
             Err(e) => {
@@ -522,9 +531,14 @@ pub(crate) fn forward_dflash2_with_taps(
 ///     Linear        — conv_state `[1, K-1, conv_dim]`,
 ///                     recurrent `[1, Hv, Dv, Dk]`
 ///     FullAttention — live K prefix `[1, Hkv, P, D]`, V prefix `[1, Hkv, P, D]`
+///   then, with `gdn_dst`, per linear layer a state destination
+///   `[1, Hv, Dv, Dk]` and a conv-history destination `[K-1, conv_dim]`
+///   (the fused GDN kernel writes its window-final state there instead of
+///   fresh buffers; `COMPILED_VERIFY_DST_BIT` in the id).
 /// Outputs, in order:
 ///   `logits` `[1, L, V]`, tap hiddens (in `tap_layers` order), then per layer:
-///     Linear        — kernel tape `q, k, v, g, beta` + post-mask `qkv` (6)
+///     Linear        — kernel tape `q, k, v, g, beta` + post-mask `qkv` +
+///                     the window-final recurrent state and conv history (8)
 ///     FullAttention — post-RoPE `new_k, new_v` `[1, Hkv, L, D]` (2)
 ///
 /// `shapeless` lifts the prefix length `P` — which changes every cycle — out
@@ -548,6 +562,7 @@ fn forward_dflash2_compiled(
     inner: &mut Qwen35Inner,
     input_ids: &MxArray,
     tap_layers: &[usize],
+    gdn_dst: Option<&crate::models::qwen3_5::gdn_blob::GdnDestinations>,
 ) -> Result<
     Option<(
         MxArray,
@@ -647,15 +662,25 @@ fn forward_dflash2_compiled(
         KvFormat::Bf16 => 2,
         KvFormat::Int8 => 4,
     };
+    let n_linear = inner.layers.iter().filter(|l| l.is_linear()).count();
+    let n_fa = inner.layers.len() - n_linear;
+    // The destinations are a per-cycle input (parity flips every commit),
+    // so the graph binds them as inputs; their count fixes the arity.
+    let dst = gdn_dst.filter(|dst| dst.state.len() == n_linear && dst.conv.len() == n_linear);
+    let has_dst = dst.is_some();
     let rope_offsets = MxArray::from_int32(&[rope_base.unwrap_or(0)], &[1])?;
-    let mut inputs: Vec<MxArray> = Vec::with_capacity(2 + per_layer_state.len());
+    let mut inputs: Vec<MxArray> =
+        Vec::with_capacity(2 + per_layer_state.len() + if has_dst { 2 * n_linear } else { 0 });
     inputs.push(input_ids.clone());
     inputs.push(rope_offsets);
     inputs.extend(per_layer_state);
-
-    let n_linear = inner.layers.iter().filter(|l| l.is_linear()).count();
-    let n_fa = inner.layers.len() - n_linear;
-    let n_outputs = 1 + tap_layers.len() + 6 * n_linear + fa_arrays * n_fa;
+    let dst_base = inputs.len();
+    if let Some(dst) = dst {
+        for (state, conv) in dst.state.iter().zip(&dst.conv) {
+            inputs.extend([state.clone(), conv.clone()]);
+        }
+    }
+    let n_outputs = 1 + tap_layers.len() + 8 * n_linear + fa_arrays * n_fa;
     // Per-(model, L) id: the verify length decides every host-int branch in
     // the builder (SDPA verify-split geometry), while the prefix length stays
     // shapeless. The high tag namespaces these ids away from the C++-side
@@ -681,7 +706,8 @@ fn forward_dflash2_compiled(
         | match kv_format {
             KvFormat::Bf16 => 0,
             KvFormat::Int8 => COMPILED_VERIFY_INT8_BIT,
-        };
+        }
+        | if has_dst { COMPILED_VERIFY_DST_BIT } else { 0 };
 
     let layers = &mut inner.layers;
     let embedding = &inner.embedding;
@@ -708,7 +734,8 @@ fn forward_dflash2_compiled(
                 }
             }
         };
-        let mut extras: Vec<MxArray> = Vec::with_capacity(6 * n_linear + fa_arrays * n_fa);
+        let mut extras: Vec<MxArray> = Vec::with_capacity(8 * n_linear + fa_arrays * n_fa);
+        let mut linear_ordinal = 0usize;
         for (index, layer) in layers.iter_mut().enumerate() {
             let input = match &pending {
                 Some((h, delta)) => VerifyResidual::Pending { h, delta },
@@ -717,11 +744,19 @@ fn forward_dflash2_compiled(
             let mut tape_slot: Option<GdnLayerTape> = None;
             if layer.is_linear() {
                 // Detached cache seeded with the graph-input states: the
-                // verify-time writes land in it and are dropped; commit
-                // replays the accepted prefix from the snapshot.
-                let mut detached = crate::models::qwen3_5::arrays_cache::ArraysCache::new(2);
+                // verify-time writes land in it and are exported below;
+                // commit replays the accepted prefix from the snapshot.
+                // Slots 2 and 3 are the window-final state's and history's
+                // destinations (the spare blob rows), which a full accept
+                // adopts.
+                let mut detached = crate::models::qwen3_5::arrays_cache::ArraysCache::new(4);
                 detached.set(0, graph_inputs[cursor].clone())?;
                 detached.set(1, graph_inputs[cursor + 1].clone())?;
+                if has_dst {
+                    detached.set(2, graph_inputs[dst_base + 2 * linear_ordinal].clone())?;
+                    detached.set(3, graph_inputs[dst_base + 2 * linear_ordinal + 1].clone())?;
+                }
+                linear_ordinal += 1;
                 let mut io = LayerVerifyIo::Linear(&mut detached);
                 let (x, h, delta) =
                     layer.forward_verify(input, &mut io, true, Some(&mut tape_slot))?;
@@ -732,9 +767,32 @@ fn forward_dflash2_compiled(
                 let tape = tape_slot.ok_or_else(|| {
                     Error::from_reason("compiled verify: GDN layer produced no tape")
                 })?;
-                let GdnLayerTape { kernel, qkv, .. } = tape;
+                let (Some(cache_conv), Some(final_state)) =
+                    (detached.get(0).cloned(), detached.get(1).cloned())
+                else {
+                    return Err(Error::from_reason(
+                        "compiled verify: GDN layer produced no state",
+                    ));
+                };
+                let GdnLayerTape {
+                    kernel,
+                    qkv,
+                    final_conv,
+                    ..
+                } = tape;
                 let GdnKernelTape { q, k, v, g, beta } = kernel;
-                extras.extend([q, k, v, g, beta, qkv]);
+                // The kernel's own history output when the layer recorded
+                // one (adoptable in place); otherwise the cache view.
+                extras.extend([
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    qkv,
+                    final_state,
+                    final_conv.unwrap_or(cache_conv),
+                ]);
                 cursor += 2;
             } else {
                 let mut out_kv = None;
@@ -823,6 +881,7 @@ fn forward_dflash2_compiled(
                   tape: &mut [Option<GdnLayerTape>]|
      -> Result<()> {
         let mut cursor = 1 + tap_layers.len();
+        let mut blocks = Vec::new();
         for (index, layer) in inner.layers.iter().enumerate() {
             if layer.is_linear() {
                 let kd = match &layer.attn {
@@ -852,6 +911,16 @@ fn forward_dflash2_compiled(
                     },
                     qkv: take(outputs)?,
                     conv_kernel_dim: kd,
+                    // Only a destination-written state is adoptable; a fresh
+                    // one is just the dropped verify write.
+                    final_state: {
+                        let state = take(outputs)?;
+                        has_dst.then_some(state)
+                    },
+                    final_conv: {
+                        let conv = take(outputs)?;
+                        has_dst.then_some(conv)
+                    },
                 });
             } else {
                 let kvc = caches[index].as_kv_cache_mut().ok_or_else(|| {
@@ -868,24 +937,39 @@ fn forward_dflash2_compiled(
                     ));
                 };
                 cursor += fa_arrays;
-                // One store dispatch per layer (rows + scales), in place.
-                kvc.store_block(&match kv_format {
-                    KvFormat::Bf16 => crate::transformer::kv_cache::KvBlock::Bf16 {
-                        keys: block[0].clone(),
-                        values: block[1].clone(),
-                    },
-                    KvFormat::Int8 => crate::transformer::kv_cache::KvBlock::Int8(
-                        crate::array::kv_int8::Int8KvRows {
+                blocks.push((
+                    index,
+                    match kv_format {
+                        KvFormat::Bf16 => crate::transformer::kv_cache::KvBlock::Bf16 {
                             keys: block[0].clone(),
                             values: block[1].clone(),
-                            key_scales: block[2].clone(),
-                            value_scales: block[3].clone(),
                         },
-                    ),
-                })?;
+                        KvFormat::Int8 => crate::transformer::kv_cache::KvBlock::Int8(
+                            crate::array::kv_int8::Int8KvRows {
+                                keys: block[0].clone(),
+                                values: block[1].clone(),
+                                key_scales: block[2].clone(),
+                                value_scales: block[3].clone(),
+                            },
+                        ),
+                    },
+                ));
             }
         }
-        Ok(())
+        // One store dispatch for every layer's rows (+ scales), in place.
+        let mut blocks = blocks.into_iter().peekable();
+        let mut entries = Vec::with_capacity(blocks.len());
+        for (index, cache) in caches.iter_mut().enumerate() {
+            if blocks.peek().is_some_and(|(at, _)| *at == index)
+                && let Some((_, block)) = blocks.next()
+            {
+                let kvc = cache.as_kv_cache_mut().ok_or_else(|| {
+                    Error::from_reason("compiled verify: attention cache kind mismatch")
+                })?;
+                entries.push((kvc, block));
+            }
+        }
+        crate::transformer::kv_cache::KVCache::store_blocks(&mut entries)
     };
     let mut tape: Vec<Option<GdnLayerTape>> = std::iter::repeat_with(|| None)
         .take(inner.layers.len())

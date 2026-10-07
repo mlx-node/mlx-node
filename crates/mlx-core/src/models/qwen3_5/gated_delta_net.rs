@@ -5,7 +5,10 @@ use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
-use super::gated_delta::{GdnKernelTape, gated_delta_update, gated_delta_update_with_tape};
+use super::gated_delta::{
+    GdnCompleteOut, GdnKernelTape, GdnPrologue, GdnTail, gated_delta_fused_complete,
+    gated_delta_update, gated_delta_update_fused, gated_delta_update_with_tape,
+};
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Per-GDN-layer tape recorded during the eager MTP verify forward.
@@ -18,6 +21,12 @@ use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 ///     rebuild the conv state by slicing the accepted prefix).
 ///   * `conv_kernel_dim` — depthwise conv kernel size; `keep = conv_kernel_dim
 ///     - 1` is the conv-state window length.
+///   * `final_state` / `final_conv` — the recurrent state `[1, Hv, Dv, Dk]`
+///     and conv history `[K-1, W]` after the WHOLE window, when the verify
+///     wrote them into the DFlash2 spare blob rows (compiled verify with
+///     destinations; the layer records the history, the compiled unpack
+///     the state). With the f32 carry the state equals the replay of every
+///     window token, so a full accept adopts both instead of replaying.
 ///
 /// All array fields are lazy `MxArray` clones (no eval, no copy) so recording
 /// stays inside the fused lazy MLX graph.
@@ -26,6 +35,8 @@ pub(crate) struct GdnLayerTape {
     pub kernel: GdnKernelTape,
     pub qkv: MxArray,
     pub conv_kernel_dim: i32,
+    pub final_state: Option<MxArray>,
+    pub final_conv: Option<MxArray>,
 }
 
 /// Rebuild the convolution history from the pre-verify snapshot and accepted rows.
@@ -83,6 +94,8 @@ impl GdnLayerTape {
             },
             qkv: combine(|row| &row.qkv)?,
             conv_kernel_dim: first.conv_kernel_dim,
+            final_state: None,
+            final_conv: None,
         })
     }
 
@@ -108,6 +121,8 @@ impl GdnLayerTape {
             },
             qkv: select(&self.qkv)?,
             conv_kernel_dim: self.conv_kernel_dim,
+            final_state: None,
+            final_conv: None,
         })
     }
 
@@ -513,6 +528,48 @@ impl GatedDeltaNet {
             None
         };
 
+        // Whole GDN core in ONE dispatch (prep + recurrence + gated norm +
+        // z gate): the decode/verify geometry with compact tiled heads. Same
+        // bits as the gdn_prepare -> fused step chain below, which stays the
+        // fallback (as does the generic path after it).
+        if let Some(complete) = self.forward_complete(
+            &qkv,
+            &z,
+            &a,
+            &b,
+            conv_state.as_ref(),
+            cache.as_deref(),
+            mask,
+            use_kernel,
+            batch,
+            seq_len,
+        ) {
+            if let Some(cache) = cache {
+                cache.set(
+                    0,
+                    complete.history.reshape(&[
+                        1,
+                        (self.conv_kernel_dim - 1) as i64,
+                        self.conv_dim as i64,
+                    ])?,
+                )?;
+                cache.set(1, complete.state)?;
+            }
+            if let (Some(sink), Some(qkv)) = (tape_sink.take(), tape_qkv) {
+                // The kernel's own history output (not the reshaped cache
+                // view): a sibling of the gated output, so it is evaluated
+                // with it and a full accept can adopt it in place.
+                *sink = Some(GdnLayerTape {
+                    kernel: complete.tape,
+                    qkv,
+                    conv_kernel_dim: self.conv_kernel_dim,
+                    final_state: None,
+                    final_conv: Some(complete.history),
+                });
+            }
+            return self.out_proj.forward(&complete.out);
+        }
+
         // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
         // gating in ONE Metal dispatch (`mlx_qwen4_gdn_prepare` — hardcoded to
         // this family's 10240-wide 16k/48v×128 geometry). Keep its existing
@@ -614,6 +671,52 @@ impl GatedDeltaNet {
 
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
+
+        // Fused tail: recurrence + gated norm + z gate in one dispatch (the
+        // production decode/verify geometry). Slot 2 of the cache, when a
+        // caller provides it, is the buffer the new state is written into.
+        {
+            let mut kernel_sink: Option<GdnKernelTape> = None;
+            let fused = gated_delta_update_fused(
+                &q,
+                &k,
+                &v,
+                &a,
+                &b,
+                &self.a_log,
+                &self.dt_bias,
+                recurrent_state,
+                mask,
+                use_kernel,
+                self.tiled_gguf_layout,
+                precomputed.as_ref().map(|(d, b)| (d, b)),
+                GdnTail {
+                    z: &z,
+                    norm_weight: self.norm.weight(),
+                    eps: self.norm.eps(),
+                    state_dst: cache.as_deref().and_then(|c| c.get(2)),
+                },
+                tape_sink.is_some().then_some(&mut kernel_sink),
+            )?;
+            if let Some((gated, new_state)) = fused {
+                if let Some(cache) = cache {
+                    cache.set(1, new_state)?;
+                }
+                if let (Some(sink), Some(kernel), Some(qkv)) =
+                    (tape_sink.take(), kernel_sink, tape_qkv)
+                {
+                    *sink = Some(GdnLayerTape {
+                        kernel,
+                        qkv,
+                        conv_kernel_dim: self.conv_kernel_dim,
+                        final_state: None,
+                        final_conv: None,
+                    });
+                }
+                return self.out_proj.forward(&gated);
+            }
+        }
+
         let (y, new_state) = if tape_sink.is_some() {
             // Record the per-step kernel inputs into a local sink, then fold
             // them (plus the recorded qkv) into the layer tape below.
@@ -639,6 +742,8 @@ impl GatedDeltaNet {
                     kernel,
                     qkv,
                     conv_kernel_dim: self.conv_kernel_dim,
+                    final_state: None,
+                    final_conv: None,
                 });
             }
             result
@@ -698,6 +803,96 @@ impl GatedDeltaNet {
 
         // Output projection
         self.out_proj.forward(&y_flat)
+    }
+
+    /// The whole GDN core as one dispatch (`gated_delta_fused_complete`):
+    /// `gdn_prepare`'s contract (batch 1, 4-tap conv, 128-wide heads, bf16
+    /// activations, the f32 conv/scale/dt sidecars) plus the fused tail's
+    /// (unmasked, T <= 16, bf16 gate and norm weight, f32 state) and compact
+    /// tiled heads (`hv % Hk`; standard checkpoints repeat-expand q/k and
+    /// stay on the chain below). `None` leaves the chain to run.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_complete(
+        &self,
+        qkv: &MxArray,
+        z: &MxArray,
+        a: &MxArray,
+        b: &MxArray,
+        conv_state: Option<&MxArray>,
+        cache: Option<&ArraysCache>,
+        mask: Option<&MxArray>,
+        use_kernel: bool,
+        batch: i64,
+        seq_len: i64,
+    ) -> Option<GdnCompleteOut> {
+        use crate::array::DType;
+        if batch != 1
+            || !(1..=16).contains(&seq_len)
+            || mask.is_some()
+            || !use_kernel
+            || self.conv_kernel_dim != 4
+            || self.key_head_dim != 128
+            || self.value_head_dim != 128
+            || !(self.tiled_gguf_layout || self.num_k_heads == self.num_v_heads)
+            || !crate::engine::persistence::compiled_forward_backend_available()
+        {
+            return None;
+        }
+        let conv = self.conv1d_w4_f32.as_ref()?;
+        let scale = self.gdn_scale_f32.as_ref()?;
+        let dt_bias = self.dt_bias_f32.as_ref()?;
+        let recurrent = cache.and_then(|c| c.get(1));
+        if [qkv, z, a, b, self.norm.weight()]
+            .iter()
+            .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+            || recurrent.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
+        {
+            return None;
+        }
+        let history = match conv_state {
+            Some(s) => s.squeeze(Some(&[0])).ok()?,
+            None => MxArray::zeros(
+                &[(self.conv_kernel_dim - 1) as i64, self.conv_dim as i64],
+                Some(DType::BFloat16),
+            )
+            .ok()?,
+        };
+        let zero_state;
+        let state = match recurrent {
+            Some(s) => s,
+            None => {
+                zero_state = MxArray::zeros(
+                    &[
+                        1,
+                        self.num_v_heads as i64,
+                        self.value_head_dim as i64,
+                        self.key_head_dim as i64,
+                    ],
+                    Some(DType::Float32),
+                )
+                .ok()?;
+                &zero_state
+            }
+        };
+        gated_delta_fused_complete(
+            &GdnPrologue {
+                qkv,
+                a,
+                b,
+                conv,
+                history: &history,
+                scale,
+                dt_bias,
+                history_dst: cache.and_then(|c| c.get(3)),
+            },
+            state,
+            &GdnTail {
+                z,
+                norm_weight: self.norm.weight(),
+                eps: self.norm.eps(),
+                state_dst: cache.and_then(|c| c.get(2)),
+            },
+        )
     }
 
     /// Generic prep path: depthwise conv (fused `window_conv` when possible)

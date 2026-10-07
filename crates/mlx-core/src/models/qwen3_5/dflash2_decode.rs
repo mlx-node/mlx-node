@@ -391,6 +391,7 @@ impl Qwen35DFlash2Stepper<'_> {
             &self.tap_layers,
             true,
             super::model::DFlash2LogitsSpan::All,
+            self.gdn_blobs.as_ref().map(GdnStateBlobs::destinations),
         )
     }
 
@@ -446,7 +447,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         let (path, draft_sparse_dists) = draft.propose(
             &self.inner.embedding,
             self.inner.lm_head.as_ref(),
-            &self.context,
+            &mut self.context,
             anchor_id,
             max_len,
             temperature,
@@ -519,6 +520,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             &self.tap_layers,
             true,
             super::model::DFlash2LogitsSpan::All,
+            self.gdn_blobs.as_ref().map(GdnStateBlobs::destinations),
         )?;
         if phase_time {
             eprintln!("[dflash2-phase] verify-build: {:?}", t0.elapsed());
@@ -575,22 +577,33 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 verified_ids.len()
             )));
         }
-        // The recurrent state is carried in f32, so the windowed verify
-        // kernel's final state now equals the per-token replay bit for bit
-        // (`gated_delta::tests::ar_chain_matches_windowed_kernel_f32`). The
-        // replay still runs on every accept here; adopting the verify state
-        // directly on full accept is the follow-up that invariant unlocks.
         let caches = self
             .inner
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
-        // Packed path: every linear layer's replay (plus its conv rebuild)
-        // in one fused primitive from the pre-verify blobs; the full-attention
-        // offsets rewind as before. A declined kernel drops back to the
-        // per-layer replay for the rest of the turn.
+        // Packed path. Full accept (every verified row kept; the bonus token
+        // is not in the state yet): the verify already wrote each layer's
+        // window-final state into the spare blob rows, and with the f32
+        // carry that equals replaying the whole window
+        // (`gated_delta::tests::ar_chain_matches_windowed_kernel_f32`), so
+        // adopting is a parity swap. Otherwise every linear layer's replay
+        // (plus its conv rebuild) runs in one fused primitive from the
+        // pre-verify blobs. The full-attention offsets rewind as before. A
+        // declined kernel drops back to the per-layer replay for the rest of
+        // the turn.
         let next_blobs = match &self.gdn_blobs {
-            Some(blobs) => blobs.commit(&tape, keep)?,
+            Some(blobs) => {
+                let adopted = if keep == total_written {
+                    blobs.adopt(&tape)?
+                } else {
+                    None
+                };
+                match adopted {
+                    Some(next) => Some(next),
+                    None => blobs.commit(&tape, keep)?,
+                }
+            }
             None => None,
         };
         match next_blobs {
@@ -806,6 +819,7 @@ impl Qwen35Inner {
                     &tap_layers,
                     false,
                     super::model::DFlash2LogitsSpan::LastRow,
+                    None,
                 )?
             };
             let draft = self
@@ -955,6 +969,7 @@ impl Qwen35Inner {
             &tap_layers,
             false,
             super::model::DFlash2LogitsSpan::LastRow,
+            None,
         )?;
         let fused = self
             .dflash2
@@ -1455,6 +1470,7 @@ mod tests {
                 &tap_layers,
                 true,
                 super::super::model::DFlash2LogitsSpan::All,
+                None,
             )?;
             let mut arrays = vec![&logits];
             arrays.extend(taps.iter());
@@ -1609,6 +1625,7 @@ mod tests {
                 &tap_layers,
                 true,
                 super::super::model::DFlash2LogitsSpan::All,
+                None,
             )?;
             let mut arrays = vec![&logits];
             arrays.extend(taps.iter());
@@ -2487,7 +2504,7 @@ mod tests {
                     let (path, _) = draft.propose(
                         &step.inner.embedding,
                         step.inner.lm_head.as_ref(),
-                        &step.context,
+                        &mut step.context,
                         anchor,
                         DRAFT_LEN,
                         0.0,

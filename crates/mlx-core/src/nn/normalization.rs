@@ -277,6 +277,16 @@ impl RMSNormGated {
         self.weight.clone()
     }
 
+    /// The weight, borrowed, and the epsilon exactly as [`Self::forward`]
+    /// hands them to `fast::rms_norm`.
+    pub fn weight(&self) -> &MxArray {
+        &self.weight
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.weight = weight.clone();
         Ok(())

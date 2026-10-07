@@ -31,6 +31,20 @@ pub(crate) struct GdnStateBlobs {
     /// contents are stale (the state before the last commit) and must not
     /// be read.
     spare: (MxArray, MxArray),
+    /// Per-layer views of the spare blobs, in `layers` order: the verify
+    /// writes each layer's window-final recurrent state `[1, Hv, Dv, Dk]`
+    /// and conv history `[K-1, W]` there (`GdnTail::state_dst`,
+    /// `GdnPrologue::history_dst`), so a full accept is a parity swap.
+    destinations: GdnDestinations,
+}
+
+/// Where the verify writes each packed layer's window-final state: rows of
+/// the spare blobs, which [`GdnStateBlobs::adopt`] then promotes to current.
+pub(crate) struct GdnDestinations {
+    /// `[1, Hv, Dv, Dk]` f32 rows of the spare recurrent blob.
+    pub state: Vec<MxArray>,
+    /// `[K-1, W]` bf16 rows of the spare conv blob.
+    pub conv: Vec<MxArray>,
 }
 
 impl GdnStateBlobs {
@@ -71,12 +85,72 @@ impl GdnStateBlobs {
             MxArray::zeros(conv.shape()?.as_ref(), Some(DType::BFloat16))?,
             MxArray::zeros(recurrent.shape()?.as_ref(), Some(DType::Float32))?,
         );
+        Self::with_parity(layers, conv, recurrent, spare)
+    }
+
+    fn with_parity(
+        layers: Vec<usize>,
+        conv: MxArray,
+        recurrent: MxArray,
+        spare: (MxArray, MxArray),
+    ) -> Result<Option<Self>> {
+        let rows = 0..layers.len() as i64;
+        let destinations = GdnDestinations {
+            state: rows
+                .clone()
+                .map(|row| spare.1.slice_axis(0, row, row + 1))
+                .collect::<Result<Vec<_>>>()?,
+            conv: rows
+                .map(|row| spare.0.slice_axis(0, row, row + 1)?.squeeze(Some(&[0])))
+                .collect::<Result<Vec<_>>>()?,
+        };
         Ok(Some(Self {
             layers,
             conv,
             recurrent,
             spare,
+            destinations,
         }))
+    }
+
+    pub(crate) fn destinations(&self) -> &GdnDestinations {
+        &self.destinations
+    }
+
+    /// Full accept: every window token is committed, so the state and conv
+    /// history the verify wrote into the spare rows ARE the committed state
+    /// (the state bit-identical to replaying the whole window from the f32
+    /// carry, the history the window's last `K-1` rows), and the commit is
+    /// a parity swap with no state traffic. `None` when a layer's tape
+    /// lacks a final state or history that is (evaluated, and) the spare
+    /// row itself — eager verify, no destinations, a verify not yet forced —
+    /// so the caller runs [`Self::commit`].
+    pub(crate) fn adopt(&self, tape: &[Option<GdnLayerTape>]) -> Result<Option<Self>> {
+        let aliases = |written: Option<&MxArray>, row: &MxArray| {
+            written.is_some_and(|written| unsafe {
+                sys::mlx_array_aliases(written.as_raw_ptr(), row.as_raw_ptr())
+            })
+        };
+        for (row, &layer) in self.layers.iter().enumerate() {
+            let Some(layer_tape) = tape.get(layer).and_then(Option::as_ref) else {
+                return Err(Error::from_reason(format!(
+                    "GDN blob adopt: layer {layer} has no verify tape"
+                )));
+            };
+            if !aliases(
+                layer_tape.final_state.as_ref(),
+                &self.destinations.state[row],
+            ) || !aliases(layer_tape.final_conv.as_ref(), &self.destinations.conv[row])
+            {
+                return Ok(None);
+            }
+        }
+        Self::with_parity(
+            self.layers.clone(),
+            self.spare.0.clone(),
+            self.spare.1.clone(),
+            (self.conv.clone(), self.recurrent.clone()),
+        )
     }
 
     /// Point every packed layer's cache slots at its blob rows.
@@ -158,12 +232,12 @@ impl GdnStateBlobs {
         }
         // The outputs own the spare buffers; the blobs just read become the
         // spare pair for the next commit.
-        Ok(Some(Self {
-            layers: self.layers.clone(),
-            recurrent: MxArray::from_handle(out_rec, "gdn_commit_all:recurrent")?,
-            conv: MxArray::from_handle(out_conv, "gdn_commit_all:conv")?,
-            spare: (self.conv.clone(), self.recurrent.clone()),
-        }))
+        Self::with_parity(
+            self.layers.clone(),
+            MxArray::from_handle(out_conv, "gdn_commit_all:conv")?,
+            MxArray::from_handle(out_rec, "gdn_commit_all:recurrent")?,
+            (self.conv.clone(), self.recurrent.clone()),
+        )
     }
 }
 
@@ -252,6 +326,8 @@ mod tests {
                 },
                 qkv,
                 conv_kernel_dim: 4,
+                final_state: None,
+                final_conv: None,
             }));
         }
         // Drop the trailing extra linear layer so the count is exact.
@@ -353,6 +429,97 @@ mod tests {
                 blobs.apply_views(&mut fx.caches).unwrap();
             }
         }
+    }
+
+    /// Full accept: a verify that wrote every layer's window-final state and
+    /// conv history into the spare rows (the complete fused kernel with both
+    /// destinations) is adopted as the committed state, byte-identical to
+    /// the fused commit of the whole window — and the adopted pair keeps the
+    /// ping-pong going. A tape whose state did not land in the spare rows
+    /// (eager verify, fresh buffers) declines so the commit replays instead.
+    #[test]
+    fn adopt_equals_full_window_commit() {
+        if !metal() {
+            return;
+        }
+        use crate::models::qwen3_5::gated_delta::{
+            GdnPrologue, GdnTail, gated_delta_fused_complete,
+        };
+        let mut fx = fixture(7, 8, true);
+        let blobs = GdnStateBlobs::pack(&fx.caches).unwrap().expect("packable");
+        blobs.apply_views(&mut fx.caches).unwrap();
+        let host = |a: &MxArray| a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let w = rand_bf16(&[128]).add_scalar(1.0).unwrap();
+        let conv = MxArray::random_normal(&[10240, 4], 0.0, 0.2, Some(DType::Float32)).unwrap();
+        let scale = MxArray::random_normal(&[48], -0.5, 0.2, Some(DType::Float32)).unwrap();
+        let dt = MxArray::random_normal(&[48], 0.0, 0.3, Some(DType::Float32)).unwrap();
+        // The verify: the complete kernel per layer from the current rows,
+        // writing into the spare rows (or fresh buffers), and its tape.
+        let verify = |blobs: &GdnStateBlobs, tape: &mut [Option<GdnLayerTape>], in_place: bool| {
+            for (row, &layer) in blobs.layers.iter().enumerate() {
+                let t = tape[layer].as_mut().unwrap();
+                let z = rand_bf16(&[1, 8, 48 * 128]);
+                let ba = rand_bf16(&[1, 8, 96]);
+                let dst = blobs.destinations();
+                let out = gated_delta_fused_complete(
+                    &GdnPrologue {
+                        qkv: &t.qkv,
+                        a: &ba.slice_axis(2, 48, 96).unwrap(),
+                        b: &ba.slice_axis(2, 0, 48).unwrap(),
+                        conv: &conv,
+                        history: &blobs
+                            .conv
+                            .slice_axis(0, row as i64, row as i64 + 1)
+                            .unwrap()
+                            .squeeze(Some(&[0]))
+                            .unwrap(),
+                        scale: &scale,
+                        dt_bias: &dt,
+                        history_dst: in_place.then_some(&dst.conv[row]),
+                    },
+                    &blobs
+                        .recurrent
+                        .slice_axis(0, row as i64, row as i64 + 1)
+                        .unwrap(),
+                    &GdnTail {
+                        z: &z,
+                        norm_weight: &w,
+                        eps: 1e-6,
+                        state_dst: in_place.then_some(&dst.state[row]),
+                    },
+                )
+                .unwrap();
+                MxArray::eval_arrays(&[&out.state, &out.history]).unwrap();
+                t.kernel = out.tape;
+                t.final_state = Some(out.state);
+                t.final_conv = Some(out.history);
+            }
+        };
+        verify(&blobs, &mut fx.tape, true);
+        let next = blobs.adopt(&fx.tape).unwrap().expect("adoptable");
+        let (adopted_rec, adopted_conv) = (host(&next.recurrent), host(&next.conv));
+        assert_eq!(next.conv.shape().unwrap().as_ref(), [7, 3, 10240]);
+        // Reference: the fused commit of the whole window from the same
+        // tape (it overwrites the same spare pair, hence the snapshot).
+        let reference = blobs.commit(&fx.tape, 8).unwrap().expect("fused");
+        assert_eq!(host(&reference.recurrent).as_ref(), adopted_rec.as_ref());
+        assert_eq!(host(&reference.conv).as_ref(), adopted_conv.as_ref());
+        // Ping-pong: the adopted pair's spare is the old current, and a
+        // commit from the adopted pair lands there.
+        let again = next.commit(&fx.tape, 3).unwrap().expect("fused");
+        assert!(
+            bytes_equal(&again.recurrent, &blobs.recurrent)
+                && bytes_equal(&again.conv, &blobs.conv),
+            "the next commit writes into the pre-adopt current buffers"
+        );
+        // Not in place: declined.
+        verify(&blobs, &mut fx.tape, false);
+        assert!(blobs.adopt(&fx.tape).unwrap().is_none());
+        for t in fx.tape.iter_mut().flatten() {
+            t.final_state = None;
+            t.final_conv = None;
+        }
+        assert!(blobs.adopt(&fx.tape).unwrap().is_none());
     }
 
     /// Full 48-layer geometry: one primitive evaluation per commit, and the

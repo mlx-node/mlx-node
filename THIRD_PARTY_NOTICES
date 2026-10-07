@@ -44,6 +44,15 @@ runtime/metal/kernels/decode/gdn.metal (verify_gdn_commit, gdn_conv_carry),
 runtime/ops/GDN.cpp, runtime/ops/StateLayout.hpp and
 runtime/metal/kernels/common/paged_store_row.h, with the arithmetic kept
 as mlx-node's per-token bf16 replay and the flat (non-paged) cache layout.
+The fused GDN step (crates/mlx-sys/src/metal/common/gdn_fused_step.metal.inc,
+crates/mlx-sys/src/mlx_gdn_fused.cpp) — one threadgroup per value head
+running the window's recurrence, then the gated RMSNorm and z gate on the
+rows kept in threadgroup memory, writing the window-final state into the
+next-parity blob so a full accept is a parity swap (gdn_commit_phase's
+early return) — follows the structure of Splash's verify_gdn_fused
+(gdn_decode_scan, gdn_decode_gate) in runtime/metal/kernels/decode/gdn.metal
+and runtime/ops/GDN.cpp, with the arithmetic kept as MLX's rms_norm kernel
+and compiled sigmoid gate so the result equals mlx-node's unfused chain.
 Splash's LICENSE is the Apache License,
 Version 2.0, whose copyright line it leaves as the template text:
 
