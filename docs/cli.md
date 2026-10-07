@@ -765,7 +765,9 @@ identify an unforked delegate session, but a fork needs its own delegate metadat
 
 ## `mlx agent`
 
-A fully-local coding agent — MLX-Node's first all-in-one local agent. It embeds the [pi coding agent](https://www.npmjs.com/org/earendil-works) (`@earendil-works/*`) and serves every model turn through in-process `@mlx-node/lm` inference. There is no HTTP server, no external process, and no API keys: prompts, tools, and weights all stay on the machine. Requires Node.js ≥ 22.19.
+A fully-local coding agent — MLX-Node's first all-in-one local agent. It embeds the [pi coding agent](https://www.npmjs.com/org/earendil-works) (`@earendil-works/*`) and reuses the mlx-node app's inference engine when it is running. Both `mlx agent` and `mlx delegate` discover the app through private credentials in `~/.mlx-node/desktop/inference.json` and stream over authenticated loopback HTTP. Model loading, swapping, and request admission stay in the app, avoiding a second copy of the weights. An unavailable attached engine produces an error, never a fallback model load. Start the app engine before starting the agent; both app and CLI must include this support.
+
+Without a running app engine, `mlx agent` uses in-process `@mlx-node/lm` inference, while `mlx delegate` uses its shared background worker. Prompts and tools remain local. When attached, the app owns cache persistence and draft policy (`--no-persist-cache` and `MLX_AGENT_ENABLE_GEMMA_DRAFT` only configure standalone inference); native diagnostics remain in the app's inference logs. Requires Node.js ≥ 22.19.
 
 ```bash
 mlx agent                       # interactive session (first run: setup wizard)

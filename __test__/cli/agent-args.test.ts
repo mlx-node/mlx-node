@@ -672,7 +672,8 @@ describe('run() argv routing', () => {
       expect(output).toContain('MLX_NODE_LOG_FILE');
       expect(output).toContain('isolated in-memory Pi session');
       expect(output).toContain('model inference is serialized');
-      expect(output).toContain('Separate mlx agent processes do not share');
+      expect(output).toContain('agents reuse it; cache/draft settings are managed by the app');
+      expect(output).toContain('never start another engine');
     } finally {
       logSpy.mockRestore();
     }

@@ -7,6 +7,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import type { Model } from '@earendil-works/pi-ai';
 import { type InlineExtension, ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -17,6 +18,8 @@ import {
   type RunAgentMain,
   type RunAgentPi,
 } from '../src/run-agent.js';
+
+vi.mock('@mlx-node/server/host/desktop-endpoint', () => ({ readDesktopEndpoint: async () => undefined }));
 
 const FAKE_MODEL = {
   discovered: { name: 'local', path: '/models/local', modelType: 'qwen3' },
@@ -58,11 +61,11 @@ function piImpl(main: RunAgentMain): RunAgentPi {
   return { main, ModelRuntime };
 }
 
-function pagedConfigOverrides(): AgentPagedConfigOverrides & { cleanup: ReturnType<typeof vi.fn> } {
+function pagedConfigOverrides() {
   return {
     resolve: vi.fn(async (path: string) => `/paged${path}`),
     cleanup: vi.fn(async () => undefined),
-  };
+  } satisfies AgentPagedConfigOverrides;
 }
 
 describe('runAgent', () => {
@@ -80,6 +83,39 @@ describe('runAgent', () => {
       else process.env[key] = savedEnv[key];
     }
   });
+
+  it.each([undefined, 'delegate'] as const)(
+    'attaches %s mode to the app without falling back after app exit',
+    async (mode) => {
+      const paged = pagedConfigOverrides();
+      const readEndpoint = vi
+        .fn()
+        .mockResolvedValueOnce({ version: 1, pid: process.pid, url: 'http://127.0.0.1:12345', token: 'secret' })
+        .mockResolvedValue(undefined);
+      await runAgent({
+        modelsDir: '/models',
+        models: [FAKE_MODEL],
+        argv: [],
+        mode,
+        pagedConfigOverrides: paged,
+        readDesktopEndpoint: readEndpoint,
+        piImpl: piImpl(async (_args, { extensionFactories }) => {
+          const provider = extensionFactories[0];
+          if (typeof provider === 'function') throw new Error('Expected named provider');
+          const registerProvider = vi.fn();
+          await provider.factory({ registerProvider, registerFlag: vi.fn(), getFlag: vi.fn(), on: vi.fn() } as never);
+          const stream = registerProvider.mock.calls[0][1].streamSimple;
+          const result = await stream({ id: 'local', api: 'mlx', provider: 'mlx' } as Model<'mlx'>, {
+            messages: [],
+          }).result();
+          expect(result.stopReason).toBe('error');
+          expect(result.errorMessage).toContain('engine stopped');
+        }),
+      });
+      expect(readEndpoint).toHaveBeenCalledTimes(2);
+      expect(paged.resolve).not.toHaveBeenCalled();
+    },
+  );
 
   it('seeds the three env vars before invoking main when they are absent', async () => {
     const { main, calls } = makeSeam();

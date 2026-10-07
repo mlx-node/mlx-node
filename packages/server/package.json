@@ -38,6 +38,11 @@
       "@mlx-node/source": "./src/host/paths.ts",
       "types": "./dist/host/paths.d.ts",
       "import": "./dist/host/paths.js"
+    },
+    "./host/desktop-endpoint": {
+      "@mlx-node/source": "./src/host/desktop-endpoint.ts",
+      "types": "./dist/host/desktop-endpoint.d.ts",
+      "import": "./dist/host/desktop-endpoint.js"
     }
   },
   "scripts": {

@@ -266,15 +266,17 @@ export interface SidecarDeps {
   channel: ParentChannel;
   /** Build the real host. Rejecting here is fatal — see {@link runSidecar}. */
   createHost(): Promise<SidecarHost>;
+  /** Publish private CLI discovery after listening; release only after the host closes. */
+  publishEndpoint?(url: string, models: SidecarHost['models']): Promise<() => Promise<void>>;
   /**
    * The bearer token `createHost` was configured with.
    *
    * It travels with the ready handshake because the URL alone is not a
    * capability any more: every inference route is gated, so a client handed
    * only the URL gets 401 for everything. MAIN keeps it in memory to hand to
-   * whoever the user points at this server — it is never written to disk, never
-   * logged, and deliberately still absent from the `info` reply, which is the
-   * one sidecar response the supervisor stores per generation.
+   * whoever the user points at this server. CLI discovery also stores it in a
+   * user-only endpoint file; it is never logged, and remains absent from the
+   * `info` reply, which the supervisor stores per generation.
    */
   authToken: string;
   /**
@@ -314,6 +316,7 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
   const { channel } = deps;
   let host: SidecarHost | null = null;
   let stopping = false;
+  let releaseEndpoint: (() => Promise<void>) | undefined;
 
   const stop = (): void => {
     if (stopping) return;
@@ -323,6 +326,9 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
     // process, so skipping it leaves work for the next host's startup sweep.
     const closing = host === null ? Promise.resolve() : host.close({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS });
     void closing
+      .then(async () => {
+        await releaseEndpoint?.();
+      })
       .catch((error: unknown) => {
         deps.logError(`[mlx] inference host did not close cleanly: ${describe(error)}`);
       })
@@ -360,6 +366,12 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
   let started: SidecarHost;
   try {
     started = await deps.createHost();
+    try {
+      releaseEndpoint = await deps.publishEndpoint?.(started.url, started.models);
+    } catch (error) {
+      await started.close({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS });
+      throw error;
+    }
   } catch (error) {
     deps.logError(`[mlx] inference host failed to start: ${describe(error)}`);
     deps.exit(isPermanentStartupFailure(error) ? EXIT_STARTUP_FAILED : 1);
@@ -374,6 +386,7 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
     await started.close({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS }).catch((error: unknown) => {
       deps.logError(`[mlx] inference host did not close cleanly: ${describe(error)}`);
     });
+    await releaseEndpoint?.();
     return;
   }
   host = started;

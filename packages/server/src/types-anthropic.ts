@@ -150,6 +150,9 @@ export interface AnthropicMessagesRequest {
     // default still applies.
     generation_mode?: string | null;
     mtp_depth?: number | null;
+    /** Local agent reasoning controls, independent of Anthropic model heuristics. */
+    reasoning_effort?: string;
+    thinking_budget?: number;
   };
 }
 

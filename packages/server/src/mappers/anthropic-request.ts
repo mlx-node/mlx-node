@@ -427,6 +427,21 @@ export function mapAnthropicRequest(
     reportPerformance: true,
   };
 
+  const effort = req.extra_body?.reasoning_effort;
+  if (effort !== undefined) {
+    if (!['none', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
+      throw new Error('Invalid extra_body.reasoning_effort');
+    }
+    config.reasoningEffort = effort as ChatConfig['reasoningEffort'];
+  }
+  const thinkingBudget = req.extra_body?.thinking_budget;
+  if (thinkingBudget !== undefined) {
+    if (!Number.isSafeInteger(thinkingBudget) || thinkingBudget < 0 || thinkingBudget > 2_147_483_647) {
+      throw new Error('Invalid extra_body.thinking_budget');
+    }
+    config.thinkingTokenBudget = thinkingBudget;
+  }
+
   if (req.cache_salt != null) {
     validateCacheSalt(req.cache_salt);
     config.cacheSalt = req.cache_salt;

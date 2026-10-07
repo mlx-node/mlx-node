@@ -7,6 +7,28 @@ import {
 import type { AnthropicContentBlock } from '../../packages/server/src/types-anthropic.js';
 
 describe('mapAnthropicRequest', () => {
+  it('preserves local agent reasoning controls, including a zero-token budget', () => {
+    const { config } = mapAnthropicRequest({
+      model: 'local',
+      messages: [],
+      max_tokens: 512,
+      extra_body: { reasoning_effort: 'low', thinking_budget: 0 },
+    });
+    expect(config.reasoningEffort).toBe('low');
+    expect(config.thinkingTokenBudget).toBe(0);
+  });
+
+  it.each([
+    { reasoning_effort: 'invalid' },
+    { thinking_budget: -1 },
+    { thinking_budget: 0.5 },
+    { thinking_budget: 2147483648 },
+  ])('rejects invalid agent reasoning controls %j', (extra_body) => {
+    expect(() => mapAnthropicRequest({ model: 'local', messages: [], max_tokens: 512, extra_body })).toThrow(
+      'Invalid extra_body',
+    );
+  });
+
   it('maps a simple string user message to a single user ChatMessage', () => {
     const { messages, config } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',

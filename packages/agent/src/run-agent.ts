@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 import { coldCacheDrain } from '@mlx-node/core';
 import { PagedConfigOverrideManager } from '@mlx-node/lm';
+import { readDesktopEndpoint } from '@mlx-node/server/host/desktop-endpoint';
 
 import { createDelegationExtension } from './extensions/delegation.js';
 import { createLocalImageInputExtension } from './extensions/local-image-input.js';
@@ -30,6 +31,7 @@ import { createPermissionGateExtension } from './extensions/permission-gate.js';
 import { createSubagentExtension } from './extensions/subagent.js';
 import { createTerminalTitleExtension } from './extensions/terminal-title.js';
 import { createTraceNoticeExtension } from './extensions/trace-notice.js';
+import { desktopStreamFactory } from './provider/desktop-client.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import { MlxModelHost } from './provider/model-host.js';
 import {
@@ -79,6 +81,8 @@ export interface RunAgentOptions {
   piImpl?: RunAgentPi;
   /** @internal Test seam for paged model-path resolution and cleanup. */
   pagedConfigOverrides?: AgentPagedConfigOverrides;
+  /** @internal Isolated discovery seam for tests. */
+  readDesktopEndpoint?: typeof readDesktopEndpoint;
 }
 
 /** @internal Exact opt-in parser kept separate so non-`1` values stay disabled. */
@@ -118,6 +122,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // paged overlay intentionally hides an embedded draft/ directory: the
   // current speculative executor is flat-cache-only and can regress quantized
   // agent workloads. Users may explicitly opt back into that native behavior.
+  const readEndpoint = opts.readDesktopEndpoint ?? readDesktopEndpoint;
+  const desktop = opts.models.length > 0 ? await readEndpoint() : undefined;
+  if (desktop) console.error('mlx agent: using the running mlx-node app inference engine (app cache/draft policy).');
   const preserveEmbeddedGemmaDraft = agentGemmaDraftEnabled();
   const pagedConfigOverrides =
     opts.pagedConfigOverrides ?? new PagedConfigOverrideManager({ preserveEmbeddedGemmaDraft });
@@ -152,17 +159,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         createMlxProviderExtension(
           opts.models,
           modelHost,
-          opts.mode === 'delegate'
+          desktop
             ? {
-                makeStreamSimple: sharedStreamFactory({
-                  persistPagedCache: opts.persistPagedCache ?? true,
-                  preserveEmbeddedGemmaDraft,
-                }),
-                // Process-global native counters in this client do not describe the worker.
+                makeStreamSimple: desktopStreamFactory(readEndpoint),
                 coldStats: () => undefined,
                 sidecarStats: () => undefined,
               }
-            : {},
+            : opts.mode === 'delegate'
+              ? {
+                  makeStreamSimple: sharedStreamFactory({
+                    persistPagedCache: opts.persistPagedCache ?? true,
+                    preserveEmbeddedGemmaDraft,
+                  }),
+                  // Process-global native counters in this client do not describe the worker.
+                  coldStats: () => undefined,
+                  sidecarStats: () => undefined,
+                }
+              : {},
         ),
         createLocalImageInputExtension(),
         opts.mode === 'delegate'

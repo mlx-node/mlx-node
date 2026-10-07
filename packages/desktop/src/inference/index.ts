@@ -21,6 +21,7 @@
 import { writeSync } from 'node:fs';
 
 import { createInferenceHost } from '@mlx-node/server/host';
+import { publishDesktopEndpoint } from '@mlx-node/server/host/desktop-endpoint';
 
 import { NoParentChannelError, resolveParentChannel, runSidecar, sidecarHostOptions } from './sidecar.js';
 
@@ -51,6 +52,14 @@ void runSidecar({
   channel,
   createHost: () => createInferenceHost(hostOptions),
   authToken: hostOptions.authToken,
+  publishEndpoint: (url, models) =>
+    publishDesktopEndpoint({
+      version: 1,
+      pid: process.pid,
+      url,
+      models: models.map(({ name, path }) => ({ name, path })),
+      token: hostOptions.authToken,
+    }),
   onStopSignal: (handler) => {
     // SIGTERM is what `utilityProcess.kill()` sends and the only stop signal
     // production ever produces. SIGINT is here for the hand-run reproduction

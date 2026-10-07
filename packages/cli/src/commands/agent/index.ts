@@ -649,8 +649,10 @@ Notes:
   The built-in subagent tool provides scout/planner/reviewer/worker. Each child
   is an isolated in-memory Pi session inside the parent process. Child sessions
   share one resident model/cache host; up to four tool loops may overlap while
-  model inference is serialized. Separate mlx agent processes do not share
-  model memory. mlx delegate calls share a background inference service instead.
+  model inference is serialized. When the mlx-node app engine is running,
+  agents reuse it; cache/draft settings are managed by the app. Connection errors
+  never start another engine. Otherwise, mlx agent uses in-process inference
+  and mlx delegate calls share a background inference service.
   --no-extensions (or -ne) disables subagents as well as
   discovered extensions.
   'mlx agent update' is disabled — update @mlx-node/cli via your package

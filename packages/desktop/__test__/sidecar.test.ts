@@ -320,6 +320,51 @@ describe('handleSidecarRequest', () => {
 });
 
 describe('shutdown', () => {
+  it('publishes discovery before readiness and releases it after host shutdown', async () => {
+    const host = await realHost();
+    const order: string[] = [];
+    const h = harness(async () => ({
+      ...host,
+      close: async () => {
+        order.push('close');
+        await host.close();
+      },
+    }));
+    h.deps.publishEndpoint = async (url) => {
+      expect(url).toBe(host.url);
+      expect(h.sent).toEqual([]);
+      order.push('publish');
+      return async () => {
+        order.push('release');
+      };
+    };
+    await runSidecar(h.deps);
+    expect(order).toEqual(['publish']);
+    h.signal();
+    await tick();
+    expect(order).toEqual(['publish', 'close', 'release']);
+    expect(h.exits).toEqual([0]);
+  });
+
+  it('closes the host if publishing discovery fails', async () => {
+    const host = await realHost();
+    let closed = false;
+    const h = harness(async () => ({
+      ...host,
+      close: async () => {
+        closed = true;
+        await host.close();
+      },
+    }));
+    h.deps.publishEndpoint = async () => {
+      throw new Error('publication failed');
+    };
+    await runSidecar(h.deps);
+    expect(closed).toBe(true);
+    expect(h.sent).toEqual([]);
+    expect(h.exits).toEqual([1]);
+  });
+
   it('closes the host and exits 0 on the stop signal', async () => {
     const host = await realHost();
     let closed = 0;
