@@ -158,7 +158,27 @@ eval, `kquant_tiled_bench` / `kquant_small_m_bench`):
 
 So the "cheaper dequant per byte" idea (Splash chunk order inside the 16 B
 units, ~700 LOC) can win at most ~15% of QMM time and is parked; the draft's
-matmul route is the next lever.
+matmul route was the next lever:
+
+| Commit      | Change                                                                                                                                                                                                                                                                  | Exact               |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `827c363e7` | MLX affine Q4/g64 as `a4g64@t64` (+ `a4g32`, `a8g64`, `a8g32`) on the tiled K-quant kernels; the draft is tiled at load (same bytes) and its head runs on 8 rows. M=8 445 vs 188 GB/s; propose 6.2 -> 4.8 ms; teacher-forced 928 vs 923 cycles, 2.32 draft matches both | no (draft rounding) |
+
+Head-to-head at `827c363e7` (ABBA, fresh processes, 1,024 tokens; Splash
+1.2.1 on the same GGUF and draft):
+
+|                           | short                                            | 6K                                                 | 32K                                        |
+| ------------------------- | ------------------------------------------------ | -------------------------------------------------- | ------------------------------------------ |
+| ms per cycle mlx / Splash | 52.2 / 48.5 = 1.077x (1 pair at 1519 / 1546 MHz) | 50.1 / 48.6 = 1.03x (normalized; ~1250 / 1300 MHz) | 60.0 / 55.7 = 1.078x (4 vs 4 at ~1430 MHz) |
+| raw decode tok/s          | 61.0 / 90.7                                      | 47.6 / 59.2                                        | 60.2 / 61.0                                |
+| accepted per cycle        | 3.18 / 4.43                                      | 2.94 / 3.04                                        | 3.61 / 3.42                                |
+| prefill tok/s             | 538 / 323                                        | 715 / 1066                                         | 730 / 875                                  |
+
+Session start was 1.20 / 1.27 / 1.49x. Under the slow GPU clock both engines
+now scale the same way (mlx 52 -> 88 ms at 896 MHz, Splash 48 -> 78 at 1012):
+the ALU/issue-bound behaviour from the morning is gone. The short-prompt
+tok/s gap is the transcript (Splash's text accepts 4.43 per cycle, ours
+3.18); on the same text the draft matches per cycle are within 0.1%.
 
 ## 3. Splash comparison (last run 2026-09-22, pre-#171 runtime, BF16 draft)
 
@@ -404,9 +424,11 @@ Deleted tools (restore from `69ccaf9d` if needed):
    chunks).
 9. Re-run the Splash comparison on the current runtime. Done in §2b for
    `0.0.16` + PR #183; repeat on a quiet machine before any parity claim.
-10. Affine Q4/g64 on the `@t64` kernel family (M=1 / M=8 / prefill), so the
-    DFlash2 draft and every MLX-affine checkpoint stop paying the per-row
-    `qmv` route at M=8 (§2c table). In progress.
+10. Affine on the `@t64` kernel family landed for the DFlash2 draft
+    (`827c363e7`). Turning it on for every MLX-affine checkpoint (the
+    `tile_kquant_layout` retag is the hook) is a product call: it changes
+    M=8 rounding (half stage) and needs the M=1 long-K `qmv_t64` gap (~7%
+    under MLX's qmv at K >= 13824) closed first.
 11. K-quant MoE experts on `@t64`: measure `gather_qmv` at 64 routes against
     a per-expert M=8 dispatch and a grouped tile-descriptor kernel (Splash
     `moe_expert_gguf`) on the Qwen3.6-35B-A3B shapes before writing kernels.
