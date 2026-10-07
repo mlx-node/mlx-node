@@ -87,7 +87,11 @@ const config: ChatConfig = {
 await model.chatSessionStart(cases[0].messages, { ...config, maxNewTokens: 16 });
 for (let run = 1; run <= Number(count); run++) {
   for (const name of names.split(',')) {
-    const item = cases.find((c) => c.name === name);
+    // `<case>:<k>` = the first k messages of a fixture conversation (more
+    // prompts for the teacher-forced acceptance runs; token counts unchecked).
+    const [base, cut] = name.split(':');
+    const found = cases.find((c) => c.name === base);
+    const item = found && cut ? { name, messages: found.messages.slice(0, Number(cut)) } : found;
     if (!item) throw new Error(`Unknown case ${name}`);
     await model.resetCaches();
     console.log(JSON.stringify({ event: 'benchmark-start', name, run }));
@@ -103,7 +107,7 @@ for (let run = 1; run <= Number(count); run++) {
       ...result,
       memory: core.memoryStats(),
     };
-    if (result.cachedTokens !== 0 || result.numTokens !== Number(tokenLimit))
+    if (result.cachedTokens !== 0 || (result.numTokens !== Number(tokenLimit) && !cut))
       throw new Error(`Invalid cold sample: ${JSON.stringify(result.performance)}`);
     if (item.promptTokens && result.promptTokens !== item.promptTokens)
       throw new Error('Fixture prompt token count drift');
