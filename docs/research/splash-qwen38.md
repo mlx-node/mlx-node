@@ -429,8 +429,16 @@ Deleted tools (restore from `69ccaf9d` if needed):
     `tile_kquant_layout` retag is the hook) is a product call: it changes
     M=8 rounding (half stage) and needs the M=1 long-K `qmv_t64` gap (~7%
     under MLX's qmv at K >= 13824) closed first.
-11. K-quant MoE experts on `@t64`: measure `gather_qmv` at 64 routes against
-    a per-expert M=8 dispatch and a grouped tile-descriptor kernel (Splash
-    `moe_expert_gguf`) on the Qwen3.6-35B-A3B shapes before writing kernels.
+11. K-quant MoE experts on `@t64`: measured, not worth it (`kquant_moe_bench`,
+    `MLX_KQUANT_MOE_BENCH=1`). At the verify width (8 tokens x top-8, ~54 of
+    256 experts, Qwen3.6-35B-A3B shapes) today's one-dispatch `gather_qmv`
+    runs at 424-432 GB/s = 88-90% of the floor and beats one dense M=8
+    tiled pass over the same rows (A/C 0.79-0.83); a per-expert tiled
+    dispatch is 2.2x slower (54 launches, split-K counters serialise them);
+    AR decode (8 experts) is launch-bound at ~20 us per node on every route.
+    A grouped tile-descriptor kernel could recover <= 12% of expert time
+    (~9% of a verify cycle) for 800-1500 LOC: parked. The real MoE gap is
+    prefill: the sorted `gather_qmm_rhs` route (B/E >= 4) runs at 113-132
+    GB/s, 3.3-3.7x slower than a dense M=8 tiled pass. Open, prefill only.
 12. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.
