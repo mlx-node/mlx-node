@@ -1574,14 +1574,83 @@ fn gpu_matches_cpu_on_every_gather_kernel() {
         });
 
         // gather_qmm_rhs, the sorted-MoE path: one row per token, a null left
-        // index, and 16 tokens over the 4 experts.
+        // index, and 16 tokens over the 4 experts. N = 128 takes the tensor op
+        // (gather_qmm_rhs_nax_nt, tf32 for float32: qmm_t_f32_tol); N = 136
+        // stays on the simdgroup kernel.
         let xr = activation(&[16, 1, K], 127, DType::Float32);
+        compare_devices(
+            &format!("gather_qmm_rhs_nax_nt {m}"),
+            qmm_t_f32_tol(),
+            || gather_of(kq, &xr, &we, None, &rhs16, true, true),
+        );
         compare_devices(&format!("gather_qmm_rhs_nt {m}"), F32_TOL, || {
-            gather_of(kq, &xr, &we, None, &rhs16, true, true)
+            gather_of(kq, &xr, &weu, None, &rhs16, true, true)
         });
         compare_devices(&format!("gather_qmm_rhs_nn {m}"), F32_TOL, || {
             gather_of(kq, &xr, &wen, None, &rhs16, false, true)
         });
+    }
+    select(Device::Cpu);
+}
+
+/// `kquant_gather_qmm_rhs_nax` (kquant_nax.h), the sorted-MoE expert matmul
+/// on the tensor op, against the CPU in float16 and bfloat16 (no tf32, so the
+/// `qmm_t` tile tolerance applies) on routings that reach every branch of the
+/// per-expert tile schedule: experts with no rows, an expert spanning two
+/// tiles, a partial last tile whose second simdgroup starts past M (the
+/// `load_safe` arm), and both instantiations (bm 32 below 64 rows per expert,
+/// bm 64 from there). On a host without the tensor op the same shapes run the
+/// simdgroup `gather_qmm_rhs_nt`; the family counter says which.
+#[test]
+fn gather_qmm_rhs_nax_matches_cpu() {
+    if !select(Device::Gpu) {
+        eprintln!("skipping gather_qmm_rhs_nax_matches_cpu: no GPU device");
+        return;
+    }
+    let family = |name: &str| {
+        let name = CString::new(name).expect("family");
+        // SAFETY: thread-local test hook reading a NUL-terminated name.
+        unsafe { mlx_sys::mlx_test_kquant_family_count(name.as_ptr()) }
+    };
+    // (experts, rows per expert): bm 32 and bm 64 schedules.
+    let routings: [(i64, &[u32]); 2] = [(6, &[0, 5, 40, 1, 0, 18]), (2, &[70, 60])];
+    for kq in &KQUANTS {
+        let m = kq.mode;
+        for (experts, rows) in &routings {
+            let we = filled_kquant_weights(kq, &[*experts, N], K);
+            let routes: Vec<u32> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(e, n)| std::iter::repeat_n(e as u32, *n as usize))
+                .collect();
+            let b = routes.len() as i64;
+            let rhs = indices(&routes);
+            for (dtype, name, tol) in [
+                (DType::Float16, "f16", F16_TILE_TOL),
+                (DType::BFloat16, "bf16", BF16_TILE_TOL),
+            ] {
+                let x = activation(&[b, 1, K], 151 + b as u32, dtype);
+                // SAFETY: thread-local test hook; enabling resets the counts.
+                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+                compare_devices(
+                    &format!("gather_qmm_rhs_nax_nt E={experts} B={b} {name} {m}"),
+                    tol,
+                    || gather_of(kq, &x, &we, None, &rhs, true, true),
+                );
+                let (nax, simd) = (family("gather_qmm_rhs_nax_nt"), family("gather_qmm_rhs_nt"));
+                // SAFETY: as above.
+                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                if nax_available() {
+                    assert!(
+                        nax == 1 && simd == 0,
+                        "{m} E={experts} B={b} {name}: expected the tensor-op gather \
+                         (nax {nax}, simdgroup {simd})"
+                    );
+                } else {
+                    assert!(nax == 0 && simd == 1, "{m}: expected the simdgroup gather");
+                }
+            }
+        }
     }
     select(Device::Cpu);
 }

@@ -51,8 +51,8 @@ MLX_MTL_CONST int8_t kIQ4NLValuesNAX[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
     1,    13,    25,  38,  53,  69,  89,  113};
 
-template <typename U, int N, int bits, bool nonlinear, typename W>
-inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
+template <typename U, int N, int bits, bool nonlinear, typename W, typename S>
+inline void dequantize(S w, U scale, U bias, W w_local) {
   // bits == 1 is the grid formats' one-word unit (kquant_grid.h); their
   // callers take the KQ_GRID arm and never reach the code paths below.
   static_assert(
@@ -145,9 +145,9 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
 // fp16 super-scale and an integer sub-scale, so it is worth more than T's
 // mantissa; decode in float and round once on the store. That also sidesteps
 // bfloat, which has no implicit conversion from float.
-template <typename T, int N, int bits, bool nonlinear>
+template <typename T, int N, int bits, bool nonlinear, typename S>
 inline void dequantize_to(
-    const device uint8_t* w,
+    S w,
     float scale,
     float bias,
     threadgroup T* w_local) {
@@ -513,6 +513,64 @@ struct QuantizedBlockLoader {
       for (int j = 0; j < n_reads_per_scale; j++) {
         dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
             src + k * bytes_per_pack, scale, bias, dst + k * pack_factor);
+        k++;
+      }
+    }
+  }
+
+  // load_unsafe() in two halves, so a kernel can issue the next tile's device
+  // reads (fetch) before the current tile's matmul and decode them (commit)
+  // after: the thread's codes (whole words when its run is a whole number of
+  // them; it starts 4-byte aligned in every row-major mode) and its groups'
+  // (scale, bias). Grid formats decode on commit; the row-major, aligned tile
+  // only.
+  MLX_MTL_CONST short raw_bytes = n_reads * bytes_per_pack;
+  MLX_MTL_CONST bool raw_aligned = raw_bytes % 4 == 0;
+  uint32_t raw[kq_is_grid<kind>() ? 1 : (raw_bytes + 3) / 4];
+  float raw_scale[n_steps_per_read];
+  float raw_bias[n_steps_per_read];
+
+  void fetch() {
+    if constexpr (kq_is_grid<kind>()) {
+      return;
+    }
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if constexpr (raw_aligned) {
+      auto words = reinterpret_cast<const device uint32_t*>(src);
+      for (int i = 0; i < raw_bytes / 4; i++) {
+        raw[i] = words[i];
+      }
+    } else {
+      thread uint8_t* bytes = reinterpret_cast<thread uint8_t*>(raw);
+      for (int i = 0; i < raw_bytes; i++) {
+        bytes[i] = src[i];
+      }
+    }
+    for (int i = 0; i < n_steps_per_read; i++) {
+      scales.at(i, raw_scale[i], raw_bias[i]);
+    }
+  }
+
+  void commit() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if constexpr (kq_is_grid<kind>()) {
+      load_grid();
+      return;
+    }
+    const thread uint8_t* bytes =
+        reinterpret_cast<const thread uint8_t*>(raw);
+    int k = 0;
+    for (int i = 0; i < n_steps_per_read; i++) {
+      for (int j = 0; j < n_reads_per_scale; j++) {
+        dequantize_to<T, pack_factor, bits, kq_codebook<kind>()>(
+            bytes + k * bytes_per_pack,
+            raw_scale[i],
+            raw_bias[i],
+            dst + k * pack_factor);
         k++;
       }
     }
@@ -928,4 +986,147 @@ template <
       simd_lid,
       scales,
       biases);
+}
+
+// The sorted-rhs MoE expert matmul (x @ w[e].T, one expert per row run) on
+// the tensor op: quantized_nax.h's affine_gather_qmm_rhs_nax with the KQScales
+// decode. `offsets[e]` is the first row of expert e (gather_mm_offsets);
+// schedule_row_tile gives tile tid.y the rows of one expert only, so an
+// expert's slab is dequantized once per BM rows and never straddles a tile.
+// N % BN == 0 and K % BK == 0 (the dispatcher's gate).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    int kind,
+    int scale_shift,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN>
+[[kernel]] void kquant_gather_qmm_rhs_nax(
+    const device T* x [[buffer(0)]],
+    const device uint32_t* w [[buffer(1)]],
+    const device uint8_t* scales [[buffer(2)]],
+    const device float16_t* biases [[buffer(3)]],
+    const device int32_t* offsets [[buffer(4)]],
+    device T* y [[buffer(5)]],
+    const constant int& M [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& K [[buffer(8)]],
+    const constant int& num_groups [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  static_assert((BM / WM) % 16 == 0 && (BN / WN) % 16 == 0, "16-row tiles");
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits,
+      super_ratio,
+      has_min,
+      kind,
+      scale_shift>;
+
+  threadgroup T Ws[BN * BK_padded];
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const size_t stride_w = size_t(N) * K_w;
+  const size_t stride_s = size_t(N) * K_g;
+  int y_row;
+  int group;
+  short tgp_bm;
+  if (!schedule_row_tile<BM>(
+          offsets, num_groups, M, tid.y, simd_lane_id, y_row, group, tgp_bm)) {
+    return;
+  }
+  const int y_col = tid.x * BN;
+
+  x += size_t(y_row) * K;
+  y += size_t(y_row) * N + y_col;
+  auto wl = (const device uint8_t*)w + group * stride_w + size_t(y_col) * K_w;
+  KQScales<float, bits, super_ratio, has_min, kind, scale_shift> sb(
+      scales, biases, group * stride_s + size_t(y_col) * K_g);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+  const short sgp_sm = short(clamp(int(tgp_bm) - tm, 0, int(SM)));
+  const bool rows_in_bounds = y_row + tm + SM <= M;
+  const bool sg_active = sgp_sm > 0;
+
+  NAXTile<float, TM, TN> Dtile;
+  Dtile.clear();
+
+  const device T* xn = x + tm * K;
+  loader_w_t loader_w(wl, sb, K, Ws, simd_group_id, simd_lane_id);
+
+  loader_w.fetch();
+  dispatch_bool(rows_in_bounds, [&](auto kAlignedM) {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_w.commit();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_w.next();
+      if (k + BK < K) {
+        loader_w.fetch();
+      }
+
+      STEEL_PRAGMA_NO_UNROLL
+      for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+        if (sg_active) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (kAlignedM.value) {
+            Atile.load(xn + kk1, K);
+          } else {
+            Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+          }
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<false>{},
+              Btile,
+              metal::bool_constant<true>{});
+
+          (void)compiler_barrier;
+        }
+      }
+
+      xn += BK;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgp_sm == SM) {
+      Dtile.store(y + tm * N + tn, N);
+    } else if (sg_active) {
+      Dtile.store_slice(y + tm * N + tn, N, short2(0, 0), short2(SN, sgp_sm));
+    }
+  });
 }

@@ -55,12 +55,33 @@
       wn, \
       true)
 
+// The sorted-rhs MoE expert kernel: row-major, transposed, N % 64 == 0; bm 32
+// for few rows per expert, 64 otherwise (mlx_kquant_metal.cpp).
+#define instantiate_kquant_gather_rhs_nax(mode, type, group_size, bits, super_ratio, has_min, kind, shift, bm, bn, bk, wm, wn) \
+  instantiate_kernel( \
+      #mode "_gather_qmm_rhs_nax_nt_" #type "_gs_" #group_size "_b_" #bits "_bm_" #bm "_bn_" #bn "_bk_" #bk "_wm_" #wm "_wn_" #wn, \
+      kquant_gather_qmm_rhs_nax, \
+      type, \
+      group_size, \
+      bits, \
+      super_ratio, \
+      has_min, \
+      kind, \
+      shift, \
+      bm, \
+      bn, \
+      bk, \
+      wm, \
+      wn)
+
 #define instantiate_kquant_nax_all(mode, type, group_size, bits, super_ratio, has_min, kind, shift) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, true, 1, group_size, bits, super_ratio, has_min, kind, shift, 64, 64, 64, 2, 2) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, true, 0, group_size, bits, super_ratio, has_min, kind, shift, 64, 64, 64, 2, 2) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, false, 1, group_size, bits, super_ratio, has_min, kind, shift, 64, 64, 64, 2, 2) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, false, 0, group_size, bits, super_ratio, has_min, kind, shift, 64, 64, 64, 2, 2) \
-  instantiate_kquant_nax_tiled(mode, qmm_t_nax, type, group_size, bits, super_ratio, has_min, kind, shift, 64, 64, 64, 2, 2)
+  instantiate_kquant_nax_tiled(mode, qmm_t_nax, type, group_size, bits, super_ratio, has_min, kind, shift, 64, 64, 64, 2, 2) \
+  instantiate_kquant_gather_rhs_nax(mode, type, group_size, bits, super_ratio, has_min, kind, shift, 32, 64, 64, 2, 2) \
+  instantiate_kquant_gather_rhs_nax(mode, type, group_size, bits, super_ratio, has_min, kind, shift, 64, 64, 64, 2, 2)
 
 #define instantiate_kquant_nax_types(type) \
   instantiate_kquant_nax_all(q6k, type, 16, 6, 16, false, KQ_LINEAR, 0) \
@@ -78,10 +99,7 @@
   instantiate_kquant_nax_all(iq1s, type, 32, 1, 8, false, KQ_GRID_IQ1S, -3) \
   instantiate_kquant_nax_all(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3) \
   instantiate_kquant_nax_all(iq3s, type, 32, 3, 8, false, KQ_GRID_IQ3S, 0) \
-  instantiate_kquant_nax_tiled(a4g64, qmm_t_nax, type, 64, 4, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2) \
-  instantiate_kquant_nax_tiled(a4g32, qmm_t_nax, type, 32, 4, 8, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2) \
-  instantiate_kquant_nax_tiled(a8g64, qmm_t_nax, type, 64, 8, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2) \
-  instantiate_kquant_nax_tiled(a8g32, qmm_t_nax, type, 32, 8, 8, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2)
+  instantiate_kquant_nax_tiled(a4g64, qmm_t_nax, type, 64, 4, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2)
 
 #if KQUANT_DTYPE == 0
 instantiate_kquant_nax_types(float)

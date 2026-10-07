@@ -14,6 +14,7 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/matmul.h"
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/utils.h"
@@ -66,8 +67,7 @@ constexpr Mode kModes[] = {Mode::Q6K,    Mode::Q4K,   Mode::Q5K,  Mode::Q3K,
                            Mode::IQ1S,   Mode::IQ1M,  Mode::IQ3S8};
 // The MLX affine modes: the Tiled64 kernels and dequantize only; a
 // row-major affine matmul stays on MLX's own route (eval_gpu refuses it).
-constexpr Mode kAffineModes[] = {Mode::A4G64, Mode::A4G32, Mode::A8G64,
-                                 Mode::A8G32};
+constexpr Mode kAffineModes[] = {Mode::A4G64};
 constexpr Dtype kTypes[] = {float32, float16, bfloat16};
 
 // qmv_wide tiles 2..8 input vectors (multi-row matvecs only) at 8 k-lanes.
@@ -82,6 +82,9 @@ struct Tile {
 };
 constexpr Tile kNaxTile{64, 64, 64, 2, 2};
 constexpr Tile kRhsTile{16, 32, 32, 1, 2};
+// gather_qmm_rhs_nax: bm 32 below kRhsNaxWideRows rows per expert, else 64.
+constexpr Tile kRhsNaxTiles[] = {{32, 64, 64, 2, 2}, {64, 64, 64, 2, 2}};
+constexpr int kRhsNaxWideRows = 64;
 
 // qmv_sg8 is bfloat16 only, for the modes kq_sg8::format decodes.
 constexpr Dtype kSg8Type = bfloat16;
@@ -195,6 +198,12 @@ std::string gather_qmm_rhs(Mode m, Dtype t, bool transpose) {
               kRhsTile.bk, "_wm_", kRhsTile.wm, "_wn_", kRhsTile.wn);
   return name;
 }
+std::string gather_qmm_rhs_nax(Mode m, Dtype t, const Tile &tile) {
+  std::string name = base(m, "gather_qmm_rhs_nax_nt", t);
+  concatenate(name, "_bm_", tile.bm, "_bn_", tile.bn, "_bk_", tile.bk, "_wm_",
+              tile.wm, "_wn_", tile.wn);
+  return name;
+}
 std::string dequantize(Mode m, Dtype t) { return base(m, "dequantize", t); }
 
 } // namespace kernels
@@ -233,6 +242,9 @@ std::vector<KernelName> metal_kernel_names() {
       add(gather_qvm(m, t));
       add(gather_qmm_rhs(m, t, true));
       add(gather_qmm_rhs(m, t, false));
+      for (const Tile &tile : kRhsNaxTiles) {
+        add(gather_qmm_rhs_nax(m, t, tile), true);
+      }
     }
   }
   // Dequantize and the Tiled64 family (transposed, aligned, unbatched
@@ -1070,6 +1082,40 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, s);
   array scales = ensure_row_contiguous(scales_, s);
+  array biases = ensure_row_contiguous(biases_, s);
+  auto &enc = metal::get_command_encoder(s);
+
+  // Tensor-op route: per-expert row tiles over `offsets`, so the small
+  // simdgroup tiles below (which straddle experts and re-dequantize) are only
+  // the fallback. Aligned tiles only; float32 only under tf32 as qmm does.
+  if (!bridge_testing::force_gather_rhs_fallback &&
+      metal::is_nax_available() && transpose && N % 64 == 0 &&
+      K % 64 == 0 && (env::enable_tf32() || x.dtype() != float32)) {
+    const int E = w.size() / w.shape(-1) / w.shape(-2);
+    const auto &tile =
+        kernels::kRhsNaxTiles[M / E < kernels::kRhsNaxWideRows ? 0 : 1];
+    array offsets = gather_mm_offsets(indices, E, M, d, s);
+    auto kernel = get_kernel(d, "gather_qmm_rhs_nax_nt",
+                             kernels::gather_qmm_rhs_nax(mode, x.dtype(), tile),
+                             M, N, K);
+    enc.set_compute_pipeline_state(kernel);
+    int c = 0;
+    enc.set_input_array(x, c++);
+    enc.set_input_array(w, c++);
+    enc.set_input_array(scales, c++);
+    enc.set_input_array(biases, c++);
+    enc.set_input_array(offsets, c++);
+    enc.set_output_array(out, c++);
+    enc.set_bytes(M, c++);
+    enc.set_bytes(N, c++);
+    enc.set_bytes(K, c++);
+    enc.set_bytes(E, c++);
+    enc.dispatch_threadgroups(
+        MTL::Size(N / tile.bn, std::min(M, (M + tile.bm - 1) / tile.bm + E - 1),
+                  1),
+        MTL::Size(32, tile.wn, tile.wm));
+    return;
+  }
 
   constexpr auto tile = kernels::kRhsTile;
   const bool align_M = (M % tile.bm) == 0;
@@ -1086,7 +1132,6 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
   concatenate(hash_name, kname, "_align_M_", align_M ? 't' : 'n', "_align_N_",
               align_N ? 't' : 'n', "_align_K_", align_K ? 't' : 'n');
 
-  auto &enc = metal::get_command_encoder(s);
   bridge_testing::record(transpose ? "gather_qmm_rhs_nt" : "gather_qmm_rhs_nn");
   auto kernel = load_kernel(d, kname, hash_name, func_consts);
   enc.set_compute_pipeline_state(kernel);
@@ -1099,7 +1144,6 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
   enc.set_input_array(x, c++);
   enc.set_input_array(w, c++);
   enc.set_input_array(scales, c++);
-  array biases = ensure_row_contiguous(biases_, s);
   enc.set_input_array(biases, c++);
   enc.set_input_array(indices, c++);
   enc.set_output_array(out, c++);

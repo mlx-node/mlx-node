@@ -7,7 +7,10 @@
 //! * A, today: row-major `mlx_gather_qmm` exactly as
 //!   `QuantizedSwitchLinear::forward` calls it (`[B,1,K]` x, `[B]` rhs
 //!   indices, `sorted` once `B >= 64` as `SwitchGLU` does): one dispatch
-//!   (`gather_qmv` / `gather_qmm_rhs`).
+//!   (`gather_qmv` / `gather_qmm_rhs_nax` / `gather_qmm_rhs`).
+//! * A0, route A pinned to the simdgroup fallback (test FFI): the simdgroup
+//!   `gather_qmm_rhs` (bm 16, bn 32) the sorted route took before the
+//!   tensor-op kernel; the same as A wherever `gather_qmv` is chosen.
 //! * B, per-expert tiled: every expert's `[N,K]` slab in the `@t64` layout;
 //!   one `mlx_quantized_matmul` per distinct expert over its gathered rows
 //!   padded to 8 (`qmm_m8_nax_t64`), or `qmv_t64` when it has one row.
@@ -18,12 +21,12 @@
 //!
 //! Workloads: AR decode (8 routes, 8 experts, 1 row each), DFlash/MTP verify
 //! (64 routes, ~45-55 distinct experts of 256; all 32 x 2 rows for LFM2),
-//! prefill chunk (512 routes, reference only). Samples interleave the routes
+//! prefill chunk (`PREFILL_TOKENS` x 8 routes). Samples interleave the routes
 //! in one process; statistic = median over `REPS` samples of a `BATCH`-layer
 //! eval. Each layer of a batch reads the next copy of a >= `RING_BYTES` ring
 //! of expert stacks with its own routing, so the weights come from DRAM.
-//! Route A and route B are also compared numerically on one routing. Run
-//! only on an idle GPU:
+//! Routes A0 and B are also compared numerically with route A on one
+//! routing. Run only on an idle GPU:
 //!
 //! ```text
 //! MLX_KQUANT_MOE_BENCH=1 cargo test -p mlx-core --release \
@@ -31,7 +34,7 @@
 //! ```
 //!
 //! `MLX_KQUANT_MOE_BENCH_MODES=q4k`, `_SHAPES=qwen|lfm2`, `_REPS=11`,
-//! `_WORKLOADS=decode,verify,prefill` narrow the run.
+//! `_WORKLOADS=decode,verify,prefill`, `_PREFILL_TOKENS=128` narrow the run.
 
 mod kquant_support;
 
@@ -46,11 +49,17 @@ use mlx_core::models::quant_dispatch::{KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kq
 const WARMUP: usize = 3;
 /// `MLX_KQUANT_MOE_BENCH_REPS` overrides (odd, >= 3).
 const REPS: usize = 11;
+/// Tokens of the prefill workload; `MLX_KQUANT_MOE_BENCH_PREFILL_TOKENS`
+/// overrides (128+ puts the 256-expert stack on the sorted rhs route).
+const PREFILL_TOKENS: usize = 64;
 /// Layers (one projection each) per eval.
 const BATCH: usize = 8;
 const RING_BYTES: usize = 384 << 20;
 /// Rows per route-B / Splash-style expert tile.
 const TILE_ROWS: usize = 8;
+/// Routes A, A0, B, C.
+const ARMS: usize = 4;
+const ARM_NAMES: [&str; ARMS] = ["A", "A0", "B", "C"];
 const FLOOR_GBPS: f64 = 480.0;
 const MODES: [&str; 2] = ["q4k", "q5k"];
 
@@ -87,11 +96,11 @@ enum Workload {
 }
 
 impl Workload {
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Decode => "decode 1x8",
-            Self::Verify => "verify 8x8",
-            Self::Prefill => "prefill 64x8",
+            Self::Decode => "decode 1x8".to_string(),
+            Self::Verify => "verify 8x8".to_string(),
+            Self::Prefill => format!("prefill {}x8", self.tokens()),
         }
     }
     fn key(self) -> &'static str {
@@ -105,7 +114,7 @@ impl Workload {
         match self {
             Self::Decode => 1,
             Self::Verify => 8,
-            Self::Prefill => 64,
+            Self::Prefill => env_usize("MLX_KQUANT_MOE_BENCH_PREFILL_TOKENS", PREFILL_TOKENS),
         }
     }
     /// Routings per workload: enough that (routing, ring copy) pairs recur
@@ -487,11 +496,25 @@ fn env_list(var: &str) -> Option<Vec<String>> {
         .map(|v| v.split(',').map(str::to_string).collect())
 }
 
-fn reps() -> usize {
-    std::env::var("MLX_KQUANT_MOE_BENCH_REPS")
+fn env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(REPS)
+        .unwrap_or(default)
+}
+
+fn reps() -> usize {
+    env_usize("MLX_KQUANT_MOE_BENCH_REPS", REPS)
+}
+
+/// Runs `f` with the simdgroup `gather_qmm_rhs` pinned (route A0); the pin
+/// is per calling thread, which is the thread the eval `f` waits on encodes on.
+fn with_rhs_nax_off<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: plain FFI setters on a thread-local flag.
+    unsafe { mlx_sys::mlx_test_kquant_gather_rhs_fallback(true) };
+    let r = f();
+    unsafe { mlx_sys::mlx_test_kquant_gather_rhs_fallback(false) };
+    r
 }
 
 /// One projection of one workload: the three routes and their inputs.
@@ -554,41 +577,38 @@ impl Case<'_> {
     fn batch(&self, arm: usize) -> f64 {
         match arm {
             0 => self.batch_a(),
-            1 => self.batch_b(),
+            1 => with_rhs_nax_off(|| self.batch_a()),
+            2 => self.batch_b(),
             _ => self.batch_c(),
         }
     }
 
-    /// Interleaved medians of A, B, C.
-    fn measure(&self) -> [f64; 3] {
+    /// Interleaved medians of A, A0, B, C.
+    fn measure(&self) -> [f64; ARMS] {
         for _ in 0..WARMUP {
-            for arm in 0..3 {
+            for arm in 0..ARMS {
                 let _ = self.batch(arm);
             }
         }
-        let mut samples: [Vec<f64>; 3] = Default::default();
+        let mut samples: [Vec<f64>; ARMS] = Default::default();
         for i in 0..reps() {
-            let order: Vec<usize> = if i % 2 == 0 {
-                vec![0, 1, 2]
-            } else {
-                vec![2, 1, 0]
-            };
+            let mut order: Vec<usize> = (0..ARMS).collect();
+            if i % 2 == 1 {
+                order.reverse();
+            }
             for arm in order {
                 samples[arm].push(self.batch(arm));
             }
         }
-        [
-            median(&mut samples[0]),
-            median(&mut samples[1]),
-            median(&mut samples[2]),
-        ]
+        std::array::from_fn(|arm| median(&mut samples[arm]))
     }
 
     /// Kernel families and dispatches per layer of each route.
-    fn families(&self) -> [String; 3] {
-        const NAMES: [&str; 10] = [
+    fn families(&self) -> [String; ARMS] {
+        const NAMES: [&str; 11] = [
             "gather_qmv_fast",
             "gather_qmv",
+            "gather_qmm_rhs_nax_nt",
             "gather_qmm_rhs_nt",
             "gather_qmm_t",
             "qmm_m8_nax_t64",
@@ -617,8 +637,9 @@ impl Case<'_> {
         })
     }
 
-    /// Route A against route B on routing 0, copy 0: max |A - B| / max |A|.
-    fn check(&self) -> f64 {
+    /// Route A against routes A0 and B on routing 0, copy 0: max |A - X| /
+    /// max |A| for each.
+    fn check(&self) -> [f64; 2] {
         let r = &self.routings[0];
         let inp = &self.inputs[0];
         let st = &self.stacks.copies[0];
@@ -630,6 +651,17 @@ impl Case<'_> {
         let to_f32 = |b: u32| f32::from_bits(b << 16);
         let a: Vec<f32> = a_bits.into_iter().map(to_f32).collect();
         let peak = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let (_, _, a0_bits) = with_rhs_nax_off(|| {
+            read_output(
+                "route A0",
+                gather_a(inp, st, self.kq, &self.mode_row, r.sorted),
+            )
+        });
+        let worst_a0 = a0_bits
+            .into_iter()
+            .map(to_f32)
+            .zip(&a)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
         let mut worst = 0f32;
         let mut row_of_chunk = 0usize;
         let mut last_expert = u32::MAX;
@@ -653,7 +685,7 @@ impl Case<'_> {
             }
             row_of_chunk += rows;
         }
-        f64::from(worst / peak)
+        [f64::from(worst_a0 / peak), f64::from(worst / peak)]
     }
 }
 
@@ -683,6 +715,24 @@ fn launch_floor_ms(kq: &KQuant) -> f64 {
     }
     let mut s: Vec<f64> = (0..reps()).map(|_| batch()).collect();
     median(&mut s)
+}
+
+/// One table row: ms per route, GB/s of the touched expert bytes per route,
+/// and the A0/A, A/B, A/C ratios.
+fn print_row(name: &str, ms: &[f64], floor: f64, bytes: f64) {
+    let gbps: Vec<String> = ms
+        .iter()
+        .map(|m| format!("{:>6.0}", bytes / m / 1e6))
+        .collect();
+    let times: Vec<String> = ms.iter().map(|m| format!("{m:>8.4}")).collect();
+    println!(
+        "  {name:<5} | {} {floor:>8.4} | {} | {:>5.2} {:>5.2} {:>5.2}",
+        times.join(" "),
+        gbps.join(" "),
+        ms[1] / ms[0],
+        ms[0] / ms[2],
+        ms[0] / ms[3]
+    );
 }
 
 fn selected<'a>(var: &str, all: &[&'a str]) -> Vec<&'a str> {
@@ -792,22 +842,24 @@ fn kquant_moe_expert_routes() {
                     routings[0].sorted
                 );
                 println!(
-                    "  {:<5} | {:>8} {:>8} {:>8} {:>8} | {:>6} {:>6} {:>6} | {:>5} {:>5} {:>5}",
+                    "  {:<5} | {:>8} {:>8} {:>8} {:>8} {:>8} | {:>6} {:>6} {:>6} {:>6} | {:>5} {:>5} {:>5}",
                     "proj",
                     "A ms",
+                    "A0 ms",
                     "B ms",
                     "C ms",
                     "floor",
-                    "A GB/s",
-                    "B GB/s",
+                    "A",
+                    "A0",
+                    "B",
                     "C GB/s",
+                    "A0/A",
                     "A/B",
-                    "A/C",
-                    "B/C"
+                    "A/C"
                 );
-                let mut sum = [0f64; 4];
-                let mut fams: Vec<(String, [String; 3])> = Vec::new();
-                let mut checks: Vec<(String, f64)> = Vec::new();
+                let mut sum = [0f64; ARMS + 1];
+                let mut fams: Vec<(String, [String; ARMS])> = Vec::new();
+                let mut checks: Vec<(String, [f64; 2])> = Vec::new();
                 for (pi, p) in projs.iter().enumerate() {
                     let inputs: Vec<Inputs> = routings
                         .iter()
@@ -833,57 +885,43 @@ fn kquant_moe_expert_routes() {
                     let rel = case.check();
                     checks.push((p.name.to_string(), rel));
                     assert!(
-                        rel < 2e-2,
-                        "{} {}: route A and route B disagree (max rel diff {rel:.3e})",
+                        rel.iter().all(|r| *r < 2e-2),
+                        "{} {}: the routes disagree (max rel diff A0 {:.3e}, B {:.3e})",
                         shape.name,
-                        p.name
+                        p.name,
+                        rel[0],
+                        rel[1]
                     );
                     fams.push((p.name.to_string(), case.families()));
-                    let [a, b, c] = case.measure();
+                    let ms = case.measure();
                     let bytes = case.d_mean * case.stacks.slab_bytes as f64;
                     let floor = bytes / FLOOR_GBPS / 1e6;
-                    sum[0] += a;
-                    sum[1] += b;
-                    sum[2] += c;
-                    sum[3] += floor;
-                    println!(
-                        "  {:<5} | {a:>8.4} {b:>8.4} {c:>8.4} {floor:>8.4} | {:>6.0} {:>6.0} {:>6.0} | {:>5.2} {:>5.2} {:>5.2}",
-                        p.name,
-                        bytes / a / 1e6,
-                        bytes / b / 1e6,
-                        bytes / c / 1e6,
-                        a / b,
-                        a / c,
-                        b / c
-                    );
+                    for (s, m) in sum.iter_mut().zip(ms.iter().chain([floor].iter())) {
+                        *s += m;
+                    }
+                    print_row(p.name, &ms, floor, bytes);
                 }
                 let bytes: f64 = rings.iter().map(|r| d_mean * r.slab_bytes as f64).sum();
-                println!(
-                    "  {:<5} | {:>8.4} {:>8.4} {:>8.4} {:>8.4} | {:>6.0} {:>6.0} {:>6.0} | {:>5.2} {:>5.2} {:>5.2}",
-                    "sum",
-                    sum[0],
-                    sum[1],
-                    sum[2],
-                    sum[3],
-                    bytes / sum[0] / 1e6,
-                    bytes / sum[1] / 1e6,
-                    bytes / sum[2] / 1e6,
-                    sum[0] / sum[1],
-                    sum[0] / sum[2],
-                    sum[1] / sum[2]
-                );
-                for (name, [a, b, c]) in &fams {
-                    println!("  dispatches/layer {name:<5}: A {a} | B {b} | C {c}");
-                }
-                let worst = checks.iter().map(|(_, r)| *r).fold(0f64, f64::max);
-                println!(
-                    "  A vs B max rel diff (routing 0): {} -> worst {worst:.2e}",
-                    checks
+                print_row("sum", &sum[..ARMS], sum[ARMS], bytes);
+                for (name, f) in &fams {
+                    let parts: Vec<String> = ARM_NAMES
                         .iter()
-                        .map(|(n, r)| format!("{n} {r:.2e}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+                        .zip(f)
+                        .map(|(arm, fam)| format!("{arm} {fam}"))
+                        .collect();
+                    println!("  dispatches/layer {name:<5}: {}", parts.join(" | "));
+                }
+                for (i, other) in ["A0", "B"].iter().enumerate() {
+                    let worst = checks.iter().map(|(_, r)| r[i]).fold(0f64, f64::max);
+                    println!(
+                        "  A vs {other} max rel diff (routing 0): {} -> worst {worst:.2e}",
+                        checks
+                            .iter()
+                            .map(|(n, r)| format!("{n} {:.2e}", r[i]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
         }
     }

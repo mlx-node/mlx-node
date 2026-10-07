@@ -2020,6 +2020,7 @@ unsafe extern "C-unwind" {
     /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
     /// disabling resets this thread's counts.
     pub fn mlx_test_kquant_counting(enable: bool);
+    pub fn mlx_test_kquant_gather_rhs_fallback(force: bool);
     /// TEST-ONLY: this thread's dispatch count for a kernel family
     /// (e.g. `qmv_fast`, `qmv_wide_nv8`, `qmm_t_nax`, `gather_qmm_rhs_nt`).
     pub fn mlx_test_kquant_family_count(family: *const std::os::raw::c_char) -> u64;

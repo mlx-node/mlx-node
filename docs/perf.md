@@ -92,7 +92,11 @@ one `"layout": "t64"` in its `quantization` entry (the mode string stays bare, s
 [convert-quantize.md](convert-quantize.md#tiled-layout)), so such a checkpoint loads
 with no permute; a row-major (legacy or secondary-output) K-quant tensor is still
 permuted at load on a Metal host. 3-D expert weights, embeddings,
-router gates and odd widths stay row-major on the row-major kernels;
+router gates and odd widths stay row-major on the row-major kernels (the
+sorted MoE expert matmul at prefill widths, `B / E >= 4`, takes a tensor-op
+`gather_qmm_rhs_nax` kernel with one expert per 32/64-row tile on gen-17+
+GPUs and aligned `N % 64`, `K % 64`; the simdgroup `gather_qmm_rhs` stays for
+the rest, and `gather_qmv` serves decode and the 8-row verify);
 an M=8 K-quant matmul (the DFlash2 verify block) takes the tensor-op kernel for
 every tiled weight and, row-major, for Q3_K and IQ4_NL only, with the K split count
 derived from the IORegistry GPU core count; and a DFlash2 verify attention block
@@ -102,11 +106,12 @@ vector vs block at 256..4096 keys, block must win by 5%; ~35 ms), below which th
 bit-exact vector kernels serve it. The one-time `[kquant route]` and `[sdpa route]`
 log lines appear under `MLX_METAL_COMMAND_TRACE`.
 
-The tiled kernels also carry MLX's affine quantization as a mode family
-(`a4g64`, `a4g32`, `a8g64`, `a8g32`: the same LSB-first codes, one bfloat16
-scale and bias per group, `mlx_kquant.h` `Mode::A4G64` ..), in the `@t64`
-layout only; a row-major affine weight stays on MLX's own route. Today only the
-DFlash2 draft takes it: `draft_linear` quantizes to affine Q4/g64 as before and
+The tiled kernels also carry MLX's affine quantization as a mode (`a4g64`: the
+same LSB-first codes, one bfloat16 scale and bias per group, `mlx_kquant.h`
+`Mode::A4G64`; the kernels are parametric, so other (bits, group) combinations
+are instantiation lines away), in the `@t64` layout only; a row-major affine
+weight stays on MLX's own route. Today only the DFlash2 draft takes it:
+`draft_linear` quantizes to affine Q4/g64 as before and
 `QuantizedLinear::tile_kquant_layout` retags the projection `a4g64@t64`, so a
 decode block's 8 rows take `qmm_m8_nax_t64` instead of MLX's per-row `qmv`
 (same codes and companions, different kernel). Tiling other affine models is the

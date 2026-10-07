@@ -78,6 +78,12 @@ void mlx_test_kquant_counting(bool enable) {
   mlx::core::bridge_testing::counting = enable;
 }
 
+// Test-only: pin the sorted MoE expert matmul to the simdgroup fallback
+// (`gather_qmm_rhs_nt`) for route parity; calling thread only.
+void mlx_test_kquant_gather_rhs_fallback(bool force) {
+  mlx::core::bridge_testing::force_gather_rhs_fallback = force;
+}
+
 uint64_t mlx_test_kquant_family_count(const char *family) {
   auto &counts = mlx::core::bridge_testing::family_counts;
   auto it = counts.find(std::string_view(family ? family : ""));
