@@ -40,7 +40,7 @@
     "prettier": "^3.9.6",
     "typescript": "^7.0.2",
     "vite-plus": "0.3.3",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   },
   "resolutions": {
     "vite": "npm:@voidzero-dev/vite-plus-core@0.3.3"
