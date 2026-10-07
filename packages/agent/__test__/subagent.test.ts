@@ -2,9 +2,15 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Api, AssistantMessage, Message, Model } from '@earendil-works/pi-ai';
+import type { AssistantMessage, Message } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolDefinition } from '@earendil-works/pi-coding-agent';
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionToolContext,
+  InlineExtension,
+  ToolDefinition,
+} from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import {
@@ -118,15 +124,17 @@ function captureTool(extension: InlineExtension): ToolDefinition {
   return captured;
 }
 
-function context(extra: Partial<ExtensionContext> = {}): ExtensionContext {
+function context(extra: Partial<ExtensionContext> = {}): ExtensionToolContext {
   return {
     cwd: '/repo',
     hasUI: true,
     model: PARENT_MODEL,
     modelRegistry: MODEL_REGISTRY,
     ui: { confirm: async () => true },
+    tools: [],
+    executeTool: async () => ({ toolCall: {}, result: {}, isError: false }),
     ...extra,
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
 }
 
 const savedAgentDir = process.env['PI_CODING_AGENT_DIR'];
@@ -318,7 +326,7 @@ describe('mlx subagent extension', () => {
       apiKey: 'mlx-local',
       // Dispatch through a FRESH runtime proves provider-id (not object-identity)
       // routing to the shared host's streamSimple. Script a minimal terminal turn.
-      streamSimple: (streamedModel: Model<Api>) => {
+      streamSimple: (streamedModel) => {
         streamCalls++;
         const stream = createAssistantMessageEventStream();
         const message: AssistantMessage = {

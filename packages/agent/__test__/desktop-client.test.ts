@@ -2,6 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import type { Model } from '@earendil-works/pi-ai';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { desktopStreamFactory } from '../src/provider/desktop-client.js';
@@ -128,7 +129,7 @@ describe('desktop inference transport', () => {
     );
     const result = await stream(
       model,
-      { messages: [{ role: 'user', content: 'hello', timestamp: 0 }] },
+      normalizeContext({ messages: [{ role: 'user', content: 'hello', timestamp: 0 }] }),
       { reasoning: 'low', sessionId: 'child' },
     ).result();
     expect(result.api).toBe('mlx');
@@ -147,8 +148,11 @@ describe('desktop inference transport', () => {
   it('keeps tool-result and image follow-ups on the same engine', async () => {
     const { endpoint, requests } = await fixture();
     const stream = desktopStreamFactory(async () => endpoint)(host());
-    const first = await stream(model, { messages: [{ role: 'user', content: 'read', timestamp: 0 }] }).result();
-    await stream(model, {
+    const first = await stream(
+      model,
+      normalizeContext({ messages: [{ role: 'user', content: 'read', timestamp: 0 }] }),
+    ).result();
+    await stream(model, normalizeContext({
       messages: [
         { role: 'user', content: 'read', timestamp: 0 },
         first,
@@ -162,7 +166,7 @@ describe('desktop inference transport', () => {
         },
         { role: 'user', content: [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }], timestamp: 2 },
       ],
-    }).result();
+    })).result();
     expect(JSON.stringify(requests[1].messages)).toContain('tool_result');
     expect(JSON.stringify(requests[1].messages)).toContain('file contents');
     expect(JSON.stringify(requests[1].messages)).toContain('image/png');
@@ -174,7 +178,7 @@ describe('desktop inference transport', () => {
     const abort = new AbortController();
     const result = desktopStreamFactory(async () => endpoint)(local)(
       model,
-      { messages: [] },
+      normalizeContext({ messages: [] }),
       { signal: abort.signal },
     ).result();
     await vi.waitFor(() => expect(requests).toHaveLength(1));
@@ -188,9 +192,9 @@ describe('desktop inference transport', () => {
     const result = await desktopStreamFactory(async () => ({
       ...endpoint,
       models: [{ name: 'local', path: '/other/local' }],
-    }))(local)(model, {
+    }))(local)(model, normalizeContext({
       messages: [],
-    }).result();
+    })).result();
     expect(result.errorMessage).toContain('different model directory');
     expect(requests).toHaveLength(0);
     expect(local.runWithResident).not.toHaveBeenCalled();
@@ -198,7 +202,10 @@ describe('desktop inference transport', () => {
   it.each([429, 500])('never retries or loads locally after HTTP %s', async (status) => {
     const { endpoint, requests } = await fixture(status);
     const local = host();
-    const result = await desktopStreamFactory(async () => endpoint)(local)(model, { messages: [] }).result();
+    const result = await desktopStreamFactory(async () => endpoint)(local)(
+      model,
+      normalizeContext({ messages: [] }),
+    ).result();
     expect(result.stopReason).toBe('error');
     expect(requests).toHaveLength(1);
     expect(local.runWithResident).not.toHaveBeenCalled();
@@ -206,7 +213,10 @@ describe('desktop inference transport', () => {
   it('rejects a model absent from the app instead of letting the server alias it', async () => {
     const { endpoint, requests } = await fixture(200, ['different']);
     const local = host();
-    const result = await desktopStreamFactory(async () => endpoint)(local)(model, { messages: [] }).result();
+    const result = await desktopStreamFactory(async () => endpoint)(local)(
+      model,
+      normalizeContext({ messages: [] }),
+    ).result();
     expect(result.errorMessage).toContain('not available');
     expect(requests).toHaveLength(0);
     expect(local.runWithResident).not.toHaveBeenCalled();
@@ -215,10 +225,12 @@ describe('desktop inference transport', () => {
     const local = host();
     const read = vi.fn(async () => undefined);
     const stream = desktopStreamFactory(read)(local);
-    expect((await stream(model, { messages: [] }).result()).errorMessage).toContain('stopped');
+    expect((await stream(model, normalizeContext({ messages: [] })).result()).errorMessage).toContain('stopped');
     const abort = new AbortController();
     abort.abort();
-    expect((await stream(model, { messages: [] }, { signal: abort.signal }).result()).stopReason).toBe('aborted');
+    expect(
+      (await stream(model, normalizeContext({ messages: [] }), { signal: abort.signal }).result()).stopReason,
+    ).toBe('aborted');
     expect(read).toHaveBeenCalledOnce();
     expect(local.runWithResident).not.toHaveBeenCalled();
   });

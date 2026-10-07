@@ -17,13 +17,13 @@ import type {
   AssistantMessage,
   AssistantMessageEvent,
   AssistantMessageEventStream,
-  Context,
   Model,
   SimpleStreamOptions,
   Tool,
   ToolResultMessage,
   TSchema,
 } from '@earendil-works/pi-ai';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { detectModelType } from '@mlx-node/lm';
 import { beforeAll, describe, expect, it } from 'vite-plus/test';
 
@@ -126,7 +126,7 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
   it(
     'streams a real text turn to a stop final',
     async () => {
-      const context: Context = {
+      const context = normalizeContext({
         systemPrompt: SYSTEM,
         messages: [
           {
@@ -135,7 +135,7 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
             timestamp: Date.now(),
           },
         ],
-      };
+      });
       const events = await collect(streamSimple(model, context, OPTIONS));
 
       expect(events[0]!.type).toBe('start');
@@ -163,7 +163,7 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
           required: ['location'],
         } as unknown as TSchema,
       };
-      const context: Context = {
+      const context = normalizeContext({
         systemPrompt: TOOL_SYSTEM,
         messages: [
           {
@@ -174,7 +174,7 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
           },
         ],
         tools: [weatherTool],
-      };
+      });
 
       // Turn 1: the model must emit a tool call.
       const callEvents = await collect(streamSimple(model, context, OPTIONS));
@@ -198,10 +198,10 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
         isError: false,
         timestamp: Date.now(),
       };
-      const continueContext: Context = {
+      const continueContext = normalizeContext({
         ...context,
         messages: [...context.messages, callMessage, toolResult],
-      };
+      });
       const continueEvents = await collect(streamSimple(model, continueContext, OPTIONS));
       const continueMessage = finalMessage(continueEvents);
       expect(continueMessage.stopReason).toBe('stop');

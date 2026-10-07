@@ -1,3 +1,5 @@
+import { normalizeContext } from '@earendil-works/pi-ai';
+
 import { encodeSharedEvent } from './shared-events.js';
 import { sharedCacheOwners, sharedLocation } from './shared-protocol.js';
 import { startSharedService, type SharedBackend } from './shared-service.js';
@@ -33,7 +35,7 @@ async function loadBackend(): Promise<SharedBackend> {
         undefined,
         () => request.rootSessionFile,
         () => request.thinkingBudget,
-      )(model, request.context, { ...options, sessionId: owners.owner, signal });
+      )(model, normalizeContext(request.context), { ...options, sessionId: owners.owner, signal });
       for await (const event of stream) yield { event: encodeSharedEvent(event) };
       if (performance) yield performance;
       if (record) yield record;

@@ -40,11 +40,11 @@ import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
-  Context,
   Model,
   SimpleStreamOptions,
+  TranscriptContext,
 } from '@earendil-works/pi-ai';
-import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+import { createAssistantMessageEventStream, getCurrentTools } from '@earendil-works/pi-ai';
 import type { ChatSession, ChatStreamFinal, PerformanceMetrics } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
@@ -223,7 +223,7 @@ export function makeMlxStreamSimple(
   onTurnStart?: () => void,
   resolveRootSessionFile?: RootSessionFileResolver,
   resolveThinkingBudget?: () => number | undefined,
-): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
+): (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
     let thinkingTokenBudget: number | undefined;
@@ -403,7 +403,7 @@ export function makeMlxStreamSimple(
           const config = buildChatConfig(
             discovered.modelType,
             options,
-            toolsToDefinitions(context.tools),
+            toolsToDefinitions(getCurrentTools(context.messages)),
             rootCacheOwnerId,
             resolvedReasoning,
             configuredModelMaxTokens,

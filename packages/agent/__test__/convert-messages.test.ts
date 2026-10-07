@@ -1,13 +1,12 @@
 import type {
   AssistantMessage,
-  Context,
   StopReason,
   Tool,
   ToolResultMessage,
   Usage,
   UserMessage,
 } from '@earendil-works/pi-ai';
-import { Type } from '@earendil-works/pi-ai';
+import { normalizeContext, Type } from '@earendil-works/pi-ai';
 import type { TSchema } from '@earendil-works/pi-ai';
 import { describe, expect, it } from 'vite-plus/test';
 
@@ -47,7 +46,7 @@ function toolResultMsg(toolCallId: string, content: ToolResultMessage['content']
 
 describe('contextToChatMessages', () => {
   it('converts system + user + assistant-with-2-toolCalls + 2 toolResults preserving order and ids', () => {
-    const context: Context = {
+    const context = normalizeContext({
       systemPrompt: 'You are a helpful agent.',
       messages: [
         userMsg('Weather in Tokyo and Osaka?'),
@@ -63,7 +62,7 @@ describe('contextToChatMessages', () => {
         toolResultMsg('call_2', [{ type: 'text', text: 'Osaka: rain' }], true),
         userMsg('Thanks!'),
       ],
-    };
+    });
 
     expect(contextToChatMessages(context)).toEqual([
       { role: 'system', content: 'You are a helpful agent.' },
@@ -83,12 +82,12 @@ describe('contextToChatMessages', () => {
   });
 
   it('omits the system message when the context has no systemPrompt', () => {
-    const converted = contextToChatMessages({ messages: [userMsg('hi')] });
+    const converted = contextToChatMessages(normalizeContext({ messages: [userMsg('hi')] }));
     expect(converted).toEqual([{ role: 'user', content: 'hi' }]);
   });
 
   it('replaces image parts with [image omitted] placeholder lines for text-only models', () => {
-    const context: Context = {
+    const context = normalizeContext({
       messages: [
         userMsg([
           { type: 'text', text: 'What is in this picture?' },
@@ -100,7 +99,7 @@ describe('contextToChatMessages', () => {
           { type: 'text', text: 'captured' },
         ]),
       ],
-    };
+    });
 
     const [user, , tool] = contextToChatMessages(context);
     expect(user!.content).toBe('What is in this picture?\n[image omitted]');
@@ -110,7 +109,7 @@ describe('contextToChatMessages', () => {
   });
 
   it('keeps user images direct and moves tool-result images to a synthetic user message', () => {
-    const context: Context = {
+    const context = normalizeContext({
       messages: [
         userMsg([
           { type: 'text', text: 'What is in this picture?' },
@@ -124,7 +123,7 @@ describe('contextToChatMessages', () => {
           { type: 'image', data: 'BAU=', mimeType: 'image/jpeg' },
         ]),
       ],
-    };
+    });
 
     const [user, , tool, toolImages] = contextToChatMessages(context, true);
     expect(user).toMatchObject({ role: 'user', content: 'What is in this picture?\nBe concise.' });
@@ -140,7 +139,7 @@ describe('contextToChatMessages', () => {
 
   it('groups consecutive tool-result images after all parallel textual results', () => {
     const converted = contextToChatMessages(
-      {
+      normalizeContext({
         messages: [
           assistantMsg(
             [
@@ -162,7 +161,7 @@ describe('contextToChatMessages', () => {
             true,
           ),
         ],
-      },
+      }),
       true,
     );
 
@@ -186,7 +185,7 @@ describe('contextToChatMessages', () => {
 
   it('repairs a missing sibling tool result before the grouped image user turn', () => {
     const converted = contextToChatMessages(
-      {
+      normalizeContext({
         messages: [
           assistantMsg(
             [
@@ -198,7 +197,7 @@ describe('contextToChatMessages', () => {
           toolResultMsg('call_1', [{ type: 'image', data: 'AQ==', mimeType: 'image/png' }]),
           userMsg('continue'),
         ],
-      },
+      }),
       true,
     );
 
@@ -217,7 +216,7 @@ describe('contextToChatMessages', () => {
   it("strips Pi's stale non-vision note from an image-bearing tool result", () => {
     const note = '[Current model does not support images. The image will be omitted from this request.]';
     const converted = contextToChatMessages(
-      {
+      normalizeContext({
         messages: [
           toolResultMsg('call_image', [
             { type: 'text', text: `Read image file [image/png]\n${note}` },
@@ -225,7 +224,7 @@ describe('contextToChatMessages', () => {
           ]),
           userMsg([{ type: 'text', text: `Literal text without an image:\n${note}` }]),
         ],
-      },
+      }),
       true,
     );
 
@@ -240,13 +239,13 @@ describe('contextToChatMessages', () => {
     const note = '[Current model does not support images. The image will be omitted from this request.]';
     const processingFailure = '[Image omitted: Failed to process image bytes]';
     const converted = contextToChatMessages(
-      {
+      normalizeContext({
         messages: [
           toolResultMsg('call_failed_image', [
             { type: 'text', text: `Read image file [image/png]\n${processingFailure}\n${note}` },
           ]),
         ],
-      },
+      }),
       true,
     );
 
@@ -263,14 +262,14 @@ describe('contextToChatMessages', () => {
   it("preserves Pi's non-vision note when it is literal direct-user text beside an image", () => {
     const note = '[Current model does not support images. The image will be omitted from this request.]';
     const converted = contextToChatMessages(
-      {
+      normalizeContext({
         messages: [
           userMsg([
             { type: 'text', text: `Do not rewrite this literal line:\n${note}` },
             { type: 'image', data: 'AQID', mimeType: 'image/png' },
           ]),
         ],
-      },
+      }),
       true,
     );
 
@@ -279,19 +278,19 @@ describe('contextToChatMessages', () => {
   });
 
   it('joins multiple user text parts with newlines', () => {
-    const converted = contextToChatMessages({
+    const converted = contextToChatMessages(normalizeContext({
       messages: [
         userMsg([
           { type: 'text', text: 'line one' },
           { type: 'text', text: 'line two' },
         ]),
       ],
-    });
+    }));
     expect(converted[0]!.content).toBe('line one\nline two');
   });
 
   it('preserves assistant reasoning bodies for byte-stable native template replay', () => {
-    const converted = contextToChatMessages({
+    const converted = contextToChatMessages(normalizeContext({
       messages: [
         assistantMsg([
           { type: 'thinking', thinking: 'pondering...' },
@@ -299,7 +298,7 @@ describe('contextToChatMessages', () => {
           { type: 'text', text: 'The answer is 4.' },
         ]),
       ],
-    });
+    }));
     expect(converted).toEqual([
       {
         role: 'assistant',
@@ -319,21 +318,21 @@ describe('contextToChatMessages', () => {
     };
     thinkingOn.mlxThinkingEnabled = true;
 
-    expect(contextToChatMessages({ messages: [thinkingOff, thinkingOn] })).toEqual([
+    expect(contextToChatMessages(normalizeContext({ messages: [thinkingOff, thinkingOn] }))).toEqual([
       { role: 'assistant', content: 'Direct answer.', thinkingEnabled: false },
       { role: 'assistant', content: 'No visible reasoning this time.', thinkingEnabled: true },
     ]);
   });
 
   it('skips husk assistant messages (aborted/error with no text and no toolCalls)', () => {
-    const converted = contextToChatMessages({
+    const converted = contextToChatMessages(normalizeContext({
       messages: [
         userMsg('q1'),
         assistantMsg([], 'aborted'),
         assistantMsg([{ type: 'thinking', thinking: 'only thoughts' }], 'error'),
         userMsg('q2'),
       ],
-    });
+    }));
     expect(converted).toEqual([
       { role: 'user', content: 'q1' },
       { role: 'user', content: 'q2' },
@@ -345,14 +344,14 @@ describe('contextToChatMessages', () => {
     // an incomplete turn pi never replays. Priming it into the reset session
     // garbles the continuation. Mutation guard: reverting to the empty-husk-only
     // check keeps these partial turns and this test fails.
-    const converted = contextToChatMessages({
+    const converted = contextToChatMessages(normalizeContext({
       messages: [
         userMsg('q1'),
         assistantMsg([{ type: 'text', text: 'partial ans' }], 'aborted'),
         assistantMsg([{ type: 'text', text: 'half an error' }], 'error'),
         userMsg('q2'),
       ],
-    });
+    }));
     expect(converted).toEqual([
       { role: 'user', content: 'q1' },
       { role: 'user', content: 'q2' },
@@ -360,13 +359,13 @@ describe('contextToChatMessages', () => {
   });
 
   it('DROPS an error/aborted assistant that carries a tool call, leaving no dangling toolCalls', () => {
-    const converted = contextToChatMessages({
+    const converted = contextToChatMessages(normalizeContext({
       messages: [
         userMsg('q1'),
         assistantMsg([{ type: 'toolCall', id: 'call_7', name: 'ls', arguments: {} }], 'error'),
         userMsg('q2'),
       ],
-    });
+    }));
     // The dropped turn's tool call is NOT tracked, so no synthetic tool result
     // is emitted for it either — it vanishes entirely.
     expect(converted).toEqual([
@@ -381,13 +380,13 @@ describe('contextToChatMessages', () => {
     // answered gets a synthetic error result before the next user/assistant, so
     // no tool call is left unresolved in the primed history. Mutation guard:
     // dropping the orphan-repair pass omits the synthetic tool message → fails.
-    const converted = contextToChatMessages({
+    const converted = contextToChatMessages(normalizeContext({
       messages: [
         userMsg('do it'),
         assistantMsg([{ type: 'toolCall', id: 'call_9', name: 'ls', arguments: {} }], 'toolUse'),
         userMsg('never mind'),
       ],
-    });
+    }));
     expect(converted).toEqual([
       { role: 'user', content: 'do it' },
       { role: 'assistant', content: '', toolCalls: [{ id: 'call_9', name: 'ls', arguments: '{}' }] },
@@ -397,9 +396,9 @@ describe('contextToChatMessages', () => {
   });
 
   it('synthesizes a No-result tool message for a trailing unresolved tool call at end of history', () => {
-    const converted = contextToChatMessages({
+    const converted = contextToChatMessages(normalizeContext({
       messages: [assistantMsg([{ type: 'toolCall', id: 'call_end', name: 'ls', arguments: {} }], 'toolUse')],
-    });
+    }));
     expect(converted).toEqual([
       { role: 'assistant', content: '', toolCalls: [{ id: 'call_end', name: 'ls', arguments: '{}' }] },
       { role: 'tool', content: 'No result provided', toolCallId: 'call_end', isError: true },
@@ -407,7 +406,7 @@ describe('contextToChatMessages', () => {
   });
 
   it('keeps completed assistant messages with empty content (stop is not a husk)', () => {
-    const converted = contextToChatMessages({ messages: [assistantMsg([], 'stop')] });
+    const converted = contextToChatMessages(normalizeContext({ messages: [assistantMsg([], 'stop')] }));
     expect(converted).toEqual([{ role: 'assistant', content: '' }]);
   });
 });

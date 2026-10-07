@@ -3,11 +3,12 @@ import type {
   AssistantMessage,
   AssistantMessageEvent,
   AssistantMessageEventStream,
-  Context,
   Model,
   Tool,
+  TranscriptContext,
   TSchema,
 } from '@earendil-works/pi-ai';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import type {
   ChatConfig,
   ChatMessage,
@@ -39,10 +40,10 @@ const MODEL: Model<Api> = {
   maxTokens: 81920,
 };
 
-const CONTEXT: Context = {
+const CONTEXT: TranscriptContext = normalizeContext({
   systemPrompt: 'Be terse.',
   messages: [{ role: 'user', content: 'Hi', timestamp: 1 }],
-};
+});
 
 function delta(text: string): ChatStreamEvent {
   return { text, done: false };
@@ -389,7 +390,7 @@ describe('makeMlxStreamSimple', () => {
       stopReason: 'toolUse',
       timestamp: 2,
     };
-    const imageContext: Context = {
+    const imageContext = normalizeContext({
       messages: [
         {
           role: 'user',
@@ -409,7 +410,7 @@ describe('makeMlxStreamSimple', () => {
           timestamp: 3,
         },
       ],
-    };
+    });
 
     await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, imageContext));
 
@@ -438,7 +439,7 @@ describe('makeMlxStreamSimple', () => {
       },
     ]);
     const sharedModel: Model<Api> = { ...MODEL, input: ['text', 'image'] };
-    const imageContext: Context = {
+    const imageContext = normalizeContext({
       messages: [
         {
           role: 'user',
@@ -449,7 +450,7 @@ describe('makeMlxStreamSimple', () => {
           timestamp: 1,
         },
       ],
-    };
+    });
 
     await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, imageContext));
 
@@ -466,7 +467,7 @@ describe('makeMlxStreamSimple', () => {
     ]);
     session.imageSupport = true;
     const frozenModel = Object.freeze({ ...MODEL, input: Object.freeze(['text']) }) as unknown as Model<Api>;
-    const imageContext: Context = {
+    const imageContext = normalizeContext({
       messages: [
         {
           role: 'user',
@@ -474,7 +475,7 @@ describe('makeMlxStreamSimple', () => {
           timestamp: 1,
         },
       ],
-    };
+    });
 
     await collect(makeMlxStreamSimple(makeFakeHost(session))(frozenModel, imageContext));
 
@@ -572,7 +573,7 @@ describe('makeMlxStreamSimple', () => {
 
       expect(session.configSeen?.reasoningEffort, `reasoning=${String(reasoning)}`).toBe(expectedEffort);
       expect(message.mlxThinkingEnabled, `reasoning=${String(reasoning)}`).toBe(expectedEnabled);
-      expect(contextToChatMessages({ messages: [message] })).toEqual([
+      expect(contextToChatMessages(normalizeContext({ messages: [message] }))).toEqual([
         {
           role: 'assistant',
           content: 'Answer',
@@ -866,14 +867,14 @@ describe('makeMlxStreamSimple', () => {
       stopReason: 'error',
       timestamp: 2,
     };
-    const ctxWithBrokenTurn: Context = {
+    const ctxWithBrokenTurn = normalizeContext({
       systemPrompt: 'Be terse.',
       messages: [
         { role: 'user', content: 'Q1', timestamp: 1 },
         brokenTurn,
         { role: 'user', content: 'Q2', timestamp: 3 },
       ],
-    };
+    });
 
     await collect(streamSimple(MODEL, ctxWithBrokenTurn));
     expect(session.primedWith).toEqual([
@@ -916,7 +917,7 @@ describe('makeMlxStreamSimple', () => {
         required: ['location'],
       } as unknown as TSchema,
     };
-    const events = await collect(streamSimple(MODEL, { ...CONTEXT, tools: [weatherTool] }));
+    const events = await collect(streamSimple(MODEL, normalizeContext({ ...CONTEXT, tools: [weatherTool] })));
 
     // The tag-buffered markup and leading whitespace never surface as text.
     expect(types(events)).toEqual(['start', 'toolcall_start', 'toolcall_delta', 'toolcall_end', 'done']);

@@ -30,7 +30,8 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Api, Context, Model } from '@earendil-works/pi-ai';
+import type { Api, Model } from '@earendil-works/pi-ai';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ProviderConfig } from '@earendil-works/pi-coding-agent';
 import { coldCacheStats, coldSidecarStats, type ColdCacheStats, type ColdSidecarStats } from '@mlx-node/core';
 import type { ChatSession, ChatStreamEvent } from '@mlx-node/lm';
@@ -275,6 +276,7 @@ describe('cold-tier counters end to end', () => {
       piModel: {
         id: 'qwen',
         name: 'qwen',
+        type: 'chat',
         reasoning: true,
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -283,7 +285,7 @@ describe('cold-tier counters end to end', () => {
       },
     };
     const model: Model<Api> = { ...modelInfo.piModel, api: 'mlx', provider: 'mlx', baseUrl: 'mlx://local' };
-    const context: Context = { systemPrompt: '', messages: [] };
+    const context = normalizeContext({ systemPrompt: '', messages: [] });
 
     const trace = new MetricsTrace({ dir });
     expect(trace.enabled).toBe(true);

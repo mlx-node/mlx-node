@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
-import { createAssistantMessageEventStream, type AssistantMessage, type Context } from '@earendil-works/pi-ai';
+import {
+  createAssistantMessageEventStream,
+  type AssistantMessage,
+  type TranscriptContext,
+} from '@earendil-works/pi-ai';
 import { stream as streamAnthropic } from '@earendil-works/pi-ai/api/anthropic-messages';
 import { readDesktopEndpoint } from '@mlx-node/server/host/desktop-endpoint';
 
@@ -56,14 +60,14 @@ export function desktopStreamFactory(readEndpoint = readDesktopEndpoint): typeof
         );
         // Pi's Anthropic codec preserves tool calls, images, reasoning, and usage.
         // Keep persisted messages under our mlx identity across local/desktop turns.
-        const wireContext: Context = {
+        const wireContext = {
           ...context,
           messages: context.messages.map((message) =>
             message.role === 'assistant' && message.provider === model.provider
               ? { ...message, api: 'anthropic-messages' }
               : message,
           ),
-        };
+        } as TranscriptContext;
         const stream = streamAnthropic(
           { ...model, api: 'anthropic-messages', baseUrl: endpoint.url, headers: undefined, compat: undefined },
           wireContext,

@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { sharedStreamFactory } from '../src/provider/shared-client.js';
@@ -136,7 +137,7 @@ describe('shared delegate service transport', () => {
       sharedStreamFactory(request.profile, async () => service.endpoint)(host, undefined, () => 'same-root');
     const first = caller();
     for (const stream of [first, first, caller()]) {
-      for await (const _event of stream(request.model, request.context, { sessionId: 'same-child' })) {
+      for await (const _event of stream(request.model, normalizeContext(request.context), { sessionId: 'same-child' })) {
         /* drain */
       }
     }
@@ -176,7 +177,7 @@ describe('shared delegate service transport', () => {
       undefined,
       () => '/session',
       () => 128,
-    )(model, request.context, { sessionId: 'child', reasoning: 'high', temperature: 0.2, maxTokens: 456 });
+    )(model, normalizeContext(request.context), { sessionId: 'child', reasoning: 'high', temperature: 0.2, maxTokens: 456 });
     const events = [];
     for await (const event of stream) events.push(event);
     const terminal = events.at(-1)!;
@@ -199,7 +200,10 @@ describe('shared delegate service transport', () => {
     const local = vi.fn();
     const host = { modelInfo: () => request.profile.discovered, runWithResident: local } as unknown as StreamSimpleHost;
     const connect = vi.fn(async () => service.endpoint);
-    const stream = sharedStreamFactory(request.profile, connect)(host)(request.model, request.context);
+    const stream = sharedStreamFactory(request.profile, connect)(host)(
+      request.model,
+      normalizeContext(request.context),
+    );
     const events = [];
     for await (const event of stream) events.push(event);
     expect(events).toHaveLength(1);
@@ -257,7 +261,10 @@ describe('shared delegate service transport', () => {
     const local = vi.fn();
     const host = { modelInfo: () => request.profile.discovered, runWithResident: local } as unknown as StreamSimpleHost;
     try {
-      const stream = sharedStreamFactory(request.profile, connect)(host)(request.model, request.context);
+      const stream = sharedStreamFactory(request.profile, connect)(host)(
+        request.model,
+        normalizeContext(request.context),
+      );
       const events = [];
       for await (const event of stream) events.push(event);
       expect(events).toEqual([

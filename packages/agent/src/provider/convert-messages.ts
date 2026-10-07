@@ -1,5 +1,5 @@
 /**
- * pi `Context` → native `ChatMessage[]` / `ToolDefinition[]` conversion.
+ * pi `TranscriptContext` → native `ChatMessage[]` / `ToolDefinition[]` conversion.
  *
  * The provider bridge replays pi's full message history through
  * `ChatSession.primeHistory()` on every LLM call, so this conversion must
@@ -8,7 +8,8 @@
  * replays and silently kill native KV-cache reuse.
  */
 
-import type { Context, ImageContent, Message, TextContent, Tool } from '@earendil-works/pi-ai';
+import type { ImageContent, Message, SystemMessage, TextContent, Tool, TranscriptContext } from '@earendil-works/pi-ai';
+import { collapseSystemMessages, getCurrentSystemPrompt } from '@earendil-works/pi-ai';
 import type { ChatMessage, ToolDefinition } from '@mlx-node/lm';
 
 const IMAGE_PLACEHOLDER = '[image omitted]';
@@ -77,7 +78,10 @@ function convertParts(
  * repair and grouped tool-result image turn live in
  * {@link contextToChatMessages}, mirroring pi's transformMessages and OpenAI
  * provider conversion. */
-function convertMessage(message: Message, supportsImages: boolean): ConvertedMessage {
+function convertMessage(
+  message: Exclude<Message, SystemMessage>,
+  supportsImages: boolean,
+): ConvertedMessage {
   switch (message.role) {
     case 'user': {
       if (typeof message.content === 'string') {
@@ -133,7 +137,7 @@ function convertMessage(message: Message, supportsImages: boolean): ConvertedMes
  * Convert a pi `Context` into the `ChatMessage[]` accepted by
  * `ChatSession.primeHistory()`.
  *
- * - `systemPrompt` becomes the leading `system` message.
+ * - The replayed system messages become the leading `system` message.
  * - For text-only models (the default), image parts become literal
  *   `[image omitted]` lines.
  * - For an image-capable loaded model, user images stay on their native user
@@ -165,10 +169,15 @@ function convertMessage(message: Message, supportsImages: boolean): ConvertedMes
  * untouched, so the byte-stable joins that keep the replayed KV prefix stable
  * are preserved.
  */
-export function contextToChatMessages(context: Context, supportsImages = false): ChatMessage[] {
+export function contextToChatMessages(context: TranscriptContext, supportsImages = false): ChatMessage[] {
+  // Replay the transcript's system messages into one leading entry: pi carries
+  // prompt deltas and tool additions/removals on mid-conversation SystemMessages,
+  // and the native chat shape has no mid-history system role to send them on.
+  const collapsed = collapseSystemMessages(context);
   const messages: ChatMessage[] = [];
-  if (context.systemPrompt) {
-    messages.push({ role: 'system', content: context.systemPrompt });
+  const prompt = getCurrentSystemPrompt(collapsed.messages);
+  if (prompt) {
+    messages.push({ role: 'system', content: prompt });
   }
 
   // Orphan-repair state: the tool-call ids awaiting a result from the most
@@ -206,8 +215,11 @@ export function contextToChatMessages(context: Context, supportsImages = false):
     flushToolResultImages();
   };
 
-  for (const message of context.messages) {
+  for (const message of collapsed.messages) {
     switch (message.role) {
+      case 'system':
+        // Already emitted above via getCurrentSystemPrompt.
+        break;
       case 'user':
         flushToolResultBoundary();
         messages.push(convertMessage(message, supportsImages).message);

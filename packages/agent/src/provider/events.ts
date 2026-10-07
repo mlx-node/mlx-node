@@ -19,6 +19,7 @@ import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
+  JsonObject,
   Model,
   TextContent,
   ThinkingContent,
@@ -76,14 +77,16 @@ function usageFromFinal(final: ChatStreamFinal): Usage {
 function toPiToolCall(call: ToolCallResult): ToolCall {
   if (call.status === 'ok') {
     const args =
-      typeof call.arguments === 'object' && call.arguments !== null ? (call.arguments as Record<string, unknown>) : {};
+      typeof call.arguments === 'object' && call.arguments !== null ? (call.arguments as JsonObject) : {};
     return { type: 'toolCall', id: call.id, name: call.name, arguments: args };
   }
   return {
     type: 'toolCall',
     id: call.id,
     name: call.name || 'malformed_tool_call',
-    arguments: { raw: call.rawContent, error: call.error },
+    // JsonObject forbids undefined; keep `error` absent (not null) to preserve
+    // the serialized shape the session JSONL and tool-result rendering expect.
+    arguments: { raw: call.rawContent, ...(call.error !== undefined ? { error: call.error } : {}) },
   };
 }
 

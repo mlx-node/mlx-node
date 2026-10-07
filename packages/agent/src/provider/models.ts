@@ -21,10 +21,13 @@ import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 
 import type { DiscoveredModelLike } from '../types.js';
 
+/** The chat variant of pi's `ProviderModelConfig` union (not root-exported by name). */
+export type MlxPiModelConfig = Extract<ProviderModelConfig, { type?: 'chat' }>;
+
 /** A discovered local checkpoint paired with its pi provider model entry. */
 export interface MlxModelInfo {
   discovered: DiscoveredModelLike;
-  piModel: ProviderModelConfig;
+  piModel: MlxPiModelConfig;
 }
 
 /** Pair the shared local inventory with pi provider metadata, without loading weights. */
@@ -35,9 +38,10 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       piModel: {
         id: name,
         name,
+        type: 'chat',
         reasoning: traits.reasoning,
         // pi types are agent-only; keep the shared structural map assignable.
-        thinkingLevelMap: traits.thinkingLevelMap satisfies ProviderModelConfig['thinkingLevelMap'],
+        thinkingLevelMap: traits.thinkingLevelMap satisfies MlxPiModelConfig['thinkingLevelMap'],
         input: supportsImages ? ['text', 'image'] : ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow,

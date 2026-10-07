@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { emptyUsage } from '../src/provider/events.js';
@@ -52,7 +53,7 @@ const done: SharedFrame = {
 async function collect(connect: typeof ensureSharedWorker, signal?: AbortSignal) {
   const stream = sharedStreamFactory({ persistPagedCache: true, preserveEmbeddedGemmaDraft: false }, connect)(host)(
     model,
-    { messages: [] },
+    normalizeContext({ messages: [] }),
     { signal },
   );
   const events = [];

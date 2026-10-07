@@ -2,7 +2,8 @@ import { mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Api, Context, Model, SimpleStreamOptions } from '@earendil-works/pi-ai';
+import type { Api, Model, SimpleStreamOptions } from '@earendil-works/pi-ai';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -116,7 +117,7 @@ async function buildOneTurnHarness(
     },
   };
   const model: Model<Api> = { ...modelInfo.piModel, api: 'mlx', provider: 'mlx', baseUrl: 'mlx://local' };
-  const context: Context = { systemPrompt: '', messages: [] };
+  const context = normalizeContext({ systemPrompt: '', messages: [] });
 
   const trace = new MetricsTrace({ dir: join(tmpdir(), 'mlx-cold-counter-test') });
   const records: Array<Omit<MetricsTraceRecord, 'v'>> = [];
@@ -254,7 +255,7 @@ describe('createMlxProviderExtension', () => {
       provider: 'mlx',
       baseUrl: 'mlx://local',
     };
-    const context: Context = { systemPrompt: '', messages: [] };
+    const context = normalizeContext({ systemPrompt: '', messages: [] });
     const extension = createMlxProviderExtension([modelInfo], host);
     if (typeof extension === 'function') throw new Error('expected a named extension');
 
@@ -383,7 +384,7 @@ describe('createMlxProviderExtension', () => {
       },
     };
     const model: Model<Api> = { ...modelInfo.piModel, api: 'mlx', provider: 'mlx', baseUrl: 'mlx://local' };
-    const context: Context = { systemPrompt: '', messages: [] };
+    const context = normalizeContext({ systemPrompt: '', messages: [] });
 
     const trace = new MetricsTrace({ dir: '/tmp/mlx-11a-test' });
     const records: Array<Omit<MetricsTraceRecord, 'v' | 'rootSessionId' | 'rootSessionFile'>> = [];
