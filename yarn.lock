@@ -1649,7 +1649,7 @@ __metadata:
     "@napi-rs/image": "npm:1.15.0"
     "@types/node": "catalog:"
     app-builder-lib: "npm:26.15.3"
-    electron: "npm:44.0.0"
+    electron: "npm:44.6.0"
     electron-updater: "npm:6.8.9"
     vite-plus: "catalog:"
   languageName: unknown
@@ -7000,9 +7000,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"electron@npm:44.0.0":
-  version: 44.0.0
-  resolution: "electron@npm:44.0.0"
+"electron@npm:44.6.0":
+  version: 44.6.0
+  resolution: "electron@npm:44.6.0"
   dependencies:
     "@electron-internal/extract-zip": "npm:^1.0.1"
     "@electron/get": "npm:^5.0.0"
@@ -7010,7 +7010,7 @@ __metadata:
   bin:
     electron: cli.js
     install-electron: install.js
-  checksum: 10c0/50fa36d8f3a56f499934ee3077a98f866fd216ac69d05ebed6200613f905fce893365b4ad9bb299272daeaebd1354b668e45f40948d85cd213489faee46ab305
+  checksum: 10c0/badd14fdc6ca29336c4c057f1ccb82981aeb4435b3be98bc4f3f42a2ce75557069573dc41992a246ed5b85e47fdb1b4b66c7afd408211e868825c39fb9e0ca68
   languageName: node
   linkType: hard
 

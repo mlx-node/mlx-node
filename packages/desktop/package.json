@@ -36,7 +36,7 @@
     "@napi-rs/image": "1.15.0",
     "@types/node": "catalog:",
     "app-builder-lib": "26.15.3",
-    "electron": "44.0.0",
+    "electron": "44.6.0",
     "vite-plus": "catalog:"
   },
   "engines": {
