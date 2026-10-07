@@ -2032,7 +2032,7 @@ __metadata:
     "@vitejs/plugin-react": "npm:^6.1.1"
     class-variance-authority: "npm:^0.7.1"
     clsx: "npm:^2.1.1"
-    drizzle-orm: "npm:1.0.0-rc.4"
+    drizzle-orm: "npm:1.0.0-rc.5-ab785fc"
     happy-dom: "npm:20.12.0"
     lucide-react: "npm:^1.38.0"
     react: "npm:^19.2.8"
@@ -7260,36 +7260,36 @@ __metadata:
   languageName: node
   linkType: hard
 
-"drizzle-orm@npm:1.0.0-rc.4":
-  version: 1.0.0-rc.4
-  resolution: "drizzle-orm@npm:1.0.0-rc.4"
+"drizzle-orm@npm:1.0.0-rc.5-ab785fc":
+  version: 1.0.0-rc.5-ab785fc
+  resolution: "drizzle-orm@npm:1.0.0-rc.5-ab785fc"
   peerDependencies:
     "@aws-sdk/client-rds-data": ">=3"
     "@cloudflare/workers-types": ">=4"
-    "@effect/sql-d1": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-libsql": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-mysql2": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-pg": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-pglite": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-sqlite-bun": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-sqlite-do": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-sqlite-node": ">=4.0.0-beta.83 || >=4.0.0"
-    "@effect/sql-sqlite-wasm": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-d1": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-libsql": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-mysql2": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-pg": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-pglite": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-sqlite-bun": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-sqlite-do": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-sqlite-node": ">=4.0.0-beta.105 || >=4.0.0"
+    "@effect/sql-sqlite-wasm": ">=4.0.0-beta.105 || >=4.0.0"
     "@electric-sql/pglite": ">=0.2.0"
     "@libsql/client": ">=0.10.0"
     "@libsql/client-wasm": ">=0.10.0"
     "@neondatabase/serverless": ">=0.10.0"
-    "@op-engineering/op-sqlite": ">=2"
+    "@op-engineering/op-sqlite": ">=17"
     "@opentelemetry/api": ^1.4.1
     "@planetscale/database": ">=1.13"
     "@sinclair/typebox": ">=0.34.8"
     "@sqlitecloud/drivers": ">=1.0.653"
     "@tidbcloud/serverless": "*"
-    "@tursodatabase/database": ">=0.6.0-pre.28 || >=0.6.0"
-    "@tursodatabase/database-common": ">=0.6.0-pre.28 || >=0.6.0"
-    "@tursodatabase/database-wasm": ">=0.6.0-pre.28 || >=0.6.0"
-    "@tursodatabase/serverless": ">=1.1.3"
-    "@tursodatabase/sync": ">=0.6.0-pre.28 || >=0.6.0"
+    "@tursodatabase/database": ">=0.7.1"
+    "@tursodatabase/database-common": ">=0.7.1"
+    "@tursodatabase/database-wasm": ">=0.7.1"
+    "@tursodatabase/serverless": ">=1.4.0"
+    "@tursodatabase/sync": ">=0.7.1"
     "@types/better-sqlite3": "*"
     "@types/mssql": ^9.1.4
     "@types/pg": "*"
@@ -7300,15 +7300,16 @@ __metadata:
     arktype: ">=2.0.0"
     better-sqlite3: ">=9.3.0"
     bun-types: "*"
-    effect: ">=4.0.0-beta.83 || >=4.0.0"
+    effect: ">=4.0.0-beta.105 || >=4.0.0"
     expo-sqlite: ">=14.0.0"
+    minipg: ">=0.2.0"
     mssql: ^11.0.1
     mysql2: ">=2"
     pg: ">=8"
     postgres: ">=3"
     sql.js: ">=1"
     sqlite3: ">=5"
-    typebox: ">=1.0.0"
+    typebox: ">=1.2.0"
     valibot: ">=1.0.0-beta.7"
     zod: ^3.25.0 || ^4.0.0
   peerDependenciesMeta:
@@ -7388,6 +7389,8 @@ __metadata:
       optional: true
     expo-sqlite:
       optional: true
+    minipg:
+      optional: true
     mssql:
       optional: true
     mysql2:
@@ -7406,7 +7409,7 @@ __metadata:
       optional: true
     zod:
       optional: true
-  checksum: 10c0/b1ffbba1b4013a6ef7ebed1bd81c2badb7a91edb94e3c5167a38b71454e3dbb220c39272049ece67d05574034759eda3efb6b38f0c492899150e09218eedc9d2
+  checksum: 10c0/f3ee042ebdf9080da2813d527aa0921c3a908014c57a0603224d02d601ad4dc17d85bdabbf539edbd47f515ffdd3b1c1b050057474629ade513f859a24f8585c
   languageName: node
   linkType: hard
 
