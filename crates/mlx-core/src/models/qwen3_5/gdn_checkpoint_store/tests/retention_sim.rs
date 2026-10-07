@@ -717,7 +717,7 @@ fn mib(bytes: usize) -> f64 {
     bytes as f64 / 1024.0 / 1024.0
 }
 
-/// Qwen3.6-27B dense, the shape the 75.00 MiB figure in `paged_forward` comes
+/// Qwen3.6-27B dense, the shape the ~146.8 MiB figure in `paged_forward` comes
 /// from.
 fn dense_27b() -> Qwen3_5Config {
     Qwen3_5Config {
@@ -1415,8 +1415,9 @@ fn chain_speed_changes_the_level_not_the_ranking() {
 fn a_checkpoint_slot_costs_what_the_model_it_belongs_to_costs() {
     let bytes_27b = checkpoint_bytes(&dense_27b());
     let bytes_0_8b = checkpoint_bytes(&dense_0_8b());
-    assert_eq!(bytes_27b, 78_446_592);
-    assert_eq!(bytes_0_8b, 10_100_736);
+    // bf16 conv + f32 recurrent per GDN layer (48 and 18 layers).
+    assert_eq!(bytes_27b, 153_944_064);
+    assert_eq!(bytes_0_8b, 19_537_920);
     assert!(
         bytes_27b > bytes_0_8b * 7,
         "{bytes_27b} vs {bytes_0_8b}: the two models' slots cost within 7x of each other, \

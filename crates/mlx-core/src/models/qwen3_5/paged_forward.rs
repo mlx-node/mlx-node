@@ -206,18 +206,18 @@ const GDN_CHECKPOINT_LADDER_RATIO: u32 = 4;
 /// resident at once ON TOP OF everything `GDN_PREFIX_CHECKPOINT_LIMIT` already
 /// retains. Both halves of that are measured, not estimated:
 ///
-/// - One checkpoint on the dense 27B (48 GDN layers, bf16; `[1,3,10240]` conv
-///   plus `[1,48,128,128]` recurrent per layer) is 78,446,592 B of tensor and
-///   78,643,202 B resident, 75.00 MiB — see
+/// - One checkpoint on the dense 27B (48 GDN layers; `[1,3,10240]` bf16 conv
+///   plus `[1,48,128,128]` f32 recurrent per layer) is 153,944,064 B of
+///   tensor, ~146.8 MiB — see
 ///   `gdn_sidecar::tests::one_gdn_checkpoint_of_the_27b_costs_a_known_number_of_bytes`
 ///   and the `#[ignore]`d allocator measurement beside it.
 /// - The peak is the store bound PLUS the whole undrained ladder, 5 + 4 = 9
 ///   checkpoints — see
 ///   `gdn_checkpoint_store::tests::publishing_a_ladder_peaks_at_the_store_bound_plus_the_whole_ladder`.
 ///
-/// So the worst case is 675 MiB, against 450 MiB for the single-rung behaviour
-/// this replaces: four rungs cost ~225 MiB of transient headroom and span a 64x
-/// range of prefix lengths. Publishing each rung as it is produced instead of
+/// So the worst case is ~1.3 GiB, against ~880 MiB for the single-rung
+/// behaviour this replaces: four rungs cost ~590 MiB of transient headroom and
+/// span a 64x range of prefix lengths. Publishing each rung as it is produced instead of
 /// accumulating the ladder would cap the peak at 6 checkpoints, but the forward
 /// pass holds the caches borrowed and cannot reach the store.
 ///

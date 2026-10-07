@@ -27,8 +27,8 @@
 //! [`ColdSidecarLayout`] carries a SINGLE `bytes_per_tensor` and
 //! [`mlx_paged_attn::ColdSidecar::validate`] rejects any sidecar whose tensors
 //! are not all that length. The two GDN tensors per layer have DIFFERENT sizes
-//! (`conv_state` is `(K-1)*conv_dim`; `recurrent_state` is `Hv*Dv*Dk`, ~25x
-//! larger on the 27B). Padding conv up to rec size would nearly double the
+//! (`conv_state` is `(K-1)*conv_dim` bf16; `recurrent_state` is `Hv*Dv*Dk` f32,
+//! ~50x larger on the 27B). Padding conv up to rec size would nearly double the
 //! sidecar, and two `tensors_per_layer` is impossible. So each GDN layer stores
 //! ONE blob = `conv_state` bytes followed by `recurrent_state` bytes, with
 //! `tensors_per_layer = 1`. The layout's `dims` carries both shapes
@@ -49,9 +49,10 @@
 //!
 //! No f32 round trip: 16-bit state goes out via `to_uint16_native` and back via
 //! `from_bfloat16` / `from_float16`; f32 state via `to_float32` / `from_float32`.
-//! The one element type this sidecar is written and read in is fixed at load
-//! from the paged pool's cache dtype (`build_cold_tier_context`), which equals
-//! the GDN activation dtype on every checkpoint; capture re-checks each array's
+//! The conv history's element type is fixed at load from the paged pool's cache
+//! dtype (`build_cold_tier_context`), which equals the GDN activation dtype on
+//! every checkpoint; the recurrent state is ALWAYS f32 ([`RECURRENT_DTYPE`],
+//! the carried precision of the GDN kernels). Capture re-checks each array's
 //! actual dtype and SKIPS (fail closed) on any mismatch rather than mislabel.
 
 use std::collections::VecDeque;
@@ -72,6 +73,11 @@ use super::layer_cache::Qwen3_5LayerCache;
 
 /// One blob per GDN layer (conv ++ recurrent), so exactly one tensor per layer.
 pub(crate) const TENSORS_PER_LAYER: u32 = 1;
+
+/// The recurrent state is carried in f32 by every GDN kernel regardless of the
+/// activation dtype, so its sidecar element type is fixed rather than taken
+/// from the pool.
+const RECURRENT_DTYPE: DType = DType::Float32;
 
 /// Decoder indices of the GDN (linear-attention) layers, ascending — the exact
 /// order the payload's `tensors[gdn_ordinal]` is indexed by. Must be identical
@@ -97,7 +103,8 @@ fn dtype_from_label(label: &str) -> Option<DType> {
 fn element_size(dtype: DType) -> usize {
     match dtype {
         DType::Float32 => std::mem::size_of::<f32>(),
-        _ => std::mem::size_of::<u16>(),
+        DType::BFloat16 | DType::Float16 => std::mem::size_of::<u16>(),
+        other => unreachable!("sidecar dtype {other:?} is rejected by dtype_from_label"),
     }
 }
 
@@ -118,7 +125,8 @@ pub(crate) struct GdnSidecarGeometry {
     pub v_head_dim: u32,
     /// `linear_key_head_dim` — recurrent state `Dk` axis.
     pub k_head_dim: u32,
-    /// Element dtype label, fixed at load from the pool cache dtype.
+    /// Conv-history element dtype label, fixed at load from the pool cache
+    /// dtype. The recurrent state is always [`RECURRENT_DTYPE`].
     pub dtype: String,
 }
 
@@ -139,13 +147,18 @@ impl GdnSidecarGeometry {
             .checked_mul(self.k_head_dim as usize)
     }
 
+    /// Byte length of the conv-history half of the per-layer blob.
+    fn conv_bytes(&self) -> Option<usize> {
+        self.conv_elements()?
+            .checked_mul(element_size(self.dtype()?))
+    }
+
     /// Byte length of the single per-layer blob = conv bytes ++ recurrent bytes.
     fn bytes_per_tensor(&self) -> Option<usize> {
-        let esz = element_size(self.dtype()?);
-        let elements = self
-            .conv_elements()?
-            .checked_add(self.recurrent_elements()?)?;
-        elements.checked_mul(esz)
+        self.conv_bytes()?.checked_add(
+            self.recurrent_elements()?
+                .checked_mul(element_size(RECURRENT_DTYPE))?,
+        )
     }
 
     /// `[K-1, conv_dim, Hv, Dv, Dk]` — five entries (batch dropped; always 1),
@@ -182,9 +195,12 @@ impl GdnSidecarGeometry {
     /// same pool geometry. The serialized `Qwen3_5Config` already carries every
     /// `linear_*` field, but binding them here makes the sidecar's identity
     /// independent of that blob's serde surface ever changing.
+    ///
+    /// `v2`: the recurrent half is f32 (`rec_dtype`), so every `v1` sidecar
+    /// (bf16 recurrent) misses instead of being misread.
     pub fn fingerprint_component(&self) -> Vec<u8> {
         format!(
-            "qwen3_5-gdn-sidecar:v1:layers={}:conv_rows={}:conv_dim={}:v_heads={}:v_dim={}:k_dim={}:dtype={}:tensors={}",
+            "qwen3_5-gdn-sidecar:v2:layers={}:conv_rows={}:conv_dim={}:v_heads={}:v_dim={}:k_dim={}:dtype={}:rec_dtype={:?}:tensors={}",
             self.gdn_layers,
             self.conv_rows,
             self.conv_dim,
@@ -192,6 +208,7 @@ impl GdnSidecarGeometry {
             self.v_head_dim,
             self.k_head_dim,
             self.dtype,
+            RECURRENT_DTYPE,
             TENSORS_PER_LAYER,
         )
         .into_bytes()
@@ -317,18 +334,20 @@ fn warn_once_on_dtype_mismatch(conv: &MxArray, rec: &MxArray, expected: DType) {
     let (Ok(conv_dtype), Ok(rec_dtype)) = (conv.dtype(), rec.dtype()) else {
         return;
     };
-    if conv_dtype == expected && rec_dtype == expected {
+    if conv_dtype == expected && rec_dtype == RECURRENT_DTYPE {
         return;
     }
     DTYPE_MISMATCH_WARNED.call_once(|| {
         tracing::warn!(
-            expected = ?expected,
+            expected_conv = ?expected,
+            expected_recurrent = ?RECURRENT_DTYPE,
             conv_state = ?conv_dtype,
             recurrent_state = ?rec_dtype,
             "qwen3_5 GDN cold sidecar can never be captured: the paged pool's cache dtype fixes \
-             the sidecar element type, but the GDN state carries a different dtype. The cold tier \
-             will keep persisting K/V blocks it can never restore from (hits stay at 0). Align the \
-             paged pool cache dtype with the GDN activation dtype, or disable persistPagedCache."
+             the conv-history element type (the recurrent state is always f32), but the GDN \
+             state carries a different dtype. The cold tier will keep persisting K/V blocks it \
+             can never restore from (hits stay at 0). Align the paged pool cache dtype with the \
+             GDN activation dtype, or disable persistPagedCache."
         );
     });
 }
@@ -388,7 +407,7 @@ pub(crate) fn encode_tensors(
         if !encode_array(conv, dtype, &conv_shape, conv_elements, &mut blob)? {
             return Ok(None);
         }
-        if !encode_array(rec, dtype, &rec_shape, rec_elements, &mut blob)? {
+        if !encode_array(rec, RECURRENT_DTYPE, &rec_shape, rec_elements, &mut blob)? {
             return Ok(None);
         }
         if blob.len() != bytes_per_tensor {
@@ -692,14 +711,14 @@ pub(crate) fn decode_caches(
     let Some(dtype) = geo.dtype() else {
         return Ok(None);
     };
-    let (Some(conv_elements), Some(rec_elements), Some(bytes_per_tensor)) = (
+    let (Some(conv_elements), Some(rec_elements), Some(conv_bytes), Some(bytes_per_tensor)) = (
         geo.conv_elements(),
         geo.recurrent_elements(),
+        geo.conv_bytes(),
         geo.bytes_per_tensor(),
     ) else {
         return Ok(None);
     };
-    let conv_bytes = conv_elements * element_size(dtype);
     let conv_shape = geo.conv_shape();
     let rec_shape = geo.recurrent_shape();
 
@@ -716,7 +735,7 @@ pub(crate) fn decode_caches(
         let Some(conv) = decode_array(conv_slice, dtype, &conv_shape, conv_elements)? else {
             return Ok(None);
         };
-        let Some(rec) = decode_array(rec_slice, dtype, &rec_shape, rec_elements)? else {
+        let Some(rec) = decode_array(rec_slice, RECURRENT_DTYPE, &rec_shape, rec_elements)? else {
             return Ok(None);
         };
         let Some(Qwen3_5LayerCache::Linear(arrays)) = caches.get_mut(layer_idx) else {
@@ -804,8 +823,8 @@ mod tests {
         assert_eq!(a.tensors_per_layer, 1);
         // conv_dim = key_dim*2 + value_dim = (1*3)*2 + (2*4) = 14; K-1 = 3.
         assert_eq!(a.dims, vec![3, 14, 2, 4, 3]);
-        // (3*14 + 2*4*3) * 2 bytes = (42 + 24) * 2 = 132.
-        assert_eq!(a.bytes_per_tensor, (3 * 14 + 2 * 4 * 3) * 2);
+        // conv 3*14 bf16 (2 B) + recurrent 2*4*3 f32 (4 B) = 84 + 96 = 180.
+        assert_eq!(a.bytes_per_tensor, 3 * 14 * 2 + 2 * 4 * 3 * 4);
 
         let policy = policy(&cfg, "BFloat16").expect("policy");
         assert_eq!(policy.group(), ColdGroup::GdnState);
@@ -813,12 +832,14 @@ mod tests {
         assert_eq!(policy.expected_at(64), b);
     }
 
-    /// Build a full-length cache vec, filling each GDN layer's conv/recurrent
-    /// slots with distinct bf16 patterns so a mis-ordered round trip is visible.
+    /// Build a full-length cache vec, filling each GDN layer's conv (bf16, or
+    /// f16 when `bf16` is false) and recurrent (`rec` dtype) slots with
+    /// distinct patterns so a mis-ordered round trip is visible.
     fn caches_for(
         cfg: &Qwen3_5Config,
         geo: &GdnSidecarGeometry,
         bf16: bool,
+        rec: DType,
     ) -> Vec<Qwen3_5LayerCache> {
         let conv_elems = geo.conv_elements().unwrap();
         let rec_elems = geo.recurrent_elements().unwrap();
@@ -834,22 +855,38 @@ mod tests {
             })
             .collect();
         for (ordinal, &layer) in gdn_layers(cfg).iter().enumerate() {
-            let make = |n: usize, tag: u16, shape: &[i64]| -> MxArray {
+            let make = |n: usize, tag: u16, shape: &[i64], dtype: DType| -> MxArray {
                 let raw: Vec<u16> = (0..n)
                     .map(|i| (i as u16).wrapping_mul(31).wrapping_add(tag))
                     .collect();
-                if bf16 {
-                    MxArray::from_bfloat16(&raw, shape).unwrap()
-                } else {
-                    MxArray::from_float16(&raw, shape).unwrap()
+                match dtype {
+                    DType::BFloat16 => MxArray::from_bfloat16(&raw, shape).unwrap(),
+                    DType::Float16 => MxArray::from_float16(&raw, shape).unwrap(),
+                    // Low mantissa bits set (and subnormals for small `r`):
+                    // finite patterns a bf16 round trip would not preserve.
+                    _ => MxArray::from_float32(
+                        &raw.iter()
+                            .map(|&r| f32::from_bits((u32::from(r) << 8) | 0x11))
+                            .collect::<Vec<_>>(),
+                        shape,
+                    )
+                    .unwrap(),
                 }
+            };
+            let conv_dtype = if bf16 {
+                DType::BFloat16
+            } else {
+                DType::Float16
             };
             if let Some(Qwen3_5LayerCache::Linear(arrays)) = caches.get_mut(layer) {
                 arrays
-                    .set(0, make(conv_elems, ordinal as u16 * 2, &conv_shape))
+                    .set(
+                        0,
+                        make(conv_elems, ordinal as u16 * 2, &conv_shape, conv_dtype),
+                    )
                     .expect("test cache slot 0");
                 arrays
-                    .set(1, make(rec_elems, ordinal as u16 * 2 + 1, &rec_shape))
+                    .set(1, make(rec_elems, ordinal as u16 * 2 + 1, &rec_shape, rec))
                     .expect("test cache slot 1");
             }
         }
@@ -858,13 +895,14 @@ mod tests {
 
     #[test]
     fn payload_round_trips_layer_major_and_bit_exact() {
+        use crate::models::qwen3_5::model::arrays_bits_equal_for_test;
         let cfg = config();
         let geo = geo_of(&cfg);
-        let caches = caches_for(&cfg, &geo, true);
+        let caches = caches_for(&cfg, &geo, true, DType::Float32);
 
         let tensors = encode_tensors(&cfg, &geo, &caches, 32)
             .unwrap()
-            .expect("bf16 caches must encode");
+            .expect("bf16 conv + f32 recurrent caches must encode");
         let layout = layout_at(&geo, 32);
         assert_eq!(tensors.len(), layout.tensor_count().unwrap());
         assert!(tensors.iter().all(|t| t.len() == layout.bytes_per_tensor));
@@ -877,10 +915,12 @@ mod tests {
             match (before, after) {
                 (Qwen3_5LayerCache::FullAttention(_), Qwen3_5LayerCache::FullAttention(_)) => {}
                 (Qwen3_5LayerCache::Linear(b), Qwen3_5LayerCache::Linear(a)) => {
+                    assert_eq!(a.get(0).unwrap().dtype().unwrap(), DType::BFloat16);
+                    assert_eq!(a.get(1).unwrap().dtype().unwrap(), DType::Float32);
                     for slot in 0..2 {
-                        assert_eq!(
-                            b.get(slot).unwrap().to_uint16_native().unwrap(),
-                            a.get(slot).unwrap().to_uint16_native().unwrap(),
+                        assert!(
+                            arrays_bits_equal_for_test(b.get(slot).unwrap(), a.get(slot).unwrap())
+                                .unwrap(),
                             "layer {layer} slot {slot} diverged",
                         );
                     }
@@ -896,10 +936,17 @@ mod tests {
         let geo = geo_of(&cfg);
         // f16 has the same byte width as bf16, so a length check alone would let
         // it through and the label would lie about the element type.
-        let caches = caches_for(&cfg, &geo, false);
+        let caches = caches_for(&cfg, &geo, false, DType::Float32);
         assert!(
             encode_tensors(&cfg, &geo, &caches, 32).unwrap().is_none(),
-            "a non-bf16 GDN cache must skip capture, not reinterpret its bytes"
+            "a non-bf16 conv GDN cache must skip capture, not reinterpret its bytes"
+        );
+        // A bf16 recurrent state (the pre-f32 carry) must never be widened
+        // into an f32-labelled blob.
+        let caches = caches_for(&cfg, &geo, true, DType::BFloat16);
+        assert!(
+            encode_tensors(&cfg, &geo, &caches, 32).unwrap().is_none(),
+            "a non-f32 recurrent GDN cache must skip capture"
         );
     }
 
@@ -907,7 +954,7 @@ mod tests {
     fn capture_skips_on_missing_slot() {
         let cfg = config();
         let geo = geo_of(&cfg);
-        let mut caches = caches_for(&cfg, &geo, true);
+        let mut caches = caches_for(&cfg, &geo, true, DType::Float32);
         if let Some(Qwen3_5LayerCache::Linear(arrays)) = caches.get_mut(2) {
             arrays.reset();
         }
@@ -918,9 +965,14 @@ mod tests {
     fn decode_refuses_short_payloads() {
         let cfg = config();
         let geo = geo_of(&cfg);
-        let tensors = encode_tensors(&cfg, &geo, &caches_for(&cfg, &geo, true), 32)
-            .unwrap()
-            .unwrap();
+        let tensors = encode_tensors(
+            &cfg,
+            &geo,
+            &caches_for(&cfg, &geo, true, DType::Float32),
+            32,
+        )
+        .unwrap()
+        .unwrap();
 
         // One blob short of the layer count.
         let mut truncated = tensors.clone();
@@ -972,20 +1024,21 @@ mod tests {
     fn one_gdn_checkpoint_of_the_27b_costs_a_known_number_of_bytes() {
         let geo = geometry(&qwen3_6_27b_config(), "BFloat16").expect("geometry");
         assert_eq!(geo.gdn_layers, 48);
-        // conv `[1, 3, 10240]` + recurrent `[1, 48, 128, 128]`, bf16.
+        // conv `[1, 3, 10240]` bf16 + recurrent `[1, 48, 128, 128]` f32.
         assert_eq!(geo.conv_elements(), Some(30_720));
         assert_eq!(geo.recurrent_elements(), Some(786_432));
-        assert_eq!(geo.bytes_per_tensor(), Some(1_634_304));
+        assert_eq!(geo.conv_bytes(), Some(61_440));
+        assert_eq!(geo.bytes_per_tensor(), Some(61_440 + 3_145_728));
 
         let layout = layout_at(&geo, 4096);
         let per_checkpoint = layout.bytes_per_tensor * layout.num_layers as usize;
-        assert_eq!(per_checkpoint, 78_446_592);
+        assert_eq!(per_checkpoint, 153_944_064);
     }
 
     /// Checks the shape calculation above against what the MLX allocator actually
     /// reserves. Ignored by default: needs a Metal device and allocates on the GPU.
     #[test]
-    #[ignore = "allocates ~75 MiB of Metal buffers; run with --ignored"]
+    #[ignore = "allocates ~147 MiB of Metal buffers; run with --ignored"]
     fn a_27b_gdn_checkpoint_allocates_the_bytes_its_layout_claims() {
         use crate::array::{DType, MxArray, get_active_memory};
 
@@ -1013,7 +1066,7 @@ mod tests {
                     i64::from(geo.v_head_dim),
                     i64::from(geo.k_head_dim),
                 ],
-                Some(DType::BFloat16),
+                Some(RECURRENT_DTYPE),
             )
             .expect("recurrent state");
             conv.eval();

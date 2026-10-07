@@ -575,11 +575,11 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 verified_ids.len()
             )));
         }
-        // Replay is required even on full accept: the windowed verify kernel
-        // carries the recurrent state in f32 across the whole window and rounds
-        // to bf16 once at the end, while replay re-rounds per token to restore
-        // the AR-exact state serial decode would leave. Skipping it would let a
-        // sub-ULP divergence compound across cycles.
+        // The recurrent state is carried in f32, so the windowed verify
+        // kernel's final state now equals the per-token replay bit for bit
+        // (`gated_delta::tests::ar_chain_matches_windowed_kernel_f32`). The
+        // replay still runs on every accept here; adopting the verify state
+        // directly on full accept is the follow-up that invariant unlocks.
         let caches = self
             .inner
             .caches
@@ -602,7 +602,12 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 self.gdn_blobs = Some(next);
             }
             None => {
-                self.gdn_blobs = None;
+                if self.gdn_blobs.take().is_some() {
+                    tracing::debug!(
+                        keep,
+                        "Qwen3.8 DFlash2 fused GDN commit declined; per-layer replay for the rest of the turn"
+                    );
+                }
                 replay_mtp_snapshot_to(
                     caches,
                     &snapshot,

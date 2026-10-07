@@ -1,4 +1,4 @@
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -63,7 +63,6 @@ fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray>
 /// `gcum_i - gcum_j = (-inf) - (-inf) = NaN` and emits garbage. The log-space form stays finite
 /// (softplus is numerically stable). Used by the CUDA chunk-parallel ops path.
 fn compute_g_log(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray> {
-    use crate::array::DType;
     let f32 = DType::Float32;
     let sp = Activations::softplus(&a.astype(f32)?.add(&dt_bias.astype(f32)?)?)?;
     let scale = a_log.astype(f32)?.exp()?;
@@ -170,14 +169,15 @@ fn gated_delta_kernel(
 /// Fused accepted-prefix replay for the eager-MTP GDN tape.
 ///
 /// ONE Metal dispatch replays `accepted_steps` tokens of the recorded verify
-/// window from `start_state`, rounding the recurrent state through the store
-/// dtype after every token — bit-identical to chaining [`gated_delta_kernel`]
-/// at T=1. The recurrent update never reads `q`, so the kernel omits it.
+/// window from `start_state`, rounding the recurrent state through its own
+/// dtype after every token (identity for the production f32 state) —
+/// bit-identical to chaining [`gated_delta_kernel`] at T=1. The recurrent
+/// update never reads `q`, so the kernel omits it.
 ///
 /// Shapes:
 ///   k: [B, S, Hk, Dk], v: [B, S, Hv, Dv]  (`S` = recorded window length)
 ///   g: [B, S, Hv] (post-`exp`, f32), beta: [B, S, Hv] (post-sigmoid)
-///   state: [B, Hv, Dv, Dk]  (model dtype)
+///   state: [B, Hv, Dv, Dk]  (f32)
 ///
 /// Returns the carried state `[B, Hv, Dv, Dk]` after `accepted_steps` tokens.
 fn gated_delta_replay(
@@ -218,12 +218,11 @@ fn gated_delta_replay(
 /// (`g_log.exp()`), and `beta` is post-sigmoid. All handles are lazy `MxArray`
 /// clones (no eval, no copy).
 ///
-/// On accept the replay walks the recorded window up to the accepted prefix,
-/// threading the bf16 recurrent state between token updates — ONE fused
-/// [`gated_delta_replay`] dispatch that replicates the per-token bf16
-/// round-trip of true autoregressive decode (the windowed verify kernel keeps
-/// state fp32 across the whole window, which is the divergence the replay
-/// corrects). The sequential T=1 [`gated_delta_kernel`] chain is the fallback.
+/// On accept the replay walks the recorded window up to the accepted prefix
+/// from the pre-verify f32 recurrent state — ONE fused [`gated_delta_replay`]
+/// dispatch, bit-identical to the sequential T=1 [`gated_delta_kernel`] chain
+/// (the fallback). With the f32 carry the windowed verify kernel's final state
+/// equals this replay at full accept (`ar_chain_matches_windowed_kernel_f32`).
 #[derive(Clone)]
 pub(crate) struct GdnKernelTape {
     /// Queries `[B, T, Hk, Dk]` (expanded or compact tiled, RMS-norm-scaled).
@@ -244,17 +243,16 @@ impl GdnKernelTape {
         self.q.shape_at(1)
     }
 
-    /// Replay the first `accepted_steps` recorded steps, threading the
-    /// bf16 recurrent state between token updates. Starts from `start_state`
-    /// (the pre-verify snapshot's bf16 recurrent state) and returns the
+    /// Replay the first `accepted_steps` recorded steps from `start_state`
+    /// (the pre-verify snapshot's f32 recurrent state) and return the
     /// AR-exact carried state after `accepted_steps` tokens.
     ///
     /// The fused [`gated_delta_replay`] kernel reproduces the T=1
     /// [`gated_delta_kernel`] chain in ONE dispatch: it keeps state in fp32
-    /// registers during each token's delta-rule update but rounds through the
-    /// store dtype after every token, matching the per-call write/reload the
-    /// sequential loop below performs. On any dispatch failure the sequential
-    /// T=1 chain remains the fallback (and the test oracle).
+    /// registers and rounds through the state dtype after every token,
+    /// matching the per-call write/reload the sequential loop below performs
+    /// (identity for f32). On any dispatch failure the sequential T=1 chain
+    /// remains the fallback (and the test oracle).
     pub(crate) fn replay_recurrent_state(
         &self,
         start_state: &MxArray,
@@ -273,7 +271,7 @@ impl GdnKernelTape {
         ) {
             return Ok(state);
         }
-        // Sequential fallback: per-step T=1 kernel calls threading the bf16
+        // Sequential fallback: per-step T=1 kernel calls threading the
         // state, reproducing autoregressive decode bit-for-bit.
         let mut state = start_state.clone();
         for t in 0..accepted_steps as i64 {
@@ -419,9 +417,10 @@ fn gated_delta_ops(
         current_state = new_state;
     }
 
-    // Concatenate along time dimension: [B, T, Hv, Dv]
+    // Concatenate along time dimension: [B, T, Hv, Dv]. The f32 state
+    // promotes `y`; hand back the activation dtype like the kernel does.
     let output_refs: Vec<&MxArray> = outputs.iter().collect();
-    let output = MxArray::concatenate_many(output_refs, Some(1))?;
+    let output = MxArray::concatenate_many(output_refs, Some(1))?.astype(v.dtype()?)?;
 
     Ok((output, current_state))
 }
@@ -437,7 +436,6 @@ fn gated_delta_ops(
 /// `solve_tril` reference. The `l - 1` steps are sequential but batched over all chunks,
 /// so the depth is independent of sequence length.
 fn invert_i_plus_strict_lower(a: &MxArray, l: i64) -> Result<MxArray> {
-    use crate::array::DType;
     let f32 = DType::Float32;
     let eye = MxArray::eye(l as i32, None, None, Some(f32))?; // [L, L]
     let zeros_col = MxArray::zeros(&[l, 1], Some(f32))?;
@@ -472,7 +470,6 @@ fn gated_delta_chunked_ops(
     beta: &MxArray,
     state: &MxArray,
 ) -> Result<(MxArray, MxArray)> {
-    use crate::array::DType;
     const BT: i64 = 64;
 
     let b = q.shape_at(0)?;
@@ -734,7 +731,7 @@ pub(crate) fn gated_delta_update_with_tape(
 
         let initial_state = match state {
             Some(s) => s.clone(),
-            None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
+            None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?,
         };
 
         // CUDA prefill: collapse the O(T) per-step recurrence into O(T/BT) chunk-serial
@@ -803,11 +800,13 @@ pub(crate) fn gated_delta_update_with_tape(
         (q.clone(), k.clone())
     };
 
-    // Initialize state if not provided: [B, Hv, Dv, Dk]
-    // Use v's dtype to avoid f32 promotion for bf16/f16 models
+    // Initialize state if not provided: [B, Hv, Dv, Dk]. The recurrent state
+    // is carried in f32 end to end (Splash / mlx-lm parity): the kernels keep
+    // the state in `StT` = the carried dtype, so this is the one place that
+    // fixes it. `y` stays in the activation dtype.
     let initial_state = match state {
         Some(s) => s.clone(),
-        None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
+        None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?,
     };
 
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
@@ -872,13 +871,12 @@ mod tests {
         assert_eq!(parse_gdn_kernel(Some("")), GdnKernel::Auto);
     }
 
-    use crate::array::DType;
-
     fn rand_bf16(shape: &[i64]) -> MxArray {
-        MxArray::random_normal(shape, 0.0, 0.3, Some(DType::Float32))
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap()
+        rand_f32(shape).astype(DType::BFloat16).unwrap()
+    }
+
+    fn rand_f32(shape: &[i64]) -> MxArray {
+        MxArray::random_normal(shape, 0.0, 0.3, Some(DType::Float32)).unwrap()
     }
 
     fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
@@ -892,65 +890,176 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
+    /// Largest elementwise distance in f32 ULPs (0 = bit-identical).
+    fn max_ulps(a: &MxArray, b: &MxArray) -> u32 {
+        let af = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let bf = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        assert_eq!(af.len(), bf.len());
+        // Monotonic integer image of the f32 ordering (negative floats are
+        // mirrored), so a bit-pattern difference is a ULP count.
+        let ordered = |x: f32| {
+            let b = x.to_bits() as i32;
+            i64::from(if b < 0 { i32::MIN - b } else { b })
+        };
+        af.iter()
+            .zip(bf.iter())
+            .map(|(x, y)| (ordered(*x) - ordered(*y)).unsigned_abs() as u32)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Production-shaped random tape: bf16 q/k/v/beta, f32 g, f32 state0.
+    fn tape_and_state(
+        b: i64,
+        hk: i64,
+        hv: i64,
+        dk: i64,
+        dv: i64,
+        t: i64,
+    ) -> (GdnKernelTape, MxArray) {
+        let gate = |dtype: DType| {
+            Activations::sigmoid(
+                &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
+            )
+            .unwrap()
+            .astype(dtype)
+            .unwrap()
+        };
+        let tape = GdnKernelTape {
+            q: rand_bf16(&[b, t, hk, dk]),
+            k: rand_bf16(&[b, t, hk, dk]),
+            v: rand_bf16(&[b, t, hv, dv]),
+            g: gate(DType::Float32),
+            // Production beta is model dtype (bf16) while g stays f32.
+            beta: gate(DType::BFloat16),
+        };
+        (tape, rand_f32(&[b, hv, dv, dk]))
+    }
+
+    /// Sequential T=1 kernel chain — AR decode, and the replay oracle the
+    /// fused dispatch must reproduce bit-for-bit at every accepted prefix.
+    /// Returns every per-token `y` plus the final state.
+    fn sequential_chain(
+        tape: &GdnKernelTape,
+        start_state: &MxArray,
+        accepted_steps: usize,
+    ) -> (Vec<MxArray>, MxArray) {
+        let mut state = start_state.clone();
+        let mut ys = Vec::with_capacity(accepted_steps);
+        for t in 0..accepted_steps as i64 {
+            let q_t = tape.q.slice_axis(1, t, t + 1).unwrap();
+            let k_t = tape.k.slice_axis(1, t, t + 1).unwrap();
+            let v_t = tape.v.slice_axis(1, t, t + 1).unwrap();
+            let g_t = tape.g.slice_axis(1, t, t + 1).unwrap();
+            let beta_t = tape.beta.slice_axis(1, t, t + 1).unwrap();
+            let (y, ns) =
+                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None).unwrap();
+            ys.push(y);
+            state = ns;
+        }
+        state.eval();
+        (ys, state)
+    }
+
+    fn sequential_replay(
+        tape: &GdnKernelTape,
+        start_state: &MxArray,
+        accepted_steps: usize,
+    ) -> MxArray {
+        sequential_chain(tape, start_state, accepted_steps).1
+    }
+
+    /// The kernel carries the state in the dtype it was handed (`StT`) and
+    /// `y` in the activation dtype: an f32 state must come back f32 while
+    /// bf16 activations keep `y` bf16, for T=1 and a window alike.
+    #[test]
+    fn kernel_keeps_state_dtype_and_activation_dtype_apart() {
+        let (tape, state0) = tape_and_state(1, 2, 4, 64, 64, 3);
+        for t in [1i64, 3] {
+            let (y, s) = gated_delta_kernel(
+                &tape.q.slice_axis(1, 0, t).unwrap(),
+                &tape.k.slice_axis(1, 0, t).unwrap(),
+                &tape.v.slice_axis(1, 0, t).unwrap(),
+                &tape.g.slice_axis(1, 0, t).unwrap(),
+                &tape.beta.slice_axis(1, 0, t).unwrap(),
+                &state0,
+                None,
+            )
+            .unwrap();
+            assert_eq!(y.dtype().unwrap(), DType::BFloat16, "T={t}");
+            assert_eq!(s.dtype().unwrap(), DType::Float32, "T={t}");
+        }
+        // `None` state zero-inits f32 on the kernel path and the ops path.
+        for use_kernel in [true, false] {
+            let a = rand_bf16(&[1, 3, 4]);
+            let b = rand_bf16(&[1, 3, 4]);
+            let a_log = rand_f32(&[4]);
+            let dt_bias = rand_f32(&[4]);
+            let (y, s) = gated_delta_update(
+                &tape.q, &tape.k, &tape.v, &a, &b, &a_log, &dt_bias, None, None, use_kernel, None,
+            )
+            .unwrap();
+            assert_eq!(y.dtype().unwrap(), DType::BFloat16, "kernel={use_kernel}");
+            assert_eq!(s.dtype().unwrap(), DType::Float32, "kernel={use_kernel}");
+        }
+    }
+
+    /// The new invariant phase 2 (adopting the verify state on full accept)
+    /// rests on: with an f32 carried state the sequential T=1 AR chain over
+    /// 8 tokens equals the windowed T=8 verify kernel's final state — and
+    /// every `y` row — bit for bit. Production geometry (Hk 16, Hv 48,
+    /// Dk = Dv = 128), so the 2-vcol per-step variant is the one exercised.
+    #[test]
+    fn ar_chain_matches_windowed_kernel_f32() {
+        let (b, hk, hv, dk, dv, t) = (1i64, 16i64, 48i64, 128i64, 128i64, 8i64);
+        let (tape, state0) = tape_and_state(b, hk, hv, dk, dv, t);
+        let (ar_ys, ar_final) = sequential_chain(&tape, &state0, t as usize);
+        let (win_y, win_final) = gated_delta_kernel(
+            &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, None,
+        )
+        .unwrap();
+        win_final.eval();
+        let state_ulps = max_ulps(&ar_final, &win_final);
+        let ar_y = MxArray::concatenate_many(ar_ys.iter().collect(), Some(1)).unwrap();
+        let y_ulps = max_ulps(&ar_y, &win_y);
+        eprintln!("AR_VS_WINDOW state_ulps={state_ulps} y_ulps={y_ulps}");
+        assert_eq!(
+            state_ulps,
+            0,
+            "f32-carried AR chain must equal the windowed kernel's final state bit-for-bit \
+             (max {state_ulps} ulps, max_abs_diff={:.6e})",
+            max_abs_diff(&ar_final, &win_final)
+        );
+        assert_eq!(
+            y_ulps, 0,
+            "windowed y rows must equal the AR chain's (max {y_ulps} ulps)"
+        );
+    }
+
     /// Diagnostic: does a per-step T=1 kernel loop (= AR decode) match
     /// recording during a windowed kernel then replaying per-step?
     #[test]
     fn tape_replay_matches_per_step_ar_loop() {
-        let b = 1i64;
-        let hv = 4i64;
-        let dk = 32i64;
-        let dv = 32i64;
-        let t = 4i64;
+        let (tape, state0) = tape_and_state(1, 4, 4, 32, 32, 4);
+        let t = 4usize;
 
-        let q = rand_bf16(&[b, t, hv, dk]);
-        let k = rand_bf16(&[b, t, hv, dk]);
-        let v = rand_bf16(&[b, t, hv, dv]);
-        // g in (0,1): sigmoid-ish decay.
-        let g = MxArray::random_normal(&[b, t, hv], 0.0, 0.3, Some(DType::Float32)).unwrap();
-        let g = Activations::sigmoid(&g).unwrap();
-        let beta = MxArray::random_normal(&[b, t, hv], 0.0, 0.3, Some(DType::Float32)).unwrap();
-        let beta = Activations::sigmoid(&beta).unwrap();
+        // (A) Reference AR loop: per-step T=1 kernel from state0, threading f32.
+        let ar_final = sequential_replay(&tape, &state0, t);
 
-        let state0 = rand_bf16(&[b, hv, dv, dk]);
-
-        // (A) Reference AR loop: per-step T=1 kernel from state0, threading bf16.
-        let ar_final = {
-            let mut s = state0.clone();
-            for ti in 0..t {
-                let q_t = q.slice_axis(1, ti, ti + 1).unwrap();
-                let k_t = k.slice_axis(1, ti, ti + 1).unwrap();
-                let v_t = v.slice_axis(1, ti, ti + 1).unwrap();
-                let g_t = g.slice_axis(1, ti, ti + 1).unwrap();
-                let beta_t = beta.slice_axis(1, ti, ti + 1).unwrap();
-                let (_y, ns) =
-                    gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &s, None).unwrap();
-                s = ns;
-            }
-            s.eval();
-            s
-        };
-
-        // (B) Windowed single call (the lossy verify-style fp32-carry path).
+        // (B) Windowed single call (the verify-style fp32-carry path).
         let win_final = {
-            let (_y, ns) = gated_delta_kernel(&q, &k, &v, &g, &beta, &state0, None).unwrap();
+            let (_y, ns) = gated_delta_kernel(
+                &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, None,
+            )
+            .unwrap();
             ns.eval();
             ns
         };
 
         // (C) Replay via GdnKernelTape (records the same q,k,v,g,beta, replays
         //     per-step T=1). This is exactly what the rollback does.
-        let tape = GdnKernelTape {
-            q: q.clone(),
-            k: k.clone(),
-            v: v.clone(),
-            g: g.clone(),
-            beta: beta.clone(),
-        };
-        let replay_final = tape.replay_recurrent_state(&state0, t as usize).unwrap();
-        let replay_final = {
-            replay_final.eval();
-            replay_final
-        };
+        let replay_final = tape.replay_recurrent_state(&state0, t).unwrap();
+        replay_final.eval();
 
         let ar_vs_replay = max_abs_diff(&ar_final, &replay_final);
         let ar_vs_win = max_abs_diff(&ar_final, &win_final);
@@ -964,62 +1073,32 @@ mod tests {
         );
     }
 
-    /// Sequential T=1 kernel chain — the replay oracle the fused dispatch
-    /// must reproduce bit-for-bit at every accepted-prefix length.
-    fn sequential_replay(
-        tape: &GdnKernelTape,
-        start_state: &MxArray,
-        accepted_steps: usize,
-    ) -> MxArray {
-        let mut state = start_state.clone();
-        for t in 0..accepted_steps as i64 {
-            let q_t = tape.q.slice_axis(1, t, t + 1).unwrap();
-            let k_t = tape.k.slice_axis(1, t, t + 1).unwrap();
-            let v_t = tape.v.slice_axis(1, t, t + 1).unwrap();
-            let g_t = tape.g.slice_axis(1, t, t + 1).unwrap();
-            let beta_t = tape.beta.slice_axis(1, t, t + 1).unwrap();
-            let (_y, ns) =
-                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None).unwrap();
-            state = ns;
-        }
-        state.eval();
-        state
-    }
-
     /// The fused [`gated_delta_replay`] kernel must equal the sequential T=1
     /// kernel chain bit-for-bit for EVERY accepted prefix length (rejection
     /// at any position), over a window larger than the replay count (the
-    /// stride case: S > T) and at production dims Dk=Dv=128.
+    /// stride case: S > T) and at production dims Dk=Dv=128 — for the f32
+    /// production state and for a bf16 one (the per-token `StT` round).
     #[test]
     fn fused_replay_matches_t1_chain_every_prefix() {
         let (b, hv, dk, dv, t) = (1i64, 4i64, 128i64, 128i64, 8i64);
-        let q = rand_bf16(&[b, t, hv, dk]);
-        let k = rand_bf16(&[b, t, hv, dk]);
-        let v = rand_bf16(&[b, t, hv, dv]);
-        let g = Activations::sigmoid(
-            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
-        )
-        .unwrap();
-        // Production beta is model dtype (bf16) while g stays f32.
-        let beta = Activations::sigmoid(
-            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let state0 = rand_bf16(&[b, hv, dv, dk]);
-        let tape = GdnKernelTape { q, k, v, g, beta };
-
-        for steps in 0..=t as usize {
-            let oracle = sequential_replay(&tape, &state0, steps);
-            let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
-            fused.eval();
-            let diff = max_abs_diff(&oracle, &fused);
-            assert_eq!(
-                diff, 0.0,
-                "fused replay diverged from the T=1 chain at accepted_steps={steps} \
-                 (max_abs_diff={diff:.6e})"
-            );
+        let (tape, state_f32) = tape_and_state(b, hv, hv, dk, dv, t);
+        for state0 in [
+            state_f32.clone(),
+            state_f32.astype(DType::BFloat16).unwrap(),
+        ] {
+            let dtype = state0.dtype().unwrap();
+            for steps in 0..=t as usize {
+                let oracle = sequential_replay(&tape, &state0, steps);
+                let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
+                fused.eval();
+                assert_eq!(fused.dtype().unwrap(), dtype);
+                let diff = max_abs_diff(&oracle, &fused);
+                assert_eq!(
+                    diff, 0.0,
+                    "fused replay diverged from the T=1 chain at accepted_steps={steps} \
+                     state={dtype:?} (max_abs_diff={diff:.6e})"
+                );
+            }
         }
     }
 
@@ -1028,25 +1107,8 @@ mod tests {
     /// B>1 shares a dispatch).
     #[test]
     fn fused_replay_batch_lanes_independent() {
-        let (hv, dk, dv, t) = (4i64, 64i64, 64i64, 5i64);
-        let b = 2i64;
-        let q = rand_bf16(&[b, t, hv, dk]);
-        let k = rand_bf16(&[b, t, hv, dk]);
-        let v = rand_bf16(&[b, t, hv, dv]);
-        let g = Activations::sigmoid(
-            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
-        )
-        .unwrap();
-        let beta = Activations::sigmoid(
-            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let state0 = rand_bf16(&[b, hv, dv, dk]);
-        let tape = GdnKernelTape { q, k, v, g, beta };
-
-        for steps in 1..=t as usize {
+        let (tape, state0) = tape_and_state(2, 4, 4, 64, 64, 5);
+        for steps in 1..=5usize {
             let oracle = sequential_replay(&tape, &state0, steps);
             let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
             fused.eval();
@@ -1063,24 +1125,8 @@ mod tests {
     /// key head `hv % Hk`. The fused replay must stay bit-identical there too.
     #[test]
     fn fused_replay_gqa_heads() {
-        let (b, hk, hv, dk, dv, t) = (1i64, 2i64, 4i64, 64i64, 64i64, 4i64);
-        let q = rand_bf16(&[b, t, hk, dk]);
-        let k = rand_bf16(&[b, t, hk, dk]);
-        let v = rand_bf16(&[b, t, hv, dv]);
-        let g = Activations::sigmoid(
-            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
-        )
-        .unwrap();
-        let beta = Activations::sigmoid(
-            &MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(DType::Float32)).unwrap(),
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let state0 = rand_bf16(&[b, hv, dv, dk]);
-        let tape = GdnKernelTape { q, k, v, g, beta };
-
-        for steps in 1..=t as usize {
+        let (tape, state0) = tape_and_state(1, 2, 4, 64, 64, 4);
+        for steps in 1..=4usize {
             let oracle = sequential_replay(&tape, &state0, steps);
             let fused = tape.replay_recurrent_state(&state0, steps).unwrap();
             fused.eval();
@@ -1100,7 +1146,6 @@ mod tests {
     /// algorithm on Mac/Metal before any DGX time.
     #[test]
     fn chunked_ops_matches_per_step_ops_f32() -> Result<()> {
-        use crate::array::DType;
         // Production dims (Dk=Dv=128 != BT=64 so a BT/Dk axis-swap can't hide).
         let (b, hv, dk, dv) = (1i64, 4i64, 128i64, 128i64);
         let f32 = DType::Float32;
@@ -1146,7 +1191,6 @@ mod tests {
     /// (The random-key test above keeps k.k ~ 0.1, which never triggers this.)
     #[test]
     fn chunked_ops_stable_with_correlated_unit_norm_keys() -> Result<()> {
-        use crate::array::DType;
         let (b, hv, dk, dv) = (1i64, 4i64, 128i64, 128i64);
         let f32 = DType::Float32;
         let randn = |shape: &[i64], std: f64| MxArray::random_normal(shape, 0.0, std, Some(f32));
@@ -1203,7 +1247,6 @@ mod tests {
     /// (the MoE GDN garbage root cause). The chunked CUDA path uses this in place of `g.log()`.
     #[test]
     fn compute_g_log_finite_under_strong_decay() -> Result<()> {
-        use crate::array::DType;
         let f32 = DType::Float32;
         let (b, t, hv) = (1i64, 8i64, 4i64);
         let max_abs = |x: &MxArray| -> Result<f32> {

@@ -31,7 +31,8 @@ use std::collections::VecDeque;
 
 /// One resident GDN sidecar for the root Pi session plus the four child loops
 /// the subagent extension can run concurrently. Sidecars are large (about
-/// 75 MiB for the dense 27B checkpoint), so keep this a hard bound rather than
+/// 147 MiB for the dense 27B checkpoint with the FP32 recurrent state), so
+/// keep this a hard bound rather than
 /// making it scale with the paged KV pool or the eight-task submission limit.
 ///
 /// This number was chosen when an owner needed ONE checkpoint. It no longer
@@ -49,7 +50,7 @@ use std::collections::VecDeque;
 /// last checkpoint. `retention_sim`'s 40-turn sweep at six owners measures 28
 /// turns with no checkpoint at all and 84% of every cached prefix re-forwarded,
 /// under BOTH global-cap arms; at five owners it measures 0 and 10.5%. Six
-/// slots would move the cliff to seven owners for +75 MiB of resident 27B
+/// slots would move the cliff to seven owners for +147 MiB of resident 27B
 /// checkpoints (`retention_sim`'s capacity sweep prints the row). It is not
 /// taken because the subagent extension caps concurrency at four child loops
 /// plus the root, which is five. A `/new` rotation mints a sixth owner id, but

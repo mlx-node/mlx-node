@@ -110,9 +110,9 @@ R"(
         }
         for (int i = 0; i < n_per_t; ++i) {
           auto s_idx = n_per_t * dk_idx + i;
-          o_state_A[s_idx] = static_cast<InT>(state_A[i]);
-          o_state_B[s_idx] = static_cast<InT>(state_B[i]);
-          o_state_C[s_idx] = static_cast<InT>(state_C[i]);
-          o_state_D[s_idx] = static_cast<InT>(state_D[i]);
+          o_state_A[s_idx] = static_cast<StT>(state_A[i]);
+          o_state_B[s_idx] = static_cast<StT>(state_B[i]);
+          o_state_C[s_idx] = static_cast<StT>(state_C[i]);
+          o_state_D[s_idx] = static_cast<StT>(state_D[i]);
         }
 )"

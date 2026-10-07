@@ -267,8 +267,9 @@ fn default_rope_theta() -> f64 {
 }
 
 impl Qwen3_5Config {
-    /// BF16 bytes for one request's complete GDN conv + recurrent state.
-    /// Full-attention K/V is accounted separately by the paged allocator.
+    /// Bytes for one request's complete GDN state: bf16 conv history plus the
+    /// f32-carried recurrent state. Full-attention K/V is accounted separately
+    /// by the paged allocator.
     pub(crate) fn recurrent_state_bytes(&self) -> u64 {
         let linear_layers = (0..self.num_layers.max(0) as usize)
             .filter(|&layer| self.is_linear_layer(layer))
@@ -280,9 +281,11 @@ impl Qwen3_5Config {
             .unwrap_or(0)
             .saturating_mul(u64::try_from(self.linear_value_head_dim.max(0)).unwrap_or(0))
             .saturating_mul(u64::try_from(self.linear_key_head_dim.max(0)).unwrap_or(0));
-        linear_layers
-            .saturating_mul(conv_elements.saturating_add(recurrent_elements))
-            .saturating_mul(2)
+        linear_layers.saturating_mul(
+            conv_elements
+                .saturating_mul(2)
+                .saturating_add(recurrent_elements.saturating_mul(4)),
+        )
     }
 
     /// Returns whether a given layer index uses linear attention (GatedDeltaNet)
@@ -422,8 +425,11 @@ mod tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
         };
-        // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14], recurrent=[2,3,4].
-        assert_eq!(config.recurrent_state_bytes(), 2 * (3 * 14 + 2 * 3 * 4) * 2);
+        // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14] bf16, recurrent=[2,3,4] f32.
+        assert_eq!(
+            config.recurrent_state_bytes(),
+            2 * (3 * 14 * 2 + 2 * 3 * 4 * 4)
+        );
     }
 
     #[test]

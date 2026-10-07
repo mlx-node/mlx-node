@@ -41,8 +41,9 @@ static const char* gated_delta_fused_gating_source =
 ;
 
 // Fused accepted-prefix replay for the eager-MTP tape: one dispatch walks all
-// accepted tokens, rounding the recurrent state through InT after EVERY token
-// so the result is bit-identical to chaining the per-step kernel at T=1.
+// accepted tokens, rounding the recurrent state through its own dtype (StT)
+// after EVERY token so the result is bit-identical to chaining the per-step
+// kernel at T=1.
 static const char* gated_delta_replay_source =
     #include "metal/common/gated_delta_replay.metal.inc"
 ;
@@ -145,9 +146,12 @@ static bool gated_delta_kernel_impl(
         int Hv = v_arr.shape(2);
         int Dv = v_arr.shape(3);
 
-        // Qwen's BF16 prompt storage is widened only in registers. Its output
-        // and persistent recurrence remain FP32, independent of input storage.
+        // `y` follows the activation dtype; the recurrent state keeps the
+        // dtype it was carried in (`StT`, f32 in production — never rounded
+        // on store). Qwen4's `float_output` widens both to FP32 regardless
+        // of the BF16 prompt storage.
         auto input_type = float_output ? mlx::core::float32 : q_arr.dtype();
+        auto state_type = float_output ? mlx::core::float32 : state_arr.dtype();
 
         // T as a scalar array (int32)
         auto T_arr = array(T, mlx::core::int32);
@@ -158,9 +162,10 @@ static bool gated_delta_kernel_impl(
             inputs.push_back(*reinterpret_cast<array*>(mask_handle));
         }
 
-        // Template args: InT (dtype), Dk, Dv, Hk, Hv
+        // Template args: InT (activation dtype), StT (state dtype), Dk, Dv, Hk, Hv
         std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
             {"InT", input_type},
+            {"StT", state_type},
             {"Dk", Dk},
             {"Dv", Dv},
             {"Hk", Hk},
@@ -201,7 +206,7 @@ static bool gated_delta_kernel_impl(
         auto results = kernel(
             inputs,
             {Shape{B, T, Hv, Dv}, state_arr.shape()},  // output_shapes
-            {input_type, input_type},                     // output_dtypes
+            {input_type, state_type},                     // output_dtypes
             std::make_tuple(32, grid_y, B * Hv),         // grid
             std::make_tuple(32, 4, 1),                    // threadgroup
             template_args,
@@ -376,18 +381,17 @@ bool mlx_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_array*
 /// Fused accepted-prefix replay for the eager-MTP GDN tape.
 ///
 /// Replays `replay_steps` tokens of the recorded verify window in ONE dispatch,
-/// rounding the fp32 register state through `InT` after every token so the
-/// result is bit-identical to chaining `mlx_gated_delta_kernel` at T=1 — the
-/// exact autoregressive state rounding the rollback contract requires. The
-/// recurrent update never reads `q`, so the query input and `y` output do not
-/// exist here.
+/// rounding the fp32 register state through the state dtype after every token
+/// so the result is bit-identical to chaining `mlx_gated_delta_kernel` at T=1
+/// (identity for the production f32 state). The recurrent update never reads
+/// `q`, so the query input and `y` output do not exist here.
 ///
 /// Inputs:
 ///   k: [B, S, Hk, Dk]  - recorded window keys (S = full window stride)
 ///   v: [B, S, Hv, Dv]  - recorded window values
 ///   g: [B, S, Hv]       - recorded decay gate (post-exp, f32)
 ///   beta: [B, S, Hv]    - recorded beta (post-sigmoid)
-///   state: [B, Hv, Dv, Dk] - pre-verify snapshot state (model dtype)
+///   state: [B, Hv, Dv, Dk] - pre-verify snapshot state (f32 in production)
 ///   replay_steps: accepted prefix length (T loop bound, <= S)
 ///   window_stride: recorded window length S (batch/time striding)
 ///
@@ -431,11 +435,10 @@ bool mlx_gated_delta_replay(
             throw std::invalid_argument("mlx_gated_delta_replay: inconsistent tensor dims");
         }
 
-        // The per-token state store dtype — the T=1 chain rounds through
-        // `input_type = q.dtype()` (the model dtype) each call; the tape
-        // records k in that same dtype, so k's dtype reproduces it even for
-        // a state snapshot stored at a different precision.
-        auto input_type = k_arr.dtype();
+        // The per-token state store dtype — the T=1 chain rounds through the
+        // carried state's dtype (`StT`) each call; f32 in production, so the
+        // round is the identity and the replay equals the windowed kernel.
+        auto state_type = state_arr.dtype();
 
         auto T_arr = array(replay_steps, mlx::core::int32);
         auto S_arr = array(window_stride, mlx::core::int32);
@@ -443,7 +446,7 @@ bool mlx_gated_delta_replay(
         std::vector<array> inputs = {k_arr, v_arr, g_arr, beta_arr, state_arr, T_arr, S_arr};
 
         std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
-            {"InT", input_type},
+            {"StT", state_type},
             {"Dk", Dk},
             {"Dv", Dv},
             {"Hk", Hk},
@@ -467,7 +470,7 @@ bool mlx_gated_delta_replay(
         auto results = replay_kernel.value()(
             inputs,
             {state_arr.shape()},
-            {input_type},
+            {state_type},
             std::make_tuple(32, Dv, B * Hv),          // Grid: same lane map as per-step
             std::make_tuple(32, 4, 1),                // Threadgroup
             template_args,

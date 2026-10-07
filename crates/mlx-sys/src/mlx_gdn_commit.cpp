@@ -1,9 +1,9 @@
 // Fused DFlash2 GDN commit: a few Metal dispatches replay the accepted
 // prefix of every linear layer's recorded verify tape into the packed
 // recurrent and conv state blobs (Splash `verify_gdn_commit`, Apache-2.0; see
-// THIRD_PARTY_NOTICES). The arithmetic is `gated_delta_replay`'s per-token
-// bf16 round-trip plus `replay_conv_state`'s row copy, so the result is
-// bit-identical to the per-layer replays it replaces.
+// THIRD_PARTY_NOTICES). The arithmetic is `gated_delta_replay`'s f32 carry
+// plus `replay_conv_state`'s row copy, so the result is bit-identical to the
+// per-layer replays it replaces.
 //
 // Metal binds at most 31 buffers per dispatch and a layer's tape is 5 arrays,
 // so one primitive evaluation encodes the layers in groups of 5 (10
@@ -186,7 +186,7 @@ void expect(bool ok, const char* what) {
 
 // Fused GDN commit over `layers` linear layers.
 //
-//   rec_in   [L, Hv, Dv, Dk] bf16 — pre-verify recurrent blob
+//   rec_in   [L, Hv, Dv, Dk] f32  — pre-verify recurrent blob
 //   conv_in  [L, K-1, W]     bf16 — pre-verify conv history blob
 //   k[l]     [1, S, Hk, Dk]  bf16, v[l] [1, S, Hv, Dv] bf16,
 //   g[l]     [1, S, Hv]      f32,  beta[l] [1, S, Hv] bf16,
@@ -220,12 +220,12 @@ extern "C" bool mlx_gdn_commit_all(mlx_array* rec_in, mlx_array* conv_in,
     expect(rec.ndim() == 4 && conv.ndim() == 3 && rec.shape(0) == layers &&
                conv.shape(0) == layers,
            "state blobs must be [L, Hv, Dv, Dk] and [L, K-1, W]");
-    expect(rec.dtype() == bfloat16 && conv.dtype() == bfloat16,
-           "state blobs must be bf16");
+    expect(rec.dtype() == float32 && conv.dtype() == bfloat16,
+           "state blobs must be f32 recurrent, bf16 conv");
     const auto& rec_spare = *reinterpret_cast<array*>(rec_next);
     const auto& conv_spare = *reinterpret_cast<array*>(conv_next);
     expect(rec_spare.shape() == rec.shape() && conv_spare.shape() == conv.shape() &&
-               rec_spare.dtype() == bfloat16 && conv_spare.dtype() == bfloat16,
+               rec_spare.dtype() == float32 && conv_spare.dtype() == bfloat16,
            "next blobs must match the current blobs");
     const int hv = rec.shape(1), dv = rec.shape(2), dk = rec.shape(3);
     const int conv_rows = conv.shape(1), width = conv.shape(2);
@@ -288,7 +288,7 @@ extern "C" bool mlx_gdn_commit_all(mlx_array* rec_in, mlx_array* conv_in,
     auto stream = default_stream(Device::gpu);
     auto primitive = std::make_shared<GdnCommit>(stream, params);
     auto outputs = array::make_arrays({rec.shape(), conv.shape()},
-                                      {bfloat16, bfloat16}, primitive,
+                                      {float32, bfloat16}, primitive,
                                       std::move(inputs));
     *out_rec = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
     *out_conv = reinterpret_cast<mlx_array*>(new array(std::move(outputs[1])));

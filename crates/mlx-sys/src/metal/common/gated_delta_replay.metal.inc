@@ -1,10 +1,10 @@
 // Gated delta accepted-prefix replay: fused variant of the per-step kernel's
 // T=1 call chain. One dispatch walks `T` accepted tokens, rounding the
-// recurrent state through `InT` after EVERY token — bit-identical to chaining
-// `gated_delta_step` at T=1 (which stores the state as InT and reloads it as
-// float between calls), unlike the windowed kernel whose fp32 carry skips
-// that round-trip. The recurrent update never reads `q`, so the query stream
-// and `y` output are omitted entirely.
+// recurrent state through the state dtype `StT` after EVERY token —
+// bit-identical to chaining `gated_delta_step` at T=1 (which stores the state
+// as StT and reloads it as float between calls). With the production f32
+// state that round is the identity. The recurrent update never reads `q`, so
+// the query stream and `y` output are omitted entirely.
 //
 //   k, v:   [B, S, Hk/Hv, Dk/Dv]   recorded verify-window inputs (S = window)
 //   g, beta: [B, S, Hv]
@@ -57,11 +57,10 @@ R"(
             auto s_idx = n_per_t * dk_idx + i;
             state[i] = state[i] + k_[s_idx] * delta;
           }
-          // AR round-trip: the T=1 chain stores the updated state as InT and
-          // reloads it as float before the next token. Fusing without this
-          // cast would keep fp32 across tokens and diverge by ~1 bf16 ULP.
+          // AR round-trip: the T=1 chain stores the updated state as StT and
+          // reloads it as float before the next token (identity for f32).
           for (int i = 0; i < n_per_t; ++i) {
-            state[i] = static_cast<float>(static_cast<InT>(state[i]));
+            state[i] = static_cast<float>(static_cast<StT>(state[i]));
           }
           // Increment data pointers to next time step
           k_ += Hk * Dk;
@@ -71,6 +70,6 @@ R"(
         }
         for (int i = 0; i < n_per_t; ++i) {
           auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<InT>(state[i]);
+          o_state[s_idx] = static_cast<StT>(state[i]);
         }
 )"

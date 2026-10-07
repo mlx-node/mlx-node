@@ -9,7 +9,7 @@
 //! every layer's accepted prefix from the blobs in a few dispatches instead
 //! of one replay plus a conv concat per layer, writing into a spare pair of
 //! blobs that then swaps roles with the current pair (`current` / `next`
-//! parity, as Splash's `swapParity`): no per-cycle 72 MiB allocation.
+//! parity, as Splash's `swapParity`): no per-cycle 144 MiB allocation.
 
 use napi::bindgen_prelude::*;
 
@@ -25,7 +25,7 @@ pub(crate) struct GdnStateBlobs {
     pub layers: Vec<usize>,
     /// `[L, K-1, conv_dim]` conv history, bf16.
     pub conv: MxArray,
-    /// `[L, Hv, Dv, Dk]` recurrent state, bf16.
+    /// `[L, Hv, Dv, Dk]` recurrent state, f32.
     pub recurrent: MxArray,
     /// The other parity: the blobs the next commit writes into. Their
     /// contents are stale (the state before the last commit) and must not
@@ -36,8 +36,8 @@ pub(crate) struct GdnStateBlobs {
 impl GdnStateBlobs {
     /// Pack every linear layer's `(conv_state, recurrent_state)` into blobs
     /// (one concat per kind: a per-turn cost, not a per-cycle one).
-    /// `None` when a linear slot is empty or the states are not bf16 — the
-    /// caller keeps the per-layer path.
+    /// `None` when a linear slot is empty or the states are not (bf16 conv,
+    /// f32 recurrent) — the caller keeps the per-layer path.
     pub(crate) fn pack(caches: &[Qwen3_5LayerCache]) -> Result<Option<Self>> {
         let mut layers = Vec::new();
         let mut convs = Vec::new();
@@ -50,7 +50,7 @@ impl GdnStateBlobs {
                 return Ok(None);
             };
             if conv.dtype()? != DType::BFloat16
-                || rec.dtype()? != DType::BFloat16
+                || rec.dtype()? != DType::Float32
                 || conv.ndim()? != 3
                 || rec.ndim()? != 4
                 || conv.shape_at(0)? != 1
@@ -69,7 +69,7 @@ impl GdnStateBlobs {
         let recurrent = MxArray::concatenate_many(recs, Some(0))?;
         let spare = (
             MxArray::zeros(conv.shape()?.as_ref(), Some(DType::BFloat16))?,
-            MxArray::zeros(recurrent.shape()?.as_ref(), Some(DType::BFloat16))?,
+            MxArray::zeros(recurrent.shape()?.as_ref(), Some(DType::Float32))?,
         );
         Ok(Some(Self {
             layers,
@@ -216,7 +216,13 @@ mod tests {
             }
             let mut arrays = ArraysCache::new(2);
             arrays.set(0, rand_bf16(&[1, 3, width])).unwrap();
-            arrays.set(1, rand_bf16(&[1, hv, dv, dk])).unwrap();
+            arrays
+                .set(
+                    1,
+                    MxArray::random_normal(&[1, hv, dv, dk], 0.0, 0.3, Some(DType::Float32))
+                        .unwrap(),
+                )
+                .unwrap();
             caches.push(Qwen3_5LayerCache::Linear(arrays));
             let gate = |dtype: DType| {
                 Activations::sigmoid(

@@ -4,8 +4,8 @@
 //
 // Per layer this reproduces, bit for bit, what the per-layer path did:
 //   * recurrent state: `gated_delta_replay` — walk the first `keep` recorded
-//     tokens from the pre-verify state, rounding through bf16 after every
-//     token (the AR round-trip serial decode performs);
+//     tokens from the pre-verify f32 state in f32 registers (the state is
+//     never rounded, matching serial T=1 decode with an f32 carry);
 //   * conv state: the last K-1 rows of `[conv_in ; qkv[0..keep]]`
 //     (`replay_conv_state`'s concat + split, now a plain copy).
 //
@@ -13,7 +13,7 @@
 // layers in groups of GDN_COMMIT_GROUP (5 tape arrays each) and every group
 // writes its own slice of the shared output blobs.
 //
-//   rec_in / rec_out:   [L, Hv, Dv, Dk] bf16 (one blob for every layer)
+//   rec_in / rec_out:   [L, Hv, Dv, Dk] f32 (one blob for every layer)
 //   conv_in / conv_out: [L, K-1, W]     bf16
 //   per layer: k [S, Hk, Dk] bf16, v [S, Hv, Dv] bf16, g [S, Hv] f32,
 //              beta [S, Hv] bf16, qkv [S, W] bf16 with row stride qkv_stride
@@ -48,9 +48,9 @@ struct GdnCommitParams {
   case i: k_ = k##i; v_ = v##i; g_ = g##i; beta_ = beta##i; qkv_ = qkv##i; break;
 
 [[kernel]] void mlx_node_gdn_commit(
-    const device bfloat16_t* rec_in [[buffer(0)]],
+    const device float* rec_in [[buffer(0)]],
     const device bfloat16_t* conv_in [[buffer(1)]],
-    device bfloat16_t* rec_out [[buffer(2)]],
+    device float* rec_out [[buffer(2)]],
     device bfloat16_t* conv_out [[buffer(3)]],
     constant GdnCommitParams& p [[buffer(4)]],
     GDN_COMMIT_TAPE(0), GDN_COMMIT_TAPE(1), GDN_COMMIT_TAPE(2),
@@ -107,12 +107,12 @@ struct GdnCommitParams {
   v_ += hv_idx * p.dv;
 
   const ulong row = ulong(layer) * uint(p.hv) + hv_idx;
-  const device bfloat16_t* i_state = rec_in + (row * p.dv + dv_idx) * p.dk;
-  device bfloat16_t* o_state = rec_out + (row * p.dv + dv_idx) * p.dk;
+  const device float* i_state = rec_in + (row * p.dv + dv_idx) * p.dk;
+  device float* o_state = rec_out + (row * p.dv + dv_idx) * p.dk;
 
   float state[n_per_t];
   for (int i = 0; i < n_per_t; ++i) {
-    state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+    state[i] = i_state[n_per_t * dk_idx + i];
   }
   for (int t = 0; t < p.keep; ++t) {
     float kv_mem = 0.0f;
@@ -127,16 +127,13 @@ struct GdnCommitParams {
       const int s_idx = n_per_t * dk_idx + i;
       state[i] = state[i] + k_[s_idx] * delta;
     }
-    for (int i = 0; i < n_per_t; ++i) {
-      state[i] = static_cast<float>(static_cast<bfloat16_t>(state[i]));
-    }
     k_ += p.hk * p.dk;
     v_ += p.hv * p.dv;
     g_ += p.hv;
     beta_ += p.hv;
   }
   for (int i = 0; i < n_per_t; ++i) {
-    o_state[n_per_t * dk_idx + i] = static_cast<bfloat16_t>(state[i]);
+    o_state[n_per_t * dk_idx + i] = state[i];
   }
 }
 )"

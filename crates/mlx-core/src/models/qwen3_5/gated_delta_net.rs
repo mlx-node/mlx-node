@@ -114,8 +114,8 @@ impl GdnLayerTape {
     /// Replay the accepted prefix into the pre-verify snapshot caches.
     ///
     /// `accepted_steps = accepted_drafts + 1`. Rebuilds BOTH the recurrent
-    /// state (per-step T=1 kernel replay from `snapshot_recurrent`, threading
-    /// bf16 between calls = AR round-trip) and the conv state (slice the
+    /// state (per-step T=1 kernel replay from the f32 `snapshot_recurrent`,
+    /// = AR decode bit-for-bit) and the conv state (slice the
     /// accepted prefix of the recorded `qkv` onto `snapshot_conv`), then writes
     /// them into the live cache slots (slot 0 = conv_state, slot 1 =
     /// recurrent_state).
@@ -131,10 +131,10 @@ impl GdnLayerTape {
         accepted_steps: usize,
     ) -> Result<()> {
         // --- Recurrent state ---------------------------------------------
-        // Start from the pre-verify (bf16) recurrent state. If the snapshot
+        // Start from the pre-verify (f32) recurrent state. If the snapshot
         // had no recurrent state (cold cache — should not happen at decode
-        // time), zero-init to the recorded shapes via the kernel's own
-        // zero-state default by re-deriving from `v`.
+        // time), zero-init to the recorded shapes, f32 like the kernel's own
+        // zero-state default.
         let start_state = match snapshot_recurrent {
             Some(s) => s.clone(),
             None => {
@@ -142,10 +142,7 @@ impl GdnLayerTape {
                 let num_v_heads = self.kernel.v.shape_at(2)?;
                 let v_dim = self.kernel.v.shape_at(3)?;
                 let k_dim = self.kernel.q.shape_at(3)?;
-                MxArray::zeros(
-                    &[batch, num_v_heads, v_dim, k_dim],
-                    Some(self.kernel.v.dtype()?),
-                )?
+                MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?
             }
         };
         let new_recurrent = self
