@@ -285,10 +285,11 @@ fn qwen38_dominant_small_m_qmm() {
 
 /// The DFlash2 draft's affine Q4/group-64 projections at the verify widths:
 /// MLX's own `quantized_matmul` route (M < 13 takes `qmv`, one threadgroup
-/// per row), on draft-sized shapes. Eight matmuls per eval over a ring of
-/// eight weight copies (DRAM-cold, launch latency amortised), as
-/// `kquant_tiled_bench` does. If M=7/8 costs well over M=1, the draft
-/// re-reads its weights per row and an 8-row kernel is the lever.
+/// per row) against the same arrays tiled into the K-quant `a4g64@t64`
+/// contract (`qmv_t64` / `qmv_wide_t64` / `qmm_m8_nax_t64` / the GEMM), on
+/// draft-sized shapes. Eight matmuls per eval over a ring of eight weight
+/// copies (DRAM-cold, launch latency amortised), as `kquant_tiled_bench`
+/// does.
 #[test]
 #[ignore = "manual exact-shape affine small-M microbenchmark"]
 fn draft_affine_q4_small_m_qmm() {
@@ -311,6 +312,10 @@ fn draft_affine_q4_small_m_qmm() {
             biases_cols: k / GROUP,
             signed_scales: false,
         };
+        let tiled = Format {
+            mode: "a4g64@t64",
+            ..format
+        };
         let ring: Vec<(MxArray, MxArray, MxArray)> = (0..RING)
             .map(|i| {
                 let mut state = 0xa44e_0000u32 + i as u32;
@@ -327,9 +332,23 @@ fn draft_affine_q4_small_m_qmm() {
                 (w, sc, bi)
             })
             .collect();
+        // The same bytes in the Tiled64 order: codes per 32-value unit (4
+        // words), scales and biases per 256-value super-block (4 bf16 each).
+        let tiled_ring: Vec<(MxArray, MxArray, MxArray)> = ring
+            .iter()
+            .map(|(w, sc, bi)| {
+                let tw = kquant_tile_rows(w, 4).expect("tile weight");
+                let tsc = kquant_tile_rows(sc, 256 / GROUP).expect("tile scales");
+                let tbi = kquant_tile_rows(bi, 256 / GROUP).expect("tile biases");
+                tw.eval();
+                tsc.eval();
+                tbi.eval();
+                (tw, tsc, tbi)
+            })
+            .collect();
         let bytes = (n * k / 2 + 2 * n * k / GROUP * 2) as f64;
         println!(
-            "\n  draft affine Q4/g64, N={n}, K={k}, {:.0} MB, {RING} matmuls per eval",
+            "\n  draft affine Q4/g64, N={n}, K={k}, {:.0} MB, {RING} matmuls per eval: MLX affine | a4g64@t64",
             bytes / 1e6
         );
         for m in [1i64, 4, 7, 8, 12, 16] {
@@ -341,7 +360,7 @@ fn draft_affine_q4_small_m_qmm() {
                 })
                 .collect();
             let x = MxArray::from_bfloat16(&x, &[m, k]).expect("x");
-            let batch = |ring: &[(MxArray, MxArray, MxArray)]| -> f64 {
+            let batch = |ring: &[(MxArray, MxArray, MxArray)], format: Format| -> f64 {
                 let mut handles: Vec<_> = ring
                     .iter()
                     .map(|(w, sc, bi)| qmm(&x, w, sc, bi, format))
@@ -363,14 +382,19 @@ fn draft_affine_q4_small_m_qmm() {
                 }
                 elapsed / RING as f64
             };
-            for _ in 0..WARMUP {
-                batch(&ring);
-            }
-            let mut samples: Vec<f64> = (0..REPS).map(|_| batch(&ring)).collect();
-            let ms = median_ms(&mut samples);
+            let measure = |ring: &[(MxArray, MxArray, MxArray)], format: Format| -> f64 {
+                for _ in 0..WARMUP {
+                    batch(ring, format);
+                }
+                let mut samples: Vec<f64> = (0..REPS).map(|_| batch(ring, format)).collect();
+                median_ms(&mut samples)
+            };
+            let ms = measure(&ring, format);
+            let ms_t64 = measure(&tiled_ring, tiled);
             println!(
-                "  M={m:>2}: {ms:.4} ms/matmul  {:.0} GB/s",
-                bytes / (ms / 1e3) / 1e9
+                "  M={m:>2}: {ms:.4} ms  {:>4.0} GB/s | {ms_t64:.4} ms  {:>4.0} GB/s",
+                bytes / (ms / 1e3) / 1e9,
+                bytes / (ms_t64 / 1e3) / 1e9
             );
         }
     }

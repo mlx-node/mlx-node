@@ -15,16 +15,20 @@ use std::ffi::{CStr, c_char};
 /// the legacy iq3s8 and the seven grid formats iq2xxs, iq2xs, iq2s, iq3xxs,
 /// iq1s, iq1m, iq3s.
 const MODES: i64 = 15;
+/// The MLX affine modes a4g64, a4g32, a8g64, a8g32: dequantize and the
+/// Tiled64 families only.
+const AFFINE_MODES: i64 = 4;
 /// 15 modes x 3 dtypes x (39 row-major families + 11 Tiled64 "_t64" families:
 /// qmv_t64 at 8 and 16 k-splits, qmv_wide nv 2..8, qmm_t, qmm_t_splitk),
 /// plus 4 bfloat16 qmv_sg8 kernels and the 2 sg8 prep kernels (group sizes
-/// 16 and 32).
-const BASE_NAMES: i64 = MODES * 3 * (39 + 11) + 4 + 2;
+/// 16 and 32), plus the affine modes' dequantize and 11 Tiled64 families.
+const BASE_NAMES: i64 = MODES * 3 * (39 + 11) + 4 + 2 + AFFINE_MODES * 3 * (1 + 11);
 /// 15 modes x 3 dtypes x (qmm_t_nax {aligned, unaligned} x {batched, single}
 /// plus the aligned, single Tiled64 qmm_t_nax_t64), plus the bfloat16
 /// qmm_m8_nax kernels: 15 Tiled64 and 10 row-major (q3k, q2k, iq4nl and the
-/// seven grid formats).
-const NAX_NAMES: i64 = MODES * 3 * (4 + 1) + MODES + 10;
+/// seven grid formats); the affine modes add qmm_t_nax_t64 per dtype and
+/// one Tiled64 qmm_m8_nax each.
+const NAX_NAMES: i64 = MODES * 3 * (4 + 1) + MODES + 10 + AFFINE_MODES * 3 + AFFINE_MODES;
 
 struct Check {
     base: i64,

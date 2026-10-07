@@ -220,6 +220,13 @@
   instantiate_kquant_all_rhs(mode, type, group_size, bits, super_ratio, has_min, kind, shift) \
   instantiate_kquant_all_tiled(mode, type, group_size, bits, super_ratio, has_min, kind, shift)
 
+// The MLX affine modes (KQ_AFFINE: bfloat16 scale and bias per group):
+// the Tiled64 kernels and the row-major dequantize only; row-major affine
+// matmuls stay on MLX's own kernels (mlx_kquant_metal.cpp refuses them).
+#define instantiate_kquant_affine(mode, type, group_size, bits, super_ratio) \
+  instantiate_kquant(mode, dequantize, type, group_size, bits, super_ratio, false, KQ_AFFINE, 0) \
+  instantiate_kquant_all_tiled(mode, type, group_size, bits, super_ratio, false, KQ_AFFINE, 0)
+
 // (group_size, bits, super_ratio, has_min, kind, scale_shift) per mode:
 // kquant_mode.h; must agree with kquant::Mode's traits in mlx_kquant.h.
 #define instantiate_kquant_types(type) \
@@ -237,7 +244,11 @@
   instantiate_kquant_modes(iq3xxs, type, 32, 2, 8, false, KQ_GRID_IQ3XXS, -2) \
   instantiate_kquant_modes(iq1s, type, 32, 1, 8, false, KQ_GRID_IQ1S, -3) \
   instantiate_kquant_modes(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3) \
-  instantiate_kquant_modes(iq3s, type, 32, 3, 8, false, KQ_GRID_IQ3S, 0)
+  instantiate_kquant_modes(iq3s, type, 32, 3, 8, false, KQ_GRID_IQ3S, 0) \
+  instantiate_kquant_affine(a4g64, type, 64, 4, 4) \
+  instantiate_kquant_affine(a4g32, type, 32, 4, 8) \
+  instantiate_kquant_affine(a8g64, type, 64, 8, 4) \
+  instantiate_kquant_affine(a8g32, type, 32, 8, 8)
 
 #if KQUANT_DTYPE == 0
 instantiate_kquant_types(float)

@@ -49,6 +49,14 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     return Mode::IQ1M;
   if (mode == "iq3s8")
     return Mode::IQ3S8;
+  if (mode == "a4g64")
+    return Mode::A4G64;
+  if (mode == "a4g32")
+    return Mode::A4G32;
+  if (mode == "a8g64")
+    return Mode::A8G64;
+  if (mode == "a8g32")
+    return Mode::A8G32;
   return std::nullopt;
 }
 
@@ -102,6 +110,14 @@ const char *mode_name(Mode mode) {
     return "iq1m";
   case Mode::IQ3S8:
     return "iq3s8";
+  case Mode::A4G64:
+    return "a4g64";
+  case Mode::A4G32:
+    return "a4g32";
+  case Mode::A8G64:
+    return "a8g64";
+  case Mode::A8G32:
+    return "a8g32";
   }
   throw std::invalid_argument("[kquant] Unknown quantization mode.");
 }
@@ -134,9 +150,10 @@ void validate_mode_with_type(std::string_view tag, Mode mode,
         << mode_name(mode) << "'.";
     throw std::invalid_argument(msg.str());
   }
-  if (biases->dtype() != float16) {
+  auto biases_type = biases_dtype(mode);
+  if (biases->dtype() != biases_type) {
     std::ostringstream msg;
-    msg << "[" << tag << "] Bias type must be " << float16
+    msg << "[" << tag << "] Bias type must be " << biases_type
         << " for quantization mode '" << mode_name(mode)
         << "' but received type " << biases->dtype() << ".";
     throw std::invalid_argument(msg.str());
@@ -199,7 +216,9 @@ void validate_quantized_input(std::string_view tag, const array &w,
   check_batch_shape(scales, "scales");
 
   int el_per_row = w.shape(-1) * 32 / bits;
-  if (el_per_row * per_group != scales.shape(-1) * group_size) {
+  // `per_group` counts bytes; the affine modes' `.scales` are bfloat16.
+  if (el_per_row * per_group !=
+      scales.shape(-1) * group_size * int(scales.itemsize())) {
     std::ostringstream msg;
     msg << "[" << tag << "] The shapes of the weight and scales are "
         << "incompatible based on bits and group_size. w.shape() == "
@@ -606,23 +625,37 @@ class KQScales {
 public:
   static constexpr int per_group =
       kq_scale_bytes_per_group<has_min, static_cast<int>(kind)>();
-  // `.biases` entries per super-block: (d, dmin) or d.
-  static constexpr int per_super = has_min ? 2 : 1;
+  // `.biases` entries per super-block: (d, dmin) or d; one bias per group
+  // for the affine kind.
+  static constexpr int per_super =
+      kq_bias_entries_per_super<has_min, static_cast<int>(kind), super_ratio>();
   static constexpr bool nonlinear = kind == Kind::Codebook;
 
   KQScales(const uint8_t *scales, const float16_t *biases)
       : scales_(scales), biases_(biases) {}
 
   void at(size_t g, float &scale, float &bias) const {
-    decode(biases_ + (g / super_ratio) * per_super, scales_ + g * per_group,
-           scale, bias);
+    decode(biases_ + (g / super_ratio) * per_super + bias_sub_index(g),
+           scales_ + g * per_group, scale, bias);
+  }
+
+  static int bias_sub_index(size_t g) {
+    return kq_bias_sub_index<static_cast<int>(kind), super_ratio>(g);
   }
 
   // (scale, bias) of the group whose super-scale(s) start at `d` and whose
   // sub-scale entries start at `sc`, in either layout.
   static void decode(const float16_t *d, const uint8_t *sc, float &scale,
                      float &bias) {
-    if constexpr (has_min) {
+    if constexpr (kind == Kind::Affine) {
+      // bfloat16 scale and bias as stored (the float16_t pointer type is
+      // the companion buffer's).
+      uint16_t scale_bits, bias_bits;
+      std::memcpy(&scale_bits, sc, sizeof(scale_bits));
+      std::memcpy(&bias_bits, d, sizeof(bias_bits));
+      scale = kq_bf16_to_float(scale_bits);
+      bias = kq_bf16_to_float(bias_bits);
+    } else if constexpr (has_min) {
       scale = static_cast<float>(d[0]) * static_cast<float>(sc[0]);
       if constexpr (scale_shift != 0) {
         scale *= kq_scale_factor<scale_shift>();
@@ -816,6 +849,9 @@ void kq_qmm_t_tiled(T *result, const T *x, const uint32_t *w,
   constexpr int pack_factor = get_pack_factor(bits, 8);
   constexpr int bytes_per_pack = get_bytes_per_pack(bits);
   constexpr int packs_in_group = group_size / pack_factor;
+  // A group wider than a 32-value unit (the affine modes' 64) spans whole
+  // units, each at its own tiled address.
+  constexpr int span = group_size < 32 ? group_size : 32;
   using scales_t = KQScales<bits, super_ratio, has_min, kind, scale_shift>;
   constexpr bool nonlinear = scales_t::nonlinear;
   constexpr int per_group = scales_t::per_group;
@@ -840,14 +876,15 @@ void kq_qmm_t_tiled(T *result, const T *x, const uint32_t *w,
       const T *x_local = x;
       float sum = 0;
       for (size_t g = 0; g < K_g; g++) {
-        const float16_t *d = btile + (g / super_ratio) * kTileRows * per_super;
+        const float16_t *d = btile + (g / super_ratio) * kTileRows * per_super +
+                             scales_t::bias_sub_index(g);
         const uint8_t *sc =
             stile + (g / super_ratio) * kTileRows * super_ratio * per_group +
             (g % super_ratio) * per_group;
         const size_t k0 = g * group_size;
-        const uint8_t *w_local =
-            wtile + (k0 / 32) * kTileRows * unit_bytes + (k0 % 32) * bits / 8;
         if constexpr (is_grid(kind)) {
+          const uint8_t *w_local =
+              wtile + (k0 / 32) * kTileRows * unit_bytes + (k0 % 32) * bits / 8;
           float wl[group_size];
           scales_t::decode_grid(d, sc, w_local, wl);
           for (int p = 0; p < group_size; p++) {
@@ -858,6 +895,19 @@ void kq_qmm_t_tiled(T *result, const T *x, const uint32_t *w,
         float scale;
         float bias;
         scales_t::decode(d, sc, scale, bias);
+        const uint8_t *w_local =
+            wtile + (k0 / 32) * kTileRows * unit_bytes + (k0 % 32) * bits / 8;
+        // A group of several units is gathered into one contiguous run, so
+        // the dot loop below is the row-major one.
+        uint8_t run[group_size * bits / 8];
+        if constexpr (span < group_size) {
+          for (int u = 0; u < group_size / 32; u++) {
+            std::memcpy(run + u * unit_bytes,
+                        w_local + size_t(u) * kTileRows * unit_bytes,
+                        unit_bytes);
+          }
+          w_local = run;
+        }
         for (int kw = 0; kw < packs_in_group; kw++) {
           if constexpr (bits == 3 || bits == 5 || bits == 6) {
             float wl[pack_factor];
@@ -971,6 +1021,22 @@ void kq_qmm_dispatch_mode(T *result, const T *x, const uint32_t *w,
     break;
   case Mode::IQ1M:
     kq_qmm_dispatch_transpose<T, 1, 32, 8, false, Kind::GridIQ1M, -3>(
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
+    break;
+  case Mode::A4G64:
+    kq_qmm_dispatch_transpose<T, 4, 64, 4, false, Kind::Affine, 0>(
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
+    break;
+  case Mode::A4G32:
+    kq_qmm_dispatch_transpose<T, 4, 32, 8, false, Kind::Affine, 0>(
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
+    break;
+  case Mode::A8G64:
+    kq_qmm_dispatch_transpose<T, 8, 64, 4, false, Kind::Affine, 0>(
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
+    break;
+  case Mode::A8G32:
+    kq_qmm_dispatch_transpose<T, 8, 32, 8, false, Kind::Affine, 0>(
         result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
   }
@@ -1200,6 +1266,22 @@ void kq_dequantize_typed(array &out, const array &w, const array &scales,
     break;
   case Mode::IQ1M:
     kq_dequantize<T, 1, 32, 8, false, Kind::GridIQ1M, -3>(
+        out_ptr, w_ptr, scales_ptr, biases_ptr, size);
+    break;
+  case Mode::A4G64:
+    kq_dequantize<T, 4, 64, 4, false, Kind::Affine, 0>(
+        out_ptr, w_ptr, scales_ptr, biases_ptr, size);
+    break;
+  case Mode::A4G32:
+    kq_dequantize<T, 4, 32, 8, false, Kind::Affine, 0>(
+        out_ptr, w_ptr, scales_ptr, biases_ptr, size);
+    break;
+  case Mode::A8G64:
+    kq_dequantize<T, 8, 64, 4, false, Kind::Affine, 0>(
+        out_ptr, w_ptr, scales_ptr, biases_ptr, size);
+    break;
+  case Mode::A8G32:
+    kq_dequantize<T, 8, 32, 8, false, Kind::Affine, 0>(
         out_ptr, w_ptr, scales_ptr, biases_ptr, size);
     break;
   }

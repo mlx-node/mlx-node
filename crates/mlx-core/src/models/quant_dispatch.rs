@@ -754,6 +754,10 @@ pub enum KQuantKind {
     /// (`KQ_GRID_IQ2XXS` ..); here `(bits, scale_bytes_per_group,
     /// scale_shift)` identify the format.
     Grid,
+    /// `scale * code + bias` with MLX's own affine companions: one bfloat16
+    /// scale and one bfloat16 bias per group, read as stored
+    /// ([`kquant_affine_mode_params`]).
+    Affine,
 }
 
 /// Everything the three-array contract of one K-quant mode fixes, as the
@@ -775,9 +779,13 @@ pub struct KQuantModeParams {
     /// per-group metadata in `.scales` raises this.
     pub scale_bytes_per_group: i32,
     /// `.biases` entries per super-block: 2 for the `(d, dmin)` modes, else
-    /// 1. The Tiled64 companion unit of `.biases`.
+    /// 1; `super_ratio` (one bias per group) for the affine kinds. The
+    /// Tiled64 companion unit of `.biases`.
     pub bias_entries_per_super_block: i32,
     pub scales_dtype: DType,
+    /// `.biases` dtype: ggml's float16 `d`, or the affine kinds' bfloat16
+    /// bias.
+    pub biases_dtype: DType,
     pub kind: KQuantKind,
     /// Power-of-two exponent applied to every decoded scale in fp32
     /// (`scale *= 2^scale_shift`, exact): 0 for the affine / codebook / int8
@@ -812,6 +820,7 @@ impl KQuantModeParams {
             scale_bytes_per_group: if has_min { 2 } else { 1 },
             bias_entries_per_super_block: if has_min { 2 } else { 1 },
             scales_dtype: if has_min { DType::Uint8 } else { DType::Int8 },
+            biases_dtype: DType::Float16,
             kind,
             scale_shift: 0,
         }
@@ -829,17 +838,68 @@ impl KQuantModeParams {
             scale_bytes_per_group: scale_bytes,
             bias_entries_per_super_block: 1,
             scales_dtype: DType::Uint8,
+            biases_dtype: DType::Float16,
             kind: KQuantKind::Grid,
             scale_shift,
         }
     }
 
-    /// `.scales` entries per 256-value super-block, the Tiled64 companion
-    /// unit of `.scales`.
+    /// An MLX affine quantization read through the K-quant kernels: the
+    /// packed codes as MLX stores them, one bfloat16 scale (`.scales`) and
+    /// one bfloat16 bias (`.biases`) per group, a 256-value super-block.
+    const fn affine(mode_str: &'static str, bits: i32, group_size: i32) -> Self {
+        Self {
+            mode_str,
+            bits,
+            group_size,
+            super_ratio: 256 / group_size,
+            scale_bytes_per_group: 2,
+            bias_entries_per_super_block: 256 / group_size,
+            scales_dtype: DType::BFloat16,
+            biases_dtype: DType::BFloat16,
+            kind: KQuantKind::Affine,
+            scale_shift: 0,
+        }
+    }
+
+    /// `.scales` bytes per 256-value super-block, the Tiled64 companion
+    /// stride of `.scales`.
     pub fn scale_bytes_per_super_block(&self) -> i32 {
         self.super_ratio * self.scale_bytes_per_group
     }
+
+    /// `.scales` array entries per 256-value super-block, the Tiled64
+    /// companion unit of `.scales` ([`kquant_tile_rows`] permutes entries):
+    /// the bytes for the uint8 / int8 K-quant companions, half as many for
+    /// the affine kinds' bfloat16 scales.
+    pub fn scale_entries_per_super_block(&self) -> i32 {
+        let entry_bytes = match self.scales_dtype {
+            DType::BFloat16 | DType::Float16 => 2,
+            _ => 1,
+        };
+        self.scale_bytes_per_super_block() / entry_bytes
+    }
 }
+
+/// The K-quant contract an MLX affine linear of `(bits, group_size)` can be
+/// read through (`mlx_kquant.h` `Mode::A4G64` ..); `None` for a pair the
+/// kernels do not carry. The mode string is `a<bits>g<group_size>`; the
+/// Metal side has these kernels in the Tiled64 layout only, so a projection
+/// takes this contract through
+/// [`QuantizedLinear::tile_kquant_layout`](crate::models::quantized_linear::QuantizedLinear::tile_kquant_layout)
+/// and nowhere else.
+pub fn kquant_affine_mode_params(bits: i32, group_size: i32) -> Option<KQuantModeParams> {
+    Some(match (bits, group_size) {
+        (4, 64) => KQuantModeParams::affine("a4g64", 4, 64),
+        (4, 32) => KQuantModeParams::affine("a4g32", 4, 32),
+        (8, 64) => KQuantModeParams::affine("a8g64", 8, 64),
+        (8, 32) => KQuantModeParams::affine("a8g32", 8, 32),
+        _ => return None,
+    })
+}
+
+/// Every affine contract of [`kquant_affine_mode_params`].
+pub const KQUANT_AFFINE_MODES: [(i32, i32); 4] = [(4, 64), (4, 32), (8, 64), (8, 32)];
 
 /// The contract a resolved K-quant mode demands; `None` for non-K-quant modes.
 pub fn kquant_mode_params(mode: PerLayerMode) -> Option<KQuantModeParams> {
@@ -919,6 +979,7 @@ pub fn resolve_kquant_group(
         bits,
         group_size,
         scales_dtype,
+        biases_dtype,
         ..
     }) = kquant_mode_params_for_scales(mode, scales.dtype()?)
     else {
@@ -948,9 +1009,9 @@ pub fn resolve_kquant_group(
         )));
     }
     let b_dtype = biases.dtype()?;
-    if b_dtype != DType::Float16 {
+    if b_dtype != biases_dtype {
         return Err(Error::from_reason(format!(
-            "{family} {mode_str} layer '{key_prefix}': expected float16 .biases (ggml `d`), got {b_dtype:?}"
+            "{family} {mode_str} layer '{key_prefix}': expected {biases_dtype:?} .biases (ggml `d`), got {b_dtype:?}"
         )));
     }
     let w_shape = weight.shape()?;
@@ -2430,6 +2491,7 @@ mod tests {
                 "{mode:?} scale bytes per group"
             );
             assert_eq!(kq.scales_dtype, scales_dtype, "{mode:?} scales dtype");
+            assert_eq!(kq.biases_dtype, DType::Float16, "{mode:?} biases dtype");
             assert_eq!(kq.kind, kind, "{mode:?} kind");
             assert_eq!(kq.scale_shift, shift, "{mode:?} scale shift");
             // `.biases`: (d, dmin) for the has_min modes, d alone otherwise.
@@ -2468,8 +2530,31 @@ mod tests {
                 super_ratio * per_group,
                 "{mode:?} Tiled64 companion stride"
             );
+            assert_eq!(
+                kq.scale_entries_per_super_block(),
+                kq.scale_bytes_per_super_block(),
+                "{mode:?} byte companions"
+            );
             assert!(is_kquant_mode(mode));
         }
+        // The MLX affine contracts (mlx_kquant.h Mode::A4G64 ..): bfloat16
+        // scale and bias per group, so `.scales` is 2 bytes per group and
+        // `.biases` super_ratio entries per super-block.
+        for (bits, group_size) in KQUANT_AFFINE_MODES {
+            let kq = kquant_affine_mode_params(bits, group_size).unwrap();
+            assert_eq!(kq.mode_str, format!("a{bits}g{group_size}"));
+            assert_eq!((kq.bits, kq.group_size), (bits, group_size));
+            assert_eq!(kq.super_ratio * group_size, 256);
+            assert_eq!(kq.scale_bytes_per_group, 2);
+            assert_eq!(kq.bias_entries_per_super_block, kq.super_ratio);
+            assert_eq!(kq.scales_dtype, DType::BFloat16);
+            assert_eq!(kq.biases_dtype, DType::BFloat16);
+            assert_eq!(kq.kind, Affine);
+            assert_eq!(kq.scale_shift, 0);
+            assert_eq!(kq.scale_entries_per_super_block(), kq.super_ratio);
+        }
+        assert!(kquant_affine_mode_params(4, 128).is_none());
+        assert!(kquant_affine_mode_params(6, 64).is_none());
         for mode in [
             PerLayerMode::Affine,
             PerLayerMode::Mxfp8,

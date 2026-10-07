@@ -51,8 +51,17 @@ enum Format : int {
   IQ1S,
   IQ1M,
   IQ3S,
+  // MLX affine companions (KQ_AFFINE): 4-bit codes as Q4K's, 8-bit as
+  // IQ3S8's; the group size is the kernel's, not the format's.
+  A4,
+  A8,
   Unsupported
 };
+
+template <Format F>
+constexpr bool is_affine() {
+  return F == A4 || F == A8;
+}
 
 // The kquant_mode.h kind of a grid format, -1 for the others.
 template <Format F>
@@ -74,6 +83,10 @@ constexpr bool is_grid() {
 
 template <int group_size, int bits, int super_ratio, bool has_min, int kind>
 constexpr Format format() {
+  if (kind == KQ_AFFINE && !has_min && group_size * super_ratio == 256 &&
+      group_size % 32 == 0) {
+    return bits == 4 ? A4 : bits == 8 ? A8 : Unsupported;
+  }
   if (group_size == 32 && super_ratio == 8 && !has_min) {
     if (kind == KQ_GRID_IQ2XXS && bits == 1) {
       return IQ2XXS;
@@ -231,6 +244,21 @@ struct Codes<IQ3S8> {
 };
 
 template <>
+struct Codes<A4> {
+  typedef uint4 W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<Q4K>::load(base, u, stride);
+  }
+};
+template <>
+struct Codes<A8> {
+  typedef Codes<IQ3S8>::W W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<IQ3S8>::load(base, u, stride);
+  }
+};
+
+template <>
 struct Codes<Q2K> {
   // 32 codes x 2 bits: one 8-byte unit (Splash FmtQ2K's Payload).
   typedef uint2 W;
@@ -305,9 +333,11 @@ METAL_FUNC size_t companion_index(
 // are contiguous bytes in both layouts (8 or 16 (sc, m) pairs, 16 int8 or 8
 // int8: sb_scale_bytes) and its float16 super-scales one half2 / half, so
 // both are loaded once per super-block and decoded per unit; IQ4_NL has one
-// group per super-block and loads per unit. Same operations and order as
-// KQScales (mlx_kquant.cpp); `scale_shift` applies to every scale as there.
-template <Format F, bool tiled, int scale_shift = 0>
+// group per super-block and loads per unit. The affine formats read the
+// unit's group's bfloat16 scale and bias (one 16-bit load each, `group_size`
+// values per group). Same operations and order as KQScales (mlx_kquant.cpp);
+// `scale_shift` applies to every scale as there.
+template <Format F, bool tiled, int scale_shift = 0, int group_size = 32>
 struct CoefCursor {
   const device uint8_t* scales;
   const device half* biases;
@@ -339,6 +369,30 @@ struct CoefCursor {
 
   Coef at(uint u) {
     Coef c;
+    if constexpr (is_affine<F>()) {
+      // The super-block's sr bfloat16 scales and sr bfloat16 biases (sr 4
+      // or 8: one 8- or 16-byte load each), loaded once per super-block;
+      // unit u's group is entry (u * 32 / group_size) % sr of both.
+      constexpr uint sr = 256 / group_size;
+      static_assert(sr == 4 || sr == 8, "an affine super-block is 4 or 8 groups");
+      if ((u >> 3) != sb) {
+        sb = u >> 3;
+        const device uint8_t* s = scales + companion_index<tiled>(n, K / 256, sb, 2 * sr);
+        const device uint8_t* b = reinterpret_cast<const device uint8_t*>(
+            biases + companion_index<tiled>(n, K / 256, sb, sr));
+        if constexpr (sr == 8) {
+          sc = *reinterpret_cast<const device uint4*>(s);
+          sc2 = *reinterpret_cast<const device uint4*>(b);
+        } else {
+          sc = uint4(*reinterpret_cast<const device uint2*>(s), 0u, 0u);
+          sc2 = uint4(*reinterpret_cast<const device uint2*>(b), 0u, 0u);
+        }
+      }
+      const uint e = ((u * 32) / group_size) % sr;
+      c.s = float2(kq_bf16_to_float(uint16_t((sc[e >> 1] >> (16 * (e & 1))) & 0xFFFFu)));
+      c.m = float2(kq_bf16_to_float(uint16_t((sc2[e >> 1] >> (16 * (e & 1))) & 0xFFFFu)));
+      return c;
+    }
     if constexpr (is_grid<F>()) {
       // The super-block d alone; the per-unit scale lives in the companion
       // bytes and kq_grid_decode8 applies it.
@@ -513,6 +567,16 @@ METAL_FUNC uint2 bytes8<IQ3S8>(Codes<IQ3S8>::W w, ushort j) {
   return uint2(even, odd);
 }
 
+template <>
+METAL_FUNC uint2 bytes8<A4>(uint4 w, ushort j) {
+  return bytes8<Q4K>(w, j);
+}
+
+template <>
+METAL_FUNC uint2 bytes8<A8>(Codes<A8>::W w, ushort j) {
+  return bytes8<IQ3S8>(w, j);
+}
+
 // One lane's unit as 32 half values at dst, each rounded once from fp32.
 // Threadgroup entries of a grid format's table (1 for the unused width and
 // for the other formats).
@@ -639,8 +703,9 @@ template <
   constexpr Format F = format<group_size, bits, super_ratio, has_min, kind>();
   static_assert(F != Unsupported, "no M = 8 NAX decode for this mode");
   static_assert(
-      sb_scale_bytes<F>() ==
-          (F == IQ4NL ? 8 : super_ratio * kq_scale_bytes_per_group<has_min, kind>()),
+      is_affine<F>() ||
+          sb_scale_bytes<F>() ==
+              (F == IQ4NL ? 8 : super_ratio * kq_scale_bytes_per_group<has_min, kind>()),
       "the super-block companion stride must match kquant_mode.h");
   static_assert(is_same_v<T, bfloat>, "the tensor-op A operand is bfloat16");
   constexpr bool codebook = F == IQ4XS || F == IQ4NL;
@@ -701,7 +766,7 @@ template <
   // Qwen3.8 shapes, from the extra registers.)
   const device uint32_t* row = unit_base<bits, tiled>(w, n, K);
   constexpr uint stride = unit_stride<bits, tiled>();
-  CoefCursor<F, tiled, scale_shift> coefs(scales, biases, n, K);
+  CoefCursor<F, tiled, scale_shift, group_size> coefs(scales, biases, n, K);
   W cur = Codes<F>::load(row, step_begin, stride);
   Coef cc = coefs.at(step_begin);
   if constexpr (is_grid<F>()) {

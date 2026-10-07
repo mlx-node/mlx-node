@@ -687,7 +687,13 @@ inline void kq_decode_group(
     const device uint8_t* sc,
     thread U& scale,
     thread U& bias) {
-  if constexpr (has_min) {
+  if constexpr (kq_is_affine<kind>()) {
+    // `sc` is the group's bfloat16 scale, `d` its bfloat16 bias (the
+    // float16_t pointer type is the companion buffer's, not the value's).
+    scale = static_cast<U>(kq_bf16_to_float(
+        *reinterpret_cast<const device uint16_t*>(sc)));
+    bias = static_cast<U>(kq_bf16_to_float(as_type<uint16_t>(d[0])));
+  } else if constexpr (has_min) {
     scale = kq_shift_scale<scale_shift>(
         static_cast<U>(d[0]) * static_cast<U>(sc[0]));
     bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
@@ -735,7 +741,8 @@ struct KQScales {
   // the companion bytes of a grid unit; super-scale entries per super-block:
   // (d, dmin) or d.
   MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
-  MLX_MTL_CONST int per_super = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_super =
+      kq_bias_entries_per_super<has_min, kind, super_ratio>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -750,7 +757,8 @@ struct KQScales {
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
     kq_decode_group<U, bits, has_min, kind, scale_shift>(
-        biases + (gi / super_ratio) * per_super,
+        biases + (gi / super_ratio) * per_super +
+            kq_bias_sub_index<kind, super_ratio>(gi),
         scales + gi * per_group,
         scale,
         bias);
@@ -804,7 +812,8 @@ METAL_FUNC constexpr size_t kq_tiled_unit_stride() {
 template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScalesTiled {
   MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
-  MLX_MTL_CONST int per_super = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_super =
+      kq_bias_entries_per_super<has_min, kind, super_ratio>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -836,8 +845,9 @@ struct KQScalesTiled {
 
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
-    const device float16_t* d =
-        biases + (gi / super_ratio) * KQ_TILE_ROWS * per_super;
+    const device float16_t* d = biases +
+        (gi / super_ratio) * KQ_TILE_ROWS * per_super +
+        kq_bias_sub_index<kind, super_ratio>(gi);
     const device uint8_t* sc = scales +
         (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
         (gi % super_ratio) * per_group;
@@ -1657,10 +1667,15 @@ template <
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  static_assert(group_size == 32 || group_size == 16, "a unit is 1 or 2 groups");
+  static_assert(
+      group_size == 16 || group_size % 32 == 0,
+      "a unit is 1 or 2 groups, or a group is whole units");
   constexpr int rows_per_tg = SIMD_SIZE;
   constexpr bool nonlinear = kq_codebook<kind>();
-  constexpr int groups_per_unit = 32 / group_size;
+  // Groups inside one unit, and the values of a unit one group covers (the
+  // whole unit when a group spans several).
+  constexpr int groups_per_unit = group_size < 32 ? 32 / group_size : 1;
+  constexpr int span = group_size < 32 ? group_size : 32;
   typedef float U;
 
   threadgroup U partial[k_splits][rows_per_tg];
@@ -1681,7 +1696,12 @@ template <
   // in 8-value chunks (bits bytes each); scale and bias are per group, so
   // the chunk terms add up to the group's affine dot product.
   constexpr int chunk = 8;
+  // A group of several units (the affine modes' 64) keeps its coefficients
+  // across them.
+  constexpr int units_per_group = group_size > 32 ? group_size / 32 : 1;
   U acc = 0;
+  U scale = 0;
+  U bias = 0;
   for (int u = u_begin; u < u_end; ++u) {
     const device uint8_t* wu = wrow + size_t(u) * kq_tiled_unit_stride<bits>();
     const device T* xu = x + u * 32;
@@ -1704,13 +1724,13 @@ template <
     }
 #pragma clang loop unroll(full)
     for (int g = 0; g < groups_per_unit; ++g) {
-      U scale;
-      U bias;
-      srow.at(u * groups_per_unit + g, scale, bias);
+      if (units_per_group == 1 || u == u_begin || u % units_per_group == 0) {
+        srow.at((u * 32 + g * span) / group_size, scale, bias);
+      }
 #pragma clang loop unroll(full)
-      for (int c = 0; c < group_size / chunk; ++c) {
+      for (int c = 0; c < span / chunk; ++c) {
         U x_thread[chunk];
-        const int k0 = g * group_size + c * chunk;
+        const int k0 = g * span + c * chunk;
         const U sum = load_vector<T, U, chunk, bits>(xu + k0, x_thread);
         acc += qdot<U, chunk, bits, nonlinear>(
             wu + k0 * bits / 8, x_thread, scale, bias, sum);

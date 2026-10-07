@@ -6,7 +6,9 @@
 // lookup, under a float16 super-block scale. `scales` holds the integer sub-block
 // scales (int8, or interleaved uint8 (sc, m) pairs for q2k/q4k/q5k; the grid
 // formats' per-unit companion bytes, uint8); `biases` holds the float16
-// super-block d (and dmin for q2k/q4k/q5k) -- a scale, not a bias.
+// super-block d (and dmin for q2k/q4k/q5k) -- a scale, not a bias. The
+// affine modes (A4G64 ..) are the exception: MLX's own bfloat16 scale and
+// bias per group, read as stored.
 //
 // Per-mode traits (super_ratio, has_sub_min, kind, scale_shift,
 // scale_bytes_per_group) are the single C++ description of a mode; the Metal
@@ -44,7 +46,16 @@ enum class Mode {
   // (mode string "iq3s8", bits 8). Artifacts converted before the packed
   // form carry `mode: "iq3s", bits: 8`; resolve_mode maps them here, so
   // they keep loading. Nothing produces this form any more.
-  IQ3S8
+  IQ3S8,
+  // MLX's affine quantization (`quantize(..., mode="affine")`) read through
+  // the K-quant kernels: the same LSB-first codes, `.scales` the bfloat16
+  // scale per group, `.biases` the bfloat16 bias per group. Metal kernels
+  // exist for the Tiled64 layout only; row-major affine stays on MLX's own
+  // route. "a<bits>g<group_size>".
+  A4G64,
+  A4G32,
+  A8G64,
+  A8G32
 };
 
 // How a mode's codes turn into values. Mirrors KQ_LINEAR .. KQ_GRID_IQ1M in
@@ -54,6 +65,7 @@ enum class Mode {
 //   Int8      scale * int8 (iq3s8: the grid value expanded to a byte)
 //   Grid*     scale * signed grid magnitude, one kind per grid format since
 //             they share no byte layout (metal/kquant/kquant_grid.h)
+//   Affine    scale * code + bias with a bfloat16 scale and bias per group
 enum class Kind : int {
   Linear = 0,
   Codebook = 1,
@@ -64,7 +76,8 @@ enum class Kind : int {
   GridIQ3XXS = 6,
   GridIQ1S = 7,
   GridIQ1M = 8,
-  GridIQ3S = 9
+  GridIQ3S = 9,
+  Affine = 10
 };
 
 constexpr bool is_grid(Kind kind) {
@@ -132,7 +145,12 @@ constexpr int super_ratio(Mode mode) {
   case Mode::IQ3XXS:
   case Mode::IQ1S:
   case Mode::IQ1M:
+  case Mode::A4G32:
+  case Mode::A8G32:
     return 8;
+  case Mode::A4G64:
+  case Mode::A8G64:
+    return 4;
   case Mode::IQ4NL:
     return 1;
   }
@@ -148,6 +166,12 @@ constexpr bool uses_iq4nl_grid(Mode mode) {
   return mode == Mode::IQ4NL || mode == Mode::IQ4XS;
 }
 
+// The MLX affine modes: Metal kernels in the Tiled64 layout only.
+constexpr bool is_affine(Mode mode) {
+  return mode == Mode::A4G64 || mode == Mode::A4G32 || mode == Mode::A8G64 ||
+         mode == Mode::A8G32;
+}
+
 constexpr Kind kind(Mode mode) {
   switch (mode) {
   case Mode::IQ4NL:
@@ -155,6 +179,11 @@ constexpr Kind kind(Mode mode) {
     return Kind::Codebook;
   case Mode::IQ3S8:
     return Kind::Int8;
+  case Mode::A4G64:
+  case Mode::A4G32:
+  case Mode::A8G64:
+  case Mode::A8G32:
+    return Kind::Affine;
   case Mode::Q6K:
   case Mode::Q4K:
   case Mode::Q5K:
@@ -221,19 +250,30 @@ constexpr int scale_bytes_per_group(Mode mode) {
   case Mode::IQ1M:
     return 3;
   default:
-    return has_sub_min(mode) ? 2 : 1;
+    // The affine modes: one bfloat16 scale.
+    return (has_sub_min(mode) || is_affine(mode)) ? 2 : 1;
   }
 }
 
-// Entries of `.biases` per super-block: (d, dmin) or d alone.
+// Entries of `.biases` per super-block: (d, dmin) or d alone; one bias per
+// group for the affine modes.
 constexpr int bias_entries_per_super_block(Mode mode) {
-  return has_sub_min(mode) ? 2 : 1;
+  return is_affine(mode) ? super_ratio(mode) : (has_sub_min(mode) ? 2 : 1);
 }
 
 // `.scales` dtype: the (sc, m) modes and the grid formats carry unsigned
-// bytes, the symmetric K-quants and IQ4 / iq3s8 signed sub-scales.
+// bytes, the symmetric K-quants and IQ4 / iq3s8 signed sub-scales, the
+// affine modes bfloat16 scales.
 inline Dtype scales_dtype(Mode mode) {
+  if (is_affine(mode)) {
+    return bfloat16;
+  }
   return (has_sub_min(mode) || is_grid(mode)) ? uint8 : int8;
+}
+
+// `.biases` dtype: ggml's float16 d, or the affine modes' bfloat16 bias.
+inline Dtype biases_dtype(Mode mode) {
+  return is_affine(mode) ? bfloat16 : float16;
 }
 
 // For the grid formats `bits` is the unit's `.weight` word count (1 to 3),
@@ -257,7 +297,12 @@ constexpr int default_bits(Mode mode) {
   case Mode::IQ3XXS:
     return 2;
   case Mode::IQ3S8:
+  case Mode::A8G64:
+  case Mode::A8G32:
     return 8;
+  case Mode::A4G64:
+  case Mode::A4G32:
+    return 4;
   case Mode::IQ2XXS:
   case Mode::IQ1S:
   case Mode::IQ1M:
@@ -267,6 +312,9 @@ constexpr int default_bits(Mode mode) {
 }
 
 constexpr int default_group_size(Mode mode) {
+  if (mode == Mode::A4G64 || mode == Mode::A8G64) {
+    return 64;
+  }
   return (mode == Mode::Q6K || mode == Mode::Q3K || mode == Mode::Q2K) ? 16
                                                                        : 32;
 }

@@ -102,6 +102,16 @@ vector vs block at 256..4096 keys, block must win by 5%; ~35 ms), below which th
 bit-exact vector kernels serve it. The one-time `[kquant route]` and `[sdpa route]`
 log lines appear under `MLX_METAL_COMMAND_TRACE`.
 
+The tiled kernels also carry MLX's affine quantization as a mode family
+(`a4g64`, `a4g32`, `a8g64`, `a8g32`: the same LSB-first codes, one bfloat16
+scale and bias per group, `mlx_kquant.h` `Mode::A4G64` ..), in the `@t64`
+layout only; a row-major affine weight stays on MLX's own route. Today only the
+DFlash2 draft takes it: `draft_linear` quantizes to affine Q4/g64 as before and
+`QuantizedLinear::tile_kquant_layout` retags the projection `a4g64@t64`, so a
+decode block's 8 rows take `qmm_m8_nax_t64` instead of MLX's per-row `qmv`
+(same codes and companions, different kernel). Tiling other affine models is the
+same call on their projections; it is not switched on for them.
+
 Eligible Qwen/DFlash projection merges, fused GDN preparation/window convolution,
 fused draft convolution/top-16/greedy selection, segmented one-call verifier attention,
 compiled verification, eligible two-column GDN recurrence and D256 full prefill

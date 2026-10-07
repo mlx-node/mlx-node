@@ -64,6 +64,10 @@ constexpr Mode kModes[] = {Mode::Q6K,    Mode::Q4K,   Mode::Q5K,  Mode::Q3K,
                            Mode::IQ4NL,  Mode::IQ4XS, Mode::IQ3S, Mode::Q2K,
                            Mode::IQ2XXS, Mode::IQ2XS, Mode::IQ2S, Mode::IQ3XXS,
                            Mode::IQ1S,   Mode::IQ1M,  Mode::IQ3S8};
+// The MLX affine modes: the Tiled64 kernels and dequantize only; a
+// row-major affine matmul stays on MLX's own route (eval_gpu refuses it).
+constexpr Mode kAffineModes[] = {Mode::A4G64, Mode::A4G32, Mode::A8G64,
+                                 Mode::A8G32};
 constexpr Dtype kTypes[] = {float32, float16, bfloat16};
 
 // qmv_wide tiles 2..8 input vectors (multi-row matvecs only) at 8 k-lanes.
@@ -229,23 +233,37 @@ std::vector<KernelName> metal_kernel_names() {
       add(gather_qvm(m, t));
       add(gather_qmm_rhs(m, t, true));
       add(gather_qmm_rhs(m, t, false));
-      add(dequantize(m, t));
-      // Tiled64: transposed, aligned, unbatched only.
-      for (int v = kWideMinVectors; v <= kWideMaxVectors; ++v) {
-        add(qmv_wide_t64(m, t, v));
-      }
-      for (int ks : kTiledQmvKSplits) {
-        add(qmv_t64(m, t, ks));
-      }
-      add(qmm_t(m, t, true, false, true));
-      add(qmm_t_splitk(m, t, true, true));
-      add(qmm_t_nax(m, t, true, false, true), true);
+    }
+  }
+  // Dequantize and the Tiled64 family (transposed, aligned, unbatched
+  // only): every mode, the affine ones included.
+  auto tiled = [&](Mode m, Dtype t) {
+    add(dequantize(m, t));
+    for (int v = kWideMinVectors; v <= kWideMaxVectors; ++v) {
+      add(qmv_wide_t64(m, t, v));
+    }
+    for (int ks : kTiledQmvKSplits) {
+      add(qmv_t64(m, t, ks));
+    }
+    add(qmm_t(m, t, true, false, true));
+    add(qmm_t_splitk(m, t, true, true));
+    add(qmm_t_nax(m, t, true, false, true), true);
+  };
+  for (Dtype t : kTypes) {
+    for (Mode m : kModes) {
+      tiled(m, t);
+    }
+    for (Mode m : kAffineModes) {
+      tiled(m, t);
     }
   }
   for (Mode m : kModes) {
     if (m8_nax_row_major_mode(m)) {
       add(qmm_m8_nax(m), true);
     }
+    add(qmm_m8_nax(m, true), true);
+  }
+  for (Mode m : kAffineModes) {
     add(qmm_m8_nax(m, true), true);
   }
   std::vector<int> prep_group_sizes;
@@ -650,10 +668,14 @@ bool use_qmm_m8_nax(const Operands &o, int M, int N, int K) {
   if (!o.tiled && !kernels::m8_nax_row_major_mode(o.mode)) {
     return false;
   }
+  // The affine modes load a super-block's bfloat16 companions as one uint2
+  // / uint4.
+  const int64_t companion_align = is_affine(o.mode) ? 16 : 2;
   return o.x.dtype() == kernels::kSg8Type && o.out.dtype() == kernels::kSg8Type &&
          o.out.size() == size_t(8) * N && N % kernels::kM8TileCols == 0 &&
-         K % 32 == 0 && o.x.offset() % 8 == 0 && o.scales.offset() % 2 == 0 &&
-         o.biases.offset() % 2 == 0;
+         K % 32 == 0 && o.x.offset() % 8 == 0 &&
+         o.scales.offset() % companion_align == 0 &&
+         o.biases.offset() % companion_align == 0;
 }
 
 // The split-K arrival counters of a stream: one uint32 per 64-column tile,
@@ -1143,6 +1165,12 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
     qmv_wide(o, M, N, K);
     return;
   }
+  if (is_affine(mode_)) {
+    throw std::runtime_error(
+        std::string("[quantized_matmul] The ") + mode_name(mode_) +
+        " mode has Metal kernels for the " + std::string(kTiledSuffix) +
+        " layout only; row-major affine weights take MLX's own route.");
+  }
 
   if (M >= qmv_vector_limit(K, N, transpose_, d)) {
     int B = out.size() / M / N;
@@ -1181,6 +1209,11 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
 }
 
 void KQuantGatherQMM::eval_gpu(const std::vector<array> &inputs, array &out) {
+  if (is_affine(mode_)) {
+    throw std::runtime_error(std::string("[gather_qmm] The ") +
+                             mode_name(mode_) +
+                             " mode has no Metal gather kernels.");
+  }
   auto &s = stream();
   auto &d = metal::device(s.device);
   out.set_data(allocator::malloc(out.nbytes()));

@@ -2259,12 +2259,6 @@ unsafe extern "C-unwind" {
     // (Metal device with residency sets).
     pub fn mlx_kv_store_batched_available() -> bool;
 
-    // Row counts `M < limit` of an affine quantized matmul `x @ W^T`
-    // (`W` `[n, k]` at `bits`) take MLX's per-row `qmv_fast` route on this
-    // device, so the output bits do not depend on `n`; 0 when the shape
-    // would not take that route or without Metal.
-    pub fn mlx_affine_qmv_fast_limit(k: i32, n: i32, bits: i32) -> i32;
-
     // Fused DFlash2 grouped dynamic causal conv: one elementwise dispatch
     // reproducing the pad/slice/add/mul/add chain bit-exactly (per-op dtype
     // rounding preserved inside the kernel).

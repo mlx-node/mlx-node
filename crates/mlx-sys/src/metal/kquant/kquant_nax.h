@@ -179,7 +179,11 @@ inline void kq_decode_group(
     const device uint8_t* sc,
     thread U& scale,
     thread U& bias) {
-  if constexpr (has_min) {
+  if constexpr (kq_is_affine<kind>()) {
+    scale = static_cast<U>(kq_bf16_to_float(
+        *reinterpret_cast<const device uint16_t*>(sc)));
+    bias = static_cast<U>(kq_bf16_to_float(as_type<uint16_t>(d[0])));
+  } else if constexpr (has_min) {
     scale = kq_shift_scale<scale_shift>(
         static_cast<U>(d[0]) * static_cast<U>(sc[0]));
     bias = -(static_cast<U>(d[1]) * static_cast<U>(sc[1]));
@@ -221,7 +225,8 @@ struct KQScales {
   // the companion bytes of a grid unit; super-scale entries per super-block:
   // (d, dmin) or d.
   MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
-  MLX_MTL_CONST int per_super = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_super =
+      kq_bias_entries_per_super<has_min, kind, super_ratio>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -236,7 +241,8 @@ struct KQScales {
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
     kq_decode_group<U, bits, has_min, kind, scale_shift>(
-        biases + (gi / super_ratio) * per_super,
+        biases + (gi / super_ratio) * per_super +
+            kq_bias_sub_index<kind, super_ratio>(gi),
         scales + gi * per_group,
         scale,
         bias);
@@ -280,7 +286,8 @@ METAL_FUNC constexpr size_t kq_tiled_unit_stride() {
 template <typename U, int bits, int super_ratio, bool has_min, int kind, int scale_shift>
 struct KQScalesTiled {
   MLX_MTL_CONST int per_group = kq_scale_bytes_per_group<has_min, kind>();
-  MLX_MTL_CONST int per_super = has_min ? 2 : 1;
+  MLX_MTL_CONST int per_super =
+      kq_bias_entries_per_super<has_min, kind, super_ratio>();
 
   const device uint8_t* scales;
   const device float16_t* biases;
@@ -312,8 +319,9 @@ struct KQScalesTiled {
 
   void at(size_t g, thread U& scale, thread U& bias) const {
     const size_t gi = group + g;
-    const device float16_t* d =
-        biases + (gi / super_ratio) * KQ_TILE_ROWS * per_super;
+    const device float16_t* d = biases +
+        (gi / super_ratio) * KQ_TILE_ROWS * per_super +
+        kq_bias_sub_index<kind, super_ratio>(gi);
     const device uint8_t* sc = scales +
         (gi / super_ratio) * KQ_TILE_ROWS * super_ratio * per_group +
         (gi % super_ratio) * per_group;

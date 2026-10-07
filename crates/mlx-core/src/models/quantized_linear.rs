@@ -716,13 +716,13 @@ pub fn row_major_kquant_arrays(
             "row_major_kquant_arrays: '{prefix}.biases' missing on a Tiled64 K-quant group"
         )));
     };
-    let per_group = i64::from(kq.scale_bytes_per_group);
-    let per_super = i64::from(kq.bias_entries_per_super_block);
-    let super_ratio = i64::from(kq.super_ratio);
     Ok(Some((
         kquant_untile_rows(weight, i64::from(kq.bits))?,
-        kquant_untile_rows(scales, super_ratio * per_group)?,
-        Some(kquant_untile_rows(biases, per_super)?),
+        kquant_untile_rows(scales, i64::from(kq.scale_entries_per_super_block()))?,
+        Some(kquant_untile_rows(
+            biases,
+            i64::from(kq.bias_entries_per_super_block),
+        )?),
     )))
 }
 
@@ -921,30 +921,52 @@ impl QuantizedLinear {
 
     fn tile_kquant_layout_impl(&mut self, pad_rows: bool) -> Result<bool> {
         use crate::models::quant_dispatch::{
-            KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kquant_mode_params_for_scales, kquant_tile_rows,
-            kquant_tileable, parse_mode_str, split_kquant_layout,
+            KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kquant_affine_mode_params,
+            kquant_mode_params_for_scales, kquant_tile_rows, kquant_tileable, parse_mode_str,
+            split_kquant_layout,
         };
         let (base, already) = split_kquant_layout(&self.mode);
         if already {
             return Ok(true);
         }
-        let Some(mode) = parse_mode_str(Some(base)) else {
-            return Ok(false);
+        let kq = if base == DEFAULT_QUANT_MODE {
+            // An MLX affine linear reads through the affine K-quant contract
+            // (`a<bits>g<group>`) when the kernels carry its (bits, group)
+            // and its companions are the bfloat16 the contract stores.
+            let Some(kq) = kquant_affine_mode_params(self.bits, self.group_size) else {
+                return Ok(false);
+            };
+            let biases_dtype = self.biases.as_ref().map(|b| b.dtype()).transpose()?;
+            if self.scales.dtype()? != kq.scales_dtype || biases_dtype != Some(kq.biases_dtype) {
+                return Ok(false);
+            }
+            // The affine contract carries no calibration state: a linear with
+            // an activation amax (static FP8 fake-quant) or amax keys keeps
+            // MLX's affine route, where those are honoured.
+            if self.input_amax.is_some() || self.amax_keys.is_some() {
+                return Ok(false);
+            }
+            kq
+        } else {
+            let Some(mode) = parse_mode_str(Some(base)) else {
+                return Ok(false);
+            };
+            // `None` for every non-K-quant mode. The `.scales` dtype picks
+            // the legacy expanded IQ3_S contract (`iq3s8`) for an artifact
+            // that predates the packed form; its `bits` must agree with the
+            // projection's.
+            let Some(kq) = kquant_mode_params_for_scales(mode, self.scales.dtype()?) else {
+                return Ok(false);
+            };
+            if kq.bits != self.bits {
+                return Err(Error::from_reason(format!(
+                    "tile_kquant_layout: {base} projection carries bits={} but the {} contract \
+                     its .scales dtype selects has bits={} — config/tensor disagreement",
+                    self.bits, kq.mode_str, kq.bits
+                )));
+            }
+            kq
         };
-        // `None` for every non-K-quant mode. The `.scales` dtype picks the
-        // legacy expanded IQ3_S contract (`iq3s8`) for an artifact that
-        // predates the packed form; its `bits` must agree with the
-        // projection's.
-        let Some(kq) = kquant_mode_params_for_scales(mode, self.scales.dtype()?) else {
-            return Ok(false);
-        };
-        if kq.bits != self.bits {
-            return Err(Error::from_reason(format!(
-                "tile_kquant_layout: {base} projection carries bits={} but the {} contract its \
-                 .scales dtype selects has bits={} — config/tensor disagreement",
-                self.bits, kq.mode_str, kq.bits
-            )));
-        }
         if self.output_layout != QuantizedOutputLayout::Native
             || self.hadamard.is_some()
             || self.fp8_dequant_weight.is_some()
@@ -966,14 +988,14 @@ impl QuantizedLinear {
             return Ok(false);
         }
         // Codes interleave per 32-value unit (`bits` words); the companions
-        // per super-block: `scale_bytes_per_group` entries per group over
-        // `super_ratio` groups for `.scales` (q2k/q4k/q5k: (sc, m) pairs; the
-        // grid formats their companion bytes; the rest one byte; IQ4_NL: one
-        // group), `bias_entries_per_super_block` entries for `.biases`
-        // ((d, dmin) pairs or d alone).
-        let per_group = i64::from(kq.scale_bytes_per_group);
+        // per super-block: `scale_entries_per_super_block` entries of
+        // `.scales` (q2k/q4k/q5k: (sc, m) pairs; the grid formats their
+        // companion bytes; the rest one byte; IQ4_NL: one group; the affine
+        // kinds one bfloat16 per group), `bias_entries_per_super_block`
+        // entries of `.biases` ((d, dmin) pairs, d alone, or the affine
+        // kinds' bfloat16 per group).
+        let scale_entries = i64::from(kq.scale_entries_per_super_block());
         let per_super = i64::from(kq.bias_entries_per_super_block);
-        let super_ratio = i64::from(kq.super_ratio);
         // Zero rows appended to a row-major `[n, cols]` array (`padded_n - n`
         // of them); the identity when the row count is already whole tiles.
         let pad = |a: &MxArray| -> Result<MxArray> {
@@ -985,7 +1007,7 @@ impl QuantizedLinear {
             MxArray::concatenate(a, &zeros, 0)
         };
         let weight = kquant_tile_rows(&pad(&self.weight)?, i64::from(self.bits))?;
-        let scales = kquant_tile_rows(&pad(&self.scales)?, super_ratio * per_group)?;
+        let scales = kquant_tile_rows(&pad(&self.scales)?, scale_entries)?;
         let biases = kquant_tile_rows(&pad(biases)?, per_super)?;
         let bias = match (&self.bias, padded_n == n) {
             (Some(b), false) => Some(MxArray::concatenate(
@@ -1002,7 +1024,7 @@ impl QuantizedLinear {
         self.scales = scales;
         self.biases = Some(biases);
         self.bias = bias;
-        self.mode = format!("{base}{KQUANT_TILED_SUFFIX}");
+        self.mode = format!("{}{KQUANT_TILED_SUFFIX}", kq.mode_str);
         Ok(true)
     }
 
@@ -3475,6 +3497,71 @@ mod kquant_tiled_tests {
         );
         assert!(!affine.tile_kquant_layout().unwrap());
         assert_eq!(affine.mode(), DEFAULT_QUANT_MODE);
+    }
+
+    /// An MLX affine linear with the bf16 companions MLX's `quantize` emits
+    /// tiles into the `a<bits>g<group>@t64` K-quant contract (the DFlash2
+    /// draft's load path), keeping its bytes and shapes and matching the
+    /// row-major affine forward; one the kernels do not carry (group 128)
+    /// or with f16 companions stays affine.
+    #[test]
+    fn affine_bf16_tiles_into_the_kquant_contract() {
+        let (n, k) = (128i64, 512i64);
+        let affine = |group: i32, seed: u32| {
+            let mut st = seed;
+            let words: Vec<u32> = (0..n * k / 8).map(|_| lcg(&mut st)).collect();
+            let groups = n * k / i64::from(group);
+            let scales: Vec<u16> = (0..groups)
+                .map(|_| half::bf16::from_f32(0.005 + (lcg(&mut st) % 100) as f32 * 1e-4).to_bits())
+                .collect();
+            let biases: Vec<u16> = (0..groups)
+                .map(|_| half::bf16::from_f32(-((lcg(&mut st) % 100) as f32) * 1e-3).to_bits())
+                .collect();
+            QuantizedLinear::new(
+                MxArray::from_uint32(&words, &[n, k / 8]).unwrap(),
+                MxArray::from_bfloat16(&scales, &[n, k / i64::from(group)]).unwrap(),
+                Some(MxArray::from_bfloat16(&biases, &[n, k / i64::from(group)]).unwrap()),
+                None,
+                group,
+                4,
+                DEFAULT_QUANT_MODE.to_string(),
+            )
+        };
+        let row_major = affine(64, 11);
+        let mut tiled = affine(64, 11);
+        assert!(tiled.tile_kquant_layout().unwrap());
+        assert_eq!(tiled.mode(), "a4g64@t64");
+        assert!(tiled.is_kquant_tiled());
+        assert_eq!(tiled.get_scales().dtype().unwrap(), DType::BFloat16);
+        assert_eq!(
+            tiled.get_scales().shape().unwrap().to_vec(),
+            row_major.get_scales().shape().unwrap().to_vec()
+        );
+        // The permutation is exact: untiling restores every array.
+        assert_eq!(
+            bits_of(&kquant_untile_rows(tiled.get_weight(), 4).unwrap()),
+            bits_of(row_major.get_weight())
+        );
+        assert_eq!(
+            bits_of(&kquant_untile_rows(tiled.get_scales(), 4).unwrap()),
+            bits_of(row_major.get_scales())
+        );
+        assert_eq!(
+            bits_of(&kquant_untile_rows(tiled.get_biases().unwrap(), 4).unwrap()),
+            bits_of(row_major.get_biases().unwrap())
+        );
+        for m in [1i64, 3, 8, 64] {
+            let a = x(m, k, 20 + m as u32);
+            close(
+                &tiled.forward(&a).unwrap(),
+                &row_major.forward(&a).unwrap(),
+                3e-2,
+                &format!("a4g64@t64 vs affine M={m}"),
+            );
+        }
+        let mut wide = affine(128, 12);
+        assert!(!wide.tile_kquant_layout().unwrap());
+        assert_eq!(wide.mode(), DEFAULT_QUANT_MODE);
     }
 
     #[test]

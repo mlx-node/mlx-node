@@ -878,17 +878,16 @@ impl CandidateSelector {
 /// Rows a draft window buffer grows by.
 const DRAFT_KV_STEP: i64 = 256;
 
-/// Whether a row merge of projections may serve `block_rows` rows: every
-/// per-row route limit (`mlx_affine_qmv_fast_limit` of each separate width
-/// and of the merged width; 0 = the shape does not take that route) must
-/// exceed `block_rows`, so the merged matmul computes each output element
-/// exactly as the separate one would. `None` declines the merge.
-fn merge_rows_for(block_rows: i64, limits: impl IntoIterator<Item = i32>) -> Option<i64> {
-    let mut limits = limits.into_iter().peekable();
-    limits.peek()?;
-    limits
-        .all(|limit| i64::from(limit) > block_rows)
-        .then_some(block_rows)
+/// Whether draft projections of the given row widths may be row-merged (and
+/// the merge sliced back into views): only Tiled64 K-quant/affine linears,
+/// whose kernels decode and reduce each output row the same way at any
+/// width, and whose layout concatenates and slices in whole 64-row tiles, so
+/// every width must be a tile multiple. A projection still on MLX's affine
+/// route (no Metal, or a shape the tiled kernels do not take) is not merged:
+/// its per-row `qmv` / GEMM choice follows the width.
+fn kquant_rows_merge(packed: &QuantizedLinear, widths: &[i64]) -> bool {
+    use crate::models::quant_dispatch::{KQUANT_TILE_ROWS, split_kquant_layout};
+    split_kquant_layout(packed.mode()).1 && widths.iter().all(|w| w % KQUANT_TILE_ROWS == 0)
 }
 
 /// One draft layer's attention context: the newest `window` rows of K and V
@@ -1256,36 +1255,28 @@ impl DFlash2Model {
 
     /// Row-merge the projections that share an input so each runs as one
     /// quantized matmul: `q|k|v` and `gate|up` per layer, and every layer's
-    /// `k|v` for the context append. A merge is made only where it is
-    /// bit-exact: the packed formats agree, and on this device a decode
-    /// block's rows take MLX's per-row `qmv` route for every width involved
-    /// (separate and merged; see [`merge_rows_for`]). Otherwise the separate
-    /// projections stay. Per-layer merges turn the originals into row views
+    /// `k|v` for the context append. The merge needs K-quant projections
+    /// whose widths are whole Tiled64 tiles ([`kquant_rows_merge`]) and
+    /// agreeing packed formats; otherwise the separate projections stay.
+    /// Below the GEMM threshold the tiled kernels decode and reduce each
+    /// output row the same way at any width except the M = 8 tensor-op
+    /// route's split-K count, which follows N (`qmm_m8_nax_splits`), so a
+    /// merged block of 8 rows may differ from the separate projections in
+    /// the last bf16 bit. Per-layer merges turn the originals into row views
     /// of the merged buffer (no extra bytes); the cross-layer `k|v` merge is
     /// an extra resident copy, counted in `weight_bytes`.
     fn merge_projections(&mut self) -> Result<()> {
-        let block_rows = self.config.block_size as i64 + 1;
-        let hidden = self.config.hidden_size as i64;
-        let merge_rows = |first: &LinearProj, widths: &[i64]| -> Option<i64> {
-            let LinearProj::Quantized(packed) = first else {
-                return None;
-            };
-            if packed.mode() != "affine" {
-                return None;
+        let merge_rows = |first: &LinearProj, widths: &[i64]| -> bool {
+            match first {
+                LinearProj::Quantized(packed) => kquant_rows_merge(packed, widths),
+                LinearProj::Standard(_) => false,
             }
-            // SAFETY: plain FFI query on integer arguments.
-            merge_rows_for(
-                block_rows,
-                widths.iter().map(|&n| unsafe {
-                    sys::mlx_affine_qmv_fast_limit(hidden as i32, n as i32, packed.bits())
-                }),
-            )
         };
         for layer in &mut self.layers {
             let attention = &mut layer.attention;
             let q_rows = attention.num_heads * attention.head_dim;
             let kv_rows = attention.num_kv_heads * attention.head_dim;
-            if merge_rows(&attention.q_proj, &[q_rows, kv_rows, q_rows + 2 * kv_rows]).is_some()
+            if merge_rows(&attention.q_proj, &[q_rows, kv_rows])
                 && let Some(qk) = attention.q_proj.concat_rows(&attention.k_proj)?
                 && let Some(qkv) = qk.concat_rows(&attention.v_proj)?
             {
@@ -1296,7 +1287,7 @@ impl DFlash2Model {
             }
             let mlp = &mut layer.mlp;
             let split = self.config.intermediate_size as i64;
-            if merge_rows(&mlp.gate_proj, &[split, 2 * split]).is_some()
+            if merge_rows(&mlp.gate_proj, &[split])
                 && let Some(gate_up) = mlp.gate_proj.concat_rows(&mlp.up_proj)?
             {
                 mlp.gate_proj = gate_up.slice_rows(0, split)?;
@@ -1308,8 +1299,7 @@ impl DFlash2Model {
             return Ok(());
         };
         let kv_rows = first.attention.num_kv_heads * first.attention.head_dim;
-        let all_rows = 2 * kv_rows * self.layers.len() as i64;
-        if merge_rows(&first.attention.k_proj, &[kv_rows, all_rows]).is_none() {
+        if !merge_rows(&first.attention.k_proj, &[kv_rows]) {
             return Ok(());
         }
         let mut merged: Option<LinearProj> = None;
@@ -1346,10 +1336,9 @@ impl DFlash2Model {
     }
 
     /// Row heights the merged projections serve: a decode block (anchor +
-    /// proposals). Merges exist only where that many rows take the per-row
-    /// matmul route for every width involved (`merge_projections`), so a
-    /// wider merged weight gives the same bits; taller (prefill) inputs take
-    /// the separate projections.
+    /// proposals), the heights the merges were made for. Taller (prefill)
+    /// inputs take the separate projections, whose GEMM split-K then follows
+    /// each projection's own width.
     fn merged_rows(&self) -> i64 {
         self.config.block_size as i64 + 1
     }
@@ -1476,11 +1465,17 @@ impl DFlash2Model {
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
         let query_base = context.logical_len;
         let hidden = self.forward_hidden(target_embedding, &block, query_base, context)?;
-        let hidden = hidden.slice_axis(1, 1, max_len as i64 + 1)?;
+        // The head runs on the whole block (anchor + proposals, 8 rows), the
+        // height its K-quant M = 8 route serves, and the anchor row's logits
+        // are dropped: at 7 rows the head took the per-row kernel and cost
+        // more than at 8.
         let logits = match target_lm_head {
             Some(head) => head.forward(&hidden)?,
             None => target_embedding.as_linear(&hidden)?,
         };
+        let rows = max_len as i64 + 1;
+        let hidden = hidden.slice_axis(1, 1, rows)?;
+        let logits = logits.slice_axis(1, 1, rows)?;
         let out = self
             .selector
             .select(&hidden, &logits, anchor, temperature, device_path, rng)?;
@@ -1650,10 +1645,15 @@ fn validate_tensor(value: &MxArray, key: &str, shape: &[i64]) -> Result<()> {
 
 /// The published DFlash2 companion ships bf16. Its dense projections load as
 /// affine Q4/group64: against bf16 and Q8 it kept teacher-forced acceptance
-/// within noise and gave the lowest decode time per committed token. The
-/// draft reuses the target output head. A change of draft precision moves
-/// proposals and verify grouping, so it can change the transcript even
-/// though the target verifies every emitted token.
+/// within noise and gave the lowest decode time per committed token. On a
+/// Metal host the packed arrays are then tiled into the K-quant `a4g64@t64`
+/// contract (same codes, same bf16 scale and bias per group), so a decode
+/// block's 8 rows take the tensor-op `qmm_m8_nax_t64` kernel instead of
+/// MLX's per-row affine `qmv` (which read the weights once per row: ~2.2x
+/// the bandwidth floor at M = 8). The draft reuses the target output head.
+/// A change of draft precision moves proposals and verify grouping, so it
+/// can change the transcript even though the target verifies every emitted
+/// token.
 const DRAFT_GROUP_SIZE: i32 = 64;
 const DRAFT_BITS: i32 = 4;
 
@@ -1697,6 +1697,40 @@ fn quantize_affine(
     Ok((packed, scales, biases))
 }
 
+/// Quantize a floating `[out, in]` weight to affine Q4/group64 as a
+/// `QuantizedLinear`, tiled into the `a4g64@t64` K-quant contract when this
+/// host runs the `_t64` kernels ([`QuantizedLinear::tile_kquant_layout`];
+/// the row-major arrays are released). The shape must be tileable
+/// (`N % 64 == 0`, `K % 256 == 0`) on every host: an odd draft geometry
+/// fails here rather than silently taking a slower layout.
+fn quantize_draft_weight(weight: &MxArray, name: &str) -> Result<QuantizedLinear> {
+    use crate::models::quant_dispatch::{kquant_tileable, kquant_tiled_enabled};
+    let shape = weight.shape()?;
+    let (rows, k) = (shape[0], shape[1]);
+    if !kquant_tileable(rows, k) {
+        return Err(Error::from_reason(format!(
+            "DFlash2 draft projection '{name}' is [{rows}, {k}]; the a{DRAFT_BITS}g{DRAFT_GROUP_SIZE} \
+             Tiled64 layout needs N % 64 == 0 and K % 256 == 0"
+        )));
+    }
+    let (packed, scales, biases) = quantize_affine(weight, DRAFT_GROUP_SIZE, DRAFT_BITS)?;
+    let mut linear = QuantizedLinear::new(
+        packed,
+        scales,
+        Some(biases),
+        None,
+        DRAFT_GROUP_SIZE,
+        DRAFT_BITS,
+        "affine".to_string(),
+    );
+    if kquant_tiled_enabled() && !linear.tile_kquant_layout()? {
+        return Err(Error::from_reason(format!(
+            "DFlash2 draft projection '{name}' [{rows}, {k}] did not tile"
+        )));
+    }
+    Ok(linear)
+}
+
 /// Builds a draft projection as affine Q4/group64. `savings` accumulates
 /// `dense − resident` bytes so the loader can report true residency rather
 /// than the bf16 file size.
@@ -1707,23 +1741,14 @@ fn draft_linear(
     output: usize,
     savings: &mut u64,
 ) -> Result<LinearProj> {
-    let weight = required(
-        params,
-        &format!("{prefix}.weight"),
-        &[output as i64, input as i64],
-    )?;
-    let (packed, scales, biases) = quantize_affine(&weight, DRAFT_GROUP_SIZE, DRAFT_BITS)?;
-    let resident = packed.nbytes() as u64 + scales.nbytes() as u64 + biases.nbytes() as u64;
+    let key = format!("{prefix}.weight");
+    let weight = required(params, &key, &[output as i64, input as i64])?;
+    let linear = quantize_draft_weight(&weight, &key)?;
+    let resident = linear.get_weight().nbytes() as u64
+        + linear.get_scales().nbytes() as u64
+        + linear.get_biases().map_or(0, |b| b.nbytes() as u64);
     *savings += (weight.nbytes() as u64).saturating_sub(resident);
-    Ok(LinearProj::Quantized(QuantizedLinear::new(
-        packed,
-        scales,
-        Some(biases),
-        None,
-        DRAFT_GROUP_SIZE,
-        DRAFT_BITS,
-        "affine".to_string(),
-    )))
+    Ok(LinearProj::Quantized(linear))
 }
 
 fn dense_linear(
@@ -2140,16 +2165,18 @@ mod tests {
     use crate::models::quantized_linear::LinearProj;
     use crate::nn::{Embedding, Linear};
 
+    /// The smallest geometry whose every draft projection is tileable
+    /// (`N % 64 == 0`, `K % 256 == 0`): o_proj's K is `heads * head_dim`.
     fn checkpoint_inventory_config() -> DFlash2Config {
         DFlash2Config {
             block_size: 7,
             mask_token_id: 0,
             target_layers: vec![0, 1],
             target_num_layers: 2,
-            hidden_size: 64,
-            intermediate_size: 128,
+            hidden_size: 256,
+            intermediate_size: 256,
             num_hidden_layers: 1,
-            num_attention_heads: 1,
+            num_attention_heads: 4,
             num_key_value_heads: 1,
             head_dim: 64,
             vocab_size: 32,
@@ -2211,7 +2238,7 @@ mod tests {
         }
         params.insert(
             "fc.scales".into(),
-            MxArray::zeros(&[64, 2], Some(DType::BFloat16)).unwrap(),
+            MxArray::zeros(&[256, 2], Some(DType::BFloat16)).unwrap(),
         );
         assert!(
             super::validate_tensor_inventory(&params, &config)
@@ -2224,18 +2251,31 @@ mod tests {
     #[test]
     fn selector_linear_keeps_checkpoint_precision() {
         let mut params = checkpoint_inventory();
-        let projection = super::dense_linear(&mut params, "fc", 128, 64).unwrap();
+        let projection = super::dense_linear(&mut params, "fc", 512, 256).unwrap();
         assert!(matches!(projection, LinearProj::Standard(_)));
         assert_eq!(projection.get_weight().dtype().unwrap(), DType::BFloat16);
     }
 
+    /// The mode a draft projection carries on this host: the affine arrays
+    /// tiled into the K-quant contract where the `_t64` kernels run, MLX's
+    /// own affine route elsewhere.
+    fn draft_mode() -> &'static str {
+        if crate::models::quant_dispatch::kquant_tiled_enabled() {
+            "a4g64@t64"
+        } else {
+            "affine"
+        }
+    }
+
     /// Asserts an affine Q4/group64 projection of a bf16 `[rows, cols]`
-    /// weight: 8 codes per u32 and one bf16 scale/offset pair per 64 inputs.
+    /// weight: 8 codes per u32 and one bf16 scale/offset pair per 64 inputs
+    /// (the Tiled64 permutation keeps the 2-D shapes).
     fn assert_q4_group64(projection: &LinearProj, rows: i64, cols: i64, name: &str) {
         let LinearProj::Quantized(packed) = projection else {
             panic!("{name}: draft projection must load quantized");
         };
-        assert_eq!(packed.mode(), "affine", "{name}");
+        assert_eq!(packed.mode(), draft_mode(), "{name}");
+        assert_eq!(packed.bits(), 4, "{name}");
         assert_eq!(
             packed.get_weight().dtype().unwrap(),
             DType::Uint32,
@@ -2247,11 +2287,17 @@ mod tests {
             "{name}: packed codes"
         );
         assert_eq!(
+            packed.get_scales().dtype().unwrap(),
+            DType::BFloat16,
+            "{name}"
+        );
+        assert_eq!(
             packed.get_scales().shape().unwrap().as_ref(),
             &[rows, cols / 64],
             "{name}: scales"
         );
         let biases = packed.get_biases().expect("affine Q4 has offsets");
+        assert_eq!(biases.dtype().unwrap(), DType::BFloat16, "{name}");
         assert_eq!(
             biases.shape().unwrap().as_ref(),
             &[rows, cols / 64],
@@ -2259,52 +2305,70 @@ mod tests {
         );
     }
 
+    /// `draft_linear` keeps the affine Q4/group64 numerics through the
+    /// tiled contract: integer endpoints spanning exactly 15 steps decode
+    /// exactly, in rows of either sign (stored offsets), on every route a
+    /// decode block reaches (M = 1, 8 and a prefill height).
     #[test]
     fn draft_linear_is_q4_group64_with_exact_endpoints_and_residency() {
-        // Integer endpoints span exactly 15 steps, so affine Q4 retains both
-        // values exactly. Opposite-sign rows also check stored offsets.
-        let values = (0..256)
+        let (rows, cols) = (64i64, 256i64);
+        let values = (0..rows * cols)
             .map(|i| {
-                if i % 2 == 0 {
+                let (row, col) = (i / cols, i % cols);
+                if col % 2 == 0 {
                     0.0
-                } else if i < 128 {
+                } else if row % 2 == 0 {
                     15.0
                 } else {
                     -15.0
                 }
             })
             .collect::<Vec<_>>();
-        let weight = MxArray::from_float32(&values, &[2, 128])
+        let weight = MxArray::from_float32(&values, &[rows, cols])
             .unwrap()
             .astype(DType::BFloat16)
             .unwrap();
-        let source_values = weight.to_float32().unwrap().to_vec();
         let mut params = std::collections::HashMap::from([("fc.weight".into(), weight.clone())]);
         let mut savings = 0;
-        let projection = super::draft_linear(&mut params, "fc", 128, 2, &mut savings).unwrap();
-        assert_q4_group64(&projection, 2, 128, "fc");
+        let projection = super::draft_linear(
+            &mut params,
+            "fc",
+            cols as usize,
+            rows as usize,
+            &mut savings,
+        )
+        .unwrap();
+        assert_q4_group64(&projection, rows, cols, "fc");
         let LinearProj::Quantized(packed) = &projection else {
             unreachable!();
         };
         let resident = packed.get_weight().nbytes()
             + packed.get_scales().nbytes()
             + packed.get_biases().map_or(0, |biases| biases.nbytes());
-        // Each row owns 64 packed bytes and two bf16 scale/offset pairs.
-        assert_eq!(resident, 2 * (64 + 4 + 4));
+        // Each row owns 128 packed bytes and four bf16 scale/offset pairs.
+        assert_eq!(resident as i64, rows * (cols / 2 + cols / 64 * 4));
         assert_eq!(savings, weight.nbytes() as u64 - resident as u64);
         assert!(params.is_empty());
-        assert_eq!(weight.dtype().unwrap(), DType::BFloat16);
-        assert_eq!(
-            weight.to_float32().unwrap().as_ref(),
-            source_values.as_slice()
-        );
 
-        let input = MxArray::from_float32(&[1.0; 128], &[1, 128])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
-        let output = projection.forward(&input).unwrap().to_float32().unwrap();
-        assert_eq!(output.as_ref(), &[960.0, -960.0]);
+        // Every row sums its 128 non-zero entries: +-1920, exact in bf16.
+        let want = (0..rows)
+            .map(|row| if row % 2 == 0 { 1920.0 } else { -1920.0 })
+            .collect::<Vec<f32>>();
+        for m in [1i64, 8, 87] {
+            let input = MxArray::ones(&[1, m, cols], Some(DType::BFloat16)).unwrap();
+            let output = projection.forward(&input).unwrap().to_float32().unwrap();
+            assert_eq!(output.len() as i64, m * rows, "M={m}");
+            for (row, got) in output.chunks_exact(rows as usize).enumerate() {
+                assert_eq!(got, want.as_slice(), "M={m} input row {row}");
+            }
+        }
+
+        // An untileable geometry fails loud rather than loading slower.
+        let odd = MxArray::zeros(&[2, 128], Some(DType::BFloat16)).unwrap();
+        let Err(err) = super::quantize_draft_weight(&odd, "odd") else {
+            panic!("an untileable draft weight must be refused");
+        };
+        assert!(err.to_string().contains("N % 64 == 0"), "{err}");
     }
 
     #[test]
@@ -2386,8 +2450,14 @@ mod tests {
                 }
             })
             .sum::<u64>();
+        // The merges follow the tiled contract: on a Metal host every
+        // projection tiles, so q|k|v, gate|up and the cross-layer k|v (a
+        // second resident copy of k/v) all exist.
+        let tiled = crate::models::quant_dispatch::kquant_tiled_enabled();
+        assert_eq!(model.context_kv.is_some(), tiled);
+        assert_eq!(model.layers[0].attention.qkv_proj.is_some(), tiled);
+        assert_eq!(model.layers[0].mlp.gate_up.is_some(), tiled);
         if model.context_kv.is_some() {
-            // The cross-layer k|v merge is a second resident copy of k/v.
             let kv = (config.num_key_value_heads * config.head_dim * config.hidden_size) as u64;
             expected_bytes += 2 * packed_bytes(kv) * config.num_hidden_layers as u64;
         }
@@ -3089,11 +3159,29 @@ mod tests {
         assert_eq!(model.config.block_size, 7);
         assert_eq!(model.config.target_layers, vec![5, 19, 33, 47, 61]);
         // Q4/group64 projections: ~1.27 GB resident versus 3.85 GB bf16
-        // and ~2.17 GB at Q8/group64.
+        // and ~2.17 GB at Q8/group64, plus the cross-layer k|v copy.
         assert!(
             bytes > 1_000_000_000 && bytes < 1_500_000_000,
             "resident draft bytes {bytes}"
         );
+        // Every projection of the published geometry tiles (hidden 5120,
+        // 32/8 heads of 128, intermediate 17408, fc K = 25600, conv N =
+        // 1280) and the merges follow.
+        let tiled = crate::models::quant_dispatch::kquant_tiled_enabled();
+        assert_q4_group64(&model.fc, 5120, 25600, "fc");
+        for layer in &model.layers {
+            assert_eq!(layer.attention.qkv_proj.is_some(), tiled, "q|k|v merge");
+            assert_eq!(layer.mlp.gate_up.is_some(), tiled, "gate|up merge");
+            assert_q4_group64(&layer.attention.o_proj, 5120, 4096, "o_proj");
+            assert_q4_group64(&layer.mlp.down_proj, 5120, 17408, "down_proj");
+            assert_q4_group64(
+                &layer.attention_conv.kernel_projection,
+                1280,
+                5120,
+                "attention_conv",
+            );
+        }
+        assert_eq!(model.context_kv.is_some(), tiled, "cross-layer k|v merge");
     }
 
     fn three_layer_tiny_draft() -> super::DFlash2Model {
@@ -3232,10 +3320,10 @@ mod tests {
     }
 
     /// A draft at the published Qwen3.8 attention geometry (hidden 5120,
-    /// 32/8 heads of 128, affine Q4/g64) with random weights.
+    /// 32/8 heads of 128, affine Q4/g64 as `draft_linear` loads it) with
+    /// random weights.
     fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Model {
         use super::{DFlash2Attention, DFlash2Layer, DFlash2Mlp, GroupedDynamicCausalConv};
-        use crate::models::quantized_linear::QuantizedLinear;
         use crate::nn::{RMSNorm, RoPE};
         let (hidden, heads, kv_heads, head_dim) = (5120usize, 32i64, 8i64, 128i64);
         let eps = 1e-6;
@@ -3247,18 +3335,7 @@ mod tests {
                 Some(DType::BFloat16),
             )
             .unwrap();
-            let (packed, scales, biases) =
-                super::quantize_affine(&weight, super::DRAFT_GROUP_SIZE, super::DRAFT_BITS)
-                    .unwrap();
-            LinearProj::Quantized(QuantizedLinear::new(
-                packed,
-                scales,
-                Some(biases),
-                None,
-                super::DRAFT_GROUP_SIZE,
-                super::DRAFT_BITS,
-                "affine".to_string(),
-            ))
+            LinearProj::Quantized(super::quantize_draft_weight(&weight, "test").unwrap())
         };
         let norm = |size: i64| {
             RMSNorm::from_weight(
@@ -3349,23 +3426,29 @@ mod tests {
         array.to_uint16_native().unwrap()
     }
 
-    /// The merge gate admits a block height only when every width's per-row
-    /// route limit exceeds it; a width that does not take the route (0), a
-    /// limit at or below the block (older GPU generations: 6/10/12 at
-    /// K > 4096) or no widths decline.
+    /// The merge gate admits K-quant projections (a tiled one only at whole
+    /// tile widths) and declines MLX's affine route and dense projections.
     #[test]
-    fn merge_rows_gate_follows_the_smallest_route_limit() {
-        use super::merge_rows_for;
-        assert_eq!(merge_rows_for(8, [13, 13, 13]), Some(8));
-        assert_eq!(merge_rows_for(8, [33, 13]), Some(8));
-        assert_eq!(merge_rows_for(8, [13, 6]), None);
-        assert_eq!(merge_rows_for(8, [10, 10]), Some(8));
-        assert_eq!(merge_rows_for(8, [8, 13]), None);
-        assert_eq!(merge_rows_for(8, [12, 12]), Some(8));
-        assert_eq!(merge_rows_for(12, [12]), None);
-        assert_eq!(merge_rows_for(8, [13, 0]), None);
-        assert_eq!(merge_rows_for(8, []), None);
-        assert_eq!(merge_rows_for(1, [2]), Some(1));
+    fn merge_rows_gate_follows_the_packed_contract() {
+        use super::kquant_rows_merge;
+        use crate::models::quantized_linear::QuantizedLinear;
+        let packed = |mode: &str| {
+            QuantizedLinear::new(
+                MxArray::zeros(&[64, 32], Some(DType::Uint32)).unwrap(),
+                MxArray::zeros(&[64, 4], Some(DType::BFloat16)).unwrap(),
+                Some(MxArray::zeros(&[64, 4], Some(DType::BFloat16)).unwrap()),
+                None,
+                64,
+                4,
+                mode.to_string(),
+            )
+        };
+        assert!(kquant_rows_merge(&packed("a4g64@t64"), &[64, 1024]));
+        assert!(!kquant_rows_merge(&packed("a4g64@t64"), &[64, 96]));
+        assert!(kquant_rows_merge(&packed("q4k@t64"), &[128]));
+        assert!(!kquant_rows_merge(&packed("q4k"), &[64]));
+        assert!(!kquant_rows_merge(&packed("affine"), &[64]));
+        assert!(!kquant_rows_merge(&packed("mxfp4"), &[64]));
     }
 
     /// The flat window holds exactly the newest `window` appended rows in
@@ -3459,13 +3542,42 @@ mod tests {
         }
     }
 
+    /// bf16 bit patterns `got` against `want`: identical when `exact`, else
+    /// (the M = 8 heights, where the merged width changes the tensor-op
+    /// split-K and so the fp32 summation order) every element within 2^-6
+    /// of the tensor's largest magnitude and at most 5% of them differing
+    /// at all — last-bit flips, not a wrong row or slice.
+    fn assert_bits_match(got: &[u16], want: &[u16], exact: bool, label: &str) {
+        assert_eq!(got.len(), want.len(), "{label}: length");
+        if exact {
+            assert!(got == want, "{label}: bits differ");
+            return;
+        }
+        let f = |b: u16| half::bf16::from_bits(b).to_f32();
+        let scale = want.iter().map(|&w| f(w).abs()).fold(0f32, f32::max);
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(&g, &w)| (f(g) - f(w)).abs())
+            .fold(0f32, f32::max);
+        let differing = got.iter().zip(want).filter(|(g, w)| g != w).count();
+        assert!(
+            worst <= scale / 64.0 && differing * 20 <= got.len(),
+            "{label}: max |diff| {worst} of scale {scale}, {differing}/{} elements differ",
+            got.len()
+        );
+    }
+
     /// The merged `q|k|v`, `gate|up` and cross-layer `k|v` matmuls, the
     /// fused q/k norm + RoPE kernel and the one RoPE over all layers' keys
-    /// must reproduce the separate projections and the four-op chain bit
-    /// for bit at every block height, at the real head geometry (where the
-    /// merged widths cross the `qmv_wide` tiling thresholds). A prefill-high
-    /// input (87 rows) must still match: there the merge is bypassed, since
-    /// the GEMM split-K would differ with the output width.
+    /// must reproduce the separate projections and the four-op chain at the
+    /// real head geometry. Bit for bit at 1..=7 rows (the tiled `qmv_t64` /
+    /// `qmv_wide_t64` kernels reduce each row the same way at any width) and
+    /// at a prefill-high 87 rows (the merge is bypassed: the GEMM split-K
+    /// follows N). At 8 rows the `qmm_m8_nax_t64` split-K count follows N
+    /// too (`qmm_m8_nax_splits`: k/v at N = 1024 split 8 ways, the merged
+    /// q|k|v at 6144 4 ways), so the merged widths round the fp32 partial
+    /// sums differently in a few last bits: `assert_bits_match` bounds it.
     #[test]
     fn merged_draft_projections_match_separate_bits() {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
@@ -3524,16 +3636,7 @@ mod tests {
             want.push((per_layer, context));
         }
         model.merge_projections().unwrap();
-        let limit = |n: i32| unsafe { mlx_sys::mlx_affine_qmv_fast_limit(5120, n, 4) };
-        let admits = |widths: &[i32]| widths.iter().all(|&n| limit(n) > 8);
-        assert_eq!(
-            model.context_kv.is_some(),
-            admits(&[1024, 6144]),
-            "cross-layer k|v merge follows the device route limit"
-        );
-        if model.context_kv.is_none() {
-            eprintln!("this device routes 8 rows at K=5120 through the GEMM: merges declined");
-        }
+        assert!(model.context_kv.is_some(), "cross-layer k|v merge");
         let probe = |heads: i64| {
             MxArray::random_normal(&[1, 8, heads, 128], 0.0, 1.0, Some(DType::BFloat16)).unwrap()
         };
@@ -3546,40 +3649,32 @@ mod tests {
         );
         for (x, (per_layer, context)) in inputs.iter().zip(&want) {
             let seq = x.shape_at(1).unwrap();
+            let exact = seq != model.merged_rows();
             for (index, layer) in model.layers.iter().enumerate() {
-                assert_eq!(
-                    layer.attention.qkv_proj.is_some(),
-                    admits(&[4096, 1024, 6144]),
-                    "q|k|v merge"
-                );
-                assert_eq!(
-                    layer.mlp.gate_up.is_some(),
-                    admits(&[4096, 8192]),
-                    "gate|up merge"
-                );
+                assert!(layer.attention.qkv_proj.is_some(), "q|k|v merge");
+                assert!(layer.mlp.gate_up.is_some(), "gate|up merge");
                 let (queries, keys, values) = layer
                     .attention
                     .project_block(x, base, model.merged_rows())
                     .unwrap();
                 let (want_q, want_k, want_v, want_mlp) = &per_layer[index];
-                assert_eq!(&bits(&queries), want_q, "T={seq} layer {index}: queries");
-                assert_eq!(&bits(&keys), want_k, "T={seq} layer {index}: block keys");
-                assert_eq!(
-                    &bits(&values),
-                    want_v,
-                    "T={seq} layer {index}: block values"
-                );
-                assert_eq!(
+                let label = |what: &str| format!("T={seq} layer {index}: {what}");
+                assert_bits_match(&bits(&queries), want_q, exact, &label("queries"));
+                assert_bits_match(&bits(&keys), want_k, exact, &label("block keys"));
+                assert_bits_match(&bits(&values), want_v, exact, &label("block values"));
+                assert_bits_match(
                     &bits(&layer.mlp.forward(x, model.merged_rows()).unwrap()),
                     want_mlp,
-                    "T={seq} layer {index}: mlp"
+                    exact,
+                    &label("mlp"),
                 );
             }
             let got = model.project_context(x, base).unwrap();
             assert_eq!(got.len(), context.len());
             for (index, ((k, v), (want_k, want_v))) in got.iter().zip(context).enumerate() {
-                assert_eq!(&bits(k), want_k, "T={seq} layer {index}: context keys");
-                assert_eq!(&bits(v), want_v, "T={seq} layer {index}: context values");
+                let label = |what: &str| format!("T={seq} layer {index}: {what}");
+                assert_bits_match(&bits(k), want_k, exact, &label("context keys"));
+                assert_bits_match(&bits(v), want_v, exact, &label("context values"));
             }
         }
     }

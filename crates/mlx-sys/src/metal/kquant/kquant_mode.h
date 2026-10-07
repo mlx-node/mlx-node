@@ -15,6 +15,8 @@
 #ifdef __METAL_VERSION__
 #define KQ_MODE_CONST constant constexpr int
 #else
+#include <cstring>
+#include <stdint.h>
 #define KQ_MODE_CONST inline constexpr int
 #endif
 
@@ -30,6 +32,10 @@
 //                (kquant_grid.h lists each layout), `.biases` the super-block
 //                d. One kind per format, since the formats share no byte
 //                layout; kq_is_grid is the family test.
+//   KQ_AFFINE    scale * code + bias with MLX's affine companions as stored:
+//                `.scales` one bfloat16 scale per group, `.biases` one
+//                bfloat16 bias per group (so super_ratio entries per
+//                super-block), both read as raw 16-bit patterns (a4g64 ..)
 KQ_MODE_CONST KQ_LINEAR = 0;
 KQ_MODE_CONST KQ_CODEBOOK = 1;
 KQ_MODE_CONST KQ_INT8 = 2;
@@ -40,12 +46,34 @@ KQ_MODE_CONST KQ_GRID_IQ3XXS = 6;
 KQ_MODE_CONST KQ_GRID_IQ1S = 7;
 KQ_MODE_CONST KQ_GRID_IQ1M = 8;
 KQ_MODE_CONST KQ_GRID_IQ3S = 9;
+KQ_MODE_CONST KQ_AFFINE = 10;
 
 // Whether `kind` is one of the grid formats.
 template <int kind>
 constexpr bool kq_is_grid() {
   return kind >= KQ_GRID_IQ2XXS && kind <= KQ_GRID_IQ3S;
 }
+
+// Whether `kind` reads MLX affine companions (bfloat16 scale and bias per
+// group).
+template <int kind>
+constexpr bool kq_is_affine() {
+  return kind == KQ_AFFINE;
+}
+
+// A bfloat16 bit pattern as the float it denotes (exact).
+#ifdef __METAL_VERSION__
+inline float kq_bf16_to_float(uint16_t bits) {
+  return as_type<float>(uint32_t(bits) << 16);
+}
+#else
+inline float kq_bf16_to_float(uint16_t bits) {
+  const uint32_t wide = uint32_t(bits) << 16;
+  float value;
+  std::memcpy(&value, &wide, sizeof(value));
+  return value;
+}
+#endif
 
 // Whether the dot / dequantize helpers apply the IQ4_NL codebook.
 template <int kind>
@@ -68,10 +96,12 @@ constexpr bool kq_affine_zero_point() {
 //   IQ2_S   2  the qh byte, the scale byte  IQ1_M   3  qh (2), the scale byte
 //   IQ3_S   2  the qh byte, the scale nibble (in its own byte)
 // The Tiled64 companion stride per super-block is
-// super_ratio * kq_scale_bytes_per_group<..>().
+// super_ratio * kq_scale_bytes_per_group<..>(). The affine kind stores one
+// bfloat16 scale per group.
 template <bool has_min, int kind>
 constexpr int kq_scale_bytes_per_group() {
   return has_min                      ? 2
+      : kind == KQ_AFFINE             ? 2
       : kind == KQ_GRID_IQ2XXS        ? 4
       : kind == KQ_GRID_IQ2XS         ? 1
       : kind == KQ_GRID_IQ2S          ? 2
@@ -80,6 +110,20 @@ constexpr int kq_scale_bytes_per_group() {
       : kind == KQ_GRID_IQ1M          ? 3
       : kind == KQ_GRID_IQ3S          ? 2
                                       : 1;
+}
+
+// 16-bit entries of `.biases` per 256-value super-block: (d, dmin) or d for
+// the K-quants, one bias per group for the affine kind.
+template <bool has_min, int kind, int super_ratio>
+constexpr int kq_bias_entries_per_super() {
+  return kind == KQ_AFFINE ? super_ratio : (has_min ? 2 : 1);
+}
+
+// Entry of group `g`'s bias inside its super-block's run: `g % super_ratio`
+// for the affine kind, 0 (the run's d) for every other.
+template <int kind, int super_ratio>
+inline int kq_bias_sub_index(size_t g) {
+  return kind == KQ_AFFINE ? int(g % super_ratio) : 0;
 }
 
 // 2^shift as an fp32 constant; multiplying by it is exact away from the
