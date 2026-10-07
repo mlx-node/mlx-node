@@ -123,6 +123,43 @@ Acceptance differs by transcript, not engine: short 4.43 (Splash) vs 3.72
 (mlx, int8 K/V) / 4.28 (bf16); 6K 2.82 vs 4.71; 32K 3.54 vs 3.52. Only a
 teacher-forced run on the same text can compare engines (see §6).
 
+### 2c. Second round (same PR): FP32 GDN state, one GDN kernel, glue, tracing
+
+| Commit      | Change                                                                                                                                                                                                                                   | Exact                |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `455026426` | Teacher-forced acceptance harness restored (`MLX_DFLASH2_TF_RECORD` / `MLX_DFLASH2_TF_DIR`, `tf-acceptance.ts`). Forcing a build onto its own transcript reproduces the free run exactly (hash, cycles, by-position, flip rate 0)        | tooling              |
+| `6c7c61429` | GDN recurrent state carried in f32 (Splash-aligned); `y` and conv stay bf16. T=1 chain == T=8 window bit-for-bit. State 72 -> 144 MiB; sidecar fingerprint v2                                                                            | no (state precision) |
+| `f37bee5cf` | One Metal primitive per GDN verify layer: prologue (conv, q/k norm, gates) + recurrence + gated RMSNorm + z-gate (Splash `verify_gdn_fused` shape). 0 ulps vs the chain. Full accept adopts the verify state (parity swap, no GdnCommit) | yes                  |
+| `4cd4f0837` | 16 KvStoreRows -> 1 (address table); draft K/V flat window with in-place stores; draft q\|k\|v, gate\|up, cross-layer k\|v merged; one RoPE; fused q/k norm + RoPE in the draft. Commit 50 -> 18 and propose 134 -> 99 dispatches        | yes                  |
+| `c2650b622` | Per-cycle timeline: `[dspark-span]` host spans on the Metal trace clock + `timeline.ts` (per-phase GPU attribution, idle gaps, Perfetto export)                                                                                          | tooling              |
+| `09d35f662` | Q8_K stays refused, by name, as Splash does                                                                                                                                                                                              | -                    |
+
+Teacher-forced gate for the f32 state (1,024 tokens, short/6K/32K, real
+compiled verify): each build forced onto the OTHER build's transcript loses
+the same ~1.5% of cycles (bf16 build 934 vs its own 923; f32 build 899 vs 885) with a 3% flip rate either way, so the precision change is neutral on
+acceptance. Paired ABBA was flat (B/A 1.013 at a slow clock).
+
+Wave 2 (fused GDN kernel + glue) cut dispatches per cycle ~1190 -> ~845 and
+bought only 1.2% (short) / 1.8% (32K) in clock-matched pairs: dispatch
+overhead was not where the gap lived. The timeline shows why: GPU busy 49.6
+of 50.2 ms per cycle, idle 0.6 ms at the cycle tail (`eval_boundary` -> next
+`propose`), verify 42 ms (~85%), draft propose 6.2 ms (~13%), commit ~1 ms.
+Device-side accept/commit (Splash's `encodeBatchAcceptance`) is therefore
+capped at ~1% here and was not built.
+
+Kernel facts measured this round (M5 Max, DRAM-cold ring, 8 matmuls per
+eval, `kquant_tiled_bench` / `kquant_small_m_bench`):
+
+| Kernel                                   | M=1          | M=8                            | Note                                                              |
+| ---------------------------------------- | ------------ | ------------------------------ | ----------------------------------------------------------------- |
+| K-quant `@t64` (q4k/q5k/q6k, big shapes) | 440-487 GB/s | 1.14-1.16x the M=1 time        | was 1.54-2.60x row-major: the M=8 K-quant path is bandwidth-bound |
+| MLX affine Q4/g64 (the draft's format)   | 438-496 GB/s | 190-230 GB/s (per-row `qmv`)   | the draft runs at ~2.2x its floor                                 |
+| lm_head q6k `@t64`, N=248320             | 1.97 ms      | 2.24 ms; M=7 2.53 (`qmv_wide`) | run the draft head on 8 rows, not 7                               |
+
+So the "cheaper dequant per byte" idea (Splash chunk order inside the 16 B
+units, ~700 LOC) can win at most ~15% of QMM time and is parked; the draft's
+matmul route is the next lever.
+
 ## 3. Splash comparison (last run 2026-09-22, pre-#171 runtime, BF16 draft)
 
 |                               | short         | 6K            | 32K             |
@@ -224,13 +261,15 @@ Scheduling and memory:
 
 Draft and policy:
 
-| Experiment                                                                               | Result                                                                                                                               |
-| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Depth 3 vs 7                                                                             | short +14.8%, 6K -21.9% (216 -> 391 cycles); no generic rule                                                                         |
-| Adaptive AR fallback                                                                     | 6K switched to AR after 2 cycles, -46% decode; removed                                                                               |
-| Imported Splash packed Q4 draft                                                          | -5/-27/+19% raw (drift); removed. Draft bytes are not the Splash gap: at 32K it needed fewer cycles than Splash and was still slower |
-| Q8 head clone for the draft                                                              | +0.39 GB; never clone the head. Q4 head clone for the draft: only 0.2 ms                                                             |
-| Splash integer-dot / scale-bias-sum arithmetic, FP32 GDN state, Splash Q4 target package | change numerics or the model; not neutral optimizations                                                                              |
+| Experiment                                                                       | Result                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Depth 3 vs 7                                                                     | short +14.8%, 6K -21.9% (216 -> 391 cycles); no generic rule                                                                                                                                                |
+| Adaptive AR fallback                                                             | 6K switched to AR after 2 cycles, -46% decode; removed                                                                                                                                                      |
+| Imported Splash packed Q4 draft                                                  | -5/-27/+19% raw (drift); removed. Draft bytes are not the Splash gap: at 32K it needed fewer cycles than Splash and was still slower                                                                        |
+| Q8 head clone for the draft                                                      | +0.39 GB; never clone the head. Q4 head clone for the draft: only 0.2 ms                                                                                                                                    |
+| Splash integer-dot / scale-bias-sum arithmetic, Splash Q4 target package         | change numerics or the model; not neutral optimizations                                                                                                                                                     |
+| Draft re-quantized to Q4_K at load so it takes the `@t64` M=8 kernels (Oct 2026) | draft phase -37%, cycle -5%, but -2% draft matches on 9 teacher-forced prompts (6 of 9 worse; Q4_K's 6-bit sub-scales vs g64's bf16 scales). Rejected; the fix is an affine M=8 kernel, not a format change |
+| Device-side greedy accept + commit (Splash `encodeBatchAcceptance`)              | not built: the timeline shows GPU idle 0.6 ms per 50 ms cycle, all at the cycle tail, so the ceiling is ~1%                                                                                                 |
 
 ## 6. Method
 
@@ -365,3 +404,11 @@ Deleted tools (restore from `69ccaf9d` if needed):
    chunks).
 9. Re-run the Splash comparison on the current runtime. Done in §2b for
    `0.0.16` + PR #183; repeat on a quiet machine before any parity claim.
+10. Affine Q4/g64 on the `@t64` kernel family (M=1 / M=8 / prefill), so the
+    DFlash2 draft and every MLX-affine checkpoint stop paying the per-row
+    `qmv` route at M=8 (§2c table). In progress.
+11. K-quant MoE experts on `@t64`: measure `gather_qmv` at 64 routes against
+    a per-expert M=8 dispatch and a grouped tile-descriptor kernel (Splash
+    `moe_expert_gguf`) on the Qwen3.6-35B-A3B shapes before writing kernels.
+12. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
+    parked, <= 15% of QMM time now that M=8 is bandwidth-bound.
