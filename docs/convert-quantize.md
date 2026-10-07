@@ -795,7 +795,10 @@ Twenty-four types are recognized (`GgufTensorType`, `crates/mlx-core/src/utils/g
 rejection message lists them from `GgufTensorType::ALL`). Anything else is a **hard error at header
 parse** — the whole file is refused even if one tensor uses an unlisted type. The IQ1 / IQ2 and
 IQ3_XXS / IQ3_S grid formats (the experts of the Unsloth `UD-Q2_K_XL`, `UD-IQ*` and `UD-IQ3_XXS`
-mixes) import through the K-quant repack like the others; only Q8_K remains outside.
+mixes) import through the K-quant repack like the others; only Q8_K remains outside. Q8_K (type 15) is ggml's dot-product activation format with an f32 block scale; `llama.cpp quantize` never
+writes it and only Unsloth's `UD-Q8_K_XL` files carry it as weights. It is refused with a message
+that names it, the same choice Splash makes (its loader has no entry for type 15); pick `UD-Q6_K_XL`
+or a `Q8_0` mix instead.
 
 | ggml type (id)  | block | `type_size` | route                                                                       | mlx-node bytes / 4096-col row | ggml bytes | Δ      |
 | --------------- | ----- | ----------- | --------------------------------------------------------------------------- | ----------------------------- | ---------- | ------ |

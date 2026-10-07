@@ -744,6 +744,17 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
 
         let tensor_type = match tensor_type {
             Some(t) => t,
+            // Q8_K (type 15) is ggml's dot-product activation format; only
+            // Unsloth's `UD-Q8_K_XL` files store weights in it, its f32 block
+            // scale does not fit the f16 K-quant contract, and Splash refuses
+            // it too. Choose another variant.
+            None if type_u32 == 15 => {
+                return Err(Error::from_reason(format!(
+                    "Tensor '{name}' is stored as GGUF Q8_K, which this GGUF loader cannot load \
+                     (f32 block scales; Splash refuses it as well). Choose another quant variant, \
+                     e.g. UD-Q6_K_XL or Q8_0."
+                )));
+            }
             None => {
                 return Err(Error::from_reason(format!(
                     "Tensor '{}' has unsupported GGUF type {} — only {} are recognized. \
