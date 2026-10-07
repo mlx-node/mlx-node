@@ -48,9 +48,12 @@ const environment = Object.fromEntries(
     'MLX_DFLASH2_PHASE_TIME',
     'MLX_MAX_OPS_PER_BUFFER',
     'MLX_MAX_MB_PER_BUFFER',
+    'MLX_DFLASH2_TF_DIR',
+    'MLX_DFLASH2_TF_RECORD',
+    'MLX_DFLASH2_TF_LABEL',
   ].map((name) => [name, process.env[name] ?? null]),
 );
-const target = resolve('.cache/models/qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf');
+const target = resolve(process.env.MLX_BENCH_TARGET ?? '.cache/models/qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf');
 const draft = resolve('.cache/models/qwen3.8-27b-dflash2');
 const started = performance.now();
 const model = await core.Qwen35Model.load(target, mode === 'dflash' ? { draftModelPath: draft } : undefined);

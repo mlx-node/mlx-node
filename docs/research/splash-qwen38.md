@@ -296,6 +296,24 @@ oxnode docs/research/splash-qwen38/validate.ts <addon.node> <out.json> [tokens]
   - `long-first`
   - `long-continued` (crosses the 2,048-row draft window)
 
+Teacher-forced acceptance (`tf-acceptance.ts`, one fresh process per case):
+
+```sh
+oxnode docs/research/splash-qwen38/tf-acceptance.ts record <addon.node> <ref-dir> [short,6k,32k] [tokens=1024]
+oxnode docs/research/splash-qwen38/tf-acceptance.ts force <addon.node> <ref-dir> <label> [short,6k,32k] [tokens=1024]
+```
+
+- `record` runs `benchmark.ts` with `MLX_DFLASH2_TF_RECORD=<ref-dir>` and
+  writes one `ref-<prompt key>.json` per case from the base build.
+- `force` runs the candidate build with `MLX_DFLASH2_TF_DIR=<ref-dir>` and
+  `MLX_DFLASH2_TF_LABEL=<label>`: the reference ids go through the real
+  verify path, so KV and GDN state follow the reference text. It then prints
+  cycles, mean committed per cycle (`a_live + 1`), mean `a_ref` (drafts that
+  match the reference), flip rate (target argmax left the reference), accept
+  rate by position and ms per committed token from `cycles-<label>.jsonl`.
+  Compare labels on the same `<ref-dir>`. `MLX_BENCH_TARGET` overrides the
+  target GGUF path for `benchmark.ts`.
+
 Deleted tools (restore from `69ccaf9d` if needed):
 
 | Script                      | Use                                                                                    |

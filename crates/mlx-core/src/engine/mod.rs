@@ -32,6 +32,7 @@ pub(crate) mod scheduler;
 pub(crate) mod session;
 pub(crate) mod spec_owner;
 pub(crate) mod spec_paged;
+pub(crate) mod tf_research;
 pub mod types;
 pub(crate) mod verification_budget;
 pub(crate) mod vision;

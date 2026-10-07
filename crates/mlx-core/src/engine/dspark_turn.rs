@@ -591,6 +591,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         plan.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(block_size))
     });
 
+    let mut tf = super::tf_research::TfMode::begin(hist)?;
     let mut step = backend.begin_dspark_decode(block_size)?;
 
     // Materialize the prefill-sampled seed once; it is the first anchor.
@@ -609,7 +610,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
 
     // Same nonpositive-budget clamp as `run_mtp_turn` (see its PARITY-FIX
     // comment): a negative `max` must behave as 0, not wrap to a huge usize.
-    let max_as_usize: usize = (max).max(0) as usize;
+    // Teacher forcing also caps the turn at the reference length, so the
+    // per-cycle `remaining` math and the length stop follow the reference.
+    let max_as_usize: usize = tf.cap_max_new((max).max(0) as usize);
 
     // Initial-`y` emit, guarded by the budget — mirrors `run_mtp_turn`'s
     // initial push verbatim (eval / observe_token / streaming skip-on-cancel
@@ -876,8 +879,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         let verify_started_at = Instant::now();
         let ar_probe_started_at =
             (measurement_cycle == DsparkMeasurementCycle::ArProbe).then_some(verify_started_at);
+        // Teacher forcing: the reference continuation replaces the drafts as
+        // the verify input, through the same host verify path.
+        let tf_ids = tf.verify_ids(generated, anchor, draft_len)?;
         let verify_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
             step.verify_ar_probe(anchor)
+        } else if let Some(ids) = tf_ids.as_ref() {
+            step.verify(ids)
         } else if let Some(device_ids) = proposal.device_draft_ids.as_ref() {
             // Device-resident proposal: anchor + draft path enter the target
             // graph without a host round-trip (the acceptance eval below
@@ -902,6 +910,8 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             // Force the verify graph before retaining its anchor's cache state.
             logits.eval();
             Ok((0, tracker.forced_token_id()?))
+        } else if tf_ids.is_some() {
+            tf.accept(&logits, &mut proposal, generated)
         } else {
             accept_dspark_proposal(&logits, &mut proposal, hist, p, rng)
         };
@@ -968,9 +978,12 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             },
         );
         let kept_drafts = keep - 1;
-        let mut verified_ids = Vec::with_capacity(1 + draft_len);
-        verified_ids.push(anchor);
-        verified_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+        let verified_ids = tf_ids.unwrap_or_else(|| {
+            let mut verified_ids = Vec::with_capacity(1 + draft_len);
+            verified_ids.push(anchor);
+            verified_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+            verified_ids
+        });
         profiler.begin("dspark_commit");
         let commit_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
             if keep != 1 || draft_len != 0 {
@@ -985,6 +998,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         };
         profiler.end();
         commit_res?;
+        if tf.is_forcing() {
+            tf.end_cycle(cycle_started_at.elapsed());
+        }
         let break_even_decision = if stop.is_some() {
             None
         } else {
@@ -1134,6 +1150,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     }
 
     step.finish()?;
+    tf.finish(generated, max)?;
     profiler.snapshot_memory_after();
     profiler.report();
 
