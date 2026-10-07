@@ -760,6 +760,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
 
         let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
+        profiler.begin_cycle("dspark_cycle");
         let cycle_started_at = Instant::now();
 
         // Per-cycle draft cap. `remaining >= 1` here (the length check above
@@ -1117,7 +1118,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
 
         // Bound allocator cache growth at the established token cadence.
         if generated.len() >= last_clear_at + 256 {
+            profiler.begin("dspark_cache_clear");
             crate::array::synchronize_and_clear_cache();
+            profiler.end();
             last_clear_at = generated.len();
         }
 
@@ -1140,13 +1143,17 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 CycleStop::Cancelled => *reason = String::from("cancelled"),
                 CycleStop::Repetition(r) => *reason = r.to_string(),
             }
+            profiler.end();
             break;
         }
 
         // Continue: the boundary becomes the next cycle's anchor.
         anchor = boundary_id;
         let y_arr = MxArray::from_int32(&[boundary_id as i32], &[1])?;
+        profiler.begin("dspark_eval_boundary");
         step.eval_boundary(&y_arr);
+        profiler.end();
+        profiler.end();
     }
 
     step.finish()?;

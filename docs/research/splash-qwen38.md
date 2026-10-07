@@ -251,8 +251,9 @@ Draft and policy:
   report slow-mode runs separately.
 - One GPU job at a time. The desktop alone keeps the GPU 30-80% "active", so
   gate on GPU power < 6 W, not active ratio. Reject runs with host load.
-- Trace runs never count for timing. CPU and GPU clocks are separate domains.
-  Fewer command buffers does not mean fewer kernels or bytes.
+- Trace runs never count for timing. CPU and GPU stamps share one host clock
+  on macOS (`timeline.ts` prints the check), but a GPU interval is still not a
+  host cost. Fewer command buffers does not mean fewer kernels or bytes.
 - Rebuild check: a header-only Metal edit once shipped a stale metallib after a
   "successful" build. Check metallib hashes and kernel names after kernel edits.
 - Token equality is not state equality. Compare caches, frontiers and the next
@@ -313,6 +314,23 @@ oxnode docs/research/splash-qwen38/tf-acceptance.ts force <addon.node> <ref-dir>
   rate by position and ms per committed token from `cycles-<label>.jsonl`.
   Compare labels on the same `<ref-dir>`. `MLX_BENCH_TARGET` overrides the
   target GGUF path for `benchmark.ts`.
+
+Per-cycle host/GPU timeline (`timeline.ts`, one combined stderr log):
+
+```sh
+MLX_PROFILE_DECODE=1 MLX_METAL_COMMAND_TRACE=1 oxnode docs/research/splash-qwen38/benchmark.ts <addon.node> out.json dflash short 1 256 > run.log 2>&1
+oxnode docs/research/splash-qwen38/timeline.ts run.log [--turn N] [--cycles 20-60] [--gap-us 50] [--chrome trace.json]
+```
+
+- Joins the `[dspark-span]` host phases with the `[metal-command]` GPU
+  intervals of the last turn (the benchmark's measured one). A command buffer
+  belongs to the phase that encoded it (`encodeStartCpu` inside the span); the
+  `gpu(overlap)` column shows where it ran instead. Per cycle: GPU busy
+  (union), idle gaps over the threshold with the phase they fall in, host-only
+  time; then medians and p90. `--chrome` writes a two-track Perfetto trace.
+- Both stamps are `std::chrono::steady_clock`; Metal's `GPUStartTime` is the
+  same host clock here (the tool prints `gpuStart - submitCpu`, min ~10 µs).
+  Timing from a traced run still never counts (§6 rules).
 
 Deleted tools (restore from `69ccaf9d` if needed):
 

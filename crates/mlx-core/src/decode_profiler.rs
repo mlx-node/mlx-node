@@ -52,6 +52,13 @@ use std::time::Instant;
 use crate::profiling;
 use crate::profiling::{GenerationProfile, MemorySnapshot, PhaseProfile};
 
+/// `std::chrono::steady_clock` seconds, the clock of the
+/// `MLX_METAL_COMMAND_TRACE` command stamps, so host spans and GPU command
+/// intervals land on one timeline.
+fn steady_now_s() -> f64 {
+    unsafe { mlx_sys::mlx_steady_clock_now_s() }
+}
+
 /// Controls whether decode profiling is active via env var.
 /// Cached on first access for fast repeated checks.
 fn is_env_enabled() -> bool {
@@ -73,10 +80,19 @@ pub struct DecodeProfiler {
     model_type: &'static str,
     phases: HashMap<&'static str, PhaseStats>,
     phase_order: Vec<&'static str>,
-    /// Stack of in-flight phases. Each frame stores its own `(name, start)`,
-    /// so nested begin/end pairs compose correctly (e.g. outer `mtp_cycle`
-    /// can wrap inner `draft`, `verify`, etc. without losing the cycle total).
-    phase_stack: Vec<(&'static str, Instant)>,
+    /// Stack of in-flight phases. Each frame stores its own `(name, start,
+    /// steady-clock start)`, so nested begin/end pairs compose correctly
+    /// (e.g. outer `mtp_cycle` can wrap inner `draft`, `verify`, etc.
+    /// without losing the cycle total).
+    phase_stack: Vec<(&'static str, Instant, f64)>,
+    /// Every closed phase as a timestamped span, for the per-cycle timeline
+    /// dump (`[dspark-span]`). Empty while disabled.
+    spans: Vec<Span>,
+    /// One entry per `record_mtp_cycle` while enabled.
+    cycle_marks: Vec<CycleMark>,
+    /// Current cycle index for spans; `begin_cycle` advances it (1-based,
+    /// `0` = before the first cycle).
+    cycle_index: u32,
     loop_start: Instant,
     /// Number of emitted generated output tokens, including the first token.
     /// Decode throughput derives its numerator as `num_tokens - 1` because the
@@ -110,6 +126,25 @@ struct PhaseStats {
     count: u64,
 }
 
+/// One closed phase on the steady clock (seconds), tagged with the cycle
+/// it ran in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Span {
+    pub phase: &'static str,
+    pub cycle: u32,
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
+/// Per-cycle acceptance marker: `keep = accepted drafts + 1` committed
+/// tokens out of `depth` drafted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CycleMark {
+    pub cycle: u32,
+    pub depth: u32,
+    pub keep: u32,
+}
+
 impl DecodeProfiler {
     /// Create a new profiler. `label` identifies the decode loop variant
     /// (e.g. "chat_compiled", "chat_rust", "generate_compiled").
@@ -131,6 +166,9 @@ impl DecodeProfiler {
             phases: HashMap::new(),
             phase_order: Vec::new(),
             phase_stack: Vec::new(),
+            spans: Vec::new(),
+            cycle_marks: Vec::new(),
+            cycle_index: 0,
             loop_start: Instant::now(),
             num_tokens: 0,
             prompt_tokens: 0,
@@ -231,7 +269,19 @@ impl DecodeProfiler {
             return;
         }
         self.register_phase(phase);
-        self.phase_stack.push((phase, Instant::now()));
+        self.phase_stack
+            .push((phase, Instant::now(), steady_now_s()));
+    }
+
+    /// `begin` for the phase that wraps one speculative cycle: every span
+    /// closed until the next `begin_cycle` carries the new cycle index.
+    #[inline]
+    pub fn begin_cycle(&mut self, phase: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        self.cycle_index += 1;
+        self.begin(phase);
     }
 
     /// End the most-recently-begun phase and accumulate its time. No-op if
@@ -241,9 +291,15 @@ impl DecodeProfiler {
         if !self.enabled {
             return;
         }
-        if let Some((phase, start)) = self.phase_stack.pop() {
+        if let Some((phase, start, start_s)) = self.phase_stack.pop() {
             let elapsed_us = start.elapsed().as_micros() as u64;
             self.accumulate(phase, elapsed_us);
+            self.spans.push(Span {
+                phase,
+                cycle: self.cycle_index,
+                start_s,
+                end_s: steady_now_s(),
+            });
         }
     }
 
@@ -310,6 +366,13 @@ impl DecodeProfiler {
     #[inline]
     pub fn record_mtp_cycle(&mut self, depth: usize, accepted_drafts: usize) {
         let k = accepted_drafts.min(depth);
+        if self.enabled {
+            self.cycle_marks.push(CycleMark {
+                cycle: self.cycle_index,
+                depth: depth as u32,
+                keep: k as u32 + 1,
+            });
+        }
         self.mtp_cycles += 1;
         self.mtp_accepted_drafts_total += k as u64;
         self.mtp_depth_total += depth as u64;
@@ -325,6 +388,16 @@ impl DecodeProfiler {
         for slot in self.mtp_accept_by_position.iter_mut().take(k) {
             *slot += 1;
         }
+    }
+
+    /// Closed spans so far, in close order.
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+
+    /// Cycle markers so far, in call order.
+    pub fn cycle_marks(&self) -> &[CycleMark] {
+        &self.cycle_marks
     }
 
     /// Test-only: force the profiler on so `begin`/`end` record phases.
@@ -523,6 +596,9 @@ impl DecodeProfiler {
         // Stderr output (backward compat when env var set)
         if self.env_enabled {
             self.print_stderr_report(n, decode_ms, tok_s);
+            if self.cycle_index > 0 {
+                self.print_span_dump();
+            }
         }
 
         // Structured inference diagnostics retain the profiler's aggregate
@@ -676,6 +752,44 @@ impl DecodeProfiler {
         }
 
         lines.join("\n")
+    }
+
+    /// JSON lines for the per-cycle timeline: a `turn` header, then one
+    /// `span` per closed phase and one `cycle` marker per recorded cycle,
+    /// all on the `[metal-command]` steady clock (`%.9f` seconds, same as
+    /// `device.cpp`). Prefixed so one stderr log carries both traces.
+    fn format_span_dump(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(1 + self.spans.len() + self.cycle_marks.len());
+        out.push(format!(
+            "[dspark-span] {{\"kind\":\"turn\",\"label\":\"{}\",\"model\":\"{}\",\"cycles\":{},\"spans\":{}}}\n",
+            self.label,
+            self.model_type,
+            self.cycle_index,
+            self.spans.len()
+        ));
+        out.extend(self.spans.iter().map(|s| {
+            format!(
+                "[dspark-span] {{\"kind\":\"span\",\"phase\":\"{}\",\"cycle\":{},\"start\":{:.9},\"end\":{:.9}}}\n",
+                s.phase, s.cycle, s.start_s, s.end_s
+            )
+        }));
+        out.extend(self.cycle_marks.iter().map(|m| {
+            format!(
+                "[dspark-span] {{\"kind\":\"cycle\",\"cycle\":{},\"depth\":{},\"keep\":{}}}\n",
+                m.cycle, m.depth, m.keep
+            )
+        }));
+        out
+    }
+
+    /// One `write` per line: the Metal trace writes stderr from its
+    /// completion-handler thread, so a line must never split across writes.
+    fn print_span_dump(&self) {
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        for line in self.format_span_dump() {
+            let _ = err.write_all(line.as_bytes());
+        }
     }
 
     fn print_stderr_report(&self, n: f64, wall_ms: f64, wall_tok_s: f64) {
@@ -978,6 +1092,80 @@ mod tests {
             let sample = last.phases.iter().find(|p| p.name == "sample").unwrap();
             assert_eq!(sample.count, 5);
         });
+    }
+
+    #[test]
+    fn test_spans_carry_cycle_index_and_steady_clock() {
+        let mut profiler = DecodeProfiler::new("test_spans", "qwen3_5");
+        profiler.enable_for_test();
+        assert!(profiler.spans().is_empty());
+
+        let before = steady_now_s();
+        for cycle in 1..=2u32 {
+            profiler.begin_cycle("dspark_cycle");
+            profiler.begin("dspark_verify");
+            thread::sleep(Duration::from_micros(200));
+            profiler.end();
+            profiler.record_mtp_cycle(7, 3);
+            profiler.end();
+            let marks = profiler.cycle_marks();
+            assert_eq!(
+                marks.last(),
+                Some(&CycleMark {
+                    cycle,
+                    depth: 7,
+                    keep: 4
+                })
+            );
+        }
+        let after = steady_now_s();
+
+        let spans = profiler.spans();
+        assert_eq!(
+            spans.iter().map(|s| (s.phase, s.cycle)).collect::<Vec<_>>(),
+            vec![
+                ("dspark_verify", 1),
+                ("dspark_cycle", 1),
+                ("dspark_verify", 2),
+                ("dspark_cycle", 2)
+            ]
+        );
+        for s in spans {
+            assert!(before <= s.start_s && s.start_s < s.end_s && s.end_s <= after);
+        }
+        // Inner span nests inside its cycle span.
+        assert!(spans[1].start_s <= spans[0].start_s && spans[0].end_s <= spans[1].end_s);
+        assert!(spans[0].end_s - spans[0].start_s >= 150e-6);
+
+        let dump = profiler.format_span_dump();
+        assert_eq!(dump.len(), 1 + 4 + 2);
+        assert!(dump[0].starts_with(
+            "[dspark-span] {\"kind\":\"turn\",\"label\":\"test_spans\",\"model\":\"qwen3_5\",\"cycles\":2,\"spans\":4}"
+        ));
+        assert!(dump[1].starts_with(
+            "[dspark-span] {\"kind\":\"span\",\"phase\":\"dspark_verify\",\"cycle\":1,\"start\":"
+        ));
+        assert_eq!(
+            dump[5],
+            "[dspark-span] {\"kind\":\"cycle\",\"cycle\":1,\"depth\":7,\"keep\":4}\n"
+        );
+        assert!(dump.iter().all(|line| line.ends_with("}\n")));
+    }
+
+    #[test]
+    fn test_spans_not_recorded_while_disabled() {
+        let mut profiler = DecodeProfiler::new("test_spans_off", "qwen3_5");
+        if profiler.is_enabled() {
+            return; // MLX_PROFILE_DECODE set in this environment
+        }
+        profiler.begin_cycle("dspark_cycle");
+        profiler.begin("dspark_verify");
+        profiler.end();
+        profiler.record_mtp_cycle(7, 3);
+        profiler.end();
+        assert!(profiler.spans().is_empty());
+        assert!(profiler.cycle_marks().is_empty());
+        assert_eq!(profiler.cycle_index, 0);
     }
 
     #[test]

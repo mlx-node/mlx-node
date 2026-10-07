@@ -352,6 +352,9 @@ unsafe extern "C-unwind" {
     ) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
 
+    /// `std::chrono::steady_clock` seconds — the clock of the
+    /// `MLX_METAL_COMMAND_TRACE` `encodeStartCpu`/`submitCpu` stamps.
+    pub fn mlx_steady_clock_now_s() -> f64;
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
     pub fn mlx_compile_clear_cache() -> bool;

@@ -1,9 +1,17 @@
+#include <chrono>
 #include <memory>
 
 #include "mlx_common.h"
 #include "mlx_sampling.h"
 
 extern "C" {
+
+// Same clock as the [metal-command] stamps in mlx/backend/metal/device.cpp.
+double mlx_steady_clock_now_s() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // Synchronize with the default stream to ensure all operations complete
 void mlx_synchronize() {
