@@ -160,9 +160,11 @@ So the "cheaper dequant per byte" idea (Splash chunk order inside the 16 B
 units, ~700 LOC) can win at most ~15% of QMM time and is parked; the draft's
 matmul route was the next lever:
 
-| Commit      | Change                                                                                                                                                                                                                                    | Exact               |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
-| `827c363e7` | MLX affine Q4/g64 as `a4g64@t64` on the tiled K-quant kernels; the draft is tiled at load (same bytes) and its head runs on 8 rows. M=8 445 vs 188 GB/s; propose 6.2 -> 4.8 ms; teacher-forced 928 vs 923 cycles, 2.32 draft matches both | no (draft rounding) |
+| Commit      | Change                                                                                                                                                                                                                                                     | Exact               |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `827c363e7` | MLX affine Q4/g64 as `a4g64@t64` on the tiled K-quant kernels; the draft is tiled at load (same bytes) and its head runs on 8 rows. M=8 445 vs 188 GB/s; propose 6.2 -> 4.8 ms; teacher-forced 928 vs 923 cycles, 2.32 draft matches both                  | no (draft rounding) |
+| `52c9cb8cd` | Sorted MoE expert matmul at prefill widths (`B / E >= 4`) on a tensor-op `gather_qmm_rhs_nax` kernel, one expert per 32/64-row tile; 112-220 -> 240-410 GB/s (1.8-2.4x) on the LFM2.5 / Qwen3.6-35B-A3B shapes; decode and verify untouched (`gather_qmv`) | <= 1 bf16 ulp       |
+| `707096991` | Affine modes trimmed to the one with a producer (`a4g64`)                                                                                                                                                                                                  | -                   |
 
 Head-to-head at `827c363e7` (ABBA, fresh processes, 1,024 tokens; Splash
 1.2.1 on the same GGUF and draft):
@@ -440,6 +442,10 @@ Deleted tools (restore from `69ccaf9d` if needed):
     A grouped tile-descriptor kernel could recover <= 12% of expert time
     (~9% of a verify cycle) for 800-1500 LOC: parked. The real MoE gap is
     prefill: the sorted `gather_qmm_rhs` route (B/E >= 4) runs at 113-132
-    GB/s, 3.3-3.7x slower than a dense M=8 tiled pass. Open, prefill only.
+    GB/s, 3.3-3.7x slower than a dense M=8 tiled pass. Closed in
+    `52c9cb8cd`: a tensor-op route with one expert per row tile (Splash's
+    tile-descriptor shape) reaches 240-410 GB/s; the remaining gap to a
+    dense pass (~400 GB/s on LFM2) is the un-overlapped MMA phase with 1-3
+    resident threadgroups per core.
 12. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.
