@@ -50,7 +50,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.84.4",
-    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.99.2",
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/server": "workspace:*",
