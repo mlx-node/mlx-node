@@ -51,11 +51,10 @@ enum class Mode {
   // the K-quant kernels: the same LSB-first codes, `.scales` the bfloat16
   // scale per group, `.biases` the bfloat16 bias per group. Metal kernels
   // exist for the Tiled64 layout only; row-major affine stays on MLX's own
-  // route. "a<bits>g<group_size>".
-  A4G64,
-  A4G32,
-  A8G64,
-  A8G32
+  // route. "a<bits>g<group_size>": only Q4/g64 has a producer (the DFlash2
+  // draft); the kernels are parametric, so another pair is an enum value, a
+  // dispatch arm and its instantiation lines away.
+  A4G64
 };
 
 // How a mode's codes turn into values. Mirrors KQ_LINEAR .. KQ_GRID_IQ1M in
@@ -145,11 +144,8 @@ constexpr int super_ratio(Mode mode) {
   case Mode::IQ3XXS:
   case Mode::IQ1S:
   case Mode::IQ1M:
-  case Mode::A4G32:
-  case Mode::A8G32:
     return 8;
   case Mode::A4G64:
-  case Mode::A8G64:
     return 4;
   case Mode::IQ4NL:
     return 1;
@@ -167,10 +163,7 @@ constexpr bool uses_iq4nl_grid(Mode mode) {
 }
 
 // The MLX affine modes: Metal kernels in the Tiled64 layout only.
-constexpr bool is_affine(Mode mode) {
-  return mode == Mode::A4G64 || mode == Mode::A4G32 || mode == Mode::A8G64 ||
-         mode == Mode::A8G32;
-}
+constexpr bool is_affine(Mode mode) { return mode == Mode::A4G64; }
 
 constexpr Kind kind(Mode mode) {
   switch (mode) {
@@ -180,9 +173,6 @@ constexpr Kind kind(Mode mode) {
   case Mode::IQ3S8:
     return Kind::Int8;
   case Mode::A4G64:
-  case Mode::A4G32:
-  case Mode::A8G64:
-  case Mode::A8G32:
     return Kind::Affine;
   case Mode::Q6K:
   case Mode::Q4K:
@@ -297,11 +287,8 @@ constexpr int default_bits(Mode mode) {
   case Mode::IQ3XXS:
     return 2;
   case Mode::IQ3S8:
-  case Mode::A8G64:
-  case Mode::A8G32:
     return 8;
   case Mode::A4G64:
-  case Mode::A4G32:
     return 4;
   case Mode::IQ2XXS:
   case Mode::IQ1S:
@@ -312,7 +299,7 @@ constexpr int default_bits(Mode mode) {
 }
 
 constexpr int default_group_size(Mode mode) {
-  if (mode == Mode::A4G64 || mode == Mode::A8G64) {
+  if (mode == Mode::A4G64) {
     return 64;
   }
   return (mode == Mode::Q6K || mode == Mode::Q3K || mode == Mode::Q2K) ? 16

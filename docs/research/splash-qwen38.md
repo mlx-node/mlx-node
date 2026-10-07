@@ -160,9 +160,9 @@ So the "cheaper dequant per byte" idea (Splash chunk order inside the 16 B
 units, ~700 LOC) can win at most ~15% of QMM time and is parked; the draft's
 matmul route was the next lever:
 
-| Commit      | Change                                                                                                                                                                                                                                                                  | Exact               |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
-| `827c363e7` | MLX affine Q4/g64 as `a4g64@t64` (+ `a4g32`, `a8g64`, `a8g32`) on the tiled K-quant kernels; the draft is tiled at load (same bytes) and its head runs on 8 rows. M=8 445 vs 188 GB/s; propose 6.2 -> 4.8 ms; teacher-forced 928 vs 923 cycles, 2.32 draft matches both | no (draft rounding) |
+| Commit      | Change                                                                                                                                                                                                                                    | Exact               |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `827c363e7` | MLX affine Q4/g64 as `a4g64@t64` on the tiled K-quant kernels; the draft is tiled at load (same bytes) and its head runs on 8 rows. M=8 445 vs 188 GB/s; propose 6.2 -> 4.8 ms; teacher-forced 928 vs 923 cycles, 2.32 draft matches both | no (draft rounding) |
 
 Head-to-head at `827c363e7` (ABBA, fresh processes, 1,024 tokens; Splash
 1.2.1 on the same GGUF and draft):

@@ -36,10 +36,7 @@ instantiate_kquant_m8_nax(iq3xxs, 32, 2, 8, false, KQ_GRID_IQ3XXS, -2)
 instantiate_kquant_m8_nax(iq1s, 32, 1, 8, false, KQ_GRID_IQ1S, -3)
 instantiate_kquant_m8_nax(iq1m, 32, 1, 8, false, KQ_GRID_IQ1M, -3)
 instantiate_kquant_m8_nax(iq3s, 32, 3, 8, false, KQ_GRID_IQ3S, 0)
-// The MLX affine modes exist in the Tiled64 layout only (row-major affine
+// The MLX affine mode exists in the Tiled64 layout only (row-major affine
 // stays on MLX's own kernels).
 instantiate_kquant_m8_nax_tiled(a4g64, 64, 4, 4, false, KQ_AFFINE, 0)
-instantiate_kquant_m8_nax_tiled(a4g32, 32, 4, 8, false, KQ_AFFINE, 0)
-instantiate_kquant_m8_nax_tiled(a8g64, 64, 8, 4, false, KQ_AFFINE, 0)
-instantiate_kquant_m8_nax_tiled(a8g32, 32, 8, 8, false, KQ_AFFINE, 0)
 // clang-format on

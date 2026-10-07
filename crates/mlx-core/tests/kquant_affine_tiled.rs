@@ -1,9 +1,9 @@
-//! The MLX affine modes of the K-quant kernels (`a4g64`, `a4g32`, `a8g64`,
-//! `a8g32`: `mlx_kquant.h` `Mode::A4G64` ..): MLX's own affine arrays — the
-//! LSB-first codes, one bfloat16 scale and one bfloat16 bias per group — read
-//! through the Tiled64 kernels (`qmv_t64`, `qmv_wide_t64`, `qmm_m8_nax_t64`,
-//! `qmm_t_nax_t64` / `qmm_t_splitk_t64`) and the row-major `dequantize`.
-//! The DFlash2 draft loads its affine Q4/g64 projections this way.
+//! The MLX affine mode of the K-quant kernels (`a4g64`: `mlx_kquant.h`
+//! `Mode::A4G64`): MLX's own affine arrays — the LSB-first codes, one bfloat16
+//! scale and one bfloat16 bias per group — read through the Tiled64 kernels
+//! (`qmv_t64`, `qmv_wide_t64`, `qmm_m8_nax_t64`, `qmm_t_nax_t64` /
+//! `qmm_t_splitk_t64`) and the row-major `dequantize`. The DFlash2 draft
+//! loads its affine Q4/g64 projections this way.
 //!
 //!   cargo test -p mlx-core --release --test kquant_affine_tiled -- --nocapture
 
@@ -14,7 +14,8 @@ use std::ffi::CString;
 use kquant_support::*;
 use mlx_core::array::{DType, MxArray};
 use mlx_core::models::quant_dispatch::{
-    KQUANT_TILED_SUFFIX, kquant_affine_mode_params, kquant_tile_rows, kquant_tileable,
+    KQUANT_AFFINE_MODES, KQUANT_TILED_SUFFIX, kquant_affine_mode_params, kquant_tile_rows,
+    kquant_tileable,
 };
 
 /// (K, N): the DFlash2 draft projections at the published geometry
@@ -252,20 +253,14 @@ fn assert_no_row_major_route(what: &str) {
     }
 }
 
-fn affine_modes() -> Vec<KQuant> {
-    mlx_core::models::quant_dispatch::KQUANT_AFFINE_MODES
-        .iter()
-        .map(|&(bits, group)| affine_kquant(bits, group))
-        .collect()
-}
-
 /// The CPU reference decodes MLX's affine arrays as MLX does (max one bf16
 /// ulp from MLX's own dequantize, which rounds in bf16), the Metal
 /// dequantize kernel bit-identically to the CPU reference, and the tiled
 /// CPU matmul bit-identically to the row-major one.
 #[test]
 fn affine_dequantize_matches_cpu_reference_and_mlx() {
-    for (ki, kq) in affine_modes().iter().enumerate() {
+    for (ki, &(bits, group)) in KQUANT_AFFINE_MODES.iter().enumerate() {
+        let kq = &affine_kquant(bits, group);
         let (k, n) = (1024i64, 192i64);
         assert!(kquant_tileable(n, k));
         let w = Affine::new(kq, n, k, 0xaf00 + ki as u32);
@@ -394,36 +389,6 @@ fn affine_tiled_routes_match_exact_and_mlx() {
     }
     for line in table {
         println!("{line}");
-    }
-}
-
-/// The other affine contracts take the same routes on one draft shape.
-#[cfg(target_os = "macos")]
-#[test]
-fn affine_contracts_share_the_tiled_routes() {
-    assert!(gpu_gen() > 0, "no Metal device");
-    let (k, n) = (5120i64, 1280i64);
-    for (ki, kq) in affine_modes().iter().enumerate() {
-        let w = Affine::new(kq, n, k, 0xb800 + ki as u32);
-        let t = tiled(&w.arrays, kq);
-        let mut worst_rel = 0f64;
-        for m in [1i64, 5, 8, 64] {
-            let x = activation(&[m, k], 0xb900 + ki as u32 + m as u32, DType::BFloat16);
-            let what = format!("{} K={k} N={n} M={m}", kq.mode);
-            start_counting();
-            let (_, _, ours) = read_output(&what, qmm_tiled(&x, &t, kq, GPU));
-            assert_no_row_major_route(&what);
-            stop_counting();
-            let rel = worst_rel_to_exact(&ours, &x, &w, n);
-            let tol = if m == 8 && nax_available() {
-                f64::from(BF16_TILE_TOL)
-            } else {
-                1e-2
-            };
-            assert!(rel <= tol, "{what}: rel {rel:e} > {tol:e}");
-            worst_rel = worst_rel.max(rel);
-        }
-        println!("  {:<6} tiled routes worst rel {worst_rel:.2e}", kq.mode);
     }
 }
 

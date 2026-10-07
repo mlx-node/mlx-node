@@ -51,16 +51,15 @@ enum Format : int {
   IQ1S,
   IQ1M,
   IQ3S,
-  // MLX affine companions (KQ_AFFINE): 4-bit codes as Q4K's, 8-bit as
-  // IQ3S8's; the group size is the kernel's, not the format's.
+  // MLX affine companions (KQ_AFFINE): 4-bit codes as Q4K's; the group
+  // size is the kernel's, not the format's.
   A4,
-  A8,
   Unsupported
 };
 
 template <Format F>
 constexpr bool is_affine() {
-  return F == A4 || F == A8;
+  return F == A4;
 }
 
 // The kquant_mode.h kind of a grid format, -1 for the others.
@@ -85,7 +84,7 @@ template <int group_size, int bits, int super_ratio, bool has_min, int kind>
 constexpr Format format() {
   if (kind == KQ_AFFINE && !has_min && group_size * super_ratio == 256 &&
       group_size % 32 == 0) {
-    return bits == 4 ? A4 : bits == 8 ? A8 : Unsupported;
+    return bits == 4 ? A4 : Unsupported;
   }
   if (group_size == 32 && super_ratio == 8 && !has_min) {
     if (kind == KQ_GRID_IQ2XXS && bits == 1) {
@@ -248,13 +247,6 @@ struct Codes<A4> {
   typedef uint4 W;
   static W load(const device uint32_t* base, uint u, uint stride) {
     return Codes<Q4K>::load(base, u, stride);
-  }
-};
-template <>
-struct Codes<A8> {
-  typedef Codes<IQ3S8>::W W;
-  static W load(const device uint32_t* base, uint u, uint stride) {
-    return Codes<IQ3S8>::load(base, u, stride);
   }
 };
 
@@ -570,11 +562,6 @@ METAL_FUNC uint2 bytes8<IQ3S8>(Codes<IQ3S8>::W w, ushort j) {
 template <>
 METAL_FUNC uint2 bytes8<A4>(uint4 w, ushort j) {
   return bytes8<Q4K>(w, j);
-}
-
-template <>
-METAL_FUNC uint2 bytes8<A8>(Codes<A8>::W w, ushort j) {
-  return bytes8<IQ3S8>(w, j);
 }
 
 // One lane's unit as 32 half values at dst, each rounded once from fp32.

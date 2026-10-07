@@ -882,24 +882,22 @@ impl KQuantModeParams {
 }
 
 /// The K-quant contract an MLX affine linear of `(bits, group_size)` can be
-/// read through (`mlx_kquant.h` `Mode::A4G64` ..); `None` for a pair the
-/// kernels do not carry. The mode string is `a<bits>g<group_size>`; the
-/// Metal side has these kernels in the Tiled64 layout only, so a projection
-/// takes this contract through
+/// read through (`mlx_kquant.h` `Mode::A4G64`); `None` for a pair the
+/// kernels do not carry (only Q4/g64, the DFlash2 draft's, is instantiated).
+/// The mode string is `a<bits>g<group_size>`; the Metal side has these
+/// kernels in the Tiled64 layout only, so a projection takes this contract
+/// through
 /// [`QuantizedLinear::tile_kquant_layout`](crate::models::quantized_linear::QuantizedLinear::tile_kquant_layout)
 /// and nowhere else.
 pub fn kquant_affine_mode_params(bits: i32, group_size: i32) -> Option<KQuantModeParams> {
     Some(match (bits, group_size) {
         (4, 64) => KQuantModeParams::affine("a4g64", 4, 64),
-        (4, 32) => KQuantModeParams::affine("a4g32", 4, 32),
-        (8, 64) => KQuantModeParams::affine("a8g64", 8, 64),
-        (8, 32) => KQuantModeParams::affine("a8g32", 8, 32),
         _ => return None,
     })
 }
 
 /// Every affine contract of [`kquant_affine_mode_params`].
-pub const KQUANT_AFFINE_MODES: [(i32, i32); 4] = [(4, 64), (4, 32), (8, 64), (8, 32)];
+pub const KQUANT_AFFINE_MODES: [(i32, i32); 1] = [(4, 64)];
 
 /// The contract a resolved K-quant mode demands; `None` for non-K-quant modes.
 pub fn kquant_mode_params(mode: PerLayerMode) -> Option<KQuantModeParams> {
@@ -2537,7 +2535,7 @@ mod tests {
             );
             assert!(is_kquant_mode(mode));
         }
-        // The MLX affine contracts (mlx_kquant.h Mode::A4G64 ..): bfloat16
+        // The MLX affine contract (mlx_kquant.h Mode::A4G64): bfloat16
         // scale and bias per group, so `.scales` is 2 bytes per group and
         // `.biases` super_ratio entries per super-block.
         for (bits, group_size) in KQUANT_AFFINE_MODES {
@@ -2554,6 +2552,8 @@ mod tests {
             assert_eq!(kq.scale_entries_per_super_block(), kq.super_ratio);
         }
         assert!(kquant_affine_mode_params(4, 128).is_none());
+        assert!(kquant_affine_mode_params(4, 32).is_none());
+        assert!(kquant_affine_mode_params(8, 64).is_none());
         assert!(kquant_affine_mode_params(6, 64).is_none());
         for mode in [
             PerLayerMode::Affine,
