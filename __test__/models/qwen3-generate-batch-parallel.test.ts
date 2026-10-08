@@ -13,7 +13,7 @@ import { describe, it, expect, beforeAll } from 'vite-plus/test';
  * Each test creates its own GrpoTrainingEngine and resets it when done
  * to release the model thread's training state for the next test.
  */
-describe.sequential('GRPOTrainer - Parallel Batch Generation', () => {
+describe('GRPOTrainer - Parallel Batch Generation', () => {
   let model: Qwen3Model | null = null;
 
   beforeAll(async () => {

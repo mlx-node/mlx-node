@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 import { createTempQwen35Model, type TempModel } from '../test-model-utils';
 import { shape } from '../test-utils';
 
-describe.sequential('Qwen3.5 Generation', () => {
+describe('Qwen3.5 Generation', () => {
   let tempModel: TempModel;
 
   beforeAll(async () => {

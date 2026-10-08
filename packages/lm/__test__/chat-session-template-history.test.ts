@@ -1,5 +1,5 @@
 import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult, ToolDefinition } from '@mlx-node/core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vite-plus/test';
 
 import { ChatSession, type SessionCapableModel } from '../src/chat-session.js';
 import { K2HorizonModel, type ChatStreamEvent } from '../src/stream.js';

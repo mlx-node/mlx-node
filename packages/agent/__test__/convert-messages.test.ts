@@ -1,11 +1,4 @@
-import type {
-  AssistantMessage,
-  StopReason,
-  Tool,
-  ToolResultMessage,
-  Usage,
-  UserMessage,
-} from '@earendil-works/pi-ai';
+import type { AssistantMessage, StopReason, Tool, ToolResultMessage, Usage, UserMessage } from '@earendil-works/pi-ai';
 import { normalizeContext, Type } from '@earendil-works/pi-ai';
 import type { TSchema } from '@earendil-works/pi-ai';
 import { describe, expect, it } from 'vite-plus/test';
@@ -278,27 +271,31 @@ describe('contextToChatMessages', () => {
   });
 
   it('joins multiple user text parts with newlines', () => {
-    const converted = contextToChatMessages(normalizeContext({
-      messages: [
-        userMsg([
-          { type: 'text', text: 'line one' },
-          { type: 'text', text: 'line two' },
-        ]),
-      ],
-    }));
+    const converted = contextToChatMessages(
+      normalizeContext({
+        messages: [
+          userMsg([
+            { type: 'text', text: 'line one' },
+            { type: 'text', text: 'line two' },
+          ]),
+        ],
+      }),
+    );
     expect(converted[0]!.content).toBe('line one\nline two');
   });
 
   it('preserves assistant reasoning bodies for byte-stable native template replay', () => {
-    const converted = contextToChatMessages(normalizeContext({
-      messages: [
-        assistantMsg([
-          { type: 'thinking', thinking: 'pondering...' },
-          { type: 'thinking', thinking: 'still pondering...' },
-          { type: 'text', text: 'The answer is 4.' },
-        ]),
-      ],
-    }));
+    const converted = contextToChatMessages(
+      normalizeContext({
+        messages: [
+          assistantMsg([
+            { type: 'thinking', thinking: 'pondering...' },
+            { type: 'thinking', thinking: 'still pondering...' },
+            { type: 'text', text: 'The answer is 4.' },
+          ]),
+        ],
+      }),
+    );
     expect(converted).toEqual([
       {
         role: 'assistant',
@@ -325,14 +322,16 @@ describe('contextToChatMessages', () => {
   });
 
   it('skips husk assistant messages (aborted/error with no text and no toolCalls)', () => {
-    const converted = contextToChatMessages(normalizeContext({
-      messages: [
-        userMsg('q1'),
-        assistantMsg([], 'aborted'),
-        assistantMsg([{ type: 'thinking', thinking: 'only thoughts' }], 'error'),
-        userMsg('q2'),
-      ],
-    }));
+    const converted = contextToChatMessages(
+      normalizeContext({
+        messages: [
+          userMsg('q1'),
+          assistantMsg([], 'aborted'),
+          assistantMsg([{ type: 'thinking', thinking: 'only thoughts' }], 'error'),
+          userMsg('q2'),
+        ],
+      }),
+    );
     expect(converted).toEqual([
       { role: 'user', content: 'q1' },
       { role: 'user', content: 'q2' },
@@ -344,14 +343,16 @@ describe('contextToChatMessages', () => {
     // an incomplete turn pi never replays. Priming it into the reset session
     // garbles the continuation. Mutation guard: reverting to the empty-husk-only
     // check keeps these partial turns and this test fails.
-    const converted = contextToChatMessages(normalizeContext({
-      messages: [
-        userMsg('q1'),
-        assistantMsg([{ type: 'text', text: 'partial ans' }], 'aborted'),
-        assistantMsg([{ type: 'text', text: 'half an error' }], 'error'),
-        userMsg('q2'),
-      ],
-    }));
+    const converted = contextToChatMessages(
+      normalizeContext({
+        messages: [
+          userMsg('q1'),
+          assistantMsg([{ type: 'text', text: 'partial ans' }], 'aborted'),
+          assistantMsg([{ type: 'text', text: 'half an error' }], 'error'),
+          userMsg('q2'),
+        ],
+      }),
+    );
     expect(converted).toEqual([
       { role: 'user', content: 'q1' },
       { role: 'user', content: 'q2' },
@@ -359,13 +360,15 @@ describe('contextToChatMessages', () => {
   });
 
   it('DROPS an error/aborted assistant that carries a tool call, leaving no dangling toolCalls', () => {
-    const converted = contextToChatMessages(normalizeContext({
-      messages: [
-        userMsg('q1'),
-        assistantMsg([{ type: 'toolCall', id: 'call_7', name: 'ls', arguments: {} }], 'error'),
-        userMsg('q2'),
-      ],
-    }));
+    const converted = contextToChatMessages(
+      normalizeContext({
+        messages: [
+          userMsg('q1'),
+          assistantMsg([{ type: 'toolCall', id: 'call_7', name: 'ls', arguments: {} }], 'error'),
+          userMsg('q2'),
+        ],
+      }),
+    );
     // The dropped turn's tool call is NOT tracked, so no synthetic tool result
     // is emitted for it either — it vanishes entirely.
     expect(converted).toEqual([
@@ -380,13 +383,15 @@ describe('contextToChatMessages', () => {
     // answered gets a synthetic error result before the next user/assistant, so
     // no tool call is left unresolved in the primed history. Mutation guard:
     // dropping the orphan-repair pass omits the synthetic tool message → fails.
-    const converted = contextToChatMessages(normalizeContext({
-      messages: [
-        userMsg('do it'),
-        assistantMsg([{ type: 'toolCall', id: 'call_9', name: 'ls', arguments: {} }], 'toolUse'),
-        userMsg('never mind'),
-      ],
-    }));
+    const converted = contextToChatMessages(
+      normalizeContext({
+        messages: [
+          userMsg('do it'),
+          assistantMsg([{ type: 'toolCall', id: 'call_9', name: 'ls', arguments: {} }], 'toolUse'),
+          userMsg('never mind'),
+        ],
+      }),
+    );
     expect(converted).toEqual([
       { role: 'user', content: 'do it' },
       { role: 'assistant', content: '', toolCalls: [{ id: 'call_9', name: 'ls', arguments: '{}' }] },
@@ -396,9 +401,11 @@ describe('contextToChatMessages', () => {
   });
 
   it('synthesizes a No-result tool message for a trailing unresolved tool call at end of history', () => {
-    const converted = contextToChatMessages(normalizeContext({
-      messages: [assistantMsg([{ type: 'toolCall', id: 'call_end', name: 'ls', arguments: {} }], 'toolUse')],
-    }));
+    const converted = contextToChatMessages(
+      normalizeContext({
+        messages: [assistantMsg([{ type: 'toolCall', id: 'call_end', name: 'ls', arguments: {} }], 'toolUse')],
+      }),
+    );
     expect(converted).toEqual([
       { role: 'assistant', content: '', toolCalls: [{ id: 'call_end', name: 'ls', arguments: '{}' }] },
       { role: 'tool', content: 'No result provided', toolCallId: 'call_end', isError: true },

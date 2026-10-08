@@ -229,11 +229,14 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         forcedDownReason ??= reason;
         // Wait for termination/exit before settling through goDown. Until then a
         // live worker could still reach the queued mutation we are retracting.
-        void worker.terminate().then(() => goDown(forcedDownReason!)).catch(() => {
-          // A rejected terminate is not proof the worker stopped. Keep waiting
-          // for its real response or eventual error/exit rather than report a
-          // failure while it may still execute the request later.
-        });
+        void worker
+          .terminate()
+          .then(() => goDown(forcedDownReason!))
+          .catch(() => {
+            // A rejected terminate is not proof the worker stopped. Keep waiting
+            // for its real response or eventual error/exit rather than report a
+            // failure while it may still execute the request later.
+          });
       };
       const requestWithdrawal = (reason: string): void => {
         if (settled || withdrawalReason !== null) return;

@@ -137,7 +137,9 @@ describe('shared delegate service transport', () => {
       sharedStreamFactory(request.profile, async () => service.endpoint)(host, undefined, () => 'same-root');
     const first = caller();
     for (const stream of [first, first, caller()]) {
-      for await (const _event of stream(request.model, normalizeContext(request.context), { sessionId: 'same-child' })) {
+      for await (const _event of stream(request.model, normalizeContext(request.context), {
+        sessionId: 'same-child',
+      })) {
         /* drain */
       }
     }
@@ -177,7 +179,12 @@ describe('shared delegate service transport', () => {
       undefined,
       () => '/session',
       () => 128,
-    )(model, normalizeContext(request.context), { sessionId: 'child', reasoning: 'high', temperature: 0.2, maxTokens: 456 });
+    )(model, normalizeContext(request.context), {
+      sessionId: 'child',
+      reasoning: 'high',
+      temperature: 0.2,
+      maxTokens: 456,
+    });
     const events = [];
     for await (const event of stream) events.push(event);
     const terminal = events.at(-1)!;

@@ -6,11 +6,11 @@ Essential findings from [PR #144](https://github.com/mlx-node/mlx-node/pull/144)
 
 The checkpoint has 328 Q4_0 projections and a Q6_K tied embedding/output head. Its 48 layers comprise 40 sliding-attention layers (16Q/8KV, D256, window 1,024) and eight global layers (16Q/1KV, D512).
 
-| Cause | Implemented correction | Source |
-| --- | --- | --- |
+| Cause                                                                                                                                                                                            | Implemented correction                                                                                                                                                                                                        | Source                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | Affine QMM promoted BF16 activations plus FP16 scale/bias arrays to FP32, rebuilding large metadata casts on each forward. Missing nested text dtype also disabled the existing load-time hoist. | Record the actual nested BF16 text dtype in the native cache; hoist prefill metadata once. Single-row Q4 decode reads original scales directly, derives a symmetric bias in registers, accumulates in FP32, and returns BF16. | [Persistence](../../crates/mlx-core/src/models/gemma4/persistence.rs), [Q4 Metal bridge](../../crates/mlx-sys/src/mlx_affine_qmv.cpp) |
-| Sliding attention retained full logical history in its read view, partitioned over it, and masked old tokens after loading keys. Prefill gathered the full history too. | Trim retired whole pages from the private decode view; gather only window plus current prefill chunk. For this fixture the gather is bounded by 1,536 tokens. | [Paged cache adapter](../../crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs) |
-| Conservative global-attention routing and CPU submission left supported faster paths unused. | Calibrate attention partitions and early submission from completed real decode tokens on the loaded device. | [Decode tuning](../../crates/mlx-core/src/models/gemma4/decode_tuning.rs) |
+| Sliding attention retained full logical history in its read view, partitioned over it, and masked old tokens after loading keys. Prefill gathered the full history too.                          | Trim retired whole pages from the private decode view; gather only window plus current prefill chunk. For this fixture the gather is bounded by 1,536 tokens.                                                                 | [Paged cache adapter](../../crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs)                                                |
+| Conservative global-attention routing and CPU submission left supported faster paths unused.                                                                                                     | Calibrate attention partitions and early submission from completed real decode tokens on the loaded device.                                                                                                                   | [Decode tuning](../../crates/mlx-core/src/models/gemma4/decode_tuning.rs)                                                             |
 
 This was **not a whole-weight Q4 → BF16 → Q4 cycle**. Weights stayed packed; embedding lookup dequantizes selected rows, and the tied output head uses packed matmul.
 
@@ -21,10 +21,10 @@ Qwen's result in [issue #142](https://github.com/mlx-node/mlx-node/issues/142) c
 Medians of three fresh-process runs per runtime and context on an M5 Max, 40 GPU cores, 128 GB, macOS 26.6.2. The baseline MLX measurements were earlier that day; llama.cpp below was freshly measured alongside optimized MLX.
 
 | Input tokens | Original MLX decode tok/s | Optimized decode tok/s MLX / llama.cpp | Prefill tok/s MLX / llama.cpp | Request seconds MLX / llama.cpp |
-| ---: | ---: | ---: | ---: | ---: |
-| 7,733 | 28.21 | 50.53 / 48.70 | 1,153.2 / 1,252.0 | 11.76 / 11.24 |
-| 40,528 | 16.15 | 39.84 / 35.29 | 1,000.4 / 740.9 | 46.99 / 61.93 |
-| 66,904 | 12.22 | 34.05 / 28.80 | 872.1 / 526.5 | 84.40 / 135.93 |
+| -----------: | ------------------------: | -------------------------------------: | ----------------------------: | ------------------------------: |
+|        7,733 |                     28.21 |                          50.53 / 48.70 |             1,153.2 / 1,252.0 |                   11.76 / 11.24 |
+|       40,528 |                     16.15 |                          39.84 / 35.29 |               1,000.4 / 740.9 |                   46.99 / 61.93 |
+|       66,904 |                     12.22 |                          34.05 / 28.80 |                 872.1 / 526.5 |                  84.40 / 135.93 |
 
 Decode improved 1.79–2.79× over original MLX; the shortest request remains slower than llama.cpp overall. Three repeats on one active desktop do not establish statistical confidence or performance on other devices. No competing inference/compilation or thermal warning was recorded.
 
@@ -64,13 +64,13 @@ Projection differences stayed within one BF16 ULP (relative L2 approximately `9.
 
 ## Evidence anchors
 
-| Artifact | Pinned identity |
-| --- | --- |
-| Model SHA-256 | `93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b` |
-| MLX library commit | `6d45ab90cfec5e7fe0cfe25bc635a23ac8a351bb` (unchanged submodule) |
-| llama.cpp commit | `a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92` (build 10610, Metal/Accelerate) |
+| Artifact                      | Pinned identity                                                                                                  |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Model SHA-256                 | `93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b`                                               |
+| MLX library commit            | `6d45ab90cfec5e7fe0cfe25bc635a23ac8a351bb` (unchanged submodule)                                                 |
+| llama.cpp commit              | `a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92` (build 10610, Metal/Accelerate)                                       |
 | Measured source patch SHA-256 | `df19f7b76b8b1e02067012667bb464725bb55048f91447cb87251568ba75f6f4` (base `185bc1b0`, including new source files) |
-| Measured native addon SHA-256 | `2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface` |
+| Measured native addon SHA-256 | `2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface`                                               |
 
 Archived `gemma4-optimization-2026-09-10/results.json` holds all 18 samples, source/output hashes, and plans; runners and baseline/audit evidence share the Git-history link above. Later formatting/preflight/discovery changes leave the timed inference path unchanged; the matrix was not rerun.
 

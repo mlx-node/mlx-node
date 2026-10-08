@@ -92,7 +92,10 @@ describe('MODEL_CATALOG', () => {
     for (const entry of visibleCatalog()) {
       expect(entry.globs, entry.label).toBeDefined();
       expect(entry.globs!.length, entry.label).toBeGreaterThan(0);
-      expect(entry.globs!.some((glob) => glob.includes('UD-Q4_K_XL')), entry.label).toBe(true);
+      expect(
+        entry.globs!.some((glob) => glob.includes('UD-Q4_K_XL')),
+        entry.label,
+      ).toBe(true);
     }
   });
 

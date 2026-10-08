@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
  * (mirroring the native loader's config validation in
  * crates/mlx-core/src/models/nemotron_h/config.rs).
  */
-describe.sequential('Nemotron H model detection', () => {
+describe('Nemotron H model detection', () => {
   let tempDir: string;
 
   beforeEach(async () => {

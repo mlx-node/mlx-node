@@ -19,7 +19,7 @@ import { createTempQwen35Model, createTempQwen35MoeModel, type TempModel } from 
 
 const constantReward = (outputs: RewardOutput[]): Float32Array => Float32Array.from(outputs.map(() => 0.5));
 
-describe.sequential('GRPOTrainer - Qwen3.5 Dense smoke', () => {
+describe('GRPOTrainer - Qwen3.5 Dense smoke', () => {
   let tempModel: TempModel;
 
   beforeAll(async () => {
@@ -57,7 +57,7 @@ describe.sequential('GRPOTrainer - Qwen3.5 Dense smoke', () => {
   });
 });
 
-describe.sequential('GRPOTrainer - Qwen3.5 MoE smoke', () => {
+describe('GRPOTrainer - Qwen3.5 MoE smoke', () => {
   let tempModel: TempModel;
 
   beforeAll(async () => {

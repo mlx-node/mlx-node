@@ -45,8 +45,8 @@ function finalChunk(text: string): ChatStreamFinal {
 
 /** The session surface every case needs, minus the MTP getters. */
 function sessionStubs() {
-  const chatSessionStart = vi.fn(
-    async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('reply'),
+  const chatSessionStart = vi.fn(async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+    makeChatResult('reply'),
   );
   const chatSessionContinue = vi.fn(
     async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('reply'),

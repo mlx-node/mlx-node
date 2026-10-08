@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { detectModelType } from '@mlx-node/lm';
 import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 
-describe.sequential('Harrier Model Detection', () => {
+describe('Harrier Model Detection', () => {
   let tempDir: string;
 
   beforeEach(async () => {

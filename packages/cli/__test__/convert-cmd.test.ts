@@ -398,12 +398,10 @@ describe('mlx convert model-type auto-detection', () => {
   });
 
   it("detects an architecture-only Nemotron config (no model_type) as 'nemotron_h'", async () => {
-    expect(
-      await detectModelTypeFromConfig({ architectures: ['NemotronHForCausalLM'] }),
-    ).toBe('nemotron_h');
+    expect(await detectModelTypeFromConfig({ architectures: ['NemotronHForCausalLM'] })).toBe('nemotron_h');
   });
 
-  it("the Nemotron architecture beats a stale recognized model_type", async () => {
+  it('the Nemotron architecture beats a stale recognized model_type', async () => {
     // The architecture is authoritative (native parser + runtime registry):
     // a Nemotron checkpoint carrying a stale-but-recognized model_type must
     // not route to another family's sanitizer.
@@ -562,9 +560,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     ]);
 
     const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
-    expect(warnings).toContain(
-      'The requested fixed Qwen hybrid or exact SafeTensors Gemma4 MoE',
-    );
+    expect(warnings).toContain('The requested fixed Qwen hybrid or exact SafeTensors Gemma4 MoE');
     expect(warnings).toContain('rejects one anyway');
     expect(warnings).toContain('need no calibration');
     expect(warnings).toContain('unsupported inputs will be rejected');

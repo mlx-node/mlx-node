@@ -330,7 +330,7 @@ function startTickProbe(intervalMs = 50): { stop: () => number } {
   };
 }
 
-const stage0Describe = MODEL_ENV_PRESENT ? describe.sequential : describe.skip;
+const stage0Describe = MODEL_ENV_PRESENT ? describe : describe.skip;
 
 stage0Describe('Stage-0 real-model concurrency hazards', () => {
   let instance: ServerInstance;

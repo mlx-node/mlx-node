@@ -34,10 +34,10 @@ the canonical model existed and needed no reconversion.
 **2.50% paired speedup across 12 warm continuations**, with 11 wins and one
 regression. These measurements predate CPU transfers; the gains are separate.
 
-| Warm continuation | Mean control | Mean optimized | Paired speedup |
-| --- | ---: | ---: | ---: |
-| After full prefill | 13.701 s | 13.386 s | 2.33% |
-| After SSD restart | 12.968 s | 12.631 s | 2.67% |
+| Warm continuation  | Mean control | Mean optimized | Paired speedup |
+| ------------------ | -----------: | -------------: | -------------: |
+| After full prefill |     13.701 s |       13.386 s |          2.33% |
+| After SSD restart  |     12.968 s |       12.631 s |          2.67% |
 
 All 14 output pairs, including setup, and their MTP statistics matched. Each
 SSD arm restored 3,920 tokens (6.2% of input), installed one recurrent sidecar
@@ -51,12 +51,12 @@ one recurrent sidecar and read **4,158,439,110 bytes per arm**. All four pairs
 improved; outputs, MTP cycles and acceptance statistics matched exactly.
 Early submission stayed enabled in both arms.
 
-| Pair (first arm) | Native TTFT: GPU transfers | CPU transfers | Whole turn: GPU | CPU |
-| --- | ---: | ---: | ---: | ---: |
-| 1 (GPU) | 3.184 s | 2.814 s | 16.748 s | 16.558 s |
-| 2 (CPU) | 3.281 s | 2.573 s | 16.815 s | 16.219 s |
-| 3 (GPU) | 3.311 s | 2.658 s | 17.294 s | 16.451 s |
-| 4 (CPU) | 3.205 s | 2.479 s | 17.843 s | 16.089 s |
+| Pair (first arm) | Native TTFT: GPU transfers | CPU transfers | Whole turn: GPU |      CPU |
+| ---------------- | -------------------------: | ------------: | --------------: | -------: |
+| 1 (GPU)          |                    3.184 s |       2.814 s |        16.748 s | 16.558 s |
+| 2 (CPU)          |                    3.281 s |       2.573 s |        16.815 s | 16.219 s |
+| 3 (GPU)          |                    3.311 s |       2.658 s |        17.294 s | 16.451 s |
+| 4 (CPU)          |                    3.205 s |       2.479 s |        17.843 s | 16.089 s |
 
 Native time to first token averaged **3.245 → 2.631 s**: **19.0% lower paired
 latency**. This includes cache preparation and the uncached suffix. The first

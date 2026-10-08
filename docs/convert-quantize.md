@@ -1,6 +1,6 @@
 # Convert & quantize internals
 
-`docs/cli.md` covers how to *invoke* `mlx convert` / `mlx calibrate`. This doc covers what those
+`docs/cli.md` covers how to _invoke_ `mlx convert` / `mlx calibrate`. This doc covers what those
 commands actually do: the on-disk formats, the per-tensor decision engine, the `config.json`
 provenance contract, and the places where a conversion looks right for the wrong reason.
 
@@ -14,11 +14,11 @@ Every quantized tensor is a group of 1–3 arrays sharing a base key: `{base}.we
 actually is comes from `config.json`, not from the file layout — so three stages own three different
 things and confusing them is the main source of drift here.
 
-| Stage         | Code                                                                                                                     | Owns                                                                                                                                     |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| **CONVERTER** | `crates/mlx-core/src/convert.rs`, `crates/mlx-core/src/utils/gguf.rs`, `crates/mlx-core/src/convert_gemma_import.rs`      | Picks per-key `{bits, group_size, mode}`, packs the bytes, writes the `quantization` block + per-tensor overrides                        |
-| **LOADER**    | `crates/mlx-core/src/engine/persistence.rs`, `crates/mlx-core/src/models/quant_dispatch.rs`, per-family `persistence.rs` | Parses that block, **rebuilds arrays that are not on disk**, fail-loud validates every dtype/shape before dispatch                       |
-| **KERNEL**    | `crates/mlx-sys/mlx/mlx/ops.cpp` → `backend/{metal,cpu}`; K-quants: `crates/mlx-sys/src/mlx_kquant*.cpp` (not in MLX)      | Consumes `(weight, scales, biases, group_size, bits, mode)`; re-validates via `validate_mode_with_type` + `quantization_params_from_mode` |
+| Stage         | Code                                                                                                                     | Owns                                                                                                                                      |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| **CONVERTER** | `crates/mlx-core/src/convert.rs`, `crates/mlx-core/src/utils/gguf.rs`, `crates/mlx-core/src/convert_gemma_import.rs`     | Picks per-key `{bits, group_size, mode}`, packs the bytes, writes the `quantization` block + per-tensor overrides                         |
+| **LOADER**    | `crates/mlx-core/src/engine/persistence.rs`, `crates/mlx-core/src/models/quant_dispatch.rs`, per-family `persistence.rs` | Parses that block, **rebuilds arrays that are not on disk**, fail-loud validates every dtype/shape before dispatch                        |
+| **KERNEL**    | `crates/mlx-sys/mlx/mlx/ops.cpp` → `backend/{metal,cpu}`; K-quants: `crates/mlx-sys/src/mlx_kquant*.cpp` (not in MLX)    | Consumes `(weight, scales, biases, group_size, bits, mode)`; re-validates via `validate_mode_with_type` + `quantization_params_from_mode` |
 
 Three things the loader materializes that are **not bytes on disk**:
 
@@ -112,20 +112,20 @@ before MLX sees them (`crates/mlx-sys/src/mlx_advanced_ops.cpp:892`).
 
 Shapes are for a dense `[N, K]` source weight; stacked experts add a leading `[E, …]` to every array.
 
-| mode                 | `.weight`               | `.scales`               | `.biases`                     | bpw                                   | default bits / gs     | mlx-lm loadable         | direction        |
-| -------------------- | ----------------------- | ----------------------- | ----------------------------- | ------------------------------------- | --------------------- | ----------------------- | ---------------- |
-| **affine**           | u32 `[N, K·b/32]`       | *wdtype* `[N, K/gs]`    | *wdtype* `[N, K/gs]`          | `b + 2·16/gs` → 4/64 = **4.500**      | **4 / 64**            | yes                     | produce + consume |
-| **mxfp4**            | u32 `[N, K/8]`          | u8 `[N, K/32]`          | must be absent                | **4.250**                             | **4 / 32** (pinned)   | yes                     | produce + consume |
-| **mxfp8**            | u32 `[N, K/4]`          | u8 `[N, K/32]`          | must be absent                | **8.250**                             | **8 / 32** (pinned)   | yes                     | produce + consume |
-| **nvfp4**            | u32 `[N, K/8]`          | u8 (E4M3) `[N, K/16]`   | must be absent                | **4.500**                             | **4 / 16** (pinned)   | yes                     | produce + consume |
-| **fp8_e4m3**         | u8 `[N, K]` raw E4M3    | bf16 `[N, 1]`           | must be absent                | `8 + 16/K` = **8.0039** @ K=4096      | 8 / `null`            | no — KeyError + null gs | DGX map only     |
-| **sym8**             | **int8** `[N, K]`       | **f32 `[N]`**           | error if present              | `8 + 32/K` = **8.0078** @ K=4096      | 8 / `null`            | no — by design          | produce + consume, **M5+ only** |
-| **q6k**              | u32 `[N, K·6/32]`       | **int8** `[N, K/16]`    | f16 `[N, K/256]`              | **6.5625** (= ggml)                   | 6 / 16 (pinned)       | no                      | **consume only** |
-| **q4k**              | u32 `[N, K/8]`          | u8 `[N, 2K/32]`         | f16 `[N, 2K/256]`             | **4.6250** (ggml 4.500)               | 4 / 32 (pinned)       | no                      | **consume only** |
-| **q5k**              | u32 `[N, 5K/32]`        | u8 `[N, 2K/32]`         | f16 `[N, 2K/256]`             | **5.6250** (ggml 5.500)               | 5 / 32 (pinned)       | no                      | **consume only** |
-| **Q4_0 → affine**    | u32 `[N, K/8]`          | f16 `[N, K/32]`         | **omitted, derived `-8·s`**   | **4.500** (= ggml)                    | 4 / 32                | no — missing `.biases`  | GGUF source only |
-| **Q8_0 → affine**    | u32 `[N, K/4]`          | f16 `[N, K/32]`         | **omitted, derived `-128·s`** | **8.500** (= ggml)                    | 8 / 32                | no                      | GGUF source only |
-| **Q4_1 → affine**    | u32 `[N, K/8]`          | f16 `[N, K/32]`         | f16 `[N, K/32]` (ggml `m`)    | **5.000** (= ggml)                    | 4 / 32                | yes                     | GGUF source only |
+| mode              | `.weight`            | `.scales`             | `.biases`                     | bpw                              | default bits / gs   | mlx-lm loadable         | direction                       |
+| ----------------- | -------------------- | --------------------- | ----------------------------- | -------------------------------- | ------------------- | ----------------------- | ------------------------------- |
+| **affine**        | u32 `[N, K·b/32]`    | _wdtype_ `[N, K/gs]`  | _wdtype_ `[N, K/gs]`          | `b + 2·16/gs` → 4/64 = **4.500** | **4 / 64**          | yes                     | produce + consume               |
+| **mxfp4**         | u32 `[N, K/8]`       | u8 `[N, K/32]`        | must be absent                | **4.250**                        | **4 / 32** (pinned) | yes                     | produce + consume               |
+| **mxfp8**         | u32 `[N, K/4]`       | u8 `[N, K/32]`        | must be absent                | **8.250**                        | **8 / 32** (pinned) | yes                     | produce + consume               |
+| **nvfp4**         | u32 `[N, K/8]`       | u8 (E4M3) `[N, K/16]` | must be absent                | **4.500**                        | **4 / 16** (pinned) | yes                     | produce + consume               |
+| **fp8_e4m3**      | u8 `[N, K]` raw E4M3 | bf16 `[N, 1]`         | must be absent                | `8 + 16/K` = **8.0039** @ K=4096 | 8 / `null`          | no — KeyError + null gs | DGX map only                    |
+| **sym8**          | **int8** `[N, K]`    | **f32 `[N]`**         | error if present              | `8 + 32/K` = **8.0078** @ K=4096 | 8 / `null`          | no — by design          | produce + consume, **M5+ only** |
+| **q6k**           | u32 `[N, K·6/32]`    | **int8** `[N, K/16]`  | f16 `[N, K/256]`              | **6.5625** (= ggml)              | 6 / 16 (pinned)     | no                      | **consume only**                |
+| **q4k**           | u32 `[N, K/8]`       | u8 `[N, 2K/32]`       | f16 `[N, 2K/256]`             | **4.6250** (ggml 4.500)          | 4 / 32 (pinned)     | no                      | **consume only**                |
+| **q5k**           | u32 `[N, 5K/32]`     | u8 `[N, 2K/32]`       | f16 `[N, 2K/256]`             | **5.6250** (ggml 5.500)          | 5 / 32 (pinned)     | no                      | **consume only**                |
+| **Q4_0 → affine** | u32 `[N, K/8]`       | f16 `[N, K/32]`       | **omitted, derived `-8·s`**   | **4.500** (= ggml)               | 4 / 32              | no — missing `.biases`  | GGUF source only                |
+| **Q8_0 → affine** | u32 `[N, K/4]`       | f16 `[N, K/32]`       | **omitted, derived `-128·s`** | **8.500** (= ggml)               | 8 / 32              | no                      | GGUF source only                |
+| **Q4_1 → affine** | u32 `[N, K/8]`       | f16 `[N, K/32]`       | f16 `[N, K/32]` (ggml `m`)    | **5.000** (= ggml)               | 4 / 32              | yes                     | GGUF source only                |
 
 Defaults are declared in exactly three consistent places plus MLX itself:
 `packages/cli/src/commands/convert.ts:9` (display only — see gotchas),
@@ -151,12 +151,12 @@ K-quants in the bridge's `params_from_mode` (`crates/mlx-sys/src/mlx_kquant.cpp:
 bpw = `bits + 2·(scale_dtype_bits / group_size)`. On `[4096, 4096]` = 16,777,216 weights, bf16
 companions:
 
-| config | weight bytes                | scales    | biases    | total      | bpw       |
-| ------ | --------------------------- | --------- | --------- | ---------- | --------- |
-| 4 / 64 | 4096·512·4 = 8,388,608      | 524,288   | 524,288   | 9,437,184  | **4.500** |
-| 8 / 64 | 4096·1024·4 = 16,777,216    | 524,288   | 524,288   | 17,825,792 | **8.500** |
-| 4 / 32 | 8,388,608                   | 1,048,576 | 1,048,576 | 10,485,760 | **5.000** |
-| 3 / 64 | 4096·384·4 = 6,291,456      | 524,288   | 524,288   | 7,340,032  | **3.500** |
+| config | weight bytes             | scales    | biases    | total      | bpw       |
+| ------ | ------------------------ | --------- | --------- | ---------- | --------- |
+| 4 / 64 | 4096·512·4 = 8,388,608   | 524,288   | 524,288   | 9,437,184  | **4.500** |
+| 8 / 64 | 4096·1024·4 = 16,777,216 | 524,288   | 524,288   | 17,825,792 | **8.500** |
+| 4 / 32 | 8,388,608                | 1,048,576 | 1,048,576 | 10,485,760 | **5.000** |
+| 3 / 64 | 4096·384·4 = 6,291,456   | 524,288   | 524,288   | 7,340,032  | **3.500** |
 
 `--dtype float32` doubles the companion cost: 4/64 becomes `4 + 2·32/64` = **5.000** bpw.
 
@@ -180,18 +180,18 @@ scale   codec by GROUP_SIZE, not by mode:                  fp_quantized.h:30
 Output dtypes `{uint32, uint8}` are hard-coded in `fp_quantize`
 (`crates/mlx-sys/mlx/mlx/ops.cpp:5340`). bpw:
 
-| mode  | bits | gs | weight bpw | scale bpw   | total     |
-| ----- | ---- | -- | ---------- | ----------- | --------- |
-| mxfp4 | 4    | 32 | 4          | 8/32 = 0.25 | **4.250** |
-| mxfp8 | 8    | 32 | 8          | 0.25        | **8.250** |
-| nvfp4 | 4    | 16 | 4          | 8/16 = 0.50 | **4.500** |
+| mode  | bits | gs  | weight bpw | scale bpw   | total     |
+| ----- | ---- | --- | ---------- | ----------- | --------- |
+| mxfp4 | 4    | 32  | 4          | 8/32 = 0.25 | **4.250** |
+| mxfp8 | 8    | 32  | 8          | 0.25        | **8.250** |
+| nvfp4 | 4    | 16  | 4          | 8/16 = 0.50 | **4.500** |
 
 Checked on `[4096,4096]`: mxfp4 = 8,388,608 + 524,288 = 8,912,896 B ⇒ 4.25 ✓; nvfp4 = 8,388,608 +
 1,048,576 = 9,437,184 ⇒ 4.50 ✓.
 
 **Convert does not use MLX's encoder for mxfp4 or mxfp8.** The layout above is the
 format contract — codec, group size, sidecar shapes, dtypes — and it is what convert
-writes and what every loader reads. The *block exponent* inside it is chosen in-tree,
+writes and what every loader reads. The _block exponent_ inside it is chosen in-tree,
 on every convert, with no flag: `crates/mlx-core/src/quant/mxfp4_weight.rs` evaluates
 both candidate E8M0 exponents per block and keeps the lower squared error, and
 `crates/mlx-core/src/quant/mxfp8_weight.rs` takes the ceiling. Since upstream `02adf7b21`
@@ -206,7 +206,7 @@ nvfp4 keeps MLX's encoder, and adds a pre-quantization
 power-of-two lift on dense FFNs (see `docs/cli.md`, "Data-free encoder tuning").
 
 **The MLX nvfp4 quantizer writes no global scale.** The DGX port does not carry Unsloth's calibrated
-global scales. The `nemotron_h` modelopt *ingest* is the one exception — it emits a `.global_scale`
+global scales. The `nemotron_h` modelopt _ingest_ is the one exception — it emits a `.global_scale`
 sidecar rather than folding `weight_scale_2` into the per-group E4M3 scales; see the Nemotron-H NVFP4
 section below.
 
@@ -229,7 +229,7 @@ forward  plain x.matmul(weight.T)             qwen3_5/quantized_linear.rs:763
 decoded magnitude > 448, because MLX's fast decoder maps the reserved `0x7f`/`0xff` E4M3 patterns to
 ±480 while `to_fp8` saturates at ±448 (`crates/mlx-core/src/quant/fp8_weight.rs:170`).
 
-**Emission gate** — `--q-recipe unsloth --q-mode nvfp4` alone is *not* enough.
+**Emission gate** — `--q-recipe unsloth --q-mode nvfp4` alone is _not_ enough.
 `select_official_unsloth_recipe` (`crates/mlx-core/src/convert.rs:4416`) returns `Some(Nvfp4)` only
 when `recipe == "unsloth"` **and** `is_qwen35_hybrid` **and** `!quant_mxfp` **and**
 `quant_mode == "nvfp4"`. On any non-Qwen-hybrid input the same CLI line returns `None` and
@@ -262,15 +262,15 @@ gotchas.
 
 Fallback ladder inside `resolve_legacy_entry` (`crates/mlx-core/src/convert.rs:6233`), in order:
 
-| condition                                                                       | outcome                    |
-| ------------------------------------------------------------------------------- | -------------------------- |
-| `!should_quantize(key)`                                                          | dense bf16                 |
-| gemma4 PLE (`per_layer_*`) / `audio_tower` / `audio_encoder` / `embed_audio`     | dense bf16 (sym8-scoped)   |
-| lfm2 packed embedding                                                            | dense bf16                 |
-| `is_affine_only_key` (lm_head / router.proj / embed_tokens\* / embedding_projection) | 8-bit **affine**, gs 64 |
-| `is_router_gate`                                                                 | 8-bit **affine**, gs 64    |
-| 3-D `[E,N,K]` experts, or 2-D with `K % 16 != 0`                                 | 8-bit **affine**, gs 64    |
-| everything else                                                                  | **sym8**                   |
+| condition                                                                            | outcome                  |
+| ------------------------------------------------------------------------------------ | ------------------------ |
+| `!should_quantize(key)`                                                              | dense bf16               |
+| gemma4 PLE (`per_layer_*`) / `audio_tower` / `audio_encoder` / `embed_audio`         | dense bf16 (sym8-scoped) |
+| lfm2 packed embedding                                                                | dense bf16               |
+| `is_affine_only_key` (lm_head / router.proj / embed_tokens\* / embedding_projection) | 8-bit **affine**, gs 64  |
+| `is_router_gate`                                                                     | 8-bit **affine**, gs 64  |
+| 3-D `[E,N,K]` experts, or 2-D with `K % 16 != 0`                                     | 8-bit **affine**, gs 64  |
+| everything else                                                                      | **sym8**                 |
 
 `enforce_sym8_group_coherence` (`crates/mlx-core/src/convert.rs:6002`) then re-applies the emission
 gates to every co-quantized group (five tables at `:5963`) and forces the whole group dense if any
@@ -308,7 +308,7 @@ has_min == false   (q6k)                  super_ratio = 16
 
 Why this reuses MLX's affine kernel algebra:
 
-1. A K-quant sub-block is *algebraically* affine — `value = scale*q + bias`, both constant inside a
+1. A K-quant sub-block is _algebraically_ affine — `value = scale*q + bias`, both constant inside a
    group (`kquant.h:5`). `get_pack_factor`, `load_vector`, `qdot`, `qouter`, `dequantize` are byte
    copies of the affine ones and take `(scale, bias)` by value — they never see a K-quant.
 2. The **importer**, not the kernel, absorbs ggml's swizzle: `q6k_code`/`q4k_code`/`q5k_code`
@@ -329,11 +329,11 @@ into `group_steps`/`scale_step` because q6k's group of 16 is narrower than the B
 
 bpw = `bits + 8/scales_per_value + 16·per_group/256`:
 
-| mode | weight | scales      | biases          | mlx-node   | bytes/super-block | ggml block | ggml bpw | Δ      |
-| ---- | ------ | ----------- | --------------- | ---------- | ----------------- | ---------- | -------- | ------ |
-| q6k  | 6      | 8/16 = 0.5  | 16/256 = 0.0625 | **6.5625** | 192+16+2 = **210** | 210 B      | 6.5625   | **0**  |
+| mode | weight | scales       | biases           | mlx-node   | bytes/super-block  | ggml block | ggml bpw | Δ      |
+| ---- | ------ | ------------ | ---------------- | ---------- | ------------------ | ---------- | -------- | ------ |
+| q6k  | 6      | 8/16 = 0.5   | 16/256 = 0.0625  | **6.5625** | 192+16+2 = **210** | 210 B      | 6.5625   | **0**  |
 | q4k  | 4      | 2·8/32 = 0.5 | 2·16/256 = 0.125 | **4.6250** | 128+16+4 = **148** | 144 B      | 4.5000   | +0.125 |
-| q5k  | 5      | 0.5         | 0.125           | **5.6250** | 160+16+4 = **180** | 176 B      | 5.5000   | +0.125 |
+| q5k  | 5      | 0.5          | 0.125            | **5.6250** | 160+16+4 = **180** | 176 B      | 5.5000   | +0.125 |
 
 Exactness vs llama.cpp: decode is float32 on both levels, so **q4k and q5k are bitwise identical**.
 **Q6_K is identical up to the sign of zero** — ggml subtracts 32 in integer arithmetic, the contract
@@ -372,11 +372,11 @@ raw IEEE-754 bit equality with **no tolerance** over an adversarial scale set.
 
 bpw at K=4096 rows:
 
-| source | weight | scales      | biases            | mlx-node  | ggml block | ggml bpw |
-| ------ | ------ | ----------- | ----------------- | --------- | ---------- | -------- |
-| Q4_0   | 4      | 16/32 = 0.5 | **0** (derived)   | **4.500** | 18 B / 32  | 4.500    |
-| Q8_0   | 8      | 0.5         | **0** (derived)   | **8.500** | 34 B / 32  | 8.500    |
-| Q4_1   | 4      | 0.5         | 0.5 (real `m`)    | **5.000** | 20 B / 32  | 5.000    |
+| source | weight | scales      | biases          | mlx-node  | ggml block | ggml bpw |
+| ------ | ------ | ----------- | --------------- | --------- | ---------- | -------- |
+| Q4_0   | 4      | 16/32 = 0.5 | **0** (derived) | **4.500** | 18 B / 32  | 4.500    |
+| Q8_0   | 8      | 0.5         | **0** (derived) | **8.500** | 34 B / 32  | 8.500    |
+| Q4_1   | 4      | 0.5         | 0.5 (real `m`)  | **5.000** | 20 B / 32  | 5.000    |
 
 Before the change, Q4_0 landed at 5.0 and Q8_0 at 9.0 — larger than the GGUF they came from. 0.5 bpw
 = 0.0625 bytes/weight; the 681 MB saving on Gemma-4-12B-QAT (`crates/mlx-core/src/engine/persistence.rs:206`) therefore implies
@@ -396,18 +396,18 @@ weights but **does** write a real `.biases` array (every entry `-2^(bits-1)·s`)
 Because all nine formats share the triplet shape, dtypes are the only discriminator. Every guard runs
 **before** dispatching on `plq.mode`.
 
-| guard                                     | trips when                                                                                          | file:line                                              |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| `ensure_dense_weight_floating`            | non-float weight reaches a dense `set_weight` (stripped `.scales`)                                   | `crates/mlx-core/src/models/quant_dispatch.rs:224-234` |
-| `ensure_int8_storage_resolves_sym8`       | int8 `.weight` but mode ≠ sym8                                                                       | `quant_dispatch.rs:243-261`                            |
-| `ensure_plain_fp8_storage_resolves_fp8_e4m3` | u8 weight + **floating** `.scales` but mode ≠ fp8_e4m3                                             | `quant_dispatch.rs:270-295`                            |
-| `ensure_kquant_storage_resolves_kquant`   | int8 `.scales` (q6k) **or** u8 `.scales` + f16 `.biases` (q4k/q5k) but mode is not a K-quant          | `quant_dispatch.rs:307-334`                            |
-| `ensure_affine_biases_present`            | affine group has `.weight` + `.scales` but no `.biases`                                              | `quant_dispatch.rs:355-378`                            |
-| `resolve_kquant_group`                    | K-quant with wrong dtype or rank; `Ok(None)` **only** if `.scales` is absent                          | `quant_dispatch.rs:417-475`                            |
-| `validate_mode_with_type` (MLX)           | affine w/o biases; float modes with non-uint8 scales or non-null biases                             | `crates/mlx-sys/mlx/mlx/ops.cpp:4838-4888`             |
-| `kquant::validate_mode_with_type` (bridge) | K-quant wrong scales dtype / missing or non-f16 biases                                             | `crates/mlx-sys/src/mlx_kquant.cpp:56-88`              |
-| `fp_quantize` / `fp_dequantize` (MLX)     | float mode whose `(gs, bits)` differ from the pinned pair (quantize / dequantize only)               | `crates/mlx-sys/mlx/mlx/ops.cpp:5242-5257`, `:5491-5506` |
-| `kquant::params_from_mode` (bridge)       | K-quant whose `(gs, bits)` differ from the pinned pair                                               | `crates/mlx-sys/src/mlx_kquant.cpp:90-116`             |
+| guard                                        | trips when                                                                                   | file:line                                                |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `ensure_dense_weight_floating`               | non-float weight reaches a dense `set_weight` (stripped `.scales`)                           | `crates/mlx-core/src/models/quant_dispatch.rs:224-234`   |
+| `ensure_int8_storage_resolves_sym8`          | int8 `.weight` but mode ≠ sym8                                                               | `quant_dispatch.rs:243-261`                              |
+| `ensure_plain_fp8_storage_resolves_fp8_e4m3` | u8 weight + **floating** `.scales` but mode ≠ fp8_e4m3                                       | `quant_dispatch.rs:270-295`                              |
+| `ensure_kquant_storage_resolves_kquant`      | int8 `.scales` (q6k) **or** u8 `.scales` + f16 `.biases` (q4k/q5k) but mode is not a K-quant | `quant_dispatch.rs:307-334`                              |
+| `ensure_affine_biases_present`               | affine group has `.weight` + `.scales` but no `.biases`                                      | `quant_dispatch.rs:355-378`                              |
+| `resolve_kquant_group`                       | K-quant with wrong dtype or rank; `Ok(None)` **only** if `.scales` is absent                 | `quant_dispatch.rs:417-475`                              |
+| `validate_mode_with_type` (MLX)              | affine w/o biases; float modes with non-uint8 scales or non-null biases                      | `crates/mlx-sys/mlx/mlx/ops.cpp:4838-4888`               |
+| `kquant::validate_mode_with_type` (bridge)   | K-quant wrong scales dtype / missing or non-f16 biases                                       | `crates/mlx-sys/src/mlx_kquant.cpp:56-88`                |
+| `fp_quantize` / `fp_dequantize` (MLX)        | float mode whose `(gs, bits)` differ from the pinned pair (quantize / dequantize only)       | `crates/mlx-sys/mlx/mlx/ops.cpp:5242-5257`, `:5491-5506` |
+| `kquant::params_from_mode` (bridge)          | K-quant whose `(gs, bits)` differ from the pinned pair                                       | `crates/mlx-sys/src/mlx_kquant.cpp:90-116`               |
 
 `ensure_affine_biases_present` is live in four families: gemma4 (6 non-test call sites —
 `crates/mlx-core/src/models/gemma4/persistence.rs:1361`, `:1390`, `:1586`, `:1850`, `:2140`, `:2205`),
@@ -419,7 +419,7 @@ The converter mirrors these before writing: `validate_existing_quantized_entry` 
 (`crates/mlx-core/src/convert.rs:5620`). Dtype-cast preservation is content-keyed, not suffix-keyed:
 `kquant_biases_to_preserve` freezes an f16 `.biases` only when its sibling `.scales` is int8/u8
 (`:5455`), and `sym8_scales_cast_action` normalizes an f16/bf16 `[N]` scale next to an int8 weight
-*up* to f32 (`:5485`).
+_up_ to f32 (`:5485`).
 
 ## Recipes & the per-tensor decision engine
 
@@ -431,14 +431,14 @@ enum QuantDecision { Skip, Default, Custom { bits: i32, group_size: i32, mode: S
 There are **six predicate-builder functions**; `build_predicate_for_recipe`
 (`crates/mlx-core/src/convert.rs:5207`) is a dispatcher, not a builder:
 
-| builder                          | line   | serves                                              |
-| -------------------------------- | ------ | --------------------------------------------------- |
-| `build_recipe_predicate`         | `3949` | all four `mixed_*` (one dispatcher arm at `:5214`)   |
-| `build_qwen35_recipe`            | `4049` | `qwen3_5`                                           |
-| `build_unsloth_recipe`           | `4172` | `unsloth` (legacy affine, imatrix-gated)            |
-| `build_official_unsloth_recipe`  | `4470` | the **fixed** Unsloth class map (Mxfp / Nvfp4)      |
-| `build_nvidia_recipe`            | `4637` | `nvidia`                                            |
-| `build_privacy_filter_predicate` | `4736` | privacy-filter (never calls `should_quantize`)      |
+| builder                          | line   | serves                                             |
+| -------------------------------- | ------ | -------------------------------------------------- |
+| `build_recipe_predicate`         | `3949` | all four `mixed_*` (one dispatcher arm at `:5214`) |
+| `build_qwen35_recipe`            | `4049` | `qwen3_5`                                          |
+| `build_unsloth_recipe`           | `4172` | `unsloth` (legacy affine, imatrix-gated)           |
+| `build_official_unsloth_recipe`  | `4470` | the **fixed** Unsloth class map (Mxfp / Nvfp4)     |
+| `build_nvidia_recipe`            | `4637` | `nvidia`                                           |
+| `build_privacy_filter_predicate` | `4736` | privacy-filter (never calls `should_quantize`)     |
 
 Seven `--q-recipe` names are accepted (`crates/mlx-core/src/convert.rs:2122`); nine dispatch paths
 exist once the fixed map and privacy-filter are counted; `resolve_legacy_entry` (`:6233`) is the tenth
@@ -450,23 +450,23 @@ path and the only sym8-aware one.
 `recipe_gs = 64` instead of the top-level 16, because affine only accepts {32,64,128}
 (`crates/mlx-core/src/convert.rs:2878`).
 
-| Tensor class                                 | `mixed_L_H`               | `qwen3_5`         | `unsloth` legacy | `unsloth`+`--q-mxfp` (fixed) | `unsloth`+`nvfp4` (fixed) | `nvidia`     | no recipe   |
-| -------------------------------------------- | ------------------------- | ----------------- | ---------------- | ---------------------------- | ------------------------- | ------------ | ----------- |
-| `embed_tokens` / `embedding.`                | Skip                      | Skip              | `snap(B+2)`/G    | **Skip**                     | **Skip**                  | Skip         | Skip\*      |
-| `lm_head`                                    | `H`/G affine              | **Skip**          | `snap(B+3)`/G    | mxfp8 8/32                   | fp8_e4m3                  | mxfp4 4/32   | Skip        |
-| `self_attn.q/k/v_proj`                       | `L` (v→`H` in eligible)   | `min(B+2,8)`      | `snap(B+2)`      | mxfp8 8/32                   | fp8_e4m3                  | mxfp8 8/32   | top-level   |
-| `self_attn.o_proj`                           | `L`                       | **8/64 affine**   | **8/64 affine**  | mxfp8 8/32                   | fp8_e4m3                  | mxfp8 8/32   | top-level   |
-| `linear_attn.in_proj_qkv` / `in_proj_z`      | `L`                       | `min(B+2,8)`      | `snap(B+2)`      | mxfp8                        | fp8_e4m3                  | mxfp8 8/32   | top-level   |
-| `linear_attn.out_proj`                       | `L`                       | **8/64 affine**   | **8/64 affine**  | mxfp8                        | fp8_e4m3                  | mxfp8 8/32   | top-level   |
-| `linear_attn.in_proj_a` / `in_proj_b`        | `L`                       | **8/64 affine**   | **8/64 affine**  | **Skip (bf16)**              | **Skip (bf16)**           | 8/64 affine  | top-level   |
-| `linear_attn.in_proj_ba`                     | Skip                      | Skip              | Skip             | Skip                         | Skip                      | Skip         | Skip        |
-| FFN `gate_proj` / `up_proj`                  | `L`                       | `Default`         | `Default`        | layer < N−8 → mxfp4; else mxfp8 | layer < N−8 → nvfp4; else fp8_e4m3 | mxfp4 4/32 | top-level |
-| FFN `down_proj`                              | `H` in eligible, else `L` | `min(B+1,8)`      | `snap(B+1)`      | same split                   | same split                | mxfp4 4/32   | top-level   |
-| Router gates                                 | 8/64 affine               | 8/64 affine       | 8/64 affine      | **Skip (bf16)**              | **Skip (bf16)**           | 8/64 affine  | 8/64 affine |
-| norms / `A_log` / `dt_bias` / `conv1d`       | Skip                      | Skip              | Skip             | Skip                         | Skip                      | Skip         | Skip        |
-| vision (`vision_tower`, `visual.`, …)        | Skip                      | Skip              | Skip             | Skip                         | Skip                      | Skip         | Skip        |
-| `mtp.*`                                      | Skip                      | Skip              | Skip             | Skip                         | Skip                      | Skip         | Skip        |
-| **anything unmatched**                       | `L`                       | `Default`         | `Default`        | **Skip**                     | **Skip**                  | **Skip**     | top-level   |
+| Tensor class                            | `mixed_L_H`               | `qwen3_5`       | `unsloth` legacy | `unsloth`+`--q-mxfp` (fixed)    | `unsloth`+`nvfp4` (fixed)          | `nvidia`    | no recipe   |
+| --------------------------------------- | ------------------------- | --------------- | ---------------- | ------------------------------- | ---------------------------------- | ----------- | ----------- |
+| `embed_tokens` / `embedding.`           | Skip                      | Skip            | `snap(B+2)`/G    | **Skip**                        | **Skip**                           | Skip        | Skip\*      |
+| `lm_head`                               | `H`/G affine              | **Skip**        | `snap(B+3)`/G    | mxfp8 8/32                      | fp8_e4m3                           | mxfp4 4/32  | Skip        |
+| `self_attn.q/k/v_proj`                  | `L` (v→`H` in eligible)   | `min(B+2,8)`    | `snap(B+2)`      | mxfp8 8/32                      | fp8_e4m3                           | mxfp8 8/32  | top-level   |
+| `self_attn.o_proj`                      | `L`                       | **8/64 affine** | **8/64 affine**  | mxfp8 8/32                      | fp8_e4m3                           | mxfp8 8/32  | top-level   |
+| `linear_attn.in_proj_qkv` / `in_proj_z` | `L`                       | `min(B+2,8)`    | `snap(B+2)`      | mxfp8                           | fp8_e4m3                           | mxfp8 8/32  | top-level   |
+| `linear_attn.out_proj`                  | `L`                       | **8/64 affine** | **8/64 affine**  | mxfp8                           | fp8_e4m3                           | mxfp8 8/32  | top-level   |
+| `linear_attn.in_proj_a` / `in_proj_b`   | `L`                       | **8/64 affine** | **8/64 affine**  | **Skip (bf16)**                 | **Skip (bf16)**                    | 8/64 affine | top-level   |
+| `linear_attn.in_proj_ba`                | Skip                      | Skip            | Skip             | Skip                            | Skip                               | Skip        | Skip        |
+| FFN `gate_proj` / `up_proj`             | `L`                       | `Default`       | `Default`        | layer < N−8 → mxfp4; else mxfp8 | layer < N−8 → nvfp4; else fp8_e4m3 | mxfp4 4/32  | top-level   |
+| FFN `down_proj`                         | `H` in eligible, else `L` | `min(B+1,8)`    | `snap(B+1)`      | same split                      | same split                         | mxfp4 4/32  | top-level   |
+| Router gates                            | 8/64 affine               | 8/64 affine     | 8/64 affine      | **Skip (bf16)**                 | **Skip (bf16)**                    | 8/64 affine | 8/64 affine |
+| norms / `A_log` / `dt_bias` / `conv1d`  | Skip                      | Skip            | Skip             | Skip                            | Skip                               | Skip        | Skip        |
+| vision (`vision_tower`, `visual.`, …)   | Skip                      | Skip            | Skip             | Skip                            | Skip                               | Skip        | Skip        |
+| `mtp.*`                                 | Skip                      | Skip            | Skip             | Skip                            | Skip                               | Skip        | Skip        |
+| **anything unmatched**                  | `L`                       | `Default`       | `Default`        | **Skip**                        | **Skip**                           | **Skip**    | top-level   |
 
 \* unless `embed_quantizable` (lfm2/lfm2_moe) — but see the note below: no recipe ever receives it.
 
@@ -477,14 +477,14 @@ The last row is the sharpest structural split: `mixed_*` / `qwen3_5` / `unsloth`
 
 Bits arithmetic for `unsloth` (`snap_bits` maps 7 → 8, `crates/mlx-core/src/convert.rs:4176`):
 
-| class                            | formula      | via CLI (`d=3`)  | via direct NAPI (`d=4`) |
-| -------------------------------- | ------------ | ---------------- | ----------------------- |
-| `gate_proj` / `up_proj`          | `Default`→`d` | 3                | 4                       |
-| `down_proj`                      | `snap(d+1)`  | `snap(4)` = 4    | `snap(5)` = 5           |
-| `embed_tokens`                   | `snap(d+2)`  | `snap(5)` = 5    | `snap(6)` = 6           |
-| `lm_head`                        | `snap(d+3)`  | `snap(6)` = 6    | `snap(7)` = **8**       |
-| `q/k/v_proj`, `in_proj_qkv/z`    | `snap(d+2)`  | 5 + AWQ          | 6 + AWQ                 |
-| `o_proj`, `out_proj`, `in_proj_a/b` | pinned    | 8-bit affine gs 64 | 8-bit affine gs 64    |
+| class                               | formula       | via CLI (`d=3`)    | via direct NAPI (`d=4`) |
+| ----------------------------------- | ------------- | ------------------ | ----------------------- |
+| `gate_proj` / `up_proj`             | `Default`→`d` | 3                  | 4                       |
+| `down_proj`                         | `snap(d+1)`   | `snap(4)` = 4      | `snap(5)` = 5           |
+| `embed_tokens`                      | `snap(d+2)`   | `snap(5)` = 5      | `snap(6)` = 6           |
+| `lm_head`                           | `snap(d+3)`   | `snap(6)` = 6      | `snap(7)` = **8**       |
+| `q/k/v_proj`, `in_proj_qkv/z`       | `snap(d+2)`   | 5 + AWQ            | 6 + AWQ                 |
+| `o_proj`, `out_proj`, `in_proj_a/b` | pinned        | 8-bit affine gs 64 | 8-bit affine gs 64      |
 
 The `d=3` column reproduces the documented ladder (`packages/cli/src/commands/convert.ts:87`). `d=3`
 is a **TS-only injection** at `packages/cli/src/commands/convert.ts:383` — see gotchas.
@@ -493,19 +493,19 @@ is a **TS-only injection** at `packages/cli/src/commands/convert.ts:383` — see
 
 Returns `false` for (`crates/mlx-core/src/convert.rs:3317-3396`):
 
-| #  | test                                                              | line   |
-| -- | ----------------------------------------------------------------- | ------ |
-| 1  | key does not end in `.weight`                                     | `3319` |
-| 2  | `vision_tower` or `visual.`                                       | `3324` |
-| 3  | `vision_embedder` (loader has no quantized branch)                | `3331` |
-| 4  | `lm_head` — **unconditional**                                     | `3338` |
-| 5  | `embed_tokens` / `embedding.` unless `embed_quantizable`          | `3345` |
-| 6  | `layernorm` / `rms_norm` / `_norm.`                               | `3350` |
-| 7  | `conv1d`                                                          | `3355` |
-| 8  | ends with `conv.conv.weight` (LFM2 depthwise short conv)          | `3365` |
-| 9  | `A_log` / `dt_bias`                                               | `3370` |
-| 10 | `in_proj_ba.` (fused GDN low-rank; split a/b are NOT excluded)    | `3384` |
-| 11 | `is_mtp_key`                                                      | `3391` |
+| #   | test                                                           | line   |
+| --- | -------------------------------------------------------------- | ------ |
+| 1   | key does not end in `.weight`                                  | `3319` |
+| 2   | `vision_tower` or `visual.`                                    | `3324` |
+| 3   | `vision_embedder` (loader has no quantized branch)             | `3331` |
+| 4   | `lm_head` — **unconditional**                                  | `3338` |
+| 5   | `embed_tokens` / `embedding.` unless `embed_quantizable`       | `3345` |
+| 6   | `layernorm` / `rms_norm` / `_norm.`                            | `3350` |
+| 7   | `conv1d`                                                       | `3355` |
+| 8   | ends with `conv.conv.weight` (LFM2 depthwise short conv)       | `3365` |
+| 9   | `A_log` / `dt_bias`                                            | `3370` |
+| 10  | `in_proj_ba.` (fused GDN low-rank; split a/b are NOT excluded) | `3384` |
+| 11  | `is_mtp_key`                                                   | `3391` |
 
 Recipes that quantize `lm_head` / `embed_tokens` branch **before** calling it: `mixed_*` (`:3988`),
 `unsloth` (`:4198`, `:4205`), fixed-Unsloth (`:4534`), `nvidia` (`:4648`). `qwen3_5` has no such
@@ -551,11 +551,11 @@ original = inner(key)
 
 `apply_nvfp4_upgrade` (`crates/mlx-core/src/convert.rs:5139`) is **not** the same shape:
 
-| difference                     | `apply_mxfp_upgrade`                 | `apply_nvfp4_upgrade`                            |
-| ------------------------------ | ------------------------------------ | ------------------------------------------------ |
-| `is_bitexact_affine_proj` arm  | present (`:4836`)                    | **absent** — no equivalent (`:3890` says none needed) |
-| `is_affine_only_key` arm       | returns `original` untouched (`:4820`) | **rewrites** `Default` → `Custom{8,64,affine}` (`:5155`) |
-| `Default` arm                  | branches on `default_bits` (`:4863`) | promotes **unconditionally** to nvfp4 4/16 (`:5185`) |
+| difference                    | `apply_mxfp_upgrade`                   | `apply_nvfp4_upgrade`                                    |
+| ----------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| `is_bitexact_affine_proj` arm | present (`:4836`)                      | **absent** — no equivalent (`:3890` says none needed)    |
+| `is_affine_only_key` arm      | returns `original` untouched (`:4820`) | **rewrites** `Default` → `Custom{8,64,affine}` (`:5155`) |
+| `Default` arm                 | branches on `default_bits` (`:4863`)   | promotes **unconditionally** to nvfp4 4/16 (`:5185`)     |
 
 ### The two decision-scoping traps
 
@@ -580,7 +580,7 @@ consulted by the no-recipe ladder (`:6311`), where listing `o_proj` would stop a
 
 **Trap B — `sym8_eligible` must not be asked about a packed tensor.** It reads the ARRAY:
 `ndim == 2 && K % 16 == 0` (`:5546`). A packed affine weight is `Uint32 [N, K/8]` — for `[8, 128]`
-that is 2-D with `128 % 16 == 0`, so it answers "eligible" while describing the *packing*.
+that is 2-D with `128 % 16 == 0`, so it answers "eligible" while describing the _packing_.
 `resolve_legacy_entry` therefore takes a `for_existing` flag and swaps the question for a dtype
 witness (`:6345`):
 
@@ -612,12 +612,12 @@ mtp_quant_decision(key)                                   convert.rs:3790
     else                                          → Some(Skip)
 ```
 
-| policy               | MTP layer linears        | `mtp.fc`  | norms | storage                                                       |
-| -------------------- | ------------------------ | --------- | ----- | ------------------------------------------------------------- |
-| `off`                | inner predicate (Skip)   | Skip      | Skip  | —                                                             |
-| `cyankiwi`           | affine 4/32              | **Skip**  | Skip  | dense qwen3_5 → `mtp.safetensors`; qwen3_5_moe → inline shards |
-| `all`                | affine 4/32              | affine 4/32 | Skip | same split                                                    |
-| `split` (= `drafter`) | **not wrapped** (like `off`, `:2909`) | — | —  | `mtp.*` pulled into a bf16 `mtp-drafter/` dir                 |
+| policy                | MTP layer linears                     | `mtp.fc`    | norms | storage                                                        |
+| --------------------- | ------------------------------------- | ----------- | ----- | -------------------------------------------------------------- |
+| `off`                 | inner predicate (Skip)                | Skip        | Skip  | —                                                              |
+| `cyankiwi`            | affine 4/32                           | **Skip**    | Skip  | dense qwen3_5 → `mtp.safetensors`; qwen3_5_moe → inline shards |
+| `all`                 | affine 4/32                           | affine 4/32 | Skip  | same split                                                     |
+| `split` (= `drafter`) | **not wrapped** (like `off`, `:2909`) | —           | —     | `mtp.*` pulled into a bf16 `mtp-drafter/` dir                  |
 
 `MTP_QUANT_BITS = 4`, `MTP_QUANT_GROUP_SIZE = 32` are hard-coded
 (`crates/mlx-core/src/convert.rs:3303`). Because `apply_mtp_quant_policy` is the **outermost**
@@ -644,10 +644,10 @@ use_more_bits = (index < num_layers // 8
 
 `num_layers = 48`:
 
-|          | first | last boundary  | middle band (6 ≤ i < 42)               | count |
-| -------- | ----- | -------------- | -------------------------------------- | ----- |
-| mlx-node | i<6   | i ≥ 48−6 = 42  | `i%3==0` → {6, 9, …, 39}               | 24    |
-| mlx-lm   | i<6   | i ≥ 7·48//8 = 42 | `(i−6)%3==2` ⇒ i≡2 (mod 3) → {8,11,…,41} | 24  |
+|          | first | last boundary    | middle band (6 ≤ i < 42)                 | count |
+| -------- | ----- | ---------------- | ---------------------------------------- | ----- |
+| mlx-node | i<6   | i ≥ 48−6 = 42    | `i%3==0` → {6, 9, …, 39}                 | 24    |
+| mlx-lm   | i<6   | i ≥ 7·48//8 = 42 | `(i−6)%3==2` ⇒ i≡2 (mod 3) → {8,11,…,41} | 24    |
 
 Same count, **different layers** — the middle-band phase is offset by 2. `num_layers = 36`:
 mlx-node's last boundary is 32, mlx-lm's is `7*36//8 = 31`, so layer 31 is high-bit there and low-bit
@@ -712,18 +712,18 @@ config-write `?` at `:3215` / `:3178`.
 Nine types are recognized (`GgufTensorType`, `crates/mlx-core/src/utils/gguf.rs:42`). Anything else is
 a **hard error at header parse** — the whole file is refused even if one tensor uses an unlisted type.
 
-| ggml type (id) | block | `type_size` | route                                  | mlx-node bytes / 4096-col row | ggml bytes | Δ    |
-| -------------- | ----- | ----------- | -------------------------------------- | ----------------------------- | ---------- | ---- |
-| F32 (0)        | 1     | 4           | dense (`:597`)                         | —                             | —          | —    |
-| F16 (1)        | 1     | 2           | dense (`:604`)                         | —                             | —          | —    |
-| BF16 (30)      | 1     | 2           | dense (`:611`)                         | —                             | —          | —    |
-| Q4_0 (2)       | 32    | 18          | affine repack (`:808`)                 | 512·4 + 128·2 = **2304**      | 2304       | **0** |
-| Q4_1 (3)       | 32    | 20          | affine repack (`:831`)                 | 2048+256+256 = **2560**       | 2560       | **0** |
-| Q8_0 (8)       | 32    | 34          | affine repack (`:854`)                 | 1024·4 + 256 = **4352**       | 4352       | **0** |
-| Q4_K (12)      | 256   | 144         | K-quant repack, needs `--gguf-kquant`  | 2048+256+64 = **2368**        | 2304       | +64  |
-| Q5_K (13)      | 256   | 176         | K-quant repack, needs `--gguf-kquant`  | 2560+256+64 = **2880**        | 2816       | +64  |
-| Q6_K (14)      | 256   | 210         | K-quant repack **or** BF16 dequant     | 3072+256+32 = **3360**        | 3360       | **0** |
-| everything else | —    | —           | **rejected at `:530`**                 | —                             | —          | —    |
+| ggml type (id)  | block | `type_size` | route                                 | mlx-node bytes / 4096-col row | ggml bytes | Δ     |
+| --------------- | ----- | ----------- | ------------------------------------- | ----------------------------- | ---------- | ----- |
+| F32 (0)         | 1     | 4           | dense (`:597`)                        | —                             | —          | —     |
+| F16 (1)         | 1     | 2           | dense (`:604`)                        | —                             | —          | —     |
+| BF16 (30)       | 1     | 2           | dense (`:611`)                        | —                             | —          | —     |
+| Q4_0 (2)        | 32    | 18          | affine repack (`:808`)                | 512·4 + 128·2 = **2304**      | 2304       | **0** |
+| Q4_1 (3)        | 32    | 20          | affine repack (`:831`)                | 2048+256+256 = **2560**       | 2560       | **0** |
+| Q8_0 (8)        | 32    | 34          | affine repack (`:854`)                | 1024·4 + 256 = **4352**       | 4352       | **0** |
+| Q4_K (12)       | 256   | 144         | K-quant repack, needs `--gguf-kquant` | 2048+256+64 = **2368**        | 2304       | +64   |
+| Q5_K (13)       | 256   | 176         | K-quant repack, needs `--gguf-kquant` | 2560+256+64 = **2880**        | 2816       | +64   |
+| Q6_K (14)       | 256   | 210         | K-quant repack **or** BF16 dequant    | 3072+256+32 = **3360**        | 3360       | **0** |
+| everything else | —     | —           | **rejected at `:530`**                | —                             | —          | —     |
 
 `block_size()` (`:99`), `k_quant_format()` (`:127`) and `SourceQuantProfile::for_gguf_type` (`:1902`)
 are all `_`-free exhaustive matches, so adding a type forces every routing site to be updated.
@@ -737,21 +737,21 @@ block but allocates the destination in full.
 Dispatch is by metadata only (`gguf_name_to_hf_for_metadata`,
 `crates/mlx-core/src/utils/gguf.rs:1252`):
 
-| condition                                                                          | map                             | can return `None`?          |
-| ---------------------------------------------------------------------------------- | ------------------------------- | --------------------------- |
-| `general.architecture == "gemma4"`                                                 | `gemma4_name_to_hf` (`:1178`)   | **yes** — `rope_freqs.weight` only |
-| `arch == "clip"` and (`clip.vision.projector_type == "gemma4uv"` or `clip.audio.projector_type == "gemma4ua"`) | `gemma4_mmproj_name_to_hf` (`:1219`) | no |
-| otherwise                                                                          | `gguf_name_to_hf` (`:1266`)     | no                          |
+| condition                                                                                                      | map                                  | can return `None`?                 |
+| -------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------- |
+| `general.architecture == "gemma4"`                                                                             | `gemma4_name_to_hf` (`:1178`)        | **yes** — `rope_freqs.weight` only |
+| `arch == "clip"` and (`clip.vision.projector_type == "gemma4uv"` or `clip.audio.projector_type == "gemma4ua"`) | `gemma4_mmproj_name_to_hf` (`:1219`) | no                                 |
+| otherwise                                                                                                      | `gguf_name_to_hf` (`:1266`)          | no                                 |
 
 Where the two LLM maps disagree — the whole reason the gemma4 map exists:
 
-| GGUF infix                    | generic (`:1322`)               | gemma4 (`:1199`)                     |
-| ----------------------------- | ------------------------------- | ------------------------------------ |
-| `.attn_norm.`                 | `.input_layernorm.`             | `.input_layernorm.`                  |
-| `.ffn_norm.`                  | `.post_attention_layernorm.`    | **`.pre_feedforward_layernorm.`**    |
-| `.post_attention_norm.`       | `.post_attention_layernorm.`    | `.post_attention_layernorm.`         |
-| `.post_ffw_norm.`             | *(unmapped, passes through)*    | `.post_feedforward_layernorm.`       |
-| `.layer_output_scale.weight`  | *(unmapped)*                    | `.layer_scalar`                      |
+| GGUF infix                   | generic (`:1322`)            | gemma4 (`:1199`)                  |
+| ---------------------------- | ---------------------------- | --------------------------------- |
+| `.attn_norm.`                | `.input_layernorm.`          | `.input_layernorm.`               |
+| `.ffn_norm.`                 | `.post_attention_layernorm.` | **`.pre_feedforward_layernorm.`** |
+| `.post_attention_norm.`      | `.post_attention_layernorm.` | `.post_attention_layernorm.`      |
+| `.post_ffw_norm.`            | _(unmapped, passes through)_ | `.post_feedforward_layernorm.`    |
+| `.layer_output_scale.weight` | _(unmapped)_                 | `.layer_scalar`                   |
 
 Under the generic map `ffn_norm` and `post_attention_norm` both land on `post_attention_layernorm` —
 a silent one-of-two loss when collected into a `HashMap`. `remap_keys` (`:1365`) now makes that a
@@ -774,13 +774,13 @@ any suffix. The three global tensors are whole-string matches and need
 `rename_global_quant_group` (`:1167`), which requires the remainder to be exactly one of
 `QUANT_GROUP_SUFFIXES = [".weight", ".scales", ".biases"]` (`:1154`):
 
-| from                                    | to                                                  |
-| --------------------------------------- | --------------------------------------------------- |
-| `token_embd{.weight,.scales,.biases}`   | `model.embed_tokens{…}`                             |
-| `output_norm.weight`                    | `model.norm.weight` (exact — norms are never quantized) |
-| `output{.weight,.scales,.biases}`       | `lm_head{…}`                                        |
-| `mm.input_projection{…}`                | `model.embed_vision.embedding_projection{…}`        |
-| `mm.a.input_projection{…}`              | `model.embed_audio.embedding_projection{…}`         |
+| from                                  | to                                                      |
+| ------------------------------------- | ------------------------------------------------------- |
+| `token_embd{.weight,.scales,.biases}` | `model.embed_tokens{…}`                                 |
+| `output_norm.weight`                  | `model.norm.weight` (exact — norms are never quantized) |
+| `output{.weight,.scales,.biases}`     | `lm_head{…}`                                            |
+| `mm.input_projection{…}`              | `model.embed_vision.embedding_projection{…}`            |
+| `mm.a.input_projection{…}`            | `model.embed_audio.embedding_projection{…}`             |
 
 Moving only `.weight` was the original bug: loaders probe `embed_tokens.scales` as the "this tensor
 is quantized" sentinel, so a stranded sidecar silently degrades the group to a bare packed weight
@@ -801,10 +801,10 @@ returns the string unchanged (`:1299`), so a non-gemma4 GGUF carries the precomp
 
 Is the dropped data recoverable?
 
-| family              | RoPE source at load                                                        | recoverable from GGUF metadata? |
-| ------------------- | --------------------------------------------------------------------------- | ------------------------------- |
-| qwen3_5 / lfm2 / …  | flat top-level `rope_theta` (serde, `crates/mlx-core/src/models/qwen3_5/config.rs:88`)          | **yes** — `extract_config` writes it from `{arch}.rope.freq_base` (`gguf.rs:1783`) |
-| gemma4              | **nested** `rope_parameters.full_attention.{rope_theta, partial_rotary_factor}` + `rope_parameters.sliding_attention.rope_theta` (`crates/mlx-core/src/models/gemma4/persistence.rs:192`, `:441`) | **no** — nothing writes `rope_parameters` |
+| family             | RoPE source at load                                                                                                                                                                               | recoverable from GGUF metadata?                                                    |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| qwen3_5 / lfm2 / … | flat top-level `rope_theta` (serde, `crates/mlx-core/src/models/qwen3_5/config.rs:88`)                                                                                                            | **yes** — `extract_config` writes it from `{arch}.rope.freq_base` (`gguf.rs:1783`) |
+| gemma4             | **nested** `rope_parameters.full_attention.{rope_theta, partial_rotary_factor}` + `rope_parameters.sliding_attention.rope_theta` (`crates/mlx-core/src/models/gemma4/persistence.rs:192`, `:441`) | **no** — nothing writes `rope_parameters`                                          |
 
 So for gemma4 with a synthesized config, `parse_rope_parameters(None)` returns the hard-coded triple
 `(1_000_000.0, 10_000.0, 0.25)` (`crates/mlx-core/src/models/gemma4/persistence.rs:446`), and the
@@ -878,22 +878,22 @@ becomes `log(-x)` because GGUF stores `-exp(A_log)` (`:1626`).
 ### dtype policy
 
 `GgufConversionOptions.dtype` accepts `float32|f32`, `float16|f16`, `bfloat16|bf16`
-(`crates/mlx-core/src/utils/gguf.rs:3363`). The napi doc says *"default: keep original"* (`:2904`) —
+(`crates/mlx-core/src/utils/gguf.rs:3363`). The napi doc says _"default: keep original"_ (`:2904`) —
 but the CLI never passes `None`: `const dtype = args.dtype || 'bfloat16'`
 (`packages/cli/src/commands/convert.ts:625`, the GGUF branch).
 
 The cast loop (`:3376`) skips a key if any of four tests hit:
 
-| # | test                                | line   | covers                                                  |
-| - | ----------------------------------- | ------ | -------------------------------------------------------- |
-| 1 | `preserve_dtype_keys.contains(key)` | `3377` | every K-quant-sourced output, named explicitly            |
-| 2 | `key.ends_with(".scales")`          | `3381` | affine f16 scales, K-quant int8/uint8 sub-scales          |
-| 3 | `key.ends_with(".biases")`          | `3381` | Q4_1 f16 minima, K-quant f16 `d`/`dmin`                   |
-| 4 | `arr.dtype() == DType::Uint32`      | `3386` | every packed weight plane                                 |
+| #   | test                                | line   | covers                                           |
+| --- | ----------------------------------- | ------ | ------------------------------------------------ |
+| 1   | `preserve_dtype_keys.contains(key)` | `3377` | every K-quant-sourced output, named explicitly   |
+| 2   | `key.ends_with(".scales")`          | `3381` | affine f16 scales, K-quant int8/uint8 sub-scales |
+| 3   | `key.ends_with(".biases")`          | `3381` | Q4_1 f16 minima, K-quant f16 `d`/`dmin`          |
+| 4   | `arr.dtype() == DType::Uint32`      | `3386` | every packed weight plane                        |
 
 `preserve_dtype_keys` (`:3319`) is built from the source tensor list mapped through the **same**
 `gguf_name_to_hf_for_metadata` that `remap_keys` uses, then expanded by `k_quant_output_keys`
-(`:947`). Tests 2-4 only *happen* to cover those keys today, which is why the producer and the
+(`:947`). Tests 2-4 only _happen_ to cover those keys today, which is why the producer and the
 do-not-cast set are named through one helper and cannot drift (`:3307`).
 
 ## SafeTensors inputs, families, foreign formats
@@ -909,7 +909,7 @@ else → Err "No model weights found"                                          :
 
 The index is used **only to derive the set of shard filenames**
 (`let shard_files: HashSet<String> = index.weight_map.values().cloned().collect();`, `:2403`), and
-shards merge with `all_tensors.extend(...)` (`:2427`). Tensor *names* in `weight_map` are never
+shards merge with `all_tensors.extend(...)` (`:2427`). Tensor _names_ in `weight_map` are never
 cross-checked in either direction.
 
 Output sharding is fixed and does not depend on the input layout
@@ -955,30 +955,30 @@ audio-carrying unified QAT into an importer that drops audio.
 Native registry: 12 `model_type` strings → 9 recipe impls (`recipe_for`,
 `crates/mlx-core/src/convert.rs:2783`).
 
-| `model_type`               | impl                            | struct line |
-| -------------------------- | ------------------------------- | ----------- |
-| `qwen3_asr`                | `Qwen3AsrRecipe`                | `1727`      |
-| `qwen3_5`, `qwen3_5_moe`   | `Qwen35Recipe { is_moe }`       | `226`       |
-| `lfm2`, `lfm2_moe`         | `Lfm2Recipe`                    | `1340`      |
-| `paddleocr-vl`             | `PaddleOcrVlRecipe`             | `1671`      |
-| `qianfan-ocr`              | `QianfanOcrRecipe`              | `1695`      |
-| `privacy-filter`           | `PrivacyFilterRecipe`           | `1800`      |
-| `muse_glimmer`             | `MuseGlimmerRecipe`             | `1832`      |
-| `gemma4`, `gemma4_unified` | `Gemma4Recipe`                  | `1912`      |
-| `nemotron_h`               | `NemotronHRecipe`               | `2720`      |
+| `model_type`               | impl                      | struct line |
+| -------------------------- | ------------------------- | ----------- |
+| `qwen3_asr`                | `Qwen3AsrRecipe`          | `1727`      |
+| `qwen3_5`, `qwen3_5_moe`   | `Qwen35Recipe { is_moe }` | `226`       |
+| `lfm2`, `lfm2_moe`         | `Lfm2Recipe`              | `1340`      |
+| `paddleocr-vl`             | `PaddleOcrVlRecipe`       | `1671`      |
+| `qianfan-ocr`              | `QianfanOcrRecipe`        | `1695`      |
+| `privacy-filter`           | `PrivacyFilterRecipe`     | `1800`      |
+| `muse_glimmer`             | `MuseGlimmerRecipe`       | `1832`      |
+| `gemma4`, `gemma4_unified` | `Gemma4Recipe`            | `1912`      |
+| `nemotron_h`               | `NemotronHRecipe`         | `2720`      |
 
 ### Recipe asymmetry flags
 
 Five behaviour flags on the trait (`crates/mlx-core/src/convert.rs:153`), all defaulting to the
 conservative value:
 
-| flag (default)                       | qwen3_asr | qwen3_5 | qwen3_5_moe | lfm2 / lfm2_moe | paddleocr-vl | qianfan-ocr | privacy-filter | muse_glimmer | gemma4\* | nemotron_h |
-| ------------------------------------ | --------- | ------- | ----------- | --------------- | ------------ | ----------- | -------------- | ------------ | -------- | ---------- |
-| `owns_dtype_cast` (false)            | false     | **true** (`1317`) | **true** | **true** (`1656`) | false | false  | false          | false        | false    | **true** (`2727`) |
-| `embed_quantizable` (false)          | **true** (`1792`) | false | false   | **true** (`1660`) | false | false  | false          | false        | false    | false      |
-| `sym8_supported` (false)             | false     | **true** (`1321`) | **true** | **true** (`1664`) | false | false  | false          | false        | **true** (`2055`) | false |
-| `quant_managed_by_sanitizer` (false) | false     | false   | false       | false           | false        | false       | **true** (`1822`) | false     | false    | false      |
-| `has_mtp` (None)                     | None      | **Sidecar** (`1330`) | **Inline** | None     | None         | None        | None           | None         | None     | None       |
+| flag (default)                       | qwen3_asr         | qwen3_5              | qwen3_5_moe | lfm2 / lfm2_moe   | paddleocr-vl | qianfan-ocr | privacy-filter    | muse_glimmer | gemma4\*          | nemotron_h        |
+| ------------------------------------ | ----------------- | -------------------- | ----------- | ----------------- | ------------ | ----------- | ----------------- | ------------ | ----------------- | ----------------- |
+| `owns_dtype_cast` (false)            | false             | **true** (`1317`)    | **true**    | **true** (`1656`) | false        | false       | false             | false        | false             | **true** (`2727`) |
+| `embed_quantizable` (false)          | **true** (`1792`) | false                | false       | **true** (`1660`) | false        | false       | false             | false        | false             | false             |
+| `sym8_supported` (false)             | false             | **true** (`1321`)    | **true**    | **true** (`1664`) | false        | false       | false             | false        | **true** (`2055`) | false             |
+| `quant_managed_by_sanitizer` (false) | false             | false                | false       | false             | false        | false       | **true** (`1822`) | false        | false             | false             |
+| `has_mtp` (None)                     | None              | **Sidecar** (`1330`) | **Inline**  | None              | None         | None        | None              | None         | None              | None              |
 
 `owns_dtype_cast = true` bypasses the generic dtype loop entirely (`:3878`), so the hard
 `Err("Unsupported target dtype")` at `:3966` is **unreachable** for qwen3_5 / qwen3_5_moe / lfm2 /
@@ -1023,7 +1023,7 @@ one Conv2d transpose gated on the heuristic `shape[1] < shape[2]` (`:85`). Unmat
 through unchanged.
 
 **privacy-filter** (`crates/mlx-core/src/convert.rs:1567`). **Identity pass** — `Ok(weights)`.
-Quantization is owned by a dedicated predicate block (`:2813`) that re-derives a *complete* per-layer
+Quantization is owned by a dedicated predicate block (`:2813`) that re-derives a _complete_ per-layer
 override map from the resulting `.scales` keys.
 
 ### Foreign weight formats
@@ -1100,14 +1100,14 @@ under `--q-mode sym8`**, via `sym8_eligible`'s `ndim != 2 → false`.
 `convert_model` never writes `vision.safetensors`. Vision/audio tensors stay in the main sharded
 output under their family prefix.
 
-| family                     | prefix kept                                     | quantized by the generic pass?                                     |
-| -------------------------- | ----------------------------------------------- | ------------------------------------------------------------------- |
-| qwen3_5 / qwen3_5_moe      | `vision_tower.`                                 | no — `should_quantize` skips it (`:3323`)                           |
-| paddleocr-vl               | `visual.`                                       | no (`:3324`)                                                        |
-| gemma4 (SigLIP)            | `vision_tower.`, `multi_modal_projector.`       | no for `vision_tower`; `multi_modal_projector` is **not** excluded  |
-| gemma4_unified             | `vision_embedder.`, `embed_vision.`             | `vision_embedder` skipped (`:3328`); `embed_vision.embedding_projection` forced to 8-bit affine by `is_affine_only_key` (`:3865`) |
-| gemma4 audio               | `audio_tower.`, `audio_encoder.`, `embed_audio.` | **yes** for `audio_tower`/`audio_encoder` outside sym8 — see gotchas |
-| qianfan-ocr                | `vision.`                                       | **yes** — no `vision.` arm in `should_quantize`                     |
+| family                | prefix kept                                      | quantized by the generic pass?                                                                                                    |
+| --------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| qwen3_5 / qwen3_5_moe | `vision_tower.`                                  | no — `should_quantize` skips it (`:3323`)                                                                                         |
+| paddleocr-vl          | `visual.`                                        | no (`:3324`)                                                                                                                      |
+| gemma4 (SigLIP)       | `vision_tower.`, `multi_modal_projector.`        | no for `vision_tower`; `multi_modal_projector` is **not** excluded                                                                |
+| gemma4_unified        | `vision_embedder.`, `embed_vision.`              | `vision_embedder` skipped (`:3328`); `embed_vision.embedding_projection` forced to 8-bit affine by `is_affine_only_key` (`:3865`) |
+| gemma4 audio          | `audio_tower.`, `audio_encoder.`, `embed_audio.` | **yes** for `audio_tower`/`audio_encoder` outside sym8 — see gotchas                                                              |
+| qianfan-ocr           | `vision.`                                        | **yes** — no `vision.` arm in `should_quantize`                                                                                   |
 
 The `vision.safetensors` sidecar is a **GGUF-path artifact**, written only by the `--mmproj` second
 pass (`packages/cli/src/commands/convert.ts:567`). At load it is **never required**:
@@ -1147,10 +1147,10 @@ quant_mtp == "split"                → mtp-drafter/ dir, EXCLUDED from Sidecar 
 `model_type: "qwen3_5_mtp"`, `block_size = mtp_num_hidden_layers + 2` (`:3624`),
 `tie_word_embeddings` defaulting to **true** when absent (`:3645`), and copies tokenizer assets from
 the **source** dir. It first removes stale legacy sidecars (`:3050`), because the dense loader probes
-`mtp.safetensors` *before* `mtp-drafter/`.
+`mtp.safetensors` _before_ `mtp-drafter/`.
 
 MTP sanitize is deliberately split from the body: the main `+1.0` norm loop skips `mtp.*`, but an
-**independent** probe (`:1069-1083`) samples the *mean* of `mtp.layers.0.input_layernorm.weight` and
+**independent** probe (`:1069-1083`) samples the _mean_ of `mtp.layers.0.input_layernorm.weight` and
 shifts the seven MTP norms when `mean < 0.5` (`:1146`). The comment at `:1141` records that a
 previous revision skipped `mtp.*` entirely and produced zero MTP acceptance.
 
@@ -1181,12 +1181,12 @@ the checkpoint, so any other gemma4 QAT variant is rejected rather than mis-repa
 
 Routing (`crates/mlx-core/src/convert_gemma_import.rs:483`):
 
-| source class                                    | detector          | output                              | override                   |
-| ----------------------------------------------- | ----------------- | ----------------------------------- | -------------------------- |
-| `embed_tokens_per_layer` (PLE)                  | name (`:585`)     | affine triplet, group 128           | `{4, 128, affine}`         |
-| I8 modules (per-layer gates, vision tower)      | `dtype == Int8` (`:633`) | **dequant to target dtype**  | none (dense at runtime)    |
-| 2/4-bit U8 linears / `lm_head` / `embed_tokens` | `dtype == Uint8` (`:554`) | affine triplet, group 128    | `{bits, 128, affine}`      |
-| floats (norms, projections, conv)               | fallthrough (`:567`) | cast + gemma4 conv transposes    | none                       |
+| source class                                    | detector                  | output                        | override                |
+| ----------------------------------------------- | ------------------------- | ----------------------------- | ----------------------- |
+| `embed_tokens_per_layer` (PLE)                  | name (`:585`)             | affine triplet, group 128     | `{4, 128, affine}`      |
+| I8 modules (per-layer gates, vision tower)      | `dtype == Int8` (`:633`)  | **dequant to target dtype**   | none (dense at runtime) |
+| 2/4-bit U8 linears / `lm_head` / `embed_tokens` | `dtype == Uint8` (`:554`) | affine triplet, group 128     | `{bits, 128, affine}`   |
+| floats (norms, projections, conv)               | fallthrough (`:567`)      | cast + gemma4 conv transposes | none                    |
 
 Bit routing: `lm_head`/`embed_tokens` → 2; attention q/k/v/o → 4; MLP → 4 for `layer <= 14`, else 2
 (`:292`). Dropped (`:235`): `.input_activation_scale`, `.output_activation_scale`, `.k_cache_scale`,
@@ -1205,11 +1205,11 @@ MLX:     w[o,c] =  q_unsigned[o,c] * scales[o,g] + biases[o,g],  g = c/group_siz
 
 Size cost at `LINEAR_GROUP_SIZE = 128`, `in = 2048`:
 
-|                              | 4-bit                     | 2-bit                     |
-| ---------------------------- | ------------------------- | ------------------------- |
-| Google source (per-row f32)  | 4 + 32/2048 = **4.0156**  | 2 + 32/2048 = **2.0156**  |
-| MLX affine @ gs 128          | 4 + 64/128 = **4.5**      | 2 + 64/128 = **2.5**      |
-| MLX affine @ gs 64 (rejected) | 4 + 64/64 = **5.0**      | 2 + 1.0 = **3.0**         |
+|                               | 4-bit                    | 2-bit                    |
+| ----------------------------- | ------------------------ | ------------------------ |
+| Google source (per-row f32)   | 4 + 32/2048 = **4.0156** | 2 + 32/2048 = **2.0156** |
+| MLX affine @ gs 128           | 4 + 64/128 = **4.5**     | 2 + 64/128 = **2.5**     |
+| MLX affine @ gs 64 (rejected) | 4 + 64/64 = **5.0**      | 2 + 1.0 = **3.0**        |
 
 Lossless but ~+0.48 bpw of pure redundancy, since every group in a row carries the identical source
 scale. 128 is MLX affine's largest legal group, which halves that overhead versus 64.
@@ -1270,6 +1270,7 @@ what v1 cannot use:
   - **Existing converted checkpoints must be regenerated.** Anything produced by the folding
     ingest carries pre-multiplied `.scales` and no `.global_scale`; the fail-closed check turns
     such a checkpoint into a loud load error rather than a silently-8%-wrong model.
+
 - **`lm_head`** — NVFP4 in the source, **dequantized to bf16** at ingest (a single dense matmul;
   keeping the widest matrix in bf16 avoids a 4-bit gather on it). The dequant uses the **exact**
   scale: dequantize with the unmodified `weight_scale` into F32, multiply by `weight_scale_2`,
@@ -1323,17 +1324,17 @@ output_config["quantization"] = quant_obj;
 ```
 
 That delete is load-bearing. `quantization_config` is NVIDIA modelopt's and gemma-QAT's name for
-the *input* encoding, so leaving it beside the block just written gives the loader two aliases that
+the _input_ encoding, so leaving it beside the block just written gives the loader two aliases that
 disagree — which `select_quantization_block` rejects outright.
 
 The **reader** still accepts `quantization_config`; dropping it would make an NVIDIA source
 un-ingestable. The GGUF converter still writes both keys.
 
-| writer                                       | site                                        | `skip_mtp` |
-| -------------------------------------------- | ------------------------------------------- | ---------- |
-| SafeTensors convert                          | `crates/mlx-core/src/convert.rs`            | `true`     |
-| GGUF → SafeTensors with `--quantize`         | `crates/mlx-core/src/utils/gguf.rs`         | `false`    |
-| GGUF → SafeTensors, source-preserved         | `crates/mlx-core/src/utils/gguf.rs`         | n/a        |
+| writer                               | site                                | `skip_mtp` |
+| ------------------------------------ | ----------------------------------- | ---------- |
+| SafeTensors convert                  | `crates/mlx-core/src/convert.rs`    | `true`     |
+| GGUF → SafeTensors with `--quantize` | `crates/mlx-core/src/utils/gguf.rs` | `false`    |
+| GGUF → SafeTensors, source-preserved | `crates/mlx-core/src/utils/gguf.rs` | n/a        |
 
 Built by one function so the frontends cannot diverge
 (`build_quantization_object`, `crates/mlx-core/src/convert.rs`):
@@ -1360,12 +1361,12 @@ separate `mtplx_mtp_quantization` object pinned to `{4, 32, affine}` (`:3155`).
 There is **no `mixed` field in any emitted config** — `grep -rn '"mixed"' --include=*.rs crates/`
 returns nothing. `mixed` is a local `bool` in the GGUF importer.
 
-| emitter                  | rule                                                                             | coverage           |
-| ------------------------ | -------------------------------------------------------------------------------- | ------------------ |
-| generic quantize         | entry only if `bits != default \|\| group_size != default \|\| mode != default` (`convert.rs:5601`) | **SPARSE by design** |
-| privacy-filter           | iterate every `*.scales` key, insert unconditionally (`convert.rs:2843`)          | 100 %              |
-| GGUF source-preserved    | modal profile wins top level; entry if `mixed \|\| profile.requires_explicit_entry()` (`gguf.rs:2344`) | see below |
-| gemma-QAT import         | `verify_override_coverage` **fails the conversion** on a gap (`convert_gemma_import.rs:268`) | 100 %, enforced |
+| emitter               | rule                                                                                                   | coverage             |
+| --------------------- | ------------------------------------------------------------------------------------------------------ | -------------------- |
+| generic quantize      | entry only if `bits != default \|\| group_size != default \|\| mode != default` (`convert.rs:5601`)    | **SPARSE by design** |
+| privacy-filter        | iterate every `*.scales` key, insert unconditionally (`convert.rs:2843`)                               | 100 %                |
+| GGUF source-preserved | modal profile wins top level; entry if `mixed \|\| profile.requires_explicit_entry()` (`gguf.rs:2344`) | see below            |
+| gemma-QAT import      | `verify_override_coverage` **fails the conversion** on a gap (`convert_gemma_import.rs:268`)           | 100 %, enforced      |
 
 GGUF modal derivation (`crates/mlx-core/src/utils/gguf.rs:2344`):
 
@@ -1412,24 +1413,24 @@ turns a loud missing-`.biases` failure into silent corruption."
 
 ### Loud vs silent
 
-| condition                                                          | behaviour                                                      | site                              |
-| ------------------------------------------------------------------ | -------------------------------------------------------------- | --------------------------------- |
-| `.biases` present AND config declares `symmetric_zero_point` for it | **Err** "derived or stored, never both"                        | `crates/mlx-core/src/engine/persistence.rs:257`              |
-| `.scales` non-floating under a symmetric declaration                | **Err** "an affine scale must be floating"                     | `crates/mlx-core/src/engine/persistence.rs:272`              |
-| both aliases present but **different**                             | **Err** "Conflicting quantization aliases … must be identical" | `quant_dispatch.rs:576`           |
-| either alias present but not an object                             | **Err** "Invalid {name} alias: expected an object"             | `quant_dispatch.rs:567`           |
-| `symmetric_zero_point != 1 << (bits-1)`                            | **Err** "a symmetric group subtracts {expected}"               | `quant_dispatch.rs:701`           |
-| `symmetric_zero_point` on a non-affine mode                        | **Err**                                                        | `quant_dispatch.rs:693`           |
-| K-quant group missing `.weight` / `.biases` / wrong dtype          | **Err**, names the layer                                       | `quant_dispatch.rs:432`           |
-| int8 weight resolving to non-sym8                                  | **Err** "config drift / stale quantization metadata"           | `quant_dispatch.rs:255`           |
-| u8 weight + float scales resolving to non-fp8_e4m3                 | **Err** "config drift / missing fp8_e4m3 override"             | `quant_dispatch.rs:288`           |
-| per-layer object naming mode/group_size but **no** `bits`          | **Err** — fails the whole load                                 | `quant_dispatch.rs:833`           |
-| per-layer object with **none** of bits/group_size/mode/input_amax/symmetric_zero_point | silent `continue`                          | `quant_dispatch.rs:824`           |
-| plain-Qwen3 loader given ANY non-empty quantization block          | **Err**, names the mode                                        | `crates/mlx-core/src/models/qwen3/persistence.rs:342`        |
-| **`config.json` unreadable / unparseable**                         | **silent** `Ok(0)` — no bias rebuild                           | `crates/mlx-core/src/engine/persistence.rs:227`, `:237`      |
-| **config text lacks the literal `symmetric_zero_point`**           | **silent** `Ok(0)`, block never strictly parsed                | `crates/mlx-core/src/engine/persistence.rs:234`              |
-| **`config.json` missing/unparseable at quant-settings load**       | **silent** caller defaults + EMPTY override map                | `quant_dispatch.rs:977`           |
-| `vision.safetensors` absent when `load_vision = true`              | silent `Ok(())`                                                | `crates/mlx-core/src/engine/persistence.rs:186`              |
+| condition                                                                              | behaviour                                                      | site                                                    |
+| -------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------- |
+| `.biases` present AND config declares `symmetric_zero_point` for it                    | **Err** "derived or stored, never both"                        | `crates/mlx-core/src/engine/persistence.rs:257`         |
+| `.scales` non-floating under a symmetric declaration                                   | **Err** "an affine scale must be floating"                     | `crates/mlx-core/src/engine/persistence.rs:272`         |
+| both aliases present but **different**                                                 | **Err** "Conflicting quantization aliases … must be identical" | `quant_dispatch.rs:576`                                 |
+| either alias present but not an object                                                 | **Err** "Invalid {name} alias: expected an object"             | `quant_dispatch.rs:567`                                 |
+| `symmetric_zero_point != 1 << (bits-1)`                                                | **Err** "a symmetric group subtracts {expected}"               | `quant_dispatch.rs:701`                                 |
+| `symmetric_zero_point` on a non-affine mode                                            | **Err**                                                        | `quant_dispatch.rs:693`                                 |
+| K-quant group missing `.weight` / `.biases` / wrong dtype                              | **Err**, names the layer                                       | `quant_dispatch.rs:432`                                 |
+| int8 weight resolving to non-sym8                                                      | **Err** "config drift / stale quantization metadata"           | `quant_dispatch.rs:255`                                 |
+| u8 weight + float scales resolving to non-fp8_e4m3                                     | **Err** "config drift / missing fp8_e4m3 override"             | `quant_dispatch.rs:288`                                 |
+| per-layer object naming mode/group_size but **no** `bits`                              | **Err** — fails the whole load                                 | `quant_dispatch.rs:833`                                 |
+| per-layer object with **none** of bits/group_size/mode/input_amax/symmetric_zero_point | silent `continue`                                              | `quant_dispatch.rs:824`                                 |
+| plain-Qwen3 loader given ANY non-empty quantization block                              | **Err**, names the mode                                        | `crates/mlx-core/src/models/qwen3/persistence.rs:342`   |
+| **`config.json` unreadable / unparseable**                                             | **silent** `Ok(0)` — no bias rebuild                           | `crates/mlx-core/src/engine/persistence.rs:227`, `:237` |
+| **config text lacks the literal `symmetric_zero_point`**                               | **silent** `Ok(0)`, block never strictly parsed                | `crates/mlx-core/src/engine/persistence.rs:234`         |
+| **`config.json` missing/unparseable at quant-settings load**                           | **silent** caller defaults + EMPTY override map                | `quant_dispatch.rs:977`                                 |
+| `vision.safetensors` absent when `load_vision = true`                                  | silent `Ok(())`                                                | `crates/mlx-core/src/engine/persistence.rs:186`         |
 
 The missing-weight message is deliberately bare and uninterpolated (`crates/mlx-core/src/models/gemma4/persistence.rs:502-807`):
 `Missing required weight: layers.7.self_attn.q_proj.weight`. Rationale at `:500`: without it "the
@@ -1463,7 +1464,7 @@ float scales + **mandatory** float `.biases`; mxfp/nvfp needs u32 + u8 scales an
 sym8 needs int8 + float scales; fp8_e4m3 needs rank 2/3 and no `.biases`; K-quants get a full ggml
 geometry check.
 
-The *recording* half is the regression, spelled out at `:6493`:
+The _recording_ half is the regression, spelled out at `:6493`:
 
 > "Record: a key the ladder moves off the top-level triple (every router gate, pinned to 8-bit
 > affine) needs its per-layer override re-emitted. Without it the config writer stamps the top-level
@@ -1475,7 +1476,7 @@ affine, survive the write and surface at first decode as `null handle returned: 
 naming neither the layer nor the shape.
 
 **Second round-trip hazard: the derived-bias claim.** `expand_symmetric_affine_biases` runs at the
-converter's *input* boundary (`:2447`), so the output is a *stored*-bias checkpoint.
+converter's _input_ boundary (`:2447`), so the output is a _stored_-bias checkpoint.
 `strip_symmetric_zero_point` (`:1930`) therefore removes `symmetric_zero_point` from both aliases and
 from every child object before writing. Without it, a plain `mlx convert` of an imported model
 produces an unloadable model — the loader hits the "derived or stored, never both" contradiction.
@@ -1519,12 +1520,12 @@ ratio = 0.5, hardcoded at BOTH entry points:
 
 Fold groups (`crates/mlx-core/src/convert.rs:6885`, impl `:6920`):
 
-| group | multiply by `s` (input cols)                                        | divide by `s`                                                        | missing target |
-| ----- | -------------------------------------------------------------------- | -------------------------------------------------------------------- | -------------- |
-| A     | `mlp.gate_proj`, `mlp.up_proj`                                       | **`pre_feedforward_layernorm` if present, else `post_attention_layernorm`** | **silent**  |
-| B     | `mlp.down_proj` (cols)                                               | `mlp.up_proj` (rows)                                                 | n/a            |
-| C     | `self_attn.{q,k,v}_proj`                                             | `input_layernorm`                                                    | warns          |
-| D     | `linear_attn.{in_proj_qkv, in_proj_z, in_proj_a, in_proj_b}`         | `input_layernorm`                                                    | warns          |
+| group | multiply by `s` (input cols)                                 | divide by `s`                                                               | missing target |
+| ----- | ------------------------------------------------------------ | --------------------------------------------------------------------------- | -------------- |
+| A     | `mlp.gate_proj`, `mlp.up_proj`                               | **`pre_feedforward_layernorm` if present, else `post_attention_layernorm`** | **silent**     |
+| B     | `mlp.down_proj` (cols)                                       | `mlp.up_proj` (rows)                                                        | n/a            |
+| C     | `self_attn.{q,k,v}_proj`                                     | `input_layernorm`                                                           | warns          |
+| D     | `linear_attn.{in_proj_qkv, in_proj_z, in_proj_a, in_proj_b}` | `input_layernorm`                                                           | warns          |
 
 `self_attn.o_proj` and `linear_attn.out_proj` are **not covered by design** — their inputs come from
 attention/GDN compute, not a norm (`:6891`).
@@ -1544,14 +1545,14 @@ worse than none" (`:7126`).
 
 Recipe acceptance:
 
-| recipe                                                          | imatrix                | gate                                          |
-| --------------------------------------------------------------- | ---------------------- | --------------------------------------------- |
-| `unsloth` legacy affine (no `--q-mxfp`, mode ≠ nvfp4)           | **required**           | `validate_unsloth_imatrix_selector`, `:4374`  |
-| `unsloth` + `--q-mxfp` or `--q-mode nvfp4`                      | optional (warns)       | `:4365`, `:2803`                              |
-| `unsloth` no-imatrix that failed family/shape validation        | **hard error**         | `validate_unsloth_imatrix_after_selection`, `:4396` |
-| `nvidia`                                                        | **rejected outright**  | `:5069` — "a data-free port; an imatrix would trigger AWQ pre-scaling that silently alters weights" |
-| `mixed_*`, `qwen3_5`, no recipe                                 | accepted, no gate      | `:2719`                                       |
-| gemma-QAT source / `--gguf-kquant`                              | **rejected**           | `:2267` / `packages/cli/src/commands/convert.ts:503` |
+| recipe                                                   | imatrix               | gate                                                                                                |
+| -------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------- |
+| `unsloth` legacy affine (no `--q-mxfp`, mode ≠ nvfp4)    | **required**          | `validate_unsloth_imatrix_selector`, `:4374`                                                        |
+| `unsloth` + `--q-mxfp` or `--q-mode nvfp4`               | optional (warns)      | `:4365`, `:2803`                                                                                    |
+| `unsloth` no-imatrix that failed family/shape validation | **hard error**        | `validate_unsloth_imatrix_after_selection`, `:4396`                                                 |
+| `nvidia`                                                 | **rejected outright** | `:5069` — "a data-free port; an imatrix would trigger AWQ pre-scaling that silently alters weights" |
+| `mixed_*`, `qwen3_5`, no recipe                          | accepted, no gate     | `:2719`                                                                                             |
+| gemma-QAT source / `--gguf-kquant`                       | **rejected**          | `:2267` / `packages/cli/src/commands/convert.ts:503`                                                |
 
 Pre-quantized bodies are rejected before any mutation (`reject_awq_for_prequantized_body`, `:6861`):
 "Packed weights cannot be safely AWQ-scaled and this converter has no dequantize/requantize path;
@@ -1625,63 +1626,63 @@ The highest-value section. Everything here is confirmed in code.
 
 ### Silent defaults that substitute for missing data
 
-| # | Trap                                                                                                                                                                                                                 | Where                                                                                     |
-| - | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| 1 | **An undetectable or unreadable `config.json` silently disables ALL sanitization.** The TS auto-detect wraps the config read in `try { … } catch {}`, leaving `modelType` undefined; the native driver then takes `None => converted_tensors` — pure dtype conversion, no key remap, no norm shift, no expert stacking, no error, no warning. Only an *explicit* unknown `-m` errors. A `model_type: "qwen3_5_text"` root config (accepted by `qwen35_recipe_family` but absent from the CLI's exact-match list) converts to a checkpoint that loads with raw ~0.0 RMSNorm weights. | `packages/cli/src/commands/convert.ts:648`, `crates/mlx-core/src/convert.rs:2699`, `:2688` |
-| 2 | **`load_quant_settings_from_disk` returns the caller's defaults + an EMPTY override map** when `config.json` is missing or is not valid JSON. No warning. An affine-4/64 fallback over bytes that were really affine-4/32 passes every storage guard and decodes garbage. | `crates/mlx-core/src/models/quant_dispatch.rs:977`                                          |
-| 3 | **`expand_symmetric_affine_biases` returns `Ok(0)` silently** on an unreadable config, an unparseable config, *and* when the raw config TEXT does not literally contain `symmetric_zero_point`. The last is a deliberate compatibility shim, but it means a corrupt config skips the bias rebuild. Caught loudly only in gemma4 / qwen3_5 / qwen3_5_moe / lfm2. | `crates/mlx-core/src/engine/persistence.rs:227`, `:234`, `:237`                            |
-| 4 | **`read_meta_array`'s unsupported-element arm yields an EMPTY `ArrayU32`**, so "unreadable" is indistinguishable from "empty". Only Uint32/Int32/Float32/String arrays decode; Bool, U8, I8, U16, I16, U64, I64, F64 all hit `_ => { … Ok(ArrayU32(Vec::new())) }`. Live victim: `gemma4.attention.sliding_window_pattern` is a bool array, which is why the K=V inference falls back to `head_count_kv`. | `crates/mlx-core/src/utils/gguf.rs:447`, `:2023`                                            |
-| 5 | **`extract_config`'s value match has `_ => {}`, dropping every array-valued metadata field.** Gemma4 spells `attention.head_count_kv` as an array, so `num_key_value_heads` is silently dropped — the exact reason `apply_gemma4_attention_geometry` exists. Any other architecture spelling a mapped field as an array gets the same drop, with no rescue helper. | `crates/mlx-core/src/utils/gguf.rs:1790`, `:2242`                                            |
-| 6 | **`fixup_qwen35_linear_attn` uses hard-coded geometry fallbacks**: `ssm.state_size` → 128, `ssm.inner_size` → 4096, `qk_dim` → 4096, and silently `Ok(())`s when `n_value_heads < 2`.                                                                                        | `crates/mlx-core/src/utils/gguf.rs:1584`, `:1598`, `:1613`                                  |
-| 7 | **Unknown Paddle dtypes silently become f32 and desync the stream parse.** `paddle_dtype_to_str` maps only 2/3/4/5/6; `numpy_dtype_size` also defaults to 4; `parse_tensor_desc` defaults `dtype = 5` when absent. The `.pdiparams` reader is a sequential byte walk, so a wrong `elem_size` lands the offset mid-tensor and every later tensor is garbage. | `crates/mlx-core/src/utils/foreign_weights.rs:1199`, `:776`, `:1095`                        |
-| 8 | **Missing MoE config fields fall back to magic numbers with only a `warn!`** — `num_experts` → 256, `num_hidden_layers` → 40. The failure then surfaces as "Missing expert weight: …" naming an expert index, not "num_experts not found".                                     | `crates/mlx-core/src/convert.rs:518`, `:872`                                                |
-| 9 | **The `mlx_dequantize` FFI shim substitutes `"affine"` for a null/empty mode string** (`mlx_advanced_ops.cpp:872`) and treats `group_size <= 0` / `bits <= 0` as "use the mode default" (`:869-870`). The `-1` sentinel convention collides with sym8/fp8_e4m3's own `-1` group-size sentinel, so a `-1` arriving here is silently reinterpreted. | `crates/mlx-sys/src/mlx_advanced_ops.cpp:869`, `:872`                                       |
+| #   | Trap                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Where                                                                                      |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| 1   | **An undetectable or unreadable `config.json` silently disables ALL sanitization.** The TS auto-detect wraps the config read in `try { … } catch {}`, leaving `modelType` undefined; the native driver then takes `None => converted_tensors` — pure dtype conversion, no key remap, no norm shift, no expert stacking, no error, no warning. Only an _explicit_ unknown `-m` errors. A `model_type: "qwen3_5_text"` root config (accepted by `qwen35_recipe_family` but absent from the CLI's exact-match list) converts to a checkpoint that loads with raw ~0.0 RMSNorm weights. | `packages/cli/src/commands/convert.ts:648`, `crates/mlx-core/src/convert.rs:2699`, `:2688` |
+| 2   | **`load_quant_settings_from_disk` returns the caller's defaults + an EMPTY override map** when `config.json` is missing or is not valid JSON. No warning. An affine-4/64 fallback over bytes that were really affine-4/32 passes every storage guard and decodes garbage.                                                                                                                                                                                                                                                                                                           | `crates/mlx-core/src/models/quant_dispatch.rs:977`                                         |
+| 3   | **`expand_symmetric_affine_biases` returns `Ok(0)` silently** on an unreadable config, an unparseable config, _and_ when the raw config TEXT does not literally contain `symmetric_zero_point`. The last is a deliberate compatibility shim, but it means a corrupt config skips the bias rebuild. Caught loudly only in gemma4 / qwen3_5 / qwen3_5_moe / lfm2.                                                                                                                                                                                                                     | `crates/mlx-core/src/engine/persistence.rs:227`, `:234`, `:237`                            |
+| 4   | **`read_meta_array`'s unsupported-element arm yields an EMPTY `ArrayU32`**, so "unreadable" is indistinguishable from "empty". Only Uint32/Int32/Float32/String arrays decode; Bool, U8, I8, U16, I16, U64, I64, F64 all hit `_ => { … Ok(ArrayU32(Vec::new())) }`. Live victim: `gemma4.attention.sliding_window_pattern` is a bool array, which is why the K=V inference falls back to `head_count_kv`.                                                                                                                                                                           | `crates/mlx-core/src/utils/gguf.rs:447`, `:2023`                                           |
+| 5   | **`extract_config`'s value match has `_ => {}`, dropping every array-valued metadata field.** Gemma4 spells `attention.head_count_kv` as an array, so `num_key_value_heads` is silently dropped — the exact reason `apply_gemma4_attention_geometry` exists. Any other architecture spelling a mapped field as an array gets the same drop, with no rescue helper.                                                                                                                                                                                                                  | `crates/mlx-core/src/utils/gguf.rs:1790`, `:2242`                                          |
+| 6   | **`fixup_qwen35_linear_attn` uses hard-coded geometry fallbacks**: `ssm.state_size` → 128, `ssm.inner_size` → 4096, `qk_dim` → 4096, and silently `Ok(())`s when `n_value_heads < 2`.                                                                                                                                                                                                                                                                                                                                                                                               | `crates/mlx-core/src/utils/gguf.rs:1584`, `:1598`, `:1613`                                 |
+| 7   | **Unknown Paddle dtypes silently become f32 and desync the stream parse.** `paddle_dtype_to_str` maps only 2/3/4/5/6; `numpy_dtype_size` also defaults to 4; `parse_tensor_desc` defaults `dtype = 5` when absent. The `.pdiparams` reader is a sequential byte walk, so a wrong `elem_size` lands the offset mid-tensor and every later tensor is garbage.                                                                                                                                                                                                                         | `crates/mlx-core/src/utils/foreign_weights.rs:1199`, `:776`, `:1095`                       |
+| 8   | **Missing MoE config fields fall back to magic numbers with only a `warn!`** — `num_experts` → 256, `num_hidden_layers` → 40. The failure then surfaces as "Missing expert weight: …" naming an expert index, not "num_experts not found".                                                                                                                                                                                                                                                                                                                                          | `crates/mlx-core/src/convert.rs:518`, `:872`                                               |
+| 9   | **The `mlx_dequantize` FFI shim substitutes `"affine"` for a null/empty mode string** (`mlx_advanced_ops.cpp:872`) and treats `group_size <= 0` / `bits <= 0` as "use the mode default" (`:869-870`). The `-1` sentinel convention collides with sym8/fp8_e4m3's own `-1` group-size sentinel, so a `-1` arriving here is silently reinterpreted.                                                                                                                                                                                                                                   | `crates/mlx-sys/src/mlx_advanced_ops.cpp:869`, `:872`                                      |
 
 ### Silent losses
 
-| # | Trap                                                                                                                                                                                                                            | Where                                                                            |
-| - | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| 10 | **SafeTensors weight-file discovery is first-match-wins**, so a stray single-file `model.safetensors` beside a shard index silently masks every shard. There is no cross-check that the index's `weight_map` is covered — the map is used only to derive the shard *filename* set — and shards merge with `HashMap::extend` over an unordered `HashSet`, so a name in two shards resolves nondeterministically. | `crates/mlx-core/src/convert.rs:2355`, `:2403`, `:2427`                          |
-| 12 | **`.pdiparams` name↔tensor pairing is positional with only a count check.** Names are sorted by de-`_deepcopy_N`'d name and zipped against binary order; the decoded `dims` are explicitly discarded (`for (name, (_dims, array)) in …`). If Paddle's on-disk order ever diverges from alphabetical, every tensor gets the wrong name and the conversion reports success. | `crates/mlx-core/src/utils/foreign_weights.rs:992`, `:1002`, `:1005`             |
-| 13 | **No multi-part / split GGUF support, and no error when one is passed.** The parser reads no `split.no` / `split.count` / `split.tensors.count` keys. `model-00001-of-00003.gguf` imports only that shard's tensors and exits cleanly with a plausible `numTensors`. | `crates/mlx-core/src/utils/gguf.rs:459`                                          |
-| 14 | **`rope_freqs.weight` is dropped only by the gemma4 map**; the generic map writes it into the output under its raw GGUF name, as dead weight the loader does not expect. It is the only tensor any map ever drops. | `crates/mlx-core/src/utils/gguf.rs:1179`, `:1299`, `:1372`                       |
-| 15 | **For gemma4, the `rope_theta` extracted from GGUF metadata is DEAD**, and `partial_rotary_factor` has no GGUF source at all. The gemma4 loader reads only a nested `rope_parameters` object that nothing in the converter writes, so a gemma4 GGUF converted without `--config-dir` silently gets `(1e6, 1e4, 0.25)` while the extracted flat field sits in config.json looking authoritative. Other families read it flat and are unaffected — which is what makes this easy to miss. | `crates/mlx-core/src/models/gemma4/persistence.rs:441`, `crates/mlx-core/src/utils/gguf.rs:1783` |
-| 16 | **The gemma-QAT importer drops the entire activation half of "wNa8o8"** — `.input_activation_scale`, `.output_activation_scale`, `.k_cache_scale`, `.v_cache_scale`. The imported model is weight-only. | `crates/mlx-core/src/convert_gemma_import.rs:235`                                |
-| 18 | **`--config-dir`'s asset copy fails hard, but the implicit alongside-GGUF copy only warns.** Same loop, two branches — without `--config-dir`, a permission error or full disk while copying `tokenizer.json` gives a warning line and a `✓ Converted` banner, leaving an unusable directory. | `crates/mlx-core/src/utils/gguf.rs:3214`                                         |
-| 19 | **The `vision.safetensors` media sidecar is silently optional at load.** `append_vision_safetensors` returns `Ok(())` when the file is absent even though `should_load_media_sidecar` returned true. Only a few individual weights have explicit presence checks. | `crates/mlx-core/src/engine/persistence.rs:185`, `crates/mlx-core/src/models/gemma4/persistence.rs:392` |
-| 20 | **On the GGUF path an AWQ whole-model no-match is completely silent.** `apply_gguf_awq_prescaling` discards the returned `modified` count, so the SafeTensors path's `warn!("modified == 0")` has no GGUF counterpart. Layer-prefix detection recognizes only `language_model.model.layers.` and `model.layers.`, so a third wrapper spelling gets zero AWQ. | `crates/mlx-core/src/utils/gguf.rs:2466`, `crates/mlx-core/src/convert.rs:2725`, `:6911` |
-| 21 | **An imatrix tensor whose `.counts` is ≤ 0 or absent is silently `continue`d** and never enters the importance map. Group A may still fire on the surviving partner, producing a scale derived from half the intended evidence. | `crates/mlx-core/src/utils/imatrix.rs:294`, `crates/mlx-core/src/convert.rs:7103` |
+| #   | Trap                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Where                                                                                                   |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| 10  | **SafeTensors weight-file discovery is first-match-wins**, so a stray single-file `model.safetensors` beside a shard index silently masks every shard. There is no cross-check that the index's `weight_map` is covered — the map is used only to derive the shard _filename_ set — and shards merge with `HashMap::extend` over an unordered `HashSet`, so a name in two shards resolves nondeterministically.                                                                         | `crates/mlx-core/src/convert.rs:2355`, `:2403`, `:2427`                                                 |
+| 12  | **`.pdiparams` name↔tensor pairing is positional with only a count check.** Names are sorted by de-`_deepcopy_N`'d name and zipped against binary order; the decoded `dims` are explicitly discarded (`for (name, (_dims, array)) in …`). If Paddle's on-disk order ever diverges from alphabetical, every tensor gets the wrong name and the conversion reports success.                                                                                                               | `crates/mlx-core/src/utils/foreign_weights.rs:992`, `:1002`, `:1005`                                    |
+| 13  | **No multi-part / split GGUF support, and no error when one is passed.** The parser reads no `split.no` / `split.count` / `split.tensors.count` keys. `model-00001-of-00003.gguf` imports only that shard's tensors and exits cleanly with a plausible `numTensors`.                                                                                                                                                                                                                    | `crates/mlx-core/src/utils/gguf.rs:459`                                                                 |
+| 14  | **`rope_freqs.weight` is dropped only by the gemma4 map**; the generic map writes it into the output under its raw GGUF name, as dead weight the loader does not expect. It is the only tensor any map ever drops.                                                                                                                                                                                                                                                                      | `crates/mlx-core/src/utils/gguf.rs:1179`, `:1299`, `:1372`                                              |
+| 15  | **For gemma4, the `rope_theta` extracted from GGUF metadata is DEAD**, and `partial_rotary_factor` has no GGUF source at all. The gemma4 loader reads only a nested `rope_parameters` object that nothing in the converter writes, so a gemma4 GGUF converted without `--config-dir` silently gets `(1e6, 1e4, 0.25)` while the extracted flat field sits in config.json looking authoritative. Other families read it flat and are unaffected — which is what makes this easy to miss. | `crates/mlx-core/src/models/gemma4/persistence.rs:441`, `crates/mlx-core/src/utils/gguf.rs:1783`        |
+| 16  | **The gemma-QAT importer drops the entire activation half of "wNa8o8"** — `.input_activation_scale`, `.output_activation_scale`, `.k_cache_scale`, `.v_cache_scale`. The imported model is weight-only.                                                                                                                                                                                                                                                                                 | `crates/mlx-core/src/convert_gemma_import.rs:235`                                                       |
+| 18  | **`--config-dir`'s asset copy fails hard, but the implicit alongside-GGUF copy only warns.** Same loop, two branches — without `--config-dir`, a permission error or full disk while copying `tokenizer.json` gives a warning line and a `✓ Converted` banner, leaving an unusable directory.                                                                                                                                                                                           | `crates/mlx-core/src/utils/gguf.rs:3214`                                                                |
+| 19  | **The `vision.safetensors` media sidecar is silently optional at load.** `append_vision_safetensors` returns `Ok(())` when the file is absent even though `should_load_media_sidecar` returned true. Only a few individual weights have explicit presence checks.                                                                                                                                                                                                                       | `crates/mlx-core/src/engine/persistence.rs:185`, `crates/mlx-core/src/models/gemma4/persistence.rs:392` |
+| 20  | **On the GGUF path an AWQ whole-model no-match is completely silent.** `apply_gguf_awq_prescaling` discards the returned `modified` count, so the SafeTensors path's `warn!("modified == 0")` has no GGUF counterpart. Layer-prefix detection recognizes only `language_model.model.layers.` and `model.layers.`, so a third wrapper spelling gets zero AWQ.                                                                                                                            | `crates/mlx-core/src/utils/gguf.rs:2466`, `crates/mlx-core/src/convert.rs:2725`, `:6911`                |
+| 21  | **An imatrix tensor whose `.counts` is ≤ 0 or absent is silently `continue`d** and never enters the importance map. Group A may still fire on the surviving partner, producing a scale derived from half the intended evidence.                                                                                                                                                                                                                                                         | `crates/mlx-core/src/utils/imatrix.rs:294`, `crates/mlx-core/src/convert.rs:7103`                       |
 
 ### Flags that do less than they look like
 
-| # | Trap                                                                                                                                                                                                                                  | Where                                                                       |
-| - | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 22 | **`--q-mxfp` is a complete no-op on `mixed_2_6` and `mixed_3_6`, and a partial no-op on `mixed_3_4`.** The upgrade arms match only `bits: 8` and `bits: 4`; `mixed_2_6` emits 2- and 6-bit, `mixed_3_6` emits 3- and 6-bit. The CLI prints `--q-mxfp: eligible 8b->mxfp8/4b->mxfp4` with no warning that the eligible set is empty. | `crates/mlx-core/src/convert.rs:4876`, `:3955`, `packages/cli/src/commands/convert.ts:404` |
-| 23 | **`--q-bits` is silently ignored by all four `mixed_*` recipes.** `build_predicate_for_recipe` forwards only `default_group_size` to `build_recipe_predicate`, which has no bits parameter — but `--q-bits 8` still changes the recorded top-level `bits`, and therefore which decisions count as overrides. | `crates/mlx-core/src/convert.rs:5214`, `:3949`                              |
-| 24 | **`--model-type` is parsed but never read at all on the GGUF path** — not forwarded, not validated, not auto-detected. The GGUF branch returns before the auto-detect block, and `GgufConversionOptions` has no `model_type` field. This is load-bearing for the nvidia gate: GGUF passes `None` for both `config_family` and `requested_model_type`, which is what makes `--q-recipe nvidia` on GGUF reject wholesale. | `packages/cli/src/commands/convert.ts:591`, `crates/mlx-core/src/utils/gguf.rs:2529` |
-| 25 | **`--config-dir`, `--mmproj`, and `--imatrix-path` are fully validated by the CLI and then silently discarded on the paths where they do not apply.** `ConversionOptions` has no `config_source_dir` and no mmproj field at all; the foreign path forwards no imatrix. The user sees a successful conversion with no warning. | `packages/cli/src/commands/convert.ts:440-475`, `:669`, `:706`               |
-| 26 | **`--q-mtp cyankiwi`/`all` silently no-ops on any non-Qwen model type AND still writes a false `mtplx_mtp_quantization: {prequantized: true}` block.** The "no mtp.* tensors" safety errors are scoped to `MtpPolicy::Sidecar` / `Inline` / `is_split`; for `MtpPolicy::None` nothing rejects it, but the config writer is gated only on `do_quantize && quant_mtp != "off" && !is_split`. | `crates/mlx-core/src/convert.rs:2978`, `:3148`                              |
-| 27 | **`--q-recipe` without `--quantize` is silently ignored on the GGUF path** — the guard exists in `convert.rs:2110` and has no GGUF counterpart. Except `unsloth` and `nvidia`, whose validators run *unconditionally* and still hard-error. Inconsistent coverage of one flag. | `crates/mlx-core/src/convert.rs:2110`, `crates/mlx-core/src/utils/gguf.rs:2503`, `:2941` |
-| 28 | **`apply_mxfp_upgrade`'s `Default` arm falls through to `Default` for any `default_bits` outside {4, 8}.** Under `--q-recipe unsloth --q-mxfp` on a checkpoint that FAILS official-map validation, any key the legacy predicate leaves `Default` stays 3-bit affine gs 64 while the request said mxfp. The recorded metadata is *correct* (it matches the top-level triple) but the checkpoint is not what the flag promised. | `crates/mlx-core/src/convert.rs:4863`                                       |
-| 29 | **The `--gguf-kquant` + re-quantization reject uses two different predicates.** TS rejects on flags alone, unconditionally; Rust rejects only when the source file actually contains K-quant tensors. `importKQuants: true, quantize: true` on a BF16 GGUF is accepted natively and refused by the CLI. | `packages/cli/src/commands/convert.ts:502`, `crates/mlx-core/src/utils/gguf.rs:2591` |
-| 30 | **`--mmproj` silently rewrites the MAIN model's tensor keys to the `language_model.*` VLM namespace**, which `--help` does not mention — it describes `--mmproj` purely as "Converts and merges vision weights". The mmproj sub-conversion also hardcodes `dtype: 'bfloat16'`, ignoring `--dtype`. | `packages/cli/src/commands/convert.ts:42`, `:550`, `:569`, `crates/mlx-core/src/utils/gguf.rs:3061` |
-| 31 | **The CLI's `-d` default makes the napi field's documented "keep original" behaviour unreachable.** `const dtype = args.dtype \|\| 'bfloat16'` is forwarded unconditionally, so an F32 GGUF is always downcast to bf16 unless `-d float32` is given. | `packages/cli/src/commands/convert.ts:512`, `crates/mlx-core/src/utils/gguf.rs:2404` |
-| 32 | **The `mlx calibrate` per-5% progress logging is dead code.** `calibrate()` runs one blocking native call then calls `onProgress?.(rows.length, rows.length)`, so the handler's throttling can only ever emit a single `calibrated N/N rows` line. A 1024×512 calibration prints nothing for its whole runtime, which reads as a hang. | `packages/cli/src/commands/calibrate.ts:91`, `:193`                         |
+| #   | Trap                                                                                                                                                                                                                                                                                                                                                                                                                          | Where                                                                                               |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| 22  | **`--q-mxfp` is a complete no-op on `mixed_2_6` and `mixed_3_6`, and a partial no-op on `mixed_3_4`.** The upgrade arms match only `bits: 8` and `bits: 4`; `mixed_2_6` emits 2- and 6-bit, `mixed_3_6` emits 3- and 6-bit. The CLI prints `--q-mxfp: eligible 8b->mxfp8/4b->mxfp4` with no warning that the eligible set is empty.                                                                                           | `crates/mlx-core/src/convert.rs:4876`, `:3955`, `packages/cli/src/commands/convert.ts:404`          |
+| 23  | **`--q-bits` is silently ignored by all four `mixed_*` recipes.** `build_predicate_for_recipe` forwards only `default_group_size` to `build_recipe_predicate`, which has no bits parameter — but `--q-bits 8` still changes the recorded top-level `bits`, and therefore which decisions count as overrides.                                                                                                                  | `crates/mlx-core/src/convert.rs:5214`, `:3949`                                                      |
+| 24  | **`--model-type` is parsed but never read at all on the GGUF path** — not forwarded, not validated, not auto-detected. The GGUF branch returns before the auto-detect block, and `GgufConversionOptions` has no `model_type` field. This is load-bearing for the nvidia gate: GGUF passes `None` for both `config_family` and `requested_model_type`, which is what makes `--q-recipe nvidia` on GGUF reject wholesale.       | `packages/cli/src/commands/convert.ts:591`, `crates/mlx-core/src/utils/gguf.rs:2529`                |
+| 25  | **`--config-dir`, `--mmproj`, and `--imatrix-path` are fully validated by the CLI and then silently discarded on the paths where they do not apply.** `ConversionOptions` has no `config_source_dir` and no mmproj field at all; the foreign path forwards no imatrix. The user sees a successful conversion with no warning.                                                                                                 | `packages/cli/src/commands/convert.ts:440-475`, `:669`, `:706`                                      |
+| 26  | **`--q-mtp cyankiwi`/`all` silently no-ops on any non-Qwen model type AND still writes a false `mtplx_mtp_quantization: {prequantized: true}` block.** The "no mtp.* tensors" safety errors are scoped to `MtpPolicy::Sidecar` / `Inline` / `is_split`; for `MtpPolicy::None` nothing rejects it, but the config writer is gated only on `do_quantize && quant_mtp != "off" && !is_split`.                                    | `crates/mlx-core/src/convert.rs:2978`, `:3148`                                                      |
+| 27  | **`--q-recipe` without `--quantize` is silently ignored on the GGUF path** — the guard exists in `convert.rs:2110` and has no GGUF counterpart. Except `unsloth` and `nvidia`, whose validators run _unconditionally_ and still hard-error. Inconsistent coverage of one flag.                                                                                                                                                | `crates/mlx-core/src/convert.rs:2110`, `crates/mlx-core/src/utils/gguf.rs:2503`, `:2941`            |
+| 28  | **`apply_mxfp_upgrade`'s `Default` arm falls through to `Default` for any `default_bits` outside {4, 8}.** Under `--q-recipe unsloth --q-mxfp` on a checkpoint that FAILS official-map validation, any key the legacy predicate leaves `Default` stays 3-bit affine gs 64 while the request said mxfp. The recorded metadata is _correct_ (it matches the top-level triple) but the checkpoint is not what the flag promised. | `crates/mlx-core/src/convert.rs:4863`                                                               |
+| 29  | **The `--gguf-kquant` + re-quantization reject uses two different predicates.** TS rejects on flags alone, unconditionally; Rust rejects only when the source file actually contains K-quant tensors. `importKQuants: true, quantize: true` on a BF16 GGUF is accepted natively and refused by the CLI.                                                                                                                       | `packages/cli/src/commands/convert.ts:502`, `crates/mlx-core/src/utils/gguf.rs:2591`                |
+| 30  | **`--mmproj` silently rewrites the MAIN model's tensor keys to the `language_model.*` VLM namespace**, which `--help` does not mention — it describes `--mmproj` purely as "Converts and merges vision weights". The mmproj sub-conversion also hardcodes `dtype: 'bfloat16'`, ignoring `--dtype`.                                                                                                                            | `packages/cli/src/commands/convert.ts:42`, `:550`, `:569`, `crates/mlx-core/src/utils/gguf.rs:3061` |
+| 31  | **The CLI's `-d` default makes the napi field's documented "keep original" behaviour unreachable.** `const dtype = args.dtype \|\| 'bfloat16'` is forwarded unconditionally, so an F32 GGUF is always downcast to bf16 unless `-d float32` is given.                                                                                                                                                                          | `packages/cli/src/commands/convert.ts:512`, `crates/mlx-core/src/utils/gguf.rs:2404`                |
+| 32  | **The `mlx calibrate` per-5% progress logging is dead code.** `calibrate()` runs one blocking native call then calls `onProgress?.(rows.length, rows.length)`, so the handler's throttling can only ever emit a single `calibrated N/N rows` line. A 1024×512 calibration prints nothing for its whole runtime, which reads as a hang.                                                                                        | `packages/cli/src/commands/calibrate.ts:91`, `:193`                                                 |
 
 ### Validation that fires too late, or not at all
 
-| # | Trap                                                                                                                                                                                              | Where                                                                       |
-| - | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 33 | **Neither layer validates `--q-bits` against MLX's {2,3,4,5,6,8}, nor `--q-group-size` against affine's {32,64,128}.** TS checks `/^[1-9]\d*$/`; Rust checks `> 0` (and even that is missing on the GGUF path). `--q-bits 7 --q-mode affine` or `--q-group-size 48` reaches `mlx_quantize` mid-conversion. `convert.rs:2871` states the affine constraint in a comment while validating nothing. | `packages/cli/src/commands/convert.ts:220`, `crates/mlx-core/src/convert.rs:2019`, `:2871`, `:5320` |
-| 34 | **`build_qwen35_recipe` can emit `bits = 7`**, which the repo's own comment says MLX cannot express. `high_bits = (default_bits + 2).min(8)` with NO `snap_bits`. `--q-bits 5` ⇒ attention/GDN at 7; `--q-bits 6` ⇒ `down_proj` at 7. | `crates/mlx-core/src/convert.rs:4053`, `:4176`                              |
-| 35 | **`--q-mode nvfp4` without `--q-recipe` is rejected only in Rust, and only after the entire checkpoint is loaded and sanitized.** On a 100 GB MoE that is many minutes of work before a purely static flag error. Same for `--q-mxfp` without a recipe and bits ∉ {4,8}. | `crates/mlx-core/src/convert.rs:2930`, `:2944`, `crates/mlx-core/src/utils/gguf.rs:3012` |
-| 36 | **`--config-dir` pointing at a directory with no `config.json` is not detected until AFTER `model.safetensors` has been written.** The TS check only verifies the directory exists. The output is left with valid weights and no config. | `packages/cli/src/commands/convert.ts:466`, `crates/mlx-core/src/utils/gguf.rs:3096`, `:3109` |
-| 37 | **The affine GGUF repack performs no divisibility validation**, unlike the K-quant path which rejects a last dim that is not a positive multiple of `QK_K`. `load_quantized_tensor` uses integer division throughout; a 2-row tensor with last dim 48 indexes `scales[2]` out of bounds — a panic across the napi boundary, not a named error. | `crates/mlx-core/src/utils/gguf.rs:776`, `:978`                             |
-| 38 | **`Vec::with_capacity` on `tensor_count` and `n_dims` is not covered by `MAX_GGUF_ALLOC`.** The 256 MiB cap applies to string lengths and array element *counts* only (256 M `String` headers ≈ 6 GB). A malformed header can abort the process before a single tensor is parsed. | `crates/mlx-core/src/utils/gguf.rs:511`, `:517`, `:362`                     |
-| 39 | **The gemma-QAT "already quantized" reject is narrower than it looks.** It is gated on `is_gemma_qat_family` = `nvidia_recipe_family(model_type) == Some("gemma4") && is_gemma_qat_source`, so a gemma-QAT source converted with a mismatched `-m` (e.g. `-m qwen3_5 -q`) escapes it entirely and falls through to the generic quantizer, which would re-quantize already-quantized weights. Only the *unified* reject hangs off bare `is_gemma_qat_source`. | `crates/mlx-core/src/convert.rs:2264`, `:2267`, `:2284`                     |
-| 40 | **`--dtype` is validated inconsistently by family.** For `owns_dtype_cast` families the generic loop is bypassed, so `Err("Unsupported target dtype")` is unreachable and a `warn!` is the only handler. `mlx convert -m qwen3_5 -d float64` prints `Dtype: float64`, writes bf16, exits 0. The same flag on `-m gemma4` hard-errors. **`-m nemotron_h` is a third behaviour**: its sanitize binds the parameter as `_target_dtype_str` and never reads it, so `--dtype` is a silent no-op with not even a warning — correct for a format-preserving ingest, indistinguishable from a working flag at the CLI. | `crates/mlx-core/src/convert.rs:686`, `:3878`, `:3966`, `:2731`             |
-| 42 | **`verify_override_coverage` — the set-difference audit — exists ONLY for the gemma-prequant import.** Its doc explains why: the generic paths' override maps are intentionally sparse, so a `.scales` tensor without an override is normal there. No automated guard will catch a coverage hole on any other path. | `crates/mlx-core/src/convert_gemma_import.rs:262`                           |
-| 43 | **A sym8 checkpoint refuses to load on any GPU below Apple gen 17 (M5).** `try_build_sym8_quantized_linear` hard-errors with "sym8 checkpoints require an M5+ GPU". `sym8_eligible` deliberately OMITS this check because it is a runtime property, so conversion succeeds on an M1–M4 box and produces a checkpoint that same box cannot load. Neither `docs/cli.md:144` nor the `--q-mode` help mentions it. | `crates/mlx-core/src/models/qwen3_5/quantized_linear.rs:389`, `crates/mlx-core/src/convert.rs:5546` |
+| #   | Trap                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Where                                                                                               |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| 33  | **Neither layer validates `--q-bits` against MLX's {2,3,4,5,6,8}, nor `--q-group-size` against affine's {32,64,128}.** TS checks `/^[1-9]\d*$/`; Rust checks `> 0` (and even that is missing on the GGUF path). `--q-bits 7 --q-mode affine` or `--q-group-size 48` reaches `mlx_quantize` mid-conversion. `convert.rs:2871` states the affine constraint in a comment while validating nothing.                                                                                                                                                                                                               | `packages/cli/src/commands/convert.ts:220`, `crates/mlx-core/src/convert.rs:2019`, `:2871`, `:5320` |
+| 34  | **`build_qwen35_recipe` can emit `bits = 7`**, which the repo's own comment says MLX cannot express. `high_bits = (default_bits + 2).min(8)` with NO `snap_bits`. `--q-bits 5` ⇒ attention/GDN at 7; `--q-bits 6` ⇒ `down_proj` at 7.                                                                                                                                                                                                                                                                                                                                                                          | `crates/mlx-core/src/convert.rs:4053`, `:4176`                                                      |
+| 35  | **`--q-mode nvfp4` without `--q-recipe` is rejected only in Rust, and only after the entire checkpoint is loaded and sanitized.** On a 100 GB MoE that is many minutes of work before a purely static flag error. Same for `--q-mxfp` without a recipe and bits ∉ {4,8}.                                                                                                                                                                                                                                                                                                                                       | `crates/mlx-core/src/convert.rs:2930`, `:2944`, `crates/mlx-core/src/utils/gguf.rs:3012`            |
+| 36  | **`--config-dir` pointing at a directory with no `config.json` is not detected until AFTER `model.safetensors` has been written.** The TS check only verifies the directory exists. The output is left with valid weights and no config.                                                                                                                                                                                                                                                                                                                                                                       | `packages/cli/src/commands/convert.ts:466`, `crates/mlx-core/src/utils/gguf.rs:3096`, `:3109`       |
+| 37  | **The affine GGUF repack performs no divisibility validation**, unlike the K-quant path which rejects a last dim that is not a positive multiple of `QK_K`. `load_quantized_tensor` uses integer division throughout; a 2-row tensor with last dim 48 indexes `scales[2]` out of bounds — a panic across the napi boundary, not a named error.                                                                                                                                                                                                                                                                 | `crates/mlx-core/src/utils/gguf.rs:776`, `:978`                                                     |
+| 38  | **`Vec::with_capacity` on `tensor_count` and `n_dims` is not covered by `MAX_GGUF_ALLOC`.** The 256 MiB cap applies to string lengths and array element _counts_ only (256 M `String` headers ≈ 6 GB). A malformed header can abort the process before a single tensor is parsed.                                                                                                                                                                                                                                                                                                                              | `crates/mlx-core/src/utils/gguf.rs:511`, `:517`, `:362`                                             |
+| 39  | **The gemma-QAT "already quantized" reject is narrower than it looks.** It is gated on `is_gemma_qat_family` = `nvidia_recipe_family(model_type) == Some("gemma4") && is_gemma_qat_source`, so a gemma-QAT source converted with a mismatched `-m` (e.g. `-m qwen3_5 -q`) escapes it entirely and falls through to the generic quantizer, which would re-quantize already-quantized weights. Only the _unified_ reject hangs off bare `is_gemma_qat_source`.                                                                                                                                                   | `crates/mlx-core/src/convert.rs:2264`, `:2267`, `:2284`                                             |
+| 40  | **`--dtype` is validated inconsistently by family.** For `owns_dtype_cast` families the generic loop is bypassed, so `Err("Unsupported target dtype")` is unreachable and a `warn!` is the only handler. `mlx convert -m qwen3_5 -d float64` prints `Dtype: float64`, writes bf16, exits 0. The same flag on `-m gemma4` hard-errors. **`-m nemotron_h` is a third behaviour**: its sanitize binds the parameter as `_target_dtype_str` and never reads it, so `--dtype` is a silent no-op with not even a warning — correct for a format-preserving ingest, indistinguishable from a working flag at the CLI. | `crates/mlx-core/src/convert.rs:686`, `:3878`, `:3966`, `:2731`                                     |
+| 42  | **`verify_override_coverage` — the set-difference audit — exists ONLY for the gemma-prequant import.** Its doc explains why: the generic paths' override maps are intentionally sparse, so a `.scales` tensor without an override is normal there. No automated guard will catch a coverage hole on any other path.                                                                                                                                                                                                                                                                                            | `crates/mlx-core/src/convert_gemma_import.rs:262`                                                   |
+| 43  | **A sym8 checkpoint refuses to load on any GPU below Apple gen 17 (M5).** `try_build_sym8_quantized_linear` hard-errors with "sym8 checkpoints require an M5+ GPU". `sym8_eligible` deliberately OMITS this check because it is a runtime property, so conversion succeeds on an M1–M4 box and produces a checkpoint that same box cannot load. Neither `docs/cli.md:144` nor the `--q-mode` help mentions it.                                                                                                                                                                                                 | `crates/mlx-core/src/models/qwen3_5/quantized_linear.rs:389`, `crates/mlx-core/src/convert.rs:5546` |
 
 ### Guard coverage: TS vs Rust
 
@@ -1689,7 +1690,7 @@ The highest-value section. Everything here is confirmed in code.
 TS-only ones, only two are genuinely reachable by a direct NAPI caller (`--mmproj` and
 `--imatrix-path` path/extension checks) — the rest are structurally impossible or fail later anyway.
 Of the Rust-only ones the load-bearing one is the **nvidia family gate**
-(`crates/mlx-core/src/convert.rs:5027`, `:5042`, `:5054`): it reads the *input config.json's* own
+(`crates/mlx-core/src/convert.rs:5027`, `:5042`, `:5054`): it reads the _input config.json's_ own
 `model_type`, not `-m`, precisely because the CLI forwards an explicit `-m` verbatim and skips
 auto-detection.
 
@@ -1705,7 +1706,7 @@ Two consequences worth naming:
   silently produces the `4/5/6/8/6` ladder instead of the documented `3/4/5/6/5`. (Without
   `imatrixPath` the call hard-errors at `crates/mlx-core/src/convert.rs:2148` — it does not silently
   produce anything.)
-- The **nvfp4 arm** of `effectiveQuantBits` is *not* redundant. It is a ternary chain:
+- The **nvfp4 arm** of `effectiveQuantBits` is _not_ redundant. It is a ternary chain:
   `quantMode === 'nvfp4' ? 4 : quantRecipe === 'unsloth' ? 3 : undefined`. For the documented
   `--q-recipe unsloth --q-mode nvfp4` pair the nvfp4 arm **preempts** the unsloth 3-bit arm; delete
   it and the TS nvfp4 invariant check at `convert.ts:430` rejects the invocation with "nvfp4 requires
@@ -1713,62 +1714,62 @@ Two consequences worth naming:
 
 ### `config.json` provenance traps
 
-| # | Trap                                                                                                                                                                                                                                               | Where                                                                       |
-| - | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 44 | **`--q-recipe unsloth --q-mxfp` writes a top-level `{bits:3, group_size:64, mode:"affine"}` block that describes ZERO tensors.** The recipe branch never updates `quant_mode_effective` / `quant_group_size_effective`; only the no-recipe branch does. It is safe *only* because the fixed official map returns `Custom`/`Skip` for every key and never `Default`, so 100 % of quantized tensors carry an explicit override and the fallback is never taken. On this path the map emits only mxfp8 8/32, mxfp4 4/32, and `Skip` (bf16) — the 8-bit-affine router-gate class belongs to the *upgrade wrapper*, which does not run here. | `crates/mlx-core/src/convert.rs:2914` vs `:2967`; `:3132`; `packages/cli/src/commands/convert.ts:383` |
-| 45 | **The same bug class was recognized and fixed for `--q-mode nvfp4` and never for `--q-mxfp`.** The CLI comment: "the unsloth 3-bit default would otherwise produce an inconsistent checkpoint: top-level bits=3 but per-layer overrides at bits=4 … with no failure surface." The nvfp4 top-level `nvfp4/4/16` is genuinely load-bearing — the early-FFN class equals it and correctly gets **no** override. | `packages/cli/src/commands/convert.ts:379`, `crates/mlx-core/src/convert.rs:9889` |
-| 46 | **The top-level block is misleading for EVERY recipe artifact.** Auditing by reading `quantization.mode` gives the wrong answer; the only correct audit is the set difference of `.scales` keys against the override map. There is one exception in the other direction: the gemma-QAT import (`convert.rs:2750`) is the sole path that rewrites all *four* effective values, deriving them honestly from its own override map. | `crates/mlx-core/src/convert.rs:2740`, `:2750`, `:2967`, `:6726`             |
-| 47 | **There is no `mixed` field in any emitted config.** Any consumer looking for `"mixed": true` to decide whether the top-level triple is trustworthy finds nothing. `mixed` is a local `bool` in the GGUF importer. | `crates/mlx-core/src/utils/gguf.rs:2349`, `:2371`                            |
-| 48 | **MTP quantization is excluded from the `quantization` block** and described by a non-standard `mtplx_mtp_quantization` key hard-coded to `{4, 32, affine}` regardless of what the MTP tensors actually are. Any standard loader reading only `quantization` treats them as unquantized. The `cyankiwi` description string also says "Load **calibrated** CyanKiwi MTP layer linears" — nothing is calibrated; `cyankiwi` and `all` differ by exactly one tensor (`mtp.fc`). | `crates/mlx-core/src/convert.rs:3138`, `:3155`, `:3156`, `:3798`            |
-| 49 | **The emitted `config.json` is a verbatim clone of the source with only `_name_or_path` removed and quantization injected.** `torch_dtype` is never read or rewritten — an f32 source converted to bf16 emits `torch_dtype: "float32"` beside bf16 tensors, while mlx-lm uses `config["torch_dtype"]` as its default conversion dtype. The source `model_type` is likewise preserved, so a `gemma4_text` input keeps `gemma4_text` even though it was sanitized as `gemma4`. | `crates/mlx-core/src/convert.rs:3122`, `mlx-lm/mlx_lm/convert.py:131`        |
+| #   | Trap                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Where                                                                                                 |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| 44  | **`--q-recipe unsloth --q-mxfp` writes a top-level `{bits:3, group_size:64, mode:"affine"}` block that describes ZERO tensors.** The recipe branch never updates `quant_mode_effective` / `quant_group_size_effective`; only the no-recipe branch does. It is safe _only_ because the fixed official map returns `Custom`/`Skip` for every key and never `Default`, so 100 % of quantized tensors carry an explicit override and the fallback is never taken. On this path the map emits only mxfp8 8/32, mxfp4 4/32, and `Skip` (bf16) — the 8-bit-affine router-gate class belongs to the _upgrade wrapper_, which does not run here. | `crates/mlx-core/src/convert.rs:2914` vs `:2967`; `:3132`; `packages/cli/src/commands/convert.ts:383` |
+| 45  | **The same bug class was recognized and fixed for `--q-mode nvfp4` and never for `--q-mxfp`.** The CLI comment: "the unsloth 3-bit default would otherwise produce an inconsistent checkpoint: top-level bits=3 but per-layer overrides at bits=4 … with no failure surface." The nvfp4 top-level `nvfp4/4/16` is genuinely load-bearing — the early-FFN class equals it and correctly gets **no** override.                                                                                                                                                                                                                            | `packages/cli/src/commands/convert.ts:379`, `crates/mlx-core/src/convert.rs:9889`                     |
+| 46  | **The top-level block is misleading for EVERY recipe artifact.** Auditing by reading `quantization.mode` gives the wrong answer; the only correct audit is the set difference of `.scales` keys against the override map. There is one exception in the other direction: the gemma-QAT import (`convert.rs:2750`) is the sole path that rewrites all _four_ effective values, deriving them honestly from its own override map.                                                                                                                                                                                                         | `crates/mlx-core/src/convert.rs:2740`, `:2750`, `:2967`, `:6726`                                      |
+| 47  | **There is no `mixed` field in any emitted config.** Any consumer looking for `"mixed": true` to decide whether the top-level triple is trustworthy finds nothing. `mixed` is a local `bool` in the GGUF importer.                                                                                                                                                                                                                                                                                                                                                                                                                      | `crates/mlx-core/src/utils/gguf.rs:2349`, `:2371`                                                     |
+| 48  | **MTP quantization is excluded from the `quantization` block** and described by a non-standard `mtplx_mtp_quantization` key hard-coded to `{4, 32, affine}` regardless of what the MTP tensors actually are. Any standard loader reading only `quantization` treats them as unquantized. The `cyankiwi` description string also says "Load **calibrated** CyanKiwi MTP layer linears" — nothing is calibrated; `cyankiwi` and `all` differ by exactly one tensor (`mtp.fc`).                                                                                                                                                            | `crates/mlx-core/src/convert.rs:3138`, `:3155`, `:3156`, `:3798`                                      |
+| 49  | **The emitted `config.json` is a verbatim clone of the source with only `_name_or_path` removed and quantization injected.** `torch_dtype` is never read or rewritten — an f32 source converted to bf16 emits `torch_dtype: "float32"` beside bf16 tensors, while mlx-lm uses `config["torch_dtype"]` as its default conversion dtype. The source `model_type` is likewise preserved, so a `gemma4_text` input keeps `gemma4_text` even though it was sanitized as `gemma4`.                                                                                                                                                            | `crates/mlx-core/src/convert.rs:3122`, `mlx-lm/mlx_lm/convert.py:131`                                 |
 
 ### Naming and layout traps
 
-| # | Trap                                                                                                                                                                                                                        | Where                                                                       |
-| - | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 50 | **`.biases` on a K-quant holds ggml's `d` (and `dmin`) — a SCALE, not an additive bias.** Any code assuming it is additive (a bias-folding pass, a dtype-following cast rule, a re-quantizer) silently corrupts K-quant tensors. Its dtype must stay exactly `float16`. This is why the converter needs a dedicated content-keyed exemption rather than the ordinary "float follows `--dtype`" rule. | `crates/mlx-core/src/utils/gguf_kquant.rs:22`, `crates/mlx-core/src/models/quant_dispatch.rs:455`, `crates/mlx-core/src/convert.rs:5455` |
-| 51 | **`kquant_biases_to_preserve` is skipped entirely when the family owns its own dtype cast** (`let kquant_biases_keys = if has_custom_sanitizer { HashSet::new() } else { … }`). `owns_dtype_cast()` is true for qwen3_5, qwen3_5_moe, lfm2, lfm2_moe **and nemotron_h** — the flag's membership grows with every family that takes over its own dtype cast, so this list is the thing to re-derive rather than trust. Latent today (the GGUF K-quant import writes its own output, re-quantization is refused, and the nemotron_h ingest reads modelopt NVFP4/FP8 rather than GGUF), but it is a whole-family opt-out, not a per-tensor one. | `crates/mlx-core/src/convert.rs:3833`, `:1317`, `:2727`                     |
-| 52 | **`nn::Linear`'s quantized backend hardcodes `mode = "affine"`** at both the forward (`mlx_quantized_matmul`) and the load-time dequant. There is no mode parameter on `Linear::load_quantized`. This is the concrete reason `is_affine_only_key` exists — emitting mxfp4/mxfp8/nvfp4 at lm_head / router.proj / embed_tokens\* / embedding_projection would be silently mis-dequantized as affine, no error, just wrong numbers. | `crates/mlx-core/src/nn/linear.rs:62`, `:149`, `crates/mlx-core/src/convert.rs:3865` |
-| 53 | **`is_affine_only_key` short-circuits `is_router_gate` inside both upgrade wrappers, and the two disagree.** For `.router.proj`, `apply_mxfp_upgrade` returns the inner decision unchanged (including a bare `Default`, which resolves to the global affine default), whereas `apply_nvfp4_upgrade` rewrites a `Default` into an explicit `Custom{8, 64, affine}`. Latent — no shipped recipe returns `Default` there. | `crates/mlx-core/src/convert.rs:4820` vs `:5153`                            |
-| 54 | **PaddleOCR-VL's key transform uses `String::replace`, which rewrites ALL occurrences**: `result.replace("model.", "language_model.model.")` guarded only by `!result.contains("visual")`. Any key containing `model.` more than once is rewritten at every position, and `transform_key` is the identity for unmatched keys, so the damage is silent. | `crates/mlx-core/src/models/paddleocr_vl/persistence.rs:31`                  |
-| 55 | **Three families each guess PyTorch-vs-MLX conv layout from shape alone.** Qianfan-OCR uses `shape[1] < shape[2]`; Qwen uses `dim2 <= 16`; paddleocr uses `t == 3 \|\| (out >= k_h && out >= k_w && k_h == k_w)`. A conv whose in_channels equals its kernel height (or a kernel > 16) is silently left in the wrong layout — both layouts have the same rank and element count, so nothing downstream can fail. | `crates/mlx-core/src/models/qianfan_ocr/persistence.rs:88`, `crates/mlx-core/src/convert.rs:1121`, `crates/mlx-core/src/models/paddleocr_vl/persistence.rs:60` |
-| 56 | **The `already_sanitized` probe reads a single f32 scalar and, when true, skips the whole of Step 4** — including both conv transposes, not just the norm shift. It samples element 0 of the first non-MTP `.input_layernorm.weight` and treats `> 0.5` as "already MLX format", then sets `keys = Vec::new()`. Norm-shift state and conv-layout state are independent properties decided by one number. | `crates/mlx-core/src/convert.rs:1019-1032`, `:1084-1089`                    |
-| 57 | **The GGUF path writes ONE unsharded `model.safetensors` with no `index.json`**; the SafeTensors path shards at 5 GiB and always writes an index. A 60 GB GGUF import produces one 60 GB file — a different on-disk shape from every other conversion, with no flag to change it. | `crates/mlx-core/src/utils/gguf.rs:3096`, `crates/mlx-core/src/utils/safetensors.rs:833` |
-| 58 | **There is no inverse of llama.cpp's Q/K head permutation anywhere in the importer.** The only head-order fixup is `fixup_qwen35_linear_attn`, and it touches GDN tensors only. `self_attn.q_proj`/`k_proj` are copied through unreordered. mlx-lm has an export-direction `permute_weights` (`mlx-lm/mlx_lm/gguf.py:133`); nothing here undoes it. Shapes are identical, so nothing downstream can detect it. | `crates/mlx-core/src/utils/gguf.rs:1570`                                    |
+| #   | Trap                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Where                                                                                                                                                          |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 50  | **`.biases` on a K-quant holds ggml's `d` (and `dmin`) — a SCALE, not an additive bias.** Any code assuming it is additive (a bias-folding pass, a dtype-following cast rule, a re-quantizer) silently corrupts K-quant tensors. Its dtype must stay exactly `float16`. This is why the converter needs a dedicated content-keyed exemption rather than the ordinary "float follows `--dtype`" rule.                                                                                                                                                                                                                                         | `crates/mlx-core/src/utils/gguf_kquant.rs:22`, `crates/mlx-core/src/models/quant_dispatch.rs:455`, `crates/mlx-core/src/convert.rs:5455`                       |
+| 51  | **`kquant_biases_to_preserve` is skipped entirely when the family owns its own dtype cast** (`let kquant_biases_keys = if has_custom_sanitizer { HashSet::new() } else { … }`). `owns_dtype_cast()` is true for qwen3_5, qwen3_5_moe, lfm2, lfm2_moe **and nemotron_h** — the flag's membership grows with every family that takes over its own dtype cast, so this list is the thing to re-derive rather than trust. Latent today (the GGUF K-quant import writes its own output, re-quantization is refused, and the nemotron_h ingest reads modelopt NVFP4/FP8 rather than GGUF), but it is a whole-family opt-out, not a per-tensor one. | `crates/mlx-core/src/convert.rs:3833`, `:1317`, `:2727`                                                                                                        |
+| 52  | **`nn::Linear`'s quantized backend hardcodes `mode = "affine"`** at both the forward (`mlx_quantized_matmul`) and the load-time dequant. There is no mode parameter on `Linear::load_quantized`. This is the concrete reason `is_affine_only_key` exists — emitting mxfp4/mxfp8/nvfp4 at lm_head / router.proj / embed_tokens\* / embedding_projection would be silently mis-dequantized as affine, no error, just wrong numbers.                                                                                                                                                                                                            | `crates/mlx-core/src/nn/linear.rs:62`, `:149`, `crates/mlx-core/src/convert.rs:3865`                                                                           |
+| 53  | **`is_affine_only_key` short-circuits `is_router_gate` inside both upgrade wrappers, and the two disagree.** For `.router.proj`, `apply_mxfp_upgrade` returns the inner decision unchanged (including a bare `Default`, which resolves to the global affine default), whereas `apply_nvfp4_upgrade` rewrites a `Default` into an explicit `Custom{8, 64, affine}`. Latent — no shipped recipe returns `Default` there.                                                                                                                                                                                                                       | `crates/mlx-core/src/convert.rs:4820` vs `:5153`                                                                                                               |
+| 54  | **PaddleOCR-VL's key transform uses `String::replace`, which rewrites ALL occurrences**: `result.replace("model.", "language_model.model.")` guarded only by `!result.contains("visual")`. Any key containing `model.` more than once is rewritten at every position, and `transform_key` is the identity for unmatched keys, so the damage is silent.                                                                                                                                                                                                                                                                                       | `crates/mlx-core/src/models/paddleocr_vl/persistence.rs:31`                                                                                                    |
+| 55  | **Three families each guess PyTorch-vs-MLX conv layout from shape alone.** Qianfan-OCR uses `shape[1] < shape[2]`; Qwen uses `dim2 <= 16`; paddleocr uses `t == 3 \|\| (out >= k_h && out >= k_w && k_h == k_w)`. A conv whose in_channels equals its kernel height (or a kernel > 16) is silently left in the wrong layout — both layouts have the same rank and element count, so nothing downstream can fail.                                                                                                                                                                                                                             | `crates/mlx-core/src/models/qianfan_ocr/persistence.rs:88`, `crates/mlx-core/src/convert.rs:1121`, `crates/mlx-core/src/models/paddleocr_vl/persistence.rs:60` |
+| 56  | **The `already_sanitized` probe reads a single f32 scalar and, when true, skips the whole of Step 4** — including both conv transposes, not just the norm shift. It samples element 0 of the first non-MTP `.input_layernorm.weight` and treats `> 0.5` as "already MLX format", then sets `keys = Vec::new()`. Norm-shift state and conv-layout state are independent properties decided by one number.                                                                                                                                                                                                                                     | `crates/mlx-core/src/convert.rs:1019-1032`, `:1084-1089`                                                                                                       |
+| 57  | **The GGUF path writes ONE unsharded `model.safetensors` with no `index.json`**; the SafeTensors path shards at 5 GiB and always writes an index. A 60 GB GGUF import produces one 60 GB file — a different on-disk shape from every other conversion, with no flag to change it.                                                                                                                                                                                                                                                                                                                                                            | `crates/mlx-core/src/utils/gguf.rs:3096`, `crates/mlx-core/src/utils/safetensors.rs:833`                                                                       |
+| 58  | **There is no inverse of llama.cpp's Q/K head permutation anywhere in the importer.** The only head-order fixup is `fixup_qwen35_linear_attn`, and it touches GDN tensors only. `self_attn.q_proj`/`k_proj` are copied through unreordered. mlx-lm has an export-direction `permute_weights` (`mlx-lm/mlx_lm/gguf.py:133`); nothing here undoes it. Shapes are identical, so nothing downstream can detect it.                                                                                                                                                                                                                               | `crates/mlx-core/src/utils/gguf.rs:1570`                                                                                                                       |
 
 ### Dead / defensive code you should not read as capability
 
-| # | Fact                                                                                                                                                                                                                  | Where                                                                       |
-| - | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 59 | **The K-quant arms in the SafeTensors converter are unreachable from any production path.** `VALID_QUANT_MODES` is `[affine, mxfp4, mxfp8, nvfp4, sym8]`, no recipe constructs a `Custom{mode:"q6k"}`, and the GGUF frontend restricts its modes to affine/mxfp8/mxfp4/nvfp4. They are defensive and unit-tested — but reading them as evidence that convert can emit or round-trip K-quants is wrong. | `crates/mlx-core/src/convert.rs:5910`, `:5711`, `:1967`, `crates/mlx-sys/src/mlx_advanced_ops.cpp:892` |
-| 60 | **`resolve_legacy_entry`'s `lm_head` clause in arm 4 is dead by construction** — `should_quantize` already excluded it at arm 1. The code says so: "kept for defense-in-depth". | `crates/mlx-core/src/convert.rs:6297`                                       |
-| 61 | **`VALID_MTP_QUANT_POLICIES` still lists `"drafter"`**, but the alias is normalized to `"split"` fourteen lines earlier, so that entry can never match. Two independent copies of the list (TS and Rust) can drift. | `crates/mlx-core/src/convert.rs:1960`, `:1977`, `packages/cli/src/commands/convert.ts:265` |
-| 62 | **`derived_symmetric_bias_bits` is `pub` production code with zero production callers** — it exists purely as the parity gate's test oracle. It looks like dead code to a linter, and deleting it removes the only check that the load-time reconstruction still reproduces the historical bytes. | `crates/mlx-core/src/utils/gguf.rs:743`                                     |
-| 63 | **`fn model_types()` on `ConversionRecipe` is `#[allow(dead_code)]`** — no runtime dispatch role; it exists only for the registry-consistency test. | `crates/mlx-core/src/convert.rs:161`                                        |
-| 64 | **`utils/gemma_quant_repack.rs` is NOT on the GGUF path.** Its module doc says it "mirrors the GGUF Q4_0 → MLX affine repack in `super::gguf`", which makes it easy to mistake for shared code. Its only production caller is `convert_gemma_import.rs:52`, and unlike the GGUF path it still **materializes** the derived biases array. Changing one does not change the other. | `crates/mlx-core/src/utils/gemma_quant_repack.rs:31`                        |
-| 65 | **There are TWO independent GGUF header parsers in the crate.** `utils/gguf.rs:34` and `utils/imatrix.rs:23` each declare `GGUF_MAGIC` and their own reader helpers; the imatrix copy has no `MAX_GGUF_ALLOC` equivalent. They *do* share the name mapper (`imatrix.rs:20` imports `gguf_name_to_hf`), so a rename rule fixed in one reaches the other — but a spec/hardening fix does not. | `crates/mlx-core/src/utils/imatrix.rs:20`, `:23`                            |
+| #   | Fact                                                                                                                                                                                                                                                                                                                                                                                                   | Where                                                                                                  |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| 59  | **The K-quant arms in the SafeTensors converter are unreachable from any production path.** `VALID_QUANT_MODES` is `[affine, mxfp4, mxfp8, nvfp4, sym8]`, no recipe constructs a `Custom{mode:"q6k"}`, and the GGUF frontend restricts its modes to affine/mxfp8/mxfp4/nvfp4. They are defensive and unit-tested — but reading them as evidence that convert can emit or round-trip K-quants is wrong. | `crates/mlx-core/src/convert.rs:5910`, `:5711`, `:1967`, `crates/mlx-sys/src/mlx_advanced_ops.cpp:892` |
+| 60  | **`resolve_legacy_entry`'s `lm_head` clause in arm 4 is dead by construction** — `should_quantize` already excluded it at arm 1. The code says so: "kept for defense-in-depth".                                                                                                                                                                                                                        | `crates/mlx-core/src/convert.rs:6297`                                                                  |
+| 61  | **`VALID_MTP_QUANT_POLICIES` still lists `"drafter"`**, but the alias is normalized to `"split"` fourteen lines earlier, so that entry can never match. Two independent copies of the list (TS and Rust) can drift.                                                                                                                                                                                    | `crates/mlx-core/src/convert.rs:1960`, `:1977`, `packages/cli/src/commands/convert.ts:265`             |
+| 62  | **`derived_symmetric_bias_bits` is `pub` production code with zero production callers** — it exists purely as the parity gate's test oracle. It looks like dead code to a linter, and deleting it removes the only check that the load-time reconstruction still reproduces the historical bytes.                                                                                                      | `crates/mlx-core/src/utils/gguf.rs:743`                                                                |
+| 63  | **`fn model_types()` on `ConversionRecipe` is `#[allow(dead_code)]`** — no runtime dispatch role; it exists only for the registry-consistency test.                                                                                                                                                                                                                                                    | `crates/mlx-core/src/convert.rs:161`                                                                   |
+| 64  | **`utils/gemma_quant_repack.rs` is NOT on the GGUF path.** Its module doc says it "mirrors the GGUF Q4_0 → MLX affine repack in `super::gguf`", which makes it easy to mistake for shared code. Its only production caller is `convert_gemma_import.rs:52`, and unlike the GGUF path it still **materializes** the derived biases array. Changing one does not change the other.                       | `crates/mlx-core/src/utils/gemma_quant_repack.rs:31`                                                   |
+| 65  | **There are TWO independent GGUF header parsers in the crate.** `utils/gguf.rs:34` and `utils/imatrix.rs:23` each declare `GGUF_MAGIC` and their own reader helpers; the imatrix copy has no `MAX_GGUF_ALLOC` equivalent. They _do_ share the name mapper (`imatrix.rs:20` imports `gguf_name_to_hf`), so a rename rule fixed in one reaches the other — but a spec/hardening fix does not.            | `crates/mlx-core/src/utils/imatrix.rs:20`, `:23`                                                       |
 
 ### Documentation vs code — code wins
 
-| claim                                                                                                                                        | where                                                | reality                                                                                                                                                                                       |
-| --------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--q-recipe nvidia` "is supported **only** for `qwen3_5` / `qwen3_5_moe` … Other families (e.g. `gemma4`) need their own recipe."             | `docs/cli.md:97-100`                                 | Stale. `nvidia_recipe_family` accepts `gemma4` / `gemma4_unified` / `gemma4_text` (`crates/mlx-core/src/convert.rs:4952`) and `validate_nvidia_recipe_options` passes them for **dense** gemma4 (`:5027`). Only gemma4 **MoE** is rejected. The CLI's own `--help` documents it correctly (`convert.ts:112`). |
-| Auto-detected families list                                                                                                                  | `docs/cli.md:229-232`                                | No arm exists for `qianfan-ocr` / `pp-lcnet-ori` / `uvdoc` (all need explicit `-m`), and the list **omits** `lfm2`, `lfm2_moe`, `privacy-filter`, which *are* detected (`convert.ts:641`, `:644`). |
-| `--model-type` options in `mlx convert --help`                                                                                               | `packages/cli/src/commands/convert.ts:37`            | Omits `gemma4` and `gemma4_unified`, both accepted and auto-detected (`crates/mlx-core/src/convert.rs:1753`).                                                                                    |
-| sym8 allowlist is "dense qwen3_5, lfm2/lfm2_moe, gemma4 — **NOT** qwen3_5_moe"                                                                | `crates/mlx-core/src/convert.rs:194-201`, `convert.ts:51` | Contradicted by the impl 970 lines below: `Qwen35Recipe::sym8_supported()` returns `true` **unconditionally** for both dense and MoE, and its own inline comment says "Both dense qwen3_5 and qwen3_5_moe dispatch sym8" (`:1170`). `ConversionOptions`'s doc (`:1801`) has it right. `-m qwen3_5_moe -q --q-mode sym8` **is** accepted today — and MoE is exactly where the 3-D `switch_mlp` experts divert to forced 8-bit affine, so the result is a sym8/affine mixture. |
-| `--gguf-kquant` "keeps the source … byte size" / "the same bits at ggml's byte size"                                                          | `convert.ts:138`, `crates/mlx-core/src/utils/gguf_kquant.rs:323` | True **only** for Q6_K. Q4_K grows 144→148 B/super-block (+2.8 %), Q5_K 176→180 (+2.3 %). The same source file contradicts itself 110 lines later (`gguf_kquant.rs:432`), and `docs/cli.md:184` carries the correct +0.125 bpw table. |
-| `fixup_shapes` doc: "Norm weights: GGUF stores delta from 1.0 → add +1.0"                                                                     | `crates/mlx-core/src/utils/gguf.rs:1471`             | The body forty lines later says the exact opposite ("GGUF stores actual trained norm weights … We do NOT apply it here"), and no `+1.0` appears in the function. The NOTE's escape hatch — "handled by persistence.rs sanitize_weights" — cannot fire for GGUF input, because qwen3_5's detector is `conv1d.weight` shape[-1] != 1 and `fixup_shapes` has already reshaped it to `[C,K,1]`. GGUF norms are used verbatim, always. |
-| AWQ inline comment `// post_attention_layernorm.weight /= scales`                                                                             | `crates/mlx-core/src/convert.rs:6952`                | Stale — the selection three lines above probes `pre_feedforward_layernorm` first (`:6932`). Any note asserting "fold post_attention_layernorm, NOT pre_feedforward" contradicts both the code and the gemma4 decoder layer. |
-| `convert_gemma_import.rs` module doc: "does **NOT** wire into the `mlx convert` CLI driver"                                                   | `crates/mlx-core/src/convert_gemma_import.rs:7`      | Contradicted 36 lines later in the **same** doc comment (`:43`) and by the call site at `crates/mlx-core/src/convert.rs:2560`.                                                                   |
-| `Gemma4Recipe`'s sanitize "is the real transform (set via [`set_gemma4_sanitize`])"                                                           | `crates/mlx-core/src/convert.rs:1589`                | `set_gemma4_sanitize` does not exist — the only occurrence in the file is that doc link. Broken intra-doc link; the body is inline at `:1596`.                                                    |
-| "GDN `a_log` … stays f32 and is cast on-the-fly inside `compute_g`. Casting it would diverge from mlx-lm semantics."                          | `crates/mlx-core/src/models/qwen3_5_moe/paged_forward.rs:1066` | `set_a_log` unconditionally casts A_log to `dt_bias`'s dtype (`crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs:486`) and is the only such function in the tree. mlx-node genuinely diverges from mlx-lm's `cast_predicate` here (`mlx-lm/mlx_lm/models/qwen3_5.py:386` excludes `A_log`); the divergence is a deliberate perf choice, but this comment denies it. |
-| Recipe list                                                                                                                                  | `docs/perf.md:457-475`                               | Omits `nvidia` entirely, and describes the no-recipe default as "router gates → 8-bit; everything else → 4-bit" without noting the 4 is really the per-mode default (affine=4, mxfp8=8, sym8=8) nor the affine-only-key force. |
-| `docs/cli.md` convert flag table                                                                                                             | `docs/cli.md:139-149`                                | Omits `--config-dir`, `-m`/`--model-type`, `--q-bits`, `--q-group-size`, `--gguf-kquant`, `-h`.                                                                                                  |
-| foreign formats "Paddle `.pdiparams`, PyTorch `.pkl`" / module header lists `.pdparams` only                                                  | `docs/cli.md:236`, `crates/mlx-core/src/utils/foreign_weights.rs:6` | Code supports `.pdiparams` (+ mandatory sibling `.json`), `.pdparams`, `.pt`, `.pkl`, `.pth`, and directory auto-detect. Neither doc is complete; the module header omits `.pdiparams`, which is a completely different (non-pickle) code path. |
-| GGUF source-type support in `--help`                                                                                                         | `packages/cli/src/commands/convert.ts:156`           | Says only "BF16, F16, F32, Q4_0, Q4_1, Q8_0". Omits that Q6_K imports **without** `--gguf-kquant` when the tensor is gemma4's `token_embd.weight`, dequantized to BF16 at 16 bpw — a 2.44× size expansion over the 6.5625 bpw source that no doc mentions. |
-| `--dtype` default                                                                                                                            | `convert.ts:32` (bfloat16), `crates/mlx-core/src/convert.rs:1782` (float32), `crates/mlx-core/src/utils/gguf.rs:2404` ("keep original") | All three are accurate **for their own layer** — three different defaults for one option name. `docs/cli.md:141` states none of them. |
+| claim                                                                                                                             | where                                                                                                                                   | reality                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--q-recipe nvidia` "is supported **only** for `qwen3_5` / `qwen3_5_moe` … Other families (e.g. `gemma4`) need their own recipe." | `docs/cli.md:97-100`                                                                                                                    | Stale. `nvidia_recipe_family` accepts `gemma4` / `gemma4_unified` / `gemma4_text` (`crates/mlx-core/src/convert.rs:4952`) and `validate_nvidia_recipe_options` passes them for **dense** gemma4 (`:5027`). Only gemma4 **MoE** is rejected. The CLI's own `--help` documents it correctly (`convert.ts:112`).                                                                                                                                                                |
+| Auto-detected families list                                                                                                       | `docs/cli.md:229-232`                                                                                                                   | No arm exists for `qianfan-ocr` / `pp-lcnet-ori` / `uvdoc` (all need explicit `-m`), and the list **omits** `lfm2`, `lfm2_moe`, `privacy-filter`, which _are_ detected (`convert.ts:641`, `:644`).                                                                                                                                                                                                                                                                           |
+| `--model-type` options in `mlx convert --help`                                                                                    | `packages/cli/src/commands/convert.ts:37`                                                                                               | Omits `gemma4` and `gemma4_unified`, both accepted and auto-detected (`crates/mlx-core/src/convert.rs:1753`).                                                                                                                                                                                                                                                                                                                                                                |
+| sym8 allowlist is "dense qwen3_5, lfm2/lfm2_moe, gemma4 — **NOT** qwen3_5_moe"                                                    | `crates/mlx-core/src/convert.rs:194-201`, `convert.ts:51`                                                                               | Contradicted by the impl 970 lines below: `Qwen35Recipe::sym8_supported()` returns `true` **unconditionally** for both dense and MoE, and its own inline comment says "Both dense qwen3_5 and qwen3_5_moe dispatch sym8" (`:1170`). `ConversionOptions`'s doc (`:1801`) has it right. `-m qwen3_5_moe -q --q-mode sym8` **is** accepted today — and MoE is exactly where the 3-D `switch_mlp` experts divert to forced 8-bit affine, so the result is a sym8/affine mixture. |
+| `--gguf-kquant` "keeps the source … byte size" / "the same bits at ggml's byte size"                                              | `convert.ts:138`, `crates/mlx-core/src/utils/gguf_kquant.rs:323`                                                                        | True **only** for Q6_K. Q4_K grows 144→148 B/super-block (+2.8 %), Q5_K 176→180 (+2.3 %). The same source file contradicts itself 110 lines later (`gguf_kquant.rs:432`), and `docs/cli.md:184` carries the correct +0.125 bpw table.                                                                                                                                                                                                                                        |
+| `fixup_shapes` doc: "Norm weights: GGUF stores delta from 1.0 → add +1.0"                                                         | `crates/mlx-core/src/utils/gguf.rs:1471`                                                                                                | The body forty lines later says the exact opposite ("GGUF stores actual trained norm weights … We do NOT apply it here"), and no `+1.0` appears in the function. The NOTE's escape hatch — "handled by persistence.rs sanitize_weights" — cannot fire for GGUF input, because qwen3_5's detector is `conv1d.weight` shape[-1] != 1 and `fixup_shapes` has already reshaped it to `[C,K,1]`. GGUF norms are used verbatim, always.                                            |
+| AWQ inline comment `// post_attention_layernorm.weight /= scales`                                                                 | `crates/mlx-core/src/convert.rs:6952`                                                                                                   | Stale — the selection three lines above probes `pre_feedforward_layernorm` first (`:6932`). Any note asserting "fold post_attention_layernorm, NOT pre_feedforward" contradicts both the code and the gemma4 decoder layer.                                                                                                                                                                                                                                                  |
+| `convert_gemma_import.rs` module doc: "does **NOT** wire into the `mlx convert` CLI driver"                                       | `crates/mlx-core/src/convert_gemma_import.rs:7`                                                                                         | Contradicted 36 lines later in the **same** doc comment (`:43`) and by the call site at `crates/mlx-core/src/convert.rs:2560`.                                                                                                                                                                                                                                                                                                                                               |
+| `Gemma4Recipe`'s sanitize "is the real transform (set via [`set_gemma4_sanitize`])"                                               | `crates/mlx-core/src/convert.rs:1589`                                                                                                   | `set_gemma4_sanitize` does not exist — the only occurrence in the file is that doc link. Broken intra-doc link; the body is inline at `:1596`.                                                                                                                                                                                                                                                                                                                               |
+| "GDN `a_log` … stays f32 and is cast on-the-fly inside `compute_g`. Casting it would diverge from mlx-lm semantics."              | `crates/mlx-core/src/models/qwen3_5_moe/paged_forward.rs:1066`                                                                          | `set_a_log` unconditionally casts A_log to `dt_bias`'s dtype (`crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs:486`) and is the only such function in the tree. mlx-node genuinely diverges from mlx-lm's `cast_predicate` here (`mlx-lm/mlx_lm/models/qwen3_5.py:386` excludes `A_log`); the divergence is a deliberate perf choice, but this comment denies it.                                                                                                      |
+| Recipe list                                                                                                                       | `docs/perf.md:457-475`                                                                                                                  | Omits `nvidia` entirely, and describes the no-recipe default as "router gates → 8-bit; everything else → 4-bit" without noting the 4 is really the per-mode default (affine=4, mxfp8=8, sym8=8) nor the affine-only-key force.                                                                                                                                                                                                                                               |
+| `docs/cli.md` convert flag table                                                                                                  | `docs/cli.md:139-149`                                                                                                                   | Omits `--config-dir`, `-m`/`--model-type`, `--q-bits`, `--q-group-size`, `--gguf-kquant`, `-h`.                                                                                                                                                                                                                                                                                                                                                                              |
+| foreign formats "Paddle `.pdiparams`, PyTorch `.pkl`" / module header lists `.pdparams` only                                      | `docs/cli.md:236`, `crates/mlx-core/src/utils/foreign_weights.rs:6`                                                                     | Code supports `.pdiparams` (+ mandatory sibling `.json`), `.pdparams`, `.pt`, `.pkl`, `.pth`, and directory auto-detect. Neither doc is complete; the module header omits `.pdiparams`, which is a completely different (non-pickle) code path.                                                                                                                                                                                                                              |
+| GGUF source-type support in `--help`                                                                                              | `packages/cli/src/commands/convert.ts:156`                                                                                              | Says only "BF16, F16, F32, Q4_0, Q4_1, Q8_0". Omits that Q6_K imports **without** `--gguf-kquant` when the tensor is gemma4's `token_embd.weight`, dequantized to BF16 at 16 bpw — a 2.44× size expansion over the 6.5625 bpw source that no doc mentions.                                                                                                                                                                                                                   |
+| `--dtype` default                                                                                                                 | `convert.ts:32` (bfloat16), `crates/mlx-core/src/convert.rs:1782` (float32), `crates/mlx-core/src/utils/gguf.rs:2404` ("keep original") | All three are accurate **for their own layer** — three different defaults for one option name. `docs/cli.md:141` states none of them.                                                                                                                                                                                                                                                                                                                                        |
 
-Asymmetries where the code is right but the *quality rationale* does not survive scrutiny:
+Asymmetries where the code is right but the _quality rationale_ does not survive scrutiny:
 
 - **`linear_attn.out_proj` is protected asymmetrically.** `validate_nvfp4_recipe`
   (`crates/mlx-core/src/convert.rs:4930`) rejects `--q-mode nvfp4 --q-recipe mixed_*` precisely

@@ -42,7 +42,7 @@ const UNIFIED_GEMMA_COMPATIBILITY_CASES = [
   ['competing Harrier probe', { model_type: 'qwen3', architectures: ['Qwen3Model', UNIFIED_GEMMA_ARCHITECTURE] }],
 ] as const satisfies readonly (readonly [string, Readonly<Record<string, unknown>>])[];
 
-describe.sequential('declarative model loader registry', () => {
+describe('declarative model loader registry', () => {
   let tempDir: string;
 
   beforeEach(async () => {

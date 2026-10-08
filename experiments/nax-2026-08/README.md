@@ -7,12 +7,12 @@ All work ran isolated in worktree `nax-experiments` (2026-08-06 → 08-08), adve
 
 ## TL;DR
 
-| # | finding | verdict |
-|---|---|---|
-| 1 | **Opt A — quantized split-K→NAX reroute** (`qmm_splitk` at `split_k<=2`) | VALIDATED: +2.68% ttft@32 gemma4-26B, +2.31% ornith-35B; no regressions; decode untouched (never reaches `qmm_splitk`) |
-| 2 | **Opt B — masked D=256 fused NAX SDPA** (bool-mask sliding layers) | VALIDATED: kernel 1.22–1.28× vs unfused, +2.63% gemma4 6k-tok TTFT (needs `MLX_PAGED_PREFILL_CHUNK_SIZE=2048`), ~0.4–0.6 GB less transient/sliding layer |
-| 3 | **`mlx agent` default-path audit + measurements** | warm turns are append-prefill-bound (sliding ladder healthy, replay_delta=0); **T=0 sampling = +3.05% decode REAL** on the 26B default; thinking-clamp lever REFUTED (`reasoningTokens` always 0); warm-TTFT floor 230–360 ms with a small-append prefill inversion (190 tok slower than 543 tok — needs a sweep) |
-| 4 | **flashqla closure v2** (chunked WY-UT GDN on NAX) | RE-CLOSED with corrected data: chunked loses to **serialization/launch latency, not GEMM speed**. The June closure's premises were wrong (geometry K=192 vs real 128; 5.5 TF floor vs 7–16 TF today) but the verdict stands |
+| #   | finding                                                                  | verdict                                                                                                                                                                                                                                                                                                           |
+| --- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Opt A — quantized split-K→NAX reroute** (`qmm_splitk` at `split_k<=2`) | VALIDATED: +2.68% ttft@32 gemma4-26B, +2.31% ornith-35B; no regressions; decode untouched (never reaches `qmm_splitk`)                                                                                                                                                                                            |
+| 2   | **Opt B — masked D=256 fused NAX SDPA** (bool-mask sliding layers)       | VALIDATED: kernel 1.22–1.28× vs unfused, +2.63% gemma4 6k-tok TTFT (needs `MLX_PAGED_PREFILL_CHUNK_SIZE=2048`), ~0.4–0.6 GB less transient/sliding layer                                                                                                                                                          |
+| 3   | **`mlx agent` default-path audit + measurements**                        | warm turns are append-prefill-bound (sliding ladder healthy, replay_delta=0); **T=0 sampling = +3.05% decode REAL** on the 26B default; thinking-clamp lever REFUTED (`reasoningTokens` always 0); warm-TTFT floor 230–360 ms with a small-append prefill inversion (190 tok slower than 543 tok — needs a sweep) |
+| 4   | **flashqla closure v2** (chunked WY-UT GDN on NAX)                       | RE-CLOSED with corrected data: chunked loses to **serialization/launch latency, not GEMM speed**. The June closure's premises were wrong (geometry K=192 vs real 128; 5.5 TF floor vs 7–16 TF today) but the verdict stands                                                                                       |
 
 The June "K∈[128,256) NAX GEMM garbage band" is **empirically FIXED** on this pin (K=64/128/192 all bf16-rounding-clean), despite `gemm_nax.h`/`nax.h` being byte-identical since the garbage era — the fix came from the toolchain/metallib side, not kernel source. In-tree `test_support.rs` canary docs are stale and should be re-run before being believed.
 
@@ -48,6 +48,7 @@ reroute to plain `qmm` iff `split_k <= MLX_QMM_SPLITK_NAX_MAX_SK` (default **2**
 Real default on this machine = `Gemma-4-26B-A4B-Unsloth-MXFP4-mlx` via `~/.mlx-node/agent/settings.json` (catalog `isDefault` only orders the first-run wizard). Paged cache required; gemma4 `draft/` hidden (speculative executor is flat-cache-only ⇒ structurally exclusive with paged prefix reuse); sampling preset T=0.7/topP.95/topK64, `maxNewTokens` 16384; full-history jinja re-render + retokenize every turn (the token-splice fast path is Continue-only; agent always sends Start).
 
 Measured (traced live session, 4 warm turns):
+
 - **Sliding-rung ladder healthy**: warm turns all `prefix_checkpoint` with `replay_delta_tokens=0` — pure append-prefill. Per-turn `cold_restore_declined reason=no_backed_boundary` lines are benign. Cross-process SSD restore: 4096/7466 tokens → TTFT 1270 ms vs 2019 cold.
 - **Warm TTFT floor 230–360 ms regardless of append size**; single-sample inversion: 190-tok append prefill 353 ms (538 tok/s) vs 543-tok 228 ms (2381 tok/s) — fixed per-turn cost (O(context) KV gather + underfilled GEMMs + full re-render). Needs an append-size sweep before acting.
 - **T=0 vs agent preset decode A/B: +3.05% REAL** (89.1→91.9 tok/s, 4/4 pairs +2.9–3.5%, clears strict control hurdle 2.16%). The cost is compiled top-k/top-p over the 262,144-entry vocab every step; T=0 collapses to argmax. Product tradeoff open (T=0 + repetitionPenalty 1.0 + cutoffs-off = loop risk).
@@ -59,7 +60,7 @@ Measured (traced live session, 4 warm turns):
 
 June-2026 closure premises re-litigated and found wrong — verdict re-derived and **upheld** on corrected data:
 
-- **Geometry**: closure said K=Dk=192 "pinned by head geometry". Every shipped qwen3.5 checkpoint (0.8B/4B/27B/35B-A3B) has **Dk=Dv=128, Hk=16** (75/75 configs). `config.rs` *defaults* to 192 — the likely source of the June harnesses' error.
+- **Geometry**: closure said K=Dk=192 "pinned by head geometry". Every shipped qwen3.5 checkpoint (0.8B/4B/27B/35B-A3B) has **Dk=Dv=128, Hk=16** (75/75 configs). `config.rs` _defaults_ to 192 — the likely source of the June harnesses' error.
 - **NAX correctness**: the K∈[128,256) garbage band is gone (measured, both arms, full-mantissa inputs).
 - **GEMM floor**: 7–16 TF at the true batched WY shapes (vs June's 5.5 TF) — but **NAX vs simdgroup is a wash at the big batch-2048 rows (0.93–1.11×, bandwidth-bound)**; real NAX wins only on small-batch bf16 state rows (1.38–1.69×). The ops path's internal f32 cast alone halves throughput.
 - **The actual killer, measured**: modeled floor **332 ms faithful / 170 ms optimistic** vs today's per-step bar **272–386 ms** (2.77 µs/tok warm; June: 293–483). Split: **63-step serial tri-solve = 71%** (9.88 ms/layer faithful; 70.6 µs/serial step; the full-M `where_` scatter doubles the 4.45 ms gemv-only chain), chunk-serial state carry 16% (2.24 ms), ALL GEMM terms **12%** (41 ms/stack). Scalar chunked Metal kernel re-measured 15–16× slower than per-step (PR #68 confirmed).
@@ -77,15 +78,15 @@ June-2026 closure premises re-litigated and found wrong — verdict re-derived a
 
 ## 6. Env-var inventory introduced/used
 
-| var | default | meaning |
-|---|---|---|
-| `MLX_ENABLE_QMM_SPLITK_NAX` | 1 | Opt A master switch |
-| `MLX_QMM_SPLITK_NAX_MAX_SK` | 2 | reroute only when split_k ≤ this |
-| `MLX_QMM_SPLITK_NAX_DEBUG` | off | `[splitk-dbg]` per-dispatch trace |
-| `MLX_ENABLE_D256_MASKED_SDPA` | 1 | Opt B master switch |
-| `MLX_DISABLE_GEMM_NAX` | 0 | dense-GEMM NAX kill switch (read per dispatch; added for the flashqla re-litigation) |
-| `MLX_GDN_KERNEL` | auto | `chunked` = scalar Metal chunked kernel; `chunked_ops` parses but is non-Metal-only |
-| `MLX_AB_SAMPLING` | unset | harness arm selector: `agent-gemma4` = T0.7/topP.95/topK64, unset = greedy |
+| var                           | default | meaning                                                                              |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `MLX_ENABLE_QMM_SPLITK_NAX`   | 1       | Opt A master switch                                                                  |
+| `MLX_QMM_SPLITK_NAX_MAX_SK`   | 2       | reroute only when split_k ≤ this                                                     |
+| `MLX_QMM_SPLITK_NAX_DEBUG`    | off     | `[splitk-dbg]` per-dispatch trace                                                    |
+| `MLX_ENABLE_D256_MASKED_SDPA` | 1       | Opt B master switch                                                                  |
+| `MLX_DISABLE_GEMM_NAX`        | 0       | dense-GEMM NAX kill switch (read per dispatch; added for the flashqla re-litigation) |
+| `MLX_GDN_KERNEL`              | auto    | `chunked` = scalar Metal chunked kernel; `chunked_ops` parses but is non-Metal-only  |
+| `MLX_AB_SAMPLING`             | unset   | harness arm selector: `agent-gemma4` = T0.7/topP.95/topK64, unset = greedy           |
 
 ## 7. Test-suite designs (code removed; recreate from these)
 
@@ -135,7 +136,7 @@ index 17726635..062ff11b 100644
 @@ -70,6 +70,38 @@ bool nax_supports_mode(const std::string& mode, NaxPath path) {
    return path == NaxPath::QmmT;
  }
- 
+
 +// Whether a transposed qmm on this input would take the NAX tensor-op branch.
 +// One predicate shared by `qmm` and the split-K reroute in `qmm_splitk`, so the
 +// two call sites cannot drift apart: K % 64 == 0 is the NAX kernel's K-tile
@@ -224,7 +225,7 @@ index 697e9a61..a96d84f3 100644
 @@ -23,6 +23,14 @@ bool d256_full_sdpa_enabled() {
    return enabled;
  }
- 
+
 +bool d256_masked_sdpa_enabled() {
 +  // Independent kill switch for the bool-array-masked D=256 route. It only
 +  // narrows: the masked route also requires d256_full_sdpa_available(), so
@@ -239,7 +240,7 @@ index 697e9a61..a96d84f3 100644
 @@ -695,12 +703,37 @@ bool d256_full_sdpa_would_use(
        !has_array_mask && d256_full_sdpa_available(effective_dtype_is_float32);
  }
- 
+
 +bool d256_masked_sdpa_would_use(
 +    bool effective_dtype_is_float32,
 +    int32_t query_head_dim,
@@ -371,11 +372,11 @@ index f70ac7c0..40286d2f 100644
 +    bool has_bool_mask);
  }  // namespace mlx::core::fast
  #endif
- 
+
 @@ -221,6 +228,46 @@ int32_t mlx_metal_d256_full_sdpa_would_use(
  #endif
  }
- 
+
 +// Bool-array-masked D=256 eligibility probe (Gemma4 sliding-window prefill).
 +// Calls the same helper used inside ScaledDotProductAttention::use_fallback;
 +// callers still own the dispatcher's outer inference/stream gates. Same 0/-1
@@ -515,12 +516,7 @@ function median(xs: number[]): number {
 
 const relevantToggles: Record<string, string> = {};
 for (const [k, v] of Object.entries(process.env)) {
-  if (
-    k.startsWith('MLX_LFM2_') ||
-    k === 'MLX_NO_COMPILE' ||
-    k === 'MLX_DISABLE_COMPILE' ||
-    k === 'MLX_AB_SAMPLING'
-  ) {
+  if (k.startsWith('MLX_LFM2_') || k === 'MLX_NO_COMPILE' || k === 'MLX_DISABLE_COMPILE' || k === 'MLX_AB_SAMPLING') {
     relevantToggles[k] = v ?? '';
   }
 }
@@ -529,10 +525,7 @@ for (const [k, v] of Object.entries(process.env)) {
 //   unset          -> greedy (temperature 0)
 //   'agent-gemma4' -> the mlx agent's gemma4 preset (server presets.ts)
 const samplingArm = process.env.MLX_AB_SAMPLING ?? '';
-const samplingConfig =
-  samplingArm === 'agent-gemma4'
-    ? { temperature: 0.7, topP: 0.95, topK: 64 }
-    : { temperature: 0 };
+const samplingConfig = samplingArm === 'agent-gemma4' ? { temperature: 0.7, topP: 0.95, topK: 64 } : { temperature: 0 };
 if (samplingArm && samplingArm !== 'agent-gemma4') {
   throw new Error(`unknown MLX_AB_SAMPLING arm: ${samplingArm}`);
 }

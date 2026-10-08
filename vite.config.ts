@@ -2,7 +2,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { Plugin } from 'vite';
+import type { Plugin } from 'vite-plus';
 import { defineConfig } from 'vite-plus';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -100,6 +100,8 @@ export default defineConfig({
       '/mlx-lm',
       '/mlx-rs',
       '/crates/mlx-sys/mlx',
+      // Byte-for-byte upstream excerpts; kquant_ggml_parity verifies them verbatim.
+      '/crates/mlx-core/vendor',
       '**/*.metal.inc',
     ],
   },

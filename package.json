@@ -39,11 +39,11 @@
     "oxc-parser": "^0.153.0",
     "prettier": "^3.9.6",
     "typescript": "^7.0.2",
-    "vite-plus": "0.3.3",
-    "vitest": "^4.1.11"
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
   },
   "resolutions": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.3"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.1.0"
   },
   "packageManager": "yarn@4.18.1"
 }

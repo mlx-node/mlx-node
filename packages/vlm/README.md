@@ -18,9 +18,10 @@ npm install @mlx-node/vlm
 `QianfanOCRModel` conforms to the same `ChatSession<M>` surface as the language models in `@mlx-node/lm`, so a single session handle drives both single-shot and multi-turn VLM conversations:
 
 ```typescript
+import { readFileSync } from 'node:fs';
+
 import { ChatSession } from '@mlx-node/lm';
 import { QianfanOCRModel } from '@mlx-node/vlm';
-import { readFileSync } from 'node:fs';
 
 const model = await QianfanOCRModel.load('./models/Qianfan-VL');
 const session = new ChatSession(model, { system: 'You read documents precisely.' });

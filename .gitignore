@@ -218,3 +218,4 @@ __pycache__/
 *.metallib
 .vite-agent
 /Model-Optimizer
+.vitest/

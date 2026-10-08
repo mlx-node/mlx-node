@@ -920,9 +920,7 @@ export async function run(argv: string[]) {
     // later run with a resolvable revision repairs it then. This also covers
     // the `planned.length === 0 && revision === null` case: nothing to do.
     if (plan.revision === null) {
-      console.warn(
-        `Could not resolve the latest revision of "${assetsRepo}"; skipping sidecar repair for this run.\n`,
-      );
+      console.warn(`Could not resolve the latest revision of "${assetsRepo}"; skipping sidecar repair for this run.\n`);
       return;
     }
     const planned = plan.candidates.map((file) => file.path);

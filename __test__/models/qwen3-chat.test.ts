@@ -19,7 +19,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 
 import { createTempModel, findTokenizerPath, TINY_TEST_CONFIG } from '../test-model-utils';
 
-describe.sequential('Qwen3 Chat Session API', () => {
+describe('Qwen3 Chat Session API', () => {
   let model: Qwen3Model;
   let cleanup: () => void;
 

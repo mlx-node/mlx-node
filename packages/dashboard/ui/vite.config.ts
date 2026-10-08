@@ -2,7 +2,7 @@ import { resolve } from 'node:path';
 
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vite-plus';
 
 // No dev-server `/api` proxy: the SPA reaches the runtime over a MessagePort
 // handed to it by the desktop app's preload, not over HTTP. There is no port to

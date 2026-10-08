@@ -129,7 +129,7 @@ function expectDeterministicOptimizerState(path: string): void {
   expect(state.secondMoment).toEqual(Array(MOMENT_LENGTH).fill(SECOND_MOMENT));
 }
 
-describe.sequential('GRPOTrainer checkpoint + optimizer state round-trip', () => {
+describe('GRPOTrainer checkpoint + optimizer state round-trip', () => {
   // Track every temp model/checkpoint directory at describe scope so cleanup
   // still runs when an assertion or checkpoint load fails partway through.
   const cleanups: Array<() => void> = [];

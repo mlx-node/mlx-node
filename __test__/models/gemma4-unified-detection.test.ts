@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
  * resolve to the one shared `gemma4` Rust decoder + `Gemma4Model` registry
  * row — there is no separate unified registry entry.
  */
-describe.sequential('Gemma4 unified model detection', () => {
+describe('Gemma4 unified model detection', () => {
   let tempDir: string;
 
   beforeEach(async () => {

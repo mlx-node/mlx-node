@@ -1,27 +1,14 @@
 #!/usr/bin/env oxnode
 
-import { fork } from "node:child_process";
-import {
-  mkdir,
-  readFile,
-  rename,
-  stat,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
-import { createRequire } from "node:module";
-import {
-  cpus,
-  platform,
-  release,
-  totalmem,
-  version as osVersion,
-} from "node:os";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { parseArgs } from "node:util";
+import { fork } from 'node:child_process';
+import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { cpus, platform, release, totalmem, version as osVersion } from 'node:os';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
 
-import type { PerformanceMetrics, SessionCapableModel } from "@mlx-node/lm";
+import type { PerformanceMetrics, SessionCapableModel } from '@mlx-node/lm';
 
 const DEFAULT_RUNS = 3;
 const DEFAULT_MAX_NEW_TOKENS = 512;
@@ -30,9 +17,9 @@ const DEFAULT_WARMUP_RUNS = 0;
 const MINIMUM_COMPLETION_RATIO = 0.95;
 
 const SYSTEM_PROMPT =
-  "You are a technical writer in a deterministic inference benchmark. Produce a continuous, detailed response and do not conclude early.";
+  'You are a technical writer in a deterministic inference benchmark. Produce a continuous, detailed response and do not conclude early.';
 const DEFAULT_PROMPT =
-  "Write a comprehensive technical handbook chapter about building a production compiler. Cover lexical analysis, parsing, semantic analysis, type checking, intermediate representations, optimization, code generation, linking, testing, debugging, and deployment. Use detailed explanations and concrete examples. Do not summarize or conclude early; keep expanding the chapter until the generation limit is reached.";
+  'Write a comprehensive technical handbook chapter about building a production compiler. Cover lexical analysis, parsing, semantic analysis, type checking, intermediate representations, optimization, code generation, linking, testing, debugging, and deployment. Use detailed explanations and concrete examples. Do not summarize or conclude early; keep expanding the chapter until the generation limit is reached.';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const require = createRequire(import.meta.url);
@@ -65,12 +52,12 @@ interface Sample {
 }
 
 interface RunReport extends Sample {
-  phase: "warmup" | "measured";
+  phase: 'warmup' | 'measured';
   run: number;
 }
 
 interface WorkerMessage {
-  type: "benchmark-model-sample";
+  type: 'benchmark-model-sample';
   sample: Sample;
 }
 
@@ -79,16 +66,13 @@ interface PackageMetadata {
   version: string;
 }
 
-async function readPackageFile(
-  packageFile: string,
-  packageName: string,
-): Promise<PackageMetadata | null> {
+async function readPackageFile(packageFile: string, packageName: string): Promise<PackageMetadata | null> {
   try {
-    const parsed: unknown = JSON.parse(await readFile(packageFile, "utf8"));
+    const parsed: unknown = JSON.parse(await readFile(packageFile, 'utf8'));
     if (
       isRecord(parsed) &&
       parsed.name === packageName &&
-      typeof parsed.version === "string" &&
+      typeof parsed.version === 'string' &&
       parsed.version.length > 0
     ) {
       return { name: packageName, version: parsed.version };
@@ -130,9 +114,7 @@ function parseInteger(raw: string, name: string, minimum: number): number {
   }
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < minimum) {
-    throw new Error(
-      `${name} must be at least ${minimum}, got ${JSON.stringify(raw)}`,
-    );
+    throw new Error(`${name} must be at least ${minimum}, got ${JSON.stringify(raw)}`);
   }
   return value;
 }
@@ -140,9 +122,7 @@ function parseInteger(raw: string, name: string, minimum: number): number {
 function parseCooldown(raw: string): number {
   const value = Number(raw);
   if (!Number.isFinite(value) || value < 0) {
-    throw new Error(
-      `--cooldown must be a non-negative number of seconds, got ${JSON.stringify(raw)}`,
-    );
+    throw new Error(`--cooldown must be a non-negative number of seconds, got ${JSON.stringify(raw)}`);
   }
   return value;
 }
@@ -153,19 +133,19 @@ function parseCli(): CliOptions | null {
     allowPositionals: true,
     strict: true,
     options: {
-      runs: { type: "string", default: String(DEFAULT_RUNS) },
-      "max-new-tokens": {
-        type: "string",
+      runs: { type: 'string', default: String(DEFAULT_RUNS) },
+      'max-new-tokens': {
+        type: 'string',
         default: String(DEFAULT_MAX_NEW_TOKENS),
       },
-      cooldown: { type: "string", default: String(DEFAULT_COOLDOWN_SECONDS) },
-      "warmup-runs": { type: "string", default: String(DEFAULT_WARMUP_RUNS) },
-      prompt: { type: "string", default: DEFAULT_PROMPT },
-      output: { type: "string" },
-      help: { type: "boolean", short: "h", default: false },
+      cooldown: { type: 'string', default: String(DEFAULT_COOLDOWN_SECONDS) },
+      'warmup-runs': { type: 'string', default: String(DEFAULT_WARMUP_RUNS) },
+      prompt: { type: 'string', default: DEFAULT_PROMPT },
+      output: { type: 'string' },
+      help: { type: 'boolean', short: 'h', default: false },
       // Internal child-process mode. Kept on the same entrypoint so the
       // parent and worker always execute exactly the same checked-in code.
-      worker: { type: "boolean", default: false },
+      worker: { type: 'boolean', default: false },
     },
   });
 
@@ -178,43 +158,32 @@ function parseCli(): CliOptions | null {
   }
 
   const prompt = values.prompt.trim();
-  if (prompt.length === 0) throw new Error("--prompt must not be empty");
+  if (prompt.length === 0) throw new Error('--prompt must not be empty');
   const output = values.output?.trim();
-  if (output !== undefined && output.length === 0)
-    throw new Error("--output must not be empty");
+  if (output !== undefined && output.length === 0) throw new Error('--output must not be empty');
 
   return {
     modelPath: resolve(positionals[0]!),
-    runs: parseInteger(values.runs, "--runs", 1),
-    maxNewTokens: parseInteger(values["max-new-tokens"], "--max-new-tokens", 1),
+    runs: parseInteger(values.runs, '--runs', 1),
+    maxNewTokens: parseInteger(values['max-new-tokens'], '--max-new-tokens', 1),
     cooldownSeconds: parseCooldown(values.cooldown),
-    warmupRuns: parseInteger(values["warmup-runs"], "--warmup-runs", 0),
+    warmupRuns: parseInteger(values['warmup-runs'], '--warmup-runs', 0),
     prompt,
     outputPath: output === undefined ? null : resolve(output),
     worker: values.worker,
   };
 }
 
-function assertMetric(
-  value: unknown,
-  name: keyof PerformanceMetrics,
-  allowZero = false,
-): asserts value is number {
-  if (
-    typeof value !== "number" ||
-    !Number.isFinite(value) ||
-    (allowZero ? value < 0 : value <= 0)
-  ) {
-    throw new Error(
-      `Missing or invalid performance metric ${name}: ${String(value)}`,
-    );
+function assertMetric(value: unknown, name: keyof PerformanceMetrics, allowZero = false): asserts value is number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || (allowZero ? value < 0 : value <= 0)) {
+    throw new Error(`Missing or invalid performance metric ${name}: ${String(value)}`);
   }
 }
 
 async function runWorker(options: CliOptions): Promise<Sample> {
   // Deliberately delayed until worker mode so --help and argument validation
   // never initialize the native binding or load a checkpoint.
-  const { ChatSession, HarrierModel, loadModel } = await import("@mlx-node/lm");
+  const { ChatSession, HarrierModel, loadModel } = await import('@mlx-node/lm');
 
   const totalStartedAt = performance.now();
   const loadStartedAt = totalStartedAt;
@@ -222,9 +191,7 @@ async function runWorker(options: CliOptions): Promise<Sample> {
   const loadedAt = performance.now();
 
   if (model instanceof HarrierModel) {
-    throw new Error(
-      `Expected a generative model, got an embedding model: ${options.modelPath}`,
-    );
+    throw new Error(`Expected a generative model, got an embedding model: ${options.modelPath}`);
   }
 
   const session = new ChatSession(model as unknown as SessionCapableModel, {
@@ -235,7 +202,7 @@ async function runWorker(options: CliOptions): Promise<Sample> {
     config: {
       maxNewTokens: options.maxNewTokens,
       temperature: 0,
-      reasoningEffort: "none",
+      reasoningEffort: 'none',
       reportPerformance: true,
     },
   });
@@ -243,25 +210,16 @@ async function runWorker(options: CliOptions): Promise<Sample> {
 
   const metrics = result.performance;
   if (metrics === undefined) {
-    throw new Error(
-      "Generation returned no performance metrics despite reportPerformance: true",
-    );
+    throw new Error('Generation returned no performance metrics despite reportPerformance: true');
   }
-  assertMetric(metrics.ttftMs, "ttftMs");
-  assertMetric(metrics.prefillTokensPerSecond, "prefillTokensPerSecond");
+  assertMetric(metrics.ttftMs, 'ttftMs');
+  assertMetric(metrics.prefillTokensPerSecond, 'prefillTokensPerSecond');
   // A one-token plumbing check has no decode interval by definition, so zero
   // is valid only for that short-validation case. Normal benchmark runs must
   // provide a positive decode throughput.
-  assertMetric(
-    metrics.decodeTokensPerSecond,
-    "decodeTokensPerSecond",
-    options.maxNewTokens === 1,
-  );
+  assertMetric(metrics.decodeTokensPerSecond, 'decodeTokensPerSecond', options.maxNewTokens === 1);
 
-  const minimumGeneratedTokens = Math.max(
-    1,
-    Math.ceil(options.maxNewTokens * MINIMUM_COMPLETION_RATIO),
-  );
+  const minimumGeneratedTokens = Math.max(1, Math.ceil(options.maxNewTokens * MINIMUM_COMPLETION_RATIO));
   if (result.numTokens < minimumGeneratedTokens) {
     throw new Error(
       `Generation ended materially early: got ${result.numTokens}/${options.maxNewTokens} tokens ` +
@@ -287,30 +245,25 @@ async function runWorker(options: CliOptions): Promise<Sample> {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === 'object' && value !== null;
 }
 
 function isWorkerMessage(value: unknown): value is WorkerMessage {
-  if (
-    !isRecord(value) ||
-    value.type !== "benchmark-model-sample" ||
-    !isRecord(value.sample)
-  )
-    return false;
+  if (!isRecord(value) || value.type !== 'benchmark-model-sample' || !isRecord(value.sample)) return false;
   const sample = value.sample;
   return (
-    typeof sample.pid === "number" &&
-    typeof sample.loadMs === "number" &&
-    typeof sample.ttftMs === "number" &&
-    typeof sample.prefillTokensPerSecond === "number" &&
-    typeof sample.decodeTokensPerSecond === "number" &&
-    typeof sample.generatedTokens === "number"
+    typeof sample.pid === 'number' &&
+    typeof sample.loadMs === 'number' &&
+    typeof sample.ttftMs === 'number' &&
+    typeof sample.prefillTokensPerSecond === 'number' &&
+    typeof sample.decodeTokensPerSecond === 'number' &&
+    typeof sample.generatedTokens === 'number'
   );
 }
 
 async function sendWorkerMessage(message: WorkerMessage): Promise<void> {
   if (process.send === undefined || process.disconnect === undefined)
-    throw new Error("Benchmark worker was started without an IPC channel");
+    throw new Error('Benchmark worker was started without an IPC channel');
   await new Promise<void>((resolvePromise, rejectPromise) => {
     process.send!(message, (error) => {
       if (error === null) resolvePromise();
@@ -323,16 +276,16 @@ async function sendWorkerMessage(message: WorkerMessage): Promise<void> {
 function workerArgs(options: CliOptions): string[] {
   return [
     options.modelPath,
-    "--worker",
-    "--runs",
+    '--worker',
+    '--runs',
     String(options.runs),
-    "--max-new-tokens",
+    '--max-new-tokens',
     String(options.maxNewTokens),
-    "--cooldown",
+    '--cooldown',
     String(options.cooldownSeconds),
-    "--warmup-runs",
+    '--warmup-runs',
     String(options.warmupRuns),
-    "--prompt",
+    '--prompt',
     options.prompt,
   ];
 }
@@ -341,32 +294,23 @@ function runIsolatedSample(options: CliOptions): Promise<Sample> {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = fork(SCRIPT_PATH, workerArgs(options), {
       execArgv: process.execArgv,
-      stdio: ["ignore", "inherit", "inherit", "ipc"],
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     });
     let sample: Sample | undefined;
     let protocolError: Error | undefined;
 
-    child.on("message", (message) => {
+    child.on('message', (message) => {
       if (isWorkerMessage(message)) sample = message.sample;
-      else
-        protocolError = new Error(
-          "Benchmark worker returned an invalid IPC message",
-        );
+      else protocolError = new Error('Benchmark worker returned an invalid IPC message');
     });
-    child.once("error", rejectPromise);
-    child.once("exit", (code, signal) => {
+    child.once('error', rejectPromise);
+    child.once('exit', (code, signal) => {
       if (protocolError !== undefined) {
         rejectPromise(protocolError);
       } else if (code !== 0) {
-        rejectPromise(
-          new Error(
-            `Benchmark worker failed (${signal === null ? `exit ${code}` : `signal ${signal}`})`,
-          ),
-        );
+        rejectPromise(new Error(`Benchmark worker failed (${signal === null ? `exit ${code}` : `signal ${signal}`})`));
       } else if (sample === undefined) {
-        rejectPromise(
-          new Error("Benchmark worker exited without returning a sample"),
-        );
+        rejectPromise(new Error('Benchmark worker exited without returning a sample'));
       } else {
         resolvePromise(sample);
       }
@@ -375,8 +319,7 @@ function runIsolatedSample(options: CliOptions): Promise<Sample> {
 }
 
 function formatSample(report: RunReport): string {
-  const label =
-    report.phase === "warmup" ? `warmup ${report.run}` : `run ${report.run}`;
+  const label = report.phase === 'warmup' ? `warmup ${report.run}` : `run ${report.run}`;
   return (
     `${label}: load ${report.loadMs.toFixed(0)} ms | TTFT ${report.ttftMs.toFixed(0)} ms | ` +
     `prefill ${report.prefillTokensPerSecond.toFixed(1)} tok/s | ` +
@@ -386,13 +329,10 @@ function formatSample(report: RunReport): string {
 }
 
 function median(values: number[]): number {
-  if (values.length === 0)
-    throw new Error("Cannot take the median of an empty sample set");
+  if (values.length === 0) throw new Error('Cannot take the median of an empty sample set');
   const sorted = [...values].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1
-    ? sorted[middle]!
-    : (sorted[middle - 1]! + sorted[middle]!) / 2;
+  return sorted.length % 2 === 1 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
 function medians(reports: RunReport[]) {
@@ -401,41 +341,30 @@ function medians(reports: RunReport[]) {
     generationWallMs: median(reports.map((report) => report.generationWallMs)),
     totalWallMs: median(reports.map((report) => report.totalWallMs)),
     ttftMs: median(reports.map((report) => report.ttftMs)),
-    prefillTokensPerSecond: median(
-      reports.map((report) => report.prefillTokensPerSecond),
-    ),
-    decodeTokensPerSecond: median(
-      reports.map((report) => report.decodeTokensPerSecond),
-    ),
+    prefillTokensPerSecond: median(reports.map((report) => report.prefillTokensPerSecond)),
+    decodeTokensPerSecond: median(reports.map((report) => report.decodeTokensPerSecond)),
     promptTokens: median(reports.map((report) => report.promptTokens)),
     generatedTokens: median(reports.map((report) => report.generatedTokens)),
   };
 }
 
-async function readPackageMetadata(
-  packageName: string,
-): Promise<PackageMetadata | null> {
+async function readPackageMetadata(packageName: string): Promise<PackageMetadata | null> {
   let entryPath: string;
   try {
     entryPath = require.resolve(packageName);
   } catch {
     const workspacePackageFile =
-      packageName === "@mlx-node/lm"
-        ? resolve(dirname(SCRIPT_PATH), "../packages/lm/package.json")
-        : packageName === "@mlx-node/core"
-          ? resolve(dirname(SCRIPT_PATH), "../packages/core/package.json")
+      packageName === '@mlx-node/lm'
+        ? resolve(dirname(SCRIPT_PATH), '../packages/lm/package.json')
+        : packageName === '@mlx-node/core'
+          ? resolve(dirname(SCRIPT_PATH), '../packages/core/package.json')
           : null;
-    return workspacePackageFile === null
-      ? null
-      : await readPackageFile(workspacePackageFile, packageName);
+    return workspacePackageFile === null ? null : await readPackageFile(workspacePackageFile, packageName);
   }
 
   let currentDirectory = dirname(entryPath);
   for (let depth = 0; depth < 5; depth++) {
-    const metadata = await readPackageFile(
-      resolve(currentDirectory, "package.json"),
-      packageName,
-    );
+    const metadata = await readPackageFile(resolve(currentDirectory, 'package.json'), packageName);
     if (metadata !== null) return metadata;
     // Keep walking: the resolved entry is commonly inside a dist/ folder.
     const parentDirectory = dirname(currentDirectory);
@@ -446,13 +375,9 @@ async function readPackageMetadata(
 }
 
 function nativePackageCandidates(): string[] {
-  if (process.platform === "darwin" && process.arch === "arm64")
-    return ["@mlx-node/core-darwin-arm64"];
-  if (process.platform === "linux" && process.arch === "arm64") {
-    return [
-      "@mlx-node/core-linux-arm64-gnu",
-      "@mlx-node/core-linux-arm64-musl",
-    ];
+  if (process.platform === 'darwin' && process.arch === 'arm64') return ['@mlx-node/core-darwin-arm64'];
+  if (process.platform === 'linux' && process.arch === 'arm64') {
+    return ['@mlx-node/core-linux-arm64-gnu', '@mlx-node/core-linux-arm64-musl'];
   }
   return [];
 }
@@ -474,39 +399,31 @@ async function environmentMetadata() {
     totalMemoryBytes: totalmem(),
     nodeVersion: process.version,
     packages: {
-      lm: await readPackageMetadata("@mlx-node/lm"),
-      core: await readPackageMetadata("@mlx-node/core"),
+      lm: await readPackageMetadata('@mlx-node/lm'),
+      core: await readPackageMetadata('@mlx-node/core'),
       native: nativePackage,
     },
   };
 }
 
 function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolvePromise) =>
-    setTimeout(resolvePromise, milliseconds),
-  );
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
-async function writeJsonAtomically(
-  outputPath: string,
-  contents: string,
-): Promise<void> {
+async function writeJsonAtomically(outputPath: string, contents: string): Promise<void> {
   const outputDirectory = dirname(outputPath);
   await mkdir(outputDirectory, { recursive: true });
   const temporaryPath = `${outputPath}.${process.pid}.${Date.now()}.tmp`;
 
   try {
     await writeFile(temporaryPath, `${contents}\n`, {
-      encoding: "utf8",
-      flag: "wx",
+      encoding: 'utf8',
+      flag: 'wx',
     });
     await rename(temporaryPath, outputPath);
   } catch (error) {
     await unlink(temporaryPath).catch(() => undefined);
-    throw new Error(
-      `Failed to write JSON summary to ${JSON.stringify(outputPath)}`,
-      { cause: error },
-    );
+    throw new Error(`Failed to write JSON summary to ${JSON.stringify(outputPath)}`, { cause: error });
   }
 }
 
@@ -515,10 +432,7 @@ async function assertModelPath(modelPath: string): Promise<void> {
   try {
     modelStat = await stat(modelPath);
   } catch (error) {
-    throw new Error(
-      `Cannot access model directory ${JSON.stringify(modelPath)}`,
-      { cause: error },
-    );
+    throw new Error(`Cannot access model directory ${JSON.stringify(modelPath)}`, { cause: error });
   }
   if (!modelStat.isDirectory() && !modelStat.isFile()) {
     throw new Error(`Model path is neither a directory nor a file: ${modelPath}`);
@@ -539,17 +453,11 @@ async function runParent(options: CliOptions): Promise<void> {
     `${options.runs} measured x ${options.maxNewTokens} tokens; ` +
       `${options.warmupRuns} warmup; ${options.cooldownSeconds}s cooldown; temperature 0`,
   );
-  console.log("Each sample uses a fresh child process and model load.");
+  console.log('Each sample uses a fresh child process and model load.');
 
-  const executePhase = async (
-    phase: RunReport["phase"],
-    count: number,
-    destination: RunReport[],
-  ) => {
+  const executePhase = async (phase: RunReport['phase'], count: number, destination: RunReport[]) => {
     for (let index = 1; index <= count; index++) {
-      console.log(
-        `\n${phase === "warmup" ? "Warmup" : "Run"} ${index}/${count}: starting`,
-      );
+      console.log(`\n${phase === 'warmup' ? 'Warmup' : 'Run'} ${index}/${count}: starting`);
       const report: RunReport = {
         ...(await runIsolatedSample(options)),
         phase,
@@ -566,8 +474,8 @@ async function runParent(options: CliOptions): Promise<void> {
     }
   };
 
-  await executePhase("warmup", options.warmupRuns, warmups);
-  await executePhase("measured", options.runs, runs);
+  await executePhase('warmup', options.warmupRuns, warmups);
+  await executePhase('measured', options.runs, runs);
 
   const summary = {
     schemaVersion: 1,
@@ -581,12 +489,12 @@ async function runParent(options: CliOptions): Promise<void> {
       cooldownSeconds: options.cooldownSeconds,
       warmupRuns: options.warmupRuns,
       temperature: 0,
-      reasoningEffort: "none",
+      reasoningEffort: 'none',
       reportPerformance: true,
       minimumCompletionRatio: MINIMUM_COMPLETION_RATIO,
       systemPrompt: SYSTEM_PROMPT,
       prompt: options.prompt,
-      isolation: "fresh child process and model load per sample",
+      isolation: 'fresh child process and model load per sample',
     },
     warmups,
     runs,
@@ -598,7 +506,7 @@ async function runParent(options: CliOptions): Promise<void> {
     await writeJsonAtomically(options.outputPath, summaryJson);
     console.log(`\nWrote JSON summary to ${options.outputPath}`);
   }
-  console.log("\nJSON summary:");
+  console.log('\nJSON summary:');
   console.log(summaryJson);
 }
 
@@ -608,7 +516,7 @@ async function main(): Promise<void> {
 
   if (options.worker) {
     const sample = await runWorker(options);
-    await sendWorkerMessage({ type: "benchmark-model-sample", sample });
+    await sendWorkerMessage({ type: 'benchmark-model-sample', sample });
     return;
   }
 

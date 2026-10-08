@@ -43,7 +43,7 @@ const sftConfig: SftEngineConfig = {
   gradientCheckpointing: true,
 };
 
-describe.sequential('SftTrainingEngine — training state lifecycle', () => {
+describe('SftTrainingEngine — training state lifecycle', () => {
   // Shared thread-backed model. `loadModel` spins up the dedicated OS thread
   // that `SftTrainingEngine` requires (it pulls `model.thread.cmd_sender()`).
   let model: Qwen3Model;

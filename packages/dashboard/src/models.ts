@@ -169,9 +169,7 @@ export function isModelPresent(modelDir: string): boolean {
   // counting one as present disables Install on the card for a directory the
   // loader never lists.
   if (
-    entries.some(
-      (file) => file.endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)),
-    )
+    entries.some((file) => file.endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)))
   ) {
     return true;
   }

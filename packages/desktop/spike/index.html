@@ -2,15 +2,53 @@
 <meta charset="utf-8" />
 <title>mlx-node — Phase 0 watchdog spike</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin: 0; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
-         background: #0b0d10; color: #d7dde5; display: flex; flex-direction: column; height: 100vh; }
-  header { padding: 10px 14px; border-bottom: 1px solid #1e242c; display: flex; gap: 18px; align-items: center; }
-  .spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #2b3441; border-top-color: #4a9eff;
-          animation: r .7s linear infinite; }
-  @keyframes r { to { transform: rotate(360deg); } }
-  #out { flex: 1; overflow: auto; padding: 12px 14px; white-space: pre-wrap; line-height: 1.5; }
-  b { color: #4a9eff; font-weight: 600; }
+  :root {
+    color-scheme: dark;
+  }
+  body {
+    margin: 0;
+    font:
+      13px ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      monospace;
+    background: #0b0d10;
+    color: #d7dde5;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  header {
+    padding: 10px 14px;
+    border-bottom: 1px solid #1e242c;
+    display: flex;
+    gap: 18px;
+    align-items: center;
+  }
+  .spin {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid #2b3441;
+    border-top-color: #4a9eff;
+    animation: r 0.7s linear infinite;
+  }
+  @keyframes r {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  #out {
+    flex: 1;
+    overflow: auto;
+    padding: 12px 14px;
+    white-space: pre-wrap;
+    line-height: 1.5;
+  }
+  b {
+    color: #4a9eff;
+    font-weight: 600;
+  }
 </style>
 <header>
   <div class="spin"></div>
@@ -24,7 +62,11 @@
   // so the window is genuinely repainting while MLX saturates the GPU.
   let frames = 0;
   const framesEl = document.getElementById('frames');
-  (function tick() { frames++; framesEl.textContent = frames; requestAnimationFrame(tick); })();
+  (function tick() {
+    frames++;
+    framesEl.textContent = frames;
+    requestAnimationFrame(tick);
+  })();
 
   let tokens = 0;
   const t0 = Date.now();

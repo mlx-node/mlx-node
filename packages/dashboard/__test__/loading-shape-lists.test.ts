@@ -172,8 +172,8 @@ function modelsRoutes(): Record<string, unknown> {
         present: false,
         blockedByForeignDir: false,
         localRevision: null,
-      localAssetsRepo: null,
-      localAssetsRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
       },
       {
         label: 'Qwen-AgentWorld-35B-A3B',
@@ -185,8 +185,8 @@ function modelsRoutes(): Record<string, unknown> {
         present: false,
         blockedByForeignDir: false,
         localRevision: null,
-      localAssetsRepo: null,
-      localAssetsRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
       },
       {
         label: 'Gemma-4-26B-A4B',
@@ -198,8 +198,8 @@ function modelsRoutes(): Record<string, unknown> {
         present: false,
         blockedByForeignDir: false,
         localRevision: null,
-      localAssetsRepo: null,
-      localAssetsRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
       },
     ],
   };

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { detectModelType } from '@mlx-node/lm';
 import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 
-describe.sequential('LFM2 MoE Model Detection', () => {
+describe('LFM2 MoE Model Detection', () => {
   let tempDir: string;
 
   beforeEach(async () => {

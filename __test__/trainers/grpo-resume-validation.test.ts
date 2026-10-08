@@ -107,7 +107,7 @@ describe('computeDatasetHash', () => {
   });
 });
 
-describe.sequential('GRPOTrainer - Dataset Resume Validation', () => {
+describe('GRPOTrainer - Dataset Resume Validation', () => {
   let tempDir: string;
 
   beforeAll(() => {

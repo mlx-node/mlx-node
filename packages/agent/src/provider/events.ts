@@ -76,8 +76,7 @@ function usageFromFinal(final: ChatStreamFinal): Usage {
  */
 function toPiToolCall(call: ToolCallResult): ToolCall {
   if (call.status === 'ok') {
-    const args =
-      typeof call.arguments === 'object' && call.arguments !== null ? (call.arguments as JsonObject) : {};
+    const args = typeof call.arguments === 'object' && call.arguments !== null ? (call.arguments as JsonObject) : {};
     return { type: 'toolCall', id: call.id, name: call.name, arguments: args };
   }
   return {

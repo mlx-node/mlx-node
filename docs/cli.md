@@ -48,16 +48,16 @@ quantization variants downloads all remaining variants, and that the marker
 makes the directory dashboard-managed — a dashboard install into it may
 replace the contents wholesale.
 
-| Flag             | Default                | Purpose                                                |
-| ---------------- | ---------------------- | ------------------------------------------------------ |
-| `-m`, `--model`  | `Qwen/Qwen3-0.6B`      | HuggingFace model id                                   |
-| `-g`, `--glob`   | —                      | Filename pattern filter (download only matching files) |
-| `--assets-repo`  | —                      | Base-model repo to fetch tokenizer/config sidecars from |
+| Flag             | Default                | Purpose                                                                  |
+| ---------------- | ---------------------- | ------------------------------------------------------------------------ |
+| `-m`, `--model`  | `Qwen/Qwen3-0.6B`      | HuggingFace model id                                                     |
+| `-g`, `--glob`   | —                      | Filename pattern filter (download only matching files)                   |
+| `--assets-repo`  | —                      | Base-model repo to fetch tokenizer/config sidecars from                  |
 | `--complete`     | `false`                | Marker records a full-model (catalog) install, not a partial `-g` subset |
-| `--force`        | `false`                | Re-verify every file against upstream by content hash  |
-| `--cache-dir`    | `~/.cache/huggingface` | HuggingFace cache directory                            |
-| `--set-token`    | —                      | Store HuggingFace credentials                          |
-| `-o`, `--output` | —                      | Output directory                                       |
+| `--force`        | `false`                | Re-verify every file against upstream by content hash                    |
+| `--cache-dir`    | `~/.cache/huggingface` | HuggingFace cache directory                                              |
+| `--set-token`    | —                      | Store HuggingFace credentials                                            |
+| `-o`, `--output` | —                      | Output directory                                                         |
 
 `--complete` marks the selection as the COMPLETE prescribed model — the wizard
 passes it, because a catalog install must read as installed (and update-able)
@@ -189,7 +189,7 @@ SwiGLU FFN is rescaled by a power of two and the inverse folded into the norm
 the MLP reads, moving every block scale into the normal band.
 
 The fold is exact, not approximate. RMSNorm computes its reciprocal from the
-norm's *input*, so scaling the norm *weight* scales its output by exactly that
+norm's _input_, so scaling the norm _weight_ scales its output by exactly that
 factor; a power of two only shifts an exponent field, so no mantissa and no
 rounding decision changes anywhere downstream. silu is not homogeneous, which
 pins `gate_proj`'s factor to the inverse of the norm's; the elementwise product
@@ -355,19 +355,19 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 `qwen3_5_mtp` format (bare-keyed, BF16 MTP head); it does not require
 `--quantize`/`--q-recipe` and the body may be BF16 or already-quantized.
 
-| Flag               | Purpose                                                                                       |
-| ------------------ | --------------------------------------------------------------------------------------------- |
-| `-i`, `--input`    | Source model directory (required)                                                             |
-| `-o`, `--output`   | Output directory (required)                                                                   |
-| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                              |
-| `-q`, `--quantize` | Enable quantization                                                                           |
-| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia`     |
+| Flag               | Purpose                                                                                                                                                                                                     |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-i`, `--input`    | Source model directory (required)                                                                                                                                                                           |
+| `-o`, `--output`   | Output directory (required)                                                                                                                                                                                 |
+| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                                                                                                                                            |
+| `-q`, `--quantize` | Enable quantization                                                                                                                                                                                         |
+| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia`                                                                                                                   |
 | `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`. `mxfp4`/`mxfp8` always use the in-tree encoders, never MLX's; `nvfp4` also applies the power-of-two lift to dense FFNs (SafeTensors sources only) |
-| `--q-mxfp`         | Select Unsloth's fixed MXFP tensor-class map, or upgrade eligible decisions for other recipes; MX block exponents are always encoder-tuned |
-| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)                 |
-| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                      |
-| `--mmproj`         | Vision-encoder conversion path                                                                |
-| `-v`, `--verbose`  | Verbose logging                                                                               |
+| `--q-mxfp`         | Select Unsloth's fixed MXFP tensor-class map, or upgrade eligible decisions for other recipes; MX block exponents are always encoder-tuned                                                                  |
+| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)                                                                                                                               |
+| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                                                                                                                                    |
+| `--mmproj`         | Vision-encoder conversion path                                                                                                                                                                              |
+| `-v`, `--verbose`  | Verbose logging                                                                                                                                                                                             |
 
 ### Load Gemma 4 GGUF directly
 
@@ -595,17 +595,17 @@ kl_topk          0.13782  (K=512, teacher tail mass 0.04045)
 top1_agreement   77.64%
 ```
 
-| Flag             | Purpose                                                                     |
-| ---------------- | --------------------------------------------------------------------------- |
-| `--teacher`      | Reference checkpoint, normally bf16 (`cache` mode, required)                |
-| `--model`, `-m`  | Candidate checkpoint to score (`score` mode, required)                      |
-| `--dataset`      | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)               |
-| `--cache`        | Teacher cache directory (required in both modes)                            |
-| `--rows`         | Dataset rows to capture (default `64`)                                      |
-| `--seq`          | Tokens kept per row (default `512`, minimum `2`)                            |
-| `--top-k`        | Retained support per position (default `1024`, clamped to the vocabulary)   |
-| `--logit-chunk`  | Positions per head projection (default `64`)                                |
-| `--json`         | Emit the report as one JSON object (`score` mode), for A/B scripting        |
+| Flag            | Purpose                                                                   |
+| --------------- | ------------------------------------------------------------------------- |
+| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)              |
+| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                    |
+| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)             |
+| `--cache`       | Teacher cache directory (required in both modes)                          |
+| `--rows`        | Dataset rows to capture (default `64`)                                    |
+| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                          |
+| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary) |
+| `--logit-chunk` | Positions per head projection (default `64`)                              |
+| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting      |
 
 **Reading the numbers.** `nll`, `perplexity` and `top1_agreement` are exact over
 the full vocabulary. `kl_topk` is a KL over a `K+1`-way partition: one term per
@@ -637,7 +637,7 @@ bf16 teacher it came from. The cache is also re-checked after scoring: if a
 capture replaced it mid-run, the score is refused rather than reported.
 
 **What the teacher is.** `--teacher` is normally the bf16 model, and every
-number is a divergence *from it*. A quantized checkpoint is accepted rather than
+number is a divergence _from it_. A quantized checkpoint is accepted rather than
 refused — anchoring on a released reference, or A/B-ing two recipes against a
 shared one, is a real comparison — but the cache records that it was quantized
 and `score` prints the fact beside the teacher path. Read a report carrying that
@@ -829,11 +829,11 @@ On a fresh run (no explicit `--model`/`--provider`/session flag), it injects the
 
 When no local model exists, an interactive terminal shows a first-run wizard over a curated catalog and downloads the choice via `mlx download model`. In a non-interactive shell it prints the equivalent `mlx download model` commands instead. The catalog:
 
-| Model                 | HuggingFace repo                       | Size    | Notes                        |
-| --------------------- | -------------------------------------- | ------- | ---------------------------- |
-| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`             | ~18 GB  | Best tool use — recommended  |
-| Qwen-AgentWorld-35B   | `unsloth/Qwen-AgentWorld-35B-A3B-GGUF` | ~22 GB  | Agent-tuned MoE, fast decode |
-| Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF`      | ~19 GB  | MoE, fast decode             |
+| Model                 | HuggingFace repo                       | Size   | Notes                        |
+| --------------------- | -------------------------------------- | ------ | ---------------------------- |
+| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`             | ~18 GB | Best tool use — recommended  |
+| Qwen-AgentWorld-35B   | `unsloth/Qwen-AgentWorld-35B-A3B-GGUF` | ~22 GB | Agent-tuned MoE, fast decode |
+| Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF`      | ~19 GB | MoE, fast decode             |
 
 Each entry installs its Unsloth **UD-Q4_K_XL** GGUF (`-g "*UD-Q4_K_XL*"`, plus
 Gemma's `mmproj` projector), one variant out of the dozens

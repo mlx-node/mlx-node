@@ -166,9 +166,9 @@ describe('attach', () => {
     expect(await Promise.race([oldReply.then(() => 'settled'), settle().then(() => 'pending')])).toBe('pending');
 
     // Replacing the connection must not hold up unrelated work on the new one.
-    expect(
-      await ask(second.peer, { kind: 'call', id: 2, call: { method: 'GET', path: '/api/models' } }),
-    ).toMatchObject({ kind: 'response', id: 2 });
+    expect(await ask(second.peer, { kind: 'call', id: 2, call: { method: 'GET', path: '/api/models' } })).toMatchObject(
+      { kind: 'response', id: 2 },
+    );
 
     // Cancellation lost the race to a mutation that had already started. The
     // retired connection stays alive long enough to report that real result.

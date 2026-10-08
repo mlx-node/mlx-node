@@ -43,7 +43,7 @@ function fakeNativeMethod(numTokens: number) {
   };
 }
 
-describe.sequential('_runChatStream bridge', () => {
+describe('_runChatStream bridge', () => {
   it('should yield delta chunks followed by a final chunk', async () => {
     const events: ChatStreamEvent[] = [];
     const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];

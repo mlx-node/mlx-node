@@ -33,7 +33,7 @@ const HARRIER_0_6B_CONFIG = {
   useQkNorm: true,
 };
 
-describe.sequential('HarrierModel', () => {
+describe('HarrierModel', () => {
   describe('Model Instantiation', () => {
     it('should create model from tiny config', () => {
       const model = new HarrierModel(TINY_CONFIG);

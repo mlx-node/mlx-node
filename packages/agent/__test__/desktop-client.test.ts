@@ -152,21 +152,24 @@ describe('desktop inference transport', () => {
       model,
       normalizeContext({ messages: [{ role: 'user', content: 'read', timestamp: 0 }] }),
     ).result();
-    await stream(model, normalizeContext({
-      messages: [
-        { role: 'user', content: 'read', timestamp: 0 },
-        first,
-        {
-          role: 'toolResult',
-          toolCallId: 'toolu_1',
-          toolName: 'read',
-          content: [{ type: 'text', text: 'file contents' }],
-          isError: false,
-          timestamp: 1,
-        },
-        { role: 'user', content: [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }], timestamp: 2 },
-      ],
-    })).result();
+    await stream(
+      model,
+      normalizeContext({
+        messages: [
+          { role: 'user', content: 'read', timestamp: 0 },
+          first,
+          {
+            role: 'toolResult',
+            toolCallId: 'toolu_1',
+            toolName: 'read',
+            content: [{ type: 'text', text: 'file contents' }],
+            isError: false,
+            timestamp: 1,
+          },
+          { role: 'user', content: [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }], timestamp: 2 },
+        ],
+      }),
+    ).result();
     expect(JSON.stringify(requests[1].messages)).toContain('tool_result');
     expect(JSON.stringify(requests[1].messages)).toContain('file contents');
     expect(JSON.stringify(requests[1].messages)).toContain('image/png');
@@ -176,11 +179,9 @@ describe('desktop inference transport', () => {
     const { endpoint, requests } = await fixture(0);
     const local = host();
     const abort = new AbortController();
-    const result = desktopStreamFactory(async () => endpoint)(local)(
-      model,
-      normalizeContext({ messages: [] }),
-      { signal: abort.signal },
-    ).result();
+    const result = desktopStreamFactory(async () => endpoint)(local)(model, normalizeContext({ messages: [] }), {
+      signal: abort.signal,
+    }).result();
     await vi.waitFor(() => expect(requests).toHaveLength(1));
     abort.abort();
     expect((await result).stopReason).toBe('aborted');
@@ -192,9 +193,12 @@ describe('desktop inference transport', () => {
     const result = await desktopStreamFactory(async () => ({
       ...endpoint,
       models: [{ name: 'local', path: '/other/local' }],
-    }))(local)(model, normalizeContext({
-      messages: [],
-    })).result();
+    }))(local)(
+      model,
+      normalizeContext({
+        messages: [],
+      }),
+    ).result();
     expect(result.errorMessage).toContain('different model directory');
     expect(requests).toHaveLength(0);
     expect(local.runWithResident).not.toHaveBeenCalled();

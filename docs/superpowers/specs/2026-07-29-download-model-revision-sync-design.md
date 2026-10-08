@@ -94,7 +94,7 @@ outputDir exists?
 ### Revision resolution
 
 - `resolveRemoteRevision(repo, accessToken)` calls `modelInfo({ name,
-additionalFields: ['sha'] })` from `@huggingface/hub`, wrapped in the
+  additionalFields: ['sha'] })` from `@huggingface/hub`, wrapped in the
   existing `withRetries`. Result must match `/^[0-9a-f]{40}$/i`; otherwise
   return `null`.
 - `null` (offline, 401 on gated repo, API change) → print a warning

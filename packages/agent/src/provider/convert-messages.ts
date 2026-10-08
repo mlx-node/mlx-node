@@ -78,10 +78,7 @@ function convertParts(
  * repair and grouped tool-result image turn live in
  * {@link contextToChatMessages}, mirroring pi's transformMessages and OpenAI
  * provider conversion. */
-function convertMessage(
-  message: Exclude<Message, SystemMessage>,
-  supportsImages: boolean,
-): ConvertedMessage {
+function convertMessage(message: Exclude<Message, SystemMessage>, supportsImages: boolean): ConvertedMessage {
   switch (message.role) {
     case 'user': {
       if (typeof message.content === 'string') {

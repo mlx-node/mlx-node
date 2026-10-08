@@ -2,12 +2,7 @@
 
 import { resolve } from 'node:path';
 
-import {
-  ChatSession,
-  HarrierModel,
-  loadModel,
-  type SessionCapableModel,
-} from '@mlx-node/lm';
+import { ChatSession, HarrierModel, loadModel, type SessionCapableModel } from '@mlx-node/lm';
 
 const modelArg = process.argv[2];
 if (modelArg == null) {

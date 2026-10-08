@@ -16,7 +16,7 @@ const TEST_OUTPUT_DIR = './test-integration-output';
 // Shared temp model for all tests
 let tempModel: { modelPath: string; cleanup: () => void };
 
-describe.sequential('GRPO Integration Tests', () => {
+describe('GRPO Integration Tests', () => {
   beforeAll(async () => {
     tempModel = await createTempModel();
   });
@@ -39,7 +39,7 @@ describe.sequential('GRPO Integration Tests', () => {
     }
   });
 
-  describe.sequential('End-to-End Training', () => {
+  describe('End-to-End Training', () => {
     it('should complete a full training run with multiple epochs', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
@@ -135,7 +135,7 @@ describe.sequential('GRPO Integration Tests', () => {
     });
   });
 
-  describe.sequential('Generation and Scoring Pipeline', () => {
+  describe('Generation and Scoring Pipeline', () => {
     it('should generate, score, and compute loss correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
@@ -211,7 +211,7 @@ describe.sequential('GRPO Integration Tests', () => {
     });
   });
 
-  describe.sequential('Loss Computation Variants', () => {
+  describe('Loss Computation Variants', () => {
     it('should compute GRPO loss correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
@@ -294,7 +294,7 @@ describe.sequential('GRPO Integration Tests', () => {
     });
   });
 
-  describe.sequential('Advantage Computation', () => {
+  describe('Advantage Computation', () => {
     it('should normalize advantages per group', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
@@ -346,7 +346,7 @@ describe.sequential('GRPO Integration Tests', () => {
     });
   });
 
-  describe.sequential('Batch Processing', () => {
+  describe('Batch Processing', () => {
     it('should handle large batches correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
@@ -403,7 +403,7 @@ describe.sequential('GRPO Integration Tests', () => {
     });
   });
 
-  describe.sequential('Sampling Configuration', () => {
+  describe('Sampling Configuration', () => {
     it('should respect temperature settings', async () => {
       const temperatures = [0.5, 1.0, 1.5];
 
@@ -465,7 +465,7 @@ describe.sequential('GRPO Integration Tests', () => {
     }, 30000); // 30s timeout - creates 3 trainers in sequence
   });
 
-  describe.sequential('Error Handling', () => {
+  describe('Error Handling', () => {
     it('should handle empty dataset gracefully', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
@@ -540,7 +540,7 @@ describe.sequential('GRPO Integration Tests', () => {
     });
   });
 
-  describe.sequential('Metrics Tracking', () => {
+  describe('Metrics Tracking', () => {
     it('should track all metrics correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,

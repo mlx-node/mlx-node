@@ -14,7 +14,7 @@ afterAll(() => {
   tempModel?.cleanup();
 });
 
-describe.sequential('GRPOTrainer - generateBatch()', () => {
+describe('GRPOTrainer - generateBatch()', () => {
   describe('Basic Functionality', () => {
     it('should generate completions for single prompt', async () => {
       const trainer = await GRPOTrainer.create({
@@ -261,7 +261,7 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
   });
 });
 
-describe.sequential('GRPOTrainer - Constructor', () => {
+describe('GRPOTrainer - Constructor', () => {
   it('should create trainer with default config', async () => {
     const trainer = await GRPOTrainer.create({ modelPath: tempModel.modelPath, modelName: 'qwen3-0.6b' });
     expect(trainer).toBeDefined();
@@ -297,7 +297,7 @@ describe.sequential('GRPOTrainer - Constructor', () => {
   });
 });
 
-describe.sequential('GRPOTrainer - scoreGenerations()', () => {
+describe('GRPOTrainer - scoreGenerations()', () => {
   describe('Basic Functionality', () => {
     it('should score completions with custom reward function', async () => {
       // Simple reward function: length-based
@@ -392,7 +392,7 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
   });
 });
 
-describe.sequential('GRPOTrainer - trainStep()', () => {
+describe('GRPOTrainer - trainStep()', () => {
   describe('Basic Functionality', () => {
     it('should execute a training step and return metrics', async () => {
       const rewardFn = (outputs: RewardOutput[]) => {
@@ -726,7 +726,7 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 // GRPOTrainer - train() tests
 // ============================================================================
 
-describe.sequential('GRPOTrainer - train()', () => {
+describe('GRPOTrainer - train()', () => {
   describe('Basic Training Loop', () => {
     it('should execute training loop with dataset', async () => {
       const trainer = await GRPOTrainer.create({

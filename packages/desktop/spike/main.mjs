@@ -13,10 +13,11 @@
  *   run:  yarn workspace @mlx-node/desktop spike:electron
  */
 
-import { app, BrowserWindow, utilityProcess } from 'electron';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { app, BrowserWindow, utilityProcess } from 'electron';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = process.env.MLX_SPIKE_LOG_DIR ?? join(HERE, '.spike-logs');

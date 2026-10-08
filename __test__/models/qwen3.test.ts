@@ -2,7 +2,7 @@ import { Qwen3Model } from '@mlx-node/core';
 import { QWEN3_CONFIGS, getQwen3Config } from '@mlx-node/lm';
 import { describe, it, expect } from 'vite-plus/test';
 
-describe.sequential('Qwen3 Model', () => {
+describe('Qwen3 Model', () => {
   describe('Model Configuration', () => {
     it('should have correct default configurations', () => {
       expect(QWEN3_CONFIGS['qwen3-0.6b']).toBeDefined();
