@@ -485,7 +485,7 @@ Deleted tools (restore from `69ccaf9d` if needed):
     partials to bf16 over different page subsets, then merge), so a greedy
     transcript could flip on a near-tie between runs, and the first 20
     tokens past 512 mixed partitions within one run. Resolved by a
-    device rule instead of the sweep (`gemma4/attention.rs`
+    device rule instead of the sweep (then `gemma4/attention.rs`
     `grouped_d512_rule_stripes`): the smallest power of two whose
     query-head SIMD groups reach 16 per GPU core, bounded by the work tiles
     and 256. Measured on the 40-core M5 Max with forced stripes
@@ -503,12 +503,34 @@ Deleted tools (restore from `69ccaf9d` if needed):
     attention traffic at 32K or the short-context parallelism the kernel
     lives on. `MLX_GEMMA4_DECODE_TUNING` is gone; the remaining
     submission-depth sweep does not change numerics (hash `e9a263b752`
-    for depths 0/4/16/34). Two leftovers, each deterministic on its own,
-    product calls: Muse-Glimmer still picks its D128 partition by the same
-    timing sweep (`muse_glimmer/model.rs` via `begin_with_limit`); and the
+    for depths 0/4/16/34). Muse-Glimmer's D128 partition, the first
+    leftover, picked by the same timing sweep (`muse_glimmer/model.rs` via
+    `begin_with_limit`): resolved the same way. The rule is now one shared
+    helper (`engine/decode_tuning.rs` `grouped_partition_stripes`; D512
+    caps it at 256, Muse at its live temporary-storage limit, which stays a
+    hard cap), and the attention stage of the sweep is deleted (as is
+    `MLX_MUSE_DECODE_TUNING`). muse-glimmer-30b-q4k (Hq32/Hkv2, D128, 13
+    global layers), fresh processes, 512 greedy tokens: the sweep gave 4
+    transcripts in 12 runs at 1K and 7 in 12 at 4K (it settled on generic,
+    4, 8, 16, 32, 64 or 128 partitions from run to run); the rule (32 on 40
+    cores) gives one per context (1K 12/12, 4K 12/12, 8K 10/10), the same
+    transcript as the sweep build forced to 32, for every submission depth
+    tried (0 to 51). Captured-input replay (60K capture cut to 1K-60K, 13
+    dependent calls) puts 32 partitions level with generic V2 at 1K and
+    1.2-2.3x ahead from 4K to 60K, within 6% of the fastest count to 8K;
+    from 16K, 128-512 partitions are 9-11% faster in attention (under 1.5%
+    of a decode step), left unclaimed: a context term is unmeasured for
+    D512. Decode tok/s A/B was within noise (machine under heavy outside
+    load, 10-19 tok/s spread per build; paired new/old medians 1.10, 0.98
+    and 1.00 at 1K/4K/8K over 6, 6 and 10 interleaved pairs).
+    The other leftover stays a product call, deterministic on its own: the
     Gemma4 raw (non-graph) decode route gives a different transcript than
     the graph route even with the grouped kernel off, because the graph
     route trims the sliding layers' block table before the live window
-    while the raw route passes the full table plus a mask.
+    while the raw route passes the full table plus a mask. Muse has the
+    same shape of split: its whole-turn lane (no cache owner, or
+    `MLX_SERVE_FORCE_SERIAL=1`) decodes with generic V2 attention while the
+    scheduled lane takes the grouped kernel, so the two lanes give
+    different (each reproducible) transcripts.
 13. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.

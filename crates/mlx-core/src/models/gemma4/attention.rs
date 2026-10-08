@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::{DType, MxArray};
+use crate::engine::decode_tuning::{gpu_core_count, grouped_partition_stripes};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -209,29 +210,8 @@ fn grouped_d512_diagnostic_config() -> (&'static str, Option<u32>) {
     (config.0.as_str(), config.1)
 }
 
-/// Stage-1 SIMD groups per GPU core that saturate the grouped D512 kernel
-/// (one SIMD group per query head per partition, each walking its 16-token
-/// pages serially). On a 40-core GPU, Hq8 decode rose from 64 to 128
-/// partitions (12.8 to 25.6 SIMD groups per core) and was flat at 256; Hq16
-/// rose to 64 (25.6 per core), gained 1% at 128 and lost 3% at 256.
-const GROUPED_D512_SIMD_GROUPS_PER_CORE: u32 = 16;
-
-fn gpu_core_count() -> u32 {
-    static CORES: OnceLock<u32> = OnceLock::new();
-    *CORES.get_or_init(|| u32::try_from(unsafe { mlx_sys::mlx_gpu_core_count() }).unwrap_or(0))
-}
-
-/// The smallest power-of-two partition count that fills the device, bounded
-/// by the 16-token work tiles and the reducer's 256-partition policy. A pure
-/// function of the context and device, so every token of a run and every run
-/// on one machine reduce attention in the same order.
-fn grouped_d512_rule_stripes(actual_context: u32, num_heads: i32, gpu_cores: u32) -> u32 {
-    let saturating = (GROUPED_D512_SIMD_GROUPS_PER_CORE * gpu_cores.max(1))
-        .div_ceil(num_heads.max(1) as u32)
-        .next_power_of_two();
-    let tile_bound = 1u32 << actual_context.div_ceil(16).max(1).ilog2();
-    saturating.min(tile_bound).clamp(4, 256)
-}
+/// The D512 reducer's partition policy (the dispatcher admits 4..=256).
+const GROUPED_D512_MAX_STRIPES: u32 = 256;
 
 fn grouped_d512_planned_stripes(
     selector: &str,
@@ -243,8 +223,14 @@ fn grouped_d512_planned_stripes(
     // The kernel partitions contexts beyond one generic 512-token partition.
     // Explicit diagnostics always win over the device rule.
     (actual_context > 512 && selector != "off").then(|| {
-        override_stripes
-            .unwrap_or_else(|| grouped_d512_rule_stripes(actual_context, num_heads, gpu_cores))
+        override_stripes.unwrap_or_else(|| {
+            grouped_partition_stripes(
+                actual_context,
+                num_heads.max(1) as u32,
+                gpu_cores,
+                GROUPED_D512_MAX_STRIPES,
+            )
+        })
     })
 }
 
@@ -2540,28 +2526,13 @@ mod tests {
         assert_eq!(parse_grouped_d512_selector(Some("force")), "force");
         assert_eq!(parse_grouped_d512_selector(Some("auto")), "auto");
         assert_eq!(parse_grouped_d512_selector(None), "auto");
-        // The partition count is a pure function of context, query heads and
-        // GPU cores: the smallest power of two that fills the device, bounded
-        // by the 16-token tiles and the 256-partition reducer policy.
-        for (context, heads, cores, expected) in [
-            (513, 8, 40, 32),
-            (1_024, 8, 40, 64),
-            (2_048, 8, 40, 128),
-            (20_000, 8, 40, 128),
-            (20_000, 16, 40, 64),
-            (20_000, 32, 40, 32),
-            (20_000, 16, 8, 8),
-            (20_000, 32, 8, 4),
-            (20_000, 8, 4_096, 256),
-            (600, 8, 4_096, 32),
-            (20_000, 8, 0, 4),
-        ] {
-            assert_eq!(
-                grouped_d512_rule_stripes(context, heads, cores),
-                expected,
-                "context={context} heads={heads} cores={cores}"
-            );
-        }
+        // The partition count follows the shared device rule
+        // (`engine::decode_tuning::grouped_partition_stripes`) under the
+        // 256-partition reducer policy.
+        assert_eq!(
+            grouped_d512_planned_stripes("auto", None, 20_000, 8, 4_096),
+            Some(256)
+        );
         assert_eq!(
             grouped_d512_planned_stripes("auto", None, 20_000, 16, 40),
             Some(64)

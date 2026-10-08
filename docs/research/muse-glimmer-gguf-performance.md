@@ -180,7 +180,7 @@ All accepted jobs report no thermal/performance warning; this does not prove sta
 
 ### Device and workload policy
 
-No chip names, assumed GPU-core counts, or saved winning constants enter the policy. Metal pipeline limits gate support; the D128 stage requires 512 threads and its reducer 1,024. [Apple documents these limits as pipeline-specific](https://developer.apple.com/documentation/metal/calculating-threadgroup-and-grid-sizes), including resource usage. Unsupported devices and other query geometries retain generic attention.
+No chip names, assumed GPU-core counts, or saved per-machine choices enter the policy; the core count is read from the device. Metal pipeline limits gate support; the D128 stage requires 512 threads and its reducer 1,024. [Apple documents these limits as pipeline-specific](https://developer.apple.com/documentation/metal/calculating-threadgroup-and-grid-sizes), including resource usage. Unsupported devices and other query geometries retain generic attention.
 
 For the supported 32-Q/2-KV/head-128, BF16, block-16 singleton route, the maximum partition count is the largest supported power of two satisfying all of:
 
@@ -189,11 +189,28 @@ For the supported 32-Q/2-KV/head-128, BF16, block-16 singleton route, the maximu
 - Temporary-memory headroom: `available_bytes / global_layer_count / 8448`, where 8,448 bytes accounts for FP32 sum/max and BF16 partial outputs across 32 heads. `available_bytes` is the positive difference between `min(MLX memory limit, Metal recommended working set)` and MLX active memory; it is an allocation budget, not a claim about free system RAM.
 - Metal's maximum buffer length divided by the per-partition output size, 8,192 bytes.
 
-Within that bound, reuse Gemma's completed-token tuner for generic/grouped attention and early-submission depth. The depth candidates derive from the model's layer count. Each candidate's first observation is discarded; three completed-token observations, alternating sweep order, and a median/MAD noise margin determine selection. Recheck neighboring attention choices after selecting submission depth. There are no synthetic prompts, extra forward passes, or added GPU synchronization calls for measurement. Forced or failed samples cannot qualify a selection.
+Within that bound the partition count is a device rule shared with Gemma4's D512 route (`crates/mlx-core/src/engine/decode_tuning.rs` `grouped_partition_stripes`): the smallest power of two whose query-head SIMD groups reach 16 per GPU core (IORegistry `gpu-core-count`), bounded by the 16-token work tiles, with the bound above as a hard cap. On the 40-core M5 Max that is 32 partitions at every context beyond 512 tokens.
 
-Decisions belong to the loaded model and context bucket, with an eight-entry bound. A changed partition budget triggers a separate calibration; decisions are never exported as another machine's defaults. Device specifications constrain legality and memory usage, while completed-token timings capture effects that specifications alone cannot predict, including occupancy, cache behavior, bandwidth, and CPU/GPU overlap. This selects among tested candidates, not a proof of a global optimum. Calibration runs on real tokens and its cost is included in the request benchmark.
+The partitions were first picked by the completed-token tuner below, together with the submission depth. That made greedy output irreproducible: every partition count reduces the BF16 online-softmax partials over different page subsets, so a timed pick that differs between runs gives a different transcript (the two adaptive 60k runs above), and the first tokens of each context bucket ran under mixed partitions. In fresh processes on the same binary and prompt (512 greedy tokens), the tuned build gave 4 distinct transcripts in 12 runs at 1K context and 7 in 12 at 4K, settling on generic V2 or 4 to 128 partitions from run to run; the rule gives one transcript per context (12/12 at 1K and 4K, 10/10 at 8K), the same one as the tuned build forced to 32 partitions.
 
-`MLX_MUSE_DECODE_TUNING=0` disables automatic selection. `MLX_MUSE_GROUPED_STRIPES` and `MLX_MUSE_DECODE_EARLY_EVAL_LAYERS` are process-local diagnostic overrides; use them with automatic tuning disabled. Production benchmarking uses neither override. Sliding layers, multiple-owner batches, prefill, and DFlash keep their existing routes.
+The rule was chosen from forced-partition replays of captured real inputs (the first global layer's Q/K/V at 60,548 tokens, the context cut to each length, 13 dependent calls per evaluation like one decode step; µs per call, median of three rounds, M5 Max):
+
+| Context | Generic V2 |    4 |    8 |  16 | **32** |  64 | 128 | 256 | 512 | 1024 |
+| ------: | ---------: | ---: | ---: | --: | -----: | --: | --: | --: | --: | ---: |
+|      1K |         48 |   74 |   49 |  46 |     47 |  48 |     |     |     |      |
+|      4K |         67 |  180 |  106 |  70 |     54 |  54 |  54 |  63 |     |      |
+|      8K |        101 |  328 |  183 | 108 |     80 |  85 |  75 |  76 |  87 |      |
+|     16K |        178 |  628 |  331 | 184 |    131 | 134 | 126 | 117 | 132 |  151 |
+|     32K |        474 | 1358 |  695 | 371 |    259 | 265 | 234 | 235 | 245 |  265 |
+|     60K |       1119 | 2638 | 1361 | 718 |    489 | 504 | 456 | 444 | 439 |  467 |
+
+32 partitions are level with generic V2 at 1K and 1.2-2.3x faster from 4K to 60K, within 6% of the fastest count up to 8K. From 16K, 128-512 partitions save another 9-11% of global-attention time (0.3 ms per token at 32K, 0.65 ms at 60K, under 1.5% of a decode step); the rule leaves that unclaimed rather than add a context term that is unmeasured for the D512 kernel it shares the rule with. End to end the partition count is within noise from 16 up (512 greedy tokens, fixed depth 8, quietest round: 4K generic 18.6, 4 partitions 17.0, 16-256 18.4-18.7 tok/s; 8K generic 18.4, 4 17.4, 16 18.3, 32 18.8, 128 18.6, 512 17.1).
+
+The early-submission depth is still learned from completed tokens: the candidates derive from the model's layer count, each candidate's first observation is discarded, and three completed-token observations, alternating sweep order, and a median/MAD noise margin determine selection. The depth changes when graphs are submitted, never their arithmetic (one transcript at 4K for depths 0, 2, 4, 8, 16, 32 and 51). There are no synthetic prompts, extra forward passes, or added GPU synchronization calls for measurement. Forced or failed samples cannot qualify a selection.
+
+Depth decisions belong to the loaded model and context bucket, with an eight-entry bound, and are never exported as another machine's defaults. This selects among tested candidates, not a proof of a global optimum. Calibration runs on real tokens and its cost is included in the request benchmark.
+
+`MLX_MUSE_GROUPED_STRIPES` (`0` = generic V2) and `MLX_MUSE_DECODE_EARLY_EVAL_LAYERS` are process-local diagnostic overrides; production benchmarking uses neither. Sliding layers, multiple-owner batches, the whole-turn lane (no cache owner, or `MLX_SERVE_FORCE_SERIAL=1`), prefill, and DFlash keep their existing routes.
 
 ### Interpreting the remaining limit
 

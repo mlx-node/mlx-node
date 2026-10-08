@@ -2,11 +2,6 @@
 use crate::engine::decode_tuning::DecodePlan;
 use std::sync::OnceLock;
 
-pub(super) fn enabled() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| std::env::var("MLX_MUSE_DECODE_TUNING").as_deref() != Ok("0"))
-}
-
 pub(super) fn override_plan(mut plan: DecodePlan) -> DecodePlan {
     static EARLY: OnceLock<Option<usize>> = OnceLock::new();
     static STRIPES: OnceLock<Option<u32>> = OnceLock::new();

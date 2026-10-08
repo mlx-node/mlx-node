@@ -1068,20 +1068,26 @@ impl MuseGlimmerInner {
                 .is_some_and(|p| p.coordinator.adapter(0).is_ok_and(|a| a.block_size() == 16));
         let mut plan = crate::engine::decode_tuning::DecodePlan::default();
         if eligible {
-            if super::decode_tuning::enabled() {
-                let context = planned[0].1.saturating_add(1);
-                let global_layers = text
-                    .layer_kinds
-                    .iter()
-                    .filter(|&&kind| kind == LayerKind::Full)
-                    .count() as u32;
-                let limit =
-                    unsafe { mlx_sys::mlx_paged_grouped_d128_max_stripes(context, global_layers) };
-                plan = self
-                    .decode_tuning
-                    .begin_with_limit(context, self.layers.len(), limit, true);
-                self.decode_timing = Some(std::time::Instant::now());
-            }
+            let context = planned[0].1.saturating_add(1);
+            let global_layers = text
+                .layer_kinds
+                .iter()
+                .filter(|&&kind| kind == LayerKind::Full)
+                .count() as u32;
+            // Hard cap from the live device: kernel limit, work tiles,
+            // temporary-storage headroom and buffer length (0 = unavailable).
+            let max_stripes =
+                unsafe { mlx_sys::mlx_paged_grouped_d128_max_stripes(context, global_layers) };
+            // Only the submission depth is learned from timings; the
+            // partition count is a device rule so greedy decode reproduces.
+            plan = self.decode_tuning.begin(context, self.layers.len(), true);
+            plan.grouped_stripes = Some(crate::engine::decode_tuning::grouped_partition_stripes(
+                context,
+                text.num_attention_heads as u32,
+                crate::engine::decode_tuning::gpu_core_count(),
+                max_stripes,
+            ));
+            self.decode_timing = Some(std::time::Instant::now());
             let overridden = super::decode_tuning::override_plan(plan);
             if overridden != plan {
                 self.decode_timing = None;

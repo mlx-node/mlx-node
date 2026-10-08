@@ -138,7 +138,7 @@ impl PagedStepModel for Gemma4PagedDecode<'_> {
         if let Some(started) = self.pending_timing.take() {
             self.inner
                 .decode_tuning
-                .observe(started.elapsed().as_secs_f64(), self.inner.layers.len());
+                .observe(started.elapsed().as_secs_f64());
         }
 
         // The loop has materialized the preceding sample before this hook.

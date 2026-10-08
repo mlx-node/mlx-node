@@ -154,11 +154,12 @@ pays the matvec's latency: Gemma-4-E2B AR decode measured 5% behind MLX's route 
 32-row threadgroups, within noise on 8/16-row ones). Every tiled route is
 bit-deterministic across evaluations (`kquant_affine_tiled`
 `affine_tiled_routes_are_deterministic`; the chunk partials are summed in a fixed
-order through threadgroup memory). Gemma4 greedy decode is likewise reproducible
-run to run: its grouped-D512 attention partition count is a rule of the context
-and the GPU core count (below), not a timing sweep. The remaining decode-tuning
-sweep (`MLX_NODE_LOG=mlx_core::decode_tuning=info`) picks only the submission
-depth, which changes when graphs are submitted and never their arithmetic.
+order through threadgroup memory). Gemma4 and Muse-Glimmer greedy decode is
+likewise reproducible run to run: their grouped attention partition counts
+(D512, D128) follow one rule of the context and the GPU core count (below), not
+a timing sweep. The remaining decode-tuning sweep
+(`MLX_NODE_LOG=mlx_core::decode_tuning=info`) picks only the submission depth,
+which changes when graphs are submitted and never their arithmetic.
 
 Eligible Qwen/DFlash projection merges, fused GDN preparation/window convolution,
 fused draft convolution/top-16/greedy selection, segmented one-call verifier attention,
@@ -195,20 +196,29 @@ parity, with no established throughput change from cleanup.
 | `MLX_PAGED_GROUPED_D512_STRIPES`        | Diagnostic partition override (`4\|8\|16\|32\|64\|128\|256`). It does not enable grouped attention by itself; pair with `MLX_PAGED_GROUPED_D512=force` when testing an unmeasured geometry. Gemma AR otherwise uses the smallest power of two whose query-head SIMD groups reach 16 per GPU core (IORegistry `gpu-core-count`), bounded by the 16-token work tiles and 256; the bf16 result changes with the partition count, so a forced value changes the greedy transcript.                    |
 | `MLX_GEMMA4_PAGED_DECODE_ROUTE`         | Diagnostic Gemma decode route (`auto\|sdpa\|paged`). Auto takes the grouped kernel when available; other routes keep their geometry and live-memory guards.                                                                                                                                                                                                                                                                                                                                       |
 | `MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS`   | Diagnostic override for how many leading eager decode layers are submitted early. Set before process startup; default depth is learned from completed token timings rather than a chip-name table.                                                                                                                                                                                                                                                                                                |
+| `MLX_MUSE_GROUPED_STRIPES`              | Diagnostic Muse-Glimmer partition override for single-row paged decode (`0` = generic V2, or `4\|8\|...\|1024`). It replaces the device rule below; the bf16 result changes with the partition count, so a forced value changes the greedy transcript. Set before process startup.                                                                                                                                                                                                                |
+| `MLX_MUSE_DECODE_EARLY_EVAL_LAYERS`     | Diagnostic override for how many leading Muse-Glimmer decode layers are submitted early. Set before process startup; default depth is learned from completed token timings rather than a chip-name table.                                                                                                                                                                                                                                                                                         |
 | `MLX_GEMMA4_MIXED_QMV=0`                | Restore stock QMM for single-row affine Q4/group32 BF16 decode. The default Metal kernel reads original FP16/FP32 sidecars directly and derives a symmetric bias only when checkpoint metadata authorizes it. Set before loading the model.                                                                                                                                                                                                                                                       |
 | `MLX_TEST_PAGED`                        | Test-only paged-path toggle                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `MLX_PAGED_CACHE_INITIAL_MB`            | Initial pool size (u32 MiB) for the qwen3_5 / qwen3_5_moe grow-on-demand paged pools. Env wins over the `paged_cache_initial_memory_mb` config field; a set-but-unparseable value falls back to config, and unset everywhere keeps the historical fixed pool (initial == max). The pool doubles on exhaustion up to the max (`paged_cache_memory_mb` / the auto one-full-context default). The agent override manager writes `paged_cache_initial_memory_mb: 2048` into qwen3_5 clones by default |
 | `MLX_PERSIST_PAGED_CACHE`               | Override the per-model `persistPagedCache` config for the SSD-backed cold KV tier. Precedence: env > config alias > off. Parsed leniently (`1`/`true`/`on`/`yes` → on, `0`/`false`/`off`/`no` → off; unset/other falls through to config). Off by default at library level                                                                                                                                                                                                                        |
 
-Gemma's submission-depth calibration is a bounded search over layer-count depths,
-not a guarantee of the global optimum. It excludes first-use timings and requires
-wins above measured jitter. Decisions stay within a loaded model (up to eight
-context scales); batched and speculative paths keep their existing scheduling.
-Calibration that occurs during a request contributes to that request's latency.
+Gemma's and Muse-Glimmer's submission-depth calibration is a bounded search over
+layer-count depths, not a guarantee of the global optimum. It excludes first-use
+timings and requires wins above measured jitter. Decisions stay within a loaded
+model (up to eight context scales); batched and speculative paths keep their
+existing scheduling (Muse plans single-row scheduled decode only; multi-row
+batches and the whole-turn lane keep generic V2 attention). Calibration that
+occurs during a request contributes to that request's latency.
 Attention partitions are deliberately not searched: the grouped kernel's stripes
 accumulate online-softmax partials in bf16 over different page subsets, so two
 partition counts differ by a few bf16 ulps in the logits and a timing-based pick
-made greedy transcripts differ run to run.
+made greedy transcripts differ run to run. Both families use
+`engine::decode_tuning::grouped_partition_stripes`: the smallest power of two
+whose query-head SIMD groups reach 16 per GPU core, bounded by the 16-token work
+tiles and a cap (D512: the reducer's 256; Muse D128: the live limit from
+`mlx_paged_grouped_d128_max_stripes` — kernel limit 1024, work tiles, temporary
+storage headroom and buffer length — which stays a hard cap).
 The native Gemma GGUF loader also records the nested text dtype so prefill metadata
 can be prepared once, while Q4 decode consumes the original scale precision.
 See the [Gemma GGUF performance reference](./research/gemma4-gguf-performance.md)

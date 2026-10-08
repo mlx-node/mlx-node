@@ -312,8 +312,7 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         if let Some(started) = self.decode_timing.take()
             && completed
         {
-            self.decode_tuning
-                .observe(started.elapsed().as_secs_f64(), self.layers.len());
+            self.decode_tuning.observe(started.elapsed().as_secs_f64());
         }
     }
 

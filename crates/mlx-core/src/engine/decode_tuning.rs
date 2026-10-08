@@ -1,12 +1,18 @@
-//! Bounded, device-local tuning using completed production decode steps.
+//! Decode planning for one loaded model: a device rule for grouped
+//! paged-attention partitions and a bounded submission-depth search.
 //!
-//! No chip-name tables, synthetic inputs, extra forward passes, or extra GPU
-//! synchronizations. Supported attention partitions and submission depths are
-//! searched separately on real tokens. Decisions belong to one loaded model
-//! and context scale, and are never persisted as portable hardware defaults.
+//! Partitions are never timed: every partition count reduces the bf16
+//! online-softmax partials over different page subsets, so a timing-based
+//! pick made greedy transcripts differ run to run. Only the submission depth,
+//! which changes when graphs are submitted and never their arithmetic, is
+//! searched on completed production tokens. No chip-name tables, synthetic
+//! inputs, extra forward passes, or extra GPU synchronizations. Decisions
+//! belong to one loaded model and context scale, and are never persisted as
+//! portable hardware defaults.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DecodePlan {
@@ -37,6 +43,46 @@ impl Drop for PlanScope {
     fn drop(&mut self) {
         ACTIVE.set(self.0);
     }
+}
+
+/// Stage-1 SIMD groups per GPU core that saturate a grouped paged-attention
+/// kernel (one SIMD group per query head per partition, each walking its
+/// 16-token pages serially). Measured on a 40-core GPU: Gemma4 D512 Hq8
+/// decode rose from 64 to 128 partitions (12.8 to 25.6 SIMD groups per core)
+/// and was flat at 256, Hq16 rose to 64 (25.6 per core), gained 1% at 128
+/// and lost 3% at 256; Muse-Glimmer D128 Hq32 attention at 32 (25.6 per
+/// core) was level with generic V2 at 1K, 1.2-2.3x faster from 4K to 60K,
+/// and within 6% of the fastest count up to 8K (9-11% behind 128-512 from
+/// 16K, under 1.5% of a decode step).
+const GROUPED_SIMD_GROUPS_PER_CORE: u32 = 16;
+
+/// GPU cores of the active Metal device (IORegistry `gpu-core-count`; 0 when
+/// nothing publishes it).
+pub(crate) fn gpu_core_count() -> u32 {
+    static CORES: OnceLock<u32> = OnceLock::new();
+    *CORES.get_or_init(|| u32::try_from(unsafe { mlx_sys::mlx_gpu_core_count() }).unwrap_or(0))
+}
+
+/// Partition count of a grouped paged-attention decode: the smallest power
+/// of two whose query-head SIMD groups fill the device, bounded by the
+/// 16-token work tiles and `max_stripes` (the kernel's partition limit or a
+/// live resource cap, a power of two). A pure function of the context and the
+/// device, so every token of a run and every run on one machine reduce
+/// attention in the same order. 0 when `max_stripes` admits no partition.
+pub(crate) fn grouped_partition_stripes(
+    context: u32,
+    query_heads: u32,
+    gpu_cores: u32,
+    max_stripes: u32,
+) -> u32 {
+    if max_stripes < 4 {
+        return 0;
+    }
+    let saturating = (GROUPED_SIMD_GROUPS_PER_CORE * gpu_cores.max(1))
+        .div_ceil(query_heads.max(1))
+        .next_power_of_two();
+    let tile_bound = 1u32 << context.div_ceil(16).max(1).ilog2();
+    saturating.min(tile_bound).clamp(4, max_stripes)
 }
 
 #[derive(Debug)]
@@ -118,18 +164,8 @@ fn mad(values: &[f64]) -> f64 {
 #[derive(Debug)]
 struct ContextPlan {
     bucket: u32,
-    max_stripes: u32,
     plan: DecodePlan,
     sweep: Option<Sweep>,
-    submission_pending: bool,
-    refine_pending: bool,
-    stage: &'static str,
-}
-
-fn partition_candidates(max_stripes: u32) -> impl Iterator<Item = u32> {
-    // Powers of two are a kernel/reduction layout constraint, not chip presets.
-    std::iter::successors(Some(4u32), |value| value.checked_mul(2))
-        .take_while(move |&value| value <= max_stripes)
 }
 
 fn submission_candidates(plan: DecodePlan, layers: usize) -> Vec<DecodePlan> {
@@ -161,21 +197,9 @@ pub(crate) struct DecodeTuning {
 }
 
 impl DecodeTuning {
-    /// Submission-depth search only; attention routing is left alone.
+    /// Submission-depth search only; the returned plan leaves attention
+    /// routing (`grouped_stripes`) to the caller's device rule.
     pub fn begin(&mut self, context: u32, layers: usize, submission: bool) -> DecodePlan {
-        self.begin_with_limit(context, layers, 0, submission)
-    }
-
-    /// The caller bounds partitions by live device capabilities, temporary
-    /// storage headroom, and workload size. Zero preserves generic attention.
-    pub fn begin_with_limit(
-        &mut self,
-        context: u32,
-        layers: usize,
-        max_stripes: u32,
-        submission: bool,
-    ) -> DecodePlan {
-        let grouped = max_stripes >= 4;
         let bucket = context
             .max(512)
             .checked_next_power_of_two()
@@ -183,47 +207,18 @@ impl DecodeTuning {
         if let Some(index) = self
             .contexts
             .iter()
-            .position(|entry| entry.bucket == bucket && entry.max_stripes == max_stripes)
+            .position(|entry| entry.bucket == bucket)
         {
             if let Some(entry) = self.contexts.remove(index) {
                 self.contexts.push_front(entry);
             }
         } else {
-            let plan = DecodePlan {
-                early_layers: 0,
-                grouped_stripes: grouped.then_some(0),
-            };
-            let sweep = if grouped && context > 512 {
-                let mut candidates = vec![plan];
-                // Use only resource-admitted power-of-two partitions. Never
-                // launch more partitions than physical 16-token work tiles.
-                let work_tiles = context.div_ceil(16);
-                for stripes in partition_candidates(max_stripes) {
-                    if stripes <= work_tiles {
-                        candidates.push(DecodePlan {
-                            grouped_stripes: Some(stripes),
-                            ..plan
-                        });
-                    }
-                }
-                Some(Sweep::new(candidates))
-            } else if submission && layers > 1 {
-                Some(Sweep::new(submission_candidates(plan, layers)))
-            } else {
-                None
-            };
+            let plan = DecodePlan::default();
             self.contexts.push_front(ContextPlan {
                 bucket,
-                max_stripes,
                 plan,
-                sweep,
-                submission_pending: grouped && context > 512 && submission && layers > 1,
-                refine_pending: grouped && context > 512 && submission && layers > 1,
-                stage: if grouped && context > 512 {
-                    "attention"
-                } else {
-                    "submission"
-                },
+                sweep: (submission && layers > 1)
+                    .then(|| Sweep::new(submission_candidates(plan, layers))),
             });
             self.contexts.truncate(8);
         }
@@ -231,7 +226,7 @@ impl DecodeTuning {
         entry.sweep.as_ref().map_or(entry.plan, Sweep::plan)
     }
 
-    pub fn observe(&mut self, seconds: f64, layers: usize) {
+    pub fn observe(&mut self, seconds: f64) {
         let Some(entry) = self.contexts.front_mut() else {
             return;
         };
@@ -240,39 +235,12 @@ impl DecodeTuning {
         };
         if let Some(plan) = sweep.observe(seconds) {
             entry.plan = plan;
-            let stage = entry.stage;
             tracing::info!(target: "mlx_core::decode_tuning", event = "decode_tuned",
-                stage, context_bucket = entry.bucket, early_layers = plan.early_layers,
-                grouped_stripes = plan.grouped_stripes.unwrap_or(0),
-                grouped_tuning = plan.grouped_stripes.is_some(), samples = ?sweep.samples,
+                stage = "submission", context_bucket = entry.bucket,
+                early_layers = plan.early_layers, samples = ?sweep.samples,
                 candidate_early_layers = ?sweep.candidates.iter().map(|p| p.early_layers).collect::<Vec<_>>(),
-                candidate_stripes = ?sweep.candidates.iter().map(|p| p.grouped_stripes.unwrap_or(0)).collect::<Vec<_>>(),
                 "Decode plan selected from completed token timings");
-            entry.sweep = if entry.submission_pending {
-                entry.submission_pending = false;
-                entry.stage = "submission";
-                Some(Sweep::new(submission_candidates(plan, layers)))
-            } else if entry.refine_pending {
-                entry.refine_pending = false;
-                entry.stage = "attention_refinement";
-                // Submission changes CPU/GPU overlap. Recheck neighboring
-                // attention partitions under the selected scheduling depth.
-                let mut candidates = vec![plan];
-                let selected = plan.grouped_stripes.unwrap_or(0);
-                for stripes in partition_candidates(entry.max_stripes) {
-                    if (selected == 0 || stripes == selected / 2 || stripes == selected * 2)
-                        && stripes <= entry.bucket.div_ceil(16)
-                    {
-                        candidates.push(DecodePlan {
-                            grouped_stripes: Some(stripes),
-                            ..plan
-                        });
-                    }
-                }
-                Some(Sweep::new(candidates))
-            } else {
-                None
-            };
+            entry.sweep = None;
         }
     }
 }
@@ -282,54 +250,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn device_resource_limits_and_context_bound_the_search() {
-        for (context, limit) in [(2049, 16), (60_000, 64), (60_000, 1024)] {
-            let mut tuner = DecodeTuning::default();
-            let mut seen = std::collections::BTreeSet::new();
-            for _ in 0..160 {
-                let plan = tuner.begin_with_limit(context, 52, limit, false);
-                let stripes = plan.grouped_stripes.unwrap_or(0);
-                assert!(stripes <= limit && stripes <= context.div_ceil(16));
-                seen.insert(stripes);
-                tuner.observe(1.0 / f64::from(stripes.max(1)), 52);
-            }
-            assert!(seen.contains(&limit));
+    fn partition_rule_fills_the_device_within_tiles_and_caps() {
+        // (context, query heads, GPU cores, max stripes) -> stripes: the
+        // smallest power of two that fills the device, bounded by the
+        // 16-token tiles and the caller's cap (Gemma4's 256-partition D512
+        // reducer, Muse-Glimmer's live D128 resource limit).
+        for (context, heads, cores, cap, expected) in [
+            (513, 8, 40, 256, 32),
+            (1_024, 8, 40, 256, 64),
+            (2_048, 8, 40, 256, 128),
+            (20_000, 8, 40, 256, 128),
+            (20_000, 16, 40, 256, 64),
+            (20_000, 32, 40, 256, 32),
+            (20_000, 16, 8, 256, 8),
+            (20_000, 32, 8, 256, 4),
+            (20_000, 8, 4_096, 256, 256),
+            (600, 8, 4_096, 256, 32),
+            (20_000, 8, 0, 256, 4),
+            (1_000, 32, 40, 32, 32),
+            (60_000, 32, 40, 1_024, 32),
+            (60_000, 32, 128, 1_024, 64),
+            (60_000, 32, 4_096, 1_024, 1_024),
+            (60_000, 32, 40, 16, 16),
+            (60_000, 32, 40, 0, 0),
+        ] {
             assert_eq!(
-                tuner
-                    .begin_with_limit(context, 52, limit, false)
-                    .grouped_stripes,
-                Some(limit)
+                grouped_partition_stripes(context, heads, cores, cap),
+                expected,
+                "context={context} heads={heads} cores={cores} cap={cap}"
             );
-            // A reduced live resource budget invalidates the older decision.
-            let smaller = tuner.begin_with_limit(context, 52, 4, false);
-            assert_eq!(smaller.grouped_stripes, Some(0));
         }
     }
 
     #[test]
     fn adapts_to_different_device_latency_curves_and_layer_counts() {
-        for (layers, best_stripes, best_depth) in [(48, 64, 16), (18, 16, 2), (80, 256, 0)] {
+        for (layers, best_depth) in [(48, 16), (18, 2), (80, 0)] {
             let mut tuner = DecodeTuning::default();
             for _ in 0..128 {
-                let plan = tuner.begin_with_limit(20_000, layers, 256, true);
+                let plan = tuner.begin(20_000, layers, true);
+                assert_eq!(plan.grouped_stripes, None, "routing stays with the caller");
                 // Unit-test timing observations, never model benchmark inputs.
-                let seconds =
-                    0.02 + if plan.grouped_stripes == Some(best_stripes) {
-                        0.0
-                    } else {
-                        0.01
-                    } + if plan.early_layers == best_depth {
-                        0.0
-                    } else {
-                        0.005
-                    };
-                tuner.observe(seconds, layers);
+                tuner.observe(if plan.early_layers == best_depth {
+                    0.02
+                } else {
+                    0.025
+                });
             }
             assert_eq!(
-                tuner.begin_with_limit(20_001, layers, 256, true),
+                tuner.begin(20_001, layers, true),
                 DecodePlan {
                     early_layers: best_depth,
-                    grouped_stripes: Some(best_stripes),
+                    grouped_stripes: None,
                 }
             );
         }
