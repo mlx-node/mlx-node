@@ -69,7 +69,7 @@ jobs:
           cache: 'yarn'
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
           target: aarch64-apple-darwin
@@ -179,7 +179,7 @@ jobs:
           cache: 'yarn'
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
           target: aarch64-apple-darwin
@@ -417,7 +417,7 @@ jobs:
           cache: 'yarn'
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
           target: aarch64-apple-darwin
@@ -611,7 +611,7 @@ jobs:
           cache: 'yarn'
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
           components: clippy, rustfmt
