@@ -503,6 +503,12 @@ Deleted tools (restore from `69ccaf9d` if needed):
     attention traffic at 32K or the short-context parallelism the kernel
     lives on. `MLX_GEMMA4_DECODE_TUNING` is gone; the remaining
     submission-depth sweep does not change numerics (hash `e9a263b752`
-    for depths 0/4/16/34).
+    for depths 0/4/16/34). Two leftovers, each deterministic on its own,
+    product calls: Muse-Glimmer still picks its D128 partition by the same
+    timing sweep (`muse_glimmer/model.rs` via `begin_with_limit`); and the
+    Gemma4 raw (non-graph) decode route gives a different transcript than
+    the graph route even with the grouped kernel off, because the graph
+    route trims the sliding layers' block table before the live window
+    while the raw route passes the full table plus a mask.
 13. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.
