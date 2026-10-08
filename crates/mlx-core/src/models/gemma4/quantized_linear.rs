@@ -477,6 +477,30 @@ pub fn try_build_quantized_linear(
     Some(linear)
 }
 
+/// [`try_build_quantized_linear`] followed by the Tiled64 repack into the
+/// affine K-quant contract ([`QuantizedLinear::tile_kquant_layout`]:
+/// `a4g64@t64` / `a8g64@t64`) on a Metal host; the gemma4-local twin of
+/// `crate::models::quantized_linear::try_build_affine_quantized_linear_tiled`
+/// with the same `tiled` contract (prefixes whose row-major map entries the
+/// loader drops with `release_tiled_kquant_sources`). The repack declines for
+/// f16 companions, uncarried (bits, group) pairs, odd shapes and the GGUF
+/// Q4_0 decode sidecars, leaving MLX's affine route.
+pub fn try_build_affine_quantized_linear_tiled(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    group_size: i32,
+    bits: i32,
+    tiled: &mut Vec<String>,
+) -> Result<Option<QuantizedLinear>> {
+    let Some(mut ql) = try_build_quantized_linear(params, key_prefix, group_size, bits) else {
+        return Ok(None);
+    };
+    if crate::models::quant_dispatch::kquant_tiled_enabled() && ql.tile_kquant_layout()? {
+        tiled.push(key_prefix.to_string());
+    }
+    Ok(Some(ql))
+}
+
 /// sym8 quantization parameters (per-output-channel symmetric int8 weights
 /// with f32 `[N]` scales; `group_size` is null in the checkpoint and
 /// meaningless at runtime — `SYM8_GROUP_SIZE` is a placeholder for the
@@ -1025,38 +1049,63 @@ impl QuantizedLinear {
         &self.mode
     }
 
-    /// Repack a K-quant projection into the 64-row `Tiled64` layout and tag
-    /// `mode` with `@t64` so `forward_qmm` reaches the `_t64` Metal kernels.
-    /// gemma4-local port of
+    /// Repack a K-quant or bf16-companion affine projection into the 64-row
+    /// `Tiled64` layout and tag `mode` with `@t64` (`q4k@t64`, `a4g64@t64`,
+    /// ..) so `forward_qmm` reaches the `_t64` Metal kernels. gemma4-local
+    /// port of
     /// `crate::models::quantized_linear::QuantizedLinear::tile_kquant_layout`
     /// (unpadded form only: Gemma4 has no merged odd-width projection).
     /// `Ok(true)` when tiled or already tiled; `Ok(false)` leaves a
-    /// non-K-quant, non-2-D, odd-shaped, sym8, FP8, or decode-sidecar
-    /// projection untouched.
+    /// non-K-quant / non-contract affine, non-2-D, odd-shaped, sym8, FP8, or
+    /// decode-sidecar projection untouched.
     pub fn tile_kquant_layout(&mut self) -> Result<bool> {
         use crate::models::quant_dispatch::{
-            KQUANT_TILED_SUFFIX, kquant_mode_params_for_scales, kquant_tile_rows, kquant_tileable,
-            parse_mode_str, split_kquant_layout,
+            KQUANT_TILED_SUFFIX, kquant_affine_mode_params, kquant_affine_tiled_shape,
+            kquant_mode_params_for_scales, kquant_tile_rows, kquant_tileable, parse_mode_str,
+            split_kquant_layout,
         };
         let (base, already) = split_kquant_layout(&self.mode);
         if already {
             return Ok(true);
         }
-        let Some(mode) = parse_mode_str(Some(base)) else {
-            return Ok(false);
+        let kq = if base == DEFAULT_QUANT_MODE {
+            // An MLX affine linear reads through the affine K-quant contract
+            // (`a<bits>g<group>`) when the kernels carry its (bits, group)
+            // and its companions are the bfloat16 the contract stores.
+            let Some(kq) = kquant_affine_mode_params(self.bits, self.group_size) else {
+                return Ok(false);
+            };
+            let biases_dtype = self.biases.as_ref().map(|b| b.dtype()).transpose()?;
+            if self.scales.dtype()? != kq.scales_dtype || biases_dtype != Some(kq.biases_dtype) {
+                return Ok(false);
+            }
+            // Below the measured break-even width MLX's own route is as fast
+            // or faster; the linear stays row-major.
+            if self.weight.ndim()? == 2 {
+                let shape = self.weight.shape()?;
+                if !kquant_affine_tiled_shape(shape[0], shape[1] * 32 / i64::from(self.bits)) {
+                    return Ok(false);
+                }
+            }
+            kq
+        } else {
+            let Some(mode) = parse_mode_str(Some(base)) else {
+                return Ok(false);
+            };
+            // The `.scales` dtype picks the legacy expanded IQ3_S contract for
+            // an artifact that predates the packed form (quant_dispatch).
+            let Some(kq) = kquant_mode_params_for_scales(mode, self.scales.dtype()?) else {
+                return Ok(false);
+            };
+            if kq.bits != self.bits {
+                return Err(Error::from_reason(format!(
+                    "tile_kquant_layout: {base} projection carries bits={} but the contract its \
+                     .scales dtype selects has bits={} — config/tensor disagreement",
+                    self.bits, kq.bits
+                )));
+            }
+            kq
         };
-        // The `.scales` dtype picks the legacy expanded IQ3_S contract for an
-        // artifact that predates the packed form (quant_dispatch).
-        let Some(kq) = kquant_mode_params_for_scales(mode, self.scales.dtype()?) else {
-            return Ok(false);
-        };
-        if kq.bits != self.bits {
-            return Err(Error::from_reason(format!(
-                "tile_kquant_layout: {base} projection carries bits={} but the contract its \
-                 .scales dtype selects has bits={} — config/tensor disagreement",
-                self.bits, kq.bits
-            )));
-        }
         if self.fp8_dequant_weight.is_some() || self.s_w.is_some() || self.decode_sidecars.is_some()
         {
             return Ok(false);
@@ -1073,17 +1122,19 @@ impl QuantizedLinear {
         if !kquant_tileable(n, k) {
             return Ok(false);
         }
-        let per_group = i64::from(kq.scale_bytes_per_group);
+        // Companions per super-block: `scale_entries_per_super_block` entries
+        // of `.scales` (bytes, or the affine contracts' bfloat16 per group),
+        // `bias_entries_per_super_block` of `.biases`.
+        let scale_entries = i64::from(kq.scale_entries_per_super_block());
         let per_super = i64::from(kq.bias_entries_per_super_block);
-        let super_ratio = i64::from(kq.super_ratio);
         let weight = kquant_tile_rows(&self.weight, i64::from(self.bits))?;
-        let scales = kquant_tile_rows(&self.scales, super_ratio * per_group)?;
+        let scales = kquant_tile_rows(&self.scales, scale_entries)?;
         let biases = kquant_tile_rows(biases, per_super)?;
         MxArray::eval_arrays_with_context(&[&weight, &scales, &biases], "tile_kquant_layout")?;
         self.weight = weight;
         self.scales = scales;
         self.biases = Some(biases);
-        self.mode = format!("{base}{KQUANT_TILED_SUFFIX}");
+        self.mode = format!("{}{KQUANT_TILED_SUFFIX}", kq.mode_str);
         Ok(true)
     }
 

@@ -10,9 +10,10 @@ use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, parse_generation_defaults,
 };
 use crate::models::gemma4::quantized_linear::{
-    LinearProj, try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear_tiled,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
+    LinearProj, try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
+    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, ensure_affine_biases_present, ensure_dense_weight_floating,
@@ -72,10 +73,10 @@ pub(super) fn build_projection(
 }
 
 /// [`build_projection`] that also records, in `tiled`, the prefixes whose
-/// K-quant group was repacked into the Tiled64 layout here (a `t64`
-/// checkpoint tensor is built tiled as-is and not recorded), so the caller can
-/// drop their row-major map entries with `release_tiled_kquant_sources` once
-/// the owning layer is built. The plain `build_projection` discards the list:
+/// K-quant or bf16-companion affine group was repacked into the Tiled64
+/// layout here (a `t64` checkpoint tensor is built tiled as-is and not
+/// recorded), so the caller can drop their row-major map entries with
+/// `release_tiled_kquant_sources` once the owning layer is built. The plain `build_projection` discards the list:
 /// its callers (the DFlash draft, tests) hold small maps whose transient is
 /// not worth plumbing.
 pub(super) fn build_projection_tiled(
@@ -97,9 +98,15 @@ pub(super) fn build_projection_tiled(
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
-            PerLayerMode::Affine => {
-                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-            }
+            // Tiled64 into the affine K-quant contract on a Metal host, as
+            // the K-quant arm (Muse-Glimmer threads no activation amax).
+            PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
+                params,
+                prefix,
+                plq.group_size,
+                plq.bits,
+                tiled,
+            )?,
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
             PerLayerMode::Q4K
             | PerLayerMode::Q5K

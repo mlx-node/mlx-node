@@ -51,10 +51,12 @@ enum class Mode {
   // the K-quant kernels: the same LSB-first codes, `.scales` the bfloat16
   // scale per group, `.biases` the bfloat16 bias per group. Metal kernels
   // exist for the Tiled64 layout only; row-major affine stays on MLX's own
-  // route. "a<bits>g<group_size>": only Q4/g64 has a producer (the DFlash2
-  // draft); the kernels are parametric, so another pair is an enum value, a
-  // dispatch arm and its instantiation lines away.
-  A4G64
+  // route. "a<bits>g<group_size>": the two pairs `mlx convert` emits with
+  // bfloat16 companions (Q4/g64 bodies, Q8/g64 routers and heads); the
+  // kernels are parametric, so another pair is an enum value, a dispatch arm
+  // and its instantiation lines away.
+  A4G64,
+  A8G64
 };
 
 // How a mode's codes turn into values. Mirrors KQ_LINEAR .. KQ_GRID_IQ1M in
@@ -146,6 +148,7 @@ constexpr int super_ratio(Mode mode) {
   case Mode::IQ1M:
     return 8;
   case Mode::A4G64:
+  case Mode::A8G64:
     return 4;
   case Mode::IQ4NL:
     return 1;
@@ -163,7 +166,9 @@ constexpr bool uses_iq4nl_grid(Mode mode) {
 }
 
 // The MLX affine modes: Metal kernels in the Tiled64 layout only.
-constexpr bool is_affine(Mode mode) { return mode == Mode::A4G64; }
+constexpr bool is_affine(Mode mode) {
+  return mode == Mode::A4G64 || mode == Mode::A8G64;
+}
 
 constexpr Kind kind(Mode mode) {
   switch (mode) {
@@ -173,6 +178,7 @@ constexpr Kind kind(Mode mode) {
   case Mode::IQ3S8:
     return Kind::Int8;
   case Mode::A4G64:
+  case Mode::A8G64:
     return Kind::Affine;
   case Mode::Q6K:
   case Mode::Q4K:
@@ -287,6 +293,7 @@ constexpr int default_bits(Mode mode) {
   case Mode::IQ3XXS:
     return 2;
   case Mode::IQ3S8:
+  case Mode::A8G64:
     return 8;
   case Mode::A4G64:
     return 4;
@@ -299,7 +306,7 @@ constexpr int default_bits(Mode mode) {
 }
 
 constexpr int default_group_size(Mode mode) {
-  if (mode == Mode::A4G64) {
+  if (is_affine(mode)) {
     return 64;
   }
   return (mode == Mode::Q6K || mode == Mode::Q3K || mode == Mode::Q2K) ? 16
@@ -332,6 +339,20 @@ struct KernelName {
   bool nax;
 };
 std::vector<KernelName> metal_kernel_names();
+
+// Whether a Tiled64 bfloat16 x @ w.T of (M, N, K) at `bits` per weight
+// takes a tensor-op row tier (qmm_m8/m16/m32_nax_t64) on this device:
+// M = 8..32, NAX available, and a grid that reaches the split rule's target
+// (mlx_kquant_metal.cpp use_qmm_m8_nax). Defined in Metal builds only; for
+// the route tests.
+// `affine`: the affine contracts' rule (8..32-row tiers behind the grid
+// rule); the K-quant modes take the 8-row tier at M = 8 only.
+bool tiled_tensor_op_tier(int M, int N, int K, int bits, bool affine);
+
+// The M from which a transposed x @ w.T of (K, N) leaves the matvec kernels
+// for the GEMM on this device (MLX's qmv batch limit by GPU generation and
+// shape, or MLX_QMM_SPLITK_MIN_M); 0 without Metal. For the route tests.
+int tiled_qmv_vector_limit(int K, int N);
 
 class KQuantMatmul : public UnaryPrimitive {
 public:

@@ -107,6 +107,27 @@ int32_t mlx_test_kquant_gpu_gen() {
 #endif
 }
 
+// Whether the Tiled64 bfloat16 route of (M, N, K) at `bits` takes a
+// tensor-op row tier on this device (kquant::tiled_tensor_op_tier).
+bool mlx_test_kquant_tensor_op_tier(int32_t M, int32_t N, int32_t K,
+                                    int32_t bits, bool affine) {
+  try {
+    return mlx::core::kquant::tiled_tensor_op_tier(M, N, K, bits, affine);
+  } catch (...) {
+    return false;
+  }
+}
+
+// The M from which the Tiled64 route of (K, N) takes the GEMM
+// (kquant::tiled_qmv_vector_limit); 0 without Metal.
+int32_t mlx_test_kquant_qmv_vector_limit(int32_t K, int32_t N) {
+  try {
+    return mlx::core::kquant::tiled_qmv_vector_limit(K, N);
+  } catch (...) {
+    return 0;
+  }
+}
+
 // Checks paged_attn.metallib against kquant::metal_kernel_names(). `counts`
 // receives {base names, NAX names, K-quant functions in the library, pipelines
 // built}. `report` receives one line per missing name (one the dispatcher can

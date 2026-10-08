@@ -2202,6 +2202,20 @@ impl Qwen3_5Attention {
         self.q_proj.input_amax()
     }
 
+    /// Test-only: the q_proj quantization mode (`None` when dense) and
+    /// whether its q/gate block was merged (packed reorder or dense cache).
+    #[cfg(test)]
+    pub(crate) fn q_proj_mode_and_block(&self) -> (Option<String>, bool) {
+        let mode = match &self.q_proj {
+            LinearProj::Quantized(ql) => Some(ql.mode().to_string()),
+            LinearProj::Standard(_) => None,
+        };
+        (
+            mode,
+            self.q_gate_block_t.is_some() || self.q_proj.has_q_gate_block_layout(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn prism_hadamard_sites(&self) -> (bool, bool, bool, bool) {
         (

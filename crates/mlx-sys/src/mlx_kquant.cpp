@@ -51,6 +51,8 @@ std::optional<Mode> parse_mode(std::string_view mode) {
     return Mode::IQ3S8;
   if (mode == "a4g64")
     return Mode::A4G64;
+  if (mode == "a8g64")
+    return Mode::A8G64;
   return std::nullopt;
 }
 
@@ -106,6 +108,8 @@ const char *mode_name(Mode mode) {
     return "iq3s8";
   case Mode::A4G64:
     return "a4g64";
+  case Mode::A8G64:
+    return "a8g64";
   }
   throw std::invalid_argument("[kquant] Unknown quantization mode.");
 }
@@ -1015,6 +1019,10 @@ void kq_qmm_dispatch_mode(T *result, const T *x, const uint32_t *w,
     kq_qmm_dispatch_transpose<T, 4, 64, 4, false, Kind::Affine, 0>(
         result, x, w, scales, biases, M, N, K, transposed_w, layout);
     break;
+  case Mode::A8G64:
+    kq_qmm_dispatch_transpose<T, 8, 64, 4, false, Kind::Affine, 0>(
+        result, x, w, scales, biases, M, N, K, transposed_w, layout);
+    break;
   }
 }
 
@@ -1246,6 +1254,10 @@ void kq_dequantize_typed(array &out, const array &w, const array &scales,
     break;
   case Mode::A4G64:
     kq_dequantize<T, 4, 64, 4, false, Kind::Affine, 0>(
+        out_ptr, w_ptr, scales_ptr, biases_ptr, size);
+    break;
+  case Mode::A8G64:
+    kq_dequantize<T, 8, 64, 4, false, Kind::Affine, 0>(
         out_ptr, w_ptr, scales_ptr, biases_ptr, size);
     break;
   }

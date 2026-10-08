@@ -4406,3 +4406,104 @@ fn test_compute_layer_kv_cache_specs_group_full_sliding_and_shared_aliases() {
         "ceil((17 - 1 + 32) / 8) + one partial block"
     );
 }
+
+/// Manual determinism probe (`#[ignore]`d, env-gated): prefill a fixed prompt
+/// through the block-paged cache, then teacher-force a fixed 560-token
+/// trajectory (past the 512 sliding window) with the engine's pipelined
+/// evals, repeat with the allocator's free pool churned in between, and
+/// require bit-identical logits at every step. Guards the matmul and
+/// attention kernels of the decode route against order-dependent
+/// reductions and uninitialised reads.
+///
+/// ```shell
+/// MLX_TEST_GEMMA4_MODEL_PATH=~/.mlx-node/models/gemma-4-e2b-it-4bit \
+///   cargo test -p mlx-core --release --lib -- --ignored --nocapture \
+///   gemma4_paged_forward_is_deterministic_across_repeats
+/// ```
+#[test]
+#[ignore = "needs MLX_TEST_GEMMA4_MODEL_PATH (a full load)"]
+fn gemma4_paged_forward_is_deterministic_across_repeats() {
+    use crate::array::MxArray;
+    let Ok(model) = std::env::var("MLX_TEST_GEMMA4_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_GEMMA4_MODEL_PATH unset");
+        return;
+    };
+    // SAFETY: env-gated model test, run single-threaded by contract.
+    unsafe { std::env::set_var("GEMMA4_NO_WARMUP", "1") };
+    let (mut inner, _) = Gemma4Inner::load_from_dir(&model, None).expect("load");
+    unsafe { std::env::remove_var("GEMMA4_NO_WARMUP") };
+    inner.init_caches_sync().unwrap();
+    assert!(inner.kv_cache_coordinator.is_some(), "paged cache expected");
+    let prompt: Vec<u32> = (0..39u32).map(|i| 2 + (i * 7919) % 2000).collect();
+    let trajectory: Vec<u32> = (0..560u32).map(|i| 1000 + (i * 104_729) % 50_000).collect();
+    let bits = |a: &MxArray| -> Vec<u32> {
+        a.eval();
+        a.astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let mut reference: Vec<Vec<u32>> = Vec::new();
+    for repeat in 0..6u32 {
+        if repeat > 0 {
+            let mut s = 17u32 + repeat;
+            for _ in 0..300 {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = 1024 * (1 + (s >> 20) as i64);
+                let junk = MxArray::from_float32(&vec![f32::NAN; n as usize], &[n]).unwrap();
+                junk.eval();
+            }
+        }
+        let seq_id = repeat;
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .unwrap()
+            .reset_scheduled_request(seq_id)
+            .map_err(Error::from_reason)
+            .unwrap();
+        // Pipelined like the engine: each step is enqueued asynchronously and
+        // the bits are read only at the end.
+        let mut kept = Vec::new();
+        let prefill = inner
+            .run_scheduled_paged_prefill_slice(seq_id, &prompt, 0, true)
+            .unwrap()
+            .expect("final slice returns logits");
+        MxArray::async_eval_arrays(&[&prefill]);
+        kept.push(prefill);
+        for &tok in &trajectory {
+            let logits = inner.run_paged_decode_step_for(seq_id, tok).unwrap();
+            let next = logits.argmax(-1, Some(false)).unwrap();
+            MxArray::async_eval_arrays(&[&next, &logits]);
+            kept.push(logits);
+        }
+        let step_bits: Vec<Vec<u32>> = kept.iter().map(bits).collect();
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .unwrap()
+            .release_request_all(seq_id)
+            .map_err(Error::from_reason)
+            .unwrap();
+        if repeat == 0 {
+            reference = step_bits;
+            continue;
+        }
+        for (step, (a, b)) in reference.iter().zip(&step_bits).enumerate() {
+            if a != b {
+                let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                panic!(
+                    "repeat {repeat}: logits differ at step {step} ({diff} of {} values)",
+                    a.len()
+                );
+            }
+        }
+        println!(
+            "  repeat {repeat}: prefill + {} decode steps bit-identical",
+            trajectory.len()
+        );
+    }
+}

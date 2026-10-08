@@ -1639,14 +1639,18 @@ METAL_FUNC void kquant_qmv_wide_impl(
   }
 }
 
-// M = 1 matvec on the Tiled64 layout with lane = row. A threadgroup owns 32
-// consecutive rows (half a tile) and `k_splits` simdgroups, each walking a
-// contiguous range of the row's 32-code units: lane r reads row r's unit, so
-// one load instruction covers 32 * bits * 4 contiguous bytes (the tile's unit
-// run), and the 32 inputs of the unit are the same for every lane (one
-// broadcast load_vector). The dot product is qmv's qdot (pre-scaled x, one
-// scale/bias per group); the k_splits partials are summed in fixed order
-// through threadgroup memory, so the result is deterministic.
+// M = 1 matvec on the Tiled64 layout with lane = row. A threadgroup owns
+// `rows_per_tg` consecutive rows (32: half a tile; 16 or 8: a sub-tile, so a
+// narrow N still fills the GPU with threadgroups) and `k_splits` simdgroups.
+// The row's 32-code units are split into k_splits * (32 / rows_per_tg)
+// contiguous K chunks: chunk c = simdgroup * (32 / rows_per_tg) + lane / rows_per_tg,
+// lane % rows_per_tg the row, so a 32-lane load covers 32 / rows_per_tg runs
+// of rows_per_tg * bits * 4 contiguous bytes (consecutive rows' units are
+// adjacent in the tile) and the 32 inputs of a unit are the same for every
+// lane of a run (one broadcast load_vector). The dot product is qmv's qdot
+// (pre-scaled x, one scale/bias per group); the chunk partials are summed
+// in chunk order through threadgroup memory, so the result is deterministic
+// and depends only on the chunk count, not on rows_per_tg.
 template <
     typename T,
     int group_size,
@@ -1655,7 +1659,8 @@ template <
     bool has_min,
     int kind,
     int scale_shift,
-    int k_splits>
+    int k_splits,
+    int rows_per_tg = 32>
 [[kernel]] void kquant_qmv_t64(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -1670,7 +1675,11 @@ template <
   static_assert(
       group_size == 16 || group_size % 32 == 0,
       "a unit is 1 or 2 groups, or a group is whole units");
-  constexpr int rows_per_tg = SIMD_SIZE;
+  static_assert(
+      rows_per_tg == 8 || rows_per_tg == 16 || rows_per_tg == 32,
+      "a lane run is 8, 16 or 32 consecutive rows");
+  constexpr int lane_groups = SIMD_SIZE / rows_per_tg;
+  constexpr int k_chunks = k_splits * lane_groups;
   constexpr bool nonlinear = kq_codebook<kind>();
   // Groups inside one unit, and the values of a unit one group covers (the
   // whole unit when a group spans several).
@@ -1678,13 +1687,15 @@ template <
   constexpr int span = group_size < 32 ? group_size : 32;
   typedef float U;
 
-  threadgroup U partial[k_splits][rows_per_tg];
+  threadgroup U partial[k_splits][SIMD_SIZE];
 
-  const int row = tid.y * rows_per_tg + simd_lid;
+  const int lane_row = simd_lid % rows_per_tg;
+  const int k_chunk = int(simd_gid) * lane_groups + int(simd_lid) / rows_per_tg;
+  const int row = tid.y * rows_per_tg + lane_row;
   const int K = in_vec_size;
   const int units = K / 32;
-  const int per = (units + k_splits - 1) / k_splits;
-  const int u_begin = min(int(simd_gid) * per, units);
+  const int per = (units + k_chunks - 1) / k_chunks;
+  const int u_begin = min(k_chunk * per, units);
   const int u_end = min(u_begin + per, units);
 
   const device uint8_t* wrow = kq_tiled_row<bits>(w, row, units);
@@ -1740,10 +1751,10 @@ template <
 
   partial[simd_gid][simd_lid] = acc;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_gid == 0) {
+  if (simd_gid == 0 && int(simd_lid) < rows_per_tg) {
     U total = 0;
-    for (int s = 0; s < k_splits; ++s) {
-      total += partial[s][simd_lid];
+    for (int c = 0; c < k_chunks; ++c) {
+      total += partial[c / lane_groups][(c % lane_groups) * rows_per_tg + lane_row];
     }
     y[tid.x * out_vec_size + row] = static_cast<T>(total);
   }

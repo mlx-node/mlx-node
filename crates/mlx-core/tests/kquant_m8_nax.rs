@@ -430,6 +430,26 @@ fn routes() -> bool {
     nax_available()
 }
 
+/// Whether M = 8 is under the device's qmv batch limit for (K, N): above it
+/// the GEMM takes the matmul ahead of the K-quant tensor op and qmv_wide
+/// alike (the limit is 6 on gen-13/14 GPUs, or `MLX_QMM_SPLITK_MIN_M`).
+fn m8_is_matvec(n: i64, k: i64) -> bool {
+    // SAFETY: pure predicate over the shape.
+    let limit = unsafe { mlx_sys::mlx_test_kquant_qmv_vector_limit(k as i32, n as i32) };
+    limit > 8
+}
+
+/// Whether the dispatcher takes the tensor op for a K-quant M = 8 `[N, K]`
+/// matmul here: NAX, under the qmv batch limit (`use_qmm_m8_nax` in
+/// mlx_kquant_metal.cpp, the same in both layouts); otherwise qmv_wide /
+/// qmv_sg8 (or the GEMM) keep it.
+fn routes_m8(n: i64, k: i64, bits: i32) -> bool {
+    // SAFETY: pure predicate over the shape.
+    let tier =
+        unsafe { mlx_sys::mlx_test_kquant_tensor_op_tier(8, n as i32, k as i32, bits, false) };
+    tier && m8_is_matvec(n, k)
+}
+
 /// Every mode on every Qwen3.8 verify shape, tiled, against the CPU
 /// reference (row-major), with the route observed through the kernel-family
 /// counter, no zero outputs, and the split count reported.
@@ -458,15 +478,20 @@ fn m8_nax_matches_cpu_on_every_mode_and_shape() {
                 .unwrap_or(0);
             counting(false);
             let what = format!("{} K={k} N={n} heavy={heavy}", fmt.mode);
-            if routes() {
+            if routes_m8(n, k, fmt.bits) {
                 assert!(
                     m8 == 1 && wide == 0,
                     "{what}: must take qmm_m8_nax_t64 (m8 {m8}, wide {wide})"
                 );
-            } else {
+            } else if m8_is_matvec(n, k) {
                 assert!(
                     m8 == 0 && wide == 1,
-                    "{what}: without NAX the tiled M=8 route is qmv_wide_t64"
+                    "{what}: without the tensor op the tiled M=8 route is qmv_wide_t64"
+                );
+            } else {
+                assert!(
+                    m8 == 0 && wide == 0,
+                    "{what}: M = 8 is at the qmv batch limit, the GEMM takes it"
                 );
             }
             assert_eq!(cpu.len(), y.len(), "{what}: output lengths differ");
@@ -568,67 +593,78 @@ fn m8_nax_leaves_every_other_case_alone() {
     };
     let q4k = FORMATS[0];
     let q3k = FORMATS[4];
+    // K = 1280 splits at most 2 ways (512-input partitions), so N = 2048's 32
+    // tiles stay under the grid target on every GPU wider than 10 cores and
+    // qmv_wide keeps the matmul; N = 16384 reaches it everywhere.
     let k = 1280i64;
     let xb = activation_bits(8, k, 5, false);
-
-    // Row-major: q3k goes to the tensor op, q4k stays on sg8.
-    let w4 = Weights::new(q4k, 2048, k, 2);
-    let w3 = Weights::new(q3k, 2048, k, 3);
-    let (m8, sg8, _) = route("q4k M=8 N=2048 row-major", &bf16_x(&xb, k), &w4);
-    assert!(m8 == 0 && sg8 > 0, "row-major q4k must keep qmv_sg8");
-    let (m8, _, wide) = route("q3k M=8 N=2048 row-major", &bf16_x(&xb, k), &w3);
-    if routes() {
-        assert!(m8 == 1 && wide == 0, "row-major q3k must take qmm_m8_nax");
-    } else {
-        assert!(m8 == 0 && wide > 0, "q3k must stay on qmv_wide without NAX");
-    }
-    // q2k has no sg8 decode either, so row-major it takes the tensor op too.
-    let q2k = *FORMATS.iter().find(|f| f.mode == "q2k").expect("q2k");
-    let w2 = Weights::new(q2k, 2048, k, 4);
-    let (m8, sg8, wide) = route("q2k M=8 N=2048 row-major", &bf16_x(&xb, k), &w2);
-    assert_eq!(sg8, 0, "q2k has no qmv_sg8 kernel");
-    if routes() {
-        assert!(m8 == 1 && wide == 0, "row-major q2k must take qmm_m8_nax");
-    } else {
-        assert!(m8 == 0 && wide > 0, "q2k must stay on qmv_wide without NAX");
-    }
-
-    // The grid formats have no sg8 decode either: row-major they take the
-    // tensor op like q2k.
-    for fmt in FORMATS.iter().filter(|f| f.is_grid()) {
-        let wg = Weights::new(*fmt, 2048, k, 5);
-        let (m8, sg8, wide) = route(
-            &format!("{} M=8 N=2048 row-major", fmt.mode),
-            &bf16_x(&xb, k),
-            &wg,
-        );
-        assert_eq!(sg8, 0, "{} has no qmv_sg8 kernel", fmt.mode);
-        if routes() {
-            assert!(
-                m8 == 1 && wide == 0,
-                "row-major {} must take qmm_m8_nax",
-                fmt.mode
-            );
+    let n_small = 2048i64;
+    let n_wide = 16384i64;
+    assert!(
+        routes_m8(n_wide, k, 4) || !nax_available(),
+        "N=16384 K=1280 must reach the grid target"
+    );
+    // (expected tensor op, expected qmv_wide) for the modes without sg8;
+    // the grid rule is per mode (the split count is bounded by the partials
+    // the mode's weight bytes can absorb).
+    let expect = |what: &str, n: i64, bits: i32, m8: u64, wide: u64| {
+        let takes = routes_m8(n, k, bits);
+        println!("  {what}: tensor op {takes}");
+        if takes {
+            assert!(m8 == 1 && wide == 0, "{what}: must take the tensor op");
+        } else if m8_is_matvec(n, k) {
+            assert!(m8 == 0 && wide > 0, "{what}: must stay on qmv_wide");
         } else {
             assert!(
-                m8 == 0 && wide > 0,
-                "{} must stay on qmv_wide without NAX",
-                fmt.mode
+                m8 == 0 && wide == 0,
+                "{what}: at the qmv batch limit the GEMM takes M = 8"
             );
         }
-    }
+    };
 
-    // Tiled: every mode takes it.
-    let t4 = w4.tiled();
-    let (m8, _, wide) = route("q4k M=8 N=2048 tiled", &bf16_x(&xb, k), &t4);
-    if routes() {
-        assert!(m8 == 1 && wide == 0, "tiled q4k must take qmm_m8_nax_t64");
-    } else {
-        assert!(
-            m8 == 0 && wide > 0,
-            "tiled q4k must stay on qmv_wide_t64 without NAX"
-        );
+    // Row-major: q3k goes to the tensor op where the grid allows, q4k stays
+    // on sg8 regardless.
+    let w4 = Weights::new(q4k, n_small, k, 2);
+    let (m8, sg8, _) = route("q4k M=8 N=2048 row-major", &bf16_x(&xb, k), &w4);
+    assert!(m8 == 0 && sg8 > 0, "row-major q4k must keep qmv_sg8");
+    for n in [n_small, n_wide] {
+        let w3 = Weights::new(q3k, n, k, 3);
+        let (m8, _, wide) = route(&format!("q3k M=8 N={n} row-major"), &bf16_x(&xb, k), &w3);
+        expect(&format!("row-major q3k N={n}"), n, q3k.bits, m8, wide);
+        // q2k has no sg8 decode either, so row-major it takes the tensor op
+        // too.
+        let q2k = *FORMATS.iter().find(|f| f.mode == "q2k").expect("q2k");
+        let w2 = Weights::new(q2k, n, k, 4);
+        let (m8, sg8, wide) = route(&format!("q2k M=8 N={n} row-major"), &bf16_x(&xb, k), &w2);
+        assert_eq!(sg8, 0, "q2k has no qmv_sg8 kernel");
+        expect(&format!("row-major q2k N={n}"), n, q2k.bits, m8, wide);
+
+        // The grid formats have no sg8 decode either: row-major they take
+        // the tensor op like q2k.
+        for fmt in FORMATS.iter().filter(|f| f.is_grid()) {
+            let wg = Weights::new(*fmt, n, k, 5);
+            let (m8, sg8, wide) = route(
+                &format!("{} M=8 N={n} row-major", fmt.mode),
+                &bf16_x(&xb, k),
+                &wg,
+            );
+            assert_eq!(sg8, 0, "{} has no qmv_sg8 kernel", fmt.mode);
+            expect(
+                &format!("row-major {} N={n}", fmt.mode),
+                n,
+                fmt.bits,
+                m8,
+                wide,
+            );
+        }
+
+        // Tiled: every mode takes it where the grid allows.
+        let t4 = Weights::new(q4k, n, k, 2).tiled();
+        let (m8, _, wide) = route(&format!("q4k M=8 N={n} tiled"), &bf16_x(&xb, k), &t4);
+        expect(&format!("tiled q4k N={n}"), n, q4k.bits, m8, wide);
     }
+    let w3 = Weights::new(q3k, n_small, k, 3);
+    let t4 = w4.tiled();
 
     // N % 64 == 32: no column tail, so the old routes take it (such a weight
     // cannot tile either).
@@ -638,11 +674,12 @@ fn m8_nax_leaves_every_other_case_alone() {
         &Weights::new(q3k, 2080, k, 1),
     );
     assert!(
-        m8 == 0 && wide > 0,
-        "N % 64 != 0 must fall back to qmv_wide"
+        m8 == 0 && (wide > 0 || !m8_is_matvec(2080, k)),
+        "N % 64 != 0 must fall back to qmv_wide (or the GEMM at the qmv batch limit)"
     );
 
-    // Other row counts never reach it, in either layout.
+    // Other row counts never reach the 8-row tier, in either layout (tiled
+    // M = 9 is the 16-row tier's or qmv_wide's).
     for m in [7i64, 9] {
         let x = MxArray::from_bfloat16(&activation_bits(m, k, 9 + m as u32, false), &[m, k])
             .expect("x");

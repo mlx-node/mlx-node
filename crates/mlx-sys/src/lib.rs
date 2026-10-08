@@ -2026,6 +2026,17 @@ unsafe extern "C-unwind" {
     pub fn mlx_test_kquant_family_count(family: *const std::os::raw::c_char) -> u64;
     /// TEST-ONLY: the GPU generation the Metal dispatcher sees, -1 without Metal.
     pub fn mlx_test_kquant_gpu_gen() -> i32;
+    /// TEST-ONLY: whether the Tiled64 bfloat16 route of `x[M, K] @ w[N, K].T`
+    /// at `bits` per weight takes a tensor-op row tier
+    /// (`qmm_m8/m16/m32_nax_t64`) on this device.
+    /// `affine` selects the affine contracts' rule (the 8..32-row tiers
+    /// behind the grid rule); the K-quant modes take the 8-row tier at
+    /// M = 8 only.
+    pub fn mlx_test_kquant_tensor_op_tier(m: i32, n: i32, k: i32, bits: i32, affine: bool) -> bool;
+    /// TEST-ONLY: the M from which the Tiled64 route of `x[M, K] @ w[N, K].T`
+    /// takes the GEMM instead of the matvec kernels on this device (MLX's
+    /// qmv batch limit, or `MLX_QMM_SPLITK_MIN_M`); 0 without Metal.
+    pub fn mlx_test_kquant_qmv_vector_limit(k: i32, n: i32) -> i32;
     /// TEST-ONLY: checks `paged_attn.metallib` against every K-quant kernel
     /// name the Metal dispatcher can build. `counts` (4 slots) receives base
     /// names, NAX names, K-quant functions in the library and pipelines built;

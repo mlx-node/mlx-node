@@ -675,6 +675,34 @@ pub fn try_build_kquant_quantized_linear_tiled(
     Ok(Some(ql))
 }
 
+/// [`try_build_quantized_linear`] followed by the Tiled64 repack into the
+/// affine K-quant contract ([`QuantizedLinear::tile_kquant_layout`]:
+/// `a4g64@t64` / `a8g64@t64`) on a Metal host
+/// ([`kquant_tiled_enabled`](crate::models::quant_dispatch::kquant_tiled_enabled)),
+/// the way every affine 2-D projection loads. The repack declines, leaving
+/// MLX's row-major affine route, for a (bits, group) the kernels do not
+/// carry, f16 companions (GGUF imports) or a shape that is not whole tiles
+/// and super-blocks. The affine contract carries no calibration state, so a
+/// site with a calibrated activation amax (`PerLayerQuant::input_amax`)
+/// keeps MLX's route: its loader builds the plain projection instead of
+/// calling this. When the projection did tile, `key_prefix` is pushed onto
+/// `tiled` for [`release_tiled_kquant_sources`], as the K-quant twin does.
+pub fn try_build_affine_quantized_linear_tiled(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    group_size: i32,
+    bits: i32,
+    tiled: &mut Vec<String>,
+) -> Result<Option<QuantizedLinear>> {
+    let Some(mut ql) = try_build_quantized_linear(params, key_prefix, group_size, bits) else {
+        return Ok(None);
+    };
+    if crate::models::quant_dispatch::kquant_tiled_enabled() && ql.tile_kquant_layout()? {
+        tiled.push(key_prefix.to_string());
+    }
+    Ok(Some(ql))
+}
+
 /// Row-major copies of a K-quant group's packed arrays as stored under
 /// `prefix` in `params`, undoing the Tiled64 permutation when `layout` says
 /// the checkpoint stored them tiled (the identity otherwise). For the readers
@@ -888,16 +916,24 @@ impl QuantizedLinear {
     ///
     /// `Ok(true)` when tiled (or already tiled). `Ok(false)` leaves the
     /// projection untouched: not a K-quant mode, a 3-D / expert weight,
-    /// `N % 64 != 0`, `K % 256 != 0`, or a projection with a transform or
-    /// non-native output layout (tile AFTER `finalize_packed_q_gate_block`
-    /// is not required — that permutes whole tiles when `head_dim % 64 == 0`,
-    /// see there).
+    /// `N % 64 != 0`, `K % 256 != 0`, an MLX affine linear narrower than
+    /// [`kquant_affine_tiled_shape`](crate::models::quant_dispatch::kquant_affine_tiled_shape),
+    /// or a projection with a transform or non-native output layout (tile
+    /// AFTER `finalize_packed_q_gate_block` is not required — that permutes
+    /// whole tiles when `head_dim % 64 == 0`, see there).
     ///
     /// Row operations stay valid on a tiled projection only in whole tiles:
     /// [`concat_rows`](Self::concat_rows) (both sides tiled, both `N % 64`)
     /// and [`slice_rows`](Self::slice_rows) at 64-aligned bounds.
     pub fn tile_kquant_layout(&mut self) -> Result<bool> {
-        self.tile_kquant_layout_impl(false)
+        self.tile_kquant_layout_impl(false, true)
+    }
+
+    /// [`tile_kquant_layout`](Self::tile_kquant_layout) without the affine
+    /// shape rule: every tileable shape tiles. For a caller that gates the
+    /// layout on its own measurements (the DFlash2 draft).
+    pub fn tile_kquant_layout_any_shape(&mut self) -> Result<bool> {
+        self.tile_kquant_layout_impl(false, false)
     }
 
     /// [`tile_kquant_layout`](Self::tile_kquant_layout) for a projection whose
@@ -906,8 +942,9 @@ impl QuantizedLinear {
     /// linear `bias` all get zero rows), then tiled. A zero sub-scale with a
     /// zero super-scale decodes to exactly 0 in every K-quant mode — q4k/q5k
     /// `d*sc*q - dmin*m`, q6k/q3k `d*sc*(q-32)`, iq4xs/iq4nl `d*sc*grid[q]`
-    /// (`KQScales` in `mlx_kquant.cpp` / `kquant.h`) — so the padded rows
-    /// yield exactly-zero output columns and the real columns are untouched.
+    /// (`KQScales` in `mlx_kquant.cpp` / `kquant.h`) — as does the affine
+    /// contracts' zero scale and bias (`0*q + 0`), so the padded rows yield
+    /// exactly-zero output columns and the real columns are untouched.
     ///
     /// The caller owns the consequence: `forward` returns the PADDED width and
     /// [`packed_out_features`](LinearProj::packed_out_features) reports it, so
@@ -916,14 +953,16 @@ impl QuantizedLinear {
     /// keeps merging with the tiled `in_proj_qkvz`). Same `Ok(false)` cases
     /// as the unpadded form except `N % 64 != 0`.
     pub fn tile_kquant_layout_padded(&mut self) -> Result<bool> {
-        self.tile_kquant_layout_impl(true)
+        // The padded form exists to merge with an already-tiled neighbour
+        // (the GDN `in_proj_ba`), which passed the shape rule itself.
+        self.tile_kquant_layout_impl(true, false)
     }
 
-    fn tile_kquant_layout_impl(&mut self, pad_rows: bool) -> Result<bool> {
+    fn tile_kquant_layout_impl(&mut self, pad_rows: bool, affine_shape_rule: bool) -> Result<bool> {
         use crate::models::quant_dispatch::{
             KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kquant_affine_mode_params,
-            kquant_mode_params_for_scales, kquant_tile_rows, kquant_tileable, parse_mode_str,
-            split_kquant_layout,
+            kquant_affine_tiled_shape, kquant_mode_params_for_scales, kquant_tile_rows,
+            kquant_tileable, parse_mode_str, split_kquant_layout,
         };
         let (base, already) = split_kquant_layout(&self.mode);
         if already {
@@ -945,6 +984,14 @@ impl QuantizedLinear {
             // MLX's affine route, where those are honoured.
             if self.input_amax.is_some() || self.amax_keys.is_some() {
                 return Ok(false);
+            }
+            // Below the measured break-even width MLX's own route is as fast
+            // or faster; the linear stays row-major.
+            if affine_shape_rule && self.weight.ndim()? == 2 {
+                let shape = self.weight.shape()?;
+                if !kquant_affine_tiled_shape(shape[0], shape[1] * 32 / i64::from(self.bits)) {
+                    return Ok(false);
+                }
             }
             kq
         } else {
@@ -1382,7 +1429,10 @@ impl QuantizedLinear {
         }
         let (base_mode, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
         let mode = crate::models::quant_dispatch::parse_mode_str(Some(base_mode));
-        let row_permutable = self.mode == DEFAULT_QUANT_MODE
+        // Affine (row-major or as the tiled `a4g64`/`a8g64` contract) and
+        // every K-quant mode are row-coupled.
+        let row_permutable = base_mode == DEFAULT_QUANT_MODE
+            || crate::models::quant_dispatch::is_kquant_affine_mode_str(base_mode)
             || mode.is_some_and(crate::models::quant_dispatch::is_kquant_mode);
         if !row_permutable {
             return Ok(false);
@@ -1733,6 +1783,10 @@ impl QuantizedLinear {
 
     pub fn bits(&self) -> i32 {
         self.bits
+    }
+
+    pub fn group_size(&self) -> i32 {
+        self.group_size
     }
 
     /// Test-scope accessor for the sym8 operands
@@ -3501,9 +3555,10 @@ mod kquant_tiled_tests {
 
     /// An MLX affine linear with the bf16 companions MLX's `quantize` emits
     /// tiles into the `a<bits>g<group>@t64` K-quant contract (the DFlash2
-    /// draft's load path), keeping its bytes and shapes and matching the
-    /// row-major affine forward; one the kernels do not carry (group 128)
-    /// or with f16 companions stays affine.
+    /// draft's load path, any tileable shape), keeping its bytes and shapes
+    /// and matching the row-major affine forward; the generic arm leaves a
+    /// shape under the affine shape rule row-major, and one the kernels do
+    /// not carry (group 128) or with f16 companions stays affine.
     #[test]
     fn affine_bf16_tiles_into_the_kquant_contract() {
         let (n, k) = (128i64, 512i64);
@@ -3529,7 +3584,12 @@ mod kquant_tiled_tests {
         };
         let row_major = affine(64, 11);
         let mut tiled = affine(64, 11);
-        assert!(tiled.tile_kquant_layout().unwrap());
+        assert!(
+            !tiled.tile_kquant_layout().unwrap(),
+            "[128, 512] is under the affine shape rule: the generic arm leaves it row-major"
+        );
+        assert_eq!(tiled.mode(), DEFAULT_QUANT_MODE);
+        assert!(tiled.tile_kquant_layout_any_shape().unwrap());
         assert_eq!(tiled.mode(), "a4g64@t64");
         assert!(tiled.is_kquant_tiled());
         assert_eq!(tiled.get_scales().dtype().unwrap(), DType::BFloat16);
@@ -3560,7 +3620,7 @@ mod kquant_tiled_tests {
             );
         }
         let mut wide = affine(128, 12);
-        assert!(!wide.tile_kquant_layout().unwrap());
+        assert!(!wide.tile_kquant_layout_any_shape().unwrap());
         assert_eq!(wide.mode(), DEFAULT_QUANT_MODE);
     }
 
@@ -3621,6 +3681,58 @@ mod kquant_tiled_tests {
         assert!(odd.tile_kquant_layout().unwrap());
         assert!(!odd.finalize_packed_q_gate_block(4, 32).unwrap());
         assert!(!odd.has_q_gate_block_layout());
+    }
+
+    /// A gated-attention `q_proj` tiled into the affine contract (Qwen3.5's
+    /// `[2 * H * 128, hidden]` at 4/64) merges its q/gate block like the
+    /// row-major `affine` projection does, and computes the same block order.
+    #[test]
+    fn tiled_affine_q_gate_block_merges() {
+        let (heads, dim, k) = (2, 128, 512i64);
+        let n = i64::from(2 * heads * dim);
+        let affine = |seed: u32| {
+            let mut st = seed;
+            let words: Vec<u32> = (0..n * k / 8).map(|_| lcg(&mut st)).collect();
+            let groups = n * k / 64;
+            let scales: Vec<u16> = (0..groups)
+                .map(|_| half::bf16::from_f32(0.005 + (lcg(&mut st) % 100) as f32 * 1e-4).to_bits())
+                .collect();
+            let biases: Vec<u16> = (0..groups)
+                .map(|_| half::bf16::from_f32(-((lcg(&mut st) % 100) as f32) * 1e-3).to_bits())
+                .collect();
+            QuantizedLinear::new(
+                MxArray::from_uint32(&words, &[n, k / 8]).unwrap(),
+                MxArray::from_bfloat16(&scales, &[n, k / 64]).unwrap(),
+                Some(MxArray::from_bfloat16(&biases, &[n, k / 64]).unwrap()),
+                None,
+                64,
+                4,
+                DEFAULT_QUANT_MODE.to_string(),
+            )
+        };
+        let mut row_major = affine(13);
+        let mut tiled = affine(13);
+        assert!(tiled.tile_kquant_layout_any_shape().unwrap());
+        assert_eq!(tiled.mode(), "a4g64@t64");
+        assert!(row_major.finalize_packed_q_gate_block(heads, dim).unwrap());
+        assert!(
+            tiled.finalize_packed_q_gate_block(heads, dim).unwrap(),
+            "the tiled affine contract is row-coupled too"
+        );
+        assert!(tiled.has_q_gate_block_layout() && tiled.is_kquant_tiled());
+        for m in [1i64, 3, 8, 64] {
+            let a = x(m, k, 30 + m as u32);
+            close(
+                &tiled.forward(&a).unwrap(),
+                &row_major.forward(&a).unwrap(),
+                3e-2,
+                &format!("a4g64@t64 q/gate block vs affine M={m}"),
+            );
+        }
+        // Odd head_dim: the block reorder is not a tile permutation.
+        let mut odd = affine(14);
+        assert!(odd.tile_kquant_layout_any_shape().unwrap());
+        assert!(!odd.finalize_packed_q_gate_block(8, 32).unwrap());
     }
 
     /// The GDN `in_proj_ba` case: a 96-row projection cannot tile as is, but

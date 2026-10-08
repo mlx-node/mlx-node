@@ -2396,6 +2396,15 @@ impl Gemma4Attention {
     pub(crate) fn o_proj_weight(&self) -> MxArray {
         self.o_proj.get_weight()
     }
+    /// The quantization modes of (q, k, o): `None` for a dense projection.
+    #[cfg(test)]
+    pub(crate) fn proj_modes(&self) -> [Option<String>; 3] {
+        let mode = |proj: &LinearProj| match proj {
+            LinearProj::Quantized(ql) => Some(ql.mode().to_string()),
+            LinearProj::Standard(_) => None,
+        };
+        [mode(&self.q_proj), mode(&self.k_proj), mode(&self.o_proj)]
+    }
     #[cfg(test)]
     pub(crate) fn q_norm_weight(&self) -> MxArray {
         self.q_norm.get_weight()

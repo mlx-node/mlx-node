@@ -47,9 +47,9 @@ use super::decoder_layer::{AttentionType, DecoderLayer};
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::{
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, is_quantized_checkpoint,
-    release_tiled_kquant_sources, try_build_kquant_quantized_linear_tiled,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear,
+    release_tiled_kquant_sources, try_build_affine_quantized_linear_tiled,
+    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
 };
 
 /// Reject unsupported plain-E4M3 state before any MTP dense setter can see raw
@@ -295,9 +295,9 @@ impl Qwen3_5MTPModule {
     ///     understood by the main decoder loop.
     ///
     /// `params` is `&mut` for the same reason as the dense loader's: a K-quant
-    /// projection repacked into the Tiled64 layout has its row-major source
-    /// arrays released from the map once its owner is installed
-    /// (`release_tiled_kquant_sources`).
+    /// or bf16-companion affine projection repacked into the Tiled64 layout
+    /// has its row-major source arrays released from the map once its owner
+    /// is installed (`release_tiled_kquant_sources`).
     pub fn apply_weights(
         &mut self,
         params: &mut HashMap<String, MxArray>,
@@ -338,9 +338,16 @@ impl Qwen3_5MTPModule {
                     // storage. A body-level FP8 default with BF16 MTP weights may
                     // still resolve here and correctly takes the dense fallback.
                     PerLayerMode::Fp8E4m3 => None,
-                    PerLayerMode::Affine => {
-                        try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-                    }
+                    // Tiled64 into the affine K-quant contract as in the dense
+                    // loader's `try_build_ql` (no activation-fp8 site is ever
+                    // an `mtp.*` prefix, so no calibrated amax to honour).
+                    PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
+                        params,
+                        prefix,
+                        plq.group_size,
+                        plq.bits,
+                        &mut tiled_prefixes.borrow_mut(),
+                    )?,
                     // Unreachable in practice: `apply_weights_inner` skips the MTP
                     // load entirely for sym8 checkpoints (the dense loader
                     // disables speculative MTP under sym8). `None` here keeps the

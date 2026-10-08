@@ -39,9 +39,10 @@ use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState};
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
     PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint, release_tiled_kquant_sources,
-    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear_tiled,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
+    try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
+    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 use crate::vision::qwen::processing::QwenImageProcessor;
 
@@ -1334,14 +1335,16 @@ fn apply_weights_inner(
 /// Production load variant that also returns every model-owned plain-E4M3
 /// BF16 reconstruction for eager materialization and resident accounting.
 ///
-/// `params` is `&mut`: a K-quant projection repacked into the Tiled64 layout
-/// (`try_build_kquant_quantized_linear_tiled`) has its evaluated tiled copies
-/// owned by the model, so its row-major `.weight`/`.scales`/`.biases` are
-/// dropped from the map once the owning layer is installed
+/// `params` is `&mut`: a K-quant or bf16-companion affine projection
+/// repacked into the Tiled64 layout (`try_build_kquant_quantized_linear_tiled`
+/// / `try_build_affine_quantized_linear_tiled`) has its evaluated tiled
+/// copies owned by the model, so its row-major `.weight`/`.scales`/`.biases`
+/// are dropped from the map once the owning layer is installed
 /// (`release_tiled_kquant_sources`). Everything that stays row-major (dense,
-/// affine, mxfp, non-tileable K-quant, embedding, norms) remains for the
-/// caller's materialization pass. Count the checkpoint bytes BEFORE this call
-/// (the tiled copies have the same byte size as the released originals).
+/// f16-companion / calibrated / odd-shaped affine, mxfp, non-tileable
+/// K-quant, embedding, norms) remains for the caller's materialization pass.
+/// Count the checkpoint bytes BEFORE this call (the tiled copies have the
+/// same byte size as the released originals).
 fn apply_weights_inner_with_residency(
     inner: &mut Qwen35Inner,
     params: &mut HashMap<String, MxArray>,
@@ -1416,6 +1419,19 @@ fn apply_weights_inner_with_residency(
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5")?;
         ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5")?;
         ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5")?;
+        // The per-tensor FP8 activation scale this projection will carry
+        // (threaded below): only the recipe's activation-fp8 sites (attn
+        // q/k/v/o, merged GDN in_proj_qkvz, GDN out_proj) consume one.
+        // `QuantizedLinear::forward` fake-quants whenever `input_amax > 0`
+        // AND the weight shape is static-FP8 (mxfp8 8/32 or affine 8/32 — see
+        // `quant_dispatch::admits_static_fp8_activation`), so a stale /
+        // hand-edited / future-recipe config with `input_amax` on a
+        // NON-attn/GDN mxfp8 projection must NOT thread it — else it would
+        // fake-quant a non-site's activations, violating "activation FP8
+        // only on attn/GDN sites".
+        let nk = normalize_per_layer_key(prefix);
+        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        let input_amax = if is_site { plq.input_amax } else { None };
         // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
         // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8 /
         // K-quant group must never silently fall back, see
@@ -1426,13 +1442,33 @@ fn apply_weights_inner_with_residency(
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
             PerLayerMode::Affine => {
-                // GGUF affine sidecars are f16. Under bf16/f32 activations
-                // `quantized_matmul` promotes the call to f32 and re-casts
-                // scales/biases EVERY forward — pre-cast once instead
+                // Tiled64 into the affine K-quant contract (`a4g64@t64` /
+                // `a8g64@t64`) on a Metal host, as the K-quant arm below and
+                // before the row merges so both halves share the layout; the
+                // repack keeps MLX's route for f16 companions, uncarried
+                // (bits, group) pairs and odd shapes. A calibrated
+                // activation-fp8 site keeps MLX's affine route, where the
+                // amax is honoured (the contract carries no calibration
+                // state). Tiled prefixes are released from the map once the
+                // layer is installed.
+                let built = if input_amax.is_some() {
+                    try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+                } else {
+                    try_build_affine_quantized_linear_tiled(
+                        params,
+                        prefix,
+                        plq.group_size,
+                        plq.bits,
+                        &mut tiled_prefixes.borrow_mut(),
+                    )?
+                };
+                // GGUF affine sidecars are f16 (never tiled). Under bf16/f32
+                // activations `quantized_matmul` promotes the call to f32 and
+                // re-casts scales/biases EVERY forward — pre-cast once instead
                 // (bit-identical values, fewer AsType dispatches). Under f16
                 // activations the native f16 path already matches; hoisting
                 // would flip it to f32 and cost MORE casts, so it stays off.
-                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+                built
                     .map(|mut ql| ql.promote_affine_sidecars_to_f32(compute_dtype).map(|_| ql))
                     .transpose()?
             }
@@ -1475,23 +1511,12 @@ fn apply_weights_inner_with_residency(
         // other layer stays `None`, so forward behaviour is unchanged here.
         // Also thread the normalized config key so the activation-amax
         // calibration tap can bucket recorded `max|activation|` by projection —
-        // but ONLY on the recipe's activation-fp8 sites (attn q/k/v/o, merged
-        // GDN in_proj_qkvz, GDN out_proj). A non-site mxfp8 projection (e.g. a
-        // uniform-mxfp8 or hand-edited checkpoint's FFN/lm_head) gets `None` so
-        // the tap skips it and calibration never fake-quants a non-attn/GDN
-        // site.
-        let nk = normalize_per_layer_key(prefix);
-        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        // under the SAME site predicate as the consumed amax. A non-site mxfp8
+        // projection (e.g. a uniform-mxfp8 or hand-edited checkpoint's
+        // FFN/lm_head) gets `None` so the tap skips it and calibration never
+        // fake-quants a non-attn/GDN site. (The tap reads mxfp8 projections
+        // only, so a key on a tiled affine site is inert.)
         let amax_key = is_site.then_some(nk);
-        // Gate the CONSUMED activation amax under the SAME predicate as the
-        // recorded `amax_key`: `QuantizedLinear::forward` fake-quants whenever
-        // `input_amax > 0` AND the weight shape is static-FP8 (mxfp8 8/32 or
-        // affine 8/32 — see `quant_dispatch::admits_static_fp8_activation`),
-        // so a stale / hand-edited /
-        // future-recipe config with `input_amax` on a NON-attn/GDN mxfp8
-        // projection must NOT thread it — else it would fake-quant a non-site's
-        // activations, violating "activation FP8 only on attn/GDN sites".
-        let input_amax = if is_site { plq.input_amax } else { None };
         let built = built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key));
         let built = match built {
             Some(ql) => Some(ql.with_hadamard(prism.and_then(|r| r.projection(prefix)))?),
@@ -3284,6 +3309,330 @@ mod tests {
                 bits_of(&reference.forward(&x).unwrap()),
                 "M={m}: on-disk tiled down_proj must match the load-time-tiled reference"
             );
+        }
+    }
+
+    /// On Metal every bf16-companion MLX affine 4/64 and 8/64 projection of
+    /// the Qwen3.5-4B widths (`[6144+, 1536]`) loads as `a4g64@t64` /
+    /// `a8g64@t64` (its row-major sources released from the map), while f16
+    /// companions, a calibrated activation-fp8 site and a projection under
+    /// the affine shape rule (`down_proj`, `out_proj`: N = 1536) keep MLX's
+    /// `affine` route; the GDN `in_proj_ba` (96 rows here) pads to whole
+    /// tiles so it still merges with the tiled `in_proj_qkvz`; the full
+    /// attention layer's gated `q_proj` (`[6144, 1536]`, head_dim 128) tiles
+    /// and still merges its q/gate block.
+    #[test]
+    fn affine_bf16_projections_load_tiled_and_calibrated_or_f16_sites_stay_affine() {
+        let label = "affine_bf16_projections_load_tiled_and_calibrated_or_f16_sites_stay_affine";
+        let cfg = Qwen3_5Config {
+            hidden_size: 1536,
+            intermediate_size: 6144,
+            num_heads: 24,
+            num_kv_heads: 2,
+            head_dim: 128,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_num_value_heads: 48,
+            linear_value_head_dim: 128,
+            ..no_mtp_layer_cfg()
+        };
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let message = error.reason.to_string();
+                if message.contains("Metal")
+                    || message.contains("device")
+                    || message.contains("LayerKVPool")
+                {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {message}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {message}");
+            }
+        };
+        // SAFETY: nullary predicate that catches internally.
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() };
+        let tiled = |mode: &str| -> String {
+            if metal {
+                format!("{mode}@t64")
+            } else {
+                "affine".to_string()
+            }
+        };
+
+        // A deterministic affine [rows x k] group at `bits`/64 with companions
+        // of `dtype` (bf16 as `mlx convert` writes, f16 as a GGUF import).
+        let mut state = 11u32;
+        let mut lcg = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        let mut insert = |params: &mut HashMap<String, MxArray>,
+                          prefix: &str,
+                          rows: i64,
+                          k: i64,
+                          bits: i64,
+                          dtype: DType| {
+            let words: Vec<u32> = (0..rows * k * bits / 32).map(|_| lcg()).collect();
+            let groups = rows * k / 64;
+            let scales: Vec<f32> = (0..groups)
+                .map(|_| 0.004 + (lcg() % 100) as f32 * 1e-4)
+                .collect();
+            let biases: Vec<f32> = (0..groups)
+                .map(|_| -((lcg() % 100) as f32) * 1e-3)
+                .collect();
+            params.insert(
+                format!("{prefix}.weight"),
+                MxArray::from_uint32(&words, &[rows, k * bits / 32]).unwrap(),
+            );
+            params.insert(
+                format!("{prefix}.scales"),
+                MxArray::from_float32(&scales, &[rows, k / 64])
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap(),
+            );
+            params.insert(
+                format!("{prefix}.biases"),
+                MxArray::from_float32(&biases, &[rows, k / 64])
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap(),
+            );
+        };
+        // GDN at this config: key_dim 2048, value_dim 6144 -> qkvz 16384
+        // rows, ba 96 rows, out_proj [1536, 6144] (N under the shape rule).
+        let mut params = HashMap::new();
+        for layer in 0..2 {
+            let p = format!("layers.{layer}");
+            insert(
+                &mut params,
+                &format!("{p}.linear_attn.in_proj_qkvz"),
+                16384,
+                1536,
+                4,
+                DType::BFloat16,
+            );
+            insert(
+                &mut params,
+                &format!("{p}.linear_attn.in_proj_ba"),
+                96,
+                1536,
+                4,
+                DType::BFloat16,
+            );
+            insert(
+                &mut params,
+                &format!("{p}.linear_attn.out_proj"),
+                1536,
+                6144,
+                4,
+                DType::BFloat16,
+            );
+            insert(
+                &mut params,
+                &format!("{p}.mlp.gate_proj"),
+                6144,
+                1536,
+                4,
+                DType::BFloat16,
+            );
+        }
+        // Full attention (layer 3): gated q_proj [2 * 24 * 128, 1536].
+        insert(
+            &mut params,
+            "layers.3.self_attn.q_proj",
+            6144,
+            1536,
+            4,
+            DType::BFloat16,
+        );
+        insert(
+            &mut params,
+            "layers.0.mlp.up_proj",
+            6144,
+            1536,
+            8,
+            DType::BFloat16,
+        );
+        insert(
+            &mut params,
+            "layers.0.mlp.down_proj",
+            1536,
+            6144,
+            4,
+            DType::Float16,
+        );
+        insert(
+            &mut params,
+            "layers.1.mlp.up_proj",
+            6144,
+            1536,
+            4,
+            DType::BFloat16,
+        );
+        insert(
+            &mut params,
+            "layers.1.mlp.down_proj",
+            1536,
+            6144,
+            4,
+            DType::BFloat16,
+        );
+        let affine = |bits: i32, input_amax: Option<f32>| PerLayerQuant {
+            bits,
+            group_size: 64,
+            mode: PerLayerMode::Affine,
+            input_amax,
+            layout: Default::default(),
+        };
+        let per_layer_quant = HashMap::from([
+            ("layers.0.mlp.up_proj".to_string(), affine(8, None)),
+            // A calibrated activation-fp8 site (the nvidia recipe's
+            // `input_amax`): MLX's route honours it, the contract cannot.
+            (
+                "layers.1.linear_attn.in_proj_qkvz".to_string(),
+                affine(4, Some(3.5)),
+            ),
+        ]);
+
+        let mut live = params.clone();
+        let error = apply_weights_inner_with_residency(
+            &mut inner,
+            &mut live,
+            &cfg,
+            4,
+            64,
+            Some(PerLayerMode::Affine),
+            &per_layer_quant,
+            false,
+            None,
+        )
+        .expect_err("the intentionally partial checkpoint must fail completeness validation");
+        assert!(
+            error.reason.contains("missing mandatory weights"),
+            "must reach the final completeness gate: {}",
+            error.reason
+        );
+
+        // Release bookkeeping: tiled sources leave the map (Metal only); the
+        // untiled ones stay for the materialization pass.
+        assert_eq!(live.contains_key("layers.0.mlp.gate_proj.weight"), !metal);
+        assert_eq!(live.contains_key("layers.0.mlp.up_proj.weight"), !metal);
+        assert!(live.contains_key("layers.0.mlp.down_proj.weight"));
+        assert!(live.contains_key("layers.0.linear_attn.out_proj.weight"));
+        assert!(live.contains_key("layers.1.linear_attn.in_proj_qkvz.weight"));
+
+        for layer in 0..2 {
+            let MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                ..
+            } = &inner.layers[layer].mlp
+            else {
+                panic!("layer {layer} MLP must be quantized");
+            };
+            assert_eq!(gate_proj.mode(), tiled("a4g64"), "layer {layer} gate_proj");
+            if layer == 0 {
+                assert_eq!(up_proj.mode(), tiled("a8g64"), "8/64 tiles into a8g64");
+                assert_eq!(
+                    down_proj.mode(),
+                    "affine",
+                    "f16 companions keep MLX's route"
+                );
+                assert_eq!(
+                    down_proj.get_scales().dtype().unwrap(),
+                    DType::Float32,
+                    "f16 companions are still hoisted to f32"
+                );
+            } else {
+                assert_eq!(up_proj.mode(), tiled("a4g64"));
+                assert_eq!(
+                    down_proj.mode(),
+                    "affine",
+                    "[1536, 6144] is under the affine shape rule"
+                );
+            }
+            let AttentionType::Linear(gdn) = &inner.layers[layer].attn else {
+                panic!("layer {layer} must be a GDN layer");
+            };
+            let (qkvz, ba, merged) = gdn.in_proj_modes();
+            if layer == 0 {
+                // qkvz tiles; the 96-row ba pads to 128 rows and tiles so the
+                // merge still happens, as one tiled projection.
+                assert_eq!(qkvz.as_deref(), Some(tiled("a4g64").as_str()));
+                assert_eq!(ba.as_deref(), Some(tiled("a4g64").as_str()));
+                assert_eq!(merged.as_deref(), Some(tiled("a4g64").as_str()));
+            } else {
+                assert_eq!(
+                    qkvz.as_deref(),
+                    Some("affine"),
+                    "calibrated site stays affine"
+                );
+                assert_eq!(ba.as_deref(), Some("affine"));
+                // `concat_rows` refuses halves with unequal `input_amax`, as
+                // before this route existed.
+                assert_eq!(merged, None);
+            }
+            assert!(
+                gdn.out_proj_mode().is_some_and(|m| m == "affine"),
+                "[1536, 6144] is under the affine shape rule"
+            );
+        }
+
+        let AttentionType::Full(attn) = &inner.layers[3].attn else {
+            panic!("layer 3 must be a full-attention layer");
+        };
+        let (q_mode, q_block) = attn.q_proj_mode_and_block();
+        assert_eq!(q_mode.as_deref(), Some(tiled("a4g64").as_str()));
+        assert!(
+            q_block,
+            "the tiled affine q_proj must merge its q/gate block like the row-major one"
+        );
+
+        // The tiled MLP computes what the row-major arrays compute.
+        if metal {
+            let reference = |name: &str, bits: i32| {
+                try_build_quantized_linear(&params, name, 64, bits).unwrap()
+            };
+            let MLPVariant::Quantized {
+                gate_proj, up_proj, ..
+            } = &inner.layers[0].mlp
+            else {
+                unreachable!()
+            };
+            for (ql, name, bits) in [
+                (gate_proj, "layers.0.mlp.gate_proj", 4),
+                (up_proj, "layers.0.mlp.up_proj", 8),
+            ] {
+                let row_major = reference(name, bits);
+                for m in [1i64, 8, 12, 64] {
+                    let x: Vec<f32> = (0..(m * 1536) as usize)
+                        .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+                        .collect();
+                    let x = MxArray::from_float32(&x, &[1, m, 1536])
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap();
+                    let ours = ql.forward(&x).unwrap().astype(DType::Float32).unwrap();
+                    let theirs = row_major
+                        .forward(&x)
+                        .unwrap()
+                        .astype(DType::Float32)
+                        .unwrap();
+                    let (ours, theirs) = (ours.to_float32().unwrap(), theirs.to_float32().unwrap());
+                    let peak = theirs.iter().fold(0f32, |p, v| p.max(v.abs()));
+                    let worst = ours
+                        .iter()
+                        .zip(theirs.iter())
+                        .fold(0f32, |w, (a, b)| w.max((a - b).abs()));
+                    assert!(
+                        worst <= 3e-2 * peak,
+                        "{name} M={m}: tiled forward off MLX's affine route by {worst} (peak {peak})"
+                    );
+                }
+            }
         }
     }
 

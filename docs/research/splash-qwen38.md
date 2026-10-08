@@ -428,10 +428,40 @@ Deleted tools (restore from `69ccaf9d` if needed):
 9. Re-run the Splash comparison on the current runtime. Done in §2b for
    `0.0.16` + PR #183; repeat on a quiet machine before any parity claim.
 10. Affine on the `@t64` kernel family landed for the DFlash2 draft
-    (`827c363e7`). Turning it on for every MLX-affine checkpoint (the
-    `tile_kquant_layout` retag is the hook) is a product call: it changes
-    M=8 rounding (half stage) and needs the M=1 long-K `qmv_t64` gap (~7%
-    under MLX's qmv at K >= 13824) closed first.
+    (`827c363e7`) and is now default-on for every bf16-companion MLX-affine
+    4/64 and 8/64 linear at load (the Splash model: one layout, one kernel
+    family, every M), see [perf.md](../perf.md). What it took: the tensor-op
+    kernel grew 16- and 32-row tiers (`qmm_m16/m32_nax_t64`, x staged per
+    step with zero rows past M, shared by the two simdgroups) so affine
+    M = 9..32 stop paying the GEMM's 64-row tiles or qmv_wide's re-reads
+    (M = 12 on the Qwen3.8 MLP shapes: 0.19 vs MLX 0.78 ms), a grid rule
+    that leaves the tiny shapes (Gemma4 k/v at N = 256, routers) to
+    qmv_wide, and a cap on the split-K partials for the taller tiers. The
+    tiers, the grid rule, the cap and the `qmv_t64` sub-tiles are the affine
+    contracts' only: the K-quant modes route and sum exactly as they
+    shipped, so the Qwen3.8 GGUF target is bit-for-bit unchanged (AR short
+    bench hash `e5b8ed3563` before and after; forcing the affine modes onto
+    the shipped rules reproduces the DFlash2 short bench's `bf80b142cb` /
+    321 cycles exactly). The DFlash2 draft is affine (`a4g64@t64`), so it
+    takes the new affine routes and proposes differently: the DFlash2 bench
+    hash and cycle count move with the draft (`67e565ac65`, 342 cycles on
+    the short prompt; the target's verify is unchanged). The M = 1 long-K `qmv_t64` gap did
+    not reproduce in overlapped throughput (8..32 k-splits within 3% at
+    K = 5120..25600), but a dependency-chain bench (`MLX_KQUANT_SMALL_M_CHAIN=1`,
+    the latency a decode step pays) showed `qmv_t64`'s 32-row threadgroups
+    5-12% behind MLX's `qmv` on narrow N and Gemma-4-E2B decode 5% slower;
+    `qmv_t64` now takes 8- or 16-row sub-tiles of the 64-row tile unless the
+    grid is already 16 threadgroups per core (model decode back within noise
+    of MLX's route, chain latency 0.92-1.02x). Remaining: the 32-row tier on
+    wide-N short-K shapes (N >= 12288, K = 2560) is 0.9x of MLX's GEMM; M = 8
+    `qmv_wide_t64` at N = 2560, K = 4096 is 0.84x of MLX's `qmv_wide`, and
+    `qmv_wide_t64` at K = 25600 is 0.87-0.89x in chain latency (its k-steps
+    jump a tile row, 1 KB, where the row-major kernel walks contiguous
+    bytes). The generic loaders therefore tile an affine linear only from
+    `[6144, 1536]` up (`kquant_affine_tiled_shape`); narrower ones keep
+    MLX's route, which the chain bench puts at or ahead of the tiled
+    kernels there (Gemma-4-E2B: only `gate|up` tiles; its attention
+    projections, N = 256..2048, do not).
 11. K-quant MoE experts on `@t64`: measured, not worth it (`kquant_moe_bench`,
     `MLX_KQUANT_MOE_BENCH=1`). At the verify width (8 tokens x top-8, ~54 of
     256 experts, Qwen3.6-35B-A3B shapes) today's one-dispatch `gather_qmv`

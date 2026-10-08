@@ -1,4 +1,4 @@
-// M = 8 bfloat16 K-quant matmul on the Metal 4 tensor op (NAX).
+// M <= 32 bfloat16 K-quant matmul on the Metal 4 tensor op (NAX).
 //
 // Ported from Splash (incoai/splash, Apache-2.0; see THIRD_PARTY_NOTICES):
 // runtime/metal/kernels/common/gguf_staged.h, gguf_staged_tile.h,
@@ -10,8 +10,12 @@
 // grid (N / 64, K splits). Per 32-input step every lane dequantizes its
 // column's 32 codes to half into a double-buffered threadgroup stage (fp32
 // scale * code + bias, one rounding), then the simdgroup runs matmul2d
-// (8 x 32 x 32, A = bfloat x in device memory, B = the half stage, fp32
-// accumulate) on it while the next step's codes are already in flight.
+// (rows x 32 x 32, A = bfloat x in device memory, B = the half stage, fp32
+// accumulate) on it while the next step's codes are already in flight. The
+// tile holds 8, 16 or 32 rows (Splash's decode tiers): the weights are
+// dequantized once whatever the row count, so M = 9..32 costs the 8-row
+// tile's weight stream plus the larger matmul. Each step's rows x 32 block
+// of x is staged next to the weights, zero past row M (ARows).
 // Splits > 1 publish fp32 partials; the last-arriving partition of a tile
 // adds them in split order and writes the bfloat16 output, so the result does
 // not depend on scheduling.
@@ -26,7 +30,6 @@ using namespace mpp::tensor_ops;
 
 namespace kq_m8 {
 
-constant constexpr ushort kRows = 8;
 constant constexpr ushort kCols = 32;
 constant constexpr ushort kStep = 32;
 constant constexpr ushort kTileCols = 64;
@@ -51,15 +54,16 @@ enum Format : int {
   IQ1S,
   IQ1M,
   IQ3S,
-  // MLX affine companions (KQ_AFFINE): 4-bit codes as Q4K's; the group
-  // size is the kernel's, not the format's.
+  // MLX affine companions (KQ_AFFINE): 4-bit codes as Q4K's, 8-bit as
+  // IQ3S8's; the group size is the kernel's, not the format's.
   A4,
+  A8,
   Unsupported
 };
 
 template <Format F>
 constexpr bool is_affine() {
-  return F == A4;
+  return F == A4 || F == A8;
 }
 
 // The kquant_mode.h kind of a grid format, -1 for the others.
@@ -84,7 +88,7 @@ template <int group_size, int bits, int super_ratio, bool has_min, int kind>
 constexpr Format format() {
   if (kind == KQ_AFFINE && !has_min && group_size * super_ratio == 256 &&
       group_size % 32 == 0) {
-    return bits == 4 ? A4 : Unsupported;
+    return bits == 4 ? A4 : bits == 8 ? A8 : Unsupported;
   }
   if (group_size == 32 && super_ratio == 8 && !has_min) {
     if (kind == KQ_GRID_IQ2XXS && bits == 1) {
@@ -247,6 +251,13 @@ struct Codes<A4> {
   typedef uint4 W;
   static W load(const device uint32_t* base, uint u, uint stride) {
     return Codes<Q4K>::load(base, u, stride);
+  }
+};
+template <>
+struct Codes<A8> {
+  typedef Codes<IQ3S8>::W W;
+  static W load(const device uint32_t* base, uint u, uint stride) {
+    return Codes<IQ3S8>::load(base, u, stride);
   }
 };
 
@@ -564,6 +575,11 @@ METAL_FUNC uint2 bytes8<A4>(uint4 w, ushort j) {
   return bytes8<Q4K>(w, j);
 }
 
+template <>
+METAL_FUNC uint2 bytes8<A8>(Codes<A8>::W w, ushort j) {
+  return bytes8<IQ3S8>(w, j);
+}
+
 // One lane's unit as 32 half values at dst, each rounded once from fp32.
 // Threadgroup entries of a grid format's table (1 for the unused width and
 // for the other formats).
@@ -655,14 +671,60 @@ METAL_FUNC void split_release(device atomic_uint* counter, uint thread_index) {
   }
 }
 
+// One step of x, the threadgroup's shared A operand: the rows x kStep
+// bfloat16 block at input `k0` as rows * 4 chunks of 8 values (one uint4),
+// chunk c = thread + 64 i being row c / 4, values (c % 4) * 8..; zeros for
+// rows past M. Staged in threadgroup memory so the tensor op reads a whole
+// tile whatever M is (a device tensor whose extent is M < rows measured
+// 1.1-5x slower at some (M, shape) pairs, and reading rows past M from
+// device memory would read past x), and staged once per threadgroup: the
+// two simdgroups share the rows, and the 32-row tier read per simdgroup
+// measured 1.7x the 16-row tier's time on the wide-N shapes (x is
+// L2-resident; its re-reads outran the weight stream).
+template <int rows, typename T>
+struct ARows {
+  static_assert(rows % 8 == 0 && rows <= 32, "8-row blocks, one uint4 per chunk");
+  static constexpr constant ushort kChunks = rows * 4;
+  static constexpr constant ushort kPerThread = (kChunks + kThreads - 1) / kThreads;
+  uint4 v[kPerThread];
+
+  METAL_FUNC static ARows load(
+      const device T* x, uint K, uint M, uint k0, uint tid) {
+    ARows a;
+#pragma unroll
+    for (ushort i = 0; i < kPerThread; ++i) {
+      const uint c = tid + kThreads * i;
+      const uint row = c / 4;
+      a.v[i] = c < kChunks && row < M
+          ? *reinterpret_cast<const device uint4*>(
+                x + size_t(row) * K + k0 + (c % 4) * 8)
+          : uint4(0);
+    }
+    return a;
+  }
+
+  // Row-major [rows][kStep] at dst.
+  METAL_FUNC void store(threadgroup T* dst, uint tid) const {
+#pragma unroll
+    for (ushort i = 0; i < kPerThread; ++i) {
+      const uint c = tid + kThreads * i;
+      if (c < kChunks) {
+        *reinterpret_cast<threadgroup uint4*>(dst + (c / 4) * kStep + (c % 4) * 8) =
+            v[i];
+      }
+    }
+  }
+};
+
 } // namespace kq_m8
 
-// Grid (N / 64, splits) of 64 threads. x is [8][K] bfloat16, y [8][N];
-// partials [splits][8][N] fp32 and counters [N / 64] (zero before and after
-// each dispatch) are read only when splits > 1. `tiled` reads the Tiled64
-// layout: a threadgroup's 64 columns are one tile, so each step's 64 code
-// units are one contiguous 64 * bits * 4-byte run. The arithmetic and its
-// order are the same, so the two layouts give identical bits.
+// Grid (N / 64, splits) of 64 threads. x is [M][K] bfloat16 with M <= rows,
+// y [M][N]; partials [splits][rows][N] fp32 and counters [N / 64] (zero
+// before and after each dispatch) are read only when splits > 1. `tiled`
+// reads the Tiled64 layout: a threadgroup's 64 columns are one tile, so each
+// step's 64 code units are one contiguous 64 * bits * 4-byte run. The
+// arithmetic and its order are the same, so the two layouts give identical
+// bits.
 template <
     typename T,
     int group_size,
@@ -671,7 +733,8 @@ template <
     bool has_min,
     int kind,
     int scale_shift,
-    bool tiled = false>
+    bool tiled = false,
+    int rows = 8>
 [[kernel, max_total_threads_per_threadgroup(64)]] void kquant_qmm_m8_nax(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -683,10 +746,13 @@ template <
     const constant int& in_vec_size [[buffer(7)]],
     const constant int& out_vec_size [[buffer(8)]],
     const constant int& num_splits [[buffer(9)]],
+    const constant int& num_rows [[buffer(10)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   using namespace kq_m8;
+  constexpr ushort kRows = rows;
+  static_assert(rows == 8 || rows == 16 || rows == 32, "Splash's decode tiers");
   constexpr Format F = format<group_size, bits, super_ratio, has_min, kind>();
   static_assert(F != Unsupported, "no M = 8 NAX decode for this mode");
   static_assert(
@@ -699,6 +765,7 @@ template <
   typedef typename Codes<F>::W W;
 
   threadgroup half stage[2 * 2 * kStage];
+  threadgroup T astage[2 * kRows * kStep];
   threadgroup half2 tl[codebook ? kTableEntries : 1];
   threadgroup uint64_t grid64[grid_tl64<F>()];
   threadgroup uint32_t grid32[grid_tl32<F>()];
@@ -719,6 +786,7 @@ template <
 
   const uint K = in_vec_size;
   const uint N = out_vec_size;
+  const uint M = num_rows;
   const uint splits = num_splits;
   const uint per = (K / kStep) / splits;
   const uint step_begin = group.y * per;
@@ -727,18 +795,23 @@ template <
   const uint n = column0 + simd_lane;
   threadgroup half* my = stage + simd_group * 2 * kStage;
 
-  auto a = tensor(x, dextents<int, 2>{int(K), kRows}, array<int, 2>{1, int(K)});
   constexpr auto desc = matmul2d_descriptor(
       kRows, kCols, kStep, false, true, false,
       matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<desc, execution_simdgroups<1>> op;
+  tensor<threadgroup T, dextents<int, 2>, tensor_inline> at0(
+      astage, dextents<int, 2>{kStep, kRows}, array<int, 2>{1, kStep});
+  tensor<threadgroup T, dextents<int, 2>, tensor_inline> at1(
+      astage + kRows * kStep, dextents<int, 2>{kStep, kRows},
+      array<int, 2>{1, kStep});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(
       my, dextents<int, 2>{kStep, kCols}, array<int, 2>{1, kStep});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(
       my + kStage, dextents<int, 2>{kStep, kCols}, array<int, 2>{1, kStep});
+  auto a0 = at0.template slice<kStep, kRows>(0, 0);
+  auto a1 = at1.template slice<kStep, kRows>(0, 0);
   auto b0 = bt0.template slice<kStep, kCols>(0, 0);
   auto b1 = bt1.template slice<kStep, kCols>(0, 0);
-  auto a0 = a.template slice<kStep, kRows>(0, 0);
   // Zeroed here, not in a helper: a returned initialized cooperative tensor
   // loses its values (Splash gguf_staged_tile.h).
   auto acc = op.template get_destination_cooperative_tensor<
@@ -759,22 +832,25 @@ template <
   if constexpr (is_grid<F>()) {
     cur.sc = coefs.companion(step_begin);
   }
+  ARows<rows, T> xa = ARows<rows, T>::load(x, K, M, step_begin * kStep, tid);
   for (uint step = step_begin; step < step_end; ++step) {
     threadgroup half* buf = my + (step & 1) * kStage;
     stage32<F, scale_shift>(cur, cc, tl, buf + simd_lane * kStep, grid);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    xa.store(astage + (step & 1) * kRows * kStep, tid);
+    // The A stage is the threadgroup's, so the step barrier is too.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (step + 1 < step_end) {
       cur = Codes<F>::load(row, step + 1, stride);
       cc = coefs.at(step + 1);
       if constexpr (is_grid<F>()) {
         cur.sc = coefs.companion(step + 1);
       }
+      xa = ARows<rows, T>::load(x, K, M, (step + 1) * kStep, tid);
     }
-    auto as = a.template slice<kStep, kRows>(int(step * kStep), 0);
     if (step & 1) {
-      op.run(as, b1, acc);
+      op.run(a1, b1, acc);
     } else {
-      op.run(as, b0, acc);
+      op.run(a0, b0, acc);
     }
   }
 
@@ -786,7 +862,9 @@ template <
         continue;
       }
       const auto idx = acc.get_multidimensional_index(i);
-      y[uint(idx[1]) * N + column0 + uint(idx[0])] = T(float(acc[i]));
+      if (uint(idx[1]) < M) {
+        y[uint(idx[1]) * N + column0 + uint(idx[0])] = T(float(acc[i]));
+      }
     }
     return;
   }
@@ -813,6 +891,9 @@ template <
     const auto idx = acc.get_multidimensional_index(i);
     const uint row_ = uint(idx[1]);
     const uint col = uint(idx[0]);
+    if (row_ >= M) {
+      continue;
+    }
     float total = 0.0f;
     for (uint s = 0; s < splits; ++s) {
       total += s == split ? float(acc[i]) : partials[at(s, row_, col)];

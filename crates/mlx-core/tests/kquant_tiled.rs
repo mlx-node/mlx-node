@@ -204,8 +204,9 @@ fn cpu_tiled_matches_cpu_row_major_bitwise() {
     }
 }
 
-/// (a) M = 2..7 and 9 take qmv_wide in both layouts, same lane map and sum
-/// order: bit-identical on the Qwen3.8 shapes.
+/// (a) M = 2..7 and 9 (under the device's qmv batch limit) take qmv_wide in
+/// both layouts, same lane map and sum order: bit-identical on the Qwen3.8
+/// shapes.
 #[cfg(target_os = "macos")]
 #[test]
 fn qmv_wide_tiled_is_bit_identical() {
@@ -219,6 +220,11 @@ fn qmv_wide_tiled_is_bit_identical() {
             let w = weights(kq, &[n], k, 0x7400 + (ki * 16 + si) as u32);
             let t = tiled(&w, kq);
             for m in [3i64, 5, 7, 9] {
+                // A tensor-op tier, or the GEMM from the device's qmv batch
+                // limit (6 on gen-13/14): not qmv_wide, covered elsewhere.
+                if tiled_family(m, n, k, kq, "gemm") != "qmv_wide_t64" {
+                    continue;
+                }
                 let x = activation(&[m, k], 0x7500 + (ki * 16 + si) as u32, DType::BFloat16);
                 start_counting();
                 let ours = qmm_tiled(&x, &t, kq, GPU);
@@ -297,13 +303,23 @@ fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
             let x = activation(&[8, k], 0x7900 + (ki * 16 + si) as u32, DType::BFloat16);
             let what = format!("{} K={k} N={n} M=8", kq.mode);
 
+            // Every K-quant mode takes the 8-row tier at M = 8 (the grid rule
+            // is the affine contracts'); derived from the predicate anyway.
+            let takes_tensor_op = tensor_op_tier(8, n, k, kq).is_some();
+            let gemm = if nax_available() {
+                "qmm_t_nax_t64"
+            } else {
+                "qmm_t_t64"
+            };
+            let family = tiled_family(8, n, k, kq, gemm);
             start_counting();
             let (_, _, ours) = read_output("tiled", qmm_tiled(&x, &t, kq, GPU));
-            assert_eq!(
-                family_count("qmm_m8_nax_t64"),
-                1,
-                "{what}: must take qmm_m8_nax_t64"
-            );
+            let took = if family == gemm && family_count("qmm_t_splitk_t64") == 1 {
+                "qmm_t_splitk_t64"
+            } else {
+                family
+            };
+            assert_eq!(family_count(took), 1, "{what}: must take {took}");
             assert_no_row_major_route(&what);
             let splits = [1u64, 2, 4, 8]
                 .into_iter()
@@ -311,7 +327,7 @@ fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
                 .unwrap_or(0);
             stop_counting();
 
-            if matches!(kq.mode, "q3k" | "q2k" | "iq4nl") || kq.is_grid() {
+            if takes_tensor_op && (matches!(kq.mode, "q3k" | "q2k" | "iq4nl") || kq.is_grid()) {
                 start_counting();
                 let (_, _, reference) =
                     read_output("row-major m8", quantized_matmul(&x, &w, true, kq, GPU));
@@ -345,8 +361,88 @@ fn m8_nax_tiled_matches_cpu_and_row_major_tensor_op() {
     }
 }
 
-/// (a) Prefill: M = 64 and 2048 take qmm_t_nax in both layouts, M = 16 on
-/// N = 5120 takes qmm_t_splitk; all bit-identical.
+/// (b') M = 12, 24, 32, 40 for every K-quant mode: the 16- and 32-row
+/// tensor-op tiers are the affine contracts' (kquant_affine_tiled.rs), so a
+/// K-quant mode never takes one — the route is qmv_wide_t64 under the device's
+/// qmv batch limit, else the GEMM (M = 40 included: no 32-row tier plus a
+/// tail) — and the result stays within the tile tolerance of the CPU
+/// reference and of MLX's row-major route.
+#[cfg(target_os = "macos")]
+#[test]
+fn kquant_modes_take_no_row_tier_past_m8() {
+    assert!(gpu_gen() > 0, "no Metal device");
+    if !nax_available() {
+        eprintln!("skipping: no NAX tensor-op kernels on this host");
+        return;
+    }
+    let gemm = "qmm_t_nax_t64";
+    for (ki, kq) in KQUANTS.iter().enumerate() {
+        let mut worst_rel = 0f32;
+        let mut routes = 0;
+        // One shape per split count of the grid rule. `activation` draws its
+        // values in order, so the same seed at every M is a row prefix of the
+        // M = 40 input and one CPU reference per shape serves every M.
+        for (si, &(k, n)) in SHAPES[..3].iter().enumerate() {
+            let w = weights(kq, &[n], k, 0x7c00 + (ki * 16 + si) as u32);
+            let t = tiled(&w, kq);
+            let seed = 0x7d00 + (ki * 16 + si) as u32;
+            let x40 = activation(&[40, k], seed, DType::BFloat16);
+            let (_, _, cpu40) = read_output("cpu", quantized_matmul(&x40, &w, true, kq, CPU));
+            for m in [12i64, 24, 32, 40] {
+                let x = activation(&[m, k], seed, DType::BFloat16);
+                let what = format!("{} K={k} N={n} M={m}", kq.mode);
+                let tier = tensor_op_tier(m, n, k, kq);
+                assert!(
+                    tier.is_none(),
+                    "{what}: the 16/32-row tiers are affine-only, got {tier:?}"
+                );
+                let family = tiled_family(m, n, k, kq, gemm);
+                start_counting();
+                let (_, _, ours) = read_output("tiled", qmm_tiled(&x, &t, kq, GPU));
+                let took = if family == gemm && family_count("qmm_t_splitk_t64") == 1 {
+                    "qmm_t_splitk_t64"
+                } else {
+                    family
+                };
+                assert_eq!(family_count(took), 1, "{what}: must take {took}");
+                assert_eq!(
+                    family_count("qmm_m32_nax_t64") + family_count("qmm_m16_nax_t64"),
+                    0,
+                    "{what}: no row tier"
+                );
+                assert_no_row_major_route(&what);
+                stop_counting();
+                routes += 1;
+
+                let cpu = &cpu40[..(m * n) as usize];
+                let (worst, peak) = worst_abs(&ours, cpu);
+                let rel = worst / peak;
+                assert!(
+                    rel <= BF16_TILE_TOL,
+                    "{what}: rel {rel:e} > {BF16_TILE_TOL:e} off the CPU reference"
+                );
+                worst_rel = worst_rel.max(rel);
+
+                let (_, _, row_major) =
+                    read_output("row-major", quantized_matmul(&x, &w, true, kq, GPU));
+                let (worst, peak) = worst_abs(&ours, &row_major);
+                let rel = worst / peak;
+                assert!(
+                    rel <= BF16_TILE_TOL,
+                    "{what}: rel {rel:e} > {BF16_TILE_TOL:e} off the row-major route"
+                );
+            }
+        }
+        println!(
+            "  {:<6} M = 12..40 on {routes} (shape, M) cases, no row tier, worst rel {worst_rel:.2e}",
+            kq.mode
+        );
+    }
+}
+
+/// (a) Prefill: M = 64 and 2048 take qmm_t_nax in both layouts, M = 40 on
+/// N = 1280 (80 output tiles, past the tensor-op tiers) takes qmm_t_splitk;
+/// all bit-identical.
 #[cfg(target_os = "macos")]
 #[test]
 fn qmm_tiled_is_bit_identical() {
@@ -356,7 +452,7 @@ fn qmm_tiled_is_bit_identical() {
             (5120i64, 5120i64, 64i64, "qmm_t_nax"),
             (5120, 17408, 64, "qmm_t_nax"),
             (5120, 6144, 2048, "qmm_t_nax"),
-            (5120, 5120, 16, "qmm_t_splitk"),
+            (5120, 1280, 40, "qmm_t_splitk"),
         ] {
             let w = weights(kq, &[n], k, 0x7a00 + ki as u32);
             let t = tiled(&w, kq);
@@ -560,14 +656,18 @@ fn padded_merge_is_invisible_in_every_mode() {
             // GPU: exactly one tiled dispatch, no row-major kernel.
             start_counting();
             let (_, _, ours) = read_output(&what, qmm_tiled(&x, &padded, kq, GPU));
-            let family = match m {
-                1 => "qmv_t64",
-                8 if nax_available() => "qmm_m8_nax_t64",
-                8 => "qmv_wide_t64",
-                _ if nax_available() => "qmm_t_nax_t64",
-                _ => "qmm_t_t64",
+            let gemm = if nax_available() {
+                "qmm_t_nax_t64"
+            } else {
+                "qmm_t_t64"
             };
-            assert_eq!(family_count(family), 1, "{what}: must take {family}");
+            let family = tiled_family(m, n_padded, k, kq, gemm);
+            let took = if family == gemm && family_count("qmm_t_splitk_t64") == 1 {
+                "qmm_t_splitk_t64"
+            } else {
+                family
+            };
+            assert_eq!(family_count(took), 1, "{what}: must take {took}");
             assert_no_row_major_route(&what);
             stop_counting();
             let (_, _, theirs) =

@@ -42,12 +42,13 @@ use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
     is_mxfp8_checkpoint, is_quantized_checkpoint, release_tiled_kquant_sources,
-    try_build_fp8_e4m3_quantized_linear, try_build_fp8_e4m3_quantized_switch_linear,
-    try_build_kquant_quantized_linear_tiled, try_build_kquant_quantized_switch_linear,
-    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
-    try_build_quantized_linear, try_build_sym8_quantized_linear,
+    try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
+    try_build_fp8_e4m3_quantized_switch_linear, try_build_kquant_quantized_linear_tiled,
+    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
+    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
+    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
+    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 
 /// Sanitize weights from HuggingFace format.
@@ -613,6 +614,20 @@ fn apply_weights_moe_inner_with_residency(
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5_moe")?;
+        // The per-tensor FP8 activation scale this projection will carry
+        // (threaded below) — mirrors the dense qwen3_5 loader: consumed only
+        // on the recipe's activation-fp8 sites (attn q/k/v/o, merged GDN
+        // in_proj_qkvz, GDN out_proj). `QuantizedLinear::forward` fake-quants
+        // whenever `input_amax > 0` AND the weight shape is static-FP8 (mxfp8
+        // 8/32 or affine 8/32 — see
+        // `quant_dispatch::admits_static_fp8_activation`), so a stale /
+        // hand-edited / future-recipe config with `input_amax` on a
+        // NON-attn/GDN mxfp8 projection must NOT thread it — else it would
+        // fake-quant a non-site's activations, violating "activation FP8
+        // only on attn/GDN sites".
+        let nk = normalize_per_layer_key(prefix);
+        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        let input_amax = if is_site { plq.input_amax } else { None };
         // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
         // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8 /
         // K-quant group must never silently fall back, see
@@ -623,7 +638,21 @@ fn apply_weights_moe_inner_with_residency(
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
             PerLayerMode::Affine => {
-                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+                // Tiled64 into the affine K-quant contract on a Metal host, as
+                // the dense qwen3_5 loader (the dense projections and the
+                // 2-D router gates; experts stay on gather_qmm). A calibrated
+                // activation-fp8 site keeps MLX's affine route.
+                if input_amax.is_some() {
+                    try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+                } else {
+                    try_build_affine_quantized_linear_tiled(
+                        params,
+                        prefix,
+                        plq.group_size,
+                        plq.bits,
+                        &mut tiled_prefixes.borrow_mut(),
+                    )?
+                }
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
             PerLayerMode::Q6K
@@ -660,24 +689,12 @@ fn apply_weights_moe_inner_with_residency(
         // other layer stays `None`, so forward behaviour is unchanged here.
         // Also thread the normalized config key so the activation-amax
         // calibration tap can bucket recorded `max|activation|` by projection —
-        // but ONLY on the recipe's activation-fp8 sites (attn q/k/v/o, merged
-        // GDN in_proj_qkvz, GDN out_proj). A non-site mxfp8 projection (e.g. a
-        // uniform-mxfp8 or hand-edited checkpoint's FFN/lm_head/MoE gate) gets
-        // `None` so the tap skips it and calibration never fake-quants a
-        // non-attn/GDN site.
-        let nk = normalize_per_layer_key(prefix);
-        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        // under the SAME site predicate as the consumed amax. A non-site mxfp8
+        // projection (e.g. a uniform-mxfp8 or hand-edited checkpoint's
+        // FFN/lm_head/MoE gate) gets `None` so the tap skips it and
+        // calibration never fake-quants a non-attn/GDN site. (The tap reads
+        // mxfp8 projections only, so a key on a tiled affine site is inert.)
         let amax_key = is_site.then_some(nk);
-        // Gate the CONSUMED activation amax under the SAME predicate as the
-        // recorded `amax_key` — mirrors the dense qwen3_5 loader.
-        // `QuantizedLinear::forward` fake-quants whenever `input_amax > 0` AND
-        // the weight shape is static-FP8 (mxfp8 8/32 or affine 8/32 — see
-        // `quant_dispatch::admits_static_fp8_activation`), so a stale /
-        // hand-edited / future-recipe config
-        // with `input_amax` on a NON-attn/GDN mxfp8 projection must NOT thread
-        // it — else it would fake-quant a non-site's activations, violating
-        // "activation FP8 only on attn/GDN sites".
-        let input_amax = if is_site { plq.input_amax } else { None };
         let built = built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key));
         if let Some(linear) = built.as_ref() {
             plain_fp8_residency

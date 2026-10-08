@@ -9,7 +9,7 @@ use super::gated_delta::{
     GdnCompleteOut, GdnKernelTape, GdnPrologue, GdnTail, gated_delta_fused_complete,
     gated_delta_update, gated_delta_update_fused, gated_delta_update_with_tape,
 };
-use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, LinearProj, QuantizedLinear};
 
 /// Per-GDN-layer tape recorded during the eager MTP verify forward.
 ///
@@ -404,15 +404,22 @@ impl GatedDeltaNet {
     }
 
     /// Whether `in_proj_ba` should be zero-padded to whole tiles and tiled so
-    /// it can merge with `in_proj_qkvz`: both quantized in the same K-quant
-    /// mode, qkvz already Tiled64, ba still row-major.
+    /// it can merge with `in_proj_qkvz`: both quantized in the same contract
+    /// (the same K-quant mode, or MLX affine at the (bits, group) the tiled
+    /// qkvz reads through: `affine` 4/64 pads into `a4g64@t64`), qkvz already
+    /// Tiled64, ba still row-major.
     fn ba_pads_to_tiled_qkvz(&self) -> bool {
-        use crate::models::quant_dispatch::split_kquant_layout;
+        use crate::models::quant_dispatch::{kquant_affine_mode_params, split_kquant_layout};
         match (&self.in_proj_qkvz, &self.in_proj_ba) {
             (LinearProj::Quantized(qkvz), LinearProj::Quantized(ba)) => {
-                qkvz.is_kquant_tiled()
-                    && !ba.is_kquant_tiled()
-                    && split_kquant_layout(qkvz.mode()).0 == ba.mode()
+                let base = split_kquant_layout(qkvz.mode()).0;
+                let ba_contract = if ba.mode() == DEFAULT_QUANT_MODE {
+                    kquant_affine_mode_params(ba.bits(), ba.group_size())
+                        .map_or(ba.mode(), |kq| kq.mode_str)
+                } else {
+                    ba.mode()
+                };
+                qkvz.is_kquant_tiled() && !ba.is_kquant_tiled() && base == ba_contract
             }
             _ => false,
         }
@@ -1201,6 +1208,30 @@ impl GatedDeltaNet {
             .as_ref()
             .map(|(b, a)| (b.is_quantized(), a.is_quantized()));
         (qkv_z, b_a)
+    }
+
+    /// The quantization modes of `in_proj_qkvz`, `in_proj_ba` and the merged
+    /// `[qkvz; ba]` projection (`None` when unmerged or dense).
+    #[cfg(test)]
+    pub(crate) fn in_proj_modes(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let mode = |proj: &LinearProj| match proj {
+            LinearProj::Quantized(ql) => Some(ql.mode().to_string()),
+            LinearProj::Standard(_) => None,
+        };
+        (
+            mode(&self.in_proj_qkvz),
+            mode(&self.in_proj_ba),
+            self.in_proj_qkvz_ba_q.as_ref().and_then(mode),
+        )
+    }
+
+    /// The quantization mode of `out_proj` (`None` when dense).
+    #[cfg(test)]
+    pub(crate) fn out_proj_mode(&self) -> Option<&str> {
+        match &self.out_proj {
+            LinearProj::Quantized(ql) => Some(ql.mode()),
+            LinearProj::Standard(_) => None,
+        }
     }
 
     #[cfg(test)]

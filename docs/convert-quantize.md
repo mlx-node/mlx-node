@@ -428,6 +428,13 @@ readers must un-tile or refuse: the MTPLX draft-head dequantize un-tiles
 (`config_declares_tiled_kquant_layout`; re-convert from the GGUF), and the qwen4_exp
 row-window store refuses.
 
+MLX-affine linears are never tiled on disk (the `affine` entries carry no `layout` field):
+on a Metal host the loader permutes every bf16-companion 4/64 and 8/64 2-D linear into the
+same layout at load and retags it `a4g64@t64` / `a8g64@t64`
+(`try_build_affine_quantized_linear_tiled`; what stays row-major is listed in
+[perf.md](perf.md)). The GGUF-sourced affine tensors above (Q4_0 / Q5_0 / Q8_0 / Q4_1 /
+Q5_1: f16 companions, group 32) are not candidates and keep MLX's affine route.
+
 ### ggml symmetric Q4_0 / Q8_0 — the derived-bias scheme
 
 ```

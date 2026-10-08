@@ -97,25 +97,67 @@ sorted MoE expert matmul at prefill widths, `B / E >= 4`, takes a tensor-op
 `gather_qmm_rhs_nax` kernel with one expert per 32/64-row tile on gen-17+
 GPUs and aligned `N % 64`, `K % 64`; the simdgroup `gather_qmm_rhs` stays for
 the rest, and `gather_qmv` serves decode and the 8-row verify);
-an M=8 K-quant matmul (the DFlash2 verify block) takes the tensor-op kernel for
-every tiled weight and, row-major, for Q3_K and IQ4_NL only, with the K split count
-derived from the IORegistry GPU core count; and a DFlash2 verify attention block
+a tiled K-quant matmul of 8 rows (the DFlash2 verify block, MTP verify) takes
+the tensor-op kernel's 8-row tier (`qmm_m8_nax_t64`) and, row-major at M = 8,
+Q3_K and IQ4_NL only, with the K split count derived from the IORegistry GPU
+core count — the Qwen3.8 GGUF route is what it shipped as; the tiled affine
+contracts (`a4g64@t64`, `a8g64@t64`) take the 8-, 16- or 32-row tier at
+M = 8..32 (`qmm_m8/m16/m32_nax_t64`: the weights are dequantized once per tile
+whatever the row count, x staged per step with zero rows past M), their split
+count also bounded by the fp32 partials the weight bytes can absorb, and the
+tier is skipped (qmv_wide / the GEMM) when that grid falls under 6 threadgroups
+per core at M = 8 or 2 above; and a DFlash2 verify attention block
 takes a block kernel (tensor-op where the device has one, else the simdgroup-matrix
 tile kernel) from a key count calibrated once per process at first use (GPU-timed
 vector vs block at 256..4096 keys, block must win by 5%; ~35 ms), below which the
 bit-exact vector kernels serve it. The one-time `[kquant route]` and `[sdpa route]`
 log lines appear under `MLX_METAL_COMMAND_TRACE`.
 
-The tiled kernels also carry MLX's affine quantization as a mode (`a4g64`: the
-same LSB-first codes, one bfloat16 scale and bias per group, `mlx_kquant.h`
-`Mode::A4G64`; the kernels are parametric, so other (bits, group) combinations
-are instantiation lines away), in the `@t64` layout only; a row-major affine
-weight stays on MLX's own route. Today only the DFlash2 draft takes it:
-`draft_linear` quantizes to affine Q4/g64 as before and
-`QuantizedLinear::tile_kquant_layout` retags the projection `a4g64@t64`, so a
-decode block's 8 rows take `qmm_m8_nax_t64` instead of MLX's per-row `qmv`
-(same codes and companions, different kernel). Tiling other affine models is the
-same call on their projections; it is not switched on for them.
+The tiled kernels also carry MLX's affine quantization as modes (`a4g64`,
+`a8g64`: the same LSB-first codes, one bfloat16 scale and bias per group,
+`mlx_kquant.h` `Mode::A4G64` / `Mode::A8G64`; the kernels are parametric, so
+other (bits, group) combinations are instantiation lines away), in the `@t64`
+layout only. On a Metal host every 2-D MLX-affine linear with bf16 companions at
+4/64 or 8/64 (the pairs `mlx convert` emits: bodies, routers, lm_heads) of at least
+`[N = 6144, K = 1536]` (`kquant_affine_tiled_shape`) is tiled at load by the same
+arm that tiles K-quants (`try_build_affine_quantized_linear_tiled` in the Qwen3.5
+dense/MoE, MTP, Gemma4, Muse-Glimmer, LFM2/K2 loaders) and retagged `a4g64@t64` /
+`a8g64@t64` — same bytes, the K-quant kernel family, the row-major sources released
+from the map as layers install. The shape rule is where the tiled kernels stop
+paying off against MLX's route (M5 Max, dependency-chain and DRAM-cold
+`kquant_small_m_bench`, t64/MLX): M = 1 ties from N = 6144 up (0.96-1.09x) and
+trails below it (N = 2560..4096: 0.92-0.96x); the M >= 8 tiers win from N = 4096
+up (1.1-1.6x) and lose at N <= 3072 (0.8-1.0x). So Qwen3.5-4B tiles its
+`gate|up` (9216 x 2560), `in_proj_qkvz` (12288 x 2560, with the padded
+`in_proj_ba`) and lm_head, and keeps `o_proj`, `out_proj` and `down_proj` (N = 2560)
+on MLX's route; Gemma-4-E2B tiles `gate|up` (6144 x 1536) and the per-layer
+embedding/lm_head widths and keeps its attention projections (N = 256..2048) and
+`down_proj`. The DFlash2 draft tiles every tileable projection (gated on its own
+numbers, `tile_kquant_layout_any_shape`). What stays on MLX's row-major affine
+route besides the rule: f16 companions (GGUF affine imports, also g32), other
+(bits, group) pairs (the 2/3/5/6-bit tensors of a mixed checkpoint, 8/32), shapes
+that are not whole tiles and super-blocks (`N % 64`, `K % 256`; the GDN `in_proj_ba`
+pads to whole tiles so it still merges with the tiled `in_proj_qkvz`), calibrated
+activation-fp8 sites (`input_amax`), Prism hadamard sites, Gemma4 Q4_0 decode
+sidecars, tied lm_heads / packed embeddings (gather), 3-D experts (gather_qmm),
+and non-Metal hosts. The retag is inference-only: `KQuantMatmul` has no VJP, as
+for every tiled K-quant (the training paths read the dense `.weight` params, not
+`QuantizedLinear`). Measured against MLX's own route on an M5 Max (DRAM-cold,
+`kquant_small_m_bench`): M = 1..7 at parity (±5%), M = 8 1.2-2.4x where the
+tensor-op grid fills the GPU (tie on the small shapes the grid rule leaves to
+qmv_wide), M = 9..16 1.2-4x, M = 17..32 0.8-3x (behind only on the wide-N short-K
+shapes, N ≥ 12288 at K = 2560, where MLX's GEMM reaches 220 GB/s). The M = 1
+`qmv_t64` owns 8, 16 or 32 rows of a tile per threadgroup, the largest whose grid
+still holds 16 threadgroups per core (the narrow Gemma-4-E2B shapes would otherwise
+leave the GPU 1-2 threadgroups per core and the decode step, a dependency chain,
+pays the matvec's latency: Gemma-4-E2B AR decode measured 5% behind MLX's route on
+32-row threadgroups, within noise on 8/16-row ones). Every tiled route is
+bit-deterministic across evaluations (`kquant_affine_tiled`
+`affine_tiled_routes_are_deterministic`; the chunk partials are summed in a fixed
+order through threadgroup memory). A greedy decode that still differs run to run
+is the engine's completed-token decode tuning picking a different attention
+partition (`grouped_stripes`, `MLX_NODE_LOG=mlx_core::decode_tuning=info`), not
+the matmuls.
 
 Eligible Qwen/DFlash projection merges, fused GDN preparation/window convolution,
 fused draft convolution/top-16/greedy selection, segmented one-call verifier attention,

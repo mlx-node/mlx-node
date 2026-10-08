@@ -27,6 +27,12 @@ impl KQuant {
     /// bytes (sign indices, qh, scale nibbles), so a fixture fills them with
     /// whole random bytes rather than small sub-scales. (IQ3_S's scale byte
     /// is read as a nibble, so any byte is a valid field.)
+    /// An affine contract (`a4g64`, `a8g64`): MLX affine bytes read through
+    /// the K-quant kernels; the dispatcher's affine-only routes apply.
+    pub fn is_affine(&self) -> bool {
+        self.mode.starts_with('a') && self.mode.contains('g')
+    }
+
     pub fn is_grid(&self) -> bool {
         matches!(
             self.mode,
@@ -504,6 +510,63 @@ pub fn gpu_gen() -> i32 {
 pub fn nax_available() -> bool {
     // SAFETY: nullary predicate that catches internally.
     unsafe { mlx_sys::mlx_metal_is_nax_available() }
+}
+
+/// The tensor-op row tier (`qmm_m8/m16/m32_nax_t64`) the Tiled64 bfloat16
+/// route takes for `x[M, K] @ w[N, K].T` in mode `kq` on this device, `None`
+/// when the dispatcher keeps it on `qmv_wide_t64` / the GEMM
+/// (`mlx_test_kquant_tensor_op_tier`): the affine contracts take the 8..32-row
+/// tiers behind the grid rule, the K-quant modes the 8-row tier at M = 8 only.
+pub fn tensor_op_tier(m: i64, n: i64, k: i64, kq: &KQuant) -> Option<&'static str> {
+    // SAFETY: pure predicate over the shape.
+    let takes = unsafe {
+        mlx_sys::mlx_test_kquant_tensor_op_tier(
+            m as i32,
+            n as i32,
+            k as i32,
+            kq.bits,
+            kq.is_affine(),
+        )
+    };
+    let tier = if m <= 8 {
+        "qmm_m8_nax_t64"
+    } else if m <= 16 {
+        "qmm_m16_nax_t64"
+    } else {
+        "qmm_m32_nax_t64"
+    };
+    takes.then_some(tier)
+}
+
+/// The M from which the Tiled64 route of `x[M, K] @ w[N, K].T` takes the
+/// GEMM (`qmm_t_nax_t64` / `qmm_t_splitk_t64`) rather than `qmv_wide_t64` on
+/// this device: MLX's qmv batch limit by GPU generation and shape (6..32), or
+/// `MLX_QMM_SPLITK_MIN_M` (`mlx_test_kquant_qmv_vector_limit`).
+pub fn qmv_vector_limit(k: i64, n: i64) -> i64 {
+    // SAFETY: pure predicate over the shape.
+    i64::from(unsafe { mlx_sys::mlx_test_kquant_qmv_vector_limit(k as i32, n as i32) })
+}
+
+/// The matvec / GEMM family the Tiled64 bfloat16 route takes for `M` rows
+/// of `x[M, K] @ w[N, K].T` in mode `kq` on this device: `qmv_t64` at M = 1,
+/// a tensor-op tier where the dispatcher admits one, `qmv_wide_t64` below
+/// the device's qmv batch limit, else the GEMM (`gemm`: the caller's
+/// `qmm_t_nax_t64` / `qmm_t_t64`; the GEMM heights may split K instead).
+pub fn tiled_family(m: i64, n: i64, k: i64, kq: &KQuant, gemm: &'static str) -> &'static str {
+    let tier = tensor_op_tier(m, n, k, kq);
+    // The affine tiers go ahead of the GEMM; a K-quant mode's 8-row tier
+    // comes after the qmv batch limit, as it shipped.
+    if let Some(tier) = tier.filter(|_| kq.is_affine()) {
+        tier
+    } else if m >= qmv_vector_limit(k, n) {
+        gemm
+    } else if let Some(tier) = tier {
+        tier
+    } else if m == 1 {
+        "qmv_t64"
+    } else {
+        "qmv_wide_t64"
+    }
 }
 
 /// float32 qmm reaches NAX only when `MLX_ENABLE_TF32` is unset or nonzero.

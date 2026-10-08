@@ -190,13 +190,19 @@
       0, \
       true)
 
+// qmv_t64 at 8 and 16 k-splits per 32-, 16- and 8-row threadgroup.
+#define instantiate_kquant_qmv_tiled(mode, type, rows, group_size, bits, super_ratio, has_min, kind, shift) \
+  instantiate_kernel( \
+      #mode "_qmv_t64_" #type "_gs_" #group_size "_b_" #bits "_ks_8_rows_" #rows, \
+      kquant_qmv_t64, type, group_size, bits, super_ratio, has_min, kind, shift, 8, rows) \
+  instantiate_kernel( \
+      #mode "_qmv_t64_" #type "_gs_" #group_size "_b_" #bits "_ks_16_rows_" #rows, \
+      kquant_qmv_t64, type, group_size, bits, super_ratio, has_min, kind, shift, 16, rows)
+
 #define instantiate_kquant_all_tiled(mode, type, group_size, bits, super_ratio, has_min, kind, shift) \
-  instantiate_kernel( \
-      #mode "_qmv_t64_" #type "_gs_" #group_size "_b_" #bits "_ks_8", \
-      kquant_qmv_t64, type, group_size, bits, super_ratio, has_min, kind, shift, 8) \
-  instantiate_kernel( \
-      #mode "_qmv_t64_" #type "_gs_" #group_size "_b_" #bits "_ks_16", \
-      kquant_qmv_t64, type, group_size, bits, super_ratio, has_min, kind, shift, 16) \
+  instantiate_kquant_qmv_tiled(mode, type, 32, group_size, bits, super_ratio, has_min, kind, shift) \
+  instantiate_kquant_qmv_tiled(mode, type, 16, group_size, bits, super_ratio, has_min, kind, shift) \
+  instantiate_kquant_qmv_tiled(mode, type, 8, group_size, bits, super_ratio, has_min, kind, shift) \
   instantiate_kquant_wide_tiled(mode, type, 2, group_size, bits, super_ratio, has_min, kind, shift) \
   instantiate_kquant_wide_tiled(mode, type, 3, group_size, bits, super_ratio, has_min, kind, shift) \
   instantiate_kquant_wide_tiled(mode, type, 4, group_size, bits, super_ratio, has_min, kind, shift) \
@@ -245,7 +251,8 @@
   instantiate_kquant_modes(iq1s, type, 32, 1, 8, false, KQ_GRID_IQ1S, -3) \
   instantiate_kquant_modes(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3) \
   instantiate_kquant_modes(iq3s, type, 32, 3, 8, false, KQ_GRID_IQ3S, 0) \
-  instantiate_kquant_affine(a4g64, type, 64, 4, 4)
+  instantiate_kquant_affine(a4g64, type, 64, 4, 4) \
+  instantiate_kquant_affine(a8g64, type, 64, 8, 4)
 
 #if KQUANT_DTYPE == 0
 instantiate_kquant_types(float)

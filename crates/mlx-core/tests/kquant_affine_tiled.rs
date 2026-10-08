@@ -1,9 +1,10 @@
-//! The MLX affine mode of the K-quant kernels (`a4g64`: `mlx_kquant.h`
-//! `Mode::A4G64`): MLX's own affine arrays — the LSB-first codes, one bfloat16
-//! scale and one bfloat16 bias per group — read through the Tiled64 kernels
-//! (`qmv_t64`, `qmv_wide_t64`, `qmm_m8_nax_t64`, `qmm_t_nax_t64` /
-//! `qmm_t_splitk_t64`) and the row-major `dequantize`. The DFlash2 draft
-//! loads its affine Q4/g64 projections this way.
+//! The MLX affine modes of the K-quant kernels (`a4g64`, `a8g64`:
+//! `mlx_kquant.h` `Mode::A4G64` / `Mode::A8G64`): MLX's own affine arrays —
+//! the LSB-first codes, one bfloat16 scale and one bfloat16 bias per group —
+//! read through the Tiled64 kernels (`qmv_t64`, `qmv_wide_t64`, the
+//! `qmm_m8/m16/m32_nax_t64` row tiers, `qmm_t_nax_t64` / `qmm_t_splitk_t64`)
+//! and the row-major `dequantize`. Every bf16-companion affine 4/64 and 8/64
+//! linear is loaded this way on Metal (`QuantizedLinear::tile_kquant_layout`).
 //!
 //!   cargo test -p mlx-core --release --test kquant_affine_tiled -- --nocapture
 
@@ -327,69 +328,150 @@ fn affine_dequantize_matches_cpu_reference_and_mlx() {
     }
 }
 
-/// Every tiled route on the draft shapes: the family it must take, its
-/// distance from the exact product and from MLX's own affine route.
+/// The M sweep of the route test: decode, every verify / batched-decode
+/// height of the tensor-op tiers (8..32, the partial tiles included) and two
+/// GEMM heights.
+const ROUTE_MS: [i64; 15] = [1, 3, 7, 8, 9, 12, 15, 16, 17, 23, 24, 31, 32, 64, 87];
+
+/// Every tiled route on the draft shapes, both affine contracts: the family
+/// it must take, its distance from the exact product and from MLX's own
+/// affine route.
 #[cfg(target_os = "macos")]
 #[test]
 fn affine_tiled_routes_match_exact_and_mlx() {
     assert!(gpu_gen() > 0, "no Metal device");
-    let kq = affine_kquant(4, 64);
     let mut table = Vec::new();
-    for (si, &(k, n)) in SHAPES.iter().enumerate() {
-        let w = Affine::new(&kq, n, k, 0xb000 + si as u32);
-        let t = tiled(&w.arrays, &kq);
-        for m in [1i64, 3, 7, 8, 16, 64, 87] {
-            let x = activation(&[m, k], 0xb100 + si as u32 * 8 + m as u32, DType::BFloat16);
-            let what = format!("{} K={k} N={n} M={m}", kq.mode);
-            let gemm = if nax_available() {
-                "qmm_t_nax_t64"
-            } else {
-                "qmm_t_t64"
-            };
-            let family = match m {
-                1 => "qmv_t64",
-                3 | 7 => "qmv_wide_t64",
-                8 if nax_available() => "qmm_m8_nax_t64",
-                8 => "qmv_wide_t64",
-                _ => gemm,
-            };
-            start_counting();
-            let (_, _, ours) = read_output(&what, qmm_tiled(&x, &t, &kq, GPU));
-            // The GEMM heights split K when the output tiles alone leave the
-            // GPU short of threadgroups (`qmm_splitk`), else take the GEMM.
-            let took = if m >= 16 && family_count("qmm_t_splitk_t64") == 1 {
-                "qmm_t_splitk_t64"
-            } else {
-                family
-            };
-            assert_eq!(family_count(took), 1, "{what}: must take {took}");
-            assert_no_row_major_route(&what);
-            stop_counting();
-            let rel = worst_rel_to_exact(&ours, &x, &w, n);
-            let tol = if took == "qmm_m8_nax_t64" {
-                f64::from(BF16_TILE_TOL)
-            } else {
-                1e-2
-            };
-            assert!(
-                rel <= tol,
-                "{what}: rel {rel:e} > {tol:e} off the exact product"
-            );
-            let (_, _, mlx) = read_output("mlx affine", mlx_affine_qmm(&x, &w.arrays, &kq));
-            let (worst, peak) = worst_abs(&ours, &mlx);
-            let rel_mlx = worst / peak;
-            assert!(
-                rel_mlx <= BF16_TILE_TOL,
-                "{what}: rel {rel_mlx:e} off MLX's affine route"
-            );
-            table.push(format!(
-                "  K={k:>5} N={n:>5} M={m:>2} {took:<16} rel exact {rel:.2e}  rel mlx {rel_mlx:.2e}"
-            ));
+    for (ki, &(bits, group)) in KQUANT_AFFINE_MODES.iter().enumerate() {
+        let kq = affine_kquant(bits, group);
+        // The 8-bit contract on the three shapes whose grids differ (one per
+        // split count), the 4-bit one on every draft shape.
+        let shapes: &[(i64, i64)] = if bits == 4 { &SHAPES } else { &SHAPES[..3] };
+        for (si, &(k, n)) in shapes.iter().enumerate() {
+            let w = Affine::new(&kq, n, k, 0xb000 + (ki * 16 + si) as u32);
+            let t = tiled(&w.arrays, &kq);
+            for m in ROUTE_MS {
+                let x = activation(
+                    &[m, k],
+                    0xb100 + (ki * 16 + si) as u32 * 128 + m as u32,
+                    DType::BFloat16,
+                );
+                let what = format!("{} K={k} N={n} M={m}", kq.mode);
+                let gemm = if nax_available() {
+                    "qmm_t_nax_t64"
+                } else {
+                    "qmm_t_t64"
+                };
+                let tier = tensor_op_tier(m, n, k, &kq);
+                let family = tiled_family(m, n, k, &kq, gemm);
+                start_counting();
+                let (_, _, ours) = read_output(&what, qmm_tiled(&x, &t, &kq, GPU));
+                // The GEMM heights split K when the output tiles alone leave
+                // the GPU short of threadgroups (`qmm_splitk`), else take the
+                // GEMM.
+                let took = if family == gemm && family_count("qmm_t_splitk_t64") == 1 {
+                    "qmm_t_splitk_t64"
+                } else {
+                    family
+                };
+                assert_eq!(family_count(took), 1, "{what}: must take {took}");
+                assert_no_row_major_route(&what);
+                stop_counting();
+                let rel = worst_rel_to_exact(&ours, &x, &w, n);
+                let tol = if tier.is_some() {
+                    f64::from(BF16_TILE_TOL)
+                } else {
+                    1e-2
+                };
+                assert!(
+                    rel <= tol,
+                    "{what}: rel {rel:e} > {tol:e} off the exact product"
+                );
+                let (_, _, mlx) = read_output("mlx affine", mlx_affine_qmm(&x, &w.arrays, &kq));
+                let (worst, peak) = worst_abs(&ours, &mlx);
+                let rel_mlx = worst / peak;
+                assert!(
+                    rel_mlx <= BF16_TILE_TOL,
+                    "{what}: rel {rel_mlx:e} off MLX's affine route"
+                );
+                table.push(format!(
+                    "  {:<5} K={k:>5} N={n:>5} M={m:>2} {took:<17} rel exact {rel:.2e}  rel mlx {rel_mlx:.2e}",
+                    kq.mode
+                ));
+            }
         }
     }
     for line in table {
         println!("{line}");
     }
+}
+
+/// Every tiled route is deterministic: the same matmul evaluated 24 times on
+/// fixed data gives the same bits each time. The shapes are Gemma-4-E2B's
+/// (narrow N down to 256, K up to 12288) and the Qwen3.5-4B widths, the
+/// heights the routes split on (decode M = 1 in bf16 and f32, the qmv_wide
+/// widths, the three tensor-op tiers, the GEMM at M = 39 and 64) — a greedy
+/// decode that flips between two outputs run to run is what this guards.
+#[cfg(target_os = "macos")]
+#[test]
+fn affine_tiled_routes_are_deterministic() {
+    assert!(gpu_gen() > 0, "no Metal device");
+    const REPEATS: usize = 24;
+    let shapes: [(i64, i64); 14] = [
+        (1536, 256),
+        (1536, 512),
+        (1536, 2048),
+        (1536, 4096),
+        (1536, 6144),
+        (1536, 8960),
+        (1536, 12288),
+        (12288, 1536),
+        (256, 1536),
+        (6144, 1536),
+        (2048, 1536),
+        (2560, 12288),
+        (2560, 9216),
+        (4096, 2560),
+    ];
+    let mut routes = Vec::new();
+    for (ki, &(bits, group)) in KQUANT_AFFINE_MODES.iter().enumerate() {
+        let kq = affine_kquant(bits, group);
+        for (si, &(k, n)) in shapes.iter().enumerate() {
+            let w = Affine::new(&kq, n, k, 0xd000 + (ki * 16 + si) as u32);
+            let t = tiled(&w.arrays, &kq);
+            for (m, dtype) in [
+                (1i64, DType::BFloat16),
+                (1, DType::Float32),
+                (3, DType::BFloat16),
+                (8, DType::BFloat16),
+                (12, DType::BFloat16),
+                (24, DType::BFloat16),
+                (39, DType::BFloat16),
+                (64, DType::BFloat16),
+            ] {
+                let x = activation(
+                    &[m, k],
+                    0xd100 + (ki * 16 + si) as u32 * 8 + m as u32,
+                    dtype,
+                );
+                let what = format!("{} K={k} N={n} M={m} {dtype:?}", kq.mode);
+                start_counting();
+                let (_, _, first) = read_output(&what, qmm_tiled(&x, &t, &kq, GPU));
+                stop_counting();
+                for i in 1..REPEATS {
+                    let (_, _, again) = read_output(&what, qmm_tiled(&x, &t, &kq, GPU));
+                    assert!(
+                        again == first,
+                        "{what}: evaluation {i} differs from the first"
+                    );
+                }
+                routes.push(what);
+            }
+        }
+    }
+    println!(
+        "  {} (mode, shape, M, dtype) routes x {REPEATS} evaluations identical",
+        routes.len()
+    );
 }
 
 /// Row-major affine modes have no Metal matmul: the dispatcher refuses them

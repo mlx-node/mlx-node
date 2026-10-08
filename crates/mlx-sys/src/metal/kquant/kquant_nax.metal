@@ -99,7 +99,8 @@
   instantiate_kquant_nax_all(iq1s, type, 32, 1, 8, false, KQ_GRID_IQ1S, -3) \
   instantiate_kquant_nax_all(iq1m, type, 32, 1, 8, false, KQ_GRID_IQ1M, -3) \
   instantiate_kquant_nax_all(iq3s, type, 32, 3, 8, false, KQ_GRID_IQ3S, 0) \
-  instantiate_kquant_nax_tiled(a4g64, qmm_t_nax, type, 64, 4, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2)
+  instantiate_kquant_nax_tiled(a4g64, qmm_t_nax, type, 64, 4, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2) \
+  instantiate_kquant_nax_tiled(a8g64, qmm_t_nax, type, 64, 8, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2)
 
 #if KQUANT_DTYPE == 0
 instantiate_kquant_nax_types(float)

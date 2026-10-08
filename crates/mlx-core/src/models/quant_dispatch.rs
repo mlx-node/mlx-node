@@ -34,9 +34,10 @@ use tracing::warn;
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{
     LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
-    NVFP4_GROUP_SIZE, QuantizedLinear, try_build_kquant_quantized_linear_tiled,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
+    NVFP4_GROUP_SIZE, QuantizedLinear, try_build_affine_quantized_linear_tiled,
+    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 use crate::nn::Embedding;
 
@@ -435,6 +436,24 @@ pub fn kquant_tiled_enabled() -> bool {
 /// in `mlx_kquant.cpp` enforces the same).
 pub fn kquant_tileable(n: i64, k: i64) -> bool {
     n > 0 && k > 0 && n % KQUANT_TILE_ROWS == 0 && k % 256 == 0
+}
+
+/// The smallest `[N, K]` at which an MLX affine linear is repacked into the
+/// Tiled64 layout by the generic loaders ([`kquant_affine_tiled_shape`]).
+pub const KQUANT_AFFINE_TILED_MIN_N: i64 = 6144;
+pub const KQUANT_AFFINE_TILED_MIN_K: i64 = 1536;
+
+/// Whether the generic loaders repack a tileable MLX affine `[n, k]` linear
+/// into `a<bits>g<group>@t64`. Measured against MLX's own route (M5 Max,
+/// `kquant_small_m_bench`, dependency-chain and DRAM-cold): the tiled M = 1
+/// matvec ties MLX from N = 6144 up (0.96-1.09x) and trails it below
+/// (N = 2560..4096: 0.92-0.96x), and the M >= 8 tiers win from N = 4096 up
+/// (1.1-1.6x) but lose at N <= 3072 (0.8-1.0x); K = 1536 is the smallest
+/// input width measured. A narrower linear keeps MLX's row-major route. The
+/// K-quant modes and the DFlash2 draft (gated on its own numbers) tile every
+/// tileable shape.
+pub fn kquant_affine_tiled_shape(n: i64, k: i64) -> bool {
+    kquant_tileable(n, k) && n >= KQUANT_AFFINE_TILED_MIN_N && k >= KQUANT_AFFINE_TILED_MIN_K
 }
 
 /// Permute a row-major `[N, cols]` K-quant array (weight, scales or biases)
@@ -882,22 +901,34 @@ impl KQuantModeParams {
 }
 
 /// The K-quant contract an MLX affine linear of `(bits, group_size)` can be
-/// read through (`mlx_kquant.h` `Mode::A4G64`); `None` for a pair the
-/// kernels do not carry (only Q4/g64, the DFlash2 draft's, is instantiated).
-/// The mode string is `a<bits>g<group_size>`; the Metal side has these
-/// kernels in the Tiled64 layout only, so a projection takes this contract
-/// through
+/// read through (`mlx_kquant.h` `Mode::A4G64` / `Mode::A8G64`); `None` for a
+/// pair the kernels do not carry. These are the two pairs `mlx convert`
+/// emits with bfloat16 companions: Q4/g64 bodies and the Q8/g64 routers,
+/// lm_heads and embeddings-as-linear of its recipes (GGUF affine imports are
+/// f16 + g32 and stay on MLX's route). The mode string is
+/// `a<bits>g<group_size>`; the Metal side has these kernels in the Tiled64
+/// layout only, so a projection takes this contract through
 /// [`QuantizedLinear::tile_kquant_layout`](crate::models::quantized_linear::QuantizedLinear::tile_kquant_layout)
 /// and nowhere else.
 pub fn kquant_affine_mode_params(bits: i32, group_size: i32) -> Option<KQuantModeParams> {
     Some(match (bits, group_size) {
         (4, 64) => KQuantModeParams::affine("a4g64", 4, 64),
+        (8, 64) => KQuantModeParams::affine("a8g64", 8, 64),
         _ => return None,
     })
 }
 
 /// Every affine contract of [`kquant_affine_mode_params`].
-pub const KQUANT_AFFINE_MODES: [(i32, i32); 1] = [(4, 64)];
+pub const KQUANT_AFFINE_MODES: [(i32, i32); 2] = [(4, 64), (8, 64)];
+
+/// Whether `base` (a mode string without its layout suffix) is an affine
+/// K-quant contract (`a4g64`, `a8g64`): MLX affine bytes read through the
+/// K-quant kernels, row-coupled like every K-quant mode.
+pub fn is_kquant_affine_mode_str(base: &str) -> bool {
+    KQUANT_AFFINE_MODES.iter().any(|&(bits, group)| {
+        kquant_affine_mode_params(bits, group).is_some_and(|kq| kq.mode_str == base)
+    })
+}
 
 /// The contract a resolved K-quant mode demands; `None` for non-K-quant modes.
 pub fn kquant_mode_params(mode: PerLayerMode) -> Option<KQuantModeParams> {
@@ -1901,7 +1932,16 @@ pub(crate) fn build_non_moe_ql(
                  E4M3 storage is supported only by Qwen3.5 DGX artifacts"
             )));
         }
-        PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
+        // Tiled64 into the affine K-quant contract on a Metal host, as the
+        // K-quant arm below (and with the same load-time transient: the
+        // row-major source stays in the `&` map until the loader drops it).
+        PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
+            params,
+            base,
+            plq.group_size,
+            plq.bits,
+            &mut Vec::new(),
+        )?,
         PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
         PerLayerMode::Q6K
         | PerLayerMode::Q4K
@@ -2535,7 +2575,7 @@ mod tests {
             );
             assert!(is_kquant_mode(mode));
         }
-        // The MLX affine contract (mlx_kquant.h Mode::A4G64): bfloat16
+        // The MLX affine contracts (mlx_kquant.h Mode::A4G64 / A8G64): bfloat16
         // scale and bias per group, so `.scales` is 2 bytes per group and
         // `.biases` super_ratio entries per super-block.
         for (bits, group_size) in KQUANT_AFFINE_MODES {
@@ -2553,8 +2593,50 @@ mod tests {
         }
         assert!(kquant_affine_mode_params(4, 128).is_none());
         assert!(kquant_affine_mode_params(4, 32).is_none());
-        assert!(kquant_affine_mode_params(8, 64).is_none());
+        assert!(kquant_affine_mode_params(8, 32).is_none());
         assert!(kquant_affine_mode_params(6, 64).is_none());
+    }
+
+    /// The generic loaders tile an affine linear only from `[6144, 1536]` up;
+    /// the shapes below are the Gemma-4-E2B and Qwen3.5-4B projections.
+    #[test]
+    fn affine_tiled_shape_rule() {
+        for (n, k) in [
+            (6144, 1536),
+            (8960, 1536),
+            (12288, 1536),
+            (9216, 2560),
+            (12288, 2560),
+        ] {
+            assert!(kquant_affine_tiled_shape(n, k), "[{n}, {k}] tiles");
+        }
+        for (n, k) in [
+            (1536, 6144),
+            (2048, 1536),
+            (256, 1536),
+            (1536, 256),
+            (2560, 9216),
+            (4096, 2560),
+            (4096, 4096),
+            (6144, 1280),
+            (6144, 1500),
+            (6143, 1536),
+        ] {
+            assert!(
+                !kquant_affine_tiled_shape(n, k),
+                "[{n}, {k}] stays row-major"
+            );
+        }
+        assert!(
+            kquant_tileable(4096, 2560),
+            "below the rule but tileable: the draft still tiles it"
+        );
+        assert!(is_kquant_affine_mode_str("a4g64") && is_kquant_affine_mode_str("a8g64"));
+        assert!(!is_kquant_affine_mode_str("affine") && !is_kquant_affine_mode_str("q4k"));
+        assert!(
+            !is_kquant_affine_mode_str("a4g64@t64"),
+            "takes the base, not the tagged mode"
+        );
         for mode in [
             PerLayerMode::Affine,
             PerLayerMode::Mxfp8,

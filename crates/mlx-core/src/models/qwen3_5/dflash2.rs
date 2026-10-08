@@ -1699,8 +1699,9 @@ fn quantize_affine(
 
 /// Quantize a floating `[out, in]` weight to affine Q4/group64 as a
 /// `QuantizedLinear`, tiled into the `a4g64@t64` K-quant contract when this
-/// host runs the `_t64` kernels ([`QuantizedLinear::tile_kquant_layout`];
-/// the row-major arrays are released). The shape must be tileable
+/// host runs the `_t64` kernels ([`QuantizedLinear::tile_kquant_layout_any_shape`]:
+/// the draft's widths were gated on their own numbers, not the generic
+/// affine shape rule; the row-major arrays are released). The shape must be tileable
 /// (`N % 64 == 0`, `K % 256 == 0`) on every host: an odd draft geometry
 /// fails here rather than silently taking a slower layout.
 fn quantize_draft_weight(weight: &MxArray, name: &str) -> Result<QuantizedLinear> {
@@ -1723,7 +1724,7 @@ fn quantize_draft_weight(weight: &MxArray, name: &str) -> Result<QuantizedLinear
         DRAFT_BITS,
         "affine".to_string(),
     );
-    if kquant_tiled_enabled() && !linear.tile_kquant_layout()? {
+    if kquant_tiled_enabled() && !linear.tile_kquant_layout_any_shape()? {
         return Err(Error::from_reason(format!(
             "DFlash2 draft projection '{name}' [{rows}, {k}] did not tile"
         )));
