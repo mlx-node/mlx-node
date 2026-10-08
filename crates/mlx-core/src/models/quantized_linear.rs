@@ -3681,11 +3681,21 @@ mod kquant_tiled_tests {
         // 64-aligned slices are valid tiled views, unaligned ones are refused.
         let view = merged.slice_rows(128, 320).unwrap();
         assert!(view.is_kquant_tiled());
-        assert_eq!(
-            bits_of(&view.forward(&xa).unwrap()),
-            bits_of(&b_rm.forward(&xa).unwrap()),
-            "tiled slice view differs from its source"
-        );
+        // Same route pairing as the merged assert above.
+        if same_kernel_for_m(3) {
+            assert_eq!(
+                bits_of(&view.forward(&xa).unwrap()),
+                bits_of(&b_rm.forward(&xa).unwrap()),
+                "tiled slice view differs from its source"
+            );
+        } else {
+            close(
+                &view.forward(&xa).unwrap(),
+                &b_rm.forward(&xa).unwrap(),
+                3e-2,
+                "tiled slice view",
+            );
+        }
         assert!(merged.slice_rows(32, 128).is_err());
         assert!(merged.slice_rows(0, 100).is_err());
     }
