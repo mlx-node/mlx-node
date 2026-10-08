@@ -1294,6 +1294,73 @@ mod tests {
             .unwrap()
     }
 
+    /// Whether this device launches the fused-step pipeline at the contract
+    /// head widths (Dv = 128, Dk = 128): the FFI checks
+    /// `maxTotalThreadsPerThreadgroup >= 8 * dv` when the pipeline is built,
+    /// so the entry itself reports decline — a device limit, not test input.
+    fn fused_step_launches() -> bool {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return false;
+        }
+        let z = MxArray::zeros(&[1, 1, 128], Some(DType::BFloat16)).unwrap();
+        let w = MxArray::zeros(&[128], Some(DType::BFloat16)).unwrap();
+        let tail = GdnTail {
+            z: &z,
+            norm_weight: &w,
+            eps: 1e-6,
+            state_dst: None,
+        };
+        gated_delta_fused_step(
+            &MxArray::zeros(&[1, 1, 1, 128], Some(DType::BFloat16)).unwrap(),
+            &MxArray::zeros(&[1, 1, 1, 128], Some(DType::BFloat16)).unwrap(),
+            &MxArray::zeros(&[1, 1, 1, 128], Some(DType::BFloat16)).unwrap(),
+            &MxArray::zeros(&[1, 1, 1], Some(DType::Float32)).unwrap(),
+            &MxArray::zeros(&[1, 1, 1], Some(DType::BFloat16)).unwrap(),
+            &MxArray::zeros(&[1, 1, 128, 128], Some(DType::Float32)).unwrap(),
+            &tail,
+        )
+        .is_ok()
+    }
+
+    /// The same launch check for the complete pipeline (prep folded in):
+    /// `gdn_fused_pipeline(..., complete = true)` applies the identical
+    /// threadgroup test, so a device that declines one declines both.
+    fn fused_complete_launches() -> bool {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return false;
+        }
+        // W = 2 Hk Dk + Hv Dv at Hk = Hv = 1, Dk = Dv = 128.
+        let qkv = MxArray::zeros(&[1, 1, 384], Some(DType::BFloat16)).unwrap();
+        let a = MxArray::zeros(&[1, 1, 1], Some(DType::BFloat16)).unwrap();
+        let conv = MxArray::zeros(&[384, 4], Some(DType::Float32)).unwrap();
+        let history = MxArray::zeros(&[3, 384], Some(DType::BFloat16)).unwrap();
+        let scale = MxArray::zeros(&[1], Some(DType::Float32)).unwrap();
+        let dt = MxArray::zeros(&[1], Some(DType::Float32)).unwrap();
+        let state = MxArray::zeros(&[1, 1, 128, 128], Some(DType::Float32)).unwrap();
+        let z = MxArray::zeros(&[1, 1, 128], Some(DType::BFloat16)).unwrap();
+        let w = MxArray::zeros(&[128], Some(DType::BFloat16)).unwrap();
+        gated_delta_fused_complete(
+            &GdnPrologue {
+                qkv: &qkv,
+                a: &a,
+                b: &a,
+                conv: &conv,
+                history: &history,
+                scale: &scale,
+                dt_bias: &dt,
+                history_dst: None,
+            },
+            &state,
+            &GdnTail {
+                z: &z,
+                norm_weight: &w,
+                eps: 1e-6,
+                state_dst: None,
+            },
+        )
+        .is_some()
+    }
+
     /// The fused step must equal the unfused chain — per-step kernel, then
     /// `fast::rms_norm`, then the compiled z gate — bit for bit on the
     /// production geometry: f32 state, bf16 gated output, T = 1 (AR) and the
@@ -1301,7 +1368,8 @@ mod tests {
     /// and GQA heads (compact tiled and expanded).
     #[test]
     fn fused_tail_matches_unfused_chain_bit_for_bit() {
-        if !unsafe { sys::mlx_metal_is_available() } {
+        if !fused_step_launches() {
+            eprintln!("SKIP fused tail parity: this device cannot launch the fused step kernel");
             return;
         }
         let (hv, dk, dv) = (48i64, 128i64, 128i64);
@@ -1367,7 +1435,8 @@ mod tests {
     /// spare blob row) and the returned state is that same memory.
     #[test]
     fn fused_tail_writes_state_into_destination() {
-        if !unsafe { sys::mlx_metal_is_available() } {
+        if !fused_step_launches() {
+            eprintln!("SKIP fused tail state_dst: this device cannot launch the fused step kernel");
             return;
         }
         let (b, hk, hv, dk, dv, t) = (1i64, 16i64, 48i64, 128i64, 128i64, 8i64);
@@ -1424,6 +1493,34 @@ mod tests {
         if !unsafe { sys::mlx_metal_is_available() } {
             return;
         }
+        // Off-contract: Dv != 128 declines (caller runs the unfused chain) —
+        // a geometry refusal that holds on any device, checked first so a
+        // device-level skip below cannot starve it.
+        let (small, s_small) = tape_and_state(1, 4, 4, 64, 64, 2);
+        let declined = gated_delta_update_fused(
+            &small.q,
+            &small.k,
+            &small.v,
+            &rand_bf16(&[1, 2, 4]),
+            &rand_bf16(&[1, 2, 4]),
+            &rand_f32(&[4]),
+            &rand_f32(&[4]),
+            Some(&s_small),
+            None,
+            true,
+            false,
+            None,
+            GdnTail {
+                z: &rand_gate(&[1, 2, 256]),
+                norm_weight: &rand_bf16(&[64]),
+                eps: 1e-6,
+                state_dst: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(declined.is_none());
+
         let (b, hk, hv, dk, dv, t) = (1i64, 16i64, 48i64, 128i64, 128i64, 8i64);
         let (tape, state0) = tape_and_state(b, hk, hv, dk, dv, t);
         let a = rand_bf16(&[b, t, hv]);
@@ -1451,7 +1548,7 @@ mod tests {
         .unwrap();
         let out_ref = unfused_tail(&y, &z, &w, 1e-6);
         let mut sink = None;
-        let (out, state) = gated_delta_update_fused(
+        let Some((out, state)) = gated_delta_update_fused(
             &tape.q,
             &tape.k,
             &tape.v,
@@ -1472,8 +1569,19 @@ mod tests {
             },
             Some(&mut sink),
         )
-        .unwrap()
-        .expect("production geometry takes the fused step");
+        .unwrap() else {
+            // `update_fused` maps a fused-step decline to None; on a device
+            // whose threadgroup budget cannot hold one value head per
+            // threadgroup that is the device's answer, not a regression.
+            assert!(
+                !fused_step_launches(),
+                "production geometry takes the fused step"
+            );
+            eprintln!(
+                "SKIP fused update parity: this device cannot launch the fused step kernel"
+            );
+            return;
+        };
         MxArray::eval_arrays(&[&out, &state, &out_ref, &state_ref]).unwrap();
         assert_eq!(max_ulps(&state_ref, &state), 0);
         assert_eq!(max_ulps(&out_ref, &out), 0);
@@ -1487,31 +1595,6 @@ mod tests {
         ] {
             assert_eq!(max_ulps(x, y), 0, "tape differs");
         }
-        // Off-contract: Dv != 128 declines (caller runs the unfused chain).
-        let (small, s_small) = tape_and_state(1, 4, 4, 64, 64, 2);
-        let declined = gated_delta_update_fused(
-            &small.q,
-            &small.k,
-            &small.v,
-            &rand_bf16(&[1, 2, 4]),
-            &rand_bf16(&[1, 2, 4]),
-            &rand_f32(&[4]),
-            &rand_f32(&[4]),
-            Some(&s_small),
-            None,
-            true,
-            false,
-            None,
-            GdnTail {
-                z: &rand_gate(&[1, 2, 256]),
-                norm_weight: &rand_bf16(&[64]),
-                eps: 1e-6,
-                state_dst: None,
-            },
-            None,
-        )
-        .unwrap();
-        assert!(declined.is_none());
     }
 
     /// The complete kernel (prep folded in) must equal `gdn_prepare` followed
@@ -1529,6 +1612,42 @@ mod tests {
         let scale = MxArray::random_normal(&[hv], -0.5, 0.2, Some(DType::Float32)).unwrap();
         let dt = rand_f32(&[hv]);
         let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+        // T = 17 is past the prepared-row budget: declines — a geometry
+        // refusal checked before the device-capability gate below so a skip
+        // cannot starve it.
+        {
+            let t = 17i64;
+            let qkv = rand_bf16(&[1, t, w_dim]);
+            let a = rand_bf16(&[1, t, hv]);
+            assert!(
+                gated_delta_fused_complete(
+                    &GdnPrologue {
+                        qkv: &qkv,
+                        a: &a,
+                        b: &a,
+                        conv: &conv,
+                        history: &rand_bf16(&[3, w_dim]),
+                        scale: &scale,
+                        dt_bias: &dt,
+                        history_dst: None,
+                    },
+                    &rand_f32(&[1, hv, dv, dk]),
+                    &GdnTail {
+                        z: &rand_bf16(&[1, t, hv * dv]),
+                        norm_weight: &w,
+                        eps: 1e-6,
+                        state_dst: None,
+                    },
+                )
+                .is_none()
+            );
+        }
+        if !(fused_step_launches() && fused_complete_launches()) {
+            eprintln!(
+                "SKIP fused complete parity: this device cannot launch the fused GDN kernels"
+            );
+            return;
+        }
         for t in [1i64, 3, 8, 16] {
             // qkvz | ba as the merged projection emits them, then split.
             let qkvz = rand_gate(&[1, t, w_dim + hv * dv]);
@@ -1615,32 +1734,6 @@ mod tests {
                 assert_eq!(ulps, 0, "{name} differs at T={t}");
             }
         }
-        // T = 17 is past the prepared-row budget: declines.
-        let t = 17i64;
-        let qkv = rand_bf16(&[1, t, w_dim]);
-        let a = rand_bf16(&[1, t, hv]);
-        assert!(
-            gated_delta_fused_complete(
-                &GdnPrologue {
-                    qkv: &qkv,
-                    a: &a,
-                    b: &a,
-                    conv: &conv,
-                    history: &rand_bf16(&[3, w_dim]),
-                    scale: &scale,
-                    dt_bias: &dt,
-                    history_dst: None,
-                },
-                &rand_f32(&[1, hv, dv, dk]),
-                &GdnTail {
-                    z: &rand_bf16(&[1, t, hv * dv]),
-                    norm_weight: &w,
-                    eps: 1e-6,
-                    state_dst: None,
-                },
-            )
-            .is_none()
-        );
     }
 
     /// Manual kernel microbench: the fused step against the unfused chain

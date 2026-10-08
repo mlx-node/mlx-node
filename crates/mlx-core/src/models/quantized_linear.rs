@@ -3324,6 +3324,23 @@ mod kquant_tiled_tests {
         unsafe { mlx_sys::mlx_metal_is_available() }
     }
 
+    /// Metal GPU architecture generation (see `sym8_tests::gpu_gen`).
+    fn gpu_gen() -> i32 {
+        unsafe { sys::mlx_gpu_architecture_gen() }
+    }
+
+    /// Whether the row-major and Tiled64 forwards were verified to dispatch
+    /// bit-identical kernels at this M. The pairing is gen-dependent below
+    /// the GEMM limit — row-major picks `qmv_wide` only on gen-15+ (qmv
+    /// below) and `qmv_sg8` / `qmm_m8_nax` on gen-17, while the tiled side
+    /// always runs `qmv_t64` / `qmv_wide_t64` / its own M = 8 NAX tier — so
+    /// only gen-17, the architecture these asserts were calibrated on, takes
+    /// the exact arm; M = 1 and M = 8 differ there too. The CPU reference
+    /// is bit-identical on every device.
+    fn same_kernel_for_m(m: i64) -> bool {
+        !gpu() || (gpu_gen() == 17 && matches!(m, 3 | 16 | 64))
+    }
+
     /// Tiling and un-tiling round-trip every K-quant mode's three arrays
     /// bit for bit. `.scales` moves in `super_ratio * scale_bytes_per_group`
     /// units and `.biases` in `bias_entries_per_super_block` units; the two
@@ -3516,9 +3533,10 @@ mod kquant_tiled_tests {
             let ours = tiled.forward(&a).unwrap();
             let reference = row_major.forward(&a).unwrap();
             // The GPU M=3 (qmv_wide) and M>=16 (qmm) routes are the same
-            // kernel in both layouts; M=1 and M=8 change kernels on the
-            // GPU, and the CPU reference is always bit-identical.
-            let same_kernel = !gpu() || matches!(m, 3 | 16 | 64);
+            // kernel in both layouts on gen-17 where the pairing was
+            // calibrated; M=1 and M=8 change kernels on the GPU, and the
+            // CPU reference is always bit-identical.
+            let same_kernel = same_kernel_for_m(m);
             if same_kernel {
                 assert_eq!(
                     bits_of(&ours),
@@ -3643,11 +3661,23 @@ mod kquant_tiled_tests {
         assert!(merged.is_kquant_tiled());
         let merged_rm = a_rm.concat_rows(&b_rm).unwrap().unwrap();
         let xa = x(3, k, 5);
-        assert_eq!(
-            bits_of(&merged.forward(&xa).unwrap()),
-            bits_of(&merged_rm.forward(&xa).unwrap()),
-            "merged tiled forward differs"
-        );
+        // M=3 pairs qmv_wide with qmv_wide_t64 only on gen-17 where the
+        // pairing was calibrated; other GPUs can run qmv against the tiled
+        // wide kernel, which only agrees within tolerance.
+        if same_kernel_for_m(3) {
+            assert_eq!(
+                bits_of(&merged.forward(&xa).unwrap()),
+                bits_of(&merged_rm.forward(&xa).unwrap()),
+                "merged tiled forward differs"
+            );
+        } else {
+            close(
+                &merged.forward(&xa).unwrap(),
+                &merged_rm.forward(&xa).unwrap(),
+                3e-2,
+                "merged tiled forward",
+            );
+        }
         // 64-aligned slices are valid tiled views, unaligned ones are refused.
         let view = merged.slice_rows(128, 320).unwrap();
         assert!(view.is_kquant_tiled());
@@ -3671,11 +3701,21 @@ mod kquant_tiled_tests {
         assert!(tiled.finalize_packed_q_gate_block(heads, dim).unwrap());
         assert!(row_major.finalize_packed_q_gate_block(heads, dim).unwrap());
         let xa = x(3, k, 8);
-        assert_eq!(
-            bits_of(&tiled.forward(&xa).unwrap()),
-            bits_of(&row_major.forward(&xa).unwrap()),
-            "q/gate block reorder on a tiled projection differs"
-        );
+        // Same M=3 route pairing as `tiled_row_operations_stay_whole_tile`.
+        if same_kernel_for_m(3) {
+            assert_eq!(
+                bits_of(&tiled.forward(&xa).unwrap()),
+                bits_of(&row_major.forward(&xa).unwrap()),
+                "q/gate block reorder on a tiled projection differs"
+            );
+        } else {
+            close(
+                &tiled.forward(&xa).unwrap(),
+                &row_major.forward(&xa).unwrap(),
+                3e-2,
+                "q/gate block reorder on a tiled projection",
+            );
+        }
         // D % 64 != 0 cannot be expressed as a tile permutation: left native.
         let mut odd = q4k(i64::from(2 * 4 * 32), k, 9);
         assert!(odd.tile_kquant_layout().unwrap());
@@ -3803,7 +3843,7 @@ mod kquant_tiled_tests {
             // Same rule as `tile_tags_mode_and_keeps_forward_values`: the
             // prefill route (and the CPU reference) is the same kernel in
             // both layouts; the GPU M=1 / M=8 routes change kernels.
-            if !gpu() || m == 64 {
+            if same_kernel_for_m(m) {
                 assert_eq!(
                     bits_of(&real),
                     bits_of(&reference),
@@ -3822,7 +3862,7 @@ mod kquant_tiled_tests {
             );
             let ba_real = ba_out.slice_axis(2, 0, n_ba).unwrap();
             let ba_ref = ba_rm.forward(&a).unwrap();
-            if !gpu() || m == 64 {
+            if same_kernel_for_m(m) {
                 assert_eq!(bits_of(&ba_real), bits_of(&ba_ref), "M={m}: padded ba");
             } else {
                 close(&ba_real, &ba_ref, 3e-2, &format!("M={m}: padded ba"));

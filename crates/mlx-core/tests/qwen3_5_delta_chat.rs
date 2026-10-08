@@ -26,10 +26,10 @@ use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::{ChatMessage, ToolCall};
 
 /// Clone `src` into a fresh `target/`-rooted dir with the weight files
-/// symlinked and `config.json` patched to `use_block_paged_cache=false`,
-/// returning the new path. The path is leaked — these run a couple of times
-/// per session and `target/` is already a build artifact, so cleanup is
-/// best-effort and not needed for correctness.
+/// symlinked and `config.json` patched to `use_block_paged_cache=false` and
+/// `kv_format="bf16"`, returning the new path. The path is leaked — these
+/// run a couple of times per session and `target/` is already a build
+/// artifact, so cleanup is best-effort and not needed for correctness.
 ///
 /// The vision-capable MTP checkpoint the MTP-vs-AR oracles run against defaults
 /// to the block-paged KV backend at load (its config carries a `vision_config`).
@@ -80,6 +80,13 @@ fn flat_clone_model_dir(src: &Path, suffix: &str) -> Result<PathBuf, String> {
     let mut cfg: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
     cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
+    // Pin the flat K/V cache to bf16. The default int8 format quantizes
+    // committed rows written by M=1/M=8 forwards and re-prefill rows written
+    // by chunked M≈N forwards; those routes only share bits on NAX devices
+    // (gen ≥ 17), and the quantization amplification turns the residual
+    // sub-ulp gap into a marginal greedy flip on CI's non-NAX VM GPU — see
+    // the desync_heal_reprefills_to_uncancelled oracle below.
+    cfg["kv_format"] = serde_json::Value::String("bf16".to_string());
     let pretty =
         serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
     fs::write(&cfg_path, pretty)

@@ -221,6 +221,7 @@ fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
     let layouts: [(i64, Vec<i64>); 2] = [(24, vec![4, 8]), (32, vec![2, 3, 8])];
     let mut worst = [(0f32, 0f64); 3];
     let mut checked = [0usize; 3];
+    let (mut any_tile, mut any_nax) = (false, false);
     for (q_heads, rows_list) in &layouts {
         for &rows in rows_list {
             for &prefix in &prefixes {
@@ -241,7 +242,9 @@ fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
                     );
                     worst[0] = (worst[0].0.max(max), worst[0].1.max(mean));
                     checked[0] += 1;
-                    if tile_supported(*q_heads, HKV, rows, prefix + rows) {
+                    let tile_here = tile_supported(*q_heads, HKV, rows, prefix + rows);
+                    any_tile |= tile_here;
+                    if tile_here {
                         let got = f32s(&segmented_sdpa_int8_with_route(
                             &c.q, &c.prefix, &c.new, SCALE, true, 1,
                         )?);
@@ -254,7 +257,9 @@ fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
                         worst[1] = (worst[1].0.max(max), worst[1].1.max(mean));
                         checked[1] += 1;
                     }
-                    if nax_supported(*q_heads, HKV, rows, prefix + rows) {
+                    let nax_here = nax_supported(*q_heads, HKV, rows, prefix + rows);
+                    any_nax |= nax_here;
+                    if nax_here {
                         let got = f32s(&segmented_sdpa_int8_with_route(
                             &c.q, &c.prefix, &c.new, SCALE, true, 2,
                         )?);
@@ -271,9 +276,18 @@ fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
             }
         }
     }
+    // The vector route runs on every Metal device; a block route only
+    // where its probe says this device can launch the kernel — a
+    // virtualized GPU without GPUFamilyApple7 never probes tile-supported,
+    // and checked[1] == 0 is the device's answer rather than a regression.
+    assert!(checked[0] > 0, "the vector route must run somewhere");
     assert!(
-        checked[0] > 0 && checked[1] > 0,
-        "the tile route must run somewhere"
+        checked[1] > 0 || !any_tile,
+        "the tile route is supported on this device but never ran"
+    );
+    assert!(
+        checked[2] > 0 || !any_nax,
+        "the nax route is supported on this device but never ran"
     );
     eprintln!(
         "int8 verify vs f64 reference (BF16 ulps of output magnitude): vector {} blocks worst \
