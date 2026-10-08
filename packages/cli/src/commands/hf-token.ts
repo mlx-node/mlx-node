@@ -14,7 +14,14 @@ const keyringEntry = new AsyncEntry(KEYRING_SERVICE, KEYRING_ACCOUNT);
  */
 export const keychain = {
   async read(): Promise<string | undefined> {
-    return (await keyringEntry.getPassword()) ?? undefined;
+    try {
+      return (await keyringEntry.getPassword()) ?? undefined;
+    } catch {
+      // keyring v2 rejects on store errors (locked keychain, no Secret
+      // Service on headless Linux) where v1 returned null; keep the
+      // env-var/anonymous fallback working in that case.
+      return undefined;
+    }
   },
   async write(token: string): Promise<void> {
     await keyringEntry.setPassword(token);

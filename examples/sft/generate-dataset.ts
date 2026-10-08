@@ -59,7 +59,8 @@ const { values } = parseArgs({
 
 const keyring = new AsyncEntry('mlx-node', 'openrouter');
 
-let openrouterApiKey = (await keyring.getPassword()) ?? process.env.OPENROUTER_API_KEY;
+// keyring v2 rejects on store errors where v1 returned null.
+let openrouterApiKey = (await keyring.getPassword().catch(() => null)) ?? process.env.OPENROUTER_API_KEY;
 
 if (values['delete-openrouter-key']) {
   await keyring.deletePassword();

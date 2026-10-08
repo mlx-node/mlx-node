@@ -3,7 +3,8 @@ import { Repository } from '@napi-rs/simple-git';
 import { Octokit } from 'octokit';
 
 const keyringEntry = new AsyncEntry('mlx-node', 'github-token');
-const GITHUB_TOKEN = await keyringEntry.getPassword();
+// keyring v2 rejects on store errors where v1 returned null.
+const GITHUB_TOKEN = await keyringEntry.getPassword().catch(() => null);
 
 if (!GITHUB_TOKEN) {
   throw new Error('GITHUB_TOKEN is not set');
