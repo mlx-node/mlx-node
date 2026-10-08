@@ -3648,9 +3648,20 @@ mod tests {
                 .is_some(),
             "the fused norm/rope kernel must serve the draft geometry"
         );
+        // Bitwise equality between the merged and separate projections
+        // holds only where the width change keeps the reduction order:
+        // below the GEMM limit that pairing was calibrated on gen-17
+        // (`qmv_t64` / `qmv_wide_t64` reduce each row identically at any
+        // width; the M = 8 NAX tier is the documented exception). Other
+        // GPUs pair different kernels at the merged width and differ in
+        // ulps — and unseeded inputs make that marginal equality flaky,
+        // as the CI VM GPU showed at T = 1. The CPU reference is
+        // bit-identical on every device.
+        let nax_exact = !unsafe { mlx_sys::mlx_metal_is_available() }
+            || unsafe { mlx_sys::mlx_gpu_architecture_gen() } == 17;
         for (x, (per_layer, context)) in inputs.iter().zip(&want) {
             let seq = x.shape_at(1).unwrap();
-            let exact = seq != model.merged_rows();
+            let exact = nax_exact && seq != model.merged_rows();
             for (index, layer) in model.layers.iter().enumerate() {
                 assert!(layer.attention.qkv_proj.is_some(), "q|k|v merge");
                 assert!(layer.mlp.gate_up.is_some(), "gate|up merge");
