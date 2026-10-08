@@ -1577,9 +1577,7 @@ mod tests {
                 !fused_step_launches(),
                 "production geometry takes the fused step"
             );
-            eprintln!(
-                "SKIP fused update parity: this device cannot launch the fused step kernel"
-            );
+            eprintln!("SKIP fused update parity: this device cannot launch the fused step kernel");
             return;
         };
         MxArray::eval_arrays(&[&out, &state, &out_ref, &state_ref]).unwrap();
