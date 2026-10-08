@@ -21,19 +21,21 @@
 //! there must remain valid across a park/install cycle (they re-key on
 //! `token_count` / `physical_revision` / `metadata_identity`). Entries that
 //! survive request rotation — the packed ragged wave keyed on per-row table
-//! identity, the D128 stripe plan keyed on `max_context_len`, and the D512
-//! capability keyed on `num_query_heads` — live directly on
-//! [`PagedMetadataCache`].
+//! identity, the D128 stripe plan keyed on `max_context_len` and query
+//! heads, and the D512 capability keyed on `num_query_heads` — live
+//! directly on [`PagedMetadataCache`].
 
 use std::cell::Cell;
 
 use mlx_paged_attn::{LayerKVPool, SequenceBlockTable};
 
 use crate::array::MxArray;
+use crate::engine::decode_tuning::{gpu_core_count, grouped_partition_stripes};
 use crate::inference_trace::{enabled as inference_trace_enabled, write as write_inference_trace};
 
 use super::paged_kv_cache_adapter::{
-    PagedPrefillMemorySnapshot, PagedRaggedRow, SeqId, build_prefill_block_ids_for_total,
+    PagedPrefillMemorySnapshot, PagedRaggedRow, SeqId, build_decode_block_ids,
+    build_prefill_block_ids_for_total, decode_read_span,
 };
 
 /// Cached per-prefill-chunk metadata for the MLX `paged_attention`
@@ -205,11 +207,11 @@ pub(crate) struct PagedMetadataCache {
     /// rotation, so this stays adapter-global rather than request-scoped.
     pub ragged_inputs_cache: Option<RaggedPagedInputsCache>,
 
-    /// Last `(max_context_len, stripes)` resolved for a `ForceD128`
-    /// decode that carried no explicit count. The FFI probes device memory
-    /// ceilings, so resolving once per token instead of once per layer
-    /// avoids ~num_layers-1 redundant probes per step.
-    pub d128_stripe_plan_cache: Cell<Option<(u32, u32)>>,
+    /// Last `(max_context_len, num_query_heads, stripes)` resolved for a
+    /// `ForceD128` decode that carried no explicit count. The FFI probes
+    /// device memory ceilings, so resolving once per token instead of once
+    /// per layer avoids ~num_layers-1 redundant probes per step.
+    pub d128_stripe_plan_cache: Cell<Option<(u32, u32, u32)>>,
 
     /// Immutable grouped-D512 pipeline/threadgroup capability for this
     /// pool's geometry. The Metal probe itself is process-cached, but
@@ -283,12 +285,8 @@ impl PagedMetadataCache {
         // Rebase only dispatch metadata. Cache ownership and RoPE positions
         // stay absolute; the kernel sees at most window + block_size - 1
         // positions and applies its existing lower mask to the partial page.
-        let first_block = if sliding_window == 0 {
-            0
-        } else {
-            recorded.saturating_sub(sliding_window) / block_size
-        };
-        let visible_tokens = recorded - first_block * block_size;
+        // The raw decode route reads the same span.
+        let (first_block, visible_tokens) = decode_read_span(recorded, sliding_window, block_size);
         let recorded_i32 = i32::try_from(visible_tokens).map_err(|_| {
             format!("gather_kv_for_decode_graph: recorded token count {recorded} exceeds i32::MAX")
         })?;
@@ -354,10 +352,7 @@ impl PagedMetadataCache {
         let (block_table_arr, rebuilt_block_table) = match cached_block_table {
             Some(block_table_arr) => (block_table_arr, false),
             None => {
-                let block_ids: Vec<i32> = block_table.blocks()[first_block as usize..]
-                    .iter()
-                    .map(|block| block.block_id as i32)
-                    .collect();
+                let block_ids = build_decode_block_ids(block_table, first_block);
                 debug_assert_eq!(block_ids.len(), block_count as usize);
                 for (idx, &block_id) in block_ids.iter().enumerate() {
                     if block_id < 0 || block_id as u32 >= pool_block_count {
@@ -881,20 +876,33 @@ impl PagedMetadataCache {
         true
     }
 
-    /// Resolve the grouped-D128 default stripe count for
-    /// `max_context_len`: the shared context table clamped by the live
-    /// device/memory ceiling. Cached per context length so the FFI probe
-    /// runs once per token instead of once per layer.
-    pub(crate) fn resolve_d128_stripe_plan(&self, max_context_len: u32, num_layers: u32) -> u32 {
-        if let Some((cached_ctx, stripes)) = self.d128_stripe_plan_cache.get()
+    /// Resolve the grouped-D128 partition count for a `ForceD128` decode that
+    /// carried no plan: the shared device rule
+    /// (`engine::decode_tuning::grouped_partition_stripes`) under the live
+    /// device/memory cap. Cached per `(max_context_len, num_query_heads)` so
+    /// the FFI cap probe runs once per token instead of once per layer.
+    pub(crate) fn resolve_d128_stripe_plan(
+        &self,
+        max_context_len: u32,
+        num_query_heads: u32,
+        num_layers: u32,
+    ) -> u32 {
+        if let Some((cached_ctx, cached_heads, stripes)) = self.d128_stripe_plan_cache.get()
             && cached_ctx == max_context_len
+            && cached_heads == num_query_heads
         {
             return stripes;
         }
-        let stripes =
-            unsafe { mlx_sys::mlx_paged_grouped_d128_default_stripes(max_context_len, num_layers) };
+        let max_stripes =
+            unsafe { mlx_sys::mlx_paged_grouped_d128_max_stripes(max_context_len, num_layers) };
+        let stripes = grouped_partition_stripes(
+            max_context_len,
+            num_query_heads,
+            gpu_core_count(),
+            max_stripes,
+        );
         self.d128_stripe_plan_cache
-            .set(Some((max_context_len, stripes)));
+            .set(Some((max_context_len, num_query_heads, stripes)));
         stripes
     }
 

@@ -183,8 +183,16 @@ Remaining scaffolding:
 | Varlen kernel (`cu_seqlens_q`, N ragged sequences)               | Qwen3 mixed scheduler steps and family-specific single-request paths; Qwen3 builds one physical-table row and one genuine cumulative-query boundary per request       |
 | Duplicated-row prefill layout (per-row heterogeneous `seq_lens`) | env-gated escape hatches only: gemma4 `MLX_GEMMA4_PAGED_PREFILL_ROUTE=legacy`, lfm2 `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION=1`; qwen3.5 always uses the varlen bridge |
 
-The tuned grouped D256/D512 long-context kernels remain gated to
-`num_seqs == 1`; dense Qwen3 head dimension 128 uses the generic batched route.
+The tuned grouped D128/D256/D512 long-context kernels remain gated to
+`num_seqs == 1` (the kernel indexes one sequence per dispatch); dense Qwen3 head
+dimension 128 uses the generic batched route. A consequence: a scheduled row's
+attention bits depend on co-scheduling. Muse-Glimmer's global layers take the
+grouped D128 kernel when a row decodes alone (in the scheduled or the
+whole-turn lane) and generic V2 when other rows share its step, so the same
+greedy request can give a different transcript under load. Gemma4's scheduled
+rows take generic V2 on their D512 layers even alone, while its whole-turn
+lane takes the grouped kernel, so its two lanes still give different
+transcripts (see [splash-qwen38.md](research/splash-qwen38.md) §7 item 12).
 
 ## Stage 0 concurrency hazards (verified status)
 

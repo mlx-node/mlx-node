@@ -312,6 +312,7 @@ impl PagedAttentionCore<'_> {
                 self.scale as f32,
                 1.0,
                 self.decode_route_hint,
+                /* grouped_stripes */ 0,
                 self.family,
             )
             .map_err(Error::from_reason)?;

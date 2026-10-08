@@ -1458,8 +1458,9 @@ impl LayerKVPool {
     /// The caller supplies the `block_ids` array (already cast to `i32`) for
     /// the request's block table — kernel reads it as
     /// `[num_seqs=1, max_num_blocks_per_seq]` row-major. `num_tokens_in_request`
-    /// is the live `block_table.num_tokens()` and is uploaded as the single
-    /// element of `context_lens`.
+    /// is the context length counted from the first block in `block_ids` (a
+    /// sliding-window caller may drop whole blocks before its window) and is
+    /// uploaded as the single element of `context_lens`.
     ///
     /// `queries` shape on the GPU buffer is `[1, num_query_heads, head_size]`.
     /// `query_dtype` MUST be the actual element dtype of the queries buffer —

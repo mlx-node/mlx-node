@@ -80,32 +80,15 @@ pub(crate) fn write_kv_chunk(
 }
 
 /// Gather historical K/V for one decode step: graph-native
-/// `gather_kv_for_decode_graph` when `MLX_PAGED_GRAPH_DECODE_GATHER` allows,
-/// synchronous `gather_kv_for_decode` otherwise or after a graph-gather
-/// error.
+/// `gather_kv_for_decode_graph_with_plan` (compute route plus grouped
+/// partition plan, 0 = unplanned) when `MLX_PAGED_GRAPH_DECODE_GATHER`
+/// allows, synchronous `gather_kv_for_decode` otherwise or after a
+/// graph-gather error.
 ///
 /// Callers that need an extra gate (e.g. the shared transformer block
 /// couples the read path to its KV write path) keep their own condition
 /// rather than forcing every gate into this signature.
-pub(crate) fn gather_kv_for_decode_with_fallback(
-    adapter: &mut PagedKVCacheAdapter,
-    layer_idx: u32,
-    queries: &MxArray,
-    scale: f32,
-    softcap: f32,
-    family: &'static str,
-) -> Result<MxArray, String> {
-    gather_kv_for_decode_with_route_and_fallback(
-        adapter,
-        layer_idx,
-        queries,
-        scale,
-        softcap,
-        PagedDecodeRouteHint::Auto,
-        family,
-    )
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_kv_for_decode_with_route_and_fallback(
     adapter: &mut PagedKVCacheAdapter,
     layer_idx: u32,
@@ -113,12 +96,18 @@ pub(crate) fn gather_kv_for_decode_with_route_and_fallback(
     scale: f32,
     softcap: f32,
     route: PagedDecodeRouteHint,
+    grouped_stripes: u32,
     family: &'static str,
 ) -> Result<MxArray, String> {
     if graph_decode_gather_enabled() {
-        match adapter
-            .gather_kv_for_decode_graph_with_route(layer_idx, queries, scale, softcap, route)
-        {
+        match adapter.gather_kv_for_decode_graph_with_plan(
+            layer_idx,
+            queries,
+            scale,
+            softcap,
+            route,
+            grouped_stripes,
+        ) {
             Ok(attn) => return Ok(attn),
             Err(err) => warn_once_on_sync_fallback(family, "decode_gather", layer_idx, &err),
         }

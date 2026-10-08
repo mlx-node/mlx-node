@@ -416,9 +416,11 @@ uint32_t grouped_d512_stripe_override() {
   return stripes;
 }
 
-// Partitions of an unplanned grouped dispatch. D512 has no table: the bf16
-// result changes with the count, so the model's device rule (the plan) or the
-// diagnostic override is the only source; 0 keeps generic V2.
+// Partitions of an unplanned grouped dispatch. D512 and D128 have no table:
+// the bf16 result changes with the count, so the model's device rule (the
+// plan) or the D512 diagnostic override is the only source; 0 keeps generic
+// V2, and D128 without a plan never leaves generic V2. The table below serves
+// the Qwen3.5 D256 route only.
 uint32_t grouped_stripe_count(
     GroupedPagedAttentionKind kind,
     int max_context_len) {
@@ -936,22 +938,6 @@ extern "C" uint32_t mlx_paged_grouped_d128_max_stripes(
   } catch (...) {
     return 0;
   }
-}
-
-// Default stripe plan for callers that opt into ForceD128 without their own
-// measured sweep: the shared context-length table clamped by the
-// memory/device ceiling. Returns 0 when the grouped route is unavailable —
-// dispatch then falls back to generic V2 because D128 requires nonzero
-// planned stripes.
-extern "C" uint32_t mlx_paged_grouped_d128_default_stripes(
-    uint32_t context, uint32_t attention_layers) {
-  const uint32_t maximum =
-      mlx_paged_grouped_d128_max_stripes(context, attention_layers);
-  if (maximum == 0) return 0;
-  return std::min(
-      grouped_stripe_count(
-          GroupedPagedAttentionKind::D128Direct, static_cast<int>(context)),
-      maximum);
 }
 
 extern "C" int mlx_paged_grouped_d512_capability(

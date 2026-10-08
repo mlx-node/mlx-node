@@ -523,14 +523,74 @@ Deleted tools (restore from `69ccaf9d` if needed):
     D512. Decode tok/s A/B was within noise (machine under heavy outside
     load, 10-19 tok/s spread per build; paired new/old medians 1.10, 0.98
     and 1.00 at 1K/4K/8K over 6, 6 and 10 interleaved pairs).
-    The other leftover stays a product call, deterministic on its own: the
-    Gemma4 raw (non-graph) decode route gives a different transcript than
-    the graph route even with the grouped kernel off, because the graph
-    route trims the sliding layers' block table before the live window
-    while the raw route passes the full table plus a mask. Muse has the
-    same shape of split: its whole-turn lane (no cache owner, or
-    `MLX_SERVE_FORCE_SERIAL=1`) decodes with generic V2 attention while the
-    scheduled lane takes the grouped kernel, so the two lanes give
-    different (each reproducible) transcripts.
+    The second leftover, a transcript that depended on the internal route,
+    is resolved for the paths below (512 greedy tokens unless noted, fresh
+    processes, 2 runs per hash; the 147- and 54-token rows are 1 run each):
+    - Raw vs graph decode route: the raw (synchronous) route passed the
+      whole block table plus the window mask while the graph route trimmed
+      the sliding layers' table to the live window, so the generic kernel
+      cut the same keys at different 512-token partition boundaries. Both
+      now read `decode_read_span` (`paged_kv_cache_adapter.rs`), which
+      covers every sliding family (Gemma4, Muse-Glimmer).
+      gemma-4-e2b-it-4bit, 4K prompt, `MLX_PAGED_GRAPH_DECODE_GATHER=0`
+      vs default: grouped D512 on `1af569649a` → `3b8ca77f44` = graph;
+      off (`MLX_PAGED_GROUPED_D512=0`) `ba0c056b64` → `f5c51b41dc` =
+      graph. Graph hashes unchanged.
+    - Muse-Glimmer whole-turn lane vs scheduled lane: the whole-turn lane
+      decoded with generic V2 and prefilled the whole suffix in one slice;
+      it now takes the scheduled single-row plan (grouped D128, the rule's
+      partitions) and the scheduled prefill grid (512-token slices from the
+      cached prefix). The one-slice prefill also failed above ~2.5K prompt
+      tokens (`context_length_exceeded`: the sliding group reserved the
+      whole prompt in its window-sized pool), which slicing fixes.
+      muse-glimmer-30b-q4k, whole-turn → scheduled hash: 147-token prompt
+      and 1,024 tokens `8e15c00659` → `ced7eb1218`; 1K `d891e132e4` →
+      `1ba153515b`; 2.2K `27e622b7df` → `4b91469bee`; 4K error →
+      `72f5808af4`. Scheduled hashes unchanged.
+    - `MLX_MUSE_GROUPED_STRIPES` is now bounded by the same live cap as the
+      rule; the D512 override was already limited to its reducer's set.
+    - K2-Horizon's `ForceD128` took a context table (32 to 4K, 64 to 8K,
+      ...) that changed the partition count mid-turn; it now takes the
+      same rule (32 on 40 cores at every context beyond 512), and
+      `mlx_paged_grouped_d128_default_stripes` is gone (the C++ table stays
+      for the Qwen3.5 D256 route only). k2-horizon-7b-fp8, 3.4K prompt and
+      768 tokens across 4096: 4/4 `d7bf25daf0`. This checkpoint did not
+      flip on these prompts under any partition (4K: HEAD's table and the
+      rule give `d7bf25daf0`; 7K: HEAD's 64, the rule's 32 and generic V2
+      all give `9120fe91bd`); a breakpoint on
+      `mlx_paged_grouped_d128_max_stripes` confirmed the rule is resolved
+      once per decode token.
+    - The rule's work-tile bound still moves the count inside short turns
+      (40 cores: 8-head Gemma4 32 → 64 → 128 at 1,009 and 2,033 tokens;
+      the 32-head D128 models never move beyond 512). It is a function of
+      device, heads and context, so a turn reproduces; kept. Any count at
+      or above the page count gives the same bits (empty stripes add exact
+      zeros; forced 128 and 256 partitions, 54-token prompt, 1,024 tokens:
+      one hash `4cc97efe2f`), so dropping the bound would give one count
+      per turn; not done because the empty-threadgroup cost could not be
+      separated from load noise here (gemma-4-e2b 1K, rule vs 128: 45-98
+      vs 55-90 tok/s).
+    - Decode tok/s vs `c86d991bc`, interleaved and ABBA runs on a loaded
+      machine (medians): gemma-4-e2b 4K 129.7 → 129.4 (13 runs each, 65-148
+      spread); muse-glimmer 4K scheduled lane 15.7 → 15.3 (9 each, 10-18
+      spread). The graph routes these lanes take did not change; no
+      difference is established.
+    - Still route-dependent, deliberately left: multi-row scheduled waves
+      keep generic V2 (the grouped kernels index one sequence per dispatch),
+      so a scheduled row's bits depend on co-scheduling; grouped D128 has no
+      raw-route kernel, so Muse's and K2's global layers run generic V2 when
+      the graph gather is off or fails. Gemma4 has Muse's lane split and it
+      is not fixed here: its scheduled single-row decode passes no plan to
+      the D512 layers (generic V2 where the whole-turn lane takes the
+      grouped kernel; 54-token prompt, 1,024 tokens: scheduled `9631187a81`
+      = whole-turn with the grouped kernel off, whole-turn default
+      `b252314b4e`), and at 4K the lanes differ even with both on generic V2
+      (scheduled `c0305fa44c`, whole-turn grouped-off `f5c51b41dc`), which
+      the one-slice prompt does not show, so the rest of the split is most
+      likely the prefill slicing (scheduler grid plus cold-anchor breaks vs
+      the whole-turn chunking; not traced further). Aligning it means routing
+      scheduled single-row D512 through the whole-turn attention policy
+      (SDPA, grouped, generic and their memory guards) and one prefill
+      slicing for both lanes.
 13. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.

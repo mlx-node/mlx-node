@@ -585,7 +585,7 @@ pub(super) fn gather_window(
     let table = adapter
         .block_table()
         .ok_or_else(|| Error::from_reason("Qwen4 missing page table"))?;
-    let blocks = crate::transformer::paged_kv_cache_adapter::build_decode_block_ids(table);
+    let blocks = crate::transformer::paged_kv_cache_adapter::build_decode_block_ids(table, 0);
     if blocks.len() * (adapter.block_size() as usize) < base {
         return Err(Error::from_reason(
             "Qwen4 page table does not cover its retained prefix",

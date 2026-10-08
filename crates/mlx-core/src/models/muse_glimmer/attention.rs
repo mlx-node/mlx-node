@@ -4,8 +4,12 @@ use crate::array::mask::create_causal_mask;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Activations, RoPE, rms_norm_unscaled};
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
-use crate::transformer::paged_policy::{gather_kv_for_decode_with_fallback, write_kv_chunk};
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedDecodeRouteHint, PagedKVCacheAdapter, SeqId,
+};
+use crate::transformer::paged_policy::{
+    gather_kv_for_decode_with_route_and_fallback, write_kv_chunk,
+};
 use napi::bindgen_prelude::*;
 
 use super::config::{LayerKind, MuseGlimmerTextConfig};
@@ -135,6 +139,24 @@ impl MuseGlimmerAttention {
             .forward(&Activations::sigmoid_mul_compiled(&gate, &attended)?)
     }
 
+    /// One-token decode compute route under the active plan. Global layers
+    /// of a single-row step (scheduled or whole-turn) take the planned
+    /// grouped-D128 partitions (0 = generic V2); compact sliding reads,
+    /// prefill, verification and multi-row batches carry no plan and keep
+    /// `Auto` (the grouped kernel serves one sequence per dispatch).
+    fn decode_route(&self) -> (PagedDecodeRouteHint, u32) {
+        let choice = self
+            .sliding_window
+            .is_none()
+            .then(|| super::decode_tuning::current_plan().grouped_stripes)
+            .flatten();
+        match choice {
+            Some(0) => (PagedDecodeRouteHint::ForceGeneric, 0),
+            Some(stripes) => (PagedDecodeRouteHint::ForceD128, stripes),
+            None => (PagedDecodeRouteHint::Auto, 0),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_paged(
         &self,
@@ -249,12 +271,15 @@ impl MuseGlimmerAttention {
                 ));
             }
             let query = q.squeeze(Some(&[2]))?;
-            gather_kv_for_decode_with_fallback(
+            let (route, stripes) = self.decode_route();
+            gather_kv_for_decode_with_route_and_fallback(
                 adapter,
                 paged_idx,
                 &query,
                 scale as f32,
                 1.0,
+                route,
+                stripes,
                 "muse_glimmer",
             )
             .map_err(Error::from_reason)?
@@ -362,19 +387,7 @@ impl MuseGlimmerAttention {
             .update_keys_values_native_batched(paged_idx, &k, &v, rows)
             .map_err(Error::from_reason)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        // Only global singleton decode participates. Compact sliding reads,
-        // prefill, verification and multi-owner batches keep their own route.
-        let choice = self
-            .sliding_window
-            .is_none()
-            .then(|| super::decode_tuning::current_plan().grouped_stripes)
-            .flatten();
-        use crate::transformer::paged_kv_cache_adapter::PagedDecodeRouteHint;
-        let (route, stripes) = match choice {
-            Some(0) => (PagedDecodeRouteHint::ForceGeneric, 0),
-            Some(stripes) => (PagedDecodeRouteHint::ForceD128, stripes),
-            None => (PagedDecodeRouteHint::Auto, 0),
-        };
+        let (route, stripes) = self.decode_route();
         let attended = adapter
             .gather_kv_for_decode_graph_batched_with_plan(
                 paged_idx,

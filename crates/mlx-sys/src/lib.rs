@@ -1782,10 +1782,6 @@ unsafe extern "C-unwind" {
     /// Maximum legal D128 partitions under live pipeline, storage and context limits.
     pub fn mlx_paged_grouped_d128_max_stripes(context: u32, attention_layers: u32) -> u32;
 
-    /// Context-table D128 stripe count clamped by `mlx_paged_grouped_d128_max_stripes`.
-    /// Returns 0 when the grouped route is unavailable (dispatch then keeps generic V2).
-    pub fn mlx_paged_grouped_d128_default_stripes(context: u32, attention_layers: u32) -> u32;
-
     /// Return 1 when the canonical direct-read D512 Metal pipeline, reducer,
     /// and threadgroup limits
     /// support this shipped Q/KV-head geometry, 0 when unsupported, and -1

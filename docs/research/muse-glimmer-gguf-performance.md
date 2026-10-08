@@ -210,7 +210,7 @@ The early-submission depth is still learned from completed tokens: the candidate
 
 Depth decisions belong to the loaded model and context bucket, with an eight-entry bound, and are never exported as another machine's defaults. This selects among tested candidates, not a proof of a global optimum. Calibration runs on real tokens and its cost is included in the request benchmark.
 
-`MLX_MUSE_GROUPED_STRIPES` (`0` = generic V2) and `MLX_MUSE_DECODE_EARLY_EVAL_LAYERS` are process-local diagnostic overrides; production benchmarking uses neither. Sliding layers, multiple-owner batches, the whole-turn lane (no cache owner, or `MLX_SERVE_FORCE_SERIAL=1`), prefill, and DFlash keep their existing routes.
+`MLX_MUSE_GROUPED_STRIPES` (`0` = generic V2; bounded by the same live cap as the rule) and `MLX_MUSE_DECODE_EARLY_EVAL_LAYERS` are process-local diagnostic overrides; production benchmarking uses neither. The whole-turn lane (no cache owner, or `MLX_SERVE_FORCE_SERIAL=1`) takes the same single-row partitions and the same 512-token prefill slices as the scheduled lane, so a prompt gives one transcript in either lane (whole-turn = scheduled at 1K, 2.2K and 4K; the whole-turn lane used generic V2 and one prefill slice before, and failed above ~2.5K prompt tokens). Sliding layers, multiple-owner batches, prefill attention, and DFlash keep their existing routes.
 
 ### Interpreting the remaining limit
 

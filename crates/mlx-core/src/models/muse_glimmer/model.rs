@@ -863,6 +863,48 @@ impl MuseGlimmerInner {
         self.active_flat_session = flat;
     }
 
+    /// Grouped-D128 attention partitions of one single-row paged decode step
+    /// at `context` tokens (the new one included), with the live cap they
+    /// were bounded by: `None` keeps generic V2 (geometry, dtype, backend or
+    /// page size not eligible). Both the scheduled and the whole-turn lane
+    /// ask here, so a prompt decodes to the same bits however it was
+    /// submitted.
+    fn single_row_grouped_stripes(
+        &self,
+        context: u32,
+        hidden: &MxArray,
+    ) -> Result<Option<(u32, u32)>> {
+        let text = &self.config.text_config;
+        let eligible = text.head_dim == 128
+            && text.num_attention_heads == 32
+            && text.num_key_value_heads == 2
+            && hidden.dtype()? == crate::array::DType::BFloat16
+            && crate::engine::persistence::compiled_forward_backend_available()
+            && self
+                .paged
+                .as_ref()
+                .is_some_and(|p| p.coordinator.adapter(0).is_ok_and(|a| a.block_size() == 16));
+        if !eligible {
+            return Ok(None);
+        }
+        let global_layers = text
+            .layer_kinds
+            .iter()
+            .filter(|&&kind| kind == LayerKind::Full)
+            .count() as u32;
+        // Hard cap from the live device: kernel limit, work tiles,
+        // temporary-storage headroom and buffer length (0 = unavailable).
+        let max_stripes =
+            unsafe { mlx_sys::mlx_paged_grouped_d128_max_stripes(context, global_layers) };
+        let stripes = crate::engine::decode_tuning::grouped_partition_stripes(
+            context,
+            text.num_attention_heads as u32,
+            crate::engine::decode_tuning::gpu_core_count(),
+            max_stripes,
+        );
+        Ok(Some((stripes, max_stripes)))
+    }
+
     fn run_paged_layer_loop(
         &mut self,
         tokens: &[u32],
@@ -888,6 +930,27 @@ impl MuseGlimmerInner {
             &self.embed_tokens.forward(&ids)?,
             self.config.text_config.rms_norm_eps,
         )?;
+        // Whole-turn decode takes the scheduled single-row lane's attention
+        // partitions, so a prompt decodes to the same bits in either lane.
+        // (Only the partitions are shared; this loop has no submission-depth
+        // search.)
+        let decode_stripes = if is_prefill {
+            None
+        } else {
+            self.single_row_grouped_stripes(
+                first_logical_position.saturating_add(tokens.len() as u32),
+                &hidden,
+            )?
+        };
+        let _plan_scope = decode_stripes.map(|(stripes, max_stripes)| {
+            crate::engine::decode_tuning::PlanScope::enter(super::decode_tuning::override_plan(
+                crate::engine::decode_tuning::DecodePlan {
+                    early_layers: 0,
+                    grouped_stripes: Some(stripes),
+                },
+                max_stripes,
+            ))
+        });
         for index in 0..self.layers.len() {
             let layer: &MuseGlimmerDecoderLayer = unsafe { &*self.layers.as_ptr().add(index) };
             let (route, window) = {
@@ -1055,40 +1118,18 @@ impl MuseGlimmerInner {
             &self.embed_tokens.forward(&input)?,
             self.config.text_config.rms_norm_eps,
         )?;
-        let text = &self.config.text_config;
-        let eligible = rows.len() == 1
-            && text.head_dim == 128
-            && text.num_attention_heads == 32
-            && text.num_key_value_heads == 2
-            && hidden.dtype()? == crate::array::DType::BFloat16
-            && crate::engine::persistence::compiled_forward_backend_available()
-            && self
-                .paged
-                .as_ref()
-                .is_some_and(|p| p.coordinator.adapter(0).is_ok_and(|a| a.block_size() == 16));
         let mut plan = crate::engine::decode_tuning::DecodePlan::default();
-        if eligible {
-            let context = planned[0].1.saturating_add(1);
-            let global_layers = text
-                .layer_kinds
-                .iter()
-                .filter(|&&kind| kind == LayerKind::Full)
-                .count() as u32;
-            // Hard cap from the live device: kernel limit, work tiles,
-            // temporary-storage headroom and buffer length (0 = unavailable).
-            let max_stripes =
-                unsafe { mlx_sys::mlx_paged_grouped_d128_max_stripes(context, global_layers) };
+        let context = planned[0].1.saturating_add(1);
+        if rows.len() == 1
+            && let Some((stripes, max_stripes)) =
+                self.single_row_grouped_stripes(context, &hidden)?
+        {
             // Only the submission depth is learned from timings; the
             // partition count is a device rule so greedy decode reproduces.
             plan = self.decode_tuning.begin(context, self.layers.len(), true);
-            plan.grouped_stripes = Some(crate::engine::decode_tuning::grouped_partition_stripes(
-                context,
-                text.num_attention_heads as u32,
-                crate::engine::decode_tuning::gpu_core_count(),
-                max_stripes,
-            ));
+            plan.grouped_stripes = Some(stripes);
             self.decode_timing = Some(std::time::Instant::now());
-            let overridden = super::decode_tuning::override_plan(plan);
+            let overridden = super::decode_tuning::override_plan(plan, max_stripes);
             if overridden != plan {
                 self.decode_timing = None;
             }
@@ -1379,7 +1420,26 @@ impl PagedBackend for MuseGlimmerInner {
         prefix: &Self::PrefixState,
         _stream: Stream,
     ) -> Result<MxArray> {
-        self.run_paged_prefill_slice(suffix_tokens, prefix.effective_cached_prefix_len as u32)
+        // The scheduled lane's slice grid (`scheduler_prefill_slice_tokens`,
+        // walked from the cached prefix): each slice's attention and K/V
+        // round the same way in either lane, so a prompt decodes to the same
+        // bits however it was submitted. Each slice's settle also prunes the
+        // sliding groups, keeping them within their window-sized pools.
+        let cached = prefix.effective_cached_prefix_len as u32;
+        fwd::chunked_prefill_ranges(
+            self,
+            suffix_tokens.len() as i64,
+            PREFILL_STEP_SIZE,
+            true,
+            |inner: &MuseGlimmerInner| inner.turn_cancel.as_deref(),
+            |inner, start, end, _is_final| {
+                inner.run_paged_prefill_slice(
+                    &suffix_tokens[start as usize..end as usize],
+                    cached + start as u32,
+                )
+            },
+            |_| Ok(()),
+        )
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {

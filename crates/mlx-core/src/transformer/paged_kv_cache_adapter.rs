@@ -519,12 +519,36 @@ pub(crate) fn validate_query_input(
     })
 }
 
+/// The pages a decode query at context length `context` reads: the first
+/// retained logical block and the token count visible from it. Sliding
+/// groups omit whole blocks before their live window (the kernel masks the
+/// partial page by `sliding_window`); full-attention groups start at block 0.
+///
+/// The graph-native and raw decode routes both take their block table and
+/// context length from here. The paged kernels partition by that context
+/// length, so a route that saw the full table plus a mask would reduce the
+/// same keys over different partitions and round to different bf16 bits.
+pub(crate) fn decode_read_span(context: u32, sliding_window: u32, block_size: u32) -> (u32, u32) {
+    let first_block = if sliding_window == 0 {
+        0
+    } else {
+        context.saturating_sub(sliding_window) / block_size
+    };
+    (first_block, context - first_block * block_size)
+}
+
 /// Build the `block_ids` array for a paged-attention decode dispatch from
-/// a `SequenceBlockTable`. Block IDs are `u32` ≥ 0 and bounded by allocator
-/// capacity (far below `i32::MAX`), so the cast is safe. Pure CPU — keeps
-/// the marshalling test cheap and runtime-independent.
-pub(crate) fn build_decode_block_ids(table: &SequenceBlockTable) -> Vec<i32> {
-    table.blocks().iter().map(|b| b.block_id as i32).collect()
+/// a `SequenceBlockTable`, starting at the first retained logical block
+/// (see [`decode_read_span`]). Block IDs are `u32` ≥ 0 and bounded by
+/// allocator capacity (far below `i32::MAX`), so the cast is safe. Pure
+/// CPU — keeps the marshalling test cheap and runtime-independent.
+pub(crate) fn build_decode_block_ids(table: &SequenceBlockTable, first_block: u32) -> Vec<i32> {
+    table
+        .blocks()
+        .iter()
+        .skip(first_block as usize)
+        .map(|b| b.block_id as i32)
+        .collect()
 }
 
 /// Build the `block_ids` array for a paged-attention prefill dispatch that
@@ -4271,12 +4295,11 @@ impl PagedKVCacheAdapter {
             // particular, a verifier's first query needs an older window than
             // its last query. Only read metadata is rebased; writes and RoPE
             // continue to use absolute logical positions.
-            let first_block = if self.sliding_window == 0 {
-                0
-            } else {
-                (row.first_logical_position + 1).saturating_sub(self.sliding_window)
-                    / self.block_size
-            };
+            let (first_block, _) = decode_read_span(
+                row.first_logical_position + 1,
+                self.sliding_window,
+                self.block_size,
+            );
             let visible = recorded - first_block * self.block_size;
             if query_rows.len() == 1 && row.query_len == 1 {
                 let (tables, lens, _) = self.decode_attention_inputs()?;
@@ -4476,12 +4499,13 @@ impl PagedKVCacheAdapter {
         scale: f32,
         softcap: f32,
     ) -> Result<MxArray, String> {
-        self.gather_kv_for_decode_graph_with_route(
+        self.gather_kv_for_decode_graph_with_plan(
             layer_idx,
             queries,
             scale,
             softcap,
             PagedDecodeRouteHint::Auto,
+            0,
         )
     }
 
@@ -4511,19 +4535,24 @@ impl PagedKVCacheAdapter {
     }
 
     /// Resolve the grouped-D128 stripe plan for a `ForceD128` decode that
-    /// carried no explicit count: the shared context table clamped by the
-    /// live device/memory ceiling. 0 means "unavailable" — the C++ dispatch
-    /// requires nonzero planned stripes for D128, so it keeps generic V2.
+    /// carried no explicit count (K2-Horizon): the shared device rule of the
+    /// context, the query heads and the GPU core count, under the live
+    /// device/memory cap. 0 means "unavailable" — the C++ dispatch requires
+    /// nonzero planned stripes for D128, so it keeps generic V2.
     #[cfg(target_os = "macos")]
     fn resolve_grouped_d128_stripes(
         &self,
         route_hint: PagedDecodeRouteHint,
         grouped_stripes: u32,
         max_context_len: u32,
+        num_query_heads: u32,
     ) -> u32 {
         if route_hint == PagedDecodeRouteHint::ForceD128 && grouped_stripes == 0 {
-            self.meta
-                .resolve_d128_stripe_plan(max_context_len, self.layer_kv_pool.num_layers() as u32)
+            self.meta.resolve_d128_stripe_plan(
+                max_context_len,
+                num_query_heads,
+                self.layer_kv_pool.num_layers() as u32,
+            )
         } else {
             grouped_stripes
         }
@@ -4596,8 +4625,12 @@ impl PagedKVCacheAdapter {
 
         let (block_tables, seq_lens, max_context_len) =
             self.decode_attention_inputs_batched(seq_ids)?;
-        let grouped_stripes =
-            self.resolve_grouped_d128_stripes(route_hint, grouped_stripes, max_context_len);
+        let grouped_stripes = self.resolve_grouped_d128_stripes(
+            route_hint,
+            grouped_stripes,
+            max_context_len,
+            q_meta.shape[1] as u32,
+        );
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -4788,21 +4821,10 @@ impl PagedKVCacheAdapter {
         Err("gather_kv_for_ragged_graph is only supported on macOS (Metal backend)".to_string())
     }
 
-    /// Route-hinted graph-native decode attention. The hint is captured in the
-    /// lazy MLX primitive; it never changes pool ownership, block tables, or
-    /// sequence length.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn gather_kv_for_decode_graph_with_route(
-        &mut self,
-        layer_idx: u32,
-        queries: &MxArray,
-        scale: f32,
-        softcap: f32,
-        route_hint: PagedDecodeRouteHint,
-    ) -> Result<MxArray, String> {
-        self.gather_kv_for_decode_graph_with_plan(layer_idx, queries, scale, softcap, route_hint, 0)
-    }
-
+    /// Route-hinted graph-native decode attention with a grouped partition
+    /// plan (`grouped_stripes`, 0 = unplanned). The hint and plan are
+    /// captured in the lazy MLX primitive; they never change pool ownership,
+    /// block tables, or sequence length.
     #[cfg(target_os = "macos")]
     pub(crate) fn gather_kv_for_decode_graph_with_plan(
         &mut self,
@@ -4850,6 +4872,7 @@ impl PagedKVCacheAdapter {
             route_hint,
             grouped_stripes,
             self.current_token_count(),
+            num_query_heads,
         );
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
@@ -4956,10 +4979,14 @@ impl PagedKVCacheAdapter {
         )?;
         let num_query_heads = info.num_query_heads;
 
-        // 4. Build block_ids array (i32, length = num_blocks). PhysicalBlock
+        // 4. Build block_ids array (i32) from the same first retained block
+        //    and visible context as the graph-native route, so both routes
+        //    reduce attention over identical partitions. PhysicalBlock
         //    block_ids are u32 ≥ 0; bounded by num_blocks (allocator
         //    capacity), far below i32::MAX. Cast is safe.
-        let block_ids = build_decode_block_ids(block_table);
+        let (first_block, visible_tokens) =
+            decode_read_span(num_tokens, self.sliding_window, self.block_size);
+        let block_ids = build_decode_block_ids(block_table, first_block);
 
         // 4b. Capacity guard: `record_tokens` does not currently enforce that
         //     the running token count stays within the allocated block table
@@ -4980,9 +5007,10 @@ impl PagedKVCacheAdapter {
                 block_size_us,
             )
         })?;
-        if (num_tokens as usize) > allocated_capacity {
+        if (visible_tokens as usize) > allocated_capacity {
             return Err(format!(
-                "gather_kv_for_decode: context length ({num_tokens}) exceeds allocated capacity \
+                "gather_kv_for_decode: context length ({num_tokens}; {visible_tokens} from \
+                 block {first_block}) exceeds allocated capacity \
                  (block_ids.len()={} blocks × block_size={} = {allocated_capacity} slots). \
                  Call allocate_suffix_blocks(total_tokens) before recording tokens past the \
                  currently allocated capacity.",
@@ -5042,7 +5070,7 @@ impl PagedKVCacheAdapter {
                 queries.as_raw_ptr(),
                 query_metal_dtype,
                 &block_ids,
-                num_tokens,
+                visible_tokens,
                 num_query_heads,
                 scale,
                 softcap,
@@ -5660,18 +5688,6 @@ impl PagedKVCacheAdapter {
         _queries: &MxArray,
         _scale: f32,
         _softcap: f32,
-    ) -> Result<MxArray, String> {
-        Err("gather_kv_for_decode_graph is only supported on macOS (Metal backend)".to_string())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub(crate) fn gather_kv_for_decode_graph_with_route(
-        &mut self,
-        _layer_idx: u32,
-        _queries: &MxArray,
-        _scale: f32,
-        _softcap: f32,
-        _route_hint: PagedDecodeRouteHint,
     ) -> Result<MxArray, String> {
         Err("gather_kv_for_decode_graph is only supported on macOS (Metal backend)".to_string())
     }
@@ -7216,7 +7232,7 @@ impl PagedKVCacheAdapter {
     ///   `build_slot_mapping(first_logical_position, num_new_tokens)`
     ///   produces, just sentinel-padded.
     /// - `block_table[0, ..num_valid_blocks]` is the same data
-    ///   `build_decode_block_ids(self.block_table())` produces, just
+    ///   `build_decode_block_ids(self.block_table(), 0)` produces, just
     ///   sentinel-padded and broadcast to a 2-D `[1, max_blocks_per_seq]`
     ///   layout (one batch entry, this adapter is per-request).
     /// - `seq_lens[0]` reads the recorded token count from
@@ -12754,12 +12770,41 @@ mod tests {
             table.add_block(block);
         }
 
-        let marshalled = build_decode_block_ids(&table);
+        let marshalled = build_decode_block_ids(&table, 0);
         assert_eq!(
             marshalled,
             vec![42i32, 3, 17],
             "marshalling must preserve table iteration order, with u32 → i32 cast"
         );
+        assert_eq!(
+            build_decode_block_ids(&table, 1),
+            vec![3i32, 17],
+            "a sliding read starts at its first retained block"
+        );
+    }
+
+    /// Both decode routes (graph-native and raw) take their table start and
+    /// context length from `decode_read_span`: whole blocks before a sliding
+    /// window are dropped, the partial page stays for the kernel's mask, and
+    /// full-attention groups always start at block 0.
+    #[test]
+    fn decode_read_span_drops_whole_blocks_before_the_window() {
+        // (context, window, block size) -> (first block, visible tokens)
+        for (context, window, block_size, expected) in [
+            (4_015, 0, 16, (0, 4_015)),
+            (4_015, 512, 16, (218, 527)),
+            (4_016, 512, 16, (219, 512)),
+            (512, 512, 16, (0, 512)),
+            (100, 512, 16, (0, 100)),
+            (48, 16, 8, (4, 16)),
+            (49, 16, 8, (4, 17)),
+        ] {
+            assert_eq!(
+                decode_read_span(context, window, block_size),
+                expected,
+                "context={context} window={window} block_size={block_size}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -14483,6 +14528,99 @@ mod tests {
                 }
                 assert_eq!(adapter.current_token_count(), N);
             }
+        }
+    }
+
+    /// The raw (synchronous) decode route and the graph-native one must give
+    /// the same bits. Both read the span from `decode_read_span`; a raw route
+    /// that passed the whole table plus the window mask partitioned the same
+    /// keys at different 512-token boundaries and rounded differently, so a
+    /// graph-construction fallback (or `MLX_PAGED_GRAPH_DECODE_GATHER=0`)
+    /// changed the greedy transcript.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_and_graph_decode_routes_read_the_same_window() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        const N: u32 = 2579;
+        const HQ: usize = 32;
+        const HKV: usize = 2;
+        const D: usize = 128;
+        let data = |len: usize, stride: usize, period: usize| {
+            (0..len)
+                .map(|i| ((i * stride % period) as f32 - (period / 2) as f32) / 64.0)
+                .collect::<Vec<_>>()
+        };
+        let k = MxArray::from_float32(
+            &data(N as usize * HKV * D, 13, 113),
+            &[N as i64, HKV as i64, D as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let v = MxArray::from_float32(
+            &data(N as usize * HKV * D, 17, 127),
+            &[N as i64, HKV as i64, D as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let q = MxArray::from_float32(&data(HQ * D, 19, 109), &[1, HQ as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        // The raw route reads the query's Metal buffer directly.
+        q.eval();
+        let scale = 1.0 / (D as f32).sqrt();
+        for window in [0, 513, 2048] {
+            let config = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 16,
+                num_kv_heads: HKV as u32,
+                head_size: D as u32,
+                num_layers: 1,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(8192),
+                max_batch_size: Some(1),
+            };
+            let pool = Arc::new(
+                mlx_paged_attn::LayerKVPool::new(
+                    config,
+                    512,
+                    512,
+                    mlx_paged_attn::metal::MetalDtype::BFloat16,
+                )
+                .unwrap(),
+            );
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(512, 512, 16)));
+            let mut adapter = if window == 0 {
+                PagedKVCacheAdapter::new(allocator, pool, 16).unwrap()
+            } else {
+                PagedKVCacheAdapter::new_sliding(allocator, pool, 16, window, 8192).unwrap()
+            };
+            adapter.reset_for_new_request(7).unwrap();
+            adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
+            adapter.update_keys_values(0, &k, &v, 0).unwrap();
+            let raw = adapter
+                .gather_kv_for_decode(0, &q, scale, 1.0)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let graph = adapter
+                .gather_kv_for_decode_graph(0, &q, scale, 1.0)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            assert_eq!(raw.len(), HQ * D);
+            assert!(
+                raw.iter()
+                    .zip(&graph)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "window={window}: raw and graph decode routes differ"
+            );
         }
     }
 

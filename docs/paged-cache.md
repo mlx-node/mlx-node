@@ -361,6 +361,13 @@ null sentinels, so the restored block table preserves absolute positions without
 allocating the expired prefix. Missing, malformed, or partially installable state
 resets all groups to zero; reusing only the full group is forbidden.
 
+A one-token decode read of a sliding group (Gemma4, Muse-Glimmer) starts at the
+group's first live block and passes the context length from there
+(`decode_read_span` in `paged_kv_cache_adapter.rs`); the kernel masks the rest of
+the window from the partial first page. The graph-native and the synchronous
+decode routes share that span, so the paged kernel cuts the same keys into the
+same partitions on either route and returns the same bits.
+
 The older rotating-cache representation remains active for the flat/exclusive
 route used by the flat owner lanes. It shares the same sidecar layout
 rules below, while the grouped route encodes/decodes layer-major paged K/V arrays
