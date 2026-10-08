@@ -14,9 +14,9 @@
  *    parses correctly under both broken forms, which is exactly why the bug
  *    survived a first pass — so the thin case is pinned here too, labelled, as the
  *    false negative it is.
- *  - The scan must sniff EVERY regular file. Both `@mariozechner` prebuilts in
- *    this repo's own node_modules are mode 644, so an exec-bit filter walks past
- *    the files most likely to be unsigned.
+ *  - The scan must sniff EVERY regular file. Published `.node`/`.dylib`
+ *    prebuilts are routinely mode 644, so an exec-bit filter walks past the
+ *    files most likely to be unsigned.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -504,8 +504,8 @@ describe('main', () => {
  * The scan itself, against a real directory tree.
  *
  * `/bin/echo` is a genuine universal Mach-O, so one fixture covers both hazards at
- * once: it is copied in at mode 644 — the mode both `.node` prebuilts in this
- * repo's node_modules actually have — and its `file` output is the multi-line
+ * once: it is copied in at mode 644 — the mode `.node`/`.dylib` prebuilts are
+ * routinely published with — and its `file` output is the multi-line
  * per-architecture form.
  */
 describe('findMachOFiles', () => {

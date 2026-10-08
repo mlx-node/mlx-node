@@ -89,10 +89,10 @@ export function scopeCoreNativeOverride(binding: string): string {
  * providers, so any closure rooted at @mlx-node/cli retains them. Nested package
  * pruning uses the same rule.
  *
- * The set lists what pi-ai 0.99 declares, minus `@mistralai/mistralai` and
- * `@opentelemetry/api`, which pi-ai 0.84 dropped (mistral went to plain fetch;
- * otel was never imported). Dropped entries stay dropped — a name that can
- * never be reached protects nothing.
+ * The set is exactly what pi-ai 0.99.2 declares. Earlier releases carried two
+ * more — `@mistralai/mistralai` and `@opentelemetry/api`, dropped by 0.99
+ * (mistral went to plain fetch; otel was never imported) — and dropped entries
+ * stay dropped: a name that can never be reached protects nothing.
  */
 const CLOUD_PROVIDER_SDKS = new Set([
   '@anthropic-ai/sdk',

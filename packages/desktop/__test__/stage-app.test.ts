@@ -88,9 +88,9 @@ const SDK_ROOTS = [
 /**
  * One fixture workspace covering the whole dashboard-side graph: the three
  * workspace roots, an external root, a pi-ai-like package declaring every
- * provider SDK (only `openai` is seeded — the rest must be refused by name
- * before resolution), a platform-gated napi optional, and a devDependency that
- * must never be queued.
+ * provider SDK (all five are seeded — the dashboard closure must refuse them
+ * by name, and the CLI reuse of this graph needs them resolvable), a
+ * platform-gated napi optional, and a devDependency that must never be queued.
  */
 function seedDashboardGraph(root: string): string[] {
   seedWorkspace(root, 'dashboard', '@mlx-node/dashboard', {
@@ -592,6 +592,89 @@ describe('isNonRuntimeFile', () => {
       'terrain.map',
     ]) {
       expect(isNonRuntimeFile(name), name).toBe(false);
+    }
+  });
+});
+
+/**
+ * `isNonRuntimeFile` pins the boundary; this pins the sweep that uses it.
+ *
+ * `pruneNonRuntime` walks the staged node_modules — nested copies included —
+ * and then the app's own `dist`, deleting by filename and by directory name.
+ * If that step were deleted outright every other test here stays green: the
+ * staging assertions name packages, not what a package happens to ship inside
+ * itself. So the fixture plants what the rule exists to remove — declaration
+ * files, source maps, tsbuildinfo, a `docs/` and a nested `examples/` — and
+ * the assertion lands on both halves of the contract: the staged tree lacks
+ * them, and `prunedDirs`/`prunedFiles` say so.
+ */
+describe('non-runtime pruning', () => {
+  it('removes declarations, maps, build state and doc dirs — staged tree and report agree', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-prune-stage-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const desktop = seedDesktop(root);
+      const stage = join(root, 'stage');
+      const other = join(root, 'node_modules', 'other');
+
+      // File-level pruning inside a staged package — one specimen per pattern.
+      for (const name of ['index.d.ts', 'index.js.map', 'tsconfig.tsbuildinfo']) {
+        writeFileSync(join(other, name), name);
+      }
+      // A plain `.ts` beside them: the rule must not touch what Node can run.
+      writeFileSync(join(other, 'tool.ts'), 'export {};');
+      // Dir-level pruning at the package root…
+      mkdirSync(join(other, 'docs'), { recursive: true });
+      writeFileSync(join(other, 'docs', 'guide.md'), 'readme');
+      // …and inside a nested node_modules, which the walk must recurse into.
+      const inner = join(other, 'node_modules', 'inner');
+      mkdirSync(join(inner, 'examples'), { recursive: true });
+      writeFileSync(join(inner, 'package.json'), JSON.stringify({ name: 'inner' }));
+      writeFileSync(join(inner, 'index.js'), 'module.exports = {};');
+      writeFileSync(join(inner, 'index.d.ts'), 'declare const x: number;');
+      writeFileSync(join(inner, 'examples', 'demo.js'), 'module.exports = {};');
+      // The app's own dist is swept too: `tsc -b` emits these beside every entry.
+      writeFileSync(join(desktop, 'dist', 'index.d.ts'), 'export {};');
+      writeFileSync(join(desktop, 'dist', 'index.js.map'), '{}');
+
+      const staged = stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots });
+      const modules = join(stage, 'node_modules');
+      const stagedOther = join(modules, 'other');
+      const stagedInner = join(stagedOther, 'node_modules', 'inner');
+
+      // Gone from the staged tree — files, whole dirs, and the app's own dist.
+      for (const gone of [
+        join(stagedOther, 'index.d.ts'),
+        join(stagedOther, 'index.js.map'),
+        join(stagedOther, 'tsconfig.tsbuildinfo'),
+        join(stagedOther, 'docs'),
+        join(stagedInner, 'index.d.ts'),
+        join(stagedInner, 'examples'),
+        join(stage, 'dist', 'index.d.ts'),
+        join(stage, 'dist', 'index.js.map'),
+      ]) {
+        expect(existsSync(gone), gone).toBe(false);
+      }
+      // Kept: everything a runtime can load, including the nested package and
+      // the `.ts` file the file rule deliberately does not match.
+      for (const kept of [
+        join(stagedOther, 'index.js'),
+        join(stagedOther, 'tool.ts'),
+        join(stagedInner, 'index.js'),
+        join(stagedInner, 'package.json'),
+        join(stage, 'dist', 'index.js'),
+      ]) {
+        expect(existsSync(kept), kept).toBe(true);
+      }
+
+      // Reported, not silent: three files + two dirs under `other`, two files
+      // under the app's dist. An exact count pins both directions — a sweep
+      // that deleted nothing reports 0, and one that over-deleted would have
+      // tripped the `kept` assertions above.
+      expect(staged.prunedDirs).toBe(2);
+      expect(staged.prunedFiles).toBe(6);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
