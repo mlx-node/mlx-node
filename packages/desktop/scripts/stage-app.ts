@@ -84,54 +84,26 @@ export function scopeCoreNativeOverride(binding: string): string {
 }
 
 /**
- * `@mariozechner/clipboard` and its per-platform prebuilts, which arrive
- * transitively via `@earendil-works/pi-coding-agent` and must not ship.
- *
- * They fail the release gate outright. Both darwin prebuilts bake upstream's CI
- * home into their load commands —
- * `/Users/runner/work/clipboard/clipboard/target/…/libcrosscopy_clipboard.dylib`
- * — and step [3/5] of `verify-bundle.ts` refuses a bundle that ships a build
- * path. That is not our leak to fix: it is baked into the published tarball, so
- * the only lever on this side is not to carry it.
- *
- * Dropping it is safe for three independent reasons, and it needs all three:
- *  1. pi-coding-agent declares it under `optionalDependencies`, so absence is a
- *     supported state rather than a tree we happen to get away with breaking.
- *  2. `dist/utils/clipboard-native.js` loads it inside a `try {} catch {}` that
- *     falls through to `null` — a terminal-clipboard helper degrading in a
- *     process that has no terminal.
- *  3. Nothing in this repo references it. We import pi-coding-agent for session
- *     parsing (`SessionManager`, `parseSessionEntries`, `FileEntry`) only.
- *
- * It also ships TWICE for one architecture: `-darwin-arm64` (1.4 MB) alongside
- * `-darwin-universal` (2.9 MB), whose x86_64 slices this app can never execute.
- */
-function isExcludedThirdPartyBinary(name: string): boolean {
-  return /^@mariozechner\/clipboard(-|$)/.test(name);
-}
-
-/**
  * Dashboard-only payloads can omit pi-ai's lazy cloud providers. The desktop
  * bundle now also includes the full CLI, whose agent options may reach those
  * providers, so any closure rooted at @mlx-node/cli retains them. Nested package
- * pruning uses the same rule. Native clipboard binaries remain optional fallbacks.
+ * pruning uses the same rule.
+ *
+ * The set lists what pi-ai 0.99 declares, minus `@mistralai/mistralai` and
+ * `@opentelemetry/api`, which pi-ai 0.84 dropped (mistral went to plain fetch;
+ * otel was never imported). Dropped entries stay dropped — a name that can
+ * never be reached protects nothing.
  */
 const CLOUD_PROVIDER_SDKS = new Set([
   '@anthropic-ai/sdk',
   '@aws-sdk/client-bedrock-runtime',
   '@google/genai',
-  '@mistralai/mistralai',
-  '@opentelemetry/api',
   '@smithy/node-http-handler',
   'openai',
 ]);
 
 function isExcludedPackage(name: string, includeCloudProviders = false): boolean {
-  return (
-    isPrebuiltAddonPackage(name) ||
-    isExcludedThirdPartyBinary(name) ||
-    (!includeCloudProviders && CLOUD_PROVIDER_SDKS.has(name))
-  );
+  return isPrebuiltAddonPackage(name) || (!includeCloudProviders && CLOUD_PROVIDER_SDKS.has(name));
 }
 
 /**
@@ -141,13 +113,12 @@ function isExcludedPackage(name: string, includeCloudProviders = false): boolean
  * devDependency, ~277 MB) from shipping a second copy inside the app.
  *
  * `optionalDependencies` are followed but **may legitimately be absent**, and the
- * distinction is load-bearing rather than pedantic. This tree reaches
- * `@mariozechner/clipboard`, which fans out to one prebuilt per platform —
- * `…-win32-x64-msvc`, `…-linux-x64-gnu` and so on. On macOS only the darwin one
- * is installed, so treating a missing optional as fatal fails the build on a
- * package that could never have been used. A missing HARD dependency stays fatal:
- * its symptom in a packaged app is a module-not-found on a code path nobody
- * exercised before shipping.
+ * distinction is load-bearing rather than pedantic. napi-rs packages fan out to
+ * one prebuilt per platform (`…-win32-x64-msvc`, `…-linux-x64-gnu`, and so on),
+ * of which only the darwin one is installed on a Mac, so treating a missing
+ * optional as fatal fails the build on a package that could never have been
+ * used. A missing HARD dependency stays fatal: its symptom in a packaged app is
+ * a module-not-found on a code path nobody exercised before shipping.
  */
 export function runtimeClosure(
   repoRoot: string,
@@ -157,14 +128,12 @@ export function runtimeClosure(
   workspace: string[];
   skippedOptional: string[];
   excludedPrebuilt: string[];
-  excludedThirdParty: string[];
   excludedProviderSdk: string[];
 } {
   const external = new Set<string>();
   const workspace = new Set<string>();
   const skippedOptional: string[] = [];
   const excludedPrebuilt: string[] = [];
-  const excludedThirdParty: string[] = [];
   const excludedProviderSdk: string[] = [];
   const seen = new Set<string>();
   const queue: Array<{ name: string; optional: boolean }> = roots.map((name) => ({ name, optional: false }));
@@ -176,11 +145,6 @@ export function runtimeClosure(
 
     if (isPrebuiltAddonPackage(name)) {
       excludedPrebuilt.push(name);
-      continue;
-    }
-
-    if (isExcludedThirdPartyBinary(name)) {
-      excludedThirdParty.push(name);
       continue;
     }
 
@@ -210,7 +174,6 @@ export function runtimeClosure(
     workspace: [...workspace].sort(),
     skippedOptional: skippedOptional.sort(),
     excludedPrebuilt: excludedPrebuilt.sort(),
-    excludedThirdParty: excludedThirdParty.sort(),
     excludedProviderSdk: excludedProviderSdk.sort(),
   };
 }
@@ -312,14 +275,15 @@ function packageNamesIn(nodeModules: string): string[] {
  * Remove excluded packages that ride in on a nested `node_modules`.
  *
  * `runtimeClosure` decides by NAME while the copy above happens by DIRECTORY,
- * and the two disagree wherever Yarn could not hoist. `@earendil-works/pi-ai`
- * carries its own `node_modules/@smithy/node-http-handler`, so the exclusion
- * list refused the package and staged it anyway — a rule that reports success
- * and does nothing.
+ * and the two disagree wherever Yarn could not hoist. This rule exists because
+ * `@earendil-works/pi-ai` once carried its own `node_modules/@smithy/
+ * node-http-handler` — the exclusion list refused the package and staging
+ * shipped it anyway, a rule that reports success and does nothing.
  *
- * Today that gap is 232 KB. The reason to close it is not the 232 KB: nesting is
- * a resolution outcome, so the same version bump that moves a provider SDK down
- * one level would put the whole 114 MB back with no diff to explain it.
+ * pi-ai no longer nests that copy, so today the walk finds nothing. It stays as
+ * insurance: nesting is a resolution outcome, and the same version bump that
+ * moves a provider SDK down one level would put the whole SDK back with no diff
+ * to explain it.
  */
 export function pruneExcludedNested(modules: string, includeCloudProviders = false): string[] {
   const removed: string[] = [];
@@ -349,8 +313,6 @@ export interface StageResult {
   skippedOptional: string[];
   /** napi prebuilt packages deliberately left out; the payload ships once, in Resources/native. */
   excludedPrebuilt: string[];
-  /** Third-party binaries dropped because they leak a build path; see isExcludedThirdPartyBinary. */
-  excludedThirdParty: string[];
   /** Cloud-LLM SDKs dropped because nothing local-inference can reach them; see CLOUD_PROVIDER_SDKS. */
   excludedProviderSdk: string[];
   /** Count of examples/docs/test directories removed from staged packages. */
@@ -404,8 +366,10 @@ export function stageApp(opts: {
     )}\n`,
   );
 
-  const { external, workspace, skippedOptional, excludedPrebuilt, excludedThirdParty, excludedProviderSdk } =
-    runtimeClosure(repoRoot, opts.roots);
+  const { external, workspace, skippedOptional, excludedPrebuilt, excludedProviderSdk } = runtimeClosure(
+    repoRoot,
+    opts.roots,
+  );
   const modules = join(stageDir, 'node_modules');
 
   for (const name of external) {
@@ -459,7 +423,6 @@ export function stageApp(opts: {
     workspaceCount: workspace.length,
     skippedOptional,
     excludedPrebuilt,
-    excludedThirdParty,
     excludedProviderSdk,
     prunedDirs: pruned.dirs,
     prunedFiles: pruned.files,

@@ -293,9 +293,9 @@ const MAX_BUFFER = 256 * 1024 * 1024;
  *
  * EVERY regular file, with no permission filter. Selecting by `-perm +111` is the
  * obvious approach and it is WRONG: a `.node` is often not executable and a
- * `.dylib` usually is not (both prebuilts under `node_modules/@mariozechner` are
- * mode 644), so an exec-bit filter walks straight past the files most likely to be
- * unsigned.
+ * `.dylib` usually is not — published `.node`/`.dylib` prebuilts are routinely
+ * mode 644 — so an exec-bit filter walks straight past the files most likely to
+ * be unsigned.
  */
 export function listRegularFiles(root: string): string[] {
   const files: string[] = [];

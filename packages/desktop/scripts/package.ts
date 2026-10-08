@@ -141,9 +141,6 @@ if (staged.prunedNested.length > 0) {
     `  removed ${staged.prunedNested.join(', ')} from nested node_modules — copied by directory, not by name`,
   );
 }
-if (staged.excludedThirdParty.length > 0) {
-  console.log(`  excluded ${staged.excludedThirdParty.join(', ')} — leaks a build path, fails gate [3/5]`);
-}
 if (staged.excludedPrebuilt.length > 0) {
   console.log(`  excluded ${staged.excludedPrebuilt.join(', ')} — payload ships once, in Resources/native`);
 }

@@ -2,31 +2,31 @@
  * What the bundle is allowed to contain.
  *
  * `runtimeClosure` decides, package by package, what gets copied into the
- * shipped app. Three of its rules are not size tuning — they are the difference
- * between a bundle that notarizes and one that does not, or between an app that
- * is mostly itself and one that is mostly other people's cloud SDKs. All three
+ * shipped app. Its exclusions are not size tuning — they are the difference
+ * between a bundle that notarizes and one that does not, or between an app
+ * that is mostly itself and one that is mostly other people's cloud SDKs. Both
  * were found by running the release gate or measuring the artifact rather than
  * by reading code:
  *
  *  - `@mlx-node/core-*` is napi's published prebuilt. Staging it shipped the
  *    239 MB native payload a second time (993 MB total) even though nothing
  *    loads it.
- *  - `@mariozechner/clipboard*` bakes upstream's CI home into its load commands,
- *    which `verify-bundle.ts` step [3/5] refuses outright.
  *  - The cloud-LLM provider SDKs behind `@earendil-works/pi-ai` were 114 MB of
  *    an app that exists to run models locally, reachable only from a
  *    `stream()` call this app never makes.
  *
- * All three exclusions are silent by nature: the app still builds, still
- * launches, and still passes its own tests with any one wrong. Only a gate, a
- * notary, or `du` says otherwise, and all of those are minutes-to-hours away
- * from the edit. So the rules are pinned here, at the point where they are cheap
- * to check.
+ * The exclusions are silent by nature: the app still builds, still launches,
+ * and still passes its own tests with any one wrong. Only a gate, a notary, or
+ * `du` says otherwise, and all of those are minutes-to-hours away from the
+ * edit. So the rules are pinned here, at the point where they are cheap to
+ * check.
  *
- * These run against the REAL repo tree rather than a fixture. A fixture would
- * pin the shape of the walk while saying nothing about the dependency graph we
- * actually ship, and the graph is the part that moves under us — clipboard
- * arrived transitively, through a dependency nobody added for it.
+ * These tests drive the real entry points — `runtimeClosure`, `stageApp`, and
+ * `pruneExcludedNested` — over CONSTRUCTED fixture workspaces and assert on
+ * the staged output: which packages land in `stage/node_modules` and which do
+ * not. Nothing below reads the installed repo tree's layout; an assertion that
+ * did would pin whatever dependency graph upstream happened to ship today and
+ * break on every reshuffle. The exclusion lists themselves are the contract.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -46,7 +46,94 @@ import {
   stageRuntimeBuildFiles,
 } from '../scripts/stage-app.js';
 
+// Only the out-of-process provider-SDK probe below runs against the real repo —
+// it imports the installed pi-coding-agent to prove loading it resolves no SDK.
+// No other test may read this tree's node_modules.
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+interface SeedDeps {
+  dependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+}
+
+/** A registry package under `<root>/node_modules/<name>`, manifest and entry point included. */
+function seedPkg(root: string, name: string, deps: SeedDeps = {}): void {
+  const dir = join(root, 'node_modules', name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0', ...deps }));
+  writeFileSync(join(dir, 'index.js'), 'module.exports = {};');
+}
+
+/** A workspace package under `<root>/packages/<dir>` — where `@mlx-node/*` names resolve. */
+function seedWorkspace(root: string, dir: string, name: string, deps: SeedDeps = {}): void {
+  const pkgDir = join(root, 'packages', dir);
+  mkdirSync(join(pkgDir, 'dist'), { recursive: true });
+  // stageApp copies the dashboard's `assets` unconditionally (the offline
+  // tokenizer vocabulary), so a fixture dashboard must have one.
+  if (name === '@mlx-node/dashboard') mkdirSync(join(pkgDir, 'assets'), { recursive: true });
+  writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', ...deps }));
+  writeFileSync(join(pkgDir, 'dist', 'index.js'), 'export {};');
+}
+
+/** The `dependencies` of pi-ai that are provider SDKs — the names the exclusion rule must both drop and report. */
+const SDK_ROOTS = [
+  '@anthropic-ai/sdk',
+  '@aws-sdk/client-bedrock-runtime',
+  '@google/genai',
+  '@smithy/node-http-handler',
+  'openai',
+];
+
+/**
+ * One fixture workspace covering the whole dashboard-side graph: the three
+ * workspace roots, an external root, a pi-ai-like package declaring every
+ * provider SDK (only `openai` is seeded — the rest must be refused by name
+ * before resolution), a platform-gated napi optional, and a devDependency that
+ * must never be queued.
+ */
+function seedDashboardGraph(root: string): string[] {
+  seedWorkspace(root, 'dashboard', '@mlx-node/dashboard', {
+    dependencies: { tokenizers: '1.0.0', other: '1.0.0' },
+  });
+  seedWorkspace(root, 'server', '@mlx-node/server', {
+    dependencies: { '@earendil-works/pi-ai': '1.0.0' },
+    optionalDependencies: {
+      '@mlx-node/core-darwin-arm64': '1.0.0',
+      'platform-only-optional': '1.0.0',
+    },
+  });
+  seedWorkspace(root, 'lm', '@mlx-node/lm');
+  // All five SDKs are seeded, not just referenced: the dashboard closure must
+  // refuse them by name before resolution, but the CLI test reuses this graph
+  // with `@mlx-node/cli` in the roots, where the exclusion is switched off and
+  // every one of them has to resolve. `openai` alone gets a dependency, so the
+  // walk-not-deny-list half of the rule has a subtree to shed.
+  seedPkg(root, 'openai', { dependencies: { zod: '1.0.0' } });
+  for (const name of SDK_ROOTS.filter((n) => n !== 'openai')) seedPkg(root, name);
+  seedPkg(root, '@earendil-works/pi-ai', {
+    dependencies: Object.fromEntries(SDK_ROOTS.map((name) => [name, '1.0.0'])),
+  });
+  seedPkg(root, 'tokenizers');
+  seedPkg(root, 'other');
+  seedPkg(root, 'zod');
+  // A devDependency of a staged package: installable, never part of a runtime
+  // closure.
+  seedPkg(root, 'electron-updater', { devDependencies: { 'app-builder-lib': '1.0.0' } });
+  seedPkg(root, 'app-builder-lib');
+  return ['@mlx-node/dashboard', '@mlx-node/server', '@mlx-node/lm', 'electron-updater'];
+}
+
+/** A minimal Electron-app-shaped `desktopDir` for `stageApp`. */
+function seedDesktop(root: string): string {
+  const desktop = join(root, 'desktop');
+  mkdirSync(join(desktop, 'dist'), { recursive: true });
+  mkdirSync(join(desktop, 'build'), { recursive: true });
+  writeFileSync(join(desktop, 'dist', 'index.js'), 'export {};');
+  for (const name of ['iconTemplate.png', 'iconTemplate@2x.png']) writeFileSync(join(desktop, 'build', name), name);
+  writeFileSync(join(desktop, 'package.json'), JSON.stringify({ name: '@mlx-node/desktop', version: '0.0.1' }));
+  return desktop;
+}
 
 describe('runtime build assets', () => {
   it('stages the tray images without generator inputs', () => {
@@ -75,10 +162,6 @@ describe('runtime build assets', () => {
     }
   });
 });
-
-// Dashboard-only roots exercise metadata-only pruning. Production packaging
-// adds @mlx-node/cli; the first closure test below covers that superset.
-const ROOTS = ['@mlx-node/dashboard', '@mlx-node/server', '@mlx-node/lm', 'electron-updater'];
 
 it('rejects a changed generated core loader instead of silently shipping a broken override', () => {
   expect(() => scopeCoreNativeOverride('module.exports = require("./native.node")')).toThrow(
@@ -154,50 +237,87 @@ it('stages the offline vocabulary and only the macOS arm64 tokenizer binary', ()
 });
 
 describe('runtimeClosure', () => {
-  it('keeps the complete CLI runtime, including lazy providers used by agent options', () => {
-    const cli = runtimeClosure(repoRoot, [...ROOTS, '@mlx-node/cli']);
-    expect(cli.workspace).toContain('@mlx-node/cli');
-    expect(cli.workspace).toContain('@mlx-node/agent');
-    expect(cli.external).toContain('@earendil-works/pi-coding-agent');
-    expect(cli.external).toContain('openai');
-    expect(cli.excludedProviderSdk).toEqual([]);
-  });
-  const closure = runtimeClosure(repoRoot, ROOTS);
-
-  it('reaches the workspace packages the app actually runs', () => {
-    expect(closure.workspace).toContain('@mlx-node/dashboard');
-    expect(closure.workspace).toContain('@mlx-node/server');
-    expect(closure.external.length).toBeGreaterThan(0);
-    expect(closure.external).toContain('tokenizers');
-    expect(closure.external).not.toContain('gpt-tokenizer');
-    expect(closure.external).toContain('electron-updater');
-    expect(closure.external).not.toContain('app-builder-lib');
+  it('resolves workspace packages under packages/ and externals under node_modules', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-closure-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      expect(closure.workspace).toEqual(['@mlx-node/dashboard', '@mlx-node/lm', '@mlx-node/server']);
+      expect(closure.external).toContain('tokenizers');
+      expect(closure.external).toContain('other');
+      expect(closure.external).toContain('electron-updater');
+      expect(closure.external).toContain('@earendil-works/pi-ai');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it('excludes the clipboard prebuilts that leak a build path', () => {
-    // The assertion is on `external` rather than on the excluded list, because
-    // `external` is what gets COPIED. Reporting a package as excluded while
-    // still staging it would satisfy a check on the excluded list alone.
-    const staged = closure.external.filter((name) => name.startsWith('@mariozechner/clipboard'));
-    expect(staged).toEqual([]);
+  it('never queues a devDependency', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-closure-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      // `app-builder-lib` is installed and resolvable; only its declaration
+      // kind keeps it out.
+      expect(closure.external).not.toContain('app-builder-lib');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it('reports the exclusion instead of dropping it silently', () => {
-    // A silent exclusion reads as "this dependency was never here" to the next
-    // person wondering why clipboard support does nothing.
-    expect(closure.excludedThirdParty).toContain('@mariozechner/clipboard');
+  it('reports a missing optional as skippedOptional rather than failing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-closure-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      expect(closure.skippedOptional).toEqual(['platform-only-optional']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
-  it('still reaches clipboard in the graph — the exclusion is a decision, not an accident', () => {
-    // Guard-the-guard. If pi-coding-agent ever drops the dependency, the two
-    // tests above start passing for a reason that has nothing to do with the
-    // exclusion rule, and the rule could then be deleted without any test
-    // noticing. This fails loudly when that day comes.
-    expect(existsSync(join(repoRoot, 'node_modules', '@mariozechner', 'clipboard'))).toBe(true);
+  it('throws on a missing hard dependency — absence is never silent', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-closure-'));
+    try {
+      seedWorkspace(root, 'dashboard', '@mlx-node/dashboard', { dependencies: { gone: '1.0.0' } });
+      expect(() => runtimeClosure(root, ['@mlx-node/dashboard'])).toThrow('Cannot resolve "gone"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('never stages the napi prebuilt that would duplicate the native payload', () => {
-    expect(closure.external.filter((name) => name.startsWith('@mlx-node/core-'))).toEqual([]);
+    const root = mkdtempSync(join(tmpdir(), 'mlx-closure-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      // The assertion is on `external` — the list that is actually COPIED — and
+      // on the report beside it. One without the other is a rule that either
+      // does nothing or hides what it did.
+      expect(closure.external.filter((name) => name.startsWith('@mlx-node/core-'))).toEqual([]);
+      expect(closure.excludedPrebuilt).toEqual(['@mlx-node/core-darwin-arm64']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the complete CLI runtime, including lazy providers used by agent options', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-closure-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      // `@mlx-node/cli` in the roots switches the provider-SDK exclusion off:
+      // the bundled CLI's agent options may reach those providers. `openai` is
+      // both a pi-ai SDK and on the exclusion list, so it pins the
+      // roots.includes('@mlx-node/cli') gate rather than the name set.
+      seedWorkspace(root, 'cli', '@mlx-node/cli', { dependencies: { openai: '1.0.0' } });
+      const cli = runtimeClosure(root, [...roots, '@mlx-node/cli']);
+      expect(cli.workspace).toContain('@mlx-node/cli');
+      expect(cli.external).toContain('openai');
+      expect(cli.external).toContain('zod');
+      expect(cli.excludedProviderSdk).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -210,70 +330,115 @@ describe('runtimeClosure', () => {
  * session FILES; it never asks pi to talk to a model. So the SDKs are dead
  * weight — ~72 MB of it, 38% of the `node_modules` that would otherwise ship.
  *
- * The rule names five packages. It drops 76, because the other 71 stop being
- * reachable. Both halves are asserted: naming without dropping would mean the
- * walk kept a path in through something else, and dropping without naming would
- * mean the size came from somewhere this rule cannot defend.
+ * The rule names five packages and drops each one's whole subtree, because the
+ * packages behind them stop being reachable. Both halves are asserted on the
+ * fixture: naming without dropping would mean the walk kept a path in through
+ * something else, and dropping without naming would mean the exclusion came
+ * from somewhere this rule cannot defend. Whether upstream still declares the
+ * same five is deliberately NOT checked — the rule is the contract, and the
+ * probe at the end of this block is what keeps the premise honest.
  */
 describe('cloud provider SDK exclusion', () => {
-  const closure = runtimeClosure(repoRoot, ROOTS);
-
-  // The `dependencies` of @earendil-works/pi-ai that are provider SDKs, and so
-  // the ones the rule must both exclude and report. pi-ai 0.84 dropped two it
-  // used to declare — `@mistralai/mistralai`, whose provider is plain `fetch`
-  // now, and `@opentelemetry/api`, which it never imported — so neither is
-  // reachable and neither is reported any more.
-  //
-  // Hard-coded rather than read off the installed pi-ai: deriving it would make
-  // the last test in this block agree with upstream by construction, which is
-  // the one thing it exists to refuse.
-  const SDK_ROOTS = [
-    '@anthropic-ai/sdk',
-    '@aws-sdk/client-bedrock-runtime',
-    '@google/genai',
-    '@smithy/node-http-handler',
-    'openai',
-  ];
-
   it('stages none of the five provider SDKs', () => {
-    // On `external` — the list that is actually COPIED — for the same reason as
-    // clipboard above: a rule that reports an exclusion it does not perform
-    // would satisfy an assertion on `excludedProviderSdk` alone.
-    expect(closure.external.filter((name) => SDK_ROOTS.includes(name))).toEqual([]);
+    const root = mkdtempSync(join(tmpdir(), 'mlx-sdk-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      // On `external` — the list that is actually COPIED. A rule that reports
+      // an exclusion it does not perform would satisfy an assertion on
+      // `excludedProviderSdk` alone.
+      expect(closure.external.filter((name) => SDK_ROOTS.includes(name))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('drops the subtree behind them, not just the five names', () => {
-    // These are the expensive ones, and not one of them is named by the rule:
-    // they leave because nothing reachable still depends on them. If a future
-    // edit hard-codes a deny-list instead, this keeps passing while the walk
-    // silently stops being the thing that decides.
-    const collateral = closure.external.filter(
-      (name) =>
-        name === 'zod' ||
-        name === 'protobufjs' ||
-        name === 'web-streams-polyfill' ||
-        name === 'google-auth-library' ||
-        name.startsWith('@aws-sdk/') ||
-        name.startsWith('@smithy/') ||
-        name.startsWith('@opentelemetry/'),
-    );
-    expect(collateral).toEqual([]);
+    const root = mkdtempSync(join(tmpdir(), 'mlx-sdk-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      // `zod` is installed and declared only by `openai`. It leaves because
+      // nothing reachable still depends on it — the same way the real tree
+      // sheds protobufjs, google-auth-library, and the rest of the SDK
+      // support casts. If the walk stopped deciding and only the named five
+      // were filtered, this package would still ship.
+      expect(closure.external).not.toContain('zod');
+      expect(closure.external.filter((name) => name.startsWith('@smithy/'))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('reports the exclusion instead of dropping it silently', () => {
-    expect(closure.excludedProviderSdk.sort()).toEqual([...SDK_ROOTS].sort());
+    const root = mkdtempSync(join(tmpdir(), 'mlx-sdk-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      expect(closure.excludedProviderSdk.sort()).toEqual([...SDK_ROOTS].sort());
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('still reaches pi-ai — the SDKs are excluded, the library that lazy-loads them is not', () => {
-    // Guard-the-guard, two ways at once. `pi-ai` itself IS eagerly loaded and
-    // must keep shipping; and if upstream ever drops a provider SDK from its
-    // dependencies, the assertions above would start passing for a reason that
-    // has nothing to do with this rule.
-    expect(closure.external).toContain('@earendil-works/pi-ai');
-    const piAi = JSON.parse(
-      readFileSync(join(repoRoot, 'node_modules', '@earendil-works', 'pi-ai', 'package.json'), 'utf-8'),
-    ) as { dependencies?: Record<string, string> };
-    expect(Object.keys(piAi.dependencies ?? {}).sort()).toEqual(expect.arrayContaining([...SDK_ROOTS].sort()));
+    const root = mkdtempSync(join(tmpdir(), 'mlx-sdk-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const closure = runtimeClosure(root, roots);
+      expect(closure.external).toContain('@earendil-works/pi-ai');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('stages a complete app: closure, exclusion and nested pruning all land in stage/node_modules', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-e2e-stage-'));
+    try {
+      const roots = seedDashboardGraph(root);
+      const desktop = seedDesktop(root);
+      const stage = join(root, 'stage');
+      // `keep` asks for two provider SDKs, one of which Yarn nested instead of
+      // hoisting, a normal nested package that must survive the same walk, and
+      // a platform-gated napi optional.
+      seedPkg(root, 'keep', {
+        dependencies: { openai: '1.0.0', '@smithy/node-http-handler': '1.0.0', chalk: '1.0.0' },
+        optionalDependencies: { '@mlx-node/core-darwin-arm64': '1.0.0' },
+      });
+      seedPkg(root, 'chalk');
+      const nested = join(root, 'node_modules', 'keep', 'node_modules');
+      mkdirSync(join(nested, '@smithy', 'node-http-handler'), { recursive: true });
+      writeFileSync(
+        join(nested, '@smithy', 'node-http-handler', 'package.json'),
+        JSON.stringify({ name: '@smithy/node-http-handler', version: '9.9.9' }),
+      );
+      mkdirSync(join(nested, 'chalk'), { recursive: true });
+      writeFileSync(join(nested, 'chalk', 'package.json'), JSON.stringify({ name: 'chalk', version: '9.9.9' }));
+      writeFileSync(join(nested, 'chalk', 'index.js'), 'module.exports = {};');
+
+      const staged = stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: [...roots, 'keep'] });
+      const modules = join(stage, 'node_modules');
+
+      // What ships: `keep`, its hoisted `chalk`, and the rest of the dashboard
+      // graph. What does not: every name on an exclusion list, top-level AND
+      // nested.
+      expect(existsSync(join(modules, 'keep'))).toBe(true);
+      expect(existsSync(join(modules, 'chalk'))).toBe(true);
+      expect(existsSync(join(modules, '@earendil-works', 'pi-ai'))).toBe(true);
+      expect(existsSync(join(modules, 'openai'))).toBe(false);
+      expect(existsSync(join(modules, '@smithy'))).toBe(false);
+      expect(existsSync(join(modules, '@mlx-node', 'core-darwin-arm64'))).toBe(false);
+      expect(existsSync(join(modules, 'keep', 'node_modules', '@smithy', 'node-http-handler'))).toBe(false);
+      expect(existsSync(join(modules, 'keep', 'node_modules', 'chalk'))).toBe(true);
+
+      // And each outcome is reported, not silent. `keep` and `pi-ai` between
+      // them reach all five SDK names.
+      expect(staged.excludedProviderSdk.sort()).toEqual([...SDK_ROOTS].sort());
+      expect(staged.excludedPrebuilt).toEqual(['@mlx-node/core-darwin-arm64']);
+      expect(staged.prunedNested).toEqual(['@smithy/node-http-handler']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('is safe because pi-ai loads no provider SDK until a stream() call', () => {
@@ -327,13 +492,13 @@ describe('cloud provider SDK exclusion', () => {
  *
  * Wherever Yarn could not hoist, those two disagree, and the disagreement is
  * silent in exactly the direction that matters: `runtimeClosure` reports the
- * package as excluded and a copy ships anyway. `@earendil-works/pi-ai` really
- * does nest `@smithy/node-http-handler`, so this is a live case rather than a
- * hypothetical one.
+ * package as excluded and a copy ships anyway. pi-ai once nested
+ * `@smithy/node-http-handler` this way; today it does not, so the rule is
+ * insurance against the next version bump that re-nests an SDK.
  *
- * On a fixture, not the repo tree — unlike the closure rules above, this one is
- * about a filesystem operation, and the interesting inputs (an excluded package
- * nested two levels down, a legitimate one beside it) have to be constructed.
+ * The interesting inputs — an excluded package nested two levels down, a
+ * legitimate one beside it — have to be constructed, so this runs on a fixture
+ * like everything else here.
  */
 describe('pruneExcludedNested', () => {
   it('removes excluded packages from nested node_modules and leaves the rest', () => {
@@ -378,14 +543,6 @@ describe('pruneExcludedNested', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
-
-  it('still finds a nested copy in the real tree — the gap this closes is live', () => {
-    // Guard-the-guard. If pi-ai ever stops nesting, the fixture test above keeps
-    // passing while the rule protects nothing real, and someone deletes it.
-    expect(existsSync(join(repoRoot, 'node_modules', '@earendil-works', 'pi-ai', 'node_modules', '@smithy'))).toBe(
-      true,
-    );
   });
 });
 
