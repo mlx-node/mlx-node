@@ -295,8 +295,14 @@ impl Weights {
     }
 }
 
+/// The default device is process-wide and `cpu_reference` parks it on the
+/// CPU between GPU evals, so these tests must not run concurrently —
+/// otherwise a route probe can eval on the CPU and read zero kernel
+/// counters (the CI VM flake at `m8_nax_leaves_every_other_case_alone`).
+static DEVICE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn select_cpu() {
-    // SAFETY: global device setter; tests run on one thread.
+    // SAFETY: global device setter; callers hold DEVICE_LOCK.
     unsafe { mlx_sys::mlx_set_default_device(0) };
 }
 
@@ -455,6 +461,7 @@ fn routes_m8(n: i64, k: i64, bits: i32) -> bool {
 /// counter, no zero outputs, and the split count reported.
 #[test]
 fn m8_nax_matches_cpu_on_every_mode_and_shape() {
+    let _guard = DEVICE_LOCK.lock().unwrap();
     if !select_gpu() {
         eprintln!("skipping: no GPU device");
         return;
@@ -539,6 +546,7 @@ fn m8_nax_matches_cpu_on_every_mode_and_shape() {
 /// byte-identical.
 #[test]
 fn m8_nax_is_deterministic() {
+    let _guard = DEVICE_LOCK.lock().unwrap();
     if !select_gpu() {
         eprintln!("skipping: no GPU device");
         return;
@@ -574,23 +582,40 @@ fn m8_nax_is_deterministic() {
 /// row-major, only q3k, q2k, iq4nl and the grid formats reach it.
 #[test]
 fn m8_nax_leaves_every_other_case_alone() {
+    let _guard = DEVICE_LOCK.lock().unwrap();
     if !select_gpu() {
         eprintln!("skipping: no GPU device");
         return;
     }
-    // (tensor op, sg8, qmv_wide) in the layout of `w`.
-    let route = |what: &str, x: &MxArray, w: &Weights| -> (u64, u64, u64) {
+    // (tensor op, sg8, qmv_wide, qmv) in the layout of `w`.
+    let route = |what: &str, x: &MxArray, w: &Weights| -> (u64, u64, u64, u64) {
         counting(true);
         let _ = read_u16(qmm(x, w));
         let r = if w.tiled {
-            (family("qmm_m8_nax_t64"), 0, family("qmv_wide_t64"))
+            (
+                family("qmm_m8_nax_t64"),
+                0,
+                family("qmv_wide_t64"),
+                family("qmv_t64"),
+            )
         } else {
-            (family("qmm_m8_nax"), family("qmv_sg8"), family("qmv_wide"))
+            (
+                family("qmm_m8_nax"),
+                family("qmv_sg8"),
+                family("qmv_wide"),
+                family("qmv") + family("qmv_fast"),
+            )
         };
         counting(false);
-        println!("  {what:<40} m8_nax {} sg8 {} wide {}", r.0, r.1, r.2);
+        println!(
+            "  {what:<40} m8_nax {} sg8 {} wide {} qmv {}",
+            r.0, r.1, r.2, r.3
+        );
         r
     };
+    // The Metal generation the dispatcher routes by (MLX_METAL_GPU_ARCH
+    // override included); the vector fallbacks below it are gen-dependent.
+    let gpu_gen = unsafe { mlx_sys::mlx_test_kquant_gpu_gen() };
     let q4k = FORMATS[0];
     let q3k = FORMATS[4];
     // K = 1280 splits at most 2 ways (512-input partitions), so N = 2048's 32
@@ -607,13 +632,16 @@ fn m8_nax_leaves_every_other_case_alone() {
     // (expected tensor op, expected qmv_wide) for the modes without sg8;
     // the grid rule is per mode (the split count is bounded by the partials
     // the mode's weight bytes can absorb).
-    let expect = |what: &str, n: i64, bits: i32, m8: u64, wide: u64| {
+    let expect = |what: &str, n: i64, bits: i32, m8: u64, wide: u64, qmv: u64| {
         let takes = routes_m8(n, k, bits);
         println!("  {what}: tensor op {takes}");
         if takes {
             assert!(m8 == 1 && wide == 0, "{what}: must take the tensor op");
         } else if m8_is_matvec(n, k) {
-            assert!(m8 == 0 && wide > 0, "{what}: must stay on qmv_wide");
+            assert!(
+                m8 == 0 && (wide > 0 || qmv > 0),
+                "{what}: must stay on the vector route (qmv_wide gen-15+, qmv below)"
+            );
         } else {
             assert!(
                 m8 == 0 && wide == 0,
@@ -622,28 +650,37 @@ fn m8_nax_leaves_every_other_case_alone() {
         }
     };
 
-    // Row-major: q3k goes to the tensor op where the grid allows, q4k stays
-    // on sg8 regardless.
+    // Row-major: q3k goes to the tensor op where the grid allows, q4k keeps
+    // the vector route — qmv_sg8 on gen-17+, qmv_wide on gen-15/16, qmv
+    // below (neither fallback exists on older archs; the CI VM GPU is one).
     let w4 = Weights::new(q4k, n_small, k, 2);
-    let (m8, sg8, _) = route("q4k M=8 N=2048 row-major", &bf16_x(&xb, k), &w4);
-    assert!(m8 == 0 && sg8 > 0, "row-major q4k must keep qmv_sg8");
+    let (m8, sg8, wide, qmv) = route("q4k M=8 N=2048 row-major", &bf16_x(&xb, k), &w4);
+    assert!(m8 == 0, "row-major q4k must not take the tensor op");
+    if gpu_gen >= 17 {
+        assert!(sg8 > 0, "gen-{gpu_gen}: row-major q4k must keep qmv_sg8");
+    } else {
+        assert!(
+            wide > 0 || qmv > 0 || !m8_is_matvec(n_small, k),
+            "gen-{gpu_gen}: row-major q4k must keep qmv_wide/qmv (or the GEMM)"
+        );
+    }
     for n in [n_small, n_wide] {
         let w3 = Weights::new(q3k, n, k, 3);
-        let (m8, _, wide) = route(&format!("q3k M=8 N={n} row-major"), &bf16_x(&xb, k), &w3);
-        expect(&format!("row-major q3k N={n}"), n, q3k.bits, m8, wide);
+        let (m8, _, wide, qmv) = route(&format!("q3k M=8 N={n} row-major"), &bf16_x(&xb, k), &w3);
+        expect(&format!("row-major q3k N={n}"), n, q3k.bits, m8, wide, qmv);
         // q2k has no sg8 decode either, so row-major it takes the tensor op
         // too.
         let q2k = *FORMATS.iter().find(|f| f.mode == "q2k").expect("q2k");
         let w2 = Weights::new(q2k, n, k, 4);
-        let (m8, sg8, wide) = route(&format!("q2k M=8 N={n} row-major"), &bf16_x(&xb, k), &w2);
+        let (m8, sg8, wide, qmv) = route(&format!("q2k M=8 N={n} row-major"), &bf16_x(&xb, k), &w2);
         assert_eq!(sg8, 0, "q2k has no qmv_sg8 kernel");
-        expect(&format!("row-major q2k N={n}"), n, q2k.bits, m8, wide);
+        expect(&format!("row-major q2k N={n}"), n, q2k.bits, m8, wide, qmv);
 
         // The grid formats have no sg8 decode either: row-major they take
         // the tensor op like q2k.
         for fmt in FORMATS.iter().filter(|f| f.is_grid()) {
             let wg = Weights::new(*fmt, n, k, 5);
-            let (m8, sg8, wide) = route(
+            let (m8, sg8, wide, qmv) = route(
                 &format!("{} M=8 N={n} row-major", fmt.mode),
                 &bf16_x(&xb, k),
                 &wg,
@@ -655,27 +692,28 @@ fn m8_nax_leaves_every_other_case_alone() {
                 fmt.bits,
                 m8,
                 wide,
+                qmv,
             );
         }
 
         // Tiled: every mode takes it where the grid allows.
         let t4 = Weights::new(q4k, n, k, 2).tiled();
-        let (m8, _, wide) = route(&format!("q4k M=8 N={n} tiled"), &bf16_x(&xb, k), &t4);
-        expect(&format!("tiled q4k N={n}"), n, q4k.bits, m8, wide);
+        let (m8, _, wide, qmv) = route(&format!("q4k M=8 N={n} tiled"), &bf16_x(&xb, k), &t4);
+        expect(&format!("tiled q4k N={n}"), n, q4k.bits, m8, wide, qmv);
     }
     let w3 = Weights::new(q3k, n_small, k, 3);
     let t4 = w4.tiled();
 
     // N % 64 == 32: no column tail, so the old routes take it (such a weight
     // cannot tile either).
-    let (m8, _, wide) = route(
+    let (m8, _, wide, qmv) = route(
         "q3k M=8 N=2080 row-major",
         &bf16_x(&xb, k),
         &Weights::new(q3k, 2080, k, 1),
     );
     assert!(
-        m8 == 0 && (wide > 0 || !m8_is_matvec(2080, k)),
-        "N % 64 != 0 must fall back to qmv_wide (or the GEMM at the qmv batch limit)"
+        m8 == 0 && (wide > 0 || qmv > 0 || !m8_is_matvec(2080, k)),
+        "N % 64 != 0 must fall back to the vector route (qmv_wide gen-15+, qmv below) or the GEMM"
     );
 
     // Other row counts never reach the 8-row tier, in either layout (tiled
@@ -683,9 +721,9 @@ fn m8_nax_leaves_every_other_case_alone() {
     for m in [7i64, 9] {
         let x = MxArray::from_bfloat16(&activation_bits(m, k, 9 + m as u32, false), &[m, k])
             .expect("x");
-        let (m8, _, _) = route(&format!("q3k M={m} N=2048 row-major"), &x, &w3);
+        let (m8, _, _, _) = route(&format!("q3k M={m} N=2048 row-major"), &x, &w3);
         assert_eq!(m8, 0, "M={m} must not take qmm_m8_nax");
-        let (m8, _, _) = route(&format!("q4k M={m} N=2048 tiled"), &x, &t4);
+        let (m8, _, _, _) = route(&format!("q4k M={m} N=2048 tiled"), &x, &t4);
         assert_eq!(m8, 0, "M={m} must not take qmm_m8_nax_t64");
     }
 }
