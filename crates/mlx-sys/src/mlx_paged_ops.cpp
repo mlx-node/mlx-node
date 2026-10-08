@@ -6847,6 +6847,7 @@ static int grouped_graph_parity_impl(
     float attention_scale,
     int sliding_window,
     uint8_t route_hint,
+    uint32_t grouped_stripes,
     const char* label) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
@@ -7002,7 +7003,9 @@ static int grouped_graph_parity_impl(
             kNumKvHeads,
             kHeadSize,
             KvDtype::Bf16,
-            route_hint);
+            route_hint,
+            /*s=*/{},
+            grouped_stripes);
       }
       const int32_t cu_values[2] = {0, 2};
       array cu_seqlens_q(cu_values, Shape{2}, int32);
@@ -7138,14 +7141,17 @@ int mlx_paged_grouped_qwen35_graph_parity(
       /*attention_scale=*/1.0f / 16.0f,
       /*sliding_window=*/73,
       /*route_hint=*/0,
+      /*grouped_stripes=*/0,
       "mlx_paged_grouped_qwen35_graph_parity");
 }
 
-/// Runtime-geometry graph parity for the canonical direct-read BF16 D512 route.
+/// Runtime-geometry graph parity for the canonical direct-read BF16 D512 route
+/// at the caller's partition plan.
 int mlx_paged_grouped_d512_graph_parity(
     int num_q_heads,
     int num_kv_heads,
-    int context_len) {
+    int context_len,
+    uint32_t grouped_stripes) {
   const bool supported_heads =
       (num_q_heads == 8 && num_kv_heads == 1) ||
       (num_q_heads == 16 && num_kv_heads == 1) ||
@@ -7163,15 +7169,17 @@ int mlx_paged_grouped_d512_graph_parity(
       /*attention_scale=*/1.0f,
       /*sliding_window=*/0,
       /*route_hint=*/1,
+      grouped_stripes,
       "mlx_paged_grouped_d512_graph_parity");
 }
 
 /// Compatibility wrapper for the original Gemma 4 16Q/1KV parity probe.
-int mlx_paged_grouped_gemma4_graph_parity(int context_len) {
+int mlx_paged_grouped_gemma4_graph_parity(int context_len, uint32_t grouped_stripes) {
   return mlx_paged_grouped_d512_graph_parity(
       /*num_q_heads=*/16,
       /*num_kv_heads=*/1,
-      context_len);
+      context_len,
+      grouped_stripes);
 }
 
 } // extern "C"

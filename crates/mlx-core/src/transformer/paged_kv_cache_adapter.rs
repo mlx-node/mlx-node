@@ -4905,11 +4905,13 @@ impl PagedKVCacheAdapter {
             scale,
             softcap,
             PagedDecodeRouteHint::Auto,
+            0,
         )
         .map(|(output, _)| output)
     }
 
-    /// Synchronous raw-Metal fallback with the same compute-route hint as the
+    /// Synchronous raw-Metal fallback with the same compute-route hint and
+    /// grouped partition plan (`grouped_stripes`, 0 = unplanned) as the
     /// graph-native path. Returns whether the grouped D512 kernel was actually
     /// selected, allowing callers to report a truthful demotion or fallback.
     #[cfg(target_os = "macos")]
@@ -4920,6 +4922,7 @@ impl PagedKVCacheAdapter {
         scale: f32,
         softcap: f32,
         route_hint: PagedDecodeRouteHint,
+        grouped_stripes: u32,
     ) -> Result<(MxArray, bool), String> {
         // 1. Active request?
         if self.block_table.is_none() {
@@ -5047,6 +5050,7 @@ impl PagedKVCacheAdapter {
                 k_scale,
                 v_scale,
                 raw_route_hint,
+                grouped_stripes,
             )?
         };
         let used_grouped_d512 = output.used_grouped_d512;
@@ -5704,6 +5708,7 @@ impl PagedKVCacheAdapter {
         _scale: f32,
         _softcap: f32,
         _route_hint: PagedDecodeRouteHint,
+        _grouped_stripes: u32,
     ) -> Result<(MxArray, bool), String> {
         Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
     }

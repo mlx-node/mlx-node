@@ -185,8 +185,8 @@ fn resolve_paged_decode_mode(route: Option<&str>, grouped_d512: Option<&str>) ->
 }
 
 /// Parse the D512 escape hatch with the dispatchers' exact, case-sensitive
-/// values. The model router defaults to production Auto after its model-level
-/// crossover gate; an explicit unsupported value remains the rollback switch.
+/// values. Auto takes the grouped kernel with the device rule's partitions;
+/// an explicit unsupported value remains the rollback switch.
 fn parse_grouped_d512_selector(value: Option<&str>) -> &'static str {
     match value {
         None | Some("1" | "on" | "auto" | "true") => "auto",
@@ -209,35 +209,28 @@ fn grouped_d512_diagnostic_config() -> (&'static str, Option<u32>) {
     (config.0.as_str(), config.1)
 }
 
-fn grouped_d512_measured_crossover(num_heads: i32, num_kv_heads: i32) -> Option<u32> {
-    match (num_heads, num_kv_heads) {
-        // Two-run raw-Metal operator A/Bs at 91,765 and 112K cleared the
-        // >=10% gate for these shipped geometries. Hq8/Hkv1 was unstable
-        // (0.991x in one repeat) and therefore remains force-only.
-        (16, 2) | (32, 4) => Some(92 * 1024),
-        _ => None,
-    }
+/// Stage-1 SIMD groups per GPU core that saturate the grouped D512 kernel
+/// (one SIMD group per query head per partition, each walking its 16-token
+/// pages serially). On a 40-core GPU, Hq8 decode rose from 64 to 128
+/// partitions (12.8 to 25.6 SIMD groups per core) and was flat at 256; Hq16
+/// rose to 64 (25.6 per core), gained 1% at 128 and lost 3% at 256.
+const GROUPED_D512_SIMD_GROUPS_PER_CORE: u32 = 16;
+
+fn gpu_core_count() -> u32 {
+    static CORES: OnceLock<u32> = OnceLock::new();
+    *CORES.get_or_init(|| u32::try_from(unsafe { mlx_sys::mlx_gpu_core_count() }).unwrap_or(0))
 }
 
-// Mirror both low-level dispatchers using actual context, not the rounded route
-// bucket. A fixed-session A/B measured Hq16/Hkv2 at 91,795 context for 512
-// generated tokens: 128 stripes delivered 32.8416 tok/s versus 31.0484 for 64
-// (+5.78%, 3/3 paired wins); the raw 112K sweep did not regress.
-const D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT: u32 = 88 * 1024 + 1;
-
-fn grouped_d512_default_stripes(actual_context: u32, num_heads: i32, num_kv_heads: i32) -> u32 {
-    let base_stripes: u32 = match actual_context {
-        0..=4_096 => 32,
-        4_097..=8_192 => 64,
-        _ => 128,
-    };
-    let stripes = (base_stripes / num_kv_heads.max(1) as u32).max(4);
-    if (num_heads, num_kv_heads) == (16, 2) && actual_context >= D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT
-    {
-        128
-    } else {
-        stripes
-    }
+/// The smallest power-of-two partition count that fills the device, bounded
+/// by the 16-token work tiles and the reducer's 256-partition policy. A pure
+/// function of the context and device, so every token of a run and every run
+/// on one machine reduce attention in the same order.
+fn grouped_d512_rule_stripes(actual_context: u32, num_heads: i32, gpu_cores: u32) -> u32 {
+    let saturating = (GROUPED_D512_SIMD_GROUPS_PER_CORE * gpu_cores.max(1))
+        .div_ceil(num_heads.max(1) as u32)
+        .next_power_of_two();
+    let tile_bound = 1u32 << actual_context.div_ceil(16).max(1).ilog2();
+    saturating.min(tile_bound).clamp(4, 256)
 }
 
 fn grouped_d512_planned_stripes(
@@ -245,32 +238,13 @@ fn grouped_d512_planned_stripes(
     override_stripes: Option<u32>,
     actual_context: u32,
     num_heads: i32,
-    num_kv_heads: i32,
+    gpu_cores: u32,
 ) -> Option<u32> {
-    // Production eager decode can override the conservative initial policy
-    // with a measured device-local plan. Explicit diagnostics always win.
-    if selector == "auto"
-        && override_stripes.is_none()
-        && let Some(choice) =
-            super::decode_tuning::current_plan().and_then(|plan| plan.grouped_stripes)
-    {
-        return (actual_context > 512 && choice != 0).then_some(choice);
-    }
-    let policy_context = decode_context_bucket_end(actual_context);
-    let eligible = actual_context > 512
-        && (selector == "force"
-            || (selector == "auto"
-                && grouped_d512_measured_crossover(num_heads, num_kv_heads)
-                    .is_some_and(|crossover| policy_context >= crossover)));
-    if !eligible {
-        return None;
-    }
-    override_stripes.or_else(|| {
-        Some(grouped_d512_default_stripes(
-            actual_context,
-            num_heads,
-            num_kv_heads,
-        ))
+    // The kernel partitions contexts beyond one generic 512-token partition.
+    // Explicit diagnostics always win over the device rule.
+    (actual_context > 512 && selector != "off").then(|| {
+        override_stripes
+            .unwrap_or_else(|| grouped_d512_rule_stripes(actual_context, num_heads, gpu_cores))
     })
 }
 
@@ -305,13 +279,14 @@ fn grouped_d512_kernel_candidate(
     num_kv_heads: i32,
     head_dim: i32,
     capability_confirmed: bool,
+    gpu_cores: u32,
 ) -> (&'static str, Option<u32>) {
     let grouped_stripes = grouped_d512_planned_stripes(
         selector,
         override_stripes,
         total_context,
         num_heads,
-        num_kv_heads,
+        gpu_cores,
     );
     let exact_shape = grouped_d512_geometry_supported(
         query_dtype,
@@ -332,9 +307,9 @@ fn paged_decode_route_hint(requested_paged_kernel: &str) -> PagedDecodeRouteHint
     if requested_paged_kernel == "grouped_d512_direct" {
         PagedDecodeRouteHint::ForceD512Staged
     } else {
-        // The model-level measured crossover is authoritative. Passing Auto
-        // here would let the lower-level environment selector independently
-        // re-enable grouped D512 below that crossover and make diagnostics lie.
+        // The model-level decision is authoritative. Passing Auto here would
+        // let the lower-level environment selector independently re-enable
+        // grouped D512 and make diagnostics lie.
         PagedDecodeRouteHint::ForceGeneric
     }
 }
@@ -1176,6 +1151,7 @@ impl Gemma4Attention {
         let memory_snapshot = adapter.decode_memory_snapshot(context_bucket_end);
         let live_headroom = live_prefill_headroom(memory_snapshot).selected_bytes;
         let (grouped_selector, grouped_stripe_override) = grouped_d512_diagnostic_config();
+        let gpu_cores = gpu_core_count();
         let grouped_policy_eligible = grouped_d512_geometry_supported(
             query_dtype,
             cache_dtype,
@@ -1188,7 +1164,7 @@ impl Gemma4Attention {
             grouped_stripe_override,
             total_ctx,
             self.num_heads,
-            self.num_kv_heads,
+            gpu_cores,
         )
         .is_some();
         let grouped_capability = grouped_policy_eligible
@@ -1213,6 +1189,7 @@ impl Gemma4Attention {
             self.num_kv_heads,
             self.head_dim,
             grouped_capability_confirmed,
+            gpu_cores,
         );
         let requested_paged_kernel =
             if mode == PagedDecodeMode::ForcePagedAttention && grouped_selector != "force" {
@@ -1355,7 +1332,14 @@ impl Gemma4Attention {
         let mut raw_used_grouped_d512 = false;
         let raw_route = |adapter: &mut PagedKVCacheAdapter| {
             adapter
-                .gather_kv_for_decode_with_route(paged_idx, &queries_3d, 1.0, 1.0, paged_route_hint)
+                .gather_kv_for_decode_with_route(
+                    paged_idx,
+                    &queries_3d,
+                    1.0,
+                    1.0,
+                    paged_route_hint,
+                    requested_grouped_stripes.unwrap_or(0),
+                )
                 .map_err(napi::Error::from_reason)
         };
         let attn_3d = if !graph_decode_gather_enabled() {
@@ -2556,29 +2540,45 @@ mod tests {
         assert_eq!(parse_grouped_d512_selector(Some("force")), "force");
         assert_eq!(parse_grouped_d512_selector(Some("auto")), "auto");
         assert_eq!(parse_grouped_d512_selector(None), "auto");
-        // An unmeasured geometry starts on the conservative policy. A
-        // measured choice uses actual capabilities at the final dispatch gate.
-        assert_eq!(
-            grouped_d512_planned_stripes("auto", None, 20_000, 16, 1),
-            None
-        );
-        {
-            let _scope = super::super::decode_tuning::PlanScope::enter(
-                super::super::decode_tuning::DecodePlan {
-                    early_layers: 0,
-                    grouped_stripes: Some(32),
-                },
-            );
+        // The partition count is a pure function of context, query heads and
+        // GPU cores: the smallest power of two that fills the device, bounded
+        // by the 16-token tiles and the 256-partition reducer policy.
+        for (context, heads, cores, expected) in [
+            (513, 8, 40, 32),
+            (1_024, 8, 40, 64),
+            (2_048, 8, 40, 128),
+            (20_000, 8, 40, 128),
+            (20_000, 16, 40, 64),
+            (20_000, 32, 40, 32),
+            (20_000, 16, 8, 8),
+            (20_000, 32, 8, 4),
+            (20_000, 8, 4_096, 256),
+            (600, 8, 4_096, 32),
+            (20_000, 8, 0, 4),
+        ] {
             assert_eq!(
-                grouped_d512_planned_stripes("auto", None, 20_000, 16, 1),
-                Some(32)
-            );
-            assert_eq!(grouped_d512_planned_stripes("auto", None, 512, 16, 1), None);
-            assert_eq!(
-                grouped_d512_planned_stripes("off", None, 20_000, 16, 1),
-                None
+                grouped_d512_rule_stripes(context, heads, cores),
+                expected,
+                "context={context} heads={heads} cores={cores}"
             );
         }
+        assert_eq!(
+            grouped_d512_planned_stripes("auto", None, 20_000, 16, 40),
+            Some(64)
+        );
+        assert_eq!(
+            grouped_d512_planned_stripes("auto", None, 512, 16, 40),
+            None
+        );
+        assert_eq!(
+            grouped_d512_planned_stripes("off", None, 20_000, 16, 40),
+            None
+        );
+        assert_eq!(
+            grouped_d512_planned_stripes("auto", Some(16), 20_000, 16, 40),
+            Some(16),
+            "an explicit validated override remains authoritative"
+        );
         assert_eq!(
             parse_grouped_d512_selector(Some(" FORCE ")),
             "off",
@@ -2597,6 +2597,7 @@ mod tests {
                 1,
                 512,
                 true,
+                40,
             ),
             ("grouped_d512_direct", Some(16))
         );
@@ -2612,6 +2613,7 @@ mod tests {
                 1,
                 512,
                 true,
+                40,
             ),
             ("generic_v2", None),
             "a stripes override alone must not enable the grouped kernel"
@@ -2628,98 +2630,19 @@ mod tests {
                 1,
                 512,
                 true,
+                40,
             ),
             ("generic_v2", None),
             "the diagnostic candidate must enforce the dispatcher's BF16 guard"
         );
-        assert_eq!(
-            grouped_d512_kernel_candidate(
-                "auto",
-                None,
-                94_208,
-                DType::BFloat16,
-                Some(DType::BFloat16),
-                16,
-                16,
-                2,
-                512,
-                true,
-            ),
-            ("grouped_d512_direct", Some(128)),
-            "the capability-confirmed Hkv2 geometry must remain direct-paged at long context"
-        );
-        assert_eq!(
-            grouped_d512_kernel_candidate(
-                "auto",
-                None,
-                90_112,
-                DType::BFloat16,
-                Some(DType::BFloat16),
-                16,
-                16,
-                2,
-                512,
-                true,
-            ),
-            ("generic_v2", None),
-            "the complete bucket below the measured crossover stays generic"
-        );
-        assert_eq!(
-            grouped_d512_kernel_candidate(
-                "auto",
-                None,
-                90_113,
-                DType::BFloat16,
-                Some(DType::BFloat16),
-                16,
-                16,
-                2,
-                512,
-                true,
-            ),
-            ("grouped_d512_direct", Some(128)),
-            "route stability intentionally enables the whole 92K-ending bucket"
-        );
-        for context in [91_795, 112_000] {
+        for (query_heads, kv_heads, expected_stripes) in
+            [(8, 1, 128), (16, 1, 64), (16, 2, 64), (32, 4, 32)]
+        {
             assert_eq!(
                 grouped_d512_kernel_candidate(
                     "auto",
                     None,
-                    context,
-                    DType::BFloat16,
-                    Some(DType::BFloat16),
-                    16,
-                    16,
-                    2,
-                    512,
-                    true,
-                ),
-                ("grouped_d512_direct", Some(128)),
-                "the measured Hq16/Hkv2 long-context cases use wide stripes"
-            );
-        }
-        assert_eq!(
-            grouped_d512_kernel_candidate(
-                "auto",
-                Some(32),
-                91_795,
-                DType::BFloat16,
-                Some(DType::BFloat16),
-                16,
-                16,
-                2,
-                512,
-                true,
-            ),
-            ("grouped_d512_direct", Some(32)),
-            "an explicit validated override remains authoritative"
-        );
-        for (query_heads, kv_heads, expected_stripes) in [(16, 2, 128), (32, 4, 32)] {
-            assert_eq!(
-                grouped_d512_kernel_candidate(
-                    "auto",
-                    None,
-                    90_113,
+                    4_015,
                     DType::BFloat16,
                     Some(DType::BFloat16),
                     16,
@@ -2727,26 +2650,28 @@ mod tests {
                     kv_heads,
                     512,
                     true,
+                    40,
                 ),
                 ("grouped_d512_direct", Some(expected_stripes)),
-                "qualified D512 geometries retain their mirrored defaults at the first eligible bucket"
+                "every capability-confirmed D512 geometry is direct-paged beyond 512 tokens"
             );
         }
         assert_eq!(
             grouped_d512_kernel_candidate(
                 "auto",
                 None,
-                112 * 1024,
+                4_015,
                 DType::BFloat16,
                 Some(DType::BFloat16),
                 16,
                 8,
                 1,
                 512,
-                true,
+                false,
+                40,
             ),
             ("generic_v2", None),
-            "unmeasured Hq8/Hkv1 retains the conservative initial route"
+            "an unconfirmed Metal capability keeps generic V2"
         );
         assert_eq!(
             paged_decode_route_hint("generic_v2"),

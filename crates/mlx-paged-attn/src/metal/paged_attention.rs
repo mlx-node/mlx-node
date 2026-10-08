@@ -153,65 +153,29 @@ fn grouped_d512_stripe_override() -> Option<u32> {
     })
 }
 
-// Mirror the graph dispatcher and model-free diagnostics. A fixed-session A/B
-// measured Hq16/Hkv2 at 91,795 context for 512 generated tokens: 128 stripes
-// delivered 32.8416 tok/s versus 31.0484 for 64 (+5.78%, 3/3 paired wins); the
-// raw 112K sweep did not regress.
-const D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT: u32 = 88 * 1024 + 1;
-
-fn grouped_d512_default_stripe_count(
-    max_context_len: u32,
-    num_q_heads: u32,
-    num_kv_heads: u32,
-) -> u32 {
-    let base_stripes = match max_context_len {
-        0..=4096 => 32,
-        4097..=8192 => 64,
-        _ => 128,
-    };
-    let stripes = (base_stripes / num_kv_heads.max(1)).max(4);
-    if (num_q_heads, num_kv_heads) == (16, 2)
-        && max_context_len >= D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT
-    {
-        128
-    } else {
-        stripes
-    }
-}
-
-fn grouped_d512_resolved_stripe_count(
-    override_stripes: Option<u32>,
-    max_context_len: u32,
-    num_q_heads: u32,
-    num_kv_heads: u32,
-) -> u32 {
-    override_stripes.unwrap_or_else(|| {
-        grouped_d512_default_stripe_count(max_context_len, num_q_heads, num_kv_heads)
-    })
-}
-
+/// Partition count of a grouped dispatch. D512 takes the caller's plan (the
+/// model's device rule) or the diagnostic override, never a table: the bf16
+/// result changes with the count, so one source of truth keeps greedy decode
+/// reproducible. `None` means D512 has no plan and must stay generic.
 fn grouped_stripe_count(
     kind: GroupedPagedAttentionKind,
     max_context_len: u32,
-    num_q_heads: u32,
-    num_kv_heads: u32,
-) -> u32 {
-    if kind == GroupedPagedAttentionKind::D512Direct {
-        return grouped_d512_resolved_stripe_count(
-            grouped_d512_stripe_override(),
-            max_context_len,
-            num_q_heads,
-            num_kv_heads,
-        );
+    planned_stripes: u32,
+) -> Option<u32> {
+    if planned_stripes != 0 {
+        return Some(planned_stripes);
     }
-    match max_context_len {
+    if kind == GroupedPagedAttentionKind::D512Direct {
+        return grouped_d512_stripe_override();
+    }
+    Some(match max_context_len {
         0..=4096 => 32,
         4097..=8192 => 64,
         8193..=16383 => 128,
         16384..=32768 => 256,
         32769..=65536 => 512,
         _ => 1024,
-    }
+    })
 }
 
 fn grouped_qwen35_env_enabled_value(value: Option<&str>) -> bool {
@@ -927,11 +891,13 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
             io_dtype,
             cache_dtype,
             PagedAttentionRouteHint::Auto,
+            0,
         )
     }
 }
 
 /// Route-hinted sibling of [`dispatch_paged_attention_v2_raw`].
+/// `grouped_stripes` is the caller's partition plan (0 = unplanned).
 ///
 /// # Safety
 ///
@@ -947,6 +913,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
     io_dtype: MetalDtype,
     cache_dtype: MetalDtype,
     route_hint: PagedAttentionRouteHint,
+    grouped_stripes: u32,
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
@@ -974,19 +941,14 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         params.max_seq_len,
         route_hint,
     );
-    let use_grouped = grouped_kind.is_some_and(|kind| {
-        grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
-    });
-    let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
-        grouped_stripe_count(
-            kind,
-            params.max_seq_len,
-            params.num_heads,
-            params.num_kv_heads,
-        )
-    } else {
-        params.max_seq_len.div_ceil(PARTITION_SIZE)
-    };
+    let grouped_partitions = grouped_kind
+        .filter(|&kind| {
+            grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
+        })
+        .and_then(|kind| grouped_stripe_count(kind, params.max_seq_len, grouped_stripes));
+    let use_grouped = grouped_partitions.is_some();
+    let max_num_partitions =
+        grouped_partitions.unwrap_or_else(|| params.max_seq_len.div_ceil(PARTITION_SIZE));
 
     // Allocate temporary buffers. `tmp_out` holds partition outputs in the
     // io dtype (NOT the cache dtype) — the reduce kernel reads io-typed
@@ -1273,11 +1235,13 @@ pub unsafe fn dispatch_paged_attention_auto(
             io_dtype,
             cache_dtype,
             PagedAttentionRouteHint::Auto,
+            0,
         )
     }
 }
 
 /// Route-hinted sibling of [`dispatch_paged_attention_auto`].
+/// `grouped_stripes` is the caller's partition plan (0 = unplanned).
 ///
 /// # Safety
 /// Same requirements as [`dispatch_paged_attention_auto`].
@@ -1293,6 +1257,7 @@ pub unsafe fn dispatch_paged_attention_auto_with_route(
     io_dtype: MetalDtype,
     cache_dtype: MetalDtype,
     route_hint: PagedAttentionRouteHint,
+    grouped_stripes: u32,
 ) -> Result<PagedAttentionOutput, String> {
     if max_context_len <= PARTITION_SIZE {
         // SAFETY: Caller guarantees all buffer pointers are valid
@@ -1321,6 +1286,7 @@ pub unsafe fn dispatch_paged_attention_auto_with_route(
                 io_dtype,
                 cache_dtype,
                 route_hint,
+                grouped_stripes,
             )
         }
     }
@@ -1620,26 +1586,20 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
             )
         })
         .flatten();
-    let use_grouped = grouped_kind.is_some_and(|kind| {
-        grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
-    });
-
     // Sized off the worst-case effective_context_len (the caller's
     // `max_seq_len`), so every query token fits in the allocated grid.
     // Per-token short-context queries simply leave some partition slots
     // empty — the reduce kernel skips them via the
     // `effective_context_len`-derived `num_partitions` it computes
     // independently.
-    let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
-        grouped_stripe_count(
-            kind,
-            params.max_seq_len,
-            params.num_heads,
-            params.num_kv_heads,
-        )
-    } else {
-        params.max_seq_len.div_ceil(PARTITION_SIZE)
-    };
+    let grouped_partitions = grouped_kind
+        .filter(|&kind| {
+            grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
+        })
+        .and_then(|kind| grouped_stripe_count(kind, params.max_seq_len, 0));
+    let use_grouped = grouped_partitions.is_some();
+    let max_num_partitions =
+        grouped_partitions.unwrap_or_else(|| params.max_seq_len.div_ceil(PARTITION_SIZE));
 
     // Note: the V2 main kernel writes exp_sums / max_logits / tmp_out
     // indexed by q_token_idx (NOT seq_idx), so size by total_queries.
@@ -2117,55 +2077,21 @@ mod grouped_selection_tests {
     }
 
     #[test]
-    fn d512_stripes_account_for_kv_head_parallelism() {
-        for (context, expected) in [
-            (4_096, [32, 16, 8]),
-            (4_097, [64, 32, 16]),
-            (8_193, [128, 64, 32]),
-        ] {
-            for ((q_heads, kv_heads), expected) in
-                [(16, 1), (16, 2), (32, 4)].into_iter().zip(expected)
-            {
-                assert_eq!(
-                    grouped_stripe_count(
-                        GroupedPagedAttentionKind::D512Direct,
-                        context,
-                        q_heads,
-                        kv_heads,
-                    ),
-                    expected
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn d512_wide_stripe_policy_matches_graph_and_planner_boundaries() {
-        for (context, expected) in [(90_112, 64), (90_113, 128), (91_795, 128), (112_000, 128)] {
-            assert_eq!(
-                grouped_d512_resolved_stripe_count(None, context, 16, 2),
-                expected
-            );
-        }
+    fn d512_partitions_come_from_the_plan_or_stay_generic() {
+        let d512 = GroupedPagedAttentionKind::D512Direct;
+        assert_eq!(grouped_stripe_count(d512, 8_193, 64), Some(64));
         assert_eq!(
-            grouped_d512_resolved_stripe_count(None, 90_113, 8, 1),
-            128,
-            "Hq8/Hkv1 is unchanged"
+            grouped_stripe_count(d512, 8_193, 0),
+            grouped_d512_stripe_override(),
+            "an unplanned D512 dispatch has only the diagnostic override"
         );
         assert_eq!(
-            grouped_d512_resolved_stripe_count(None, 90_113, 16, 1),
-            128,
-            "Hq16/Hkv1 is unchanged"
+            grouped_stripe_count(GroupedPagedAttentionKind::Qwen35D256, 8_193, 0),
+            Some(128)
         );
         assert_eq!(
-            grouped_d512_resolved_stripe_count(None, 90_113, 32, 4),
-            32,
-            "Hkv4 is unchanged"
-        );
-        assert_eq!(
-            grouped_d512_resolved_stripe_count(Some(32), 91_795, 16, 2),
-            32,
-            "an explicit validated override remains authoritative"
+            grouped_stripe_count(GroupedPagedAttentionKind::Qwen35D256, 8_193, 16),
+            Some(16)
         );
     }
 

@@ -1518,13 +1518,14 @@ impl LayerKVPool {
                 k_scale,
                 v_scale,
                 crate::metal::PagedAttentionRouteHint::Auto,
+                0,
             )
         }
     }
 
-    /// Route-hinted sibling of [`Self::gather_attention`]. The hint affects
-    /// only the compute kernel; K/V buffers and block-table semantics are
-    /// identical.
+    /// Route-hinted sibling of [`Self::gather_attention`]. The hint and the
+    /// grouped partition plan (`grouped_stripes`, 0 = unplanned) affect only
+    /// the compute kernel; K/V buffers and block-table semantics are identical.
     ///
     /// # Safety
     /// The caller must uphold the same evaluated-query pointer, pool lifetime,
@@ -1545,6 +1546,7 @@ impl LayerKVPool {
         k_scale: f32,
         v_scale: f32,
         route_hint: crate::metal::PagedAttentionRouteHint,
+        grouped_stripes: u32,
     ) -> Result<crate::metal::PagedAttentionOutput, String> {
         use crate::metal::{
             MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
@@ -1700,6 +1702,7 @@ impl LayerKVPool {
                 io_dtype,
                 cache_dtype,
                 route_hint,
+                grouped_stripes,
             )
         }
     }

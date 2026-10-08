@@ -73,7 +73,13 @@ fn zeroed_shared_buffer(state: &MetalState, bytes: usize) -> Buffer {
     buffer
 }
 
-fn run_case(state: &MetalState, num_heads: u32, num_kv_heads: u32, context_len: usize) {
+fn run_case(
+    state: &MetalState,
+    num_heads: u32,
+    num_kv_heads: u32,
+    context_len: usize,
+    stripes: u32,
+) {
     let logical_blocks = context_len.div_ceil(BLOCK_SIZE as usize);
     let physical_blocks = logical_blocks + 2;
     let block_table: Vec<u32> = (0..logical_blocks)
@@ -169,6 +175,7 @@ fn run_case(state: &MetalState, num_heads: u32, num_kv_heads: u32, context_len: 
             MetalDtype::BFloat16,
             MetalDtype::BFloat16,
             PagedAttentionRouteHint::ForceD512Staged,
+            stripes,
         )
     }
     .expect("grouped D512 raw dispatch must succeed");
@@ -222,7 +229,9 @@ fn grouped_d512_raw_decode_matches_uniform_reference_for_every_geometry() {
     };
 
     for (num_heads, num_kv_heads) in [(8, 1), (16, 1), (16, 2), (32, 4)] {
-        run_case(state, num_heads, num_kv_heads, 513);
+        for stripes in [4, 32, 256] {
+            run_case(state, num_heads, num_kv_heads, 513, stripes);
+        }
     }
 }
 
@@ -280,6 +289,7 @@ fn benchmark_dispatch(
     num_kv_heads: u32,
     context_len: usize,
     route_hint: PagedAttentionRouteHint,
+    stripes: u32,
 ) -> Duration {
     let logical_blocks = context_len.div_ceil(BLOCK_SIZE as usize);
     let pool_elements =
@@ -335,6 +345,7 @@ fn benchmark_dispatch(
             MetalDtype::BFloat16,
             MetalDtype::BFloat16,
             route_hint,
+            stripes,
         )
     }
     .expect("D512 benchmark dispatch must succeed");
@@ -347,11 +358,21 @@ fn benchmark_dispatch(
     started.elapsed()
 }
 
+/// Manual benchmarks take their partition count from the diagnostic override,
+/// defaulting to the 128 the Hq16/Hkv2 long-context A/B was measured at.
+fn benchmark_stripes() -> u32 {
+    std::env::var("MLX_PAGED_GROUPED_D512_STRIPES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128)
+}
+
 fn benchmark_route_pair(
     state: &MetalState,
     num_heads: u32,
     num_kv_heads: u32,
     context_len: usize,
+    stripes: u32,
     warmups: usize,
     iterations: usize,
 ) -> (f64, f64) {
@@ -362,6 +383,7 @@ fn benchmark_route_pair(
             num_kv_heads,
             context_len,
             PagedAttentionRouteHint::ForceD512Staged,
+            stripes,
         );
         let _ = benchmark_dispatch(
             state,
@@ -369,6 +391,7 @@ fn benchmark_route_pair(
             num_kv_heads,
             context_len,
             PagedAttentionRouteHint::ForceGeneric,
+            stripes,
         );
     }
 
@@ -387,7 +410,8 @@ fn benchmark_route_pair(
             ]
         };
         for route in routes {
-            let elapsed = benchmark_dispatch(state, num_heads, num_kv_heads, context_len, route);
+            let elapsed =
+                benchmark_dispatch(state, num_heads, num_kv_heads, context_len, route, stripes);
             match route {
                 PagedAttentionRouteHint::ForceD512Staged => grouped += elapsed,
                 PagedAttentionRouteHint::ForceGeneric => generic += elapsed,
@@ -1114,14 +1138,14 @@ fn grouped_d512_hq16_hkv2_alternating_benchmark() {
         Err(error) => panic!("unexpected MetalState::get failure: {error}"),
     };
 
+    let stripes = benchmark_stripes();
     eprintln!(
         "D512 Hq16/Hkv2 raw benchmark: warmups={WARMUPS}, iterations={ITERATIONS}, \
-         stripe_override={}",
-        std::env::var("MLX_PAGED_GROUPED_D512_STRIPES").unwrap_or_else(|_| "default".to_string())
+         stripes={stripes}"
     );
     for context_len in [4_096, 16_384, 32_768, 65_536, 91_765, 112_000] {
         let (grouped_ms, generic_ms) =
-            benchmark_route_pair(state, 16, 2, context_len, WARMUPS, ITERATIONS);
+            benchmark_route_pair(state, 16, 2, context_len, stripes, WARMUPS, ITERATIONS);
         eprintln!(
             "context={context_len:>6} grouped_ms={grouped_ms:>9.3} \
              generic_ms={generic_ms:>9.3} generic/grouped={:>6.3}x",
@@ -1145,9 +1169,10 @@ fn grouped_d512_all_geometry_long_context_benchmark() {
         Err(error) => panic!("unexpected MetalState::get failure: {error}"),
     };
 
+    let stripes = benchmark_stripes();
     eprintln!(
         "D512 all-geometry raw benchmark: warmups={WARMUPS}, iterations={ITERATIONS}, \
-         Hkv-aware default stripes"
+         stripes={stripes}"
     );
     for (num_heads, num_kv_heads) in [(8, 1), (16, 1), (16, 2), (32, 4)] {
         for context_len in [91_765, 112_000] {
@@ -1156,6 +1181,7 @@ fn grouped_d512_all_geometry_long_context_benchmark() {
                 num_heads,
                 num_kv_heads,
                 context_len,
+                stripes,
                 WARMUPS,
                 ITERATIONS,
             );

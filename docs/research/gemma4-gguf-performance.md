@@ -44,11 +44,11 @@ Scope is existing GGUF loading/inference, including Q3_K/Q4_K/Q5_K/Q6_K, not K-q
 
 ## Adaptive selection and rollback
 
-Single-row Gemma paged AR searches supported power-of-two partitions, layer-count-bounded submission depths, then attention again. Each candidate gets one unscored warmup and three timed steps, reversing alternate rounds. A median win must exceed twice the observed median absolute deviation and 1%.
+Single-row Gemma paged AR searches layer-count-bounded submission depths. Each candidate gets one unscored warmup and three timed steps, reversing alternate rounds. A median win must exceed twice the observed median absolute deviation and 1%. Attention partitions were searched the same way until the sweep was found to change the greedy transcript (the stripes reduce in bf16 over different page subsets); they now follow a rule of the context and the GPU core count (`crates/mlx-core/src/models/gemma4/attention.rs` `grouped_d512_rule_stripes`), see [performance controls](../perf.md).
 
 Existing token-completion timing includes host work; no extra forwards or GPU waits are added. Plans use an eight-entry model-local cache of power-of-two context scales, without machine-name presets. Batched/speculative policies are unchanged. This finite search neither proves global optimality nor continuously follows thermal/load changes.
 
-Set `MLX_GEMMA4_DECODE_TUNING=0` to disable learning or `MLX_GEMMA4_MIXED_QMV=0` to restore stock decode QMM. Diagnostic route, stripe, and early-layer overrides take precedence; see [performance controls](../perf.md). Do not turn recorded winning settings into universal presets.
+Set `MLX_GEMMA4_MIXED_QMV=0` to restore stock decode QMM. Diagnostic route, stripe, and early-layer overrides take precedence; see [performance controls](../perf.md). Do not turn recorded winning settings into universal presets.
 
 ## Memory, correctness, and remaining headroom
 

@@ -13,18 +13,29 @@ fn grouped_d512_graph_parity_across_geometries_and_stripe_boundaries() {
     }
 
     for (num_q_heads, num_kv_heads) in [(8, 1), (16, 1), (16, 2), (32, 4)] {
-        // Exercise every stripe boundary for the Hkv2 production target and
-        // the V2 floor plus a long-context tier for the other shipped
-        // geometries. Every case ends in a partial physical page.
-        let contexts: &[i32] = if (num_q_heads, num_kv_heads) == (16, 2) {
-            &[513, 3_071, 4_097, 8_193, 16_383]
+        // The V2 floor and a long-context tier, each ending in a partial
+        // physical page, across the planner's partition range (4..256) for
+        // the Hkv2 target and its usual picks for the other geometries.
+        let cases: &[(i32, u32)] = if (num_q_heads, num_kv_heads) == (16, 2) {
+            &[
+                (513, 32),
+                (3_071, 4),
+                (4_097, 256),
+                (8_193, 64),
+                (16_383, 128),
+            ]
         } else {
-            &[513, 8_193]
+            &[(513, 32), (8_193, 128)]
         };
-        for &context_len in contexts {
+        for &(context_len, stripes) in cases {
             unsafe { mlx_sys::mlx_paged_grouped_d512_test_probe_reset() };
             let rc = unsafe {
-                mlx_sys::mlx_paged_grouped_d512_graph_parity(num_q_heads, num_kv_heads, context_len)
+                mlx_sys::mlx_paged_grouped_d512_graph_parity(
+                    num_q_heads,
+                    num_kv_heads,
+                    context_len,
+                    stripes,
+                )
             };
             if rc == -3 {
                 eprintln!("skipping grouped D512 graph parity: Metal unavailable");
@@ -33,7 +44,7 @@ fn grouped_d512_graph_parity_across_geometries_and_stripe_boundaries() {
             assert_eq!(
                 rc, 1,
                 "direct-read D512 graph parity failed for q={num_q_heads} \
-                 kv={num_kv_heads} at context {context_len}"
+                 kv={num_kv_heads} at context {context_len} stripes {stripes}"
             );
             assert!(
                 unsafe { mlx_sys::mlx_paged_grouped_d512_test_probe_count() } > 0,
@@ -88,29 +99,5 @@ fn grouped_d512_selector_boundaries_and_geometries_are_pinned() {
     assert_eq!(
         unsafe { mlx_sys::mlx_paged_grouped_gemma4_shape_guard_for_test(2, 1, 513) },
         selected(2, 16, 1, 1, 513)
-    );
-}
-
-#[test]
-fn grouped_d512_graph_stripe_policy_matches_measured_boundaries() {
-    let stripes = |q_heads, kv_heads, context, override_stripes| unsafe {
-        mlx_sys::mlx_paged_grouped_d512_stripe_count_for_test(
-            q_heads,
-            kv_heads,
-            context,
-            override_stripes,
-        )
-    };
-
-    for (context, expected) in [(90_112, 64), (90_113, 128), (91_795, 128), (112_000, 128)] {
-        assert_eq!(stripes(16, 2, context, 0), expected);
-    }
-    assert_eq!(stripes(8, 1, 90_113, 0), 128, "Hq8/Hkv1 is unchanged");
-    assert_eq!(stripes(16, 1, 90_113, 0), 128, "Hq16/Hkv1 is unchanged");
-    assert_eq!(stripes(32, 4, 90_113, 0), 32, "Hkv4 is unchanged");
-    assert_eq!(
-        stripes(16, 2, 91_795, 32),
-        32,
-        "an explicit validated override remains authoritative"
     );
 }

@@ -1793,6 +1793,10 @@ unsafe extern "C-unwind" {
     /// enforce BF16, D512, BS16, q_len=1, and one sequence.
     pub fn mlx_paged_grouped_d512_capability(num_q_heads: i32, num_kv_heads: i32) -> i32;
 
+    /// GPU cores of the default Metal device (IORegistry `gpu-core-count`,
+    /// 8 when unpublished); 0 without Metal.
+    pub fn mlx_gpu_core_count() -> i32;
+
     /// Pure selector guard for the supported BF16 D512/BS16 GQA layouts.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
     pub fn mlx_paged_grouped_d512_shape_guard_for_test(
@@ -1802,15 +1806,6 @@ unsafe extern "C-unwind" {
         query_rows: i32,
         max_context_len: i32,
     ) -> i32;
-
-    /// Pure graph-dispatch stripe policy seam. A nonzero override mirrors the
-    /// validated environment override after parsing.
-    pub fn mlx_paged_grouped_d512_stripe_count_for_test(
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        max_context_len: i32,
-        override_stripes: u32,
-    ) -> u32;
 
     /// Compatibility selector for the original 16Q/1KV Gemma 4 route.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
@@ -1827,11 +1822,12 @@ unsafe extern "C-unwind" {
         num_q_heads: i32,
         num_kv_heads: i32,
         context_len: i32,
+        grouped_stripes: u32,
     ) -> i32;
 
     /// Compatibility graph-parity probe for Gemma 4's 16Q/1KV layout.
     /// Returns 1 on success and -3 without Metal.
-    pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32) -> i32;
+    pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32, grouped_stripes: u32) -> i32;
 }
 
 // ================================================================================

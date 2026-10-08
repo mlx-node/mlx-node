@@ -89,7 +89,6 @@ pub(crate) struct Gemma4PagedDecode<'a> {
     /// seam, so the stepper carries its own.
     step: i32,
     pending_timing: Option<std::time::Instant>,
-    tune_grouped: bool,
     tune_submission: bool,
     pending_cache_error: Option<String>,
     inner: &'a mut Gemma4Inner,
@@ -115,12 +114,10 @@ impl PagedStepModel for Gemma4PagedDecode<'_> {
             .as_ref()
             .map_or(0, |c| c.full_adapter().current_token_count())
             .saturating_add(1);
-        let plan = self.inner.decode_tuning.begin(
-            context,
-            self.inner.layers.len(),
-            self.tune_grouped,
-            self.tune_submission,
-        );
+        let plan =
+            self.inner
+                .decode_tuning
+                .begin(context, self.inner.layers.len(), self.tune_submission);
         let _scope = super::super::decode_tuning::PlanScope::enter(plan);
         self.pending_timing = Some(std::time::Instant::now());
         self.inner.run_paged_decode_step(token_id)
@@ -272,38 +269,15 @@ impl PagedBackend for Gemma4Inner {
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
-        let adaptive = std::env::var("MLX_GEMMA4_DECODE_TUNING").as_deref() != Ok("0")
-            && crate::engine::persistence::compiled_forward_backend_available();
-        let tune_submission =
-            adaptive && std::env::var_os("MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS").is_none();
-        let grouped_defaults = [
-            "MLX_PAGED_GROUPED_D512",
-            "MLX_PAGED_GROUPED_D512_STRIPES",
-            "MLX_GEMMA4_PAGED_DECODE_ROUTE",
-        ]
-        .iter()
-        .all(|key| std::env::var_os(key).is_none());
-        let tune_grouped = adaptive
-            && grouped_defaults
-            && self.config.global_head_dim.unwrap_or(self.config.head_dim) == 512
-            && self
-                .kv_cache_coordinator
-                .as_mut()
-                .is_some_and(|coordinator| {
-                    let adapter = coordinator.full_adapter_mut();
-                    adapter.prefill_sdpa_cache_dtype() == Some(crate::array::DType::BFloat16)
-                        && adapter
-                            .grouped_d512_decode_capability(
-                                crate::array::DType::BFloat16,
-                                self.config.num_attention_heads,
-                            )
-                            .unwrap_or(false)
-                });
+        // Only the submission depth is learned from timings: it changes when
+        // graphs are submitted, never their arithmetic. Attention partitions
+        // follow a device rule so greedy decode is reproducible.
+        let tune_submission = crate::engine::persistence::compiled_forward_backend_available()
+            && std::env::var_os("MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS").is_none();
         Ok(PagedStepper(Gemma4PagedDecode {
             step: 0,
             pending_cache_error: None,
             pending_timing: None,
-            tune_grouped,
             tune_submission,
             inner: self,
         }))

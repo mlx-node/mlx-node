@@ -478,11 +478,31 @@ Deleted tools (restore from `69ccaf9d` if needed):
     tile-descriptor shape) reaches 240-410 GB/s; the remaining gap to a
     dense pass (~400 GB/s on LFM2) is the un-overlapped MMA phase with 1-3
     resident threadgroups per core.
-12. Found while gating the affine route, pre-existing, not changed: Gemma4
-    decode picks its paged-attention `grouped_stripes` by a timing sweep at
-    context > 512 (`engine/decode_tuning.rs`), and the two partitions differ
-    by ~3 bf16 ulps in the logits, so a greedy transcript can flip on a
-    near-tie between runs (`MLX_GEMMA4_DECODE_TUNING=0` pins it). Product
-    call: pin the stripes, or make the sweep's result not change numerics.
+12. Found while gating the affine route, pre-existing: Gemma4 decode picked
+    its paged-attention `grouped_stripes` by a timing sweep at context > 512
+    (`engine/decode_tuning.rs`), and every partition count gives a different
+    bf16 transcript (the stripes round their online-softmax weights and
+    partials to bf16 over different page subsets, then merge), so a greedy
+    transcript could flip on a near-tie between runs, and the first 20
+    tokens past 512 mixed partitions within one run. Resolved by a
+    device rule instead of the sweep (`gemma4/attention.rs`
+    `grouped_d512_rule_stripes`): the smallest power of two whose
+    query-head SIMD groups reach 16 per GPU core, bounded by the work tiles
+    and 256. Measured on the 40-core M5 Max with forced stripes
+    (gemma-4-e2b-it-4bit, 512 tokens): throughput rises monotonically with
+    the partition count up to 128 (8 heads x 128 = 1024 SIMD groups) and is
+    flat at 256; generic V2 is level with the best stripes at 1K and 4-13%
+    behind at 4K/8K, so the rule never picks it. gemma-4-12b-it-qat-q4_0
+    (Hq16/Hkv1) at 8K: generic 42.7, 32 -> 44.3, 64 -> 46.1 (the rule's
+    pick), 128 -> 46.6, 256 -> 45.0 tok/s. Default build A/B, 5 interleaved
+    runs: 156.3 -> 157.6 (short), 141.5 -> 144.8 (4K), 130.4 -> 144.1 (8K)
+    tok/s median, HEAD producing 2/5/2 distinct transcripts per context and
+    the rule one. A canonical per-tile reduction (partition-independent
+    numerics) was rejected: the kernel template is shared with the
+    D128/D256 routes, and fixed-size partials cost up to 50% extra
+    attention traffic at 32K or the short-context parallelism the kernel
+    lives on. `MLX_GEMMA4_DECODE_TUNING` is gone; the remaining
+    submission-depth sweep does not change numerics (hash `e9a263b752`
+    for depths 0/4/16/34).
 13. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.

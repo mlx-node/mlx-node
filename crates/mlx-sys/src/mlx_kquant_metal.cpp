@@ -1465,9 +1465,18 @@ void KQuantDequantize::eval_gpu(const std::vector<array> &inputs, array &out) {
 
 } // namespace mlx::core::kquant
 
+extern "C" int mlx_gpu_core_count() {
+  using namespace mlx::core;
+  return is_available(Device::gpu)
+      ? kquant::gpu_core_count(metal::device(Device::gpu))
+      : 0;
+}
+
 #else
 
 #include <stdexcept>
+
+extern "C" int mlx_gpu_core_count() { return 0; }
 
 namespace mlx::core::kquant {
 

@@ -161,14 +161,9 @@ pub(crate) struct DecodeTuning {
 }
 
 impl DecodeTuning {
-    pub fn begin(
-        &mut self,
-        context: u32,
-        layers: usize,
-        grouped: bool,
-        submission: bool,
-    ) -> DecodePlan {
-        self.begin_with_limit(context, layers, if grouped { 256 } else { 0 }, submission)
+    /// Submission-depth search only; attention routing is left alone.
+    pub fn begin(&mut self, context: u32, layers: usize, submission: bool) -> DecodePlan {
+        self.begin_with_limit(context, layers, 0, submission)
     }
 
     /// The caller bounds partitions by live device capabilities, temporary
@@ -316,7 +311,7 @@ mod tests {
         for (layers, best_stripes, best_depth) in [(48, 64, 16), (18, 16, 2), (80, 256, 0)] {
             let mut tuner = DecodeTuning::default();
             for _ in 0..128 {
-                let plan = tuner.begin(20_000, layers, true, true);
+                let plan = tuner.begin_with_limit(20_000, layers, 256, true);
                 // Unit-test timing observations, never model benchmark inputs.
                 let seconds =
                     0.02 + if plan.grouped_stripes == Some(best_stripes) {
@@ -331,7 +326,7 @@ mod tests {
                 tuner.observe(seconds, layers);
             }
             assert_eq!(
-                tuner.begin(20_001, layers, true, true),
+                tuner.begin_with_limit(20_001, layers, 256, true),
                 DecodePlan {
                     early_layers: best_depth,
                     grouped_stripes: Some(best_stripes),
@@ -368,14 +363,11 @@ mod tests {
     fn respects_disabled_capabilities_and_bounds_context_storage() {
         let mut tuner = DecodeTuning::default();
         for exponent in 0..24 {
-            assert_eq!(
-                tuner.begin(1 << exponent, 1, false, false),
-                DecodePlan::default()
-            );
+            assert_eq!(tuner.begin(1 << exponent, 1, false), DecodePlan::default());
         }
         assert_eq!(tuner.contexts.len(), 8);
         let first = tuner.contexts.front().unwrap().bucket;
-        tuner.begin(1 << 22, 1, false, false);
+        tuner.begin(1 << 22, 1, false);
         assert_eq!(tuner.contexts[1].bucket, first);
     }
 
