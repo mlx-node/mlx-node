@@ -160,11 +160,12 @@ So the "cheaper dequant per byte" idea (Splash chunk order inside the 16 B
 units, ~700 LOC) can win at most ~15% of QMM time and is parked; the draft's
 matmul route was the next lever:
 
-| Commit      | Change                                                                                                                                                                                                                                                     | Exact               |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
-| `827c363e7` | MLX affine Q4/g64 as `a4g64@t64` on the tiled K-quant kernels; the draft is tiled at load (same bytes) and its head runs on 8 rows. M=8 445 vs 188 GB/s; propose 6.2 -> 4.8 ms; teacher-forced 928 vs 923 cycles, 2.32 draft matches both                  | no (draft rounding) |
-| `52c9cb8cd` | Sorted MoE expert matmul at prefill widths (`B / E >= 4`) on a tensor-op `gather_qmm_rhs_nax` kernel, one expert per 32/64-row tile; 112-220 -> 240-410 GB/s (1.8-2.4x) on the LFM2.5 / Qwen3.6-35B-A3B shapes; decode and verify untouched (`gather_qmv`) | <= 1 bf16 ulp       |
-| `707096991` | Affine modes trimmed to the one with a producer (`a4g64`)                                                                                                                                                                                                  | -                   |
+| Commit      | Change                                                                                                                                                                                                                                                                                                                                                                                        | Exact               |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `827c363e7` | MLX affine Q4/g64 as `a4g64@t64` on the tiled K-quant kernels; the draft is tiled at load (same bytes) and its head runs on 8 rows. M=8 445 vs 188 GB/s; propose 6.2 -> 4.8 ms; teacher-forced 928 vs 923 cycles, 2.32 draft matches both                                                                                                                                                     | no (draft rounding) |
+| `52c9cb8cd` | Sorted MoE expert matmul at prefill widths (`B / E >= 4`) on a tensor-op `gather_qmm_rhs_nax` kernel, one expert per 32/64-row tile; 112-220 -> 240-410 GB/s (1.8-2.4x) on the LFM2.5 / Qwen3.6-35B-A3B shapes; decode and verify untouched (`gather_qmv`)                                                                                                                                    | <= 1 bf16 ulp       |
+| `707096991` | Affine modes trimmed to the one with a producer (`a4g64`)                                                                                                                                                                                                                                                                                                                                     | -                   |
+| `e051db2ea` | MLX-affine linears tiled at load in every family (`a4g64@t64`, `a8g64@t64`; N >= 6144 and K >= 1536, bf16 companions, no calibration), with 16/32-row tensor-op tiers for M 9..32 and 8/16-row `qmv_t64` sub-tiles for small N. Qwen3.5-4B affine: AR +0..6%, prefill +15-25%, peak -1.1 GB, `mlx eval` identical to the row-major route at M=1; Gemma-4-E2B 0.997x; K-quant routes untouched | affine only         |
 
 Head-to-head at `827c363e7` (ABBA, fresh processes, 1,024 tokens; Splash
 1.2.1 on the same GGUF and draft):
@@ -477,5 +478,11 @@ Deleted tools (restore from `69ccaf9d` if needed):
     tile-descriptor shape) reaches 240-410 GB/s; the remaining gap to a
     dense pass (~400 GB/s on LFM2) is the un-overlapped MMA phase with 1-3
     resident threadgroups per core.
-12. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
+12. Found while gating the affine route, pre-existing, not changed: Gemma4
+    decode picks its paged-attention `grouped_stripes` by a timing sweep at
+    context > 512 (`engine/decode_tuning.rs`), and the two partitions differ
+    by ~3 bf16 ulps in the logits, so a greedy transcript can flip on a
+    near-tie between runs (`MLX_GEMMA4_DECODE_TUNING=0` pins it). Product
+    call: pin the stripes, or make the sweep's result not change numerics.
+13. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.
