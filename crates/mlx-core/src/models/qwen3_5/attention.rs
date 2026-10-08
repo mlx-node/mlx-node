@@ -4192,13 +4192,13 @@ mod tests {
                 let before = run(i, 0)?.to_float32()?;
                 let after = run(i, 1)?.to_float32()?;
                 assert_eq!(before.as_ref(), after.as_ref(), "prefix={prefix}, set={i}");
-                for route in 2..routes {
+                for (route, route_name) in ROUTES.iter().enumerate().take(routes).skip(2) {
                     let block = run(i, route)?.to_float32()?;
                     let (max_ulps, mean_ulps) = tile_error(block.as_ref(), before.as_ref());
                     assert!(
                         max_ulps <= 2.0 && mean_ulps <= 0.25,
                         "prefix={prefix}, set={i}: {} max {max_ulps} / mean {mean_ulps:.4} ulps",
-                        ROUTES[route]
+                        route_name
                     );
                 }
             }
