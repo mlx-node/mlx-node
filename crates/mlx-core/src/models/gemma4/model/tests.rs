@@ -4507,3 +4507,123 @@ fn gemma4_paged_forward_is_deterministic_across_repeats() {
         );
     }
 }
+
+/// Lane parity on the tiny hybrid model: a prompt prefill must give the
+/// scheduled slice walk and the whole-turn chunk walk the same bits, and a
+/// one-row scheduled decode wave must equal the whole-turn single-token
+/// step. The prompt crosses one 512-token body boundary so the test fails
+/// if `run_paged_prefill_chunk` and the scheduler's pinned ends ever
+/// diverge, and `run_paged_decode_step_batched`'s one-row arm delegates to
+/// `run_paged_decode_step_for`, which makes the decode arm tautological —
+/// its value is pinning that wiring (a one-row wave must never again fall
+/// back to the multi-row generic gather).
+#[test]
+fn gemma4_scheduled_slice_walk_matches_whole_turn_prefill_and_decode() {
+    use crate::array::MxArray;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        eprintln!("skipping (paged backend unavailable without Metal)");
+        return;
+    }
+    let config = super::Gemma4Config {
+        num_hidden_layers: 4,
+        max_position_embeddings: 4096,
+        layer_types: vec![
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+        ],
+        num_kv_shared_layers: Some(2),
+        ..paged_tiny_config(Some(true))
+    };
+    let mut inner = match super::Gemma4Inner::new(config) {
+        Ok(inner) => inner,
+        Err(error) if error.reason.contains("No Metal device found") => {
+            eprintln!("skipping (no Metal device): {}", error.reason);
+            return;
+        }
+        Err(error) => panic!("unexpected Gemma4Inner::new failure: {}", error.reason),
+    };
+    cast_paged_tiny_weights_to_bf16(&mut inner);
+    let bits = |a: &MxArray| -> Vec<u32> {
+        a.eval();
+        a.astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+
+    // 600 tokens cross one 512-token slice boundary.
+    let prompt: Vec<u32> = (0..600u32).map(|i| 3 + (i * 37) % 97).collect();
+
+    // Whole-turn lane: one `run_paged_prefill_chunk` call, seq 0.
+    inner
+        .kv_cache_coordinator
+        .as_mut()
+        .unwrap()
+        .reset_scheduled_request(0)
+        .map_err(Error::from_reason)
+        .unwrap();
+    let whole_logits = inner
+        .run_paged_prefill_chunk(&prompt, &prompt, 0, 0, 0, None)
+        .expect("whole-turn prefill");
+    let whole_decode = inner
+        .run_paged_decode_step_for(0, 7)
+        .expect("whole-turn decode");
+
+    // Scheduled lane: the shared slicing helper's ends, one
+    // `run_scheduled_paged_prefill_slice` per slice, seq 1.
+    inner
+        .kv_cache_coordinator
+        .as_mut()
+        .unwrap()
+        .reset_scheduled_request(1)
+        .map_err(Error::from_reason)
+        .unwrap();
+    let ends = crate::engine::hybrid_scheduler::prefill_slice_ends(
+        0,
+        prompt.len() as u32,
+        super::gemma4_paged_prefill_group_max_chunk(),
+        inner.scheduled_cold_anchor_rungs(),
+    );
+    assert!(ends.len() > 1, "prompt must cross a slice boundary");
+    let mut sched_logits = None;
+    let mut start = 0usize;
+    for &end in &ends {
+        sched_logits = inner
+            .run_scheduled_paged_prefill_slice(
+                1,
+                &prompt[start..end as usize],
+                start as u32,
+                end as usize == prompt.len(),
+            )
+            .expect("scheduled prefill slice");
+        start = end as usize;
+    }
+    let sched_logits = sched_logits.expect("final scheduled slice returns logits");
+    let sched_decode = inner
+        .run_paged_decode_step_batched(&[(1, 7)])
+        .expect("one-row scheduled decode");
+
+    assert_eq!(
+        bits(&whole_logits),
+        bits(&sched_logits),
+        "scheduled slice walk and whole-turn chunk walk must produce identical prefill logits"
+    );
+    assert_eq!(
+        bits(&whole_decode),
+        bits(&sched_decode),
+        "one-row scheduled decode and the whole-turn step must produce identical logits"
+    );
+
+    for seq_id in [0u32, 1] {
+        let _ = inner
+            .kv_cache_coordinator
+            .as_mut()
+            .unwrap()
+            .release_request_all(seq_id);
+    }
+}

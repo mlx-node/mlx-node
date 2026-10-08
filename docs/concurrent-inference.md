@@ -189,10 +189,14 @@ dimension 128 uses the generic batched route. A consequence: a scheduled row's
 attention bits depend on co-scheduling. Muse-Glimmer's global layers take the
 grouped D128 kernel when a row decodes alone (in the scheduled or the
 whole-turn lane) and generic V2 when other rows share its step, so the same
-greedy request can give a different transcript under load. Gemma4's scheduled
-rows take generic V2 on their D512 layers even alone, while its whole-turn
-lane takes the grouped kernel, so its two lanes still give different
-transcripts (see [splash-qwen38.md](research/splash-qwen38.md) §7 item 12).
+greedy request can give a different transcript under load. Gemma4 now behaves
+the same way on its D512 layers: a one-row scheduled wave forwards through the
+whole-turn single-token step, so the row resolves the same decode plan and
+grouped kernel either lane would pick, and a multi-row wave still takes
+generic V2 — parity is exact whenever a row decodes alone, and prefill walks
+one shared slice grid (`prefill_slice_ends`) regardless of which lane admitted,
+restored, or replayed the prompt (see
+[splash-qwen38.md](research/splash-qwen38.md) §7 item 12).
 
 ## Stage 0 concurrency hazards (verified status)
 

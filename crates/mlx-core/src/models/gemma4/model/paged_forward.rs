@@ -181,9 +181,17 @@ impl Gemma4Inner {
 
         let layer_kinds = self.compute_layer_kinds()?;
         let final_index = suffix_tokens.len() - 1;
-        let chunk_size = usize::try_from(gemma4_paged_prefill_group_max_chunk())
-            .unwrap_or(usize::MAX)
-            .max(1);
+        // The scheduled lane's pinned boundaries — the family's slice grid
+        // walked from the cached prefix, unioned with the cold-tier anchor
+        // rungs — are also this lane's chunk ends, so one prompt reduces
+        // attention identically whichever lane prefills it.
+        let slice_ends = crate::engine::hybrid_scheduler::prefill_slice_ends(
+            cached_prefix_len,
+            cached_prefix_len.saturating_add(suffix_tokens.len() as u32),
+            gemma4_paged_prefill_group_max_chunk(),
+            self.scheduled_cold_anchor_rungs(),
+        );
+        let mut end_index = 0usize;
         let mut position = 0usize;
         while position < final_index {
             if self
@@ -193,14 +201,17 @@ impl Gemma4Inner {
             {
                 return Err(Error::from_reason("prefill cancelled"));
             }
-            let end = position.saturating_add(chunk_size).min(final_index);
+            let absolute_position = suffix_start.saturating_add(position);
+            while slice_ends[end_index] as usize <= absolute_position {
+                end_index += 1;
+            }
+            let end = (slice_ends[end_index] as usize - suffix_start).min(final_index);
             let chunk = &suffix_tokens[position..end];
             self.kv_cache_coordinator
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
                 .record_tokens_all(self.active_paged_seq, chunk)
                 .map_err(Error::from_reason)?;
-            let absolute_position = suffix_start.saturating_add(position);
             let mut tap = draft_tap
                 .as_deref()
                 .map(|draft_tap| DsparkTap::new(draft_tap.layer_ids));
@@ -273,9 +284,10 @@ impl Gemma4Inner {
     /// Non-final slices are ordinary multi-token body chunks and do not run
     /// the vocabulary projection. The final slice keeps Gemma's load-bearing
     /// last-token split: its body is written first, then the prompt's final
-    /// token is forwarded alone and projected. With pinned boundaries equal
-    /// to the configured paged chunk size this is the same numerical shape as
-    /// [`Self::run_paged_prefill_chunk`], merely interruptible between slices.
+    /// token is forwarded alone and projected. Pinned on the shared
+    /// `prefill_slice_ends` grid (chunk steps plus cold-anchor rungs), this is
+    /// the same numerical shape as [`Self::run_paged_prefill_chunk`], merely
+    /// interruptible between slices.
     pub(super) fn run_scheduled_paged_prefill_slice(
         &mut self,
         seq_id: u32,
@@ -1246,11 +1258,39 @@ impl Gemma4Inner {
         Ok((self.project_paged_hidden(&hidden, false)?, captured))
     }
 
-    /// Run one uniform decode wave for multiple scheduler-owned sequences.
-    /// Full and sliding groups advance atomically for every row, then each
-    /// transformer layer executes once over `[N,1,H]` with request-specific
-    /// RoPE offsets and block tables.
+    /// Run one uniform decode wave for scheduler-owned sequences. Full and
+    /// sliding groups advance atomically for every row, then each transformer
+    /// layer executes once over `[N,1,H]` with request-specific RoPE offsets
+    /// and block tables.
+    ///
+    /// A one-row wave is not a degenerate batch: it takes the whole-turn
+    /// single-token step (`run_paged_decode_step_for`) so the scheduled lane
+    /// resolves the same attention policy — grouped D512 partitions included —
+    /// and a prompt decodes to the same bits whichever lane served it. The
+    /// grouped kernels serve one sequence per dispatch, so genuine multi-row
+    /// waves stay on the generic batched gather below.
     pub(super) fn run_paged_decode_step_batched(&mut self, rows: &[(u32, u32)]) -> Result<MxArray> {
+        if let &[(seq_id, token_id)] = rows {
+            self.set_active_paged_owner(seq_id);
+            let context = self
+                .kv_cache_coordinator
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "run_paged_decode_step_batched: KV coordinator is unavailable",
+                    )
+                })?
+                .request_token_count_all(seq_id)
+                .map_err(Error::from_reason)?
+                .saturating_add(1);
+            let tune_submission = crate::engine::persistence::compiled_forward_backend_available()
+                && std::env::var_os("MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS").is_none();
+            let plan = self
+                .decode_tuning
+                .begin(context, self.layers.len(), tune_submission);
+            let _scope = super::super::decode_tuning::PlanScope::enter(plan);
+            return self.run_paged_decode_step_for(seq_id, token_id);
+        }
         if rows.is_empty() {
             return Err(Error::from_reason(
                 "run_paged_decode_step_batched requires at least one row",

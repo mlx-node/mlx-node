@@ -423,6 +423,34 @@ fn scheduler_long_prefill_tokens() -> u32 {
     })
 }
 
+/// Pinned prefill slice ends for one prompt: the family's slice grid
+/// (`scheduler_prefill_slice_tokens`) walked from `start` (the cached prefix)
+/// to `target`, plus the family's `extra_prefill_breaks` strictly inside, in
+/// ascending order without repeats. Each slice's attention and K/V round per
+/// slice, so a whole-turn lane that must give the scheduled lane's bits walks
+/// the same ends.
+pub(crate) fn prefill_slice_ends(
+    start: u32,
+    target: u32,
+    slice_tokens: u32,
+    extra_breaks: impl IntoIterator<Item = u32>,
+) -> Vec<u32> {
+    let mut ends = Vec::new();
+    let mut boundary = start;
+    while boundary < target {
+        boundary = boundary.saturating_add(slice_tokens.max(1)).min(target);
+        ends.push(boundary);
+    }
+    ends.extend(
+        extra_breaks
+            .into_iter()
+            .filter(|&boundary| boundary > start && boundary < target),
+    );
+    ends.sort_unstable();
+    ends.dedup();
+    ends
+}
+
 pub(crate) fn scheduler_per_seq_context() -> u32 {
     static VALUE: OnceLock<u32> = OnceLock::new();
     *VALUE.get_or_init(|| scheduler_per_seq_context_override().unwrap_or(32_768))
@@ -2412,28 +2440,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             preemption_replay: None,
         };
         let prompt_len = admitted.tokens.len() as u32;
-        let mut breaks = Vec::new();
-        let mut boundary = payload.prefix.effective_cached_prefix_len() as u32;
-        while boundary < prompt_len {
-            boundary = boundary
-                .saturating_add(self.inner.scheduler_prefill_slice_tokens())
-                .min(prompt_len);
-            breaks.push(boundary);
-        }
-        breaks.extend(
-            self.inner
-                .extra_prefill_breaks(
-                    prompt_len,
-                    payload.prefix.effective_cached_prefix_len() as u32,
-                )
-                .into_iter()
-                .filter(|&boundary| {
-                    boundary > payload.prefix.effective_cached_prefix_len() as u32
-                        && boundary < prompt_len
-                }),
+        let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
+        let breaks = prefill_slice_ends(
+            cached_prefix,
+            prompt_len,
+            self.inner.scheduler_prefill_slice_tokens(),
+            self.inner.extra_prefill_breaks(prompt_len, cached_prefix),
         );
-        breaks.sort_unstable();
-        breaks.dedup();
         let turn_cancelled = Arc::clone(&cancelled);
         let draft_allowance = if payload.scheduled_speculation.is_some() {
             payload.params.mtp_depth as u32
@@ -2557,21 +2570,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     turn.payload
                         .profiler
                         .set_prompt_tokens(restored.profiler_prefill_tokens);
-                    turn.pinned_prefill_breaks.clear();
-                    let mut boundary = turn.num_computed_tokens;
-                    while boundary < turn.prompt_tokens {
-                        boundary = boundary
-                            .saturating_add(self.inner.scheduler_prefill_slice_tokens())
-                            .min(turn.prompt_tokens);
-                        turn.pinned_prefill_breaks.push(boundary);
-                    }
-                    turn.pinned_prefill_breaks.extend(
-                        restored.extra_prefill_breaks.into_iter().filter(|&value| {
-                            value > turn.num_computed_tokens && value < turn.prompt_tokens
-                        }),
+                    turn.pinned_prefill_breaks = prefill_slice_ends(
+                        turn.num_computed_tokens,
+                        turn.prompt_tokens,
+                        self.inner.scheduler_prefill_slice_tokens(),
+                        restored.extra_prefill_breaks,
                     );
-                    turn.pinned_prefill_breaks.sort_unstable();
-                    turn.pinned_prefill_breaks.dedup();
                     if let Err(error) =
                         self.scheduler
                             .wake_from_ssd(seq_id, restored.bytes_restored, restored.wait)
@@ -2765,22 +2769,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .saturating_add(restore.as_ref().map_or(0, B::restore_reserved_blocks));
         turn.num_computed_tokens = prefix.effective_cached_prefix_len() as u32;
         turn.block_materialized_blocks = materialized_blocks;
-        turn.pinned_prefill_breaks.clear();
-        let mut boundary = turn.num_computed_tokens;
-        while boundary < target {
-            boundary = boundary
-                .saturating_add(self.inner.scheduler_prefill_slice_tokens())
-                .min(target);
-            turn.pinned_prefill_breaks.push(boundary);
-        }
-        turn.pinned_prefill_breaks.extend(
+        turn.pinned_prefill_breaks = prefill_slice_ends(
+            turn.num_computed_tokens,
+            target,
+            self.inner.scheduler_prefill_slice_tokens(),
             self.inner
-                .extra_prefill_breaks(target, turn.num_computed_tokens)
-                .into_iter()
-                .filter(|&boundary| boundary > turn.num_computed_tokens && boundary < target),
+                .extra_prefill_breaks(target, turn.num_computed_tokens),
         );
-        turn.pinned_prefill_breaks.sort_unstable();
-        turn.pinned_prefill_breaks.dedup();
         let Some(replay) = turn.payload.preemption_replay.as_mut() else {
             self.fail_preempted(
                 turn,
@@ -3235,6 +3230,28 @@ mod tests {
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
         }
+    }
+
+    #[test]
+    fn prefill_slice_ends_walks_one_grid_plus_extra_breaks() {
+        // Plain grid from 0, and the same grid anchored at a cached prefix.
+        assert_eq!(
+            prefill_slice_ends(0, 2048, 512, []),
+            [512, 1024, 1536, 2048]
+        );
+        assert_eq!(
+            prefill_slice_ends(100, 2048, 512, []),
+            [612, 1124, 1636, 2048]
+        );
+        // Extra breaks land strictly inside the range, merge with the grid,
+        // and survive dedup: a rung coinciding with a grid point adds nothing.
+        assert_eq!(
+            prefill_slice_ends(0, 2048, 512, [256, 1024, 64, 4096, 100]),
+            [64, 100, 256, 512, 1024, 1536, 2048]
+        );
+        // A degenerate or zero-length range still terminates at the target.
+        assert_eq!(prefill_slice_ends(0, 7, 512, []), [7]);
+        assert_eq!(prefill_slice_ends(128, 128, 512, [64]), Vec::<u32>::new());
     }
 
     #[test]

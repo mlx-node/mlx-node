@@ -575,22 +575,36 @@ Deleted tools (restore from `69ccaf9d` if needed):
       spread); muse-glimmer 4K scheduled lane 15.7 → 15.3 (9 each, 10-18
       spread). The graph routes these lanes take did not change; no
       difference is established.
+    - Gemma4's lane split is now closed, along the lines sketched for it
+      above. Its scheduled single-row decode passed no plan to the D512
+      layers (generic V2 where the whole-turn lane takes the grouped kernel;
+      54-token prompt, 1,024 tokens: scheduled `9631187a81` = whole-turn
+      with the grouped kernel off, whole-turn default `b252314b4e`), and at
+      4K the lanes differed even with both on generic V2 (scheduled
+      `c0305fa44c`, whole-turn `f5c51b41dc`) because the scheduled lane
+      pinned different prefill breaks than the whole-turn chunking walked.
+      A one-row scheduled wave now forwards through the whole-turn
+      single-token step inside the same `decode_tuning` `PlanScope`, so it
+      resolves the identical D512 policy (SDPA, grouped at the rule's
+      stripes, generic, and their memory guards) instead of the batched
+      gather, and prefill boundaries come from one helper
+      (`engine/hybrid_scheduler.rs` `prefill_slice_ends` — the family's
+      slice grid from the cached prefix plus its extra breaks) shared by
+      admission, SSD restore, preemption replay, and the whole-turn chunk
+      loop. gemma-4-e2b-it-4bit, 512 greedy tokens, 2 runs per lane:
+      54-token `c611d4f4c3`, 1K `749930e373`, 4K `3b8ca77f44` (the grouped
+      hash), 4K with the SSD cold tier `5c19395c11`, 4K grouped-off
+      `f5c51b41dc` — scheduled = whole-turn in every configuration.
+      Interleaved decode tok/s vs the pre-fix build at 4K (sched 48-134 vs
+      48-130, wt 95-124 vs 58-137; the machine was under heavy outside
+      load) shows no established difference. A tiny-model unit test
+      (`gemma4_scheduled_slice_walk_matches_whole_turn_prefill_and_decode`)
+      crosses a slice boundary and compares whole-turn vs scheduled
+      prefill and single-row decode logits bit-for-bit.
     - Still route-dependent, deliberately left: multi-row scheduled waves
       keep generic V2 (the grouped kernels index one sequence per dispatch),
       so a scheduled row's bits depend on co-scheduling; grouped D128 has no
       raw-route kernel, so Muse's and K2's global layers run generic V2 when
-      the graph gather is off or fails. Gemma4 has Muse's lane split and it
-      is not fixed here: its scheduled single-row decode passes no plan to
-      the D512 layers (generic V2 where the whole-turn lane takes the
-      grouped kernel; 54-token prompt, 1,024 tokens: scheduled `9631187a81`
-      = whole-turn with the grouped kernel off, whole-turn default
-      `b252314b4e`), and at 4K the lanes differ even with both on generic V2
-      (scheduled `c0305fa44c`, whole-turn grouped-off `f5c51b41dc`), which
-      the one-slice prompt does not show, so the rest of the split is most
-      likely the prefill slicing (scheduler grid plus cold-anchor breaks vs
-      the whole-turn chunking; not traced further). Aligning it means routing
-      scheduled single-row D512 through the whole-turn attention policy
-      (SDPA, grouped, generic and their memory guards) and one prefill
-      slicing for both lanes.
+      the graph gather is off or fails.
 13. Dequant bit order inside the 16 B units (Splash chunk order, `t64p`):
     parked, <= 15% of QMM time now that M=8 is bandwidth-bound.

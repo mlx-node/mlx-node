@@ -123,12 +123,10 @@ pub(crate) fn install_preemption_replay<P>(
 
     turn.num_computed_tokens = 0;
     turn.prompt_tokens = target;
-    turn.pinned_prefill_breaks.clear();
-    let mut boundary = 0;
-    while boundary < target {
-        boundary = boundary.saturating_add(long_prefill_tokens).min(target);
-        turn.pinned_prefill_breaks.push(boundary);
-    }
+    // Replay prefills from scratch: the family's plain slice grid, no
+    // cached-prefix start and no extra breaks (those re-pin on restore).
+    turn.pinned_prefill_breaks =
+        super::hybrid_scheduler::prefill_slice_ends(0, target, long_prefill_tokens, []);
     turn.block_materialized_blocks = 0;
     turn.block_reservation_active = false;
     turn.recurrent_state_reservation_active = false;
