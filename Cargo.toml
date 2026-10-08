@@ -15,7 +15,7 @@ futures = "0.3.34"
 half = "2.7"
 libc = "0.2.189"
 mimalloc-safe = { version = "0.1" }
-parquet = { version = "59.2", features = ["arrow"] }
+parquet = { version = "60.0", features = ["arrow"] }
 rand = "0.10.2"
 rustfft = "6.4.1"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
