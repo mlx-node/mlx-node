@@ -431,16 +431,17 @@ fn load_pytorch_checkpoint(path: &Path, verbose: bool) -> Result<HashMap<String,
 
 /// Find the pickle entry in a PyTorch ZIP archive.
 fn find_pickle_entry<R: IoRead + std::io::Seek>(archive: &zip::ZipArchive<R>) -> Result<String> {
-    // Try common paths
-    for name in archive.file_names() {
+    // Try common paths. zip v9 yields ZipResult per name; PyTorch writes
+    // ASCII entry names, so undecodable names can never match our suffixes.
+    for name in archive.file_names().filter_map(std::result::Result::ok) {
         if name.ends_with("data.pkl") || name.ends_with("/data.pkl") {
-            return Ok(name.to_string());
+            return Ok(name.into_owned());
         }
     }
     // Fall back to any .pkl file
-    for name in archive.file_names() {
+    for name in archive.file_names().filter_map(std::result::Result::ok) {
         if name.ends_with(".pkl") {
-            return Ok(name.to_string());
+            return Ok(name.into_owned());
         }
     }
     Err(Error::from_reason(
@@ -700,8 +701,13 @@ fn read_storage_data<R: IoRead + std::io::Seek>(
         }
     }
 
-    // Try to find by suffix match
-    let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+    // Try to find by suffix match (skip names that fail to decode — see
+    // find_pickle_entry for why that is safe for PyTorch archives)
+    let names: Vec<String> = archive
+        .file_names()
+        .filter_map(std::result::Result::ok)
+        .map(|s| s.into_owned())
+        .collect();
     for name in &names {
         if name.ends_with(&format!("/{storage_key}")) {
             let mut entry = archive
