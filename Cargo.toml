@@ -25,7 +25,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "json"] }
 tokenizers = "0.23.1"
-minijinja = { version = "3.0", features = ["json", "preserve_order"] }
+minijinja = { version = "3.0", features = ["json", "preserve_order", "serde"] }
 uuid = { version = "1.26", features = ["v4"] }
 regex = "1.13"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }

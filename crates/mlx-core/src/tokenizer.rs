@@ -41,7 +41,8 @@
 //! - Random internet downloads
 //! - User-uploaded files without verification
 //! - Untrusted third-party sources
-use minijinja::Environment;
+use minijinja::value::Serde as JinjaSerde;
+use minijinja::{Environment, syntax::SyntaxConfig};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
@@ -2391,7 +2392,7 @@ impl Qwen3Tokenizer {
                 minijinja::Value::from(strength),
             );
         }
-        minijinja::Value::from_serialize(&map)
+        minijinja::Value::from(JinjaSerde(&map))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2408,8 +2409,13 @@ impl Qwen3Tokenizer {
         render_ctx: RenderContextOptions,
     ) -> std::result::Result<String, String> {
         let mut env = Environment::new();
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
+        env.set_syntax(
+            SyntaxConfig::builder()
+                .trim_blocks(true)
+                .lstrip_blocks(true)
+                .build()
+                .map_err(|e| format!("Template syntax config error: {e}"))?,
+        );
         Self::install_template_helpers(&mut env);
 
         // Neutralize HuggingFace `{% generation %}` / `{% endgeneration %}`
@@ -2523,10 +2529,13 @@ impl Qwen3Tokenizer {
         let mut ctx_map = std::collections::BTreeMap::<String, minijinja::Value>::new();
         ctx_map.insert(
             "messages".to_string(),
-            minijinja::Value::from_serialize(&messages_value),
+            minijinja::Value::from(JinjaSerde(&messages_value)),
         );
         if let Some(tools) = &tools_value {
-            ctx_map.insert("tools".to_string(), minijinja::Value::from_serialize(tools));
+            ctx_map.insert(
+                "tools".to_string(),
+                minijinja::Value::from(JinjaSerde(tools)),
+            );
         }
         ctx_map.insert(
             "add_generation_prompt".to_string(),
@@ -2619,7 +2628,7 @@ impl Qwen3Tokenizer {
                 }
             }
         }
-        let ctx = minijinja::Value::from_serialize(&ctx_map);
+        let ctx = minijinja::Value::from(JinjaSerde(&ctx_map));
 
         tmpl.render(ctx)
             .map_err(|e| format!("Template render error: {}", e))
@@ -3978,7 +3987,7 @@ mod tests {
         let messages_value: Vec<serde_json::Value> = vec![serialize_message_for_jinja(&msg)];
 
         let rendered = tmpl
-            .render(context! { messages => messages_value })
+            .render(context! { messages => JinjaSerde(&messages_value) })
             .unwrap();
 
         assert!(
@@ -4098,7 +4107,7 @@ mod tests {
             sanitized.iter().map(serialize_message_for_jinja).collect();
 
         let rendered = tmpl
-            .render(context! { messages => messages_value })
+            .render(context! { messages => JinjaSerde(&messages_value) })
             .unwrap();
 
         let start_idx = rendered.find("<|im_start|>user").unwrap();
@@ -6422,7 +6431,7 @@ mod tests {
         let dbg_out = dbg_env
             .get_template("d")
             .unwrap()
-            .render(context! { args => parsed_args.clone() })
+            .render(context! { args => JinjaSerde(parsed_args.clone()) })
             .unwrap();
         assert_eq!(
             dbg_out, "path|edits|",
@@ -6444,7 +6453,7 @@ mod tests {
         let rendered = rt
             .get_template("t")
             .unwrap()
-            .render(context! { messages => messages_value })
+            .render(context! { messages => JinjaSerde(&messages_value) })
             .unwrap();
 
         let path_idx = rendered.find("<parameter=path>").expect("path rendered");
@@ -6649,9 +6658,9 @@ mod tests {
             .get_template("t")
             .unwrap()
             .render(context! {
-                args => minijinja::Value::from_serialize(serde_json::json!({
+                args => minijinja::Value::from(JinjaSerde(serde_json::json!({
                     "zeta": 1, "alpha": 2, "mid": 3
-                })),
+                }))),
             })
             .unwrap();
         // Insertion order, NOT sorted: serde_json and miniJinja are both built
@@ -6674,7 +6683,7 @@ mod tests {
         env.add_template("f", "{%- for k, _v in args|items -%}{{ k }}|{%- endfor -%}")
             .unwrap();
         let ctx = context! {
-            args => minijinja::Value::from_serialize(serde_json::json!({"b": 1, "a": 2})),
+            args => minijinja::Value::from(JinjaSerde(serde_json::json!({"b": 1, "a": 2}))),
         };
         let via_method = env.get_template("m").unwrap().render(&ctx).unwrap();
         let via_filter = env.get_template("f").unwrap().render(&ctx).unwrap();
@@ -8944,7 +8953,7 @@ mod tests {
         let render = |json: serde_json::Value| {
             env.get_template("t")
                 .unwrap()
-                .render(context! { v => minijinja::Value::from_serialize(&json) })
+                .render(context! { v => minijinja::Value::from(JinjaSerde(&json)) })
                 .unwrap()
         };
 
