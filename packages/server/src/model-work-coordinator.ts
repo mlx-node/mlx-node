@@ -1,5 +1,10 @@
 import type { ModelLoadRecord } from './health.js';
-import type { PreDispatchAdmission, SessionRegistry } from './session-registry.js';
+import type { PreDispatchAdmission } from './session-registry.js';
+
+/** Minimal admission surface shared by chat sessions and decision inference. */
+export interface ModelAdmissionLane {
+  beginPreDispatchAdmission(): PreDispatchAdmission;
+}
 
 /**
  * Render a thrown value for {@link ModelLoadRecord.error}.
@@ -61,7 +66,7 @@ export interface ModelLoadAdmission {
    * registry; transferring after a hot-swap releases the old reservation
    * before charging the new binding.
    */
-  transferToResident(registry: SessionRegistry): PreDispatchAdmission;
+  transferToResident(registry: ModelAdmissionLane): PreDispatchAdmission;
   /** Idempotently release this request's current cold or resident unit. */
   release(): void;
 }
@@ -69,7 +74,7 @@ export interface ModelLoadAdmission {
 interface ModelLoadAdmissionState {
   released: boolean;
   coldCounted: boolean;
-  residentRegistry?: SessionRegistry;
+  residentRegistry?: ModelAdmissionLane;
   residentAdmission?: PreDispatchAdmission;
   transferError?: unknown;
 }
@@ -110,7 +115,7 @@ export class ModelWorkCoordinator {
    * Publishing transfers every already-admitted cold request before another
    * request can spend the resident budget independently.
    */
-  private readonly residentRegistriesByModel = new Map<string, SessionRegistry>();
+  private readonly residentRegistriesByModel = new Map<string, ModelAdmissionLane>();
   private readonly maxRequestLoadQueueDepth: number | undefined;
   /**
    * Most recent settled load bracket. Retained here because the coordinator
@@ -128,10 +133,10 @@ export class ModelWorkCoordinator {
 
   /**
    * Bound requests that arrive before a model has a resident
-   * `SessionRegistry`. The capacity mirrors the resident FIFO: `limit`
+   * `ModelAdmissionLane`. The capacity mirrors the resident FIFO: `limit`
    * waiters plus one owner/runner. Callers retain the permit through every
    * pre-lock await; registration synchronously transfers it into the resident
-   * `SessionRegistry` budget before any later arrival can spend that capacity.
+   * `ModelAdmissionLane` budget before any later arrival can spend that capacity.
    */
   beginRequestLoadAdmission(modelId: string): ModelLoadAdmission {
     const limit = this.maxRequestLoadQueueDepth;
@@ -188,7 +193,7 @@ export class ModelWorkCoordinator {
    * permit moves into the registry before a later arrival can be admitted
    * against an apparently empty resident budget.
    */
-  bindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void {
+  bindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void {
     this.residentRegistriesByModel.set(modelId, registry);
     const admissions = this.requestLoadAdmissionsByModel.get(modelId);
     if (!admissions) return;
@@ -205,13 +210,13 @@ export class ModelWorkCoordinator {
   }
 
   /** Forget a name only when it still points at the supplied binding. */
-  unbindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void {
+  unbindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void {
     if (this.residentRegistriesByModel.get(modelId) === registry) {
       this.residentRegistriesByModel.delete(modelId);
     }
   }
 
-  private transferAdmission(state: ModelLoadAdmissionState, registry: SessionRegistry): PreDispatchAdmission {
+  private transferAdmission(state: ModelLoadAdmissionState, registry: ModelAdmissionLane): PreDispatchAdmission {
     if (state.released) {
       throw new Error('Model load admission has already been released');
     }

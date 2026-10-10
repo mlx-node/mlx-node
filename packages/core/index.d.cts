@@ -64,6 +64,18 @@ export declare class ChatStreamHandle {
   cancel(): void;
 }
 
+export declare class ClefCancellation {
+  constructor();
+  cancel(): void;
+}
+
+/** Native implementation; use the typed ClefModel exported by @mlx-node/lm. */
+export declare class ClefModel {
+  static load(path: string): Promise<ClefModel>;
+  /** Receives raw JSON to retain HTTP object ordering and number spelling. */
+  decideJson(request: string, cancellation?: ClefCancellation | undefined | null): Promise<string>;
+}
+
 /**
  * PP-DocLayoutV3 full model for document layout analysis.
  *

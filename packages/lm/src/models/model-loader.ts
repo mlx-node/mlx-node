@@ -19,6 +19,7 @@ import {
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
+import { ClefModel } from '../clef.js';
 import { findDFlash2Draft } from '../draft-companion.js';
 import { familyDataFor, type ModelType, type TrainableFamilyId } from '../family-data.js';
 import { detectModelType as detectLocalModelType } from '../model-detection.js';
@@ -95,6 +96,7 @@ interface LoaderBinding {
  * compile.
  */
 const LOADER_BINDINGS = {
+  clef: { load: (path: string) => ClefModel.load(path), nativeModelClass: ClefModel },
   gemma4: {
     load: (modelPath: string, options?: LoadModelOptions) =>
       Gemma4Model.load(

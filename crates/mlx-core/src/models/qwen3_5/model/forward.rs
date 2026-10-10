@@ -1095,3 +1095,58 @@ pub(crate) fn partition_prefill_chunks(total: usize) -> Vec<usize> {
     chunks.push(remaining);
     chunks
 }
+
+impl Qwen35Inner {
+    pub(crate) fn decide_clef(
+        &mut self,
+        request: &crate::models::clef::encoding::Request,
+        cancelled: &AtomicBool,
+    ) -> Result<String> {
+        use crate::models::clef::{check_cancel, encoding};
+        check_cancel(cancelled)?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("CLEF tokenizer is missing"))?;
+        let record = encoding::encode(
+            request,
+            |s| tokenizer.encode_sync(s, Some(false)),
+            16384.min(self.config.max_position_embeddings as usize),
+        )?;
+        let head = self
+            .clef_head
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("CLEF head is not loaded"))?;
+        let output = self
+            .lm_head
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("CLEF output embeddings are missing"))?;
+        // One unpadded sequence; all recurrent and attention state belongs to
+        // this request. Nothing can be reused by the next decision, even on error.
+        let ids = MxArray::from_uint32(&record.input_ids, &[1, record.input_ids.len() as i64])?;
+        let mut caches = Some(fresh_dense_layer_caches(&self.config));
+        let mut hidden = self.embedding.forward(&ids)?;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            check_cancel(cancelled)?;
+            hidden = layer.forward(
+                &hidden,
+                None,
+                caches.as_mut().map(|c| &mut c[i]),
+                None,
+                true,
+            )?;
+            // Bound lazy graph growth and provide cancellation points without
+            // changing the reference's unchunked sequence computation.
+            MxArray::eval_arrays(&[&hidden])?;
+        }
+        check_cancel(cancelled)?;
+        let hidden = self.final_norm.forward(&hidden)?;
+        let probabilities = head.forward(&hidden, &record, &output.get_weight())?;
+        check_cancel(cancelled)?;
+        let rows: Vec<_> = record.questions.iter().zip(probabilities).map(|(q,p)| serde_json::json!({"id":q.id,"type":q.kind,"options":q.option_ids,"probabilities":p})).collect();
+        serde_json::to_string(
+            &serde_json::json!({"questions":rows,"input_tokens":record.input_ids.len()}),
+        )
+        .map_err(|e| Error::from_reason(e.to_string()))
+    }
+}

@@ -102,3 +102,13 @@ ggml/src/ggml-common.h and ggml/src/ggml-quants.c, under the MIT License:
    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
    SOFTWARE.
+
+Cloudflare CLEF / CLEF Flash
+https://huggingface.co/Cloudflare/clef-flash
+
+The text encoder and joint decision head in crates/mlx-core/src/models/clef
+are adapted from Cloudflare's joint_schema_model.py under Apache License 2.0.
+The native Rust implementation changes execution to MLX and adds validation
+and cancellation. Small reference-generated test fixtures and their source
+revision are in __test__/fixtures/clef; the upstream license is reproduced at
+__test__/fixtures/clef/LICENSE. No released model weights are redistributed.

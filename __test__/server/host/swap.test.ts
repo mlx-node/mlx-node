@@ -6,6 +6,8 @@ import { makeSwapController } from '../../../packages/server/src/host/swap.js';
 import type { ModelRegistry } from '../../../packages/server/src/registry.js';
 
 interface FakeRegistry {
+  getAny: ReturnType<typeof vi.fn>;
+  registerAny: ReturnType<typeof vi.fn>;
   get: ReturnType<typeof vi.fn>;
   register: ReturnType<typeof vi.fn>;
   unregister: ReturnType<typeof vi.fn>;
@@ -21,7 +23,7 @@ function fakeRegistry(): FakeRegistry {
     resident.delete(name);
     return true;
   });
-  return { get, register, unregister };
+  return { get, register, getAny: get, registerAny: register, unregister };
 }
 
 function discovered(names: string[]): DiscoveredModel[] {

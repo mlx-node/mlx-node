@@ -14,6 +14,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 const RAW_MODEL_TYPE_ALIASES = {
+  clef: ['clef'],
   harrier: ['harrier'],
   gemma4: ['gemma4', 'gemma4_text', 'gemma4_unified'],
   muse_glimmer: ['muse_glimmer', 'muse_glimmer_text'],

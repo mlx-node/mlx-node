@@ -38,13 +38,16 @@
  */
 
 import type { ChatConfig } from '@mlx-node/core';
+import type { DecisionModel } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
 
+import { DecisionRegistry } from './decision-registry.js';
+import type { ModelAdmissionLane } from './model-work-coordinator.js';
 import { SessionRegistry } from './session-registry.js';
 
 interface ModelLoadAdmissionCoordinator {
-  bindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void;
-  unbindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void;
+  bindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void;
+  unbindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void;
 }
 
 function concurrentDispatchCapacity(model: ServableModel): number {
@@ -150,6 +153,19 @@ export interface RegisterOptions {
 }
 
 export class ModelRegistry {
+  readonly decisions: DecisionRegistry;
+  getAny(name: string): ServableModel | DecisionModel | undefined {
+    return this.get(name) ?? this.decisions.get(name);
+  }
+  registerDecision(name: string, model: DecisionModel): void {
+    this.unregister(name);
+    this.decisions.register(name, model);
+    this.modelLoadAdmissionCoordinator?.bindRequestLoadAdmissions(name, this.decisions.lane(name)!);
+  }
+  registerAny(name: string, model: ServableModel | DecisionModel, opts?: RegisterOptions): void {
+    if ('kind' in model && model.kind === 'decision') this.registerDecision(name, model);
+    else this.register(name, model as ServableModel, opts);
+  }
   private readonly maxQueueDepth: number | undefined;
   private readonly models = new Map<string, ModelEntry>();
   /**
@@ -204,6 +220,7 @@ export class ModelRegistry {
 
   constructor(opts?: ModelRegistryOptions) {
     this.maxQueueDepth = opts?.maxQueueDepth;
+    this.decisions = new DecisionRegistry(opts?.maxQueueDepth);
   }
 
   /** Configured per-model waiter cap, or `undefined` when unbounded. */
@@ -223,6 +240,11 @@ export class ModelRegistry {
       for (const [name, entry] of this.models) {
         this.modelLoadAdmissionCoordinator.unbindRequestLoadAdmissions(name, entry.sessionRegistry);
       }
+    }
+    for (const entry of this.decisions.list()) {
+      const lane = this.decisions.lane(entry.id)!;
+      this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(entry.id, lane);
+      coordinator?.bindRequestLoadAdmissions(entry.id, lane);
     }
     this.modelLoadAdmissionCoordinator = coordinator;
     if (coordinator) {
@@ -257,6 +279,7 @@ export class ModelRegistry {
    * true.
    */
   register(name: string, model: ServableModel, opts?: RegisterOptions): void {
+    if (this.decisions.get(name)) this.unregister(name);
     const samplingDefaults = opts?.samplingDefaults;
     const maxOutputTokens = opts?.maxOutputTokens;
     const existing = this.models.get(name);
@@ -362,6 +385,11 @@ export class ModelRegistry {
    * @returns true if the model was removed.
    */
   unregister(name: string): boolean {
+    const lane = this.decisions.lane(name);
+    if (lane) {
+      this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, lane);
+      return this.decisions.unregister(name);
+    }
     const entry = this.models.get(name);
     if (!entry) return false;
     this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, entry.sessionRegistry);
@@ -671,7 +699,7 @@ export class ModelRegistry {
         owned_by: 'mlx-node',
       });
     }
-    return result;
+    return [...result, ...this.decisions.list()];
   }
 
   /**

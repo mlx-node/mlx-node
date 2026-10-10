@@ -59,6 +59,7 @@ impl Qwen35Inner {
             layers,
             final_norm,
             lm_head,
+            clef_head: None,
             prism_hadamard: None,
             dflash2: None,
             dflash2_context: None,

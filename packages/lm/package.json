@@ -43,6 +43,11 @@
       "@mlx-node/source": "./src/model-discovery.ts",
       "types": "./dist/model-discovery.d.ts",
       "import": "./dist/model-discovery.js"
+    },
+    "./clef-types": {
+      "@mlx-node/source": "./src/clef-types.ts",
+      "types": "./dist/clef-types.d.ts",
+      "import": "./dist/clef-types.js"
     }
   },
   "scripts": {

@@ -14,6 +14,7 @@ export function handleListModels(
   const body = {
     object: 'list',
     data: models,
+    models: models.map((model) => ({ name: model.id, description: 'Local MLX model', release_date: '' })),
   };
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
