@@ -20,7 +20,7 @@
     "mlx": "oxnode packages/cli/src/cli.ts"
   },
   "devDependencies": {
-    "@ast-grep/napi": "^0.45.3",
+    "@ast-grep/napi": "^0.50.0",
     "@mlx-node/asr": "workspace:*",
     "@mlx-node/cli": "workspace:*",
     "@mlx-node/internal-tools": "workspace:*",
