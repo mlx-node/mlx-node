@@ -102,6 +102,7 @@ describe('buildAnthropicResponse', () => {
     expect(response.content[0]).toEqual({
       type: 'thinking',
       thinking: 'Let me reason through this.',
+      signature: '',
     });
     expect(response.content[1]).toEqual({ type: 'text', text: 'Hello!' });
   });
@@ -154,6 +155,7 @@ describe('buildAnthropicResponse', () => {
     expect(response.content[0]).toEqual({
       type: 'thinking',
       thinking: 'I should inspect files.',
+      signature: '',
     });
     expect(response.content[1]).toEqual({
       type: 'text',

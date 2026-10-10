@@ -110,7 +110,9 @@ export function buildAnthropicContent(
   const content: AnthropicResponseContent[] = [];
 
   if (result.thinking) {
-    content.push({ type: 'thinking', thinking: result.thinking });
+    // Local models have no encrypted-reasoning service; the empty placeholder
+    // keeps strict Anthropic-schema consumers (grok fork, Claude Code) happy.
+    content.push({ type: 'thinking', thinking: result.thinking, signature: '' });
   }
 
   const parsedToolCalls = result.toolCalls.filter((t) => t.status === 'ok');

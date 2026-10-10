@@ -659,6 +659,10 @@ async function handleStreamingNativeWithAbort(
             buildContentBlockStart(contentBlockIndex, {
               type: 'thinking',
               thinking: '',
+              // Local models have no encrypted-reasoning service, so the
+              // signature is a placeholder — clients that require the field
+              // (e.g. strict Anthropic-schema consumers) still deserialize.
+              signature: '',
             }),
           );
           contentBlockIndex++;
