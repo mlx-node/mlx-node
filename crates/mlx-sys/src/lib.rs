@@ -1937,6 +1937,16 @@ unsafe extern "C-unwind" {
     // ============================================
     // Conv1d
     // ============================================
+    pub fn mlx_conv_transpose1d(
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        stride: i32,
+        padding: i32,
+        dilation: i32,
+        output_padding: i32,
+        groups: i32,
+    ) -> *mut mlx_array;
+
     pub fn mlx_conv1d(
         input: *mut mlx_array,
         weight: *mut mlx_array,

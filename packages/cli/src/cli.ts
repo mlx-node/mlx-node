@@ -19,6 +19,7 @@ Commands:
   convert            Convert model weights to MLX format
   calibrate          Calibrate FP8 activation amax for --q-recipe nvidia models
   eval               Score a checkpoint's output quality against a bf16 teacher
+  tts                Stream speech to a device or WAV file
   redact             Redact PII from text using a privacy-filter model
   serve              Serve local models over an Anthropic/OpenAI-compatible API
   launch claude      Start a local server and spawn Claude Code pointed at it
@@ -87,6 +88,12 @@ async function main() {
       const rest = args.slice(1);
       const { run } = await import('./commands/eval.js');
       await run(rest);
+      break;
+    }
+
+    case 'tts': {
+      const { run } = await import('./commands/tts.js');
+      await run(args.slice(1));
       break;
     }
 

@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/core" },
     { "path": "./packages/asr" },
+    { "path": "./packages/tts" },
     { "path": "./packages/lm" },
     { "path": "./packages/agent" },
     { "path": "./packages/trl" },

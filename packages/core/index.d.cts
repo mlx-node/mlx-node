@@ -1360,6 +1360,25 @@ export declare class OutputStore {
   queryRaw(sql: string): Promise<string>;
 }
 
+export declare class PcmPlayer {
+  static open(
+    sampleRate: number,
+    channels: number,
+    bufferSeconds?: number | undefined | null,
+    prebufferSeconds?: number | undefined | null,
+  ): PcmPlayer;
+  write(samples: Float32Array): Promise<undefined>;
+  finish(): Promise<PcmPlaybackStats>;
+  cancel(): void;
+}
+
+export declare class PcmTempo {
+  constructor(sampleRate: number, channels: number, speed: number);
+  write(samples: Float32Array): Float32Array;
+  finish(): Float32Array;
+  close(): void;
+}
+
 /**
  * NAPI-exported view of [`PrivacyFilterModel`].
  *
@@ -2623,6 +2642,21 @@ export declare class TextRecModel {
    * * RecResult with recognized text and confidence score
    */
   recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
+}
+
+export declare class TtsNativeModel {
+  static load(path: string, optionsJson?: string | undefined | null): Promise<TtsNativeModel>;
+  get metadata(): string;
+  start(text: string, optionsJson: string): TtsNativeStream;
+  prepareVoice(audio: Float32Array, sampleRate: number, transcript: string): Promise<string>;
+  releaseVoice(id: string): Promise<undefined>;
+  dispose(): Promise<undefined>;
+}
+
+export declare class TtsNativeStream {
+  next(): Promise<TtsNativeChunk | undefined | null>;
+  waitFinished(): Promise<undefined>;
+  cancel(): void;
 }
 
 export declare class VlmChatResult {
@@ -4835,6 +4869,12 @@ export interface ParseToolCallsResult {
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
 
+export interface PcmPlaybackStats {
+  playedSeconds: number;
+  underruns: number;
+  firstPlaybackMs?: number;
+}
+
 /**
  * Lightweight performance metrics returned by chat/chatStream when
  * `reportPerformance: true` is set in the config.
@@ -6019,6 +6059,14 @@ export interface TrainStepResultWithOutputs {
   outputsJson?: string;
   /** Actual token counts for each completion (for accurate TUI display) */
   completionLengths: Array<number>;
+}
+
+export interface TtsNativeChunk {
+  samples: Float32Array;
+  finished: boolean;
+  finishReason?: string;
+  synthesisMs?: number;
+  firstPcmMs?: number;
 }
 
 /**

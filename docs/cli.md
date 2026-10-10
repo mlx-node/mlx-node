@@ -1,6 +1,26 @@
 # CLI (`@mlx-node/cli`)
 
-The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, and `agent`.
+The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`, and `tts`.
+
+## `mlx tts`
+
+```bash
+mlx tts -m ./tts-model --voice vivian --text '你好。' --play -o speech.wav
+cat text.txt | mlx tts -m ./tts-model --voice ryan --language english --play
+mlx tts -m ./base-model --reference-audio reference.wav \
+  --reference-text 'Exact words in the reference.' --text 'New words.' -o clone.wav
+```
+
+The model argument is a local checkpoint path. Piped stdin and `--file` decode
+UTF-8 incrementally and commit complete sentences. For 1.7B CustomVoice,
+`--instruct` or `--instruct-file` controls delivery; for 1.7B VoiceDesign,
+`--voice-description` selects the voice. `--input-format jsonl` explicitly enables
+`text`, `instruct`, and `flush` records, including per-segment instruction changes.
+`--speed 1.15` applies the independent Rust speech tempo processor to both playback
+and WAV output; the default is 1 (unchanged PCM). `--buffer-seconds` controls playback
+capacity independently of `--prebuffer-seconds`, which controls startup buffering.
+At least one of `--play` or `--output` is required. See [TTS](tts.md) for capabilities, conversion,
+buffer policies and benchmark results, or `mlx tts --help` for all flags.
 
 ## `mlx download`
 
@@ -29,8 +49,10 @@ command then syncs instead of skipping blindly:
 
 Full syncs list the remote tree recursively so nested files already recorded
 by a CLI/dashboard marker are verified or removed before the revision advances.
-Fresh downloads keep the historical root-only default selection, avoiding
-unrelated checkpoints under directories such as `original/`.
+Fresh downloads select root assets and required child checkpoints declared by
+the model family, such as Qwen3-TTS's `speech_tokenizer`, avoiding unrelated
+checkpoints under directories such as `original/`. Required children are checked
+for config and all indexed weight shards before a full completion marker is written.
 
 There is no need to `rm -rf` a model directory to pick up an upstream update —
 re-running the command (or `--force`) is enough. When the revision cannot be

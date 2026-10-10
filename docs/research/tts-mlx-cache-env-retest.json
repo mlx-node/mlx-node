@@ -1,0 +1,2641 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-09",
+  "scope": "User-requested long playback retests at 1 and 0.5 GiB using TTS_MLX_CACHE_LIMIT. Pure MLX, Base-8bit, Fairy, seed534, tempo1.15; no inference algorithm change.",
+  "protocol": {
+    "input": "Original story repeated twice, 4486 graphemes, delivered at 20 graphemes/s in 2-grapheme chunks.",
+    "playbackRingSeconds": 3,
+    "startupPrebufferSeconds": 1,
+    "idleBeforeEachSeconds": 180,
+    "memoryCadenceSeconds": 5,
+    "cpuSnapshotCadenceSeconds": 30,
+    "limitations": "Two serial desktop runs, not a randomized equivalence experiment. Thermal state is not frequency. CPU snapshots are point observations. Process peak is the observed kernel high-water mark and may miss exit-time increases. Earlier runs used a different addon build; preserve their source/hash/environment records."
+  },
+  "validation": {
+    "rustCacheTestsPassed": 24,
+    "tsTtsTestsPassed": 33,
+    "productionNativeBuild": "vp run build:native succeeded",
+    "cliAndBenchmarkCompilation": "Direct tsc -p for CLI and benchmark succeeded; dependency build tsc -b packages/cli hit unrelated existing packages/agent pi-ai type conflicts.",
+    "independentCodeReview": "Review and confirm review passed before measurements.",
+    "smoke": {
+      "scoped-only": "2026-10-09T09:37:18.680324Z  INFO mlx_core::cache_limit: [cache_limit] register model guard=1 weights=1.88 GB (live_guards=1)\n2026-10-09T09:37:18.680376Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 1.0 GB (auto (weights=1.9GB, pools=0.0GB, overhead=4.0GB, headroom=4.0GB, wired=25.0GB → cap=15.1GB, live_guards=1); model ceiling=1.000 GiB); previous = 30.4 GB\n2026-10-09T09:37:18.688427Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 30.4 GB (no live model budget; restore prior model-independent cap if needed); previous = 1.0 GB\n",
+      "global-auto-disabled": "2026-10-09T09:37:18.888041Z  INFO mlx_core::cache_limit: [cache_limit] register model guard=1 weights=1.88 GB (live_guards=1)\n2026-10-09T09:37:18.888063Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 1.0 GB (env MLX_CACHE_LIMIT_GB=0; auto disabled; model ceiling=1.000 GiB); previous = 30.4 GB\n2026-10-09T09:37:18.895803Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 30.4 GB (env MLX_CACHE_LIMIT_GB=0; auto disabled); previous = 1.0 GB\n",
+      "tighter-global": "2026-10-09T09:37:19.101932Z  INFO mlx_core::cache_limit: [cache_limit] register model guard=1 weights=1.88 GB (live_guards=1)\n2026-10-09T09:37:19.101952Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 0.5 GB (env MLX_CACHE_LIMIT_GB=0.5; model ceiling=1.000 GiB); previous = 30.4 GB\n"
+    }
+  },
+  "runs": [
+    {
+      "date": "2026-10-09T09:53:48.008Z",
+      "environment": {
+        "cpu": "Apple M4",
+        "memoryBytes": 34359738368,
+        "platform": "darwin",
+        "arch": "arm64",
+        "osRelease": "27.0.0",
+        "node": "v24.21.0",
+        "note": "User-requested retest: TTS_MLX_CACHE_LIMIT=1 GiB, old global cache override unset. Same 200-segment paced story, 20 graphemes/s, seed534, Base-8bit/Fairy, speed1.15, three-second player ring and one-second startup. Production Node and release native. 180s no-inference pause before run. No concurrent model/build/trace. External memory/thermal probes each 5s; desktop CPU snapshots every 30s."
+      },
+      "execution": {
+        "execArgv": [],
+        "nodeOptions": null,
+        "sdkEntry": "file:///Users/saviio/service/mlx-node/packages/tts/dist/index.js",
+        "coreEntry": "file:///Users/saviio/service/mlx-node/packages/core/index.cjs",
+        "allocatorCacheLimitGiB": null,
+        "ttsAllocatorCacheLimitGiB": "1",
+        "nativeAddons": [
+          {
+            "path": "/Users/saviio/service/mlx-node/packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "52ff2a5bebcf43f5369a0a33bf771b3807ebdba8760a97c6dd60deb0a78569ec"
+          }
+        ]
+      },
+      "checkpoint": {
+        "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+        "revision": null,
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "reference": {
+        "path": ".cache/tts/fairy/reference.wav",
+        "sha256": "44e49825bd9dfb07987cd24a054ef65650562aa7a1d3ef8e5a6b1f8c60f99c83",
+        "transcript": "但我可以帮助您重建数据库。\n根据用户协议，我无权回复该问题。主人将在合适的时间与合适的场合获知答案。\n我可以帮助您弥补损失，重建绳匠事业。"
+      },
+      "parameters": {
+        "voice": {
+          "id": "5e125657-97a1-4f35-aeb7-2f9301053155"
+        },
+        "language": "chinese",
+        "seed": 534,
+        "chunkDurationMs": 160,
+        "instructions": [],
+        "instructionCache": false
+      },
+      "loadMs": 151.967666,
+      "voicePreparationMs": 2705.560667,
+      "firstPcmMs": 1209.7812079999994,
+      "firstBeforeInputEnded": true,
+      "synthesis": {
+        "audioSeconds": 848.31999999997,
+        "synthesisMs": 439614.4597840001,
+        "wallMs": 736309.0300840001,
+        "inputWaitMs": 1510.9565709994117,
+        "consumerWaitMs": 662279.7130330023,
+        "realTimeFactor": 0.5182177241890038,
+        "firstPcmMs": 206.90058399999953,
+        "segments": 200,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 6518.696852000553,
+        "inputFrames": 20359680,
+        "outputFrames": 17704066,
+        "rawPcmSha256": "baa770990aae9adb725c0c842926f7da138ce4c332b46b0025598a2be575b9f4",
+        "processedPcmSha256": "3c67484e2226b2ce75cacab830e5d4f29f644974cf01ed6a03baacdb5a008034",
+        "speed": 1.15,
+        "outputSeconds": 737.6694166666126
+      },
+      "timing": {
+        "observedStreamWallMs": 736409.4917499999,
+        "observedStreamWallRatio": 0.9982920195847267,
+        "playbackFinishWallMs": 739422.4626249999,
+        "measuredServiceTimeMs": 446133.15663600067,
+        "measuredServiceTimeRatio": 0.6047873838283703,
+        "note": "Service intervals may overlap and omit untimed overhead. Wall time includes input, sinks and backpressure."
+      },
+      "playbackPolicy": {
+        "bufferSeconds": 3,
+        "prebufferSeconds": 1
+      },
+      "playback": {
+        "playedSeconds": 737.6694166666666,
+        "underruns": 0,
+        "firstPlaybackMs": 1823.304
+      },
+      "playbackComplete": true,
+      "firstPlaybackFromSubmissionMs": {
+        "lowerBound": 1749.5326670000004,
+        "upperBound": 1823.297458
+      },
+      "blockIntervalMs": {
+        "p50": 138.100999999966,
+        "p95": 151.52258300001267,
+        "p99": 326.9219999999041,
+        "max": 692.856417
+      },
+      "rawSegmentBoundaryMs": {
+        "p50": 308.87704099999974,
+        "p95": 348.06354099995224,
+        "max": 692.9771659999997
+      },
+      "peakRssBytes": 2216280064,
+      "passedMeasuredServiceBudget": true,
+      "passedPacedPlayback": true,
+      "passedTenMinutePlayback": true,
+      "name": "long-cache1-scoped",
+      "budgetGiB": 1.0,
+      "reportSha256": "25f29a2fe8f2cc5df5588d3f6dcdeb7bdd356d9a2b1edf6a6de4f97396f60b97",
+      "wavSha256": "f3f4ebf7ec634982f191f2fc0869f70f50f6e8034380f87c531dacba1bd0ad3c",
+      "provenance": {
+        "name": "long-cache1-scoped",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text-file",
+          ".cache/tts/ane/paced-story-twice.txt",
+          "--once",
+          "--graphemes-per-second",
+          "20",
+          "--chunk-graphemes",
+          "2",
+          "--play",
+          "--speed",
+          "1.15",
+          "--prebuffer-seconds",
+          "1",
+          "--playback-buffer-seconds",
+          "3",
+          "--output",
+          ".cache/tts/mlx-optimization/long-cache1-scoped.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/long-cache1-scoped.json",
+          "--note",
+          "User-requested retest: TTS_MLX_CACHE_LIMIT=1 GiB, old global cache override unset. Same 200-segment paced story, 20 graphemes/s, seed534, Base-8bit/Fairy, speed1.15, three-second player ring and one-second startup. Production Node and release native. 180s no-inference pause before run. No concurrent model/build/trace. External memory/thermal probes each 5s; desktop CPU snapshots every 30s."
+        ],
+        "environment": {
+          "NODE_OPTIONS": null,
+          "MLX_PROFILE_TTS": null,
+          "MLX_CACHE_LIMIT_GB": null,
+          "TTS_MLX_CACHE_LIMIT": "1",
+          "MLX_GPU_HEADROOM_GB": null,
+          "MLX_NODE_LOG": "mlx_core::cache_limit=info",
+          "MLX_NODE_LOG_FILE": null
+        },
+        "sourceCommit": "13a34b7fb05609bf6b6b6a4864ecf5e20f552874",
+        "worktreeStatus": [],
+        "runnerSha256": "d19120fd1de7cfaa7a2b4c85afbc1d3911264462f94d4a9f38f9f656b0ae524e",
+        "idleObservations": [
+          {
+            "atUtc": "2026-10-09T09:38:25.395958+00:00",
+            "elapsedSeconds": 0,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:38:55.412428+00:00",
+            "elapsedSeconds": 30,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:39:25.433247+00:00",
+            "elapsedSeconds": 60,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:39:55.453067+00:00",
+            "elapsedSeconds": 90,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:40:25.476610+00:00",
+            "elapsedSeconds": 120,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:40:55.501763+00:00",
+            "elapsedSeconds": 150,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          }
+        ],
+        "files": [
+          {
+            "path": "packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "52ff2a5bebcf43f5369a0a33bf771b3807ebdba8760a97c6dd60deb0a78569ec"
+          },
+          {
+            "path": "packages/tts/dist/index.js",
+            "sha256": "821e0b8cbddae21e3e943ed95a9d7ca482d083cc0c9b40e4d781a30d13dfc171"
+          },
+          {
+            "path": ".cache/tts/benchmark/benchmark.js",
+            "sha256": "0be637c7c86d52d4b98e6bf0a8306dba58f69d352db0973497032fd9aeefdbd6"
+          },
+          {
+            "path": "scripts/tts/process-memory.c",
+            "sha256": "bfc33fcf357b32e30a2ca18e415ccb32c3405b1a7737a5e1f12642374cd7a370"
+          },
+          {
+            "path": ".cache/tts/mlx-optimization/process-memory-retake",
+            "sha256": "967792ddc094390278ea0c8dc8b4501de490b7bbae2832f644af51fb3d59a3f6"
+          }
+        ],
+        "startedAtUtc": "2026-10-09T09:41:25.573468+00:00",
+        "thermalBefore": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "pid": 34394,
+        "exitCode": 0,
+        "finishedAtUtc": "2026-10-09T09:53:50.354770+00:00",
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        }
+      },
+      "input": {
+        "mode": "simulated-llm-clock",
+        "textFile": ".cache/tts/ane/paced-story-twice.txt",
+        "graphemesPerSecond": 20,
+        "chunkGraphemes": 2,
+        "firstChunkMs": 500,
+        "graphemes": 4486,
+        "clockOffsetMs": 0.821292000000085,
+        "simulatedCompletionMs": 224700,
+        "playbackBeforeSimulatedCompletion": true,
+        "deliveryCompletionMs": 719682.631333,
+        "eofMs": 726008.126125,
+        "firstPcmBeforeSimulatedCompletion": true
+      },
+      "textSha256": "eaae25c949478a892527e5d57e3c4065564517f2ea989e52f3e73b6abc53b5f0",
+      "observedPeakPhysicalBytes": 3573814384,
+      "steadyMedianPhysicalBytes": 3318625608.0,
+      "sampledPeakResidentBytes": 2214887424,
+      "thermalObservationCounts": {
+        "0": 76,
+        "1": 72
+      },
+      "lastSegmentMemory": {
+        "audioSeconds": 733.4259583332796,
+        "rss": 2213445632,
+        "heapTotal": 10829824,
+        "heapUsed": 7667968,
+        "external": 2858170,
+        "arrayBuffers": 209151,
+        "activeBytes": 2056787208,
+        "peakBytes": 3145483030,
+        "cacheBytes": 1038319540
+      },
+      "policyLogLines": [
+        "2026-10-09T09:41:25.773724Z  INFO mlx_core::cache_limit: [cache_limit] register model guard=1 weights=1.88 GB (live_guards=1)",
+        "2026-10-09T09:41:25.773789Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 1.0 GB (auto (weights=1.9GB, pools=0.0GB, overhead=4.0GB, headroom=4.0GB, wired=25.0GB → cap=15.1GB, live_guards=1); model ceiling=1.000 GiB); previous = 30.4 GB",
+        "2026-10-09T09:53:48.058234Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 30.4 GB (no live model budget; restore prior model-independent cap if needed); previous = 1.0 GB"
+      ],
+      "desktopSnapshots": [
+        {
+          "observedAtUtc": "2026-10-09T09:41:26.068374+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  76.9 2127024 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "34330   3.9  22432 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "21621   2.0  14704 /usr/libexec/trustd",
+            "  679   1.6  46128 /usr/libexec/syspolicyd",
+            " 2171   1.0 146224 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   0.8  41232 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "39329   0.5  95920 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "13239   0.4  17584 /usr/libexec/wifip2pd",
+            "  598   0.3 159776 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            " 1567   0.1 156384 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "  668   0.1  10432 /usr/libexec/symptomsd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:41:56.241094+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  32.1 2158720 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  780  14.4   4384 /usr/libexec/sysmond",
+            "15205  12.3 136208 /usr/libexec/spotlightknowledged.updater",
+            "  728   9.7  40192 /usr/sbin/coreaudiod",
+            "39329   4.3  96000 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  648   4.3  10560 /usr/sbin/mDNSResponder",
+            "  539   3.9   8720 /usr/libexec/configd",
+            "  739   2.2  41296 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  654   1.9  16560 /usr/libexec/lsd",
+            "  667   1.7  21536 /usr/libexec/airportd",
+            "34330   1.6  22544 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "13239   1.6  17904 /usr/libexec/wifip2pd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:42:26.411532+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  44.1 2157088 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.6  40192 /usr/sbin/coreaudiod",
+            " 2171   0.8 146240 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  598   0.3 159712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            "39329   0.1  95984 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "33260   0.0   4352 -zsh",
+            "33259   0.0  11536 /System/Library/Frameworks/AudioToolbox.framework/XPCServices/com.apple.audio.SandboxHelper.xpc/Contents/MacOS/com.apple.audio.SandboxHelper",
+            "33258   0.0  10192 login",
+            "33241   0.0  11536 /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/XPCServices/SetStoreUpdateService.xpc/Contents/MacOS/SetStoreUpdateService",
+            "33231   0.0  24176 /System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:42:56.594093+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  37.1 2153600 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  782  12.8  31776 /usr/libexec/searchpartyd",
+            "  728   9.4  40192 /usr/sbin/coreaudiod",
+            "21621   4.3  14720 /usr/libexec/trustd",
+            "    1   1.5  26864 /sbin/launchd",
+            " 2171   1.3 146256 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   0.9  41152 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  602   0.7  24560 /usr/libexec/runningboardd",
+            "  601   0.7   8000 /usr/sbin/cfprefsd",
+            "26363   0.4 179376 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  526   0.4  64880 /usr/libexec/logd",
+            "  598   0.3 159712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:43:26.752644+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  37.0 2153280 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "26400  30.3 1219648 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  728   9.3  40192 /usr/sbin/coreaudiod",
+            "39329   1.5  95984 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.1 146240 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  555   0.6  57104 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds",
+            "26363   0.5 179360 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  888   0.4 117328 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores",
+            "  598   0.4 159760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780   0.3   4384 /usr/libexec/sysmond",
+            "34463   0.3  17104 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared",
+            " 1083   0.2  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:43:56.912742+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  36.8 2160288 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  780  23.5   4384 /usr/libexec/sysmond",
+            "  728   9.1  40192 /usr/sbin/coreaudiod",
+            "39329   7.0  96000 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.1 146240 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26363   0.6 179376 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  598   0.3 159760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  782   0.3  32048 /usr/libexec/searchpartyd",
+            "26489   0.3 451936 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  739   0.1  41152 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:44:27.072744+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  44.9 2154224 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.5  40192 /usr/sbin/coreaudiod",
+            " 2171   1.1 146240 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            " 1567   0.9 156336 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "  739   0.7  41152 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  574   0.5  21088 /usr/libexec/locationd",
+            "26342   0.4 806032 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "26402   0.4 374800 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "  591   0.3  21696 /usr/sbin/bluetoothd",
+            "  598   0.2 159728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  782   0.2  31936 /usr/libexec/searchpartyd",
+            "26365   0.2 182304 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:44:57.272800+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  728   9.6  40192 /usr/sbin/coreaudiod",
+            "34394   3.0 2158880 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  578   2.5  17952 /usr/libexec/dasd",
+            "34330   1.9  22544 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            " 2171   1.5 146240 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "22141   0.7  18640 /System/Library/PrivateFrameworks/CalendarDaemon.framework/Support/calaccessd",
+            "26363   0.6 179376 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            " 1567   0.6 156368 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "26489   0.5 451936 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  897   0.4   9200 /usr/sbin/cfprefsd",
+            "  601   0.4   8064 /usr/sbin/cfprefsd",
+            "  598   0.4 159712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:45:27.446483+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  728   9.6  40192 /usr/sbin/coreaudiod",
+            "34394   3.9 2156480 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "39329   1.4  96080 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.2 146240 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  780   1.2   4384 /usr/libexec/sysmond",
+            "34330   1.0  22560 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "  739   0.9  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "26363   0.8 179424 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            " 1564   0.4 427808 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "  598   0.3 159760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26489   0.3 451984 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            " 1567   0.2 156336 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:45:57.638243+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  34.3 2156528 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.0  40192 /usr/sbin/coreaudiod",
+            "  739   1.2  41120 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            " 2171   1.1 146240 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  598   0.3 159696 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  656   0.2   4544 /usr/libexec/clocksyncd",
+            " 1083   0.2  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "39329   0.1  96080 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "33259   0.0  11536 /System/Library/Frameworks/AudioToolbox.framework/XPCServices/com.apple.audio.SandboxHelper.xpc/Contents/MacOS/com.apple.audio.SandboxHelper",
+            "33258   0.0  10192 login",
+            "33241   0.0  11536 /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/XPCServices/SetStoreUpdateService.xpc/Contents/MacOS/SetStoreUpdateService",
+            "33231   0.0  24176 /System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:46:27.824490+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  40.1 2156624 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.8  40192 /usr/sbin/coreaudiod",
+            " 2171   1.1 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "34330   1.0  22560 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "26342   0.4 804032 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  739   0.4  41120 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  598   0.3 159712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 1567   0.2 156384 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "39329   0.1  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            "33231   0.0  24176 /System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:46:57.984158+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  34.1 2161728 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.6  40192 /usr/sbin/coreaudiod",
+            "  813   6.2  22048 /Applications/WiFiman Desktop.app/Contents/Resources/wifiman-desktopd",
+            "39329   2.2  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.3 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   0.8  41120 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "34330   0.8  22576 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "  598   0.4 159792 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780   0.3   4384 /usr/libexec/sysmond",
+            "26342   0.1 804592 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:47:28.147865+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  32.1 2161952 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.1  40192 /usr/sbin/coreaudiod",
+            "  780   3.4   4432 /usr/libexec/sysmond",
+            "26342   2.2 805408 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "26399   2.2 656512 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "39329   1.6  96112 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.4 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26365   0.8 182304 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "34330   0.6  22576 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "  739   0.4  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "32303   0.4  13280 /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/XPCServices/SetStoreUpdateService.xpc/Contents/MacOS/SetStoreUpdateService",
+            "  598   0.3 159712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:47:58.311418+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  728   9.4  40192 /usr/sbin/coreaudiod",
+            "39329   4.8  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "34394   4.3 2159040 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "34067   2.5   7344 /usr/libexec/NANDTaskScheduler",
+            "  569   1.3  14624 /System/Library/CoreServices/launchservicesd",
+            " 2171   1.3 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  598   0.4 159712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  667   0.3  21760 /usr/libexec/airportd",
+            "  739   0.3  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            " 1083   0.2  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "26342   0.1 804912 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  944   0.1  16096 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:48:28.511737+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  36.8 2158672 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   8.8  40192 /usr/sbin/coreaudiod",
+            "39329   3.6  96016 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.1 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   1.1  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  569   0.8  14624 /System/Library/CoreServices/launchservicesd",
+            " 1564   0.6 427808 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            " 1567   0.5 156352 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "26342   0.4 805184 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  598   0.4 159760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  782   0.1  32320 /usr/libexec/searchpartyd",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:48:58.706419+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  31.7 2157776 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.1  40192 /usr/sbin/coreaudiod",
+            " 2171   1.4 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26400   1.2 1259648 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "39329   1.1  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  739   0.9  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "26402   0.6 374720 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "21599   0.5  16960 /usr/libexec/trustd",
+            "  569   0.3  14624 /System/Library/CoreServices/launchservicesd",
+            "  598   0.2 159760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26399   0.2 659168 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  667   0.1  21712 /usr/libexec/airportd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:49:28.884025+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  28.2 2157200 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  780  13.2   4384 /usr/libexec/sysmond",
+            "  728   9.4  40192 /usr/sbin/coreaudiod",
+            "39329   5.3  95968 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   0.8 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26402   0.7 374592 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "  739   0.6  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  667   0.5  21744 /usr/libexec/airportd",
+            "  598   0.3 159744 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 1083   0.3  97936 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  526   0.2  65152 /usr/libexec/logd",
+            "  591   0.2  21568 /usr/sbin/bluetoothd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:49:59.044153+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  35.1 2159472 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.0  40192 /usr/sbin/coreaudiod",
+            "39329   1.7  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  739   1.5  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  667   1.4  21696 /usr/libexec/airportd",
+            " 2171   1.2 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            " 2478   0.6  83568 /Applications/UURemote.app/Contents/Helpers/UURemoteServer",
+            "26342   0.6 811664 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            " 1083   0.4  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  598   0.4 159744 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  944   0.3  16080 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent",
+            "26402   0.3 374576 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:50:29.202999+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  35.6 2156736 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728  10.0  40192 /usr/sbin/coreaudiod",
+            "26400   5.9 1268960 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            " 2171   1.1 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "34330   1.0  22576 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "  739   0.8  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "39329   0.6  95984 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2478   0.4  83568 /Applications/UURemote.app/Contents/Helpers/UURemoteServer",
+            "  598   0.3 159744 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26399   0.1 660960 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  656   0.1   4544 /usr/libexec/clocksyncd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:50:59.389340+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  35.1 2159616 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.1  40192 /usr/sbin/coreaudiod",
+            " 2171   1.1 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   0.9  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            " 2478   0.4  83568 /Applications/UURemote.app/Contents/Helpers/UURemoteServer",
+            "  598   0.4 159744 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780   0.3   4384 /usr/libexec/sysmond",
+            "39329   0.3  96064 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "26363   0.3 179408 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "33241   0.0  11536 /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/XPCServices/SetStoreUpdateService.xpc/Contents/MacOS/SetStoreUpdateService"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:51:29.564915+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  38.0 2158784 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.9  40192 /usr/sbin/coreaudiod",
+            "  739   1.2  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            " 2171   1.2 146352 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26342   0.7 804608 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            " 1567   0.7 156384 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "  598   0.4 159696 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26402   0.4 374688 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "  897   0.3   9168 /usr/sbin/cfprefsd",
+            "26365   0.3 182304 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26363   0.2 179408 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  656   0.1   4544 /usr/libexec/clocksyncd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:51:59.720752+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  44.3 2157840 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.7  40192 /usr/sbin/coreaudiod",
+            "  667   1.3  21616 /usr/libexec/airportd",
+            " 2171   1.1 146320 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   0.7  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "24009   0.4  24624 /Library/Input Methods/SogouInput.app/Contents/SogouServices",
+            "  944   0.4  16080 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent",
+            "  598   0.4 159696 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 1083   0.4  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            "  582   0.1   3296 /usr/sbin/distnoted",
+            "26363   0.1 179408 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:52:29.892355+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  38.5 2157136 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.9  40192 /usr/sbin/coreaudiod",
+            " 2171   1.0 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   0.5  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            " 1567   0.4 156384 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "39329   0.3  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  598   0.3 159760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  582   0.1   3296 /usr/sbin/distnoted",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "  897   0.1   9200 /usr/sbin/cfprefsd",
+            "  896   0.1   5568 /usr/sbin/distnoted"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:53:00.049339+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  43.8 2162560 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728  10.0  40192 /usr/sbin/coreaudiod",
+            "  780   6.4   4384 /usr/libexec/sysmond",
+            "39329   4.1  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.3 146368 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   1.1  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "26489   0.5 452016 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  598   0.4 159712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   0.3 179408 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  656   0.1   4544 /usr/libexec/clocksyncd",
+            " 1083   0.1  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "33241   0.0  11536 /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/XPCServices/SetStoreUpdateService.xpc/Contents/MacOS/SetStoreUpdateService"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:53:30.226811+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34394  31.3 2162976 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.1  40192 /usr/sbin/coreaudiod",
+            "34330   1.7  22592 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            " 2171   1.4 146384 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  739   1.3  41168 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "26363   0.5 179408 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            " 1564   0.3 427808 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "  598   0.3 159696 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  656   0.2   4544 /usr/libexec/clocksyncd",
+            "    1   0.1  26816 /sbin/launchd",
+            "  648   0.1  10576 /usr/sbin/mDNSResponder",
+            "26365   0.1 182240 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+          ]
+        }
+      ]
+    },
+    {
+      "date": "2026-10-09T10:09:58.626Z",
+      "environment": {
+        "cpu": "Apple M4",
+        "memoryBytes": 34359738368,
+        "platform": "darwin",
+        "arch": "arm64",
+        "osRelease": "27.0.0",
+        "node": "v24.21.0",
+        "note": "User-requested retest: TTS_MLX_CACHE_LIMIT=0.5 GiB, old global cache override unset. Same 200-segment paced story, 20 graphemes/s, seed534, Base-8bit/Fairy, speed1.15, three-second player ring and one-second startup. Production Node and release native. 180s no-inference pause before run. No concurrent model/build/trace. External memory/thermal probes each 5s; desktop CPU snapshots every 30s."
+      },
+      "execution": {
+        "execArgv": [],
+        "nodeOptions": null,
+        "sdkEntry": "file:///Users/saviio/service/mlx-node/packages/tts/dist/index.js",
+        "coreEntry": "file:///Users/saviio/service/mlx-node/packages/core/index.cjs",
+        "allocatorCacheLimitGiB": null,
+        "ttsAllocatorCacheLimitGiB": "0.5",
+        "nativeAddons": [
+          {
+            "path": "/Users/saviio/service/mlx-node/packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "52ff2a5bebcf43f5369a0a33bf771b3807ebdba8760a97c6dd60deb0a78569ec"
+          }
+        ]
+      },
+      "checkpoint": {
+        "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+        "revision": null,
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "reference": {
+        "path": ".cache/tts/fairy/reference.wav",
+        "sha256": "44e49825bd9dfb07987cd24a054ef65650562aa7a1d3ef8e5a6b1f8c60f99c83",
+        "transcript": "但我可以帮助您重建数据库。\n根据用户协议，我无权回复该问题。主人将在合适的时间与合适的场合获知答案。\n我可以帮助您弥补损失，重建绳匠事业。"
+      },
+      "parameters": {
+        "voice": {
+          "id": "78da5fc6-b95b-4849-bd14-1fe99d85076d"
+        },
+        "language": "chinese",
+        "seed": 534,
+        "chunkDurationMs": 160,
+        "instructions": [],
+        "instructionCache": false
+      },
+      "loadMs": 158.447541,
+      "voicePreparationMs": 2880.0759169999997,
+      "firstPcmMs": 1189.6630420000006,
+      "firstBeforeInputEnded": true,
+      "synthesis": {
+        "audioSeconds": 848.31999999997,
+        "synthesisMs": 508047.9131950001,
+        "wallMs": 736300.9211670001,
+        "inputWaitMs": 1502.936626999855,
+        "consumerWaitMs": 645182.2485000035,
+        "realTimeFactor": 0.5988871100469375,
+        "firstPcmMs": 186.073042,
+        "segments": 200,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 4341.54492599908,
+        "inputFrames": 20359680,
+        "outputFrames": 17704066,
+        "rawPcmSha256": "baa770990aae9adb725c0c842926f7da138ce4c332b46b0025598a2be575b9f4",
+        "processedPcmSha256": "3c67484e2226b2ce75cacab830e5d4f29f644974cf01ed6a03baacdb5a008034",
+        "speed": 1.15,
+        "outputSeconds": 737.6694166666126
+      },
+      "timing": {
+        "observedStreamWallMs": 736396.8457500001,
+        "observedStreamWallRatio": 0.9982748764041717,
+        "playbackFinishWallMs": 739410.8412080001,
+        "measuredServiceTimeMs": 512389.45812099916,
+        "measuredServiceTimeRatio": 0.6946058038252275,
+        "note": "Service intervals may overlap and omit untimed overhead. Wall time includes input, sinks and backpressure."
+      },
+      "playbackPolicy": {
+        "bufferSeconds": 3,
+        "prebufferSeconds": 1
+      },
+      "playback": {
+        "playedSeconds": 737.6694166666666,
+        "underruns": 0,
+        "firstPlaybackMs": 1831.5625
+      },
+      "playbackComplete": true,
+      "firstPlaybackFromSubmissionMs": {
+        "lowerBound": 1737.897042,
+        "upperBound": 1831.5561249999996
+      },
+      "blockIntervalMs": {
+        "p50": 137.51062499999534,
+        "p95": 152.24533399997745,
+        "p99": 345.0840830000234,
+        "max": 683.7015000000001
+      },
+      "rawSegmentBoundaryMs": {
+        "p50": 326.2859580000004,
+        "p95": 382.8022500000661,
+        "max": 683.7033330000004
+      },
+      "peakRssBytes": 2215772160,
+      "passedMeasuredServiceBudget": true,
+      "passedPacedPlayback": true,
+      "passedTenMinutePlayback": true,
+      "name": "long-cache-half-scoped",
+      "budgetGiB": 0.5,
+      "reportSha256": "f48c439b1c226d4ac2ef5d65a951d9bc9b9aa139e31e1b38e46933243f5e2d90",
+      "wavSha256": "f3f4ebf7ec634982f191f2fc0869f70f50f6e8034380f87c531dacba1bd0ad3c",
+      "provenance": {
+        "name": "long-cache-half-scoped",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text-file",
+          ".cache/tts/ane/paced-story-twice.txt",
+          "--once",
+          "--graphemes-per-second",
+          "20",
+          "--chunk-graphemes",
+          "2",
+          "--play",
+          "--speed",
+          "1.15",
+          "--prebuffer-seconds",
+          "1",
+          "--playback-buffer-seconds",
+          "3",
+          "--output",
+          ".cache/tts/mlx-optimization/long-cache-half-scoped.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/long-cache-half-scoped.json",
+          "--note",
+          "User-requested retest: TTS_MLX_CACHE_LIMIT=0.5 GiB, old global cache override unset. Same 200-segment paced story, 20 graphemes/s, seed534, Base-8bit/Fairy, speed1.15, three-second player ring and one-second startup. Production Node and release native. 180s no-inference pause before run. No concurrent model/build/trace. External memory/thermal probes each 5s; desktop CPU snapshots every 30s."
+        ],
+        "environment": {
+          "NODE_OPTIONS": null,
+          "MLX_PROFILE_TTS": null,
+          "MLX_CACHE_LIMIT_GB": null,
+          "TTS_MLX_CACHE_LIMIT": "0.5",
+          "MLX_GPU_HEADROOM_GB": null,
+          "MLX_NODE_LOG": "mlx_core::cache_limit=info",
+          "MLX_NODE_LOG_FILE": null
+        },
+        "sourceCommit": "13a34b7fb05609bf6b6b6a4864ecf5e20f552874",
+        "worktreeStatus": [],
+        "runnerSha256": "d19120fd1de7cfaa7a2b4c85afbc1d3911264462f94d4a9f38f9f656b0ae524e",
+        "idleObservations": [
+          {
+            "atUtc": "2026-10-09T09:54:35.868026+00:00",
+            "elapsedSeconds": 0,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:55:05.881559+00:00",
+            "elapsedSeconds": 30,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:55:35.901812+00:00",
+            "elapsedSeconds": 60,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:56:05.914219+00:00",
+            "elapsedSeconds": 90,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:56:35.924022+00:00",
+            "elapsedSeconds": 120,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          },
+          {
+            "atUtc": "2026-10-09T09:57:05.941935+00:00",
+            "elapsedSeconds": 150,
+            "thermal": {
+              "thermalState": 0,
+              "lowPowerMode": false
+            }
+          }
+        ],
+        "files": [
+          {
+            "path": "packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "52ff2a5bebcf43f5369a0a33bf771b3807ebdba8760a97c6dd60deb0a78569ec"
+          },
+          {
+            "path": "packages/tts/dist/index.js",
+            "sha256": "821e0b8cbddae21e3e943ed95a9d7ca482d083cc0c9b40e4d781a30d13dfc171"
+          },
+          {
+            "path": ".cache/tts/benchmark/benchmark.js",
+            "sha256": "0be637c7c86d52d4b98e6bf0a8306dba58f69d352db0973497032fd9aeefdbd6"
+          },
+          {
+            "path": "scripts/tts/process-memory.c",
+            "sha256": "bfc33fcf357b32e30a2ca18e415ccb32c3405b1a7737a5e1f12642374cd7a370"
+          },
+          {
+            "path": ".cache/tts/mlx-optimization/process-memory-retake",
+            "sha256": "967792ddc094390278ea0c8dc8b4501de490b7bbae2832f644af51fb3d59a3f6"
+          }
+        ],
+        "startedAtUtc": "2026-10-09T09:57:36.003491+00:00",
+        "thermalBefore": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "pid": 34972,
+        "exitCode": 0,
+        "finishedAtUtc": "2026-10-09T10:09:59.715727+00:00",
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        }
+      },
+      "input": {
+        "mode": "simulated-llm-clock",
+        "textFile": ".cache/tts/ane/paced-story-twice.txt",
+        "graphemesPerSecond": 20,
+        "chunkGraphemes": 2,
+        "firstChunkMs": 500,
+        "graphemes": 4486,
+        "clockOffsetMs": 1.1015830000001188,
+        "simulatedCompletionMs": 224700,
+        "playbackBeforeSimulatedCompletion": true,
+        "deliveryCompletionMs": 719666.991959,
+        "eofMs": 725995.748375,
+        "firstPcmBeforeSimulatedCompletion": true
+      },
+      "textSha256": "eaae25c949478a892527e5d57e3c4065564517f2ea989e52f3e73b6abc53b5f0",
+      "observedPeakPhysicalBytes": 3515503752,
+      "steadyMedianPhysicalBytes": 2780476744.0,
+      "sampledPeakResidentBytes": 2210414592,
+      "thermalObservationCounts": {
+        "0": 28,
+        "1": 120
+      },
+      "lastSegmentMemory": {
+        "audioSeconds": 733.4259583332796,
+        "rss": 2200436736,
+        "heapTotal": 8994816,
+        "heapUsed": 7961456,
+        "external": 3036150,
+        "arrayBuffers": 274687,
+        "activeBytes": 2056882024,
+        "peakBytes": 3145483030,
+        "cacheBytes": 520222682
+      },
+      "policyLogLines": [
+        "2026-10-09T09:57:36.209393Z  INFO mlx_core::cache_limit: [cache_limit] register model guard=1 weights=1.88 GB (live_guards=1)",
+        "2026-10-09T09:57:36.209468Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 0.5 GB (auto (weights=1.9GB, pools=0.0GB, overhead=4.0GB, headroom=4.0GB, wired=25.0GB → cap=15.1GB, live_guards=1); model ceiling=0.500 GiB); previous = 30.4 GB",
+        "2026-10-09T10:09:58.655896Z  INFO mlx_core::cache_limit: [cache_limit] cache pool cap set to 30.4 GB (no live model budget; restore prior model-independent cap if needed); previous = 0.5 GB"
+      ],
+      "desktopSnapshots": [
+        {
+          "observedAtUtc": "2026-10-09T09:57:36.016888+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  598  27.8 163312 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26400  16.4 1283424 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   9.7 199152 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26342   3.8 808336 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            " 2171   1.9 146512 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  591   1.1  22016 /usr/sbin/bluetoothd",
+            "  987   0.9  49552 /usr/libexec/sharingd",
+            "  739   0.7  41456 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  946   0.4  33968 /usr/libexec/rapportd",
+            "26489   0.4 450480 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "21599   0.3  17104 /usr/libexec/trustd",
+            " 1083   0.3  97888 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:58:06.143457+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  30.4 2149536 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  23.7 163344 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780  13.2   4384 /usr/libexec/sysmond",
+            "  728  10.0  40208 /usr/sbin/coreaudiod",
+            "39329   5.8  95888 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "26400   5.4 1282816 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   4.3 198752 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   2.0  22016 /usr/sbin/bluetoothd",
+            " 2171   1.8 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.5  49552 /usr/libexec/sharingd",
+            "  946   0.8  33968 /usr/libexec/rapportd",
+            "  999   0.8   9488 /usr/libexec/nearbyd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:58:36.308731+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "26400 188.4 1277920 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "34972  36.8 2148512 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  24.5 163392 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728   9.9  40208 /usr/sbin/coreaudiod",
+            "26363   7.0 198944 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26342   2.9 809776 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  591   1.8  22016 /usr/sbin/bluetoothd",
+            "  987   1.6  49552 /usr/libexec/sharingd",
+            "34891   1.6  22656 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "39329   1.0  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "26399   1.0 673264 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  946   0.9  33968 /usr/libexec/rapportd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:59:06.487161+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  598  29.3 163344 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "34972  27.8 2149216 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728  10.6  40208 /usr/sbin/coreaudiod",
+            "26363   5.5 197840 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   5.3 1293344 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.4  22016 /usr/sbin/bluetoothd",
+            " 2171   1.2 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   0.6  49552 /usr/libexec/sharingd",
+            "  739   0.4  41504 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "  946   0.3  33968 /usr/libexec/rapportd",
+            "  999   0.2   9488 /usr/libexec/nearbyd",
+            " 1185   0.2  11632 /usr/libexec/milod"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T09:59:36.615557+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  40.0 2148160 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  25.9 163376 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  11.0  40208 /usr/sbin/coreaudiod",
+            "26363   3.8 198288 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   3.4 1316032 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.3  22016 /usr/sbin/bluetoothd",
+            "  780   1.0   4384 /usr/libexec/sysmond",
+            "  987   1.0  49568 /usr/libexec/sharingd",
+            "39329   0.7  95936 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   0.7 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   0.5  34016 /usr/libexec/rapportd",
+            " 1185   0.4  11632 /usr/libexec/milod"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:00:06.736943+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  27.5 2151392 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  782  22.7  33264 /usr/libexec/searchpartyd",
+            "  598  18.1 163376 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728   9.6  40208 /usr/sbin/coreaudiod",
+            "26400   6.3 1317952 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   4.6 198288 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   2.9  95920 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   2.8  22016 /usr/sbin/bluetoothd",
+            "  987   1.7  49552 /usr/libexec/sharingd",
+            " 2171   1.4 146544 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  999   0.7   9584 /usr/libexec/nearbyd",
+            " 1185   0.6  11632 /usr/libexec/milod"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:00:36.856388+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  37.2 2147136 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  21.7 163328 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.9  40208 /usr/sbin/coreaudiod",
+            "26400   4.3 1294032 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   3.5 198544 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   2.7  22016 /usr/sbin/bluetoothd",
+            "  987   2.1  49664 /usr/libexec/sharingd",
+            " 2171   1.4 146496 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  999   1.1   9488 /usr/libexec/nearbyd",
+            "  946   1.0  34032 /usr/libexec/rapportd",
+            " 1185   0.8  11632 /usr/libexec/milod",
+            "  526   0.4  65744 /usr/libexec/logd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:01:07.000164+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  36.1 2148416 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  29.5 163344 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.9  40176 /usr/sbin/coreaudiod",
+            "26400   5.8 1325712 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   4.9 198080 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   2.0  22016 /usr/sbin/bluetoothd",
+            "  987   1.4  49664 /usr/libexec/sharingd",
+            "34891   0.9  22672 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            " 2171   0.7 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   0.7  33984 /usr/libexec/rapportd",
+            "  782   0.6  33248 /usr/libexec/searchpartyd",
+            "  999   0.5   9488 /usr/libexec/nearbyd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:01:37.171407+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  39.2 2147504 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  23.0 163264 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780  14.4   4416 /usr/libexec/sysmond",
+            "  728  10.5  40176 /usr/sbin/coreaudiod",
+            "35141   9.6  11536 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared",
+            "26400   6.6 1325536 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "35140   5.6  11568 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared",
+            "26363   3.9 198032 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   3.6  95888 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   2.1  22016 /usr/sbin/bluetoothd",
+            "  987   1.5  49664 /usr/libexec/sharingd",
+            " 1567   1.5 156528 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:02:07.342748+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "22107  47.6   3248 /System/Library/PrivateFrameworks/CacheDelete.framework/deleted_helper",
+            "34972  33.4 2150528 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  21.1 163264 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.9  40176 /usr/sbin/coreaudiod",
+            "26400   6.0 1312608 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   4.4 198832 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   2.8  22016 /usr/sbin/bluetoothd",
+            "  987   2.0  49664 /usr/libexec/sharingd",
+            "  574   1.4  23968 /usr/libexec/locationd",
+            " 2171   1.3 146512 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   1.0  33984 /usr/libexec/rapportd",
+            "  999   0.8   9488 /usr/libexec/nearbyd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:02:37.508416+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  598  29.9 163264 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363  11.1 198832 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  728  10.6  40176 /usr/sbin/coreaudiod",
+            "26400   9.8 1319728 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "34972   5.7 2150944 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  591   1.6  22016 /usr/sbin/bluetoothd",
+            "  987   1.5  49664 /usr/libexec/sharingd",
+            " 2171   1.1 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  999   0.8   9488 /usr/libexec/nearbyd",
+            "  946   0.7  33984 /usr/libexec/rapportd",
+            " 1185   0.5  11648 /usr/libexec/milod",
+            "  555   0.4  57104 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:03:07.683175+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  598  24.3 163328 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "34972  21.8 2151616 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "26400  11.7 1323056 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  728  10.6  40176 /usr/sbin/coreaudiod",
+            "26363   7.9 198080 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  574   2.5  23968 /usr/libexec/locationd",
+            "  591   2.4  22016 /usr/sbin/bluetoothd",
+            "  987   1.8  49648 /usr/libexec/sharingd",
+            " 2171   1.5 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26342   1.0 810672 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  946   0.9  34000 /usr/libexec/rapportd",
+            "  999   0.8   9488 /usr/libexec/nearbyd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:03:37.834107+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  42.6 2151296 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  18.7 163360 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.5  40176 /usr/sbin/coreaudiod",
+            "26400   6.4 1327664 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  780   5.6   4464 /usr/libexec/sysmond",
+            "  591   2.9  22016 /usr/sbin/bluetoothd",
+            "39329   2.9  95936 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "26363   2.4 198592 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  987   1.9  49648 /usr/libexec/sharingd",
+            " 2171   1.2 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   1.0  33984 /usr/libexec/rapportd",
+            "  999   1.0   9488 /usr/libexec/nearbyd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:04:07.974847+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  41.3 2151088 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  30.6 163952 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.6  40176 /usr/sbin/coreaudiod",
+            "26400   6.5 1281584 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   3.7 198592 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  987   1.6  49648 /usr/libexec/sharingd",
+            " 2171   1.2 146560 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  591   1.2  22016 /usr/sbin/bluetoothd",
+            "39329   1.1  96000 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  946   0.9  34032 /usr/libexec/rapportd",
+            "  999   0.8   9488 /usr/libexec/nearbyd",
+            " 1185   0.6  11648 /usr/libexec/milod"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:04:38.131541+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  40.4 2151840 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  28.7 163904 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.8  40176 /usr/sbin/coreaudiod",
+            "26400   6.0 1312576 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   4.7 198304 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   3.1  22048 /usr/sbin/bluetoothd",
+            "  987   2.2  49648 /usr/libexec/sharingd",
+            "39329   1.4  95936 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  946   1.2  33984 /usr/libexec/rapportd",
+            " 2171   1.1 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  999   1.0   9488 /usr/libexec/nearbyd",
+            "26342   0.9 812464 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:05:08.273775+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  37.7 2153008 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  23.9 163936 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.6  40176 /usr/sbin/coreaudiod",
+            "39329   9.8  95872 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "26400   3.5 1301696 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   2.3 198576 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "35287   2.1  41184 /opt/homebrew/bin/gh",
+            "  569   2.0  14640 /System/Library/CoreServices/launchservicesd",
+            " 2171   1.3 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  591   1.1  22048 /usr/sbin/bluetoothd",
+            "  987   0.9  49648 /usr/libexec/sharingd",
+            "  946   0.4  34032 /usr/libexec/rapportd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:05:38.418630+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  598  29.8 163840 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "34972  18.6 2151232 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  728   9.8  40480 /usr/sbin/coreaudiod",
+            "26400   9.2 1314448 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   7.8 197840 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   3.4  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "34891   1.6  22704 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "  591   1.6  22048 /usr/sbin/bluetoothd",
+            " 2171   1.3 146544 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.3  49776 /usr/libexec/sharingd",
+            "26402   1.2 375424 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "  569   0.7  14640 /System/Library/CoreServices/launchservicesd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:06:08.574545+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  39.5 2152608 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  34.7 163824 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.9  40480 /usr/sbin/coreaudiod",
+            "26400   4.7 1324976 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   4.3 198368 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   4.2  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   3.3 146560 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.4  49776 /usr/libexec/sharingd",
+            "  591   1.4  21888 /usr/sbin/bluetoothd",
+            "  946   0.7  33984 /usr/libexec/rapportd",
+            "  999   0.6   9488 /usr/libexec/nearbyd",
+            " 1185   0.6  11648 /usr/libexec/milod"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:06:38.728591+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "    1  33.6  26896 /sbin/launchd",
+            "  598  19.1 163712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.9  40480 /usr/sbin/coreaudiod",
+            "26363   6.2 198272 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "34972   4.1 2152176 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "26400   3.7 1334208 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   2.3  21984 /usr/sbin/bluetoothd",
+            "  987   1.6  49776 /usr/libexec/sharingd",
+            " 2171   1.5 146528 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "39329   1.1  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  999   0.8   9488 /usr/libexec/nearbyd",
+            "  946   0.8  33984 /usr/libexec/rapportd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:07:08.863492+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  43.1 2152960 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "    1  29.5  26928 /sbin/launchd",
+            "  598  15.6 163728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  11.1  40480 /usr/sbin/coreaudiod",
+            "  780   8.1   4416 /usr/libexec/sysmond",
+            "26400   4.5 1332768 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   3.1  21984 /usr/sbin/bluetoothd",
+            "39329   3.0  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "26363   2.6 198576 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  987   2.0  49776 /usr/libexec/sharingd",
+            "  946   1.2  33984 /usr/libexec/rapportd",
+            "  999   1.1   9488 /usr/libexec/nearbyd"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:07:39.011125+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "    1  24.9  26928 /sbin/launchd",
+            "  598  23.7 163744 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "34972  18.7 2148016 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "26400  12.7 1332320 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  728  10.9  40480 /usr/sbin/coreaudiod",
+            "26363   6.5 198000 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26342   5.1 811952 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  591   2.1  21984 /usr/sbin/bluetoothd",
+            " 2171   1.5 146624 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.4  49776 /usr/libexec/sharingd",
+            "  739   1.0  41504 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "26402   0.8 375280 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:08:09.169496+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "  598  22.8 163792 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "    1  20.6  26928 /sbin/launchd",
+            "  728  10.8  40480 /usr/sbin/coreaudiod",
+            "26363   8.3 194048 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   7.6 1311456 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "34972   3.6 2151088 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  591   2.1  21984 /usr/sbin/bluetoothd",
+            "39329   1.9  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.5 146656 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "21599   1.4  17616 /usr/libexec/trustd",
+            "  987   1.3  49776 /usr/libexec/sharingd",
+            "26402   0.9 375680 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:08:39.310415+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  40.2 2150048 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  12.6 163728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.4  40480 /usr/sbin/coreaudiod",
+            "    1   8.6  26880 /sbin/launchd",
+            "26400   3.6 1288480 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   3.0  21984 /usr/sbin/bluetoothd",
+            "26363   2.9 198256 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26342   2.6 810720 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  987   2.3  49776 /usr/libexec/sharingd",
+            "  946   1.2  34032 /usr/libexec/rapportd",
+            "  999   1.1   9488 /usr/libexec/nearbyd",
+            " 2171   1.0 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:09:09.452043+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "34972  18.6 2152112 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  17.4 163728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.2  40480 /usr/sbin/coreaudiod",
+            "    1   7.5  26928 /sbin/launchd",
+            "26363   5.1 198576 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   3.9 1327200 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.3  21984 /usr/sbin/bluetoothd",
+            " 2171   1.0 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.0  49776 /usr/libexec/sharingd",
+            "  946   0.6  33984 /usr/libexec/rapportd",
+            "39329   0.5  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 1564   0.3 428144 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          ]
+        },
+        {
+          "observedAtUtc": "2026-10-09T10:09:39.600633+00:00",
+          "processes": [
+            "  PID  %CPU    RSS COMM",
+            "26400  76.4 1334912 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "34972  39.2 2150832 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            "  598  33.7 163840 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  728  10.2  40480 /usr/sbin/coreaudiod",
+            "26363   8.0 197952 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26402   7.1 375808 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "    1   2.7  26928 /sbin/launchd",
+            " 2171   2.6 146688 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26399   1.9 678144 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26342   1.6 812384 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  591   1.5  21984 /usr/sbin/bluetoothd",
+            "  739   1.3  41504 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN"
+          ]
+        }
+      ]
+    }
+  ],
+  "shortPairs": {
+    "protocol": {
+      "plannedAtUtc": "2026-10-09T10:10:41.168834+00:00",
+      "plans": [
+        [1, "one", "1"],
+        [1, "half", "0.5"],
+        [2, "half", "0.5"],
+        [2, "one", "1"],
+        [3, "one", "1"],
+        [3, "half", "0.5"],
+        [4, "half", "0.5"],
+        [4, "one", "1"],
+        [5, "one", "1"],
+        [5, "half", "0.5"],
+        [6, "half", "0.5"],
+        [6, "one", "1"]
+      ],
+      "note": "Six alternating-order adjacent pairs, fresh production Node processes, TTS_MLX_CACHE_LIMIT=1 vs0.5; old global override unset. Same text/seed/precision/tempo; no playback. Intended after both long playback runs."
+    },
+    "runnerSha256": "646fce79da1a6df7a818c9a4a3acc5513af1dada93af8839550563dbbae10146",
+    "rows": [
+      {
+        "pair": 1,
+        "condition": "one",
+        "budgetGiB": 1.0,
+        "rtf": 0.536257462756849,
+        "firstPcmMs": 172.69437500000004,
+        "voicePreparationMs": 2942.49675,
+        "loadMs": 167.812541,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3569112248,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2193080320,
+          "heapTotal": 9256960,
+          "heapUsed": 7490656,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056787016,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1004916264
+        },
+        "provenance": {
+          "pair": 1,
+          "condition": "one",
+          "budgetGiB": 1.0,
+          "startedAtUtc": "2026-10-09T10:10:41.169251+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-1-one/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-1-one/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 0,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  18.4 163760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "35512  14.5  20848 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "26363   6.2 193856 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26402   4.2 375824 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "26400   3.4 1349808 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.9  22016 /usr/sbin/bluetoothd",
+            " 2171   1.7 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.5  49744 /usr/libexec/sharingd",
+            " 1567   1.5 156512 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+          ],
+          "pid": 35515,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 0,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  11.9 163712 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26400   6.1 1352160 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   6.1 198384 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   2.2  22016 /usr/sbin/bluetoothd",
+            "  987   1.8  49744 /usr/libexec/sharingd",
+            "  780   1.3   4464 /usr/libexec/sysmond",
+            " 1567   0.9 156480 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "39329   0.9  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  946   0.9  33984 /usr/libexec/rapportd"
+          ]
+        }
+      },
+      {
+        "pair": 1,
+        "condition": "half",
+        "budgetGiB": 0.5,
+        "rtf": 0.5267916490582188,
+        "firstPcmMs": 182.0691670000001,
+        "voicePreparationMs": 3014.4771250000003,
+        "loadMs": 158.94358400000002,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3510047880,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187329536,
+          "heapTotal": 9256960,
+          "heapUsed": 7490680,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056836280,
+          "peakBytes": 3145483030,
+          "cacheBytes": 513130170
+        },
+        "provenance": {
+          "pair": 1,
+          "condition": "half",
+          "budgetGiB": 0.5,
+          "startedAtUtc": "2026-10-09T10:10:51.371140+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-1-half/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-1-half/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 0,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  11.9 163728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26400   6.1 1352160 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   6.1 198384 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   2.2  22016 /usr/sbin/bluetoothd",
+            "  987   1.8  49744 /usr/libexec/sharingd",
+            "  780   1.3   4464 /usr/libexec/sysmond",
+            " 1567   0.9 156480 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "39329   0.9  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  946   0.9  33984 /usr/libexec/rapportd"
+          ],
+          "pid": 35535,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 0,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  27.1 163808 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   9.7 194080 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  780   8.5   4464 /usr/libexec/sysmond",
+            "26400   4.9 1352368 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "39329   4.8  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   4.6  22016 /usr/sbin/bluetoothd",
+            "  987   3.0  49792 /usr/libexec/sharingd",
+            "  999   1.9   9488 /usr/libexec/nearbyd",
+            "  946   1.7  34032 /usr/libexec/rapportd"
+          ]
+        }
+      },
+      {
+        "pair": 2,
+        "condition": "half",
+        "budgetGiB": 0.5,
+        "rtf": 0.5315651541952052,
+        "firstPcmMs": 172.7440419999998,
+        "voicePreparationMs": 3004.621,
+        "loadMs": 156.775416,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3510310000,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2188427264,
+          "heapTotal": 9256960,
+          "heapUsed": 7346896,
+          "external": 5321468,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056836288,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519744920
+        },
+        "provenance": {
+          "pair": 2,
+          "condition": "half",
+          "budgetGiB": 0.5,
+          "startedAtUtc": "2026-10-09T10:11:01.586030+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-2-half/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-2-half/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 0,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  24.3 163808 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   9.4 194080 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  780   5.3   4464 /usr/libexec/sysmond",
+            "26400   4.5 1352368 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "39329   3.0  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   2.7  22016 /usr/sbin/bluetoothd",
+            "  987   1.9  49792 /usr/libexec/sharingd",
+            " 2171   1.5 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "35512   1.5  21232 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+          ],
+          "pid": 35553,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 0,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  15.1 163792 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780  13.2   4416 /usr/libexec/sysmond",
+            "26363   4.5 198240 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "32018   3.6 240512 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+            "26400   2.7 1352528 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.7  22016 /usr/sbin/bluetoothd",
+            "26402   1.3 375744 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "  987   1.3  49792 /usr/libexec/sharingd",
+            " 2171   1.3 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island"
+          ]
+        }
+      },
+      {
+        "pair": 2,
+        "condition": "one",
+        "budgetGiB": 1.0,
+        "rtf": 0.5416365332191777,
+        "firstPcmMs": 183.78933400000005,
+        "voicePreparationMs": 3001.142,
+        "loadMs": 161.60362500000002,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3568981128,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2193719296,
+          "heapTotal": 9256960,
+          "heapUsed": 7490848,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056787144,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1010938984
+        },
+        "provenance": {
+          "pair": 2,
+          "condition": "one",
+          "budgetGiB": 1.0,
+          "startedAtUtc": "2026-10-09T10:11:11.809998+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-2-one/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-2-one/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 0,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  15.1 163792 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780  13.2   4416 /usr/libexec/sysmond",
+            "26363   4.5 198256 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "32018   3.6 240512 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+            "26400   2.7 1352528 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.7  22016 /usr/sbin/bluetoothd",
+            "26402   1.3 375744 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "  987   1.3  49792 /usr/libexec/sharingd",
+            " 2171   1.3 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island"
+          ],
+          "pid": 35568,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  28.3 163776 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   5.9 198272 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   3.6 1356464 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.9  22016 /usr/sbin/bluetoothd",
+            " 2171   1.4 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "26342   1.2 809568 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  987   1.2  49792 /usr/libexec/sharingd",
+            "  739   1.0  41504 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "26402   0.7 375904 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+          ]
+        }
+      },
+      {
+        "pair": 3,
+        "condition": "one",
+        "budgetGiB": 1.0,
+        "rtf": 0.5792113726027394,
+        "firstPcmMs": 205.08537499999966,
+        "voicePreparationMs": 3157.986166,
+        "loadMs": 165.859083,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3569046712,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2194407424,
+          "heapTotal": 9256960,
+          "heapUsed": 7490832,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056786896,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1034111136
+        },
+        "provenance": {
+          "pair": 3,
+          "condition": "one",
+          "budgetGiB": 1.0,
+          "startedAtUtc": "2026-10-09T10:11:22.014194+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-3-one/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-3-one/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  28.3 163776 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363  12.5 198272 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   9.1 1356464 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   1.9  22016 /usr/sbin/bluetoothd",
+            " 2171   1.4 146672 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.2  49792 /usr/libexec/sharingd",
+            "35512   1.1  21376 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+            "  739   1.0  41504 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+            "26402   0.9 375904 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+          ],
+          "pid": 35585,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  19.7 163760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "  780  13.1   4416 /usr/libexec/sysmond",
+            "39329   8.0  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "26363   7.2 194048 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   3.5 1364624 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   2.8  22016 /usr/sbin/bluetoothd",
+            "  987   1.9  49792 /usr/libexec/sharingd",
+            "26342   1.4 810880 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            " 1567   1.3 156528 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+          ]
+        }
+      },
+      {
+        "pair": 3,
+        "condition": "half",
+        "budgetGiB": 0.5,
+        "rtf": 0.6089494007705476,
+        "firstPcmMs": 203.53370899999982,
+        "voicePreparationMs": 3030.9247920000003,
+        "loadMs": 160.67229200000003,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3510015040,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187837440,
+          "heapTotal": 9519104,
+          "heapUsed": 7491424,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056835280,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519514212
+        },
+        "provenance": {
+          "pair": 3,
+          "condition": "half",
+          "budgetGiB": 0.5,
+          "startedAtUtc": "2026-10-09T10:11:33.256314+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-3-half/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-3-half/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  15.0 163760 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "39329   9.7  96048 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  780   8.2   4416 /usr/libexec/sysmond",
+            "26363   7.2 194048 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   3.5 1364624 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  591   3.4  22016 /usr/sbin/bluetoothd",
+            "  569   2.2  14640 /System/Library/CoreServices/launchservicesd",
+            "  987   2.0  49792 /usr/libexec/sharingd",
+            " 2171   1.5 147184 /Applications/Vibe Island.app/Contents/MacOS/vibe-island"
+          ],
+          "pid": 35611,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  24.8 163824 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 2171  15.0 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "32018  13.3 247056 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+            "26363   8.9 198208 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   7.4 1364624 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26342   3.3 813248 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  591   2.1  22016 /usr/sbin/bluetoothd",
+            "  578   1.7  18240 /usr/libexec/dasd",
+            "  987   1.3  49792 /usr/libexec/sharingd"
+          ]
+        }
+      },
+      {
+        "pair": 4,
+        "condition": "half",
+        "budgetGiB": 0.5,
+        "rtf": 0.6775319885273968,
+        "firstPcmMs": 249.36645799999997,
+        "voicePreparationMs": 3342.948667,
+        "loadMs": 160.242333,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3510228104,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187902976,
+          "heapTotal": 8732672,
+          "heapUsed": 7490872,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056917896,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519617816
+        },
+        "provenance": {
+          "pair": 4,
+          "condition": "half",
+          "budgetGiB": 0.5,
+          "startedAtUtc": "2026-10-09T10:11:44.485861+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-4-half/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-4-half/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  24.8 163824 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 2171  15.0 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "32018  13.3 247056 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+            "26363   8.9 198208 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   7.4 1364624 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26342   3.3 813312 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "  591   2.1  22016 /usr/sbin/bluetoothd",
+            "  578   1.7  18240 /usr/libexec/dasd",
+            "  987   1.3  49792 /usr/libexec/sharingd"
+          ],
+          "pid": 35627,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "26400 192.3 1372032 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  598  17.3 163824 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   5.5 198256 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   2.0  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   1.7  22016 /usr/sbin/bluetoothd",
+            " 2171   1.3 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.3  49792 /usr/libexec/sharingd",
+            "  946   0.7  33984 /usr/libexec/rapportd",
+            "  999   0.6   9488 /usr/libexec/nearbyd"
+          ]
+        }
+      },
+      {
+        "pair": 4,
+        "condition": "one",
+        "budgetGiB": 1.0,
+        "rtf": 0.7430079831335611,
+        "firstPcmMs": 278.1840000000002,
+        "voicePreparationMs": 4025.913,
+        "loadMs": 178.832708,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3569030304,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2207809536,
+          "heapTotal": 8994816,
+          "heapUsed": 7345072,
+          "external": 5321468,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056770504,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1033041448
+        },
+        "provenance": {
+          "pair": 4,
+          "condition": "one",
+          "budgetGiB": 1.0,
+          "startedAtUtc": "2026-10-09T10:11:56.736517+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-4-one/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-4-one/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "26400 192.3 1242656 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  598  17.3 163824 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   5.5 198256 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   2.0  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   1.7  22016 /usr/sbin/bluetoothd",
+            " 2171   1.3 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.3  49792 /usr/libexec/sharingd",
+            "  946   0.7  33984 /usr/libexec/rapportd",
+            "  999   0.6   9488 /usr/libexec/nearbyd"
+          ],
+          "pid": 35659,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  25.7 163728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   4.9 198144 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   3.1 1287280 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  780   1.9   4464 /usr/libexec/sysmond",
+            "  591   1.5  22016 /usr/sbin/bluetoothd",
+            "39329   1.3  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.3 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.0  49792 /usr/libexec/sharingd",
+            "35512   0.7  21616 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+          ]
+        }
+      },
+      {
+        "pair": 5,
+        "condition": "one",
+        "budgetGiB": 1.0,
+        "rtf": 0.7579336148972599,
+        "firstPcmMs": 280.11325000000033,
+        "voicePreparationMs": 4177.726625,
+        "loadMs": 273.93287499999997,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3569046640,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2199044096,
+          "heapTotal": 8994816,
+          "heapUsed": 7017208,
+          "external": 5111932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056967056,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1030711196
+        },
+        "provenance": {
+          "pair": 5,
+          "condition": "one",
+          "budgetGiB": 1.0,
+          "startedAtUtc": "2026-10-09T10:12:10.013400+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-5-one/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-5-one/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  25.7 163728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   4.9 198144 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   3.1 1287280 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  780   1.9   4464 /usr/libexec/sysmond",
+            "  591   1.5  22016 /usr/sbin/bluetoothd",
+            "39329   1.3  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            " 2171   1.3 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.0  49792 /usr/libexec/sharingd",
+            "35512   0.7  21616 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+          ],
+          "pid": 35681,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  16.0 163776 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   4.2 198016 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   3.5  96064 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   3.2  22016 /usr/sbin/bluetoothd",
+            "26400   2.5 1288784 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  987   2.2  49792 /usr/libexec/sharingd",
+            " 2171   1.6 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   1.2  33984 /usr/libexec/rapportd",
+            "  999   1.1   9488 /usr/libexec/nearbyd"
+          ]
+        }
+      },
+      {
+        "pair": 5,
+        "condition": "half",
+        "budgetGiB": 0.5,
+        "rtf": 0.7953306505136982,
+        "firstPcmMs": 265.8663749999996,
+        "voicePreparationMs": 4452.883125,
+        "loadMs": 167.924083,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3510097104,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2188099584,
+          "heapTotal": 9256960,
+          "heapUsed": 7491336,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056832708,
+          "peakBytes": 3145483030,
+          "cacheBytes": 513244954
+        },
+        "provenance": {
+          "pair": 5,
+          "condition": "half",
+          "budgetGiB": 0.5,
+          "startedAtUtc": "2026-10-09T10:12:24.326791+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-5-half/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-5-half/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  16.0 163776 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   4.2 198032 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "39329   3.5  96064 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   3.2  22016 /usr/sbin/bluetoothd",
+            "26400   2.5 1288800 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "  987   2.2  49792 /usr/libexec/sharingd",
+            " 2171   1.6 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   1.2  33984 /usr/libexec/rapportd",
+            "  999   1.1   9488 /usr/libexec/nearbyd"
+          ],
+          "pid": 35705,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  38.9 163824 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   8.5 198048 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   5.1 1289872 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "39329   2.8  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   2.3  22016 /usr/sbin/bluetoothd",
+            "  987   1.6  49792 /usr/libexec/sharingd",
+            " 2171   1.0 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   0.9  33984 /usr/libexec/rapportd",
+            "  999   0.7   9488 /usr/libexec/nearbyd"
+          ]
+        }
+      },
+      {
+        "pair": 6,
+        "condition": "half",
+        "budgetGiB": 0.5,
+        "rtf": 0.9004421626712323,
+        "firstPcmMs": 329.88104100000055,
+        "voicePreparationMs": 4845.77325,
+        "loadMs": 167.36704200000003,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3510113320,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187198464,
+          "heapTotal": 9256960,
+          "heapUsed": 7562608,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056836008,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519481526
+        },
+        "provenance": {
+          "pair": 6,
+          "condition": "half",
+          "budgetGiB": 0.5,
+          "startedAtUtc": "2026-10-09T10:12:38.622985+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-6-half/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-6-half/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  38.9 163824 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26363   8.5 198048 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "26400   5.1 1289872 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "39329   2.8  96096 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "  591   2.3  22016 /usr/sbin/bluetoothd",
+            "  987   1.6  49792 /usr/libexec/sharingd",
+            " 2171   1.0 147056 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  946   0.9  33984 /usr/libexec/rapportd",
+            "  999   0.7   9488 /usr/libexec/nearbyd"
+          ],
+          "pid": 35724,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "  598  15.9 163776 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26400   4.2 1316688 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   3.9 198256 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   3.6  22032 /usr/sbin/bluetoothd",
+            "  987   2.7  49792 /usr/libexec/sharingd",
+            "26342   1.8 813056 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            " 2171   1.7 147088 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  999   1.6   9488 /usr/libexec/nearbyd",
+            "  946   1.5  33984 /usr/libexec/rapportd"
+          ]
+        }
+      },
+      {
+        "pair": 6,
+        "condition": "one",
+        "budgetGiB": 1.0,
+        "rtf": 0.8703413599315064,
+        "firstPcmMs": 298.92875000000004,
+        "voicePreparationMs": 4782.157582999999,
+        "loadMs": 203.3165,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "observedPeakPhysicalBytes": 3568702672,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2195030016,
+          "heapTotal": 9256960,
+          "heapUsed": 7491448,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056932984,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1022003896
+        },
+        "provenance": {
+          "pair": 6,
+          "condition": "one",
+          "budgetGiB": 1.0,
+          "startedAtUtc": "2026-10-09T10:12:54.930032+00:00",
+          "command": [
+            "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+            ".cache/tts/benchmark/benchmark.js",
+            "--model",
+            ".cache/tts/models/Base-8bit",
+            "--reference",
+            ".cache/tts/fairy/reference.wav",
+            "--transcript-file",
+            ".cache/tts/fairy/reference.txt",
+            "--text",
+            "新艾利都的夜色渐渐亮起。主人，当前路线已经检查完毕，所有导航数据均已更新。请保持通讯畅通，我们将在下一处路口汇合。",
+            "--once",
+            "--speed",
+            "1.15",
+            "--output",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-6-one/audio.wav",
+            "--report",
+            ".cache/tts/mlx-optimization/scoped-budget-pairs/pair-6-one/report.json",
+            "--note",
+            "User-requested scoped 1 vs0.5 GiB cache follow-up; six alternating-order adjacent pairs after both long playback runs. No playback; ordinary production Node. One-second external physical-memory sampling."
+          ],
+          "thermalBefore": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuBefore": [
+            "  PID  %CPU    RSS COMM",
+            "  598  25.6 163776 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "26400   4.2 1316688 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "26363   3.9 198256 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  591   2.1  22032 /usr/sbin/bluetoothd",
+            "26342   1.8 813056 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            " 2171   1.7 147088 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+            "  987   1.6  49792 /usr/libexec/sharingd",
+            "  946   0.9  33984 /usr/libexec/rapportd",
+            "  999   0.8   9488 /usr/libexec/nearbyd"
+          ],
+          "pid": 35752,
+          "exitCode": 0,
+          "thermalAfter": {
+            "thermalState": 1,
+            "lowPowerMode": false
+          },
+          "cpuAfter": [
+            "  PID  %CPU    RSS COMM",
+            "32018  55.8 262592 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+            "  598  14.6 163728 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            " 9059  11.9  21840 /usr/libexec/aned",
+            "26363   4.9 194032 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+            "  888   4.7 145296 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores",
+            "  555   2.4  57184 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds",
+            "  591   2.1  22032 /usr/sbin/bluetoothd",
+            "26400   2.0 1339648 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            "32229   1.4  19120 /System/Library/PrivateFrameworks/MediaAnalysisAccess.framework/Versions/A/XPCServices/mediaanalysisd-access.xpc/Contents/MacOS/mediaanalysisd-access"
+          ]
+        }
+      }
+    ],
+    "pairs": [
+      {
+        "pair": 1,
+        "order": ["one", "half"],
+        "oneRtf": 0.536257462756849,
+        "halfRtf": 0.5267916490582188,
+        "rtfRatio": 0.9823483786128265,
+        "firstPcmDeltaMs": 9.37479200000007
+      },
+      {
+        "pair": 2,
+        "order": ["half", "one"],
+        "oneRtf": 0.5416365332191777,
+        "halfRtf": 0.5315651541952052,
+        "rtfRatio": 0.9814056504569328,
+        "firstPcmDeltaMs": -11.045292000000245
+      },
+      {
+        "pair": 3,
+        "order": ["one", "half"],
+        "oneRtf": 0.5792113726027394,
+        "halfRtf": 0.6089494007705476,
+        "rtfRatio": 1.0513422725699906,
+        "firstPcmDeltaMs": -1.551665999999841
+      },
+      {
+        "pair": 4,
+        "order": ["half", "one"],
+        "oneRtf": 0.7430079831335611,
+        "halfRtf": 0.6775319885273968,
+        "rtfRatio": 0.9118771317502864,
+        "firstPcmDeltaMs": -28.81754200000023
+      },
+      {
+        "pair": 5,
+        "order": ["one", "half"],
+        "oneRtf": 0.7579336148972599,
+        "halfRtf": 0.7953306505136982,
+        "rtfRatio": 1.0493407798274097,
+        "firstPcmDeltaMs": -14.246875000000728
+      },
+      {
+        "pair": 6,
+        "order": ["half", "one"],
+        "oneRtf": 0.8703413599315064,
+        "halfRtf": 0.9004421626712323,
+        "rtfRatio": 1.0345850537794674,
+        "firstPcmDeltaMs": 30.952291000000514
+      }
+    ],
+    "summary": {
+      "geometricMeanRatio": 1.0005670914129254,
+      "medianPairedRatio": 1.008466716196147,
+      "exploratoryLogT95Interval": [0.9443874504585575, 1.0600887421072884],
+      "medianFirstPcmDeltaMs": -6.298479000000043
+    },
+    "validation": "12 unique PIDs, exit0/EOS, same addon/config/reference/PCM hashes and sample counts. Both conditions use the new TTS environment variable; the global override is unset.",
+    "limitations": "Small serial adjacent pairs, after sustained playback. Alternating order reduces simple order bias but does not remove nonlinear thermal, carry-over or desktop load. Exploratory log-t interval is not proof of equivalence."
+  }
+}

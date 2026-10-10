@@ -27,8 +27,8 @@
 //! guard's `Drop` removes the entry and recomputes the ceiling, so
 //! unloading one model reshapes the cap without ever leaving the
 //! previously-capped value in place for a cold process — an empty
-//! coordinator intentionally leaves the last-applied cap alone (nothing
-//! to allocate anyway, cap costs nothing).
+//! coordinator leaves the last automatic cap alone. A temporary model ceiling
+//! instead restores the prior cap when no independent policy remains.
 //!
 //! ## Baseline choice: deterministic model-owned weight bytes
 //!
@@ -104,11 +104,15 @@
 //!
 //! ## Env overrides (precedence)
 //!
-//!   1. `MLX_CACHE_LIMIT_GB=N` — hard override, trumps everything. `=0`
-//!      skips the call and retains the MLX default.
+//!   1. `MLX_CACHE_LIMIT_GB=N` — overrides the automatic budget. `=0`
+//!      skips automatic policy. Explicit model ceilings still apply.
 //!   2. `MLX_GPU_HEADROOM_GB=N` — tunes only the headroom term of the
 //!      auto formula. Does NOT affect the overhead term.
 //!   3. Otherwise: the budget formula above.
+//!
+//! Models can additionally register a lifetime-scoped free-pool ceiling via
+//! [`CacheLimitCoordinator::register_with_cache_limit`]. The smallest live
+//! ceiling constrains the process policy; this is not a per-model memory pool.
 //!
 //! ## Cache hygiene (no per-request RAII)
 //!
@@ -131,11 +135,11 @@
 //! memory the process holds for no benefit until the next 256-token
 //! `clear_cache()`. [`CacheLimitCoordinator::push_decode_limit`] lowers
 //! the ceiling for the lifetime of a guard; the effective cap is
-//! `min(load-time cap, min(active decode caps))`, recomputed on every
+//! `min(load-time cap, min(model ceilings), min(active decode caps))`, recomputed on every
 //! push/pop and on every model register/unregister, so a concurrent load
 //! on another thread can never be clobbered by a stale "restore previous
 //! value" write. An explicit `MLX_CACHE_LIMIT_GB` pin still trumps the
-//! decode cap (the operator asked for that exact value).
+//! decode cap; explicit model ceilings still constrain that pin.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -175,28 +179,74 @@ const MIN_FREELIST_BYTES: u64 = GIB;
 
 struct CoordState {
     next_id: u64,
-    /// `guard_id -> weight_bytes`: per-model weight-byte totals
+    /// `guard_id -> profile`: per-model weight-byte totals and optional ceilings
     /// captured by the caller as `sum(params.values().nbytes())`
     /// over every weight array the model owns. Summed (not max'd)
     /// so the cap tracks the true total working set across loaded
     /// models: unload subtracts cleanly and load adds cleanly.
-    profiles: HashMap<u64, u64>,
+    profiles: HashMap<u64, ModelCacheProfile>,
     /// Private paged-KV pools allocate outside MLX's freelist counters but
     /// consume the same unified-memory working-set budget.
     pools: HashMap<u64, u64>,
-    /// `guard_id -> cap_bytes`: turn-scoped decode ceilings pushed by
-    /// running decode loops. The smallest live entry caps the effective
-    /// limit; an empty map means "load-time cap only".
+    /// Turn-scoped ceilings owned by active decode loops.
     decode_limits: HashMap<u64, u64>,
-    /// Cap MLX had before the first decode limit was applied while NO
-    /// load-time cap was computable (no model or pool registered). Restored
-    /// when the last decode limit pops so a decode cap never outlives its
-    /// turn on an otherwise unmanaged allocator.
-    decode_restore: Option<usize>,
-    /// Most recent cap we actually pushed through `set_cache_limit`. Used
-    /// so `recompute_locked` can short-circuit when the cap did not
-    /// change — avoids log spam on every register/unregister.
+    limit: AppliedCacheLimit,
+}
+
+struct ModelCacheProfile {
+    weight_bytes: u64,
+    cache_limit: Option<usize>,
+}
+
+impl CoordState {
+    fn cache_ceiling(&self) -> Option<usize> {
+        self.profiles.values().filter_map(|p| p.cache_limit).min()
+    }
+
+    fn scoped_cache_ceiling(&self, allow_decode_limit: bool) -> Option<usize> {
+        let decode = allow_decode_limit
+            .then(|| self.decode_limits.values().copied().min())
+            .flatten()
+            .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX));
+        self.cache_ceiling().into_iter().chain(decode).min()
+    }
+}
+
+/// Separates an applied cap from an unmanaged policy. Retain the prior cap
+/// while model or decode ceilings are live so removing the last one can restore
+/// it even when there is no automatic/global policy to recompute.
+#[derive(Default)]
+struct AppliedCacheLimit {
     last_applied: Option<usize>,
+    before_scoped_limits: Option<usize>,
+}
+
+impl AppliedCacheLimit {
+    fn update(
+        &mut self,
+        policy: Option<usize>,
+        ceiling: Option<usize>,
+        set: impl FnOnce(usize) -> Option<usize>,
+    ) {
+        let target = match (policy, ceiling) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => self.before_scoped_limits,
+        };
+        let Some(target) = target else { return };
+        let previous = if self.last_applied == Some(target) {
+            target
+        } else {
+            let Some(previous) = set(target) else { return };
+            self.last_applied = Some(target);
+            previous
+        };
+        if ceiling.is_some() {
+            self.before_scoped_limits.get_or_insert(previous);
+        } else {
+            self.before_scoped_limits = None;
+        }
+    }
 }
 
 /// Process-wide coordinator that owns the current MLX cache ceiling.
@@ -217,8 +267,7 @@ impl CacheLimitCoordinator {
                 profiles: HashMap::new(),
                 pools: HashMap::new(),
                 decode_limits: HashMap::new(),
-                decode_restore: None,
-                last_applied: None,
+                limit: AppliedCacheLimit::default(),
             }),
         }
     }
@@ -268,11 +317,29 @@ impl CacheLimitCoordinator {
     /// returns, so the caller observes the post-register cap by the
     /// time the guard is in hand.
     pub fn register(&self, weight_bytes: u64) -> CacheLimitGuard {
+        self.register_with_cache_limit(weight_bytes, None)
+    }
+
+    /// Register weights and an optional ceiling on the shared free-buffer pool.
+    /// Live ceilings compose by minimum with the automatic/global policy.
+    /// `None` adds no constraint; `Some(0)` disables free-buffer retention.
+    /// Dropping the guard removes both the weight accounting and the ceiling.
+    pub fn register_with_cache_limit(
+        &self,
+        weight_bytes: u64,
+        cache_limit: Option<usize>,
+    ) -> CacheLimitGuard {
         let id = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let id = state.next_id;
             state.next_id = state.next_id.saturating_add(1);
-            state.profiles.insert(id, weight_bytes);
+            state.profiles.insert(
+                id,
+                ModelCacheProfile {
+                    weight_bytes,
+                    cache_limit,
+                },
+            );
             info!(
                 "[cache_limit] register model guard={} weights={:.2} GB (live_guards={})",
                 id,
@@ -383,9 +450,8 @@ impl CacheLimitCoordinator {
     fn unregister(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.profiles.remove(&id).is_some() {
-            // Recompute after unregister. If the last model unloaded,
-            // `recompute_locked` leaves the existing cap in place — a
-            // cold process has nothing to allocate anyway.
+            // Recompute the surviving policy, restoring the pre-ceiling cap
+            // when the last temporary model constraint disappears.
             recompute_locked(&mut state);
         }
     }
@@ -537,46 +603,51 @@ pub(crate) fn pool_growth_lock() -> &'static Mutex<()> {
     &POOL_GROWTH_LOCK
 }
 
+struct CachePolicy {
+    limit: Option<usize>,
+    source: String,
+    // Preserve the process override: explicit pins (including disabled auto)
+    // bypass automatic turn limits, but model-specific ceilings still apply.
+    allow_decode_limit: bool,
+}
+
 fn recompute_locked(state: &mut CoordState) {
-    // Env override takes absolute precedence and bypasses the baseline
-    // tracking entirely. Behaviour preserved verbatim from the previous
-    // one-shot implementation so existing deployments do not regress.
+    let policy = cache_policy(state);
+    let ceiling = state.scoped_cache_ceiling(policy.allow_decode_limit);
+    let source = match ceiling {
+        Some(bytes) => format!(
+            "{}; scoped ceiling={:.3} GiB",
+            policy.source,
+            bytes as f64 / ONE_GIB
+        ),
+        None => policy.source,
+    };
+    state
+        .limit
+        .update(policy.limit, ceiling, |bytes| apply_limit(bytes, &source));
+}
+
+/// Select the process policy independently of model and decode ceilings.
+/// None means leave the allocator unmanaged, not a zero-byte pool.
+fn cache_policy(state: &CoordState) -> CachePolicy {
     if let Ok(raw) = std::env::var(CACHE_LIMIT_ENV) {
         let trimmed = raw.trim();
         match trimmed.parse::<f64>() {
             Ok(gib) if gib <= 0.0 => {
-                // Log once per sticky state transition — first call with
-                // env=0 logs; subsequent register/unregister calls with
-                // the same env=0 sentinel are silent.
-                if state.last_applied != Some(0) {
-                    info!(
-                        "[cache_limit] {}={} → skipping auto cache limit (MLX default retained)",
-                        CACHE_LIMIT_ENV, trimmed
-                    );
-                }
-                state.last_applied = Some(0);
-                return;
+                return CachePolicy {
+                    limit: None,
+                    source: format!("env {CACHE_LIMIT_ENV}={trimmed}; auto disabled"),
+                    allow_decode_limit: false,
+                };
             }
             Ok(gib) => {
-                let bytes = (gib * ONE_GIB).round() as usize;
-                if state.last_applied != Some(bytes) {
-                    // Memoize ONLY when the FFI confirmed the cap was
-                    // applied. A failed `set_cache_limit` (FFI returned
-                    // -1, i.e. the C++ allocator threw) MUST NOT be
-                    // recorded as success — leaving `last_applied`
-                    // unchanged ensures the next register/unregister
-                    // call retries instead of silently treating the
-                    // failure as a stable applied state.
-                    if apply_limit(bytes, &format!("env {}={}", CACHE_LIMIT_ENV, trimmed)).is_some()
-                    {
-                        state.last_applied = Some(bytes);
-                    }
-                }
-                return;
+                return CachePolicy {
+                    limit: Some((gib * ONE_GIB).round() as usize),
+                    source: format!("env {CACHE_LIMIT_ENV}={trimmed}"),
+                    allow_decode_limit: false,
+                };
             }
             Err(_) => {
-                // Parse failure only logged once per distinct (apply, recompute)
-                // cycle — fall through to auto formula below.
                 info!(
                     "[cache_limit] Ignoring unparseable {}={:?}, using auto formula",
                     CACHE_LIMIT_ENV, raw
@@ -585,109 +656,24 @@ fn recompute_locked(state: &mut CoordState) {
         }
     }
 
-    let base = load_time_cap_locked(state);
-    let has_base = base.is_some();
-    let decode = state.decode_limits.values().copied().min();
-
-    let (limit, source) = match (base, decode) {
-        // Empty coordinator and no decode loop → nothing to cap. Do NOT
-        // reset the last-applied cap: the allocator state the prior cap
-        // was protecting is gone, so the cap costs nothing; resetting
-        // just churns logs. The one exception is a decode cap that was
-        // applied on an unmanaged allocator: lift it back to what MLX had.
-        (None, None) => match state.decode_restore.take() {
-            Some(prev) => (
-                prev as u64,
-                String::from("decode cap lifted, no load-time cap"),
-            ),
-            None => return,
-        },
-        (Some((cap, source)), None) => {
-            state.decode_restore = None;
-            (cap, source)
-        }
-        (Some((cap, source)), Some(decode)) => {
-            state.decode_restore = None;
-            if decode < cap {
-                (
-                    decode,
-                    format!(
-                        "decode ({:.0} MiB, live_decode_guards={}) under {source}",
-                        decode as f64 / (1u64 << 20) as f64,
-                        state.decode_limits.len(),
-                    ),
-                )
-            } else {
-                (cap, source)
-            }
-        }
-        (None, Some(decode)) => (
-            decode,
-            format!(
-                "decode ({:.0} MiB, live_decode_guards={}, no load-time cap)",
-                decode as f64 / (1u64 << 20) as f64,
-                state.decode_limits.len(),
-            ),
-        ),
-    };
-
-    let bytes = limit as usize;
-    if state.last_applied == Some(bytes) {
-        return;
-    }
-
-    // Same fallible-FFI contract as the env-override branch: only memoize
-    // `last_applied` when `apply_limit` confirms the cap was actually
-    // pushed through the FFI. A failed call leaves `last_applied`
-    // untouched so a later register/unregister retries.
-    if let Some(prev) = apply_limit(bytes, &source) {
-        if !has_base && decode.is_some() && state.decode_restore.is_none() {
-            state.decode_restore = Some(prev);
-        }
-        state.last_applied = Some(bytes);
-    }
-}
-
-/// The load-time (model + pool budget) cap and its log `source`, or `None`
-/// when nothing is registered / every registered total is zero — in which
-/// case there is nothing to budget against and the caller leaves the
-/// allocator alone.
-fn load_time_cap_locked(state: &CoordState) -> Option<(u64, String)> {
-    if state.profiles.is_empty() && state.pools.is_empty() {
-        return None;
-    }
-    // Sum (not max) across live weight-byte totals: each caller
-    // registered its own per-model footprint, so summing gives the
-    // true multi-model working-set baseline. `saturating_add` guards
-    // against a measurement anomaly producing a huge bogus value
-    // overflowing u64 when combined with others.
-    let summed_weights: u64 = state
+    let summed_weights = state
         .profiles
         .values()
-        .copied()
-        .fold(0u64, |acc, v| acc.saturating_add(v));
-    let summed_pools: u64 = state
+        .fold(0u64, |sum, p| sum.saturating_add(p.weight_bytes));
+    let summed_pools = state
         .pools
         .values()
         .copied()
-        .fold(0u64, |acc, v| acc.saturating_add(v));
+        .fold(0u64, u64::saturating_add);
     if summed_weights == 0 && summed_pools == 0 {
-        // All weight-byte totals were zero (unlikely — should only
-        // happen in a synthetic test that registers a zero). Skip
-        // rather than set a zero ceiling that would deadlock the
-        // allocator.
-        return None;
+        return CachePolicy {
+            limit: None,
+            source: "no live model budget; restore prior independent cap if needed".into(),
+            allow_decode_limit: true,
+        };
     }
-
     let wired = WiredLimitContext::get_max_working_set_size() as u64;
     let limit = compute_cache_limit(summed_weights, summed_pools, wired);
-    if limit == 0 {
-        return None;
-    }
-
-    // Build the `source` string so the operator can reconstruct the
-    // full budget breakdown from logs. The env-override path emits its
-    // own string at the top of `recompute_locked`.
     let source = if wired == 0 {
         format!(
             "auto (weights={:.1}GB, pools={:.1}GB, wired=0 → fallback cap={:.1}GB, live_guards={})",
@@ -697,20 +683,22 @@ fn load_time_cap_locked(state: &CoordState) -> Option<(u64, String)> {
             state.profiles.len(),
         )
     } else {
-        let overhead = estimate_metal_overhead(wired);
-        let headroom = estimate_user_headroom(wired);
         format!(
             "auto (weights={:.1}GB, pools={:.1}GB, overhead={:.1}GB, headroom={:.1}GB, wired={:.1}GB → cap={:.1}GB, live_guards={})",
             summed_weights as f64 / ONE_GIB,
             summed_pools as f64 / ONE_GIB,
-            overhead as f64 / ONE_GIB,
-            headroom as f64 / ONE_GIB,
+            estimate_metal_overhead(wired) as f64 / ONE_GIB,
+            estimate_user_headroom(wired) as f64 / ONE_GIB,
             wired as f64 / ONE_GIB,
             limit as f64 / ONE_GIB,
             state.profiles.len(),
         )
     };
-    Some((limit, source))
+    CachePolicy {
+        limit: Some(limit as usize),
+        source,
+        allow_decode_limit: true,
+    }
 }
 
 /// Estimate the Metal driver's own overhead footprint for the given
@@ -771,11 +759,11 @@ fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
     (wired - reserved).max(MIN_FREELIST_BYTES)
 }
 
-/// Push a freshly computed cap through `set_cache_limit`. Returns the
-/// previous cap when the FFI succeeded so the caller can update
-/// `last_applied`; `None` indicates the FFI caught a C++ exception
-/// (degraded Metal) and the cap was NOT applied — the caller MUST leave
-/// `last_applied` untouched so the next register/unregister cycle retries.
+/// Push a freshly computed cap through `set_cache_limit`. Returns the prior cap
+/// when the FFI succeeded so the caller can update `last_applied`; `None`
+/// indicates the FFI caught a C++ exception (degraded Metal) and the cap
+/// was NOT applied — the caller MUST leave `last_applied` untouched so
+/// the next register/unregister cycle retries.
 ///
 /// Logging:
 ///   - success → `info!` with the new cap, source, and previous cap.
@@ -927,6 +915,174 @@ mod tests {
     }
 
     const GB: u64 = 1u64 << 30;
+
+    #[test]
+    fn model_and_decode_ceilings_restore_baseline_in_either_drop_order() {
+        for (model, decode) in [(4, 2), (2, 4)] {
+            for model_first in [true, false] {
+                let coord = CacheLimitCoordinator::new();
+                let mut state = coord.state.lock().unwrap();
+                let mut actual = 8;
+                state.profiles.insert(
+                    1,
+                    ModelCacheProfile {
+                        weight_bytes: 0,
+                        cache_limit: Some(model),
+                    },
+                );
+                let ceiling = state.scoped_cache_ceiling(true);
+                state
+                    .limit
+                    .update(None, ceiling, |n| Some(std::mem::replace(&mut actual, n)));
+                state.decode_limits.insert(2, decode as u64);
+                let ceiling = state.scoped_cache_ceiling(true);
+                state
+                    .limit
+                    .update(None, ceiling, |n| Some(std::mem::replace(&mut actual, n)));
+                assert_eq!(actual, model.min(decode));
+                if model_first {
+                    state.profiles.remove(&1);
+                } else {
+                    state.decode_limits.remove(&2);
+                }
+                let ceiling = state.scoped_cache_ceiling(true);
+                state
+                    .limit
+                    .update(None, ceiling, |n| Some(std::mem::replace(&mut actual, n)));
+                assert_eq!(actual, if model_first { decode } else { model });
+                state.profiles.clear();
+                state.decode_limits.clear();
+                state
+                    .limit
+                    .update(None, None, |n| Some(std::mem::replace(&mut actual, n)));
+                assert_eq!(actual, 8);
+            }
+        }
+    }
+
+    #[test]
+    fn global_pin_bypasses_decode_caps_but_keeps_explicit_model_ceilings() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let coord = CacheLimitCoordinator::new();
+        let mut state = coord.state.lock().unwrap();
+        state.profiles.insert(
+            1,
+            ModelCacheProfile {
+                weight_bytes: 0,
+                cache_limit: Some((GB / 2) as usize),
+            },
+        );
+        state.decode_limits.insert(2, GB / 4);
+        for (value, expected_policy, allow_decode) in [
+            ("2", Some((2 * GB) as usize), false),
+            ("0", None, false),
+            ("invalid", None, true),
+        ] {
+            let _env = EnvGuard::set(CACHE_LIMIT_ENV, value);
+            let policy = cache_policy(&state);
+            assert_eq!(policy.limit, expected_policy);
+            assert_eq!(policy.allow_decode_limit, allow_decode);
+            assert_eq!(
+                state.scoped_cache_ceiling(policy.allow_decode_limit),
+                Some((if allow_decode { GB / 4 } else { GB / 2 }) as usize),
+            );
+        }
+    }
+
+    #[test]
+    fn model_ceilings_compose_independently_of_registration_order() {
+        let coord = CacheLimitCoordinator::new();
+        let mut state = coord.state.lock().unwrap();
+        state.profiles.insert(
+            1,
+            ModelCacheProfile {
+                weight_bytes: GB,
+                cache_limit: Some(2),
+            },
+        );
+        state.profiles.insert(
+            2,
+            ModelCacheProfile {
+                weight_bytes: GB,
+                cache_limit: None,
+            },
+        );
+        state.profiles.insert(
+            3,
+            ModelCacheProfile {
+                weight_bytes: GB,
+                cache_limit: Some(1),
+            },
+        );
+        assert_eq!(state.cache_ceiling(), Some(1));
+        state.profiles.remove(&3);
+        assert_eq!(state.cache_ceiling(), Some(2));
+        state.profiles.remove(&1);
+        assert_eq!(state.cache_ceiling(), None);
+    }
+
+    #[test]
+    fn model_ceiling_restores_unmanaged_baseline_and_retries_failed_restore() {
+        let mut state = AppliedCacheLimit::default();
+        let mut actual = 8;
+        state.update(None, Some(1), |n| Some(std::mem::replace(&mut actual, n)));
+        assert_eq!(actual, 1);
+        state.update(None, Some(2), |n| Some(std::mem::replace(&mut actual, n)));
+        assert_eq!(actual, 2);
+        state.update(None, None, |_| None);
+        assert_eq!(state.last_applied, Some(2));
+        assert_eq!(state.before_scoped_limits, Some(8));
+        state.update(None, None, |n| Some(std::mem::replace(&mut actual, n)));
+        assert_eq!(actual, 8);
+        assert_eq!(state.before_scoped_limits, None);
+    }
+
+    #[test]
+    fn model_ceiling_respects_tighter_policy_and_releases_to_surviving_policy() {
+        let mut state = AppliedCacheLimit::default();
+        let mut actual = 8;
+        state.update(Some(2), Some(1), |n| {
+            Some(std::mem::replace(&mut actual, n))
+        });
+        assert_eq!(actual, 1);
+        state.update(Some(2), Some(4), |n| {
+            Some(std::mem::replace(&mut actual, n))
+        });
+        assert_eq!(actual, 2);
+        state.update(Some(3), None, |n| Some(std::mem::replace(&mut actual, n)));
+        assert_eq!(actual, 3);
+        assert_eq!(state.before_scoped_limits, None);
+        state.update(None, None, |_| panic!("no temporary cap left to restore"));
+    }
+
+    #[test]
+    fn failed_set_is_not_memoized_and_zero_is_a_real_generic_ceiling() {
+        let mut state = AppliedCacheLimit::default();
+        state.update(None, Some(0), |_| None);
+        assert_eq!(state.last_applied, None);
+        assert_eq!(state.before_scoped_limits, None);
+        state.update(None, Some(0), |_| Some(8));
+        assert_eq!(state.last_applied, Some(0));
+        state.update(None, Some(0), |_| {
+            panic!("unchanged cap should not be set again")
+        });
+        state.update(None, None, |n| {
+            assert_eq!(n, 8);
+            Some(0)
+        });
+        assert_eq!(state.last_applied, Some(8));
+    }
+
+    #[test]
+    fn unchanged_target_still_tracks_ceiling_lifetime() {
+        let mut state = AppliedCacheLimit::default();
+        state.update(Some(2), None, |_| Some(8));
+        state.update(Some(2), Some(2), |_| panic!("unchanged target"));
+        assert_eq!(state.before_scoped_limits, Some(2));
+        state.update(Some(2), None, |_| panic!("unchanged target"));
+        assert_eq!(state.before_scoped_limits, None);
+        state.update(None, None, |_| panic!("no temporary cap remains"));
+    }
 
     /// Clear any stale `MLX_GPU_HEADROOM_GB` before asserting on the
     /// auto formula. Must be called while holding `ENV_LOCK`.

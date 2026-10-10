@@ -1,0 +1,3770 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-09",
+  "sourceCommit": "3e8c9d8",
+  "scope": "Pure MLX 0.6B Base-8bit, Fairy Chinese, seed534, audio speed1.15. Cache experiments only; no inference behavior change.",
+  "longRuns": [
+    {
+      "date": "2026-10-09T07:54:17.369Z",
+      "loadMs": 167.808875,
+      "voicePreparationMs": 2985.145167,
+      "firstPcmMs": 1217.0254170000003,
+      "synthesis": {
+        "audioSeconds": 848.31999999997,
+        "synthesisMs": 535809.184831,
+        "wallMs": 737407.464042,
+        "inputWaitMs": 1296.112756000604,
+        "consumerWaitMs": 596816.6779380023,
+        "realTimeFactor": 0.6316121096178553,
+        "firstPcmMs": 214.52308300000004,
+        "segments": 200,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 4632.10014500094,
+        "inputFrames": 20359680,
+        "outputFrames": 17704066,
+        "speed": 1.15,
+        "outputSeconds": 737.6694166666126,
+        "realTimeFactor": 0.7326334436069644
+      },
+      "timing": null,
+      "playback": {
+        "playedSeconds": 737.6694166666666,
+        "underruns": 0,
+        "firstPlaybackMs": 1950.912125
+      },
+      "playbackPolicy": {
+        "bufferSeconds": 3,
+        "prebufferSeconds": 1
+      },
+      "blockIntervalMs": {
+        "p50": 137.03537499997765,
+        "p95": 153.98616600001696,
+        "p99": 353.2407499999972,
+        "max": 948.0665000000154
+      },
+      "rawSegmentBoundaryMs": {
+        "p50": 321.65741699992213,
+        "p95": 413.9797920000274,
+        "max": 947.6338749999995
+      },
+      "peakRssBytes": 2297315328,
+      "passedTenMinutePlayback": true,
+      "firstPlaybackFromSubmissionMs": {
+        "lowerBound": 1854.9695830000005,
+        "upperBound": 1950.9100000000003
+      },
+      "playbackComplete": null,
+      "execution": {
+        "execArgv": [],
+        "nodeOptions": null,
+        "sdkEntry": "file:///Users/saviio/service/mlx-node/packages/tts/dist/index.js",
+        "coreEntry": "file:///Users/saviio/service/mlx-node/packages/core/index.cjs",
+        "allocatorCacheLimitGiB": null,
+        "nativeAddons": [
+          {
+            "path": "/Users/saviio/service/mlx-node/packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          }
+        ]
+      },
+      "checkpoint": {
+        "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+        "revision": null,
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "name": "long-restored",
+      "reportPath": ".cache/tts/mlx-optimization/long-restored.json",
+      "reportSha256": "a457e897c5bd6d91428685d40857cd64634b1b9671eee08159460b44716f1522",
+      "wavSha256": "f3f4ebf7ec634982f191f2fc0869f70f50f6e8034380f87c531dacba1bd0ad3c",
+      "observedPeakPhysicalBytes": 5471737616,
+      "steadyMedianPhysicalBytes": 5468772016,
+      "lastSegmentMemory": {
+        "audioSeconds": 733.4259583332796,
+        "rss": 2295332864,
+        "heapTotal": 9519104,
+        "heapUsed": 8066248,
+        "external": 4870931,
+        "arrayBuffers": 209151,
+        "activeBytes": 2056774028,
+        "peakBytes": 3145483030,
+        "cacheBytes": 3189626190
+      },
+      "provenance": {
+        "startedAtUtc": "2026-10-09T07:41:53.477189+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text-file",
+          ".cache/tts/ane/paced-story-twice.txt",
+          "--once",
+          "--graphemes-per-second",
+          "20",
+          "--chunk-graphemes",
+          "2",
+          "--play",
+          "--speed",
+          "1.15",
+          "--prebuffer-seconds",
+          "1",
+          "--playback-buffer-seconds",
+          "3",
+          "--output",
+          ".cache/tts/mlx-optimization/long-restored.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/long-restored.json",
+          "--note",
+          "Restores earlier zero-underrun MLX WSOLA playback policy: three-second runtime capacity, one-second startup prebuffer, twenty graphemes/second. Original story repeated twice for the long test. Pure MLX on codex/tts-streaming 3e8c9d8, rebuilt release native and compiled SDK. Ordinary Node with no source condition. Default allocator policy; no CoreML, Xcode, LLM, tracing, compilation or other inference alongside. External proc_pid_rusage memory sampling every five seconds."
+        ],
+        "sourceCommit": "3e8c9d8dc91b8ce351e01660aac8542b0b6fa56c",
+        "memoryMetricSource": "proc_pid_rusage RUSAGE_INFO_V4; peakPhysicalFootprintBytes is kernel lifetime high-water mark, other counters are sampled and overlap",
+        "files": [
+          {
+            "path": "packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          },
+          {
+            "path": "packages/tts/dist/index.js",
+            "sha256": "821e0b8cbddae21e3e943ed95a9d7ca482d083cc0c9b40e4d781a30d13dfc171"
+          },
+          {
+            "path": ".cache/tts/benchmark/benchmark.js",
+            "sha256": "254dcd567e421fb0bd1da25d213ddbe8512bfdb12d91d5441ea45a4c87adc88e"
+          },
+          {
+            "path": ".cache/tts/mlx-optimization/process-memory.c",
+            "sha256": "3561eed6ad0d8066b870980a6cbee9a7089438a9b749e52a362568be22368896"
+          }
+        ],
+        "pid": 27070,
+        "exitCode": 0,
+        "finishedAtUtc": "2026-10-09T07:54:20.098634+00:00"
+      },
+      "thermalObservations": {},
+      "sampledPeakResidentBytes": 2295382016
+    },
+    {
+      "date": "2026-10-09T08:15:26.582Z",
+      "loadMs": 163.858,
+      "voicePreparationMs": 3018.334084,
+      "firstPcmMs": 1255.9988750000002,
+      "synthesis": {
+        "audioSeconds": 848.31999999997,
+        "synthesisMs": 685735.8074420001,
+        "wallMs": 787641.8271250001,
+        "inputWaitMs": 1421.1499080001522,
+        "consumerWaitMs": 258611.2337730024,
+        "realTimeFactor": 0.8083456802173995,
+        "firstPcmMs": 252.19054200000028,
+        "segments": 200,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 4927.627368002103,
+        "inputFrames": 20359680,
+        "outputFrames": 17704066,
+        "rawPcmSha256": "baa770990aae9adb725c0c842926f7da138ce4c332b46b0025598a2be575b9f4",
+        "processedPcmSha256": "3c67484e2226b2ce75cacab830e5d4f29f644974cf01ed6a03baacdb5a008034",
+        "speed": 1.15,
+        "outputSeconds": 737.6694166666126,
+        "realTimeFactor": 0.9362777135738912
+      },
+      "timing": null,
+      "playback": {
+        "playedSeconds": 737.6694166666666,
+        "underruns": 4720,
+        "firstPlaybackMs": 1900.143708
+      },
+      "playbackPolicy": {
+        "bufferSeconds": 3,
+        "prebufferSeconds": 1
+      },
+      "blockIntervalMs": {
+        "p50": 136.75179099998786,
+        "p95": 202.2156660000328,
+        "p99": 469.64395800000057,
+        "max": 763.4599999999627
+      },
+      "rawSegmentBoundaryMs": {
+        "p50": 395.07529099995736,
+        "p95": 590.9872079999768,
+        "max": 763.607874999987
+      },
+      "peakRssBytes": 2255437824,
+      "passedTenMinutePlayback": false,
+      "firstPlaybackFromSubmissionMs": {
+        "lowerBound": 1812.8416669999997,
+        "upperBound": 1900.1416669999999
+      },
+      "playbackComplete": null,
+      "execution": {
+        "execArgv": [],
+        "nodeOptions": null,
+        "sdkEntry": "file:///Users/saviio/service/mlx-node/packages/tts/dist/index.js",
+        "coreEntry": "file:///Users/saviio/service/mlx-node/packages/core/index.cjs",
+        "allocatorCacheLimitGiB": "1",
+        "nativeAddons": [
+          {
+            "path": "/Users/saviio/service/mlx-node/packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          }
+        ]
+      },
+      "checkpoint": {
+        "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+        "revision": null,
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "name": "long-cache1",
+      "reportPath": ".cache/tts/mlx-optimization/long-cache1.json",
+      "reportSha256": "6e3720ec926f392532cea7af567c41ac3a58d986f56e1a4ed9c6c0979850c9cb",
+      "wavSha256": "f3f4ebf7ec634982f191f2fc0869f70f50f6e8034380f87c531dacba1bd0ad3c",
+      "observedPeakPhysicalBytes": 3612988672,
+      "steadyMedianPhysicalBytes": 3353105880.0,
+      "lastSegmentMemory": {
+        "audioSeconds": 733.4259583332796,
+        "rss": 2250948608,
+        "heapTotal": 9519104,
+        "heapUsed": 8093728,
+        "external": 4842131,
+        "arrayBuffers": 209151,
+        "activeBytes": 2056785880,
+        "peakBytes": 3145483030,
+        "cacheBytes": 1038039206
+      },
+      "provenance": {
+        "startedAtUtc": "2026-10-09T08:02:15.263661+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text-file",
+          ".cache/tts/ane/paced-story-twice.txt",
+          "--once",
+          "--graphemes-per-second",
+          "20",
+          "--chunk-graphemes",
+          "2",
+          "--play",
+          "--speed",
+          "1.15",
+          "--prebuffer-seconds",
+          "1",
+          "--playback-buffer-seconds",
+          "3",
+          "--output",
+          ".cache/tts/mlx-optimization/long-cache1.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/long-cache1.json",
+          "--note",
+          "Restores earlier zero-underrun MLX WSOLA playback policy: three-second runtime capacity, one-second startup prebuffer, twenty graphemes/second. Original story repeated twice for the long test. Pure MLX on codex/tts-streaming 3e8c9d8, rebuilt release native and compiled SDK. Ordinary Node with no source condition. Explicit one-GiB allocator cache budget (MLX_CACHE_LIMIT_GB=1); no CoreML, Xcode, LLM, tracing, compilation or other inference alongside. External proc_pid_rusage memory sampling every five seconds."
+        ],
+        "sourceCommit": "3e8c9d8dc91b8ce351e01660aac8542b0b6fa56c",
+        "memoryMetricSource": "proc_pid_rusage RUSAGE_INFO_V4; peakPhysicalFootprintBytes is kernel lifetime high-water mark, other counters are sampled and overlap",
+        "files": [
+          {
+            "path": "packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          },
+          {
+            "path": "packages/tts/dist/index.js",
+            "sha256": "821e0b8cbddae21e3e943ed95a9d7ca482d083cc0c9b40e4d781a30d13dfc171"
+          },
+          {
+            "path": ".cache/tts/benchmark/benchmark.js",
+            "sha256": "54aade2d70e1a287e2f79a6a0b89259e47491b2e0789b749ec76c123ec2a90a8"
+          },
+          {
+            "path": ".cache/tts/mlx-optimization/process-memory.c",
+            "sha256": "3561eed6ad0d8066b870980a6cbee9a7089438a9b749e52a362568be22368896"
+          }
+        ],
+        "pid": 28192,
+        "exitCode": 0,
+        "finishedAtUtc": "2026-10-09T08:15:27.190649+00:00"
+      },
+      "thermalObservations": {},
+      "sampledPeakResidentBytes": 2252128256
+    },
+    {
+      "date": "2026-10-09T08:44:19.270Z",
+      "loadMs": 160.61525,
+      "voicePreparationMs": 3043.288833,
+      "firstPcmMs": 1211.461417,
+      "synthesis": {
+        "audioSeconds": 848.31999999997,
+        "synthesisMs": 675375.2234590006,
+        "wallMs": 742128.0447910001,
+        "inputWaitMs": 1444.53984099965,
+        "consumerWaitMs": 242252.82138300175,
+        "realTimeFactor": 0.7961326191284238,
+        "firstPcmMs": 208.91449999999986,
+        "segments": 200,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 4966.255608004186,
+        "inputFrames": 20359680,
+        "outputFrames": 17704066,
+        "rawPcmSha256": "baa770990aae9adb725c0c842926f7da138ce4c332b46b0025598a2be575b9f4",
+        "processedPcmSha256": "3c67484e2226b2ce75cacab830e5d4f29f644974cf01ed6a03baacdb5a008034",
+        "speed": 1.15,
+        "outputSeconds": 737.6694166666126
+      },
+      "timing": {
+        "observedStreamWallMs": 742128.881667,
+        "observedStreamWallRatio": 1.0060453434826386,
+        "playbackFinishWallMs": 744926.578125,
+        "measuredServiceTimeMs": 680341.4790670048,
+        "measuredServiceTimeRatio": 0.9222850557385694,
+        "note": "Service intervals may overlap and omit untimed overhead. Wall time includes input, sinks and backpressure."
+      },
+      "playback": {
+        "playedSeconds": 737.6694166666666,
+        "underruns": 541,
+        "firstPlaybackMs": 1892.357833
+      },
+      "playbackPolicy": {
+        "bufferSeconds": 3,
+        "prebufferSeconds": 1
+      },
+      "blockIntervalMs": {
+        "p50": 127.93895800001337,
+        "p95": 176.32783299998846,
+        "p99": 424.2298330000194,
+        "max": 760.4867080000695
+      },
+      "rawSegmentBoundaryMs": {
+        "p50": 382.0155419999792,
+        "p95": 519.6186670000025,
+        "max": 760.3274580000434
+      },
+      "peakRssBytes": 2215280640,
+      "passedTenMinutePlayback": false,
+      "firstPlaybackFromSubmissionMs": {
+        "lowerBound": 1791.3642919999998,
+        "upperBound": 1892.3538329999997
+      },
+      "playbackComplete": true,
+      "execution": {
+        "execArgv": [],
+        "nodeOptions": null,
+        "sdkEntry": "file:///Users/saviio/service/mlx-node/packages/tts/dist/index.js",
+        "coreEntry": "file:///Users/saviio/service/mlx-node/packages/core/index.cjs",
+        "allocatorCacheLimitGiB": "0.5",
+        "nativeAddons": [
+          {
+            "path": "/Users/saviio/service/mlx-node/packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          }
+        ]
+      },
+      "checkpoint": {
+        "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+        "revision": null,
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "name": "long-cache-half",
+      "reportPath": ".cache/tts/mlx-optimization/long-cache-half.json",
+      "reportSha256": "598eaed85eb5d0231b9346a836854d57333747b35398cc4baea775998d5f9dfe",
+      "wavSha256": "f3f4ebf7ec634982f191f2fc0869f70f50f6e8034380f87c531dacba1bd0ad3c",
+      "observedPeakPhysicalBytes": 3515061384,
+      "steadyMedianPhysicalBytes": 2803963208,
+      "lastSegmentMemory": {
+        "audioSeconds": 733.4259583332796,
+        "rss": 2200272896,
+        "heapTotal": 9256960,
+        "heapUsed": 7952688,
+        "external": 3018870,
+        "arrayBuffers": 274687,
+        "activeBytes": 2056869060,
+        "peakBytes": 3145483030,
+        "cacheBytes": 520754112
+      },
+      "provenance": {
+        "startedAtUtc": "2026-10-09T08:31:50.906994+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text-file",
+          ".cache/tts/ane/paced-story-twice.txt",
+          "--once",
+          "--graphemes-per-second",
+          "20",
+          "--chunk-graphemes",
+          "2",
+          "--play",
+          "--speed",
+          "1.15",
+          "--prebuffer-seconds",
+          "1",
+          "--playback-buffer-seconds",
+          "3",
+          "--output",
+          ".cache/tts/mlx-optimization/long-cache-half.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/long-cache-half.json",
+          "--note",
+          "Restores earlier zero-underrun MLX WSOLA playback policy: three-second runtime capacity, one-second startup prebuffer, twenty graphemes/second. Original story repeated twice for the long test. Pure MLX on codex/tts-streaming 3e8c9d8, rebuilt release native and compiled SDK. Ordinary Node with no source condition. Explicit half-GiB allocator cache budget (MLX_CACHE_LIMIT_GB=0.5), repeat after balanced short experiments and a fixed 180-second inference idle period; no CoreML, Xcode, LLM, tracing, compilation or other inference alongside. External proc_pid_rusage memory sampling every five seconds."
+        ],
+        "sourceCommit": "3e8c9d8dc91b8ce351e01660aac8542b0b6fa56c",
+        "memoryMetricSource": "proc_pid_rusage RUSAGE_INFO_V4; peakPhysicalFootprintBytes is kernel lifetime high-water mark, other counters are sampled and overlap",
+        "files": [
+          {
+            "path": "packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          },
+          {
+            "path": "packages/tts/dist/index.js",
+            "sha256": "821e0b8cbddae21e3e943ed95a9d7ca482d083cc0c9b40e4d781a30d13dfc171"
+          },
+          {
+            "path": ".cache/tts/benchmark/benchmark.js",
+            "sha256": "bedfeed7bf0046605c3d4541cfd5c445982dae547fb6c46f4a8f54b6787d1db3"
+          },
+          {
+            "path": ".cache/tts/mlx-optimization/process-memory.c",
+            "sha256": "3561eed6ad0d8066b870980a6cbee9a7089438a9b749e52a362568be22368896"
+          }
+        ],
+        "pid": 30365,
+        "exitCode": 0,
+        "finishedAtUtc": "2026-10-09T08:44:19.354122+00:00"
+      },
+      "thermalObservations": {
+        "0": 17,
+        "1": 132
+      },
+      "sampledPeakResidentBytes": 2207563776
+    },
+    {
+      "date": "2026-10-09T09:12:58.685Z",
+      "loadMs": 671.1877920000001,
+      "voicePreparationMs": 2754.110208,
+      "firstPcmMs": 1199.1860409999995,
+      "synthesis": {
+        "audioSeconds": 848.31999999997,
+        "synthesisMs": 526874.654832,
+        "wallMs": 736310.280042,
+        "inputWaitMs": 1494.8282459994443,
+        "consumerWaitMs": 630016.976135999,
+        "realTimeFactor": 0.6210800816107349,
+        "firstPcmMs": 196.4747500000003,
+        "segments": 200,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 5157.860907000751,
+        "inputFrames": 20359680,
+        "outputFrames": 17704066,
+        "rawPcmSha256": "baa770990aae9adb725c0c842926f7da138ce4c332b46b0025598a2be575b9f4",
+        "processedPcmSha256": "3c67484e2226b2ce75cacab830e5d4f29f644974cf01ed6a03baacdb5a008034",
+        "speed": 1.15,
+        "outputSeconds": 737.6694166666126
+      },
+      "timing": {
+        "observedStreamWallMs": 736404.54175,
+        "observedStreamWallRatio": 0.9982853092617987,
+        "playbackFinishWallMs": 739423.167958,
+        "measuredServiceTimeMs": 532032.5157390008,
+        "measuredServiceTimeRatio": 0.7212343411811135,
+        "note": "Service intervals may overlap and omit untimed overhead. Wall time includes input, sinks and backpressure."
+      },
+      "playback": {
+        "playedSeconds": 737.6694166666666,
+        "underruns": 0,
+        "firstPlaybackMs": 1824.973166
+      },
+      "playbackPolicy": {
+        "bufferSeconds": 3,
+        "prebufferSeconds": 1
+      },
+      "blockIntervalMs": {
+        "p50": 137.71120799996424,
+        "p95": 152.00370800000383,
+        "p99": 353.10779199999524,
+        "max": 739.4900830000006
+      },
+      "rawSegmentBoundaryMs": {
+        "p50": 328.3429999999935,
+        "p95": 400.24608300000546,
+        "max": 739.4536250000001
+      },
+      "peakRssBytes": 2259927040,
+      "passedTenMinutePlayback": true,
+      "firstPlaybackFromSubmissionMs": {
+        "lowerBound": 1749.2639990000002,
+        "upperBound": 1824.9710410000002
+      },
+      "playbackComplete": true,
+      "execution": {
+        "execArgv": [],
+        "nodeOptions": null,
+        "sdkEntry": "file:///Users/saviio/service/mlx-node/packages/tts/dist/index.js",
+        "coreEntry": "file:///Users/saviio/service/mlx-node/packages/core/index.cjs",
+        "allocatorCacheLimitGiB": "2",
+        "nativeAddons": [
+          {
+            "path": "/Users/saviio/service/mlx-node/packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          }
+        ]
+      },
+      "checkpoint": {
+        "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+        "revision": null,
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "name": "long-cache2-quiet",
+      "reportPath": ".cache/tts/mlx-optimization/long-cache2-quiet.json",
+      "reportSha256": "687e3d5cb917715c1c067da75a8ee41e0855166f6868bc709dfff8d1610cae2e",
+      "wavSha256": "f3f4ebf7ec634982f191f2fc0869f70f50f6e8034380f87c531dacba1bd0ad3c",
+      "observedPeakPhysicalBytes": 4544222752,
+      "steadyMedianPhysicalBytes": 4304279168.0,
+      "lastSegmentMemory": {
+        "audioSeconds": 733.4259583332796,
+        "rss": 2256846848,
+        "heapTotal": 9256960,
+        "heapUsed": 7641928,
+        "external": 2764090,
+        "arrayBuffers": 209151,
+        "activeBytes": 2056777384,
+        "peakBytes": 3145483030,
+        "cacheBytes": 2056876816
+      },
+      "provenance": {
+        "startedAtUtc": "2026-10-09T09:00:35.621478+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text-file",
+          ".cache/tts/ane/paced-story-twice.txt",
+          "--once",
+          "--graphemes-per-second",
+          "20",
+          "--chunk-graphemes",
+          "2",
+          "--play",
+          "--speed",
+          "1.15",
+          "--prebuffer-seconds",
+          "1",
+          "--playback-buffer-seconds",
+          "3",
+          "--output",
+          ".cache/tts/mlx-optimization/long-cache2-quiet.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/long-cache2-quiet.json",
+          "--note",
+          "Restores earlier zero-underrun MLX WSOLA playback policy: three-second runtime capacity, one-second startup prebuffer, twenty graphemes/second. Original story repeated twice for the long test. Pure MLX on codex/tts-streaming 3e8c9d8, rebuilt release native and compiled SDK. Ordinary Node with no source condition. Explicit two-GiB allocator cache budget (MLX_CACHE_LIMIT_GB=2), user-provided quiet desktop window, fixed 180-second inference idle period before run; no CoreML, Xcode, LLM, tracing, compilation or other inference alongside. External proc_pid_rusage memory sampling every five seconds."
+        ],
+        "sourceCommit": "3e8c9d8dc91b8ce351e01660aac8542b0b6fa56c",
+        "memoryMetricSource": "proc_pid_rusage RUSAGE_INFO_V4; peakPhysicalFootprintBytes is kernel lifetime high-water mark, other counters are sampled and overlap",
+        "files": [
+          {
+            "path": "packages/core/mlx-core.darwin-arm64.node",
+            "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+          },
+          {
+            "path": "packages/tts/dist/index.js",
+            "sha256": "821e0b8cbddae21e3e943ed95a9d7ca482d083cc0c9b40e4d781a30d13dfc171"
+          },
+          {
+            "path": ".cache/tts/benchmark/benchmark.js",
+            "sha256": "bedfeed7bf0046605c3d4541cfd5c445982dae547fb6c46f4a8f54b6787d1db3"
+          },
+          {
+            "path": ".cache/tts/mlx-optimization/process-memory.c",
+            "sha256": "3561eed6ad0d8066b870980a6cbee9a7089438a9b749e52a362568be22368896"
+          }
+        ],
+        "pid": 31727,
+        "exitCode": 0,
+        "finishedAtUtc": "2026-10-09T09:12:59.086252+00:00"
+      },
+      "thermalObservations": {
+        "0": 19,
+        "1": 129
+      },
+      "sampledPeakResidentBytes": 2259615744
+    }
+  ],
+  "oldShortPairs": {
+    "paired-rows.json": [
+      {
+        "name": "pair-1-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.5193498503424655,
+        "firstPcmMs": 169.25329199999987,
+        "voicePreparationMs": 3006.1174170000004,
+        "loadMs": 169.191417,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4635546952,
+        "lastObservedPhysicalFootprintBytes": 4635514184,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2276917248,
+          "heapTotal": 8732672,
+          "heapUsed": 6259280,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056808868,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342482370
+        }
+      },
+      {
+        "name": "pair-1-limited",
+        "cacheLimitGiB": 0.5,
+        "rtf": 0.5197565070205477,
+        "firstPcmMs": 165.96787499999982,
+        "voicePreparationMs": 2883.228042,
+        "loadMs": 160.777333,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3552793760,
+        "lastObservedPhysicalFootprintBytes": 2858112256,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2231369728,
+          "heapTotal": 8994816,
+          "heapUsed": 6259360,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056869040,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519283748
+        }
+      },
+      {
+        "name": "pair-2-limited",
+        "cacheLimitGiB": 0.5,
+        "rtf": 0.5163832232020544,
+        "firstPcmMs": 172.14420900000005,
+        "voicePreparationMs": 3051.1747920000003,
+        "loadMs": 163.227667,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3552580696,
+        "lastObservedPhysicalFootprintBytes": 2858865872,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2230173696,
+          "heapTotal": 8732672,
+          "heapUsed": 6587000,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056816548,
+          "peakBytes": 3145483030,
+          "cacheBytes": 512299260
+        }
+      },
+      {
+        "name": "pair-2-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.5185445562499996,
+        "firstPcmMs": 179.79366600000003,
+        "voicePreparationMs": 3085.7225,
+        "loadMs": 170.423875,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4636317000,
+        "lastObservedPhysicalFootprintBytes": 4636169544,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2277556224,
+          "heapTotal": 8732672,
+          "heapUsed": 6587280,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056774020,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342514658
+        }
+      },
+      {
+        "name": "pair-3-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.545110870376712,
+        "firstPcmMs": 175.28987499999994,
+        "voicePreparationMs": 3039.046041,
+        "loadMs": 167.143792,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4636628440,
+        "lastObservedPhysicalFootprintBytes": 4636628440,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2277900288,
+          "heapTotal": 8994816,
+          "heapUsed": 6257984,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056822932,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342505682
+        }
+      },
+      {
+        "name": "pair-3-limited",
+        "cacheLimitGiB": 0.5,
+        "rtf": 0.5877898365582188,
+        "firstPcmMs": 209.01420800000005,
+        "voicePreparationMs": 3171.363375,
+        "loadMs": 162.94433400000003,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3552269376,
+        "lastObservedPhysicalFootprintBytes": 2858046600,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2230992896,
+          "heapTotal": 8994816,
+          "heapUsed": 6583800,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056884404,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519406520
+        }
+      },
+      {
+        "name": "pair-4-limited",
+        "cacheLimitGiB": 0.5,
+        "rtf": 0.6329006242294516,
+        "firstPcmMs": 250.89304100000027,
+        "voicePreparationMs": 3067.499,
+        "loadMs": 160.567375,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3552679120,
+        "lastObservedPhysicalFootprintBytes": 2869630208,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2230845440,
+          "heapTotal": 8994816,
+          "heapUsed": 6259048,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056868744,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519262410
+        }
+      },
+      {
+        "name": "pair-4-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.6746099455479448,
+        "firstPcmMs": 276.2661250000001,
+        "voicePreparationMs": 3775.096333,
+        "loadMs": 164.963416,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4636202360,
+        "lastObservedPhysicalFootprintBytes": 4636202360,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2277556224,
+          "heapTotal": 8994816,
+          "heapUsed": 6183120,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056809668,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342475938
+        }
+      },
+      {
+        "name": "pair-5-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.7467516798801364,
+        "firstPcmMs": 269.9744580000006,
+        "voicePreparationMs": 4090.2488329999996,
+        "loadMs": 221.37275000000002,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4637169064,
+        "lastObservedPhysicalFootprintBytes": 0,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2278227968,
+          "heapTotal": 8732672,
+          "heapUsed": 6259840,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056822956,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342505658
+        }
+      },
+      {
+        "name": "pair-5-limited",
+        "cacheLimitGiB": 0.5,
+        "rtf": 0.8203835898972598,
+        "firstPcmMs": 262.98870800000077,
+        "voicePreparationMs": 4576.515959,
+        "loadMs": 161.146625,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3552793760,
+        "lastObservedPhysicalFootprintBytes": 2858554576,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2230419456,
+          "heapTotal": 8994816,
+          "heapUsed": 6587464,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056836056,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519577746
+        }
+      }
+    ],
+    "paired-1-rows.json": [
+      {
+        "name": "pair-1-1-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.691063470205479,
+        "firstPcmMs": 334.6962500000004,
+        "voicePreparationMs": 3770.090917,
+        "loadMs": 218.594458,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4637234552,
+        "lastObservedPhysicalFootprintBytes": 0,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2278277120,
+          "heapTotal": 8994816,
+          "heapUsed": 6259304,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056808548,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342475010
+        }
+      },
+      {
+        "name": "pair-1-1-limited",
+        "cacheLimitGiB": 1.0,
+        "rtf": 0.6669967642123283,
+        "firstPcmMs": 312.10187499999984,
+        "voicePreparationMs": 3671.164083,
+        "loadMs": 162.727417,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3611628752,
+        "lastObservedPhysicalFootprintBytes": 3369030960,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2237022208,
+          "heapTotal": 8994816,
+          "heapUsed": 6587416,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056753136,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1015161216
+        }
+      },
+      {
+        "name": "pair-1-2-limited",
+        "cacheLimitGiB": 1.0,
+        "rtf": 0.6701052978595887,
+        "firstPcmMs": 274.73475000000053,
+        "voicePreparationMs": 3658.298,
+        "loadMs": 166.955375,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3613398224,
+        "lastObservedPhysicalFootprintBytes": 3361608936,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2238300160,
+          "heapTotal": 8994816,
+          "heapUsed": 6257472,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056802792,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1004405064
+        }
+      },
+      {
+        "name": "pair-1-2-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.6777219676369859,
+        "firstPcmMs": 266.2317500000004,
+        "voicePreparationMs": 3786.8841669999997,
+        "loadMs": 166.793375,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4635858368,
+        "lastObservedPhysicalFootprintBytes": 4635858368,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2277097472,
+          "heapTotal": 8994816,
+          "heapUsed": 6586176,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056825292,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342507418
+        }
+      },
+      {
+        "name": "pair-1-3-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.703646621575342,
+        "firstPcmMs": 243.98716700000023,
+        "voicePreparationMs": 3944.104667,
+        "loadMs": 212.297041,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4636759488,
+        "lastObservedPhysicalFootprintBytes": 4636759488,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2277883904,
+          "heapTotal": 8470528,
+          "heapUsed": 6586744,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056824196,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342506466
+        }
+      },
+      {
+        "name": "pair-1-3-limited",
+        "cacheLimitGiB": 1.0,
+        "rtf": 0.720456752054794,
+        "firstPcmMs": 263.96179200000006,
+        "voicePreparationMs": 4157.354916,
+        "loadMs": 163.520291,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3614135552,
+        "lastObservedPhysicalFootprintBytes": 3384562992,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2236153856,
+          "heapTotal": 8732672,
+          "heapUsed": 6586080,
+          "external": 74771407,
+          "arrayBuffers": 72308591,
+          "activeBytes": 2056897592,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1022137912
+        }
+      },
+      {
+        "name": "pair-1-4-limited",
+        "cacheLimitGiB": 1.0,
+        "rtf": 0.7643604634417802,
+        "firstPcmMs": 262.7937919999995,
+        "voicePreparationMs": 4392.675665999999,
+        "loadMs": 199.432208,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3610481896,
+        "lastObservedPhysicalFootprintBytes": 3385972016,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2239905792,
+          "heapTotal": 8732672,
+          "heapUsed": 6586824,
+          "external": 74705871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056967136,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1016899664
+        }
+      },
+      {
+        "name": "pair-1-4-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.7654728703767119,
+        "firstPcmMs": 272.5731660000001,
+        "voicePreparationMs": 4287.821208,
+        "loadMs": 182.670791,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4636349840,
+        "lastObservedPhysicalFootprintBytes": 4636349840,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2277621760,
+          "heapTotal": 8994816,
+          "heapUsed": 6258416,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056823948,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342515930
+        }
+      },
+      {
+        "name": "pair-1-5-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.8254034388698627,
+        "firstPcmMs": 278.30912499999977,
+        "voicePreparationMs": 4912.260458,
+        "loadMs": 215.4775,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4636611984,
+        "lastObservedPhysicalFootprintBytes": 4636611984,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2277851136,
+          "heapTotal": 8732672,
+          "heapUsed": 6257064,
+          "external": 74561871,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056806572,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342531258
+        }
+      },
+      {
+        "name": "pair-1-5-limited",
+        "cacheLimitGiB": 1.0,
+        "rtf": 0.8070711295376707,
+        "firstPcmMs": 413.28462500000023,
+        "voicePreparationMs": 4721.96775,
+        "loadMs": 207.289875,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 3611694336,
+        "lastObservedPhysicalFootprintBytes": 3361428808,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2236973056,
+          "heapTotal": 8994816,
+          "heapUsed": 6299432,
+          "external": 74590671,
+          "arrayBuffers": 72243055,
+          "activeBytes": 2056770488,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1004949412
+        }
+      }
+    ]
+  },
+  "balanced": {
+    "protocol": {
+      "seed": 534,
+      "blocks": [
+        ["half", "default", "one", "one", "default", "half"],
+        ["default", "half", "one", "one", "half", "default"],
+        ["one", "half", "default", "default", "half", "one"],
+        ["default", "one", "half", "half", "one", "default"],
+        ["one", "default", "half", "half", "default", "one"],
+        ["half", "one", "default", "default", "one", "half"]
+      ],
+      "cooldownSecondsBetweenBlocks": 20,
+      "units": "GiB",
+      "budgets": {
+        "default": null,
+        "half": 0.5,
+        "one": 1
+      },
+      "analysis": "For each six-run palindrome block, compare mean log RTF of candidate with default. Average run position equal across conditions within each block. Report all six block ratios, geometric mean, and exploratory t interval across blocks; drift, nonlinear trends and desktop noise remain possible. No sequential stopping based on results.",
+      "commandSource": "/Users/saviio/service/mlx-node/.cache/tts/mlx-optimization/balanced-cache.py"
+    },
+    "rows": [
+      {
+        "block": 1,
+        "run": 1,
+        "condition": "half",
+        "rtf": 0.5169750136986297,
+        "nativeFirstPcmMs": 171.98016700000016,
+        "voicePreparationMs": 2975.2170410000003,
+        "synthesisMs": 6038.26816,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3509949504,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2186919936,
+          "heapTotal": 9256960,
+          "heapUsed": 7486720,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056836336,
+          "peakBytes": 3145483030,
+          "cacheBytes": 516971376
+        }
+      },
+      {
+        "block": 1,
+        "run": 2,
+        "condition": "default",
+        "rtf": 0.51674137739726,
+        "nativeFirstPcmMs": 174.76658399999997,
+        "voicePreparationMs": 2989.510792,
+        "synthesisMs": 6035.539288,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4592932264,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234007552,
+          "heapTotal": 9256960,
+          "heapUsed": 7485128,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056826228,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342516210
+        }
+      },
+      {
+        "block": 1,
+        "run": 3,
+        "condition": "one",
+        "rtf": 0.5240782392123285,
+        "nativeFirstPcmMs": 172.15700000000015,
+        "voicePreparationMs": 3025.8116659999996,
+        "synthesisMs": 6121.233834000001,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568997608,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2194210816,
+          "heapTotal": 9256960,
+          "heapUsed": 7342200,
+          "external": 5255932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056754344,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1013804232
+        }
+      },
+      {
+        "block": 1,
+        "run": 4,
+        "condition": "one",
+        "rtf": 0.5269484517123285,
+        "nativeFirstPcmMs": 174.98266700000022,
+        "voicePreparationMs": 3091.077083,
+        "synthesisMs": 6154.7579160000005,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3571029056,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2192687104,
+          "heapTotal": 9256960,
+          "heapUsed": 7342712,
+          "external": 5321468,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056802512,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1035406496
+        }
+      },
+      {
+        "block": 1,
+        "run": 5,
+        "condition": "default",
+        "rtf": 0.5276203946917805,
+        "nativeFirstPcmMs": 180.546875,
+        "voicePreparationMs": 3013.449125,
+        "synthesisMs": 6162.60621,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4592539048,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 0,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2233696256,
+          "heapTotal": 9256960,
+          "heapUsed": 7486960,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056806780,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342472682
+        }
+      },
+      {
+        "block": 1,
+        "run": 6,
+        "condition": "half",
+        "rtf": 0.5382511735445202,
+        "nativeFirstPcmMs": 173.6934580000002,
+        "voicePreparationMs": 3083.1075840000003,
+        "synthesisMs": 6286.773707,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3510260896,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2186297344,
+          "heapTotal": 9256960,
+          "heapUsed": 7343008,
+          "external": 5321468,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056836280,
+          "peakBytes": 3145483030,
+          "cacheBytes": 513668338
+        }
+      },
+      {
+        "block": 2,
+        "run": 1,
+        "condition": "default",
+        "rtf": 0.6663174196061641,
+        "nativeFirstPcmMs": 207.00929099999985,
+        "voicePreparationMs": 3244.331625,
+        "synthesisMs": 7782.587461000001,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4593898992,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2233745408,
+          "heapTotal": 8994816,
+          "heapUsed": 7599504,
+          "external": 5436668,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056826528,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342521030
+        }
+      },
+      {
+        "block": 2,
+        "run": 2,
+        "condition": "half",
+        "rtf": 0.6449993011986297,
+        "nativeFirstPcmMs": 230.54825000000028,
+        "voicePreparationMs": 3225.911333,
+        "synthesisMs": 7533.591837999999,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3509982344,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2188476416,
+          "heapTotal": 9256960,
+          "heapUsed": 7342312,
+          "external": 5255932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056884264,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519703694
+        }
+      },
+      {
+        "block": 2,
+        "run": 3,
+        "condition": "one",
+        "rtf": 0.6605640947773969,
+        "nativeFirstPcmMs": 238.8556669999998,
+        "voicePreparationMs": 3481.413375,
+        "synthesisMs": 7715.388627,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568866512,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2193014784,
+          "heapTotal": 9256960,
+          "heapUsed": 7486496,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056769440,
+          "peakBytes": 3145483030,
+          "cacheBytes": 997730000
+        }
+      },
+      {
+        "block": 2,
+        "run": 4,
+        "condition": "one",
+        "rtf": 0.6940754958904106,
+        "nativeFirstPcmMs": 251.58258300000034,
+        "voicePreparationMs": 3706.5027919999998,
+        "synthesisMs": 8106.801792,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3570930824,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2193981440,
+          "heapTotal": 9256960,
+          "heapUsed": 7486816,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056754104,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1012849252
+        }
+      },
+      {
+        "block": 2,
+        "run": 5,
+        "condition": "half",
+        "rtf": 0.818853228424657,
+        "nativeFirstPcmMs": 299.18712499999947,
+        "voicePreparationMs": 4334.886792,
+        "synthesisMs": 9564.205708,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3510277232,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187870208,
+          "heapTotal": 9256960,
+          "heapUsed": 7556704,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056819648,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519580804
+        }
+      },
+      {
+        "block": 2,
+        "run": 6,
+        "condition": "default",
+        "rtf": 0.8693242185787665,
+        "nativeFirstPcmMs": 379.5509579999998,
+        "voicePreparationMs": 5345.454291,
+        "synthesisMs": 10153.706873,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4614870344,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234630144,
+          "heapTotal": 9256960,
+          "heapUsed": 6942176,
+          "external": 5111932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056826400,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2364041030
+        }
+      },
+      {
+        "block": 3,
+        "run": 1,
+        "condition": "one",
+        "rtf": 0.7771565676369858,
+        "nativeFirstPcmMs": 250.46749999999975,
+        "voicePreparationMs": 4418.500083,
+        "synthesisMs": 9077.18871,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568997512,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2194653184,
+          "heapTotal": 9256960,
+          "heapUsed": 7487400,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056868688,
+          "peakBytes": 3145483030,
+          "cacheBytes": 988411676
+        }
+      },
+      {
+        "block": 3,
+        "run": 2,
+        "condition": "half",
+        "rtf": 0.8130308540239722,
+        "nativeFirstPcmMs": 296.4488330000004,
+        "voicePreparationMs": 4291.0337500000005,
+        "synthesisMs": 9496.200375,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3509867536,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2188214272,
+          "heapTotal": 9256960,
+          "heapUsed": 7487184,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056867880,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519225428
+        }
+      },
+      {
+        "block": 3,
+        "run": 3,
+        "condition": "default",
+        "rtf": 0.761748976455479,
+        "nativeFirstPcmMs": 277.15741700000035,
+        "voicePreparationMs": 4219.824792,
+        "synthesisMs": 8897.228045,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4594111912,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2235039744,
+          "heapTotal": 9256960,
+          "heapUsed": 7485320,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056823956,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342515922
+        }
+      },
+      {
+        "block": 3,
+        "run": 4,
+        "condition": "default",
+        "rtf": 0.7705874356164378,
+        "nativeFirstPcmMs": 300.9520000000002,
+        "voicePreparationMs": 4260.427,
+        "synthesisMs": 9000.461248,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4592997848,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234023936,
+          "heapTotal": 9256960,
+          "heapUsed": 7342064,
+          "external": 5255932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056826496,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342521062
+        }
+      },
+      {
+        "block": 3,
+        "run": 5,
+        "condition": "half",
+        "rtf": 0.8903995119863007,
+        "nativeFirstPcmMs": 874.8047499999993,
+        "voicePreparationMs": 5452.7847919999995,
+        "synthesisMs": 10399.8663,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3510031472,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187526144,
+          "heapTotal": 9256960,
+          "heapUsed": 7527520,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056917904,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519147694
+        }
+      },
+      {
+        "block": 3,
+        "run": 6,
+        "condition": "one",
+        "rtf": 0.8497762126712323,
+        "nativeFirstPcmMs": 274.64324999999917,
+        "voicePreparationMs": 4695.3211249999995,
+        "synthesisMs": 9925.386164,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3569177784,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2198061056,
+          "heapTotal": 8994816,
+          "heapUsed": 7487088,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056967144,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1018201160
+        }
+      },
+      {
+        "block": 4,
+        "run": 1,
+        "condition": "default",
+        "rtf": 0.7547874254280816,
+        "nativeFirstPcmMs": 255.74874999999975,
+        "voicePreparationMs": 4645.090499999999,
+        "synthesisMs": 8815.917129,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4595488168,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2233876480,
+          "heapTotal": 9256960,
+          "heapUsed": 7630624,
+          "external": 5436668,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056806668,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2345168986
+        }
+      },
+      {
+        "block": 4,
+        "run": 2,
+        "condition": "one",
+        "rtf": 0.7359142125856161,
+        "nativeFirstPcmMs": 340.5212500000007,
+        "voicePreparationMs": 3989.4488750000005,
+        "synthesisMs": 8595.478003,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568669808,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2207629312,
+          "heapTotal": 8732672,
+          "heapUsed": 7486688,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056963660,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1015465944
+        }
+      },
+      {
+        "block": 4,
+        "run": 3,
+        "condition": "half",
+        "rtf": 0.7913216644691776,
+        "nativeFirstPcmMs": 314.02850000000035,
+        "voicePreparationMs": 4439.95375,
+        "synthesisMs": 9242.637041,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3509883992,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187771904,
+          "heapTotal": 9256960,
+          "heapUsed": 7486752,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056818660,
+          "peakBytes": 3145483030,
+          "cacheBytes": 517069984
+        }
+      },
+      {
+        "block": 4,
+        "run": 4,
+        "condition": "half",
+        "rtf": 0.7719605555650679,
+        "nativeFirstPcmMs": 314.78991700000006,
+        "voicePreparationMs": 4066.3483330000004,
+        "synthesisMs": 9016.499289,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3510211624,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2188804096,
+          "heapTotal": 8732672,
+          "heapUsed": 7486528,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056868784,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519877810
+        }
+      },
+      {
+        "block": 4,
+        "run": 5,
+        "condition": "one",
+        "rtf": 0.8313000606164378,
+        "nativeFirstPcmMs": 293.50558399999954,
+        "voicePreparationMs": 4539.417792,
+        "synthesisMs": 9709.584708,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568882872,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2197291008,
+          "heapTotal": 9256960,
+          "heapUsed": 7486688,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056982424,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1027226004
+        }
+      },
+      {
+        "block": 4,
+        "run": 6,
+        "condition": "default",
+        "rtf": 0.8239659136130132,
+        "nativeFirstPcmMs": 288.28733400000056,
+        "voicePreparationMs": 4864.466292,
+        "synthesisMs": 9623.921871,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4594881912,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2235858944,
+          "heapTotal": 8994816,
+          "heapUsed": 7559008,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056826400,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342521158
+        }
+      },
+      {
+        "block": 5,
+        "run": 1,
+        "condition": "one",
+        "rtf": 0.7337041201198626,
+        "nativeFirstPcmMs": 264.63216700000066,
+        "voicePreparationMs": 4397.050291,
+        "synthesisMs": 8569.664123,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568702648,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2193948672,
+          "heapTotal": 9256960,
+          "heapUsed": 7485184,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056933352,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1022615176
+        }
+      },
+      {
+        "block": 5,
+        "run": 2,
+        "condition": "default",
+        "rtf": 0.7071986694349311,
+        "nativeFirstPcmMs": 268.636708,
+        "voicePreparationMs": 4121.479125,
+        "synthesisMs": 8260.080459,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4593702168,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234777600,
+          "heapTotal": 9256960,
+          "heapUsed": 7014608,
+          "external": 5111932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056809808,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342485010
+        }
+      },
+      {
+        "block": 5,
+        "run": 3,
+        "condition": "half",
+        "rtf": 0.7121985549657531,
+        "nativeFirstPcmMs": 252.87229200000002,
+        "voicePreparationMs": 4126.920875,
+        "synthesisMs": 8318.479122,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3510244512,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2189164544,
+          "heapTotal": 9256960,
+          "heapUsed": 7487216,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056868792,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519654584
+        }
+      },
+      {
+        "block": 5,
+        "run": 4,
+        "condition": "half",
+        "rtf": 0.7862006851027394,
+        "nativeFirstPcmMs": 262.31916699999965,
+        "voicePreparationMs": 4273.033417000001,
+        "synthesisMs": 9182.824002000001,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3510047808,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187018240,
+          "heapTotal": 9256960,
+          "heapUsed": 7341064,
+          "external": 5255932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056849052,
+          "peakBytes": 3145483030,
+          "cacheBytes": 513691136
+        }
+      },
+      {
+        "block": 5,
+        "run": 5,
+        "condition": "default",
+        "rtf": 0.7980320882705476,
+        "nativeFirstPcmMs": 310.66833399999996,
+        "voicePreparationMs": 4268.296375000001,
+        "synthesisMs": 9321.014791000001,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4592735656,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234023936,
+          "heapTotal": 8732672,
+          "heapUsed": 7485752,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056825972,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342403314
+        }
+      },
+      {
+        "block": 5,
+        "run": 6,
+        "condition": "one",
+        "rtf": 0.800261608904109,
+        "nativeFirstPcmMs": 282.42333400000007,
+        "voicePreparationMs": 4773.269416,
+        "synthesisMs": 9347.055591999999,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568899232,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2194718720,
+          "heapTotal": 8994816,
+          "heapUsed": 7014440,
+          "external": 5111932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056785616,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1007472224
+        }
+      },
+      {
+        "block": 6,
+        "run": 1,
+        "condition": "half",
+        "rtf": 0.7024530819349312,
+        "nativeFirstPcmMs": 277.9495420000003,
+        "voicePreparationMs": 3866.296667,
+        "synthesisMs": 8204.651997,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3511407824,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2188673024,
+          "heapTotal": 9256960,
+          "heapUsed": 7485016,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056867728,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519074002
+        }
+      },
+      {
+        "block": 6,
+        "run": 2,
+        "condition": "one",
+        "rtf": 0.6870129561643831,
+        "nativeFirstPcmMs": 240.6965839999998,
+        "voicePreparationMs": 3854.5764160000003,
+        "synthesisMs": 8024.311328,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568686264,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2197340160,
+          "heapTotal": 9256960,
+          "heapUsed": 7487232,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056884344,
+          "peakBytes": 3145483030,
+          "cacheBytes": 1020895408
+        }
+      },
+      {
+        "block": 6,
+        "run": 3,
+        "condition": "default",
+        "rtf": 0.7515171127568488,
+        "nativeFirstPcmMs": 297.8965419999995,
+        "voicePreparationMs": 3913.3440840000003,
+        "synthesisMs": 8777.719877,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4593931616,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234941440,
+          "heapTotal": 9256960,
+          "heapUsed": 7487496,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056823152,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342514678
+        }
+      },
+      {
+        "block": 6,
+        "run": 4,
+        "condition": "default",
+        "rtf": 0.7226660884417804,
+        "nativeFirstPcmMs": 236.4954170000001,
+        "voicePreparationMs": 4489.663042,
+        "synthesisMs": 8440.739913,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 4593472888,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234646528,
+          "heapTotal": 9256960,
+          "heapUsed": 7557384,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056806532,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342482146
+        }
+      },
+      {
+        "block": 6,
+        "run": 5,
+        "condition": "one",
+        "rtf": 0.7719958836472597,
+        "nativeFirstPcmMs": 259.121083,
+        "voicePreparationMs": 4120.090042000001,
+        "synthesisMs": 9016.911920999999,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3568899232,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2194669568,
+          "heapTotal": 9256960,
+          "heapUsed": 7556624,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056899568,
+          "peakBytes": 3145483030,
+          "cacheBytes": 990711360
+        }
+      },
+      {
+        "block": 6,
+        "run": 6,
+        "condition": "half",
+        "rtf": 0.7834305116438353,
+        "nativeFirstPcmMs": 267.69587500000034,
+        "voicePreparationMs": 4186.701,
+        "synthesisMs": 9150.468376,
+        "audioSeconds": 11.680000000000007,
+        "peakPhysicalBytes": 3510047832,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2187935744,
+          "heapTotal": 9256960,
+          "heapUsed": 7487376,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056834988,
+          "peakBytes": 3145483030,
+          "cacheBytes": 519535072
+        }
+      }
+    ],
+    "blocks": [
+      {
+        "block": 1,
+        "order": ["half", "default", "one", "one", "default", "half"],
+        "logContrasts": {
+          "half": 0.010200136289856054,
+          "one": 0.006412062961227094
+        },
+        "ratio": {
+          "half": 1.010252335007071,
+          "one": 1.0064326642456425
+        }
+      },
+      {
+        "block": 2,
+        "order": ["default", "half", "one", "one", "half", "default"],
+        "logContrasts": {
+          "half": -0.04616410983600161,
+          "one": -0.11690370762119334
+        },
+        "ratio": {
+          "half": 0.9548852432708347,
+          "one": 0.8896708575621604
+        }
+      },
+      {
+        "block": 3,
+        "order": ["one", "half", "default", "default", "half", "one"],
+        "logContrasts": {
+          "half": 0.10483455498079011,
+          "one": 0.058922333428182316
+        },
+        "ratio": {
+          "half": 1.1105268640178156,
+          "one": 1.060692857163008
+        }
+      },
+      {
+        "block": 4,
+        "order": ["default", "one", "half", "half", "one", "default"],
+        "logContrasts": {
+          "half": -0.00896366025088427,
+          "one": -0.008230474778306102
+        },
+        "ratio": {
+          "half": 0.9910763935859925,
+          "one": 0.9918033028470769
+        }
+      },
+      {
+        "block": 5,
+        "order": ["one", "default", "half", "half", "default", "one"],
+        "logContrasts": {
+          "half": -0.003945805553274451,
+          "one": 0.019792044605001835
+        },
+        "ratio": {
+          "half": 0.9960619689085913,
+          "one": 1.019989205712115
+        }
+      },
+      {
+        "block": 6,
+        "order": ["half", "one", "default", "default", "one", "half"],
+        "logContrasts": {
+          "half": 0.006609862862592075,
+          "one": -0.011854442563377698
+        },
+        "ratio": {
+          "half": 1.0066317562168978,
+          "one": 0.9882155445152832
+        }
+      }
+    ],
+    "summary": {
+      "half": {
+        "geometricMeanRatio": 1.0104830627007382,
+        "exploratoryLogT95Interval": [0.9584024512732842, 1.0653937901019714],
+        "medianObservedPeakPhysicalBytes": 3510047820.0
+      },
+      "one": {
+        "geometricMeanRatio": 0.9913935520223732,
+        "exploratoryLogT95Interval": [0.9319940067939961, 1.054578857617896],
+        "medianObservedPeakPhysicalBytes": 3568899232.0
+      },
+      "default": {
+        "medianObservedPeakPhysicalBytes": 4593800580.0
+      }
+    },
+    "validation": "All 36 runs EOS, same native hash/config hash/input and output sample counts/Float32 hashes; ordinary Node. Reports are preserved in local experiment directories.",
+    "limitations": "Palindrome cancels linear ordinal-position drift only. Six blocks are a small serial sample; exploratory log-t intervals do not prove equivalence or control nonlinear heat/background/carry-over.",
+    "checkpoint": {
+      "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+      "revision": null,
+      "generationDefaults": {
+        "do_sample": true,
+        "repetition_penalty": 1.05,
+        "temperature": 0.9,
+        "top_p": 1,
+        "top_k": 50,
+        "subtalker_dosample": true,
+        "subtalker_temperature": 0.9,
+        "subtalker_top_p": 1,
+        "subtalker_top_k": 50,
+        "max_new_tokens": 8192
+      }
+    },
+    "precision": {
+      "dtype": "checkpoint",
+      "quantization": {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine"
+      },
+      "codec": "source precision"
+    },
+    "referenceSha256": "44e49825bd9dfb07987cd24a054ef65650562aa7a1d3ef8e5a6b1f8c60f99c83",
+    "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+  },
+  "probes": {
+    "physical": "proc_pid_rusage RUSAGE_INFO_V4; observed cumulative high-water, may miss final exit-time peak",
+    "baselineLongMemoryCadenceSeconds": 5,
+    "shortMemoryCadenceSeconds": 1,
+    "balancedRunnerSource": ".cache/tts/mlx-optimization/balanced-cache.py",
+    "balancedRunnerSha256": "162fbdb541d8a14cf287d41993ed8555608cbc6f3f1c6d99c2fe87084a691aed",
+    "sourceStreamingHashNote": "Old pairs and two initial long runs read addon into one temporary Buffer; balanced runs and later long runs use streaming addon hashing. Compare within each series, not small footprint changes across harness versions."
+  },
+  "interruptedDefaultControl": {
+    "interruption": {
+      "atUtc": "2026-10-09T08:57:30.285395+00:00",
+      "pid": 31154,
+      "reason": "Stop contaminated default long control after observing heavy Chrome renderer CPU load; user now explicitly provides quiet window; preserve partial artifacts, not an acceptance result."
+    },
+    "provenance": {
+      "startedAtUtc": "2026-10-09T08:47:55.215792+00:00",
+      "command": [
+        "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+        ".cache/tts/benchmark/benchmark.js",
+        "--model",
+        ".cache/tts/models/Base-8bit",
+        "--reference",
+        ".cache/tts/fairy/reference.wav",
+        "--transcript-file",
+        ".cache/tts/fairy/reference.txt",
+        "--text-file",
+        ".cache/tts/ane/paced-story-twice.txt",
+        "--once",
+        "--graphemes-per-second",
+        "20",
+        "--chunk-graphemes",
+        "2",
+        "--play",
+        "--speed",
+        "1.15",
+        "--prebuffer-seconds",
+        "1",
+        "--playback-buffer-seconds",
+        "3",
+        "--output",
+        ".cache/tts/mlx-optimization/long-control-repeat.wav",
+        "--report",
+        ".cache/tts/mlx-optimization/long-control-repeat.json",
+        "--note",
+        "Restores earlier zero-underrun MLX WSOLA playback policy: three-second runtime capacity, one-second startup prebuffer, twenty graphemes/second. Original story repeated twice for the long test. Pure MLX on codex/tts-streaming 3e8c9d8, rebuilt release native and compiled SDK. Ordinary Node with no source condition. Default allocator cache policy, matched control after half-GiB playback failure, repeat after balanced short experiments and a fixed 180-second inference idle period; no CoreML, Xcode, LLM, tracing, compilation or other inference alongside. External proc_pid_rusage memory sampling every five seconds."
+      ],
+      "sourceCommit": "3e8c9d8dc91b8ce351e01660aac8542b0b6fa56c",
+      "memoryMetricSource": "proc_pid_rusage RUSAGE_INFO_V4; peakPhysicalFootprintBytes is kernel lifetime high-water mark, other counters are sampled and overlap",
+      "files": [
+        {
+          "path": "packages/core/mlx-core.darwin-arm64.node",
+          "sha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931"
+        },
+        {
+          "path": "packages/tts/dist/index.js",
+          "sha256": "821e0b8cbddae21e3e943ed95a9d7ca482d083cc0c9b40e4d781a30d13dfc171"
+        },
+        {
+          "path": ".cache/tts/benchmark/benchmark.js",
+          "sha256": "bedfeed7bf0046605c3d4541cfd5c445982dae547fb6c46f4a8f54b6787d1db3"
+        },
+        {
+          "path": ".cache/tts/mlx-optimization/process-memory.c",
+          "sha256": "3561eed6ad0d8066b870980a6cbee9a7089438a9b749e52a362568be22368896"
+        }
+      ],
+      "pid": 31154,
+      "exitCode": 1,
+      "finishedAtUtc": "2026-10-09T08:57:35.442437+00:00"
+    },
+    "interferenceObservation": {
+      "run": "long-control-repeat",
+      "source": "Interactive ps -Ao pid,pcpu,rss,comm -r output observed before the timestamped 08:55:10 UTC follow-up sample. Point observation, not a sustained-load trace.",
+      "observedBeforeUtc": "2026-10-09T08:55:10.260214+00:00",
+      "processes": [
+        {
+          "pid": 31469,
+          "name": "Google Chrome Helper (Renderer)",
+          "cpuPercent": 131.0
+        },
+        {
+          "pid": 31471,
+          "name": "Google Chrome Helper (Renderer)",
+          "cpuPercent": 35.2
+        },
+        {
+          "pid": 31154,
+          "name": "node benchmark",
+          "cpuPercent": 63.9
+        },
+        {
+          "pid": 1,
+          "name": "launchd",
+          "cpuPercent": 36.7
+        }
+      ],
+      "interpretation": "Additional evidence of changing background load; does not identify the cause of all playback gaps or explain earlier runs."
+    },
+    "reportProduced": false,
+    "accepted": false
+  },
+  "quietTwoGiBPairs": {
+    "protocol": {
+      "pairs": 6,
+      "order": "default/2 GiB, then 2 GiB/default, alternating; no playback; fresh process per run",
+      "precededBy": "completed 2 GiB long playback",
+      "source": ".cache/tts/mlx-optimization/quiet-cache-pairs.py",
+      "runnerSha256": "f5857657efc70e83bbce5f2a7d8ad132972320d12e28d68c81c948668cdebcb4"
+    },
+    "rows": [
+      {
+        "name": "pair-2-1-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.6762794235445201,
+        "firstPcmMs": 363.982833,
+        "voicePreparationMs": 3163.099542,
+        "loadMs": 173.15875,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4593063264,
+        "lastObservedPhysicalFootprintBytes": 4593063264,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234187776,
+          "heapTotal": 8994816,
+          "heapUsed": 7018392,
+          "external": 5111932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056826544,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342512310
+        }
+      },
+      {
+        "name": "pair-2-1-limited",
+        "cacheLimitGiB": 2.0,
+        "rtf": 0.6387343422089036,
+        "firstPcmMs": 264.35350000000017,
+        "voicePreparationMs": 3196.9285,
+        "loadMs": 183.730792,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4491908424,
+        "lastObservedPhysicalFootprintBytes": 4305524064,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2232221696,
+          "heapTotal": 9256960,
+          "heapUsed": 7459152,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056842720,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2052394812
+        }
+      },
+      {
+        "name": "pair-2-2-limited",
+        "cacheLimitGiB": 2.0,
+        "rtf": 0.6553219174657531,
+        "firstPcmMs": 223.99454100000003,
+        "voicePreparationMs": 3326.031292,
+        "loadMs": 243.03175,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4492760488,
+        "lastObservedPhysicalFootprintBytes": 4364408256,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2233253888,
+          "heapTotal": 8994816,
+          "heapUsed": 7490792,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056840308,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2051968170
+        }
+      },
+      {
+        "name": "pair-2-2-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.7074749788527395,
+        "firstPcmMs": 312.16612499999974,
+        "voicePreparationMs": 3560.2036669999998,
+        "loadMs": 244.415542,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4595225904,
+        "lastObservedPhysicalFootprintBytes": 4594996528,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2235285504,
+          "heapTotal": 9256960,
+          "heapUsed": 7560168,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056806588,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342414506
+        }
+      },
+      {
+        "name": "pair-2-3-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.6913494541952051,
+        "firstPcmMs": 289.05758300000025,
+        "voicePreparationMs": 3625.446292,
+        "loadMs": 193.824583,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4593341840,
+        "lastObservedPhysicalFootprintBytes": 4593341840,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234384384,
+          "heapTotal": 9256960,
+          "heapUsed": 7459392,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056826344,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342511998
+        }
+      },
+      {
+        "name": "pair-2-3-limited",
+        "cacheLimitGiB": 2.0,
+        "rtf": 0.7146948304794515,
+        "firstPcmMs": 264.5199169999996,
+        "voicePreparationMs": 3675.5266250000004,
+        "loadMs": 292.375125,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4492252464,
+        "lastObservedPhysicalFootprintBytes": 4366390600,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2232647680,
+          "heapTotal": 8732672,
+          "heapUsed": 7490256,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056855740,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2053138524
+        }
+      },
+      {
+        "name": "pair-2-4-limited",
+        "cacheLimitGiB": 2.0,
+        "rtf": 0.7175767376712325,
+        "firstPcmMs": 277.9524160000001,
+        "voicePreparationMs": 3758.3622910000004,
+        "loadMs": 205.258083,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4491728296,
+        "lastObservedPhysicalFootprintBytes": 4362311104,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2232352768,
+          "heapTotal": 9256960,
+          "heapUsed": 7488760,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056842736,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2052398944
+        }
+      },
+      {
+        "name": "pair-2-4-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.7326421159246571,
+        "firstPcmMs": 269.02566600000046,
+        "voicePreparationMs": 3798.56625,
+        "loadMs": 293.161834,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4594079048,
+        "lastObservedPhysicalFootprintBytes": 4594079048,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2235252736,
+          "heapTotal": 9256960,
+          "heapUsed": 7345984,
+          "external": 5255932,
+          "arrayBuffers": 2751477,
+          "activeBytes": 2056826020,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342499522
+        }
+      },
+      {
+        "name": "pair-2-5-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.7429325592465751,
+        "firstPcmMs": 310.7444999999998,
+        "voicePreparationMs": 4099.723790999999,
+        "loadMs": 287.082709,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4593718648,
+        "lastObservedPhysicalFootprintBytes": 4593718648,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234744832,
+          "heapTotal": 9256960,
+          "heapUsed": 7488720,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056823932,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2342497514
+        }
+      },
+      {
+        "name": "pair-2-5-limited",
+        "cacheLimitGiB": 2.0,
+        "rtf": 0.6966957511130132,
+        "firstPcmMs": 272.77541699999983,
+        "voicePreparationMs": 3669.3125410000002,
+        "loadMs": 171.915625,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4492678544,
+        "lastObservedPhysicalFootprintBytes": 4305425856,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2233221120,
+          "heapTotal": 9256960,
+          "heapUsed": 7560424,
+          "external": 5407868,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056907260,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2052555038
+        }
+      },
+      {
+        "name": "pair-2-6-limited",
+        "cacheLimitGiB": 2.0,
+        "rtf": 0.7637016946061638,
+        "firstPcmMs": 241.32987500000036,
+        "voicePreparationMs": 4075.6816249999997,
+        "loadMs": 180.83504200000002,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4491728320,
+        "lastObservedPhysicalFootprintBytes": 4364129728,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2231844864,
+          "heapTotal": 9256960,
+          "heapUsed": 7487304,
+          "external": 5379068,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056888748,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2052407154
+        }
+      },
+      {
+        "name": "pair-2-6-default",
+        "cacheLimitGiB": null,
+        "rtf": 0.7401466323630133,
+        "firstPcmMs": 293.3777920000002,
+        "voicePreparationMs": 3729.6523749999997,
+        "loadMs": 168.889084,
+        "audioSeconds": 11.680000000000007,
+        "finishReason": "eos",
+        "rawPcmSha256": "c91c7eaa04b5dc8d63817415e76071011e58f3d928b18713450a97de405dc4f6",
+        "processedPcmSha256": "069ca9e73e6dc723cb7ec3ae2798373a1a4da36e4a3d43892d566b5b1d5e3dc7",
+        "peakPhysicalFootprintBytes": 4594652584,
+        "lastObservedPhysicalFootprintBytes": 4594652584,
+        "lastSegmentMemory": {
+          "audioSeconds": 6.88695833333333,
+          "rss": 2234089472,
+          "heapTotal": 9256960,
+          "heapUsed": 7345736,
+          "external": 5321468,
+          "arrayBuffers": 2817013,
+          "activeBytes": 2056826328,
+          "peakBytes": 3145483030,
+          "cacheBytes": 2343864718
+        }
+      }
+    ],
+    "pairs": [
+      {
+        "pair": 1,
+        "order": [null, 2.0],
+        "defaultRtf": 0.6762794235445201,
+        "limitedRtf": 0.6387343422089036,
+        "rtfRatio": 0.9444828867647118,
+        "firstPcmDeltaMs": -99.62933299999986
+      },
+      {
+        "pair": 2,
+        "order": [2.0, null],
+        "defaultRtf": 0.7074749788527395,
+        "limitedRtf": 0.6553219174657531,
+        "rtfRatio": 0.9262828185506161,
+        "firstPcmDeltaMs": -88.17158399999971
+      },
+      {
+        "pair": 3,
+        "order": [null, 2.0],
+        "defaultRtf": 0.6913494541952051,
+        "limitedRtf": 0.7146948304794515,
+        "rtfRatio": 1.0337678378750188,
+        "firstPcmDeltaMs": -24.537666000000627
+      },
+      {
+        "pair": 4,
+        "order": [2.0, null],
+        "defaultRtf": 0.7326421159246571,
+        "limitedRtf": 0.7175767376712325,
+        "rtfRatio": 0.9794369202562007,
+        "firstPcmDeltaMs": 8.926749999999629
+      },
+      {
+        "pair": 5,
+        "order": [null, 2.0],
+        "defaultRtf": 0.7429325592465751,
+        "limitedRtf": 0.6966957511130132,
+        "rtfRatio": 0.9377644611774025,
+        "firstPcmDeltaMs": -37.969082999999955
+      },
+      {
+        "pair": 6,
+        "order": [2.0, null],
+        "defaultRtf": 0.7401466323630133,
+        "limitedRtf": 0.7637016946061638,
+        "rtfRatio": 1.0318248590390096,
+        "firstPcmDeltaMs": -52.04791699999987
+      }
+    ],
+    "summary": {
+      "geometricMeanRatio": 0.9746293621447206,
+      "medianPairedRatio": 0.9619599035104562,
+      "exploratoryLogT95Interval": [0.9261688043430297, 1.025625554542868],
+      "medianFirstPcmDeltaMs": -45.00849999999991,
+      "default": {
+        "medianObservedPeakPhysicalBytes": 4593898848.0,
+        "medianFirstPcmMs": 302.061146,
+        "medianRtf": 0.7200585473886982
+      },
+      "twoGiB": {
+        "medianObservedPeakPhysicalBytes": 4492080444.0,
+        "medianFirstPcmMs": 264.4367084999999,
+        "medianRtf": 0.7056952907962324
+      }
+    },
+    "provenance": [
+      {
+        "name": "pair-2-1-default",
+        "cacheLimitGiB": null,
+        "startedAtUtc": "2026-10-09T09:13:22.511477+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-1-default/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-1-default/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 261856 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32326  93.5  50816 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorDolittle",
+          "26400  41.8 1237632 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "32338  16.3  89968 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "  679   5.3  47936 /usr/libexec/syspolicyd",
+          "26402   2.7 389584 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          "21621   2.6  17408 /usr/libexec/trustd",
+          "26399   2.3 678080 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+        ],
+        "pid": 32341,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32018  98.5 264320 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+          "26400  96.8 1240592 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "32344  86.6  86560 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorAdload",
+          "21621   9.7  17200 /usr/libexec/trustd",
+          "  782   7.9  33600 /usr/libexec/searchpartyd",
+          "    1   2.3  27552 /sbin/launchd",
+          "  679   1.9  47872 /usr/libexec/syspolicyd",
+          " 2171   1.4 121136 /Applications/Vibe Island.app/Contents/MacOS/vibe-island"
+        ]
+      },
+      {
+        "name": "pair-2-1-limited",
+        "cacheLimitGiB": 2.0,
+        "startedAtUtc": "2026-10-09T09:13:34.785629+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-1-limited/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-1-limited/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32018  99.7 264320 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd",
+          "32344  86.5  86928 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorAdload",
+          "26400  60.1 1240592 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "32338  10.4  90256 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "21621   9.7  17200 /usr/libexec/trustd",
+          "  782   4.9  33600 /usr/libexec/searchpartyd",
+          "    1   2.6  27552 /sbin/launchd",
+          "  679   2.3  47872 /usr/libexec/syspolicyd"
+        ],
+        "pid": 32369,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32090  99.3 264368 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32392  95.6  47520 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowBeagle",
+          "26400   4.8 1268480 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          " 2171   1.1 121136 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "39329   0.9  97232 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "26363   0.5 179472 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+          "  598   0.4 174112 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+          "  574   0.4  23600 /usr/libexec/locationd"
+        ]
+      },
+      {
+        "name": "pair-2-2-limited",
+        "cacheLimitGiB": 2.0,
+        "startedAtUtc": "2026-10-09T09:13:46.077808+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-2-limited/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-2-limited/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 263488 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32392  90.2  69664 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowBeagle",
+          "32338   3.9  90320 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "26400   3.0 1270176 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          " 2171   1.2 121136 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "39329   0.5  97232 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  598   0.5 174112 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+          "  574   0.2  23600 /usr/libexec/locationd"
+        ],
+        "pid": 32399,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32090  99.7 261824 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "22961  97.6  69168 /usr/sbin/spindump",
+          "26400  96.7 1330784 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "32418  71.1  23264 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorCardboardCutout",
+          "21621  26.9  17488 /usr/libexec/trustd",
+          "39329   8.7  97216 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  780   6.9   4432 /usr/libexec/sysmond",
+          "    1   3.1  27552 /sbin/launchd"
+        ]
+      },
+      {
+        "name": "pair-2-2-default",
+        "cacheLimitGiB": null,
+        "startedAtUtc": "2026-10-09T09:13:58.408960+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-2-default/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-2-default/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 262416 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "26400  99.4 1330832 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "22961  98.1  70896 /usr/sbin/spindump",
+          "32418  69.6  23296 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorCardboardCutout",
+          "21621  29.3  17488 /usr/libexec/trustd",
+          "32338  16.8  90320 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "39329   5.3  97216 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  780   4.3   4432 /usr/libexec/sysmond"
+        ],
+        "pid": 32432,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32090  99.3 263760 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32436  72.0  32176 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorBundlore",
+          "22961  45.9 204944 /usr/sbin/spindump",
+          "21621  28.3  16800 /usr/libexec/trustd",
+          "22625  21.6   6192 /System/Library/PrivateFrameworks/CoreSymbolication.framework/coresymbolicationd",
+          "    1   3.2  27552 /sbin/launchd",
+          "26342   1.8 824560 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "26400   1.7 1182384 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+        ]
+      },
+      {
+        "name": "pair-2-3-default",
+        "cacheLimitGiB": null,
+        "startedAtUtc": "2026-10-09T09:14:11.768139+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-3-default/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-3-default/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32090  99.3 264496 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32436  72.0  32192 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorBundlore",
+          "22961  45.9 229744 /usr/sbin/spindump",
+          "21621  28.3  16800 /usr/libexec/trustd",
+          "22625  21.6   6192 /System/Library/PrivateFrameworks/CoreSymbolication.framework/coresymbolicationd",
+          "    1   3.2  27552 /sbin/launchd",
+          "26342   1.8 824560 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "26400   1.7 1182384 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+        ],
+        "pid": 32452,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 270336 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32459  87.1  26944 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorMRTv3",
+          "26400  20.8 1205808 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "  780  15.3   4048 /usr/libexec/sysmond",
+          "39329  14.1  93440 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "22961   8.0 286960 /usr/sbin/spindump",
+          "26342   6.8 828848 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "26402   1.8 389616 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        ]
+      },
+      {
+        "name": "pair-2-3-limited",
+        "cacheLimitGiB": 2.0,
+        "startedAtUtc": "2026-10-09T09:14:24.081611+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-3-limited/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-3-limited/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32090  99.3 268592 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32459  89.1  26960 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorMRTv3",
+          "32338  13.0  90336 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "26400  12.9 1205808 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "26342  10.0 828928 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "  780   9.6   4048 /usr/libexec/sysmond",
+          "39329   8.8  93440 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "22961   5.0 286960 /usr/sbin/spindump"
+        ],
+        "pid": 32481,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 266016 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32495  99.3 112288 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit",
+          " 2171   1.3 120976 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "26363   0.5 178704 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+          "  598   0.4 173600 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+          "26489   0.2 496240 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "39329   0.2  93296 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  656   0.1   4816 /usr/libexec/clocksyncd"
+        ]
+      },
+      {
+        "name": "pair-2-4-limited",
+        "cacheLimitGiB": 2.0,
+        "startedAtUtc": "2026-10-09T09:14:37.485890+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-4-limited/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-4-limited/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 264224 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32495  99.4 115568 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit",
+          "32338  13.2  90336 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          " 2171   1.5 120976 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "26363   0.6 178704 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+          "  598   0.5 173600 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+          "26342   0.1 830112 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "39329   0.1  93296 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor"
+        ],
+        "pid": 32513,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "15205 137.6 139472 /usr/libexec/spotlightknowledged.updater",
+          "26400  99.7 1237632 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "32090  99.1 269616 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32495  88.5 197648 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit",
+          "  897  20.5  10800 /usr/sbin/cfprefsd",
+          "  526   5.9  68368 /usr/libexec/logd",
+          "26402   4.4 389888 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          "  780   4.2   4048 /usr/libexec/sysmond"
+        ]
+      },
+      {
+        "name": "pair-2-4-default",
+        "cacheLimitGiB": null,
+        "startedAtUtc": "2026-10-09T09:14:50.845685+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-4-default/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-4-default/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "15205 137.6 137344 /usr/libexec/spotlightknowledged.updater",
+          "32090 100.0 269616 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "26400 100.0 1237632 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "32495  87.7 236832 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit",
+          "32338  21.9  90352 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "  897  19.9  10800 /usr/sbin/cfprefsd",
+          "  526   5.8  68448 /usr/libexec/logd",
+          "26402   2.8 389888 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        ],
+        "pid": 32599,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 274400 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32608  91.6 140832 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSheepSwap",
+          "39329   2.3  91792 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "    1   1.9  27536 /sbin/launchd",
+          "  739   1.4  41328 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+          " 2171   1.3 119568 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "26402   1.1 389856 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          "26400   0.9 1215088 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+        ]
+      },
+      {
+        "name": "pair-2-5-default",
+        "cacheLimitGiB": null,
+        "startedAtUtc": "2026-10-09T09:15:04.252278+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-5-default/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-5-default/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32090 100.0 274432 /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService",
+          "32608  85.6 142624 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSheepSwap",
+          "32338  22.2  90512 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "    1   2.1  27536 /sbin/launchd",
+          "39329   1.4  91792 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  739   1.1  41328 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+          "26402   0.8 389856 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          " 2171   0.7 119568 /Applications/Vibe Island.app/Contents/MacOS/vibe-island"
+        ],
+        "pid": 32635,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32660  94.4  37648 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowDrift",
+          "39329   2.0  91920 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          " 2171   1.7 119744 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "    1   1.5  27536 /sbin/launchd",
+          "26402   1.5 389856 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          " 2169   1.0  86448 /Applications/LaunchOS.app/Contents/MacOS/LaunchOS",
+          "26342   1.0 826480 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "32338   0.9  21408 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+        ]
+      },
+      {
+        "name": "pair-2-5-limited",
+        "cacheLimitGiB": 2.0,
+        "startedAtUtc": "2026-10-09T09:15:18.629032+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-5-limited/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-5-limited/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32660  94.4  29328 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowDrift",
+          "39329   2.0  91920 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          " 2171   1.7 119744 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "    1   1.5  27536 /sbin/launchd",
+          "26402   1.5 389856 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          " 2169   1.0  86448 /Applications/LaunchOS.app/Contents/MacOS/LaunchOS",
+          "26342   1.0 826672 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "32338   0.9  90528 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+        ],
+        "pid": 32675,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "26402   1.2 389840 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          " 2171   0.8 119696 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "39329   0.7  91952 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  569   0.5  16688 /System/Library/CoreServices/launchservicesd",
+          "  591   0.5  21680 /usr/sbin/bluetoothd",
+          "  987   0.4  44896 /usr/libexec/sharingd",
+          "  946   0.3  43776 /usr/libexec/rapportd",
+          "  598   0.3 166032 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+        ]
+      },
+      {
+        "name": "pair-2-6-limited",
+        "cacheLimitGiB": 2.0,
+        "startedAtUtc": "2026-10-09T09:15:30.890876+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-6-limited/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-6-limited/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "26402   0.8 389840 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          " 2171   0.8 119696 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "39329   0.7  91952 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  591   0.5  21680 /usr/sbin/bluetoothd",
+          "  569   0.5  16688 /System/Library/CoreServices/launchservicesd",
+          "26342   0.4 827024 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "32338   0.4  90560 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+          "  987   0.4  44896 /usr/libexec/sharingd"
+        ],
+        "pid": 32699,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "32719 100.0  27760 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorMRTv3",
+          "21599   1.6  18720 /usr/libexec/trustd",
+          " 2171   1.4 119696 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "26402   1.4 389872 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          "  739   0.6  41328 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+          "  598   0.4 165984 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+          "26363   0.4 174560 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+          " 1567   0.4 171552 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        ]
+      },
+      {
+        "name": "pair-2-6-default",
+        "cacheLimitGiB": null,
+        "startedAtUtc": "2026-10-09T09:15:45.199025+00:00",
+        "command": [
+          "/Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+          ".cache/tts/benchmark/benchmark.js",
+          "--model",
+          ".cache/tts/models/Base-8bit",
+          "--reference",
+          ".cache/tts/fairy/reference.wav",
+          "--transcript-file",
+          ".cache/tts/fairy/reference.txt",
+          "--text",
+          "\u65b0\u827e\u5229\u90fd\u7684\u591c\u8272\u6e10\u6e10\u4eae\u8d77\u3002\u4e3b\u4eba\uff0c\u5f53\u524d\u8def\u7ebf\u5df2\u7ecf\u68c0\u67e5\u5b8c\u6bd5\uff0c\u6240\u6709\u5bfc\u822a\u6570\u636e\u5747\u5df2\u66f4\u65b0\u3002\u8bf7\u4fdd\u6301\u901a\u8baf\u7545\u901a\uff0c\u6211\u4eec\u5c06\u5728\u4e0b\u4e00\u5904\u8def\u53e3\u6c47\u5408\u3002",
+          "--once",
+          "--speed",
+          "1.15",
+          "--output",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-6-default/audio.wav",
+          "--report",
+          ".cache/tts/mlx-optimization/cache-sweep/pair-2-6-default/report.json",
+          "--note",
+          "Quiet-window two-GiB comparison, six alternating-order pairs; default model/precision/seed/tempo unchanged; ordinary Node + release native; no playback or concurrent model/build. proc_pid_rusage sampled at one-second intervals identically for controls and candidates."
+        ],
+        "nativeSha256": "482fdf61eb320a6eae4122efc34d9d6e6ddf2f70113be7b08b279f093d1fc931",
+        "thermalBefore": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuBefore": [
+          "  PID  %CPU    RSS COMM",
+          "32719 100.0  27776 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorMRTv3",
+          "21599   1.6  18720 /usr/libexec/trustd",
+          " 2171   1.4 119696 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+          "26402   1.4 389872 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          "  739   0.6  41328 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+          "  598   0.4 165984 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+          "26363   0.4 174544 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+          " 1567   0.4 171552 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        ],
+        "pid": 32729,
+        "exitCode": 0,
+        "thermalAfter": {
+          "thermalState": 1,
+          "lowPowerMode": false
+        },
+        "cpuAfter": [
+          "  PID  %CPU    RSS COMM",
+          "21599  38.3  18752 /usr/libexec/trustd",
+          "  679  23.7  47840 /usr/libexec/syspolicyd",
+          "39329  22.3  91856 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+          "  780  14.8   4048 /usr/libexec/sysmond",
+          "26400  12.3 1238976 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+          "21621  11.1  17264 /usr/libexec/trustd",
+          "26342   2.9 828368 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+          "32243   2.0  14560 /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/XPCServices/XProtectPluginService.xpc/Contents/MacOS/XProtectPluginService"
+        ]
+      }
+    ],
+    "validation": "12 distinct PIDs; exit0/EOS; same native/config/Float32 hashes and sample counts; ordinary production Node.",
+    "limitations": "Serial desktop sample after long playback. ANECompilerService and XProtect CPU activity observed despite quiet user window; see snapshots. No isolated-environment or statistically established equivalence claim."
+  },
+  "desktopLoadObservations": [
+    {
+      "observedAtUtc": "2026-10-09T08:55:10.260214+00:00",
+      "phase": "default repeat long playback",
+      "topCpu": [
+        "  PID  %CPU    RSS COMM",
+        "31154  36.3 2205520 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+        "  598  17.0 176128 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+        " 2478  14.6  82560 /Applications/UURemote.app/Contents/Helpers/UURemoteServer",
+        "31503  13.6  17968 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+        "  728  12.0  41472 /usr/sbin/coreaudiod",
+        "26400   4.4 1325504 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+        "31295   3.6 786960 /Applications/DaisyDisk.app/Contents/MacOS/DaisyDisk",
+        "  591   3.3  21488 /usr/sbin/bluetoothd",
+        "26363   3.1 184592 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+        "  679   3.1  44224 /usr/libexec/syspolicyd",
+        "  987   2.8  43008 /usr/libexec/sharingd",
+        " 1175   2.6  18448 /usr/libexec/replayd",
+        "  739   2.6  43296 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN",
+        " 2516   2.4  21696 /System/Library/Frameworks/VideoToolbox.framework/Versions/A/XPCServices/VTEncoderXPCService.xpc/Contents/MacOS/VTEncoderXPCService"
+      ],
+      "thermal": {
+        "thermalState": 1,
+        "lowPowerMode": false
+      },
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=35455075)\t100%; charged; 0:00 remaining present: true\n"
+    },
+    {
+      "observedAtUtc": "2026-10-09T09:03:23.703034+00:00",
+      "phase": "two-GiB quiet long playback",
+      "topCpu": [
+        "  PID  %CPU    RSS COMM",
+        "  598  30.3 173872 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+        "26363  13.6 185424 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)",
+        "26400  11.8 1287760 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.27/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+        "  728  10.6  40544 /usr/sbin/coreaudiod",
+        "31727   3.8 2202416 /Users/saviio/.vite-plus/js_runtime/node/24.21.0/bin/node",
+        "26402   3.5 390032 /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        " 2171   3.1 120816 /Applications/Vibe Island.app/Contents/MacOS/vibe-island",
+        "  591   2.9  21488 /usr/sbin/bluetoothd",
+        "  987   1.8  43456 /usr/libexec/sharingd"
+      ],
+      "thermal": {
+        "thermalState": 1,
+        "lowPowerMode": false
+      }
+    }
+  ]
+}

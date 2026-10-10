@@ -1,8 +1,8 @@
 # @mlx-node/cli
 
-Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, redacting PII, serving local models, launching Claude Code, and running the fully-local `mlx agent`, for use with `@mlx-node/*` packages.
+Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, synthesizing speech, redacting PII, serving local models, launching Claude Code, and running the fully-local `mlx agent`, for use with `@mlx-node/*` packages.
 
-Top-level commands: `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`, `delegate`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for the CLI guide.
+Top-level commands: `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`, `delegate`, `tts`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for the CLI guide.
 
 ## Requirements
 
@@ -22,6 +22,34 @@ npx @mlx-node/cli download model --model Qwen/Qwen3-0.6B
 ```
 
 ## Commands
+
+### Text to Speech
+
+```bash
+mlx download model --model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+mlx tts -m ~/.mlx-node/models/qwen3-tts-12hz-0.6b-customvoice \
+  --voice vivian --text '你好。' --play -o speech.wav
+cat text.txt | mlx tts -m ./tts-model --voice ryan --language english --play
+mlx tts -m ./base-model --reference-audio reference.wav \
+  --reference-text 'Exact words in the reference.' --text 'New words.' -o clone.wav
+```
+
+`--model` is a local checkpoint directory. Choose `--text`, `--file`, or piped
+stdin, and at least one of `--play` or `--output`. Input is decoded incrementally
+and submitted at sentence or phrase boundaries. Select exactly one voice source:
+`--voice` for CustomVoice presets, `--reference-audio` with `--reference-text`
+(or `--reference-text-file`) for Base cloning, or `--voice-description` for 1.7B
+VoiceDesign. Supported 1.7B voice modes also accept `--instruct` or `--instruct-file`.
+
+`--input-format jsonl` accepts `text`, `instruct`, and `flush` event records, with
+a 64 KiB record limit. `--speed` applies pitch-preserving tempo processing to
+playback and WAV output (0.25–4, default 1). `--chunk-ms` defaults to 160 ms;
+playback defaults to a one-second buffer and 0.32-second prebuffer, configurable
+with `--buffer-seconds` and `--prebuffer-seconds`. `--max-duration` limits each
+text segment (default 120 seconds), and `--seed` controls reproducible sampling.
+See `mlx tts --help` and the [TTS
+guide](https://github.com/mlx-node/mlx-node/blob/main/docs/tts.md) for SDK usage,
+conversion and measured performance.
 
 ### Delegate Work
 
@@ -95,7 +123,8 @@ Download model weights and tokenizer files from HuggingFace Hub:
 mlx download model --model Qwen/Qwen3-0.6B
 ```
 
-Downloads to `.cache/models/<model-slug>` by default, pinned to the repo's
+Downloads to `~/.mlx-node/models/<model-slug>` by default, honoring `MLX_MODELS_DIR`
+and the `modelsDir` setting in `~/.mlx-node/config.json`, pinned to the repo's
 current revision. A successful download writes a `.mlx-download-complete.json`
 marker (shared with the dashboard) recording the repo, revision, and file
 list. Glob-filtered markers are explicitly partial, so a selected shard cannot
@@ -106,11 +135,12 @@ changed and removes files the repo no longer has — no need to delete the
 directory first. Use `--force` to re-verify every file even when the local copy
 looks current. If the revision cannot be resolved (offline), the previous
 local-only checks apply. Full syncs recursively verify nested files already
-tracked by a CLI/dashboard marker while fresh downloads keep the root-only
-default selection. A directory marked for another repo is refused; use
+tracked by a CLI/dashboard marker. Fresh downloads select root assets and required
+child checkpoints, such as Qwen3-TTS's `speech_tokenizer`, at the same immutable
+revision. A directory marked for another repo is refused; use
 `--output` to choose a distinct path. Marker-less legacy directories also drop
-superseded standard top-level SafeTensors layouts before the new revision is
-certified. Note:
+superseded standard SafeTensors layouts in the root and declared child checkpoints
+after the replacement files are complete, before the new revision is certified. Note:
 `--force` without `--glob` on a GGUF directory holding only some quantization
 variants downloads all remaining variants, and the marker makes the directory
 dashboard-managed — a dashboard install into it may replace the contents
@@ -118,14 +148,14 @@ wholesale.
 
 #### Options
 
-| Flag          | Short | Default                | Description                                           |
-| ------------- | ----- | ---------------------- | ----------------------------------------------------- |
-| `--model`     | `-m`  | `Qwen/Qwen3-0.6B`      | HuggingFace model name                                |
-| `--output`    | `-o`  | `.cache/models/<slug>` | Output directory                                      |
-| `--glob`      | `-g`  | (all supported files)  | Filter files by glob pattern (repeatable)             |
-| `--force`     |       | `false`                | Re-verify every file against upstream by content hash |
-| `--cache-dir` |       | `~/.cache/huggingface` | HuggingFace cache directory                           |
-| `--set-token` |       |                        | Set up HuggingFace authentication                     |
+| Flag          | Short | Default                     | Description                                           |
+| ------------- | ----- | --------------------------- | ----------------------------------------------------- |
+| `--model`     | `-m`  | `Qwen/Qwen3-0.6B`           | HuggingFace model name                                |
+| `--output`    | `-o`  | `~/.mlx-node/models/<slug>` | Output directory (honors model-directory settings)    |
+| `--glob`      | `-g`  | (all supported files)       | Filter files by glob pattern (repeatable)             |
+| `--force`     |       | `false`                     | Re-verify every file against upstream by content hash |
+| `--cache-dir` |       | `~/.cache/huggingface`      | HuggingFace cache directory                           |
+| `--set-token` |       |                             | Set up HuggingFace authentication                     |
 
 #### Authentication
 
@@ -231,14 +261,15 @@ mlx convert \
 
 Auto-detected from `config.json` when not specified:
 
-| Type           | Description                                             |
-| -------------- | ------------------------------------------------------- |
-| (default)      | Standard SafeTensors dtype conversion                   |
-| `qwen3_5`      | Qwen3.5 Dense with FP8 dequant and key remapping        |
-| `qwen3_5_moe`  | Qwen3.5 MoE with expert stacking                        |
-| `paddleocr-vl` | PaddleOCR-VL weight sanitization                        |
-| `pp-lcnet-ori` | PP-LCNet orientation classifier (Paddle to SafeTensors) |
-| `uvdoc`        | UVDoc dewarping model (Paddle/PyTorch to SafeTensors)   |
+| Type           | Description                                                               |
+| -------------- | ------------------------------------------------------------------------- |
+| (default)      | Standard SafeTensors dtype conversion                                     |
+| `qwen3_5`      | Qwen3.5 Dense with FP8 dequant and key remapping                          |
+| `qwen3_5_moe`  | Qwen3.5 MoE with expert stacking                                          |
+| `qwen3_tts`    | Qwen3-TTS Talker/predictor conversion; codec retained at source precision |
+| `paddleocr-vl` | PaddleOCR-VL weight sanitization                                          |
+| `pp-lcnet-ori` | PP-LCNet orientation classifier (Paddle to SafeTensors)                   |
+| `uvdoc`        | UVDoc dewarping model (Paddle/PyTorch to SafeTensors)                     |
 
 #### Quantization Recipes
 
@@ -344,13 +375,15 @@ mlx download dataset --dataset openai/gsm8k
 
 # 4. Quantize the model
 mlx convert \
-  --input .cache/models/Qwen-Qwen3-0.6B \
-  --output .cache/models/Qwen3-0.6B-q4 \
+  --input ~/.mlx-node/models/qwen3-0.6b \
+  --output ~/.mlx-node/models/qwen3-0.6b-q4 \
   --quantize --q-bits 4
 
 # 5. Use in your application
+# import { homedir } from 'node:os';
+# import { join } from 'node:path';
 # import { loadModel } from '@mlx-node/lm';
-# const model = await loadModel('.cache/models/Qwen3-0.6B-q4');
+# const model = await loadModel(join(homedir(), '.mlx-node/models/qwen3-0.6b-q4'));
 ```
 
 ### GGUF Conversion
@@ -360,7 +393,7 @@ mlx convert \
 mlx download model --model user/model-gguf --glob "*.gguf"
 
 # Convert to SafeTensors
-mlx convert --input .cache/models/model-gguf/model.gguf --output ./model-converted
+mlx convert --input ~/.mlx-node/models/model-gguf/model.gguf --output ./model-converted
 ```
 
 ## License

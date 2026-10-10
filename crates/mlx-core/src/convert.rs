@@ -8,7 +8,7 @@
  */
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -158,6 +158,18 @@ pub(crate) mod recipe {
             tie_word_embeddings: bool,
             verbose: bool,
         ) -> Result<HashMap<String, MxArray>>;
+
+        /// Required independently configured child checkpoints, copied losslessly.
+        fn components(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        /// Modules whose runtime consumes dense tensors even when other
+        /// components use packed weights. The generic quantizer does not need
+        /// to recognize these family-specific module names.
+        fn dense_prefixes(&self) -> &'static [&'static str] {
+            &[]
+        }
 
         /// True when the family's sanitizer owns dtype conversion (FP8 dequant
         /// and cast), so the generic dtype pass is skipped and tensors flow
@@ -1834,6 +1846,53 @@ pub(crate) mod recipe {
         }
     }
 
+    /// TTS keeps official names and records layout provenance explicitly. The
+    /// speech codec remains at source precision under its own config.
+    pub(crate) struct Qwen3TtsRecipe;
+    impl ConversionRecipe for Qwen3TtsRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["qwen3_tts"]
+        }
+        fn dense_prefixes(&self) -> &'static [&'static str] {
+            &["speaker_encoder."]
+        }
+        fn components(&self) -> &'static [&'static str] {
+            &["speech_tokenizer"]
+        }
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            config: &serde_json::Value,
+            _dtype: &str,
+            _tied: bool,
+            _verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let version = config.get("mlx_node_tts_format").and_then(|x| x.as_u64());
+            if version.is_some_and(|v| v != 1) {
+                return Err(Error::from_reason("Unsupported TTS weight layout version"));
+            }
+            weights
+                .into_iter()
+                .map(|(name, weight)| {
+                    let weight = if version.is_none()
+                        && name.starts_with("speaker_encoder.")
+                        && name.ends_with(".weight")
+                    {
+                        if weight.ndim()? != 3 {
+                            return Err(Error::from_reason(format!(
+                                "Invalid speaker convolution {name}"
+                            )));
+                        }
+                        weight.transpose(Some(&[0, 2, 1]))?
+                    } else {
+                        weight
+                    };
+                    Ok((name, weight))
+                })
+                .collect()
+        }
+    }
+
     /// openai/privacy-filter. Ships MLX-loadable safetensors already (identity
     /// sanitize) but manages its OWN quantization, so the generic quantize
     /// block must be suppressed.
@@ -2861,6 +2920,7 @@ pub(crate) mod recipe {
     /// "unknown model type" error message joins verbatim.
     pub(crate) const RECIPE_REGISTRY: &[(&[&str], RecipeFactory)] = &[
         (&["qwen3_asr"], || Box::new(Qwen3AsrRecipe)),
+        (&["qwen3_tts"], || Box::new(Qwen3TtsRecipe)),
         (&["qwen3_5"], || Box::new(Qwen35Recipe { is_moe: false })),
         (&["qwen3_5_moe"], || Box::new(Qwen35Recipe { is_moe: true })),
         (&["lfm2", "lfm2_moe"], || Box::new(Lfm2Recipe)),
@@ -3020,22 +3080,28 @@ fn reject_dense_only_family_quantization(
     )))
 }
 
-/// Qwen3-ASR's loader accepts one uniform packed format for the text tower.
-/// Mixed recipes emit per-layer metadata that the runtime intentionally
-/// rejects, and the remaining quantization modes have no ASR dispatch.
-fn validate_qwen3_asr_quantization(
+/// Qwen3-ASR's and Qwen3-TTS's loaders accept one uniform packed format for
+/// the text tower. Mixed recipes emit per-layer metadata that the runtimes
+/// intentionally reject, and the remaining quantization modes have no
+/// dispatch in either family.
+fn validate_qwen3_packed_quantization(
     model_type: Option<&str>,
     do_quantize: bool,
     quant_mode: &str,
     quant_recipe: Option<&str>,
 ) -> Result<()> {
-    if model_type != Some("qwen3_asr") || !do_quantize {
+    let family = match model_type {
+        Some("qwen3_asr") => "Qwen3-ASR",
+        Some("qwen3_tts") => "Qwen3-TTS",
+        _ => return Ok(()),
+    };
+    if !do_quantize {
         return Ok(());
     }
     if !matches!(quant_mode, "affine" | "mxfp4" | "mxfp8") || quant_recipe.is_some() {
-        return Err(Error::from_reason(
-            "Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit quant_recipe",
-        ));
+        return Err(Error::from_reason(format!(
+            "{family} packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit quant_recipe",
+        )));
     }
     Ok(())
 }
@@ -3291,7 +3357,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // dense. Fail before mode-specific validation, input I/O, the conversion
     // mutex, or any MLX operation.
     reject_dense_only_family_quantization(model_type.as_deref(), do_quantize, &quant_mode)?;
-    validate_qwen3_asr_quantization(
+    validate_qwen3_packed_quantization(
         model_type.as_deref(),
         do_quantize,
         &quant_mode,
@@ -3713,6 +3779,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // restores the prior default device + stream when convert_model returns.
     let _stream_guard = CpuConvertGuard::enter_cpu();
 
+    if let Some(recipe) = model_type.as_deref().and_then(recipe::recipe_for) {
+        for component in recipe.components() {
+            validate_model_component(&input_dir.join(component))?;
+        }
+    }
+
     info!("Loading model from: {}", input_dir.display());
     info!("Target dtype: {}", target_dtype);
 
@@ -4110,6 +4182,27 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }; // end is_gemma_e2b_import else branch
 
     let mut converted_tensors = converted_tensors;
+    let dense_prefixes = model_type
+        .as_deref()
+        .and_then(recipe::recipe_for)
+        .map(|r| r.dense_prefixes())
+        .unwrap_or_default();
+    let preserved_dense: HashMap<_, _> = converted_tensors
+        .extract_if(|key, _| dense_prefixes.iter().any(|prefix| key.starts_with(prefix)))
+        .collect();
+    for (key, tensor) in &preserved_dense {
+        if key.ends_with(".scales")
+            || key.ends_with(".biases")
+            || !matches!(
+                tensor.dtype()?,
+                DType::Float16 | DType::BFloat16 | DType::Float32
+            )
+        {
+            return Err(Error::from_reason(format!(
+                "Dense-only component contains packed or unsupported tensor {key}"
+            )));
+        }
+    }
 
     // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
     // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
@@ -4345,6 +4438,8 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         }
     }
 
+    converted_tensors.extend(preserved_dense);
+
     // "split" mode emits a standalone mlx-vlm `qwen3_5_mtp` drafter directory
     // instead of the inline `mtp.safetensors` sidecar. It is handled by its own
     // extract/write path below and deliberately does NOT take the dense sidecar
@@ -4497,6 +4592,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");
     let mut output_config = config.clone();
+    if model_type.as_deref() == Some("qwen3_tts") {
+        output_config["mlx_node_tts_format"] = serde_json::json!(1);
+    }
     strip_symmetric_zero_point(&mut output_config);
 
     // Inject quantization metadata if quantized
@@ -4612,6 +4710,15 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
     info!("Wrote config.json");
 
+    // Child components own their precision and layout metadata. Validate before
+    // copying and never mix their tensors into the root quantization pass.
+    if let Some(recipe) = model_type.as_deref().and_then(recipe::recipe_for) {
+        for component in recipe.components() {
+            let source = input_dir.join(component);
+            replace_model_component(&source, &output_dir.join(component))?;
+        }
+    }
+
     // Copy tokenizer, model config, and Python model definition files
     let config_files = [
         // Tokenizer files
@@ -4684,6 +4791,116 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
 const MTP_QUANT_BITS: i32 = 4;
 const MTP_QUANT_GROUP_SIZE: i32 = 32;
+
+fn validate_model_component(source: &Path) -> Result<()> {
+    validate_component_tree(source)?;
+    let _: serde_json::Value = serde_json::from_slice(&fs::read(source.join("config.json"))?)
+        .map_err(|e| Error::from_reason(format!("Invalid component config: {e}")))?;
+    let index = source.join("model.safetensors.index.json");
+    if index.exists() {
+        let index: serde_json::Value = serde_json::from_slice(&fs::read(index)?)
+            .map_err(|e| Error::from_reason(format!("Invalid component index: {e}")))?;
+        let map = index
+            .get("weight_map")
+            .and_then(|v| v.as_object())
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| Error::from_reason("Empty component weight index"))?;
+        for file in map.values() {
+            let file = file
+                .as_str()
+                .ok_or_else(|| Error::from_reason("Invalid component shard name"))?;
+            if !Path::new(file)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+                || !source.join(file).is_file()
+            {
+                return Err(Error::from_reason(format!(
+                    "Missing or invalid component shard: {file}"
+                )));
+            }
+        }
+    }
+    if crate::engine::persistence::load_all_safetensors(source, false)?.is_empty() {
+        return Err(Error::from_reason(format!(
+            "Missing component weights: {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Publish a complete child tree so a previous single-file checkpoint cannot
+/// shadow the new revision's shards. Roll back the old tree if rename fails.
+fn replace_model_component(source: &Path, destination: &Path) -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let stage = destination.with_extension(format!("stage-{suffix}"));
+    let backup = destination.with_extension(format!("previous-{suffix}"));
+    let result = (|| -> Result<()> {
+        copy_model_component(source, &stage)?;
+        let previous = destination.exists();
+        if previous {
+            fs::rename(destination, &backup)?;
+        }
+        if let Err(error) = fs::rename(&stage, destination) {
+            if previous {
+                fs::rename(&backup, destination)?;
+            }
+            return Err(error.into());
+        }
+        if previous {
+            fs::remove_dir_all(&backup)?;
+        }
+        Ok(())
+    })();
+    if stage.exists() {
+        let _ = fs::remove_dir_all(stage);
+    }
+    result
+}
+
+fn copy_model_component(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if component_entry_is_directory(&entry)? {
+            copy_model_component(&entry.path(), &target)?;
+        } else {
+            // Hub snapshots link regular files to a shared blob store. Publish
+            // their bytes so the converted model is independent of that cache.
+            // Directory links remain unsupported, avoiding recursive cycles.
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Preflight the same filesystem contract used by the staged copy before the
+/// converter writes root weights. File links may point to a Hub blob store;
+/// directory links are rejected rather than recursively followed.
+fn validate_component_tree(source: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if component_entry_is_directory(&entry)? {
+            validate_component_tree(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn component_entry_is_directory(entry: &fs::DirEntry) -> Result<bool> {
+    let kind = entry.file_type()?;
+    if kind.is_dir() {
+        return Ok(true);
+    }
+    if kind.is_file() || (kind.is_symlink() && fs::metadata(entry.path())?.is_file()) {
+        return Ok(false);
+    }
+    Err(Error::from_reason(format!(
+        "Model component entry is not a regular file or directory: {}",
+        entry.path().display()
+    )))
+}
 
 /// Determine whether a weight key should be quantized.
 ///
@@ -9850,6 +10067,100 @@ mod tests {
     use super::*;
     use crate::convert::recipe::{self, ConversionRecipe};
 
+    #[cfg(unix)]
+    #[test]
+    fn component_replacement_materializes_hub_blob_links() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("mlx-component-{}", uuid::Uuid::new_v4()));
+        let source = root.join("snapshot/speech_tokenizer");
+        let destination = root.join("converted/speech_tokenizer");
+        let blobs = root.join("blobs");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        for (name, bytes) in [("config.json", "{}"), ("model.safetensors", "codec bytes")] {
+            fs::write(blobs.join(name), bytes).unwrap();
+            symlink(Path::new("../../blobs").join(name), source.join(name)).unwrap();
+        }
+        validate_component_tree(&source).unwrap();
+        replace_model_component(&source, &destination).unwrap();
+        fs::remove_dir_all(root.join("snapshot")).unwrap();
+        fs::remove_dir_all(blobs).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("config.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("model.safetensors")).unwrap(),
+            "codec bytes"
+        );
+        assert!(
+            fs::symlink_metadata(destination.join("model.safetensors"))
+                .unwrap()
+                .is_file()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn component_replacement_rejects_directory_links_without_changing_previous_tree() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("mlx-component-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("model.safetensors"), "previous codec").unwrap();
+        symlink(".", source.join("cycle")).unwrap();
+        assert!(
+            validate_model_component(&source)
+                .unwrap_err()
+                .reason
+                .contains("not a regular")
+        );
+        assert!(replace_model_component(&source, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(destination.join("model.safetensors")).unwrap(),
+            "previous codec"
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            2,
+            "staging tree must be removed"
+        );
+        fs::remove_file(source.join("cycle")).unwrap();
+        symlink("missing-blob", source.join("dangling")).unwrap();
+        assert!(validate_component_tree(&source).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn component_replacement_removes_stale_layout_and_validates_shards() {
+        let root = std::env::temp_dir().join(format!("mlx-component-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("config.json"), "{}").unwrap();
+        fs::write(
+            source.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"x":"part.safetensors"}}"#,
+        )
+        .unwrap();
+        let error = validate_model_component(&source).expect_err("must reject missing shard");
+        assert!(error.reason.contains("Missing or invalid component shard"));
+        fs::write(source.join("part.safetensors"), "new shard").unwrap();
+        fs::write(destination.join("model.safetensors"), "old single").unwrap();
+        replace_model_component(&source, &destination).unwrap();
+        assert!(!destination.join("model.safetensors").exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("part.safetensors")).unwrap(),
+            "new shard"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// Re-converting a symmetric GGUF import must not emit a config that still
     /// claims the `.biases` are derived. The input boundary rebuilds them and
     /// the writer stores them, so an output that kept the claim would describe
@@ -11659,7 +11970,6 @@ mod tests {
                 )
             })
             .collect();
-
         quantize_weights_with_recipe_pub(
             &mut weights,
             4,
@@ -11787,6 +12097,7 @@ mod tests {
             known,
             [
                 "qwen3_asr",
+                "qwen3_tts",
                 "qwen3_5",
                 "qwen3_5_moe",
                 "lfm2",
@@ -12020,28 +12331,40 @@ mod tests {
     #[test]
     fn qwen3_asr_rejects_mixed_or_unsupported_native_quantization() {
         for mode in ["affine", "mxfp4", "mxfp8"] {
-            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+            validate_qwen3_packed_quantization(Some("qwen3_asr"), true, mode, None)
                 .expect("uniform ASR packed mode must remain supported");
         }
 
         for mode in ["nvfp4", "sym8"] {
-            let error = validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+            let error = validate_qwen3_packed_quantization(Some("qwen3_asr"), true, mode, None)
                 .expect_err("unsupported ASR mode must fail before conversion I/O");
             assert!(error.reason.contains("uniform"), "{}", error.reason);
         }
 
-        let error =
-            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, "affine", Some("mixed_4_6"))
-                .expect_err("ASR mixed recipe must fail before conversion I/O");
+        let error = validate_qwen3_packed_quantization(
+            Some("qwen3_asr"),
+            true,
+            "affine",
+            Some("mixed_4_6"),
+        )
+        .expect_err("ASR mixed recipe must fail before conversion I/O");
         assert!(
             error.reason.contains("omit quant_recipe"),
             "{}",
             error.reason
         );
 
-        validate_qwen3_asr_quantization(Some("qwen3_asr"), false, "affine", Some("mixed_4_6"))
+        let error = validate_qwen3_packed_quantization(Some("qwen3_tts"), true, "nvfp4", None)
+            .expect_err("unsupported TTS mode must fail before conversion I/O");
+        assert!(
+            error.reason.contains("Qwen3-TTS"),
+            "the rejection names the TTS family, not ASR: {}",
+            error.reason
+        );
+
+        validate_qwen3_packed_quantization(Some("qwen3_asr"), false, "affine", Some("mixed_4_6"))
             .expect("the existing generic recipe-without-quantize validation owns this case");
-        validate_qwen3_asr_quantization(Some("qwen3_5"), true, "affine", Some("mixed_4_6"))
+        validate_qwen3_packed_quantization(Some("qwen3_5"), true, "affine", Some("mixed_4_6"))
             .expect("other model families keep their recipe support");
     }
 

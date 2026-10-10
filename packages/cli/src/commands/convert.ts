@@ -104,7 +104,7 @@ Optional Arguments:
   --config-dir <path>   Hugging Face config/tokenizer asset directory to copy
                         when converting a GGUF model
   --model-type, -m      Model type (auto-detected if not specified)
-                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_asr,
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_asr, qwen3_tts,
                         qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr,
                         privacy-filter, muse_glimmer, nemotron_h, k2_horizon
   --verbose, -v         Enable verbose logging
@@ -265,6 +265,7 @@ Model Types:
   qwen3_5               Qwen3.5 dense model (FP8 dequant, key remapping)
   qwen3_5_moe           Qwen3.5 MoE model (FP8 dequant, expert stacking)
   qwen3_asr             Qwen3-ASR audio encoder + Qwen3 decoder
+  qwen3_tts             Qwen3-TTS Talker, predictor, and declared speech codec
   lfm2_moe              LFM2 MoE model (MLP rename, conv transpose, expert stacking; affine quant only)
   lfm2                  LFM2 dense model (MLP rename, conv transpose; affine quant only)
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle -> SafeTensors)
@@ -865,12 +866,13 @@ export async function run(argv: string[]) {
   }
 
   if (
-    modelType === 'qwen3_asr' &&
+    (modelType === 'qwen3_asr' || modelType === 'qwen3_tts') &&
     args.quantize &&
     ((quantMode !== undefined && !['affine', 'mxfp4', 'mxfp8'].includes(quantMode)) || args['q-recipe'] !== undefined)
   ) {
+    const family = modelType === 'qwen3_tts' ? 'Qwen3-TTS' : 'Qwen3-ASR';
     console.error(
-      'Error: Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit --q-recipe',
+      `Error: ${family} packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit --q-recipe`,
     );
     process.exit(1);
   }

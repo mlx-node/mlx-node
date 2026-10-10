@@ -32,6 +32,7 @@ const hub = vi.hoisted(() => ({
 }));
 
 vi.mock('@huggingface/hub', () => ({
+  downloadFile: async () => new Blob(['{}']),
   // No resolvable upstream revision → the CLI takes its legacy completeness
   // path, which is exactly where the repair must happen.
   // The CLI calls it as `modelInfo({ name, additionalFields, accessToken })`.
@@ -48,7 +49,8 @@ vi.mock('@huggingface/hub', () => ({
     const entry = Object.values(hub.manifests)
       .flat()
       .find((file) => file.path === params.path);
-    writeFileSync(snapshot, 'x'.repeat(Math.max(1, entry?.size ?? 1)));
+    const size = Math.max(1, entry?.size ?? 1);
+    writeFileSync(snapshot, params.path === 'config.json' ? '{}'.padEnd(size) : 'x'.repeat(size));
     return snapshot;
   },
 }));
@@ -180,7 +182,7 @@ describe('download model --assets-repo', () => {
     };
     writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(marker));
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
     writeFileSync(join(outputDir, 'stale-old-quant.gguf'), 'x'.repeat(7));
 
@@ -221,7 +223,7 @@ describe('download model --assets-repo', () => {
         }),
       );
       writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
-      writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+      writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
       writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
     };
     hub.shas[PRIMARY] = 'c'.repeat(40);
@@ -277,7 +279,7 @@ describe('download model --assets-repo', () => {
       }),
     );
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
 
     await run([
@@ -322,7 +324,7 @@ describe('download model --assets-repo', () => {
       }),
     );
     writeFileSync(join(outputDir, 'model.safetensors'), 'x'.repeat(64));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
 
     await run(['-m', PRIMARY, '-o', outputDir, '--assets-repo', ASSETS, '--cache-dir', cacheDir]);
 
@@ -357,7 +359,7 @@ describe('download model --assets-repo', () => {
     };
     writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
 
     await expect(
@@ -417,7 +419,7 @@ describe('download model --assets-repo', () => {
     );
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
     writeFileSync(join(outputDir, 'Tiny-UD-Q8_K_XL.gguf'), 'x'.repeat(900));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
 
     await run([
@@ -463,7 +465,7 @@ describe('download model --assets-repo', () => {
       }),
     );
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
 
     await run([
@@ -590,7 +592,7 @@ describe('download model --assets-repo', () => {
     };
     writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
 
     await expect(
@@ -626,7 +628,7 @@ describe('download model --assets-repo', () => {
     };
     writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     writeFileSync(join(outputDir, 'chat_template.jinja'), 'x'.repeat(9));
 
     await expect(
@@ -667,7 +669,7 @@ describe('download model --assets-repo', () => {
     };
     writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
     writeFileSync(join(outputDir, 'model.safetensors'), 'x'.repeat(64));
-    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
     // tokenizer.json is in the marker AND still offered by the assets
     // manifest, but missing on disk — exactly what the repair would fetch.
 

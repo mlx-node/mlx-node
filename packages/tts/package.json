@@ -1,0 +1,39 @@
+{
+  "name": "@mlx-node/tts",
+  "version": "0.0.16",
+  "description": "Native streaming text-to-speech on MLX",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mlx-node/mlx-node.git",
+    "directory": "packages/tts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@mlx-node/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./catalog": {
+      "@mlx-node/source": "./src/catalog.ts",
+      "types": "./dist/catalog.d.ts",
+      "import": "./dist/catalog.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@mlx-node/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  }
+}

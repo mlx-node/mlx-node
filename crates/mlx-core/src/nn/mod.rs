@@ -3,7 +3,9 @@ use napi::bindgen_prelude::*;
 
 // Module declarations
 pub mod activations;
+pub mod causal_conv;
 pub mod conv1d;
+pub mod conv_transpose1d;
 pub mod embedding;
 pub mod linear;
 pub mod losses;

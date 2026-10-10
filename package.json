@@ -28,6 +28,7 @@
     "@mlx-node/privacy": "workspace:*",
     "@mlx-node/server": "workspace:*",
     "@mlx-node/trl": "workspace:*",
+    "@mlx-node/tts": "workspace:*",
     "@mlx-node/vlm": "workspace:*",
     "@napi-rs/cli": "^3.8.6",
     "@napi-rs/simple-git": "^1.1.0",
