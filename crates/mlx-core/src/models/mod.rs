@@ -5,6 +5,7 @@
  */
 pub(crate) mod attention_core;
 pub(crate) mod chat_napi;
+pub mod clef;
 pub(crate) mod forward;
 pub mod gemma4;
 pub mod harrier;

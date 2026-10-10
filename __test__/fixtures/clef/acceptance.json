@@ -1,0 +1,165 @@
+[
+  {
+    "id": "invoice",
+    "request": {
+      "state": {
+        "invoice": {
+          "vendor": "Acme",
+          "total": 1250,
+          "currency": "USD",
+          "status": "overdue"
+        }
+      },
+      "questions": {
+        "status": {
+          "type": "choice",
+          "instructions": "What is the invoice status?",
+          "criteria": {
+            "paid": "Invoice is paid.",
+            "overdue": "Invoice is past due.",
+            "draft": "Not sent."
+          }
+        },
+        "large": {
+          "type": "noul",
+          "instructions": "Is the total above 1000 USD?"
+        }
+      }
+    },
+    "expected": {
+      "status": "overdue",
+      "large": true
+    }
+  },
+  {
+    "id": "outage",
+    "request": {
+      "state": "Our checkout started returning errors and all customer orders are blocked. Please fix the production outage immediately.",
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the message?",
+          "criteria": {
+            "billing": "Payments or invoices",
+            "technical": "Bugs or outages"
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "instructions": "How urgently must this be addressed?",
+          "criteria": [
+            "Can wait",
+            "This week",
+            "Today"
+          ]
+        },
+        "outage": {
+          "type": "noul",
+          "instructions": "Is a service down?"
+        }
+      }
+    },
+    "expected": {
+      "department": "technical",
+      "outage": true
+    }
+  },
+  {
+    "id": "routine",
+    "request": {
+      "state": "All systems are operating normally. No customer is affected. Please update our office mailing address next month; there is no rush.",
+      "questions": {
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does this message require immediate action?"
+        },
+        "outage": {
+          "type": "noul",
+          "instructions": "Is a service down?"
+        },
+        "priority": {
+          "type": "score",
+          "instructions": "How urgent is the request?",
+          "criteria": [
+            "Low: can wait until next month",
+            "Medium: this week",
+            "High: immediate action"
+          ]
+        }
+      }
+    },
+    "expected": {
+      "urgent": false,
+      "outage": false
+    }
+  },
+  {
+    "id": "unicode",
+    "request": {
+      "state": "La facture de 250 euros a été payée intégralement hier. Aucun montant ne reste dû. 客户已经支付全部费用。",
+      "questions": {
+        "2": {
+          "type": "noul",
+          "instructions": "Is any money still owed?"
+        },
+        "10": {
+          "type": "choice",
+          "instructions": "Determine the payment status.",
+          "criteria": {
+            "未支付": "Unpaid",
+            "已支付": "Fully paid"
+          }
+        }
+      }
+    },
+    "expected": {
+      "2": false,
+      "10": "已支付"
+    }
+  },
+  {
+    "id": "single-option",
+    "request": {
+      "state": "Delivery complete.",
+      "questions": {
+        "done": {
+          "type": "choice",
+          "instructions": "Select the only available option.",
+          "criteria": {
+            "ok": {
+              "meaning": "acknowledged",
+              "value": 1
+            }
+          }
+        }
+      }
+    },
+    "expected": {
+      "done": "ok"
+    }
+  },
+  {
+    "id": "long-context",
+    "request": {
+      "state": "Daily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nDaily log: all scheduled backups completed successfully and no incidents were reported.\nLATEST UPDATE: Production checkout is now down. Every purchase fails with HTTP 500. Escalate to engineering immediately.",
+      "questions": {
+        "action": {
+          "type": "choice",
+          "instructions": "Choose an action based on the latest update, not the earlier logs.",
+          "criteria": {
+            "escalate": "Escalate the current production outage immediately",
+            "wait": "Do nothing because everything is still healthy"
+          }
+        },
+        "down": {
+          "type": "noul",
+          "instructions": "According to the latest update, is checkout currently down?"
+        }
+      }
+    },
+    "expected": {
+      "action": "escalate",
+      "down": true
+    }
+  }
+]

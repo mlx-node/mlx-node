@@ -3326,6 +3326,13 @@ fn is_nemotron_h_config(config: &serde_json::Value) -> bool {
 async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionResult> {
     let input_dir = PathBuf::from(&options.input_dir);
     let output_dir = PathBuf::from(&options.output_dir);
+    let clef_config = input_dir.join("joint_head_config.json").is_file();
+    let clef_weights = input_dir.join("joint_head.safetensors").is_file();
+    if clef_config != clef_weights {
+        return Err(Error::from_reason(
+            "Incomplete CLEF checkpoint: both joint head assets are required",
+        ));
+    }
     let target_dtype = options.dtype.unwrap_or_else(|| "float32".to_string());
     let verbose = options.verbose.unwrap_or(false);
     let model_type = options.model_type;
@@ -4737,6 +4744,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         "video_preprocessor_config.json",
         "processor_config.json",
         "viterbi_calibration.json",
+        // CLEF's classifier head is separate from the backbone shard index.
+        "joint_head_config.json",
+        "joint_head.safetensors",
     ];
 
     for file_name in config_files.iter() {

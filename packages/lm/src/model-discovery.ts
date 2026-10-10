@@ -184,6 +184,8 @@ function isEvaluationFailure(error: unknown): boolean {
 
 /** Options for {@link discoverLocalChatModels}. */
 export interface DiscoveryScanOptions {
+  /** Server-only opt-in: decision models must stay out of chat clients. */
+  includeDecisions?: boolean;
   /**
    * Called when a directory entry or GGUF file could not be evaluated and may
    * have been omitted from the result — the scan was INCOMPLETE. Per-entry
@@ -244,17 +246,18 @@ export async function discoverLocalChatModels(
     modelType: ModelType,
     scopeName: string,
   ): Promise<void> => {
-    if (NON_GENERATIVE_FAMILY_IDS.has(modelType)) return;
+    const decision = modelType === 'clef' && opts?.includeDecisions === true;
+    if (NON_GENERATIVE_FAMILY_IDS.has(modelType) && !decision) return;
 
     // Fail-closed guards: dead-by-construction for chat families (the
     // family-data row type requires traits + a preset), live for any foreign
     // string that slips through detection.
-    const preset = launchPresetFor(modelType);
+    const preset = decision ? { sampling: {}, maxOutputTokens: 0 } : launchPresetFor(modelType);
     if (!preset) {
       if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
       return;
     }
-    const traits = familyTraitsFor(modelType);
+    const traits = decision ? { reasoning: false, fallbackContextWindow: 16384 } : familyTraitsFor(modelType);
     if (!traits) {
       if (debug) console.warn(`[mlx] skip ${path}: no FAMILY_TRAITS entry for ${modelType}`);
       return;
@@ -282,8 +285,8 @@ export async function discoverLocalChatModels(
       modelType,
       preset,
       traits,
-      contextWindow: metadata.contextWindow,
-      supportsImages: metadata.supportsImages,
+      contextWindow: decision ? Math.min(16384, metadata.contextWindow) : metadata.contextWindow,
+      supportsImages: decision ? false : metadata.supportsImages,
     });
   };
 

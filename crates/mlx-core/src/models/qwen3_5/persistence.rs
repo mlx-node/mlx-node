@@ -2138,6 +2138,37 @@ pub async fn load_with_thread(
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
 ) -> Result<Qwen3_5Model> {
+    load_with_thread_impl(model_path, draft_model_path, kv_format, false).await
+}
+
+pub(crate) async fn load_clef_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
+    for name in [
+        "joint_head_config.json",
+        "joint_head.safetensors",
+        "tokenizer.json",
+    ] {
+        let asset = Path::new(model_path).join(name);
+        if !asset.is_file() {
+            return Err(Error::from_reason(format!(
+                "Missing CLEF checkpoint asset: {name}"
+            )));
+        }
+    }
+    load_with_thread_impl(
+        model_path,
+        None,
+        Some(crate::transformer::KvFormat::Bf16),
+        true,
+    )
+    .await
+}
+
+async fn load_with_thread_impl(
+    model_path: &str,
+    draft_model_path: Option<String>,
+    kv_format: Option<crate::transformer::KvFormat>,
+    clef: bool,
+) -> Result<Qwen3_5Model> {
     let model_assets_path = model_path.to_string();
     let model_path = model_assets_path.clone();
 
@@ -2170,6 +2201,18 @@ pub async fn load_with_thread(
                     .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
 
                 let mut config = parse_config(&raw)?;
+                // Decision inference never allocates a chat KV pool or speculative head.
+                if clef {
+                    config.use_block_paged_cache = Some(false);
+                    config.persist_paged_cache = Some(false);
+                    config.n_mtp_layers = 0;
+                    config.kv_format = Some("bf16".into());
+                    if config.tie_word_embeddings {
+                        return Err(Error::from_reason(
+                            "CLEF requires an untied output embedding",
+                        ));
+                    }
+                }
                 // The flat full-attention K/V format: the load option wins
                 // over a `kv_format` key in config.json, and both over the
                 // geometry default (`Qwen3_5Config::kv_format`); an unknown
@@ -2448,6 +2491,21 @@ pub async fn load_with_thread(
                     prism_runtime.as_ref(),
                 )?;
                 inner.prism_hadamard = prism_runtime;
+                if clef {
+                    let output = inner
+                        .lm_head
+                        .as_ref()
+                        .ok_or_else(|| Error::from_reason("CLEF requires lm_head.weight"))?;
+                    if output.is_quantized() {
+                        return Err(Error::from_reason(
+                            "CLEF currently requires dense lm_head.weight; preserve the output head during conversion",
+                        ));
+                    }
+                    inner.clef_head = Some(crate::models::clef::head::JointHead::load(
+                        path,
+                        config.hidden_size as i64,
+                    )?);
+                }
 
                 // Materialize mmap-backed weights. Pages were pre-warmed above, so
                 // the chunked eval runs in the warm regime (no GPU page-fault
@@ -2484,7 +2542,7 @@ pub async fn load_with_thread(
                 // weights and emit garbage. Skip the vision encoder entirely
                 // so image turns fail loud ("vision encoder/processor not
                 // loaded") instead.
-                let vision_params = if has_sym8_mode(top_level_mode, &per_layer_quant) {
+                let vision_params = if clef || has_sym8_mode(top_level_mode, &per_layer_quant) {
                     if vision_params.is_some() {
                         warn!(
                             "Qwen3.5: sym8 checkpoint ships a vision tower, but sym8 \
@@ -2545,6 +2603,9 @@ pub async fn load_with_thread(
                 // `vision_params` (when present) so the cap covers the full
                 // materialized footprint.
                 let mut weight_bytes: u64 = text_weight_bytes;
+                if let Some(head) = inner.clef_head.as_ref() {
+                    weight_bytes = weight_bytes.saturating_add(head.nbytes());
+                }
                 if let Some(ref vparams) = vision_params {
                     weight_bytes = vparams
                         .values()

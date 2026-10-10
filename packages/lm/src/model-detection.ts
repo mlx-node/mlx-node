@@ -1,6 +1,6 @@
 /** Shared filesystem-only model detection for inference and control-panel discovery. */
 import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { open, stat } from 'node:fs/promises';
 import { dirname, extname, join } from 'node:path';
 
 import { MODEL_FAMILY_DATA, matchFamily, type ModelType } from './family-data.js';
@@ -44,5 +44,24 @@ export async function detectModelType(
     // not "not found" — discovery's onEntryFailure distinguishes the two.
     throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`, { cause: error });
   }
-  return matchFamily(modelPath, config);
+  const family = matchFamily(modelPath, config);
+  if (family === 'qwen3_5' && !isGguf) {
+    const assets = await Promise.all(
+      ['joint_head_config.json', 'joint_head.safetensors'].map(async (name) => {
+        try {
+          if (!(await stat(join(modelPath, name))).isFile())
+            throw new Error(`Invalid CLEF checkpoint: ${name} must be a regular file`);
+          return true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+          throw error;
+        }
+      }),
+    );
+    if (assets.some(Boolean)) {
+      if (!assets.every(Boolean)) throw new Error('Incomplete CLEF checkpoint: both joint head assets are required');
+      return 'clef';
+    }
+  }
+  return family;
 }

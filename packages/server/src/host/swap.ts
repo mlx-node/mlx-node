@@ -8,7 +8,7 @@
  * the new one.
  */
 
-import type { LoadableModel, SessionCapableModel } from '@mlx-node/lm';
+import type { LoadableModel, SessionCapableModel, DecisionModel } from '@mlx-node/lm';
 
 import type { PublicModelEntry } from '../handler.js';
 import type { ModelRegistry } from '../registry.js';
@@ -57,11 +57,11 @@ export function makeSwapController(
   async function resolveModel(name: string): Promise<void> {
     // Fast path: already registered under this name (either as a real
     // resident or as an alias we previously installed). Avoid chaining.
-    if (registry.get(name)) return;
+    if (registry.getAny(name)) return;
 
     const next = currentOp.then(async () => {
       // Re-check under the serialized section — a prior waiter may have loaded it.
-      if (registry.get(name)) return;
+      if (registry.getAny(name)) return;
 
       // Pick the discovered entry to resolve against. If the requested
       // name matches a discovered model, use it. Otherwise (unknown
@@ -84,7 +84,7 @@ export function makeSwapController(
       //
       // We do NOT unregister the aliases here: in-flight messages.ts
       // requests may be microtask-racing between "resolveModel returned"
-      // and "registry.get(body.model)" and dropping the alias in that
+      // and "registry.getAny(body.model)" and dropping the alias in that
       // window yields a spurious 404. Instead we carry the alias set
       // across the swap and re-point them to the new resident below,
       // so the name always resolves to *some* live instance.
@@ -94,7 +94,7 @@ export function makeSwapController(
         // Drop our local alias bookkeeping AND the old resident's primary
         // name binding, but leave the alias *names* in the registry pointed
         // at the old model — they hold the only refcount preventing GC,
-        // and an in-flight `registry.get(alias)` must keep resolving to
+        // and an in-flight `registry.getAny(alias)` must keep resolving to
         // *some* live instance until the new model is in hand.
         aliases.clear();
         registry.unregister(oldResident.name);
@@ -108,7 +108,7 @@ export function makeSwapController(
       // hold their own refcount), but the controller forgets they exist
       // and never repoints them, leaving alias-routed traffic permanently
       // pinned to a stale model.
-      let instance = registry.get(targetEntry.name);
+      let instance = registry.getAny(targetEntry.name);
       if (!instance) {
         let loaded: LoadableModel;
         try {
@@ -129,9 +129,9 @@ export function makeSwapController(
           // re-pick", not silently-wrong responses.
           for (const aliasName of carriedAliases) aliases.add(aliasName);
           if (oldResident) {
-            let oldInstance: SessionCapableModel | undefined;
+            let oldInstance: SessionCapableModel | DecisionModel | undefined;
             for (const aliasName of carriedAliases) {
-              const probe = registry.get(aliasName);
+              const probe = registry.getAny(aliasName);
               if (probe) {
                 oldInstance = probe;
                 break;
@@ -139,7 +139,7 @@ export function makeSwapController(
             }
             if (oldInstance) {
               const oldEntry = byName.get(oldResident.name);
-              registry.register(oldResident.name, oldInstance, {
+              registry.registerAny(oldResident.name, oldInstance, {
                 samplingDefaults: oldEntry?.preset.sampling,
                 maxOutputTokens: oldEntry?.preset.maxOutputTokens,
               });
@@ -148,8 +148,8 @@ export function makeSwapController(
           }
           throw err;
         }
-        instance = loaded as unknown as SessionCapableModel;
-        registry.register(targetEntry.name, instance, {
+        instance = loaded as unknown as SessionCapableModel | DecisionModel;
+        registry.registerAny(targetEntry.name, instance, {
           samplingDefaults: targetEntry.preset.sampling,
           maxOutputTokens: targetEntry.preset.maxOutputTokens,
         });
@@ -159,13 +159,13 @@ export function makeSwapController(
       }
 
       // Re-point any aliases carried across the swap onto the new
-      // resident. `registry.register(sameName, differentModel)` drops
+      // resident. `registry.registerAny(sameName, differentModel)` drops
       // the old binding's refcount and installs the new one atomically,
-      // so any concurrent `registry.get(alias)` either sees the old or
+      // so any concurrent `registry.getAny(alias)` either sees the old or
       // new instance — never null.
       for (const aliasName of carriedAliases) {
         if (aliasName === targetEntry.name) continue;
-        registry.register(aliasName, instance, {
+        registry.registerAny(aliasName, instance, {
           samplingDefaults: targetEntry.preset.sampling,
           maxOutputTokens: targetEntry.preset.maxOutputTokens,
         });
@@ -173,9 +173,9 @@ export function makeSwapController(
       }
 
       // For unknown names, register an alias on the resident instance so
-      // the endpoint's `registry.get(name)` lookup succeeds.
+      // the endpoint's `registry.getAny(name)` lookup succeeds.
       if (isAlias) {
-        registry.register(name, instance, {
+        registry.registerAny(name, instance, {
           samplingDefaults: targetEntry.preset.sampling,
           maxOutputTokens: targetEntry.preset.maxOutputTokens,
         });

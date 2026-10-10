@@ -1,0 +1,179 @@
+{
+  "repo": "Cloudflare/clef",
+  "revision": "0b331204bb13fbd2ca93a64df1956f5b55478ce5",
+  "referenceSourceSha256": "0e304cf7c6500e8bb59bef7e2afd2c6373f82596dfb3b57d1aa93c175e2dc3a3",
+  "reference": {
+    "torch": "2.14.1",
+    "device": "mps",
+    "dtype": "bfloat16"
+  },
+  "loadMs": 137578.930333,
+  "memory": {
+    "active": 86986546192,
+    "peak": 88517020710,
+    "cache": 1986832184,
+    "wiredLimit": 115448725504
+  },
+  "comparedProbabilities": 28,
+  "maxProbabilityError": 0.002309262752532959,
+  "repeat": "passed",
+  "midInferenceCancellation": "passed",
+  "http": "passed",
+  "sdk": "passed",
+  "media": "rejected",
+  "cases": [
+    {
+      "id": "invoice",
+      "inputTokens": 258,
+      "milliseconds": 23426.42829099999,
+      "expectedPassed": true,
+      "maxProbabilityError": 0.00018167495727539062,
+      "answers": {
+        "status": {
+          "type": "choice",
+          "choice": "overdue",
+          "probabilities": {
+            "draft": 0.0022527643013745546,
+            "overdue": 0.9943006038665771,
+            "paid": 0.003446573158726096
+          },
+          "confidence": 0.9914509057998657
+        },
+        "large": {
+          "type": "noul",
+          "noul": 0.9944233298301697
+        }
+      }
+    },
+    {
+      "id": "outage",
+      "inputTokens": 314,
+      "milliseconds": 1173.955459000019,
+      "expectedPassed": true,
+      "maxProbabilityError": 0.002309262752532959,
+      "answers": {
+        "department": {
+          "type": "choice",
+          "choice": "technical",
+          "probabilities": {
+            "billing": 0.034606583416461945,
+            "technical": 0.9653933644294739
+          },
+          "confidence": 0.9307867288589478
+        },
+        "urgency": {
+          "type": "score",
+          "score": 1.6074130088090897,
+          "probabilities": {
+            "0": 0.11304661631584167,
+            "1": 0.1664937287569046,
+            "2": 0.7204596400260925
+          },
+          "legend": {
+            "0": "Can wait",
+            "1": "This week",
+            "2": "Today"
+          },
+          "confidence": 0.4111195579171181
+        },
+        "outage": {
+          "type": "noul",
+          "noul": 0.9668641090393066
+        }
+      }
+    },
+    {
+      "id": "routine",
+      "inputTokens": 340,
+      "milliseconds": 696.2513329999929,
+      "expectedPassed": true,
+      "maxProbabilityError": 0.00021732738241553307,
+      "answers": {
+        "urgent": {
+          "type": "noul",
+          "noul": 0.00483692204579711
+        },
+        "outage": {
+          "type": "noul",
+          "noul": 0.007740744389593601
+        },
+        "priority": {
+          "type": "score",
+          "score": 0.01630152529105544,
+          "probabilities": {
+            "0": 0.988115668296814,
+            "1": 0.007467058952897787,
+            "2": 0.004417233169078827
+          },
+          "legend": {
+            "0": "Low: can wait until next month",
+            "1": "Medium: this week",
+            "2": "High: immediate action"
+          },
+          "confidence": 0.9755477120634168
+        }
+      }
+    },
+    {
+      "id": "unicode",
+      "inputTokens": 243,
+      "milliseconds": 376.6085000000021,
+      "expectedPassed": true,
+      "maxProbabilityError": 0.0001376657746732235,
+      "answers": {
+        "2": {
+          "type": "noul",
+          "noul": 0.006727437023073435
+        },
+        "10": {
+          "type": "choice",
+          "choice": "已支付",
+          "probabilities": {
+            "已支付": 0.9934506416320801,
+            "未支付": 0.006549393758177757
+          },
+          "confidence": 0.9869012832641602
+        }
+      }
+    },
+    {
+      "id": "single-option",
+      "inputTokens": 120,
+      "milliseconds": 297.4322500000126,
+      "expectedPassed": true,
+      "maxProbabilityError": 0,
+      "answers": {
+        "done": {
+          "type": "choice",
+          "choice": "ok",
+          "probabilities": {
+            "ok": 1
+          },
+          "confidence": 1
+        }
+      }
+    },
+    {
+      "id": "long-context",
+      "inputTokens": 2960,
+      "milliseconds": 3893.5080000000016,
+      "expectedPassed": true,
+      "maxProbabilityError": 0.00003576930612325668,
+      "answers": {
+        "action": {
+          "type": "choice",
+          "choice": "escalate",
+          "probabilities": {
+            "escalate": 0.9966251850128174,
+            "wait": 0.0033748468849807978
+          },
+          "confidence": 0.9932503700256348
+        },
+        "down": {
+          "type": "noul",
+          "noul": 0.9935474991798401
+        }
+      }
+    }
+  ]
+}

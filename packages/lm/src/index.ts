@@ -72,6 +72,8 @@ export type { K2HorizonConfig, K2RopeParameters } from '@mlx-node/core';
 // reaches for a manual drain should deep-import from `@mlx-node/core`
 // directly and read the `@internal` caveat there.
 export { memoryStats } from '@mlx-node/core';
+export { ClefModel } from './clef.js';
+export type { ClefRequest, ClefQuestion, ClefResult, ClefAnswer, DecisionModel } from './clef-types.js';
 
 // Unified Chat API types (shared by Qwen3, Qwen3.5, Qwen3.5 MoE)
 export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMetrics } from '@mlx-node/core';

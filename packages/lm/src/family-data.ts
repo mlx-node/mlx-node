@@ -10,7 +10,7 @@
 
 import type { ChatConfig } from '@mlx-node/core';
 
-export type ModelFamilyKind = 'trainable' | 'loadable' | 'embedding' | 'vlm';
+export type ModelFamilyKind = 'trainable' | 'loadable' | 'embedding' | 'vlm' | 'decision';
 
 export interface NormalizedModelConfig {
   readonly usesDefaultModelType: boolean;
@@ -288,7 +288,7 @@ interface ChatFamilyData extends ModelFamilyDataBase {
 }
 
 interface NonGenerativeFamilyData extends ModelFamilyDataBase {
-  readonly kind: 'embedding' | 'vlm';
+  readonly kind: 'embedding' | 'vlm' | 'decision';
   readonly traits?: undefined;
   readonly launchPreset?: undefined;
 }
@@ -317,6 +317,7 @@ export type ModelFamilyData = ChatFamilyData | NonGenerativeFamilyData;
  * enumerate everything else.
  */
 export const MODEL_FAMILY_DATA = [
+  { id: 'clef', kind: 'decision', match: { rawModelTypes: ['clef'] } },
   {
     id: 'gemma4',
     visionConfigKeys: ['vision_config', 'unified_vision_config'],
@@ -573,9 +574,11 @@ export const CHAT_FAMILY_IDS: readonly ChatFamilyId[] = MODEL_FAMILY_DATA.filter
   (row): row is ChatFamilyRow => row.kind === 'trainable' || row.kind === 'loadable',
 ).map((row) => row.id);
 
-/** Detection results that cannot back a chat endpoint (kind embedding | vlm). */
+/** Detection results that cannot back a chat endpoint (embedding, VLM or decision families). */
 export const NON_GENERATIVE_FAMILY_IDS: ReadonlySet<ModelType> = new Set<ModelType>(
-  MODEL_FAMILY_DATA.filter((row) => row.kind === 'embedding' || row.kind === 'vlm').map((row) => row.id),
+  MODEL_FAMILY_DATA.filter((row) => row.kind === 'embedding' || row.kind === 'vlm' || row.kind === 'decision').map(
+    (row) => row.id,
+  ),
 );
 
 interface FamilyDataIndex {

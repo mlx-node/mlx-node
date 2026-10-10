@@ -282,7 +282,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       models.map((m) => m.name),
     );
   }
-  const boundEntry = requestedEntry ?? models[0];
+  const boundEntry = requestedEntry ?? models.find((model) => model.modelType !== 'clef') ?? models[0];
 
   // `undefined` means "you pick"; `0` means "the kernel picks and I will read
   // it back". Only the former needs the up-front probe.
@@ -331,7 +331,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     const entry = models.find((model) => model.path === path)!;
     // Resolve against the source directory before creating the paged config overlay.
     const draftModelPath = findDFlash2Draft(path, entry.modelType, modelsDir);
-    const resolvedPath = await pagedConfigOverrides.resolve(path);
+    const resolvedPath = await pagedConfigOverrides.resolve(path, entry.modelType);
     return draftModelPath === undefined ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, { draftModelPath });
   };
   const controller = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);

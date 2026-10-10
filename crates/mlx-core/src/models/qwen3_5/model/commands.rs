@@ -6,6 +6,11 @@ use super::*;
 pub(crate) type Qwen35Cmd = crate::engine::model_command::ModelCommand<Qwen35FamilyCommand>;
 
 pub(crate) enum Qwen35FamilyCommand {
+    DecideClef {
+        request: crate::models::clef::encoding::Request,
+        cancelled: Arc<AtomicBool>,
+        reply: ResponseTx<String>,
+    },
     Generate {
         prompt_tokens: MxArray,
         config: Qwen3_5GenerationConfig,
@@ -163,6 +168,13 @@ impl TrainBackend for Qwen35Inner {
 impl crate::engine::model_command::FamilyCommand<Qwen35Inner> for Qwen35FamilyCommand {
     fn execute(self, inner: &mut Qwen35Inner) {
         match self {
+            Qwen35FamilyCommand::DecideClef {
+                request,
+                cancelled,
+                reply,
+            } => {
+                let _ = reply.send(inner.decide_clef(&request, &cancelled));
+            }
             Qwen35FamilyCommand::Generate {
                 prompt_tokens,
                 config,

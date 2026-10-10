@@ -8,6 +8,7 @@ import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
 import { handleListModels } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
+import { handleSystemOne } from './endpoints/systemone.js';
 import {
   sendAnthropicBadRequest,
   sendAnthropicMethodNotAllowed,
@@ -100,6 +101,22 @@ export async function routeRequest(
   extras?: RouteExtras,
 ): Promise<void> {
   const path = requestPathname(req);
+
+  if (path === '/v1/systemone') {
+    if (req.method !== 'POST') {
+      sendMethodNotAllowed(res, 'POST');
+      return;
+    }
+    let raw: string;
+    try {
+      raw = await readBody(req);
+    } catch (error) {
+      sendBadRequest(res, error instanceof Error ? error.message : 'Invalid request body');
+      return;
+    }
+    await handleSystemOne(req, res, raw, registry, idleSweeper, resolveModel, modelWorkCoordinator);
+    return;
+  }
 
   if (path === '/v1/models') {
     if (req.method !== 'GET') {

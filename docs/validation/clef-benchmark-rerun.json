@@ -1,0 +1,143 @@
+{
+  "completedAt": "2026-10-10T13:05:26.840Z",
+  "hardware": "Apple M5 Max, 128 GiB unified memory",
+  "method": "One fresh process per BF16 checkpoint, Flash then CLEF; one timed sample for each of six cases. Short-case median covers five different prompts (120–340 tokens), including the first inference. Long-context prompt has 2960 tokens. Previous independent reference outputs reused.",
+  "caveat": "Single samples under differing cache and memory pressure are not a controlled performance regression comparison. Peak is MLX allocator memory, not process RSS.",
+  "nativeBinarySha256": "11dbee24fbe2c537066b921b4e1a40a46ff07b555da7b5d6beccad530972d30e",
+  "acceptanceFixtureSha256": "b674400ffae1414fb1b28c2b203c7c2c12d428e05b7b292ac70a078708e46241",
+  "systemBefore": "vm.swapusage: total = 19456.00M  used = 18031.44M  free = 1424.56M  (encrypted)\n",
+  "systemBeforeClef": "vm.swapusage: total = 19456.00M  used = 18031.44M  free = 1424.56M  (encrypted)\n",
+  "systemAfter": "vm.swapusage: total = 30720.00M  used = 29807.38M  free = 912.62M  (encrypted)\n",
+  "models": [
+    {
+      "repo": "Cloudflare/clef-flash",
+      "revision": "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
+      "exactOutputParity": true,
+      "casesPassed": 6,
+      "comparedProbabilities": 28,
+      "maxProbabilityError": 0.0007855929434299469,
+      "checks": {
+        "repeat": "passed",
+        "midInferenceCancellation": "passed",
+        "http": "passed",
+        "sdk": "passed",
+        "media": "rejected"
+      },
+      "baseline": {
+        "loadMs": 10573.059625,
+        "shortCaseMedianMs": 151.3869999999988,
+        "longContextMs": 1076.5370829999993,
+        "peakAllocatedBytes": 28505818150
+      },
+      "rerun": {
+        "loadMs": 41650.526958,
+        "shortCaseMedianMs": 139.38791700000002,
+        "longContextMs": 1668.1092080000017,
+        "peakAllocatedBytes": 28505818150
+      },
+      "cases": [
+        {
+          "id": "invoice",
+          "inputTokens": 258,
+          "previousMs": 340.2025420000009,
+          "rerunMs": 259.6510419999977
+        },
+        {
+          "id": "outage",
+          "inputTokens": 314,
+          "previousMs": 151.3869999999988,
+          "rerunMs": 139.38791700000002
+        },
+        {
+          "id": "routine",
+          "inputTokens": 340,
+          "previousMs": 158.772167000001,
+          "rerunMs": 158.66370800000004
+        },
+        {
+          "id": "unicode",
+          "inputTokens": 243,
+          "previousMs": 113.31720799999857,
+          "rerunMs": 124.73108299999876
+        },
+        {
+          "id": "single-option",
+          "inputTokens": 120,
+          "previousMs": 86.82495799999924,
+          "rerunMs": 101.95529199999874
+        },
+        {
+          "id": "long-context",
+          "inputTokens": 2960,
+          "previousMs": 1076.5370829999993,
+          "rerunMs": 1668.1092080000017
+        }
+      ]
+    },
+    {
+      "repo": "Cloudflare/clef",
+      "revision": "0b331204bb13fbd2ca93a64df1956f5b55478ce5",
+      "exactOutputParity": true,
+      "casesPassed": 6,
+      "comparedProbabilities": 28,
+      "maxProbabilityError": 0.002309262752532959,
+      "checks": {
+        "repeat": "passed",
+        "midInferenceCancellation": "passed",
+        "http": "passed",
+        "sdk": "passed",
+        "media": "rejected"
+      },
+      "baseline": {
+        "loadMs": 137578.930333,
+        "shortCaseMedianMs": 696.2513329999929,
+        "longContextMs": 3893.5080000000016,
+        "peakAllocatedBytes": 88517020710
+      },
+      "rerun": {
+        "loadMs": 176106.492292,
+        "shortCaseMedianMs": 1691.171291000006,
+        "longContextMs": 5802.391166999994,
+        "peakAllocatedBytes": 88517004326
+      },
+      "cases": [
+        {
+          "id": "invoice",
+          "inputTokens": 258,
+          "previousMs": 23426.42829099999,
+          "rerunMs": 32671.211374999984
+        },
+        {
+          "id": "outage",
+          "inputTokens": 314,
+          "previousMs": 1173.955459000019,
+          "rerunMs": 1804.4425000000047
+        },
+        {
+          "id": "routine",
+          "inputTokens": 340,
+          "previousMs": 696.2513329999929,
+          "rerunMs": 1691.171291000006
+        },
+        {
+          "id": "unicode",
+          "inputTokens": 243,
+          "previousMs": 376.6085000000021,
+          "rerunMs": 1675.6927920000162
+        },
+        {
+          "id": "single-option",
+          "inputTokens": 120,
+          "previousMs": 297.4322500000126,
+          "rerunMs": 1646.5510829999985
+        },
+        {
+          "id": "long-context",
+          "inputTokens": 2960,
+          "previousMs": 3893.5080000000016,
+          "rerunMs": 5802.391166999994
+        }
+      ]
+    }
+  ]
+}
