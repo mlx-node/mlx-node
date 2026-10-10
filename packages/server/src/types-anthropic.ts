@@ -32,6 +32,8 @@ export interface AnthropicToolUseContentBlock {
 export interface AnthropicThinkingContentBlock {
   type: 'thinking';
   thinking: string;
+  /** Required by the Anthropic schema; local models emit an empty placeholder. */
+  signature?: string;
 }
 
 export type AnthropicContentBlock =
@@ -176,6 +178,8 @@ export interface AnthropicResponseTextBlock {
 export interface AnthropicResponseThinkingBlock {
   type: 'thinking';
   thinking: string;
+  /** Required by the Anthropic schema; local models emit an empty placeholder. */
+  signature?: string;
 }
 
 export interface AnthropicResponseToolUseBlock {
