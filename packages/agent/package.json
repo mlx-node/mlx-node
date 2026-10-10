@@ -49,7 +49,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.99.2",
+    "@earendil-works/pi-ai": "1.1.0",
     "@earendil-works/pi-coding-agent": "0.99.2",
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
