@@ -33,7 +33,7 @@ export const MLX_AGENT_BIN_ENV = 'MLX_AGENT_BIN';
 /** Release repo the prebuilt binary downloads from. */
 export const MLX_AGENT_RELEASE_REPO = 'mlx-node/grok-build';
 /** Pinned release tag the downloader fetches (bumped per vendor update). */
-export const MLX_AGENT_RELEASE_TAG = 'mlx-agent-v0.1.0';
+export const MLX_AGENT_RELEASE_TAG = 'mlx-agent-v0.2.0';
 
 /** Options for {@link launchGrokAgent}. */
 export interface GrokAgentLaunchOptions {
