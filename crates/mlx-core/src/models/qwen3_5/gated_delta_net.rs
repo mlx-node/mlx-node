@@ -6,8 +6,9 @@ use napi::bindgen_prelude::*;
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::{
-    GdnCompleteOut, GdnKernelTape, GdnPrologue, GdnTail, gated_delta_fused_complete,
-    gated_delta_update, gated_delta_update_fused, gated_delta_update_with_tape,
+    GdnCompleteOut, GdnKernelTape, GdnPrefill, GdnPrologue, GdnTail, gated_delta_fused_complete,
+    gated_delta_fused_prefill, gated_delta_update, gated_delta_update_fused,
+    gated_delta_update_with_tape, prefill_fused_enabled,
 };
 use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, LinearProj, QuantizedLinear};
 
@@ -233,6 +234,15 @@ pub struct GatedDeltaNet {
     /// F32 copy of `dt_bias` for `gdn_prepare`, which requires `float*` —
     /// checkpoints that store it bf16 would otherwise always miss the kernel.
     dt_bias_f32: Option<MxArray>,
+}
+
+/// What the prompt-window prep produced: either the gated output and new
+/// state from the fused-prefill dispatch, or the PRE-NORM conv views for the
+/// shared chain to finish (the fused kernel declined after the conv already
+/// ran — the conv work is not redone).
+enum PrefillPrep {
+    Fused { gated: MxArray, state: MxArray },
+    Raw { q: MxArray, k: MxArray, v: MxArray },
 }
 
 impl GatedDeltaNet {
@@ -535,6 +545,33 @@ impl GatedDeltaNet {
             None
         };
 
+        // Prompt-window fusion: one dispatch for the whole GDN core of an
+        // unmasked batch-1 `T >= 64` window — bit-identical to the
+        // `prep_via_conv` -> `gated_delta_update` -> tail chain it replaces.
+        // Decode/verify (`T < 64`) and the tape path never see it.
+        let prefill_prep = if tape_sink.is_none() {
+            self.prefill_fused(
+                &qkv,
+                &z,
+                &a,
+                &b,
+                conv_state.as_ref(),
+                cache.as_deref_mut(),
+                mask,
+                use_kernel,
+                batch,
+                seq_len,
+            )?
+        } else {
+            None
+        };
+        if let Some(PrefillPrep::Fused { gated, state }) = prefill_prep {
+            if let Some(cache) = cache {
+                cache.set(1, state)?;
+            }
+            return self.out_proj.forward(&gated);
+        }
+
         // Whole GDN core in ONE dispatch (prep + recurrence + gated norm +
         // z gate): the decode/verify geometry with compact tiled heads. Same
         // bits as the gdn_prepare -> fused step chain below, which stays the
@@ -657,14 +694,22 @@ impl GatedDeltaNet {
             }
             (pq, pk, pv, Some((decay, beta)))
         } else {
-            let (q, k, v) = self.prep_via_conv(
-                &qkv,
-                batch,
-                seq_len,
-                cache.as_deref_mut(),
-                conv_state,
-                use_kernel,
-            )?;
+            let (q, k, v) = match prefill_prep {
+                // The conv already ran inside `prefill_fused`; only the q/k
+                // norms are left of the prep stage.
+                Some(PrefillPrep::Raw { q, k, v }) => {
+                    let (q, k) = self.norm_qk(&q, &k)?;
+                    (q, k, v)
+                }
+                _ => self.prep_via_conv(
+                    &qkv,
+                    batch,
+                    seq_len,
+                    cache.as_deref_mut(),
+                    conv_state,
+                    use_kernel,
+                )?,
+            };
             (q, k, v, None)
         };
         if self.tiled_gguf_layout
@@ -902,11 +947,11 @@ impl GatedDeltaNet {
         )
     }
 
-    /// Generic prep path: depthwise conv (fused `window_conv` when possible)
-    /// → SiLU → q|k|v split → head reshape → q/k RMS-norm+scale. Runs whenever
-    /// the fully-fused `gdn_prepare` kernel is off-contract (batch > 1,
-    /// seq ≥ 64, non-10240 geometry) or declines.
-    fn prep_via_conv(
+    /// The conv stage of [`prep_via_conv`]: depthwise conv (fused
+    /// `window_conv` when possible) → SiLU → q|k|v split → head reshape.
+    /// Returns the PRE-NORM head tensors; the q/k RMS-norm+scale runs in
+    /// `prep_via_conv` (or inside the fused-prefill kernel).
+    fn prep_conv_qkv(
         &self,
         qkv: &MxArray,
         batch: i64,
@@ -1055,29 +1100,146 @@ impl GatedDeltaNet {
             self.num_v_heads as i64,
             self.value_head_dim as i64,
         ])?;
+        Ok((q, k, v))
+    }
 
-        // Apply RMS norm scaling to q and k (matching Python exactly):
-        //   inv_scale = head_k_dim^(-0.5)
-        //   q = (inv_scale^2) * rms_norm(q, None, 1e-6)
-        //   k = inv_scale * rms_norm(k, None, 1e-6)
-        // The scale factors live in constant bf16 vectors so the norm+scale
-        // is ONE fast_rms_norm dispatch per tensor (bf16 activations only —
-        // other dtypes keep the scalar path to avoid a promote).
-        let (q, k) = if q.dtype()? == crate::array::DType::BFloat16
+    /// Apply RMS norm scaling to q and k (matching Python exactly):
+    ///   inv_scale = head_k_dim^(-0.5)
+    ///   q = (inv_scale^2) * rms_norm(q, None, 1e-6)
+    ///   k = inv_scale * rms_norm(k, None, 1e-6)
+    /// The scale factors live in constant bf16 vectors so the norm+scale
+    /// is ONE fast_rms_norm dispatch per tensor (bf16 activations only —
+    /// other dtypes keep the scalar path to avoid a promote).
+    fn norm_qk(&self, q: &MxArray, k: &MxArray) -> Result<(MxArray, MxArray)> {
+        if q.dtype()? == crate::array::DType::BFloat16
             && k.dtype()? == crate::array::DType::BFloat16
         {
-            (
-                rms_norm_scaled(&q, &self.qk_norm_w_q, 1e-6)?,
-                rms_norm_scaled(&k, &self.qk_norm_w_k, 1e-6)?,
-            )
+            Ok((
+                rms_norm_scaled(q, &self.qk_norm_w_q, 1e-6)?,
+                rms_norm_scaled(k, &self.qk_norm_w_k, 1e-6)?,
+            ))
         } else {
             let inv_scale = (self.key_head_dim as f64).powf(-0.5);
-            (
-                rms_norm_unscaled(&q, 1e-6)?.mul_scalar(inv_scale * inv_scale)?,
-                rms_norm_unscaled(&k, 1e-6)?.mul_scalar(inv_scale)?,
-            )
-        };
+            Ok((
+                rms_norm_unscaled(q, 1e-6)?.mul_scalar(inv_scale * inv_scale)?,
+                rms_norm_unscaled(k, 1e-6)?.mul_scalar(inv_scale)?,
+            ))
+        }
+    }
+
+    /// Generic prep path: depthwise conv (fused `window_conv` when possible)
+    /// → SiLU → q|k|v split → head reshape → q/k RMS-norm+scale. Runs whenever
+    /// the fully-fused `gdn_prepare` kernel is off-contract (batch > 1,
+    /// seq ≥ 64, non-10240 geometry) or declines.
+    fn prep_via_conv(
+        &self,
+        qkv: &MxArray,
+        batch: i64,
+        seq_len: i64,
+        cache: Option<&mut ArraysCache>,
+        conv_state: Option<MxArray>,
+        use_kernel: bool,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
+        let (q, k, v) = self.prep_conv_qkv(qkv, batch, seq_len, cache, conv_state, use_kernel)?;
+        let (q, k) = self.norm_qk(&q, &k)?;
         Ok((q, k, v))
+    }
+
+    /// Prompt-window fused path (`mlx_gdn_fused_prefill`): one dispatch for
+    /// the gating + q/k norm + chunked recurrence + gated norm + z gate of an
+    /// unmasked batch-1 window, bit-identical to `prep_via_conv` +
+    /// `gated_delta_update` + the layer tail. Gated to `seq_len >= 64`: below
+    /// that `gdn_prepare` (17..=63) and the fused step (1..=32) keep their
+    /// exact existing code paths and bits. `MLX_GDN_PREFILL_FUSED=0` disables
+    /// it for A/B. `None` — or `Raw` — leaves the chain to run.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_fused(
+        &self,
+        qkv: &MxArray,
+        z: &MxArray,
+        a: &MxArray,
+        b: &MxArray,
+        conv_state: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        mask: Option<&MxArray>,
+        use_kernel: bool,
+        batch: i64,
+        seq_len: i64,
+    ) -> Result<Option<PrefillPrep>> {
+        if batch != 1
+            || seq_len < 64
+            || mask.is_some()
+            || !use_kernel
+            || !prefill_fused_enabled()
+            || !crate::engine::persistence::compiled_forward_backend_available()
+        {
+            return Ok(None);
+        }
+        // A lazy clone of the carried state (no eval): the borrow of `cache`
+        // must end before `prep_conv_qkv` takes it for the conv-history slot.
+        let recurrent = cache.as_deref().and_then(|c| c.get(1).cloned());
+        if [qkv, z, a, b, self.norm.weight()]
+            .iter()
+            .any(|x| x.dtype().ok() != Some(crate::array::DType::BFloat16))
+        {
+            return Ok(None);
+        }
+        // a_log/dt_bias ride the same `float*` contract as the fused gating
+        // kernel — require f32 storage rather than trusting the blind read.
+        if self.a_log.dtype().ok() != Some(crate::array::DType::Float32)
+            || self.dt_bias.dtype().ok() != Some(crate::array::DType::Float32)
+            || recurrent
+                .as_ref()
+                .is_some_and(|s| s.dtype().ok() != Some(crate::array::DType::Float32))
+        {
+            return Ok(None);
+        }
+        if self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0 {
+            return Ok(None);
+        }
+        // Conv first: on a late kernel decline the prepared views feed the
+        // shared chain instead of being recomputed.
+        let (q_raw, k_raw, v) =
+            self.prep_conv_qkv(qkv, batch, seq_len, cache, conv_state.cloned(), use_kernel)?;
+        if [q_raw.dtype().ok(), k_raw.dtype().ok(), v.dtype().ok()]
+            .iter()
+            .any(|d| *d != Some(crate::array::DType::BFloat16))
+        {
+            return Ok(Some(PrefillPrep::Raw {
+                q: q_raw,
+                k: k_raw,
+                v,
+            }));
+        }
+        match gated_delta_fused_prefill(
+            &q_raw,
+            &k_raw,
+            &v,
+            recurrent.as_ref(),
+            &GdnPrefill {
+                a,
+                b,
+                a_log: &self.a_log,
+                dt_bias: &self.dt_bias,
+                wq: &self.qk_norm_w_q,
+                wk: &self.qk_norm_w_k,
+                qk_eps: 1e-6,
+                tiled: self.tiled_gguf_layout,
+                tail: GdnTail {
+                    z,
+                    norm_weight: self.norm.weight(),
+                    eps: self.norm.eps(),
+                    state_dst: None,
+                },
+            },
+        )? {
+            Some((gated, state)) => Ok(Some(PrefillPrep::Fused { gated, state })),
+            None => Ok(Some(PrefillPrep::Raw {
+                q: q_raw,
+                k: k_raw,
+                v,
+            })),
+        }
     }
 
     // ========== Weight accessors (standard mode) ==========

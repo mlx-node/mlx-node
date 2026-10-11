@@ -171,6 +171,15 @@ pub(crate) struct Qwen35Inner {
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.
     pub(crate) dflash2_compiled_verify_disabled: bool,
+    /// Same latch for the compiled CLEF decide backbone. Per-model state
+    /// (not thread-local) so it sticks regardless of which thread runs
+    /// `decide_clef`.
+    pub(crate) clef_compiled_decide_disabled: bool,
+    /// Prompt lengths already given a compiled decide tape. `shapeless =
+    /// false` keys the C++ compile cache per T with no eviction; the set
+    /// caps the number of distinct tapes a model accumulates — further
+    /// lengths take the eager backbone.
+    pub(crate) clef_compiled_decide_shapes: std::collections::HashSet<i64>,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,

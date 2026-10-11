@@ -23,6 +23,7 @@
 
 #include <mutex>
 #include <chrono>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
@@ -50,7 +51,12 @@ struct CompiledGraphEntry {
 
 // fn_ids are namespaced per caller site (e.g. one id per model instance), so
 // distinct entries only ever run on their owner's model thread; the mutex
-// covers registry mutation/lookup itself.
+// covers registry mutation/lookup itself. The fn CALL runs unlocked (it is
+// copied out under the lock): a trace executes the Rust builder, which may
+// legitimately call back into this invoke for a different fn_id — holding
+// the mutex across it would deadlock, and it would serialize other models'
+// replays behind the trace. `std::function` copies share the underlying
+// tape, so `erase_matching` dropping the map entry mid-call is safe.
 std::unordered_map<uint64_t, CompiledGraphEntry>& registry() {
   static auto* map = new std::unordered_map<uint64_t, CompiledGraphEntry>();
   return *map;
@@ -101,12 +107,14 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
   const auto trace_start = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
   try {
-    std::lock_guard<std::mutex> lock(registry_mutex());
-    auto& entry = registry()[fn_id];
-    if (!entry.fn) {
-      entry.n_inputs = n_inputs;
-      entry.n_outputs = n_outputs;
-      entry.fn = mlx::core::compile(
+    std::function<std::vector<array>(const std::vector<array>&)> fn;
+    {
+      std::lock_guard<std::mutex> lock(registry_mutex());
+      auto& entry = registry()[fn_id];
+      if (!entry.fn) {
+        entry.n_inputs = n_inputs;
+        entry.n_outputs = n_outputs;
+        entry.fn = mlx::core::compile(
           [builder, n_outputs](const std::vector<array>& traced)
               -> std::vector<array> {
             // Hand Rust owning copies of the tracers: `array` shares the
@@ -143,13 +151,18 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
             return result;
           },
           shapeless);
-    }
-    if (n_inputs != entry.n_inputs || n_outputs != entry.n_outputs) {
-      std::cerr << "mlx_compiled_graph_invoke: arity mismatch for fn_id "
-                << fn_id << " (got " << n_inputs << " in / " << n_outputs
-                << " out, expected " << entry.n_inputs << " / "
-                << entry.n_outputs << ")" << std::endl;
-      return false;
+      }
+      if (n_inputs != entry.n_inputs || n_outputs != entry.n_outputs) {
+        std::cerr << "mlx_compiled_graph_invoke: arity mismatch for fn_id "
+                  << fn_id << " (got " << n_inputs << " in / " << n_outputs
+                  << " out, expected " << entry.n_inputs << " / "
+                  << entry.n_outputs << ")" << std::endl;
+        return false;
+      }
+      // Copy the callable out and drop the lock: MLX traces lazily on the
+      // fn() call below, and the tape (plus the Rust builder it may run)
+      // must not execute under registry_mutex.
+      fn = entry.fn;
     }
     std::vector<array> in;
     in.reserve(n_inputs);
@@ -170,7 +183,7 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
     // until this thread's first op creates the stream. Create it before the
     // first trace, or the second call misses the cache and traces again.
     (void)mlx::core::default_stream(mlx::core::default_device());
-    auto out = entry.fn(in);
+    auto out = fn(in);
     if (out.size() != n_outputs) {
       std::cerr << "mlx_compiled_graph_invoke: fn_id " << fn_id
                 << " produced " << out.size() << " outputs, expected "

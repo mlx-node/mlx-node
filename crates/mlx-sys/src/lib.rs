@@ -2245,6 +2245,35 @@ unsafe extern "C-unwind" {
         outputs: *mut *mut mlx_array,
     ) -> bool;
 
+    // Chunked fused GDN prefill for one prompt window, any T (the prompt
+    // counterpart of `mlx_gdn_fused_step`): the fused gating + q/k rms_norm
+    // + 32-row-chunked recurrence (f32 register state carries) + gated
+    // RMSNorm and z gate in ONE dispatch, bit-identical to the unfused
+    // prefill chain. `q`/`k` are the PRE-NORM conv outputs and `a`/`b` the
+    // raw gate views — all read through their row strides; `state` may be
+    // null for in-kernel zero init; `tiled` selects hk = hv % Hk (tiled
+    // GGUF) vs the repeat-expansion map hk = hv / (Hv / Hk). Returns false
+    // when off-contract.
+    pub fn mlx_gdn_fused_prefill(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        a_log: *mut mlx_array,
+        dt_bias: *mut mlx_array,
+        state: *mut mlx_array,
+        wq: *mut mlx_array,
+        wk: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        qk_eps: f32,
+        tiled: i32,
+        out: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
     // In-place KV row store: one dispatch writes `tensors` row blocks
     // (`src[i]`, `[B, H, T(, D)]`) into the matching flat cache buffers
     // (`dst[i]`) at row `offsets[i]`; `out[i]` are the cache handles to

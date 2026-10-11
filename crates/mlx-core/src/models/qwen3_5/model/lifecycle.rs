@@ -76,6 +76,8 @@ impl Qwen35Inner {
             cached_rope_deltas: None,
             model_id,
             dflash2_compiled_verify_disabled: false,
+            clef_compiled_decide_disabled: false,
+            clef_compiled_decide_shapes: std::collections::HashSet::new(),
             active_cache_owner_id: String::new(),
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
@@ -888,15 +890,20 @@ impl Qwen35Inner {
 }
 
 impl Qwen35Inner {
-    /// Erase every compiled-verify tape this instance has registered.
-    /// Each graph id namespaces a process-lifetime C++ registry entry whose
-    /// tape retains this model's captured weights: tapes must be invalidated
-    /// when the weights go away (drop) or change (training updates), or a
-    /// later verify silently replays the stale constants.
+    /// Erase every compiled tape this instance has registered (DFlash2
+    /// verify and the CLEF decide backbone). Each graph id namespaces a
+    /// process-lifetime C++ registry entry whose tape retains this model's
+    /// captured weights: tapes must be invalidated when the weights go away
+    /// (drop) or change (training updates), or a later call silently replays
+    /// the stale constants.
     pub(super) fn erase_compiled_verifies(&self) {
         crate::compiled_graph::erase_compiled_graphs_matching(
             forward::COMPILED_VERIFY_ERASE_MASK,
             forward::COMPILED_VERIFY_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
+        );
+        crate::compiled_graph::erase_compiled_graphs_matching(
+            forward::COMPILED_DECIDE_ERASE_MASK,
+            forward::COMPILED_DECIDE_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
         );
     }
 }

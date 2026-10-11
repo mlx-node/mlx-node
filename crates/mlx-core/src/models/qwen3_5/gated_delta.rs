@@ -26,6 +26,24 @@ fn gdn_kernel_override() -> GdnKernel {
     parse_gdn_kernel(std::env::var("MLX_GDN_KERNEL").ok().as_deref())
 }
 
+/// Read the `MLX_GDN_PREFILL_FUSED` kill switch fresh per call. Only an
+/// explicit `0`/`off`/`false`/`no` disables the chunked fused-prefill kernel
+/// (prompt windows, `T > 32`); unset or anything else keeps it on. Decode
+/// and verify windows never see this path regardless.
+pub(crate) fn prefill_fused_enabled() -> bool {
+    parse_prefill_fused(std::env::var("MLX_GDN_PREFILL_FUSED").ok().as_deref())
+}
+
+/// Pure parse of the prefill-fusion switch (env-free for race-free testing).
+fn parse_prefill_fused(mlx_gdn_prefill_fused: Option<&str>) -> bool {
+    !matches!(
+        mlx_gdn_prefill_fused
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
 /// Pure parse of the GDN-kernel env override (kept env-free for race-free testing).
 /// Unrecognized / unset → [`GdnKernel::Auto`].
 fn parse_gdn_kernel(mlx_gdn_kernel: Option<&str>) -> GdnKernel {
@@ -1072,6 +1090,100 @@ pub(crate) fn gated_delta_update_fused(
         });
     }
     Ok(Some(result))
+}
+
+/// The prologue/tail inputs [`gated_delta_fused_prefill`] needs beyond the
+/// prepared conv views: the raw gate projections `a`/`b` `[1, T, Hv]` (rows
+/// may be strided), `a_log`/`dt_bias` `[Hv]` bound `float*` exactly like the
+/// `fused_gdn_gating` kernel's contract (f32 in production), the folded q/k
+/// rms_norm weights `[Dk]` (`qk_norm_w_q`/`qk_norm_w_k`), and the [`GdnTail`]
+/// (strided `z`, gated-norm weight and eps).
+pub(crate) struct GdnPrefill<'a> {
+    pub a: &'a MxArray,
+    pub b: &'a MxArray,
+    pub a_log: &'a MxArray,
+    pub dt_bias: &'a MxArray,
+    pub wq: &'a MxArray,
+    pub wk: &'a MxArray,
+    /// The q/k rms_norm epsilon (1e-6 in production).
+    pub qk_eps: f32,
+    /// Compact tiled-GGUF heads (`hk = hv % Hk`) vs the standard
+    /// repeat-expansion map (`hk = hv / (Hv / Hk)`) on the unexpanded q/k.
+    pub tiled: bool,
+    pub tail: GdnTail<'a>,
+}
+
+/// One dispatch for a whole prompt window: `fused_gdn_gating` + the q/k
+/// `rms_norm` + the 32-row-chunked 4-vcol recurrence (f32 register state
+/// carries across chunks) + the gated RMSNorm and z gate — bit-identical to
+/// the unfused prefill chain. `q`/`k`/`v` are the PRE-NORM conv outputs
+/// (`[1, T, Hk|Hv, Dk|Dv]`, rows may be strided). `None` when off-contract
+/// (batch != 1, Dk/Dv != 128, non-bf16 activations, a `state_dst`, a
+/// non-f32 carried state, or a kernel decline) — the caller runs the chain.
+/// `state` may be `None` for in-kernel zero init.
+pub(crate) fn gated_delta_fused_prefill(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    state: Option<&MxArray>,
+    pf: &GdnPrefill<'_>,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !crate::engine::persistence::compiled_forward_backend_available()
+        || pf.tail.state_dst.is_some()
+        || v.shape_at(3)? != 128
+        || q.shape_at(3)? != 128
+        || [
+            q,
+            k,
+            v,
+            pf.a,
+            pf.b,
+            pf.tail.z,
+            pf.tail.norm_weight,
+            pf.wq,
+            pf.wk,
+        ]
+        .iter()
+        .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+        || [pf.a_log, pf.dt_bias]
+            .iter()
+            .any(|x| x.dtype().ok() != Some(DType::Float32))
+        || state.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
+    {
+        return Ok(None);
+    }
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_gdn_fused_prefill(
+            q.as_raw_ptr(),
+            k.as_raw_ptr(),
+            v.as_raw_ptr(),
+            pf.a.as_raw_ptr(),
+            pf.b.as_raw_ptr(),
+            pf.a_log.as_raw_ptr(),
+            pf.dt_bias.as_raw_ptr(),
+            state
+                .map(MxArray::as_raw_ptr)
+                .unwrap_or(std::ptr::null_mut()),
+            pf.wq.as_raw_ptr(),
+            pf.wk.as_raw_ptr(),
+            pf.tail.z.as_raw_ptr(),
+            pf.tail.norm_weight.as_raw_ptr(),
+            pf.tail.eps,
+            pf.qk_eps,
+            i32::from(pf.tiled),
+            &mut out,
+            &mut out_state,
+        )
+    };
+    if !ok {
+        return Ok(None);
+    }
+    Ok(Some((
+        MxArray::from_handle(out, "gdn_fused_prefill:out")?,
+        MxArray::from_handle(out_state, "gdn_fused_prefill:state")?,
+    )))
 }
 
 #[cfg(test)]
@@ -2174,5 +2286,318 @@ mod tests {
             "expected log(compute_g) = -inf under strong decay, got {old}"
         );
         Ok(())
+    }
+
+    /// The env parser maps switch strings → the fused-prefill gate
+    /// (tested env-free, race-free).
+    #[test]
+    fn parse_prefill_fused_switch_semantics() {
+        assert!(parse_prefill_fused(None));
+        assert!(parse_prefill_fused(Some("")));
+        assert!(parse_prefill_fused(Some("1")));
+        assert!(parse_prefill_fused(Some("garbage")));
+        assert!(!parse_prefill_fused(Some("0")));
+        assert!(!parse_prefill_fused(Some("off")));
+        assert!(!parse_prefill_fused(Some(" FALSE ")));
+        assert!(!parse_prefill_fused(Some("no")));
+    }
+
+    /// Whether this device launches the fused-prefill pipeline: same
+    /// threadgroup contract as `gdn_fused_step` (8 * Dv threads per value
+    /// head), so the FFI entry itself reports decline.
+    fn fused_prefill_launches() -> bool {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return false;
+        }
+        let w = MxArray::zeros(&[128], Some(DType::BFloat16)).unwrap();
+        let z = MxArray::zeros(&[1, 64, 128], Some(DType::BFloat16)).unwrap();
+        let a = MxArray::zeros(&[1, 64, 1], Some(DType::BFloat16)).unwrap();
+        let sc = MxArray::zeros(&[1], Some(DType::Float32)).unwrap();
+        gated_delta_fused_prefill(
+            &MxArray::zeros(&[1, 64, 1, 128], Some(DType::BFloat16)).unwrap(),
+            &MxArray::zeros(&[1, 64, 1, 128], Some(DType::BFloat16)).unwrap(),
+            &MxArray::zeros(&[1, 64, 1, 128], Some(DType::BFloat16)).unwrap(),
+            None,
+            &GdnPrefill {
+                a: &a,
+                b: &a,
+                a_log: &sc,
+                dt_bias: &sc,
+                wq: &w,
+                wk: &w,
+                qk_eps: 1e-6,
+                tiled: false,
+                tail: GdnTail {
+                    z: &z,
+                    norm_weight: &w,
+                    eps: 1e-6,
+                    state_dst: None,
+                },
+            },
+        )
+        .is_ok_and(|r| r.is_some())
+    }
+
+    /// The fused prefill must equal the production unfused chain —
+    /// `rms_norm_scaled` q/k prep -> `kernel_inputs` (fused gating + q/k
+    /// repeat/tile + zero state) -> per-step kernel -> the unfused tail —
+    /// bit for bit, over windows spanning several 32-row chunks, with the
+    /// production split-view strides, a carried f32 state, in-kernel zero
+    /// init, and both head maps (tiled `hv % Hk` and the non-tiled
+    /// `hv / (Hv / Hk)` repeat map on the unexpanded q/k).
+    #[test]
+    fn fused_prefill_matches_unfused_chain_bit_for_bit() {
+        // A geometry refusal that holds on every device, checked first so a
+        // device-level skip cannot starve it: Dv != 128 declines.
+        {
+            let w = MxArray::zeros(&[64], Some(DType::BFloat16)).unwrap();
+            let small = tape_and_state(1, 2, 4, 64, 64, 40).0;
+            let a = rand_bf16(&[1, 40, 4]);
+            let sc = rand_f32(&[4]);
+            let declined = gated_delta_fused_prefill(
+                &small.q,
+                &small.k,
+                &small.v,
+                None,
+                &GdnPrefill {
+                    a: &a,
+                    b: &a,
+                    a_log: &sc,
+                    dt_bias: &sc,
+                    wq: &w,
+                    wk: &w,
+                    qk_eps: 1e-6,
+                    tiled: false,
+                    tail: GdnTail {
+                        z: &rand_gate(&[1, 40, 256]),
+                        norm_weight: &w,
+                        eps: 1e-6,
+                        state_dst: None,
+                    },
+                },
+            )
+            .unwrap();
+            assert!(declined.is_none());
+        }
+        if !fused_prefill_launches() {
+            eprintln!(
+                "SKIP fused prefill parity: this device cannot launch the fused prefill kernel"
+            );
+            return;
+        }
+        let (hk, hv, dk, dv) = (16i64, 48i64, 128i64, 128i64);
+        let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+        let a_log = rand_f32(&[hv]);
+        let dt_bias = rand_f32(&[hv]);
+        // Folded q/k norm weights as production stores them (constants
+        // suffice for parity; the kernel applies them like fast::rms_norm).
+        let inv_scale = (dk as f64).powf(-0.5);
+        let wq = MxArray::full(
+            &[dk],
+            Either::A(inv_scale * inv_scale),
+            Some(DType::BFloat16),
+        )
+        .unwrap();
+        let wk = MxArray::full(&[dk], Either::A(inv_scale), Some(DType::BFloat16)).unwrap();
+        // (T, tiled head map, carried state): chunk boundary, whole chunks,
+        // a remainder chunk, and the non-tiled repeat map on unexpanded
+        // q/k. `carried = false` exercises in-kernel zero init.
+        for (t, tiled, carried) in [
+            (33i64, true, true),
+            (64, true, false),
+            (97, false, true),
+            (130, false, true),
+        ] {
+            // Production layout: conv output [1, T, 2 Hk Dk + Hv Dv] split
+            // into pre-norm q/k/v views (strided), ba [1, T, 2 Hv + pad].
+            let conv = rand_gate(&[1, t, 2 * hk * dk + hv * dv]);
+            let q_raw = conv
+                .slice_axis(2, 0, hk * dk)
+                .unwrap()
+                .reshape(&[1, t, hk, dk])
+                .unwrap();
+            let k_raw = conv
+                .slice_axis(2, hk * dk, 2 * hk * dk)
+                .unwrap()
+                .reshape(&[1, t, hk, dk])
+                .unwrap();
+            let v = conv
+                .slice_axis(2, 2 * hk * dk, 2 * hk * dk + hv * dv)
+                .unwrap()
+                .reshape(&[1, t, hv, dv])
+                .unwrap();
+            let ba = rand_bf16(&[1, t, 2 * hv + 32]);
+            let b = ba.slice_axis(2, 0, hv).unwrap();
+            let a = ba.slice_axis(2, hv, 2 * hv).unwrap();
+            let z = rand_gate(&[1, t, 2 * hk * dk + 2 * hv * dv + 96])
+                .slice_axis(2, 2 * hk * dk + hv * dv, 2 * hk * dk + 2 * hv * dv)
+                .unwrap();
+            // Reference chain: rms_norm_scaled prep, then the same
+            // kernel_inputs the production fused entry consumes.
+            let q_n = crate::nn::rms_norm_scaled(&q_raw, &wq, 1e-6).unwrap();
+            let k_n = crate::nn::rms_norm_scaled(&k_raw, &wk, 1e-6).unwrap();
+            let state0 = rand_f32(&[1, hv, dv, dk]);
+            let (qk, kk, g, beta, initial) = kernel_inputs(
+                &q_n,
+                &k_n,
+                &v,
+                &a,
+                &b,
+                &a_log,
+                &dt_bias,
+                carried.then_some(&state0),
+                tiled,
+                None,
+            )
+            .unwrap();
+            let (y, state_ref) =
+                gated_delta_kernel(&qk, &kk, &v, &g, &beta, &initial, None).unwrap();
+            let out_ref = unfused_tail(&y, &z, &w, 1e-6);
+            let tail = GdnTail {
+                z: &z,
+                norm_weight: &w,
+                eps: 1e-6,
+                state_dst: None,
+            };
+            let pf = GdnPrefill {
+                a: &a,
+                b: &b,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                wq: &wq,
+                wk: &wk,
+                qk_eps: 1e-6,
+                tiled,
+                tail,
+            };
+            let (out, state) =
+                gated_delta_fused_prefill(&q_raw, &k_raw, &v, carried.then_some(&state0), &pf)
+                    .unwrap()
+                    .expect("production geometry takes the fused prefill");
+            MxArray::eval_arrays(&[&out, &state, &out_ref, &state_ref]).unwrap();
+            assert_eq!(out.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(out.shape().unwrap().as_ref(), [1, t, hv * dv]);
+            let state_ulps = max_ulps(&state_ref, &state);
+            let out_ulps = max_ulps(&out_ref, &out);
+            eprintln!(
+                "FUSED_PREFILL t={t} tiled={tiled} carried={carried} state_ulps={state_ulps} out_ulps={out_ulps}"
+            );
+            assert_eq!(state_ulps, 0, "state t={t} tiled={tiled}");
+            assert_eq!(
+                out_ulps, 0,
+                "gated out t={t} tiled={tiled} carried={carried}"
+            );
+        }
+    }
+
+    /// Manual microbench: the fused prefill vs the unfused chain at the
+    /// clef geometry (T = 420, production head layout), 24 layers per
+    /// sample. `MLX_GDN_PREFILL_BENCH=1 cargo test -p mlx-core --release
+    /// --lib gated_delta::tests::fused_prefill_bench -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn fused_prefill_bench() {
+        if !unsafe { sys::mlx_metal_is_available() }
+            || std::env::var_os("MLX_GDN_PREFILL_BENCH").is_none()
+        {
+            return;
+        }
+        let (hk, hv, dk, dv, t, layers) = (16i64, 48i64, 128i64, 128i64, 420i64, 24usize);
+        let w = rand_bf16(&[dv]).add_scalar(1.0).unwrap();
+        let a_log = rand_f32(&[hv]);
+        let dt_bias = rand_f32(&[hv]);
+        let inv_scale = (dk as f64).powf(-0.5);
+        let wq = MxArray::full(
+            &[dk],
+            Either::A(inv_scale * inv_scale),
+            Some(DType::BFloat16),
+        )
+        .unwrap();
+        let wk = MxArray::full(&[dk], Either::A(inv_scale), Some(DType::BFloat16)).unwrap();
+        let inputs: Vec<_> = (0..layers)
+            .map(|_| {
+                let conv = rand_gate(&[1, t, 2 * hk * dk + hv * dv]);
+                let q_raw = conv
+                    .slice_axis(2, 0, hk * dk)
+                    .unwrap()
+                    .reshape(&[1, t, hk, dk])
+                    .unwrap();
+                let k_raw = conv
+                    .slice_axis(2, hk * dk, 2 * hk * dk)
+                    .unwrap()
+                    .reshape(&[1, t, hk, dk])
+                    .unwrap();
+                let v = conv
+                    .slice_axis(2, 2 * hk * dk, 2 * hk * dk + hv * dv)
+                    .unwrap()
+                    .reshape(&[1, t, hv, dv])
+                    .unwrap();
+                let ba = rand_bf16(&[1, t, 2 * hv + 32]);
+                let b = ba.slice_axis(2, 0, hv).unwrap();
+                let a = ba.slice_axis(2, hv, 2 * hv).unwrap();
+                let z = rand_gate(&[1, t, hv * dv]);
+                (q_raw, k_raw, v, a, b, z)
+            })
+            .collect();
+        let run = |fused: bool| -> f64 {
+            let mut samples = Vec::new();
+            for rep in 0..7 {
+                let start = std::time::Instant::now();
+                let mut outs = Vec::new();
+                for (q_raw, k_raw, v, a, b, z) in &inputs {
+                    let (o, s) = if fused {
+                        gated_delta_fused_prefill(
+                            q_raw,
+                            k_raw,
+                            v,
+                            None,
+                            &GdnPrefill {
+                                a,
+                                b,
+                                a_log: &a_log,
+                                dt_bias: &dt_bias,
+                                wq: &wq,
+                                wk: &wk,
+                                qk_eps: 1e-6,
+                                tiled: true,
+                                tail: GdnTail {
+                                    z,
+                                    norm_weight: &w,
+                                    eps: 1e-6,
+                                    state_dst: None,
+                                },
+                            },
+                        )
+                        .unwrap()
+                        .expect("production geometry takes the fused prefill")
+                    } else {
+                        let q_n = crate::nn::rms_norm_scaled(q_raw, &wq, 1e-6).unwrap();
+                        let k_n = crate::nn::rms_norm_scaled(k_raw, &wk, 1e-6).unwrap();
+                        let (qk, kk, g, beta, st) =
+                            kernel_inputs(&q_n, &k_n, v, a, b, &a_log, &dt_bias, None, true, None)
+                                .unwrap();
+                        let (y, s) = gated_delta_kernel(&qk, &kk, v, &g, &beta, &st, None).unwrap();
+                        (unfused_tail(&y, z, &w, 1e-6), s)
+                    };
+                    outs.push(o);
+                    outs.push(s);
+                }
+                MxArray::eval_arrays(&outs.iter().collect::<Vec<_>>()).unwrap();
+                if rep >= 2 {
+                    samples.push(start.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            samples.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            samples[samples.len() / 2]
+        };
+        for _ in 0..2 {
+            let unfused = run(false);
+            let fused = run(true);
+            eprintln!(
+                "GDN_PREFILL_BENCH T={t} {layers} layers: unfused {unfused:.3} ms, fused {fused:.3} ms, ratio {:.3}",
+                fused / unfused
+            );
+        }
     }
 }
