@@ -2,6 +2,7 @@
 use super::encoding::EncodedRecord;
 use crate::{
     array::{DType, MxArray, scaled_dot_product_attention},
+    models::quantized_linear::LinearProj,
     nn::{Activations, LayerNorm},
 };
 use napi::{Error, Result};
@@ -230,15 +231,18 @@ impl JointHead {
         .astype(dtype)
     }
     /// Mean-embed every (possibly ragged) contiguous id group in one take:
-    /// gather all rows once, then span-mean over the flat layout.
+    /// gather all rows once, then span-mean over the flat layout. The gather
+    /// runs on the packed projection (`take_dequantized_rows`), so a packed
+    /// lm_head dequantizes only the option-token rows instead of the whole
+    /// `[vocab, hidden]` table.
     fn group_mean_embeds(
         &self,
-        output_weight: &MxArray,
+        output: &LinearProj,
         ids: &[u32],
         lengths: &[usize],
         dtype: DType,
     ) -> Result<MxArray> {
-        let embeds = output_weight.take(&MxArray::from_uint32(ids, &[ids.len() as i64])?, 0)?;
+        let embeds = output.take_dequantized_rows(ids)?;
         let mut offset = 0;
         let spans: Vec<(usize, usize)> = lengths
             .iter()
@@ -262,7 +266,7 @@ impl JointHead {
         &self,
         hidden: &MxArray,
         record: &EncodedRecord,
-        output_weight: &MxArray,
+        output: &LinearProj,
     ) -> Result<Vec<Vec<f64>>> {
         let hidden = hidden.astype(self.w("hidden_norm.weight").dtype()?)?;
         let h = self
@@ -289,8 +293,7 @@ impl JointHead {
                 option_lengths.push(end - start);
             }
         }
-        let lexical =
-            self.group_mean_embeds(output_weight, &option_ids_flat, &option_lengths, dtype)?;
+        let lexical = self.group_mean_embeds(output, &option_ids_flat, &option_lengths, dtype)?;
         // Option→question gather index, reused by the projection and scoring.
         let mut question_index: Vec<u32> = Vec::with_capacity(option_spans.len());
         let counts: Vec<u32> = record
@@ -502,12 +505,11 @@ mod tests {
                 },
             ],
         };
+        let output_proj = LinearProj::Standard(
+            crate::nn::Linear::from_weights(&array("output", &[32, 8]), None).unwrap(),
+        );
         let actual = head
-            .forward(
-                &array("hidden", &[1, 24, 8]),
-                &record,
-                &array("output", &[32, 8]),
-            )
+            .forward(&array("hidden", &[1, 24, 8]), &record, &output_proj)
             .unwrap();
         let max_error = actual
             .iter()

@@ -99,6 +99,21 @@ impl LinearProj {
         }
     }
 
+    /// Dense `[row_ids.len(), in]` rows of the dequantized weight WITHOUT
+    /// materializing the whole `[out, in]` table — see
+    /// [`QuantizedLinear::take_dequantized_rows`]. The CLEF joint head reads
+    /// only option-token embedding rows of lm_head, so on a packed checkpoint
+    /// this is the difference between gathering a few hundred rows and a
+    /// ~2 GiB per-request dequantize.
+    pub fn take_dequantized_rows(&self, row_ids: &[u32]) -> Result<MxArray> {
+        match self {
+            LinearProj::Standard(l) => l
+                .get_weight()
+                .take(&MxArray::from_uint32(row_ids, &[row_ids.len() as i64])?, 0),
+            LinearProj::Quantized(ql) => ql.take_dequantized_rows(row_ids),
+        }
+    }
+
     /// Whether this projection holds a quantized backend.
     ///
     /// Used by the dense/bf16-only `save_model_sync` MTP path to refuse
@@ -1101,6 +1116,30 @@ impl QuantizedLinear {
         MxArray::eval_arrays_with_context(&pending, context)
     }
 
+    /// Cast affine-mode `scales`/`biases`/`bias` f16→`target` once at load.
+    /// Only f16 operands move: f32 GGUF-adjacent sidecars are already at the
+    /// promote path's dtype and bf16 companions (the `a<bits>g64` contract)
+    /// are left alone.
+    fn promote_affine_sidecars(&mut self, target: crate::array::DType) -> Result<()> {
+        if self.mode != DEFAULT_QUANT_MODE {
+            return Ok(());
+        }
+        if self.scales.dtype()? == crate::array::DType::Float16 {
+            self.scales = self.scales.astype(target)?;
+        }
+        if let Some(b) = &self.biases
+            && b.dtype()? == crate::array::DType::Float16
+        {
+            self.biases = Some(b.astype(target)?);
+        }
+        if let Some(b) = &self.bias
+            && b.dtype()? == crate::array::DType::Float16
+        {
+            self.bias = Some(b.astype(target)?);
+        }
+        Ok(())
+    }
+
     /// Cast affine-mode `scales`/`biases`/`bias` f16→f32 once at load. With
     /// bf16/f32 activations `quantized_matmul` promotes the whole call to f32
     /// anyway (`promote_types(bf16, f16)`), so the kernel receives f32
@@ -1112,23 +1151,23 @@ impl QuantizedLinear {
         &mut self,
         compute_dtype: crate::array::DType,
     ) -> Result<()> {
-        if self.mode != DEFAULT_QUANT_MODE || compute_dtype == crate::array::DType::Float16 {
+        if compute_dtype == crate::array::DType::Float16 {
             return Ok(());
         }
-        if self.scales.dtype()? == crate::array::DType::Float16 {
-            self.scales = self.scales.astype(crate::array::DType::Float32)?;
-        }
-        if let Some(b) = &self.biases
-            && b.dtype()? == crate::array::DType::Float16
-        {
-            self.biases = Some(b.astype(crate::array::DType::Float32)?);
-        }
-        if let Some(b) = &self.bias
-            && b.dtype()? == crate::array::DType::Float16
-        {
-            self.bias = Some(b.astype(crate::array::DType::Float32)?);
-        }
-        Ok(())
+        self.promote_affine_sidecars(crate::array::DType::Float32)
+    }
+
+    /// Cast affine-mode `scales`/`biases`/`bias` f16→bf16 once at load, for
+    /// the CLEF decision path whose residual stream is pinned to bf16
+    /// (`Qwen35Inner::decide_clef`). With bf16 sidecars an affine
+    /// `quantized_matmul` stays in the bf16 kernel tier (`promote_types(bf16,
+    /// bf16)`); measured on gen 17 this runs the bf16 nax kernels at ~0.36ms
+    /// per projection QMM where the f32-promote path pays ~0.62ms at
+    /// tf32-rate. Unlike the f32 hoist this changes the dequant arithmetic —
+    /// scale/bias are read in bf16 — so it is scoped to the clef loader,
+    /// which validated the drift against its bf16 ground truth.
+    pub fn promote_affine_sidecars_to_bf16(&mut self) -> Result<()> {
+        self.promote_affine_sidecars(crate::array::DType::BFloat16)
     }
 
     /// Row-concatenate two quantized projections into one `[N1+N2, K]`
@@ -1782,6 +1821,12 @@ impl QuantizedLinear {
     /// `mlx_dequantize`. `sym8` has no `mlx_dequantize` pack and is rejected —
     /// its int8 `[N,K]` weight plus `s_w` scales are a different contract.
     pub fn dequantized_weight(&self) -> Result<MxArray> {
+        if self.output_layout != QuantizedOutputLayout::Native {
+            return Err(Error::from_reason(
+                "dequantized_weight on a q/gate-permuted projection returns storage \
+                 rows, not logical output rows; remap the permutation first",
+            ));
+        }
         if self.mode == FP8_E4M3_MODE {
             return self.fp8_dequant_weight.clone().ok_or_else(|| {
                 Error::from_reason(
@@ -1849,6 +1894,141 @@ impl QuantizedLinear {
             )));
         }
         MxArray::from_handle(handle, "quantized_linear_dequantize")
+    }
+
+    /// Dense `[row_ids.len(), K]` rows of the dequantized weight, gathered on
+    /// the PACKED tensors so the full `[N, K]` table is never built. Every
+    /// `mlx_dequantize`-served mode decodes row-locally, so gather-then-
+    /// dequantize is bit-identical to `dequantized_weight().take(ids)` — the
+    /// same contract `Embedding::forward` already relies on for packed
+    /// embedding lookups. The CLEF joint head reads only option-token rows of
+    /// lm_head; on a packed checkpoint this drops a ~2 GiB transient to a few
+    /// hundred rows.
+    ///
+    /// Row-major packed modes (`affine`, mxfp*, every K/IQ mode) gather
+    /// `.weight`/`.scales`/`.biases` rows directly. A `@t64` projection
+    /// interleaves each 64-row tile across the tile's columns, so a single
+    /// logical row is not contiguous there: the containing TILES are
+    /// gathered whole, [`kquant_untile_rows`] restores the row-major order
+    /// for just those tiles, and the in-tile offsets pick the requested rows
+    /// (each operand untiles under its own unit — `bits` words of codes per
+    /// 32-value unit, `scale_entries_per_super_block`/`bias_entries_per_
+    /// super_block` companions per 256-value super-block).
+    ///
+    /// `sym8` has no `mlx_dequantize` contract: its int8 `[N,K]` weight is
+    /// gathered row-wise and scaled by `s_w` (f32 — the exact decode; the
+    /// caller casts to its compute dtype, and this fixes the hard error
+    /// `dequantized_weight` raises on sym8). `fp8_e4m3` gathers the resident
+    /// load-time BF16 reconstruction.
+    pub fn take_dequantized_rows(&self, row_ids: &[u32]) -> Result<MxArray> {
+        if self.output_layout != QuantizedOutputLayout::Native {
+            return Err(Error::from_reason(
+                "take_dequantized_rows on a q/gate-permuted projection returns storage \
+                 rows, not logical output rows; remap the permutation first",
+            ));
+        }
+        let ids = MxArray::from_uint32(row_ids, &[row_ids.len() as i64])?;
+        if let Some(w) = &self.fp8_dequant_weight {
+            return w.take(&ids, 0);
+        }
+        if self.mode == FP8_E4M3_MODE {
+            return Err(Error::from_reason(
+                "plain FP8 QuantizedLinear missing load-time BF16 reconstruction",
+            ));
+        }
+        if self.mode == SYM8_MODE {
+            let s_w = self.s_w.as_ref().ok_or_else(|| {
+                Error::from_reason("sym8 QuantizedLinear missing per-channel scales")
+            })?;
+            let w = self
+                .weight
+                .take(&ids, 0)?
+                .astype(crate::array::DType::Float32)?;
+            let s = s_w.take(&ids, 0)?.expand_dims(-1)?;
+            return w.mul(&s);
+        }
+        let (base_mode, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
+        use crate::models::quant_dispatch as qd;
+        let (weight, scales, biases, dequant_mode) = if tiled {
+            // One logical row's bytes interleave across all 64 rows of its
+            // tile, so gather whole tiles, untile them back to row-major,
+            // then select the in-tile offsets.
+            let tile = qd::KQUANT_TILE_ROWS as u32;
+            let mut tiles: Vec<u32> = row_ids.iter().map(|r| r / tile).collect();
+            tiles.sort_unstable();
+            tiles.dedup();
+            let row_sel: Vec<u32> = row_ids
+                .iter()
+                .map(|r| {
+                    // `r / tile` is always present: `tiles` is the dedup of
+                    // every requested tile id.
+                    tiles.partition_point(|&t| t < r / tile) as u32 * tile + r % tile
+                })
+                .collect();
+            let mut gather = Vec::with_capacity(tiles.len() * tile as usize);
+            for &t in &tiles {
+                gather.extend(t * tile..t * tile + tile);
+            }
+            let gather_idx = MxArray::from_uint32(&gather, &[gather.len() as i64])?;
+            let sel_idx = MxArray::from_uint32(&row_sel, &[row_sel.len() as i64])?;
+            let kq = if qd::is_kquant_affine_mode_str(base_mode) {
+                qd::kquant_affine_mode_params(self.bits, self.group_size)
+            } else {
+                qd::parse_mode_str(Some(base_mode))
+                    .and_then(|m| qd::kquant_mode_params_for_scales(m, self.scales.dtype().ok()?))
+            };
+            let Some(kq) = kq else {
+                return Err(Error::from_reason(format!(
+                    "QuantizedLinear mode '{}' has no Tiled64 dequantize contract",
+                    self.mode
+                )));
+            };
+            let untile_take = |a: &MxArray, unit: i64| -> Result<MxArray> {
+                qd::kquant_untile_rows(&a.take(&gather_idx, 0)?, unit)?.take(&sel_idx, 0)
+            };
+            let weight = untile_take(&self.weight, i64::from(kq.bits))?;
+            let scales = untile_take(&self.scales, i64::from(kq.scale_entries_per_super_block()))?;
+            let biases = self
+                .biases
+                .as_ref()
+                .map(|b| untile_take(b, i64::from(kq.bias_entries_per_super_block)))
+                .transpose()?;
+            let mode = if qd::is_kquant_affine_mode_str(base_mode) {
+                // The affine contract stores MLX affine bytes; after the
+                // untile they dequantize as `affine`, not under the kernel
+                // contract name (mirrors `dequantized_weight`).
+                DEFAULT_QUANT_MODE.to_string()
+            } else {
+                base_mode.to_string()
+            };
+            (weight, scales, biases, mode)
+        } else {
+            let weight = self.weight.take(&ids, 0)?;
+            let scales = self.scales.take(&ids, 0)?;
+            let biases = self.biases.as_ref().map(|b| b.take(&ids, 0)).transpose()?;
+            (weight, scales, biases, base_mode.to_string())
+        };
+        let biases_ptr = biases.as_ref().map_or(std::ptr::null_mut(), |b| b.handle.0);
+        let mode_c = CString::new(dequant_mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
+        let handle = unsafe {
+            sys::mlx_dequantize(
+                weight.handle.0,
+                scales.handle.0,
+                biases_ptr,
+                self.group_size,
+                self.bits,
+                -1,
+                mode_c.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(Error::from_reason(format!(
+                "mlx_dequantize failed for {} QuantizedLinear rows",
+                self.mode
+            )));
+        }
+        MxArray::from_handle(handle, "quantized_linear_rows_dequantize")
     }
 
     /// Model-owned BF16 reconstruction retained by the plain-E4M3 fallback.
@@ -4722,5 +4902,307 @@ mod affine_qmv_wide_lock_tests {
         );
         let narrow = MxArray::random_normal(&[4, 128], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
         assert!(mixed_ffi(&narrow, w, s, b, 32, 8).is_none(), "K mismatch");
+    }
+}
+
+/// Packed-row gather tests for [`QuantizedLinear::take_dequantized_rows`]:
+/// every clef-loadable backend must produce rows bit-identical to
+/// `dequantized_weight().take(ids)`.
+#[cfg(test)]
+mod clef_row_gather_tests {
+    use super::*;
+    use crate::array::DType;
+
+    fn quantize_affine(
+        weight: &MxArray,
+        group_size: i32,
+        bits: i32,
+    ) -> (MxArray, MxArray, MxArray) {
+        let mut q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut q,
+                &mut s,
+                &mut b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed");
+        (
+            MxArray::from_handle(q, "q").unwrap(),
+            MxArray::from_handle(s, "s").unwrap(),
+            MxArray::from_handle(b, "b").unwrap(),
+        )
+    }
+
+    fn ids_array(row_ids: &[u32]) -> MxArray {
+        MxArray::from_uint32(row_ids, &[row_ids.len() as i64]).unwrap()
+    }
+
+    /// Bit-exact row parity: dequantized dtypes (f16/bf16/f32) widen to f32
+    /// losslessly, so f32-vector equality is bitwise equality.
+    fn assert_rows_bit_identical(got: &MxArray, want: &MxArray, ctx: &str) {
+        got.eval();
+        want.eval();
+        let g = got
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let w = want
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        assert_eq!(g, w, "{ctx}: gathered rows must equal dequantize-then-take");
+    }
+
+    /// A fabricated row-major Q6_K projection (`K` a whole 256-value
+    /// super-block, `N` whole 64-row tiles): uint32 `[N, K*6/32]` codes,
+    /// int8 `[N, 16]` sub-scales, f16 `[N, 1]` super-scales.
+    fn synth_q6k(n: i64, k: i64, seed: u64) -> QuantizedLinear {
+        let mut state = seed;
+        let mut next_u32 = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let words = k * 6 / 32;
+        let w: Vec<u32> = (0..n * words).map(|_| next_u32()).collect();
+        let weight = MxArray::from_uint32(&w, &[n, words]).unwrap();
+        let sv: Vec<f32> = (0..n * 16)
+            .map(|_| (next_u32() % 255) as f32 - 127.0)
+            .collect();
+        let scales = MxArray::from_float32(&sv, &[n, 16])
+            .unwrap()
+            .astype(DType::Int8)
+            .unwrap();
+        let bv: Vec<f32> = (0..n)
+            .map(|_| (next_u32() % 100) as f32 * 1e-4 + 1e-3)
+            .collect();
+        let biases = MxArray::from_float32(&bv, &[n, 1])
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        QuantizedLinear::new(weight, scales, Some(biases), None, 16, 6, "q6k".to_string())
+    }
+
+    /// A fabricated row-major Q4_K projection — the `has_min` contract the
+    /// untile math must respect: uint32 `[N, K*4/32]` codes, uint8 `[N, 16]`
+    /// packed (sc, m) sub-pairs, f16 `[N, 2]` `(d, dmin)` per super-block.
+    fn synth_q4k(n: i64, k: i64, seed: u64) -> QuantizedLinear {
+        let mut state = seed;
+        let mut next_u32 = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let words = k * 4 / 32;
+        let w: Vec<u32> = (0..n * words).map(|_| next_u32()).collect();
+        let weight = MxArray::from_uint32(&w, &[n, words]).unwrap();
+        let sv: Vec<i64> = (0..n * 16).map(|_| (next_u32() % 255) as i64).collect();
+        let scales = MxArray::from_int64(&sv, &[n, 16])
+            .unwrap()
+            .astype(DType::Uint8)
+            .unwrap();
+        let bv: Vec<f32> = (0..n * 2)
+            .map(|_| (next_u32() % 100) as f32 * 1e-4 + 1e-3)
+            .collect();
+        let biases = MxArray::from_float32(&bv, &[n, 2])
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        QuantizedLinear::new(weight, scales, Some(biases), None, 32, 4, "q4k".to_string())
+    }
+
+    /// GGUF affine (Q8_0-style f16 sidecars, group 32): the packed gather
+    /// must equal dequantize-then-take.
+    #[test]
+    fn affine_g32_gathered_rows_match_full_dequantize() {
+        let (n, k) = (192i64, 256i64);
+        let w = MxArray::random_normal(&[n, k], 0.0, 0.5, Some(DType::Float32)).unwrap();
+        let (q, s, b) = quantize_affine(&w, 32, 8);
+        let ql = QuantizedLinear::new(
+            q,
+            s.astype(DType::Float16).unwrap(),
+            Some(b.astype(DType::Float16).unwrap()),
+            None,
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let ids: Vec<u32> = vec![0, 1, 63, 64, 65, 127, 191, 5, 5];
+        let want = ql
+            .dequantized_weight()
+            .unwrap()
+            .take(&ids_array(&ids), 0)
+            .unwrap();
+        let got = ql.take_dequantized_rows(&ids).unwrap();
+        assert_rows_bit_identical(&got, &want, "affine g32 b8");
+    }
+
+    /// Row-major K-quant: same contract (the Q4_K_M clef lm_head arrives as
+    /// `q6k` on hosts without Metal tiling).
+    #[test]
+    fn q6k_row_major_gathered_rows_match_full_dequantize() {
+        let ql = synth_q6k(192, 256, 0xC1EF_0001);
+        let ids: Vec<u32> = vec![0, 63, 64, 127, 128, 191, 7];
+        let want = ql
+            .dequantized_weight()
+            .unwrap()
+            .take(&ids_array(&ids), 0)
+            .unwrap();
+        let got = ql.take_dequantized_rows(&ids).unwrap();
+        assert_rows_bit_identical(&got, &want, "q6k row-major");
+    }
+
+    /// Tiled64 K-quant: gather whole tiles, untile, then pick in-tile rows —
+    /// must equal the row-major twin's dequantize-then-take, and must itself
+    /// untile correctly (its own full dequant agrees too).
+    #[test]
+    fn q6k_t64_gathered_rows_match_full_dequantize() {
+        let row_major = synth_q6k(192, 256, 0xC1EF_0001);
+        let mut tiled = synth_q6k(192, 256, 0xC1EF_0001);
+        assert!(
+            tiled.tile_kquant_layout_any_shape().unwrap(),
+            "q6k 192x256 must tile"
+        );
+        assert_eq!(tiled.mode(), "q6k@t64");
+        let ids: Vec<u32> = vec![0, 63, 64, 127, 128, 191, 7, 100, 42];
+        let want = row_major
+            .dequantized_weight()
+            .unwrap()
+            .take(&ids_array(&ids), 0)
+            .unwrap();
+        // The tiled projection's own full-dequant reference agrees, so the
+        // fast path is checked against BOTH references.
+        let tiled_full = tiled
+            .dequantized_weight()
+            .unwrap()
+            .take(&ids_array(&ids), 0)
+            .unwrap();
+        assert_rows_bit_identical(&tiled_full, &want, "q6k@t64 full dequant");
+        let got = tiled.take_dequantized_rows(&ids).unwrap();
+        assert_rows_bit_identical(&got, &want, "q6k@t64 gathered rows");
+    }
+
+    /// The has_min sibling: Q4_K carries dual `(d, dmin)` bias entries per
+    /// super-block, so its Tiled64 untile unit differs from q6k's — gather,
+    /// untile, and select must stay bit-exact under it.
+    #[test]
+    fn q4k_t64_gathered_rows_match_full_dequantize() {
+        let row_major = synth_q4k(192, 256, 0xC1EF_0002);
+        let mut tiled = synth_q4k(192, 256, 0xC1EF_0002);
+        assert!(
+            tiled.tile_kquant_layout_any_shape().unwrap(),
+            "q4k 192x256 must tile"
+        );
+        assert_eq!(tiled.mode(), "q4k@t64");
+        let ids: Vec<u32> = vec![0, 63, 64, 127, 128, 191, 7, 100, 42];
+        let want = row_major
+            .dequantized_weight()
+            .unwrap()
+            .take(&ids_array(&ids), 0)
+            .unwrap();
+        let got = tiled.take_dequantized_rows(&ids).unwrap();
+        assert_rows_bit_identical(&got, &want, "q4k@t64 gathered rows");
+    }
+
+    /// The affine K-quant contract (`a8g64@t64`): after the tile gather +
+    /// untile the bytes dequantize as plain `affine`.
+    #[test]
+    fn affine_a8g64_t64_gathered_rows_match_full_dequantize() {
+        let (n, k) = (192i64, 256i64);
+        let w = MxArray::random_normal(&[n, k], 0.0, 0.5, Some(DType::BFloat16)).unwrap();
+        let (q, s, b) = quantize_affine(&w, 64, 8);
+        let s = s.astype(DType::BFloat16).unwrap();
+        let b = b.astype(DType::BFloat16).unwrap();
+        let row_major = QuantizedLinear::new(
+            q.clone(),
+            s.clone(),
+            Some(b.clone()),
+            None,
+            64,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let mut tiled =
+            QuantizedLinear::new(q, s, Some(b), None, 64, 8, DEFAULT_QUANT_MODE.to_string());
+        assert!(
+            tiled.tile_kquant_layout_any_shape().unwrap(),
+            "affine 8/64 192x256 must tile"
+        );
+        assert_eq!(tiled.mode(), "a8g64@t64");
+        let ids: Vec<u32> = vec![0, 63, 64, 127, 191, 9];
+        let want = row_major
+            .dequantized_weight()
+            .unwrap()
+            .take(&ids_array(&ids), 0)
+            .unwrap();
+        let got = tiled.take_dequantized_rows(&ids).unwrap();
+        assert_rows_bit_identical(&got, &want, "a8g64@t64 gathered rows");
+    }
+
+    /// sym8 has no `mlx_dequantize` contract (`dequantized_weight` errors);
+    /// the gather path decodes rows as int8 * f32 per-row scale.
+    #[test]
+    fn sym8_gathered_rows_scale_int8() {
+        let (n, k) = (96i64, 64i64);
+        let mut state = 0x5197_0001u64;
+        let mut next_int = |lo: i32, hi: i32| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((state >> 33) % ((hi - lo + 1) as u64)) as i32
+        };
+        let q: Vec<f32> = (0..n * k).map(|_| next_int(-127, 127) as f32).collect();
+        let weight = MxArray::from_float32(&q, &[n, k])
+            .unwrap()
+            .astype(DType::Int8)
+            .unwrap();
+        let sv: Vec<f32> = (0..n)
+            .map(|_| 0.001 + (next_int(1, 1000) as f32) * 1e-5)
+            .collect();
+        let s_w = MxArray::from_float32(&sv, &[n]).unwrap();
+        let ql = QuantizedLinear::new_sym8(weight.clone(), s_w.clone(), None);
+        assert!(ql.dequantized_weight().is_err(), "sym8 has no dequant pack");
+        let ids: Vec<u32> = vec![0, 3, 95, 3];
+        let got = ql.take_dequantized_rows(&ids).unwrap();
+        let want = weight
+            .take(&ids_array(&ids), 0)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .mul(
+                &s_w.take(&ids_array(&ids), 0)
+                    .unwrap()
+                    .expand_dims(-1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_rows_bit_identical(&got, &want, "sym8 int8*scale rows");
+    }
+
+    /// Plain E4M3 keeps a resident BF16 reconstruction; the gather reads it
+    /// directly (same table `dequantized_weight` returns).
+    #[test]
+    fn fp8_e4m3_gathered_rows_use_resident_reconstruction() {
+        let recon = MxArray::random_normal(&[64, 32], 0.0, 0.1, Some(DType::BFloat16)).unwrap();
+        let w = MxArray::zeros(&[64, 32], Some(DType::Uint8)).unwrap();
+        let s = MxArray::full(&[64, 1], napi::Either::A(1.0f64), Some(DType::Float32)).unwrap();
+        let ql = QuantizedLinear::new_fp8_e4m3(w, s, recon.clone(), None);
+        let ids: Vec<u32> = vec![5, 0, 63];
+        let want = recon.take(&ids_array(&ids), 0).unwrap();
+        let got = ql.take_dequantized_rows(&ids).unwrap();
+        assert_rows_bit_identical(&got, &want, "fp8_e4m3 resident rows");
     }
 }

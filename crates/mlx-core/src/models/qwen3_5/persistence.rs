@@ -1328,6 +1328,7 @@ fn apply_weights_inner(
         per_layer_quant,
         _has_vision,
         prism,
+        false,
     )
     .map(drop)
 }
@@ -1355,6 +1356,12 @@ fn apply_weights_inner_with_residency(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
     prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
+    // CLEF decision models only: `decide_clef` pins the residual stream to
+    // bf16, so f16 affine sidecars are stored bf16 to keep the bf16 QMM
+    // kernels (`promote_affine_sidecars_to_bf16`) — NOT bit-identical to the
+    // f32 promote, scoped here to the clef loader whose bf16 reference is the
+    // acceptance ground truth.
+    clef_bf16_affine_sidecars: bool,
 ) -> Result<PlainFp8Residency> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -1469,7 +1476,13 @@ fn apply_weights_inner_with_residency(
                 // activations the native f16 path already matches; hoisting
                 // would flip it to f32 and cost MORE casts, so it stays off.
                 built
-                    .map(|mut ql| ql.promote_affine_sidecars_to_f32(compute_dtype).map(|_| ql))
+                    .map(|mut ql| {
+                        if clef_bf16_affine_sidecars {
+                            ql.promote_affine_sidecars_to_bf16().map(|_| ql)
+                        } else {
+                            ql.promote_affine_sidecars_to_f32(compute_dtype).map(|_| ql)
+                        }
+                    })
                     .transpose()?
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
@@ -2505,6 +2518,7 @@ async fn load_with_thread_impl(
                     &per_layer_quant,
                     has_vision,
                     prism_runtime.as_ref(),
+                    clef,
                 )?;
                 inner.prism_hadamard = prism_runtime;
                 if clef {
@@ -3305,6 +3319,7 @@ mod tests {
             &per_layer_quant,
             false,
             None,
+            false,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -3581,6 +3596,7 @@ mod tests {
             &per_layer_quant,
             false,
             None,
+            false,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(

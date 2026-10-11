@@ -1137,11 +1137,20 @@ impl Qwen35Inner {
         // Inference stream, matching the chat prefill's StreamContext.
         let _stream_ctx = crate::stream::StreamContext::new(crate::stream::Stream::generation());
         let mut hidden = self.embedding.forward(&ids)?;
+        // A packed affine (GGUF) embedding dequantizes to f16; the first bf16
+        // norm would promote the whole residual stream to f32 and route every
+        // affine QMM to its tf32-rate kernel. Pin the bf16 activation contract
+        // the dense checkpoint computes in; the clef affine sidecars are also
+        // loaded bf16 (persistence) so the bf16 nax kernels serve the prefill.
+        if hidden.dtype()? != crate::array::DType::BFloat16 {
+            hidden = hidden.astype(crate::array::DType::BFloat16)?;
+        }
         // Eval every four layers: enough to bound lazy-graph growth and land
         // cancellation points without serializing graph build behind GPU work.
         let layer_count = self.layers.len();
         for (i, layer) in self.layers.iter_mut().enumerate() {
             check_cancel(cancelled)?;
+            let layer_start = timing.then(std::time::Instant::now);
             hidden = layer.forward(
                 &hidden,
                 None,
@@ -1152,22 +1161,33 @@ impl Qwen35Inner {
             if (i + 1) % 4 == 0 || i + 1 == layer_count {
                 MxArray::eval_arrays(&[&hidden])?;
             }
+            if let Some(t) = layer_start {
+                eprintln!(
+                    "[clef] layer {i} ({}) build+eval: {:?}",
+                    if layer.is_linear() { "gdn" } else { "full" },
+                    t.elapsed()
+                );
+            }
         }
         check_cancel(cancelled)?;
         let hidden = self.final_norm.forward(&hidden)?;
         if timing {
             eprintln!("[clef] backbone: {:?} total", phase_start.elapsed());
         }
-        // A GGUF-imported checkpoint packs lm_head (the decide path never runs
-        // it as a projection); the joint head needs the dense [vocab, hidden]
-        // table for its option-token embedding gather.
-        let output_weight = output.dequantized_weight()?;
+        // The joint head gathers only option-token rows of the output table;
+        // on a packed (GGUF-imported) lm_head `take_dequantized_rows`
+        // dequantizes just those rows instead of the whole `[vocab, hidden]`
+        // table per request.
         let head_start = std::time::Instant::now();
-        let probabilities = head.forward(&hidden, &record, &output_weight)?;
+        let probabilities = head.forward(&hidden, &record, output)?;
         if timing {
             eprintln!("[clef] head: {:?}", head_start.elapsed());
         }
+        let cc_start = std::time::Instant::now();
         crate::array::clear_cache();
+        if timing {
+            eprintln!("[clef] clear_cache: {:?}", cc_start.elapsed());
+        }
         check_cancel(cancelled)?;
         let rows: Vec<_> = record.questions.iter().zip(probabilities).map(|(q,p)| serde_json::json!({"id":q.id,"type":q.kind,"options":q.option_ids,"probabilities":p})).collect();
         serde_json::to_string(
