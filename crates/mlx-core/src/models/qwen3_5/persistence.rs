@@ -1140,11 +1140,10 @@ fn dequantize_source_head(
     };
     if handle.is_null() {
         return Err(Error::from_reason(format!(
-            "mlx_dequantize failed for source draft head '{}'",
-            prefix
+            "mlx_dequantize failed for quantized weight '{prefix}'",
         )));
     }
-    MxArray::from_handle(handle, "draft_lm_head_source_dequantize").map(Some)
+    MxArray::from_handle(handle, "source_weight_dequantize").map(Some)
 }
 
 fn install_runtime_draft_lm_head(
@@ -1356,12 +1355,18 @@ fn apply_weights_inner_with_residency(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
     prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
-    // CLEF decision models only: `decide_clef` pins the residual stream to
-    // bf16, so f16 affine sidecars are stored bf16 to keep the bf16 QMM
-    // kernels (`promote_affine_sidecars_to_bf16`) — NOT bit-identical to the
-    // f32 promote, scoped here to the clef loader whose bf16 reference is the
-    // acceptance ground truth.
-    clef_bf16_affine_sidecars: bool,
+    // CLEF decision-model load. Two behaviours hang off it:
+    //   * the residual stream is pinned to bf16 in `decide_clef`, so f16
+    //     affine sidecars are stored bf16 to keep the bf16 QMM kernels
+    //     (`promote_affine_sidecars_to_bf16`) — NOT bit-identical to the f32
+    //     promote, scoped to the clef loader whose bf16 reference is the
+    //     acceptance ground truth;
+    //   * unless `MLX_CLEF_KEEP_PACKED` is set, quantized BACKBONE weights are
+    //     dequantized to bf16 at load (decide is a single prefill — the
+    //     packed QMM kernels pay inline-dequant overhead per forward while
+    //     the dense GEMM does not). The embedding and lm_head stay packed:
+    //     the lookup/gather paths already read packed rows directly.
+    clef: bool,
 ) -> Result<PlainFp8Residency> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -1393,33 +1398,94 @@ fn apply_weights_inner_with_residency(
         .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
         .unwrap_or(DType::BFloat16);
 
+    // Per-layer override lookup, shared by `try_build_ql` and the CLEF
+    // bf16-residency pre-pass. For merged GDN projections (in_proj_qkvz,
+    // in_proj_ba) the source overrides may live under the split keys; if
+    // the two sides disagree we pick the higher-precision combination:
+    //   1. higher `bits` wins,
+    //   2. on equal bits, prefer Affine > Mxfp8 > Mxfp4 (most precise mode).
+    let resolve_plq =
+        |per_layer_quant: &HashMap<String, PerLayerQuant>, prefix: &str| -> PerLayerQuant {
+            per_layer_quant
+                .get(prefix)
+                .copied()
+                .or_else(|| {
+                    if prefix.ends_with(".in_proj_qkvz") {
+                        let base = prefix.strip_suffix(".in_proj_qkvz")?;
+                        let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
+                        let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
+                        merge_per_layer(qkv, z, "in_proj_qkvz", "qkv", "z")
+                    } else if prefix.ends_with(".in_proj_ba") {
+                        let base = prefix.strip_suffix(".in_proj_ba")?;
+                        let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
+                        let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
+                        merge_per_layer(b_val, a_val, "in_proj_ba", "b", "a")
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(default_plq)
+        };
+
+    // CLEF bf16-residency pre-pass: a decide is ONE prefill — every weight is
+    // read exactly once, so the packed QMM kernels' inline dequant sits on
+    // the critical path (measured ~10-16% over the dense bf16 GEMM at the
+    // 420-token shape on M5 Max). Dequantize each quantized backbone
+    // projection to bf16 and strip its sidecars: every `try_build_*` helper
+    // takes `.scales`-absent as the "not quantized" signal and falls through
+    // to the dense `Linear` arm, so no forward-path change is needed and the
+    // `ensure_*` drift guards treat the projection as a plain bf16 tensor.
+    // Skipped: the embedding (its packed row lookup is already the fast
+    // path), the lm_head (`take_dequantized_rows` gathers packed rows for
+    // the ~dozen referenced vocab rows), and sym8 (an eager-int8 layout
+    // `mlx_dequantize` does not decode). `MLX_CLEF_KEEP_PACKED` restores
+    // packed residency for memory-constrained loads.
+    let mut per_layer_quant = per_layer_quant.clone();
+    if clef && std::env::var_os("MLX_CLEF_KEEP_PACKED").is_none() && is_quantized_checkpoint(params)
+    {
+        let prefixes: Vec<String> = params
+            .keys()
+            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+            .collect();
+        let mut dequantized = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
+        for prefix in prefixes {
+            if prefix == "embedding" || prefix == "lm_head" {
+                continue;
+            }
+            let plq = resolve_plq(&per_layer_quant, &prefix);
+            if plq.mode == PerLayerMode::Sym8 {
+                skipped.push(prefix);
+                continue;
+            }
+            let Some(dense) = dequantize_source_head(params, &prefix, plq)? else {
+                continue;
+            };
+            params.insert(format!("{prefix}.weight"), dense);
+            params.remove(&format!("{prefix}.scales"));
+            params.remove(&format!("{prefix}.biases"));
+            per_layer_quant.remove(&prefix);
+            dequantized += 1;
+        }
+        if dequantized > 0 {
+            info!(
+                "CLEF bf16-resident weights: dequantized {} projections to bf16 at load \
+                 ({} skipped, MLX_CLEF_KEEP_PACKED=1 keeps packed residency){}",
+                dequantized,
+                skipped.len(),
+                if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — kept packed: {}", skipped.join(", "))
+                }
+            );
+        }
+    }
+
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
      -> Result<Option<crate::models::quantized_linear::QuantizedLinear>> {
-        // Per-layer override lookup. For merged GDN projections (in_proj_qkvz,
-        // in_proj_ba) the source overrides may live under the split keys; if
-        // the two sides disagree we pick the higher-precision combination:
-        //   1. higher `bits` wins,
-        //   2. on equal bits, prefer Affine > Mxfp8 > Mxfp4 (most precise mode).
-        let plq = per_layer_quant
-            .get(prefix)
-            .copied()
-            .or_else(|| {
-                if prefix.ends_with(".in_proj_qkvz") {
-                    let base = prefix.strip_suffix(".in_proj_qkvz")?;
-                    let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
-                    let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
-                    merge_per_layer(qkv, z, "in_proj_qkvz", "qkv", "z")
-                } else if prefix.ends_with(".in_proj_ba") {
-                    let base = prefix.strip_suffix(".in_proj_ba")?;
-                    let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
-                    let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
-                    merge_per_layer(b_val, a_val, "in_proj_ba", "b", "a")
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(default_plq);
+        let plq = resolve_plq(&per_layer_quant, prefix);
         // int8 STORAGE with non-sym8 metadata = config drift — fail loud
         // before the int8 tensor can flow into the affine/mxfp builders.
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5")?;
@@ -1477,7 +1543,7 @@ fn apply_weights_inner_with_residency(
                 // would flip it to f32 and cost MORE casts, so it stays off.
                 built
                     .map(|mut ql| {
-                        if clef_bf16_affine_sidecars {
+                        if clef {
                             ql.promote_affine_sidecars_to_bf16().map(|_| ql)
                         } else {
                             ql.promote_affine_sidecars_to_f32(compute_dtype).map(|_| ql)
@@ -2035,7 +2101,7 @@ fn apply_weights_inner_with_residency(
     // `mtp.forward`; the module sits next to the main model and reads from
     // the same params HashMap.
     if let Some(mtp) = inner.mtp.as_mut() {
-        if has_sym8_mode(top_level_mode, per_layer_quant) {
+        if has_sym8_mode(top_level_mode, &per_layer_quant) {
             inner.mtp_weights_loaded = false;
             warn!(
                 "Qwen3.5: sym8 checkpoint with config.n_mtp_layers={} — MTP is not \
@@ -2045,7 +2111,7 @@ fn apply_weights_inner_with_residency(
         } else {
             let missing_mtp = missing_mtp_required_weights(params, config);
             if missing_mtp.is_empty() {
-                mtp.apply_weights(params, default_plq, per_layer_quant, compute_dtype)?;
+                mtp.apply_weights(params, default_plq, &per_layer_quant, compute_dtype)?;
                 inner.mtp_weights_loaded = true;
             } else {
                 inner.mtp_weights_loaded = false;
