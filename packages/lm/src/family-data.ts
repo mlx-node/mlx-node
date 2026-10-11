@@ -317,7 +317,12 @@ export type ModelFamilyData = ChatFamilyData | NonGenerativeFamilyData;
  * enumerate everything else.
  */
 export const MODEL_FAMILY_DATA = [
-  { id: 'clef', kind: 'decision', match: { rawModelTypes: ['clef'] } },
+  {
+    id: 'clef',
+    kind: 'decision',
+    ggufArchitectures: ['clef'],
+    match: { rawModelTypes: ['clef'] },
+  },
   {
     id: 'gemma4',
     visionConfigKeys: ['vision_config', 'unified_vision_config'],

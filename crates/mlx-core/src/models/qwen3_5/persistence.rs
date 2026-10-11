@@ -2508,14 +2508,11 @@ async fn load_with_thread_impl(
                 )?;
                 inner.prism_hadamard = prism_runtime;
                 if clef {
-                    let output = inner
-                        .lm_head
-                        .as_ref()
-                        .ok_or_else(|| Error::from_reason("CLEF requires lm_head.weight"))?;
-                    if output.is_quantized() {
-                        return Err(Error::from_reason(
-                            "CLEF currently requires dense lm_head.weight; preserve the output head during conversion",
-                        ));
+                    // Presence is the contract: decide_json never runs the
+                    // output projection, so a packed (GGUF-imported) lm_head
+                    // is a valid — and much smaller — checkpoint.
+                    if inner.lm_head.is_none() {
+                        return Err(Error::from_reason("CLEF requires lm_head.weight"));
                     }
                     inner.clef_head = Some(crate::models::clef::head::JointHead::load(
                         path,

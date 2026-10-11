@@ -88,6 +88,17 @@ impl LinearProj {
         }
     }
 
+    /// Dense `[out, in]` weight regardless of backend. Callers that treat the
+    /// projection as a weight matrix (the CLEF joint head's output-embedding
+    /// gather) must use this over `get_weight`, which returns packed storage
+    /// for a quantized projection.
+    pub fn dequantized_weight(&self) -> Result<MxArray> {
+        match self {
+            LinearProj::Standard(l) => Ok(l.get_weight()),
+            LinearProj::Quantized(ql) => ql.dequantized_weight(),
+        }
+    }
+
     /// Whether this projection holds a quantized backend.
     ///
     /// Used by the dense/bf16-only `save_model_sync` MTP path to refuse
@@ -1762,6 +1773,82 @@ impl QuantizedLinear {
 
     pub fn get_scales(&self) -> &MxArray {
         &self.scales
+    }
+
+    /// Dense `[out, in]` reconstruction of the packed weight for consumers
+    /// that read the projection as a weight matrix (for example the CLEF
+    /// joint head gathering output embeddings). Plain `fp8_e4m3` reuses the
+    /// load-time BF16 reconstruction; every other mode goes through
+    /// `mlx_dequantize`. `sym8` has no `mlx_dequantize` pack and is rejected —
+    /// its int8 `[N,K]` weight plus `s_w` scales are a different contract.
+    pub fn dequantized_weight(&self) -> Result<MxArray> {
+        if self.mode == FP8_E4M3_MODE {
+            return self.fp8_dequant_weight.clone().ok_or_else(|| {
+                Error::from_reason(
+                    "plain FP8 QuantizedLinear missing load-time BF16 reconstruction",
+                )
+            });
+        }
+        if self.mode == SYM8_MODE {
+            return Err(Error::from_reason(
+                "sym8 QuantizedLinear has no mlx_dequantize reconstruction",
+            ));
+        }
+        // `mlx_dequantize` reads row-major bytes only; a Tiled64 group must be
+        // untiled back to the checkpoint layout first. The affine `a<bits>g64`
+        // contract stores MLX affine bytes, so it dequantizes as `affine`
+        // after the untile, not under its kernel contract name.
+        let (base_mode, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
+        let mut weight = self.weight.clone();
+        let mut scales = self.scales.clone();
+        let mut biases = self.biases.clone();
+        let mut dequant_mode = base_mode.to_string();
+        if tiled {
+            use crate::models::quant_dispatch as qd;
+            let kq = if qd::is_kquant_affine_mode_str(base_mode) {
+                qd::kquant_affine_mode_params(self.bits, self.group_size)
+            } else {
+                qd::parse_mode_str(Some(base_mode))
+                    .and_then(|m| qd::kquant_mode_params_for_scales(m, self.scales.dtype().ok()?))
+            };
+            let Some(kq) = kq else {
+                return Err(Error::from_reason(format!(
+                    "QuantizedLinear mode '{}' has no Tiled64 dequantize contract",
+                    self.mode
+                )));
+            };
+            weight = qd::kquant_untile_rows(&weight, i64::from(kq.bits))?;
+            scales =
+                qd::kquant_untile_rows(&scales, i64::from(kq.scale_entries_per_super_block()))?;
+            biases = biases
+                .as_ref()
+                .map(|b| qd::kquant_untile_rows(b, i64::from(kq.bias_entries_per_super_block)))
+                .transpose()?;
+            if qd::is_kquant_affine_mode_str(base_mode) {
+                dequant_mode = DEFAULT_QUANT_MODE.to_string();
+            }
+        }
+        let biases_ptr = biases.as_ref().map_or(std::ptr::null_mut(), |b| b.handle.0);
+        let mode_c = CString::new(dequant_mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
+        let handle = unsafe {
+            sys::mlx_dequantize(
+                weight.handle.0,
+                scales.handle.0,
+                biases_ptr,
+                self.group_size,
+                self.bits,
+                -1,
+                mode_c.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(Error::from_reason(format!(
+                "mlx_dequantize failed for {} QuantizedLinear",
+                self.mode
+            )));
+        }
+        MxArray::from_handle(handle, "quantized_linear_dequantize")
     }
 
     /// Model-owned BF16 reconstruction retained by the plain-E4M3 fallback.

@@ -30,6 +30,19 @@ export async function detectModelType(
   readArchitecture: (path: string) => string | Promise<string> = readGgufArchitecture,
 ): Promise<ModelType> {
   const isGguf = extname(modelPath).toLowerCase() === '.gguf';
+  // A GGUF file's own header declares its architecture; a sibling config.json
+  // beside it may describe an entirely different model (e.g. a text config
+  // copied next to a CLEF decision GGUF). The header wins whenever it maps to
+  // a known family; an unmapped architecture (mmproj, draft) or an unreadable
+  // header falls back to the sibling config before giving up.
+  if (isGguf) {
+    try {
+      const type = GGUF_ARCHITECTURE_MODEL_TYPES.get(await readArchitecture(modelPath));
+      if (type !== undefined) return type;
+    } catch {
+      // Fall through to the sibling config.
+    }
+  }
   let config: unknown;
   try {
     config = await readModelConfig(isGguf ? dirname(modelPath) : modelPath);

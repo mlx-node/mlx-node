@@ -44,8 +44,22 @@ pub struct ClefModel {
 impl ClefModel {
     #[napi]
     pub async fn load(path: String) -> Result<Self> {
+        let source = std::path::Path::new(&path);
+        let prepared = if source.is_file()
+            && source
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            crate::utils::gguf::prepare_clef_native_gguf(source)
+                .await?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            path
+        };
         Ok(Self {
-            backbone: persistence::load_clef_with_thread(&path).await?,
+            backbone: persistence::load_clef_with_thread(&prepared).await?,
         })
     }
     /// Receives raw JSON to retain HTTP object ordering and number spelling.

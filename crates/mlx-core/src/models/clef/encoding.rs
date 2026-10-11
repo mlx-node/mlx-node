@@ -145,24 +145,32 @@ fn json(value: &Value) -> String {
                 "{{{}}}",
                 entries
                     .into_iter()
-                    .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap(), json(v)))
+                    // serde_json cannot fail to serialize a &str.
+                    .map(|(k, v)| {
+                        let key = serde_json::to_string(k).unwrap_or_else(|_| format!("\"{k}\""));
+                        format!("{key}:{}", json(v))
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             )
         }
         Value::Number(n) if n.is_f64() => {
-            let v = n.as_f64().unwrap();
+            let v = n.as_f64().unwrap_or_default();
             if v != 0.0 && (v.abs() < 1e-4 || v.abs() >= 1e16) {
                 let s = format!("{v:e}");
-                let (mantissa, exponent) = s.split_once('e').unwrap();
-                let exponent: i32 = exponent.parse().unwrap();
-                format!("{mantissa}e{exponent:+03}")
+                match s
+                    .split_once('e')
+                    .and_then(|(m, e)| e.parse::<i32>().ok().map(|exponent| (m, exponent)))
+                {
+                    Some((mantissa, exponent)) => format!("{mantissa}e{exponent:+03}"),
+                    None => s,
+                }
             } else {
                 let s = format!("{v}");
                 if s.contains('.') { s } else { format!("{s}.0") }
             }
         }
-        _ => serde_json::to_string(value).unwrap(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
     }
 }
 fn render(value: &Value) -> String {

@@ -2090,11 +2090,42 @@ fn gguf_name_to_hf_for_metadata(
         muse_glimmer_mmproj_name_to_hf(name)
     } else if is_muse_glimmer_dflash_gguf(metadata) {
         muse_glimmer_dflash_name_to_hf(name)
+    } else if is_clef_main_gguf(metadata) {
+        Some(clef_name_to_hf(name, metadata))
     } else if is_qwen35_moe_main_gguf(metadata) {
         Some(qwen35_moe_name_to_hf(name, metadata))
     } else {
         Some(qwen35_name_to_hf(name, metadata))
     }
+}
+
+/// A Cloudflare CLEF decision checkpoint: dense Qwen3.5 backbone plus an
+/// embedded joint-schema head. `general.architecture = clef` is the only
+/// positive signal; the `clef.decision.*` geometry is validated during head
+/// extraction, not here, so a truncated header still fails inside the
+/// conversion that reads it.
+fn is_clef_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("clef")
+}
+
+/// CLEF head tensors keep their llama.cpp names verbatim: the backbone rules
+/// in [`gguf_name_to_hf`] would mangle them (`dec.blk.2.attn_q.weight` →
+/// `dec.blk.2.self_attn.q_proj.weight`), and the joint-head extractor owns the
+/// torch-style destination names by fusing q/k/v groups that cannot be
+/// expressed as a string rename. Everything else maps through the dense
+/// Qwen3.5 table — the `clef.` metadata prefix mirrors `qwen35.*` and the
+/// backbone `blk.*` layout is identical.
+fn clef_name_to_hf(name: &str, metadata: &HashMap<String, GgufMetaValue>) -> String {
+    if name.starts_with("dec.blk.")
+        || name.starts_with("decision.")
+        || name.starts_with("token_types.")
+    {
+        return name.to_string();
+    }
+    qwen35_name_to_hf(name, metadata)
 }
 
 const QWEN35_INLINE_MTP_NEXTN_SUFFIXES: [&str; 4] = [
@@ -2218,7 +2249,7 @@ fn apply_qwen35_gdn_config(
     let Some(arch) = metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
-        .filter(|arch| matches!(*arch, "qwen35" | "qwen35moe"))
+        .filter(|arch| matches!(*arch, "qwen35" | "qwen35moe" | "clef"))
     else {
         return;
     };
@@ -2269,7 +2300,7 @@ fn validate_qwen35_standalone_geometry(metadata: &HashMap<String, GgufMetaValue>
     let Some(arch) = metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
-        .filter(|arch| matches!(*arch, "qwen35" | "qwen35moe"))
+        .filter(|arch| matches!(*arch, "qwen35" | "qwen35moe" | "clef"))
     else {
         return Ok(());
     };
@@ -2975,6 +3006,451 @@ fn fixup_qwen35_linear_attn(
     Ok(())
 }
 
+// ── CLEF joint-schema head extraction ────────────────────────────────────────
+
+/// Resolve one CLEF head tensor to a dense floating array. Dense blocks
+/// (biases, norms, `decision.scales`) pass through; packed affine groups
+/// (every published CLEF head weight is Q8_0) are dequantized through
+/// `mlx_dequantize`, synthesizing the `.biases` companion a symmetric ggml
+/// block leaves implicit (`w = scale * (q - Z)`, Z = 128 for Q8_0).
+/// Asymmetric blocks (Q4_1 / Q5_1) carry their own `.biases`; anything else —
+/// including a future K-quant head weight — is rejected rather than silently
+/// imported as a dense-looking tensor the head loader would reject anyway.
+fn clef_dense_tensor(
+    weights: &mut HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    name: &str,
+) -> Result<MxArray> {
+    let weight = weights
+        .remove(name)
+        .ok_or_else(|| Error::from_reason(format!("CLEF GGUF is missing head tensor '{name}'")))?;
+    let info = gguf
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == name)
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "CLEF GGUF tensor '{name}' loaded but has no descriptor"
+            ))
+        })?;
+    let Some(profile) = SourceQuantProfile::for_gguf_type(info.tensor_type) else {
+        if info.tensor_type.is_quantized() {
+            return Err(Error::from_reason(format!(
+                "CLEF head tensor '{name}' uses {}, which the dense joint head cannot import; \
+                 use a checkpoint whose head stays in affine ggml blocks",
+                info.tensor_type.name()
+            )));
+        }
+        return Ok(weight);
+    };
+    if profile.mode != "affine" {
+        return Err(Error::from_reason(format!(
+            "CLEF head tensor '{name}' uses {}, which dequantizes only through the {} mode; \
+             the dense joint head requires affine-compatible ggml blocks",
+            info.tensor_type.name(),
+            profile.mode
+        )));
+    }
+    // load_quantized_tensor writes sidecars as '{prefix}.scales' / '.biases'
+    // where prefix is the tensor name minus its '.weight' suffix.
+    let base = name.strip_suffix(".weight").unwrap_or(name);
+    let scales_name = format!("{base}.scales");
+    let scales = weights.remove(&scales_name).ok_or_else(|| {
+        Error::from_reason(format!(
+            "CLEF packed head tensor '{name}' lost its '{scales_name}' companion"
+        ))
+    })?;
+    let biases_name = format!("{base}.biases");
+    let biases = match weights.remove(&biases_name) {
+        Some(biases) => biases,
+        None => {
+            let zero_point = profile.symmetric_zero_point.ok_or_else(|| {
+                Error::from_reason(format!(
+                    "CLEF packed head tensor '{name}' has no '{biases_name}' and no symmetric zero point to derive it from"
+                ))
+            })?;
+            scales.mul_scalar(-f64::from(zero_point))?
+        }
+    };
+    let handle = unsafe {
+        mlx_sys::mlx_dequantize(
+            weight.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.as_raw_ptr(),
+            profile.group_size,
+            profile.bits,
+            -1, // output dtype follows the scales
+            c"affine".as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        return Err(Error::from_reason(format!(
+            "mlx_dequantize failed for CLEF head tensor '{name}'"
+        )));
+    }
+    MxArray::from_handle(handle, "clef_head_dequantize")
+}
+
+/// Fuse a split q/k/v projection into the head's torch-style `in_proj`
+/// `[3*width, width]` packing (nn.MultiheadAttention order).
+fn clef_fused_attention(
+    weights: &mut HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    names: &str,
+    dest: &str,
+    head: &mut HashMap<String, MxArray>,
+) -> Result<()> {
+    let q = clef_dense_tensor(weights, gguf, &format!("{names}_q.weight"))?;
+    let k = clef_dense_tensor(weights, gguf, &format!("{names}_k.weight"))?;
+    let v = clef_dense_tensor(weights, gguf, &format!("{names}_v.weight"))?;
+    head.insert(
+        format!("{dest}.in_proj_weight"),
+        MxArray::concatenate_many(vec![&q, &k, &v], Some(0))?,
+    );
+    let qb = clef_dense_tensor(weights, gguf, &format!("{names}_q.bias"))?;
+    let kb = clef_dense_tensor(weights, gguf, &format!("{names}_k.bias"))?;
+    let vb = clef_dense_tensor(weights, gguf, &format!("{names}_v.bias"))?;
+    head.insert(
+        format!("{dest}.in_proj_bias"),
+        MxArray::concatenate_many(vec![&qb, &kb, &vb], Some(0))?,
+    );
+    let ow = clef_dense_tensor(weights, gguf, &format!("{names}_o.weight"))?;
+    head.insert(format!("{dest}.out_proj.weight"), ow);
+    let ob = clef_dense_tensor(weights, gguf, &format!("{names}_o.bias"))?;
+    head.insert(format!("{dest}.out_proj.bias"), ob);
+    Ok(())
+}
+
+fn clef_copy_norm(
+    weights: &mut HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    src: &str,
+    dest: &str,
+    head: &mut HashMap<String, MxArray>,
+) -> Result<()> {
+    head.insert(
+        format!("{dest}.weight"),
+        clef_dense_tensor(weights, gguf, &format!("{src}.weight"))?,
+    );
+    head.insert(
+        format!("{dest}.bias"),
+        clef_dense_tensor(weights, gguf, &format!("{src}.bias"))?,
+    );
+    Ok(())
+}
+
+fn clef_copy_linear(
+    weights: &mut HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    src: &str,
+    dest: &str,
+    bias: bool,
+    head: &mut HashMap<String, MxArray>,
+) -> Result<()> {
+    head.insert(
+        format!("{dest}.weight"),
+        clef_dense_tensor(weights, gguf, &format!("{src}.weight"))?,
+    );
+    if bias {
+        head.insert(
+            format!("{dest}.bias"),
+            clef_dense_tensor(weights, gguf, &format!("{src}.bias"))?,
+        );
+    }
+    Ok(())
+}
+
+/// Split `dec.*` / `decision.*` / `token_types.*` tensors out of the backbone
+/// weight map into the torch-style `joint_head` layout the CLEF loader reads,
+/// and synthesize `joint_head_config.json` from the `clef.decision.*`
+/// metadata plus tensor geometry.
+///
+/// `decision.scales` stores the head's three runtime constants in their
+/// POST-transform form — `exp(logit_scale)` for the two prior/joint scales
+/// and `sigmoid(residual_gate)` for the gate — while the checkpoint layout
+/// stores raw parameters that `JointHead::forward` transforms itself. Values
+/// verified against Cloudflare's published clef-flash checkpoint
+/// (exp(2.296875) = 9.943, sigmoid(-2) = 0.1192).
+fn extract_clef_head_assets(
+    weights: &mut HashMap<String, MxArray>,
+    gguf: &GgufFile,
+) -> Result<Option<(HashMap<String, MxArray>, serde_json::Value)>> {
+    if !is_clef_main_gguf(&gguf.metadata) {
+        return Ok(None);
+    }
+    if !weights.keys().any(|key| key.starts_with("dec.")) {
+        return Err(Error::from_reason(
+            "CLEF GGUF carries no 'dec.*' decision-head tensors".to_string(),
+        ));
+    }
+    let meta_u64 = |key: &str, what: &str| -> Result<u64> {
+        gguf.metadata
+            .get(key)
+            .and_then(GgufMetaValue::as_u64)
+            .ok_or_else(|| Error::from_reason(format!("CLEF GGUF is missing '{key}' ({what})")))
+    };
+    let routing_layers =
+        meta_u64("clef.decision.routing_block_count", "routing layer count")? as usize;
+    let head_layers = meta_u64("clef.decision.block_count", "head layer count")? as usize;
+    let heads = meta_u64("clef.decision.head_count", "head attention count")? as i64;
+    let hidden_size = meta_u64("clef.embedding_length", "backbone hidden size")? as i64;
+    if routing_layers + head_layers > 64 {
+        return Err(Error::from_reason(
+            "CLEF GGUF declares more than 64 decision-head blocks".to_string(),
+        ));
+    }
+
+    let mut head: HashMap<String, MxArray> = HashMap::new();
+
+    // Routing ("evidence") layers: cross-attention only, query over options
+    // attending to fields, plus a feed-forward. GGUF norms map to the head's
+    // query/memory/feedforward norms respectively.
+    for i in 0..routing_layers {
+        let src = format!("dec.blk.{i}");
+        let dest = format!("evidence_layers.{i}");
+        clef_copy_norm(
+            weights,
+            gguf,
+            &format!("{src}.cross_attn_norm"),
+            &format!("{dest}.query_norm"),
+            &mut head,
+        )?;
+        clef_copy_norm(
+            weights,
+            gguf,
+            &format!("{src}.cross_attn_norm_kv"),
+            &format!("{dest}.memory_norm"),
+            &mut head,
+        )?;
+        clef_fused_attention(
+            weights,
+            gguf,
+            &format!("{src}.cross_attn"),
+            &format!("{dest}.attention"),
+            &mut head,
+        )?;
+        clef_copy_norm(
+            weights,
+            gguf,
+            &format!("{src}.ffn_norm"),
+            &format!("{dest}.feedforward_norm"),
+            &mut head,
+        )?;
+        clef_copy_linear(
+            weights,
+            gguf,
+            &format!("{src}.ffn_up"),
+            &format!("{dest}.feedforward.0"),
+            true,
+            &mut head,
+        )?;
+        clef_copy_linear(
+            weights,
+            gguf,
+            &format!("{src}.ffn_down"),
+            &format!("{dest}.feedforward.3"),
+            true,
+            &mut head,
+        )?;
+    }
+
+    // Scoring layers: full transformer decoder blocks — self-attention over
+    // field anchors, cross-attention to the routed options, then the FFN.
+    for i in 0..head_layers {
+        let src = format!("dec.blk.{}", routing_layers + i);
+        let dest = format!("layers.{i}");
+        clef_copy_norm(
+            weights,
+            gguf,
+            &format!("{src}.attn_norm"),
+            &format!("{dest}.norm1"),
+            &mut head,
+        )?;
+        clef_fused_attention(
+            weights,
+            gguf,
+            &format!("{src}.attn"),
+            &format!("{dest}.self_attn"),
+            &mut head,
+        )?;
+        clef_copy_norm(
+            weights,
+            gguf,
+            &format!("{src}.cross_attn_norm"),
+            &format!("{dest}.norm2"),
+            &mut head,
+        )?;
+        clef_fused_attention(
+            weights,
+            gguf,
+            &format!("{src}.cross_attn"),
+            &format!("{dest}.multihead_attn"),
+            &mut head,
+        )?;
+        clef_copy_norm(
+            weights,
+            gguf,
+            &format!("{src}.ffn_norm"),
+            &format!("{dest}.norm3"),
+            &mut head,
+        )?;
+        clef_copy_linear(
+            weights,
+            gguf,
+            &format!("{src}.ffn_up"),
+            &format!("{dest}.linear1"),
+            true,
+            &mut head,
+        )?;
+        clef_copy_linear(
+            weights,
+            gguf,
+            &format!("{src}.ffn_down"),
+            &format!("{dest}.linear2"),
+            true,
+            &mut head,
+        )?;
+    }
+
+    // Global tensors: norms keep their names, projections lose the `proj_`
+    // infix, the scorer becomes the two-layer residual scorer, `token_types`
+    // becomes the type embedding table, and `decision.scales` splits back
+    // into the head's three raw scalar parameters.
+    clef_copy_norm(
+        weights,
+        gguf,
+        "decision.hidden_norm",
+        "hidden_norm",
+        &mut head,
+    )?;
+    clef_copy_norm(
+        weights,
+        gguf,
+        "decision.field_norm",
+        "field_norm",
+        &mut head,
+    )?;
+    clef_copy_norm(
+        weights,
+        gguf,
+        "decision.option_norm",
+        "option_norm",
+        &mut head,
+    )?;
+    clef_copy_norm(
+        weights,
+        gguf,
+        "decision.option_summary_norm",
+        "option_summary_norm",
+        &mut head,
+    )?;
+    for (src, dest) in [
+        ("decision.proj_memory", "memory_projection"),
+        ("decision.proj_question", "question_projection"),
+        (
+            "decision.proj_option_question",
+            "option_question_projection",
+        ),
+        ("decision.proj_global", "global_projection"),
+        ("decision.proj_option_context", "option_context_projection"),
+        ("decision.proj_option_lexical", "option_lexical_projection"),
+    ] {
+        clef_copy_linear(weights, gguf, src, dest, false, &mut head)?;
+    }
+    let type_embedding = clef_dense_tensor(weights, gguf, "token_types.weight")?;
+    head.insert("type_embedding.weight".to_string(), type_embedding);
+
+    clef_copy_linear(
+        weights,
+        gguf,
+        "decision.scorer",
+        "residual_scorer.0",
+        true,
+        &mut head,
+    )?;
+    // GGUF stores scorer_out.weight as a bare [width] vector; the head's
+    // second residual layer is a Linear(width, 1) expecting [1, width].
+    let scorer_out_w = clef_dense_tensor(weights, gguf, "decision.scorer_out.weight")?;
+    let scorer_out_w = if scorer_out_w.ndim()? == 1 {
+        scorer_out_w.reshape(&[1, scorer_out_w.shape_at(0)?])?
+    } else {
+        scorer_out_w
+    };
+    head.insert("residual_scorer.3.weight".to_string(), scorer_out_w);
+    let scorer_out_b = clef_dense_tensor(weights, gguf, "decision.scorer_out.bias")?;
+    head.insert("residual_scorer.3.bias".to_string(), scorer_out_b);
+
+    let scales = clef_dense_tensor(weights, gguf, "decision.scales")?;
+    let raw: Vec<f32> = scales.astype(DType::Float32)?.to_float32()?.to_vec();
+    if raw.len() != 3 {
+        return Err(Error::from_reason(format!(
+            "CLEF 'decision.scales' must hold exactly 3 values, got {}",
+            raw.len()
+        )));
+    }
+    // Invert the exporter's parameterization: scales are exp()-ed and the
+    // gate is sigmoid()-ed in the GGUF, so the stored checkpoint wants
+    // ln(scale) and logit(gate). Clamp the gate into (0, 1) so a saturated
+    // value cannot turn into inf.
+    let s0 = f64::from(raw[0]);
+    let s1 = f64::from(raw[1]);
+    let gate = f64::from(raw[2]).clamp(1e-7, 1.0 - 1e-7);
+    head.insert(
+        "prior_logit_scale".to_string(),
+        MxArray::scalar_float(s0.ln())?,
+    );
+    head.insert(
+        "joint_logit_scale".to_string(),
+        MxArray::scalar_float(s1.ln())?,
+    );
+    head.insert(
+        "residual_gate".to_string(),
+        MxArray::scalar_float((gate / (1.0 - gate)).ln())?,
+    );
+
+    // Width and feed-forward come from tensor geometry (the header carries no
+    // decision.embedding_length / feed_forward field).
+    let width = head
+        .get("field_norm.weight")
+        .ok_or_else(|| Error::from_reason("CLEF head lost field_norm.weight".to_string()))?
+        .shape_at(0)?;
+    let feedforward_source = if routing_layers > 0 {
+        "evidence_layers.0.feedforward.0.weight"
+    } else {
+        "layers.0.linear1.weight"
+    };
+    let feedforward = head
+        .get(feedforward_source)
+        .ok_or_else(|| Error::from_reason(format!("CLEF head lost '{feedforward_source}'")))?
+        .shape_at(0)?;
+
+    let leftovers: Vec<String> = weights
+        .keys()
+        .filter(|key| {
+            key.starts_with("dec.blk.")
+                || key.starts_with("decision.")
+                || key.starts_with("token_types.")
+        })
+        .cloned()
+        .collect();
+    if let Some(extra) = leftovers.first() {
+        return Err(Error::from_reason(format!(
+            "Unmapped CLEF head tensor '{extra}' ({} leftovers total); extend the joint-head rename table",
+            leftovers.len()
+        )));
+    }
+
+    let config = serde_json::json!({
+        "hidden_size": hidden_size,
+        "width": width,
+        "routing_layers": routing_layers,
+        "layers": head_layers,
+        "heads": heads,
+        "feedforward": feedforward,
+    });
+    Ok(Some((head, config)))
+}
+
 /// Find an imported K-quant tensor that the Qwen3.5 GGUF layout fixup would
 /// have to reorder as a dense array.
 ///
@@ -3016,7 +3492,7 @@ fn is_qwen35_hybrid_gguf(
     let is_qwen35_arch = metadata
         .get("general.architecture")
         .and_then(|value| value.as_str())
-        .is_some_and(|arch| matches!(arch, "qwen35" | "qwen35moe" | "qwen3"));
+        .is_some_and(|arch| matches!(arch, "qwen35" | "qwen35moe" | "qwen3" | "clef"));
 
     is_qwen35_arch && crate::convert::has_qwen35_hybrid_weight_shape(weight_keys)
 }
@@ -3078,6 +3554,10 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
     let model_type = match arch.as_str() {
         "qwen35" => "qwen3_5",
         "qwen35moe" => "qwen3_5_moe",
+        // CLEF decides on a plain dense Qwen3.5 backbone: the synthesized
+        // config must spell the backbone family so the directory loads
+        // through the qwen3_5 loader.
+        "clef" => "qwen3_5",
         _ => arch.as_str(),
     };
     config.insert(
@@ -3166,7 +3646,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
     // legacy `hidden / heads` derivation — both to keep the field byte-identical
     // with existing Gemma4 K-quant conversions and because neither GGUF value is
     // the whole story there.
-    let is_qwen_family = matches!(arch.as_str(), "qwen3" | "qwen35" | "qwen35moe");
+    let is_qwen_family = matches!(arch.as_str(), "qwen3" | "qwen35" | "qwen35moe" | "clef");
     let has_independent_head_dim = is_qwen_family || arch == "muse-glimmer";
     // A key_length of 0 is not a head dim; fall through to the derivation
     // rather than writing a config that divides by it downstream. Same guard
@@ -4307,6 +4787,16 @@ fn source_quantization_profiles(
         let Some(mapped) = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata) else {
             continue;
         };
+        // CLEF decision-head tensors are extracted into joint_head.safetensors
+        // and never land in model.safetensors; a quantization entry for them
+        // would describe keys the file does not contain.
+        if is_clef_main_gguf(&gguf.metadata)
+            && (mapped.starts_with("dec.")
+                || mapped.starts_with("decision.")
+                || mapped.starts_with("token_types."))
+        {
+            continue;
+        }
         let prefix = mapped.strip_suffix(".weight").unwrap_or(&mapped);
         let prefix = super::normalize_override_key(prefix);
         if let Some(previous) = profiles.insert(prefix.clone(), profile)
@@ -5391,6 +5881,14 @@ pub async fn convert_gguf_to_safetensors(
     // Fix Qwen3.5 linear attention head deinterleaving and A_log conversion
     fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, native_qwen35_layout)?;
 
+    // Route the CLEF decision head out of the backbone map: the tensors
+    // dequantize, fuse into torch-style in_proj groups, and land in
+    // joint_head.safetensors beside model.safetensors — never inside it.
+    // Runs after the GDN fixups (which only touch `linear_attn.*` keys) and
+    // before the dtype pass so head tensors keep their stored f32/f16
+    // precision instead of being rounded by the backbone's --dtype.
+    let clef_head = extract_clef_head_assets(&mut weights, &gguf)?;
+
     // Optional dtype conversion (only for non-quantized weights)
     if let Some(dtype_str) = &options.dtype {
         let target_dtype = match dtype_str.as_str() {
@@ -5716,7 +6214,25 @@ pub async fn convert_gguf_to_safetensors(
     // Add "format: mlx" metadata so loaders (e.g., mlx-vlm) know weights are
     // already in MLX layout and skip sanitize (which would double-apply +1.0 to norms).
     let st_metadata = serde_json::json!({ "format": "mlx" });
-    save_safetensors(&safetensors_path, &mut weights, Some(st_metadata))?;
+    save_safetensors(&safetensors_path, &mut weights, Some(st_metadata.clone()))?;
+
+    // The CLEF joint head travels as its own safetensors + config pair: the
+    // backbone load (`model.safetensors` + config.json) is deliberately
+    // unaware of it, and `JointHead::load` reads these two files by name.
+    if let Some((mut head_weights, head_config)) = clef_head {
+        save_safetensors(
+            output_dir.join("joint_head.safetensors"),
+            &mut head_weights,
+            Some(st_metadata.clone()),
+        )?;
+        let head_config_str = serde_json::to_string_pretty(&head_config).map_err(|e| {
+            Error::from_reason(format!("Failed to serialize joint_head_config.json: {e}"))
+        })?;
+        fs::write(output_dir.join("joint_head_config.json"), head_config_str).map_err(|e| {
+            Error::from_reason(format!("Failed to write joint_head_config.json: {e}"))
+        })?;
+        info!("Wrote CLEF joint_head.safetensors + joint_head_config.json");
+    }
 
     // Only write config.json and tokenizer files for the primary model file
     // (`is_primary_model`, resolved before the save). Secondary files (e.g.,
@@ -6571,6 +7087,7 @@ async fn prepare_muse_glimmer_native_gguf_in(input: &Path, root: &Path) -> Resul
 enum NativeGgufFamily {
     Qwen35,
     Qwen35Moe,
+    Clef,
     Gemma4,
     MuseGlimmer,
 }
@@ -6593,6 +7110,10 @@ impl NativeGgufFamily {
             // A distinct string keeps the sparse family's cache key from
             // aliasing the dense one on the same source filename.
             Self::Qwen35Moe => "tiled-moe-v1",
+            // CLEF shares the dense Qwen3.5 tiled GDN layout; the tag keeps
+            // its head-bearing staging output from aliasing a plain qwen35
+            // conversion of a (hypothetical) same-named file.
+            Self::Clef => "clef-v1",
             Self::Gemma4 => "gemma4-text-dtype-v2",
             Self::MuseGlimmer => "muse-glimmer-packed-v1",
         }
@@ -6601,7 +7122,7 @@ impl NativeGgufFamily {
     fn companion_filename(self) -> &'static str {
         match self {
             Self::MuseGlimmer => "draft.safetensors",
-            Self::Qwen35 | Self::Qwen35Moe | Self::Gemma4 => "vision.safetensors",
+            Self::Qwen35 | Self::Qwen35Moe | Self::Clef | Self::Gemma4 => "vision.safetensors",
         }
     }
 }
@@ -6672,6 +7193,24 @@ async fn prepare_qwen35_moe_native_gguf_inner(
     prepare_native_gguf_inner(&input_path, cache_root, NativeGgufFamily::Qwen35Moe, None).await
 }
 
+/// Prepare a Cloudflare CLEF (`general.architecture = clef`) GGUF for native
+/// decision-model loading. The staging conversion splits the embedded
+/// joint-schema head into `joint_head.safetensors` +
+/// `joint_head_config.json` beside the backbone `model.safetensors`, and the
+/// tokenizer is reconstructed from `tokenizer.ggml.*` metadata, so the cached
+/// directory satisfies every asset `load_clef_with_thread` requires.
+pub(crate) async fn prepare_clef_native_gguf(input_path: &Path) -> Result<PathBuf> {
+    let cache_root = native_gguf_cache_root()?;
+    let input_path = input_path.canonicalize()?;
+    if !is_clef_main_gguf(&parse_gguf(&input_path)?.metadata) {
+        return Err(Error::from_reason(
+            "CLEF load requires a decision-model GGUF (general.architecture=clef); a plain \
+             backbone, projector, or another architecture cannot be loaded through this family",
+        ));
+    }
+    prepare_native_gguf_inner(&input_path, &cache_root, NativeGgufFamily::Clef, None).await
+}
+
 async fn prepare_native_gguf_inner(
     input_path: &Path,
     cache_root: &Path,
@@ -6719,7 +7258,7 @@ async fn prepare_native_gguf_inner(
     // preparation digest.
     let native_qwen35_layout = matches!(
         family,
-        NativeGgufFamily::Qwen35 | NativeGgufFamily::Qwen35Moe
+        NativeGgufFamily::Qwen35 | NativeGgufFamily::Qwen35Moe | NativeGgufFamily::Clef
     );
     let layout = family.layout();
     let prism_contract = if family == NativeGgufFamily::Qwen35 {

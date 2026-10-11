@@ -1158,8 +1158,12 @@ impl Qwen35Inner {
         if timing {
             eprintln!("[clef] backbone: {:?} total", phase_start.elapsed());
         }
+        // A GGUF-imported checkpoint packs lm_head (the decide path never runs
+        // it as a projection); the joint head needs the dense [vocab, hidden]
+        // table for its option-token embedding gather.
+        let output_weight = output.dequantized_weight()?;
         let head_start = std::time::Instant::now();
-        let probabilities = head.forward(&hidden, &record, &output.get_weight())?;
+        let probabilities = head.forward(&hidden, &record, &output_weight)?;
         if timing {
             eprintln!("[clef] head: {:?}", head_start.elapsed());
         }
