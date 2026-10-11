@@ -96,21 +96,38 @@ export function findRepoRoot(start: string = fileURLToPath(import.meta.url)): st
   return undefined;
 }
 
-/** Download `mlx-agent-<tag>-<platform>-<arch>.tar.gz` from the fork's GitHub release. */
+/** Public R2 mirror of the release assets — Cloudflare edge, much faster than GitHub. */
+const MLX_AGENT_R2_BASE = 'https://dl.portato.si';
+
+/** Download `mlx-agent-<tag>-<platform>-<arch>.tar.gz` — R2 mirror first, GitHub release as fallback. */
 async function downloadAgentBinary(dest: string): Promise<string> {
   // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
   const platform =
     process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
   const asset = `mlx-agent-${MLX_AGENT_RELEASE_TAG}-${platform}-${arch}.tar.gz`;
-  const url = `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${MLX_AGENT_RELEASE_TAG}/${asset}`;
+  const urls = [
+    `${MLX_AGENT_R2_BASE}/${MLX_AGENT_RELEASE_TAG}/${asset}`,
+    `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${MLX_AGENT_RELEASE_TAG}/${asset}`,
+  ];
 
   mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok || res.body === null) {
+  let res: Response | null = null;
+  for (const url of urls) {
+    try {
+      const r = await fetch(url, { redirect: 'follow' });
+      if (r.ok && r.body !== null) {
+        res = r;
+        break;
+      }
+    } catch {
+      // fall through to the next mirror
+    }
+  }
+  if (!res) {
     throw new Error(
       `mlx agent: no local binary found and the prebuilt download failed ` +
-        `(${res.status} ${res.statusText} for ${asset}). ` +
+        `(${asset} unavailable on R2 and GitHub). ` +
         `Set ${MLX_AGENT_BIN_ENV}, or run \`yarn build:agent\` in the mlx-node repo.`,
     );
   }
