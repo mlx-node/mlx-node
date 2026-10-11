@@ -172,55 +172,96 @@ fn render(value: &Value) -> String {
         .unwrap_or_else(|| json(value))
 }
 
+/// `tokenize` encodes every fragment in ONE call (the tokenizer's batch API)
+/// and returns one id vector per fragment. Fragments stay independent —
+/// BPE may not merge across a boundary — so the token stream is identical to
+/// per-fragment `encode` calls, just without paying full pipeline overhead
+/// for each of the ~5Q + 3·Σoptions fragments.
 pub(crate) fn encode(
     request: &Request,
-    tokenize: impl Fn(&str) -> Result<Vec<u32>>,
+    tokenize: impl Fn(&[String]) -> Result<Vec<Vec<u32>>>,
     max_length: usize,
 ) -> Result<EncodedRecord> {
     if request.questions.is_empty() {
         return Err(invalid("questions must not be empty"));
     }
-    let mut schema = tokenize("\n\nSCHEMA FIELDS:\n")?;
-    let mut questions = Vec::new();
+    // Fragment texts plus the mark identifying each span's fragment index.
+    let mut frags: Vec<String> = vec!["\n\nSCHEMA FIELDS:\n".into()];
+    let mut instruction_marks = Vec::with_capacity(request.questions.len());
+    let mut option_marks = Vec::with_capacity(request.questions.len());
+    let mut question_options = Vec::with_capacity(request.questions.len());
     for (index, (id, question)) in request.questions.iter().enumerate() {
-        schema.extend(tokenize(&format!(
+        frags.push(format!(
             "\nFIELD {}\nID: {}\nTYPE: {}\nINSTRUCTION: ",
             index + 1,
             id,
             question.kind
-        ))?);
-        let start = schema.len();
+        ));
         let instruction = question
             .instructions
             .as_ref()
             .filter(|v| !v.is_null() && v.as_str() != Some(""));
-        schema.extend(tokenize(
-            &instruction.map(render).unwrap_or_else(|| id.clone()),
-        )?);
-        let span = (start, schema.len());
-        if span.0 == span.1 {
-            return Err(invalid("question instruction produces no tokens"));
-        }
-        schema.extend(tokenize("\nALLOWED OPTIONS:\n")?);
-        let mut option_spans = Vec::new();
-        let mut option_ids = Vec::new();
-        for (i, (option_id, description)) in question.options()?.into_iter().enumerate() {
-            schema.extend(tokenize(&format!("OPTION {}: ", i + 1))?);
-            let start = schema.len();
+        instruction_marks.push(frags.len());
+        frags.push(instruction.map(render).unwrap_or_else(|| id.clone()));
+        frags.push("\nALLOWED OPTIONS:\n".into());
+        let options = question.options()?;
+        let mut marks = Vec::with_capacity(options.len());
+        let mut option_ids = Vec::with_capacity(options.len());
+        for (i, (option_id, description)) in options.into_iter().enumerate() {
+            frags.push(format!("OPTION {}: ", i + 1));
             let mut semantics = serde_json::Map::new();
             semantics.insert("option_id".into(), Value::String(option_id.clone()));
             if !description.is_null() {
                 semantics.insert("description".into(), description);
             }
-            schema.extend(tokenize(&json(&Value::Object(semantics)))?);
-            option_spans.push((start, schema.len()));
+            marks.push(frags.len());
+            frags.push(json(&Value::Object(semantics)));
+            frags.push("\n".into());
             option_ids.push(option_id);
-            schema.extend(tokenize("\n")?);
         }
-        schema.extend(tokenize("END FIELD\n")?);
-        if schema.len() > max_length {
-            return Err(invalid("schema exceeds the input token limit"));
+        frags.push("END FIELD\n".into());
+        option_marks.push(marks);
+        question_options.push(option_ids);
+    }
+    let prefix_mark = frags.len();
+    frags.push(
+        "<|im_start|>system\nRead the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.<|im_end|>\n<|im_start|>user\nSTATE:\n".into(),
+    );
+    let suffix_mark = frags.len();
+    frags.push(
+        "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:"
+            .into(),
+    );
+    let state_mark = frags.len();
+    frags.push(render(&request.state));
+
+    let encoded = tokenize(&frags)?;
+    if encoded.len() != frags.len() {
+        return Err(Error::from_reason(
+            "CLEF tokenizer returned a mismatched batch",
+        ));
+    }
+    // Schema token lengths in emission order; marks below prefix_mark are schema.
+    let mut schema_len = 0usize;
+    let mut mark_offsets = vec![0usize; prefix_mark];
+    for (i, ids) in encoded.iter().enumerate().take(prefix_mark) {
+        mark_offsets[i] = schema_len;
+        schema_len += ids.len();
+    }
+    if schema_len > max_length {
+        return Err(invalid("schema exceeds the input token limit"));
+    }
+    let mut questions = Vec::with_capacity(request.questions.len());
+    for (i, (id, question)) in request.questions.iter().enumerate() {
+        let im = instruction_marks[i];
+        let span = (mark_offsets[im], mark_offsets[im] + encoded[im].len());
+        if span.0 == span.1 {
+            return Err(invalid("question instruction produces no tokens"));
         }
+        let option_spans = option_marks[i]
+            .iter()
+            .map(|&m| (mark_offsets[m], mark_offsets[m] + encoded[m].len()))
+            .collect();
         questions.push(EncodedQuestion {
             id: id.clone(),
             kind: match question.kind.as_str() {
@@ -230,25 +271,20 @@ pub(crate) fn encode(
             },
             span,
             option_spans,
-            option_ids,
+            option_ids: std::mem::take(&mut question_options[i]),
         });
     }
-    let mut prefix = tokenize(
-        "<|im_start|>system\nRead the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.<|im_end|>\n<|im_start|>user\nSTATE:\n",
-    )?;
-    let suffix = tokenize(
-        "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",
-    )?;
-    let fixed = prefix.len() + schema.len() + suffix.len();
+    let mut prefix = encoded[prefix_mark].clone();
+    let suffix = &encoded[suffix_mark];
+    let mut state = encoded[state_mark].clone();
+    let fixed = prefix.len() + schema_len + suffix.len();
     if fixed > max_length {
         return Err(invalid(format!(
             "schema requires {fixed} tokens before state; maximum is {max_length}"
         )));
     }
-    let mut state = tokenize(&render(&request.state))?;
     state.truncate(max_length - fixed);
-    prefix.extend(state);
-    let offset = prefix.len();
+    let offset = prefix.len() + state.len();
     for q in &mut questions {
         q.span.0 += offset;
         q.span.1 += offset;
@@ -257,8 +293,11 @@ pub(crate) fn encode(
             span.1 += offset;
         }
     }
-    prefix.extend(schema);
-    prefix.extend(suffix);
+    prefix.extend(state);
+    for ids in &encoded[..prefix_mark] {
+        prefix.extend_from_slice(ids);
+    }
+    prefix.extend_from_slice(suffix);
     Ok(EncodedRecord {
         input_ids: prefix,
         questions,
@@ -270,21 +309,22 @@ mod tests {
     use super::*;
     #[test]
     fn ordering_rendering_and_truncation() {
+        let char_tokens = |frags: &[String]| {
+            Ok(frags
+                .iter()
+                .map(|s| s.chars().map(u32::from).collect())
+                .collect::<Vec<Vec<u32>>>())
+        };
         let request: Request = serde_json::from_str(r#"{"state":{"z":1e-7,"a":"你好"},"questions":{"10":{"type":"choice","criteria":{"z":null,"a":"yes"}},"2":{"type":"noul"}}}"#).unwrap();
-        let encoded = encode(&request, |s| Ok(s.chars().map(u32::from).collect()), 16384).unwrap();
+        let encoded = encode(&request, char_tokens, 16384).unwrap();
         assert_eq!(encoded.questions[0].id, "10");
         assert_eq!(encoded.questions[1].id, "2");
         assert_eq!(encoded.questions[0].option_ids, ["a", "z"]);
         assert_eq!(json(&request.state), r#"{"a":"你好","z":1e-07}"#);
-        let short = encode(
-            &request,
-            |s| Ok(s.chars().map(u32::from).collect()),
-            encoded.input_ids.len() - 3,
-        )
-        .unwrap();
+        let short = encode(&request, char_tokens, encoded.input_ids.len() - 3).unwrap();
         assert_eq!(short.input_ids.len(), encoded.input_ids.len() - 3);
         assert_eq!(short.questions[0].span.0, encoded.questions[0].span.0 - 3);
-        assert!(encode(&request, |s| Ok(s.chars().map(u32::from).collect()), 10).is_err());
+        assert!(encode(&request, char_tokens, 10).is_err());
     }
     #[test]
     fn duplicate_questions_and_media_fail_closed() {
@@ -315,7 +355,14 @@ mod reference_tests {
             let request: Request = serde_json::from_value(fixture["request"].clone()).unwrap();
             let actual = encode(
                 &request,
-                |s| Ok(tokenizer.encode(s, false).unwrap().get_ids().to_vec()),
+                |frags| {
+                    Ok(tokenizer
+                        .encode_batch(frags.to_vec(), false)
+                        .unwrap()
+                        .iter()
+                        .map(|e| e.get_ids().to_vec())
+                        .collect())
+                },
                 fixture["max_length"].as_u64().unwrap() as usize,
             )
             .unwrap();

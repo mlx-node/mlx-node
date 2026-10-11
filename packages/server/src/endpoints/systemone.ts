@@ -40,10 +40,12 @@ export async function handleSystemOne(
   idleSweeper?.beginRequest();
   try {
     abort.signal.throwIfAborted();
-    if (!registry.decisions.get(body.model) && resolveModel) {
+    // A resident chat model can never serve decisions: skip the load queue
+    // entirely and let the 400 below answer without taking a writer slot.
+    if (!registry.decisions.get(body.model) && !registry.get(body.model) && resolveModel) {
       loadAdmission = coordinator?.beginRequestLoadAdmission(body.model);
       const resolve = () => resolveModel(body.model);
-      if (coordinator) await coordinator.withModelLoad(resolve);
+      if (coordinator) await coordinator.withModelLoad(resolve, body.model, abort.signal);
       else await resolve();
     }
     abort.signal.throwIfAborted();
@@ -64,11 +66,15 @@ export async function handleSystemOne(
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ model: dispatch.canonicalName, ...result }));
       }, abort.signal);
-    if (coordinator) await coordinator.withInference(run);
+    if (coordinator) await coordinator.withInference(run, abort.signal);
     else await run();
   } catch (error) {
     if (abort.signal.aborted || res.destroyed) return;
-    if (error instanceof DecisionQueueFullError || error instanceof ModelLoadQueueFullError)
+    if (
+      error instanceof DecisionQueueFullError ||
+      error instanceof ModelLoadQueueFullError ||
+      (error instanceof Error && error.message.includes('binding changed while waiting'))
+    )
       sendRateLimit(res, error.message);
     else if (error instanceof Error && error.message.includes('Invalid CLEF request:'))
       sendBadRequest(res, error.message);

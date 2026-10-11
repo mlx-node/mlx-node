@@ -295,8 +295,8 @@ export class ModelWorkCoordinator {
    * @param label Optional identifier (normally the model name) stamped into
    *   {@link lastLoad} so `/health` can name what was being loaded.
    */
-  async withModelLoad<T>(fn: () => Promise<T> | T, label?: string): Promise<T> {
-    await this.acquireWrite();
+  async withModelLoad<T>(fn: () => Promise<T> | T, label?: string, signal?: AbortSignal): Promise<T> {
+    await this.acquireWrite(signal);
     // Measured from lock acquisition, not from arrival: `startedAt` is meant
     // to answer "how long has the actual materialization been running",
     // which is what a supervisor deciding whether to wait needs.
@@ -329,7 +329,11 @@ export class ModelWorkCoordinator {
    * 60-second cold-load does not look like 60 seconds of own work for
    * every concurrent request.
    */
-  async withModelLoadInstrumented<T>(fn: () => Promise<T> | T, label?: string): Promise<ModelLoadOutcome<T>> {
+  async withModelLoadInstrumented<T>(
+    fn: () => Promise<T> | T,
+    label?: string,
+    signal?: AbortSignal,
+  ): Promise<ModelLoadOutcome<T>> {
     // `owner` MUST be decided synchronously, before any await, so the
     // signal reflects coordinator state at arrival rather than after
     // any peer transition. The wait/own split is measured around the
@@ -338,7 +342,7 @@ export class ModelWorkCoordinator {
     // elapsed time — see `ModelLoadOutcome` for the contract.
     const owner = !this.writerHeld && this.queuedWriters === 0;
     const arrivedAt = Date.now();
-    await this.acquireWrite();
+    await this.acquireWrite(signal);
     const lockAcquiredAt = Date.now();
     let ok = false;
     let failure: unknown;
@@ -358,8 +362,8 @@ export class ModelWorkCoordinator {
     }
   }
 
-  async withInference<T>(fn: () => Promise<T> | T): Promise<T> {
-    await this.acquireRead();
+  async withInference<T>(fn: () => Promise<T> | T, signal?: AbortSignal): Promise<T> {
+    await this.acquireRead(signal);
     try {
       return await fn();
     } finally {
@@ -367,32 +371,65 @@ export class ModelWorkCoordinator {
     }
   }
 
-  private acquireRead(): Promise<void> {
+  private acquireRead(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (!this.writerHeld && this.queuedWriters === 0) {
       this.activeReaders += 1;
       return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-      this.readerWaiters.push(() => {
-        this.activeReaders += 1;
-        resolve();
-      });
-    });
+    return this.parkWaiter(this.readerWaiters, () => {
+      this.activeReaders += 1;
+    }, signal);
   }
 
-  private acquireWrite(): Promise<void> {
+  private acquireWrite(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     this.queuedWriters += 1;
     if (!this.writerHeld && this.activeReaders === 0) {
       this.queuedWriters -= 1;
       this.writerHeld = true;
       return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-      this.writerWaiters.push(() => {
+    return this.parkWaiter(
+      this.writerWaiters,
+      () => {
         this.queuedWriters -= 1;
         this.writerHeld = true;
+      },
+      signal,
+      () => {
+        this.queuedWriters -= 1;
+      },
+    );
+  }
+
+  /**
+   * Queue `grant` on `queue`, rejecting on `signal` abort. An aborted waiter
+   * is removed from the queue — via `onDequeue` bookkeeping — so it neither
+   * holds a slot nor wakes up dead.
+   */
+  private parkWaiter(
+    queue: Array<() => void>,
+    grant: () => void,
+    signal?: AbortSignal,
+    onDequeue?: () => void,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const entry = () => {
+        signal?.removeEventListener('abort', onAbort);
+        grant();
         resolve();
-      });
+      };
+      const onAbort = () => {
+        const index = queue.indexOf(entry);
+        if (index >= 0) {
+          queue.splice(index, 1);
+          onDequeue?.();
+        }
+        reject(signal?.reason ?? new Error('Request aborted'));
+      };
+      queue.push(entry);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 

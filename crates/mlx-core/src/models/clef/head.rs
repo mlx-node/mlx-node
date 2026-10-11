@@ -210,9 +210,45 @@ impl JointHead {
             &format!("{prefix}.out_proj"),
         )
     }
-    fn mean_span(x: &MxArray, span: (usize, usize)) -> Result<MxArray> {
-        x.slice_axis(0, span.0 as i64, span.1 as i64)?
-            .mean(Some(&[0]), Some(true))
+    /// Row-wise mean over `spans` of `x` in ONE gather pair: an fp32 exclusive
+    /// prefix sum indexed at (start, end) beats one slice+mean op per span.
+    /// fp32 accumulation also matches MLX's own reduction accumulation, so the
+    /// astype back to the weight dtype lands within a ulp of slice.mean().
+    fn span_means(x: &MxArray, dtype: DType, spans: &[(usize, usize)]) -> Result<MxArray> {
+        let zero = MxArray::zeros(&[1, x.shape_at(1)?], Some(DType::Float32))?;
+        let cumsum = MxArray::concatenate(&zero, &x.astype(DType::Float32)?.cumsum(0)?, 0)?;
+        let starts: Vec<u32> = spans.iter().map(|s| s.0 as u32).collect();
+        let ends: Vec<u32> = spans.iter().map(|s| s.1 as u32).collect();
+        let lengths: Vec<f32> = spans.iter().map(|s| (s.1 - s.0) as f32).collect();
+        let sums = cumsum
+            .take(&MxArray::from_uint32(&ends, &[ends.len() as i64])?, 0)?
+            .sub(&cumsum.take(&MxArray::from_uint32(&starts, &[starts.len() as i64])?, 0)?)?;
+        sums.div(&MxArray::from_float32(
+            &lengths,
+            &[lengths.len() as i64, 1],
+        )?)?
+        .astype(dtype)
+    }
+    /// Mean-embed every (possibly ragged) contiguous id group in one take:
+    /// gather all rows once, then span-mean over the flat layout.
+    fn group_mean_embeds(
+        &self,
+        output_weight: &MxArray,
+        ids: &[u32],
+        lengths: &[usize],
+        dtype: DType,
+    ) -> Result<MxArray> {
+        let embeds = output_weight.take(&MxArray::from_uint32(ids, &[ids.len() as i64])?, 0)?;
+        let mut offset = 0;
+        let spans: Vec<(usize, usize)> = lengths
+            .iter()
+            .map(|&len| {
+                let span = (offset, offset + len);
+                offset += len;
+                span
+            })
+            .collect();
+        Self::span_means(&embeds, dtype, &spans)
     }
     fn unit(x: &MxArray, eps: f64) -> Result<MxArray> {
         x.div(
@@ -232,40 +268,49 @@ impl JointHead {
         let h = self
             .norm(&hidden, "hidden_norm")?
             .reshape(&[-1, self.config.hidden_size])?;
+        let dtype = h.dtype()?;
         let memory = self.linear(&h, "memory_projection")?;
         let global = h.slice_axis(0, h.shape_at(0)? - 1, h.shape_at(0)?)?;
-        let qvectors = record
+        // Batched span means: question vectors [Q,H] and option contexts [O,H].
+        let q_spans: Vec<(usize, usize)> = record.questions.iter().map(|q| q.span).collect();
+        let questions = Self::span_means(&h, dtype, &q_spans)?;
+        let option_spans: Vec<(usize, usize)> = record
             .questions
             .iter()
-            .map(|q| Self::mean_span(&h, q.span))
-            .collect::<Result<Vec<_>>>()?;
-        let questions = MxArray::concatenate_many(qvectors.iter().collect(), Some(0))?;
-        let mut lexical = Vec::new();
-        let mut option_queries = Vec::new();
-        for (i, q) in record.questions.iter().enumerate() {
-            let mut contexts = Vec::new();
-            let mut words = Vec::new();
-            for &span in &q.option_spans {
-                contexts.push(Self::mean_span(&h, span)?);
-                let ids = &record.input_ids[span.0..span.1];
-                let ids = MxArray::from_uint32(ids, &[ids.len() as i64])?;
-                words.push(
-                    output_weight
-                        .take(&ids, 0)?
-                        .mean(Some(&[0]), Some(true))?
-                        .astype(h.dtype()?)?,
-                );
+            .flat_map(|q| q.option_spans.iter().copied())
+            .collect();
+        let contexts = Self::span_means(&h, dtype, &option_spans)?;
+        // Lexical embeddings: one take over every option token, one mean pass.
+        let mut option_ids_flat: Vec<u32> = Vec::new();
+        let mut option_lengths: Vec<usize> = Vec::new();
+        for q in &record.questions {
+            for &(start, end) in &q.option_spans {
+                option_ids_flat.extend_from_slice(&record.input_ids[start..end]);
+                option_lengths.push(end - start);
             }
-            let contexts = MxArray::concatenate_many(contexts.iter().collect(), Some(0))?;
-            let words = MxArray::concatenate_many(words.iter().collect(), Some(0))?;
-            option_queries.push(
-                self.linear(&contexts, "option_context_projection")?
-                    .add(&self.linear(&words, "option_lexical_projection")?)?
-                    .add(&self.linear(&qvectors[i], "option_question_projection")?)?,
-            );
-            lexical.push(words);
         }
-        let mut routed = MxArray::concatenate_many(option_queries.iter().collect(), Some(0))?;
+        let lexical =
+            self.group_mean_embeds(output_weight, &option_ids_flat, &option_lengths, dtype)?;
+        // Option→question gather index, reused by the projection and scoring.
+        let mut question_index: Vec<u32> = Vec::with_capacity(option_spans.len());
+        let counts: Vec<u32> = record
+            .questions
+            .iter()
+            .map(|q| q.option_ids.len() as u32)
+            .collect();
+        for (i, &count) in counts.iter().enumerate() {
+            question_index.extend(std::iter::repeat_n(i as u32, count as usize));
+        }
+        let option_count = option_spans.len() as i64;
+        let option_of_question = MxArray::from_uint32(&question_index, &[option_count])?;
+        let mut routed = self
+            .linear(&contexts, "option_context_projection")?
+            .add(&self.linear(&lexical, "option_lexical_projection")?)?
+            .add(
+                &self
+                    .linear(&questions, "option_question_projection")?
+                    .take(&option_of_question, 0)?,
+            )?;
         for i in 0..self.config.routing_layers {
             let p = format!("evidence_layers.{i}");
             routed = routed.add(&self.attention(
@@ -280,29 +325,52 @@ impl JointHead {
             routed = routed.add(&self.linear(&ff, &format!("{p}.feedforward.3"))?)?;
         }
         let base = self.linear(&questions, "question_projection")?;
-        let mut offset = 0;
-        let mut splits = Vec::new();
-        let mut summaries = Vec::new();
-        for (i, q) in record.questions.iter().enumerate() {
-            let count = q.option_ids.len() as i64;
-            let options = routed.slice_axis(0, offset, offset + count)?;
+        // Per-question option softmax, padded to [Q, max_options]: index O_tot
+        // addresses a zero row, masked out before the softmax either way.
+        let question_count = record.questions.len() as i64;
+        let max_options = counts.iter().copied().max().unwrap_or(0) as i64;
+        let mut padded_indices: Vec<u32> =
+            Vec::with_capacity((question_count * max_options) as usize);
+        let mut offset = 0u32;
+        for &count in &counts {
+            for j in 0..max_options as u32 {
+                padded_indices.push(if j < count {
+                    offset + j
+                } else {
+                    option_count as u32
+                });
+            }
             offset += count;
-            let weights = Activations::softmax(
-                &options
-                    .matmul(
-                        &base
-                            .slice_axis(0, i as i64, i as i64 + 1)?
-                            .transpose(None)?,
-                    )?
-                    .div_scalar((self.config.width as f64).sqrt())?,
-                Some(0),
-            )?;
-            summaries.push(weights.mul(&options)?.sum(Some(&[0]), Some(true))?);
-            splits.push(options);
         }
+        let routed_padded = MxArray::concatenate(
+            &routed,
+            &MxArray::zeros(&[1, self.config.width], Some(dtype))?,
+            0,
+        )?;
+        let options_padded = routed_padded.take(
+            &MxArray::from_uint32(&padded_indices, &[question_count, max_options])?,
+            0,
+        )?;
+        let valid = MxArray::arange(0.0, max_options as f64, Some(1.0), None)?
+            .reshape(&[1, max_options])?
+            .less(&MxArray::from_uint32(&counts, &[question_count, 1])?.astype(DType::Float32)?)?;
+        let neg_inf = MxArray::full(
+            &[question_count, max_options],
+            napi::Either::A(f64::NEG_INFINITY),
+            Some(dtype),
+        )?;
+        let scores = base
+            .expand_dims(1)?
+            .matmul(&options_padded.transpose(Some(&[0, 2, 1]))?)?
+            .reshape(&[question_count, max_options])?
+            .div_scalar((self.config.width as f64).sqrt())?;
+        let option_weights = Activations::softmax(&valid.where_(&scores, &neg_inf)?, Some(-1))?;
+        let summaries = option_weights
+            .expand_dims(-1)?
+            .mul(&options_padded)?
+            .sum(Some(&[1]), Some(false))?;
         let types: Vec<_> = record.questions.iter().map(|q| q.kind).collect();
         let types = MxArray::from_uint32(&types, &[types.len() as i64])?;
-        let summaries = MxArray::concatenate_many(summaries.iter().collect(), Some(0))?;
         let mut fields = base
             .add(&self.norm(&summaries, "option_summary_norm")?)?
             .add(&self.linear(&global, "global_projection")?)?
@@ -323,50 +391,62 @@ impl JointHead {
             fields = fields.add(&self.linear(&ff, &format!("{p}.linear2"))?)?;
         }
         fields = self.norm(&fields, "field_norm")?;
-        let mut results = Vec::new();
-        for (i, options) in splits.iter().enumerate() {
-            let anchor = Self::unit(&qvectors[i].add(&global)?, 1e-12)?;
-            let prior = Self::unit(&lexical[i], 1e-12)?
-                .matmul(&anchor.transpose(None)?)?
-                .squeeze(Some(&[-1]))?
-                .mul(
-                    &self
-                        .w("prior_logit_scale")
-                        .clip(None, Some(100f64.ln()))?
-                        .exp()?,
-                )?;
-            let options = self.norm(options, "option_norm")?;
-            let field = fields
-                .slice_axis(0, i as i64, i as i64 + 1)?
-                .broadcast_to(options.shape()?.as_ref())?;
-            let cosine = Self::unit(&field, 1e-8)?
-                .mul(&Self::unit(&options, 1e-8)?)?
-                .sum(Some(&[-1]), Some(false))?;
-            let product = field.mul(&options)?;
-            let distance = field.sub(&options)?.abs()?;
-            let features =
-                MxArray::concatenate_many(vec![&field, &options, &product, &distance], Some(-1))?;
-            let residual = self
-                .linear(
-                    &Activations::gelu_exact(&self.linear(&features, "residual_scorer.0")?)?,
-                    "residual_scorer.3",
-                )?
-                .squeeze(Some(&[-1]))?;
-            let joint = cosine
-                .mul(
-                    &self
-                        .w("joint_logit_scale")
-                        .clip(None, Some(100f64.ln()))?
-                        .exp()?,
-                )?
-                .add(&residual)?;
-            let logits = prior.add(&joint.mul(&Activations::sigmoid(self.w("residual_gate"))?)?)?;
-            let probabilities =
-                Activations::softmax_precise(&logits.astype(DType::Float32)?, Some(-1))?
-                    .to_float32()?
-                    .iter()
-                    .map(|v| f64::from(*v))
-                    .collect::<Vec<_>>();
+        // Scoring flattened over every (question, option) pair; one device
+        // readback at the end instead of a GPU sync per question.
+        let prior_scale = self
+            .w("prior_logit_scale")
+            .clip(None, Some(100f64.ln()))?
+            .exp()?;
+        let joint_scale = self
+            .w("joint_logit_scale")
+            .clip(None, Some(100f64.ln()))?
+            .exp()?;
+        let gate = Activations::sigmoid(self.w("residual_gate"))?;
+        let anchors = Self::unit(&questions.add(&global)?, 1e-12)?.take(&option_of_question, 0)?;
+        let prior = Self::unit(&lexical, 1e-12)?
+            .mul(&anchors)?
+            .sum(Some(&[-1]), Some(false))?
+            .mul(&prior_scale)?;
+        let options = self.norm(&routed, "option_norm")?;
+        let field = fields.take(&option_of_question, 0)?;
+        let cosine = Self::unit(&field, 1e-8)?
+            .mul(&Self::unit(&options, 1e-8)?)?
+            .sum(Some(&[-1]), Some(false))?;
+        let product = field.mul(&options)?;
+        let distance = field.sub(&options)?.abs()?;
+        let features =
+            MxArray::concatenate_many(vec![&field, &options, &product, &distance], Some(-1))?;
+        let residual = self
+            .linear(
+                &Activations::gelu_exact(&self.linear(&features, "residual_scorer.0")?)?,
+                "residual_scorer.3",
+            )?
+            .squeeze(Some(&[-1]))?;
+        let joint = cosine.mul(&joint_scale)?.add(&residual)?;
+        let logits_flat = prior.add(&joint.mul(&gate)?)?;
+        // Scatter flat logits into [Q, max_options]; pad slots read index
+        // O_tot (a -inf row) so the masked softmax is exact per question.
+        let logits_padded = MxArray::concatenate(
+            &logits_flat,
+            &MxArray::full(&[1], napi::Either::A(f64::NEG_INFINITY), Some(dtype))?,
+            0,
+        )?;
+        let logits = logits_padded.take(
+            &MxArray::from_uint32(&padded_indices, &[question_count, max_options])?,
+            0,
+        )?;
+        let probabilities_padded = Activations::softmax_precise(
+            &valid.where_(&logits, &neg_inf)?.astype(DType::Float32)?,
+            Some(-1),
+        )?;
+        let flat: Vec<f32> = probabilities_padded.to_float32()?.to_vec();
+        let mut results = Vec::with_capacity(record.questions.len());
+        for (i, &count) in counts.iter().enumerate() {
+            let row = &flat[i * max_options as usize..(i + 1) * max_options as usize];
+            let probabilities: Vec<f64> = row[..count as usize]
+                .iter()
+                .map(|&v| f64::from(v))
+                .collect();
             if probabilities.iter().any(|p| !p.is_finite()) {
                 return Err(Error::from_reason("CLEF produced non-finite probabilities"));
             }

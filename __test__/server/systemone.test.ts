@@ -160,6 +160,39 @@ describe('CLEF System One', () => {
     await load;
     expect(lease.current()).toBe(false);
   });
+  it('an aborted waiter releases its read-queue slot instead of parking behind a writer', async () => {
+    const coordinator = new ModelWorkCoordinator(1);
+    const gate = deferred();
+    const writerDone = deferred();
+    const writer = coordinator.withModelLoad(async () => {
+      await gate.promise;
+      writerDone.resolve();
+    });
+    const abort = new AbortController();
+    const ran = vi.fn();
+    const parked = coordinator.withInference(ran, abort.signal);
+    abort.abort();
+    await expect(parked).rejects.toThrow();
+    expect(ran).not.toHaveBeenCalled();
+    // The aborted reader left the queue: a live reader still waits on the
+    // writer, but proceeds the moment the writer finishes.
+    const live = vi.fn();
+    const liveParked = coordinator.withInference(live);
+    gate.resolve();
+    await Promise.all([writer, liveParked]);
+    expect(live).toHaveBeenCalled();
+    // Aborted queued writers dequeue too and never run their load.
+    const writerGate = deferred();
+    const held = coordinator.withModelLoad(() => writerGate.promise);
+    const abort2 = new AbortController();
+    const deadLoad = vi.fn();
+    const dead = coordinator.withModelLoad(deadLoad, 'dead', abort2.signal);
+    abort2.abort();
+    await expect(dead).rejects.toThrow();
+    writerGate.resolve();
+    await held;
+    expect(deadLoad).not.toHaveBeenCalled();
+  });
   it('does not execute an aborted queued request', async () => {
     const registry = new ModelRegistry();
     registry.registerDecision('flash', model());

@@ -2286,7 +2286,14 @@ async fn load_with_thread_impl(
                 // warms the external MTP sidecar candidates (incl. a non-standard
                 // `mlx_lm_extra_tensors.mtp_file`) that the merge below mmaps and
                 // sanitize/materialize then evals. See `prewarm_checkpoint_pages`.
-                prewarm_checkpoint_pages_with(path, &mtp_sidecar_candidates(path, &raw));
+                prewarm_checkpoint_pages_with(
+                    path,
+                    &if clef {
+                        Vec::new()
+                    } else {
+                        mtp_sidecar_candidates(path, &raw)
+                    },
+                );
                 // MTP head discovery precedence — supports three on-disk
                 // checkpoint layouts:
                 //   1. inline `mtp.*` tensors in the body shards (handled
@@ -2295,12 +2302,15 @@ async fn load_with_thread_impl(
                 //   3. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
                 // Only attempt the sidecar/drafter merge when the body itself
                 // carries NO inline `mtp.*` tensors so inline always wins.
-                let has_inline_mtp = raw_params
-                    .keys()
-                    .any(|name| normalize_mtp_weight_key(name).is_some());
+                let has_inline_mtp = !clef
+                    && raw_params
+                        .keys()
+                        .any(|name| normalize_mtp_weight_key(name).is_some());
                 if has_inline_mtp {
                     info!("Using inline mtp.* tensors from body shards (drafter merge skipped)");
-                } else if let Some(mtp_sidecar_params) = load_external_mtp_sidecar(path, &raw)? {
+                } else if !clef
+                    && let Some(mtp_sidecar_params) = load_external_mtp_sidecar(path, &raw)?
+                {
                     let before = raw_params.len();
                     raw_params.retain(|name, _| normalize_mtp_weight_key(name).is_none());
                     let removed_embedded = before.saturating_sub(raw_params.len());
@@ -2310,8 +2320,9 @@ async fn load_with_thread_impl(
                         "Merged external MTP sidecar tensors: added={}, removed_embedded_mtp={}",
                         sidecar_count, removed_embedded
                     );
-                } else if let Some(drafter_path) =
-                    crate::models::mtp_drafter::detect_drafter_safetensors(path)
+                } else if !clef
+                    && let Some(drafter_path) =
+                        crate::models::mtp_drafter::detect_drafter_safetensors(path)
                     && let Some(drafter_params) = crate::models::mtp_drafter::load_drafter_tensors(
                         &drafter_path,
                         // Dense backbone: there are no experts, so the MTP
@@ -2328,6 +2339,11 @@ async fn load_with_thread_impl(
                         "Merged split MTP drafter tensors: added={} (re-prefixed mtp.*)",
                         drafter_count
                     );
+                }
+                // Decision inference runs no speculative decode: mtp.* tensors
+                // in the body shards would materialize as dead weight.
+                if clef {
+                    raw_params.retain(|name, _| normalize_mtp_weight_key(name).is_none());
                 }
                 info!("Loaded {} raw tensors", raw_params.len());
 

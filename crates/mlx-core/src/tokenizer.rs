@@ -2731,6 +2731,20 @@ impl Qwen3Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Encode fragments in one batch call (for per-fragment encoding paths
+    /// like CLEF's schema builder — one pipeline pass instead of one per call).
+    pub(crate) fn encode_batch_sync(
+        &self,
+        texts: &[String],
+        add_special_tokens: Option<bool>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let add_special = add_special_tokens.unwrap_or(true);
+        self.tokenizer
+            .encode_batch(texts.to_vec(), add_special)
+            .map(|encodings| encodings.iter().map(|e| e.get_ids().to_vec()).collect())
+            .map_err(|e| Error::new(Status::InvalidArg, format!("Batch encoding failed: {}", e)))
+    }
+
     /// Encode text synchronously and return both token ids and per-token
     /// byte offsets `(start, end)` into the original UTF-8 source string.
     ///

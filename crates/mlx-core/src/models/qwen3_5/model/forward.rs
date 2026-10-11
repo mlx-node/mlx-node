@@ -1103,6 +1103,8 @@ impl Qwen35Inner {
         cancelled: &AtomicBool,
     ) -> Result<String> {
         use crate::models::clef::{check_cancel, encoding};
+        let timing = std::env::var_os("CLEF_DEBUG_TIMING").is_some();
+        let phase_start = std::time::Instant::now();
         check_cancel(cancelled)?;
         let tokenizer = self
             .tokenizer
@@ -1110,9 +1112,16 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("CLEF tokenizer is missing"))?;
         let record = encoding::encode(
             request,
-            |s| tokenizer.encode_sync(s, Some(false)),
+            |frags| tokenizer.encode_batch_sync(frags, Some(false)),
             16384.min(self.config.max_position_embeddings as usize),
         )?;
+        if timing {
+            eprintln!(
+                "[clef] encode: {:?} ({} tokens)",
+                phase_start.elapsed(),
+                record.input_ids.len()
+            );
+        }
         let head = self
             .clef_head
             .as_ref()
@@ -1125,7 +1134,12 @@ impl Qwen35Inner {
         // this request. Nothing can be reused by the next decision, even on error.
         let ids = MxArray::from_uint32(&record.input_ids, &[1, record.input_ids.len() as i64])?;
         let mut caches = Some(fresh_dense_layer_caches(&self.config));
+        // Inference stream, matching the chat prefill's StreamContext.
+        let _stream_ctx = crate::stream::StreamContext::new(crate::stream::Stream::generation());
         let mut hidden = self.embedding.forward(&ids)?;
+        // Eval every four layers: enough to bound lazy-graph growth and land
+        // cancellation points without serializing graph build behind GPU work.
+        let layer_count = self.layers.len();
         for (i, layer) in self.layers.iter_mut().enumerate() {
             check_cancel(cancelled)?;
             hidden = layer.forward(
@@ -1135,13 +1149,21 @@ impl Qwen35Inner {
                 None,
                 true,
             )?;
-            // Bound lazy graph growth and provide cancellation points without
-            // changing the reference's unchunked sequence computation.
-            MxArray::eval_arrays(&[&hidden])?;
+            if (i + 1) % 4 == 0 || i + 1 == layer_count {
+                MxArray::eval_arrays(&[&hidden])?;
+            }
         }
         check_cancel(cancelled)?;
         let hidden = self.final_norm.forward(&hidden)?;
+        if timing {
+            eprintln!("[clef] backbone: {:?} total", phase_start.elapsed());
+        }
+        let head_start = std::time::Instant::now();
         let probabilities = head.forward(&hidden, &record, &output.get_weight())?;
+        if timing {
+            eprintln!("[clef] head: {:?}", head_start.elapsed());
+        }
+        crate::array::clear_cache();
         check_cancel(cancelled)?;
         let rows: Vec<_> = record.questions.iter().zip(probabilities).map(|(q,p)| serde_json::json!({"id":q.id,"type":q.kind,"options":q.option_ids,"probabilities":p})).collect();
         serde_json::to_string(
