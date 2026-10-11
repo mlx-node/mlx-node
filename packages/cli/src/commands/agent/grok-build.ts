@@ -98,7 +98,9 @@ export function findRepoRoot(start: string = fileURLToPath(import.meta.url)): st
 
 /** Download `mlx-agent-<tag>-<platform>-<arch>.tar.gz` from the fork's GitHub release. */
 async function downloadAgentBinary(dest: string): Promise<string> {
-  const platform = process.platform === 'darwin' ? 'macos' : 'linux';
+  // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
+  const platform =
+    process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
   const asset = `mlx-agent-${MLX_AGENT_RELEASE_TAG}-${platform}-${arch}.tar.gz`;
   const url = `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${MLX_AGENT_RELEASE_TAG}/${asset}`;
