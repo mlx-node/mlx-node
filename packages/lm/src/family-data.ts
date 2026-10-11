@@ -321,6 +321,9 @@ export const MODEL_FAMILY_DATA = [
     id: 'clef',
     kind: 'decision',
     ggufArchitectures: ['clef'],
+    // The staging conversion reconstructs config.json + tokenizer.json from
+    // header metadata, so a bare decision GGUF is admissible without siblings.
+    ggufDiscovery: { variants: 'all' },
     match: { rawModelTypes: ['clef'] },
   },
   {

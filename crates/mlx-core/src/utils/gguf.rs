@@ -6656,6 +6656,7 @@ fn qwen35_native_cache_is_current(
     source_identity_digest: &str,
     asset_digest: &str,
     expected_dtype: &str,
+    required_files: &[&str],
 ) -> bool {
     let marker = output_dir.join(".complete");
     fs::read_to_string(marker).is_ok_and(|contents| {
@@ -6665,8 +6666,9 @@ fn qwen35_native_cache_is_current(
             ))
             && contents.contains(&format!("assets_sha256={asset_digest}\n"))
             && contents.contains(&format!("dtype={expected_dtype}\n"))
-            && output_dir.join("model.safetensors").is_file()
-            && output_dir.join("config.json").is_file()
+            && required_files
+                .iter()
+                .all(|name| output_dir.join(name).is_file())
     })
 }
 
@@ -7125,6 +7127,25 @@ impl NativeGgufFamily {
             Self::Qwen35 | Self::Qwen35Moe | Self::Clef | Self::Gemma4 => "vision.safetensors",
         }
     }
+
+    /// Files a published staging entry must contain for a cache hit to be
+    /// honored — the marker alone does not witness them, and a truncated or
+    /// half-deleted entry would otherwise keep failing at load with no
+    /// self-healing rebuild.
+    fn required_files(self) -> &'static [&'static str] {
+        match self {
+            Self::Clef => &[
+                "model.safetensors",
+                "config.json",
+                "joint_head.safetensors",
+                "joint_head_config.json",
+                "tokenizer.json",
+            ],
+            Self::Qwen35 | Self::Qwen35Moe | Self::Gemma4 | Self::MuseGlimmer => {
+                &["model.safetensors", "config.json"]
+            }
+        }
+    }
 }
 
 fn native_gguf_companion_digest(companion: Option<&Path>) -> Result<String> {
@@ -7352,6 +7373,7 @@ async fn prepare_native_gguf_inner(
         &source_identity_digest,
         &asset_digest,
         cache_dtype,
+        family.required_files(),
     ) && (companion.is_none() || output_dir.join(family.companion_filename()).is_file())
     {
         return Ok(output_dir);
@@ -14225,7 +14247,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !qwen35_native_cache_is_current(&root, "abc", "def", "bf16"),
+            !qwen35_native_cache_is_current(&root, "abc", "def", "bf16", &["model.safetensors"]),
             "a v5 marker must not satisfy the current reader"
         );
         fs::remove_dir_all(&root).ok();
