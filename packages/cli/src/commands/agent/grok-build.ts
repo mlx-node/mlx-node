@@ -59,8 +59,9 @@ export interface GrokAgentLaunchOptions {
  * Locate the agent binary, in priority order:
  *   1. `$MLX_AGENT_BIN` — developer / vendored-build override.
  *   2. `<repo>/grok-build/target/release/mlx-agent` — `yarn build:agent` output.
- *   3. `~/.mlx-node/bin/mlx-agent` — previously downloaded prebuilt.
- *   4. Download a prebuilt release tarball into (3), then use it.
+ *   3. `…/Contents/Resources/native/mlx-agent` — bundled inside the packaged app.
+ *   4. `~/.mlx-node/bin/mlx-agent` — previously downloaded prebuilt.
+ *   5. Download a prebuilt release tarball into (4), then use it.
  */
 export async function resolveAgentBinary(repoRoot = findRepoRoot()): Promise<string> {
   const envBin = process.env[MLX_AGENT_BIN_ENV];
@@ -73,10 +74,34 @@ export async function resolveAgentBinary(repoRoot = findRepoRoot()): Promise<str
   const vendored = repoRoot ? join(repoRoot, 'grok-build', 'target', 'release', 'mlx-agent') : undefined;
   if (vendored && existsSync(vendored)) return vendored;
 
+  const bundled = findBundledAppBinary();
+  if (bundled) return bundled;
+
   const installed = join(homedir(), '.mlx-node', 'bin', 'mlx-agent');
   if (existsSync(installed)) return installed;
 
   return downloadAgentBinary(installed);
+}
+
+/**
+ * `mlx agent` invoked from the packaged desktop app: the CLI sits at
+ * `Contents/Resources/app/node_modules/@mlx-node/cli/dist/…` and package.ts
+ * drops the release binary at `Contents/Resources/native/mlx-agent`. Walking
+ * up for the `Contents/Resources/app` anchor is more robust than guessing how
+ * many `node_modules` levels the packager will add.
+ */
+export function findBundledAppBinary(start: string = fileURLToPath(import.meta.url)): string | undefined {
+  let dir = dirname(start);
+  for (let i = 0; i < 12; i++) {
+    if (dir.endsWith(join('Contents', 'Resources', 'app'))) {
+      const candidate = join(dir, '..', 'native', 'mlx-agent');
+      return existsSync(candidate) ? candidate : undefined;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
 }
 
 /**
@@ -100,7 +125,7 @@ export function findRepoRoot(start: string = fileURLToPath(import.meta.url)): st
 const MLX_AGENT_R2_BASE = 'https://dl.portato.si';
 
 /** Download `mlx-agent-<tag>-<platform>-<arch>.tar.gz` — R2 mirror first, GitHub release as fallback. */
-async function downloadAgentBinary(dest: string): Promise<string> {
+export async function downloadAgentBinary(dest: string): Promise<string> {
   // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
   const platform =
     process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';

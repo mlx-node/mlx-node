@@ -15,7 +15,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -85,6 +85,25 @@ const stagedNative = join(STAGE, 'native');
 mkdirSync(stagedNative, { recursive: true });
 for (const file of NATIVE_FILES) {
   cpSync(payload.native[file], join(stagedNative, file));
+}
+
+// The prebuilt grok-build fork binary. `mlx agent` probes
+// Contents/Resources/native/mlx-agent at runtime, so bundling it here means a
+// packaged install never hits the download path. Release packaging (--sign)
+// REQUIRES it — fetch-agent.ts stages it into out/agent first — while local
+// unsigned packages may skip it and fall back to a runtime download.
+const agentSrc = process.env.MLX_AGENT_PATH ?? join(OUT, 'agent', 'mlx-agent');
+if (existsSync(agentSrc)) {
+  cpSync(agentSrc, join(stagedNative, 'mlx-agent'));
+  chmodSync(join(stagedNative, 'mlx-agent'), 0o755);
+  console.log(`bundled mlx-agent from ${agentSrc}`);
+} else if (sign) {
+  console.error(
+    `\nno mlx-agent at ${agentSrc}\n\n  run: yarn oxnode packages/desktop/scripts/fetch-agent.ts\n`,
+  );
+  process.exit(1);
+} else {
+  console.log('no mlx-agent found — packaging without it (runtime download fallback)');
 }
 
 // Two fixups on the staged copy, BEFORE packager or codesign sees it. Both are

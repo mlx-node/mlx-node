@@ -140,6 +140,14 @@ jobs:
       - name: Build dashboard UI
         run: yarn workspace @mlx-node/dashboard build:ui
 
+      # The packaged app must ship the prebuilt grok-build fork binary — `mlx
+      # agent` probes Contents/Resources/native/mlx-agent before it ever tries
+      # a runtime download. package.ts refuses to --sign without it. Fetching
+      # BEFORE the signing/packaging sequence means a download failure costs
+      # seconds instead of a signed-then-incomplete bundle.
+      - name: Fetch prebuilt mlx-agent
+        run: yarn oxnode packages/desktop/scripts/fetch-agent.ts
+
       # A dedicated keychain, not the login keychain: the runner is ephemeral but
       # the login keychain is shared with every other step, and `security unlock`
       # on it would expose anything else stored there.
