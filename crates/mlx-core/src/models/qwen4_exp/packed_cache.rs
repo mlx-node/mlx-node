@@ -331,6 +331,29 @@ fn packed_total_cap() -> Option<u64> {
         .map(|gb| (gb * (1u64 << 30) as f64) as u64)
 }
 
+/// Root-wide admission lock for the total cap: one flock per cache root
+/// serializes the whole estimate→evict→reserve critical section across
+/// processes. The name is a dot-file under the root, so `dir_name_identity`
+/// keeps it invisible to `sweep_packed_cache`, `enforce_packed_total_cap`
+/// and `root_pack_spend`, and it is never unlinked (flock mutual exclusion
+/// depends on a stable inode). None on busy or error — cache writes never
+/// stall.
+fn packed_root_cap_lock(parent: &Path) -> Option<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(".mlx-qwen4-packed-cap.lock"))
+        .ok()?;
+    // SAFETY: `file` owns the descriptor for the flock call, and the returned
+    // guard keeps it — and the lock — alive until the caller drops it.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(file)
+}
+
 /// Enforce the optional total cap: evict least-recently-used sibling dirs
 /// first, then shed the oldest `.pack` files inside the current dir under its
 /// own ledger lock.
@@ -646,6 +669,17 @@ impl PackedCache {
     }
 
     pub fn write(&self, key: &str, weight: &Weight) -> Result<()> {
+        self.write_with_total_cap(key, weight, packed_total_cap())
+    }
+
+    /// `total_cap` is injectable so tests can exercise the root-wide cap
+    /// without mutating the process environment.
+    fn write_with_total_cap(
+        &self,
+        key: &str,
+        weight: &Weight,
+        total_cap: Option<u64>,
+    ) -> Result<()> {
         if weight.bytes()? > MAX_READ_BYTES || weight.scales.is_none() {
             return Ok(());
         }
@@ -729,7 +763,6 @@ impl PackedCache {
             })?;
         // A configured total cap bounds the whole cache root but never loosens
         // the per-dir DISK_BUDGET invariant.
-        let total_cap = packed_total_cap();
         let budget = total_cap.map_or(DISK_BUDGET, |cap| cap.min(DISK_BUDGET));
         let record = |ledger: &mut File, value: u64| -> Result<()> {
             ledger.seek(SeekFrom::Start(0)).map_err(err)?;
@@ -743,25 +776,44 @@ impl PackedCache {
             return Ok(());
         }
         // Bound the configured cap against ROOT-WIDE spend, not just this
-        // dir's: sibling caches share the same cap. The fast path estimates
-        // siblings from their ledgers (a full byte scan per tensor write would
-        // be too hot); only a plausible overspend pays the real enforcement
-        // sweep and byte-accurate recheck.
-        if let Some((cap, parent)) = total_cap.zip(self.root.parent()) {
+        // dir's: sibling caches share the same cap. The whole estimate →
+        // evict → recheck → reserve critical section runs under a root-wide
+        // flock; without it two writers on different identity dirs could both
+        // admit writes that jointly overspend. A busy lock skips this chunk:
+        // cache writes never stall.
+        // Lock order stays acyclic: own budget lock (held above) → root cap
+        // lock → siblings' budget locks, non-blocking, inside enforce.
+        let _root_guard = if let Some((cap, parent)) = total_cap.zip(self.root.parent()) {
+            let guard = packed_root_cap_lock(parent);
+            if guard.is_none() {
+                return Ok(());
+            }
+            // The fast path estimates siblings from their ledgers (a full
+            // byte scan per tensor write would be too hot); only a plausible
+            // overspend pays the real enforcement sweep.
             let estimate = root_pack_spend(parent, &self.root, used, sibling_pack_estimate);
             if estimate.saturating_add(reserve) > cap {
-                // Evict LRU siblings under their budget locks, then recheck
-                // with real byte counts. Our own packs are safe: we hold this
-                // dir's budget lock and `used` is freshly reconciled above.
+                // Evict LRU siblings under their budget locks, then recheck.
+                // The recheck is ledger-first (sibling_pack_estimate), not
+                // pack_bytes: a sibling's reservation is already accounted
+                // while its temp file is still writing, and that in-flight
+                // spend stays authoritative. Our own packs are safe: we hold
+                // this dir's budget lock and `used` is freshly reconciled.
                 enforce_packed_total_cap(parent, &self.root, cap);
-                let actual = root_pack_spend(parent, &self.root, used, pack_bytes);
+                let actual = root_pack_spend(parent, &self.root, used, sibling_pack_estimate);
                 if actual.saturating_add(reserve) > cap {
                     return Ok(());
                 }
             }
-        }
+            guard
+        } else {
+            None
+        };
         // Reserve first: an interrupted write can overcount, never overspend.
+        // With a cap configured the reservation stays under the root lock, so
+        // admission and reservation are atomic across processes.
         record(&mut ledger, used + reserve)?;
+        drop(_root_guard);
         let digest = Sha256::new()
             .chain_update(&header)
             .chain_update(&data)
@@ -1499,5 +1551,43 @@ mod tests {
                 .is_err()
         );
         assert!(cache.read_batch(&vec![("q4k".into(), 1); 25]).is_err());
+    }
+
+    #[test]
+    fn total_cap_admission_counts_sibling_reservations_and_busy_lock_skips() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source_a = temp.0.join("a.gguf");
+        let source_b = temp.0.join("b.gguf");
+        fs::write(&source_a, b"first").unwrap();
+        fs::write(&source_b, b"second").unwrap();
+        let a = PackedCache::new_at(&parent, BTreeSet::from([source_a])).unwrap();
+        let b = PackedCache::new_at(&parent, BTreeSet::from([source_b])).unwrap();
+        assert_ne!(a.root, b.root);
+        let w = weight("affine");
+        // Under the cap the write goes through and the ledger reserves it.
+        a.write_with_total_cap("k1", &w, Some(u64::MAX)).unwrap();
+        let pack = fs::metadata(a.path("k1")).unwrap().len();
+        assert!(pack > 0);
+        // A sibling ledger reservation counts toward the shared cap: b's
+        // write is vetoed even though its own dir is empty, and no eviction
+        // can free it (a's dir is fresh).
+        b.write_with_total_cap("k1", &w, Some(pack)).unwrap();
+        assert!(!b.path("k1").exists());
+        // A busy root cap lock skips the chunk instead of stalling; the next
+        // write after the guard drops succeeds.
+        let guard = packed_root_cap_lock(&parent).unwrap();
+        a.write_with_total_cap("k2", &w, Some(u64::MAX)).unwrap();
+        assert!(!a.path("k2").exists());
+        drop(guard);
+        a.write_with_total_cap("k2", &w, Some(u64::MAX)).unwrap();
+        assert!(a.path("k2").exists());
+        // The cap lock file itself is never treated as a cache dir.
+        assert!(parent.join(".mlx-qwen4-packed-cap.lock").is_file());
+        assert_eq!(
+            root_pack_spend(&parent, &b.root, 0, sibling_pack_estimate),
+            pack * 2,
+            "the lock file must not be counted as spend"
+        );
     }
 }

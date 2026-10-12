@@ -6737,6 +6737,43 @@ fn native_gguf_lock_name(key: &str) -> String {
     }
 }
 
+/// Strict cache-key contract for a plain entry directory:
+/// `{stem}-{len}-{modified}-v{fmt}-{src digest}-{prep digest}` (see the
+/// `cache_key` construction in `prepare_native_gguf_inner`). Parsed from the
+/// right so hyphens inside the stem are safe. The format digit run is NOT
+/// pinned: entries from older format versions keep `-v{old}-...` and must
+/// still qualify so the sweep can remove them as "outdated cache format".
+/// Anything else under the root is foreign tooling and is never touched.
+fn native_gguf_is_entry_name(name: &str) -> bool {
+    let is_hex_digest = |field: &str| {
+        field.len() == 64
+            && field
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let is_digits =
+        |field: &str| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit());
+    let mut fields = name.rsplitn(6, '-');
+    let (Some(prep), Some(source), Some(format), Some(modified), Some(len), Some(stem)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    is_hex_digest(prep)
+        && is_hex_digest(source)
+        && format.len() > 1
+        && format.starts_with('v')
+        && is_digits(&format[1..])
+        && is_digits(modified)
+        && is_digits(len)
+        && !stem.is_empty()
+}
+
 /// Try to win a non-blocking exclusive flock on `key`'s lock. `Some(_)`
 /// returns a guard the caller must hold across any deletion; the inner None
 /// means no lock file exists (nothing can be holding the lock). `None` means
@@ -6895,13 +6932,25 @@ fn native_gguf_entry_stale_reason(
 
 /// A stale entry may be deleted only after winning a non-blocking flock on
 /// its own `.{key}.lock`: a held lock means a live writer, so the entry is
-/// skipped and left for a later sweep. The guard stays alive across the
-/// removal itself — dropping it first would let a writer publish into a
-/// half-deleted directory.
-fn native_gguf_locked_remove(cache_root: &Path, path: &Path, key: &str, reason: &str) -> u64 {
+/// skipped and left for a later sweep. `still_deletable` runs AFTER the lock
+/// is won — a cache hit stamps its marker under the same lock file, so a
+/// recency snapshot taken before the flock cannot prove the entry is still
+/// dead once we hold it. The guard stays alive across the removal itself —
+/// dropping it first would let a writer publish into a half-deleted
+/// directory.
+fn native_gguf_locked_remove(
+    cache_root: &Path,
+    path: &Path,
+    key: &str,
+    reason: &str,
+    still_deletable: impl Fn(&Path) -> bool,
+) -> u64 {
     let Some(_guard) = native_gguf_try_entry_lock(cache_root, key) else {
         return 0;
     };
+    if !still_deletable(path) {
+        return 0;
+    }
     native_gguf_remove_logged(path, reason)
 }
 
@@ -6944,10 +6993,11 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
     let now = std::time::SystemTime::now();
     let mut reclaimed = 0_u64;
     let mut digests = NativeGgufSweepDigests::default();
-    // (path, recency, lock key) for directories that count toward the cap.
-    // The lock key resolves through `native_gguf_lock_name`: `.{key}.lock`
-    // for plain entries and `{name}.lock` for dot-prefixed asset sidecars.
-    let mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String)> = Vec::new();
+    // (path, recency, lock key, recency marker name) for directories that
+    // count toward the cap. The lock key resolves through
+    // `native_gguf_lock_name`: `.{key}.lock` for plain entries and
+    // `{name}.lock` for dot-prefixed asset sidecars.
+    let mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String, &'static str)> = Vec::new();
     let mut total = 0_u64;
 
     for name in names {
@@ -6981,7 +7031,7 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 let bytes = native_gguf_path_bytes(&path);
                 total = total.saturating_add(bytes);
                 let recency = native_gguf_object_recency(&path, "complete");
-                lru.push((path, recency, name));
+                lru.push((path, recency, name, "complete"));
                 continue;
             }
             if name.starts_with('.')
@@ -6990,19 +7040,35 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
             {
                 // `.{key}.staging-{pid}-{uuid}`: the key sits between the
                 // leading dot and the staging infix, and its lock file is
-                // `.{key}.lock`.
+                // `.{key}.lock`. A malformed key means foreign tooling — the
+                // same "never delete what we do not own" gate as plain dirs.
                 let key = &name[1..index];
+                if !native_gguf_is_entry_name(key) {
+                    continue;
+                }
                 let pid = name[index + NATIVE_GGUF_STAGING_INFIX.len()..]
                     .split('-')
                     .next()
                     .and_then(|token| token.parse::<u32>().ok());
                 let dead = pid.is_some_and(native_gguf_pid_dead);
                 if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
+                    // Re-derive the verdict under the held entry lock: a
+                    // writer that restarted since the snapshot owns the lock
+                    // anyway, but the mtime gate must not stand on a
+                    // pre-lock reading.
                     reclaimed += native_gguf_locked_remove(
                         cache_root,
                         &path,
                         key,
                         "interrupted staging directory",
+                        |dir| {
+                            let now = std::time::SystemTime::now();
+                            pid.is_some_and(native_gguf_pid_dead)
+                                || fs::symlink_metadata(dir)
+                                    .and_then(|meta| meta.modified())
+                                    .ok()
+                                    .is_some_and(|mtime| native_gguf_mtime_older(Some(mtime), now))
+                        },
                     );
                 }
                 continue;
@@ -7011,14 +7077,28 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 // Any other dot-directory is tooling we do not own; leave it.
                 continue;
             }
+            // Anything that is not a cache-key-shaped name is foreign tooling:
+            // it is neither deleted nor counted toward the cap (it is not
+            // evictable, so counting it would over-evict real entries).
+            if !native_gguf_is_entry_name(&name) {
+                continue;
+            }
             if name == current_key {
                 total = total.saturating_add(native_gguf_path_bytes(&path));
                 continue;
             }
             if let Some(reason) = native_gguf_entry_stale_reason(&path, &mut digests) {
                 let recency = native_gguf_object_recency(&path, ".complete");
+                // Recheck recency under the held entry lock: a concurrent
+                // cache hit re-stamps `.complete` under the same lock, so the
+                // pre-flock snapshot is not proof the entry is still dead.
                 if native_gguf_mtime_older(recency, now)
-                    && native_gguf_locked_remove(cache_root, &path, &name, reason) > 0
+                    && native_gguf_locked_remove(cache_root, &path, &name, reason, |dir| {
+                        native_gguf_mtime_older(
+                            native_gguf_object_recency(dir, ".complete"),
+                            std::time::SystemTime::now(),
+                        )
+                    }) > 0
                 {
                     continue;
                 }
@@ -7026,7 +7106,7 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
             let bytes = native_gguf_path_bytes(&path);
             total = total.saturating_add(bytes);
             let recency = native_gguf_object_recency(&path, ".complete");
-            lru.push((path, recency, name));
+            lru.push((path, recency, name, ".complete"));
             continue;
         }
 
@@ -7046,15 +7126,23 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
     if let Some(cap) = native_gguf_cache_cap_bytes()
         && total > cap
     {
-        lru.sort_by_key(|(_, recency, _)| *recency);
-        for (path, recency, key) in lru {
+        lru.sort_by_key(|(_, recency, _, _)| *recency);
+        for (path, recency, key, marker) in lru {
             if total <= cap {
                 break;
             }
             if !native_gguf_mtime_older(recency, now) {
                 continue;
             }
-            let bytes = native_gguf_locked_remove(cache_root, &path, &key, "over cache size cap");
+            // Recheck recency under the held entry lock for the same reason
+            // as the stale sweep above.
+            let bytes =
+                native_gguf_locked_remove(cache_root, &path, &key, "over cache size cap", |dir| {
+                    native_gguf_mtime_older(
+                        native_gguf_object_recency(dir, marker),
+                        std::time::SystemTime::now(),
+                    )
+                });
             reclaimed = reclaimed.saturating_add(bytes);
             total = total.saturating_sub(bytes);
         }
@@ -17008,6 +17096,14 @@ mod tests {
         i32::MAX as u32
     }
 
+    /// A syntactically valid cache-entry name (`{stem}-{len}-{modified}-v{fmt}-
+    /// {64hex}-{64hex}`) so sweep fixtures stay deletion candidates; anything
+    /// else under the root is foreign and must survive the sweep.
+    #[cfg(unix)]
+    fn native_sweep_entry_name(stem: &str) -> String {
+        format!("{stem}-1-1-v7-{}-{}", "a".repeat(64), "b".repeat(64))
+    }
+
     // The std Mutex guard must stay held across the awaits below: it
     // serializes the `MLX_NATIVE_GGUF_CACHE_MAX_GB` env mutation against sweep
     // tests on other threads for the whole test, and `#[tokio::test]`'s
@@ -17027,7 +17123,7 @@ mod tests {
             .unwrap();
 
         // Orphan: gone source, aged marker → deleted on the next prepare.
-        let orphan = cache_root.join("orphan-1-1-v7-abc-def");
+        let orphan = cache_root.join(native_sweep_entry_name("orphan"));
         fs::create_dir_all(&orphan).unwrap();
         fs::write(orphan.join("model.safetensors"), b"x").unwrap();
         let orphan_marker = orphan.join(".complete");
@@ -17042,7 +17138,7 @@ mod tests {
         native_sweep_age_file(&orphan_marker);
 
         // Orphan whose source is gone but still fresh: the mtime grace keeps it.
-        let fresh_orphan = cache_root.join("fresh-orphan-1-1-v7-abc-def");
+        let fresh_orphan = cache_root.join(native_sweep_entry_name("fresh-orphan"));
         fs::create_dir_all(&fresh_orphan).unwrap();
         fs::write(
             fresh_orphan.join(".complete"),
@@ -17054,14 +17150,14 @@ mod tests {
         .unwrap();
 
         // Format mismatch: a pre-format-7 marker is stale once aged.
-        let outdated = cache_root.join("outdated-1-1-v7-abc-def");
+        let outdated = cache_root.join(native_sweep_entry_name("outdated"));
         fs::create_dir_all(&outdated).unwrap();
         let outdated_marker = outdated.join(".complete");
         fs::write(&outdated_marker, native_sweep_marker(&input, 6, None, true)).unwrap();
         native_sweep_age_file(&outdated_marker);
 
         // Pre-fix marker without `companion=`: unverifiable → stale once aged.
-        let unverifiable = cache_root.join("unverifiable-1-1-v7-abc-def");
+        let unverifiable = cache_root.join(native_sweep_entry_name("unverifiable"));
         fs::create_dir_all(&unverifiable).unwrap();
         let unverifiable_marker = unverifiable.join(".complete");
         fs::write(
@@ -17072,7 +17168,7 @@ mod tests {
         native_sweep_age_file(&unverifiable_marker);
 
         // Fully valid aged entry stays: a healthy cache is never swept.
-        let healthy = cache_root.join("healthy-1-1-v7-abc-def");
+        let healthy = cache_root.join(native_sweep_entry_name("healthy"));
         fs::create_dir_all(&healthy).unwrap();
         let healthy_marker = healthy.join(".complete");
         fs::write(
@@ -17083,14 +17179,14 @@ mod tests {
         native_sweep_age_file(&healthy_marker);
 
         // Marker-less aged entry: stale, and its lock file is free.
-        let markerless = cache_root.join("markerless-1-1-v7-abc-def");
+        let markerless = cache_root.join(native_sweep_entry_name("markerless"));
         fs::create_dir_all(&markerless).unwrap();
         fs::write(markerless.join("model.safetensors"), b"x").unwrap();
         native_sweep_age_dir(&markerless);
 
         // Stale entry whose lock is held by a live writer: skipped.
-        let held_name = "held-1-1-v7-abc-def";
-        let held = cache_root.join(held_name);
+        let held_name = native_sweep_entry_name("held");
+        let held = cache_root.join(&held_name);
         fs::create_dir_all(&held).unwrap();
         let held_marker = held.join(".complete");
         fs::write(
@@ -17107,10 +17203,23 @@ mod tests {
 
         // Leftovers: dead-pid staging + write probe removed; live-pid and
         // fresh leftovers kept; a finished assets sidecar is never an orphan.
-        let dead_staging = cache_root.join(format!(".deadkey.staging-{}", dead_test_pid()));
+        let dead_staging = cache_root.join(format!(
+            ".{}.staging-{}",
+            native_sweep_entry_name("dead"),
+            dead_test_pid()
+        ));
         fs::create_dir_all(&dead_staging).unwrap();
-        let live_staging = cache_root.join(format!(".livekey.staging-{}", std::process::id()));
+        let live_staging = cache_root.join(format!(
+            ".{}.staging-{}",
+            native_sweep_entry_name("live"),
+            std::process::id()
+        ));
         fs::create_dir_all(&live_staging).unwrap();
+        // A dead-pid staging dir whose embedded key is not cache-key-shaped
+        // is foreign and never removed.
+        let foreign_staging = cache_root.join(format!(".mybackup.staging-{}", dead_test_pid()));
+        fs::create_dir_all(&foreign_staging).unwrap();
+        native_sweep_age_dir(&foreign_staging);
         let dead_probe = cache_root.join(format!(".write-probe-{}-x", dead_test_pid()));
         fs::write(&dead_probe, b"p").unwrap();
         let live_probe = cache_root.join(format!(".write-probe-{}-x", std::process::id()));
@@ -17126,6 +17235,13 @@ mod tests {
         let foreign = cache_root.join(".unrelated-tooling");
         fs::create_dir_all(&foreign).unwrap();
         native_sweep_age_dir(&foreign);
+        // A markerless, aged plain directory whose name is NOT cache-key
+        // shaped is foreign data (e.g. MLX_NATIVE_GGUF_CACHE_DIR pointed at
+        // a shared dir): never deleted and never counted toward the cap.
+        let photos = cache_root.join("my-photos");
+        fs::create_dir_all(&photos).unwrap();
+        fs::write(photos.join("pic.jpg"), b"x").unwrap();
+        native_sweep_age_dir(&photos);
 
         let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
             .await
@@ -17141,9 +17257,11 @@ mod tests {
             &healthy,
             &held,
             &live_staging,
+            &foreign_staging,
             &live_probe,
             &assets_sidecar,
             &foreign,
+            &photos,
         ] {
             assert!(kept.exists(), "{} should have been kept", kept.display());
         }
@@ -17207,7 +17325,7 @@ mod tests {
         let cache_root = root.path().join("cache");
 
         // A healthy, valid, aged sibling entry is cap-evictable.
-        let old_entry = cache_root.join("oldentry-1-1-v7-abc-def");
+        let old_entry = cache_root.join(native_sweep_entry_name("oldentry"));
         fs::create_dir_all(&old_entry).unwrap();
         fs::write(old_entry.join("model.safetensors"), vec![0_u8; 2048]).unwrap();
         let old_marker = old_entry.join(".complete");
@@ -17226,6 +17344,13 @@ mod tests {
         fs::write(&complete, b"1").unwrap();
         native_sweep_age_file(&complete);
 
+        // A foreign (non-key-shaped) directory never counts toward the cap
+        // and is never evicted, however old it is.
+        let foreign = cache_root.join("my-photos");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("pic.jpg"), vec![0_u8; 2048]).unwrap();
+        native_sweep_age_dir(&foreign);
+
         let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
             .await
             .unwrap();
@@ -17238,5 +17363,84 @@ mod tests {
             !assets_sidecar.exists(),
             "aged assets sidecars are included in the capped-LRU accounting"
         );
+        assert!(
+            foreign.exists(),
+            "foreign directories are neither evicted nor counted toward the cap"
+        );
+    }
+
+    /// A recency snapshot taken before the entry flock cannot prove the
+    /// entry is still dead: `native_gguf_locked_remove` must re-derive the
+    /// verdict after the lock is won, so a `.complete` re-stamp from a
+    /// concurrent cache hit keeps the entry.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_locked_remove_rechecks_recency_under_the_lock() {
+        let root = NativeSweepTestDir::new("recheck");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        let key = native_sweep_entry_name("restamped");
+        let entry = cache_root.join(&key);
+        fs::create_dir_all(&entry).unwrap();
+        // An aged stale-looking dir whose marker is FRESH — the state the
+        // sweep would race into when a hit re-stamps between the snapshot
+        // and the flock. The post-lock recheck must keep it.
+        fs::write(entry.join("model.safetensors"), b"x").unwrap();
+        fs::write(entry.join(".complete"), b"stale-shape").unwrap();
+        native_sweep_age_dir(&entry);
+        assert_eq!(
+            native_gguf_locked_remove(&cache_root, &entry, &key, "test", |dir| {
+                native_gguf_mtime_older(
+                    native_gguf_object_recency(dir, ".complete"),
+                    std::time::SystemTime::now(),
+                )
+            }),
+            0
+        );
+        assert!(
+            entry.exists(),
+            "a freshly re-stamped entry survives removal"
+        );
+        // The same entry with the marker aged out is deletable.
+        native_sweep_age_file(&entry.join(".complete"));
+        assert!(
+            native_gguf_locked_remove(&cache_root, &entry, &key, "test", |dir| {
+                native_gguf_mtime_older(
+                    native_gguf_object_recency(dir, ".complete"),
+                    std::time::SystemTime::now(),
+                )
+            }) > 0
+        );
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn native_gguf_entry_names_require_the_cache_key_shape() {
+        let digest_a = "a".repeat(64);
+        let digest_b = "b".repeat(64);
+        // Stems may contain hyphens; parse-from-the-right must still hold.
+        for name in [
+            format!("model-4096-1729-v7-{digest_a}-{digest_b}"),
+            format!("a-b-c-1-1-v7-{digest_a}-{digest_b}"),
+            // Older/newer format digits stay sweepable.
+            format!("model-1-1-v3-{digest_a}-{digest_b}"),
+            format!("model-1-1-v12-{digest_a}-{digest_b}"),
+        ] {
+            assert!(native_gguf_is_entry_name(&name), "{name}");
+        }
+        for name in [
+            "my-photos".to_string(),
+            String::new(),
+            "-1-1-v7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            "model-1-1-v7-abc-def".to_string(),            // short digests
+            "model-1-1-v7-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(), // uppercase hex
+            format!("model-1-1-v-{digest_a}-{digest_b}"), // empty fmt digits
+            "model-x-1-v7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(), // non-digit len
+            "model-1-x-v7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(), // non-digit modified
+            format!("model-1-1-7-{digest_a}-{digest_b}"),  // missing 'v'
+            format!("model-1-1-v7-{digest_a}"),            // missing a digest
+        ] {
+            assert!(!native_gguf_is_entry_name(&name), "{name}");
+        }
     }
 }
