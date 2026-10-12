@@ -18,6 +18,12 @@ export async function handleSystemOne(
   resolveModel?: (name: string) => Promise<void>,
   coordinator?: ModelWorkCoordinator,
 ): Promise<void> {
+  // Bind BEFORE admission so a registerDecision inside resolveModel
+  // synchronously transfers every outstanding cold permit, matching the
+  // Messages/Responses handlers.
+  if (coordinator) {
+    registry.setModelLoadAdmissionCoordinator(coordinator);
+  }
   res.setHeader('x-typesafe-request-id', randomUUID());
   let body: { model: string };
   try {
