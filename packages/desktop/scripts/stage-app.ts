@@ -372,11 +372,6 @@ export function stageApp(opts: {
     cpSync(join(repoRoot, 'node_modules', name), join(modules, name), {
       recursive: true,
       dereference: true,
-      // The tokenizers tarball bundles every OS/architecture in one package.
-      // package.ts targets darwin-arm64; its loader falls back from universal
-      // to this file. Do not ship foreign binaries or a second macOS slice.
-      filter: (source) =>
-        name !== 'tokenizers' || !source.endsWith('.node') || source.endsWith('/tokenizers.darwin-arm64.node'),
     });
   }
 

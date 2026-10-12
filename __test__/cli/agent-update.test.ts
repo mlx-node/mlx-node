@@ -81,6 +81,18 @@ describe('resolveReleaseTag', () => {
     });
     await expect(resolveReleaseTag()).resolves.toBe(MLX_AGENT_MIN_RELEASE);
   });
+
+  it('rejects a pinned tag below the minimum instead of downloading a stale cache', async () => {
+    process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.1.0';
+    await expect(resolveReleaseTag()).rejects.toThrow(MLX_AGENT_TAG_ENV);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('honors a pinned tag at or above the minimum', async () => {
+    process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.9.0';
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.9.0');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('agentUpdateStatus', () => {

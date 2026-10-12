@@ -64,9 +64,14 @@ export interface GrokAgentLaunchOptions {
   serveToken?: string;
 }
 
+/** The binary's platform filename — CreateProcessW needs the `.exe` suffix. */
+function agentBinName(): string {
+  return process.platform === 'win32' ? 'mlx-agent.exe' : 'mlx-agent';
+}
+
 /** Where the prebuilt download lives — the only binary `mlx agent update` manages. */
 export function managedAgentBinPath(homeDir: string = homedir()): string {
-  return join(homeDir, '.mlx-node', 'bin', 'mlx-agent');
+  return join(homeDir, '.mlx-node', 'bin', agentBinName());
 }
 
 export interface AgentInstallProbe {
@@ -109,7 +114,7 @@ export function probeAgentInstall(
     throw new Error(`${MLX_AGENT_BIN_ENV}=${envBin} does not exist`);
   }
 
-  const vendored = repoRoot ? join(repoRoot, 'grok-build', 'target', 'release', 'mlx-agent') : undefined;
+  const vendored = repoRoot ? join(repoRoot, 'grok-build', 'target', 'release', agentBinName()) : undefined;
   if (vendored && existsSync(vendored)) return { source: 'vendored', path: vendored, managedTag };
 
   const bundled = findBundledAppBinary();
@@ -174,7 +179,7 @@ export function findBundledAppBinary(start: string = fileURLToPath(import.meta.u
   let dir = dirname(start);
   for (let i = 0; i < 12; i++) {
     if (dir.endsWith(join('Contents', 'Resources', 'app'))) {
-      const candidate = join(dir, '..', 'native', 'mlx-agent');
+      const candidate = join(dir, '..', 'native', agentBinName());
       return existsSync(candidate) ? candidate : undefined;
     }
     const parent = dirname(dir);
@@ -235,7 +240,17 @@ export function compareReleaseTags(a: string, b: string): number {
  */
 export async function resolveReleaseTag(): Promise<string> {
   const pinned = process.env[MLX_AGENT_TAG_ENV];
-  if (pinned) return pinned;
+  if (pinned) {
+    // A below-minimum pin can never satisfy probeAgentInstall: every launch
+    // would redownload it and then reject its own cache as stale. Refuse the
+    // pin instead of downloading something we know we cannot keep.
+    if (tagVersion(pinned) && compareReleaseTags(pinned, MLX_AGENT_MIN_RELEASE) < 0) {
+      throw new Error(
+        `${MLX_AGENT_TAG_ENV}=${pinned} is below the minimum supported release (${MLX_AGENT_MIN_RELEASE}).`,
+      );
+    }
+    return pinned;
+  }
 
   try {
     const res = await fetch(`${MLX_AGENT_R2_BASE}/${MLX_AGENT_LATEST_KEY}`, {
