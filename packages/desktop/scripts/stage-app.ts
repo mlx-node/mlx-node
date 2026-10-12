@@ -69,7 +69,7 @@ function workspaceDirFor(repoRoot: string, name: string): string | null {
  * copy precisely so the addon lives in exactly one place.
  */
 function isPrebuiltAddonPackage(name: string): boolean {
-  return /^@mlx-node\/core-/.test(name);
+  return name.startsWith('@mlx-node/core-');
 }
 
 /** Give only the bundled core loader an app-specific override. Other napi-rs

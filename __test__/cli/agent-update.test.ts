@@ -66,7 +66,7 @@ describe('resolveReleaseTag', () => {
 
   it('falls through to GitHub when the R2 latest is below the minimum', async () => {
     fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
-      const u = String(url);
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.1.0');
       return githubLatest('mlx-agent-v0.3.0');
     });
@@ -75,7 +75,7 @@ describe('resolveReleaseTag', () => {
 
   it('falls back to the minimum when every discovered tag is below it', async () => {
     fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
-      const u = String(url);
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.1.0');
       return githubLatest('mlx-agent-v0.1.0');
     });
