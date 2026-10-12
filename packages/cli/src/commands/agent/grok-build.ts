@@ -64,12 +64,23 @@ export interface GrokAgentLaunchOptions {
   serveToken?: string;
 }
 
-/** The binary's platform filename — CreateProcessW needs the `.exe` suffix. */
-function agentBinName(): string {
-  return process.platform === 'win32' ? 'mlx-agent.exe' : 'mlx-agent';
+/**
+ * The binary's platform filename — CreateProcessW needs the `.exe` suffix.
+ * With a release `tag` this is the versioned managed name (`<tag>` already
+ * carries the `mlx-agent-` prefix, so the filename IS the tag); without one,
+ * the legacy unversioned/base name.
+ */
+function agentBinName(tag?: string): string {
+  const base = tag ?? 'mlx-agent';
+  return process.platform === 'win32' ? `${base}.exe` : base;
 }
 
-/** Where the prebuilt download lives — the only binary `mlx agent update` manages. */
+/**
+ * Base path of the managed cache — the only location `mlx agent update`
+ * writes. Its `.tag` sibling is the pointer naming the release tag whose
+ * versioned binary (`bin/<tag>`) is live; legacy installs keep the binary at
+ * the base name itself.
+ */
 export function managedAgentBinPath(homeDir: string = homedir()): string {
   return join(homeDir, '.mlx-node', 'bin', agentBinName());
 }
@@ -105,7 +116,15 @@ export function probeAgentInstall(
   homeDir: string = homedir(),
 ): AgentInstallProbe {
   const managed = managedAgentBinPath(homeDir);
-  const managedTag = existsSync(managed) ? readAgentTag(managed) : undefined;
+  // The pointer names the release whose versioned binary is live; a
+  // versioned miss or a legacy install falls back to the unversioned base.
+  const stamped = readAgentTag(managed);
+  const versioned = stamped !== undefined ? join(dirname(managed), agentBinName(stamped)) : undefined;
+  const managedBin =
+    versioned !== undefined && existsSync(versioned) ? versioned : existsSync(managed) ? managed : undefined;
+  // The tag counts only with a binary on disk — an orphaned pointer left by
+  // a failed install must not suppress the next download.
+  const managedTag = managedBin !== undefined ? stamped : undefined;
 
   const envBin = env[MLX_AGENT_BIN_ENV];
   if (envBin) {
@@ -127,7 +146,7 @@ export function probeAgentInstall(
     const cacheWins = managedTag !== undefined && compareReleaseTags(managedTag, bundledTag ?? '') > 0;
     return {
       source: cacheWins ? 'managed' : 'bundled',
-      path: cacheWins ? managed : bundled,
+      path: cacheWins ? managedBin : bundled,
       managedTag,
       bundledTag,
       effectiveTag: cacheWins ? managedTag : bundledTag,
@@ -139,7 +158,7 @@ export function probeAgentInstall(
   // treated as stale — cheaper than trusting whatever was downloaded before
   // markers existed.
   if (managedTag !== undefined && compareReleaseTags(managedTag, MLX_AGENT_MIN_RELEASE) >= 0) {
-    return { source: 'managed', path: managed, managedTag, effectiveTag: managedTag };
+    return { source: 'managed', path: managedBin, managedTag, effectiveTag: managedTag };
   }
   return { source: 'none', managedTag };
 }
@@ -149,7 +168,8 @@ export function probeAgentInstall(
  *   1. `$MLX_AGENT_BIN` — developer / vendored-build override.
  *   2. `<repo>/grok-build/target/release/mlx-agent` — `yarn build:agent` output.
  *   3. `…/Contents/Resources/native/mlx-agent` — bundled inside the packaged app.
- *   4. `~/.mlx-node/bin/mlx-agent` — previously downloaded prebuilt.
+ *   4. `~/.mlx-node/bin/<tag>` — the downloaded prebuilt the `.tag` pointer
+ *      names (legacy: unversioned `~/.mlx-node/bin/mlx-agent`).
  *   5. Download a prebuilt release tarball into (4), then use it.
  */
 export async function resolveAgentBinary(repoRoot = findRepoRoot()): Promise<string> {
@@ -315,9 +335,14 @@ async function releaseChecksum(tag: string, asset: string): Promise<string | und
  * against the GitHub-published checksum before extracting — the desktop app
  * SIGNS these bytes, so a tampered mirror must never reach the bundle.
  * R2 mirror first, GitHub release as fallback.
+ *
+ * `dest` is the managed cache BASE path (`bin/mlx-agent`); the binary lands
+ * at `bin/<tag>` and the `<dest>.tag` pointer flips to it last, so a running
+ * previous version is never renamed over. Returns the versioned path.
  */
 export async function downloadAgentBinary(dest: string, tag?: string): Promise<string> {
   tag ??= await resolveReleaseTag();
+  const versioned = join(dirname(dest), agentBinName(tag));
   // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
   const platform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
@@ -364,29 +389,53 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     );
   }
   const tmp = join(dirname(dest), `${asset}.tmp-${process.pid}`);
-  const { writeFileSync, rmSync, chmodSync, renameSync } = await import('node:fs');
+  const { writeFileSync, rmSync, chmodSync, renameSync, readdirSync } = await import('node:fs');
   writeFileSync(tmp, Buffer.from(tar), { mode: 0o600 });
   const out = spawnSync('tar', ['-xzf', tmp, '-O'], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
   rmSync(tmp, { force: true });
   if (out.status !== 0 || out.stdout.length === 0) {
     throw new Error(`mlx agent: downloaded ${asset} but failed to unpack it`);
   }
-  // Atomic install: a sibling temp file renamed over dest. Truncating the
-  // live path fails ETXTBSY on Linux while an agent runs and can expose a
-  // half-written binary to a concurrent launch everywhere else.
+  // Atomic install: a sibling temp file renamed over the versioned path.
+  // Truncating the live path fails ETXTBSY on Linux while an agent runs and
+  // can expose a half-written binary to a concurrent launch everywhere else
+  // — and on Windows a running binary cannot be replaced at all, which is
+  // why installs write a NEW filename per release instead of dest itself.
   const staged = join(dirname(dest), `.mlx-agent.tmp-${process.pid}`);
   try {
     writeFileSync(staged, out.stdout, { mode: 0o700 });
-    renameSync(staged, dest);
+    renameSync(staged, versioned);
   } catch (error) {
     rmSync(staged, { force: true });
     throw error;
   }
-  chmodSync(dest, 0o700);
-  // Record which release produced this binary — the marker is what
-  // resolveAgentBinary checks against the CLI's minimum on the next launch.
-  writeFileSync(`${dest}.tag`, tag, { mode: 0o600 });
-  return dest;
+  chmodSync(versioned, 0o700);
+  // The pointer flips LAST and atomically (sibling tmp + rename): probes
+  // either see the old tag with its binary still on disk, or the new tag
+  // with this file already in place — never a tag naming a missing binary.
+  const stagedTag = `${dest}.tag.tmp-${process.pid}`;
+  try {
+    writeFileSync(stagedTag, tag, { mode: 0o600 });
+    renameSync(stagedTag, `${dest}.tag`);
+  } catch (error) {
+    rmSync(stagedTag, { force: true });
+    throw error;
+  }
+  // Old versioned binaries accumulate (~100MB each). A still-running one
+  // cannot be deleted on Windows — expected; leave it for the next sweep.
+  try {
+    for (const entry of readdirSync(dirname(dest))) {
+      if (!entry.startsWith('mlx-agent-v') || entry === agentBinName(tag)) continue;
+      try {
+        rmSync(join(dirname(dest), entry), { force: true });
+      } catch {
+        // locked by a running agent — next sweep gets it
+      }
+    }
+  } catch {
+    // cache dir unreadable — not fatal to a completed install
+  }
+  return versioned;
 }
 
 /** What `mlx agent update --check` reports and the desktop tray consumes. */
@@ -397,7 +446,10 @@ export interface AgentUpdateStatus {
   latest: string;
   /** A newer managed download is available. */
   updateAvailable: boolean;
-  /** Path `mlx agent update` writes; the managed download cache. */
+  /**
+   * Base path of the managed cache `mlx agent update` writes — the binary
+   * lands at the sibling `<tag>` file its `.tag` pointer names, not here.
+   */
   managedPath: string;
   /**
    * How the NEXT `mlx agent` resolves its binary. `env`/`vendored` pins

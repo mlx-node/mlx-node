@@ -11,7 +11,7 @@
  * bit-identical to what a standalone CLI would fetch.
  */
 
-import { chmodSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,6 +25,11 @@ const { downloadAgentBinary } = await import(
 
 const dest = join(HERE, '..', 'out', 'agent', 'mlx-agent');
 mkdirSync(dirname(dest), { recursive: true });
+// dest is the managed base path: the binary lands at the sibling
+// `mlx-agent-v<tag>` file the `.tag` pointer names. package.ts stages the
+// bundle under the unversioned name, so fold it back here — the `.tag`
+// marker already sits at `${dest}.tag`.
 const path = await downloadAgentBinary(dest);
-chmodSync(path, 0o755);
-console.log(`mlx-agent staged at ${path}`);
+renameSync(path, dest);
+chmodSync(dest, 0o755);
+console.log(`mlx-agent staged at ${dest}`);

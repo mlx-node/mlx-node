@@ -1,12 +1,16 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
 import {
   agentUpdateStatus,
   applyAgentUpdate,
+  downloadAgentBinary,
+  managedAgentBinPath,
   probeAgentInstall,
   resolveReleaseTag,
   MLX_AGENT_BIN_ENV,
@@ -37,6 +41,143 @@ describe('probeAgentInstall', () => {
 
   it('rejects a missing MLX_AGENT_BIN path', () => {
     expect(() => probeAgentInstall(undefined, { [MLX_AGENT_BIN_ENV]: '/no/such/bin' })).toThrow(MLX_AGENT_BIN_ENV);
+  });
+
+  const EXE = process.platform === 'win32' ? '.exe' : '';
+  const versioned = (home: string, tag: string) => join(home, '.mlx-node', 'bin', `${tag}${EXE}`);
+  const mkdirBin = (home: string) => mkdirSync(join(home, '.mlx-node', 'bin'), { recursive: true });
+
+  it('resolves the versioned binary the .tag pointer names', () => {
+    const root = mkdtempSync(join(tmpdir(), 'probe-'));
+    try {
+      mkdirBin(root);
+      writeFileSync(versioned(root, 'mlx-agent-v0.2.0'), 'v020');
+      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.2.0');
+      const probe = probeAgentInstall(root, {}, root);
+      expect(probe).toMatchObject({
+        source: 'managed',
+        path: versioned(root, 'mlx-agent-v0.2.0'),
+        managedTag: 'mlx-agent-v0.2.0',
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers the versioned binary the pointer names while an older versioned file remains', () => {
+    const root = mkdtempSync(join(tmpdir(), 'probe-'));
+    try {
+      mkdirBin(root);
+      writeFileSync(versioned(root, 'mlx-agent-v0.2.0'), 'v020');
+      writeFileSync(versioned(root, 'mlx-agent-v0.3.0'), 'v030');
+      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.3.0');
+      const probe = probeAgentInstall(root, {}, root);
+      expect(probe).toMatchObject({ source: 'managed', path: versioned(root, 'mlx-agent-v0.3.0') });
+      expect(readFileSync(probe.path!, 'utf-8')).toBe('v030');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to a legacy unversioned binary when the versioned file is absent', () => {
+    const root = mkdtempSync(join(tmpdir(), 'probe-'));
+    try {
+      mkdirBin(root);
+      const legacy = managedAgentBinPath(root);
+      writeFileSync(legacy, 'legacy');
+      writeFileSync(`${legacy}.tag`, 'mlx-agent-v0.2.0');
+      const probe = probeAgentInstall(root, {}, root);
+      expect(probe).toMatchObject({ source: 'managed', path: legacy, managedTag: 'mlx-agent-v0.2.0' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('treats an orphaned .tag pointer as no install', () => {
+    const root = mkdtempSync(join(tmpdir(), 'probe-'));
+    try {
+      mkdirBin(root);
+      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.2.0');
+      const probe = probeAgentInstall(root, {}, root);
+      expect(probe).toMatchObject({ source: 'none', managedTag: undefined });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('downloadAgentBinary', () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.spyOn(globalThis, 'fetch');
+  });
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  /** Real tar.gz on stdout containing a single file holding `content`. */
+  function makeTarball(dir: string, content: string): Buffer {
+    const file = join(dir, 'agent-bin');
+    writeFileSync(file, content);
+    const out = spawnSync('tar', ['-czf', '-', '-C', dir, 'agent-bin']);
+    rmSync(file, { force: true });
+    expect(out.status, `tar pack failed: ${out.stderr?.toString()}`).toBe(0);
+    return out.stdout;
+  }
+
+  function mockMirrors(tar: Buffer): string {
+    const sha = createHash('sha256').update(tar).digest('hex');
+    fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      if (u.endsWith('.sha256')) return new Response(sha);
+      if (u.endsWith('.tar.gz')) return new Response(new Uint8Array(tar));
+      return new Response('nope', { status: 404 });
+    });
+    return sha;
+  }
+
+  it('installs the versioned binary + pointer and never writes the unversioned base', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      mockMirrors(makeTarball(home, 'fake-agent-binary'));
+      const dest = managedAgentBinPath(home);
+      const path = await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(path).toBe(join(dirname(dest), `mlx-agent-v0.3.0${process.platform === 'win32' ? '.exe' : ''}`));
+      expect(readFileSync(path, 'utf-8')).toBe('fake-agent-binary');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      expect(existsSync(dest)).toBe(false);
+
+      const probe = probeAgentInstall(home, {}, home);
+      expect(probe).toMatchObject({ source: 'managed', path, managedTag: 'mlx-agent-v0.3.0' });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('flips the pointer to the new versioned binary and sweeps old versions', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dest = managedAgentBinPath(home);
+      const versionedName = (tag: string) =>
+        join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
+
+      mockMirrors(makeTarball(home, 'v020'));
+      const old = await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
+      expect(old).toBe(versionedName('mlx-agent-v0.2.0'));
+
+      mockMirrors(makeTarball(home, 'v030'));
+      const current = await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(current).toBe(versionedName('mlx-agent-v0.3.0'));
+      expect(readFileSync(current, 'utf-8')).toBe('v030');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      expect(existsSync(old)).toBe(false);
+
+      const probe = probeAgentInstall(home, {}, home);
+      expect(probe).toMatchObject({ source: 'managed', path: current, managedTag: 'mlx-agent-v0.3.0' });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
