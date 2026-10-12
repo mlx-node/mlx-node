@@ -241,12 +241,13 @@ export function compareReleaseTags(a: string, b: string): number {
 export async function resolveReleaseTag(): Promise<string> {
   const pinned = process.env[MLX_AGENT_TAG_ENV];
   if (pinned) {
-    // A below-minimum pin can never satisfy probeAgentInstall: every launch
+    // A pin that is malformed or below the minimum can never satisfy
+    // probeAgentInstall — its marker sorts below the floor, so every launch
     // would redownload it and then reject its own cache as stale. Refuse the
     // pin instead of downloading something we know we cannot keep.
-    if (tagVersion(pinned) && compareReleaseTags(pinned, MLX_AGENT_MIN_RELEASE) < 0) {
+    if (!tagVersion(pinned) || compareReleaseTags(pinned, MLX_AGENT_MIN_RELEASE) < 0) {
       throw new Error(
-        `${MLX_AGENT_TAG_ENV}=${pinned} is below the minimum supported release (${MLX_AGENT_MIN_RELEASE}).`,
+        `${MLX_AGENT_TAG_ENV}=${pinned} is not a supported release tag (expected mlx-agent-vX.Y.Z at or above ${MLX_AGENT_MIN_RELEASE}).`,
       );
     }
     return pinned;

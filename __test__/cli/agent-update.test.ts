@@ -88,6 +88,14 @@ describe('resolveReleaseTag', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('rejects a malformed pinned tag instead of looping the download', async () => {
+    for (const bad of ['v0.3.0', 'mlx-agent-latest', 'mlx-agent-v0.3']) {
+      process.env[MLX_AGENT_TAG_ENV] = bad;
+      await expect(resolveReleaseTag()).rejects.toThrow(MLX_AGENT_TAG_ENV);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('honors a pinned tag at or above the minimum', async () => {
     process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.9.0';
     await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.9.0');
