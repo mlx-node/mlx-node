@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -139,6 +139,19 @@ export function probeAgentInstall(
   const bundled = findBundledAppBinary();
   const bundledTag = bundled ? readAgentTag(bundled) : undefined;
 
+  // An MLX_AGENT_TAG pin selects exactly that managed release — newer or
+  // older than the pointer or bundle, the pin wins (developer env/vendored
+  // pins still shadow it). A pin the cache cannot satisfy resolves as
+  // 'none' so the launcher downloads that exact release instead of
+  // silently running whatever is cached.
+  const pin = releasePin(env);
+  if (pin !== undefined) {
+    const pinnedBin = join(dirname(managed), agentBinName(pin));
+    return existsSync(pinnedBin)
+      ? { source: 'managed', path: pinnedBin, managedTag, bundledTag, effectiveTag: pin }
+      : { source: 'none', managedTag, bundledTag };
+  }
+
   // Bundled-vs-cache: the newer release tag wins. A freshly `mlx agent
   // update`d download in ~/.mlx-node/bin must not be shadowed by the older
   // bundled binary, and an unmarked cache never beats a stamped bundle.
@@ -167,10 +180,12 @@ export function probeAgentInstall(
  * Locate the agent binary, in priority order:
  *   1. `$MLX_AGENT_BIN` — developer / vendored-build override.
  *   2. `<repo>/grok-build/target/release/mlx-agent` — `yarn build:agent` output.
- *   3. `…/Contents/Resources/native/mlx-agent` — bundled inside the packaged app.
- *   4. `~/.mlx-node/bin/<tag>` — the downloaded prebuilt the `.tag` pointer
+ *   3. `$MLX_AGENT_TAG` pin — exactly that managed release, ahead of
+ *      bundled/latest (downloaded into the cache when absent).
+ *   4. `…/Contents/Resources/native/mlx-agent` — bundled inside the packaged app.
+ *   5. `~/.mlx-node/bin/<tag>` — the downloaded prebuilt the `.tag` pointer
  *      names (legacy: unversioned `~/.mlx-node/bin/mlx-agent`).
- *   5. Download a prebuilt release tarball into (4), then use it.
+ *   6. Download a prebuilt release tarball into (5), then use it.
  */
 export async function resolveAgentBinary(repoRoot = findRepoRoot()): Promise<string> {
   const probe = probeAgentInstall(repoRoot);
@@ -253,25 +268,34 @@ export function compareReleaseTags(a: string, b: string): number {
 }
 
 /**
+ * A valid `MLX_AGENT_TAG` pin selects exactly that release. Invalid pins
+ * throw wherever the pin is consulted — probe included — so a stale or
+ * mismatched cache can never mask a misspelled pin and run anyway.
+ */
+function releasePin(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const pinned = env[MLX_AGENT_TAG_ENV];
+  if (!pinned) return undefined;
+  // A pin that is malformed or below the minimum can never satisfy
+  // probeAgentInstall — its marker sorts below the floor, so every launch
+  // would redownload it and then reject its own cache as stale. Refuse the
+  // pin instead of downloading something we know we cannot keep.
+  if (!tagVersion(pinned) || compareReleaseTags(pinned, MLX_AGENT_MIN_RELEASE) < 0) {
+    throw new Error(
+      `${MLX_AGENT_TAG_ENV}=${pinned} is not a supported release tag (expected mlx-agent-vX.Y.Z at or above ${MLX_AGENT_MIN_RELEASE}).`,
+    );
+  }
+  return pinned;
+}
+
+/**
  * Which release tag to download: `MLX_AGENT_TAG` override, then the R2
  * `latest` pointer (the release pipeline maintains it), then GitHub's
  * /releases/latest, then the baked minimum. Fork releases can ship at any
  * cadence and a CLI rebuild picks them up with no pin bump.
  */
 export async function resolveReleaseTag(): Promise<string> {
-  const pinned = process.env[MLX_AGENT_TAG_ENV];
-  if (pinned) {
-    // A pin that is malformed or below the minimum can never satisfy
-    // probeAgentInstall — its marker sorts below the floor, so every launch
-    // would redownload it and then reject its own cache as stale. Refuse the
-    // pin instead of downloading something we know we cannot keep.
-    if (!tagVersion(pinned) || compareReleaseTags(pinned, MLX_AGENT_MIN_RELEASE) < 0) {
-      throw new Error(
-        `${MLX_AGENT_TAG_ENV}=${pinned} is not a supported release tag (expected mlx-agent-vX.Y.Z at or above ${MLX_AGENT_MIN_RELEASE}).`,
-      );
-    }
-    return pinned;
-  }
+  const pin = releasePin();
+  if (pin !== undefined) return pin;
 
   try {
     const res = await fetch(`${MLX_AGENT_R2_BASE}/${MLX_AGENT_LATEST_KEY}`, {
@@ -389,53 +413,102 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     );
   }
   const tmp = join(dirname(dest), `${asset}.tmp-${process.pid}`);
-  const { writeFileSync, rmSync, chmodSync, renameSync, readdirSync } = await import('node:fs');
+  const { chmodSync, renameSync, readdirSync } = await import('node:fs');
   writeFileSync(tmp, Buffer.from(tar), { mode: 0o600 });
   const out = spawnSync('tar', ['-xzf', tmp, '-O'], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
   rmSync(tmp, { force: true });
   if (out.status !== 0 || out.stdout.length === 0) {
     throw new Error(`mlx agent: downloaded ${asset} but failed to unpack it`);
   }
-  // Atomic install: a sibling temp file renamed over the versioned path.
-  // Truncating the live path fails ETXTBSY on Linux while an agent runs and
-  // can expose a half-written binary to a concurrent launch everywhere else
-  // — and on Windows a running binary cannot be replaced at all, which is
-  // why installs write a NEW filename per release instead of dest itself.
-  const staged = join(dirname(dest), `.mlx-agent.tmp-${process.pid}`);
+  // The staged write → pointer flip → sweep sequence runs under a lockfile:
+  // two concurrent installs of different tags must not let one process'
+  // sweep delete the version the other's pointer just selected.
+  const locked = acquireInstallLock(`${dest}.lock`);
   try {
-    writeFileSync(staged, out.stdout, { mode: 0o700 });
-    renameSync(staged, versioned);
-  } catch (error) {
-    rmSync(staged, { force: true });
-    throw error;
-  }
-  chmodSync(versioned, 0o700);
-  // The pointer flips LAST and atomically (sibling tmp + rename): probes
-  // either see the old tag with its binary still on disk, or the new tag
-  // with this file already in place — never a tag naming a missing binary.
-  const stagedTag = `${dest}.tag.tmp-${process.pid}`;
-  try {
-    writeFileSync(stagedTag, tag, { mode: 0o600 });
-    renameSync(stagedTag, `${dest}.tag`);
-  } catch (error) {
-    rmSync(stagedTag, { force: true });
-    throw error;
-  }
-  // Old versioned binaries accumulate (~100MB each). A still-running one
-  // cannot be deleted on Windows — expected; leave it for the next sweep.
-  try {
-    for (const entry of readdirSync(dirname(dest))) {
-      if (!entry.startsWith('mlx-agent-v') || entry === agentBinName(tag)) continue;
+    // Atomic install: a sibling temp file renamed over the versioned path.
+    // Truncating the live path fails ETXTBSY on Linux while an agent runs and
+    // can expose a half-written binary to a concurrent launch everywhere else
+    // — and on Windows a running binary cannot be replaced at all, which is
+    // why installs write a NEW filename per release instead of dest itself.
+    const staged = join(dirname(dest), `.mlx-agent.tmp-${process.pid}`);
+    try {
+      writeFileSync(staged, out.stdout, { mode: 0o700 });
+      renameSync(staged, versioned);
+      chmodSync(versioned, 0o700);
+      // The pointer flips LAST and atomically (sibling tmp + rename): probes
+      // either see the old tag with its binary still on disk, or the new tag
+      // with this file already in place — never a tag naming a missing binary.
+      const stagedTag = `${dest}.tag.tmp-${process.pid}`;
       try {
-        rmSync(join(dirname(dest), entry), { force: true });
-      } catch {
-        // locked by a running agent — next sweep gets it
+        writeFileSync(stagedTag, tag, { mode: 0o600 });
+        renameSync(stagedTag, `${dest}.tag`);
+      } catch (error) {
+        rmSync(stagedTag, { force: true });
+        throw error;
       }
+    } catch (error) {
+      rmSync(staged, { force: true });
+      throw error;
     }
-  } catch {
-    // cache dir unreadable — not fatal to a completed install
+    // Old versioned binaries accumulate (~100MB each). A still-running one
+    // cannot be deleted on Windows — expected; leave it for the next sweep.
+    // The pointer is re-read here so a sweep can never remove the release a
+    // live pointer names, even if a third party flipped it mid-install.
+    const live = readAgentTag(dest);
+    const keep = new Set([agentBinName(tag), ...(live !== undefined ? [agentBinName(live)] : [])]);
+    try {
+      for (const entry of readdirSync(dirname(dest))) {
+        if (!entry.startsWith('mlx-agent-v') || keep.has(entry)) continue;
+        try {
+          rmSync(join(dirname(dest), entry), { force: true });
+        } catch {
+          // locked by a running agent — next sweep gets it
+        }
+      }
+    } catch {
+      // cache dir unreadable — not fatal to a completed install
+    }
+  } finally {
+    releaseInstallLock(`${dest}.lock`, locked);
   }
   return versioned;
+}
+
+/**
+ * Serialize the install critical section across processes. `<dest>.lock` is
+ * created with `wx` (fails while held); a holder that died mid-install
+ * leaves the file behind, so a lock older than the stale threshold is
+ * stolen. Waiting past the deadline proceeds unlocked — an update that
+ * eventually lands beats one that spins forever on a wedged lock.
+ */
+function acquireInstallLock(path: string): boolean {
+  const STALE_MS = 30_000;
+  const DEADLINE_MS = 10_000;
+  const deadline = Date.now() + DEADLINE_MS;
+  while (true) {
+    try {
+      writeFileSync(path, String(process.pid), { flag: 'wx', mode: 0o600 });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
+      try {
+        if (Date.now() - statSync(path).mtimeMs > STALE_MS) rmSync(path, { force: true });
+      } catch {
+        // vanished between checks — retry create
+      }
+      if (Date.now() > deadline) return false;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+}
+
+function releaseInstallLock(path: string, held: boolean): void {
+  if (!held) return;
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    // lock cleanup is best-effort
+  }
 }
 
 /** What `mlx agent update --check` reports and the desktop tray consumes. */
@@ -475,6 +548,7 @@ export interface AgentUpdateDeps {
 export async function agentUpdateStatus(deps: AgentUpdateDeps = {}): Promise<AgentUpdateStatus> {
   const probe = deps.probe ?? (() => probeAgentInstall());
   const resolveTag = deps.resolveTag ?? resolveReleaseTag;
+  const managedPath = deps.managedPath ?? managedAgentBinPath();
   const [latest, install] = await Promise.all([resolveTag(), Promise.resolve(probe())]);
   const current = install.effectiveTag ?? null;
   // Update is needed when the newest artifact ON DISK trails latest. The
@@ -485,11 +559,17 @@ export async function agentUpdateStatus(deps: AgentUpdateDeps = {}): Promise<Age
       tag !== undefined && tag !== null && (best === null || compareReleaseTags(tag, best) > 0) ? tag : best,
     null,
   );
+  // An exact pin asks for that tag specifically: older cache, newer cache,
+  // or bundle — anything else on disk still needs the pinned download.
+  const pin = releasePin();
+  const pinnedInstalled =
+    pin !== undefined &&
+    (install.effectiveTag === pin || existsSync(join(dirname(managedPath), agentBinName(pin))));
   return {
     current,
     latest,
-    updateAvailable: newest === null || compareReleaseTags(latest, newest) > 0,
-    managedPath: deps.managedPath ?? managedAgentBinPath(),
+    updateAvailable: pin !== undefined ? !pinnedInstalled : newest === null || compareReleaseTags(latest, newest) > 0,
+    managedPath,
     pinned: install.source,
   };
 }
