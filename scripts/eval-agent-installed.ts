@@ -59,7 +59,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   const options = evalOptions(args);
   if (options.help) {
     console.log(
-      'Usage: vp exec oxnode scripts/eval-agent-installed.ts [--entrypoint agent|delegate|app] [--case ID] [--split all|development|holdout] [--repeat 1..20] [--seed VALUE] [--output NEW_DIR] [--list]\nRuns the real built mlx CLI with --mode rpc, or the App detector and production desktop sidecar. Uses entrypoint defaults, without inference tuning overrides.',
+      'Usage: vp exec oxnode scripts/eval-agent-installed.ts [--entrypoint agent|delegate|app] [--case ID] [--split all|development|holdout] [--repeat 1..20] [--seed VALUE] [--output NEW_DIR] [--list]\nRuns the installed mlx-agent binary headless (one -p run per case) against a spawned `mlx serve`, mirroring `mlx agent`/`mlx delegate`, or the App detector and production desktop sidecar. Uses entrypoint defaults, without inference tuning overrides.',
     );
     return 0;
   }
@@ -85,13 +85,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
         'evals/agent-installed/process-memory.ts',
         'scripts/eval-agent-installed.ts',
         'packages/cli/dist/cli.js',
-        'packages/cli/dist/commands/agent/index.js',
-        'packages/cli/dist/commands/agent/grok-build.js',
-        'packages/cli/dist/commands/delegate.js',
-        'packages/agent/dist/delegate.js',
-        'packages/agent/dist/models.js',
-        'packages/agent/dist/provider/model-host.js',
-        'packages/agent/dist/provider/stream-adapter.js',
+        'packages/cli/dist/commands/serve.js',
+        'packages/cli/src/commands/agent/index.ts',
+        'packages/cli/src/commands/agent/grok-build.ts',
+        'packages/cli/src/commands/delegate.ts',
+        'packages/agent/src/delegate.ts',
+        'packages/agent/src/paths.ts',
+        'packages/lm/src/model-discovery.ts',
+        'packages/server/src/host/paths.ts',
       ].map(async (path) => [path, sha256(await readFile(join(root, path), 'utf8'))]),
     ),
   );
@@ -116,12 +117,12 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
         /^(MLX_(PAGED_|CACHE_LIMIT|IDLE_CLEAR|CONTINUOUS_BATCHING|SERVE_FORCE_SERIAL)|GROK_HOME$)/.test(key),
       ),
     ),
-    note: 'Actual mlx CLI with normal saved settings, default model, tools, system prompt, paged cache, permissions and session persistence. RPC changes transport only. The detector rubric is a user task, not a system-prompt override. This measures CLI installation classification and read-tool/session behavior, not the dashboard HTTP completion path or live Codex instruction loading. File-layout/verdict-cache behavior is covered separately by service unit tests. Synthetic evidence and labels are fixed before this run.',
+    note: "Installed mlx-agent binary run headless (`-p`, streaming-messages-json) against a spawned `mlx serve`, the same process/env pairing `mlx agent` and `mlx delegate` perform; the serve is shared across cases so the model stays loaded, and each case is a fresh session. Default model follows the CLI's own selection (persisted pick, else first discovered); tools, system prompt, permissions and session persistence use the entrypoint's normal defaults. The detector rubric is a user task, not a system-prompt override. This measures agent installation classification and read-file/session behavior, not the dashboard HTTP completion path or live Codex instruction loading. File-layout/verdict-cache behavior is covered separately by service unit tests. Synthetic evidence and labels are fixed before this run.",
   };
   await writeFile(join(output, 'metadata.json'), JSON.stringify(metadata, null, 2) + '\n');
   await writeFile(join(output, 'cases.json'), JSON.stringify(options.cases, null, 2) + '\n');
   console.log(
-    `Starting mlx ${options.entrypoint} with its normal defaults. ${metadata.plannedSamples} cases. ${output}`,
+    `Starting mlx ${options.entrypoint} eval with its normal defaults. ${metadata.plannedSamples} cases. ${output}`,
   );
   const cli = new AgentCli(root, options.entrypoint, workspace, output);
   const samples: AgentSample[] = [];
@@ -135,17 +136,21 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-  const memory = observeProcess(cli.child.pid!, join(output, 'memory.jsonl'));
+  let memory: ReturnType<typeof observeProcess> | undefined;
   let timeout = setTimeout(() => {
-    fatal = 'CLI startup timed out.';
+    fatal = 'Runtime startup timed out.';
     void close();
   }, 60_000);
   try {
-    initialState = (await cli.request('get_state')) as AgentState;
+    // Probe the binary + default model and boot `mlx serve` (the process the
+    // memory observer and metrics trace follow; per-case agent children are
+    // short-lived).
+    initialState = await cli.start();
+    memory = observeProcess(cli.child.pid!, join(output, 'memory.jsonl'));
     clearTimeout(timeout);
     if (initialState.model?.provider !== 'mlx')
       throw new Error('No local model selected. Install/select one in mlx agent first.');
-    console.log(`Selected ${initialState.model.id}; thinking ${initialState.thinkingLevel}. No settings overridden.`);
+    console.log(`Selected ${initialState.model.id}. No settings overridden.`);
     await writeFile(join(output, 'initial-state.json'), JSON.stringify(initialState, null, 2) + '\n');
     for (let repeat = 1; repeat <= options.repeat; repeat++) {
       const ordered = [...options.cases].sort((a, b) =>
@@ -154,7 +159,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
       for (const fixture of ordered) {
         if (fatal) break;
         const runId = `${repeat}-${fixture.id}`;
-        memory.phase(runId);
+        memory?.phase(runId);
         timeout = setTimeout(() => {
           fatal = `Case ${runId} timed out after 5 minutes.`;
           void close();
@@ -176,12 +181,13 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     fatal ??= String(error);
   } finally {
     clearTimeout(timeout);
-    await memory.stop();
+    await memory?.stop();
     await close();
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
   }
   const { modelCalls: taskRequests, ...scores } = summarize(samples);
+  const memorySummary = memory?.summary ?? { peakRssBytes: 0, peakPhysicalBytes: undefined };
   const summary = {
     ...scores,
     taskRequests,
@@ -189,9 +195,11 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     complete: !fatal && samples.length === metadata.plannedSamples,
     fatal,
     initialState,
-    memory: memory.summary,
+    memory: memorySummary,
   };
   for (const date of new Set([metadata.startedAt.slice(0, 10), new Date().toISOString().slice(0, 10)])) {
+    // The metrics trace is keyed by the serve child pid — inference happens there.
+    if (cli.child?.pid === undefined) break;
     const trace = join(metricsTraceDir(), `${date}-${cli.child.pid}.jsonl`);
     try {
       const records = await readFile(trace, 'utf8');
@@ -207,11 +215,11 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     [
       '# Agent installation CLI eval',
       '',
-      `Command: mlx ${options.entrypoint} --mode rpc`,
-      `Model: ${initialState?.model?.id ?? 'unavailable'}; thinking: ${initialState?.thinkingLevel ?? 'unavailable'} (normal defaults).`,
+      `Command: mlx-agent ${cliInvocation(root, options.entrypoint).join(' ')} (against spawned mlx serve; mirrors mlx ${options.entrypoint}).`,
+      `Model: ${initialState?.model?.id ?? 'unavailable'} (normal defaults).`,
       `Result: ${summary.passed}/${summary.total} passed; ${metadata.plannedSamples} planned. Complete: ${summary.complete}.`,
       `False installed: ${summary.falseInstalled}; errors: ${summary.errors}.`,
-      `Observed physical footprint peak: ${memory.summary.peakPhysicalBytes === undefined ? 'unavailable' : (memory.summary.peakPhysicalBytes / 2 ** 30).toFixed(2) + ' GiB'}. Sampled RSS peak: ${(memory.summary.peakRssBytes / 2 ** 30).toFixed(2)} GiB. External observation only; no allocator/cache override.`,
+      `Observed physical footprint peak: ${memorySummary.peakPhysicalBytes === undefined ? 'unavailable' : (memorySummary.peakPhysicalBytes / 2 ** 30).toFixed(2) + ' GiB'}. Sampled RSS peak: ${(memorySummary.peakRssBytes / 2 ** 30).toFixed(2)} GiB. External observation of the mlx serve process only; no allocator/cache override.`,
       `Task latency p50/p95: ${summary.latencyMs.p50?.toFixed(0) ?? 'n/a'} / ${summary.latencyMs.p95?.toFixed(0) ?? 'n/a'} ms. First task includes lazy model load; tasks include tool calls and natural cache reuse.`,
       '',
       '| Split/category | Passed | Total |',
@@ -227,7 +235,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
       '',
       metadata.note,
       '',
-      'CLI events: events.jsonl. Inference metrics: metrics.jsonl. Diagnostics: stderr.log when emitted. Saved sessions and copies: samples.jsonl / sessions/. Memory: memory.jsonl. Exact fixtures and source hashes: cases.json / metadata.json.',
+      'Agent events: events.jsonl. Inference metrics: metrics.jsonl. Diagnostics: serve.log / stderr.log. Saved sessions and copies: samples.jsonl / sessions/. Memory: memory.jsonl. Exact fixtures and source hashes: cases.json / metadata.json.',
       '',
     ].join('\n'),
   );

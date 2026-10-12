@@ -1,37 +1,67 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { appendFileSync } from 'node:fs';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { appendFileSync, existsSync, realpathSync } from 'node:fs';
+import { readdir, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { StringDecoder } from 'node:string_decoder';
 
 import { parseLocalJson } from '../../packages/agent/src/delegate.js';
+import { agentConfigDir } from '../../packages/agent/src/paths.js';
+import { probeAgentInstall } from '../../packages/cli/src/commands/agent/grok-build.js';
+import { chooseDefaultModel, readPersistedDefaultModel } from '../../packages/cli/src/commands/agent/index.js';
+import { DELEGATE_DEFAULT_ARGS } from '../../packages/cli/src/commands/delegate.js';
 import {
   DETECTION_SYSTEM,
   detectionMessage,
   detectionResult,
 } from '../../packages/dashboard/src/coding-agent-detection.js';
+import { discoverLocalChatModels } from '../../packages/lm/src/model-discovery.js';
+import { resolveModelsDir } from '../../packages/server/src/host/paths.js';
 import { selectedText, type DetectionCase } from './cases.js';
 import { grade, type Sample } from './evaluate.js';
 
 export interface AgentState {
   model?: { id: string; provider: string };
+  /** Not exposed by the new binary's headless output; always undefined here. */
   thinkingLevel?: string;
-  sessionFile?: string;
+  /** Session transcript directory under `<grok home>/sessions/<encoded cwd>/<id>/`. */
+  sessionDir?: string;
   sessionId?: string;
 }
 
+/**
+ * One line of `mlx-agent -p --output-format streaming-messages-json`: the
+ * Messages API `stream-json` wire format. Only the fields the eval consumes
+ * are typed; everything else stays `unknown`.
+ */
 interface Event {
   type: string;
+  subtype?: string;
+  session_id?: string;
+  model?: string;
+  is_error?: boolean;
+  stop_reason?: string;
+  result?: string;
+  errors?: unknown;
+  message?: {
+    role: string;
+    model?: string;
+    stop_reason?: string;
+    content?: ContentBlock[];
+  };
+}
+
+interface ContentBlock {
+  type: string;
+  text?: string;
+  /** `tool_use` id and `server_tool_use`/`tool_use` name. */
   id?: string;
-  success?: boolean;
-  error?: string;
-  data?: unknown;
-  method?: string;
-  toolName?: string;
-  toolCallId?: string;
-  args?: { path?: string };
-  isError?: boolean;
-  message?: { role: string; stopReason?: string; errorMessage?: string; content?: { type: string; text?: string }[] };
+  name?: string;
+  input?: Record<string, unknown>;
+  /** `tool_result` linkage and error flag. */
+  tool_use_id?: string;
+  is_error?: boolean;
 }
 
 /** LF framing preserves Unicode separators and UTF-8 characters across pipe chunks. */
@@ -50,103 +80,270 @@ export class JsonLines {
   }
 }
 
-/** Only the transport mode is selected. All runtime settings remain the CLI's. */
-export function cliInvocation(root: string, entrypoint: 'agent' | 'delegate'): string[] {
-  return [join(root, 'packages/cli/dist/cli.js'), entrypoint, '--mode', 'rpc'];
+/** Args the real `mlx <entrypoint>` injects ahead of the prompt. */
+function entrypointArgs(entrypoint: 'agent' | 'delegate'): string[] {
+  // `mlx delegate` owns the worker profile; bare `mlx agent -p` still needs a
+  // non-interactive permission mode so reads cannot block on a prompt.
+  return entrypoint === 'delegate' ? DELEGATE_DEFAULT_ARGS : ['--permission-mode', 'auto'];
 }
 
+/**
+ * Shape of every per-case agent invocation, for reports. `<…>` placeholders
+ * are filled at spawn time; the inference host runs separately as
+ * `mlx serve --port 0 --auth-token <token>`.
+ */
+export function cliInvocation(_root: string, entrypoint: 'agent' | 'delegate'): string[] {
+  return [
+    '<mlx-agent>',
+    '-m',
+    '<default model>',
+    ...entrypointArgs(entrypoint),
+    '--prompt-file',
+    '<prompt file>',
+    '--output-format',
+    'streaming-messages-json',
+    '--cwd',
+    '<workspace>',
+  ];
+}
+
+export interface PromptOutcome {
+  events: Event[];
+  /** The `system`/`init` line, when emitted (carries session_id and model). */
+  init?: Event;
+  /** The terminal `result` line; absent when the run failed before finishing. */
+  result?: Event;
+  /** `stop_reason` of the result line (`end_turn`, `max_tokens`, …). */
+  stopReason?: string;
+}
+
+/**
+ * The installed-agent runtime: ONE `mlx serve` child plus one
+ * `mlx-agent -p` child per case — the same pairing `mlx agent` performs via
+ * `launchGrokAgent` (ephemeral port, bearer token, `GROK_*_BASE_URL` env), but
+ * the serve survives between cases so the model stays loaded. Each `-p` run
+ * is a fresh session in the normal `~/.mlx-agent` store, like the old
+ * `new_session` RPC. No env/model/cache/thinking/tool/prompt override beyond
+ * the entrypoint's own defaults — the CLI's default-model selection is
+ * replicated via `chooseDefaultModel` so the eval still does not pick one.
+ */
 export class AgentCli {
-  readonly child: ChildProcessWithoutNullStreams;
-  private nextId = 0;
-  private pending = new Map<string, { resolve: (data: unknown) => void; reject: (error: Error) => void }>();
-  private turn?: { events: Event[]; resolve: (events: Event[]) => void; reject: (error: Error) => void };
+  /** The `mlx serve` child once started; memory observation targets it. */
+  child!: ChildProcess;
+  /** Model id injected as `-m`, mirroring `mlx agent`'s default resolution. */
+  modelId!: string;
+  private bin!: string;
+  private serveUrl!: string;
+  private serveToken!: string;
+  private agentEnv!: NodeJS.ProcessEnv;
+  private active?: { child: ChildProcess; reject: (error: Error) => void };
   private failure?: Error;
   private closing = false;
-  private exited: Promise<void>;
 
-  constructor(root: string, entrypoint: 'agent' | 'delegate', cwd: string, output: string) {
-    // No env/model/cache/thinking/tool/prompt override. The real CLI owns inference.
-    this.child = spawn(process.execPath, cliInvocation(root, entrypoint), { cwd, stdio: 'pipe' });
-    this.exited = new Promise((done) => this.child.once('close', () => done()));
-    const frames = new JsonLines((event) => {
-      // Partial messages repeat their growing content for every token. The
-      // final messages and saved session preserve it without quadratic storage.
-      if (event.type === 'message_update' || event.type === 'tool_execution_update') return;
-      appendFileSync(join(output, 'events.jsonl'), JSON.stringify(event) + '\n');
-      this.turn?.events.push(event);
-      if (event.type === 'response' && event.id) {
-        const request = this.pending.get(event.id);
-        this.pending.delete(event.id);
-        if (event.success) request?.resolve(event.data);
-        else request?.reject(new Error(event.error ?? 'CLI request failed.'));
-      }
-      if (
-        event.type === 'extension_ui_request' &&
-        ['select', 'confirm', 'input', 'editor'].includes(event.method ?? '')
-      ) {
-        // This read-only evaluation grants no new tool permission or configuration change.
-        this.send({ type: 'extension_ui_response', id: event.id, cancelled: true });
-      }
-      if (event.type === 'agent_settled' && this.turn) {
-        const turn = this.turn;
-        this.turn = undefined;
-        turn.resolve(turn.events);
-      }
-    });
-    this.child.stdout.on('data', (chunk: Buffer) => {
-      try {
-        frames.push(chunk);
-      } catch (error) {
-        this.fail(new Error(`Invalid CLI event stream: ${String(error)}`));
-      }
-    });
-    this.child.stderr.on('data', (chunk: Buffer) => appendFileSync(join(output, 'stderr.log'), chunk));
-    this.child.on('error', (error) => this.fail(error));
-    this.child.stdin.on('error', (error) => this.fail(error));
-    this.child.on('close', (code, signal) => {
-      if (!this.closing)
-        this.fail(new Error(`mlx ${entrypoint} exited unexpectedly: ${code ?? signal}. See stderr.log.`));
+  constructor(
+    private root: string,
+    private entrypoint: 'agent' | 'delegate',
+    private cwd: string,
+    private output: string,
+  ) {}
+
+  /**
+   * Resolve the agent binary and default model, then boot `mlx serve` and
+   * wait for `/health`. Mirrors `launchGrokAgent`: ephemeral `--port 0`, a
+   * random `--auth-token`, the serve URL fed back through `GROK_*_BASE_URL`.
+   */
+  async start(): Promise<AgentState> {
+    const probe = probeAgentInstall(this.root);
+    if (probe.path === undefined) {
+      throw new Error('No mlx-agent binary found. Build or install one before running the eval.');
+    }
+    this.bin = probe.path;
+
+    const modelsDir = resolveModelsDir();
+    const models = (await discoverLocalChatModels(modelsDir)).map((model) => model.name);
+    if (models.length === 0) {
+      throw new Error(`No usable model found in ${modelsDir}; install one before running the eval.`);
+    }
+    // The same persisted-pick-then-first rule `mlx agent` applies via
+    // `withDefaultModel`; the eval never substitutes its own choice.
+    this.modelId = chooseDefaultModel(models, readPersistedDefaultModel()).modelId;
+
+    this.serveToken = randomBytes(24).toString('base64url');
+    const cliEntry = join(this.root, 'packages', 'cli', 'dist', 'cli.js');
+    const serve = spawn(
+      process.execPath,
+      [cliEntry, 'serve', '--port', '0', '--auth-token', this.serveToken, '--models-dir', modelsDir],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    this.child = serve;
+    serve.stdout!.on('data', (chunk: Buffer) => appendFileSync(join(this.output, 'serve.log'), chunk));
+    serve.stderr!.on('data', (chunk: Buffer) => appendFileSync(join(this.output, 'serve.log'), chunk));
+    this.serveUrl = await this.waitForServe(serve, 60_000);
+
+    this.agentEnv = {
+      ...process.env,
+      GROK_MODELS_BASE_URL: this.serveUrl,
+      GROK_CLI_CHAT_PROXY_BASE_URL: this.serveUrl,
+      GROK_XAI_API_BASE_URL: this.serveUrl,
+      XAI_API_KEY: this.serveToken,
+      GROK_DISABLE_AUTOUPDATER: '1',
+    };
+    return { model: { id: this.modelId, provider: 'mlx' } };
+  }
+
+  /** `mlx serve` prints `listening on http://HOST:PORT`; confirm `/health`. */
+  private waitForServe(serve: ChildProcess, timeoutMs: number): Promise<string> {
+    return new Promise((resolvePromise, reject) => {
+      const rl = serve.stdout ? createInterface({ input: serve.stdout }) : undefined;
+      const timer = setTimeout(
+        () => fail(new Error('timed out waiting for `mlx serve` to report its port')),
+        timeoutMs,
+      );
+      const fail = (error: Error): void => {
+        clearTimeout(timer);
+        rl?.close();
+        reject(error);
+      };
+      serve.once('exit', (code) => fail(new Error(`mlx serve exited (${code}) before reporting a port`)));
+      rl?.on('line', (line) => {
+        const match = line.match(/listening on (http:\/\/\S+)/);
+        if (!match) return;
+        fetch(`${match[1]}/health`)
+          .then((res) => (res.ok ? `${match[1]}/v1` : Promise.reject(new Error(`health ${res.status}`))))
+          .then((ready) => {
+            clearTimeout(timer);
+            rl?.close();
+            resolvePromise(ready);
+          })
+          .catch(fail);
+      });
     });
   }
 
-  private send(value: unknown): void {
-    this.child.stdin.write(JSON.stringify(value) + '\n');
-  }
   private fail(error: Error): void {
     this.failure ??= error;
-    for (const request of this.pending.values()) request.reject(error);
-    this.pending.clear();
-    this.turn?.reject(error);
-    this.turn = undefined;
+    this.active?.reject(error);
   }
-  async request(type: string, data: Record<string, unknown> = {}): Promise<unknown> {
+
+  /**
+   * Run one case as a fresh headless session: `mlx-agent -m <default>
+   * <entrypoint args> --prompt-file <file> --output-format
+   * streaming-messages-json --cwd <workspace>`. Resolves when the child exits;
+   * a non-zero exit or a missing/error `result` line rejects.
+   */
+  async prompt(message: string, runId: string): Promise<PromptOutcome> {
+    if (this.active) throw new Error('Eval cases must run sequentially.');
     if (this.failure) throw this.failure;
-    const id = String(++this.nextId);
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.send({ ...data, type, id });
+    const promptFile = join(this.output, 'prompts', `${runId}.txt`);
+    await mkdir(join(this.output, 'prompts'), { recursive: true });
+    await writeFile(promptFile, message);
+    const argv = [
+      '-m',
+      this.modelId,
+      ...entrypointArgs(this.entrypoint),
+      '--prompt-file',
+      promptFile,
+      '--output-format',
+      'streaming-messages-json',
+      '--cwd',
+      this.cwd,
+    ];
+    const child = spawn(this.bin, argv, {
+      cwd: this.cwd,
+      env: this.agentEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    return new Promise<PromptOutcome>((resolvePromise, reject) => {
+      const events: Event[] = [];
+      const outcome: PromptOutcome = { events };
+      const frames = new JsonLines((event) => {
+        appendFileSync(join(this.output, 'events.jsonl'), JSON.stringify(event) + '\n');
+        events.push(event);
+        if (event.type === 'system' && event.subtype === 'init') outcome.init = event;
+        if (event.type === 'result') {
+          outcome.result = event;
+          outcome.stopReason = event.stop_reason;
+        }
+      });
+      child.stdout.on('data', (chunk: Buffer) => {
+        try {
+          frames.push(chunk);
+        } catch (error) {
+          reject(new Error(`Invalid agent event stream: ${String(error)}`));
+          child.kill('SIGKILL');
+        }
+      });
+      child.stderr.on('data', (chunk: Buffer) => appendFileSync(join(this.output, 'stderr.log'), chunk));
+      child.on('error', reject);
+      this.active = { child, reject };
+      child.on('close', (code, signal) => {
+        this.active = undefined;
+        if (this.closing) {
+          reject(new Error('Evaluation stopped.'));
+          return;
+        }
+        if (code !== 0) {
+          const detail = outcome.result?.errors ? JSON.stringify(outcome.result.errors) : 'see stderr.log';
+          reject(new Error(`mlx-agent exited with ${code ?? signal}: ${detail}`));
+          return;
+        }
+        if (!outcome.result || outcome.result.subtype !== 'success' || outcome.result.is_error) {
+          reject(new Error(`Agent run failed: ${JSON.stringify(outcome.result?.errors ?? 'no result line')}`));
+          return;
+        }
+        resolvePromise(outcome);
+      });
     });
   }
-  async prompt(message: string): Promise<Event[]> {
-    if (this.turn) throw new Error('Eval cases must run sequentially.');
-    if (this.failure) throw this.failure;
-    const settled = new Promise<Event[]>((resolve, reject) => {
-      this.turn = { events: [], resolve, reject };
-    });
-    void this.request('prompt', { message }).catch((error) => this.fail(error));
-    return settled;
+
+  /**
+   * The binary's session store: `~/.mlx-agent/sessions/<url-encoded cwd>/<id>/`
+   * (or `$GROK_HOME` when set). The binary sees the realpath of `--cwd`, so
+   * both encodings are tried before falling back to an id scan.
+   */
+  async sessionDir(sessionId: string): Promise<string | undefined> {
+    const root = join(agentConfigDir(), 'sessions');
+    let real = this.cwd;
+    try {
+      real = realpathSync(this.cwd);
+    } catch {
+      // The workspace should exist; the id scan below still covers it.
+    }
+    for (const cwd of new Set([this.cwd, real])) {
+      const candidate = join(root, encodeURIComponent(cwd), sessionId);
+      if (existsSync(candidate)) return candidate;
+    }
+    try {
+      for (const dir of await readdir(root)) {
+        const candidate = join(root, dir, sessionId);
+        if (existsSync(candidate)) return candidate;
+      }
+    } catch {
+      // sessions root absent — persistence already failed.
+    }
+    return undefined;
   }
+
+  /** Kill the serve child; any in-flight case is rejected first. */
   async close(): Promise<void> {
     this.closing = true;
     this.fail(new Error('Evaluation stopped.'));
-    // EOF is the CLI's graceful shutdown protocol; TERM/KILL are bounded fallbacks.
-    this.child.stdin.end();
-    const term = setTimeout(() => this.child.kill('SIGTERM'), 5_000);
-    const kill = setTimeout(() => this.child.kill('SIGKILL'), 10_000);
+    const exited = this.child
+      ? new Promise<void>((done) => {
+          if (this.child.exitCode !== null || this.child.killed) return done();
+          this.child.once('close', () => done());
+        })
+      : Promise.resolve();
+    this.active?.child.kill('SIGTERM');
+    this.child?.kill('SIGTERM');
+    const kill = setTimeout(() => {
+      this.active?.child.kill('SIGKILL');
+      this.child?.kill('SIGKILL');
+    }, 10_000);
     try {
-      await this.exited;
+      await exited;
     } finally {
-      clearTimeout(term);
       clearTimeout(kill);
     }
   }
@@ -179,12 +376,7 @@ export async function evaluateAgentCase(
     passed: false,
   };
   try {
-    const reset = (await cli.request('new_session')) as { cancelled?: boolean };
-    if (reset?.cancelled) throw new Error('The CLI cancelled session creation.');
-    await cli.request('set_session_name', { name: `Install detection eval: ${runId}` });
-    const state = (await cli.request('get_state')) as AgentState;
-    sample.session = state;
-    if (state.model?.provider !== 'mlx') throw new Error('The CLI did not select a local mlx model.');
+    // Each -p run is a fresh session; there is no name or reset RPC.
     const evidence = join(workspace, `${runId}.txt`);
     const input = detectionMessage(selectedText(fixture), fixture.command);
     await writeFile(evidence, input);
@@ -196,60 +388,78 @@ export async function evaluateAgentCase(
       DETECTION_SYSTEM,
     ].join('\n\n');
     sample.prompt = prompt;
-    const events = await cli.prompt(prompt);
-    const messages = events
-      .filter((e) => e.type === 'message_end' && e.message?.role === 'assistant')
+    const outcome = await cli.prompt(prompt, runId);
+    const { events } = outcome;
+    const assistant = events
+      .filter((e) => e.type === 'assistant' && e.message?.role === 'assistant')
       .map((e) => e.message!);
-    const last = messages.at(-1);
+    const last = assistant.at(-1);
     const answer =
-      last?.content
-        ?.filter((part) => part.type === 'text')
-        .map((part) => part.text ?? '')
-        .join('') ?? '';
+      typeof outcome.result?.result === 'string'
+        ? outcome.result.result
+        : (last?.content
+            ?.filter((part) => part.type === 'text')
+            .map((part) => part.text ?? '')
+            .join('') ?? '');
+    sample.session = {
+      model: { id: outcome.init?.model ?? cli.modelId, provider: 'mlx' },
+      sessionId: outcome.init?.session_id,
+    };
+    if (sample.session.sessionId) {
+      sample.session.sessionDir = await cli.sessionDir(sample.session.sessionId);
+    }
+    const usedModel = sample.session.model?.id ?? 'unknown';
+    if (usedModel === 'unknown') throw new Error('The agent binary did not report the model it used.');
     sample.calls.push({
-      model: state.model.id,
-      system: 'CLI default (no override); rubric supplied as user task',
+      model: usedModel,
+      system: 'Agent binary default (no override); rubric supplied as user task',
       input: prompt,
       maxTokens: undefined,
       elapsedMs: performance.now() - start,
       answer,
     });
-    if (!last || last.stopReason !== 'stop')
-      throw new Error(last?.errorMessage ?? `Agent did not finish: ${last?.stopReason}`);
+    if (!last || outcome.stopReason !== 'end_turn')
+      throw new Error(`Agent did not finish: ${outcome.stopReason ?? 'no result'}`);
     const result = detectionResult(parseLocalJson(answer), selectedText(fixture));
     sample.actual = result.installed ? 'installed' : result.needsUpdate ? 'needs-update' : 'not-installed';
     if (result.source) sample.source = [result.source.startLine, result.source.endLine];
+    const toolUses = events
+      .flatMap((e) => e.message?.content ?? [])
+      .filter((part) => part.type === 'tool_use' || part.type === 'server_tool_use');
+    const toolResults = events.flatMap((e) => e.message?.content ?? []).filter((part) => part.type === 'tool_result');
+    const pathOf = (input: Record<string, unknown> | undefined): string | undefined => {
+      const candidate = input?.['target_file'] ?? input?.['path'] ?? input?.['file_path'];
+      return typeof candidate === 'string' ? candidate : undefined;
+    };
     const readIds = new Set(
-      events
-        .filter(
-          (e) =>
-            e.type === 'tool_execution_start' &&
-            e.toolName === 'read' &&
-            e.args?.path &&
-            resolve(workspace, e.args.path) === evidence,
-        )
-        .map((e) => e.toolCallId),
+      toolUses
+        .filter((part) => {
+          const file = pathOf(part.input);
+          return part.name === 'read_file' && file !== undefined && resolve(workspace, file) === evidence;
+        })
+        .map((part) => part.id),
     );
     sample.checks = {
       ...grade(fixture, sample.actual, sample.source),
-      readEvidence: events.some((e) => e.type === 'tool_execution_end' && readIds.has(e.toolCallId) && !e.isError),
+      readEvidence: toolResults.some((part) => readIds.has(part.tool_use_id) && !part.is_error),
       preservedEvidence: (await readFile(evidence, 'utf8')) === input,
-      noToolErrors: !events.some((e) => e.type === 'tool_execution_end' && e.isError),
-      readOnlyTools: events.filter((e) => e.type === 'tool_execution_start').every((e) => e.toolName === 'read'),
+      noToolErrors: !toolResults.some((part) => Boolean(part.is_error)),
+      readOnlyTools: toolUses.every((part) => part.name === 'read_file'),
     };
     sample.passed = Object.values(sample.checks).every(Boolean);
   } catch (error) {
     sample.error = String(error);
   } finally {
     sample.elapsedMs = performance.now() - start;
-    // Save the real session, including failed turns. Keep the original in the app's normal store.
-    if (sample.session?.sessionFile) {
+    // Save the real session, including failed turns. Keep the original in the
+    // agent's normal store; `chat_history.jsonl` is the persisted transcript.
+    if (sample.session?.sessionDir) {
       try {
-        const contents = await readFile(sample.session.sessionFile, 'utf8');
+        const contents = await readFile(join(sample.session.sessionDir, 'chat_history.jsonl'), 'utf8');
         await mkdir(join(output, 'sessions'), { recursive: true });
         sample.sessionCopy = join('sessions', `${runId}.jsonl`);
         await writeFile(join(output, sample.sessionCopy), contents);
-        sample.checks.sessionSaved = contents.includes('"role":"assistant"');
+        sample.checks.sessionSaved = contents.includes('"type":"assistant"');
         sample.passed &&= sample.checks.sessionSaved;
       } catch (error) {
         sample.error ??= `Session not persisted: ${String(error)}`;

@@ -19,7 +19,7 @@ Start with `--entrypoint app --case generated-prompt --case unlabelled-fence --c
 
 ## CLI classification
 
-Run installation-classification tasks through the **real `mlx agent` or `mlx delegate` CLI**. The runner only sends tasks, observes events, and grades results. It never creates an inference host or sets model, thinking, output, sampling, cache, system-prompt, tool, or permission overrides.
+Run installation-classification tasks through the **installed `mlx-agent` binary's headless mode**, launched the same way `mlx agent`/`mlx delegate` launch it: one spawned `mlx serve` (ephemeral port, bearer token, `GROK_*_BASE_URL` env) plus one `mlx-agent -p` child per case. The runner only sends tasks, observes events, and grades results. It never sets model, thinking, output, sampling, cache, system-prompt, tool, or permission overrides beyond the entrypoint's own defaults.
 
 ```sh
 vp run build:ts
@@ -27,7 +27,7 @@ vp exec oxnode scripts/eval-agent-installed.ts --entrypoint delegate
 vp exec oxnode scripts/eval-agent-installed.ts --entrypoint agent
 ```
 
-The subprocess invokes this checkout's built public CLI (`node packages/cli/dist/cli.js agent|delegate --mode rpc`). RPC changes the input/output transport; production defaults and saved local settings select the model. Sessions persist in the normal app store. One process runs at a time, with a new session per case and the normal cache lifecycle. Missing models fail through the CLI's normal startup. No cloud inference is allowed by the production agent.
+The runner resolves the agent binary exactly as `mlx agent` does (`MLX_AGENT_BIN` → vendored build → bundled → managed download; no download is attempted) and spawns this checkout's built `mlx serve` (`node packages/cli/dist/cli.js serve --port 0`). The `delegate` entrypoint injects `DELEGATE_DEFAULT_ARGS`; `agent` adds only a non-interactive permission mode. The default model follows the CLI's own selection (persisted `/model` pick, else first discovered). Each `-p` run is a fresh session persisted in the normal `~/.mlx-agent` store, one case at a time with the shared serve keeping the model resident. Missing models fail before the first case. No cloud inference is involved.
 
 Start with a small probe:
 
@@ -52,8 +52,8 @@ Fixtures contain no real user instructions. The user agent configuration remains
 Reports under `.cache/agent-installed-eval/` contain:
 
 - `report.md` / `summary.json`: scores, failed checks, latency, and memory.
-- `samples.jsonl`: task, raw answer, source range, checks, selected model/thinking, real session path.
-- `events.jsonl` / `stderr.log`: CLI lifecycle events, final messages, tool calls/results, and diagnostics. Repeated per-token partial updates are discarded to avoid quadratic memory/disk growth; final contents remain in the saved session.
+- `samples.jsonl`: task, raw answer, source range, checks, selected model, real session path.
+- `events.jsonl` / `stderr.log` / `serve.log`: agent `streaming-messages-json` events, per-case stderr, and the serve transcript.
 - `metrics.jsonl`: the CLI's normal per-turn inference metrics, copied from its process-specific trace. If unavailable, the source path and error are recorded in `metrics-status.jsonl`.
 - `sessions/`: copies of the real saved sessions, including failed turns.
 - `metadata.json`, `initial-state.json`, `cases.json`: exact invocation, settings reported by the CLI, source hashes, and fixed corpus.

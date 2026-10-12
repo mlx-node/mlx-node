@@ -107,10 +107,20 @@ describe('agent-installed eval oracle and execution', () => {
     expect(complete.mock.calls[0][2][0].content).toBe(detectionMessage(override.override!, override.command));
   });
 
-  it('uses the real CLI without overriding runtime defaults', () => {
+  it('uses the real agent binary without overriding runtime defaults', () => {
     expect(evalOptions(['--entrypoint', 'app']).entrypoint).toBe('app');
-    expect(cliInvocation('/repo', 'agent')).toEqual(['/repo/packages/cli/dist/cli.js', 'agent', '--mode', 'rpc']);
-    expect(cliInvocation('/repo', 'delegate')).toEqual(['/repo/packages/cli/dist/cli.js', 'delegate', '--mode', 'rpc']);
+    const agent = cliInvocation('/repo', 'agent');
+    const delegate = cliInvocation('/repo', 'delegate');
+    for (const argv of [agent, delegate]) {
+      expect(argv).toContain('--prompt-file');
+      expect(argv).toContain('streaming-messages-json');
+      expect(argv).not.toContain('--mode');
+    }
+    // The delegate entrypoint carries its production worker profile; the
+    // agent entrypoint gets only a non-interactive permission mode.
+    expect(delegate).toContain('--system-prompt-override');
+    expect(agent).not.toContain('--system-prompt-override');
+    expect(agent).toEqual(expect.arrayContaining(['--permission-mode', 'auto']));
     expect(() => evalOptions(['--model', 'replacement'])).toThrow();
     expect(() => evalOptions(['--thinking', 'off'])).toThrow();
     expect(() => evalOptions(['--entrypoint', 'serve'])).toThrow();
@@ -131,15 +141,15 @@ describe('agent-installed eval oracle and execution', () => {
     expect(physicalFootprint('Permission denied')).toBeUndefined();
   });
 
-  it('keeps RPC events intact across byte boundaries and Unicode line separators', () => {
+  it('keeps stream-json events intact across byte boundaries and Unicode line separators', () => {
     const receive = vi.fn();
     const stream = new JsonLines(receive);
     const event = {
-      type: 'message_end',
+      type: 'assistant',
       message: { role: 'assistant', content: [{ type: 'text', text: '中\u2028文\u2029é' }] },
     };
-    const bytes = Buffer.from(JSON.stringify(event) + '\n' + JSON.stringify({ type: 'agent_settled' }) + '\r\n');
+    const bytes = Buffer.from(JSON.stringify(event) + '\n' + JSON.stringify({ type: 'result' }) + '\r\n');
     for (const byte of bytes) stream.push(Buffer.from([byte]));
-    expect(receive.mock.calls).toEqual([[event], [{ type: 'agent_settled' }]]);
+    expect(receive.mock.calls).toEqual([[event], [{ type: 'result' }]]);
   });
 });
