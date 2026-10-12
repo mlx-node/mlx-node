@@ -154,6 +154,7 @@ describe('TurnTraceModel', () => {
       // First call: turn-start baseline. Second: end-of-turn snapshot.
       coldStats: () => coldStats({ hits: 10 + coldCalls++ * 2 }),
       sidecarStats: () => sidecarStats(),
+      watermarks: { cold: {}, sidecar: {} },
     });
 
     const result = await model.chatSessionContinue([{ role: 'user', content: 'hi' }], {
@@ -192,6 +193,54 @@ describe('TurnTraceModel', () => {
     expect(raw).not.toContain('rawText');
   });
 
+  it('sums overlapping turns without double-counting shared counter advances', async () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    // One mutable counter both turns read. Timeline: slow begins (seeds at
+    // 10) → slow bumps +2 → fast begins → fast bumps +1 → fast finishes
+    // (reads 13) → slow bumps +3 → slow finishes (reads 16). Real advance
+    // across both turns is 16 − 10 = 6; naive per-turn baselines would
+    // record 6 + 3 = 9, counting the +2 window twice.
+    let counter = 10;
+    const bump = (n: number) => {
+      counter += n;
+    };
+    const sharedMarks = { cold: {}, sidecar: {} };
+    const makeModel = (chatSessionContinue: () => Promise<ChatResult>) =>
+      new TurnTraceModel(makeInner({ chatSessionContinue }), {
+        modelName: 'qwen-small',
+        trace,
+        now: () => FIXED_NOW,
+        coldStats: () => coldStats({ hits: counter }),
+        sidecarStats: () => sidecarStats(),
+        // The two wrappers share one marks store — same as every registry
+        // wrapper in a serve process sharing SHARED_WATERMARKS.
+        watermarks: sharedMarks,
+      });
+    const slow = makeModel(async () => {
+      bump(2);
+      const result = makeResult();
+      bump(3);
+      return result;
+    });
+    const fast = makeModel(async () => {
+      bump(1);
+      return makeResult();
+    });
+
+    const slowTurn = slow.chatSessionContinue([]);
+    // Let slow's synchronous begin + inner dispatch run before fast begins.
+    await Promise.resolve();
+    await fast.chatSessionContinue([]);
+    await slowTurn;
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(2);
+    const hits = lines.map((l) => l.coldHits ?? 0);
+    // Attribution may skew toward one turn; the sum is exact and monotone.
+    expect(hits.reduce((a, b) => a + b, 0)).toBe(6);
+    for (const h of hits) expect(h).toBeGreaterThanOrEqual(0);
+  });
+
   it('records after the terminal streaming event and streams every event through', async () => {
     const inner = makeInner();
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
@@ -201,6 +250,7 @@ describe('TurnTraceModel', () => {
       now: () => FIXED_NOW,
       coldStats: () => coldStats(),
       sidecarStats: () => sidecarStats(),
+      watermarks: { cold: {}, sidecar: {} },
     });
 
     const seen: ChatStreamEvent[] = [];
@@ -238,7 +288,12 @@ describe('TurnTraceModel', () => {
       }),
     });
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
-    const model = new TurnTraceModel(inner, { modelName: 'qwen-small', trace, now: () => FIXED_NOW });
+    const model = new TurnTraceModel(inner, {
+      modelName: 'qwen-small',
+      trace,
+      now: () => FIXED_NOW,
+      watermarks: { cold: {}, sidecar: {} },
+    });
 
     const errorResult = await model.chatSessionStart([]);
     expect(errorResult.finishReason).toBe('error');
@@ -259,7 +314,12 @@ describe('TurnTraceModel', () => {
     process.env.MLX_AGENT_METRICS = '0';
     const inner = makeInner();
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
-    const model = new TurnTraceModel(inner, { modelName: 'qwen-small', trace, now: () => FIXED_NOW });
+    const model = new TurnTraceModel(inner, {
+      modelName: 'qwen-small',
+      trace,
+      now: () => FIXED_NOW,
+      watermarks: { cold: {}, sidecar: {} },
+    });
 
     await model.chatSessionStart([]);
     for await (const _ of model.chatStreamSessionStart([])) {
@@ -278,6 +338,7 @@ describe('TurnTraceModel', () => {
     const model = new TurnTraceModel(inner, {
       modelName: 'qwen-small',
       trace: new MetricsTrace({ dir, now: () => FIXED_NOW }),
+      watermarks: { cold: {}, sidecar: {} },
     });
 
     expect(model.hasBlockPagedCache?.()).toBe(true);
@@ -318,6 +379,7 @@ describe('SessionRegistry trace hook', () => {
         now: () => FIXED_NOW,
         coldStats: () => coldStats(),
         sidecarStats: () => sidecarStats(),
+        watermarks: { cold: {}, sidecar: {} },
       },
     });
 

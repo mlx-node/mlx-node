@@ -19,10 +19,12 @@
  * aborts, or ends on `finishReason: 'error'` simply never diffs and cannot
  * leak its restores into the next successful turn's delta. On continuously
  * batched models (`maxConcurrentSequences() > 1`) two turns can overlap in
- * native flight, which makes every synchronous-counter delta a best-effort
- * attribution — the same caveat the `*_Total` absolute columns exist to
- * cover. `durationMs` therefore measures the wrapped dispatch call itself;
- * admission-lane queue waits happen upstream and are not included.
+ * native flight: each turn then reports the counter advance since the
+ * PREVIOUS record's high-water mark ({@link TurnWatermarks}), so attribution
+ * between overlapping turns is approximate while the deltas still sum to the
+ * counter's real advance — the dashboard SUMs these columns. `durationMs`
+ * therefore measures the wrapped dispatch call itself; admission-lane queue
+ * waits happen upstream and are not included.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -78,7 +80,36 @@ export interface TurnTraceDeps {
   sidecarStats?: () => ColdSidecarStats | undefined;
   /** Clock for `ts`, `durationMs`, and the trace filename. Default: `Date.now`. */
   now?: () => number;
+  /**
+   * High-water marks for the process-wide counters. Default: a module-level
+   * store SHARED by every wrapper in the process — see {@link TurnWatermarks}.
+   * Tests inject a fresh one so records stay deterministic.
+   */
+  watermarks?: TurnWatermarks;
 }
+
+/**
+ * Per-counter high-water marks, one per cold/sidecar field. The native
+ * counters are process-global and cumulative, so diffing each turn against
+ * its OWN begin-snapshot double-counts whatever another turn increments
+ * during the overlap — two turns around one hit would record 1 + 2 for 2
+ * total, and the dashboard `SUM`s these columns. Recording each turn's delta
+ * since the PREVIOUS record's mark instead makes intervals sequential:
+ * attribution between overlapping turns stays approximate, but the sum of
+ * deltas equals the counter's real advance at every point. Per-field marks
+ * (not per-struct) so a snapshot missing one struct cannot lose the other's
+ * attribution. A field that DECREASES below its mark means the counter
+ * reset; the new cumulative value is the delta, not a negative.
+ */
+export interface TurnWatermarks {
+  /** Field-name → last recorded counter value for the cold tier. */
+  cold: Record<string, number>;
+  /** Field-name → last recorded counter value for the sidecar counters. */
+  sidecar: Record<string, number>;
+}
+
+/** Process-wide default: every `TurnTraceModel` in the serve process shares it. */
+const SHARED_WATERMARKS: TurnWatermarks = { cold: {}, sidecar: {} };
 
 /**
  * Per-turn recording context. `null` when the trace sink is disabled — the
@@ -102,6 +133,32 @@ interface TurnContext {
  * missing `mtpAutoEnabled` as a proto-walk fallback, and `hasBlockPagedCache`
  * absent means "not paged". Mirroring presence exactly preserves both.
  */
+/** Cold-tier counters diffed per turn — the keys {@link TurnWatermarks.cold} tracks. */
+const COLD_DELTA_KEYS = [
+  'hits',
+  'misses',
+  'bytesWritten',
+  'bytesRestored',
+  'enqueued',
+  'queueDrops',
+  'evictions',
+  'corruptions',
+  'writeErrors',
+  'restoreDeclines',
+] as const;
+
+/** Sidecar counters diffed per turn — the keys {@link TurnWatermarks.sidecar} tracks. */
+const SIDECAR_DELTA_KEYS = [
+  'captureReached',
+  'chainEmpty',
+  'boundarySkips',
+  'alreadyPersisted',
+  'enqueued',
+  'queueDrops',
+  'installed',
+  'restoreSuppressed',
+] as const;
+
 const OPTIONAL_MEMBER_NAMES = [
   'applyChatTemplate',
   'expandedPromptTokenCount',
@@ -174,14 +231,29 @@ export class TurnTraceModel implements SessionCapableModel {
 
   /**
    * Open a turn context: mint the trace id, stamp the start clock, and
-   * snapshot the process-wide cold counters BEFORE native work begins so the
-   * record below can emit this turn's delta rather than the process total.
+   * snapshot the process-wide cold counters BEFORE native work begins. The
+   * snapshot ALSO seeds any unmarked counter field — the first turn a field
+   * is measured still gets its own delta, after which marks chain
+   * intervals so recorded deltas always sum to the counter's real advance.
    */
   private beginTurn(config: ChatConfig | null | undefined): TurnContext | null {
     const trace = this.trace;
     if (trace instanceof MetricsTrace && !trace.enabled) return null;
+    const marks = this.deps.watermarks ?? SHARED_WATERMARKS;
     const cold = (this.deps.coldStats ?? safeColdStats)();
+    if (cold) {
+      for (const key of COLD_DELTA_KEYS) {
+        const value = cold[key];
+        if (typeof value === 'number') marks.cold[key] ??= value;
+      }
+    }
     const sidecar = (this.deps.sidecarStats ?? safeSidecarStats)();
+    if (sidecar) {
+      for (const key of SIDECAR_DELTA_KEYS) {
+        const value = sidecar[key];
+        if (typeof value === 'number') marks.sidecar[key] ??= value;
+      }
+    }
     return {
       traceId: randomUUID(),
       sessionId: typeof config?.cacheOwnerId === 'string' ? config.cacheOwnerId : undefined,
@@ -193,9 +265,9 @@ export class TurnTraceModel implements SessionCapableModel {
   }
 
   /**
-   * Diff the end-of-turn counters against the turn's own baseline and append
-   * the record. Rebuilt field by field from the terminal result — never the
-   * free-text members — then handed to the allowlisted sink.
+   * Diff the end-of-turn counters against the per-field high-water marks and
+   * append the record. Rebuilt field by field from the terminal result —
+   * never the free-text members — then handed to the allowlisted sink.
    *
    * The SIDECAR diff is its own guard, deliberately not folded into the cold
    * block: the sidecar reader never consults the tier, so it keeps reporting
@@ -229,29 +301,47 @@ export class TurnTraceModel implements SessionCapableModel {
         // mlx-vlm-comparable headline accept rate (committed tokens per cycle).
         rec.mtpMeanAccepted = perf.mtpMeanAcceptedTokensTotal;
       }
+      // One delta per counter field: current minus the LAST record's mark
+      // (beginTurn seeds an unmarked field from that turn's own baseline, so
+      // the first record reports a real per-turn delta too), then advance
+      // the mark. Marks keep overlapping turns from reporting the same
+      // increment twice — deltas always chain, never nest — and a counter
+      // that RESETS yields its new cumulative value, not a negative.
+      const marks = this.deps.watermarks ?? SHARED_WATERMARKS;
+      const delta = (mark: Record<string, number>, key: string, current: number | undefined): number | undefined => {
+        if (current === undefined) return undefined;
+        const since = mark[key];
+        // current < mark means the counter reset: the whole new cumulative
+        // value is the advance since the reset, not zero and not negative.
+        const value = since === undefined || current < since ? current : current - since;
+        mark[key] = current;
+        return value;
+      };
       const cold = coldStats();
       if (cold && ctx.cold) {
-        rec.coldHits = cold.hits - ctx.cold.hits;
-        rec.coldMisses = cold.misses - ctx.cold.misses;
-        rec.coldBytesWritten = cold.bytesWritten - ctx.cold.bytesWritten;
-        rec.coldBytesRestored = cold.bytesRestored - ctx.cold.bytesRestored;
-        rec.coldEnqueued = cold.enqueued - ctx.cold.enqueued;
-        rec.coldQueueDrops = cold.queueDrops - ctx.cold.queueDrops;
-        rec.coldEvictions = cold.evictions - ctx.cold.evictions;
-        rec.coldCorruptions = cold.corruptions - ctx.cold.corruptions;
-        rec.coldWriteErrors = cold.writeErrors - ctx.cold.writeErrors;
-        rec.coldRestoreDeclines = cold.restoreDeclines - ctx.cold.restoreDeclines;
-        // Absolutes, not deltas: an aborted/errored turn never reaches this
-        // recorder, so a corruption or a dropped write during one lands in NO
-        // delta. The cumulative counter observed by the next successful turn
-        // still carries it, which is what makes "corruptions must be 0"
-        // checkable at all (`MAX(total) > 0` over any window).
+        rec.coldHits = delta(marks.cold, 'hits', cold.hits);
+        rec.coldMisses = delta(marks.cold, 'misses', cold.misses);
+        rec.coldBytesWritten = delta(marks.cold, 'bytesWritten', cold.bytesWritten);
+        rec.coldBytesRestored = delta(marks.cold, 'bytesRestored', cold.bytesRestored);
+        rec.coldEnqueued = delta(marks.cold, 'enqueued', cold.enqueued);
+        rec.coldQueueDrops = delta(marks.cold, 'queueDrops', cold.queueDrops);
+        rec.coldEvictions = delta(marks.cold, 'evictions', cold.evictions);
+        rec.coldCorruptions = delta(marks.cold, 'corruptions', cold.corruptions);
+        rec.coldWriteErrors = delta(marks.cold, 'writeErrors', cold.writeErrors);
+        rec.coldRestoreDeclines = delta(
+          marks.cold,
+          'restoreDeclines',
+          cold.restoreDeclines,
+        );
+        // Absolutes, not deltas: a dropped write inside an aborted turn (or
+        // in the last turn before a crash) can land in a delta attributed to
+        // the NEXT record, and one at process end lands in none at all. The
+        // cumulative counter observed by each successful turn is what makes
+        // "corruptions must be 0" checkable at all (`MAX(total) > 0` over any
+        // window) — and "is my cache root broken?" is a question about ever,
+        // not about this turn.
         rec.coldCorruptionsTotal = cold.corruptions;
         rec.coldQueueDropsTotal = cold.queueDrops;
-        // Same latch, and the counter that needs it most: a write error is
-        // raised on the background writer, so the one covering the LAST turn
-        // before a crash lands in no delta at all — and "is my cache root
-        // broken?" is a question about ever, not about this turn.
         rec.coldWriteErrorsTotal = cold.writeErrors;
         // Cache IDENTITY comes from the END-of-turn snapshot, never the
         // baseline: the tier opens LAZILY on first use, so on a process's
@@ -273,14 +363,30 @@ export class TurnTraceModel implements SessionCapableModel {
       }
       const sidecar = sidecarStats();
       if (sidecar && ctx.sidecar) {
-        rec.coldSidecarCaptureReached = sidecar.captureReached - ctx.sidecar.captureReached;
-        rec.coldSidecarChainEmpty = sidecar.chainEmpty - ctx.sidecar.chainEmpty;
-        rec.coldSidecarBoundarySkips = sidecar.boundarySkips - ctx.sidecar.boundarySkips;
-        rec.coldSidecarAlreadyPersisted = sidecar.alreadyPersisted - ctx.sidecar.alreadyPersisted;
-        rec.coldSidecarEnqueued = sidecar.enqueued - ctx.sidecar.enqueued;
-        rec.coldSidecarQueueDrops = sidecar.queueDrops - ctx.sidecar.queueDrops;
-        rec.coldSidecarInstalled = sidecar.installed - ctx.sidecar.installed;
-        rec.coldSidecarRestoreSuppressed = sidecar.restoreSuppressed - ctx.sidecar.restoreSuppressed;
+        rec.coldSidecarCaptureReached = delta(
+          marks.sidecar,
+          'captureReached',
+          sidecar.captureReached,
+        );
+        rec.coldSidecarChainEmpty = delta(marks.sidecar, 'chainEmpty', sidecar.chainEmpty);
+        rec.coldSidecarBoundarySkips = delta(
+          marks.sidecar,
+          'boundarySkips',
+          sidecar.boundarySkips,
+        );
+        rec.coldSidecarAlreadyPersisted = delta(
+          marks.sidecar,
+          'alreadyPersisted',
+          sidecar.alreadyPersisted,
+        );
+        rec.coldSidecarEnqueued = delta(marks.sidecar, 'enqueued', sidecar.enqueued);
+        rec.coldSidecarQueueDrops = delta(marks.sidecar, 'queueDrops', sidecar.queueDrops);
+        rec.coldSidecarInstalled = delta(marks.sidecar, 'installed', sidecar.installed);
+        rec.coldSidecarRestoreSuppressed = delta(
+          marks.sidecar,
+          'restoreSuppressed',
+          sidecar.restoreSuppressed,
+        );
       }
       this.trace.record(rec);
     } catch {
