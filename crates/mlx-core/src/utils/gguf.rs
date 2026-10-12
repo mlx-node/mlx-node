@@ -6746,18 +6746,42 @@ fn native_gguf_is_hex64(field: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Canonical lowercase uuid text `8-4-4-4-12` — the shape `Uuid::new_v4()`
-/// renders for `.mlx-qwen4-assets-tmp-{uuid}` publish temps.
+/// Canonical v4 uuid text `8-4-4-4-12` — the shape `Uuid::new_v4()` renders
+/// for `.mlx-qwen4-assets-tmp-{uuid}` publish temps. The version nibble
+/// (index 14) is fixed to `4` and the variant nibble (index 19) to `89ab`;
+/// layout-only shapes that `new_v4` cannot emit are foreign.
 fn native_gguf_is_uuid_text(field: &str) -> bool {
     let is_hex = |byte: u8| matches!(byte, b'0'..=b'9' | b'a'..=b'f');
     field.len() == 36
         && field.bytes().enumerate().all(|(i, byte)| {
             if matches!(i, 8 | 13 | 18 | 23) {
                 byte == b'-'
+            } else if i == 14 {
+                byte == b'4'
+            } else if i == 19 {
+                matches!(byte, b'8' | b'9' | b'a' | b'b')
             } else {
                 is_hex(byte)
             }
         })
+}
+
+/// The `{pid}-{simple-uuid}` suffix producers append after
+/// `.{key}.staging-` and `.write-probe-`: a decimal pid, one hyphen, then
+/// `Uuid::new_v4().simple()` (32 lowercase hex). Anything else is foreign,
+/// even under a valid key. Returns the pid for the liveness probe.
+fn native_gguf_writer_pid_suffix(suffix: &str) -> Option<u32> {
+    let (pid_text, uuid_text) = suffix.split_once('-')?;
+    if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid_text.parse::<u32>().ok()?;
+    let is_hex = |byte: u8| matches!(byte, b'0'..=b'9' | b'a'..=b'f');
+    if uuid_text.len() == 32 && uuid_text.bytes().all(is_hex) {
+        Some(pid)
+    } else {
+        None
+    }
 }
 
 /// Strict cache-key contract for a plain entry directory:
@@ -6983,12 +7007,6 @@ fn native_gguf_locked_remove(
     native_gguf_remove_logged(path, reason)
 }
 
-/// Extract the pid a `.staging-{pid}-{uuid}` or `.write-probe-{pid}-{uuid}`
-/// name embeds.
-fn native_gguf_embedded_pid(name: &str) -> Option<u32> {
-    name.split('-').next()?.parse().ok()
-}
-
 /// Recency witness for an entry directory: `.complete` first, dir fallback.
 /// Asset sidecars use their `complete` marker the same way.
 fn native_gguf_object_recency(dir: &Path, marker_name: &str) -> Option<std::time::SystemTime> {
@@ -7075,17 +7093,19 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
             {
                 // `.{key}.staging-{pid}-{uuid}`: the key sits between the
                 // leading dot and the staging infix, and its lock file is
-                // `.{key}.lock`. A malformed key means foreign tooling — the
-                // same "never delete what we do not own" gate as plain dirs.
+                // `.{key}.lock`. A malformed key or suffix means foreign
+                // tooling — the same "never delete what we do not own" gate
+                // as plain dirs.
                 let key = &name[1..index];
                 if !native_gguf_is_entry_name(key) {
                     continue;
                 }
-                let pid = name[index + NATIVE_GGUF_STAGING_INFIX.len()..]
-                    .split('-')
-                    .next()
-                    .and_then(|token| token.parse::<u32>().ok());
-                let dead = pid.is_some_and(native_gguf_pid_dead);
+                let pid =
+                    native_gguf_writer_pid_suffix(&name[index + NATIVE_GGUF_STAGING_INFIX.len()..]);
+                let Some(pid) = pid else {
+                    continue;
+                };
+                let dead = native_gguf_pid_dead(pid);
                 if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
                     // Re-derive the verdict under the held entry lock: a
                     // writer that restarted since the snapshot owns the lock
@@ -7098,7 +7118,7 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                         "interrupted staging directory",
                         |dir| {
                             let now = std::time::SystemTime::now();
-                            pid.is_some_and(native_gguf_pid_dead)
+                            native_gguf_pid_dead(pid)
                                 || fs::symlink_metadata(dir)
                                     .and_then(|meta| meta.modified())
                                     .ok()
@@ -7148,8 +7168,11 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
         // Loose files: interrupted write probes only; every other file in the
         // root is foreign and left alone.
         if let Some(stripped) = name.strip_prefix(NATIVE_GGUF_WRITE_PROBE_PREFIX) {
-            let dead = native_gguf_embedded_pid(stripped).is_some_and(native_gguf_pid_dead);
-            if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
+            // Probes are `.write-probe-{pid}-{simple-uuid}` files; a
+            // malformed suffix means foreign tooling.
+            if let Some(pid) = native_gguf_writer_pid_suffix(stripped)
+                && (native_gguf_pid_dead(pid) || native_gguf_mtime_older(meta.modified().ok(), now))
+            {
                 reclaimed += native_gguf_remove_logged(&path, "abandoned write probe");
             }
         }
@@ -17239,35 +17262,66 @@ mod tests {
         // Leftovers: dead-pid staging + write probe removed; live-pid and
         // fresh leftovers kept; a finished assets sidecar is never an orphan.
         let dead_staging = cache_root.join(format!(
-            ".{}.staging-{}",
+            ".{}.staging-{}-{}",
             native_sweep_entry_name("dead"),
-            dead_test_pid()
+            dead_test_pid(),
+            "d".repeat(32)
         ));
         fs::create_dir_all(&dead_staging).unwrap();
         let live_staging = cache_root.join(format!(
-            ".{}.staging-{}",
+            ".{}.staging-{}-{}",
             native_sweep_entry_name("live"),
-            std::process::id()
+            std::process::id(),
+            "e".repeat(32)
         ));
         fs::create_dir_all(&live_staging).unwrap();
-        // A dead-pid staging dir whose embedded key is not cache-key-shaped
-        // is foreign and never removed.
+        // Staging dirs the producer cannot emit are foreign and never
+        // removed: a malformed embedded key, a missing uuid suffix, or a
+        // dead pid followed by trailing junk after the uuid.
         let foreign_staging = cache_root.join(format!(".mybackup.staging-{}", dead_test_pid()));
         fs::create_dir_all(&foreign_staging).unwrap();
         native_sweep_age_dir(&foreign_staging);
-        let dead_probe = cache_root.join(format!(".write-probe-{}-x", dead_test_pid()));
+        let foreign_staging_nouuid = cache_root.join(format!(
+            ".{}.staging-{}",
+            native_sweep_entry_name("nouuid"),
+            dead_test_pid()
+        ));
+        fs::create_dir_all(&foreign_staging_nouuid).unwrap();
+        native_sweep_age_dir(&foreign_staging_nouuid);
+        let foreign_staging_extra = cache_root.join(format!(
+            ".{}.staging-{}-{}-extra",
+            native_sweep_entry_name("extra"),
+            dead_test_pid(),
+            "f".repeat(32)
+        ));
+        fs::create_dir_all(&foreign_staging_extra).unwrap();
+        native_sweep_age_dir(&foreign_staging_extra);
+        let dead_probe = cache_root.join(format!(
+            ".write-probe-{}-{}",
+            dead_test_pid(),
+            "f".repeat(32)
+        ));
         fs::write(&dead_probe, b"p").unwrap();
-        let live_probe = cache_root.join(format!(".write-probe-{}-x", std::process::id()));
+        let live_probe = cache_root.join(format!(
+            ".write-probe-{}-{}",
+            std::process::id(),
+            "a".repeat(32)
+        ));
         fs::write(&live_probe, b"p").unwrap();
+        // A probe whose uuid segment is malformed is foreign even when the
+        // pid reads as dead.
+        let foreign_probe = cache_root.join(format!(".write-probe-{}-x", dead_test_pid()));
+        fs::write(&foreign_probe, b"p").unwrap();
+        native_sweep_age_file(&foreign_probe);
         let assets_tmp =
-            cache_root.join(".mlx-qwen4-assets-tmp-12345678-90ab-cdef-0123-456789abcdef");
+            cache_root.join(".mlx-qwen4-assets-tmp-12345678-90ab-4def-8012-456789abcdef");
         fs::create_dir_all(&assets_tmp).unwrap();
         native_sweep_age_dir(&assets_tmp);
-        // A FRESH assets temp whose uuid-looking suffix starts with an
-        // all-decimal segment must survive: that segment is not a pid (the
-        // name embeds none) and must not bypass the mtime grace.
+        // A FRESH assets temp whose v4 uuid starts with an all-decimal
+        // segment must survive: that segment is not a pid (the name embeds
+        // none) and must not bypass the mtime grace.
         let live_assets_tmp =
-            cache_root.join(".mlx-qwen4-assets-tmp-99999999-dead-beef-0123-456789abcdef");
+            cache_root.join(".mlx-qwen4-assets-tmp-99999999-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
         fs::create_dir_all(&live_assets_tmp).unwrap();
         // Malformed asset-prefixed names are foreign tooling: never deleted
         // and never counted, however old.
@@ -17277,6 +17331,13 @@ mod tests {
         let foreign_assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-not-a-uuid");
         fs::create_dir_all(&foreign_assets_tmp).unwrap();
         native_sweep_age_dir(&foreign_assets_tmp);
+        // A hyphenated 8-4-4-4-12 shape that `Uuid::new_v4` cannot emit
+        // (version nibble 'c', variant '8' present but version wrong) is
+        // foreign too.
+        let foreign_assets_tmp_v3 =
+            cache_root.join(".mlx-qwen4-assets-tmp-12345678-90ab-cdef-0123-456789abcdef");
+        fs::create_dir_all(&foreign_assets_tmp_v3).unwrap();
+        native_sweep_age_dir(&foreign_assets_tmp_v3);
         let assets_sidecar = cache_root.join(format!(".mlx-qwen4-assets-v2-{}", "c".repeat(64)));
         fs::create_dir_all(&assets_sidecar).unwrap();
         fs::write(assets_sidecar.join("complete"), b"1").unwrap();
@@ -17308,10 +17369,14 @@ mod tests {
             &held,
             &live_staging,
             &foreign_staging,
+            &foreign_staging_nouuid,
+            &foreign_staging_extra,
             &live_probe,
+            &foreign_probe,
             &live_assets_tmp,
             &foreign_assets,
             &foreign_assets_tmp,
+            &foreign_assets_tmp_v3,
             &assets_sidecar,
             &foreign,
             &photos,
