@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod array;
+pub mod audio;
 pub mod autograd;
 pub mod benchmarks;
 pub mod cache_limit;

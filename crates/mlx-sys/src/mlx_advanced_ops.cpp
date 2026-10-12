@@ -1240,6 +1240,21 @@ mlx_array* mlx_conv_transpose2d(
 // Conv1d
 // ============================================
 
+mlx_array* mlx_conv_transpose1d(
+    mlx_array* input, mlx_array* weight, int stride, int padding,
+    int dilation, int output_padding, int groups
+) {
+    try {
+        auto& x = *reinterpret_cast<mlx::core::array*>(input);
+        auto& w = *reinterpret_cast<mlx::core::array*>(weight);
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(
+            mlx::core::conv_transpose1d(x, w, stride, padding, dilation, output_padding, groups)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_conv_transpose1d error: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
 mlx_array* mlx_conv1d(
     mlx_array* input,
     mlx_array* weight,

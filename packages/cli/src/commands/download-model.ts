@@ -1,14 +1,15 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { readdir, copyFile, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from '@huggingface/hub';
+import { downloadFile, listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from '@huggingface/hub';
 // Leaf subpath on purpose: `@mlx-node/server/host` would dlopen the native
 // addon, and downloading a model must work before any of that is needed.
 import { isGgufCompanionName } from '@mlx-node/lm/model-discovery';
 import { resolveModelsDir } from '@mlx-node/server/host/paths';
+import { ttsComponents } from '@mlx-node/tts/catalog';
 
 import { ensureDir, formatBytes } from '../utils.js';
 import { markCompletionPartial, readCompletion, writeCompletion, type DownloadCompletion } from './download-marker.js';
@@ -60,6 +61,19 @@ const PERMANENT_FS_CODES = new Set([
  * transient case, and it must keep retrying.
  */
 const PERMANENT_PROTOCOL_MESSAGES = ['Unsupported chunk version', 'Unsupported compression scheme'];
+
+/**
+ * Deterministic composite-model refusals raised by `listModelFilesOnce`, which
+ * runs INSIDE `withRetries`. Each describes repo state a repeat cannot change:
+ * a vanished config, a component that is incomplete at this revision, or a
+ * composite listing with no immutable revision to pin to — so they must not
+ * cost four recursive listings plus 1/2/4s of backoff to fail identically.
+ */
+const PERMANENT_DOWNLOAD_MESSAGES = [
+  'Repository config disappeared',
+  'Composite models require an immutable revision',
+  'Required model component',
+];
 
 /** The human-readable text of a failure, whatever shape it arrived in. */
 function failureText(error: unknown): string {
@@ -130,8 +144,9 @@ function isRetriableStatus(status: number): boolean {
  * The harm is asymmetric, but NOT as cheaply as "7 s of backoff": because each
  * attempt truncates `<blob>.incomplete` and re-GETs without a Range header, a
  * wrongly-retried failure also re-transfers the shard up to three more times.
- * That is why the two categories which are deterministic AND status-less —
- * {@link PERMANENT_FS_CODES} and {@link PERMANENT_PROTOCOL_MESSAGES} — are
+ * That is why the categories which are deterministic AND status-less —
+ * {@link PERMANENT_FS_CODES}, {@link PERMANENT_PROTOCOL_MESSAGES}, and
+ * {@link PERMANENT_DOWNLOAD_MESSAGES} — are
  * named explicitly instead of being left to the default. Refusing to retry
  * something transient still costs the whole download, so everything else
  * unmodelled keeps defaulting to retry.
@@ -156,6 +171,7 @@ export function isRetriableFetchError(error: unknown): boolean {
   // string through the blob stream, but as an Error when awaited directly.
   const text = failureText(error);
   if (PERMANENT_PROTOCOL_MESSAGES.some((m) => text.includes(m))) return false;
+  if (PERMANENT_DOWNLOAD_MESSAGES.some((m) => text.includes(m))) return false;
 
   if (typeof error === 'string') {
     const status = FLATTENED_STATUS.exec(error);
@@ -345,6 +361,7 @@ async function listModelFilesOnce(
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
   const allFiles: ListFileEntry[] = [];
+  let components: readonly string[] = [];
 
   // Compile glob patterns if provided
   const globs = globPatterns?.map(globToRegex);
@@ -386,7 +403,40 @@ async function listModelFilesOnce(
     }
   }
 
-  return { totalSize, filesToDownload, allFiles };
+  // Composite models declare mandatory components in their family metadata.
+  // Read config and all component assets at the SAME revision as root weights.
+  if (allFiles.some((file) => file.path === 'config.json')) {
+    const blob = await downloadFile({
+      repo: { type: 'model', name: modelName },
+      path: 'config.json',
+      accessToken,
+      revision,
+    });
+    if (!blob) throw new Error('Repository config disappeared while listing model assets');
+    components = ttsComponents(JSON.parse(await blob.text()) as { model_type?: unknown });
+    if (components.length && !revision)
+      throw new Error(
+        'Composite models require an immutable revision; retry when the repository revision can be resolved',
+      );
+    for (const component of components) {
+      const prefix = `${component}/`;
+      const assets = allFiles.filter(
+        (file) => file.path.startsWith(prefix) && isDefaultModelDownloadPath(file.path.slice(prefix.length), new Set()),
+      );
+      if (
+        !assets.some((file) => file.path === `${prefix}config.json`) ||
+        !assets.some((file) => file.path.endsWith('.safetensors'))
+      )
+        throw new Error(`Required model component ${component} is incomplete`);
+      const selected = new Set(filesToDownload.map((file) => file.path));
+      for (const file of assets)
+        if (!selected.has(file.path)) {
+          filesToDownload.push(file);
+          totalSize += file.size ?? 0;
+        }
+    }
+  }
+  return { totalSize, filesToDownload, allFiles, components };
 }
 
 /** Root-default selection plus nested files already claimed by a prior marker. */
@@ -432,15 +482,32 @@ async function resolveRemoteRevision(modelName: string, accessToken?: string): P
  * shards would silently exit as "already downloaded" and leave the user
  * with a broken local copy.
  *
- * Pure function: takes the directory + its file list and only reads the
- * index file when sharded-model checks need it. No network, no other I/O.
+ * Reads local configuration, declared components and shard indexes without
+ * network I/O. `excludedPaths` checks the future layout before planned pruning.
  */
-export function isModelAlreadyDownloaded(outputDir: string, files: string[]): boolean {
-  const fileSet = new Set(files);
+export function isModelAlreadyDownloaded(
+  outputDir: string,
+  files: string[],
+  excludedPaths: ReadonlySet<string> = new Set(),
+): boolean {
+  const fileSet = new Set(files.filter((file) => !excludedPaths.has(file)));
   const hasConfig = fileSet.has('config.json');
   if (!hasConfig) return false;
+  try {
+    const config = JSON.parse(readFileSync(join(outputDir, 'config.json'), 'utf8')) as { model_type?: unknown };
+    for (const component of ttsComponents(config)) {
+      const path = join(outputDir, component);
+      const prefix = `${component}/`;
+      const excluded = new Set(
+        [...excludedPaths].filter((file) => file.startsWith(prefix)).map((file) => file.slice(prefix.length)),
+      );
+      if (!isModelAlreadyDownloaded(path, readdirSync(path), excluded)) return false;
+    }
+  } catch {
+    return false;
+  }
 
-  const hasSingleModel = fileSet.has('model.safetensors');
+  const hasSingleModel = fileSet.has('model.safetensors') || fileSet.has('weights.safetensors');
   const hasPaddleModel = fileSet.has('inference.pdiparams');
   if (hasSingleModel || hasPaddleModel) return true;
 
@@ -468,7 +535,7 @@ export function isModelAlreadyDownloaded(outputDir: string, files: string[]): bo
   if (shardFilenames.size === 0) return false;
 
   for (const shard of shardFilenames) {
-    if (!existsSync(join(outputDir, shard))) return false;
+    if (excludedPaths.has(shard) || !existsSync(join(outputDir, shard))) return false;
   }
   return true;
 }
@@ -872,7 +939,7 @@ export async function run(argv: string[]) {
     console.warn('Could not resolve the latest revision from HuggingFace; update check disabled for this run.\n');
   }
 
-  let cachedManifest: { totalSize: number; filesToDownload: ListFileEntry[]; allFiles: ListFileEntry[] } | null = null;
+  let cachedManifest: Awaited<ReturnType<typeof getModelFiles>> | null = null;
   let completion: DownloadCompletion | null = null;
   let existingTopLevelFiles: string[] = [];
   // Content-hash verification is needed exactly when local files might be
@@ -1124,7 +1191,7 @@ export async function run(argv: string[]) {
   if (cachedManifest === null) {
     console.log('Fetching file list from HuggingFace...\n');
   }
-  let manifest: { totalSize: number; filesToDownload: ListFileEntry[]; allFiles: ListFileEntry[] };
+  let manifest: Awaited<ReturnType<typeof getModelFiles>>;
   try {
     manifest =
       cachedManifest ??
@@ -1142,7 +1209,7 @@ export async function run(argv: string[]) {
     await restoreCompletionMarker();
     throw error;
   }
-  const { totalSize, filesToDownload, allFiles } = manifest;
+  const { totalSize, filesToDownload, allFiles, components } = manifest;
 
   if (filesToDownload.length === 0) {
     console.error('No files matched the given criteria.\n');
@@ -1237,6 +1304,24 @@ export async function run(argv: string[]) {
       previousCompletion !== null
         ? computePruneList(previousCompletion.files, scopedPaths, outputDir, !fullSemantics, exemptFromPrune)
         : computeLegacyWeightPruneList(existingTopLevelFiles, scopedPaths, outputDir, !fullSemantics);
+    // Legacy child checkpoints need the same layout cleanup as the root. A
+    // stale single-file codec otherwise shadows newly downloaded shards and
+    // would remain untracked after the first completion marker is written.
+    if (previousCompletion === null && fullSemantics) {
+      for (const component of components) {
+        const directory = join(outputDir, component);
+        if (!existsSync(directory)) continue;
+        const prefix = `${component}/`;
+        pruneList.push(
+          ...computeLegacyWeightPruneList(
+            readdirSync(directory),
+            scopedPaths.filter((file) => file.startsWith(prefix)).map((file) => file.slice(prefix.length)),
+            directory,
+            false,
+          ).map((file) => `${prefix}${file}`),
+        );
+      }
+    }
     // The exact file list this run will certify — computed BEFORE the prune so
     // the guard and the marker agree on one set.
     certified = buildMarkerFiles(
@@ -1403,6 +1488,19 @@ export async function run(argv: string[]) {
             `The installed directory is unchanged.`,
         );
       }
+    }
+    const installedConfig = existsSync(join(outputDir, 'config.json'))
+      ? (JSON.parse(readFileSync(join(outputDir, 'config.json'), 'utf8')) as { model_type?: unknown })
+      : {};
+    // Verify the layout that will remain BEFORE deleting old weights. Exclude
+    // obsolete single files so they cannot hide missing replacement shards.
+    if (
+      ttsComponents(installedConfig).length &&
+      !isModelAlreadyDownloaded(outputDir, readdirSync(outputDir), new Set(pruneList))
+    ) {
+      throw new Error(
+        'Composite model is incomplete: root and every declared component must contain all indexed weight shards',
+      );
     }
     for (const rel of pruneList) {
       console.log(`  Removing ${rel} (no longer in the upstream repo)`);

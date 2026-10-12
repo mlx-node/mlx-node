@@ -29,6 +29,7 @@ tracing-subscriber = { workspace = true }
 image = { workspace = true }
 mlx-paged-attn = { workspace = true }
 mlx-db = { workspace = true }
+mlx-tts = { workspace = true }
 sqlx = { workspace = true }
 unicode-width = { workspace = true }
 unicode-ident = { workspace = true }

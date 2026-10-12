@@ -6,6 +6,7 @@
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/trl": "workspace:*",
+    "@mlx-node/tts": "workspace:*",
     "@mlx-node/vlm": "workspace:*",
     "@napi-rs/image": "1.14.0",
     "@openrouter/ai-sdk-provider": "^3.0.0",

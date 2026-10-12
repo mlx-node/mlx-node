@@ -78,7 +78,8 @@ struct StorePlan {
 /// Key-Value cache for efficient transformer inference.
 ///
 /// Uses pre-allocated buffers with in-place assignment to avoid O(N²) concatenation overhead.
-/// Allocates memory in 256-token chunks (matching MLX-LM's step size).
+/// Defaults to 256-token allocation chunks. Short, bounded sequences can use a
+/// smaller growth step without changing the logical cache or reset semantics.
 ///
 /// In [`KvFormat::Int8`] mode `keys` / `values` are int8 `[B, H, capacity,
 /// D]` and `key_scales` / `value_scales` float32 `[B, H, capacity]`; rows are
@@ -126,6 +127,21 @@ impl KVCache {
         }
     }
 
+    /// Choose allocation granularity for a workload with a known sequence bound.
+    /// This controls spare capacity, not how many tokens attention can observe.
+    pub(crate) fn with_growth_step(rows: usize) -> Result<Self> {
+        let step = i32::try_from(rows)
+            .ok()
+            .filter(|&rows| rows > 0)
+            .ok_or_else(|| {
+                Error::from_reason("KV cache growth step must be within 1..=i32::MAX")
+            })?;
+        Ok(Self {
+            step,
+            ..Self::new()
+        })
+    }
+
     /// Element format of the rows this cache holds.
     pub fn format(&self) -> KvFormat {
         self.format
@@ -145,21 +161,33 @@ impl KVCache {
         v_dtype: DType,
     ) -> Result<()> {
         let prev = self.offset;
+        let next = prev
+            .checked_add(seq_len)
+            .ok_or_else(|| Error::from_reason("KV cache sequence is too large"))?;
         let needs_grow = match &self.keys {
-            Some(cached_keys) => (prev + seq_len) > cached_keys.shape_at(2)? as i32,
+            Some(cached_keys) => i64::from(next) > cached_keys.shape_at(2)?,
             None => true,
         };
         if !needs_grow {
             return Ok(());
         }
         // Calculate how many steps we need to allocate
-        let n_steps = (self.step + seq_len - 1) / self.step;
-        let step_rows = n_steps as i64 * self.step as i64;
+        let step = i64::from(self.step);
+        let step_rows = (step + i64::from(seq_len) - 1) / step * step;
         let new_rows = if self.keys.is_some() {
             step_rows
         } else {
-            step_rows.max(std::mem::take(&mut self.pending_rows))
+            step_rows.max(self.pending_rows)
         };
+        let keep_rows = if prev % self.step != 0 {
+            Some(i64::from(prev))
+        } else {
+            None
+        };
+        let retained = keep_rows.unwrap_or(self.capacity()?);
+        if retained + new_rows > i64::from(i32::MAX) {
+            return Err(Error::from_reason("KV cache allocation is too large"));
+        }
         let k_shape = [batch_size, n_kv_heads, new_rows, k_head_dim];
         let v_shape = [batch_size, n_kv_heads, new_rows, v_head_dim];
 
@@ -179,12 +207,9 @@ impl KVCache {
 
         // Align to step boundary if needed; only concatenate when growing
         // the buffer (rare!)
-        let keep_rows = if prev % self.step != 0 {
-            Some(prev as i64)
-        } else {
-            None
-        };
-        self.append_rows(keep_rows, new_k, new_v, new_scales)
+        self.append_rows(keep_rows, new_k, new_v, new_scales)?;
+        self.pending_rows = 0;
+        Ok(())
     }
 
     /// Updates the cache with new keys and values, and returns all cached keys/values.
@@ -213,11 +238,15 @@ impl KVCache {
         // Extract dimensions without copying entire shape vectors
         let batch_size = keys.shape_at(0)?;
         let n_kv_heads = keys.shape_at(1)?;
-        let seq_len = keys.shape_at(2)? as i32;
+        let seq_len = i32::try_from(keys.shape_at(2)?)
+            .map_err(|_| Error::from_reason("KV cache input sequence is too large"))?;
         let k_head_dim = keys.shape_at(3)?;
         let v_head_dim = values.shape_at(3)?;
 
         let prev = self.offset;
+        let next = prev
+            .checked_add(seq_len)
+            .ok_or_else(|| Error::from_reason("KV cache sequence is too large"))?;
         self.ensure_rows(
             batch_size,
             n_kv_heads,
@@ -230,7 +259,7 @@ impl KVCache {
 
         // In-place assignment: write new keys/values to pre-allocated buffer
         // This is O(N) instead of O(N²) concatenation!
-        self.offset += seq_len;
+        self.offset = next;
 
         // Get mutable references and perform TRUE in-place updates
         // This modifies the pre-allocated buffers directly without creating new arrays!
@@ -288,7 +317,8 @@ impl KVCache {
         }
         let batch_size = rows.keys.shape_at(0)?;
         let n_kv_heads = rows.keys.shape_at(1)?;
-        let seq_len = rows.keys.shape_at(2)? as i32;
+        let seq_len = i32::try_from(rows.keys.shape_at(2)?)
+            .map_err(|_| Error::from_reason("KV cache input sequence is too large"))?;
         let k_head_dim = rows.keys.shape_at(3)?;
         let v_head_dim = rows.values.shape_at(3)?;
         let prev = self.offset;
@@ -422,7 +452,8 @@ impl KVCache {
                 (DType::Int8, DType::Int8)
             }
         };
-        let seq_len = keys.shape_at(2)? as i32;
+        let seq_len = i32::try_from(keys.shape_at(2)?)
+            .map_err(|_| Error::from_reason("KV cache input sequence is too large"))?;
         let offset = self.offset;
         self.ensure_rows(
             keys.shape_at(0)?,
@@ -502,6 +533,57 @@ impl KVCache {
         self.value_scales = None;
         self.offset = 0;
         self.pending_rows = 0;
+    }
+
+    /// Reset the logical sequence while retaining the allocated buffers.
+    /// No value beyond the new offset is observable by update_and_fetch.
+    pub(crate) fn reset_keep_capacity(&mut self) {
+        self.offset = 0;
+    }
+
+    /// Fork a reusable prefix into an independently writable cache. Cloning an
+    /// MxArray handle would alias the buffers modified by update_and_fetch.
+    pub(crate) fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            keys: self.keys.as_ref().map(MxArray::deep_copy).transpose()?,
+            values: self.values.as_ref().map(MxArray::deep_copy).transpose()?,
+            key_scales: self
+                .key_scales
+                .as_ref()
+                .map(MxArray::deep_copy)
+                .transpose()?,
+            value_scales: self
+                .value_scales
+                .as_ref()
+                .map(MxArray::deep_copy)
+                .transpose()?,
+            format: self.format,
+            offset: self.offset,
+            step: self.step,
+            pending_rows: self.pending_rows,
+        })
+    }
+
+    /// Retain a bounded suffix. Position encodings must use a separate absolute
+    /// cursor: this cache's offset counts resident rows only.
+    pub(crate) fn retain_recent(&mut self, rows: usize) -> Result<()> {
+        if rows >= self.offset as usize {
+            return Ok(());
+        }
+        let start = i64::from(self.offset) - rows as i64;
+        for buffer in [
+            &mut self.keys,
+            &mut self.values,
+            &mut self.key_scales,
+            &mut self.value_scales,
+        ] {
+            *buffer = buffer
+                .as_ref()
+                .map(|x| x.slice_axis(2, start, i64::from(self.offset))?.deep_copy())
+                .transpose()?;
+        }
+        self.offset = rows as i32;
+        Ok(())
     }
 
     /// Make the buffer hold at least `rows` rows (rounded up to the step), so
@@ -945,9 +1027,116 @@ mod tests {
     }
 
     #[test]
+    fn test_growth_step_validation() {
+        assert!(KVCache::with_growth_step(0).is_err());
+        assert!(KVCache::with_growth_step(i32::MAX as usize + 1).is_err());
+        assert!(KVCache::with_growth_step(i32::MAX as usize).is_ok());
+    }
+
+    #[test]
+    fn test_growth_overflow_is_rejected_before_allocation_or_mutation() {
+        let row = MxArray::from_float32(&[1.], &[1, 1, 1, 1]).unwrap();
+        let mut cache = KVCache::new();
+        cache.update_and_fetch(&row, &row).unwrap();
+        cache.step = i32::MAX;
+        cache.offset = 256;
+        // One retained buffer plus one huge step exceeds the index range.
+        assert!(cache.update_and_fetch(&row, &row).is_err());
+        assert_eq!(cache.offset, 256);
+        assert_eq!(cache.capacity().unwrap(), 256);
+        cache.offset = i32::MAX;
+        assert!(cache.update_and_fetch(&row, &row).is_err());
+        assert_eq!(cache.offset, i32::MAX);
+        assert_eq!(cache.capacity().unwrap(), 256);
+    }
+
+    #[test]
+    fn test_small_growth_steps_preserve_values_reset_reservation_and_forks() {
+        for step in [1, 3, 16, 256] {
+            let mut cache = KVCache::with_growth_step(step).unwrap();
+            let mut expected = Vec::new();
+            for count in [2, 1, 5, 17] {
+                let input: Vec<f32> = (expected.len()..expected.len() + count)
+                    .map(|i| i as f32)
+                    .collect();
+                let values = MxArray::from_float32(&input, &[1, 1, count as i64, 1]).unwrap();
+                let (keys, vals) = cache.update_and_fetch(&values, &values).unwrap();
+                expected.extend(input);
+                assert_eq!(keys.to_float32().unwrap().as_ref(), expected.as_slice());
+                assert_eq!(vals.to_float32().unwrap().as_ref(), expected.as_slice());
+                assert!(cache.capacity().unwrap() < (expected.len() + step) as i64);
+            }
+            cache.reserve(cache.capacity().unwrap() + 40).unwrap();
+            let capacity = cache.capacity().unwrap();
+            assert_eq!(capacity % step as i64, 0);
+            let mut fork = cache.fork().unwrap();
+            assert_eq!(fork.step, step as i32);
+            fork.reset_keep_capacity();
+            let replacement = MxArray::from_float32(&[91., 92.], &[1, 1, 2, 1]).unwrap();
+            let (keys, _) = fork.update_and_fetch(&replacement, &replacement).unwrap();
+            assert_eq!(keys.to_float32().unwrap().as_ref(), &[91., 92.]);
+            assert_eq!(fork.capacity().unwrap(), capacity);
+            assert_eq!(cache.get_offset(), expected.len() as i32);
+            assert_eq!(
+                cache
+                    .keys_ref()
+                    .unwrap()
+                    .slice_axis(2, 0, expected.len() as i64)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .as_ref(),
+                expected.as_slice()
+            );
+            cache.reset();
+            cache.reserve(5).unwrap();
+            cache.update_and_fetch(&replacement, &replacement).unwrap();
+            assert_eq!(
+                cache.capacity().unwrap(),
+                5usize.div_ceil(step) as i64 * step as i64
+            );
+        }
+    }
+
+    #[test]
+    fn test_reuse_capacity_and_bounded_suffix_do_not_expose_old_rows() {
+        let mut cache = KVCache::new();
+        let old = MxArray::from_float32(&[1., 2., 3., 4.], &[1, 1, 4, 1]).unwrap();
+        cache.update_and_fetch(&old, &old).unwrap();
+        let capacity = cache.capacity().unwrap();
+        cache.reset_keep_capacity();
+        assert_eq!(cache.capacity().unwrap(), capacity);
+        let next = MxArray::from_float32(&[7., 8., 9.], &[1, 1, 3, 1]).unwrap();
+        let (keys, _) = cache.update_and_fetch(&next, &next).unwrap();
+        assert_eq!(keys.to_float32().unwrap().as_ref(), &[7., 8., 9.]);
+        cache.retain_recent(2).unwrap();
+        let last = MxArray::from_float32(&[10.], &[1, 1, 1, 1]).unwrap();
+        let (keys, _) = cache.update_and_fetch(&last, &last).unwrap();
+        assert_eq!(keys.to_float32().unwrap().as_ref(), &[8., 9., 10.]);
+    }
+
+    #[test]
     fn test_cache_default() {
         let cache = KVCache::default();
         assert_eq!(cache.get_offset(), 0);
+    }
+
+    #[test]
+    fn test_fork_isolates_in_place_writes_and_keeps_capacity() {
+        let mut prefix = KVCache::new();
+        let input = MxArray::from_float32(&[1., 2., 3.], &[1, 1, 3, 1]).unwrap();
+        let (keys, _) = prefix.update_and_fetch(&input, &input).unwrap();
+        keys.eval();
+        let mut fork = prefix.fork().unwrap();
+        assert_eq!(fork.capacity().unwrap(), prefix.capacity().unwrap());
+        fork.trim(1);
+        let replacement = MxArray::from_float32(&[9., 8.], &[1, 1, 2, 1]).unwrap();
+        let (keys, _) = fork.update_and_fetch(&replacement, &replacement).unwrap();
+        assert_eq!(keys.to_float32().unwrap().as_ref(), &[1., 9., 8.]);
+        let suffix = MxArray::from_float32(&[4.], &[1, 1, 1, 1]).unwrap();
+        let (keys, _) = prefix.update_and_fetch(&suffix, &suffix).unwrap();
+        assert_eq!(keys.to_float32().unwrap().as_ref(), &[1., 2., 3., 4.]);
+        assert_eq!(fork.get_offset(), 3);
     }
 
     #[test]
@@ -1241,6 +1430,49 @@ mod tests {
 
     fn metal() -> bool {
         unsafe { mlx_sys::mlx_metal_is_available() }
+    }
+
+    #[test]
+    fn int8_fork_suffix_and_reuse_keep_scales_aligned_with_small_growth() {
+        if !metal() {
+            return;
+        }
+        let check = |a: &Int8KvRows, b: &Int8KvRows| {
+            assert_eq!(bits(&a.keys), bits(&b.keys));
+            assert_eq!(bits(&a.values), bits(&b.values));
+            assert_eq!(bits(&a.key_scales), bits(&b.key_scales));
+            assert_eq!(bits(&a.value_scales), bits(&b.value_scales));
+        };
+        let mut cache = KVCache::with_format(KvFormat::Int8);
+        cache.step = 7;
+        let (k, v) = rows256(2, 10, 1.0);
+        cache.update_and_fetch_int8(&k, &v).unwrap();
+        assert_eq!(cache.capacity().unwrap(), 14);
+        let expected = Int8KvRows::quantize(&k, &v).unwrap();
+        // Materialize all four copies before either branch writes in place.
+        let mut fork = cache.fork().unwrap();
+        check(&fork.int8_view().unwrap(), &expected);
+        fork.reset_keep_capacity();
+        let (next_k, next_v) = rows256(2, 2, 9.0);
+        let next = Int8KvRows::quantize(&next_k, &next_v).unwrap();
+        check(&fork.append_quantized(&next).unwrap(), &next);
+        check(&cache.int8_view().unwrap(), &expected);
+        assert_eq!(fork.capacity().unwrap(), 14);
+
+        cache.retain_recent(3).unwrap();
+        check(
+            &cache.int8_view().unwrap(),
+            &expected.slice_tokens(7, 10).unwrap(),
+        );
+        let all = cache.append_quantized(&next).unwrap();
+        check(
+            &all.slice_tokens(0, 3).unwrap(),
+            &expected.slice_tokens(7, 10).unwrap(),
+        );
+        check(&all.slice_tokens(3, 5).unwrap(), &next);
+        assert_eq!(cache.capacity().unwrap(), 10);
+        assert_eq!(cache.key_scales_ref().unwrap().shape_at(2).unwrap(), 10);
+        assert_eq!(cache.value_scales_ref().unwrap().shape_at(2).unwrap(), 10);
     }
 
     /// Quantize -> dequantize keeps every element within half a quantization

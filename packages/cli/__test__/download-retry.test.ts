@@ -121,6 +121,20 @@ describe('isRetriableFetchError', () => {
     expect(isRetriableFetchError('Failed to fetch all data for term abc123, fetched 4 bytes out of 99')).toBe(true);
   });
 
+  it('does NOT retry a deterministic composite-model refusal', () => {
+    // `listModelFilesOnce` runs inside `withRetries`, so these plain Errors
+    // would otherwise default to retriable and cost four full recursive
+    // listings plus 1/2/4s of backoff to report a failure that can never
+    // succeed on a repeat: they describe repo state, not transport.
+    for (const text of [
+      'Repository config disappeared while listing model assets',
+      'Composite models require an immutable revision; retry when the repository revision can be resolved',
+      'Required model component speech_tokenizer is incomplete',
+    ]) {
+      expect([text, isRetriableFetchError(new Error(text))]).toEqual([text, false]);
+    }
+  });
+
   it('retries transport failures that are not spelled "fetch failed"', () => {
     // Naming known network errors is a trap: `fetch` rejects `TypeError: fetch
     // failed` on connect/DNS but `TypeError: terminated` on a mid-body socket

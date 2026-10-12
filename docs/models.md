@@ -1,5 +1,13 @@
 # Models
 
+## Speech synthesis
+
+`@mlx-node/tts` supports Qwen3-TTS CustomVoice presets and Base reference voice
+cloning, plus 1.7B CustomVoice instructions and VoiceDesign descriptions. It
+exposes segmented incremental text and instruction events, streaming PCM, WAV
+output and CoreAudio playback through one native inference path. See
+[Native streaming text to speech](tts.md) for the SDK, CLI and validation details.
+
 ## Language models
 
 All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendStream` / `sendToolResult` / `reset`) driven by the native `chatSessionStart` / `chatSessionContinue` / `chatSessionContinueTool` NAPI entry points. The legacy `model.chat()` / `model.chatStream()` methods are removed from every generative model.

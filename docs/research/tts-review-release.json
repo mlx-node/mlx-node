@@ -1,0 +1,340 @@
+{
+  "date": "2026-10-09",
+  "reviewBase": "168300598d46163fbde31e7545a1d6b7d6b428eb",
+  "nativeAddonSha256": "9732249471d06d66d3b6ec71ffe63829056468981f230f69bd240b204ebf0b4f",
+  "protocol": {
+    "build": "release / optimized",
+    "node": "ordinary Node, emitted JS, built SDK; NODE_OPTIONS unset",
+    "cacheGiB": 0.5,
+    "sampling": "checkpoint defaults; seed 534",
+    "instructionCache": false,
+    "playback": false,
+    "performanceClaim": "Single short smoke per model, unpaired. Does not measure physical footprint, playback underruns, or establish a performance improvement."
+  },
+  "encoderOracle": {
+    "torch": "2.7.1",
+    "transformers": "4.57.3",
+    "device": "cpu",
+    "dtype": "float32",
+    "attention": "eager",
+    "sourceRevision": "5d83992436eae1d760afd27aff78a71d676296fc",
+    "configSha256": "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167",
+    "weightsSha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+    "comparisons": [
+      {
+        "wave": "wave",
+        "samples": 48017,
+        "shape": [1, 26, 16],
+        "oldIdDifferences": 0
+      },
+      {
+        "wave": "long_wave",
+        "samples": 528187,
+        "shape": [1, 276, 16],
+        "oldIdDifferences": 28
+      }
+    ]
+  },
+  "models": {
+    "base": {
+      "model": ".cache/tts/models/Base-8bit",
+      "environment": {
+        "cpu": "Apple M4",
+        "memoryBytes": 34359738368,
+        "platform": "darwin",
+        "arch": "arm64",
+        "osRelease": "27.0.0",
+        "node": "v24.21.0",
+        "note": "Review release smoke; no playback; no concurrent inference or builds; not a paired performance comparison."
+      },
+      "parameters": {
+        "voice": {
+          "id": "b13e8b74-1d8d-48a0-9fce-2293e4222504"
+        },
+        "language": "chinese",
+        "seed": 534,
+        "chunkDurationMs": 160,
+        "instructions": [],
+        "instructionCache": false
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "checkpoint": {
+        "configSha256": "adc2f05407bd364ddb657cd1198661250f58fb347cf6b9450072f93f238afcff",
+        "revision": null,
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "loadMs": 169.947917,
+      "voicePreparationMs": 2990.20725,
+      "synthesis": {
+        "audioSeconds": 11.520000000000007,
+        "synthesisMs": 5817.740085,
+        "wallMs": 5823.5415,
+        "inputWaitMs": 0.6753330000005917,
+        "consumerWaitMs": 58.70458299999336,
+        "realTimeFactor": 0.5050121601562497,
+        "firstPcmMs": 170.17112499999985,
+        "segments": 3,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 39.21012100000189,
+        "inputFrames": 276480,
+        "outputFrames": 240417,
+        "rawPcmSha256": "b2da7f088df940f46e8e2ad6cf19e38f6a8532d128baeb8cd5366f20dc37253f",
+        "processedPcmSha256": "09007987f6b46e06f93194057b966db970edcbf407231de784a187b375b06869",
+        "speed": 1.15,
+        "outputSeconds": 10.017375000000001
+      },
+      "timing": {
+        "observedStreamWallMs": 5839.2970829999995,
+        "observedStreamWallRatio": 0.5829168902032716,
+        "playbackFinishWallMs": null,
+        "measuredServiceTimeMs": 5856.950206000002,
+        "measuredServiceTimeRatio": 0.5846791405932195,
+        "note": "Service intervals may overlap and omit untimed overhead. Wall time includes input, sinks and backpressure."
+      },
+      "blockIntervalMs": {
+        "p50": 75.24079200000006,
+        "p95": 80.97608300000047,
+        "p99": 204.44808399999965,
+        "max": 204.44808399999965
+      },
+      "peakRssBytes": 2208776192,
+      "lifecycle": {
+        "cancelledFullNativeQueue": true,
+        "reusedModel": true,
+        "chunkingMaxError": 1.959502696990967e-6,
+        "disposedPausedInput": true,
+        "referenceLifecycle": {
+          "native": {
+            "activeBytesBefore": 1985675780,
+            "activeBytesAfter": 1980256324
+          },
+          "sdk": {
+            "activeBytesBefore": 1985814744,
+            "activeBytesAfter": 1980392216
+          },
+          "rejectedBusyRelease": true,
+          "rejectedReleasedVoices": true,
+          "preparedReplacementVoices": true,
+          "disposedPreparationMs": 19.619791000000987
+        }
+      },
+      "benchmarkReport": ".cache/tts/review/base-benchmark.json",
+      "benchmarkReportSha256": "416941249e18505a4db036a147ddd3055130330cdd8bfe064dfdef5f3571e297",
+      "wavSha256": "61aac89f37f36689a2ccc024f44eaf11d253b4ec348e1305d246c18a0a4a4d52"
+    },
+    "custom": {
+      "model": ".cache/tts/models/CustomVoice-1.7B-8bit",
+      "environment": {
+        "cpu": "Apple M4",
+        "memoryBytes": 34359738368,
+        "platform": "darwin",
+        "arch": "arm64",
+        "osRelease": "27.0.0",
+        "node": "v24.21.0",
+        "note": "Review release smoke; no playback; no concurrent inference or builds; not a paired performance comparison."
+      },
+      "parameters": {
+        "voice": "vivian",
+        "instruct": "用平静沉稳的语气说。",
+        "language": "chinese",
+        "seed": 534,
+        "chunkDurationMs": 160,
+        "instructions": [],
+        "instructionCache": false
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "checkpoint": {
+        "configSha256": "7eb2903c7b2ecf2525115e5f9a2193dc9c66726264b17b707bb616ac875f04f9",
+        "revision": {
+          "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+          "revision": "0c0e3051f131929182e2c023b9537f8b1c68adfe"
+        },
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "loadMs": 213.159792,
+      "voicePreparationMs": 0.0011659999999551474,
+      "synthesis": {
+        "audioSeconds": 13.040000000000008,
+        "synthesisMs": 8326.27717,
+        "wallMs": 8329.83525,
+        "inputWaitMs": 0.2769999999994752,
+        "consumerWaitMs": 23.065208999996514,
+        "realTimeFactor": 0.6385181878834352,
+        "firstPcmMs": 160.068667,
+        "segments": 3,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 0,
+        "inputFrames": 312960,
+        "outputFrames": 312960,
+        "rawPcmSha256": "07cce8cc39d85ddc26273125fed9067506ceb10e2c787d83251ff4d0c3e507b0",
+        "processedPcmSha256": "07cce8cc39d85ddc26273125fed9067506ceb10e2c787d83251ff4d0c3e507b0",
+        "speed": 1,
+        "outputSeconds": 13.040000000000008
+      },
+      "timing": {
+        "observedStreamWallMs": 8335.706,
+        "observedStreamWallRatio": 0.6392412576687113,
+        "playbackFinishWallMs": null,
+        "measuredServiceTimeMs": 8326.27717,
+        "measuredServiceTimeRatio": 0.6385181878834352,
+        "note": "Service intervals may overlap and omit untimed overhead. Wall time includes input, sinks and backpressure."
+      },
+      "blockIntervalMs": {
+        "p50": 98.20033299999977,
+        "p95": 113.53237499999977,
+        "p99": 130.9227920000003,
+        "max": 130.9227920000003
+      },
+      "peakRssBytes": 3084894208,
+      "lifecycle": {
+        "cancelledFullNativeQueue": true,
+        "reusedModel": true,
+        "chunkingMaxError": 6.854534149169922e-6,
+        "disposedPausedInput": true
+      },
+      "benchmarkReport": ".cache/tts/review/custom-benchmark.json",
+      "benchmarkReportSha256": "d5149a38a120610d961820953d4a670fa3334479e3ee308c0eed4c5037a36552",
+      "wavSha256": "958d7d776afdaac4b2c325e5fed1ae97e0e6563d514859a0f953356af04a9b88"
+    },
+    "design": {
+      "model": ".cache/tts/models/VoiceDesign-1.7B-8bit",
+      "environment": {
+        "cpu": "Apple M4",
+        "memoryBytes": 34359738368,
+        "platform": "darwin",
+        "arch": "arm64",
+        "osRelease": "27.0.0",
+        "node": "v24.21.0",
+        "note": "Review release smoke; no playback; no concurrent inference or builds; not a paired performance comparison."
+      },
+      "parameters": {
+        "voice": {
+          "type": "description",
+          "description": "成年女性，音色清晰、沉稳，普通话发音自然。"
+        },
+        "instruct": "用平静沉稳的语气说。",
+        "language": "chinese",
+        "seed": 534,
+        "chunkDurationMs": 160,
+        "instructions": [],
+        "instructionCache": false
+      },
+      "precision": {
+        "dtype": "checkpoint",
+        "quantization": {
+          "group_size": 64,
+          "bits": 8,
+          "mode": "affine"
+        },
+        "codec": "source precision"
+      },
+      "checkpoint": {
+        "configSha256": "230d9f634e945411bb8f2f80ab34ef96c5b15d852d99b9f5c804e5d8f2491359",
+        "revision": {
+          "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+          "revision": "5ecdb67327fd37bb2e042aab12ff7391903235d3"
+        },
+        "generationDefaults": {
+          "do_sample": true,
+          "repetition_penalty": 1.05,
+          "temperature": 0.9,
+          "top_p": 1,
+          "top_k": 50,
+          "subtalker_dosample": true,
+          "subtalker_temperature": 0.9,
+          "subtalker_top_p": 1,
+          "subtalker_top_k": 50,
+          "max_new_tokens": 8192
+        }
+      },
+      "loadMs": 221.888083,
+      "voicePreparationMs": 0.007457999999985532,
+      "synthesis": {
+        "audioSeconds": 11.200000000000006,
+        "synthesisMs": 7147.489044,
+        "wallMs": 7151.403875,
+        "inputWaitMs": 0.3612069999998653,
+        "consumerWaitMs": 20.340874999999357,
+        "realTimeFactor": 0.6381686646428568,
+        "firstPcmMs": 182.91445799999997,
+        "segments": 3,
+        "finishReason": "eos"
+      },
+      "audioProcessing": {
+        "processingMs": 0,
+        "inputFrames": 268800,
+        "outputFrames": 268800,
+        "rawPcmSha256": "c1d4a7bf14bcb2c5ba98c23eecea40aced5f0148e1565362591ebef51f0eff91",
+        "processedPcmSha256": "c1d4a7bf14bcb2c5ba98c23eecea40aced5f0148e1565362591ebef51f0eff91",
+        "speed": 1,
+        "outputSeconds": 11.200000000000006
+      },
+      "timing": {
+        "observedStreamWallMs": 7157.358416,
+        "observedStreamWallRatio": 0.6390498585714283,
+        "playbackFinishWallMs": null,
+        "measuredServiceTimeMs": 7147.489044,
+        "measuredServiceTimeRatio": 0.6381686646428568,
+        "note": "Service intervals may overlap and omit untimed overhead. Wall time includes input, sinks and backpressure."
+      },
+      "blockIntervalMs": {
+        "p50": 96.94512499999996,
+        "p95": 104.55699999999979,
+        "p99": 194.82254199999988,
+        "max": 194.82254199999988
+      },
+      "peakRssBytes": 3084976128,
+      "lifecycle": {
+        "cancelledFullNativeQueue": true,
+        "reusedModel": true,
+        "chunkingMaxError": 2.592802047729492e-6,
+        "disposedPausedInput": true
+      },
+      "benchmarkReport": ".cache/tts/review/design-benchmark.json",
+      "benchmarkReportSha256": "a130cc5e69ce251a6b9098042ceef25c10f98d8811df5dd315cfaa40d392a508",
+      "wavSha256": "8e04b0d4b6c856076eb73b9447c2fd04d072835d35c815f598ad270c9c2e4905"
+    }
+  }
+}

@@ -34,6 +34,7 @@ export const CONVERT_DETECT: readonly ConvertDetectRow[] = [
   // dense-only quantization guard cannot be bypassed when -m is omitted.
   { rawModelTypes: ['internvl_chat', 'qianfan-ocr'], out: 'qianfan-ocr' },
   { rawModelTypes: ['qwen3_asr'] },
+  { rawModelTypes: ['qwen3_tts'] },
   { rawModelTypes: ['qwen3_5_moe', 'qwen3_5'] },
   { rawModelTypes: ['gemma4', 'gemma4_text'], out: 'gemma4' },
   // 'gemma4_unified' must reach the native side as that EXACT string: the E2B
