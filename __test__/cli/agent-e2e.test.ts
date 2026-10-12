@@ -16,7 +16,7 @@
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +92,9 @@ describe.skipIf(!MODEL_PATH || !existsSync(CLI_ENTRY))('mlx agent CLI e2e smoke'
 
   beforeAll(async () => {
     agentDir = await mkdtemp(join(tmpdir(), 'mlx-agent-e2e-'));
+    // An empty config.toml marks the fork's home as initialized — a truly
+    // empty GROK_HOME makes single-mode exit silently on its first run.
+    await writeFile(join(agentDir, 'config.toml'), '');
   });
 
   afterAll(async () => {
@@ -110,16 +113,18 @@ describe.skipIf(!MODEL_PATH || !existsSync(CLI_ENTRY))('mlx agent CLI e2e smoke'
           'agent',
           '--models-dir',
           modelsDir,
+          // Model ids are the names /v1/models reports — the same bare name
+          // withDefaultModel injects on a fresh interactive run.
           '--model',
-          `mlx/${modelId}`,
+          modelId,
           '-p',
           `Reply with exactly: ${EXPECTED}`,
-          '--no-session',
         ],
         {
           ...process.env,
           MLX_AGENT_AUTO_APPROVE: '1',
-          PI_CODING_AGENT_DIR: agentDir,
+          // The fork's session/config home — keeps this run hermetic.
+          GROK_HOME: agentDir,
         },
       );
 

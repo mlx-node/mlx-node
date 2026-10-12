@@ -21,11 +21,11 @@
  */
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { createInterface } from 'node:readline';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import semver from 'semver';
@@ -64,6 +64,81 @@ export interface GrokAgentLaunchOptions {
   serveToken?: string;
 }
 
+/** Where the prebuilt download lives — the only binary `mlx agent update` manages. */
+export function managedAgentBinPath(homeDir: string = homedir()): string {
+  return join(homeDir, '.mlx-node', 'bin', 'mlx-agent');
+}
+
+export interface AgentInstallProbe {
+  /**
+   * What owns the resolved path: a user pin the updater must not touch
+   * (`env`/`vendored`), the signed app's bundle (`bundled` — still shadowed
+   * by a NEWER managed download, since the bundle is read-only), the managed
+   * download cache, or nothing found yet (`none`).
+   */
+  source: 'env' | 'vendored' | 'bundled' | 'managed' | 'none';
+  /** The binary `mlx agent` would run; undefined when `source === 'none'`. */
+  path?: string;
+  /**
+   * Release tag stamped beside the managed cache and the newest tag among
+   * the managed+bundled pair — the "current version" an update compares
+   * against. Bundled wins ties, mirroring resolveAgentBinary.
+   */
+  managedTag?: string;
+  bundledTag?: string;
+  effectiveTag?: string;
+}
+
+/**
+ * Filesystem probe behind {@link resolveAgentBinary}, minus the download.
+ * Everything is sync by contract: this runs inside the CLI utilityProcess,
+ * never on the Electron main thread.
+ */
+export function probeAgentInstall(
+  repoRoot = findRepoRoot(),
+  env = process.env,
+  homeDir: string = homedir(),
+): AgentInstallProbe {
+  const managed = managedAgentBinPath(homeDir);
+  const managedTag = existsSync(managed) ? readAgentTag(managed) : undefined;
+
+  const envBin = env[MLX_AGENT_BIN_ENV];
+  if (envBin) {
+    const path = resolve(envBin);
+    if (existsSync(path)) return { source: 'env', path, managedTag };
+    throw new Error(`${MLX_AGENT_BIN_ENV}=${envBin} does not exist`);
+  }
+
+  const vendored = repoRoot ? join(repoRoot, 'grok-build', 'target', 'release', 'mlx-agent') : undefined;
+  if (vendored && existsSync(vendored)) return { source: 'vendored', path: vendored, managedTag };
+
+  const bundled = findBundledAppBinary();
+  const bundledTag = bundled ? readAgentTag(bundled) : undefined;
+
+  // Bundled-vs-cache: the newer release tag wins. A freshly `mlx agent
+  // update`d download in ~/.mlx-node/bin must not be shadowed by the older
+  // bundled binary, and an unmarked cache never beats a stamped bundle.
+  if (bundled) {
+    const cacheWins = managedTag !== undefined && compareReleaseTags(managedTag, bundledTag ?? '') > 0;
+    return {
+      source: cacheWins ? 'managed' : 'bundled',
+      path: cacheWins ? managed : bundled,
+      managedTag,
+      bundledTag,
+      effectiveTag: cacheWins ? managedTag : bundledTag,
+    };
+  }
+
+  // The cached binary is valid only while it satisfies this CLI's minimum
+  // release: its marker records which tag produced it. An unmarked binary is
+  // treated as stale — cheaper than trusting whatever was downloaded before
+  // markers existed.
+  if (managedTag !== undefined && compareReleaseTags(managedTag, MLX_AGENT_MIN_RELEASE) >= 0) {
+    return { source: 'managed', path: managed, managedTag, effectiveTag: managedTag };
+  }
+  return { source: 'none', managedTag };
+}
+
 /**
  * Locate the agent binary, in priority order:
  *   1. `$MLX_AGENT_BIN` — developer / vendored-build override.
@@ -73,34 +148,19 @@ export interface GrokAgentLaunchOptions {
  *   5. Download a prebuilt release tarball into (4), then use it.
  */
 export async function resolveAgentBinary(repoRoot = findRepoRoot()): Promise<string> {
-  const envBin = process.env[MLX_AGENT_BIN_ENV];
-  if (envBin) {
-    const path = resolve(envBin);
-    if (existsSync(path)) return path;
-    throw new Error(`${MLX_AGENT_BIN_ENV}=${envBin} does not exist`);
+  const probe = probeAgentInstall(repoRoot);
+  if (probe.path !== undefined) return probe.path;
+  return downloadAgentBinary(managedAgentBinPath());
+}
+
+/** Tag marker written beside a downloaded/bundled binary, e.g. `mlx-agent-v0.2.0`. */
+export function readAgentTag(bin: string): string | undefined {
+  try {
+    const tag = readFileSync(`${bin}.tag`, 'utf-8').trim();
+    return tag.length > 0 ? tag : undefined;
+  } catch {
+    return undefined;
   }
-
-  const vendored = repoRoot ? join(repoRoot, 'grok-build', 'target', 'release', 'mlx-agent') : undefined;
-  if (vendored && existsSync(vendored)) return vendored;
-
-  const bundled = findBundledAppBinary();
-  if (bundled) return bundled;
-
-  // The cached binary is valid only while it satisfies this CLI's minimum
-  // release: its marker records which tag produced it. An unmarked binary is
-  // treated as stale — cheaper than trusting whatever was downloaded before
-  // markers existed.
-  const installed = join(homedir(), '.mlx-node', 'bin', 'mlx-agent');
-  if (existsSync(installed)) {
-    try {
-      const cachedTag = readFileSync(`${installed}.tag`, 'utf-8').trim();
-      if (compareReleaseTags(cachedTag, MLX_AGENT_MIN_RELEASE) >= 0) return installed;
-    } catch {
-      // no marker — fall through to re-download
-    }
-  }
-
-  return downloadAgentBinary(installed);
 }
 
 /**
@@ -184,7 +244,10 @@ export async function resolveReleaseTag(): Promise<string> {
     });
     if (res.ok) {
       const tag = (await res.text()).trim();
-      if (tagVersion(tag)) return tag;
+      // Syntax alone is not enough: a stale or rolled-back pointer can name a
+      // release below this CLI's floor. Anything the pipeline publishes is
+      // accepted once it clears the minimum.
+      if (tagVersion(tag) && compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0) return tag;
     }
   } catch {
     // fall through to GitHub
@@ -197,7 +260,7 @@ export async function resolveReleaseTag(): Promise<string> {
     });
     if (res.ok) {
       const tag = ((await res.json()) as { tag_name?: string }).tag_name?.trim();
-      if (tag && tagVersion(tag)) return tag;
+      if (tag && tagVersion(tag) && compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0) return tag;
     }
   } catch {
     // fall through to the baked minimum
@@ -216,17 +279,31 @@ async function fetchText(url: string): Promise<string | undefined> {
   return undefined;
 }
 
+/** How long a single archive-body fetch may run before we try the next mirror. */
+const ARCHIVE_FETCH_TIMEOUT_MS = 120_000;
+
+/**
+ * The checksum is fetched ONLY from the GitHub release — the trust anchor —
+ * while the archive itself may come from either mirror. Fetching
+ * `${mirror}.sha256` would let a compromised R2 object pair a tampered
+ * tarball with a tampered digest; GitHub is what the release pipeline
+ * publishes first and what our credentials write. A mirror that cannot
+ * produce bytes matching the GitHub checksum simply loses the race.
+ */
+async function releaseChecksum(tag: string, asset: string): Promise<string | undefined> {
+  return fetchText(`https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}.sha256`);
+}
+
 /**
  * Download `mlx-agent-<tag>-<platform>-<arch>.tar.gz` and verify its SHA256
- * against the release-published checksum before extracting — the desktop app
+ * against the GitHub-published checksum before extracting — the desktop app
  * SIGNS these bytes, so a tampered mirror must never reach the bundle.
  * R2 mirror first, GitHub release as fallback.
  */
 export async function downloadAgentBinary(dest: string, tag?: string): Promise<string> {
   tag ??= await resolveReleaseTag();
   // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
-  const platform =
-    process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
+  const platform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
   const asset = `mlx-agent-${tag}-${platform}-${arch}.tar.gz`;
   const urls = [
@@ -234,24 +311,30 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}`,
   ];
 
+  const expected = await releaseChecksum(tag, asset);
+  if (!expected) {
+    throw new Error(
+      `mlx agent: cannot verify ${asset} — its .sha256 is missing on the GitHub release ` +
+        `(${MLX_AGENT_RELEASE_REPO} @ ${tag}). Set ${MLX_AGENT_BIN_ENV}, or run \`yarn build:agent\` ` +
+        `in the mlx-node repo.`,
+    );
+  }
+
   mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
   let tar: ArrayBuffer | null = null;
-  let shaUrl = '';
   for (const url of urls) {
-    // Pull the checksum from the same mirror — a per-release asset, so a
-    // mirror that can serve a tampered tarball could also serve a tampered
-    // checksum ONLY if the trusted side (the release pipeline's publish)
-    // never wrote the real one. Both are produced by the same CI step.
-    const expected = await fetchText(`${url}.sha256`);
-    if (!expected) continue;
     try {
-      const r = await fetch(url, { redirect: 'follow' });
+      // Bounded: a mirror that stalls mid-body must not hang the launch or
+      // the desktop-release fetch step — the fallback mirror is one try away.
+      const r = await fetch(url, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(ARCHIVE_FETCH_TIMEOUT_MS),
+      });
       if (!r.ok || r.body === null) continue;
       const buf = await r.arrayBuffer();
       const digest = createHash('sha256').update(Buffer.from(buf)).digest('hex');
       if (digest !== expected) continue;
       tar = buf;
-      shaUrl = url;
       break;
     } catch {
       // fall through to the next mirror
@@ -265,19 +348,98 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     );
   }
   const tmp = join(dirname(dest), `${asset}.tmp-${process.pid}`);
-  const { writeFileSync, rmSync, chmodSync } = await import('node:fs');
+  const { writeFileSync, rmSync, chmodSync, renameSync } = await import('node:fs');
   writeFileSync(tmp, Buffer.from(tar), { mode: 0o600 });
   const out = spawnSync('tar', ['-xzf', tmp, '-O'], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
   rmSync(tmp, { force: true });
   if (out.status !== 0 || out.stdout.length === 0) {
     throw new Error(`mlx agent: downloaded ${asset} but failed to unpack it`);
   }
-  writeFileSync(dest, out.stdout, { mode: 0o700 });
+  // Atomic install: a sibling temp file renamed over dest. Truncating the
+  // live path fails ETXTBSY on Linux while an agent runs and can expose a
+  // half-written binary to a concurrent launch everywhere else.
+  const staged = join(dirname(dest), `.mlx-agent.tmp-${process.pid}`);
+  try {
+    writeFileSync(staged, out.stdout, { mode: 0o700 });
+    renameSync(staged, dest);
+  } catch (error) {
+    rmSync(staged, { force: true });
+    throw error;
+  }
   chmodSync(dest, 0o700);
   // Record which release produced this binary — the marker is what
   // resolveAgentBinary checks against the CLI's minimum on the next launch.
   writeFileSync(`${dest}.tag`, tag, { mode: 0o600 });
   return dest;
+}
+
+/** What `mlx agent update --check` reports and the desktop tray consumes. */
+export interface AgentUpdateStatus {
+  /** Release tag the active binary was built from; null when nothing is installed or stamped. */
+  current: string | null;
+  /** Newest published release tag. */
+  latest: string;
+  /** A newer managed download is available. */
+  updateAvailable: boolean;
+  /** Path `mlx agent update` writes; the managed download cache. */
+  managedPath: string;
+  /**
+   * How the NEXT `mlx agent` resolves its binary. `env`/`vendored` pins
+   * shadow the managed cache, so an applied update has no effect until the
+   * pin is removed — the CLI warns about this case.
+   */
+  pinned: AgentInstallProbe['source'];
+}
+
+/** Injectable seams so tests never touch the network or $HOME. */
+export interface AgentUpdateDeps {
+  resolveTag?: () => Promise<string>;
+  probe?: () => AgentInstallProbe;
+  managedPath?: string;
+  download?: (dest: string, tag: string) => Promise<string>;
+}
+
+/**
+ * Compare the published latest tag against the active install without
+ * downloading anything. `MLX_AGENT_TAG` still pins `latest` — an explicit
+ * pin reports whatever it points at.
+ */
+export async function agentUpdateStatus(deps: AgentUpdateDeps = {}): Promise<AgentUpdateStatus> {
+  const probe = deps.probe ?? (() => probeAgentInstall());
+  const resolveTag = deps.resolveTag ?? resolveReleaseTag;
+  const [latest, install] = await Promise.all([resolveTag(), Promise.resolve(probe())]);
+  const current = install.effectiveTag ?? null;
+  // Update is needed when the newest artifact ON DISK trails latest. The
+  // managed cache is counted even when a pin or an untagged bundle shadows
+  // it: once it reaches latest, further downloads are pure waste.
+  const newest = [current, install.managedTag].reduce<string | null>(
+    (best, tag) =>
+      tag !== undefined && tag !== null && (best === null || compareReleaseTags(tag, best) > 0) ? tag : best,
+    null,
+  );
+  return {
+    current,
+    latest,
+    updateAvailable: newest === null || compareReleaseTags(latest, newest) > 0,
+    managedPath: deps.managedPath ?? managedAgentBinPath(),
+    pinned: install.source,
+  };
+}
+
+/**
+ * `mlx agent update`: download the resolved release into the managed cache
+ * when it is newer than the active install. Returns the status AFTER the
+ * operation plus whether a download ran — a `null` current (missing or
+ * unstamped binary) also counts as updatable.
+ */
+export async function applyAgentUpdate(
+  deps: AgentUpdateDeps = {},
+): Promise<{ status: AgentUpdateStatus; downloaded: boolean }> {
+  const status = await agentUpdateStatus(deps);
+  if (!status.updateAvailable) return { status, downloaded: false };
+  const download = deps.download ?? downloadAgentBinary;
+  await download(status.managedPath, status.latest);
+  return { status: { ...status, current: status.latest, updateAvailable: false }, downloaded: true };
 }
 
 /**
@@ -353,7 +515,11 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   const bin = await resolveAgentBinary();
 
   // One-shots that exit inside the binary (help/version) skip the server.
-  const oneShot = opts.argv.includes('--version') || opts.argv.includes('-v') || opts.argv.includes('--help') || opts.argv.includes('-h');
+  const oneShot =
+    opts.argv.includes('--version') ||
+    opts.argv.includes('-v') ||
+    opts.argv.includes('--help') ||
+    opts.argv.includes('-h');
   const needsServer = opts.needsServer !== false && !oneShot;
 
   let serve: { child: ChildProcess; url: string; token: string } | undefined;

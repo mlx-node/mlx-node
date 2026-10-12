@@ -468,12 +468,7 @@ describe('withDefaultModel', () => {
       // --client-identifier consumes `-c` as its value (grok: args[++i]); the
       // benign reverse direction — the leftover run is a plain fresh run →
       // concrete -m.
-      expect(withDefaultModel(['--client-identifier', '-c'], 'd')).toEqual([
-        '-m',
-        'd',
-        '--client-identifier',
-        '-c',
-      ]);
+      expect(withDefaultModel(['--client-identifier', '-c'], 'd')).toEqual(['-m', 'd', '--client-identifier', '-c']);
     });
 
     it('still classifies a REAL option name after its consumer sentinel skips its own value', () => {
@@ -709,12 +704,23 @@ describe('run() argv routing', () => {
     }
   });
 
-  it('still blocks update with exit code 1 before anything runs', async () => {
+  it('routes update to the mlx-owned updater before anything else runs', async () => {
     const { deps, calls } = makeDeps();
+    const applyUpdate = vi.fn(async () => ({
+      downloaded: false,
+      status: {
+        current: 'mlx-agent-v0.2.0',
+        latest: 'mlx-agent-v0.2.0',
+        updateAvailable: false,
+        managedPath: '/m/mlx-agent',
+        pinned: 'managed' as const,
+      },
+    }));
     const prevExitCode = process.exitCode;
     try {
-      await run(['update'], deps);
-      expect(process.exitCode).toBe(1);
+      await run(['update'], { ...deps, applyUpdate });
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
     } finally {
       process.exitCode = prevExitCode;
     }
@@ -723,12 +729,23 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(0);
   });
 
-  it('still blocks update even when --version rides along', async () => {
+  it('still routes update to the updater even when --version rides along', async () => {
     const { deps, calls } = makeDeps();
+    const applyUpdate = vi.fn(async () => ({
+      downloaded: true,
+      status: {
+        current: 'mlx-agent-v0.3.0',
+        latest: 'mlx-agent-v0.3.0',
+        updateAvailable: false,
+        managedPath: '/m/mlx-agent',
+        pinned: 'managed' as const,
+      },
+    }));
     const prevExitCode = process.exitCode;
     try {
-      await run(['update', '--version'], deps);
-      expect(process.exitCode).toBe(1);
+      await run(['update', '--version'], { ...deps, applyUpdate });
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
     } finally {
       process.exitCode = prevExitCode;
     }

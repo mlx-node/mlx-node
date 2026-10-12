@@ -96,11 +96,18 @@ const agentSrc = process.env.MLX_AGENT_PATH ?? join(OUT, 'agent', 'mlx-agent');
 if (existsSync(agentSrc)) {
   cpSync(agentSrc, join(stagedNative, 'mlx-agent'));
   chmodSync(join(stagedNative, 'mlx-agent'), 0o755);
+  // The release-tag marker travels with the binary: it is how `mlx agent
+  // update` and the tray's agent-update entry tell "bundled 0.2.0" apart
+  // from a newer managed download. fetch-agent.ts writes it for free.
+  const agentTagSrc = `${agentSrc}.tag`;
+  if (existsSync(agentTagSrc)) {
+    cpSync(agentTagSrc, join(stagedNative, 'mlx-agent.tag'));
+  } else {
+    console.warn(`no ${agentTagSrc} — bundled agent reports as unversioned to update checks`);
+  }
   console.log(`bundled mlx-agent from ${agentSrc}`);
 } else if (sign) {
-  console.error(
-    `\nno mlx-agent at ${agentSrc}\n\n  run: yarn oxnode packages/desktop/scripts/fetch-agent.ts\n`,
-  );
+  console.error(`\nno mlx-agent at ${agentSrc}\n\n  run: yarn oxnode packages/desktop/scripts/fetch-agent.ts\n`);
   process.exit(1);
 } else {
   console.log('no mlx-agent found — packaging without it (runtime download fallback)');

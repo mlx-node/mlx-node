@@ -25,6 +25,8 @@ export interface TrayActions {
   copyCodexConnectCommand(): void;
   setShowInDock(next: boolean): void;
   updateApp(): void;
+  /** Check for / install an MLX Agent binary update (the `mlx agent update` flow). */
+  updateAgent(): void;
   quit(): void;
 }
 
@@ -40,6 +42,7 @@ export interface TrayOptions {
   iconPath: string;
   showInDock(): boolean;
   appUpdate(): UpdatePresentation;
+  agentUpdate(): UpdatePresentation;
   actions: TrayActions;
 }
 
@@ -140,6 +143,12 @@ export function createTray(options: TrayOptions): TrayController {
           options.actions.updateApp();
         },
       },
+      {
+        ...options.agentUpdate(),
+        click: () => {
+          options.actions.updateAgent();
+        },
+      },
       // The accelerator is display-only on a tray menu, which is why an
       // application menu with the standard roles is also installed — see
       // `index.ts`.
@@ -162,7 +171,7 @@ export function createTray(options: TrayOptions): TrayController {
       // The supervisor emits a state event for every health poll and every
       // trace line. Rebuilding the menu closes it if it happens to be open, so
       // an unchanged presentation is not re-rendered.
-      const key = `${JSON.stringify(presentation)}|${String(options.showInDock())}|${JSON.stringify(options.appUpdate())}`;
+      const key = `${JSON.stringify(presentation)}|${String(options.showInDock())}|${JSON.stringify(options.appUpdate())}|${JSON.stringify(options.agentUpdate())}`;
       if (key === rendered) return;
       rendered = key;
       render(presentation);
