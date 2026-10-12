@@ -214,15 +214,19 @@ fn pack_bytes(dir: &Path) -> u64 {
 }
 
 /// Best-effort sibling spend estimate: the ledger u64 when it reads, else a
-/// live .pack byte count. Advisory only — the sibling's flock stays with its
-/// writer and any failure degrades to the byte count, never to an error.
+/// live .pack byte count. A ledger value can lag reality (a skipped/failed
+/// replacement write leaves the old target on disk but absent from `used`),
+/// so a readable ledger is floored at the real byte count — the estimate can
+/// overcount pending spend, never undercount. Advisory only — the sibling's
+/// flock stays with its writer and any failure degrades to the byte count,
+/// never to an error.
 fn sibling_pack_estimate(dir: &Path) -> u64 {
     let mut n = [0u8; 8];
     let from_ledger = File::open(dir.join("budget"))
         .and_then(|mut f| f.read_exact(&mut n))
         .is_ok();
     if from_ledger {
-        u64::from_le_bytes(n)
+        u64::from_le_bytes(n).max(pack_bytes(dir))
     } else {
         pack_bytes(dir)
     }
@@ -801,11 +805,14 @@ impl PackedCache {
             None
         };
         // Reconcile the ledger to actual .pack bytes: externally deleted files
-        // must not permanently inflate the recorded spend. The target's own
-        // bytes are excluded: rename replaces it atomically, so its current
+        // must not permanently inflate the recorded spend. `used` excludes the
+        // target's own bytes — rename replaces it atomically, so its current
         // size is not new spend and must not veto repairing a corrupt or
-        // oversized entry.
+        // oversized entry. `real_used` includes them: the ledger can be
+        // persisted on any of the early returns below while the old target
+        // stays on disk, so the recorded value must never undercount reality.
         let target = self.path(key);
+        let target_len = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         let mut used: u64 = fs::read_dir(&self.root)
             .map_err(err)?
             .filter_map(|e| e.ok())
@@ -817,6 +824,7 @@ impl PackedCache {
                 sum.checked_add(e.metadata().map_err(err)?.len())
                     .ok_or_else(|| err("Packed cache budget overflow"))
             })?;
+        let real_used = used.saturating_add(target_len);
         // A configured total cap bounds the whole cache root but never loosens
         // the per-dir DISK_BUDGET invariant.
         let budget = total_cap.map_or(DISK_BUDGET, |cap| cap.min(DISK_BUDGET));
@@ -825,8 +833,8 @@ impl PackedCache {
             ledger.write_all(&value.to_le_bytes()).map_err(err)?;
             ledger.set_len(8).map_err(err)
         };
-        if recorded != Some(used) {
-            record(&mut ledger, used)?;
+        if recorded != Some(real_used) {
+            record(&mut ledger, real_used)?;
         }
         if !has_disk_space(&self.root, reserve) {
             return Ok(());
@@ -890,8 +898,14 @@ impl PackedCache {
         };
         // Reserve first: an interrupted write can overcount, never overspend.
         // With a cap configured the reservation stays under the root lock, so
-        // admission and reservation are atomic across processes.
-        record(&mut ledger, used + reserve)?;
+        // admission and reservation are atomic across processes. The record is
+        // max(reservation, real bytes): the rename swaps the target's bytes
+        // atomically, so if this write later fails the old pack persists and
+        // the ledger must never fall below real spend.
+        record(
+            &mut ledger,
+            (used + reserve).max(used.saturating_add(target_len)),
+        )?;
         drop(_root_guard);
         let digest = Sha256::new()
             .chain_update(&header)
@@ -1749,5 +1763,37 @@ mod tests {
         b.write_with_total_cap("k3", &w, Some(pack * 10)).unwrap();
         assert!(!b.path("k3").exists());
         drop(held);
+    }
+
+    #[test]
+    fn skipped_replacement_write_keeps_ledger_at_or_above_real_bytes() {
+        let temp = Temp::new();
+        let cache = PackedCache {
+            root: temp.0.join("cache"),
+            manifest: None,
+        };
+        let w = weight("affine");
+        cache.write("k1", &w).unwrap();
+        let pack = fs::metadata(cache.path("k1")).unwrap().len();
+        // A vetoed REPLACEMENT write leaves the old target on disk: the
+        // ledger reconcile must record real spend (target included), not the
+        // ex-target `used` — an undercounted ledger would let siblings
+        // overspend the configured cap.
+        cache.write_with_total_cap("k1", &w, Some(1)).unwrap();
+        let mut n = [0u8; 8];
+        File::open(cache.root.join("budget"))
+            .unwrap()
+            .read_exact(&mut n)
+            .unwrap();
+        assert!(
+            u64::from_le_bytes(n) >= pack,
+            "ledger {} must stay >= real pack bytes {}",
+            u64::from_le_bytes(n),
+            pack
+        );
+        assert!(cache.path("k1").exists());
+        // And sibling estimates floor a stale-low ledger at real bytes.
+        fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
+        assert_eq!(sibling_pack_estimate(&cache.root), pack);
     }
 }

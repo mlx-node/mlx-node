@@ -6737,6 +6737,29 @@ fn native_gguf_lock_name(key: &str) -> String {
     }
 }
 
+/// Exactly 64 lowercase-hex chars — the sha256 digest shape used for cache
+/// fingerprints (source identity, preparation, assets identity).
+fn native_gguf_is_hex64(field: &str) -> bool {
+    field.len() == 64
+        && field
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Canonical lowercase uuid text `8-4-4-4-12` — the shape `Uuid::new_v4()`
+/// renders for `.mlx-qwen4-assets-tmp-{uuid}` publish temps.
+fn native_gguf_is_uuid_text(field: &str) -> bool {
+    let is_hex = |byte: u8| matches!(byte, b'0'..=b'9' | b'a'..=b'f');
+    field.len() == 36
+        && field.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                is_hex(byte)
+            }
+        })
+}
+
 /// Strict cache-key contract for a plain entry directory:
 /// `{stem}-{len}-{modified}-v{fmt}-{src digest}-{prep digest}` (see the
 /// `cache_key` construction in `prepare_native_gguf_inner`). Parsed from the
@@ -6745,12 +6768,7 @@ fn native_gguf_lock_name(key: &str) -> String {
 /// still qualify so the sweep can remove them as "outdated cache format".
 /// Anything else under the root is foreign tooling and is never touched.
 fn native_gguf_is_entry_name(name: &str) -> bool {
-    let is_hex_digest = |field: &str| {
-        field.len() == 64
-            && field
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    };
+    let is_hex_digest = native_gguf_is_hex64;
     let is_digits =
         |field: &str| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit());
     let mut fields = name.rsplitn(6, '-');
@@ -7014,17 +7032,22 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
         }
 
         if meta.is_dir() {
-            if name.starts_with(NATIVE_GGUF_ASSETS_TMP_PREFIX) {
+            if let Some(suffix) = name.strip_prefix(NATIVE_GGUF_ASSETS_TMP_PREFIX) {
                 // Abandoned publish temp: the name is `{prefix}{uuid}` — no
                 // pid is embedded, so do NOT parse one; an all-decimal uuid
                 // segment would read as a dead pid and bypass the age gate
-                // on a live publish temp. Age is the only gate.
-                if native_gguf_mtime_older(meta.modified().ok(), now) {
+                // on a live publish temp. Age is the only gate, and only a
+                // canonical uuid suffix is ours to delete.
+                if native_gguf_is_uuid_text(suffix)
+                    && native_gguf_mtime_older(meta.modified().ok(), now)
+                {
                     reclaimed += native_gguf_remove_logged(&path, "abandoned assets temp");
                 }
                 continue;
             }
-            if name.starts_with(NATIVE_GGUF_ASSETS_PREFIX) {
+            if name.starts_with(NATIVE_GGUF_ASSETS_PREFIX)
+                && native_gguf_is_hex64(&name[NATIVE_GGUF_ASSETS_PREFIX.len()..])
+            {
                 // Live tokenizer sidecars are never orphan-deleted; they only
                 // leave through the capped-LRU pass below. The dot-prefixed
                 // name is the lock key so a held `assets_in` reader lock
@@ -17225,7 +17248,8 @@ mod tests {
         fs::write(&dead_probe, b"p").unwrap();
         let live_probe = cache_root.join(format!(".write-probe-{}-x", std::process::id()));
         fs::write(&live_probe, b"p").unwrap();
-        let assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-abandoned");
+        let assets_tmp =
+            cache_root.join(".mlx-qwen4-assets-tmp-12345678-90ab-cdef-0123-456789abcdef");
         fs::create_dir_all(&assets_tmp).unwrap();
         native_sweep_age_dir(&assets_tmp);
         // A FRESH assets temp whose uuid-looking suffix starts with an
@@ -17234,7 +17258,15 @@ mod tests {
         let live_assets_tmp =
             cache_root.join(".mlx-qwen4-assets-tmp-99999999-dead-beef-0123-456789abcdef");
         fs::create_dir_all(&live_assets_tmp).unwrap();
-        let assets_sidecar = cache_root.join(".mlx-qwen4-assets-v2-fedcba9876543210");
+        // Malformed asset-prefixed names are foreign tooling: never deleted
+        // and never counted, however old.
+        let foreign_assets = cache_root.join(".mlx-qwen4-assets-v2-garbage");
+        fs::create_dir_all(&foreign_assets).unwrap();
+        native_sweep_age_dir(&foreign_assets);
+        let foreign_assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-not-a-uuid");
+        fs::create_dir_all(&foreign_assets_tmp).unwrap();
+        native_sweep_age_dir(&foreign_assets_tmp);
+        let assets_sidecar = cache_root.join(format!(".mlx-qwen4-assets-v2-{}", "c".repeat(64)));
         fs::create_dir_all(&assets_sidecar).unwrap();
         fs::write(assets_sidecar.join("complete"), b"1").unwrap();
         native_sweep_age_file(&assets_sidecar.join("complete"));
@@ -17267,6 +17299,8 @@ mod tests {
             &foreign_staging,
             &live_probe,
             &live_assets_tmp,
+            &foreign_assets,
+            &foreign_assets_tmp,
             &assets_sidecar,
             &foreign,
             &photos,
@@ -17345,7 +17379,7 @@ mod tests {
         native_sweep_age_file(&old_marker);
 
         // An aged assets sidecar counts toward the cap and is evictable too.
-        let assets_sidecar = cache_root.join(".mlx-qwen4-assets-v2-0123456789abcdef");
+        let assets_sidecar = cache_root.join(format!(".mlx-qwen4-assets-v2-{}", "d".repeat(64)));
         fs::create_dir_all(&assets_sidecar).unwrap();
         fs::write(assets_sidecar.join("tokenizer.json"), vec![0_u8; 2048]).unwrap();
         let complete = assets_sidecar.join("complete");
@@ -17358,6 +17392,17 @@ mod tests {
         fs::create_dir_all(&foreign).unwrap();
         fs::write(foreign.join("pic.jpg"), vec![0_u8; 2048]).unwrap();
         native_sweep_age_dir(&foreign);
+        // Aged asset-prefixed dirs whose suffixes do not match the producer
+        // shapes are foreign too: the sweep must not fabricate a lock and
+        // LRU-delete them, and must not count them toward the cap.
+        let foreign_assets = cache_root.join(".mlx-qwen4-assets-v2-garbage");
+        fs::create_dir_all(&foreign_assets).unwrap();
+        fs::write(foreign_assets.join("x"), vec![0_u8; 2048]).unwrap();
+        native_sweep_age_dir(&foreign_assets);
+        let foreign_assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-not-a-uuid");
+        fs::create_dir_all(&foreign_assets_tmp).unwrap();
+        fs::write(foreign_assets_tmp.join("x"), vec![0_u8; 2048]).unwrap();
+        native_sweep_age_dir(&foreign_assets_tmp);
 
         let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
             .await
@@ -17375,6 +17420,8 @@ mod tests {
             foreign.exists(),
             "foreign directories are neither evicted nor counted toward the cap"
         );
+        assert!(foreign_assets.exists());
+        assert!(foreign_assets_tmp.exists());
     }
 
     /// A recency snapshot taken before the entry flock cannot prove the
