@@ -6767,17 +6767,26 @@ fn native_gguf_is_uuid_text(field: &str) -> bool {
 }
 
 /// The `{pid}-{simple-uuid}` suffix producers append after
-/// `.{key}.staging-` and `.write-probe-`: a decimal pid, one hyphen, then
-/// `Uuid::new_v4().simple()` (32 lowercase hex). Anything else is foreign,
-/// even under a valid key. Returns the pid for the liveness probe.
+/// `.{key}.staging-` and `.write-probe-`: the canonical decimal
+/// `std::process::id()` rendering (nonzero, no leading zeros), one hyphen,
+/// then `Uuid::new_v4().simple()` — 32 lowercase hex with the version
+/// nibble (index 12) fixed to `4` and the variant nibble (index 16) in
+/// `89ab`. Anything else is foreign, even under a valid key: `0` parses
+/// dead on Unix and would bypass the age gate for immediate deletion.
+/// Returns the pid for the liveness probe.
 fn native_gguf_writer_pid_suffix(suffix: &str) -> Option<u32> {
     let (pid_text, uuid_text) = suffix.split_once('-')?;
-    if pid_text.is_empty() || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) {
+    let pid = pid_text.parse::<u32>().ok()?;
+    if pid == 0 || pid.to_string() != pid_text {
         return None;
     }
-    let pid = pid_text.parse::<u32>().ok()?;
     let is_hex = |byte: u8| matches!(byte, b'0'..=b'9' | b'a'..=b'f');
-    if uuid_text.len() == 32 && uuid_text.bytes().all(is_hex) {
+    let bytes = uuid_text.as_bytes();
+    if uuid_text.len() == 32
+        && uuid_text.bytes().all(is_hex)
+        && bytes[12] == b'4'
+        && matches!(bytes[16], b'8' | b'9' | b'a' | b'b')
+    {
         Some(pid)
     } else {
         None
@@ -17261,18 +17270,20 @@ mod tests {
 
         // Leftovers: dead-pid staging + write probe removed; live-pid and
         // fresh leftovers kept; a finished assets sidecar is never an orphan.
+        // Suffixes must be producer-valid v4 simple uuids (version nibble at
+        // index 12 = '4', variant nibble at index 16 in 89ab).
         let dead_staging = cache_root.join(format!(
             ".{}.staging-{}-{}",
             native_sweep_entry_name("dead"),
             dead_test_pid(),
-            "d".repeat(32)
+            "dddddddddddd4dddaddddddddddddddd"
         ));
         fs::create_dir_all(&dead_staging).unwrap();
         let live_staging = cache_root.join(format!(
             ".{}.staging-{}-{}",
             native_sweep_entry_name("live"),
             std::process::id(),
-            "e".repeat(32)
+            "eeeeeeeeeeee4eee8eeeeeeeeeeeeeee"
         ));
         fs::create_dir_all(&live_staging).unwrap();
         // Staging dirs the producer cannot emit are foreign and never
@@ -17292,20 +17303,37 @@ mod tests {
             ".{}.staging-{}-{}-extra",
             native_sweep_entry_name("extra"),
             dead_test_pid(),
-            "f".repeat(32)
+            "ffffffffffff4fff8fffffffffffffff"
         ));
         fs::create_dir_all(&foreign_staging_extra).unwrap();
         native_sweep_age_dir(&foreign_staging_extra);
+        // pid 0 reads as dead on Unix, and process::id() never emits it (or
+        // leading-zero renderings) — both stay foreign, never swept.
+        let foreign_staging_pid0 = cache_root.join(format!(
+            ".{}.staging-{}",
+            native_sweep_entry_name("pidzero"),
+            "0-dddddddddddd4dddaddddddddddddddd"
+        ));
+        fs::create_dir_all(&foreign_staging_pid0).unwrap();
+        native_sweep_age_dir(&foreign_staging_pid0);
+        let foreign_staging_lead0 = cache_root.join(format!(
+            ".{}.staging-0{}-{}",
+            native_sweep_entry_name("leadzero"),
+            dead_test_pid(),
+            "dddddddddddd4dddaddddddddddddddd"
+        ));
+        fs::create_dir_all(&foreign_staging_lead0).unwrap();
+        native_sweep_age_dir(&foreign_staging_lead0);
         let dead_probe = cache_root.join(format!(
             ".write-probe-{}-{}",
             dead_test_pid(),
-            "f".repeat(32)
+            "ffffffffffff4fff8fffffffffffffff"
         ));
         fs::write(&dead_probe, b"p").unwrap();
         let live_probe = cache_root.join(format!(
             ".write-probe-{}-{}",
             std::process::id(),
-            "a".repeat(32)
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"
         ));
         fs::write(&live_probe, b"p").unwrap();
         // A probe whose uuid segment is malformed is foreign even when the
@@ -17371,6 +17399,8 @@ mod tests {
             &foreign_staging,
             &foreign_staging_nouuid,
             &foreign_staging_extra,
+            &foreign_staging_pid0,
+            &foreign_staging_lead0,
             &live_probe,
             &foreign_probe,
             &live_assets_tmp,
