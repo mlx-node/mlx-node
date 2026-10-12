@@ -184,8 +184,8 @@ describe('packaged update eligibility', () => {
   });
 });
 
-it('stages only the macOS arm64 native binary out of a fat addon package', () => {
-  const root = mkdtempSync(join(tmpdir(), 'mlx-tokenizer-stage-'));
+it('stages a fat addon package verbatim, foreign .node slices included', () => {
+  const root = mkdtempSync(join(tmpdir(), 'mlx-fat-addon-stage-'));
   const desktop = join(root, 'desktop');
   const stage = join(root, 'stage');
   const dashboard = join(root, 'packages', 'dashboard');
@@ -196,26 +196,26 @@ it('stages only the macOS arm64 native binary out of a fat addon package', () =>
     mkdirSync(join(dashboard, 'dist'), { recursive: true });
     writeFileSync(
       join(dashboard, 'package.json'),
-      JSON.stringify({ name: '@mlx-node/dashboard', dependencies: { tokenizers: '0.23.2', other: '1.0.0' } }),
+      JSON.stringify({ name: '@mlx-node/dashboard', dependencies: { 'fat-addon': '0.23.2', other: '1.0.0' } }),
     );
-    for (const name of ['tokenizers', 'other']) {
+    for (const name of ['fat-addon', 'other']) {
       const dir = join(root, 'node_modules', name);
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, 'package.json'), JSON.stringify({ name }));
       writeFileSync(join(dir, 'index.js'), 'module.exports = {};');
       for (const file of [
-        'tokenizers.darwin-arm64.node',
-        'tokenizers.darwin-universal.node',
-        'tokenizers.linux-x64-gnu.node',
+        'fat-addon.darwin-arm64.node',
+        'fat-addon.darwin-universal.node',
+        'fat-addon.linux-x64-gnu.node',
       ])
         writeFileSync(join(dir, file), file);
     }
     stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: ['@mlx-node/dashboard'] });
     const modules = join(stage, 'node_modules');
-    expect(readdirSync(join(modules, 'tokenizers')).filter((name) => name.endsWith('.node'))).toEqual([
-      'tokenizers.darwin-arm64.node',
-    ]);
-    expect(readdirSync(join(modules, 'other')).filter((name) => name.endsWith('.node'))).toHaveLength(3);
+    // No per-package copy filter anymore: whatever an external ships, ships.
+    for (const name of ['fat-addon', 'other']) {
+      expect(readdirSync(join(modules, name)).filter((n) => n.endsWith('.node'))).toHaveLength(3);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

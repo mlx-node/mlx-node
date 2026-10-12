@@ -40,6 +40,7 @@ const ADDON_PACKAGES = ['@mlx-node/core', '@mlx-node/lm', '@mlx-node/vlm', '@mlx
  */
 const ADDON_FREE_SUBPATHS = [
   '@mlx-node/lm/family-data',
+  '@mlx-node/lm/cold-tier',
   '@mlx-node/lm/draft-companion',
   '@mlx-node/lm/model-detection',
   '@mlx-node/lm/model-discovery',
