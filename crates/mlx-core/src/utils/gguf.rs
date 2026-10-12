@@ -6782,6 +6782,17 @@ fn native_gguf_is_entry_name(name: &str) -> bool {
     ) else {
         return false;
     };
+    // The producer sanitizes stems to `[A-Za-z0-9_-]` truncated at 32 chars
+    // (`prepare_native_gguf_inner`): the ownership gate must match that
+    // grammar exactly or an unrelated dir like `report.txt-1-1-v7-<64hex>-
+    // <64hex>` would pass the strict-tail check and be deleted as ours.
+    let is_producer_stem = |stem: &str| {
+        !stem.is_empty()
+            && stem.len() <= 32
+            && stem
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
     is_hex_digest(prep)
         && is_hex_digest(source)
         && format.len() > 1
@@ -6789,7 +6800,7 @@ fn native_gguf_is_entry_name(name: &str) -> bool {
         && is_digits(&format[1..])
         && is_digits(modified)
         && is_digits(len)
-        && !stem.is_empty()
+        && is_producer_stem(stem)
 }
 
 /// Try to win a non-blocking exclusive flock on `key`'s lock. `Some(_)`
@@ -17494,6 +17505,11 @@ mod tests {
             "model-1-x-v7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(), // non-digit modified
             format!("model-1-1-7-{digest_a}-{digest_b}"),  // missing 'v'
             format!("model-1-1-v7-{digest_a}"),            // missing a digest
+            // Stems the producer cannot emit: the strict tail still parses,
+            // but `.`, unicode, or an overlong stem means foreign data.
+            format!("report.txt-1-1-v7-{digest_a}-{digest_b}"),
+            format!("mödel-1-1-v7-{digest_a}-{digest_b}"),
+            format!("{}-1-1-v7-{digest_a}-{digest_b}", "m".repeat(33)),
         ] {
             assert!(!native_gguf_is_entry_name(&name), "{name}");
         }
