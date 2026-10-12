@@ -22,18 +22,25 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** Env override for a locally built or externally installed agent binary. */
 export const MLX_AGENT_BIN_ENV = 'MLX_AGENT_BIN';
+/** Env override to pin a specific release tag instead of resolving latest. */
+export const MLX_AGENT_TAG_ENV = 'MLX_AGENT_TAG';
 /** Release repo the prebuilt binary downloads from. */
 export const MLX_AGENT_RELEASE_REPO = 'mlx-node/grok-build';
-/** Pinned release tag the downloader fetches (bumped per vendor update). */
-export const MLX_AGENT_RELEASE_TAG = 'mlx-agent-v0.2.0';
+/**
+ * Minimum release the CLI will accept: a cached binary stamped below this is
+ * treated as stale and re-downloaded, and it is the last-resort tag when the
+ * `latest` pointer is unreachable. Bump only when a release is REQUIRED —
+ * resolving `latest` handles ordinary upgrades with no code change here.
+ */
+export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.2.0';
 
 /** Options for {@link launchGrokAgent}. */
 export interface GrokAgentLaunchOptions {
@@ -77,8 +84,19 @@ export async function resolveAgentBinary(repoRoot = findRepoRoot()): Promise<str
   const bundled = findBundledAppBinary();
   if (bundled) return bundled;
 
+  // The cached binary is valid only while it satisfies this CLI's minimum
+  // release: its marker records which tag produced it. An unmarked binary is
+  // treated as stale — cheaper than trusting whatever was downloaded before
+  // markers existed.
   const installed = join(homedir(), '.mlx-node', 'bin', 'mlx-agent');
-  if (existsSync(installed)) return installed;
+  if (existsSync(installed)) {
+    try {
+      const cachedTag = readFileSync(`${installed}.tag`, 'utf-8').trim();
+      if (compareReleaseTags(cachedTag, MLX_AGENT_MIN_RELEASE) >= 0) return installed;
+    } catch {
+      // no marker — fall through to re-download
+    }
+  }
 
   return downloadAgentBinary(installed);
 }
@@ -123,40 +141,124 @@ export function findRepoRoot(start: string = fileURLToPath(import.meta.url)): st
 
 /** Public R2 mirror of the release assets — Cloudflare edge, much faster than GitHub. */
 const MLX_AGENT_R2_BASE = 'https://dl.portato.si';
+/** The R2 key holding the newest release tag, written by the release pipeline. */
+const MLX_AGENT_LATEST_KEY = 'latest';
 
-/** Download `mlx-agent-<tag>-<platform>-<arch>.tar.gz` — R2 mirror first, GitHub release as fallback. */
-export async function downloadAgentBinary(dest: string): Promise<string> {
+/**
+ * Compare `mlx-agent-vX.Y.Z` tags by version triplet (non-triplet tails sort
+ * lexically). Returns <0, 0, >0.
+ */
+export function compareReleaseTags(a: string, b: string): number {
+  const parse = (t: string): number[] => {
+    const m = t.match(/^mlx-agent-v(\d+)\.(\d+)\.(\d+)/);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [-1];
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? -1) - (pb[i] ?? -1);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/**
+ * Which release tag to download: `MLX_AGENT_TAG` override, then the R2
+ * `latest` pointer (the release pipeline maintains it), then GitHub's
+ * /releases/latest, then the baked minimum. Fork releases can ship at any
+ * cadence and a CLI rebuild picks them up with no pin bump.
+ */
+export async function resolveReleaseTag(): Promise<string> {
+  const pinned = process.env[MLX_AGENT_TAG_ENV];
+  if (pinned) return pinned;
+
+  try {
+    const res = await fetch(`${MLX_AGENT_R2_BASE}/${MLX_AGENT_LATEST_KEY}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.ok) {
+      const tag = (await res.text()).trim();
+      if (/^mlx-agent-v\d/.test(tag)) return tag;
+    }
+  } catch {
+    // fall through to GitHub
+  }
+
+  try {
+    const res = await fetch(`https://api.github.com/repos/${MLX_AGENT_RELEASE_REPO}/releases/latest`, {
+      headers: { Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.ok) {
+      const tag = ((await res.json()) as { tag_name?: string }).tag_name?.trim();
+      if (tag && /^mlx-agent-v\d/.test(tag)) return tag;
+    }
+  } catch {
+    // fall through to the baked minimum
+  }
+
+  return MLX_AGENT_MIN_RELEASE;
+}
+
+async function fetchText(url: string): Promise<string | undefined> {
+  try {
+    const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(15_000) });
+    if (res.ok) return (await res.text()).trim();
+  } catch {
+    // caller falls through
+  }
+  return undefined;
+}
+
+/**
+ * Download `mlx-agent-<tag>-<platform>-<arch>.tar.gz` and verify its SHA256
+ * against the release-published checksum before extracting — the desktop app
+ * SIGNS these bytes, so a tampered mirror must never reach the bundle.
+ * R2 mirror first, GitHub release as fallback.
+ */
+export async function downloadAgentBinary(dest: string, tag?: string): Promise<string> {
+  tag ??= await resolveReleaseTag();
   // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
   const platform =
     process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-  const asset = `mlx-agent-${MLX_AGENT_RELEASE_TAG}-${platform}-${arch}.tar.gz`;
+  const asset = `mlx-agent-${tag}-${platform}-${arch}.tar.gz`;
   const urls = [
-    `${MLX_AGENT_R2_BASE}/${MLX_AGENT_RELEASE_TAG}/${asset}`,
-    `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${MLX_AGENT_RELEASE_TAG}/${asset}`,
+    `${MLX_AGENT_R2_BASE}/${tag}/${asset}`,
+    `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}`,
   ];
 
   mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
-  let res: Response | null = null;
+  let tar: ArrayBuffer | null = null;
+  let shaUrl = '';
   for (const url of urls) {
+    // Pull the checksum from the same mirror — a per-release asset, so a
+    // mirror that can serve a tampered tarball could also serve a tampered
+    // checksum ONLY if the trusted side (the release pipeline's publish)
+    // never wrote the real one. Both are produced by the same CI step.
+    const expected = await fetchText(`${url}.sha256`);
+    if (!expected) continue;
     try {
       const r = await fetch(url, { redirect: 'follow' });
-      if (r.ok && r.body !== null) {
-        res = r;
-        break;
-      }
+      if (!r.ok || r.body === null) continue;
+      const buf = await r.arrayBuffer();
+      const digest = createHash('sha256').update(Buffer.from(buf)).digest('hex');
+      if (digest !== expected) continue;
+      tar = buf;
+      shaUrl = url;
+      break;
     } catch {
       // fall through to the next mirror
     }
   }
-  if (!res) {
+  if (!tar) {
     throw new Error(
-      `mlx agent: no local binary found and the prebuilt download failed ` +
-        `(${asset} unavailable on R2 and GitHub). ` +
+      `mlx agent: no local binary found and the verified download failed ` +
+        `(${asset} unavailable or checksum-mismatched on R2 and GitHub). ` +
         `Set ${MLX_AGENT_BIN_ENV}, or run \`yarn build:agent\` in the mlx-node repo.`,
     );
   }
-  const tar = await res.arrayBuffer();
   const tmp = join(dirname(dest), `${asset}.tmp-${process.pid}`);
   const { writeFileSync, rmSync, chmodSync } = await import('node:fs');
   writeFileSync(tmp, Buffer.from(tar), { mode: 0o600 });
@@ -167,6 +269,9 @@ export async function downloadAgentBinary(dest: string): Promise<string> {
   }
   writeFileSync(dest, out.stdout, { mode: 0o700 });
   chmodSync(dest, 0o700);
+  // Record which release produced this binary — the marker is what
+  // resolveAgentBinary checks against the CLI's minimum on the next launch.
+  writeFileSync(`${dest}.tag`, tag, { mode: 0o600 });
   return dest;
 }
 

@@ -7,8 +7,8 @@
  * The release workflow runs this BEFORE `package.ts --sign` so a fetch failure
  * costs seconds, not a signed-then-broken bundle. The downloader is the same
  * one `mlx agent` uses at runtime (R2 mirror first, GitHub release fallback,
- * pinned MLX_AGENT_RELEASE_TAG), so the bundled binary is bit-identical to
- * what a standalone CLI would fetch.
+ * latest-tag resolution + SHA256 verification), so the bundled binary is
+ * bit-identical to what a standalone CLI would fetch.
  */
 
 import { chmodSync, mkdirSync } from 'node:fs';

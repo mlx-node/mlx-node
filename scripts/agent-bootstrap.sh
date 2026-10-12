@@ -5,7 +5,8 @@
 # resolves the binary in this order (see packages/cli/src/commands/agent/grok-build.ts):
 #   1. MLX_AGENT_BIN env var
 #   2. <repo>/grok-build/target/release/mlx-agent   (this script's output)
-#   3. ~/.mlx-node/bin/mlx-agent                    (release download fallback)
+#   3. <app>/Contents/Resources/native/mlx-agent    (bundled desktop app)
+#   4. ~/.mlx-node/bin/mlx-agent                    (verified release download)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
