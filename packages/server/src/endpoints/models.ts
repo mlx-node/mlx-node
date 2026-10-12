@@ -4,6 +4,7 @@ import type { ServerResponse } from 'node:http';
 
 import type { PublicModelEntry } from '../handler.js';
 import type { ModelRegistry } from '../registry.js';
+import { stringifyStrictJson } from '../strict-json.js';
 
 export function handleListModels(
   res: ServerResponse,
@@ -17,5 +18,5 @@ export function handleListModels(
     models: models.map((model) => ({ name: model.id, description: 'Local MLX model', release_date: '' })),
   };
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(body));
+  res.end(stringifyStrictJson(body));
 }

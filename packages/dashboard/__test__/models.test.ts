@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -144,6 +144,42 @@ describe('discoverLocalModels', () => {
 
     rmSync(externalDir, { recursive: true, force: true });
   });
+
+  it('admits a symlinked model directory and sizes its real tree', () => {
+    // A Dirent reports the link itself — `isDirectory()` is false for a symlink —
+    // so a checkpoint linked into the store (a shared HF checkout, a mount) used
+    // to be invisible to listing. It must list like a copied dir, and
+    // `walkDirStats` must follow the ROOT link to report the real tree's size.
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-model-'));
+    try {
+      writeFileSync(join(external, 'config.json'), CONFIG_A);
+      writeFileSync(join(external, 'model.safetensors'), Buffer.alloc(WEIGHT_A_BYTES));
+      symlinkSync(external, join(modelsDir, 'linked-model'));
+
+      const { models } = discoverLocalModels(modelsDir);
+      const linked = models.find((m) => m.name === 'linked-model')!;
+      expect(linked).toBeDefined();
+      expect(linked.modelType).toBe('qwen3');
+      expect(linked.fileCount).toBe(2);
+      expect(linked.sizeBytes).toBe(Buffer.byteLength(CONFIG_A) + WEIGHT_A_BYTES);
+      // And the internal no-follow walk still holds: a link inside a model dir is
+      // never descended into (covered by the cycle test above).
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
+  it('skips a dangling symlink and a symlink to a file without warning', () => {
+    // Neither resolves to a directory — they stay invisible, never warnings.
+    symlinkSync(join(modelsDir, 'gone'), join(modelsDir, 'dangling'));
+    writeFileSync(join(modelsDir, 'plain-file'), 'x');
+    symlinkSync(join(modelsDir, 'plain-file'), join(modelsDir, 'file-link'));
+
+    const { models, warnings } = discoverLocalModels(modelsDir);
+    expect(models.map((m) => m.name)).toEqual(['model-a', 'model-b']);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('junk');
+  });
 });
 
 describe('deleteLocalModel', () => {
@@ -192,19 +228,37 @@ describe('deleteLocalModel', () => {
     expect(existsSync(join(staging, 'in-flight.txt'))).toBe(true);
   });
 
-  it('refuses to delete a symlinked child and leaves its target untouched', () => {
+  it('deletes ONLY the link for a symlinked checkpoint and leaves its target untouched', () => {
     const outside = mkdtempSync(join(tmpdir(), 'dash-outside-'));
+    writeFileSync(join(outside, 'config.json'), CONFIG_A);
+    writeFileSync(join(outside, 'model.safetensors'), Buffer.alloc(64));
     const keep = join(outside, 'victim.txt');
     writeFileSync(keep, 'important');
-    // <modelsDir>/link -> outside (an intermediate symlink rmSync must not follow).
+    // <modelsDir>/link -> outside: deleting must remove the link, never follow it.
     symlinkSync(outside, join(modelsDir, 'link'));
 
-    expect(() => deleteLocalModel(modelsDir, 'link')).toThrow(/symlink/i);
-    // The symlink target's contents survive.
+    deleteLocalModel(modelsDir, 'link');
+    // The link itself is gone (lstat throws — not merely a dangling link).
+    expect(() => lstatSync(join(modelsDir, 'link'))).toThrow();
+    // The symlink target — including a file NOT in the checkpoint set — survives.
     expect(existsSync(keep)).toBe(true);
+    expect(existsSync(join(outside, 'config.json'))).toBe(true);
     // And the encoded child-of-a-symlink attack is rejected by the separator guard.
     expect(() => deleteLocalModel(modelsDir, 'link/victim.txt')).toThrow();
     expect(existsSync(keep)).toBe(true);
+
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('refuses to delete a symlink whose target is not a checkpoint', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'dash-outside-'));
+    writeFileSync(join(outside, 'victim.txt'), 'important');
+    symlinkSync(outside, join(modelsDir, 'link'));
+
+    expect(() => deleteLocalModel(modelsDir, 'link')).toThrow(/not a model checkpoint/i);
+    // The link itself survives — it was refused, not unlinked.
+    expect(lstatSync(join(modelsDir, 'link')).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(outside, 'victim.txt'))).toBe(true);
 
     rmSync(outside, { recursive: true, force: true });
   });
@@ -499,11 +553,13 @@ describe('isDownloaderOwned', () => {
     }
   });
 
-  // A LIVE symlink whose target is an EXTERNAL directory carrying a valid marker must
-  // NOT read as owned: `readFileSync` follows the link and would otherwise report the
-  // foreign install as ours, letting the download runner overwrite/report-done through
-  // a path we never wrote. The no-follow `lstat` gate refuses any non-directory.
-  it('is false for a live symlink to an external marked dir (no-follow ownership)', () => {
+  // A LIVE symlink whose target is an EXTERNAL directory carrying a valid marker
+  // reads as OWNED: the gate follows the link (a symlinked model dir is admitted
+  // everywhere else — listing, presence, loading), so the foreign install's
+  // marker is a truthful ownership record. This stays safe because every
+  // mutation of the final path acts on the LINK — rename moves it, rm unlinks
+  // it — never writes through to the target.
+  it('is true for a live symlink to an external marked dir (the link resolves to our marker)', () => {
     const external = mkdtempSync(join(tmpdir(), 'dash-ext-owned-'));
     writeFileSync(
       join(external, DOWNLOAD_COMPLETE_MARKER),
@@ -512,9 +568,9 @@ describe('isDownloaderOwned', () => {
     const link = join(modelsDir, 'linked-final');
     symlinkSync(external, link);
 
-    // The link resolves to a valid foreign marker, yet ownership is refused.
+    // The link resolves to a valid foreign marker, which now proves ownership.
     expect(existsSync(join(link, DOWNLOAD_COMPLETE_MARKER))).toBe(true);
-    expect(isDownloaderOwned(link)).toBe(false);
+    expect(isDownloaderOwned(link)).toBe(true);
 
     rmSync(external, { recursive: true, force: true });
   });
@@ -810,11 +866,11 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
   });
 
-  it('flags a LIVE symlink to an external checkpoint as blocked, not installed', () => {
-    // Both discovery walks and the CLI's filter on `Dirent.isDirectory()`, false for a
-    // symlink, and delete refuses one outright — so a followed presence check would
-    // label "Installed" a model nothing can list, pick or remove, and would suppress
-    // the cleanup notice by short-circuiting the occupancy test.
+  it('admits a LIVE symlink to an external checkpoint as present, not blocked', () => {
+    // Discovery, the loader and delete all resolve a symlinked checkpoint dir —
+    // a followed presence check is now the only consistent answer: the card
+    // reads Present like a markerless CLI install, and the occupancy fallback
+    // never fires (a symlink is not a "foreign dir" to clean up).
     const external = mkdtempSync(join(tmpdir(), 'dash-ext-ckpt-'));
     writeFileSync(join(external, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
     writeFileSync(join(external, 'model.safetensors'), Buffer.alloc(2048));
@@ -823,11 +879,13 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     try {
       // The link is LIVE — without this the case would hold for the wrong reason.
       expect(existsSync(join(link, 'config.json'))).toBe(true);
-      expect(isModelPresent(link)).toBe(false);
-      expect(catalogItem(RECOMMENDED.label).present).toBe(false);
-      expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
-      // The same directory the catalog now calls blocked is absent from discovery.
-      expect(discoverLocalModels(modelsDir).models.map((model) => model.name)).not.toContain(RECOMMENDED_SLUG);
+      expect(isModelPresent(link)).toBe(true);
+      const item = catalogItem(RECOMMENDED.label);
+      expect(item.present).toBe(true);
+      expect(item.installed).toBe(false);
+      expect(item.blockedByForeignDir).toBe(false);
+      // Discovery admits the same linked dir the catalog now calls present.
+      expect(discoverLocalModels(modelsDir).models.map((model) => model.name)).toContain(RECOMMENDED_SLUG);
     } finally {
       rmSync(external, { recursive: true, force: true });
     }

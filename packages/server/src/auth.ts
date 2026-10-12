@@ -14,6 +14,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
+import { stringifyStrictJson } from './strict-json.js';
+
 /** `Bearer ` prefix length, used to slice the credential out of `authorization`. */
 const BEARER_PREFIX = 'bearer ';
 
@@ -99,7 +101,7 @@ export function sendUnauthorized(res: ServerResponse): void {
     'Content-Type': 'application/json',
   });
   res.end(
-    JSON.stringify({
+    stringifyStrictJson({
       error: {
         type: 'authentication_error',
         message: 'Missing or invalid API key',

@@ -132,18 +132,19 @@ export function isModelInstalled(modelDir: string): boolean {
  * offering a dashboard install, which would refuse to overwrite the unowned
  * directory (`DownloadManager.refuseIfUnownedFinal`) and fail deterministically.
  *
- * NO-FOLLOW on the final component, matching every other predicate that reasons
- * about a model root: both discovery walks and the CLI's filter entries on
- * `Dirent.isDirectory()`, which is FALSE for a symlink, and `deleteLocalModel`
- * refuses one outright. A FOLLOWING check would call a symlinked slug present —
- * a model the dashboard cannot list, the agent cannot pick, and delete refuses —
- * and, because `present` short-circuits {@link isPathOccupied}, it would suppress
- * the very cleanup notice that explains the state. Only the final component is
- * `lstat`-ed, so a symlinked models ROOT still resolves normally.
+ * FOLLOWS a symlink on the final component — `statSync`, not `lstatSync` — so a
+ * symlinked model directory admits exactly like a real one. That mirrors the
+ * loader and discovery (`entryIsUsableDir`), which resolve a symlink to the
+ * directory it points at: refusing to follow here would report `present=false`
+ * for a checkpoint that loads and lists, and would flag it
+ * `blockedByForeignDir` via the {@link isPathOccupied} fallback — a false
+ * "foreign occupant" warning on a working install. A symlink whose target is
+ * missing or is not a directory still reads as absent (a broken link admits
+ * nothing); a symlinked models ROOT resolves the same way.
  */
 export function isModelPresent(modelDir: string): boolean {
   try {
-    if (!lstatSync(modelDir).isDirectory()) return false;
+    if (!statSync(modelDir).isDirectory()) return false;
   } catch {
     return false;
   }
@@ -258,12 +259,10 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
  * a dangling link (target on an unmounted volume, say) reads as ABSENT and slips
  * past the ownership preflight, triggering a full wasted download that only fails at
  * publish. `lstatSync` stats the LINK itself, so such a path reads as occupied and
- * is refused up front. {@link isDownloaderOwned} is likewise no-follow (it
- * `lstat`-gates on a real directory before reading the marker), so ANY symlink here —
- * a DANGLING link OR a LIVE link into an external marked dir — returns false and the
- * preflight/publish guards refuse it. Without that, `readFileSync` would follow a live
- * link and mistake the foreign marker for our own install, letting the runner
- * overwrite or report done through a path it never wrote.
+ * is refused up front. {@link isDownloaderOwned} follows a LIVE link into a marked
+ * directory (the target's marker is a valid ownership record — the publish swap
+ * renames the LINK, never the target), so a live symlink into an unmarked dir or
+ * a dangling one is what stays unowned and refused here.
  *
  * Shared with the catalog so the state the UI renders and the state the download
  * runner enforces are the SAME predicate: the runner refuses an occupied, unowned
@@ -289,12 +288,15 @@ export function isPathOccupied(path: string): boolean {
  * current CLI writes the shared marker, so its installs count as
  * downloader-owned here.
  *
- * NO-FOLLOW: a symlink (or any non-directory) at this path was never written by us
- * as a managed model dir, so the check `lstat`-gates on a REAL directory BEFORE
- * reading the marker. Without this gate `readFileSync` would FOLLOW a live final
- * symlink into an external directory and read its foreign marker, reporting that
- * link as downloader-owned — which would slip a foreign install past the ownership
- * preflight/publish guards (a wasted overwrite, or a false "done" through the link).
+ * FOLLOWS a symlink on the final component — `statSync`, not `lstatSync`: a
+ * symlinked model directory now lists, loads, and reports present like a real
+ * one, so a live link into a marked install must read as owned too (its marker
+ * is a valid record of THAT install; skip-detection reporting `done` through
+ * the link is truthful). This stays safe at the destructive boundary because
+ * every mutation of the final path acts on the LINK: `rename` moves it aside,
+ * `rm` unlinks it — the foreign target is never written through. A symlink into
+ * an UNMARKED dir is unowned exactly like that dir itself; a dangling link or a
+ * non-directory resolves to false.
  *
  * The shape test is {@link readCompletion}, our FULL marker, not merely "carries a
  * `files` array". This is the only gate between `POST /api/downloads` and a
@@ -308,7 +310,7 @@ export function isPathOccupied(path: string): boolean {
  */
 export function isDownloaderOwned(modelDir: string): boolean {
   try {
-    if (!lstatSync(modelDir).isDirectory()) return false;
+    if (!statSync(modelDir).isDirectory()) return false;
   } catch {
     return false;
   }
@@ -355,15 +357,16 @@ function readMarkerFile(dir: string): unknown {
 /**
  * Is `path` a REGULAR FILE — not a directory, FIFO, socket or device?
  *
- * FOLLOWS symlinks, unlike the no-follow gate {@link readMarkerFile} puts on the
- * marker and {@link isModelPresent} puts on the model ROOT, and the difference is
- * deliberate. Those two guard a directory whose identity every other consumer
- * also refuses to follow (discovery filters on `Dirent.isDirectory()`, which is
- * false for a symlink; `deleteLocalModel` refuses one outright). A weight FILE is
- * the opposite: every consumer follows it — the loader opens it, and `walkDirStats`
- * already `statSync`s it precisely "so HF-cache-symlinked blobs count at their real
- * byte size". A no-follow test here would call a symlinked weight missing and hide
- * a checkpoint that loads perfectly, which is the regression this shape avoids.
+ * FOLLOWS symlinks, like {@link isModelPresent} on the model ROOT and unlike
+ * the no-follow gate {@link readMarkerFile} puts on the marker FILE, and the
+ * difference is deliberate. The marker gate refuses a link because a link's
+ * target is proof about the target, never about the directory holding the
+ * link — while the model ROOT follows links because discovery admits a
+ * symlinked directory wholesale. A weight FILE is the same case: every consumer
+ * follows it — the loader opens it, and `walkDirStats` already `statSync`s it
+ * precisely "so HF-cache-symlinked blobs count at their real byte size". A
+ * no-follow test here would call a symlinked weight missing and hide a
+ * checkpoint that loads perfectly, which is the regression this shape avoids.
  */
 export function isRegularFile(path: string): boolean {
   try {
@@ -497,9 +500,12 @@ const MAX_WALK_ENTRIES = 100_000;
  * each directory's `Dir` handle is CLOSED before any child is opened, so at most
  * ONE handle is ever open — a deep tree can never hold one fd per level and hit
  * `EMFILE` on a child `opendirSync` (which a recursive descent, whose parent handle
- * stays open across the child call, does). Only REAL directories are descended into
- * (`Dirent` carries lstat semantics, so a symlink whose target is a directory
- * reports `isDirectory() === false` and is never pushed) — this is what breaks a
+ * stays open across the child call, does). The ROOT is followed once (`statSync`):
+ * discovery now admits a symlinked model directory, so the walk must size the
+ * checkpoint the loader opens rather than reporting 0 bytes for a linked install.
+ * INSIDE the tree only REAL directories are descended into (`Dirent` carries lstat
+ * semantics, so a symlink whose target is a directory reports
+ * `isDirectory() === false` and is never pushed) — this is what breaks a
  * symlink cycle (`self -> .`, or two `-> .` links whose exponential fan-out used to
  * freeze the handler) and keeps an external symlinked tree's bytes out of the total.
  * A symlink is still `statSync`'d for its real byte size (preserving the HF-cache
@@ -534,7 +540,10 @@ export function walkDirStats(
     // the rare non-symlink loop. A vanished/unreadable dir here is a TOCTOU skip
     // (like the per-file skip), not a resource-exhaustion truncation.
     try {
-      const self = lstatSync(current);
+      // The ROOT is followed (`statSync`) — discovery admits a symlinked model
+      // dir, so its real tree must be sized; children stay no-follow (`lstatSync`)
+      // so a symlink is never descended into and a cycle stays broken.
+      const self = (current === dir ? statSync : lstatSync)(current);
       const key = `${self.dev}:${self.ino}`;
       if (visited.has(key)) continue;
       visited.add(key);
@@ -543,7 +552,9 @@ export function walkDirStats(
       // swapped-in link would be descended into and its external target sized. `lstat`
       // is no-follow — a symlink's `lstat` is never a directory — so reject any
       // non-directory here BEFORE `opendirSync`, closing the escape across the whole
-      // enqueue→pop window (discovery already filters symlink roots, so real roots stay).
+      // enqueue→pop window. Only queued CHILDREN get the no-follow stat: the root
+      // itself was followed once above (deliberately — discovery admits symlink
+      // roots now), so it resolves to the real tree it names.
       //
       // ACCEPTED RESIDUAL: this no-follows only the FINAL component. Because the walk
       // traverses lexical paths, a concurrent adversary who swaps an ANCESTOR directory
@@ -635,6 +646,24 @@ export function walkDirStats(
 }
 
 /**
+ * Whether a discovery entry names a directory the loader could open: a REAL
+ * directory, or a symlink whose target is a directory (`statSync` follows;
+ * `Dirent.isDirectory()` is false for any symlink). Both are admitted — a
+ * linked-in checkpoint must list like a copied one. A dangling or unreadable
+ * link resolves to false (skipped silently, like sockets/fifos — a broken link
+ * admits nothing).
+ */
+function entryIsUsableDir(modelsDir: string, entry: Dirent): boolean {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  try {
+    return statSync(join(modelsDir, entry.name)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Scan `modelsDir` for checkpoint subdirectories. A subdirectory is a model
  * only when it carries a readable `config.json`; anything else is reported as
  * a warning and skipped (never guessed). A missing `modelsDir` yields empty
@@ -661,7 +690,10 @@ export function discoverLocalModels(
   }
 
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+    // A symlink whose target is a directory is admitted: the loader resolves it,
+    // so it lists like a real checkpoint dir. A link to a file, a dangling link,
+    // and every other non-directory is skipped before it can warn.
+    if (!entryIsUsableDir(modelsDir, entry)) continue;
     // Hidden dirs are runner scratch (`.staging/<slug>`), never checkpoints:
     // skip them silently so an in-flight download raises no spurious warning.
     if (entry.name.startsWith('.')) continue;
@@ -720,9 +752,10 @@ export function discoverLocalModels(
  * direct child of `modelsDir`: any path separator, `.`/`..`, or NUL is rejected,
  * so a decoded route param like `link%2Fvictim` (→ `link/victim`) or `../../etc`
  * can never traverse out of the store. The resolved child is `lstat`-ed without
- * following the final component, and a symlinked child is refused outright —
- * otherwise `rmSync(..., { recursive })` would follow the link and recursively
- * delete whatever lives outside the store that it points at.
+ * following the final component. A symlinked child is admitted — discovery lists
+ * it — but ONLY the link itself is removed (a non-recursive `rmSync` unlinks a
+ * symlink rather than following it), so the foreign target outside the store is
+ * never touched.
  */
 export function deleteLocalModel(modelsDir: string, name: string): void {
   // A deletable model is a SINGLE direct child: it must be a safe relative path
@@ -753,7 +786,16 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
     throw new Error(`Model "${name}" not found`);
   }
   if (stat.isSymbolicLink()) {
-    throw new Error(`Refusing to delete "${name}": target is a symlink, not a model directory`);
+    // A linked-in checkpoint is deletable like a real one — but only the LINK
+    // is removed, never the foreign target it names. The checkpoint gate below
+    // still applies through the link, so a link to a non-checkpoint is refused.
+    if (!existsSync(join(target, 'config.json'))) {
+      throw new Error(`Refusing to delete "${name}": not a model checkpoint directory`);
+    }
+    // Non-recursive `rmSync` unlinks a symlink — it never descends into the
+    // target, so the external checkpoint survives intact.
+    rmSync(target);
+    return;
   }
   // Only delete a real checkpoint directory — a model or companion (a dir
   // carrying a `config.json`). The route takes an arbitrary name, so without

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
@@ -6672,6 +6672,403 @@ fn qwen35_native_cache_is_current(
     })
 }
 
+// ── Native GGUF cache sweep (issue 173) ─────────────────────────────────────
+
+/// Minimum age before any sweep decision can delete a cache object. Anything
+/// fresher than this may belong to a concurrent load on another machine's
+/// clock or a writer that has not published its marker yet.
+const NATIVE_GGUF_SWEEP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const NATIVE_GGUF_CACHE_MAX_GB_ENV: &str = "MLX_NATIVE_GGUF_CACHE_MAX_GB";
+const NATIVE_GGUF_ONE_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+const NATIVE_GGUF_ASSETS_PREFIX: &str = ".mlx-qwen4-assets-v2-";
+const NATIVE_GGUF_ASSETS_TMP_PREFIX: &str = ".mlx-qwen4-assets-tmp-";
+const NATIVE_GGUF_STAGING_INFIX: &str = ".staging-";
+const NATIVE_GGUF_WRITE_PROBE_PREFIX: &str = ".write-probe-";
+const NATIVE_GGUF_LOCK_SUFFIX: &str = ".lock";
+
+/// Optional total size cap for the whole native-GGUF cache root. Parsed like
+/// `cache_limit.rs`'s GiB knobs: a finite float > 0 enables an LRU eviction;
+/// `<=0`, unset or unparseable means unlimited.
+fn native_gguf_cache_cap_bytes() -> Option<u64> {
+    let raw = std::env::var(NATIVE_GGUF_CACHE_MAX_GB_ENV).ok()?;
+    match raw.trim().parse::<f64>() {
+        Ok(gib) if gib.is_finite() && gib > 0.0 => Some((gib * NATIVE_GGUF_ONE_GIB).round() as u64),
+        _ => None,
+    }
+}
+
+/// Conservative age check: only a readable timestamp strictly older than the
+/// grace window counts. Unreadable or future mtimes are NOT old.
+fn native_gguf_mtime_older(
+    mtime: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    mtime
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > NATIVE_GGUF_SWEEP_MIN_AGE)
+}
+
+/// True when `pid` no longer exists (or cannot be signaled by us). A live pid
+/// always reports false so leftovers from a running writer are never touched.
+#[cfg(unix)]
+fn native_gguf_pid_dead(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    // SAFETY: `kill(pid, 0)` sends no signal; it only probes liveness.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn native_gguf_pid_dead(_pid: u32) -> bool {
+    false
+}
+
+/// Lock file for a cache object keyed by `key`. Plain entry keys live beside
+/// their `.{key}.lock`; keys that already carry a leading dot (asset
+/// sidecars) append the suffix directly so readers and the sweep agree on one
+/// name — `.mlx-qwen4-assets-v2-{identity}.lock`, never a double dot.
+fn native_gguf_lock_name(key: &str) -> String {
+    if key.starts_with('.') {
+        format!("{key}{NATIVE_GGUF_LOCK_SUFFIX}")
+    } else {
+        format!(".{key}{NATIVE_GGUF_LOCK_SUFFIX}")
+    }
+}
+
+/// Try to win a non-blocking exclusive flock on `key`'s lock. `Some(_)`
+/// returns a guard the caller must hold across any deletion; the inner None
+/// means no lock file exists (nothing can be holding the lock). `None` means
+/// a live writer or an open/flock failure: keep the entry. The lock file
+/// itself is never deleted — unlinking it would break flock mutual exclusion
+/// across processes.
+#[cfg(unix)]
+fn native_gguf_try_entry_lock(cache_root: &Path, key: &str) -> Option<Option<fs::File>> {
+    let file = match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(cache_root.join(native_gguf_lock_name(key)))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
+    };
+    // SAFETY: `file` owns the descriptor for the flock call, and the returned
+    // guard keeps it — and the lock — alive until the caller drops it.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(Some(file))
+}
+
+#[cfg(not(unix))]
+fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<fs::File>> {
+    None
+}
+
+/// Best-effort recursive size. Uses each entry's own metadata so symlinked
+/// targets outside the cache root are never counted (or deleted).
+fn native_gguf_path_bytes(path: &Path) -> u64 {
+    let mut total = 0_u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(native_gguf_path_bytes(&entry.path()));
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Delete a cache object, count its bytes only after the removal actually
+/// succeeded, and log the reason at debug level. Returns reclaimed bytes.
+fn native_gguf_remove_logged(path: &Path, reason: &str) -> u64 {
+    let bytes = native_gguf_path_bytes(path);
+    let removed = if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => {
+            debug!(
+                "native GGUF cache sweep removed '{}' ({reason})",
+                path.display()
+            );
+            bytes
+        }
+        Err(error) => {
+            debug!(
+                "native GGUF cache sweep could not remove '{}' ({reason}): {error}",
+                path.display()
+            );
+            0
+        }
+    }
+}
+
+/// Per-sweep memoization: several entries can share one source GGUF, so each
+/// stat-derived identity and each sibling-asset hash is computed at most once
+/// per call.
+#[derive(Default)]
+struct NativeGgufSweepDigests {
+    identities: HashMap<PathBuf, Option<String>>,
+    assets: HashMap<PathBuf, Option<String>>,
+}
+
+/// Decide whether a published entry directory is stale. Cheap checks (marker
+/// presence, format tag, source existence, source identity, companion
+/// fingerprint) run first; the sibling-asset hash only runs after the source
+/// and its identity match, per `digests`.
+fn native_gguf_entry_stale_reason(
+    dir: &Path,
+    digests: &mut NativeGgufSweepDigests,
+) -> Option<&'static str> {
+    let marker = match fs::read_to_string(dir.join(".complete")) {
+        Ok(marker) => marker,
+        Err(_) => return Some("missing .complete marker"),
+    };
+    let field = |key: &str| {
+        marker
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::to_string)
+    };
+    if field("format=").and_then(|value| value.parse::<u32>().ok())
+        != Some(QWEN35_NATIVE_CACHE_FORMAT)
+    {
+        return Some("outdated cache format");
+    }
+    let source = PathBuf::from(match field("source=") {
+        Some(source) => source,
+        None => return Some("unreadable source record"),
+    });
+    let source_meta = match fs::metadata(&source) {
+        Ok(meta) => meta,
+        Err(_) => return Some("source GGUF is gone"),
+    };
+    let identity = digests
+        .identities
+        .entry(source.clone())
+        .or_insert_with(|| Some(source_file_identity_digest(&source, &source_meta)))
+        .clone()?;
+    if Some(identity.as_str()) != field("source_identity_sha256=").as_deref() {
+        return Some("source GGUF changed");
+    }
+    let companion = match field("companion=") {
+        Some(companion) => companion,
+        None => return Some("unverifiable companion record"),
+    };
+    let companion_actual = if companion == "none" {
+        "none".to_string()
+    } else {
+        let path = PathBuf::from(&companion);
+        fs::metadata(&path)
+            .map(|meta| source_file_identity_digest(&path, &meta))
+            .unwrap_or_else(|_| "none".to_string())
+    };
+    if Some(companion_actual.as_str()) != field("companion_sha256=").as_deref() {
+        return Some("companion GGUF changed");
+    }
+    // Only now hash the sibling config/tokenizer set: it is the expensive
+    // check and only matters once source and companion match.
+    let parent = source.parent()?.to_path_buf();
+    let assets = digests
+        .assets
+        .entry(parent.clone())
+        .or_insert_with(|| qwen35_native_asset_digest(&parent).ok())
+        .clone()?;
+    if Some(assets.as_str()) != field("assets_sha256=").as_deref() {
+        return Some("sibling assets changed");
+    }
+    None
+}
+
+/// A stale entry may be deleted only after winning a non-blocking flock on
+/// its own `.{key}.lock`: a held lock means a live writer, so the entry is
+/// skipped and left for a later sweep. The guard stays alive across the
+/// removal itself — dropping it first would let a writer publish into a
+/// half-deleted directory.
+fn native_gguf_locked_remove(cache_root: &Path, path: &Path, key: &str, reason: &str) -> u64 {
+    let Some(_guard) = native_gguf_try_entry_lock(cache_root, key) else {
+        return 0;
+    };
+    native_gguf_remove_logged(path, reason)
+}
+
+/// Extract the pid a `.staging-{pid}-{uuid}` or `.write-probe-{pid}-{uuid}`
+/// name embeds.
+fn native_gguf_embedded_pid(name: &str) -> Option<u32> {
+    name.split('-').next()?.parse().ok()
+}
+
+/// Recency witness for an entry directory: `.complete` first, dir fallback.
+/// Asset sidecars use their `complete` marker the same way.
+fn native_gguf_object_recency(dir: &Path, marker_name: &str) -> Option<std::time::SystemTime> {
+    fs::metadata(dir.join(marker_name))
+        .or_else(|_| fs::metadata(dir))
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// Touch `.complete` on a verified cache hit so the capped-LRU sweep treats
+/// the entry as recently used.
+fn native_gguf_stamp_mtime(path: &Path) {
+    if let Ok(file) = OpenOptions::new().write(true).open(path) {
+        file.set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .ok();
+    }
+}
+
+/// Sweep stale, orphaned and over-capital entries from the native GGUF cache
+/// root. Runs under the process mutex and the caller's per-key lock; every
+/// gate is conservative so a load can never be broken by the sweep and every
+/// failure is logged and swallowed by the caller.
+fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
+    let Ok(entries) = fs::read_dir(cache_root) else {
+        return;
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect();
+    let now = std::time::SystemTime::now();
+    let mut reclaimed = 0_u64;
+    let mut digests = NativeGgufSweepDigests::default();
+    // (path, recency, lock key) for directories that count toward the cap.
+    // The lock key resolves through `native_gguf_lock_name`: `.{key}.lock`
+    // for plain entries and `{name}.lock` for dot-prefixed asset sidecars.
+    let mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String)> = Vec::new();
+    let mut total = 0_u64;
+
+    for name in names {
+        let path = cache_root.join(&name);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+
+        // Lock files carry flock state; deleting one would let two processes
+        // believe they hold the same key, so they are unconditionally kept.
+        if name.starts_with('.') && name.ends_with(NATIVE_GGUF_LOCK_SUFFIX) {
+            continue;
+        }
+
+        if meta.is_dir() {
+            if let Some(stripped) = name.strip_prefix(NATIVE_GGUF_ASSETS_TMP_PREFIX) {
+                // Abandoned publish temp: no pid is embedded, so a dead pid
+                // can never apply and age is the only gate.
+                let dead = native_gguf_embedded_pid(stripped).is_some_and(native_gguf_pid_dead);
+                if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
+                    reclaimed += native_gguf_remove_logged(&path, "abandoned assets temp");
+                }
+                continue;
+            }
+            if name.starts_with(NATIVE_GGUF_ASSETS_PREFIX) {
+                // Live tokenizer sidecars are never orphan-deleted; they only
+                // leave through the capped-LRU pass below. The dot-prefixed
+                // name is the lock key so a held `assets_in` reader lock
+                // blocks eviction.
+                let bytes = native_gguf_path_bytes(&path);
+                total = total.saturating_add(bytes);
+                let recency = native_gguf_object_recency(&path, "complete");
+                lru.push((path, recency, name));
+                continue;
+            }
+            if name.starts_with('.')
+                && let Some(index) = name.find(NATIVE_GGUF_STAGING_INFIX)
+                && index >= 1
+            {
+                // `.{key}.staging-{pid}-{uuid}`: the key sits between the
+                // leading dot and the staging infix, and its lock file is
+                // `.{key}.lock`.
+                let key = &name[1..index];
+                let pid = name[index + NATIVE_GGUF_STAGING_INFIX.len()..]
+                    .split('-')
+                    .next()
+                    .and_then(|token| token.parse::<u32>().ok());
+                let dead = pid.is_some_and(native_gguf_pid_dead);
+                if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
+                    reclaimed += native_gguf_locked_remove(
+                        cache_root,
+                        &path,
+                        key,
+                        "interrupted staging directory",
+                    );
+                }
+                continue;
+            }
+            if name.starts_with('.') {
+                // Any other dot-directory is tooling we do not own; leave it.
+                continue;
+            }
+            if name == current_key {
+                total = total.saturating_add(native_gguf_path_bytes(&path));
+                continue;
+            }
+            if let Some(reason) = native_gguf_entry_stale_reason(&path, &mut digests) {
+                let recency = native_gguf_object_recency(&path, ".complete");
+                if native_gguf_mtime_older(recency, now)
+                    && native_gguf_locked_remove(cache_root, &path, &name, reason) > 0
+                {
+                    continue;
+                }
+            }
+            let bytes = native_gguf_path_bytes(&path);
+            total = total.saturating_add(bytes);
+            let recency = native_gguf_object_recency(&path, ".complete");
+            lru.push((path, recency, name));
+            continue;
+        }
+
+        // Loose files: interrupted write probes only; every other file in the
+        // root is foreign and left alone.
+        if let Some(stripped) = name.strip_prefix(NATIVE_GGUF_WRITE_PROBE_PREFIX) {
+            let dead = native_gguf_embedded_pid(stripped).is_some_and(native_gguf_pid_dead);
+            if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
+                reclaimed += native_gguf_remove_logged(&path, "abandoned write probe");
+            }
+        }
+    }
+
+    // Optional total cap: evict least-recently-used eligible directories until
+    // the root fits. The mtime grace and the lock gate apply exactly as in the
+    // stale sweep, and the current key never enters the eviction list.
+    if let Some(cap) = native_gguf_cache_cap_bytes()
+        && total > cap
+    {
+        lru.sort_by_key(|(_, recency, _)| *recency);
+        for (path, recency, key) in lru {
+            if total <= cap {
+                break;
+            }
+            if !native_gguf_mtime_older(recency, now) {
+                continue;
+            }
+            let bytes = native_gguf_locked_remove(cache_root, &path, &key, "over cache size cap");
+            reclaimed = reclaimed.saturating_add(bytes);
+            total = total.saturating_sub(bytes);
+        }
+    }
+
+    if reclaimed > 0 {
+        info!(
+            "native GGUF cache sweep reclaimed {} bytes under '{}'",
+            reclaimed,
+            cache_root.display()
+        );
+    }
+}
+
 /// Resolve every split by its declared ordinal, accepting any GGUF extension
 /// casing while rejecting ambiguous sibling names. Payload validation remains
 /// the caller's responsibility; this reads directory entries only.
@@ -7368,6 +7765,26 @@ async fn prepare_native_gguf_inner(
             "GGUF source changed while acquiring the native cache lock; retry the load".to_string(),
         ));
     }
+
+    // Sweep stale/orphaned siblings once per prepare while both locks are
+    // held (safe on hits and misses). A sweep failure or panic must never
+    // fail a load, so it runs on a blocking thread behind catch_unwind.
+    {
+        let sweep_root = cache_root.to_path_buf();
+        let sweep_key = cache_key.clone();
+        let swept = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sweep_native_gguf_cache(&sweep_root, &sweep_key);
+            }))
+        })
+        .await;
+        match swept {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
+            Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
+        }
+    }
+
     if qwen35_native_cache_is_current(
         &output_dir,
         &source_identity_digest,
@@ -7376,6 +7793,9 @@ async fn prepare_native_gguf_inner(
         family.required_files(),
     ) && (companion.is_none() || output_dir.join(family.companion_filename()).is_file())
     {
+        // Stamp the marker mtime so the capped-LRU sweep treats this verified
+        // hit as recently used instead of a deletion candidate.
+        native_gguf_stamp_mtime(&output_dir.join(".complete"));
         return Ok(output_dir);
     }
 
@@ -7475,11 +7895,17 @@ async fn prepare_native_gguf_inner(
                 .to_string(),
         ));
     }
+    // Record the companion's canonical path (or `none`) so the sweep can
+    // recompute its identity digest; entries published before this field
+    // existed fail verification and rebuild once they age out.
+    let companion_path = companion
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "none".to_string());
     let marker = staging_dir.join(".complete");
     if let Err(error) = fs::write(
         marker,
         format!(
-            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n",
+            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion={companion_path}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n",
             input_path.display(),
             source_identity_digest,
             metadata.len(),
@@ -16385,5 +16811,403 @@ mod tests {
         .expect_err("a prism.hadamard source must reject a companion GGUF");
         assert!(err.reason.contains("text-only"), "{}", err.reason);
         fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Native GGUF cache sweep tests (issue 173) ───────────────────────────
+
+    /// Serialize tests that mutate `MLX_NATIVE_GGUF_CACHE_MAX_GB`: the prepare
+    /// mutex only serializes code inside `prepare_native_gguf_inner`, not the
+    /// env writes around it.
+    #[cfg(unix)]
+    fn sweep_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    struct SweepEnvVar(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl SweepEnvVar {
+        fn set_max_gb(value: &str) -> Self {
+            let prior = std::env::var_os(NATIVE_GGUF_CACHE_MAX_GB_ENV);
+            unsafe {
+                std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, value);
+            }
+            Self(prior)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SweepEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(prior) => std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, prior),
+                    None => std::env::remove_var(NATIVE_GGUF_CACHE_MAX_GB_ENV),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct NativeSweepTestDir(PathBuf);
+
+    #[cfg(unix)]
+    impl NativeSweepTestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "mlx-node-native-sweep-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn source(&self) -> PathBuf {
+            let dir = self.0.join("model");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+            fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+            let input = dir.join("model.gguf");
+            fs::write(
+                &input,
+                build_minimal_gguf(
+                    &[
+                        (
+                            "general.architecture",
+                            GgufMetaValue::String("qwen35".to_string()),
+                        ),
+                        ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+                    ],
+                    &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+                ),
+            )
+            .unwrap();
+            input
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for NativeSweepTestDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// Write a `.complete` marker for `source`'s current digests. `format` and
+    /// `companion` are injectable so stale variants can be produced.
+    #[cfg(unix)]
+    fn native_sweep_marker(
+        source: &Path,
+        format: u32,
+        companion: Option<&Path>,
+        include_companion: bool,
+    ) -> String {
+        let source = source.canonicalize().unwrap();
+        let meta = fs::metadata(&source).unwrap();
+        let identity = source_file_identity_digest(&source, &meta);
+        let assets = qwen35_native_asset_digest(source.parent().unwrap()).unwrap();
+        let (companion_path, companion_digest) = match companion {
+            Some(path) => {
+                let path = path.canonicalize().unwrap();
+                let meta = fs::metadata(&path).unwrap();
+                (
+                    path.display().to_string(),
+                    source_file_identity_digest(&path, &meta),
+                )
+            }
+            None => ("none".to_string(), "none".to_string()),
+        };
+        format!(
+            "format={format}\nsource={}\nsource_identity_sha256={identity}\nsize={}\nmodified_ns=1\nassets_sha256={assets}\nlayout=tiled\n{}companion_sha256={companion_digest}\ndtype=bf16\n",
+            source.display(),
+            meta.len(),
+            if include_companion {
+                format!("companion={companion_path}\n")
+            } else {
+                String::new()
+            },
+        )
+    }
+
+    /// Entry directories can only be aged through their `.complete` mtime
+    /// (the dir mtime is just the fallback); temp files age via their own
+    /// mtime.
+    #[cfg(unix)]
+    fn native_sweep_age_file(path: &Path) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(past))
+            .unwrap();
+    }
+
+    /// Age a directory itself (for the tmp leftover whose only witness is the
+    /// dir mtime). `utimensat` works on a plain path where `File::set_times`
+    /// needs a writable fd a directory cannot provide.
+    #[cfg(unix)]
+    fn native_sweep_age_dir(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let seconds = (std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600))
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let times = [
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+        ];
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a live NUL-terminated string and `times` points
+        // at two valid timespecs for the duration of the call.
+        let result = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(
+            result,
+            0,
+            "utimensat failed: {:?}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Largest plausible pid: above the platform pid_max on macOS and Linux,
+    /// so `kill(pid, 0)` reports ESRCH and the pid reads as dead.
+    #[cfg(unix)]
+    fn dead_test_pid() -> u32 {
+        i32::MAX as u32
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_sweep_removes_stale_orphans_and_keeps_live_entries() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0");
+        let root = NativeSweepTestDir::new("mixed");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let live = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+
+        // Orphan: gone source, aged marker → deleted on the next prepare.
+        let orphan = cache_root.join("orphan-1-1-v7-abc-def");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("model.safetensors"), b"x").unwrap();
+        let orphan_marker = orphan.join(".complete");
+        fs::write(
+            &orphan_marker,
+            format!(
+                "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
+                root.path().join("missing.gguf").display()
+            ),
+        )
+        .unwrap();
+        native_sweep_age_file(&orphan_marker);
+
+        // Orphan whose source is gone but still fresh: the mtime grace keeps it.
+        let fresh_orphan = cache_root.join("fresh-orphan-1-1-v7-abc-def");
+        fs::create_dir_all(&fresh_orphan).unwrap();
+        fs::write(
+            fresh_orphan.join(".complete"),
+            format!(
+                "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
+                root.path().join("missing-fresh.gguf").display()
+            ),
+        )
+        .unwrap();
+
+        // Format mismatch: a pre-format-7 marker is stale once aged.
+        let outdated = cache_root.join("outdated-1-1-v7-abc-def");
+        fs::create_dir_all(&outdated).unwrap();
+        let outdated_marker = outdated.join(".complete");
+        fs::write(&outdated_marker, native_sweep_marker(&input, 6, None, true)).unwrap();
+        native_sweep_age_file(&outdated_marker);
+
+        // Pre-fix marker without `companion=`: unverifiable → stale once aged.
+        let unverifiable = cache_root.join("unverifiable-1-1-v7-abc-def");
+        fs::create_dir_all(&unverifiable).unwrap();
+        let unverifiable_marker = unverifiable.join(".complete");
+        fs::write(
+            &unverifiable_marker,
+            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, false),
+        )
+        .unwrap();
+        native_sweep_age_file(&unverifiable_marker);
+
+        // Fully valid aged entry stays: a healthy cache is never swept.
+        let healthy = cache_root.join("healthy-1-1-v7-abc-def");
+        fs::create_dir_all(&healthy).unwrap();
+        let healthy_marker = healthy.join(".complete");
+        fs::write(
+            &healthy_marker,
+            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
+        )
+        .unwrap();
+        native_sweep_age_file(&healthy_marker);
+
+        // Marker-less aged entry: stale, and its lock file is free.
+        let markerless = cache_root.join("markerless-1-1-v7-abc-def");
+        fs::create_dir_all(&markerless).unwrap();
+        fs::write(markerless.join("model.safetensors"), b"x").unwrap();
+        native_sweep_age_dir(&markerless);
+
+        // Stale entry whose lock is held by a live writer: skipped.
+        let held_name = "held-1-1-v7-abc-def";
+        let held = cache_root.join(held_name);
+        fs::create_dir_all(&held).unwrap();
+        let held_marker = held.join(".complete");
+        fs::write(
+            &held_marker,
+            format!(
+                "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
+                root.path().join("missing-held.gguf").display()
+            ),
+        )
+        .unwrap();
+        native_sweep_age_file(&held_marker);
+        let held_lock =
+            Qwen35NativeCacheLock::acquire(&cache_root.join(format!(".{held_name}.lock"))).unwrap();
+
+        // Leftovers: dead-pid staging + write probe removed; live-pid and
+        // fresh leftovers kept; a finished assets sidecar is never an orphan.
+        let dead_staging = cache_root.join(format!(".deadkey.staging-{}", dead_test_pid()));
+        fs::create_dir_all(&dead_staging).unwrap();
+        let live_staging = cache_root.join(format!(".livekey.staging-{}", std::process::id()));
+        fs::create_dir_all(&live_staging).unwrap();
+        let dead_probe = cache_root.join(format!(".write-probe-{}-x", dead_test_pid()));
+        fs::write(&dead_probe, b"p").unwrap();
+        let live_probe = cache_root.join(format!(".write-probe-{}-x", std::process::id()));
+        fs::write(&live_probe, b"p").unwrap();
+        let assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-abandoned");
+        fs::create_dir_all(&assets_tmp).unwrap();
+        native_sweep_age_dir(&assets_tmp);
+        let assets_sidecar = cache_root.join(".mlx-qwen4-assets-v2-fedcba9876543210");
+        fs::create_dir_all(&assets_sidecar).unwrap();
+        fs::write(assets_sidecar.join("complete"), b"1").unwrap();
+        native_sweep_age_file(&assets_sidecar.join("complete"));
+        // Unknown dot-directory: foreign tooling, never touched.
+        let foreign = cache_root.join(".unrelated-tooling");
+        fs::create_dir_all(&foreign).unwrap();
+        native_sweep_age_dir(&foreign);
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert_eq!(prepared, live, "the current cache must remain a hit");
+
+        for gone in [&orphan, &outdated, &unverifiable, &markerless] {
+            assert!(!gone.exists(), "{} should have been swept", gone.display());
+        }
+        for kept in [
+            &live,
+            &fresh_orphan,
+            &healthy,
+            &held,
+            &live_staging,
+            &live_probe,
+            &assets_sidecar,
+            &foreign,
+        ] {
+            assert!(kept.exists(), "{} should have been kept", kept.display());
+        }
+        assert!(!dead_staging.exists());
+        assert!(!dead_probe.exists());
+        assert!(!assets_tmp.exists());
+        assert!(
+            cache_root.join(format!(".{held_name}.lock")).is_file(),
+            "the entry lock file itself is never deleted"
+        );
+        drop(held_lock);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_sweep_cache_hit_stamps_marker_recency() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0");
+        let root = NativeSweepTestDir::new("stamp");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        let marker = prepared.join(".complete");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        OpenOptions::new()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let hit = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert_eq!(hit, prepared);
+        let stamped = fs::metadata(&marker).unwrap().modified().unwrap();
+        assert!(
+            stamped > old + std::time::Duration::from_secs(60),
+            "a verified cache hit must refresh the marker mtime for LRU"
+        );
+        let contents = fs::read_to_string(&marker).unwrap();
+        assert!(contents.contains("companion=none\n"), "{contents}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_sweep_evicts_lru_under_size_cap() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0.000001");
+        let root = NativeSweepTestDir::new("cap");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        // A healthy, valid, aged sibling entry is cap-evictable.
+        let old_entry = cache_root.join("oldentry-1-1-v7-abc-def");
+        fs::create_dir_all(&old_entry).unwrap();
+        fs::write(old_entry.join("model.safetensors"), vec![0_u8; 2048]).unwrap();
+        let old_marker = old_entry.join(".complete");
+        fs::write(
+            &old_marker,
+            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
+        )
+        .unwrap();
+        native_sweep_age_file(&old_marker);
+
+        // An aged assets sidecar counts toward the cap and is evictable too.
+        let assets_sidecar = cache_root.join(".mlx-qwen4-assets-v2-0123456789abcdef");
+        fs::create_dir_all(&assets_sidecar).unwrap();
+        fs::write(assets_sidecar.join("tokenizer.json"), vec![0_u8; 2048]).unwrap();
+        let complete = assets_sidecar.join("complete");
+        fs::write(&complete, b"1").unwrap();
+        native_sweep_age_file(&complete);
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert!(prepared.exists(), "the current key is never cap-evicted");
+        assert!(
+            !old_entry.exists(),
+            "the oldest healthy entry must be evicted to fit the cap"
+        );
+        assert!(
+            !assets_sidecar.exists(),
+            "aged assets sidecars are included in the capped-LRU accounting"
+        );
     }
 }

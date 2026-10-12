@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -63,6 +63,31 @@ describe('DFlash2 companion discovery', () => {
       expect(findDFlash2Draft(join(root, name), 'qwen3_5')).toBeUndefined();
     }
     expect(findDFlash2Draft(target, 'qwen3_5_moe')).toBeUndefined();
+  });
+
+  it('pairs a companion living behind a directory symlink', () => {
+    // A Dirent reports the link itself — `isDirectory()` is false for a symlink —
+    // so a store entry that merely LINKS the companion dir (e.g. a shared HF
+    // checkout linked into the models dir) must still be found.
+    const external = mkdtempSync(join(tmpdir(), 'mlx-draft-external-'));
+    try {
+      writeDraft(external);
+      symlinkSync(external, join(root, 'Qwen3.8-27B-DFlash2'));
+      expect(findDFlash2Draft(target, 'qwen3_5')).toBe(join(root, 'Qwen3.8-27B-DFlash2'));
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores a dangling or non-directory symlink at the companion slug', () => {
+    // A broken link admits nothing, and a link to a FILE at the slug name is
+    // not a companion directory.
+    symlinkSync(join(root, 'no-such-target'), join(root, 'qwen3.8-27b-dflash2'));
+    expect(findDFlash2Draft(target, 'qwen3_5')).toBeUndefined();
+    writeFileSync(join(root, 'loose-file'), 'x');
+    rmSync(join(root, 'qwen3.8-27b-dflash2'));
+    symlinkSync(join(root, 'loose-file'), join(root, 'qwen3.8-27b-dflash2'));
+    expect(findDFlash2Draft(target, 'qwen3_5')).toBeUndefined();
   });
 
   it('ignores incomplete, empty, and wrong-architecture companion weights', () => {

@@ -102,6 +102,7 @@ import {
   trackSSEClientAbort,
   writeSSEEvent as writeRawSSEEvent,
 } from '../streaming.js';
+import { sanitizeJsonString, stringifyStrictJson } from '../strict-json.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import type { TracedChatConfig } from '../turn-trace.js';
@@ -271,7 +272,7 @@ async function handleNonStreaming(
   // The request AbortSignal reaches the normal session method, whose wrapper
   // maps it to native cancellation at the next model safepoint. `endJson` keeps
   // the final pre-entry destroyed check for the transport race after decode.
-  await endJson(res, JSON.stringify(response), visibility);
+  await endJson(res, stringifyStrictJson(response), visibility);
 }
 
 // Streaming path
@@ -608,10 +609,20 @@ async function handleStreamingNativeWithAbort(
           // native side did not populate an id (an in-process driver or
           // a legacy bridge).
           const toolId = tc.id != null ? internalToolCallIdToAnthropic(tc.id) : genId('toolu_');
-          const parsedInput =
-            typeof tc.arguments === 'string'
-              ? (JSON.parse(tc.arguments) as Record<string, unknown>)
-              : (tc.arguments as Record<string, unknown>);
+          // Model-generated arguments are verbatim JSON text: raw control
+          // characters inside its string literals make a bare JSON.parse
+          // throw (a 500 mid-stream) and would leak unescaped bytes into the
+          // partial_json frame. Sanitize first — byte-identical for
+          // compliant input — then emit the sanitized document itself so
+          // the inner JSON clients parse incrementally stays strict.
+          const sanitizedArgs =
+            typeof tc.arguments === 'string' ? sanitizeJsonString(tc.arguments) : undefined;
+          // When arguments arrived as a string the sanitized text IS the
+          // partial_json payload — re-parsing it here would only re-expose
+          // the 500 a malformed model payload was sanitized to avoid, and
+          // its result was never read. Non-string arguments serialize
+          // directly.
+          const partialJson = sanitizedArgs ?? stringifyStrictJson(tc.arguments);
 
           writeSSEEvent(
             res,
@@ -628,7 +639,7 @@ async function handleStreamingNativeWithAbort(
             'content_block_delta',
             buildContentBlockDelta(contentBlockIndex, {
               type: 'input_json_delta',
-              partial_json: JSON.stringify(parsedInput),
+              partial_json: partialJson,
             }),
           );
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));

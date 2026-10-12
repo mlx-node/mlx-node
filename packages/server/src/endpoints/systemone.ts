@@ -8,6 +8,7 @@ import { sendBadRequest, sendInternalError, sendNotFound, sendRateLimit } from '
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { ModelLoadQueueFullError, type ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
+import { stringifyStrictJson } from '../strict-json.js';
 
 export async function handleSystemOne(
   req: IncomingMessage,
@@ -70,7 +71,7 @@ export async function handleSystemOne(
         const result = await dispatch.model.decideRaw(raw, { signal: abort.signal });
         abort.signal.throwIfAborted();
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ model: dispatch.canonicalName, ...result }));
+        res.end(stringifyStrictJson({ model: dispatch.canonicalName, ...result }));
       }, abort.signal);
     if (coordinator) await coordinator.withInference(run, abort.signal);
     else await run();

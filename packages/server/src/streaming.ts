@@ -2,6 +2,8 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
+import { stringifyStrictJson } from './strict-json.js';
+
 /** Default time a connected SSE peer may remain continuously backpressured. */
 export const DEFAULT_SSE_DRAIN_TIMEOUT_MS = 30_000;
 
@@ -86,11 +88,31 @@ interface SSEDrainWaitOptions {
   onTimeout?: () => void;
 }
 
-function resolveSSEDrainTimeoutMs(): number {
+/** Warn once (not per stream) when the drain-timeout env var is malformed. */
+let warnedInvalidSSEDrainTimeout = false;
+
+/**
+ * Strict parse for `MLX_SSE_DRAIN_TIMEOUT_MS`: decimal digits only.
+ * `Number()` would silently accept `0x10`, `1e5`, `Infinity`, and
+ * whitespace padding — a typo'd timeout is indistinguishable from a
+ * deliberate one, so anything outside `^[0-9]+$` (and non-positive /
+ * non-safe-integer results) falls back to the default and warns once.
+ * Exported for unit tests.
+ */
+export function resolveSSEDrainTimeoutMs(): number {
   const raw = process.env.MLX_SSE_DRAIN_TIMEOUT_MS;
-  if (raw == null || raw.trim() === '') return DEFAULT_SSE_DRAIN_TIMEOUT_MS;
-  const parsed = Number(raw);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_SSE_DRAIN_TIMEOUT_MS;
+  const normalized = raw?.trim();
+  if (normalized == null || normalized === '') return DEFAULT_SSE_DRAIN_TIMEOUT_MS;
+  const parsed = /^[0-9]+$/.test(normalized) ? Number(normalized) : NaN;
+  if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  if (!warnedInvalidSSEDrainTimeout) {
+    warnedInvalidSSEDrainTimeout = true;
+    console.warn(
+      `[mlx] ignoring invalid MLX_SSE_DRAIN_TIMEOUT_MS=${JSON.stringify(raw)} ` +
+        `(expected a positive decimal integer; using ${DEFAULT_SSE_DRAIN_TIMEOUT_MS}ms)`,
+    );
+  }
+  return DEFAULT_SSE_DRAIN_TIMEOUT_MS;
 }
 
 export function beginSSE(res: ServerResponse): void {
@@ -112,7 +134,7 @@ export function beginSSE(res: ServerResponse): void {
 /** Write one SSE event. Injects `type: eventType` into the payload (data's own `type` wins) for OpenAI SDK compatibility. */
 export function writeSSEEvent(res: ServerResponse, eventType: string, data: object): boolean {
   const payload = { type: eventType, ...data };
-  return res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
+  return res.write(`event: ${eventType}\ndata: ${stringifyStrictJson(payload)}\n\n`);
 }
 
 /**

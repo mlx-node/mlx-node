@@ -2,6 +2,7 @@
 
 import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
+import { stringifyStrictJson } from '../strict-json.js';
 import type { ContentPart, ResponsesAPIRequest, ResponsesToolDefinition } from '../types.js';
 
 export const MAX_CACHE_SALT_BYTES = 256;
@@ -354,7 +355,7 @@ function isEncodedUint8Array(value: unknown): value is EncodedUint8Array {
  * instead of silently corrupting image state.
  */
 export function stringifyStoredInputMessages(messages: ChatMessage[]): string {
-  return JSON.stringify(messages, (_key, value: unknown) => {
+  return stringifyStrictJson(messages, (_key, value: unknown) => {
     if (value instanceof Uint8Array) {
       return { [UINT8_SENTINEL]: Buffer.from(value).toString('base64') };
     }

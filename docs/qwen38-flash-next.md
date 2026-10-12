@@ -64,6 +64,27 @@ atomically. Each checkpoint/cache version is capped at 96 GiB and leaves at
 least 16 GiB disk space. It defaults to `~/Library/Caches/mlx-node/qwen4-packed`
 on macOS. Deleting that cache is safe while the model is stopped.
 
+Each identity directory also carries a `.manifest` recording its canonical
+source directory and packed file list. Opening the cache sweeps sibling
+`.mlx-qwen4-packed-v2-*` directories: one is orphaned when its manifest cannot
+prove liveness (missing or unreadable source) or records a different identity
+than its directory name, or when its newest `budget`/`.manifest`/`.pack` mtime
+is older than one hour. Removal requires a non-blocking lock on that
+directory's `budget` ledger — a live writer holds it — and directories without
+a manifest are never removed, since nothing can prove them stale. Under the
+same lock, the ledger's `used` figure is reconciled against the `.pack` bytes
+actually on disk. The same maintenance sweeps stale entries of the native
+GGUF cache under a 24 h grace and per-entry locks; `.mlx-qwen4-assets-v2-*`
+tokenizer sidecars are exempt from orphan removal and their markers are
+re-stamped on use, so they are only collected by the
+`MLX_NATIVE_GGUF_CACHE_MAX_GB` least-recently-used cap.
+
+Bootstrap, admission and the SSD-read safety limit also gate on macOS memory
+pressure rather than failing on the first reading: pressure is polled every
+250 ms for up to about 3 s before the load is refused, and a breached safety
+limit reclaims the allocator freelist and re-polls before erroring.
+`MLX_QWEN4_IGNORE_MEMORY_PRESSURE=1` bypasses the gate entirely.
+
 | Setting                      | Behavior                                                                |
 | ---------------------------- | ----------------------------------------------------------------------- |
 | `MLX_QWEN4_RESIDENCY=auto`   | Admit full or partial hot residency from current headroom.              |
@@ -73,6 +94,9 @@ on macOS. Deleting that cache is safe while the model is stopped.
 | `MLX_QWEN4_PREFILL_CHUNK`    | Power of two from 1–1024, constrained by the working-memory allowance.  |
 | `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
+| `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
+| `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace. Unset, `<=0` or unparseable means unlimited. |
+| `MLX_QWEN4_IGNORE_MEMORY_PRESSURE` | `=1` skips the macOS bootstrap memory-pressure gate — diagnostic only; the free/file-backed headroom checks still apply. |
 
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
 expert-slot capacity, and prefill window. These are runtime budgets; they do

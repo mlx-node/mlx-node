@@ -2,6 +2,8 @@
 
 import type { ServerResponse } from 'node:http';
 
+import { stringifyStrictJson } from './strict-json.js';
+
 export interface APIError {
   type: string;
   message: string;
@@ -25,7 +27,7 @@ export function sendError(
     },
   };
   res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(body));
+  res.end(stringifyStrictJson(body));
 }
 
 export function sendBadRequest(res: ServerResponse, message: string, param?: string): void {
@@ -39,7 +41,7 @@ export function sendNotFound(res: ServerResponse, message: string): void {
 export function sendMethodNotAllowed(res: ServerResponse, allowed: string): void {
   res.writeHead(405, { Allow: allowed, 'Content-Type': 'application/json' });
   res.end(
-    JSON.stringify({
+    stringifyStrictJson({
       error: { type: 'invalid_request_error', message: 'Method not allowed', code: null, param: null },
     }),
   );
@@ -71,7 +73,7 @@ export function sendStorageTimeout(res: ServerResponse, message: string): void {
 export function sendRateLimit(res: ServerResponse, message: string): void {
   res.writeHead(429, { 'Retry-After': '1', 'Content-Type': 'application/json' });
   res.end(
-    JSON.stringify({
+    stringifyStrictJson({
       error: {
         type: 'rate_limit_error',
         message,
@@ -84,7 +86,7 @@ export function sendRateLimit(res: ServerResponse, message: string): void {
 
 export function sendAnthropicError(res: ServerResponse, status: number, type: string, message: string): void {
   res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+  res.end(stringifyStrictJson({ type: 'error', error: { type, message } }));
 }
 
 export function sendAnthropicBadRequest(res: ServerResponse, message: string): void {
@@ -105,7 +107,9 @@ export function sendAnthropicNotImplemented(res: ServerResponse, message: string
 
 export function sendAnthropicMethodNotAllowed(res: ServerResponse, allowed: string): void {
   res.writeHead(405, { Allow: allowed, 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Method not allowed' } }));
+  res.end(
+    stringifyStrictJson({ type: 'error', error: { type: 'invalid_request_error', message: 'Method not allowed' } }),
+  );
 }
 
 /**
@@ -116,5 +120,5 @@ export function sendAnthropicMethodNotAllowed(res: ServerResponse, allowed: stri
  */
 export function sendAnthropicRateLimit(res: ServerResponse, message: string): void {
   res.writeHead(429, { 'Retry-After': '1', 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message } }));
+  res.end(stringifyStrictJson({ type: 'error', error: { type: 'rate_limit_error', message } }));
 }

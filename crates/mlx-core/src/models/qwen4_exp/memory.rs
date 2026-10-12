@@ -20,12 +20,16 @@ pub(super) struct Plan {
 }
 
 pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
-    let policy = std::env::var("MLX_QWEN4_RESIDENCY").unwrap_or_else(|_| "auto".into());
-    if !["auto", "stream", "full"].contains(&policy.as_str()) {
-        return Err(Error::from_reason(
-            "MLX_QWEN4_RESIDENCY must be auto, stream or full",
-        ));
-    }
+    let policy = match std::env::var_os("MLX_QWEN4_RESIDENCY") {
+        None => "auto".into(),
+        Some(value) => value
+            .to_str()
+            .map(str::to_owned)
+            .filter(|s| ["auto", "stream", "full"].contains(&s.as_str()))
+            .ok_or_else(|| {
+                Error::from_reason("MLX_QWEN4_RESIDENCY must be auto, stream or full")
+            })?,
+    };
     let explicit = std::env::var_os("MLX_QWEN4_WEIGHT_CACHE_GIB")
         .map(|value| {
             value
@@ -223,6 +227,81 @@ fn fits_with_headroom(bytes: u64, available: u64, reserve: u64) -> bool {
         .is_some_and(|need| need <= available)
 }
 
+/// Read `kern.memorystatus_vm_pressure_level`: levels below 2 are normal.
+#[cfg(target_os = "macos")]
+fn read_pressure_level() -> Result<i32> {
+    let mut pressure = 0i32;
+    let mut size = std::mem::size_of_val(&pressure);
+    if unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&mut pressure as *mut i32).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(Error::from_reason(
+            "Cannot read macOS memory pressure for Qwen4 bootstrap",
+        ));
+    }
+    Ok(pressure)
+}
+
+/// Wait out a transient pressure spike before failing a load. The ignore
+/// opt-out is checked before the first read so it bypasses the gate entirely,
+/// including a sysctl failure. Injection points keep the timing testable.
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_pressure(
+    mut read: impl FnMut() -> Result<i32>,
+    ignore_flag: impl Fn() -> bool,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<()> {
+    if ignore_flag() {
+        return Ok(());
+    }
+    let mut retries = 0;
+    loop {
+        match read() {
+            Ok(level) if level < 2 => return Ok(()),
+            _ if retries < 12 => {
+                retries += 1;
+                sleep(std::time::Duration::from_millis(250));
+            }
+            _ => {
+                return Err(Error::from_reason(
+                    "Qwen4 bootstrap requires normal, readable macOS memory pressure",
+                ));
+            }
+        }
+    }
+}
+
+/// Re-check the SSD read safety limit after freeing the allocator freelist.
+/// A freelist spike is transient; real pressure still refuses after the same
+/// bounded re-poll the bootstrap pressure gate uses.
+pub(super) fn check_active_memory_budget(
+    cache_limit: u64,
+    mut active: impl FnMut() -> f64,
+    mut reclaim: impl FnMut(),
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<()> {
+    if active() <= (cache_limit + (4 << 30)) as f64 {
+        return Ok(());
+    }
+    reclaim();
+    for _ in 0..3 {
+        sleep(std::time::Duration::from_millis(100));
+        if active() <= (cache_limit + (4 << 30)) as f64 {
+            return Ok(());
+        }
+    }
+    Err(Error::from_reason(
+        "qwen4_exp SSD safety limit: active MLX memory exceeds weight budget plus 4 GiB",
+    ))
+}
+
 #[cfg(target_os = "macos")]
 fn available_memory() -> Result<u64> {
     unsafe extern "C" {
@@ -233,22 +312,11 @@ fn available_memory() -> Result<u64> {
             name: libc::mach_port_t,
         ) -> libc::kern_return_t;
     }
-    let mut pressure = 0i32;
-    let mut size = std::mem::size_of_val(&pressure);
-    let ok = unsafe {
-        libc::sysctlbyname(
-            c"kern.memorystatus_vm_pressure_level".as_ptr(),
-            (&mut pressure as *mut i32).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if ok != 0 || pressure >= 2 {
-        return Err(Error::from_reason(
-            "Qwen4 bootstrap requires normal, readable macOS memory pressure",
-        ));
-    }
+    wait_for_pressure(
+        read_pressure_level,
+        || runtime_flags::is_one(c"MLX_QWEN4_IGNORE_MEMORY_PRESSURE"),
+        std::thread::sleep,
+    )?;
     let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
     let mut count = libc::HOST_VM_INFO64_COUNT;
     let host = unsafe { mach_host_self() };
@@ -353,6 +421,96 @@ mod tests {
         refresh_from_snapshot(&mut full, 112 << 30, 128 << 30).unwrap();
         assert!(full.resident);
         assert!(refresh_from_snapshot(&mut plan, 19 << 30, 128 << 30).is_err());
+    }
+
+    #[test]
+    fn pressure_gate_waits_out_a_transient_spike() {
+        use std::sync::{Arc, Mutex};
+        let levels = Arc::new(Mutex::new(vec![2, 1].into_iter()));
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let read = {
+            let levels = Arc::clone(&levels);
+            move || {
+                levels
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .ok_or_else(|| Error::from_reason("unexpected extra read"))
+            }
+        };
+        let sleep = {
+            let sleeps = Arc::clone(&sleeps);
+            move |d| sleeps.lock().unwrap().push(d)
+        };
+        super::wait_for_pressure(read, || false, sleep).unwrap();
+        assert_eq!(
+            *sleeps.lock().unwrap(),
+            vec![std::time::Duration::from_millis(250)]
+        );
+    }
+
+    #[test]
+    fn pressure_gate_gives_up_after_bounded_retries() {
+        let mut sleeps = 0;
+        let err = super::wait_for_pressure(|| Ok(3), || false, |_| sleeps += 1).unwrap_err();
+        assert_eq!(sleeps, 12);
+        assert!(
+            err.reason
+                .contains("requires normal, readable macOS memory pressure")
+        );
+    }
+
+    #[test]
+    fn pressure_gate_ignore_bypasses_unreadable_sysctl() {
+        let mut reads = 0;
+        super::wait_for_pressure(
+            || {
+                reads += 1;
+                Err(Error::from_reason("sysctl unavailable"))
+            },
+            || true,
+            |_| panic!("ignore must not wait"),
+        )
+        .unwrap();
+        assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn active_budget_reclaims_and_repolls_before_refusing() {
+        use std::sync::{Arc, Mutex};
+        let readings = Arc::new(Mutex::new(
+            vec![40.0 * (1 << 30) as f64, 10.0 * (1 << 30) as f64].into_iter(),
+        ));
+        let mut reclaims = 0;
+        let mut sleeps = 0;
+        super::check_active_memory_budget(
+            32 << 30,
+            {
+                let readings = Arc::clone(&readings);
+                move || readings.lock().unwrap().next().unwrap_or(0.0)
+            },
+            || reclaims += 1,
+            |_| sleeps += 1,
+        )
+        .unwrap();
+        assert_eq!(reclaims, 1);
+        assert_eq!(sleeps, 1);
+    }
+
+    #[test]
+    fn active_budget_refuses_after_bounded_repolls() {
+        let mut reclaims = 0;
+        let mut sleeps = 0;
+        let err = super::check_active_memory_budget(
+            8 << 30,
+            || 40.0 * (1 << 30) as f64,
+            || reclaims += 1,
+            |_| sleeps += 1,
+        )
+        .unwrap_err();
+        assert_eq!(reclaims, 1);
+        assert_eq!(sleeps, 3);
+        assert!(err.reason.contains("SSD safety limit"));
     }
 }
 

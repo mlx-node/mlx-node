@@ -165,7 +165,8 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     // users this change exists to move onto the mxfp4 build.
     const present = isModelPresent(dir) || downloaded.has(catalogRepo(entry).toLowerCase());
     // Exactly the state the download runner's ownership preflight refuses, computed
-    // with the SAME no-follow predicates it uses so the two cannot disagree.
+    // with the SAME predicates it uses (isPathOccupied stays no-follow; a live
+    // symlink into a marked dir counts as owned) so the two cannot disagree.
     const blockedByForeignDir = !present && isPathOccupied(dir) && !isDownloaderOwned(dir);
     const installed = isModelInstalled(dir);
     // Read from the canonical slug ONLY — see `localRevision` on CatalogItem for why

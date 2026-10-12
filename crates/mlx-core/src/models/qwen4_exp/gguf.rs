@@ -157,14 +157,53 @@ pub fn assets(first: &Path, store: &Store, c: &Config) -> Result<PathBuf> {
     assets_in(first, store, c, &native_gguf_cache_root()?)
 }
 
+/// Per-sidecar flock shared with the native-GGUF sweep: a held lock makes the
+/// sweep skip the directory, so the hit check below cannot race a mid-flight
+/// eviction. `Some(_)` keeps the fd as a guard (inner None on non-Unix, where
+/// no sweep runs); `None` means contention — fall through to republish, which
+/// converges on the same content.
+#[cfg(unix)]
+fn assets_sidecar_lock(root: &Path, dir_name: &str) -> Option<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(format!("{dir_name}.lock")))
+        .ok()?;
+    // SAFETY: `file` owns the descriptor for the flock call, and the returned
+    // guard keeps it — and the lock — alive until the caller drops it.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(Some(file))
+}
+
+#[cfg(not(unix))]
+fn assets_sidecar_lock(_root: &Path, _dir_name: &str) -> Option<Option<std::fs::File>> {
+    Some(None)
+}
+
 fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<PathBuf> {
     let source = first
         .canonicalize()
         .map_err(|e| Error::from_reason(e.to_string()))?;
     let metadata = std::fs::metadata(&source).map_err(|e| Error::from_reason(e.to_string()))?;
     let identity = source_file_identity_digest(&source, &metadata);
-    let dir = root.join(format!(".mlx-qwen4-assets-v2-{identity}"));
-    if dir.join("complete").exists() {
+    let dir_name = format!(".mlx-qwen4-assets-v2-{identity}");
+    let dir = root.join(&dir_name);
+    if let Some(_guard) = assets_sidecar_lock(root, &dir_name)
+        && dir.join("complete").exists()
+    {
+        // Stamp recency on hits so the native-GGUF sweep's LRU never eats a
+        // live sidecar directory; the held lock blocks that same sweep.
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("complete"))
+        {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
         return Ok(dir);
     }
     // Publish a complete directory in one rename. Simultaneous loads may race,
@@ -273,6 +312,31 @@ mod tests {
     }
 
     #[test]
+    fn asset_cache_hit_stamps_complete_marker_recency() {
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let (store, config) = tokenizer_fixture();
+        let dir = assets_in(&source, &store, &config, &cache).unwrap();
+        let marker = dir.join("complete");
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+        OpenOptions::new()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        assert_eq!(assets_in(&source, &store, &config, &cache).unwrap(), dir);
+        assert!(
+            fs::metadata(&marker).unwrap().modified().unwrap() > stale,
+            "cache hits must refresh the complete marker for LRU recency"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn asset_cache_never_writes_beside_read_only_source() {
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let source = root.join("source");
@@ -305,7 +369,13 @@ mod tests {
             serde_json::to_value(&config).unwrap()
         );
         assert!(output.join("complete").is_file());
-        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+        // The sidecar dir plus its hit-path lock file — nothing else may be
+        // written beside the read-only source or in the cache root.
+        let names: Vec<String> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
         assert_eq!(store.bytes_read, 0);
         fs::remove_dir_all(root).unwrap();
     }

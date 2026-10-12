@@ -163,6 +163,55 @@ describe('buildAnthropicResponse', () => {
     });
   });
 
+  it('degrades to an empty input object for structurally malformed arguments', () => {
+    // Sanitizing repairs control characters only — a truncated or otherwise
+    // unparseable arguments string must not 500 the whole turn. `input` is a
+    // JSON object on the Anthropic wire, so the fallback is the same `{}` the
+    // streaming tool_use block starts with.
+    for (const malformed of ['{"city":"SF', 'not json', '', '{"a":']) {
+      const result = makeChatResult({
+        text: '',
+        toolCalls: [
+          {
+            id: 'call_bad',
+            name: 'get_weather',
+            arguments: malformed,
+            status: 'ok',
+            rawContent: '',
+          },
+        ],
+      });
+      const response = buildAnthropicResponse(result, baseReq, 'msg_bad_args');
+      expect(response.content[0]).toEqual({
+        type: 'tool_use',
+        id: 'toolu_bad',
+        name: 'get_weather',
+        input: {},
+      });
+      expect(response.stop_reason).toBe('tool_use');
+    }
+  });
+
+  it('degrades to an empty input object for valid JSON arguments that are not objects', () => {
+    // `"null"`/arrays/scalars parse fine but `tool_use.input` must be an object.
+    for (const scalar of ['"text"', '[1,2]', '42', 'null']) {
+      const result = makeChatResult({
+        text: '',
+        toolCalls: [
+          {
+            id: 'call_scalar',
+            name: 'fn',
+            arguments: scalar,
+            status: 'ok',
+            rawContent: '',
+          },
+        ],
+      });
+      const response = buildAnthropicResponse(result, baseReq, 'msg_scalar_args');
+      expect((response.content[0] as { input: unknown }).input).toEqual({});
+    }
+  });
+
   it('tool use with object arguments uses them directly', () => {
     const result = makeChatResult({
       text: '',

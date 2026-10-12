@@ -21,6 +21,7 @@ import { toMinimalHealth, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
+import { stringifyStrictJson } from './strict-json.js';
 import type { AnthropicCountTokensRequest, AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
 
@@ -210,14 +211,14 @@ export async function routeRequest(
       // No reporter wired (a bare `createHandler` mounted by hand): keep the
       // historical constant so existing consumers are unaffected.
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok' }));
+      res.end(stringifyStrictJson({ status: 'ok' }));
       return;
     }
     // Unauthenticated pollers get liveness only. `models.resident` leaks
     // project names and local paths, so it stays behind the token.
     const body = extras?.authenticated === false ? toMinimalHealth(health) : health;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(body));
+    res.end(stringifyStrictJson(body));
     return;
   }
 
@@ -229,7 +230,7 @@ export async function routeRequest(
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ service: 'mlx-node' }));
+    res.end(req.method === 'HEAD' ? undefined : stringifyStrictJson({ service: 'mlx-node' }));
     return;
   }
 

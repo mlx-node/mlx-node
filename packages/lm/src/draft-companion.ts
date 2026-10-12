@@ -1,5 +1,5 @@
 /** Native-free metadata and discovery for optional speculative draft checkpoints. */
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { type Dirent, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 export const QWEN38_DFLASH2 = {
@@ -14,6 +14,30 @@ function regularFile(path: string): boolean {
     return stat.isFile() && stat.size > 0;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Sync counterpart of `resolveDirentKind` in `model-discovery.ts`: a Dirent
+ * reports the link itself, never the target, so a symlinked companion directory
+ * reads as neither file nor dir and would be silently skipped. `statSync`
+ * follows the link and classifies what it points at; a dangling/unreadable link
+ * resolves to `'other'` (a broken link admits nothing), and non-symlink entries
+ * keep their `Dirent` answer unchanged.
+ */
+function direntKind(dir: string, entry: Dirent): 'file' | 'dir' | 'other' {
+  if (!entry.isSymbolicLink()) {
+    if (entry.isFile()) return 'file';
+    if (entry.isDirectory()) return 'dir';
+    return 'other';
+  }
+  try {
+    const resolved = statSync(join(dir, entry.name));
+    if (resolved.isFile()) return 'file';
+    if (resolved.isDirectory()) return 'dir';
+    return 'other';
+  } catch {
+    return 'other';
   }
 }
 
@@ -60,7 +84,7 @@ export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir
   for (const root of roots) {
     try {
       const candidates = readdirSync(root, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory() && entry.name.toLowerCase() === slug)
+        .filter((entry) => direntKind(root, entry) === 'dir' && entry.name.toLowerCase() === slug)
         .sort((a, b) => a.name.localeCompare(b.name));
       for (const candidate of candidates) {
         const path = join(root, candidate.name);

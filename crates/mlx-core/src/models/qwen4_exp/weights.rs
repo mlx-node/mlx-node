@@ -1053,12 +1053,15 @@ impl Store {
         let d = self.descriptor(name)?.clone();
         let (offset, bytes) = d.range(start, rows)?;
         let cache_limit = self.cache_limit;
-        // Refuse before allocation, also accounting for other models in this process.
-        if crate::array::memory::get_active_memory() > (cache_limit + (4 << 30)) as f64 {
-            return Err(err(
-                "qwen4_exp SSD safety limit: active MLX memory exceeds weight budget plus 4 GiB",
-            ));
-        }
+        // Refuse before allocation, also accounting for other models in this
+        // process. A freelist spike is transient, so reclaim it and re-poll
+        // briefly under the same safety limit before refusing.
+        super::memory::check_active_memory_budget(
+            cache_limit,
+            crate::array::memory::get_active_memory,
+            crate::array::memory::clear_cache,
+            std::thread::sleep,
+        )?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
         if cfg!(target_os = "macos") && self.growth_bytes >= 256 << 20 {
             super::memory::check_growth_headroom()?;

@@ -24,6 +24,7 @@
 import type { ServerResponse } from 'node:http';
 
 import { writeSSEEvent } from './streaming.js';
+import { stringifyStrictJson } from './strict-json.js';
 
 /**
  * Wire format committed by the handler. `null` = pre-headers (outer catch
@@ -124,7 +125,7 @@ export async function flushTerminalSSE(
   visibility: TransportVisibility,
 ): Promise<void> {
   const payload = { type: eventType, ...data };
-  const chunk = `event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`;
+  const chunk = `event: ${eventType}\ndata: ${stringifyStrictJson(payload)}\n\n`;
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     const onError = (err: Error): void => {

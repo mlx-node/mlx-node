@@ -906,6 +906,22 @@ Leading positionals pass through to the agent binary and run without spawning th
 
 `mlx agent update [--check]` is mlx-owned — the binary's own npm-style self-update would fight the managed install, so `mlx agent` intercepts it and downloads the newest `mlx-agent` release (from `mlx-node/grok-build`, pinned by `MLX_AGENT_TAG`) into `~/.mlx-node/bin`. `MLX_AGENT_BIN` points at a locally built binary instead and shadows the managed download.
 
+### Native caches
+
+GGUF-backed loads (Qwen3.8, Gemma 4, Muse-Glimmer and the other GGUF families)
+and the Qwen3.8 prepared SSD weight cache write into per-user native caches.
+Both self-maintain on the next load: stale or orphaned entries are removed
+under per-key locks, and live writers are never disturbed — deleting a cache
+directory yourself is only needed to reclaim space immediately.
+
+| Env var                            | Effect                                                                                                                                          |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MLX_NATIVE_GGUF_CACHE_DIR`        | Override the native GGUF cache location (packed weights, extracted tokenizer assets, companions)                                                 |
+| `MLX_NATIVE_GGUF_CACHE_MAX_GB`     | Cap its total size, in GiB (fractional allowed). `<=0`, unset or unparseable = unlimited. Least-recently-used entries evict under a 24 h grace  |
+| `MLX_QWEN4_PACKED_CACHE_DIR`       | Override the Qwen3.8 prepared SSD cache location (default `~/Library/Caches/mlx-node/qwen4-packed`)                                               |
+| `MLX_QWEN4_PACKED_CACHE_MAX_GB`    | Cap its total size across all checkpoints, in GiB (fractional allowed). `<=0` or unset = only the per-checkpoint 96 GiB budget                    |
+| `MLX_QWEN4_IGNORE_MEMORY_PRESSURE` | `=1` skips the macOS memory-pressure gate that otherwise makes a Qwen3.8 load wait out a transient spike — diagnostic only                        |
+
 ## Dashboard
 
 `mlx dashboard` was **removed**. The dashboard is now the Control Panel window of the mlx-node

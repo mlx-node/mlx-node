@@ -54,6 +54,7 @@ import {
   trackSSEClientAbort,
   writeSSEEvent as writeRawSSEEvent,
 } from '../streaming.js';
+import { sanitizeJsonString, stringifyStrictJson } from '../strict-json.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import type { TracedChatConfig } from '../turn-trace.js';
@@ -248,7 +249,7 @@ async function handleNonStreaming(
   // shape; `responseBodyWritten` flips only from `res.end`'s write
   // callback (proving the kernel accepted the chunk) so the adopt
   // gate refuses to cache the session under an unreachable responseId.
-  await endJson(res, JSON.stringify(response), visibility);
+  await endJson(res, stringifyStrictJson(response), visibility);
   return { response };
 }
 
@@ -807,7 +808,12 @@ async function handleStreamingNativeWithAbort(
             type: 'function_call',
             call_id: callId,
             name: tc.name,
-            arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+            // Model-generated JSON ships verbatim — sanitize so the inner
+            // arguments document stays strictly parseable for clients.
+            arguments:
+              typeof tc.arguments === 'string'
+                ? sanitizeJsonString(tc.arguments)
+                : stringifyStrictJson(tc.arguments),
             status: 'completed',
           };
           outputItems.push(fcItem);
@@ -1041,7 +1047,10 @@ async function handleStreamingNativeWithAbort(
       if (item.type === 'function_call') {
         const fcIndex = outputItems.indexOf(item);
         writeSSEEvent(res, 'response.output_item.added', { output_index: fcIndex, item });
-        const argsStr = item.arguments;
+        // Idempotent: items built above are already sanitized, but a
+        // `function_call` item arriving through another construction path
+        // must still emit strict inner JSON on the delta/done frames.
+        const argsStr = sanitizeJsonString(item.arguments);
         writeSSEEvent(res, 'response.function_call_arguments.delta', {
           item_id: item.id,
           output_index: fcIndex,
@@ -1538,11 +1547,11 @@ function buildResponseRecord(
     status: response.status,
     instructions: response.instructions ?? undefined,
     inputJson: stringifyStoredInputMessages(newInputMessages),
-    outputJson: JSON.stringify(response.output),
+    outputJson: stringifyStrictJson(response.output),
     outputText: response.output_text,
-    usageJson: JSON.stringify(response.usage),
+    usageJson: stringifyStrictJson(response.usage),
     previousResponseId: previousResponseId ?? undefined,
-    configJson: JSON.stringify({
+    configJson: stringifyStrictJson({
       temperature: response.temperature,
       top_p: response.top_p,
       max_output_tokens: response.max_output_tokens,

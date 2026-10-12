@@ -14,6 +14,7 @@ import type { IdleSweeper } from '../idle-sweeper.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry, ServableModel } from '../registry.js';
+import { stringifyStrictJson } from '../strict-json.js';
 import type { AnthropicCountTokensRequest, AnthropicCountTokensResponse } from '../types-anthropic.js';
 
 interface ChatTemplateTokenCounter {
@@ -32,7 +33,7 @@ function getChatTemplateTokenCounter(model: ServableModel): ChatTemplateTokenCou
 
 function endJson(res: ServerResponse, body: AnthropicCountTokensResponse): void {
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(body));
+  res.end(stringifyStrictJson(body));
 }
 
 export async function handleCountMessageTokens(

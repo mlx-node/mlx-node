@@ -2,16 +2,19 @@
 //! Opening a Store only fingerprints source metadata. Entries are created on
 //! demand, atomically, and contain at most one bounded row/expert chunk.
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use napi::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::{debug, info};
 
 use super::weights::{MAX_READ_BYTES, Weight};
 use crate::array::{DType, MxArray};
@@ -20,6 +23,13 @@ const MAGIC: &[u8; 8] = b"Q4PACK02";
 const MAX_HEADER: usize = 4096;
 const DISK_BUDGET: u64 = 96 << 30;
 const FREE_RESERVE: u64 = 16 << 30;
+/// Idle identity dirs are stale after this; `.pack`/budget mtime stamps on
+/// verified reads keep a live dir young.
+const PACKED_SWEEP_MIN_AGE: Duration = Duration::from_secs(3600);
+const DIR_PREFIX: &str = ".mlx-qwen4-packed-v2-";
+/// Optional total cap across all identity dirs; unset/<=0 keeps the per-dir
+/// DISK_BUDGET behaviour.
+const TOTAL_CAP_ENV: &str = "MLX_QWEN4_PACKED_CACHE_MAX_GB";
 
 fn err(e: impl std::fmt::Display) -> Error {
     Error::from_reason(e.to_string())
@@ -50,6 +60,10 @@ pub(super) struct VerifiedChunk {
 
 pub(super) struct PackedCache {
     root: PathBuf,
+    /// `.manifest` bytes written by `new_at`; `write` republishes them if a
+    /// sweep deletes the file (or the whole dir) mid-session. None only for
+    /// tests constructing the struct literally.
+    manifest: Option<Vec<u8>>,
 }
 
 pub(super) fn chunk_key(
@@ -66,6 +80,352 @@ pub(super) fn chunk_key(
         hash.update(n.to_le_bytes());
     }
     hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn packed_identity(files: impl Iterator<Item = PathBuf>) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(MAGIC);
+    for path in files {
+        let canonical = path.canonicalize().map_err(err)?;
+        let meta = fs::metadata(&canonical).map_err(err)?;
+        hash.update(canonical.as_os_str().as_bytes());
+        for n in [
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime() as u64,
+            meta.mtime_nsec() as u64,
+            meta.ctime() as u64,
+            meta.ctime_nsec() as u64,
+        ] {
+            hash.update(n.to_le_bytes());
+        }
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Recompute an identity dir's source fingerprint from its `.manifest`. Any
+/// missing source file or unreadable manifest is Err so callers can treat the
+/// dir as orphaned.
+fn identity_from_manifest(dir: &Path) -> Result<String> {
+    let data = fs::read(dir.join(".manifest")).map_err(err)?;
+    let mut lines = data.split(|&b| b == b'\n');
+    let base = lines
+        .next()
+        .and_then(|line| line.strip_prefix(b"path=".as_slice()))
+        .map(|raw| PathBuf::from(OsStr::from_bytes(raw)))
+        .ok_or_else(|| err("packed manifest missing path="))?;
+    let files: Vec<PathBuf> = lines
+        .filter_map(|line| line.strip_prefix(b"file=".as_slice()))
+        .map(|raw| base.join(OsStr::from_bytes(raw)))
+        .collect();
+    if files.is_empty() {
+        return Err(err("packed manifest lists no files"));
+    }
+    packed_identity(files.into_iter())
+}
+
+/// Serialize canonical source paths into `.manifest` bytes: the common base
+/// on `path=` and each file relative to it on `file=` lines.
+fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
+    let base = canonical
+        .first()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    let mut manifest = b"path=".to_vec();
+    manifest.extend_from_slice(base.as_os_str().as_bytes());
+    manifest.push(b'\n');
+    for path in canonical {
+        let rel = path.strip_prefix(&base).unwrap_or(path);
+        manifest.extend_from_slice(b"file=");
+        manifest.extend_from_slice(rel.as_os_str().as_bytes());
+        manifest.push(b'\n');
+    }
+    manifest
+}
+
+fn dir_name_identity(dir: &Path) -> Option<&str> {
+    dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)
+}
+
+/// Newest mtime over the dir and every direct entry (.manifest, budget,
+/// .pack, in-flight .tmp); a present-but-unreadable mtime counts as fresh
+/// (None) so the dir is never deleted on a bad clock.
+fn packed_dir_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = fs::metadata(dir).ok()?.modified().ok()?;
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        newest = newest.max(entry.metadata().ok()?.modified().ok()?);
+    }
+    Some(newest)
+}
+
+/// True when the newest witness in `dir` is older than the sweep grace. Every
+/// deletion goes through this so a dir another process just opened or a
+/// writer mid-staging is never removed.
+fn packed_dir_idle(dir: &Path) -> bool {
+    packed_dir_mtime(dir).is_some_and(|newest| newest < SystemTime::now() - PACKED_SWEEP_MIN_AGE)
+}
+
+/// None keeps the dir (manifest-less dirs are never orphan-deleted: their
+/// staleness cannot be proven). The idle gate applies to every reason: a
+/// fresh dir keeps its packs until the grace window passes.
+fn packed_orphan_reason(dir: &Path) -> Option<&'static str> {
+    let manifest = dir.join(".manifest");
+    if !manifest.is_file() || !packed_dir_idle(dir) {
+        return None;
+    }
+    match identity_from_manifest(dir) {
+        Err(_) => return Some("unreadable manifest or missing source"),
+        Ok(identity) if dir_name_identity(dir) != Some(identity.as_str()) => {
+            return Some("source fingerprint changed");
+        }
+        Ok(_) => {}
+    }
+    Some("idle beyond sweep grace")
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Bytes actually held by .pack files — the same quantity the budget ledger
+/// records.
+fn pack_bytes(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|s| s == "pack"))
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Try the writer flock non-blockingly. Some(_) keeps the fd as a guard; the
+/// inner None means no ledger exists (nothing can be holding a lock). None
+/// means a live writer or an error: keep the dir.
+fn try_budget_lock(dir: &Path) -> Option<Option<File>> {
+    let path = dir.join("budget");
+    // macOS flock requires a writable fd for LOCK_EX; a read-only ledger falls
+    // back to read-only and relies on the kernel accepting or refusing it.
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .or_else(|_| File::open(&path))
+    {
+        Ok(f) => f,
+        // No ledger means no writer ever locked it; treat as free.
+        Err(e) if e.kind() == ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    // The ledger could have been unlinked between open and flock; only act on
+    // the dir whose ledger we actually hold.
+    let held = file.metadata().ok();
+    let live = fs::metadata(&path).ok();
+    match (held, live) {
+        (Some(a), Some(b)) if a.dev() == b.dev() && a.ino() == b.ino() => Some(Some(file)),
+        _ => None,
+    }
+}
+
+fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) -> u64 {
+    let Some(_guard) = try_budget_lock(dir) else {
+        debug!(
+            "packed cache: keeping {} (writer holds budget lock)",
+            dir.display()
+        );
+        return 0;
+    };
+    // Recheck under the held lock: the dir may have been rebuilt while we
+    // waited, in which case our lock no longer proves staleness.
+    if !still_stale(dir) {
+        return 0;
+    }
+    let size = dir_size(dir);
+    match fs::remove_dir_all(dir) {
+        Ok(()) => {
+            debug!(
+                "packed cache: removed {} ({reason}, {size} bytes)",
+                dir.display()
+            );
+            size
+        }
+        Err(e) => {
+            debug!("packed cache: failed to remove {}: {e}", dir.display());
+            0
+        }
+    }
+}
+
+fn remove_packed_dir(dir: &Path, reason: &str) -> u64 {
+    locked_remove(dir, reason, |d| packed_orphan_reason(d).is_some())
+}
+
+/// Best-effort mtime stamp; keeps the dir young for idle-expiry and LRU.
+fn stamp_mtime(path: &Path) {
+    let Ok(file) = OpenOptions::new().write(true).open(path) else {
+        return;
+    };
+    let _ = file.set_modified(SystemTime::now());
+}
+
+fn packed_total_cap() -> Option<u64> {
+    let raw = std::env::var(TOTAL_CAP_ENV).ok()?;
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|gb| gb.is_finite() && *gb > 0.0)
+        .map(|gb| (gb * (1u64 << 30) as f64) as u64)
+}
+
+/// Enforce the optional total cap: evict least-recently-used sibling dirs
+/// first, then shed the oldest `.pack` files inside the current dir under its
+/// own ledger lock.
+fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
+    let mut dirs: Vec<(PathBuf, Option<SystemTime>)> = fs::read_dir(parent)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && dir_name_identity(p).is_some())
+                .map(|p| {
+                    let mtime = packed_dir_mtime(&p);
+                    (p, mtime)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort_by_key(|(_, mtime)| mtime.unwrap_or(SystemTime::UNIX_EPOCH));
+    let mut total: u64 = dirs.iter().map(|(p, _)| dir_size(p)).sum();
+    if !dirs.iter().any(|(p, _)| p == current) {
+        // new_at creates the current dir eagerly, but tests may sweep roots
+        // whose PackedCache was constructed without one.
+        total += dir_size(current);
+    }
+    // Same idle grace as the orphan sweep: a dir that became active
+    // mid-enforcement is rechecked under the budget lock before removal, and
+    // manifest-less dirs are never cap-evicted.
+    let cutoff = SystemTime::now() - PACKED_SWEEP_MIN_AGE;
+    let mut reclaimed = 0u64;
+    for (dir, snapshot) in dirs.iter().filter(|(p, _)| p != current) {
+        if total <= cap {
+            break;
+        }
+        if !snapshot.is_some_and(|mtime| mtime < cutoff) {
+            continue;
+        }
+        let removed = locked_remove(dir, "total cap LRU eviction", |d| {
+            dir_name_identity(d).is_some()
+                && d.join(".manifest").is_file()
+                && packed_dir_mtime(d)
+                    .is_some_and(|mtime| snapshot.is_some_and(|snap| mtime <= snap))
+        });
+        total = total.saturating_sub(removed);
+        reclaimed += removed;
+    }
+    if total > cap {
+        // Shed oldest .pack files in the current dir under its own budget lock.
+        let Some(_guard) = try_budget_lock(current) else {
+            if reclaimed > 0 {
+                info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
+            }
+            return;
+        };
+        let mut packs: Vec<(SystemTime, PathBuf, u64)> = fs::read_dir(current)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|s| s == "pack"))
+                    .filter_map(|p| {
+                        let m = fs::metadata(&p).ok()?;
+                        Some((m.modified().ok()?, p, m.len()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        packs.sort_by_key(|(t, _, _)| *t);
+        for (_, path, len) in packs {
+            if total <= cap {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                debug!("packed cache: shed {} (total cap)", path.display());
+                total = total.saturating_sub(len);
+                reclaimed += len;
+            }
+        }
+        // Re-reconcile the ledger after removals.
+        let _ = OpenOptions::new()
+            .write(true)
+            .open(current.join("budget"))
+            .and_then(|mut f| f.write_all(&pack_bytes(current).to_le_bytes()));
+    }
+    if reclaimed > 0 {
+        info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
+    }
+}
+
+/// Sweep sibling `.mlx-qwen4-packed-v2-*` dirs for orphans and enforce the
+/// optional total cap. Never fatal.
+fn sweep_packed_cache(parent: &Path, current: &Path) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if dir == current || !dir.is_dir() || dir_name_identity(&dir).is_none() {
+                continue;
+            }
+            if let Some(reason) = packed_orphan_reason(&dir) {
+                remove_packed_dir(&dir, reason);
+            }
+        }
+        // Crash-leftover `{uuid}.tmp` files carry no ledger bytes: drop them
+        // once they age past the sweep grace (a live writer's tmp is fresh).
+        if let Ok(entries) = fs::read_dir(current) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|s| s == "tmp")
+                    && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
+                    && mtime < SystemTime::now() - PACKED_SWEEP_MIN_AGE
+                    && fs::remove_file(&path).is_ok()
+                {
+                    debug!(
+                        "packed cache: removed {} (stale staging tmp)",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if let Some(cap) = packed_total_cap() {
+            enforce_packed_total_cap(parent, current, cap);
+        }
+    }));
+}
+
+/// Serialize writers in-process: BSD flock is per-process, so two threads
+/// opening the ledger could both hold LOCK_EX.
+fn writer_mutex() -> &'static std::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 impl PackedCache {
@@ -88,27 +448,25 @@ impl PackedCache {
     }
 
     pub(super) fn new_at(root: &Path, files: BTreeSet<PathBuf>) -> Result<Self> {
-        let mut hash = Sha256::new();
-        hash.update(MAGIC);
-        for path in files {
-            let canonical = path.canonicalize().map_err(err)?;
-            let meta = fs::metadata(&canonical).map_err(err)?;
-            hash.update(canonical.as_os_str().as_bytes());
-            for n in [
-                meta.dev(),
-                meta.ino(),
-                meta.len(),
-                meta.mtime() as u64,
-                meta.mtime_nsec() as u64,
-                meta.ctime() as u64,
-                meta.ctime_nsec() as u64,
-            ] {
-                hash.update(n.to_le_bytes());
-            }
+        let mut canonical = Vec::with_capacity(files.len());
+        for path in &files {
+            canonical.push(path.canonicalize().map_err(err)?);
         }
-        let identity: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        let root = root.join(format!(".mlx-qwen4-packed-v2-{identity}"));
-        Ok(Self { root })
+        let identity = packed_identity(canonical.iter().cloned())?;
+        let dir = root.join(format!("{DIR_PREFIX}{identity}"));
+        // Eagerly create the identity dir and record its provenance so the
+        // sweep can re-verify staleness later. A missing/failed manifest is
+        // harmless: manifest-less dirs are never orphan-deleted.
+        let manifest = pack_manifest(&canonical);
+        if fs::create_dir_all(&dir).is_ok() {
+            let _ = fs::write(dir.join(".manifest"), &manifest);
+        }
+        let cache = Self {
+            root: dir,
+            manifest: Some(manifest),
+        };
+        sweep_packed_cache(root, &cache.root);
+        Ok(cache)
     }
 
     fn path(&self, key: &str) -> PathBuf {
@@ -172,7 +530,7 @@ impl PackedCache {
     fn read_verified(&self, key: &str, payload_limit: u64) -> Result<Option<VerifiedChunk>> {
         let mut file = match File::open(self.path(key)) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(err(e)),
         };
         let len = file.metadata().map_err(err)?.len();
@@ -239,6 +597,10 @@ impl PackedCache {
         if digest[..] != prefix[12..44] {
             return Err(err("Packed chunk checksum mismatch"));
         }
+        // Verified hit: stamp recency so idle-expiry and LRU see live entries.
+        drop(file);
+        stamp_mtime(&self.path(key));
+        stamp_mtime(&self.root.join("budget"));
         Ok(Some(VerifiedChunk {
             header,
             data,
@@ -251,42 +613,15 @@ impl PackedCache {
             return Ok(());
         }
         fs::create_dir_all(&self.root).map_err(err)?;
-        // Serialize writers across processes. A busy writer never stalls inference.
-        let mut ledger = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join("budget"))
-            .map_err(err)?;
-        if unsafe { libc::flock(ledger.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Ok(());
+        // A sweep may have deleted the .manifest (or the whole dir) between
+        // new_at and this write; republish so the recreated dir stays
+        // verifiable instead of becoming an unaccountable manifest-less dir.
+        if let Some(manifest) = &self.manifest
+            && !self.root.join(".manifest").is_file()
+        {
+            let _ = fs::write(self.root.join(".manifest"), manifest);
         }
-        // Closing ledger releases the lock on every return/error path.
-        let mut n = [0u8; 8];
-        let used = if ledger.metadata().map_err(err)?.len() == 8 {
-            ledger.read_exact(&mut n).map_err(err)?;
-            u64::from_le_bytes(n)
-        } else {
-            fs::read_dir(&self.root)
-                .map_err(err)?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|s| s == "pack"))
-                .try_fold(0u64, |sum, e| {
-                    sum.checked_add(e.metadata().map_err(err)?.len())
-                        .ok_or_else(|| err("Packed cache budget overflow"))
-                })?
-        };
-        let reserve = weight.bytes()? + MAX_HEADER as u64 + 44;
-        if used.saturating_add(reserve) > DISK_BUDGET || !has_disk_space(&self.root, reserve) {
-            return Ok(());
-        }
-        // Reserve first: an interrupted write can overcount, never overspend.
-        ledger.seek(SeekFrom::Start(0)).map_err(err)?;
-        ledger
-            .write_all(&(used + reserve).to_le_bytes())
-            .map_err(err)?;
-        ledger.set_len(8).map_err(err)?;
+        // Serialize outside the lock so the ledger can reserve exact bytes.
         let mut header = Header {
             key: key.into(),
             group: weight.group,
@@ -315,6 +650,60 @@ impl PackedCache {
         if header.len() > MAX_HEADER || data.len() as u64 > MAX_READ_BYTES {
             return Err(err("Packed chunk exceeds staging budget"));
         }
+        let reserve = 44 + header.len() as u64 + data.len() as u64;
+        // Serialize writers across processes. A busy writer never stalls inference.
+        let _in_process = writer_mutex()
+            .lock()
+            .map_err(|_| err("Packed writer mutex poisoned"))?;
+        let mut ledger = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("budget"))
+            .map_err(err)?;
+        if unsafe { libc::flock(ledger.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Ok(());
+        }
+        // Closing ledger releases the lock on every return/error path.
+        let mut n = [0u8; 8];
+        let recorded = if ledger.metadata().map_err(err)?.len() == 8 {
+            ledger.read_exact(&mut n).map_err(err)?;
+            Some(u64::from_le_bytes(n))
+        } else {
+            None
+        };
+        // Reconcile the ledger to actual .pack bytes: externally deleted files
+        // must not permanently inflate the recorded spend. The target's own
+        // bytes are excluded: rename replaces it atomically, so its current
+        // size is not new spend and must not veto repairing a corrupt or
+        // oversized entry.
+        let target = self.path(key);
+        let used: u64 = fs::read_dir(&self.root)
+            .map_err(err)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let path = e.path();
+                path.extension().is_some_and(|s| s == "pack") && path != target
+            })
+            .try_fold(0u64, |sum, e| {
+                sum.checked_add(e.metadata().map_err(err)?.len())
+                    .ok_or_else(|| err("Packed cache budget overflow"))
+            })?;
+        let budget = packed_total_cap().unwrap_or(DISK_BUDGET);
+        let record = |ledger: &mut File, value: u64| -> Result<()> {
+            ledger.seek(SeekFrom::Start(0)).map_err(err)?;
+            ledger.write_all(&value.to_le_bytes()).map_err(err)?;
+            ledger.set_len(8).map_err(err)
+        };
+        if recorded != Some(used) {
+            record(&mut ledger, used)?;
+        }
+        if used.saturating_add(reserve) > budget || !has_disk_space(&self.root, reserve) {
+            return Ok(());
+        }
+        // Reserve first: an interrupted write can overcount, never overspend.
+        record(&mut ledger, used + reserve)?;
         let digest = Sha256::new()
             .chain_update(&header)
             .chain_update(&data)
@@ -551,11 +940,26 @@ mod tests {
         }
     }
 
+    fn age(path: &Path, seconds: u64) {
+        let old = SystemTime::now() - Duration::from_secs(seconds);
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(old).unwrap();
+    }
+
+    /// `age` needs a writable fd a directory cannot provide; futimens on a
+    /// read-only dir fd reaches the same witness.
+    fn age_dir(path: &Path, seconds: u64) {
+        let old = SystemTime::now() - Duration::from_secs(seconds);
+        let file = File::open(path).unwrap();
+        file.set_modified(old).unwrap();
+    }
+
     #[test]
     fn packed_chunks_preserve_codes_signed_scales_and_quantized_outputs() {
         let temp = Temp::new();
         let cache = PackedCache {
             root: temp.0.join("cache"),
+            manifest: None,
         };
         let x = MxArray::from_float32(
             &(0..256)
@@ -679,6 +1083,7 @@ mod tests {
         let temp = Temp::new();
         let cache = PackedCache {
             root: temp.0.join("cache"),
+            manifest: None,
         };
         let w = weight("affine");
         cache.write("key", &w).unwrap();
@@ -706,22 +1111,282 @@ mod tests {
         drop(f);
         cache.write("key", &w).unwrap();
         assert!(cache.read("key").unwrap().is_some());
-        let mut ledger = File::create(cache.root.join("budget")).unwrap();
-        ledger.write_all(&DISK_BUDGET.to_le_bytes()).unwrap();
-        cache.write("full", &w).unwrap();
-        assert!(cache.read("full").unwrap().is_none());
     }
 
     #[test]
     fn source_change_invalidates_prepared_chunks_without_reading_payloads() {
         let temp = Temp::new();
+        let parent = temp.0.join("cache");
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"first").unwrap();
-        let a = PackedCache::new(&source, BTreeSet::from([source.clone()])).unwrap();
-        assert!(!a.root.exists());
+        let a = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        assert!(a.root.join(".manifest").is_file());
         fs::write(&source, b"replacement").unwrap();
-        let b = PackedCache::new(&source, BTreeSet::from([source.clone()])).unwrap();
+        let b = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
         assert_ne!(a.root, b.root);
+    }
+
+    #[test]
+    fn manifest_records_source_dir_and_recomputes_identity() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        let manifest = fs::read_to_string(cache.root.join(".manifest")).unwrap();
+        let canonical = source.canonicalize().unwrap();
+        assert_eq!(
+            manifest.lines().next().unwrap(),
+            format!("path={}", canonical.parent().unwrap().display())
+        );
+        assert_eq!(manifest.lines().nth(1).unwrap(), "file=source.gguf");
+        assert_eq!(
+            identity_from_manifest(&cache.root).unwrap(),
+            dir_name_identity(&cache.root).unwrap()
+        );
+        // Deleting the source makes the identity unverifiable; the orphan
+        // verdict still waits out the idle grace on the newest witness.
+        fs::remove_file(&source).unwrap();
+        assert!(identity_from_manifest(&cache.root).is_err());
+        assert_eq!(packed_orphan_reason(&cache.root), None);
+        age(&cache.root.join(".manifest"), 7200);
+        age_dir(&cache.root, 7200);
+        assert_eq!(
+            packed_orphan_reason(&cache.root),
+            Some("unreadable manifest or missing source")
+        );
+    }
+
+    #[test]
+    fn stale_sibling_identity_is_swept_current_is_preserved() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        // A stale sibling: manifest present but its source is gone, aged past
+        // the idle grace on every witness.
+        let stale = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        age(&stale.join(".manifest"), 7200);
+        age_dir(&stale, 7200);
+        // A manifest-less sibling is never orphan-deleted.
+        let unknown = parent.join(format!("{DIR_PREFIX}{}", "b".repeat(64)));
+        fs::create_dir(&unknown).unwrap();
+        fs::write(unknown.join("leftover.pack"), b"data").unwrap();
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        assert!(!stale.exists());
+        assert!(unknown.exists());
+        assert!(cache.root.join(".manifest").is_file());
+    }
+
+    // flock is per-process on BSD/macOS, so a held writer lock can only be
+    // observed from a second process.
+    #[test]
+    #[ignore = "helper process for held_budget_lock_skips_sweep_deletion"]
+    fn packed_budget_lock_child() {
+        let path = PathBuf::from(
+            std::env::var_os("MLX_NODE_PACKED_LOCK_TEST_PATH").expect("lock-test child path"),
+        );
+        let acquired = PathBuf::from(
+            std::env::var_os("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED")
+                .expect("lock-test child acquired path"),
+        );
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        fs::write(acquired, b"acquired").unwrap();
+        // The parent kills this process once the sweep assertion completes.
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn held_budget_lock_skips_sweep_deletion() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let stale = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        fs::write(stale.join("budget"), 0u64.to_le_bytes()).unwrap();
+        age(&stale.join(".manifest"), 7200);
+        age(&stale.join("budget"), 7200);
+        age_dir(&stale, 7200);
+        let acquired = temp.0.join("child.acquired");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("models::qwen4_exp::packed_cache::tests::packed_budget_lock_child")
+            .arg("--ignored")
+            .env("MLX_NODE_PACKED_LOCK_TEST_PATH", stale.join("budget"))
+            .env("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED", &acquired)
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if acquired.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(acquired.is_file(), "child never acquired the budget lock");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let _cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        // A live writer's held flock makes the sweep keep even an orphan dir.
+        assert!(stale.exists());
+        child.kill().unwrap();
+        let _ = child.wait();
+        let _cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn ledger_reconciles_externally_deleted_packs() {
+        let temp = Temp::new();
+        let cache = PackedCache {
+            root: temp.0.join("cache"),
+            manifest: None,
+        };
+        let w = weight("affine");
+        cache.write("k1", &w).unwrap();
+        cache.write("k2", &w).unwrap();
+        // Simulated external cleanup inflates the recorded spend.
+        fs::remove_file(cache.path("k1")).unwrap();
+        cache.write("k3", &w).unwrap();
+        let mut n = [0u8; 8];
+        File::open(cache.root.join("budget"))
+            .unwrap()
+            .read_exact(&mut n)
+            .unwrap();
+        let actual: u64 = fs::read_dir(&cache.root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|s| s == "pack"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        // Recorded spend = reconciled used + exact reserve for the new pack,
+        // which now equals the true on-disk bytes.
+        assert_eq!(u64::from_le_bytes(n), actual);
+        cache.write("k4", &w).unwrap();
+        File::open(cache.root.join("budget"))
+            .unwrap()
+            .read_exact(&mut n)
+            .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(n),
+            fs::metadata(cache.path("k4")).unwrap().len()
+                + fs::metadata(cache.path("k2")).unwrap().len()
+                + fs::metadata(cache.path("k3")).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn total_cap_sheds_oldest_packs_in_current_dir() {
+        let temp = Temp::new();
+        let cache = PackedCache {
+            root: temp.0.join("cache"),
+            manifest: None,
+        };
+        let w = weight("affine");
+        for (key, seconds) in [("old", 300u64), ("mid", 200), ("new", 100)] {
+            cache.write(key, &w).unwrap();
+            age(&cache.path(key), seconds);
+        }
+        let pack = fs::metadata(cache.path("old")).unwrap().len();
+        // Cap fits exactly two packs plus ledger bytes: shed only the oldest.
+        enforce_packed_total_cap(&temp.0, &cache.root, 2 * pack + 64);
+        assert!(!cache.path("old").exists());
+        assert!(cache.path("mid").exists());
+        assert!(cache.path("new").exists());
+        // Ledger re-reconciled to actual bytes.
+        let mut n = [0u8; 8];
+        File::open(cache.root.join("budget"))
+            .unwrap()
+            .read_exact(&mut n)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(n), 2 * pack);
+    }
+
+    #[test]
+    fn write_republishes_manifest_and_sweep_drops_stale_tmps() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        // A sweep-deleted manifest comes back on the next write.
+        fs::remove_file(cache.root.join(".manifest")).unwrap();
+        cache.write("key", &weight("affine")).unwrap();
+        assert!(cache.root.join(".manifest").is_file());
+        // Crash leftovers in the current dir leave through the sweep once
+        // aged; a fresh .tmp (a plausibly live writer) is kept.
+        let stale_tmp = cache.root.join("old.tmp");
+        let live_tmp = cache.root.join("live.tmp");
+        fs::write(&stale_tmp, b"x").unwrap();
+        fs::write(&live_tmp, b"x").unwrap();
+        age(&stale_tmp, 7200);
+        sweep_packed_cache(&parent, &cache.root);
+        assert!(!stale_tmp.exists());
+        assert!(live_tmp.exists());
+    }
+
+    #[test]
+    fn total_cap_evicts_only_idle_manifested_siblings() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        // Eldest with a manifest and past the idle grace: the only eviction.
+        let oldest = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        fs::create_dir(&oldest).unwrap();
+        fs::write(oldest.join("a.pack"), vec![0_u8; 100]).unwrap();
+        fs::write(oldest.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        age(&oldest.join("a.pack"), 7200);
+        age(&oldest.join(".manifest"), 7200);
+        age_dir(&oldest, 7200);
+        // Fresh manifest dir and manifest-less dir both survive the cap: the
+        // idle grace shields the first, the manifest requirement the second.
+        let fresh = parent.join(format!("{DIR_PREFIX}{}", "b".repeat(64)));
+        fs::create_dir(&fresh).unwrap();
+        fs::write(fresh.join("b.pack"), vec![0_u8; 100]).unwrap();
+        fs::write(fresh.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        let bare = parent.join(format!("{DIR_PREFIX}{}", "c".repeat(64)));
+        fs::create_dir(&bare).unwrap();
+        fs::write(bare.join("c.pack"), vec![0_u8; 100]).unwrap();
+        age(&bare.join("c.pack"), 7200);
+        age_dir(&bare, 7200);
+        let cache = PackedCache {
+            root: temp.0.join("current"),
+            manifest: None,
+        };
+        fs::create_dir(&cache.root).unwrap();
+        enforce_packed_total_cap(&parent, &cache.root, 150);
+        assert!(!oldest.exists());
+        assert!(fresh.exists());
+        assert!(bare.exists());
+    }
+
+    #[test]
+    fn verified_read_stamps_recency() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        cache.write("key", &weight("affine")).unwrap();
+        age(&cache.path("key"), 7200);
+        age(&cache.root.join("budget"), 7200);
+        age(&cache.root.join(".manifest"), 7200);
+        let before = fs::metadata(cache.path("key")).unwrap().modified().unwrap();
+        assert!(before < SystemTime::now() - PACKED_SWEEP_MIN_AGE);
+        assert!(cache.read("key").unwrap().is_some());
+        let after = fs::metadata(cache.path("key")).unwrap().modified().unwrap();
+        assert!(after > before);
+        // Identity verifies and the stamped pack keeps the dir's newest mtime
+        // inside the grace window (the dir mtime itself is also fresh).
+        assert_eq!(packed_orphan_reason(&cache.root), None);
     }
 
     #[test]
@@ -729,6 +1394,7 @@ mod tests {
         let temp = Temp::new();
         let cache = PackedCache {
             root: temp.0.join("cache"),
+            manifest: None,
         };
         for mode in ["affine", "q4k", "q6k"] {
             cache.write(mode, &weight(mode)).unwrap();

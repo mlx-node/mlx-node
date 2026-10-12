@@ -2,6 +2,7 @@
 
 import type { ChatResult } from '@mlx-node/core';
 
+import { sanitizeJsonString } from '../strict-json.js';
 import { mergeTimingUsageExtensions, type PerformanceMetricsForUsage, type ServerTimingForUsage } from '../timing.js';
 import type {
   AnthropicContentBlockDeltaEvent,
@@ -19,7 +20,24 @@ import { genId } from './response.js';
 
 function parseArguments(args: Record<string, unknown> | string): Record<string, unknown> {
   if (typeof args === 'string') {
-    return JSON.parse(args) as Record<string, unknown>;
+    // Model-generated arguments are verbatim JSON text: a raw control
+    // character inside one of its string literals makes a bare JSON.parse
+    // throw and sinks the whole turn into a 500. Sanitizing first is
+    // byte-identical for compliant input and repairs the raw bytes to
+    // proper escapes.
+    try {
+      const parsed: unknown = JSON.parse(sanitizeJsonString(args));
+      // `tool_use.input` is a JSON OBJECT on the wire: malformed arguments
+      // (structurally broken even after sanitizing) or valid JSON that is not
+      // an object must not throw or emit a schema-invalid input. Fall back to
+      // the same `{}` the streaming tool_use block starts with.
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return {};
+    } catch {
+      return {};
+    }
   }
   return args;
 }

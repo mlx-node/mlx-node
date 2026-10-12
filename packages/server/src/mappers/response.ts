@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import type { ChatResult } from '@mlx-node/core';
 
+import { sanitizeJsonString, stringifyStrictJson } from '../strict-json.js';
 import { mergeTimingUsageExtensions } from '../timing.js';
 import type {
   FunctionCallOutputItem,
@@ -61,7 +62,10 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
       type: 'function_call',
       call_id: callId,
       name: tc.name,
-      arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+      // Model-generated arguments ship verbatim on the wire — sanitize so
+      // the inner JSON document stays strictly parseable for clients.
+      arguments:
+        typeof tc.arguments === 'string' ? sanitizeJsonString(tc.arguments) : stringifyStrictJson(tc.arguments),
       status: 'completed',
     };
     items.push(fcItem);

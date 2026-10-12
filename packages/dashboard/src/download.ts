@@ -901,18 +901,19 @@ export class DownloadManager {
 
     let stagingDir: string | undefined;
     try {
-      // The no-follow ownership preflight, factored so it reads identically at both
+      // The occupancy preflight, factored so it reads identically at both
       // its call sites: a final dir the downloader does not own (a manual copy or an
-      // `mlx download` install with no completion marker, OR any symlink, which
-      // `isDownloaderOwned` rejects no-follow) is refused — so an unowned local
+      // `mlx download` install with no completion marker, a symlink into such an
+      // UNMARKED dir, or a dangling link — `isDownloaderOwned` follows the link and
+      // reads the TARGET's marker, so only a live link into an unmarked/absent
+      // target stays unowned) is refused — so an unowned local
       // checkpoint never triggers a full multi-GB download+hash only to be refused at
       // publish. It reads ONLY `finalDir`, so it is order-independent of the staging
       // root and the resolved revision. Run it (a) before backup recovery — the
-      // recovery reap classifies finalDir with `isModelInstalled`, which FOLLOWS
-      // symlinks, so a foreign `finalDir` link must be refused BEFORE recovery could
-      // follow it and reap a recoverable rollback backup — and (b) again after
-      // recovery, so a `finalDir` that recovery (or a race) restored to a foreign
-      // symlink is refused BEFORE skip-detection follows it. The publish-time checks
+      // recovery reap classifies finalDir no-follow (`lstat`), so a refused link
+      // never reaches it — and (b) again after
+      // recovery, so a `finalDir` that recovery (or a race) replaced is refused
+      // BEFORE skip-detection follows it. The publish-time checks
       // below still guard the narrow check-then-swap race for a dir that races in
       // after this point.
       const refuseIfUnownedFinal = (): void => {
@@ -950,9 +951,9 @@ export class DownloadManager {
       await this.recoverBackup(slug, finalDir);
 
       // Re-run the preflight after recovery: recovery restores only an owned real-dir
-      // backup, but this refuses any foreign symlink a race put at finalDir before
+      // backup, but this refuses any unowned occupant a race put at finalDir before
       // skip-detection (`readCompletion`/`isModelInstalled`, which FOLLOW symlinks)
-      // could read the foreign marker and report a false `done` through the link.
+      // could read an unowned dir's marker-free state and report a false `done`.
       refuseIfUnownedFinal();
 
       const at = ++this.resolveSeq;
@@ -1238,12 +1239,13 @@ export class DownloadManager {
   /**
    * SLUG-SCOPED recover/reap of an orphaned publish backup for THIS model
    * (`<slug>.backup-<pid>.<uuid>`), gated by pid-liveness. Runs AFTER the ownership
-   * preflight (which already refused a foreign `finalDir` symlink), so nothing here
-   * follows such a link. A backup whose owner pid is still ALIVE belongs to a peer
-   * mid-publish and is never touched. For a dead-owner backup, classify finalDir
-   * NO-FOLLOW first — `isModelInstalled` alone FOLLOWS symlinks, so a live `finalDir`
-   * link into an external marked model would read as a complete install and REAP a
-   * recoverable rollback backup:
+   * preflight (which already refused an unowned `finalDir` occupant), so nothing
+   * here follows a foreign link into an unmarked dir. A backup whose owner pid is
+   * still ALIVE belongs to a peer mid-publish and is never touched. For a
+   * dead-owner backup, classify finalDir NO-FOLLOW first — `lstat` reports any
+   * `finalDir` symlink as not-a-directory, so a link into an external marked model
+   * can never be read as a complete install and REAP a recoverable rollback
+   * backup:
    *
    *   - finalDir is a proven owned-complete REAL dir → the backup is redundant → rm;
    *   - finalDir is ABSENT (a crashed swap) AND the backup is itself an OWNED REAL
