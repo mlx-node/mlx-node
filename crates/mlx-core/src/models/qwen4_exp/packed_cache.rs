@@ -213,6 +213,43 @@ fn pack_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Best-effort sibling spend estimate: the ledger u64 when it reads, else a
+/// live .pack byte count. Advisory only — the sibling's flock stays with its
+/// writer and any failure degrades to the byte count, never to an error.
+fn sibling_pack_estimate(dir: &Path) -> u64 {
+    let mut n = [0u8; 8];
+    let from_ledger = File::open(dir.join("budget"))
+        .and_then(|mut f| f.read_exact(&mut n))
+        .is_ok();
+    if from_ledger {
+        u64::from_le_bytes(n)
+    } else {
+        pack_bytes(dir)
+    }
+}
+
+/// Root-wide spend: `current_used` for `current` plus `sibling_bytes` over
+/// every other identity dir under `parent`. Read errors count as 0 — this is
+/// an advisory estimate, never a load failure.
+fn root_pack_spend(
+    parent: &Path,
+    current: &Path,
+    current_used: u64,
+    sibling_bytes: impl Fn(&Path) -> u64,
+) -> u64 {
+    let siblings: u64 = fs::read_dir(parent)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p != current && p.is_dir() && dir_name_identity(p).is_some())
+                .map(|p| sibling_bytes(&p))
+                .sum()
+        })
+        .unwrap_or(0);
+    current_used.saturating_add(siblings)
+}
+
 /// Try the writer flock non-blockingly. Some(_) keeps the fd as a guard; the
 /// inner None means no ledger exists (nothing can be holding a lock). None
 /// means a live writer or an error: keep the dir.
@@ -690,7 +727,10 @@ impl PackedCache {
                 sum.checked_add(e.metadata().map_err(err)?.len())
                     .ok_or_else(|| err("Packed cache budget overflow"))
             })?;
-        let budget = packed_total_cap().unwrap_or(DISK_BUDGET);
+        // A configured total cap bounds the whole cache root but never loosens
+        // the per-dir DISK_BUDGET invariant.
+        let total_cap = packed_total_cap();
+        let budget = total_cap.map_or(DISK_BUDGET, |cap| cap.min(DISK_BUDGET));
         let record = |ledger: &mut File, value: u64| -> Result<()> {
             ledger.seek(SeekFrom::Start(0)).map_err(err)?;
             ledger.write_all(&value.to_le_bytes()).map_err(err)?;
@@ -701,6 +741,24 @@ impl PackedCache {
         }
         if used.saturating_add(reserve) > budget || !has_disk_space(&self.root, reserve) {
             return Ok(());
+        }
+        // Bound the configured cap against ROOT-WIDE spend, not just this
+        // dir's: sibling caches share the same cap. The fast path estimates
+        // siblings from their ledgers (a full byte scan per tensor write would
+        // be too hot); only a plausible overspend pays the real enforcement
+        // sweep and byte-accurate recheck.
+        if let Some((cap, parent)) = total_cap.zip(self.root.parent()) {
+            let estimate = root_pack_spend(parent, &self.root, used, sibling_pack_estimate);
+            if estimate.saturating_add(reserve) > cap {
+                // Evict LRU siblings under their budget locks, then recheck
+                // with real byte counts. Our own packs are safe: we hold this
+                // dir's budget lock and `used` is freshly reconciled above.
+                enforce_packed_total_cap(parent, &self.root, cap);
+                let actual = root_pack_spend(parent, &self.root, used, pack_bytes);
+                if actual.saturating_add(reserve) > cap {
+                    return Ok(());
+                }
+            }
         }
         // Reserve first: an interrupted write can overcount, never overspend.
         record(&mut ledger, used + reserve)?;

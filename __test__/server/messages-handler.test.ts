@@ -5771,19 +5771,21 @@ describe('handleCreateMessage', () => {
       // `wasCommitted()` alone (ignoring `streamResult.ok`) would
       // silently leak the failed session to the next request.
       //
-      // Trigger choice: a clean done event whose `toolCalls[].arguments`
-      // is malformed JSON. Routing in `handleStreamingNative`
-      // (messages.ts:295-317):
+      // Trigger choice: a clean done event whose tool-use `input_json_delta`
+      // frame fails at the transport — `res.write` throws. Routing in
+      // `handleStreamingNative`:
       //
       //   1. The done event yields with `finishReason: 'stop'` and
       //      `status: 'ok'` tool calls — `sawDone = true`,
-      //      `terminalErrorMessage = null`.
+      //      `terminalErrorMessage = null`. (The malformed `arguments`
+      //      string no longer throws in the writer — sanitized args fall
+      //      back to `'{}'` — so the wire failure is simulated directly.)
       //   2. The producer (`ChatSession.startFromHistoryStream`) sets
       //      `sawFinal = true` BEFORE yielding (chat-session.ts:806-815),
       //      so the moment control passes to the consumer's body the
       //      producer is already poised to commit on iterator cleanup.
-      //   3. The okToolCalls writer loop runs `JSON.parse(tc.arguments)`
-      //      on the malformed string, which throws.
+      //   3. The okToolCalls writer loop emits the tool_use block start,
+      //      then `res.write` throws on the `input_json_delta` frame.
       //   4. The throw propagates out of the for-await body. The spec
       //      requires `for-await` to call `iterator.return()` before
       //      re-throwing, which runs the producer's `finally` block —
@@ -5820,8 +5822,10 @@ describe('handleCreateMessage', () => {
         {
           id: 'toolu_01',
           name: 'do_thing',
-          // Strings hit the `typeof tc.arguments === 'string'` branch in
-          // messages.ts which calls JSON.parse. Malformed JSON throws.
+          // Malformed arguments still flow through the sanitized `'{}'`
+          // fallback — the failure trigger below is the transport-level
+          // `res.write` throw on the `input_json_delta` frame, which happens
+          // AFTER the producer committed.
           arguments: '{not valid json',
           status: 'ok',
           rawContent: '{not valid json',
@@ -5897,10 +5901,17 @@ describe('handleCreateMessage', () => {
       try {
         // Turn 1: warm-hit, committed-producer + writer-side failure.
         // Lookup leases `warmSession`; the producer commits on its
-        // `finally` (turnCount: 0 -> 1); the writer's JSON.parse on
-        // the malformed tool-call args throws; the dual-gate denies
-        // adopt; the handler drops the slot.
+        // `finally` (turnCount: 0 -> 1); the simulated transport throw on
+        // the `input_json_delta` frame fails the writer; the dual-gate
+        // denies adopt; the handler drops the slot.
         const r1 = createMockRes();
+        const realWrite = r1.res.write.bind(r1.res);
+        r1.res.write = (chunk: unknown, ...rest: unknown[]): boolean => {
+          if (typeof chunk === 'string' && chunk.includes('input_json_delta')) {
+            throw new Error('simulated transport failure mid-tool_use');
+          }
+          return (realWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
+        };
         await handleCreateMessage(
           r1.res,
           {

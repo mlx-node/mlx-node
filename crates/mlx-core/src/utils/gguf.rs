@@ -7940,6 +7940,24 @@ async fn prepare_native_gguf_inner(
             output_dir.display()
         ))
     })?;
+    // Re-run the sweep now that the new entry's bytes are on disk: the
+    // pre-conversion sweep could not account for them, so the cap must be
+    // enforced again. The published key is exempt from cap eviction.
+    {
+        let sweep_root = cache_root.to_path_buf();
+        let sweep_key = cache_key.clone();
+        let swept = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sweep_native_gguf_cache(&sweep_root, &sweep_key);
+            }))
+        })
+        .await;
+        match swept {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
+            Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
+        }
+    }
     Ok(output_dir)
 }
 
@@ -16990,6 +17008,11 @@ mod tests {
         i32::MAX as u32
     }
 
+    // The std Mutex guard must stay held across the awaits below: it
+    // serializes the `MLX_NATIVE_GGUF_CACHE_MAX_GB` env mutation against sweep
+    // tests on other threads for the whole test, and `#[tokio::test]`'s
+    // current-thread runtime cannot deadlock on it.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn native_gguf_sweep_removes_stale_orphans_and_keeps_live_entries() {
@@ -17134,6 +17157,9 @@ mod tests {
         drop(held_lock);
     }
 
+    // Env-var serialization guard held across awaits: same rationale as the
+    // sweep test above.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn native_gguf_sweep_cache_hit_stamps_marker_recency() {
@@ -17168,6 +17194,9 @@ mod tests {
         assert!(contents.contains("companion=none\n"), "{contents}");
     }
 
+    // Env-var serialization guard held across awaits: same rationale as the
+    // sweep tests above.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn native_gguf_sweep_evicts_lru_under_size_cap() {

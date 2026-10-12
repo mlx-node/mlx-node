@@ -382,6 +382,58 @@ describe('BUG 2: /v1/messages strict JSON', () => {
     expect(JSON.parse(partialJson)).toEqual({ q: 'a\ta\x1fb' });
     expect(events.some((e) => e.event === 'message_stop')).toBe(true);
   });
+
+  it('streaming: malformed or non-object tool arguments emit partial_json = {} and the turn still completes', async () => {
+    // `partial_json` must assemble into a JSON OBJECT — Anthropic clients
+    // merge the deltas into `tool_use.input`. A structurally malformed
+    // model payload or a valid JSON scalar/array root would fail
+    // client-side assembly, so the endpoint emits the same `{}` the
+    // non-streaming mapper falls back to.
+    for (const badArgs of ['{"city":', '[1,2]', '"just a string"']) {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        {
+          text: '',
+          done: true,
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { status: 'ok', id: 'call_bad', name: 'get_weather', arguments: badArgs },
+          ],
+          thinking: null,
+          numTokens: 3,
+          promptTokens: 2,
+          reasoningTokens: 0,
+          rawText: '',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+          tools: TOOLS,
+        } as never,
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const events = parseSSE(getBody());
+      const jsonDelta = events.find(
+        (e) =>
+          e.event === 'content_block_delta' &&
+          (e.data['delta'] as { type?: string }).type === 'input_json_delta',
+      );
+      expect(jsonDelta, `partial_json delta for ${badArgs}`).toBeDefined();
+      expect((jsonDelta!.data['delta'] as { partial_json: string }).partial_json).toBe('{}');
+      expect(events.some((e) => e.event === 'message_stop')).toBe(true);
+      expect(events.some((e) => e.event === 'error')).toBe(false);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

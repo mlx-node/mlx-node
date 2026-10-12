@@ -617,12 +617,34 @@ async function handleStreamingNativeWithAbort(
           // the inner JSON clients parse incrementally stays strict.
           const sanitizedArgs =
             typeof tc.arguments === 'string' ? sanitizeJsonString(tc.arguments) : undefined;
-          // When arguments arrived as a string the sanitized text IS the
-          // partial_json payload — re-parsing it here would only re-expose
-          // the 500 a malformed model payload was sanitized to avoid, and
-          // its result was never read. Non-string arguments serialize
-          // directly.
-          const partialJson = sanitizedArgs ?? stringifyStrictJson(tc.arguments);
+          // The sanitized string text is usually the partial_json payload
+          // verbatim, but `partial_json` must assemble into a JSON OBJECT for
+          // Anthropic clients — sanitized text that is structurally malformed
+          // (`{"city":`) or valid JSON with a non-object root fails client-side
+          // assembly where the non-streaming mapper falls back to `{}`. Parse
+          // once to prove objectness; on failure emit the same empty object.
+          // Non-string arguments must be non-null, non-array objects too.
+          const partialJson = (() => {
+            if (sanitizedArgs !== undefined) {
+              try {
+                const parsed: unknown = JSON.parse(sanitizedArgs);
+                if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+                  return sanitizedArgs;
+                }
+              } catch {
+                // fall through to the `{}` fallback
+              }
+              return '{}';
+            }
+            if (
+              typeof tc.arguments === 'object' &&
+              tc.arguments !== null &&
+              !Array.isArray(tc.arguments)
+            ) {
+              return stringifyStrictJson(tc.arguments);
+            }
+            return '{}';
+          })();
 
           writeSSEEvent(
             res,
