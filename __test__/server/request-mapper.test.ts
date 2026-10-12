@@ -627,7 +627,7 @@ describe('mapRequest', () => {
 
   describe('assistant history replay (client-echoed input[])', () => {
     it('accepts output_text content parts when a client replays an assistant message', () => {
-      // Clients that do not use `previous_response_id` (pi-ai, Codex) replay
+      // Clients that do not use `previous_response_id` (Codex and other agent harnesses) replay
       // the prior assistant turn as `{type:"message",role:"assistant",content:[{type:"output_text",...}]}`.
       // Rejecting output_text breaks cold-start multi-turn outright.
       const { messages } = mapRequest({
@@ -651,7 +651,7 @@ describe('mapRequest', () => {
     });
 
     it('coalesces a replayed reasoning item onto the trailing assistant message', () => {
-      // Real pi-ai payload shape: user → reasoning → message(assistant) → user.
+      // Real harness payload shape: user → reasoning → message(assistant) → user.
       // The reasoning summary must land as `reasoningContent` on the assistant turn.
       const { messages } = mapRequest({
         model: 'test-model',

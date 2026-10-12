@@ -79,8 +79,8 @@ describe('ingestTraces', () => {
     expect(a.coldBytesRestored).toBe(2048);
   });
 
-  // Finding 11b: a subagent turn's root session id must survive ingest so the
-  // root session's metrics view can include its delegated children.
+  // Finding 11b: a subagent turn's root session id must survive ingest so a
+  // root view can include its delegated children.
   it('stores root_session_id from a subagent trace record', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });
     writeFileSync(
@@ -549,8 +549,7 @@ describe('ingestTraces', () => {
     expect(dash.db.select().from(traceFiles).all()).toHaveLength(0);
   });
 
-  // The kind check FOLLOWS symlinks on purpose, unlike the session listing (which is
-  // no-follow so an external transcript cannot surface under the target's id). A
+  // The kind check FOLLOWS symlinks on purpose: a
   // symlinked trace entry ingests today and must keep ingesting: an `lstat().isFile()`
   // check is false for a symlink, so a no-follow fix would silently stop reading it
   // and reconcile its rows away.

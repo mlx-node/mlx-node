@@ -246,8 +246,8 @@ describe('rpc request/response', () => {
   it('carries a path with its query string as text (URLSearchParams cannot be cloned)', async () => {
     const stub = stubRuntime();
     const { client } = connected(stub);
-    expect(await within(client.call({ method: 'GET', path: '/api/sessions?limit=1&offset=2' }))).not.toBe('HUNG');
-    expect(stub.calls[0].path).toBe('/api/sessions?limit=1&offset=2');
+    expect(await within(client.call({ method: 'GET', path: '/api/models?limit=1&offset=2' }))).not.toBe('HUNG');
+    expect(stub.calls[0].path).toBe('/api/models?limit=1&offset=2');
   });
 
   it('correlates concurrent replies that come back out of order', async () => {
@@ -278,11 +278,11 @@ describe('rpc request/response', () => {
   });
 
   it('round-trips a failure envelope with its code AND its derived status', async () => {
-    const stub = stubRuntime(() => failure('E_CONFLICT', 'Session is being written'));
+    const stub = stubRuntime(() => failure('E_CONFLICT', 'Model is being written'));
     const { client } = connected(stub);
 
-    const res = await within(client.call({ method: 'PATCH', path: '/api/sessions/x' }));
-    expect(res).toEqual({ ok: false, code: 'E_CONFLICT', message: 'Session is being written', status: 409 });
+    const res = await within(client.call({ method: 'PATCH', path: '/api/models/x' }));
+    expect(res).toEqual({ ok: false, code: 'E_CONFLICT', message: 'Model is being written', status: 409 });
   });
 
   it('drops a malformed reply instead of settling a real call with it', async () => {
@@ -371,7 +371,7 @@ describe('rpc never hangs a caller', () => {
         },
       );
 
-      const response = client.call({ method: 'DELETE', path: '/api/sessions/queued' }).then((result) => {
+      const response = client.call({ method: 'DELETE', path: '/api/models/queued' }).then((result) => {
         order.push('settled');
         return result;
       });
@@ -474,7 +474,7 @@ describe('rpc never hangs a caller', () => {
 
     try {
       let settled = false;
-      const response = client.call({ method: 'DELETE', path: '/api/sessions/doomed' }).then((res) => {
+      const response = client.call({ method: 'DELETE', path: '/api/models/doomed' }).then((res) => {
         settled = true;
         order.push('settled');
         return res;
@@ -605,7 +605,7 @@ describe('rpc never hangs a caller', () => {
     );
     const { client } = connected(stub, { timeoutMs: 60_000 });
 
-    const inflight = client.call({ method: 'DELETE', path: '/api/sessions/already-started' });
+    const inflight = client.call({ method: 'DELETE', path: '/api/models/already-started' });
     await flush();
     client.close();
     await flush();

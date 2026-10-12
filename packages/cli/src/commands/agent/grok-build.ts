@@ -17,7 +17,7 @@
  * `authorization: Bearer <token>`.
  *
  * Both children are killed when `mlx agent` exits; neither inherits stdio
- * except the agent binary, which takes over the terminal like pi did.
+ * except the agent binary, which takes over the terminal.
  */
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';

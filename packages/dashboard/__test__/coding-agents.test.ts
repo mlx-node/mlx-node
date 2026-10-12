@@ -366,11 +366,8 @@ describe('local model coding-agent setup', () => {
 
   it('uses the persisted default rather than the host default or first model', async () => {
     const { service, home, complete } = await setup(['alpha', 'chosen']);
-    await mkdir(join(home, '.mlx-node', 'agent'), { recursive: true });
-    await writeFile(
-      join(home, '.mlx-node', 'agent', 'settings.json'),
-      JSON.stringify({ defaultProvider: 'mlx', defaultModel: 'chosen' }),
-    );
+    await mkdir(join(home, '.mlx-agent'), { recursive: true });
+    await writeFile(join(home, '.mlx-agent', 'config.toml'), '[models]\ndefault = "chosen"\n');
     await mkdir(join(home, '.claude'));
     await writeFile(join(home, '.claude', 'CLAUDE.md'), 'Use yarn.');
     await service.start('detect', 'claude');
@@ -385,8 +382,8 @@ describe('local model coding-agent setup', () => {
     const { service, home, env, complete } = await setup(['alpha', 'chosen']);
     const dir = join(home, 'custom agent #配置');
     await mkdir(dir);
-    await writeFile(join(dir, 'settings.json'), JSON.stringify({ defaultProvider: 'mlx', defaultModel: 'chosen' }));
-    env.PI_CODING_AGENT_DIR =
+    await writeFile(join(dir, 'config.toml'), '[models]\ndefault = "chosen"\n');
+    env.GROK_HOME =
       kind === 'file-url' ? pathToFileURL(dir).href : kind === 'tilde' ? '~/custom agent #配置' : dir;
     await mkdir(join(home, '.claude'));
     await writeFile(join(home, '.claude', 'CLAUDE.md'), 'Use yarn.');
@@ -398,13 +395,14 @@ describe('local model coding-agent setup', () => {
     expect(complete.mock.calls.every(([connection]) => connection.model === 'chosen')).toBe(true);
   });
 
-  it('blocks setup for an invalid agent directory URL instead of choosing another model', async () => {
-    const { service, env, complete, connect } = await setup(['alpha', 'chosen']);
-    env.PI_CODING_AGENT_DIR = 'file:///%ZZ';
-    await expect(service.start('detect', 'claude')).rejects.toThrow('Could not read the default local model');
-    await expect(service.start('install', 'claude')).rejects.toThrow('Could not read the default local model');
-    expect(complete).not.toHaveBeenCalled();
-    expect(connect).not.toHaveBeenCalled();
+  it('falls back to an installed model when the agent config directory is unreadable', async () => {
+    const { service, home, env, complete } = await setup(['alpha', 'chosen']);
+    env.GROK_HOME = 'file:///%ZZ';
+    await mkdir(join(home, '.claude'));
+    await writeFile(join(home, '.claude', 'CLAUDE.md'), 'Use yarn.');
+    await service.start('detect', 'claude');
+    expect((await settled(service)).status).toBe('not-installed');
+    expect(complete.mock.calls[0][0].model).toBe('alpha');
   });
 
   it('recognizes a manually worded installation through the model without markers', async () => {

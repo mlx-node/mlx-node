@@ -14,7 +14,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -23,30 +22,25 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
 
-import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
-import { openDashboardDb } from '../src/db/open.js';
 import { DownloadsClosedError } from '../src/download.js';
 import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
-import { agentSessionsRoot } from '../src/paths.js';
 import { createRpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import { createDashboardRuntime, type DashboardRuntime } from '../src/runtime.js';
 import { createTestClient, type TestClient } from './helpers/api-client.js';
-import { delegationFixture } from './helpers/delegation-fixture.js';
 
-const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.meta.url));
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
 
 const MODEL_CONFIG = JSON.stringify({ model_type: 'qwen3', max_position_embeddings: 40960 });
@@ -73,7 +67,6 @@ function hexBlock(index: number): string {
 }
 
 let base: string;
-let sessionsRoot: string;
 let tracesDir: string;
 let modelsDir: string;
 let cacheRoot: string;
@@ -88,8 +81,6 @@ async function ingest(): Promise<void> {
 
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'dash-api-'));
-  sessionsRoot = join(base, 'sessions');
-  cpSync(FIXTURE_SESSIONS, sessionsRoot, { recursive: true });
   tracesDir = join(base, 'traces');
   cpSync(FIXTURE_TRACES, tracesDir, { recursive: true });
 
@@ -105,112 +96,11 @@ beforeEach(() => {
 
   runtime = createDashboardRuntime({
     dbPath: ':memory:',
-    sessionsRoot,
     tracesDir,
     modelsDir,
     cacheRoot,
   });
   api = createTestClient(runtime);
-});
-
-it('serves delegate identity and evidence compression consistently, and withholds a live partial handoff', async () => {
-  const file = join(sessionsRoot, 'delegate.jsonl');
-  const raw =
-    delegationFixture()
-      .map((entry) => JSON.stringify(entry))
-      .join('\n') + '\n';
-  writeFileSync(file, raw);
-  await ingest();
-  const listing = (await (await api.fetch('/api/sessions')).json()) as {
-    sessions: { id: string; inputTokens: number; outputTokens: number; delegation: unknown }[];
-  };
-  const indexed = listing.sessions.find((s) => s.id === 'delegate')!;
-  expect(indexed).toMatchObject({
-    inputTokens: 2000,
-    outputTokens: 2000,
-    delegation: {
-      status: 'complete',
-      evidenceTokens: 3,
-      handoffTokens: 1,
-      savedTokens: 2,
-      savingsRatio: 2 / 3,
-    },
-  });
-  const detail = (await (await api.fetch('/api/sessions/delegate')).json()) as { session: { delegation: unknown } };
-  expect(detail.session.delegation).toEqual(indexed.delegation);
-  expect(readFileSync(file, 'utf8')).toBe(raw);
-
-  const partial =
-    raw +
-    JSON.stringify({
-      type: 'custom',
-      id: 'next',
-      parentId: 'f',
-      timestamp: '',
-      customType: 'mlx-delegate-session',
-      data: { version: 1, sessionId: 'delegate' },
-    }) +
-    '\n{"type":"message"';
-  writeFileSync(file, partial);
-  // Detail reads the new snapshot even before the periodic index refresh.
-  const live = (await (await api.fetch('/api/sessions/delegate')).json()) as { session: { delegation: unknown } };
-  expect(live.session.delegation).toEqual({ status: 'incomplete', reason: 'partial-record' });
-  expect(readFileSync(file, 'utf8')).toBe(partial);
-  await ingest();
-  const refreshed = (await (await api.fetch('/api/sessions')).json()) as {
-    sessions: { id: string; delegation: unknown }[];
-  };
-  expect(refreshed.sessions.find((s) => s.id === 'delegate')!.delegation).toEqual(live.session.delegation);
-});
-
-it('serves session-wide unique evidence and does not label a real fork of a legacy delegate', async () => {
-  const original = delegationFixture();
-  const follow = delegationFixture()
-    .slice(1)
-    .map((entry) => ({
-      ...entry,
-      id: `next-${entry.id}`,
-      parentId: entry.parentId ? `next-${entry.parentId}` : 'f',
-    }));
-  writeFileSync(
-    join(sessionsRoot, 'delegate.jsonl'),
-    [...original, ...follow].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
-  );
-
-  const legacy = delegationFixture('legacy');
-  legacy.splice(1, 1);
-  legacy[1]!.parentId = null;
-  const legacyFile = join(sessionsRoot, 'legacy.jsonl');
-  legacy.push({
-    type: 'custom',
-    id: 'blocked',
-    parentId: 'f',
-    timestamp: '',
-    customType: 'mlx-delegate-handoff',
-    data: { reason: 'permission denied', sessionFile: legacyFile },
-  });
-  writeFileSync(legacyFile, legacy.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
-  const fork = SessionManager.forkFrom(legacyFile, '/w', sessionsRoot);
-  expect(fork.getHeader()?.parentSession).toBe(legacyFile);
-  await ingest();
-
-  const listing = (await (await api.fetch('/api/sessions')).json()) as {
-    sessions: { id: string; delegation: unknown }[];
-  };
-  const byId = new Map(listing.sessions.map((session) => [session.id, session.delegation]));
-  expect(byId.get('delegate')).toMatchObject({
-    status: 'complete',
-    evidenceTokens: 3,
-    handoffTokens: 2,
-    savedTokens: 1,
-    savingsRatio: 1 / 3,
-  });
-  expect(byId.get('legacy')).toEqual({ status: 'unavailable', reason: 'legacy' });
-  expect(byId.get(fork.getSessionId())).toBeNull();
-  for (const id of ['delegate', 'legacy', fork.getSessionId()]) {
-    const detail = (await (await api.fetch(`/api/sessions/${id}`)).json()) as { session: { delegation: unknown } };
-    expect(detail.session.delegation).toEqual(byId.get(id));
-  }
 });
 
 afterEach(async () => {
@@ -246,11 +136,8 @@ describe('dashboard api — models & catalog', () => {
     };
     expect(await listModels()).toEqual(names);
     const home = join(base, 'home');
-    mkdirSync(join(home, '.mlx-node', 'agent'), { recursive: true });
-    writeFileSync(
-      join(home, '.mlx-node', 'agent', 'settings.json'),
-      JSON.stringify({ defaultProvider: 'mlx', defaultModel: names[1] }),
-    );
+    mkdirSync(join(home, '.mlx-agent'), { recursive: true });
+    writeFileSync(join(home, '.mlx-agent', 'config.toml'), `[models]\ndefault = "${names[1]}"\n`);
     const service = new CodingAgentsService({
       prepareCommand: async () => join(home, '.mlx-node', 'bin', 'mlx'),
       home,
@@ -283,11 +170,8 @@ describe('dashboard api — models & catalog', () => {
     };
     expect(await listModels()).toContain(name);
     const home = join(base, 'native-home');
-    mkdirSync(join(home, '.mlx-node', 'agent'), { recursive: true });
-    writeFileSync(
-      join(home, '.mlx-node', 'agent', 'settings.json'),
-      JSON.stringify({ defaultProvider: 'mlx', defaultModel: name }),
-    );
+    mkdirSync(join(home, '.mlx-agent'), { recursive: true });
+    writeFileSync(join(home, '.mlx-agent', 'config.toml'), `[models]\ndefault = "${name}"\n`);
     const service = new CodingAgentsService({
       home,
       env: {},
@@ -385,1298 +269,33 @@ describe('dashboard api — models & catalog', () => {
   });
 });
 
-describe('dashboard api — sessions', () => {
-  it('lists ingested sessions', async () => {
-    await ingest();
-    const res = await api.fetch('/api/sessions');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { sessions: Array<{ id: string; name: string | null; models: string[] }> };
-    const ids = body.sessions.map((s) => s.id);
-    expect(ids).toContain('fix-1');
-    expect(ids).toContain('fix-2');
-  });
-
-  it('reports the true total and honors limit/offset paging', async () => {
-    await ingest();
-    const all = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string }>;
-      total: number;
-    };
-    expect(all.total).toBe(2);
-    expect(all.sessions).toHaveLength(2);
-
-    // A capped page still reports the full match total (so the Overview tile is
-    // accurate past the page size), and offset walks to the next row.
-    const page = (await (await api.fetch('/api/sessions?limit=1')).json()) as {
-      sessions: Array<{ id: string }>;
-      total: number;
-    };
-    expect(page.total).toBe(2);
-    expect(page.sessions).toHaveLength(1);
-
-    const next = (await (await api.fetch('/api/sessions?limit=1&offset=1')).json()) as {
-      sessions: Array<{ id: string }>;
-      total: number;
-    };
-    expect(next.sessions).toHaveLength(1);
-    expect(next.sessions[0].id).not.toBe(page.sessions[0].id);
-  });
-
-  it('serves a token total scoped to the sessions it counted, unlike the machine-wide metrics', async () => {
-    // The Overview "Sessions" tile shows a count and a token total side by side.
-    // The count can only ever describe THIS sessions root — ingest deletes rows
-    // whose file left it — while `/api/metrics/overview` sums `traces`, a
-    // machine-wide log under ~/.mlx-node/metrics/traces that no --session-dir
-    // narrows. Serving the tokens beside the count is what makes the two halves
-    // describable by one sentence.
-    await ingest();
-    const body = (await (await api.fetch('/api/sessions')).json()) as { total: number; tokens: number };
-    expect(body.total).toBe(2);
-    // fix-1: (100 + 50) + (180 + 60); fix-2: 40 + 20. The three fixture traces
-    // are NOT delegated work — none carries a root_session_id pointing here — so
-    // none of them belongs to these sessions.
-    expect(body.tokens).toBe(450);
-
-    const overview = (await (await api.fetch('/api/metrics/overview')).json()) as {
-      totals: { inputTokens: number; outputTokens: number };
-    };
-    // The same window, machine-wide: the two orphan traces add 390 tokens that
-    // belong to no session in this root. Pairing this number with `total` above
-    // is the defect; the gap is exactly what the tile used to misreport.
-    expect(overview.totals.inputTokens + overview.totals.outputTokens).toBe(840);
-  });
-
-  // The list token total and the per-session `/metrics` totals answer different
-  // questions and MUST NOT be assumed equal: a fork copies its parent's turns
-  // verbatim, so the list bills that shared history once while each session's own
-  // page keeps its copy. Both numbers are pinned here so neither can drift into
-  // the other's meaning unnoticed.
-  it('bills inherited fork turns once in the list total, twice across the per-session ones', async () => {
-    // fork-1 copies fix-1's m1..m4 VERBATIM (same entry ids, same mlxTraceId) and
-    // adds one new inference of its own.
-    const fork = [
-      { type: 'session', version: 3, id: 'fork-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      {
-        type: 'message',
-        id: 'm1',
-        parentId: null,
-        timestamp: '2026-07-01T10:00:01.000Z',
-        message: { role: 'user', content: 'Hello, world', timestamp: 1782036001000 },
-      },
-      {
-        type: 'message',
-        id: 'm2',
-        parentId: 'm1',
-        timestamp: '2026-07-01T10:00:02.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'Hi there' }],
-          model: 'qwen3_5',
-          usage: { input: 100, output: 50, cacheRead: 10, reasoning: 5 },
-          timestamp: 1782036002000,
-          mlxTraceId: 'trace-aaa',
-        },
-      },
-      {
-        type: 'message',
-        id: 'm3',
-        parentId: 'm2',
-        timestamp: '2026-07-01T10:00:03.000Z',
-        message: { role: 'user', content: 'Second question', timestamp: 1782036003000 },
-      },
-      {
-        type: 'message',
-        id: 'm4',
-        parentId: 'm3',
-        timestamp: '2026-07-01T10:00:04.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'An answer' }],
-          model: 'qwen3_5',
-          usage: { input: 180, output: 60, cacheRead: 100, reasoning: 12 },
-          timestamp: 1782036004000,
-        },
-      },
-      {
-        type: 'message',
-        id: 'm5',
-        parentId: 'm4',
-        timestamp: '2026-07-01T11:00:05.000Z',
-        message: { role: 'user', content: 'Only on the fork', timestamp: 1782039605000 },
-      },
-      {
-        type: 'message',
-        id: 'm6',
-        parentId: 'm5',
-        timestamp: '2026-07-01T11:00:06.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'Fork-only answer' }],
-          model: 'qwen3_5',
-          usage: { input: 7, output: 3, cacheRead: 0, reasoning: 0 },
-          timestamp: 1782039606000,
-        },
-      },
-    ];
-    writeFileSync(
-      join(sessionsRoot, '--w--', '2026-07-01T11-00-00_fork-1.jsonl'),
-      `${fork.map((l) => JSON.stringify(l)).join('\n')}\n`,
-    );
-    await ingest();
-
-    const body = (await (await api.fetch('/api/sessions')).json()) as {
-      total: number;
-      tokens: number;
-      sessions: Array<{ id: string; inputTokens: number; outputTokens: number }>;
-    };
-    expect(body.total).toBe(3);
-    // Distinct inferences: trace-aaa (150) + entry m4 (240) — each held by BOTH
-    // fix-1 and fork-1 but billed once — plus fix-2's n2 (60) and the fork's own
-    // m6 (10).
-    expect(body.tokens).toBe(460);
-
-    // The per-row columns are raw per-session sums, so the fork's inherited
-    // history shows up in both rows. Summing them is NOT the headline total.
-    const byId = new Map(body.sessions.map((s) => [s.id, s.inputTokens + s.outputTokens]));
-    expect(byId.get('fix-1')).toBe(390);
-    expect(byId.get('fix-2')).toBe(60);
-    expect(byId.get('fork-1')).toBe(400);
-    const rowSum = [...byId.values()].reduce((a, b) => a + b, 0);
-    expect(rowSum).toBe(850);
-
-    // The per-session `/metrics` endpoint agrees with its own row, copy for copy.
-    const perSession: number[] = [];
-    for (const id of ['fix-1', 'fix-2', 'fork-1']) {
-      const m = (await (await api.fetch(`/api/sessions/${id}/metrics`)).json()) as {
-        turns: Array<{ inputTokens: number | null; outputTokens: number | null }>;
-      };
-      perSession.push(m.turns.reduce((sum, t) => sum + (t.inputTokens ?? 0) + (t.outputTokens ?? 0), 0));
-    }
-    expect(perSession).toEqual([390, 60, 400]);
-
-    // The gap between the two readings is exactly the shared history (150 + 240),
-    // counted once by the list and once more by the fork's own page.
-    expect(rowSum - body.tokens).toBe(390);
-  });
-
-  it('reports no tokens for an empty sessions root while machine-wide metrics stay populated', async () => {
-    // Same machine, same trace log, a --session-dir holding nothing. The session
-    // list correctly says zero; the metrics overview still reports hundreds of
-    // tokens. A tile that reads its headline from one and its subtitle from the
-    // other renders "Sessions 0 · 530 tokens".
-    const emptyRoot = join(base, 'empty-sessions');
-    mkdirSync(emptyRoot, { recursive: true });
-    const other = createDashboardRuntime({
-      dbPath: ':memory:',
-      sessionsRoot: emptyRoot,
-      tracesDir,
-      modelsDir,
-      cacheRoot,
-    });
-    const otherApi = createTestClient(other);
-    try {
-      expect((await otherApi.fetch('/api/ingest', { method: 'POST' })).status).toBe(200);
-      const body = (await (await otherApi.fetch('/api/sessions')).json()) as { total: number; tokens: number };
-      expect(body.total).toBe(0);
-      expect(body.tokens).toBe(0);
-
-      const overview = (await (await otherApi.fetch('/api/metrics/overview')).json()) as {
-        totals: { inputTokens: number; outputTokens: number };
-      };
-      expect(overview.totals.inputTokens + overview.totals.outputTokens).toBeGreaterThan(0);
-    } finally {
-      await other.close();
-    }
-  });
-
-  it('returns a session detail with transcript text', async () => {
-    await ingest();
-    const res = await api.fetch('/api/sessions/fix-1');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      session: { id: string };
-      transcript: Array<{ role: string; text: string }>;
-    };
-    expect(body.session.id).toBe('fix-1');
-    const texts = body.transcript.map((t) => t.text);
-    expect(texts.some((t) => t.includes('Hello, world'))).toBe(true);
-    expect(texts.some((t) => t.includes('Hi there'))).toBe(true);
-  });
-
-  it('reports an invalid transcript rather than 500ing when a bare null precedes the header', async () => {
-    // `null` is a syntactically valid JSONL record that `parseSessionEntries` keeps
-    // verbatim, and `readSessionEntries` returns the array UNMIGRATED once any record
-    // is a non-object. The detail handler then looked the header up with a raw
-    // `.type` deref — before the topology gate that exists to reject exactly this —
-    // so the one record whose deref throws produced a 500 carrying a raw TypeError
-    // string. `isValidSessionTopology`'s own contract is to run "BEFORE any
-    // `.type`/`.id` access"; this was the site that broke it.
-    await ingest();
-    const file = join(sessionsRoot, '--w--', '2026-07-01T10-00-00_fix-1.jsonl');
-    writeFileSync(file, `null\n${readFileSync(file, 'utf8')}`);
-
-    const res = await api.fetch('/api/sessions/fix-1');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      session: { id: string };
-      transcript: unknown[];
-      transcriptError?: string;
-    };
-    // Not a 409: the header still names THIS row, so the file is this session,
-    // merely malformed. The row's last-known-good metadata is still served — the
-    // same answer every other non-object record already got.
-    expect(body.session.id).toBe('fix-1');
-    expect(body.transcript).toEqual([]);
-    expect(body.transcriptError).toContain('Session tree is invalid');
-  });
-
-  it('answers a non-object record the same way whether or not its deref would throw', async () => {
-    // The convention guard. `null` is the only first-record value whose `.type`
-    // deref throws — `(123).type` is merely `undefined`, and an array IS an object
-    // — so a fix that special-cases `null` into a 409 or a 404 would split one
-    // malformed-file behaviour into two. Both must land on the same answer.
-    await ingest();
-    const file = join(sessionsRoot, '--w--', '2026-07-01T10-00-00_fix-1.jsonl');
-    const original = readFileSync(file, 'utf8');
-    for (const record of ['null', '123', '"str"', 'true', '[]']) {
-      writeFileSync(file, `${record}\n${original}`);
-      const res = await api.fetch('/api/sessions/fix-1');
-      const body = (await res.json()) as { transcriptError?: string };
-      expect([record, res.status]).toEqual([record, 200]);
-      expect([record, body.transcriptError]).toEqual([
-        record,
-        'Session tree is invalid (cycle, duplicate id, or non-object message); transcript unavailable',
-      ]);
-    }
-  });
-
-  it('404s an unknown session', async () => {
-    await ingest();
-    const res = await api.fetch('/api/sessions/does-not-exist');
-    expect(res.status).toBe(404);
-  });
-
-  it('renames a session (persists a session_info line and reflects the new name)', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
-    // The fixture file was just copied (recent mtime); age it past the liveness
-    // window so this idle session renames instead of tripping the active-session
-    // refusal (Finding 3).
-    const old = Date.now() / 1000 - 600;
-    utimesSync(filePath, old, old);
-
-    const patch = await api.fetch('/api/sessions/fix-1', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Renamed Session' }),
-    });
-    expect(patch.status).toBe(200);
-
-    const detail = (await (await api.fetch('/api/sessions/fix-1')).json()) as {
-      session: { name: string | null };
-    };
-    expect(detail.session.name).toBe('Renamed Session');
-
-    const fileText = readFileSync(filePath, 'utf-8');
-    expect(fileText).toContain('"type":"session_info"');
-    expect(fileText).toContain('Renamed Session');
-  });
-
-  // Finding F: a rename must verify the indexed path still holds THIS session
-  // before writing its name — a reused path must not stamp a foreign session.
-  it('refuses to rename when the indexed path was reused by another session', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
-
-    // Replace fix-1's file on disk with a different session (bypassing ingest):
-    // the index still points fix-1 at a path that now holds session 'reused-B'.
-    writeFileSync(
-      filePath,
-      `${JSON.stringify({ type: 'session', version: 3, id: 'reused-B', timestamp: '2026-07-09T10:00:00.000Z', cwd: '/w' })}\n${JSON.stringify({ type: 'message', id: 'b1', parentId: null, timestamp: '2026-07-09T10:00:01.000Z', message: { role: 'user', content: 'from B' } })}\n`,
-    );
-
-    const patch = await api.fetch('/api/sessions/fix-1', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Hijack' }),
-    });
-    expect(patch.status).toBe(409);
-
-    // Session B's file was never stamped with fix-1's requested name.
-    const fileText = readFileSync(filePath, 'utf-8');
-    expect(fileText).not.toContain('Hijack');
-    expect(fileText).not.toContain('"type":"session_info"');
-    expect(fileText).toContain('reused-B');
-  });
-
-  // Finding 3: renaming a session whose file has an incomplete trailing line must
-  // be refused (409). SessionManager.open migrates + rewrites on construction,
-  // persisting only the parsed entries, so opening would permanently truncate the
-  // malformed trailing record. The file must be left byte-for-byte unchanged.
-  it('refuses to rename a session with an incomplete trailing line and leaves the file byte-identical', async () => {
-    const dir = join(sessionsRoot, '--w--');
-    mkdirSync(dir, { recursive: true });
-    const file = join(dir, '2026-07-12T10-00-00_rn-trunc.jsonl');
-    const header = JSON.stringify({
-      type: 'session',
-      version: 3,
-      id: 'rn-trunc',
-      timestamp: '2026-07-12T10:00:00.000Z',
-      cwd: '/w',
-    });
-    const user = JSON.stringify({
-      type: 'message',
-      id: 'm1',
-      parentId: null,
-      timestamp: '2026-07-12T10:00:01.000Z',
-      message: { role: 'user', content: 'keep me' },
-    });
-    const asst = JSON.stringify({
-      type: 'message',
-      id: 'm2',
-      parentId: 'm1',
-      timestamp: '2026-07-12T10:00:02.000Z',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'and me' }],
-        model: 'qwen3_5',
-        usage: { input: 5, output: 6 },
-      },
-    });
-    const truncated =
-      '{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-12T10:00:03.000Z","message":{"role":"asst';
-    const original = `${header}\n${user}\n${asst}\n${truncated}`;
-    writeFileSync(file, original);
-    // Age it past the liveness window. Without this the file's fresh mtime trips
-    // the ACTIVE-session refusal, which is also a 409 — so the assertion below
-    // would pass even with the data-loss guard removed. Ageing it leaves the
-    // data-loss guard as the only thing that can produce this 409.
-    const old = Date.now() / 1000 - 600;
-    utimesSync(file, old, old);
-    await ingest();
-    const before = readFileSync(file);
-
-    const patch = await api.fetch('/api/sessions/rn-trunc', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Should Not Apply' }),
-    });
-    expect(patch.status).toBe(409);
-
-    // No write happened: byte-for-byte unchanged, no session_info stamped.
-    const after = readFileSync(file);
-    expect(after.equals(before)).toBe(true);
-    expect(after.toString('utf-8')).toBe(original);
-    expect(after.toString('utf-8')).not.toContain('"type":"session_info"');
-    expect(after.toString('utf-8')).not.toContain('Should Not Apply');
-  });
-
-  // Finding 3 (liveness): renaming a session that appears actively written by a
-  // live agent turn is refused (409). pi has no cross-process lock, so appending a
-  // `session_info` to a file a concurrent turn is extending would race that turn.
-  // An IDLE session (mtime well beyond the liveness window) renames normally.
-  it('refuses to rename a session that looks active, but renames an idle one', async () => {
-    const dir = join(sessionsRoot, '--w--');
-    mkdirSync(dir, { recursive: true });
-    const completeSession = (id: string, hour: string): object[] => [
-      { type: 'session', version: 3, id, timestamp: `2026-07-13T${hour}:00:00.000Z`, cwd: '/w' },
-      {
-        type: 'message',
-        id: 'u1',
-        parentId: null,
-        timestamp: `2026-07-13T${hour}:00:01.000Z`,
-        message: { role: 'user', content: 'hi' },
-      },
-      {
-        type: 'message',
-        id: 'a1',
-        parentId: 'u1',
-        timestamp: `2026-07-13T${hour}:00:02.000Z`,
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'yo' }],
-          model: 'qwen3_5',
-          usage: { input: 5, output: 6 },
-        },
-      },
-    ];
-
-    // A complete, valid session with a very recent mtime → reaches (and trips) the
-    // liveness pre-check rather than a records/identity 409.
-    const liveFile = join(dir, '2026-07-13T10-00-00_rn-live.jsonl');
-    writeFileSync(
-      liveFile,
-      `${completeSession('rn-live', '10')
-        .map((l) => JSON.stringify(l))
-        .join('\n')}\n`,
-    );
-    const now = Date.now() / 1000;
-    utimesSync(liveFile, now, now);
-    await ingest();
-    const before = readFileSync(liveFile);
-
-    const live = await api.fetch('/api/sessions/rn-live', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Should Not Apply (active)' }),
-    });
-    expect(live.status).toBe(409);
-    // The active session's file is byte-for-byte untouched — no session_info stamped.
-    const after = readFileSync(liveFile);
-    expect(after.equals(before)).toBe(true);
-    expect(after.toString('utf-8')).not.toContain('"type":"session_info"');
-    expect(after.toString('utf-8')).not.toContain('Should Not Apply');
-
-    // An idle session (mtime well beyond the window) renames normally.
-    const idleFile = join(dir, '2026-07-13T09-00-00_rn-idle.jsonl');
-    writeFileSync(
-      idleFile,
-      `${completeSession('rn-idle', '09')
-        .map((l) => JSON.stringify(l))
-        .join('\n')}\n`,
-    );
-    const old = Date.now() / 1000 - 600; // 10 minutes ago
-    utimesSync(idleFile, old, old);
-    await ingest();
-
-    const idle = await api.fetch('/api/sessions/rn-idle', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Idle Renamed' }),
-    });
-    expect(idle.status).toBe(200);
-    const detail = (await (await api.fetch('/api/sessions/rn-idle')).json()) as {
-      session: { name: string | null };
-    };
-    expect(detail.session.name).toBe('Idle Renamed');
-    expect(readFileSync(idleFile, 'utf-8')).toContain('Idle Renamed');
-  });
-
-  // Finding H: the detail transcript uses the same active-branch projection as
-  // the index — a detached metadata leaf must not resurrect abandoned turns.
-  it('detail transcript shows only the active branch under a detached metadata leaf', async () => {
-    const forked = [
-      { type: 'session', version: 3, id: 'detach-1', timestamp: '2026-07-08T10:00:00.000Z', cwd: '/w' },
-      {
-        type: 'message',
-        id: 'u1',
-        parentId: null,
-        timestamp: '2026-07-08T10:00:01.000Z',
-        message: { role: 'user', content: 'q' },
-      },
-      {
-        type: 'message',
-        id: 'a1',
-        parentId: 'u1',
-        timestamp: '2026-07-08T10:00:02.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'ABANDONED' }],
-          model: 'gemma4',
-          usage: { input: 999, output: 999 },
-        },
-      },
-      {
-        type: 'message',
-        id: 'a2',
-        parentId: 'u1',
-        timestamp: '2026-07-08T10:00:03.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'ACTIVE' }],
-          model: 'qwen3_5',
-          usage: { input: 1, output: 2 },
-        },
-      },
-      { type: 'session_info', id: 'si1', parentId: null, timestamp: '2026-07-08T10:00:04.000Z', name: 'Detached' },
-    ];
-    writeFileSync(
-      join(sessionsRoot, '--w--', '2026-07-08T10-00-00_detach-1.jsonl'),
-      `${forked.map((l) => JSON.stringify(l)).join('\n')}\n`,
-    );
-    await ingest();
-
-    const body = (await (await api.fetch('/api/sessions/detach-1')).json()) as {
-      transcript: Array<{ text: string }>;
-    };
-    const texts = body.transcript.map((t) => t.text);
-    expect(texts.some((t) => t.includes('ACTIVE'))).toBe(true);
-    expect(texts.some((t) => t.includes('ABANDONED'))).toBe(false);
-  });
-
-  // Finding 5: a GET of the session detail must be READ-ONLY. A v1 session with a
-  // malformed trailing line (the case where an open-for-write migrate would both
-  // persist the v1→v3 rewrite and drop the malformed line) must be left byte-for-
-  // byte unchanged on disk while still returning the valid transcript.
-  it('detail GET does not rewrite a v1 session with a malformed trailing line', async () => {
-    const dir = join(sessionsRoot, '--w--');
-    mkdirSync(dir, { recursive: true });
-    const file = join(dir, '2026-07-10T10-00-00_ro-1.jsonl');
-    const header = JSON.stringify({
-      type: 'session',
-      version: 1,
-      id: 'ro-1',
-      timestamp: '2026-07-10T10:00:00.000Z',
-      cwd: '/w',
-    });
-    const user = JSON.stringify({
-      type: 'message',
-      timestamp: '2026-07-10T10:00:01.000Z',
-      message: { role: 'user', content: 'READ ONLY hi' },
-    });
-    const asst = JSON.stringify({
-      type: 'message',
-      timestamp: '2026-07-10T10:00:02.000Z',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'READ ONLY yo' }],
-        model: 'qwen3_5',
-        usage: { input: 5, output: 6 },
-      },
-    });
-    const truncated = '{"type":"message","message":{"role":"asst';
-    const original = `${header}\n${user}\n${asst}\n${truncated}`;
-    writeFileSync(file, original);
-    await ingest();
-    const before = readFileSync(file);
-
-    const res = await api.fetch('/api/sessions/ro-1');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { transcript: Array<{ text: string }> };
-    const texts = body.transcript.map((t) => t.text);
-    expect(texts.some((t) => t.includes('READ ONLY hi'))).toBe(true);
-    expect(texts.some((t) => t.includes('READ ONLY yo'))).toBe(true);
-
-    // The GET never mutated the source of truth.
-    const after = readFileSync(file);
-    expect(after.equals(before)).toBe(true);
-    expect(after.toString('utf-8')).toBe(original);
-  });
-
-  it('deletes a session (file and rows removed)', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
-    expect(existsSync(filePath)).toBe(true);
-
-    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
-    expect(del.status).toBe(200);
-    expect(existsSync(filePath)).toBe(false);
-
-    const after = (await (await api.fetch('/api/sessions')).json()) as { sessions: Array<{ id: string }> };
-    expect(after.sessions.map((s) => s.id)).not.toContain('fix-2');
-    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
-  });
-
-  // Delete carries NO liveness pre-check, unlike rename — see the note in
-  // `handleSessionDelete`. A session written a moment ago (the just-finished or
-  // just-crashed agent, the common cleanup case) must still delete outright rather
-  // than 409 like the rename path does, so borrowing that window here is a
-  // regression, not a hardening.
-  it('deletes a session that was just written (no liveness refusal)', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
-    const now = Date.now() / 1000;
-    utimesSync(filePath, now, now);
-
-    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
-    expect(del.status).toBe(200);
-    expect(existsSync(filePath)).toBe(false);
-    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
-  });
-
-  // A file that exists on disk but cannot be verified (unreadable / corrupt) must
-  // NOT be half-deleted. The old code skipped the `rmSync` yet still dropped the
-  // rows and replied `deleted`, so the transcript stayed on disk out of sync with
-  // the DB: it could re-index on a later successful ingest (reappearing after we
-  // said `deleted`) or linger as an orphan. Delete now refuses with 409, reconciles
-  // the index, and leaves BOTH the row and the file intact. Reading is unrestricted
-  // for root, so chmod 000 there is a no-op — skip.
-  const canTestUnreadable = (process.getuid?.() ?? 0) !== 0;
-  (canTestUnreadable ? it : it.skip)(
-    'refuses to delete an unreadable session file, keeping the row and the file',
-    async () => {
-      await ingest();
-      const before = (await (await api.fetch('/api/sessions')).json()) as {
-        sessions: Array<{ id: string; path: string }>;
-      };
-      const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
-
-      // Unreadable in place: chmod touches ctime only, so mtime/size are unchanged
-      // and the reconcile the handler runs cannot re-read it — its watermark keeps
-      // the existing row rather than quarantining it.
-      chmodSync(filePath, 0o000);
-      try {
-        const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
-        expect(del.status).toBe(409);
-      } finally {
-        chmodSync(filePath, 0o644); // restore so the assertions below (and cleanup) can read it
-      }
-
-      // Neither the file nor the row was removed.
-      expect(existsSync(filePath)).toBe(true);
-      expect((await api.fetch('/api/sessions/fix-2')).status).toBe(200);
-    },
-  );
-
-  // The stale-row guard's legitimate case: a row whose PATH was reused by a NEWER
-  // session must drop ONLY its own rows on delete — never `rmSync` the newer
-  // session's file. This is `different`, not `unverifiable`, so it still succeeds.
-  it('deletes only the stale rows when the path was reused by a newer session', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
-
-    // Overwrite fix-2's path with a brand-new VALID session (a different id), as if
-    // pi reused the path — WITHOUT re-ingesting, so the stale fix-2 row still points
-    // here and the delete must classify the file as `different`.
-    const reused = [
-      JSON.stringify({ type: 'session', version: 3, id: 'reused-B', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/w' }),
-      JSON.stringify({
-        type: 'message',
-        id: 'm1',
-        parentId: null,
-        timestamp: '2026-07-20T10:00:01.000Z',
-        message: { role: 'user', content: 'I am the newer session' },
-      }),
-    ].join('\n');
-    writeFileSync(filePath, `${reused}\n`);
-
-    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
-    expect(del.status).toBe(200);
-    expect((await del.json()) as { deleted: boolean; id: string }).toMatchObject({ deleted: true, id: 'fix-2' });
-
-    // The newer session's file was left untouched (content intact), and the stale
-    // fix-2 row is gone; a fresh ingest then surfaces the newer session.
-    expect(existsSync(filePath)).toBe(true);
-    expect(readFileSync(filePath, 'utf-8')).toContain('reused-B');
-    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
-    await ingest();
-    const after = (await (await api.fetch('/api/sessions')).json()) as { sessions: Array<{ id: string }> };
-    expect(after.sessions.map((s) => s.id)).toContain('reused-B');
-  });
-
-  // A row whose file has already vanished must still be cleaned up — there is
-  // nothing on disk left to orphan, so this is a plain success, not a conflict.
-  it('deletes the rows when the session file is already gone', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
-    unlinkSync(filePath);
-
-    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
-    expect(del.status).toBe(200);
-    expect((await del.json()) as { deleted: boolean; id: string }).toMatchObject({ deleted: true, id: 'fix-2' });
-    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
-  });
-
-  it('renders image reads as thumbnails and raw-binary reads as chips (not garbage)', async () => {
-    // A 1x1 PNG (base64) — the backend passes it through verbatim for the UI to inline.
-    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
-    // Raw HEIC bytes a `read` returned verbatim in a text block: leading NUL control
-    // bytes (→ classified binary) and the `ftypheic` magic (→ labelled HEIC).
-    const nul = String.fromCharCode(0);
-    const heicBytes = nul.repeat(3) + 'ftypheic' + nul.repeat(2) + 'mif1garbagebytes';
-    const dir = join(sessionsRoot, '--imgproj--');
-    mkdirSync(dir, { recursive: true });
-    const lines = [
-      { type: 'session', version: 3, id: 'img-1', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/imgproj' },
-      {
-        type: 'message',
-        id: 'u1',
-        parentId: null,
-        timestamp: '2026-07-20T10:00:01.000Z',
-        message: { role: 'user', content: 'read the files' },
-      },
-      {
-        type: 'message',
-        id: 'r1',
-        parentId: 'u1',
-        timestamp: '2026-07-20T10:00:02.000Z',
-        message: {
-          role: 'toolResult',
-          toolName: 'read',
-          content: [
-            { type: 'text', text: 'Read image file [image/png]' },
-            {
-              type: 'text',
-              text: '[Image: original 6720x4480, displayed at 2000x1333. Multiply coordinates by 3.36 to map to original image.]',
-            },
-            { type: 'image', data: png, mimeType: 'image/png' },
-          ],
-        },
-      },
-      {
-        type: 'message',
-        id: 'r2',
-        parentId: 'r1',
-        timestamp: '2026-07-20T10:00:03.000Z',
-        message: { role: 'toolResult', toolName: 'read', content: [{ type: 'text', text: heicBytes }] },
-      },
-    ];
-    writeFileSync(join(dir, 'img.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
-    await ingest();
-
-    const detail = (await (await api.fetch('/api/sessions/img-1')).json()) as {
-      transcript: Array<{
-        role: string;
-        text: string;
-        images?: Array<{ mimeType: string; data: string }>;
-        binaryNotes?: string[];
-        imageNotes?: string[];
-      }>;
-    };
-
-    const imageEntry = detail.transcript.find((e) => e.images !== undefined);
-    expect(imageEntry?.images).toEqual([{ mimeType: 'image/png', data: png }]);
-    // The coordinate-mapping note is split out of the rendered prose into imageNotes,
-    // leaving only the plain action label — and never left inline in the text.
-    expect(imageEntry?.text).toBe('Read image file [image/png]');
-    expect(imageEntry?.imageNotes?.[0]).toMatch(/Multiply coordinates by 3\.36/);
-    expect(imageEntry?.text ?? '').not.toContain('Multiply coordinates');
-
-    const binaryEntry = detail.transcript.find((e) => e.binaryNotes !== undefined);
-    expect(binaryEntry?.binaryNotes?.[0]).toMatch(/^HEIC · /);
-    // The raw bytes are NOT dumped into rendered text.
-    expect(binaryEntry?.text ?? '').toBe('');
-    expect(JSON.stringify(detail.transcript)).not.toContain('garbagebytes');
-  });
-
-  it('summarizes tool-call args and joins them onto the result row title', async () => {
-    const dir = join(sessionsRoot, '--callproj--');
-    mkdirSync(dir, { recursive: true });
-    const lines = [
-      { type: 'session', version: 3, id: 'call-1', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/callproj' },
-      {
-        type: 'message',
-        id: 'u1',
-        parentId: null,
-        timestamp: '2026-07-20T10:00:01.000Z',
-        message: { role: 'user', content: 'read it' },
-      },
-      {
-        type: 'message',
-        id: 'a1',
-        parentId: 'u1',
-        timestamp: '2026-07-20T10:00:02.000Z',
-        message: {
-          role: 'assistant',
-          model: 'qwen3.6-27b-unsloth-mxfp4-mlx',
-          content: [{ type: 'toolCall', id: 'call_abc', name: 'read', arguments: { path: '/callproj/src/lib.rs' } }],
-        },
-      },
-      {
-        type: 'message',
-        id: 'r1',
-        parentId: 'a1',
-        timestamp: '2026-07-20T10:00:03.000Z',
-        message: {
-          role: 'toolResult',
-          toolCallId: 'call_abc',
-          toolName: 'read',
-          content: [{ type: 'text', text: 'fn main() {}' }],
-        },
-      },
-    ];
-    writeFileSync(join(dir, 'call.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
-    await ingest();
-
-    const detail = (await (await api.fetch('/api/sessions/call-1')).json()) as {
-      transcript: Array<{
-        role: string;
-        title?: string;
-        toolName?: string;
-        model?: string;
-        toolCalls: Array<{ name: string; summary: string }>;
-      }>;
-    };
-
-    // The assistant's tool call carries a one-line arg digest, and the entry
-    // surfaces the model that produced it (for its per-model logo)…
-    const callEntry = detail.transcript.find((e) => e.toolCalls.length > 0);
-    expect(callEntry?.toolCalls[0]).toMatchObject({ name: 'read', summary: '/callproj/src/lib.rs' });
-    expect(callEntry?.model).toBe('qwen3.6-27b-unsloth-mxfp4-mlx');
-    // …and the result row recovers the same digest by joining on toolCallId.
-    const resultEntry = detail.transcript.find((e) => e.role === 'toolResult' && e.toolName === 'read');
-    expect(resultEntry?.title).toBe('/callproj/src/lib.rs');
-  });
-
-  it('renders the causal parent chain, not the wall clock', async () => {
-    // A clock step backwards mid-session (an NTP correction) makes the tool result
-    // and the closing reply older than the prompt that caused them. The branch walk
-    // returns them in parent order; ordering by `ts` instead would render the result
-    // card ABOVE the assistant bubble holding its call, and the reply above the
-    // prompt — while the session list still shows the correct first message, because
-    // the index derives `firstMessage` from the same chain WITHOUT sorting.
-    //
-    // The step-back is load-bearing: with a monotonic fixture this passes with or
-    // without a sort, and would pin nothing.
-    const dir = join(sessionsRoot, '--clockstep--');
-    mkdirSync(dir, { recursive: true });
-    const lines = [
-      { type: 'session', version: 3, id: 'clock-1', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/clockstep' },
-      {
-        type: 'message',
-        id: 'u1',
-        parentId: null,
-        timestamp: '2026-07-20T10:00:10.000Z',
-        message: { role: 'user', content: 'read it' },
-      },
-      {
-        type: 'message',
-        id: 'a1',
-        parentId: 'u1',
-        timestamp: '2026-07-20T10:00:11.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'toolCall', id: 'call_step', name: 'read', arguments: { path: '/clockstep/lib.rs' } }],
-        },
-      },
-      {
-        type: 'message',
-        id: 'r1',
-        parentId: 'a1',
-        timestamp: '2026-07-20T10:00:05.000Z',
-        message: {
-          role: 'toolResult',
-          toolCallId: 'call_step',
-          toolName: 'read',
-          content: [{ type: 'text', text: 'fn main() {}' }],
-        },
-      },
-      {
-        type: 'message',
-        id: 'a2',
-        parentId: 'r1',
-        timestamp: '2026-07-20T10:00:06.000Z',
-        message: { role: 'assistant', content: 'done' },
-      },
-    ];
-    writeFileSync(join(dir, 'clock.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
-    await ingest();
-
-    const detail = (await (await api.fetch('/api/sessions/clock-1')).json()) as {
-      session: { firstMessage: string | null };
-      transcript: Array<{ role: string; text: string }>;
-    };
-
-    expect(detail.transcript.map((entry) => entry.role)).toEqual(['user', 'assistant', 'toolResult', 'assistant']);
-    // The list row and the transcript must agree on where the conversation starts.
-    expect(detail.session.firstMessage).toBe('read it');
-    expect(detail.transcript[0]?.text).toBe('read it');
-  });
-
-  it('joins turns and traces for session metrics', async () => {
-    await ingest();
-    const res = await api.fetch('/api/sessions/fix-1/metrics');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      turns: Array<{ traceId: string | null; ttftMs: number | null }>;
-      traces: unknown[];
-    };
-    const traced = body.turns.find((t) => t.traceId === 'trace-aaa');
-    expect(traced).toBeDefined();
-    expect(traced?.ttftMs).toBeCloseTo(120.5, 1);
-  });
-
-  // Finding 11b: a subagent (child) turn has no persisted session JSONL of its
-  // own; its trace carries rootSessionId. The root session's metrics view must
-  // surface it via root_session_id, not only its own session_id.
-  it('includes subagent traces under the root session metrics', async () => {
-    writeFileSync(
-      join(tracesDir, '2026-07-02-child.jsonl'),
-      `${JSON.stringify({
-        v: 1,
-        traceId: 'trace-child',
-        ts: 1782036302000,
-        sessionId: 'child-of-fix-1',
-        rootSessionId: 'fix-1',
-        model: 'qwen3_5',
-        durationMs: 10,
-        finishReason: 'stop',
-        promptTokens: 1,
-        cachedTokens: 0,
-        outputTokens: 1,
-        reasoningTokens: 0,
-      })}\n`,
-    );
-    await ingest();
-    const res = await api.fetch('/api/sessions/fix-1/metrics');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { traces: Array<{ traceId: string }> };
-    const traceIds = body.traces.map((t) => t.traceId);
-    // Both the root's own trace (session_id match) and the child's (root match).
-    expect(traceIds).toContain('trace-aaa');
-    expect(traceIds).toContain('trace-child');
-  });
-
-  // #7: a delegated subagent turn has a `traces` row (rootSessionId → root) but no
-  // persisted `turns` row, so the counts/tokens/charts the SPA computes from the
-  // `turns` array used to omit it — disagreeing with the child badge + throughput
-  // it already shows (and with the global overview). The session metrics `turns`
-  // set must UNION the trace-only child rows, net-of-cache and deduped (mirroring
-  // the global fix in handleMetricsOverview).
-  it('merges delegated subagent turns into the session metric turn set (net-of-cache, deduped)', async () => {
-    writeFileSync(
-      join(tracesDir, '2026-07-03-delegated.jsonl'),
-      `${JSON.stringify({
-        v: 1,
-        traceId: 'trace-deleg',
-        ts: 1782036402000,
-        sessionId: 'child-session',
-        rootSessionId: 'fix-1',
-        model: 'child-model',
-        durationMs: 20,
-        finishReason: 'stop',
-        promptTokens: 300,
-        cachedTokens: 40,
-        outputTokens: 90,
-        reasoningTokens: 9,
-        ttftMs: 55.5,
-        decodeTps: 42,
-      })}\n`,
-    );
-    await ingest();
-    const res = await api.fetch('/api/sessions/fix-1/metrics');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      turns: Array<{
-        entryId: string | null;
-        traceId: string | null;
-        inputTokens: number | null;
-        outputTokens: number | null;
-        cachedTokens: number | null;
-        reasoningTokens: number | null;
-        model: string | null;
-        ttftMs: number | null;
-        decodeTps: number | null;
-      }>;
-    };
-
-    const child = body.turns.filter((t) => t.traceId === 'trace-deleg');
-    // Exactly one merged row for the delegated turn (deduped by trace_id).
-    expect(child).toHaveLength(1);
-    // Tokens are NET of cache (300 gross prompt − 40 cached = 260), never gross.
-    expect(child[0].inputTokens).toBe(260);
-    expect(child[0].outputTokens).toBe(90);
-    expect(child[0].cachedTokens).toBe(40);
-    expect(child[0].reasoningTokens).toBe(9);
-    expect(child[0].model).toBe('child-model');
-    // No persisted turn row → no entryId; its trace-derived fields are carried.
-    expect(child[0].entryId).toBeNull();
-    expect(child[0].ttftMs).toBeCloseTo(55.5, 1);
-    expect(child[0].decodeTps).toBeCloseTo(42, 1);
-
-    // The root's own persisted turn (trace-aaa) stays present exactly once — the
-    // dedup excludes only trace-only rows, never a correlated turn.
-    expect(body.turns.filter((t) => t.traceId === 'trace-aaa')).toHaveLength(1);
-  });
-
-  // #3 (R15): the trace-only UNION must admit ONLY genuine delegated children, never
-  // resurrect an ABANDONED root turn. When a root session branches, ingestion drops
-  // its abandoned assistant turn from `turns`, yet the trace lingers with
-  // session_id == root_session_id == the root id. The old `session_id = ? OR
-  // root_session_id = ?` predicate re-admitted it (it passes the trace-only dedup —
-  // no longer in `turns`) and counted it as a fake delegated turn, inflating the
-  // turn count and token totals. A genuine child runs on its own in-memory session,
-  // so its trace has session_id = <child id> != root; the fixed predicate keys on
-  // `root_session_id = ? AND session_id != ?`.
-  it('excludes an abandoned root trace (session_id = root) but keeps genuine children', async () => {
-    writeFileSync(
-      join(tracesDir, '2026-07-04-branch.jsonl'),
-      `${[
-        // (b) ABANDONED root turn: no surviving `turns` row; trace lingers with
-        // session_id == root_session_id == fix-1. Must NOT be counted.
-        {
-          v: 1,
-          traceId: 'trace-abandoned-root',
-          ts: 1782036502000,
-          sessionId: 'fix-1',
-          rootSessionId: 'fix-1',
-          model: 'ghost-model',
-          durationMs: 30,
-          finishReason: 'stop',
-          promptTokens: 9999,
-          cachedTokens: 0,
-          outputTokens: 8888,
-          reasoningTokens: 0,
-        },
-        // (c) GENUINE delegated child: own in-memory session id != root.
-        {
-          v: 1,
-          traceId: 'trace-real-child',
-          ts: 1782036503000,
-          sessionId: 'child-of-fix-1',
-          rootSessionId: 'fix-1',
-          model: 'child-model',
-          durationMs: 20,
-          finishReason: 'stop',
-          promptTokens: 100,
-          cachedTokens: 0,
-          outputTokens: 40,
-          reasoningTokens: 0,
-        },
-      ]
-        .map((r) => JSON.stringify(r))
-        .join('\n')}\n`,
-    );
-    await ingest();
-    const res = await api.fetch('/api/sessions/fix-1/metrics');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      turns: Array<{ traceId: string | null; inputTokens: number | null; outputTokens: number | null }>;
-      traces: Array<{ traceId: string }>;
-    };
-    const ids = body.turns.map((t) => t.traceId);
-
-    // The active root turn (trace-aaa) stays present, the genuine child is merged
-    // exactly once.
-    expect(body.turns.filter((t) => t.traceId === 'trace-aaa')).toHaveLength(1);
-    expect(body.turns.filter((t) => t.traceId === 'trace-real-child')).toHaveLength(1);
-    // The abandoned root trace is NEVER resurrected as a delegated turn.
-    expect(ids).not.toContain('trace-abandoned-root');
-    // Its inflated tokens never reach the session totals.
-    const totalOut = body.turns.reduce((sum, t) => sum + (t.outputTokens ?? 0), 0);
-    const totalIn = body.turns.reduce((sum, t) => sum + (t.inputTokens ?? 0), 0);
-    expect(totalOut).toBeLessThan(8888);
-    expect(totalIn).toBeLessThan(9999);
-
-    // A12: the SAME abandoned trace must also be excluded from the `traces` array
-    // the SPA derives model badges + avg TTFT/decode chips from — mirroring the
-    // turns filter — so those chips agree with the transcript / turn charts. The
-    // active root trace and the genuine delegated child remain.
-    const traceIds = body.traces.map((t) => t.traceId);
-    expect(traceIds).toContain('trace-aaa');
-    expect(traceIds).toContain('trace-real-child');
-    expect(traceIds).not.toContain('trace-abandoned-root');
-  });
-});
-
-// The Sessions page's directory dropdown must offer every indexed directory, not
-// only the ones that happen to appear on the page of rows it was served. The list
-// is capped at 500 rows, so a directory whose sessions are all older than that cap
-// would be missing from the dropdown — and the page's own footnote tells the user
-// to reach older sessions with exactly that filter. The fixture is deliberately
-// larger than the cap: below 501 rows nothing distinguishes the two.
-describe('dashboard server — session directories past the page cap', () => {
-  const OLD_DIR = '/tmp/only-old';
-  const NEW_DIR = '/tmp/recent';
-
-  /** Fake context over an in-memory index holding one row past the 500-row page cap. */
-  function seededCtx(): { ctx: ApiContext; close: () => void } {
-    const dash = openDashboardDb(':memory:');
-    const insert = dash.sqlite.prepare(
-      'INSERT INTO sessions (id, path, cwd, name, created, modified, message_count) VALUES (?, ?, ?, NULL, ?, ?, 1)',
-    );
-    // One session in OLD_DIR, older than every other row, then 500 newer ones in
-    // NEW_DIR — exactly enough to push the old row off the served page.
-    insert.run('old-1', `${OLD_DIR}/old-1.jsonl`, OLD_DIR, 1_000, 1_000);
-    for (let i = 0; i < 500; i++) {
-      insert.run(`new-${i}`, `${NEW_DIR}/new-${i}.jsonl`, NEW_DIR, 10_000 + i, 10_000 + i);
-    }
-    return { ctx: { dash } as unknown as ApiContext, close: dash.close };
-  }
-
-  it('serves every indexed directory even when its sessions fall outside the served page', async () => {
-    const { ctx, close } = seededCtx();
-    try {
-      const res = await call(ctx, 'GET', '/api/sessions');
-      expect(res.ok).toBe(true);
-      const body = (res.ok ? res.body : null) as {
-        sessions: Array<{ cwd: string }>;
-        total: number;
-        cwds: string[];
-      };
-
-      // The fixture really does exercise the cap: 501 matches, 500 rows served,
-      // and the old directory appears on none of them.
-      expect(body.total).toBe(501);
-      expect(body.sessions).toHaveLength(500);
-      expect(body.sessions.map((s) => s.cwd)).not.toContain(OLD_DIR);
-
-      // …yet the directory list, which the dropdown is built from, still names it.
-      expect(body.cwds).toContain(OLD_DIR);
-      expect(body.cwds).toContain(NEW_DIR);
-    } finally {
-      close();
-    }
-  });
-
-  it('keeps the directory list unfiltered so a chosen directory never hides the others', async () => {
-    const { ctx, close } = seededCtx();
-    try {
-      const res = await dispatch(ctx, {
-        method: 'GET',
-        pathname: '/api/sessions',
-        query: new URLSearchParams({ cwd: NEW_DIR }),
-        body: null,
-      });
-      const body = (res.ok ? res.body : null) as { total: number; cwds: string[] };
-      expect(body.total).toBe(500);
-      // Narrowing to one directory must not strand the user there.
-      expect(body.cwds).toEqual([NEW_DIR, OLD_DIR].sort((a, b) => (a < b ? -1 : 1)));
-    } finally {
-      close();
-    }
-  });
-});
-
-// Finding 4: session-file symlink containment. Primary — a symlinked transcript
-// is never indexed, so its external id is simply unknown (404). Defense-in-depth
-// — a GET whose indexed path resolves outside the managed root (via a symlink
-// swapped in after indexing) is refused (403) by the realpath containment guard.
-describe('dashboard api — session symlink containment (Finding 4)', () => {
-  it('never indexes a symlinked transcript, so its external id 404s on GET and PATCH', async () => {
-    const externalFile = join(base, 'external.jsonl');
-    writeFileSync(
-      externalFile,
-      `${[
-        { type: 'session', version: 3, id: 'external-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/secret' },
-        {
-          type: 'message',
-          id: 'm1',
-          parentId: null,
-          timestamp: '2026-07-01T10:00:01.000Z',
-          message: { role: 'user', content: 'secret transcript' },
-        },
-      ]
-        .map((l) => JSON.stringify(l))
-        .join('\n')}\n`,
-    );
-    symlinkSync(externalFile, join(sessionsRoot, '--w--', 'evil.jsonl'));
-    await ingest();
-
-    expect((await api.fetch('/api/sessions/external-1')).status).toBe(404);
-    const patch = await api.fetch('/api/sessions/external-1', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'x' }),
-    });
-    expect(patch.status).toBe(404);
-  });
-
-  it('refuses a GET whose indexed file was swapped to an external symlink', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
-
-    // Swap the indexed real file for a symlink pointing outside the managed root.
-    const externalFile = join(base, 'external-detail.jsonl');
-    writeFileSync(externalFile, readFileSync(filePath));
-    unlinkSync(filePath);
-    symlinkSync(externalFile, filePath);
-
-    // The row still points at filePath, but it now resolves outside the root.
-    expect((await api.fetch('/api/sessions/fix-1')).status).toBe(403);
-  });
-
-  // Finding 5: an IN-ROOT swap passes realpath containment (the target is a real
-  // session inside the root), so the detail handler must additionally require the
-  // parsed header id to still be THIS row. A file (or in-root symlink) that now
-  // holds a different session → 409, and reconciling the stale row → 404 next.
-  it('409s a GET whose indexed file resolves in-root to a different session, then drops the row', async () => {
-    await ingest();
-    const before = (await (await api.fetch('/api/sessions')).json()) as {
-      sessions: Array<{ id: string; path: string }>;
-    };
-    const aPath = before.sessions.find((s) => s.id === 'fix-1')!.path;
-
-    // A genuine in-root session B (the symlink target — a regular file in the root).
-    const bPath = join(sessionsRoot, '--w--', '2026-07-11T10-00-00_sess-B.jsonl');
-    writeFileSync(
-      bPath,
-      `${[
-        { type: 'session', version: 3, id: 'sess-B', timestamp: '2026-07-11T10:00:00.000Z', cwd: '/w' },
-        {
-          type: 'message',
-          id: 'b1',
-          parentId: null,
-          timestamp: '2026-07-11T10:00:01.000Z',
-          message: { role: 'user', content: 'B in root' },
-        },
-      ]
-        .map((l) => JSON.stringify(l))
-        .join('\n')}\n`,
-    );
-
-    // Swap A's real file for an in-root symlink to B: containment passes, header id won't.
-    unlinkSync(aPath);
-    symlinkSync(bPath, aPath);
-
-    // fix-1's row resolves (in-root) to B, whose header id is sess-B, not fix-1 → 409.
-    expect((await api.fetch('/api/sessions/fix-1')).status).toBe(409);
-    // The 409 path reconciles: A's row (now a symlink, not a regular file) is dropped.
-    expect((await api.fetch('/api/sessions/fix-1')).status).toBe(404);
-    // B itself indexes and serves normally.
-    expect((await api.fetch('/api/sessions/sess-B')).status).toBe(200);
-  });
-});
-
 describe('dashboard api — ingest fault isolation', () => {
   // chmod 000 is a no-op for root, so the unreadable root would still list — skip.
   const canTestUnreadable = (process.getuid?.() ?? 0) !== 0;
 
-  (canTestUnreadable ? it : it.skip)('still ingests traces when the session root is unreadable', async () => {
-    // `doIngest` wraps BOTH halves in one try/catch, so a throw out of the session
-    // scan means the trace ingest on the next line never runs: every periodic pass
-    // fails identically, `/api/ingest` reports all-zero with a 200, and the metrics
-    // pages go stale while the 30-day trace prune (which lives inside the trace
-    // ingest) freezes. The session scan must degrade to a warning instead.
+  (canTestUnreadable ? it : it.skip)('degrades an unreadable trace root to a warning, not a failure', async () => {
+    // The trace ingest must degrade to a warning instead of throwing: a throw out
+    // of `doIngest` would report the whole pass as failed while the rows stay
+    // stale, and an empty listing read as "every source file gone" would delete
+    // the index on a fault that says nothing about the files.
     await ingest();
 
-    writeFileSync(
-      join(tracesDir, 'late.jsonl'),
-      `${JSON.stringify({
-        v: 1,
-        traceId: 'trace-after-chmod',
-        ts: 1782039999000,
-        model: 'qwen3_5',
-        durationMs: 10,
-        finishReason: 'stop',
-        promptTokens: 1,
-        cachedTokens: 0,
-        outputTokens: 1,
-        reasoningTokens: 0,
-      })}\n`,
-    );
-
-    chmodSync(sessionsRoot, 0o000);
+    chmodSync(tracesDir, 0o000);
     try {
       const res = await api.fetch('/api/ingest', { method: 'POST' });
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
-        sessions: { removed: number; warnings: string[] };
-        traces: { files: number; records: number };
+        traces: { files: number; records: number; pruned: number; warnings: string[] };
       };
-      // The trace half ran to completion and picked up the file written above.
-      expect(body.traces.files).toBeGreaterThan(0);
-      expect(body.traces.records).toBeGreaterThan(0);
-      // The session half reported a skip, not a scan, and deleted nothing.
-      expect(body.sessions.warnings.some((w) => w.includes('scan skipped'))).toBe(true);
-      expect(body.sessions.removed).toBe(0);
+      expect(body.traces.warnings.some((w) => w.includes('scan skipped'))).toBe(true);
 
-      // An unreadable root is unknown, not empty: the indexed sessions survive it.
-      const list = (await (await api.fetch('/api/sessions')).json()) as { total: number };
-      expect(list.total).toBe(2);
+      // An unreadable root is unknown, not empty: the indexed traces survive it.
+      const overview = (await (await api.fetch('/api/metrics/overview')).json()) as {
+        totals: { traces: number };
+      };
+      expect(overview.totals.traces).toBe(3);
     } finally {
-      chmodSync(sessionsRoot, 0o755); // restore so afterEach cleanup can remove it
+      chmodSync(tracesDir, 0o755); // restore so afterEach cleanup can remove it
     }
   });
 });
@@ -1698,175 +317,6 @@ describe('dashboard api — metrics overview', () => {
     expect(Array.isArray(body.modelShare)).toBe(true);
     expect(body.totals.turns).toBeGreaterThan(0);
     expect(body.totals.outputTokens).toBeGreaterThan(0);
-  });
-
-  // Finding 4: a forked session copies fix-1's turns verbatim (same entry ids and
-  // mlxTraceId) into a new session file. The per-session views keep every copy,
-  // but the GLOBAL overview must count each inference once.
-  it('counts a forked inference once in the global overview, not per copy', async () => {
-    const fork = [
-      { type: 'session', version: 3, id: 'fork-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      {
-        type: 'message',
-        id: 'm1',
-        parentId: null,
-        timestamp: '2026-07-01T10:00:01.000Z',
-        message: { role: 'user', content: 'Hello, world', timestamp: 1782036001000 },
-      },
-      {
-        type: 'message',
-        id: 'm2',
-        parentId: 'm1',
-        timestamp: '2026-07-01T10:00:02.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'Hi there' }],
-          model: 'qwen3_5',
-          usage: { input: 100, output: 50, cacheRead: 10, reasoning: 5 },
-          timestamp: 1782036002000,
-          mlxTraceId: 'trace-aaa',
-        },
-      },
-      {
-        type: 'message',
-        id: 'm3',
-        parentId: 'm2',
-        timestamp: '2026-07-01T10:00:03.000Z',
-        message: { role: 'user', content: 'Second question', timestamp: 1782036003000 },
-      },
-      {
-        type: 'message',
-        id: 'm4',
-        parentId: 'm3',
-        timestamp: '2026-07-01T10:00:04.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'An answer' }],
-          model: 'qwen3_5',
-          usage: { input: 180, output: 60, cacheRead: 100, reasoning: 12 },
-          timestamp: 1782036004000,
-        },
-      },
-    ];
-    writeFileSync(
-      join(sessionsRoot, '--w--', '2026-07-01T11-00-00_fork-1.jsonl'),
-      `${fork.map((l) => JSON.stringify(l)).join('\n')}\n`,
-    );
-    await ingest();
-
-    const body = (await (await api.fetch('/api/metrics/overview')).json()) as {
-      modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
-      totals: {
-        turns: number;
-        inputTokens: number;
-        outputTokens: number;
-        cachedTokens: number;
-        reasoningTokens: number;
-      };
-    };
-    // fix-1 (2 turns) + fix-2 (1) + fork-1 (2 verbatim copies of fix-1) → 3 distinct
-    // turns, PLUS the two trace-only fixture rows that carry no correlating `turns`
-    // row (trace-bbb=gemma4, trace-ccc=lfm2), which the F3 union counts as delegated
-    // subagent turns → 5 total.
-    expect(body.totals.turns).toBe(5);
-    expect(body.totals.inputTokens).toBe(570); // 100 + 180 + 40 (fork collapsed) + 200 + 50 (trace-only, net of cache)
-    expect(body.totals.outputTokens).toBe(270); // 50 + 60 + 20 + 128 + 12
-    expect(body.totals.cachedTokens).toBe(135); // 10 + 100 + 0 + 0 + 25
-    expect(body.totals.reasoningTokens).toBe(17); // 5 + 12 + 0 + 0 + 0
-
-    // Distinct real inferences per model stay separate: qwen3_5's forked copies
-    // collapse to 2 (trace-aaa correlates, so it is not double-counted); gemma4 is
-    // the n2 turn (20) plus the trace-only trace-bbb (128) → 2 turns / 148 output.
-    const qwen = body.modelShare.find((m) => m.model === 'qwen3_5');
-    const gemma = body.modelShare.find((m) => m.model === 'gemma4');
-    expect(qwen?.turns).toBe(2);
-    expect(qwen?.outputTokens).toBe(110);
-    expect(gemma?.turns).toBe(2);
-    expect(gemma?.outputTokens).toBe(148);
-  });
-
-  // F3: subagent turns run on an in-memory session manager → no session JSONL → no
-  // `turns` row, but the shared provider still writes a `traces` row carrying token
-  // columns. Those trace-only rows must be UNIONed into tokensByDay/modelShare/
-  // turnTotals (which otherwise read `turns` only), each counted ONCE and never
-  // double-counting a normal turn whose trace correlates 1:1 to a `turns` row.
-  it('includes trace-only (subagent) turns in token aggregates without double-counting', async () => {
-    const dayStart = Date.parse('2026-07-05T00:00:00.000Z');
-    const dayEnd = Date.parse('2026-07-05T23:59:59.999Z');
-    const midMs = Date.parse('2026-07-05T12:00:00.000Z');
-
-    // A NORMAL turn: a persisted assistant turn whose trace correlates 1:1 (same
-    // trace_id `corr-1`). Its authoritative tokens live in `turns`.
-    const root = [
-      { type: 'session', version: 3, id: 'sub-root', timestamp: '2026-07-05T12:00:00.000Z', cwd: '/w' },
-      {
-        type: 'message',
-        id: 'sm1',
-        parentId: null,
-        timestamp: '2026-07-05T12:00:00.500Z',
-        message: { role: 'user', content: 'root question', timestamp: midMs },
-      },
-      {
-        type: 'message',
-        id: 'sm2',
-        parentId: 'sm1',
-        timestamp: '2026-07-05T12:00:01.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'root answer' }],
-          model: 'corr-model',
-          usage: { input: 300, output: 90, cacheRead: 30, reasoning: 9 },
-          timestamp: midMs,
-          mlxTraceId: 'corr-1',
-        },
-      },
-    ];
-    writeFileSync(
-      join(sessionsRoot, '--w--', '2026-07-05T12-00-00_sub-root.jsonl'),
-      `${root.map((l) => JSON.stringify(l)).join('\n')}\n`,
-    );
-
-    // Two trace rows on the same day: `corr-1` correlates to the turn above (must NOT
-    // double-count), `sub-1` is a subagent (trace-only: no `turns` row references it).
-    writeFileSync(
-      join(tracesDir, '2026-07-05-subagent.jsonl'),
-      `${JSON.stringify({ v: 1, traceId: 'corr-1', ts: midMs, sessionId: 'sub-root', model: 'corr-model', promptTokens: 300, cachedTokens: 30, outputTokens: 90, reasoningTokens: 9 })}\n${JSON.stringify({ v: 1, traceId: 'sub-1', ts: midMs, rootSessionId: 'sub-root', model: 'sub-model', promptTokens: 500, cachedTokens: 40, outputTokens: 200, reasoningTokens: 15 })}\n`,
-    );
-    await ingest();
-
-    // Scope to the seeded day so totals are deterministic regardless of other fixtures.
-    const body = (await (await api.fetch(`/api/metrics/overview?from=${dayStart}&to=${dayEnd}`)).json()) as {
-      tokensByDay: Array<{ day: string; input: number; output: number; cached: number; reasoning: number }>;
-      modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
-      totals: {
-        turns: number;
-        inputTokens: number;
-        outputTokens: number;
-        cachedTokens: number;
-        reasoningTokens: number;
-      };
-    };
-
-    // turnTotals: normal turn (300 net/90/30/9) + trace-only sub-1 (500 gross −40
-    // cache = 460 net / 200 / 40 / 15), each once. inputTokens is NET of cache on
-    // both sides: turns store `usage.input` (already net), traces store gross
-    // `promptTokens`, so the trace side clamps `MAX(prompt − cached, 0)`.
-    expect(body.totals.turns).toBe(2);
-    expect(body.totals.inputTokens).toBe(760); // 300 (net) + 460 (net of cache)
-    expect(body.totals.outputTokens).toBe(290);
-    expect(body.totals.cachedTokens).toBe(70);
-    expect(body.totals.reasoningTokens).toBe(24);
-
-    // tokensByDay: one 2026-07-05 bucket with the combined tokens (correlated once).
-    const bucket = body.tokensByDay.find((d) => d.day === '2026-07-05');
-    expect(bucket).toEqual({ day: '2026-07-05', input: 760, output: 290, cached: 70, reasoning: 24 });
-
-    // modelShare: the correlated turn counted ONCE under corr-model (90, not 180),
-    // and the trace-only subagent surfaced under sub-model.
-    const corr = body.modelShare.find((m) => m.model === 'corr-model');
-    const sub = body.modelShare.find((m) => m.model === 'sub-model');
-    expect(corr).toEqual({ model: 'corr-model', turns: 1, outputTokens: 90 });
-    expect(sub).toEqual({ model: 'sub-model', turns: 1, outputTokens: 200 });
   });
 
   // Finding 9-query: the overview must expose a day-bucketed throughput/TTFT trend
@@ -2284,8 +734,7 @@ describe('dashboard api — cache trend scoping', () => {
     symlinkSync(cacheRoot, linkRoot);
     const linked = createDashboardRuntime({
       dbPath: ':memory:',
-      sessionsRoot,
-      tracesDir,
+        tracesDir,
       modelsDir,
       cacheRoot: linkRoot,
     });
@@ -2515,8 +964,7 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
 
     defaulted = createDashboardRuntime({
       dbPath: ':memory:',
-      sessionsRoot,
-      tracesDir,
+        tracesDir,
       modelsDir,
       // Exactly what the app's Control Panel entry passes.
       cacheRoot: undefined,
@@ -2665,7 +1113,7 @@ describe('dashboard api — method-not-allowed vs not-found', () => {
   it('405s a known path reached with the wrong method', async () => {
     for (const [method, pathname] of [
       ['PUT', '/api/models'],
-      ['POST', '/api/sessions/fix-1'],
+      ['PATCH', '/api/models/model-a'],
       ['GET', '/api/ingest'],
       ['PATCH', '/api/downloads/some-id'],
     ] as const) {
@@ -2686,7 +1134,7 @@ describe('dashboard api — method-not-allowed vs not-found', () => {
 
   it('does not treat a non-API path as a route', () => {
     expect(isApiPath('/')).toBe(false);
-    expect(isApiPath('/sessions/deep/link')).toBe(false);
+    expect(isApiPath('/assets/deep/link')).toBe(false);
     expect(isApiPath('/health')).toBe(true);
     expect(isApiPath('/api/models')).toBe(true);
   });
@@ -2773,7 +1221,7 @@ describe('dashboard api — the RPC transport carries the error model over a por
   });
 
   it('carries a handler 404 across with its message', async () => {
-    const res = await rpc.fetch('/api/sessions/no-such-session');
+    const res = await rpc.fetch('/api/models/no-such-model', { method: 'DELETE' });
     expect(res.status).toBe(404);
     expect((await res.json()) as { error: string }).toMatchObject({ error: expect.stringContaining('not found') });
   });
@@ -2793,56 +1241,21 @@ describe('dashboard api — the RPC transport carries the error model over a por
     expect(after.disk.entryCount).toBe(2);
   });
 
-  it('checks the session id BEFORE the body, so an unknown id still 404s', async () => {
-    // The rename handler looks the session up first; an unparseable body must not
+  it('checks the resource id BEFORE the body, so an unknown id still 404s', async () => {
+    // The delete handler looks the model up first; an unparseable body must not
     // pre-empt that 404 (the transport records the parse failure as data instead
     // of raising it at read time).
-    const res = await rpc.fetch('/api/sessions/no-such-session', { method: 'PATCH', rawBody: '{ not json either' });
+    const res = await rpc.fetch('/api/models/no-such-model', { method: 'DELETE', rawBody: '{ not json either' });
     expect(res.status).toBe(404);
   });
 
   it('reaches the database worker through the port, not just main-thread routes', async () => {
-    // `/api/models` and `/api/sessions` are worker-owned: a reply proves the port
-    // hop and the thread hop compose, which no in-process test can show.
-    const res = await rpc.fetch('/api/sessions');
+    // `/api/cache` is worker-owned: a reply proves the port hop and the thread
+    // hop compose, which no in-process test can show.
+    const res = await rpc.fetch('/api/cache');
     expect(res.status).toBe(200);
-    expect((await res.json()) as { total: number }).toMatchObject({ total: expect.any(Number) });
-  });
-});
-
-// Finding 7: sessions written under a custom agent home (`PI_CODING_AGENT_DIR`)
-// must be discoverable. `agentSessionsRoot()` resolves that env var the same way
-// the agent/pi do, falling back to the default home.
-describe('paths — agentSessionsRoot honors PI_CODING_AGENT_DIR', () => {
-  const KEY = 'PI_CODING_AGENT_DIR';
-
-  function withEnv(value: string | undefined, fn: () => void): void {
-    const saved = process.env[KEY];
-    if (value === undefined) delete process.env[KEY];
-    else process.env[KEY] = value;
-    try {
-      fn();
-    } finally {
-      if (saved === undefined) delete process.env[KEY];
-      else process.env[KEY] = saved;
-    }
-  }
-
-  it('falls back to ~/.mlx-node/agent/sessions when unset', () => {
-    withEnv(undefined, () => {
-      expect(agentSessionsRoot()).toBe(join(homedir(), '.mlx-node', 'agent', 'sessions'));
-    });
-  });
-
-  it('derives <PI_CODING_AGENT_DIR>/sessions for an absolute override', () => {
-    withEnv('/tmp/custom-agent', () => {
-      expect(agentSessionsRoot()).toBe(join('/tmp/custom-agent', 'sessions'));
-    });
-  });
-
-  it('expands a ~/ override with the pi tilde rule', () => {
-    withEnv('~/agent-home', () => {
-      expect(agentSessionsRoot()).toBe(join(homedir(), 'agent-home', 'sessions'));
+    expect((await res.json()) as { disk: { entryCount: number } }).toMatchObject({
+      disk: { entryCount: expect.any(Number) },
     });
   });
 });

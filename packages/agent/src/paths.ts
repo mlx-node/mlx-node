@@ -7,6 +7,7 @@
  * (`packages/server/src/host/paths.ts`).
  */
 
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +17,7 @@ import { fileURLToPath } from 'node:url';
  * Accept home-relative paths and file URLs without trimming literal paths or
  * expanding another user's `~user` prefix. `home` is a test seam.
  */
-export function expandPiAgentDir(dir: string, home: string = homedir()): string {
+export function expandAgentDir(dir: string, home: string = homedir()): string {
   if (dir === '~') return home;
   if (dir.startsWith('~/') || (process.platform === 'win32' && dir.startsWith('~\\'))) {
     return join(home, dir.slice(2));
@@ -33,4 +34,32 @@ export function mlxNodeHome(): string {
 /** Directory holding per-process `MetricsTrace` JSONL files. */
 export function metricsTraceDir(): string {
   return join(mlxNodeHome(), 'metrics', 'traces');
+}
+
+/**
+ * The agent binary's config home: `GROK_HOME` when set, else `~/.mlx-agent`.
+ * `GROK_HOME` gets the same `~`/`file://` expansion as a `--dir` flag.
+ * `env`/`home` are test seams.
+ */
+export function agentConfigDir(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  return env.GROK_HOME ? expandAgentDir(env.GROK_HOME, home) : join(home, '.mlx-agent');
+}
+
+/**
+ * Read the persisted `[models] default = "…"` the agent binary wrote to
+ * `config.toml` (its `/model` picker persists there). Minimal line scan —
+ * TOML parsing is not worth a dependency for one key. `dir` overrides the
+ * config home; `env`/`home` are test seams.
+ */
+export function readAgentDefaultModel(
+  dir?: string,
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string | undefined {
+  try {
+    const text = readFileSync(join(dir ?? agentConfigDir(env, home), 'config.toml'), 'utf8');
+    return text.match(/^\s*default\s*=\s*"([^"]+)"/m)?.[1];
+  } catch {
+    return undefined;
+  }
 }

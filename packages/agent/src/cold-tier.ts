@@ -2,11 +2,12 @@
  * Cold-tier facts shared by the agent (writer), the CLI (help text) and the
  * dashboard (reader), kept in a NATIVE-FREE leaf module.
  *
- * `provider/model-host.ts` value-imports `@mlx-node/lm`, which loads the native
- * addon; the dashboard is a separate viewer process that must never link it
+ * The `@mlx-node/lm` root loads the native addon; the dashboard is a separate
+ * viewer process that must never link it
  * ("no Metal init, instant start" — docs/dashboard.md), and `mlx agent --help`
  * must print without loading weights. This module therefore has NO runtime
- * imports beyond `node:` builtins, and reaches those consumers through the
+ * imports beyond `node:` builtins and the native-free `@mlx-node/lm` leaf
+ * subpaths, and reaches those consumers through the
  * existing native-free `@mlx-node/agent/catalog` subpath, which re-exports it.
  * There is deliberately no `./cold-tier` entry in `package.json`: a second
  * published subpath would be a second thing to keep native-free, and `catalog`

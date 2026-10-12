@@ -33,8 +33,15 @@ describe('dashboard npm pack ships the SPA', () => {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const parsed = JSON.parse(stdout) as Array<{ files: Array<{ path: string }> }>;
-    const packed = parsed[0].files.map((f) => f.path);
+    // npm's --json shape has moved across releases: an array of results, a
+    // bare result object, or (npm 12) a map keyed by package name.
+    const parsed = JSON.parse(stdout) as unknown;
+    const results: Array<{ files: Array<{ path: string }> }> = Array.isArray(parsed)
+      ? parsed
+      : 'files' in (parsed as object)
+        ? [parsed as { files: Array<{ path: string }> }]
+        : Object.values(parsed as Record<string, { files: Array<{ path: string }> }>);
+    const packed = results[0]!.files.map((f) => f.path);
 
     expect(packed).toContain('web/index.html');
     expect(packed.some((p) => /^web\/assets\/.+/.test(p))).toBe(true);

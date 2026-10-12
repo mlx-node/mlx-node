@@ -117,7 +117,7 @@ export type WwwDecision =
  * fails as a blank window with a syntax error pointing at `<` — indistinguishable
  * from a dozen other packaging faults, and precisely what a stale or mis-copied
  * bundle produces. Everything else falls back to `index.html` so `BrowserRouter`
- * deep links (`/sessions/abc`) resolve.
+ * deep links (`/models/abc`) resolve.
  */
 export function decideWww(root: string, pathname: string): WwwDecision {
   const base = resolve(root);

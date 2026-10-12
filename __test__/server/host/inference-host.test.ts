@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import type { LoadableModel, LoadModelOptions } from '@mlx-node/lm';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
-import { discoverMlxModels } from '../../../packages/agent/src/provider/models.js';
+import { discoverMlxModels } from '../../../packages/agent/src/models.js';
 import { handleCodingAgentModels } from '../../../packages/dashboard/src/api/handlers/models.js';
 import { isServingStatus } from '../../../packages/desktop/src/main/supervisor/state.js';
 import {
@@ -173,7 +173,7 @@ describe('createInferenceHost — discovery and model binding', () => {
     }
     const agentModels = await discoverMlxModels(modelsDir);
     expect(agentModels.map(({ discovered }) => discovered.name)).toEqual(names);
-    expect(await handleCodingAgentModels({ modelsDir, sessionsRoot: '', tracesDir: '', cacheRoot: '' })).toEqual({
+    expect(await handleCodingAgentModels({ modelsDir, tracesDir: '', cacheRoot: '' })).toEqual({
       models: names.map((name) => ({ name })),
     });
 

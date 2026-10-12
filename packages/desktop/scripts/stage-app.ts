@@ -84,15 +84,11 @@ export function scopeCoreNativeOverride(binding: string): string {
 }
 
 /**
- * Dashboard-only payloads can omit pi-ai's lazy cloud providers. The desktop
- * bundle now also includes the full CLI, whose agent options may reach those
- * providers, so any closure rooted at @mlx-node/cli retains them. Nested package
- * pruning uses the same rule.
- *
- * The set is exactly what pi-ai 0.99.2 declares. Earlier releases carried two
- * more — `@mistralai/mistralai` and `@opentelemetry/api`, dropped by 0.99
- * (mistral went to plain fetch; otel was never imported) — and dropped entries
- * stay dropped: a name that can never be reached protects nothing.
+ * Dashboard-only payloads can omit the cloud-LLM provider SDKs: nothing in a
+ * local-inference app ever opens one. The desktop bundle also includes the
+ * full CLI, so a closure rooted at @mlx-node/cli retains them in case a
+ * workspace dependency legitimately reaches one. Nested package pruning uses
+ * the same rule.
  */
 const CLOUD_PROVIDER_SDKS = new Set([
   '@anthropic-ai/sdk',
@@ -183,10 +179,10 @@ export function runtimeClosure(
  *
  * Pruning them is not a size optimisation that happens to help — it is required.
  * `@electron/osx-sign` walks the bundle and tries to sign anything that looks like
- * a binary, and `@earendil-works/pi-coding-agent` ships
- * `examples/extensions/doom-overlay/doom/build/doom.wasm`. A .wasm is not a Mach-O,
- * codesign fails on it, and the whole signing step dies on a DOOM build that has no
- * business being in an inference app in the first place.
+ * a binary, and a published package's `examples/` tree can ship real binary
+ * payloads (one dependency's example dir carried a `doom.wasm` build). A .wasm
+ * is not a Mach-O, codesign fails on it, and the whole signing step dies on a
+ * demo binary that has no business being in an inference app in the first place.
  *
  * Deliberately conservative: only directories that are unambiguously not shipping
  * code. `src/` is NOT pruned — plenty of packages resolve their entry points into
@@ -232,9 +228,8 @@ interface PruneCount {
 
 /**
  * Recurses through nested `node_modules` as well. Yarn hoists most of the tree,
- * but not all of it: `@earendil-works/*` alone carries 20 MB of nested copies,
- * and skipping them left the biggest single duplicate — three copies of typebox
- * — untouched.
+ * but not all of it, and skipping nested copies once left the biggest single
+ * duplicate — three copies of typebox — untouched.
  */
 function pruneNonRuntime(dir: string, count: PruneCount = { dirs: 0, files: 0 }): PruneCount {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -276,14 +271,13 @@ function packageNamesIn(nodeModules: string): string[] {
  *
  * `runtimeClosure` decides by NAME while the copy above happens by DIRECTORY,
  * and the two disagree wherever Yarn could not hoist. This rule exists because
- * `@earendil-works/pi-ai` once carried its own `node_modules/@smithy/
- * node-http-handler` — the exclusion list refused the package and staging
- * shipped it anyway, a rule that reports success and does nothing.
+ * a dependency once carried its own `node_modules/@smithy/node-http-handler` —
+ * the exclusion list refused the package and staging shipped it anyway, a rule
+ * that reports success and does nothing.
  *
- * pi-ai no longer nests that copy, so today the walk finds nothing. It stays as
- * insurance: nesting is a resolution outcome, and the same version bump that
- * moves a provider SDK down one level would put the whole SDK back with no diff
- * to explain it.
+ * Today the walk usually finds nothing. It stays as insurance: nesting is a
+ * resolution outcome, and the same version bump that moves an SDK down one
+ * level would put the whole package back with no diff to explain it.
  */
 export function pruneExcludedNested(modules: string, includeCloudProviders = false): string[] {
   const removed: string[] = [];
@@ -398,9 +392,6 @@ export function stageApp(opts: {
     for (const dir of ['dist', 'web']) {
       if (existsSync(join(from, dir))) cpSync(join(from, dir), join(to, dir), { recursive: true, dereference: true });
     }
-    if (name === '@mlx-node/dashboard') {
-      cpSync(join(from, 'assets'), join(to, 'assets'), { recursive: true, dereference: true });
-    }
     for (const file of ['index.cjs', 'index.d.cts', 'index.js', 'index.d.ts']) {
       if (existsSync(join(from, file))) cpSync(join(from, file), join(to, file));
     }
@@ -414,7 +405,7 @@ export function stageApp(opts: {
   // beside every entry, and none of it is reachable once the app is running.
   const pruned = pruneNonRuntime(modules);
   pruneNonRuntime(join(stageDir, 'dist'), pruned);
-  // The bundled CLI supports normal agent options too; its lazy providers must exist.
+  // A CLI-rooted closure keeps the provider SDKs; nested copies must survive the same way.
   const prunedNested = pruneExcludedNested(modules, opts.roots.includes('@mlx-node/cli'));
 
   return {

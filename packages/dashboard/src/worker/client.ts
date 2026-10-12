@@ -50,7 +50,7 @@ export interface DbWorkerOptions extends DbWorkerBootstrap {
 
 /**
  * Long on purpose. This is the backstop for a thread that will never answer, not
- * a latency target — a boot ingest over a large sessions tree can hold the
+ * a latency target — a boot ingest over a large trace dir can hold the
  * worker for tens of seconds, and killing that caller would turn a slow scan into
  * a visible failure.
  */
@@ -88,8 +88,7 @@ export interface DbWorkerClient {
 /** Mirrors `doIngest`'s never-throw contract: a failed rescan is a warning, not an error. */
 function unavailableSummary(reason: string): IngestSummary {
   return {
-    sessions: { scanned: 0, updated: 0, removed: 0, warnings: [reason] },
-    traces: { files: 0, records: 0, pruned: 0, warnings: [] },
+    traces: { files: 0, records: 0, pruned: 0, warnings: [reason] },
   };
 }
 
@@ -118,7 +117,6 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
     workerData: {
       dbPath: opts.dbPath,
       modelsDir: opts.modelsDir,
-      sessionsRoot: opts.sessionsRoot,
       tracesDir: opts.tracesDir,
       cacheRoot: opts.cacheRoot,
       withdrawPort: withdrawals.port2,

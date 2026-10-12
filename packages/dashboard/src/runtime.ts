@@ -27,7 +27,7 @@ import { CodingAgentsService } from './coding-agents.js';
 import type { CodingAgentsOptions } from './coding-agents.js';
 import { DownloadManager, type DownloadEvent } from './download.js';
 import { defaultModelsDir } from './models.js';
-import { agentSessionsRoot, dashboardDbPath, metricsTraceDir } from './paths.js';
+import { dashboardDbPath, metricsTraceDir } from './paths.js';
 import { startDbWorker, type DbWorkerLifecycle } from './worker/client.js';
 
 /** Incremental rescan cadence while the runtime is alive. */
@@ -42,7 +42,6 @@ export interface DashboardRuntimeOptions {
   prepareDelegation?: CodingAgentsOptions['prepareCommand'];
   dbPath?: string;
   modelsDir?: string;
-  sessionsRoot?: string;
   tracesDir?: string;
   cacheRoot?: string;
   /**
@@ -63,7 +62,7 @@ export interface DashboardRuntimeOptions {
 /** One API call, addressed the way `fetch` would address it. */
 export interface ApiCall {
   method: string;
-  /** Path, optionally with a query string (`/api/sessions?limit=1`). */
+  /** Path, optionally with a query string (`/api/models?limit=1`). */
   path: string;
   /** Already-parsed payload; omit when the call carries none. */
   body?: unknown;
@@ -73,7 +72,6 @@ export interface ApiCall {
 
 export interface DashboardRuntime {
   readonly modelsDir: string;
-  readonly sessionsRoot: string;
   readonly tracesDir: string;
   readonly cacheRoot: string | undefined;
   /**
@@ -121,7 +119,6 @@ function defaultWorkerUrl(): URL {
 export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): DashboardRuntime {
   const dbPath = opts.dbPath ?? dashboardDbPath();
   const modelsDir = opts.modelsDir ?? defaultModelsDir();
-  const sessionsRoot = opts.sessionsRoot ?? agentSessionsRoot();
   const tracesDir = opts.tracesDir ?? metricsTraceDir();
   const cacheRoot = opts.cacheRoot;
 
@@ -141,7 +138,6 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     onLifecycle: opts.onLifecycle ?? ((): void => {}),
     dbPath,
     modelsDir,
-    sessionsRoot,
     tracesDir,
     cacheRoot,
   });
@@ -160,7 +156,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
         throw new Error('Open the mlx-node desktop app to connect to your local model.');
       }),
   });
-  const context: MainApiContext = { modelsDir, sessionsRoot, tracesDir, cacheRoot, downloads, codingAgents };
+  const context: MainApiContext = { modelsDir, tracesDir, cacheRoot, downloads, codingAgents };
 
   // The boot ingest runs inside the worker; only the periodic rescan is driven
   // from here.
@@ -190,7 +186,6 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
 
   return {
     modelsDir,
-    sessionsRoot,
     tracesDir,
     cacheRoot,
     context,

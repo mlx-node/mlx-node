@@ -88,8 +88,8 @@ describe('SessionRegistry tier-2 prompt_cache_key lookup', () => {
   });
 
   it('tier-2 hit: adopt with promptCacheKey and look up by the same key', () => {
-    // Core stateless-agent use case: pi-mono (and every other stateless
-    // client) never threads `previous_response_id`, so the only way
+    // Core stateless-agent use case: stateless coding-agent harnesses
+    // never thread `previous_response_id`, so the only way
     // warm-session reuse can happen across turns is the
     // `promptCacheKey`-keyed tier-2 scan.
     const model = makeMockModel();

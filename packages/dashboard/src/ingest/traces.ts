@@ -91,19 +91,16 @@ function boolToInt(value: unknown): number | null {
  * `readFileSync` BLOCKS on it until a writer closes, and since the server funnels every
  * pass through one serialized ingest chain that wedges the whole dashboard. Neither is
  * reachable from product code (the writer only ever appends to `<date>-<pid>.jsonl`),
- * but the sibling session ingest already stats its candidates, and the same rule belongs
- * here.
+ * but the scan cannot judge entries by name alone.
  *
  * A stat FAILURE is NOT "gone": a root that is readable but not searchable (mode 0600)
  * lists its entries and then gives EACCES per child. Those names map to `null` and stay
  * live — rows kept, file skipped this pass — the same stance the root guard below takes,
  * so a transient fault never reads as a deletion.
  *
- * `statSync` FOLLOWS symlinks, deliberately unlike `sessions.ts`'s no-follow listing:
- * that one is no-follow so an external Pi transcript cannot surface under the target's
- * id, an identity concern traces do not have. A symlinked trace entry is a legitimate
- * source and ingests today; `unlinkSync` does not follow, so the 30-day prune can only
- * ever remove the link itself, never an external target.
+ * `statSync` FOLLOWS symlinks: a symlinked trace entry is a legitimate source and
+ * ingests today; `unlinkSync` does not follow, so the 30-day prune can only ever remove
+ * the link itself, never an external target.
  */
 function statTraceEntries(traceDir: string, entries: string[]): Map<string, Stats | null> {
   const kinds = new Map<string, Stats | null>();
@@ -237,7 +234,7 @@ export async function ingestTraces(
       continue;
     }
 
-    // Incremental skip (mirrors the session ingest watermark): a file whose
+    // Incremental skip via the watermark table: a file whose
     // floored mtime AND size match its stored watermark has already been fully
     // ingested, so skip the read/parse/insert entirely. Without this, every 30s
     // rescan re-reads and re-parses the whole retention window on the event loop.

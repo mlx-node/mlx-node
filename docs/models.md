@@ -247,9 +247,7 @@ For a self-contained checkpoint, place the draft's `config.json` and
 `model.safetensors` under `<model>/draft/`. Gemma4 discovers that directory
 automatically, so `loadSession('./models/gemma-4-12b-it')` enables the same
 speculative path without a load option. An explicit `draftModelPath` overrides
-the embedded directory. `mlx agent` is the exception: it uses a paged AR
-overlay by default and enables the embedded draft only when
-`MLX_AGENT_ENABLE_GEMMA_DRAFT=1` is set.
+the embedded directory.
 
 - **Lossless at T=0** — every committed token is verified by the target model, so greedy output matches the plain autoregressive run (up to inherent bf16 near-ties; see the oracle suites in `crates/mlx-core/tests/gemma4_dspark.rs` and `crates/mlx-core/tests/gemma4_assistant.rs`).
 - **Stats** — `ChatResult.performance` reports `mtpCycles` (actual draft+verify cycles executed) and `mtpMeanAcceptedTokensTotal` (mean committed tokens per speculative cycle, including the always-verified token). DSpark's target-only calibration/fallback cycles remain part of the overall token/decode-speed metrics but are intentionally excluded from these MTP acceptance fields.

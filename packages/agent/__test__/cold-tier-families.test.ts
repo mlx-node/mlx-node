@@ -22,7 +22,6 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import { COLD_TIER_RESTORE_FAMILIES as viaCatalog, coldTierRestoreFamilyList } from '../src/catalog.js';
 import { COLD_TIER_RESTORE_FAMILIES } from '../src/cold-tier.js';
-import { COLD_TIER_RESTORE_FAMILIES as viaModelHost } from '../src/provider/model-host.js';
 
 describe('cold-tier restore allowlist', () => {
   it('agrees exactly with the native allowlist', () => {
@@ -31,10 +30,9 @@ describe('cold-tier restore allowlist', () => {
 
   // Identity, not equality: a re-export that ever became a second `new Set([…])`
   // would satisfy a deep compare on the day it was written and drift the day
-  // after. The host is what actually gates a load, and the catalog subpath is
-  // what the dashboard and the CLI help text read — all three must BE the leaf.
+  // after. The catalog subpath is what the dashboard and the CLI help text
+  // read — it must BE the leaf.
   it('is the same object everywhere it is consumed', () => {
-    expect(viaModelHost).toBe(COLD_TIER_RESTORE_FAMILIES);
     expect(viaCatalog).toBe(COLD_TIER_RESTORE_FAMILIES);
   });
 

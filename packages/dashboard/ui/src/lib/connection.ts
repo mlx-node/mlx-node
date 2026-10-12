@@ -18,7 +18,7 @@
  *
  * Subscribing to this instead of keying the whole tree on it is deliberate.
  * Remounting would also discard scroll position, an open confirm dialog, the
- * Models page's in-progress download map and the sessions filter — and on the
+ * Models page's in-progress download map — and on the
  * Models page that state IS the download UI the fix is meant to rescue.
  */
 

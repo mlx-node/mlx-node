@@ -1,9 +1,8 @@
 /** Addon-free client for the desktop's global instruction installation checks. */
-import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { expandPiAgentDir } from './paths.js';
+import { readAgentDefaultModel } from './paths.js';
 
 export const DELEGATION_PROMPT =
   'Delegate GitHub investigation to `mlx delegate github --caller-approved --repo OWNER/REPO "TASK"`. Approve the bounded task and its tool execution before invoking. Include the PR, issue, or run number. Wait for the final handoff and read it once; do not poll by dumping worker transcripts. Use its findings and evidence for implementation; address specific gaps with a focused follow-up or relevant evidence excerpt. Add `--allow-write` only for GitHub changes already authorized by the user. If delegation fails or reports incomplete work, continue from its handoff.';
@@ -41,22 +40,9 @@ export function expandHome(path: string, home = homedir()): string {
   return path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path;
 }
 
-/** Match the persisted default used by `mlx agent`; never select a cloud provider. */
+/** Match the persisted default used by `mlx agent`. */
 export async function preferredLocalModel(home = homedir(), env = process.env): Promise<string | undefined> {
-  try {
-    const dir = env.PI_CODING_AGENT_DIR
-      ? expandPiAgentDir(env.PI_CODING_AGENT_DIR, home)
-      : join(home, '.mlx-node', 'agent');
-    const value = JSON.parse(await readFile(join(dir, 'settings.json'), 'utf8'));
-    if (value.defaultProvider === 'mlx' && typeof value.defaultModel === 'string') {
-      return value.defaultModel.replace(/^mlx\//, '');
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw new Error('Could not read the default local model. Open mlx agent and select a model again.');
-    }
-  }
-  return undefined;
+  return readAgentDefaultModel(undefined, env, home);
 }
 
 /** Refuse remote endpoints even if a caller accidentally supplies a cloud API URL. */

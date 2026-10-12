@@ -7,7 +7,7 @@
  * HTTP to `mlx serve`. This command's whole job:
  *
  *   1. lift mlx-owned flags out of argv (`--models-dir`, tracing, help,
- *      the blocked `update` positional),
+ *      the mlx-owned `update` positional),
  *   2. make sure at least one local model exists (first-run wizard),
  *   3. spawn `mlx serve --port 0 --auth-token <tok>` + the agent binary,
  *      pointed at the real port via `GROK_*_BASE_URL`/`XAI_API_KEY`
@@ -18,14 +18,14 @@
  * forwards the rest verbatim.
  */
 
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 // Native-free subpaths: the help path must print without loading the addon, and
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
-import { expandPiAgentDir } from '@mlx-node/agent/paths';
+import { readAgentDefaultModel } from '@mlx-node/agent/paths';
 
 import {
   agentUpdateStatus,
@@ -36,7 +36,7 @@ import {
   type GrokAgentLaunchOptions,
 } from './grok-build.js';
 
-export { expandPiAgentDir } from '@mlx-node/agent/paths';
+export { expandAgentDir } from '@mlx-node/agent/paths';
 
 export interface AgentArgScan {
   /** Value of `--models-dir` (the flag pair is removed from `passthrough`). */
@@ -63,7 +63,7 @@ export interface AgentArgScan {
    * those pass through untouched).
    */
   help: boolean;
-  /** Leading `update` positional — the binary's self-update, always blocked. */
+  /** Leading `update` positional — intercepted by `run()` for the mlx-owned release download. */
   update: boolean;
   /**
    * The binary answers these BEFORE model resolution and exits — they need no
@@ -81,7 +81,7 @@ export interface AgentArgScan {
  * except `agent` (ACP server) is a local metadata operation that never needs a
  * running model — the launcher skips the inference host for them. `update`
  * also lands here so the leading-positional rule is one table; `run()`
- * intercepts it before the handoff.
+ * intercepts it for the managed download before the handoff.
  */
 const GROK_SUBCOMMANDS: ReadonlySet<string> = new Set([
   'agent',
@@ -437,19 +437,12 @@ export interface PersistedGrokDefault {
 
 /**
  * Read the persisted `[models] default = "…"` the binary wrote to
- * `~/.mlx-agent/config.toml` (its `/model` picker persists there). Minimal
- * line scan — TOML parsing is not worth a dependency for one key.
+ * `~/.mlx-agent/config.toml` (its `/model` picker persists there) via the
+ * shared reader in `@mlx-node/agent/paths`.
  */
 export function readPersistedDefaultModel(agentDir?: string): PersistedGrokDefault | undefined {
-  try {
-    const dir = agentDir ?? process.env.GROK_HOME ?? join(homedir(), '.mlx-agent');
-    const text = readFileSync(join(dir, 'config.toml'), 'utf8');
-    const match = text.match(/^\s*default\s*=\s*"([^"]+)"/m);
-    if (!match?.[1]) return undefined;
-    return { modelId: match[1] };
-  } catch {
-    return undefined;
-  }
+  const modelId = readAgentDefaultModel(agentDir);
+  return modelId === undefined ? undefined : { modelId };
 }
 
 /**

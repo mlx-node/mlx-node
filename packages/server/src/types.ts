@@ -18,7 +18,7 @@ export interface InputImagePart {
 }
 
 /**
- * Echoed back by clients (Codex, pi-ai, etc.) when they replay prior
+ * Echoed back by clients (Codex and other agent harnesses) when they replay prior
  * assistant turns in `input[]` instead of using `previous_response_id`.
  * Equivalent to `InputTextPart` for mapping purposes — we only need the text.
  */
@@ -129,7 +129,7 @@ export interface ResponsesAPIRequest {
   /**
    * Stable caller-supplied key identifying the logical conversation for
    * warm-session reuse across stateless turns. Stateless agent clients
-   * (pi-mono, Aider, Codex CLI, etc.) own the conversation history
+   * (Aider, Codex CLI, and similar harnesses) own the conversation history
    * client-side and resend the full transcript on every turn — they do
    * NOT use `previous_response_id` — so the server-side
    * `SessionRegistry` can only reuse a warm `ChatSession` across those

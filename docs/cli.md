@@ -762,29 +762,11 @@ Launches the same inference host as `mlx serve` and spawns Claude Code against i
 
 ## `mlx delegate`
 
-A focused local worker for bounded investigations. It shares the `mlx agent`
-model, session, cache and thinking settings, defaults to print mode, and uses
-read/bash tools without project instructions, skills or nested agents.
-
-Repeated and simultaneous delegate calls automatically connect to one local
-background inference service per OS user. It keeps one model resident, admits
-up to four independent sessions using the model's supported continuous-batching
-capacity, and queues inference for models without that support. Changing models
-or cache policy waits for active inference to finish before replacing the resident.
-Each caller still runs its own tools, permission checks and agent session.
-Follow-up turns retain their own cache identity; at most four warm sessions are
-kept, with older idle sessions released as needed. Separate callers resuming the
-same saved session have independent caches.
-
-The service starts on demand and exits after five minutes without requests or
-pending inference. Its private connection record and startup log are in
-`~/.mlx-node/delegate/`. It selects an available local port automatically and
-elects one worker through that private directory. A failed service returns an
-error; delegate never falls back to loading a separate model in the caller.
-Ordinary `mlx agent`, `mlx serve`
-and the desktop inference service retain their own model processes.
-Native engine environment settings, including native tracing, come from the
-caller that starts the service and remain fixed until that service exits.
+A focused local worker for bounded investigations. It runs on the same
+`mlx agent` runtime — the grok-build binary against a locally spawned
+`mlx serve` — folded into headless print mode with a focused system prompt
+and `read_file` + `run_terminal_command` tools, without project instructions,
+skills or nested agents.
 
 From a regular terminal, Claude Code, Grok or another caller, approve the bounded
 task and its tool execution before passing `--caller-approved`. This also applies
@@ -803,7 +785,7 @@ the SHAs match. These are model instructions, not enforced output limits;
 requested evidence, uncertainty and incomplete work still belong in the answer.
 
 Consume the final print-mode handoff once. While waiting, check process
-completion rather than loading the worker's transcript. `--mode json` exposes
+completion rather than loading the worker's transcript. `--output-format json` exposes
 the full event stream for debugging; returning its reasoning and raw tool
 results to the caller can erase any token savings. Resolve a specific gap with
 a focused follow-up or the relevant evidence excerpt.
@@ -814,35 +796,18 @@ process sandbox. The flag does not copy another coding agent's tool approval rul
 approved in the task; neither flag grants extra sandbox access. Failed or
 incomplete work returns a handoff for the caller to continue.
 
-The dashboard labels recorded delegate invocations with a **Delegate** badge.
-Session rows show estimated tokens saved, or extra tokens when the handoff is
-larger. The detail page shows the evidence and handoff counts and their ratio.
-These compare unique successful tool-result text with the final handoff using
-the fixed `o200k_base` vocabulary through Hugging Face's native Node `tokenizers`
-binding. The vocabulary is bundled locally; measurement needs no network access.
-Repeated evidence is counted once across resumed invocations, while every
-completed handoff is counted. They exclude tool errors,
-caller invocation costs, reasoning, and transcript rereads, so they measure
-evidence compression and do not establish total coding-agent savings. Incomplete or non-text runs
-show an unavailable estimate. Older sessions without delegate metadata remain
-unclassified; titles are not used to infer their origin. An old blocked handoff can
-identify an unforked delegate session, but a fork needs its own delegate metadata.
-
 ## `mlx agent`
 
-A fully-local coding agent — MLX-Node's first all-in-one local agent. It embeds the [pi coding agent](https://www.npmjs.com/org/earendil-works) (`@earendil-works/*`) and reuses the mlx-node app's inference engine when it is running. Both `mlx agent` and `mlx delegate` discover the app through private credentials in `~/.mlx-node/desktop/inference.json` and stream over authenticated loopback HTTP. Model loading, swapping, and request admission stay in the app, avoiding a second copy of the weights. An unavailable attached engine produces an error, never a fallback model load. Start the app engine before starting the agent; both app and CLI must include this support.
-
-Without a running app engine, `mlx agent` uses in-process `@mlx-node/lm` inference, while `mlx delegate` uses its shared background worker. Prompts and tools remain local. When attached, the app owns cache persistence and draft policy (`--no-persist-cache` and `MLX_AGENT_ENABLE_GEMMA_DRAFT` only configure standalone inference); native diagnostics remain in the app's inference logs. Requires Node.js ≥ 22.19.
+A fully-local coding agent — MLX-Node's first all-in-one local agent. It runs the forked Grok Build TUI (`mlx-agent`, a standalone Rust binary built from the `mlx` branch of `mlx-node/grok-build`) against a freshly spawned `mlx serve --port 0 --auth-token <token>`. The binary discovers models from the spawned host's `/v1/models` and speaks the Anthropic Messages wire protocol — the same path `mlx launch claude` uses — wired via `GROK_MODELS_BASE_URL` / `GROK_CLI_CHAT_PROXY_BASE_URL` / `GROK_XAI_API_BASE_URL` plus the `XAI_API_KEY` bearer. Both children die when `mlx agent` exits; only the agent binary owns the terminal. Requires Node.js ≥ 22.19.
 
 ```bash
 mlx agent                       # interactive session (first run: setup wizard)
-mlx agent -c                    # resume the most recent session
-mlx agent -p 'summarize this repo' --no-session   # headless / print mode
-mlx agent --mode json           # newline-delimited JSON events (for scripting)
+mlx agent -p 'summarize this repo'   # headless / print mode
+mlx agent -r SESSION            # resume a saved session
 mlx agent --models-dir ./models # use a specific local models directory
 ```
 
-Almost every flag belongs to pi and is forwarded verbatim; `mlx agent` only handles the options below before handing off.
+Almost every flag belongs to the agent binary and is forwarded verbatim; `mlx agent` only handles the options below before handing off (`--models-dir`, `--trace`/`--trace-dir`, `--no-persist-cache`, and mlx-side help).
 
 For local Qwen3.8 models, `--thinking low`, `medium`, and `xhigh` select the
 checkpoint's reasoning effort. `minimal` aliases `low`; `high` and `max` alias
@@ -929,30 +894,17 @@ A more compact Gemma-4-12B entry (mxfp4 MLP + mxfp8 attention, ~9 GB, for smalle
 
 ### Config home
 
-pi's config home is `~/.mlx-node/agent` (override with `PI_CODING_AGENT_DIR`) — it holds `settings.json`, saved sessions, extensions, skills, prompts, and themes. A project-local `.pi/` directory still works for per-repo overrides. `mlx agent` also seeds `PI_SKIP_VERSION_CHECK=1` and `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` (both only when unset) so long prompts keep bounded time-to-first-token on the default paged path.
-
-Gemma4 also uses paged autoregressive decoding by default, even when the checkpoint contains an embedded `draft/`: the agent's temporary config overlay hides that directory without modifying the checkpoint. Set `MLX_AGENT_ENABLE_GEMMA_DRAFT=1` to explicitly use the embedded DSpark/assistant draft instead; that opt-in currently uses flat KV cache and may be slower for quantized agent workloads.
+The agent binary's config home is `~/.mlx-agent` (override with `GROK_HOME`) — it holds `config.toml` (including the persisted `/model` pick), saved sessions, and the rest of the binary's state. `mlx agent` seeds `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` when unset so long prompts keep bounded time-to-first-token on the default paged path.
 
 ### Permission gate
 
-pi has no permission system of its own, so `mlx agent` installs a safety gate: every `bash`, `write`, and `edit` tool call must be approved before it runs. In an interactive session it prompts (`Yes` / `Always (this session)` / `No`). Without an attached UI — headless print or `--mode json` runs — it blocks those tools unless you opt in with `MLX_AGENT_AUTO_APPROVE=1`:
+The agent binary's own permission system applies. `mlx delegate` drives it headless: `--permission-mode auto` auto-reviews each tool call (the default), and `--caller-approved` switches to `bypassPermissions` once the caller has approved the bounded task.
 
-```bash
-MLX_AGENT_AUTO_APPROVE=1 mlx agent -p 'run the test suite and report failures' --no-session
-```
+### Binary subcommands
 
-### Extensions and skills
+Leading positionals pass through to the agent binary and run without spawning the inference host — `models`, `sessions`, `export`, `doctor`, `mcp`, `plugin`, `memory`, `config`, `leader`, `login`, `logout`, `setup`, `share`, `usage`, `wrap`, `trace`. `mlx agent -h`/`--help` prints the mlx options above and then the binary's full flag list; `mlx agent --version` is answered by the binary directly, so no local model is needed for either.
 
-The leading positional commands pass through to pi and manage what lives under the agent config home:
-
-```bash
-mlx agent install <source>   # add a pi extension / theme / skill
-mlx agent remove <name>      # remove one (alias: uninstall)
-mlx agent list               # list installed
-mlx agent config             # edit which are enabled
-```
-
-`mlx agent update` is intentionally blocked (it maps to pi's npm self-update, which would fight the installed `@mlx-node/cli`); update `@mlx-node/cli` through your package manager instead. `mlx agent -h`/`--help` prints the mlx options above and then pi's full flag list. `mlx agent --version`/`-v` and `mlx agent --export <session>` are answered by pi directly — no local model needed, so the first-run wizard stays out — and `--version` prints the embedded pi version, not `@mlx-node/cli`'s (`mlx --version`).
+`mlx agent update [--check]` is mlx-owned — the binary's own npm-style self-update would fight the managed install, so `mlx agent` intercepts it and downloads the newest `mlx-agent` release (from `mlx-node/grok-build`, pinned by `MLX_AGENT_TAG`) into `~/.mlx-node/bin`. `MLX_AGENT_BIN` points at a locally built binary instead and shadows the managed download.
 
 ## Dashboard
 

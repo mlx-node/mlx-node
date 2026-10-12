@@ -3,8 +3,8 @@
  */
 
 /**
- * Structural guards for the loading → loaded swap on the Cache, Session detail
- * and Metrics pages.
+ * Structural guards for the loading → loaded swap on the Cache and Metrics
+ * pages.
  *
  * A skeleton is only doing its job if it occupies the SAME box as the content it
  * stands in for; otherwise every request that lands nudges the page and the whole
@@ -24,17 +24,10 @@
 import { MessageChannel } from 'node:worker_threads';
 
 import { categoryChartHeight } from '@/lib/chart';
-import type {
-  CacheResponse,
-  MetricsOverviewResponse,
-  SessionDetailResponse,
-  SessionMetricsResponse,
-} from '@/lib/types';
+import type { CacheResponse, MetricsOverviewResponse } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
-import SessionDetail from '@/pages/session-detail';
 import { createElement, type ReactElement } from 'react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { bindEventTargetPort } from '../src/rpc/port.js';
@@ -219,62 +212,6 @@ describe('Cache page — a health counter loads into the box it will occupy', ()
     expect(subs).toHaveLength(CACHE_TILES);
     expect(allCarry(values, 'h-[1lh]')).toBe(true);
     expect(allCarry(subs, 'h-[1lh]')).toBe(true);
-  });
-});
-
-function sessionRoutes(): Record<string, unknown> {
-  const detail: SessionDetailResponse = {
-    session: {
-      id: 'abc',
-      path: '/sessions/abc.jsonl',
-      cwd: '/Users/dev/workspace/mlx-node',
-      name: 'Refactor the paged cache',
-      created: Date.UTC(2026, 6, 20, 9, 30),
-      modified: Date.UTC(2026, 6, 20, 11, 0),
-      messageCount: 2,
-      firstMessage: 'hello',
-    },
-    transcript: [],
-  };
-  // No turns and no traces: `models` stays empty, so the loaded header is the
-  // badge-less variant the loading header is shaped to match.
-  const metrics: SessionMetricsResponse = { sessionId: 'abc', turns: [], traces: [] };
-  return { '/sessions/abc': detail, '/sessions/abc/metrics': metrics };
-}
-
-function sessionPage(): ReactElement {
-  return createElement(
-    MemoryRouter,
-    { initialEntries: ['/sessions/abc'] },
-    createElement(Routes, null, createElement(Route, { path: '/sessions/:id', element: createElement(SessionDetail) })),
-  );
-}
-
-describe('Session detail — the loading header is the loaded header', () => {
-  it('gives the title bar the title element’s own classes', async () => {
-    // By class, not by tag: the loaded title is an `h1` and the loading one a
-    // `div` (an empty heading is a heading a screen reader still announces), and
-    // it is the classes that decide the box either way.
-    const title = '.text-2xl.tracking-tight';
-    const loading = await whileLoading(sessionPage(), 'Sessions', (page) => classesOf(page, title));
-    const loaded = await whenLoaded(sessionPage(), sessionRoutes(), 'Refactor the paged cache', (page) =>
-      classesOf(page, title),
-    );
-    expect(loading).toEqual(loaded);
-    expect(loading).toHaveLength(1);
-  });
-
-  it('stands in for the title, the meta line and the button — and for nothing else', async () => {
-    const { title, all } = await whileLoading(sessionPage(), 'Sessions', (page) => ({
-      title: classesOf(page, '.text-2xl > [data-slot="skeleton"]'),
-      all: classesOf(page, '[data-slot="skeleton"]'),
-    }));
-    expect(allCarry(title, 'h-[1lh]')).toBe(true);
-    // Title, meta line, copy button. NOT the model badges: that row is gated on
-    // data from the metrics request, a different fetch, so reserving it here
-    // could not spare the page that row's reflow and would cost a collapse on
-    // every session that names no model.
-    expect(all).toHaveLength(3);
   });
 });
 

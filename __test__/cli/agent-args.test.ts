@@ -10,7 +10,7 @@ import {
   type AgentRunDeps,
   chooseDefaultModel,
   configureAgentTracing,
-  expandPiAgentDir,
+  expandAgentDir,
   readPersistedDefaultModel,
   run,
   scanAgentArgs,
@@ -485,28 +485,28 @@ describe('withDefaultModel', () => {
 });
 
 /**
- * Compat re-export of pi 0.80.6 `getAgentDir` → `normalizePath` (default
- * options): lone `~` and leading `~/` expand, `file://` URLs resolve,
- * `~user` and everything else pass verbatim.
+ * Shared agent-dir expansion (re-exported from `@mlx-node/agent/paths`):
+ * lone `~` and leading `~/` expand, `file://` URLs resolve, `~user` and
+ * everything else pass verbatim.
  */
-describe('expandPiAgentDir', () => {
+describe('expandAgentDir', () => {
   it('expands a lone ~ and a leading ~/ against the home dir', () => {
-    expect(expandPiAgentDir('~', '/home/u')).toBe('/home/u');
-    expect(expandPiAgentDir('~/tilde-agent', '/home/u')).toBe(join('/home/u', 'tilde-agent'));
-    expect(expandPiAgentDir('~/a b/agent', '/home/u')).toBe(join('/home/u', 'a b/agent'));
+    expect(expandAgentDir('~', '/home/u')).toBe('/home/u');
+    expect(expandAgentDir('~/tilde-agent', '/home/u')).toBe(join('/home/u', 'tilde-agent'));
+    expect(expandAgentDir('~/a b/agent', '/home/u')).toBe(join('/home/u', 'a b/agent'));
   });
 
   it('does NOT expand ~user and passes other values verbatim', () => {
-    expect(expandPiAgentDir('~user/agent', '/home/u')).toBe('~user/agent');
-    expect(expandPiAgentDir('/abs/agent', '/home/u')).toBe('/abs/agent');
-    expect(expandPiAgentDir('relative/agent', '/home/u')).toBe('relative/agent');
+    expect(expandAgentDir('~user/agent', '/home/u')).toBe('~user/agent');
+    expect(expandAgentDir('/abs/agent', '/home/u')).toBe('/abs/agent');
+    expect(expandAgentDir('relative/agent', '/home/u')).toBe('relative/agent');
     // No trim: normalizePath default options leave whitespace alone, so a
     // padded value stays a literal (weird) path — parity over polish.
-    expect(expandPiAgentDir(' ~/padded', '/home/u')).toBe(' ~/padded');
+    expect(expandAgentDir(' ~/padded', '/home/u')).toBe(' ~/padded');
   });
 
   it('resolves file:// URLs', () => {
-    expect(expandPiAgentDir('file:///abs/agent', '/home/u')).toBe('/abs/agent');
+    expect(expandAgentDir('file:///abs/agent', '/home/u')).toBe('/abs/agent');
   });
 });
 

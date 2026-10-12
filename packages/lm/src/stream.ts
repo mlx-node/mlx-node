@@ -923,7 +923,7 @@ void _familyConformance;
 /**
  * `FamilyStreamOpts` (`family-data.ts`) is the row-side structural mirror of
  * {@link StreamingModelOptions} — the same mirror pattern
- * `FamilyThinkingLevelMap` uses for pi's map. A key-set drift or a widened
+ * `FamilyThinkingLevelMap` uses for the agent's thinking-level map. A key-set drift or a widened
  * field type resolves to a failure string, which is not assignable to
  * `true`.
  */

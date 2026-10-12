@@ -73,7 +73,7 @@ export async function runAppEval(
     enginePolicy: LAUNCHER_ENGINE_POLICY,
     inheritedInferenceEnvironment: Object.fromEntries(
       Object.entries(process.env).filter(([key]) =>
-        /^(MLX_(PAGED_|CACHE_LIMIT|IDLE_CLEAR|CONTINUOUS_BATCHING|SERVE_FORCE_SERIAL)|PI_CODING_AGENT_DIR$)/.test(key),
+        /^(MLX_(PAGED_|CACHE_LIMIT|IDLE_CLEAR|CONTINUOUS_BATCHING|SERVE_FORCE_SERIAL)|GROK_HOME$)/.test(key),
       ),
     ),
     sources,

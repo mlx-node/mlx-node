@@ -82,8 +82,8 @@ import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 
 /**
  * Tier-2 `prompt_cache_key` reuse is **ON by default** so the server
- * is immediately compatible with any stateless LLM agent (pi-mono,
- * Aider, Codex CLI, Claude Code, Cline, Continue) that sends the full
+ * is immediately compatible with any stateless LLM agent
+ * (Aider, Codex CLI, Claude Code, Cline, Continue) that sends the full
  * transcript every turn. Agents that set OpenAI's standard
  * `prompt_cache_key` field — which most do — get automatic KV cache
  * reuse across turns of the same logical session.
@@ -828,7 +828,7 @@ export class SessionRegistry {
    *
    *   2. **Tier 2 — `promptCacheKey`.** Only runs when
    *      `previousResponseId` is `null`. Stateless agent clients
-   *      (pi-mono, Aider, Codex CLI, Continue, etc.) never use
+   *      (Aider, Codex CLI, Continue, etc.) never use
    *      `previous_response_id` — they own the conversation history
    *      client-side and resend the full transcript on every turn —
    *      so the only way to reuse a warm session across those turns

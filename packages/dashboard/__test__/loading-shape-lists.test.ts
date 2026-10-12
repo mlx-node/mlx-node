@@ -3,9 +3,9 @@
  */
 
 /**
- * Shape guards for the LOADING tree of the two list pages.
+ * Shape guards for the LOADING tree of the Models list page.
  *
- * Both pages used to answer `loading` with a bare stack of grey bars and then
+ * The page used to answer `loading` with a bare stack of grey bars and then
  * swap in a `<Table>` that carries a `<TableHeader>` the bars never reserved:
  * the header appeared out of nowhere, pushed every row down by its own height,
  * and the column grid re-solved underneath. That reads as a flash of movement on
@@ -26,18 +26,9 @@
  * environment stays `node`.
  */
 
-import type {
-  CatalogResponse,
-  DownloadsResponse,
-  LocalModel,
-  ModelsResponse,
-  SessionRow,
-  SessionsResponse,
-} from '@/lib/types';
+import type { CatalogResponse, DownloadsResponse, LocalModel, ModelsResponse } from '@/lib/types';
 import Models from '@/pages/models';
-import Sessions from '@/pages/sessions';
 import { act, createElement, type ReactElement } from 'react';
-import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { renderPage, type RenderedPage, stubApi } from './render.js';
@@ -207,33 +198,6 @@ function modelsRoutes(): Record<string, unknown> {
   return { '/models': models, '/catalog': catalog, '/catalog/updates': { items: [] }, '/downloads': downloads };
 }
 
-function sessionRow(overrides: Partial<SessionRow>): SessionRow {
-  return {
-    id: 'sess-1',
-    path: '/sessions/sess-1.jsonl',
-    cwd: '/work/mlx-node',
-    name: 'Refactor the planner',
-    created: 1_700_000_000_000,
-    modified: 1_700_000_100_000,
-    messageCount: 42,
-    firstMessage: 'hello',
-    models: ['qwen3-8b'],
-    inputTokens: 1_000,
-    outputTokens: 2_000,
-    ...overrides,
-  };
-}
-
-function sessionsRoutes(): Record<string, unknown> {
-  const sessions: SessionsResponse = {
-    sessions: [sessionRow({}), sessionRow({ id: 'sess-2', name: 'Bump MLX' })],
-    total: 2,
-    tokens: 6_000,
-    cwds: ['/work/mlx-node'],
-  };
-  return { '/sessions': sessions };
-}
-
 describe('Models page — the loading tree holds the loaded page’s box', () => {
   /**
    * The regression guard for the whole class. A header rendered by only one of
@@ -274,33 +238,5 @@ describe('Models page — the loading tree holds the loaded page’s box', () =>
     expect(loading.skeletons).toBeGreaterThan(0);
     expect(loaded.catalogCards).toBe(3);
     expect(loading.catalogCards).toBe(loaded.catalogCards);
-  });
-});
-
-describe('Sessions page — the loading tree holds the loaded page’s box', () => {
-  function page(): ReactElement {
-    return createElement(MemoryRouter, null, createElement(Sessions));
-  }
-
-  it('renders the same column headers while loading as it does when loaded', async () => {
-    const { loading, loaded } = await shapesAcrossLoad(page(), sessionsRoutes(), (text) =>
-      text.includes('Refactor the planner'),
-    );
-    expect(loading.skeletons).toBeGreaterThan(0);
-    expect(loaded.heads).toEqual(['Session', 'Directory', 'Models', 'Modified', 'Messages', 'Tokens', '']);
-    expect(loading.heads).toEqual(loaded.heads);
-  });
-
-  it('gives every placeholder row the cells a real row has', async () => {
-    // This table is `table-fixed` with percentage column widths, so the header
-    // is not merely a strip of height — it is what solves the grid. A body of
-    // full-width bars under no header is laid out by a different algorithm
-    // entirely, and every column moves when the rows replace it.
-    const { loading, loaded } = await shapesAcrossLoad(page(), sessionsRoutes(), (text) =>
-      text.includes('Refactor the planner'),
-    );
-    expect(loading.skeletons).toBeGreaterThan(0);
-    expect(new Set(loaded.rowWidths)).toEqual(new Set([7]));
-    expect(new Set(loading.rowWidths)).toEqual(new Set(loaded.rowWidths));
   });
 });

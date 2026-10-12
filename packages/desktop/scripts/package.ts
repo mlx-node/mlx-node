@@ -159,7 +159,7 @@ console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged p
 console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);
 if (staged.excludedProviderSdk.length > 0) {
   console.log(
-    `  excluded ${staged.excludedProviderSdk.join(', ')} — cloud LLM SDKs, unreachable without a pi-ai stream()`,
+    `  excluded ${staged.excludedProviderSdk.join(', ')} — cloud LLM SDKs, unreachable from a local-inference app`,
   );
 }
 if (staged.prunedNested.length > 0) {

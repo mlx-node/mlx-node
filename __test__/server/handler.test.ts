@@ -2640,7 +2640,7 @@ describe('createHandler', () => {
 
     it('closes the reasoning output item BEFORE opening the message item (thinking-model round-trip regression)', async () => {
       // Regression for a reasoning-replay bug that broke thinking-model
-      // agent loops. OpenAI Responses clients (e.g. pi-mono) drive a
+      // agent loops. OpenAI Responses clients drive a
       // single `currentBlock` state machine over the SSE stream:
       // `response.output_item.added` sets `currentBlock` to the new
       // item's type, and `response.output_item.done` only stores

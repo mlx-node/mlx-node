@@ -22,7 +22,6 @@ import type { ApiResponse } from '../api/errors.js';
 export interface DbWorkerBootstrap {
   dbPath: string;
   modelsDir: string;
-  sessionsRoot: string;
   tracesDir: string;
   cacheRoot: string | undefined;
 }

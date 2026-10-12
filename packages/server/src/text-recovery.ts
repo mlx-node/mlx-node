@@ -18,7 +18,7 @@
  *
  * The implementation lives in `@mlx-node/lm` next to `ToolCallTagBuffer`
  * (the suppression that creates the prefix invariant this relies on) so
- * non-server consumers — the pi agent `TurnEmitter` — share one source.
+ * non-server stream emitters can share one source.
  *
  * Internal-only — not exported from `packages/server/src/index.ts`.
  */

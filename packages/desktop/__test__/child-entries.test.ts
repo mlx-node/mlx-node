@@ -105,9 +105,9 @@ function workspaceSourceFor(specifier: string): string | null {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
     exports?: Record<string, string | { import?: string; default?: string }>;
   };
-  // Published subpaths can alias a nested source file (agent/models is
-  // dist/provider/models.js). Follow the actual runtime export so the walk
-  // covers that file's entire graph instead of guessing from the public name.
+  // Published subpaths can alias a nested source file. Follow the actual
+  // runtime export so the walk covers that file's entire graph instead of
+  // guessing from the public name.
   if (manifest.exports !== undefined) {
     const entry = manifest.exports[subpath === undefined ? '.' : `./${subpath}`];
     const target = typeof entry === 'string' ? entry : (entry?.import ?? entry?.default);
@@ -209,7 +209,7 @@ describe('CONTROL PANEL never links the native addon', () => {
     expect(graph.files).toContain('packages/dashboard/src/runtime.ts');
     expect(graph.files).toContain('packages/dashboard/src/download.ts');
     expect(graph.files).toContain('packages/lm/src/draft-companion.ts');
-    expect(graph.files).toContain('packages/agent/src/provider/models.ts');
+    expect(graph.files).toContain('packages/agent/src/models.ts');
     expect(graph.files).toContain('packages/lm/src/model-discovery.ts');
     expect(graph.files).toContain('packages/lm/src/model-detection.ts');
     expect(graph.files).toContain('packages/lm/src/gguf-metadata.ts');

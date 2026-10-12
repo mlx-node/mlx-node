@@ -24,7 +24,7 @@ export function validateCacheSalt(cacheSalt: unknown): asserts cacheSalt is stri
  * Accepts both input-side (`input_text`, `input_image`) and replay-side
  * (`output_text`, `refusal`, `summary_text`) content parts. Clients that echo
  * prior assistant turns in `input[]` instead of using `previous_response_id`
- * (pi-ai, Codex) send `output_text` on assistant messages — rejecting those
+ * (Codex and other agent harnesses) send `output_text` on assistant messages — rejecting those
  * would break cold-start replay. `input_image` with a base64 `data:` URL is
  * decoded to bytes; `http(s)://` URLs are not fetched (the mapper stays sync).
  */

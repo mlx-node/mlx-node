@@ -130,7 +130,7 @@ describe('attach', () => {
     expect(await stale).toEqual([]);
 
     // The new one works.
-    const reply = await ask(second.peer, { kind: 'call', id: 3, call: { method: 'GET', path: '/api/sessions' } });
+    const reply = await ask(second.peer, { kind: 'call', id: 3, call: { method: 'GET', path: '/api/models' } });
     expect(reply).toMatchObject({ kind: 'response', id: 3 });
   });
 
@@ -140,7 +140,7 @@ describe('attach', () => {
     let finishOld: ((response: ApiResponse) => void) | undefined;
     runtime.call = (call: ApiCall, signal?: AbortSignal): Promise<ApiResponse> => {
       runtime.calls.push(call);
-      if (call.path === '/api/sessions/already-started') {
+      if (call.path === '/api/models/already-started') {
         oldSignal = signal;
         return new Promise<ApiResponse>((resolve) => {
           finishOld = resolve;
@@ -155,7 +155,7 @@ describe('attach', () => {
     const oldReply = ask(first.peer, {
       kind: 'call',
       id: 1,
-      call: { method: 'DELETE', path: '/api/sessions/already-started' },
+      call: { method: 'DELETE', path: '/api/models/already-started' },
     });
     await settle();
 

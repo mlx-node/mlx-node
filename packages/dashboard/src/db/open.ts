@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { getTableColumns } from 'drizzle-orm';
 import { drizzle, type NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
 
-import { sessions, traceFiles, traces, turns } from './schema.js';
+import { traceFiles, traces } from './schema.js';
 
 export interface DashboardDb {
   db: NodeSQLiteDatabase;
@@ -18,36 +18,9 @@ export interface DashboardDb {
  * rather than migrated in place. The index is disposable and repopulated from
  * JSONL on boot, so a rebuild never loses source-of-truth data.
  */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 const DDL = `
-CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,
-  path TEXT NOT NULL,
-  cwd TEXT NOT NULL,
-  name TEXT,
-  created INTEGER NOT NULL,
-  modified INTEGER NOT NULL,
-  message_count INTEGER NOT NULL DEFAULT 0,
-  first_message TEXT,
-  delegation TEXT,
-  last_ingested_mtime INTEGER NOT NULL DEFAULT 0,
-  last_ingested_size INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS turns (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL,
-  entry_id TEXT,
-  trace_id TEXT,
-  ts INTEGER NOT NULL,
-  model TEXT,
-  input_tokens INTEGER,
-  output_tokens INTEGER,
-  cached_tokens INTEGER,
-  reasoning_tokens INTEGER
-);
-
 CREATE TABLE IF NOT EXISTS traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   trace_id TEXT NOT NULL UNIQUE,
@@ -100,7 +73,6 @@ CREATE TABLE IF NOT EXISTS trace_files (
   last_ingested_size INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_turns_session_id ON turns (session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_session_id ON traces (session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_root_session_id ON traces (root_session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_trace_id ON traces (trace_id);
@@ -157,8 +129,6 @@ function assertUsableSchema(sqlite: DatabaseSync): void {
  * table names; values the full set of DB column names each must carry.
  */
 const EXPECTED_COLUMNS: Record<string, string[]> = {
-  sessions: Object.values(getTableColumns(sessions)).map((c) => c.name),
-  turns: Object.values(getTableColumns(turns)).map((c) => c.name),
   traces: Object.values(getTableColumns(traces)).map((c) => c.name),
   trace_files: Object.values(getTableColumns(traceFiles)).map((c) => c.name),
 };

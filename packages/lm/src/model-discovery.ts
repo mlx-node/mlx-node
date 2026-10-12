@@ -131,7 +131,7 @@ function nonEmptyRecord(value: unknown): value is Record<string, unknown> {
  * Image support is advertised only when a family with a native multimodal
  * implementation carries its valid, non-empty vision marker: `vision_config`
  * for Qwen, and either `vision_config` or `unified_vision_config` for Gemma.
- * This lets Pi's model picker and `--list-models` expose checkpoint capability
+ * This lets the agent's model picker and `--list-models` expose checkpoint capability
  * without loading weights. The first resident load remains authoritative and
  * reconciles this optimistic config-level advertisement via
  * `session.supportsImages()` (for example, when conversion stripped an

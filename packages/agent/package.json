@@ -40,23 +40,19 @@
       "default": "./dist/paths.js"
     },
     "./models": {
-      "@mlx-node/source": "./src/provider/models.ts",
-      "types": "./dist/provider/models.d.ts",
-      "default": "./dist/provider/models.js"
+      "@mlx-node/source": "./src/models.ts",
+      "types": "./dist/models.d.ts",
+      "default": "./dist/models.js"
     }
   },
   "scripts": {
     "build": "tsc -b"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.99.2",
-    "@earendil-works/pi-coding-agent": "0.99.2",
-    "@mlx-node/core": "workspace:*",
-    "@mlx-node/lm": "workspace:*",
-    "@mlx-node/server": "workspace:*",
-    "typebox": "1.3.37"
+    "@mlx-node/lm": "workspace:*"
   },
   "devDependencies": {
+    "@mlx-node/core": "workspace:*",
     "@types/node": "^26.4.0"
   },
   "engines": {

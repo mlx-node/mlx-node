@@ -18,7 +18,7 @@ import {
 
 describe('classifyNavigation', () => {
   it('allows the SPA to route within itself', () => {
-    for (const url of [CONTROL_PANEL_URL, 'app://mlx/sessions', 'app://mlx/sessions/abc-123?tab=metrics']) {
+    for (const url of [CONTROL_PANEL_URL, 'app://mlx/models', 'app://mlx/models/abc-123?tab=metrics']) {
       expect(classifyNavigation(url), url).toBe('allow');
     }
   });

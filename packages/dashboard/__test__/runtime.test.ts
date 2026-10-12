@@ -20,7 +20,6 @@ import { createDashboardRuntime, type DashboardRuntime, type RuntimeLifecycleEve
 import { startDbWorker } from '../src/worker/client.js';
 
 let base: string;
-let sessionsRoot: string;
 let tracesDir: string;
 let modelsDir: string;
 let runtime: DashboardRuntime;
@@ -31,37 +30,23 @@ let runtime: DashboardRuntime;
  */
 let order: string[];
 
-/** Enough real session files that an ingest spans several I/O turns. */
-const SESSION_COUNT = 120;
+/** Enough real trace files that an ingest spans several I/O turns. */
+const TRACE_FILE_COUNT = 120;
 
-function seedSessions(root: string, count: number): void {
-  const dir = join(root, '--w--');
+function seedTraces(dir: string, count: number): void {
   mkdirSync(dir, { recursive: true });
   for (let i = 0; i < count; i++) {
-    const id = `rt-${i}`;
-    const lines = [
-      { type: 'session', version: 3, id, timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      {
-        type: 'message',
-        id: 'u1',
-        parentId: null,
-        timestamp: '2026-07-01T10:00:01.000Z',
-        message: { role: 'user', content: `question ${i}` },
-      },
-      {
-        type: 'message',
-        id: 'a1',
-        parentId: 'u1',
-        timestamp: '2026-07-01T10:00:02.000Z',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: `answer ${i}` }],
-          model: 'qwen3_5',
-          usage: { input: 5, output: 6 },
-        },
-      },
-    ];
-    writeFileSync(join(dir, `2026-07-01T10-00-00_${id}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    const line = JSON.stringify({ traceId: `rt-${i}`, ts: 1, model: 'qwen3_5' });
+    writeFileSync(join(dir, `2026-07-01-${i}.jsonl`), `${line}\n`);
+  }
+}
+
+/** Fake checkpoints `DELETE /api/models/:name` can act on. */
+function seedModels(dir: string, ids: string[]): void {
+  for (const id of ids) {
+    const modelDir = join(dir, id);
+    mkdirSync(modelDir, { recursive: true });
+    writeFileSync(join(modelDir, 'config.json'), '{}');
   }
 }
 
@@ -80,17 +65,15 @@ async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T | 'HU
 
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'dash-runtime-'));
-  sessionsRoot = join(base, 'sessions');
-  seedSessions(sessionsRoot, SESSION_COUNT);
   tracesDir = join(base, 'traces');
-  mkdirSync(tracesDir, { recursive: true });
+  seedTraces(tracesDir, TRACE_FILE_COUNT);
   modelsDir = join(base, 'models');
   mkdirSync(modelsDir, { recursive: true });
+  seedModels(modelsDir, ['rt-0', 'rt-1', 'rt-2', 'rt-3', 'rt-4']);
 
   order = [];
   runtime = createDashboardRuntime({
     dbPath: ':memory:',
-    sessionsRoot,
     tracesDir,
     modelsDir,
     onLifecycle: (event: RuntimeLifecycleEvent) => order.push(event.type),
@@ -118,7 +101,7 @@ describe('dashboard runtime — call', () => {
    */
   it('returns a failure envelope, never a rejection, for a malformed percent-escape', async () => {
     // Worker-owned route.
-    await expect(runtime.call({ method: 'GET', path: '/api/sessions/%' })).resolves.toMatchObject({
+    await expect(runtime.call({ method: 'DELETE', path: '/api/models/%' })).resolves.toMatchObject({
       ok: false,
       code: 'E_BAD_REQUEST',
       status: 400,
@@ -130,7 +113,7 @@ describe('dashboard runtime — call', () => {
       status: 400,
     });
     // Control: `%25` decodes cleanly to `%`, so this is a plain miss.
-    await expect(runtime.call({ method: 'GET', path: '/api/sessions/%25' })).resolves.toMatchObject({
+    await expect(runtime.call({ method: 'DELETE', path: '/api/models/%25' })).resolves.toMatchObject({
       ok: false,
       code: 'E_NOT_FOUND',
       status: 404,
@@ -140,16 +123,15 @@ describe('dashboard runtime — call', () => {
   it('answers an API call with the route body, no socket involved', async () => {
     const res = await runtime.call({ method: 'GET', path: '/api/health' });
     expect(res.status).toBe(200);
-    expect(res.ok ? res.body : null).toMatchObject({ status: 'ok', sessionsRoot, tracesDir, modelsDir });
+    expect(res.ok ? res.body : null).toMatchObject({ status: 'ok', tracesDir, modelsDir });
   });
 
   it('parses the query string off the path', async () => {
     await runtime.ingestNow();
-    const res = await runtime.call({ method: 'GET', path: '/api/sessions?limit=3' });
+    const res = await runtime.call({ method: 'GET', path: '/api/metrics/overview?from=0&to=10' });
     expect(res.ok).toBe(true);
-    const body = res.ok ? (res.body as { sessions: unknown[]; total: number }) : { sessions: [], total: 0 };
-    expect(body.sessions).toHaveLength(3);
-    expect(body.total).toBe(SESSION_COUNT);
+    const body = res.ok ? (res.body as { range: { from: number | null; to: number | null } }) : null;
+    expect(body?.range).toEqual({ from: 0, to: 10 });
   });
 
   it('returns a failure envelope (never rejects) for an unknown path', async () => {
@@ -170,7 +152,7 @@ describe('dashboard runtime — call', () => {
 // the thread that owns the transport, the download manager and its progress
 // events. Asserting SETTLE ORDER rather than a duration keeps it deterministic —
 // a transport-thread route is answered in microtasks, so it cannot lose to a
-// cross-thread round trip, let alone one queued behind a 120-session ingest.
+// cross-thread round trip, let alone one queued behind a 120-file ingest.
 describe('dashboard runtime — thread split', () => {
   it('answers a transport-thread route while the worker is busy ingesting', async () => {
     const settled: string[] = [];
@@ -191,7 +173,7 @@ describe('dashboard runtime — thread split', () => {
 
   it('answers a transport-thread route before the worker has even booted', async () => {
     // A cancel click during startup must not wait for the database to open.
-    const fresh = createDashboardRuntime({ dbPath: ':memory:', sessionsRoot, tracesDir, modelsDir });
+    const fresh = createDashboardRuntime({ dbPath: ':memory:', tracesDir, modelsDir });
     try {
       const settled: string[] = [];
       const boot = fresh.call({ method: 'GET', path: '/api/health' }).then(() => settled.push('worker'));
@@ -225,7 +207,7 @@ describe('dashboard runtime — route ownership', () => {
   });
 
   it('reports the owning thread per request, and none for an unmatched one', () => {
-    expect(routeThreadFor('GET', '/api/sessions')).toBe('worker');
+    expect(routeThreadFor('GET', '/api/models')).toBe('worker');
     expect(routeThreadFor('GET', '/api/coding-agents/models')).toBe('worker');
     expect(routeThreadFor('DELETE', '/api/downloads/job-1')).toBe('main');
     // Wrong method on a known path, and an unknown path: no owner, answered
@@ -235,11 +217,11 @@ describe('dashboard runtime — route ownership', () => {
   });
 
   it('refuses to run a route the other thread owns', async () => {
-    const mainCtx = { modelsDir, sessionsRoot, tracesDir, cacheRoot: undefined } as unknown as MainApiContext;
-    const workerCtx = { modelsDir, sessionsRoot, tracesDir, cacheRoot: undefined } as unknown as WorkerApiContext;
+    const mainCtx = { modelsDir, tracesDir, cacheRoot: undefined } as unknown as MainApiContext;
+    const workerCtx = { modelsDir, tracesDir, cacheRoot: undefined } as unknown as WorkerApiContext;
     const query = new URLSearchParams();
 
-    const dbOnMain = await dispatchMain(mainCtx, { method: 'GET', pathname: '/api/sessions', query });
+    const dbOnMain = await dispatchMain(mainCtx, { method: 'GET', pathname: '/api/models', query });
     expect(dbOnMain.status).toBe(500);
     expect(dbOnMain.ok ? '' : dbOnMain.message).toContain('owned by the worker thread');
 
@@ -255,7 +237,7 @@ describe('dashboard runtime — shutdown', () => {
   // invisible because the ingest catch swallowed "database is not open" into a
   // warning nobody read. `close()` must await the ingest chain instead.
   it('awaits an in-flight ingest before closing the database', async () => {
-    // `ingestSessions`/`ingestTraces` have synchronous bodies, so ONE queued
+    // `ingestTraces` has a synchronous body, so ONE queued
     // rescan can finish inside the handful of turns `downloads.shutdown()` costs
     // — a single-ingest assertion would pass even with the await removed. Queue a
     // deep chain instead: it takes far more turns than the rest of the shutdown,
@@ -278,10 +260,21 @@ describe('dashboard runtime — shutdown', () => {
     expect(settled).toBe(true);
     const summary = await tail;
     // It ran to completion against an OPEN database: no swallowed
-    // "database is not open", no worker torn down under it, and every seeded
-    // session was indexed.
-    expect(summary.sessions.warnings).toEqual([]);
-    expect(summary.sessions.scanned).toBe(SESSION_COUNT);
+    // "database is not open", no worker torn down under it. `files` counts
+    // only files read by THIS pass — the first pass indexed them all, so the
+    // tail summary legitimately reads 0; the row count itself is checked
+    // against a live query below.
+    expect(summary.traces.warnings).toEqual([]);
+  });
+
+  it('indexed trace rows survive an ingest that ran under a queued chain', async () => {
+    for (let i = 0; i < 5; i++) void runtime.ingestNow();
+    // Awaiting one more ingestNow drains every segment queued before it.
+    await runtime.ingestNow();
+    const res = await runtime.call({ method: 'GET', path: '/api/metrics/overview' });
+    expect(res.ok).toBe(true);
+    const body = res.ok ? (res.body as { totals: { traces: number } }) : null;
+    expect(body?.totals.traces).toBe(TRACE_FILE_COUNT);
   });
 
   // Downloads must drain BEFORE anything else tears down: a shutdown that killed
@@ -317,14 +310,13 @@ describe('dashboard runtime — worker death', () => {
   it('settles an in-flight call when the worker dies under it', async () => {
     const crashed = createDashboardRuntime({
       dbPath: ':memory:',
-      sessionsRoot,
       tracesDir,
       modelsDir,
       workerUrl: new URL('./helpers/crashing-db-worker.ts', import.meta.url),
       onLifecycle: (event) => order.push(event.type),
     });
     try {
-      const inFlight = await withDeadline(crashed.call({ method: 'GET', path: '/api/sessions' }), 10_000);
+      const inFlight = await withDeadline(crashed.call({ method: 'GET', path: '/api/models' }), 10_000);
       expect(inFlight).not.toBe('HUNG');
       const res = inFlight as Exclude<typeof inFlight, 'HUNG'>;
       expect(res.ok).toBe(false);
@@ -348,7 +340,6 @@ describe('dashboard runtime — worker death', () => {
   it('rejects an unconfirmed drain and still closes on a bounded timeout', async () => {
     const wedged = createDashboardRuntime({
       dbPath: ':memory:',
-      sessionsRoot,
       tracesDir,
       modelsDir,
       workerUrl: new URL('./helpers/wedged-db-worker.ts', import.meta.url),
@@ -411,13 +402,12 @@ describe('dashboard runtime — worker death', () => {
       onLifecycle: (event) => lifecycle.push(event),
       dbPath: ':memory:',
       modelsDir,
-      sessionsRoot,
       tracesDir,
       cacheRoot: undefined,
     });
 
     try {
-      const call = await withDeadline(client.call({ method: 'GET', path: '/api/sessions' }), 5_000);
+      const call = await withDeadline(client.call({ method: 'GET', path: '/api/models' }), 5_000);
       expect(call).not.toBe('HUNG');
       const res = call as Exclude<typeof call, 'HUNG'>;
       expect(res.status).toBe(503);
@@ -426,7 +416,7 @@ describe('dashboard runtime — worker death', () => {
       // The periodic rescan is the leak's engine, so it needs the same bound.
       const ingest = await withDeadline(client.ingest(), 5_000);
       expect(ingest).not.toBe('HUNG');
-      expect((ingest as Exclude<typeof ingest, 'HUNG'>).sessions.warnings).toHaveLength(1);
+      expect((ingest as Exclude<typeof ingest, 'HUNG'>).traces.warnings).toHaveLength(1);
 
       // No cancellation acknowledgement and no real response means the worker
       // cannot remain alive after the caller is failed: it could otherwise
@@ -447,14 +437,14 @@ describe('dashboard runtime — worker death', () => {
  * ran and may be sitting in the worker's message queue. Without an acknowledged
  * retraction, a timed-out `DELETE` answered the UI `503 E_UNAVAILABLE` and then
  * performed the deletion anyway — the user is told nothing happened, retries or
- * gives up, and the model / session / cache entry is gone regardless.
+ * gives up, and the model / cache entry is gone regardless.
  *
- * Asserted on the on-disk transcript rather than a database row: it is the part
+ * Asserted on the on-disk checkpoint rather than a database row: it is the part
  * of the mutation that outlives the worker, and it is visible from this thread
  * without asking the worker anything.
  */
 describe('dashboard database worker — withdrawing an abandoned request', () => {
-  const transcriptOf = (id: string): string => join(sessionsRoot, '--w--', `2026-07-01T10-00-00_${id}.jsonl`);
+  const checkpointOf = (id: string): string => join(modelsDir, id);
 
   function client(requestTimeoutMs: number): ReturnType<typeof startDbWorker> {
     return startDbWorker({
@@ -466,21 +456,20 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       onLifecycle: (): void => {},
       dbPath: ':memory:',
       modelsDir,
-      sessionsRoot,
       tracesDir,
       cacheRoot: undefined,
     });
   }
 
-  it('does not delete a session whose caller was already told the call failed', async () => {
-    const doomed = transcriptOf('rt-0');
+  it('does not delete a model whose caller was already told the call failed', async () => {
+    const doomed = checkpointOf('rt-0');
     expect(existsSync(doomed)).toBe(true);
 
     // 20 ms cannot survive worker startup, so the deadline is guaranteed to
     // expire while the request is still queued — the exact window the
     // withdrawal covers.
     const timing = client(20);
-    const res = await withDeadline(timing.call({ method: 'DELETE', path: '/api/sessions/rt-0' }), 10_000);
+    const res = await withDeadline(timing.call({ method: 'DELETE', path: '/api/models/rt-0' }), 10_000);
     expect(res).not.toBe('HUNG');
     const failed = res as Exclude<typeof res, 'HUNG'>;
     expect(failed.status).toBe(503);
@@ -496,11 +485,11 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
   it('still deletes when the caller waits for the answer', async () => {
     // The control. Without it the test above would pass just as well against a
     // DELETE route that had stopped working altogether.
-    const doomed = transcriptOf('rt-1');
+    const doomed = checkpointOf('rt-1');
     expect(existsSync(doomed)).toBe(true);
 
     const patient = client(30_000);
-    const res = await withDeadline(patient.call({ method: 'DELETE', path: '/api/sessions/rt-1' }), 10_000);
+    const res = await withDeadline(patient.call({ method: 'DELETE', path: '/api/models/rt-1' }), 10_000);
     expect(res).not.toBe('HUNG');
     expect((res as Exclude<typeof res, 'HUNG'>).status).toBe(200);
 
@@ -509,8 +498,8 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
   });
 
   it('does not post a pre-aborted call or poison the next worker request id', async () => {
-    const spared = transcriptOf('rt-3');
-    const control = transcriptOf('rt-4');
+    const spared = checkpointOf('rt-3');
+    const control = checkpointOf('rt-4');
     expect(existsSync(spared)).toBe(true);
     expect(existsSync(control)).toBe(true);
 
@@ -518,7 +507,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     const controller = new AbortController();
     controller.abort();
     const cancelled = await withDeadline(
-      worker.call({ method: 'DELETE', path: '/api/sessions/rt-3' }, controller.signal),
+      worker.call({ method: 'DELETE', path: '/api/models/rt-3' }, controller.signal),
       10_000,
     );
     expect(cancelled).not.toBe('HUNG');
@@ -529,7 +518,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     // A normal call immediately after the pre-aborted one proves both that the
     // first was never posted and that cancellation did not occupy/corrupt a
     // request id in the worker's ordered protocol.
-    const deleted = await withDeadline(worker.call({ method: 'DELETE', path: '/api/sessions/rt-4' }), 10_000);
+    const deleted = await withDeadline(worker.call({ method: 'DELETE', path: '/api/models/rt-4' }), 10_000);
     expect(deleted).not.toBe('HUNG');
     expect((deleted as Exclude<typeof deleted, 'HUNG'>).status).toBe(200);
 
@@ -539,7 +528,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
   });
 
   it('returns the real result when the worker sampled just before withdrawal arrived', async () => {
-    const target = join(sessionsRoot, 'late-withdraw-target');
+    const target = join(modelsDir, 'late-withdraw-target');
     writeFileSync(target, 'alive');
     const gate = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
     const controller = new AbortController();
@@ -554,7 +543,6 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       onLifecycle: (): void => {},
       dbPath: ':memory:',
       modelsDir,
-      sessionsRoot,
       tracesDir,
       cacheRoot: undefined,
     });
@@ -598,7 +586,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
   });
 
   it('does not execute a deletion after the renderer RPC deadline reports failure', async () => {
-    const doomed = transcriptOf('rt-2');
+    const doomed = checkpointOf('rt-2');
     expect(existsSync(doomed)).toBe(true);
 
     const { port1, port2 } = new MessageChannel();
@@ -615,7 +603,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     });
 
     try {
-      const res = await withDeadline(renderer.call({ method: 'DELETE', path: '/api/sessions/rt-2' }), 10_000);
+      const res = await withDeadline(renderer.call({ method: 'DELETE', path: '/api/models/rt-2' }), 10_000);
       expect(res).not.toBe('HUNG');
       const failed = res as Exclude<typeof res, 'HUNG'>;
       expect(failed.status).toBe(503);

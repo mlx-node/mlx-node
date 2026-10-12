@@ -882,7 +882,7 @@ async function handleStreamingNativeWithAbort(
       } else {
         // Transition from reasoning to assistant text: close the reasoning
         // output item BEFORE emitting any `response.output_item.added` for
-        // the message. OpenAI Responses clients (e.g. pi-mono) maintain a
+        // the message. OpenAI Responses clients maintain a
         // single `currentBlock` state — opening the message item while the
         // reasoning item is still "in progress" overwrites that state, so
         // the later `output_item.done` for reasoning fails its

@@ -2,10 +2,9 @@
   "name": "@mlx-node/dashboard",
   "version": "0.0.11",
   "private": true,
-  "description": "Local web dashboard for mlx-node: models, sessions, metrics, paged cache",
+  "description": "Local web dashboard for mlx-node: models, metrics, paged cache",
   "license": "MIT",
   "files": [
-    "assets",
     "dist",
     "web"
   ],
@@ -25,12 +24,10 @@
     "prepack": "yarn build"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.99.0",
     "@huggingface/hub": "^2.16.1",
     "@mlx-node/agent": "workspace:*",
     "@mlx-node/lm": "workspace:*",
-    "drizzle-orm": "1.0.0-rc.5-ab785fc",
-    "tokenizers": "0.23.2"
+    "drizzle-orm": "1.0.0-rc.5-ab785fc"
   },
   "devDependencies": {
     "@radix-ui/react-dialog": "^1.1.23",
@@ -49,10 +46,8 @@
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-is": "^19.2.8",
-    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.18.3",
     "recharts": "^3.10.1",
-    "remark-gfm": "^4.0.1",
     "sonner": "^2.0.8",
     "tailwind-merge": "^3.6.0",
     "tailwindcss": "^4.3.3",

@@ -1,39 +1,10 @@
 import { integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
-import type { DelegationSummary } from '../ingest/delegation.js';
-
-export const sessions = sqliteTable('sessions', {
-  id: text('id').primaryKey(),
-  path: text('path').notNull(),
-  cwd: text('cwd').notNull(),
-  name: text('name'),
-  created: integer('created').notNull(),
-  modified: integer('modified').notNull(),
-  messageCount: integer('message_count').notNull().default(0),
-  firstMessage: text('first_message'),
-  delegation: text('delegation', { mode: 'json' }).$type<DelegationSummary>(),
-  lastIngestedMtime: integer('last_ingested_mtime').notNull().default(0),
-  lastIngestedSize: integer('last_ingested_size').notNull().default(0),
-});
-
-export const turns = sqliteTable('turns', {
-  id: integer('id').primaryKey({ autoIncrement: true }),
-  sessionId: text('session_id').notNull(),
-  entryId: text('entry_id'),
-  traceId: text('trace_id'),
-  ts: integer('ts').notNull(),
-  model: text('model'),
-  inputTokens: integer('input_tokens'),
-  outputTokens: integer('output_tokens'),
-  cachedTokens: integer('cached_tokens'),
-  reasoningTokens: integer('reasoning_tokens'),
-});
-
 export const traces = sqliteTable('traces', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   traceId: text('trace_id').notNull().unique(),
   sessionId: text('session_id'),
-  /** Root pi session id (subagent turns correlate to their delegating root). */
+  /** Root session id (subagent turns correlate to their delegating root). */
   rootSessionId: text('root_session_id'),
   ts: integer('ts').notNull(),
   model: text('model'),
@@ -93,7 +64,7 @@ export const traces = sqliteTable('traces', {
   /**
    * The eight `ColdSidecarStats` counters — the recurrent / sliding-window
    * state that lives OUTSIDE the paged pool. Every one is a per-turn DELTA
-   * (`provider/index.ts` differences the native snapshot across the turn), so
+   * (the trace writer differences the native snapshot across the turn), so
    * every one SUMS. None has a cumulative `*_total` twin, and MAX would not
    * substitute for one: over deltas it reports the busiest single turn, which
    * answers no question anyone asks.
@@ -134,8 +105,8 @@ export const traces = sqliteTable('traces', {
 
 /**
  * Per-file ingest watermark for the trace JSONL directory. Trace rows are keyed
- * by `traceId` (many per file), so — unlike `sessions` — there is no 1:1
- * file↔row anchor to hang the watermark on; this dedicated table records the
+ * by `traceId` (many per file), so there is no 1:1 file↔row anchor to hang a
+ * row-level watermark on; this dedicated table records the
  * `(mtime, size)` of each fully-ingested trace file so a 30s rescan can skip
  * unchanged files instead of re-reading the entire history every pass.
  */

@@ -2,11 +2,9 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { LoadableModel } from '@mlx-node/lm';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vite-plus/test';
+import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
-import { MlxModelHost } from '../src/provider/model-host.js';
-import { discoverMlxModels, type MlxModelInfo } from '../src/provider/models.js';
+import { discoverMlxModels, type MlxModelInfo } from '../src/models.js';
 
 let modelsDir: string;
 let infos: MlxModelInfo[];
@@ -124,47 +122,47 @@ describe('discoverMlxModels', () => {
     expect(gemma!.discovered.modelType).toBe('gemma4');
   });
 
-  it('builds a pi entry with dir name as id and name and zero cost', () => {
+  it('builds an agent model entry with dir name as id and name and zero cost', () => {
     for (const info of infos) {
-      expect(info.piModel.id).toBe(info.discovered.name);
-      expect(info.piModel.name).toBe(info.discovered.name);
-      expect(info.piModel.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+      expect(info.agentModel.id).toBe(info.discovered.name);
+      expect(info.agentModel.name).toBe(info.discovered.name);
+      expect(info.agentModel.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
     }
   });
 
   it('advertises images for Gemma and Qwen checkpoints with a valid vision_config', () => {
-    expect(infos[0]!.piModel.input).toEqual(['text', 'image']);
-    expect(infos[1]!.piModel.input).toEqual(['text', 'image']);
-    expect(infos[5]!.piModel.input).toEqual(['text', 'image']);
+    expect(infos[0]!.agentModel.input).toEqual(['text', 'image']);
+    expect(infos[1]!.agentModel.input).toEqual(['text', 'image']);
+    expect(infos[5]!.agentModel.input).toEqual(['text', 'image']);
   });
 
   it('accepts unified_vision_config only for Gemma', () => {
-    expect(infos[6]!.piModel.input).toEqual(['text', 'image']);
-    expect(infos[7]!.piModel.input).toEqual(['text']);
+    expect(infos[6]!.agentModel.input).toEqual(['text', 'image']);
+    expect(infos[7]!.agentModel.input).toEqual(['text']);
   });
 
   it('stays text-only without a valid multimodal vision_config', () => {
-    expect(infos[2]!.piModel.input).toEqual(['text']);
-    expect(infos[3]!.piModel.input).toEqual(['text']);
-    expect(infos[4]!.piModel.input).toEqual(['text']);
+    expect(infos[2]!.agentModel.input).toEqual(['text']);
+    expect(infos[3]!.agentModel.input).toEqual(['text']);
+    expect(infos[4]!.agentModel.input).toEqual(['text']);
   });
 
   it('flags reasoning for Qwen3.5, Gemma4, and LFM2 MoE', () => {
     const [qwen, gemma, fallback, moe] = infos;
-    expect(qwen!.piModel.reasoning).toBe(true);
-    expect(gemma!.piModel.reasoning).toBe(true);
-    expect(fallback!.piModel.reasoning).toBe(true);
-    expect(moe!.piModel.reasoning).toBe(true);
+    expect(qwen!.agentModel.reasoning).toBe(true);
+    expect(gemma!.agentModel.reasoning).toBe(true);
+    expect(fallback!.agentModel.reasoning).toBe(true);
+    expect(moe!.agentModel.reasoning).toBe(true);
   });
 
   it('exposes only Gemma4 distinct thinking modes', () => {
-    expect(infos[1]!.piModel.thinkingLevelMap).toEqual({
+    expect(infos[1]!.agentModel.thinkingLevelMap).toEqual({
       minimal: 'minimal',
       low: null,
       medium: null,
       high: 'high',
     });
-    expect(infos[0]!.piModel.thinkingLevelMap).toBeUndefined();
+    expect(infos[0]!.agentModel.thinkingLevelMap).toBeUndefined();
   });
 
   it('discovers lfm2_moe with lfm2-family traits and the first-class MoE preset', () => {
@@ -174,28 +172,28 @@ describe('discoverMlxModels', () => {
       path: join(modelsDir, 'lfm-moe'),
       modelType: 'lfm2_moe',
     });
-    expect(moe.piModel.reasoning).toBe(true);
-    expect(moe.piModel.contextWindow).toBe(128000); // LFM2.5 family fallback window
-    expect(moe.piModel.maxTokens).toBe(8192); // agent-local lfm2_moe preset maxOutputTokens
+    expect(moe.agentModel.reasoning).toBe(true);
+    expect(moe.agentModel.contextWindow).toBe(128000); // LFM2.5 family fallback window
+    expect(moe.agentModel.maxTokens).toBe(8192); // agent-local lfm2_moe preset maxOutputTokens
   });
 
   it('reads contextWindow from text_config.max_position_embeddings (qwen3_5 nesting)', () => {
-    expect(infos[0]!.piModel.contextWindow).toBe(32768);
+    expect(infos[0]!.agentModel.contextWindow).toBe(32768);
   });
 
   it('prefers the root max_position_embeddings over text_config', () => {
-    expect(infos[1]!.piModel.contextWindow).toBe(8192);
+    expect(infos[1]!.agentModel.contextWindow).toBe(8192);
   });
 
   it('falls back to the documented family default when config carries no window', () => {
-    expect(infos[2]!.piModel.contextWindow).toBe(262144);
+    expect(infos[2]!.agentModel.contextWindow).toBe(262144);
   });
 
   it('sources maxTokens from the family launch preset', () => {
     const [qwen, gemma, fallback] = infos;
-    expect(qwen!.piModel.maxTokens).toBe(81920);
-    expect(gemma!.piModel.maxTokens).toBe(16384);
-    expect(fallback!.piModel.maxTokens).toBe(81920);
+    expect(qwen!.agentModel.maxTokens).toBe(81920);
+    expect(gemma!.agentModel.maxTokens).toBe(16384);
+    expect(fallback!.agentModel.maxTokens).toBe(81920);
   });
 
   it('returns an empty list for an unreadable models dir', async () => {
@@ -225,65 +223,6 @@ describe('discoverMlxModels', () => {
     }
   });
 
-  it.each(['safetensors', 'top-level GGUF', 'nested GGUF', 'embedded draft'] as const)(
-    'rechecks the %s companion after discovery and on each model swap',
-    async (layout) => {
-      const root = await mkdtemp(join(tmpdir(), 'mlx-agent-draft-lifecycle-'));
-      const repo = join(root, 'qwen3.8-27b');
-      const filename = 'Qwen3.8-27B-UD-Q4_K_XL.gguf';
-      const target = layout === 'safetensors' ? repo : join(layout === 'top-level GGUF' ? root : repo, filename);
-      const draft = layout === 'embedded draft' ? join(repo, 'draft') : join(root, 'qwen3.8-27b-dflash2');
-      try {
-        if (layout !== 'top-level GGUF') {
-          await mkdir(repo);
-          await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
-        }
-        if (layout === 'safetensors') {
-          await writeFile(join(repo, 'model.safetensors'), 'target weights');
-        } else {
-          await writeFile(target, minimalGguf('qwen35'));
-        }
-        await mkdir(draft);
-        await writeFile(
-          join(draft, 'config.json'),
-          JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] }),
-        );
-        await writeFile(join(draft, 'model.safetensors'), 'draft weights');
-        // Use the real startup discovery record: hand-built records would miss
-        // the stale automatic path that previously became authoritative here.
-        const models = await discoverMlxModels(root);
-        expect(models).toHaveLength(1);
-        const model = models[0]!.discovered;
-        const loader = vi.fn(async (path: string) => ({ fakeModelFor: path }) as unknown as LoadableModel);
-        const host = new MlxModelHost(
-          [...models.map((info) => info.discovered), { name: 'other', path: '/models/other', modelType: 'qwen3' }],
-          { loadModelFn: loader, resolveModelPathFn: async (entry) => `/paged/${entry.name}` },
-        );
-        const loadTarget = () => host.runWithResident(model.name, async () => undefined);
-        const swapAway = () => host.runWithResident('other', async () => undefined);
-
-        // A partial companion before the first load must not prevent target use.
-        await rm(join(draft, 'model.safetensors'));
-        await loadTarget();
-        expect(loader).toHaveBeenLastCalledWith(`/paged/${model.name}`);
-
-        // Restoring it is picked up from the original target, not the overlay.
-        await writeFile(join(draft, 'model.safetensors'), 'draft weights');
-        await swapAway();
-        await loadTarget();
-        expect(loader).toHaveBeenLastCalledWith(`/paged/${model.name}`, { draftModelPath: draft });
-
-        // Deleting a previously loaded companion must not poison a later swap.
-        await swapAway();
-        await rm(draft, { recursive: true });
-        await loadTarget();
-        expect(loader).toHaveBeenLastCalledWith(`/paged/${model.name}`);
-      } finally {
-        await rm(root, { recursive: true, force: true });
-      }
-    },
-  );
-
   it.each(['qwen4_exp', 'qwen4_exp_text'])('advertises %s images only with a vision config', async (model_type) => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-qwen4-vision-'));
     try {
@@ -293,7 +232,7 @@ describe('discoverMlxModels', () => {
         await writeFile(join(model, 'config.json'), JSON.stringify({ model_type, vision_config }));
         const [entry] = await discoverMlxModels(root);
         expect(entry!.discovered.modelType).toBe('qwen4_exp');
-        expect(entry!.piModel.input).toEqual(vision_config?.hidden_size ? ['text', 'image'] : ['text']);
+        expect(entry!.agentModel.input).toEqual(vision_config?.hidden_size ? ['text', 'image'] : ['text']);
       }
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -312,7 +251,7 @@ describe('discoverMlxModels', () => {
       }
       const entries = await discoverMlxModels(root);
       expect(entries.map((e) => e.discovered.path).sort()).toEqual([direct, first].sort());
-      expect(entries.every((e) => e.discovered.modelType === 'qwen4_exp' && e.piModel.input.length === 1)).toBe(true);
+      expect(entries.every((e) => e.discovered.modelType === 'qwen4_exp' && e.agentModel.input.length === 1)).toBe(true);
       await writeFile(join(split, 'config.json'), JSON.stringify({ model_type: 'qwen4_exp' }));
       await writeFile(join(split, 'model.safetensors'), 'converted weights');
       expect((await discoverMlxModels(root)).map((e) => e.discovered.path).sort()).toEqual([direct, split].sort());
@@ -372,7 +311,7 @@ describe('discoverMlxModels', () => {
           modelType: 'qwen3_5',
         },
       ]);
-      expect(discovered.map((model) => model.piModel.contextWindow)).toEqual([65536, 65536, 65536]);
+      expect(discovered.map((model) => model.agentModel.contextWindow)).toEqual([65536, 65536, 65536]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -406,8 +345,8 @@ describe('discoverMlxModels', () => {
         'gemma-4-Q4_K_M',
       ]);
       expect(found.every((entry) => entry.discovered.modelType === 'gemma4')).toBe(true);
-      expect(found[0].piModel.input).toEqual(['text', 'image']);
-      expect(found[0].piModel.contextWindow).toBe(262144);
+      expect(found[0].agentModel.input).toEqual(['text', 'image']);
+      expect(found[0].agentModel.contextWindow).toBe(262144);
 
       // A converted checkpoint remains selectable even when its source XL
       // GGUF is retained beside the SafeTensors weights.
@@ -493,7 +432,7 @@ describe('discoverMlxModels', () => {
           modelType: 'muse_glimmer',
         })),
       );
-      expect(found.every((entry) => entry.piModel.input.join() === 'text')).toBe(true);
+      expect(found.every((entry) => entry.agentModel.input.join() === 'text')).toBe(true);
 
       // Retaining the downloaded XL alongside an imported model must not
       // hide the usable SafeTensors directory or switch it to another variant.
@@ -576,32 +515,7 @@ describe('discoverMlxModels', () => {
         path: gguf,
         modelType: 'qwen3_5',
       });
-      expect(discovered?.piModel.contextWindow).toBe(262144);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('does not attach a companion outside the store when loading a discovered top-level GGUF', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-companion-boundary-'));
-    try {
-      const store = join(root, 'models');
-      await mkdir(store);
-      const gguf = join(store, 'Qwen3.8-27B-UD-Q4_K_XL.gguf');
-      await writeFile(gguf, minimalGguf('qwen35'));
-      const outside = join(root, 'qwen3.8-27b-dflash2');
-      await mkdir(outside);
-      await writeFile(join(outside, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
-      await writeFile(join(outside, 'model.safetensors'), 'draft weights');
-      const models = await discoverMlxModels(store);
-      expect(models).toHaveLength(1);
-      const loader = vi.fn(async () => ({}) as LoadableModel);
-      const host = new MlxModelHost(
-        models.map((model) => model.discovered),
-        { loadModelFn: loader },
-      );
-      await host.runWithResident(models[0]!.discovered.name, async () => undefined);
-      expect(loader).toHaveBeenCalledExactlyOnceWith(gguf);
+      expect(discovered?.agentModel.contextWindow).toBe(262144);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -158,8 +158,8 @@ describe('useJson stale-while-revalidate', () => {
     page.unmount();
 
     // The mounted-component case, which unmount-and-remount above cannot reach:
-    // a live `useJson` handed a NEW path. This is what the sessions search box
-    // and the metrics range selector do on every change, and it is the one
+    // a live `useJson` handed a NEW path. This is what the metrics range
+    // selector does on every change, and it is the one
     // route by which state belonging to the old path can survive into a render
     // of the new one. `useState`'s initializer does not re-run for an existing
     // instance, so only the render-phase reset stands between the user and a

@@ -89,20 +89,20 @@ describe('SPA api client', () => {
 
   it('does not double-prefix an already-qualified path', async () => {
     const h = connect();
-    await getJson('/api/sessions?limit=1');
-    expect(h.calls[0].path).toBe('/api/sessions?limit=1');
+    await getJson('/api/models?limit=1');
+    expect(h.calls[0].path).toBe('/api/models?limit=1');
   });
 
   it('sends the method and body a mutation carries', async () => {
     const h = connect();
-    await mutate('PATCH', '/sessions/fix-1', { name: 'Renamed' });
-    expect(h.calls[0]).toEqual({ method: 'PATCH', path: '/api/sessions/fix-1', body: { name: 'Renamed' } });
+    await mutate('PATCH', '/models/fix-1', { name: 'Renamed' });
+    expect(h.calls[0]).toEqual({ method: 'PATCH', path: '/api/models/fix-1', body: { name: 'Renamed' } });
   });
 
   it('rethrows a failure envelope as a DashboardApiError keeping code, status and message', async () => {
-    connect(() => failure('E_CONFLICT', 'Session is being written'));
+    connect(() => failure('E_CONFLICT', 'Model is being written'));
 
-    const err = await getJson('/sessions/fix-1').then(
+    const err = await getJson('/models/fix-1').then(
       () => null,
       (e: unknown) => e,
     );
@@ -112,7 +112,7 @@ describe('SPA api client', () => {
     // to. Losing either turns every failure into an indistinguishable red toast.
     expect(api.code).toBe('E_CONFLICT');
     expect(api.status).toBe(409);
-    expect(api.message).toBe('Session is being written');
+    expect(api.message).toBe('Model is being written');
   });
 
   it('distinguishes a 404 from a 400 by status, not just by message', async () => {
@@ -193,7 +193,7 @@ describe('SPA api client', () => {
           recoveries += 1;
         },
       });
-      const oldMutation = mutate('DELETE', '/sessions/old').catch((error: unknown) => error);
+      const oldMutation = mutate('DELETE', '/models/old').catch((error: unknown) => error);
 
       // Reconnection asks the old client to cancel. If that old port is wedged,
       // its grace timer must not later kill the runtime behind this new port.

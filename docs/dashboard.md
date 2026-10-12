@@ -1,6 +1,6 @@
 # Dashboard (Control Panel window)
 
-Browse local models, `mlx agent` sessions, inference metrics, and the
+Browse local models, inference metrics, and the
 paged-attention cold cache. It ships inside `@mlx-node/dashboard` and is the Control Panel
 window of the **mlx-node desktop app** — open it from the tray.
 
@@ -53,10 +53,8 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 
 | Page           | Content                                                                                                 | Actions                                                                  |
 | -------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Overview       | Stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads | —                                                                        |
+| Overview       | Stat tiles (models/disk, cache size + hit rate, active downloads)                                       | —                                                                        |
 | Models         | Local table: name, family, quant, size, ctx window                                                      | delete; install from the recommended catalog (live port-pushed progress) |
-| Sessions       | Table with search + filters (cwd, model, date)                                                          | open, rename (idle only, see below), delete, copy resume command         |
-| Session detail | Transcript (collapsible tool calls) + per-turn tokens / tok-s chips + charts                            | —                                                                        |
 | Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                               |
 | Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                                       |
 
@@ -83,7 +81,6 @@ All state lives on disk; SQLite is only an index.
 
 | Source                          | Location                                                                                            | Role                                                             |
 | ------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| pi session JSONL                | `~/.mlx-node/agent/sessions/--<cwd>--/*.jsonl`                                                      | Transcripts + per-turn token usage; the source of truth          |
 | `MetricsTrace` JSONL            | `~/.mlx-node/metrics/traces/<date>-<pid>.jsonl`                                                     | Per-turn throughput / cold-cache deltas (see Phase B below)      |
 | Disposable SQLite index         | `~/.mlx-node/dashboard.db`                                                                          | Index over the JSONL above; **rebuilt on next start if deleted** |
 | Local models                    | `--models-dir` → `MLX_MODELS_DIR` → `modelsDir` in `~/.mlx-node/config.json` → `~/.mlx-node/models` | Model list, size on disk, family/quant/ctx from `config.json`    |
@@ -96,8 +93,6 @@ file mtime every 30 s (plus a manual `POST /api/ingest`). Trace files older than
 
 Trace records are metadata-only: every field is a number, a small enumerated
 string, or an identifier — never prompt content, tool arguments, or model output.
-Records join to session entries via `mlxTraceId`, a UUID the agent provider mints
-per turn and stamps on both the trace record and the pi assistant message.
 
 ## Persist paged cache (`persistPagedCache`)
 
@@ -178,8 +173,8 @@ class of bug is deleted rather than mitigated. What remains:
 - **`app://` serves only inside the bundle.** A miss under `/assets/` returns 404
   rather than falling back to `index.html`, so a stale or mis-copied bundle fails
   loudly instead of returning HTML labelled `text/javascript`.
-- **Mutations are still the dangerous part** — model delete, cache clear, session
-  delete — and they are reachable by anything that gets the port. The port is minted
+- **Mutations are still the dangerous part** — model delete, cache clear —
+  and they are reachable by anything that gets the port. The port is minted
   by MAIN, transferred once to the Control Panel window it created, and consumed on receipt.
 
 ## Known limitation
@@ -198,7 +193,7 @@ That envelope is structured-clonable by design — it is what makes the port tra
 cheap, and it gives code written against the in-process runtime an identical signature
 over a port.
 
-`GET /health` returns `{ status, modelsDir, sessionsRoot, tracesDir }`.
+`GET /health` returns `{ status, modelsDir, tracesDir }`.
 
 | Route                       | Method       | Purpose                                                                    |
 | --------------------------- | ------------ | -------------------------------------------------------------------------- |
@@ -208,22 +203,6 @@ over a port.
 | `/api/catalog/updates`      | GET          | Upstream sha per catalog repo; the page joins it against `/api/catalog`    |
 | `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                                |
 | `/api/downloads/:id/events` | GET          | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503 |
-| `/api/sessions`             | GET          | Indexed session list; search + filters                                     |
-| `/api/sessions/:id`         | GET          | Transcript (active branch) + per-turn usage                                |
-| `/api/sessions/:id`         | PATCH/DELETE | Rename (refused while active, see below) / delete file + rows              |
-| `/api/sessions/:id/metrics` | GET          | Joined trace metrics for the session                                       |
 | `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share                |
 | `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days                      |
 | `/api/ingest`               | POST         | Trigger an incremental rescan                                              |
-
-**Rename is durable but idle-only.** A rename appends a `session_info` entry to the
-pi session JSONL (the source of truth) — it is _not_ stored index-only, because the
-SQLite index is disposable and would lose the name on the next rebuild. pi has no
-cross-process lock, so if a live agent (a separate process) appends a turn between
-the dashboard's snapshot of the file and its append, one of the two writes is
-orphaned on the next resume. To avoid that race the rename is **refused with 409
-while the session file appears active** (modified within the last ~30 s); rename an
-idle session instead. This is a best-effort product rule, not a hard guarantee: a
-session that goes idle and is then written concurrently, or one that goes live
-inside the brief check→append window, can still race — the pre-check removes the
-realistic reachability, it does not eliminate the theoretical race.

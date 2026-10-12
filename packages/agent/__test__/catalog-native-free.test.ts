@@ -21,7 +21,7 @@ const CATALOG_DIST = resolve(ROOT, 'packages/agent/dist/catalog.js');
 const PATHS_DIST = resolve(ROOT, 'packages/agent/dist/paths.js');
 const FAMILY_DATA_DIST = resolve(ROOT, 'packages/lm/dist/family-data.js');
 const LM_ROOT_DIST = resolve(ROOT, 'packages/lm/dist/index.js');
-const MODELS_DIST = resolve(ROOT, 'packages/agent/dist/provider/models.js');
+const MODELS_DIST = resolve(ROOT, 'packages/agent/dist/models.js');
 const MODEL_HANDLER_DIST = resolve(ROOT, 'packages/dashboard/dist/api/handlers/models.js');
 
 const RESOLVE_HOOK = `
@@ -111,7 +111,7 @@ describe('native-free catalog + family-data subpaths', () => {
       const paths = await import(${JSON.stringify(PATHS_DIST)});
       const { pathToFileURL } = await import('node:url');
       const dir = ${JSON.stringify(resolve(ROOT, '.cache/agent #配置'))};
-      if (paths.expandPiAgentDir(pathToFileURL(dir).href) !== dir) throw new Error('File URL expansion differs');
+      if (paths.expandAgentDir(pathToFileURL(dir).href) !== dir) throw new Error('File URL expansion differs');
       if (typeof catalog.matchFamily !== 'function') throw new Error('catalog.matchFamily missing');
       if (typeof catalog.rawModelTypeToCanonical !== 'function') throw new Error('catalog.rawModelTypeToCanonical missing');
       if (!(catalog.NON_GENERATIVE_FAMILY_IDS instanceof Set)) throw new Error('catalog.NON_GENERATIVE_FAMILY_IDS missing');

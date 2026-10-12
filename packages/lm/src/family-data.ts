@@ -31,9 +31,9 @@ export interface ModelConfigMatcher {
 }
 
 /**
- * Structural mirror of pi's `ProviderModelConfig['thinkingLevelMap']`. Declared
- * here because pi types are agent-only; `packages/agent/src/provider/models.ts`
- * pins assignability with a `satisfies` check at its use site.
+ * The agent's thinking-level map shape. Declared here so the registry row
+ * owns it; consumed by `AgentModelConfig.thinkingLevelMap` in
+ * `packages/agent/src/models.ts`.
  */
 export interface FamilyThinkingLevelMap {
   readonly off?: string | null;
@@ -47,14 +47,14 @@ export interface FamilyThinkingLevelMap {
 
 export interface FamilyTraits {
   /**
-   * Whether the family emits `<think>` reasoning (drives pi's thinking
+   * Whether the family emits `<think>` reasoning (drives the agent's thinking
    * levels). Gemma4 routes its `<|channel>thought` protocol through its
    * family stream parser rather than the generic `<think>` tracker, but the
    * user-facing level still controls the prompt's `<|think|>` capability.
    */
   readonly reasoning: boolean;
   /**
-   * Optional family-specific projection of Pi's thinking controls. Gemma4's
+   * Optional family-specific projection of the agent's thinking controls. Gemma4's
    * prompt protocol has two modes rather than four distinct effort levels:
    * minimal disables `<|think|>` and high enables it.
    */
@@ -191,7 +191,7 @@ export interface LaunchPreset {
  * the registry row owns the value; `stream.ts` pins field-for-field
  * assignability against the factory's own interface in its compile-time
  * conformance block (the same pattern {@link FamilyThinkingLevelMap} uses
- * for pi's thinking-level map).
+ * for the agent's thinking-level map).
  */
 export interface FamilyStreamOpts {
   /**
@@ -513,7 +513,7 @@ export const MODEL_FAMILY_DATA = [
        * K2 always thinks — its template raises on `reasoning_effort="none"`
        * and offers exactly three levels (high/medium/low, rendered as
        * `<ifm|think>` / `<ifm|think_fast>` / `<ifm|think_faster>`). The map
-       * below hides xhigh/max from pi (null) and projects minimal→low; the
+       * below hides xhigh/max from the agent (null) and projects minimal→low; the
        * native side applies the same projection for direct API callers
        * (none/minimal→low, xhigh/max→high — `normalize_k2_effort`).
        */

@@ -23,7 +23,7 @@ export async function verifyBundledCli(appPath: string): Promise<void> {
     // --version enters the full agent runtime before exiting, so missing lazy
     // dependencies and native runtime incompatibilities cannot hide behind help.
     const version = execFileSync(path, ['agent', '--version'], {
-      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home, PI_CODING_AGENT_DIR: join(home, 'agent') },
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home, GROK_HOME: join(home, 'agent') },
       encoding: 'utf8',
       timeout: 30_000,
       maxBuffer: 256 * 1024,

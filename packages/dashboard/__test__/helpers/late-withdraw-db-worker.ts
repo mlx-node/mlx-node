@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { parentPort, receiveMessageOnPort, workerData, type MessagePort } from 'node:worker_threads';
 
 interface Boot {
-  sessionsRoot: string;
+  modelsDir: string;
   withdrawPort?: MessagePort;
 }
 
@@ -29,7 +29,7 @@ interface Request {
 
 const port = parentPort;
 if (port === null) throw new Error('late-withdraw-db-worker.ts must run as a worker');
-const { sessionsRoot, withdrawPort } = workerData as Boot;
+const { modelsDir, withdrawPort } = workerData as Boot;
 
 function sampledWithdrawal(id: number): boolean {
   if (withdrawPort === undefined) return false;
@@ -85,7 +85,7 @@ port.on('message', (message: Request) => {
       Atomics.notify(gate, 0);
 
       while (Atomics.load(gate, 1) === 0) Atomics.wait(gate, 1, 0);
-      rmSync(join(sessionsRoot, 'late-withdraw-target'), { force: true });
+      rmSync(join(modelsDir, 'late-withdraw-target'), { force: true });
       port.postMessage({
         kind: 'response',
         id: message.id,
@@ -98,7 +98,6 @@ port.on('message', (message: Request) => {
         kind: 'ingested',
         id: message.id,
         summary: {
-          sessions: { scanned: 0, updated: 0, removed: 0, warnings: [] },
           traces: { files: 0, records: 0, pruned: 0, warnings: [] },
         },
       });

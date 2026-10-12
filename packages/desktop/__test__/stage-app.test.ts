@@ -11,9 +11,9 @@
  *  - `@mlx-node/core-*` is napi's published prebuilt. Staging it shipped the
  *    239 MB native payload a second time (993 MB total) even though nothing
  *    loads it.
- *  - The cloud-LLM provider SDKs behind `@earendil-works/pi-ai` were 114 MB of
- *    an app that exists to run models locally, reachable only from a
- *    `stream()` call this app never makes.
+ *  - The cloud-LLM provider SDKs a dependency once dragged in were 114 MB of
+ *    an app that exists to run models locally, reachable only from a code path
+ *    this app never runs.
  *
  * The exclusions are silent by nature: the app still builds, still launches,
  * and still passes its own tests with any one wrong. Only a gate, a notary, or
@@ -29,11 +29,9 @@
  * break on every reshuffle. The exclusion lists themselves are the contract.
  */
 
-import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
@@ -45,11 +43,6 @@ import {
   stageApp,
   stageRuntimeBuildFiles,
 } from '../scripts/stage-app.js';
-
-// Only the out-of-process provider-SDK probe below runs against the real repo —
-// it imports the installed pi-coding-agent to prove loading it resolves no SDK.
-// No other test may read this tree's node_modules.
-const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 interface SeedDeps {
   dependencies?: Record<string, string>;
@@ -69,14 +62,11 @@ function seedPkg(root: string, name: string, deps: SeedDeps = {}): void {
 function seedWorkspace(root: string, dir: string, name: string, deps: SeedDeps = {}): void {
   const pkgDir = join(root, 'packages', dir);
   mkdirSync(join(pkgDir, 'dist'), { recursive: true });
-  // stageApp copies the dashboard's `assets` unconditionally (the offline
-  // tokenizer vocabulary), so a fixture dashboard must have one.
-  if (name === '@mlx-node/dashboard') mkdirSync(join(pkgDir, 'assets'), { recursive: true });
   writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', ...deps }));
   writeFileSync(join(pkgDir, 'dist', 'index.js'), 'export {};');
 }
 
-/** The `dependencies` of pi-ai that are provider SDKs — the names the exclusion rule must both drop and report. */
+/** The provider-SDK names the exclusion rule must both drop and report. */
 const SDK_ROOTS = [
   '@anthropic-ai/sdk',
   '@aws-sdk/client-bedrock-runtime',
@@ -87,7 +77,7 @@ const SDK_ROOTS = [
 
 /**
  * One fixture workspace covering the whole dashboard-side graph: the three
- * workspace roots, an external root, a pi-ai-like package declaring every
+ * workspace roots, an external root, an agent-SDK-like package declaring every
  * provider SDK (all five are seeded — the dashboard closure must refuse them
  * by name, and the CLI reuse of this graph needs them resolvable), a
  * platform-gated napi optional, and a devDependency that must never be queued.
@@ -97,7 +87,7 @@ function seedDashboardGraph(root: string): string[] {
     dependencies: { tokenizers: '1.0.0', other: '1.0.0' },
   });
   seedWorkspace(root, 'server', '@mlx-node/server', {
-    dependencies: { '@earendil-works/pi-ai': '1.0.0' },
+    dependencies: { 'agent-sdk': '1.0.0' },
     optionalDependencies: {
       '@mlx-node/core-darwin-arm64': '1.0.0',
       'platform-only-optional': '1.0.0',
@@ -111,7 +101,7 @@ function seedDashboardGraph(root: string): string[] {
   // walk-not-deny-list half of the rule has a subtree to shed.
   seedPkg(root, 'openai', { dependencies: { zod: '1.0.0' } });
   for (const name of SDK_ROOTS.filter((n) => n !== 'openai')) seedPkg(root, name);
-  seedPkg(root, '@earendil-works/pi-ai', {
+  seedPkg(root, 'agent-sdk', {
     dependencies: Object.fromEntries(SDK_ROOTS.map((name) => [name, '1.0.0'])),
   });
   seedPkg(root, 'tokenizers');
@@ -194,7 +184,7 @@ describe('packaged update eligibility', () => {
   });
 });
 
-it('stages the offline vocabulary and only the macOS arm64 tokenizer binary', () => {
+it('stages only the macOS arm64 native binary out of a fat addon package', () => {
   const root = mkdtempSync(join(tmpdir(), 'mlx-tokenizer-stage-'));
   const desktop = join(root, 'desktop');
   const stage = join(root, 'stage');
@@ -204,13 +194,10 @@ it('stages the offline vocabulary and only the macOS arm64 tokenizer binary', ()
     mkdirSync(join(desktop, 'build'), { recursive: true });
     for (const name of ['iconTemplate.png', 'iconTemplate@2x.png']) writeFileSync(join(desktop, 'build', name), name);
     mkdirSync(join(dashboard, 'dist'), { recursive: true });
-    mkdirSync(join(dashboard, 'assets'), { recursive: true });
     writeFileSync(
       join(dashboard, 'package.json'),
       JSON.stringify({ name: '@mlx-node/dashboard', dependencies: { tokenizers: '0.23.2', other: '1.0.0' } }),
     );
-    writeFileSync(join(dashboard, 'assets', 'o200k_base.json.gz'), 'vocabulary');
-    writeFileSync(join(dashboard, 'assets', 'tiktoken-LICENSE'), 'license');
     for (const name of ['tokenizers', 'other']) {
       const dir = join(root, 'node_modules', name);
       mkdirSync(dir, { recursive: true });
@@ -229,8 +216,6 @@ it('stages the offline vocabulary and only the macOS arm64 tokenizer binary', ()
       'tokenizers.darwin-arm64.node',
     ]);
     expect(readdirSync(join(modules, 'other')).filter((name) => name.endsWith('.node'))).toHaveLength(3);
-    expect(readFileSync(join(modules, '@mlx-node/dashboard/assets/o200k_base.json.gz'), 'utf8')).toBe('vocabulary');
-    expect(readFileSync(join(modules, '@mlx-node/dashboard/assets/tiktoken-LICENSE'), 'utf8')).toBe('license');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -246,7 +231,7 @@ describe('runtimeClosure', () => {
       expect(closure.external).toContain('tokenizers');
       expect(closure.external).toContain('other');
       expect(closure.external).toContain('electron-updater');
-      expect(closure.external).toContain('@earendil-works/pi-ai');
+      expect(closure.external).toContain('agent-sdk');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -301,14 +286,13 @@ describe('runtimeClosure', () => {
     }
   });
 
-  it('keeps the complete CLI runtime, including lazy providers used by agent options', () => {
+  it('keeps the complete CLI runtime, including provider SDKs a CLI dep may reach', () => {
     const root = mkdtempSync(join(tmpdir(), 'mlx-closure-'));
     try {
       const roots = seedDashboardGraph(root);
-      // `@mlx-node/cli` in the roots switches the provider-SDK exclusion off:
-      // the bundled CLI's agent options may reach those providers. `openai` is
-      // both a pi-ai SDK and on the exclusion list, so it pins the
-      // roots.includes('@mlx-node/cli') gate rather than the name set.
+      // `@mlx-node/cli` in the roots switches the provider-SDK exclusion off.
+      // `openai` is both an agent-sdk dep and on the exclusion list, so it pins
+      // the roots.includes('@mlx-node/cli') gate rather than the name set.
       seedWorkspace(root, 'cli', '@mlx-node/cli', { dependencies: { openai: '1.0.0' } });
       const cli = runtimeClosure(root, [...roots, '@mlx-node/cli']);
       expect(cli.workspace).toContain('@mlx-node/cli');
@@ -324,19 +308,17 @@ describe('runtimeClosure', () => {
 /**
  * The cloud-LLM SDKs.
  *
- * `@earendil-works/pi-ai` declares five provider SDKs as hard dependencies and
- * puts every one of them behind a `*.lazy.js` shim, so the module is fetched by
- * the `stream()` call that needs it and at no other time. This app parses pi
- * session FILES; it never asks pi to talk to a model. So the SDKs are dead
- * weight — ~72 MB of it, 38% of the `node_modules` that would otherwise ship.
+ * An agent-side dependency declares five provider SDKs as hard dependencies
+ * and puts every one behind a lazy shim, so the module is fetched by the code
+ * path that needs it and at no other time. This app never runs that path, so
+ * the SDKs are dead weight — ~72 MB of it, 38% of the `node_modules` that
+ * would otherwise ship.
  *
  * The rule names five packages and drops each one's whole subtree, because the
  * packages behind them stop being reachable. Both halves are asserted on the
  * fixture: naming without dropping would mean the walk kept a path in through
  * something else, and dropping without naming would mean the exclusion came
- * from somewhere this rule cannot defend. Whether upstream still declares the
- * same five is deliberately NOT checked — the rule is the contract, and the
- * probe at the end of this block is what keeps the premise honest.
+ * from somewhere this rule cannot defend.
  */
 describe('cloud provider SDK exclusion', () => {
   it('stages none of the five provider SDKs', () => {
@@ -381,12 +363,12 @@ describe('cloud provider SDK exclusion', () => {
     }
   });
 
-  it('still reaches pi-ai — the SDKs are excluded, the library that lazy-loads them is not', () => {
+  it('still reaches the SDK consumer — the SDKs are excluded, the library that lazy-loads them is not', () => {
     const root = mkdtempSync(join(tmpdir(), 'mlx-sdk-'));
     try {
       const roots = seedDashboardGraph(root);
       const closure = runtimeClosure(root, roots);
-      expect(closure.external).toContain('@earendil-works/pi-ai');
+      expect(closure.external).toContain('agent-sdk');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -424,15 +406,15 @@ describe('cloud provider SDK exclusion', () => {
       // nested.
       expect(existsSync(join(modules, 'keep'))).toBe(true);
       expect(existsSync(join(modules, 'chalk'))).toBe(true);
-      expect(existsSync(join(modules, '@earendil-works', 'pi-ai'))).toBe(true);
+      expect(existsSync(join(modules, 'agent-sdk'))).toBe(true);
       expect(existsSync(join(modules, 'openai'))).toBe(false);
       expect(existsSync(join(modules, '@smithy'))).toBe(false);
       expect(existsSync(join(modules, '@mlx-node', 'core-darwin-arm64'))).toBe(false);
       expect(existsSync(join(modules, 'keep', 'node_modules', '@smithy', 'node-http-handler'))).toBe(false);
       expect(existsSync(join(modules, 'keep', 'node_modules', 'chalk'))).toBe(true);
 
-      // And each outcome is reported, not silent. `keep` and `pi-ai` between
-      // them reach all five SDK names.
+      // And each outcome is reported, not silent. `keep` and `agent-sdk`
+      // between them reach all five SDK names.
       expect(staged.excludedProviderSdk.sort()).toEqual([...SDK_ROOTS].sort());
       expect(staged.excludedPrebuilt).toEqual(['@mlx-node/core-darwin-arm64']);
       expect(staged.prunedNested).toEqual(['@smithy/node-http-handler']);
@@ -441,50 +423,6 @@ describe('cloud provider SDK exclusion', () => {
     }
   });
 
-  it('is safe because pi-ai loads no provider SDK until a stream() call', () => {
-    // The assertion the whole exclusion rests on, measured rather than argued.
-    //
-    // A separate `node` process imports the pi barrel exactly the way
-    // packages/dashboard does, with a `module.registerHooks` resolve hook
-    // recording every file URL Node resolves. If ANY provider SDK is reached
-    // while merely loading the module — a static import upstream added, an
-    // eager `import()` at module scope — its path shows up here.
-    //
-    // Out of process on purpose: the hook has to see Node's own resolver, and
-    // inside vitest the module graph is the runner's, not the app's.
-    const probe = `
-      import { registerHooks } from 'node:module';
-      const hits = new Set();
-      registerHooks({
-        resolve(spec, ctx, next) {
-          const r = next(spec, ctx);
-          // Greedy prefix so this lands on the LAST node_modules segment. The
-          // obvious non-greedy form names the OUTER package for anything nested
-          // — and @earendil-works/pi-ai nests — which would report every nested
-          // provider SDK as pi-ai and pass no matter what got loaded.
-          const m = /^.*\\/node_modules\\/((?:@[^/]+\\/)?[^/]+)\\//.exec(r?.url ?? '');
-          if (m !== null) hits.add(m[1]);
-          return r;
-        },
-      });
-      const pi = await import('@earendil-works/pi-coding-agent');
-      for (const name of ['SessionManager', 'parseSessionEntries', 'buildContextEntries', 'migrateSessionEntries']) {
-        if (pi[name] === undefined) throw new Error('missing export: ' + name);
-      }
-      console.log(JSON.stringify([...hits]));
-    `;
-    const out = execFileSync(process.execPath, ['--input-type=module', '-e', probe], {
-      cwd: repoRoot,
-      encoding: 'utf-8',
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    const resolved = JSON.parse(out.trim().split('\n').at(-1) as string) as string[];
-
-    // Sanity: the probe really did load the library, so "no SDK" cannot mean
-    // "nothing was loaded".
-    expect(resolved).toContain('@earendil-works/pi-ai');
-    expect(resolved.filter((name) => SDK_ROOTS.includes(name))).toEqual([]);
-  });
 });
 
 /**
@@ -492,7 +430,7 @@ describe('cloud provider SDK exclusion', () => {
  *
  * Wherever Yarn could not hoist, those two disagree, and the disagreement is
  * silent in exactly the direction that matters: `runtimeClosure` reports the
- * package as excluded and a copy ships anyway. pi-ai once nested
+ * package as excluded and a copy ships anyway. An SDK once nested
  * `@smithy/node-http-handler` this way; today it does not, so the rule is
  * insurance against the next version bump that re-nests an SDK.
  *
@@ -509,10 +447,10 @@ describe('pruneExcludedNested', () => {
         writeFileSync(join(root, rel, 'package.json'), '{}');
       };
       // Scoped and unscoped, one and two levels deep, plus the survivors.
-      seed('@earendil-works/pi-ai/node_modules/@smithy/node-http-handler');
-      seed('@earendil-works/pi-ai/node_modules/typebox');
-      seed('@earendil-works/pi-coding-agent/node_modules/openai');
-      seed('@earendil-works/pi-coding-agent/node_modules/undici');
+      seed('agent-sdk/node_modules/@smithy/node-http-handler');
+      seed('agent-sdk/node_modules/typebox');
+      seed('agent-cli/node_modules/openai');
+      seed('agent-cli/node_modules/undici');
       seed('drizzle-orm/node_modules/@mlx-node/core-darwin-arm64');
       seed('a/node_modules/b/node_modules/@anthropic-ai/sdk');
       seed('a/node_modules/b/node_modules/chalk');
@@ -526,16 +464,16 @@ describe('pruneExcludedNested', () => {
         'openai',
       ]);
       for (const gone of [
-        '@earendil-works/pi-ai/node_modules/@smithy/node-http-handler',
-        '@earendil-works/pi-coding-agent/node_modules/openai',
+        'agent-sdk/node_modules/@smithy/node-http-handler',
+        'agent-cli/node_modules/openai',
         'drizzle-orm/node_modules/@mlx-node/core-darwin-arm64',
         'a/node_modules/b/node_modules/@anthropic-ai/sdk',
       ]) {
         expect(existsSync(join(root, gone)), gone).toBe(false);
       }
       for (const kept of [
-        '@earendil-works/pi-ai/node_modules/typebox',
-        '@earendil-works/pi-coding-agent/node_modules/undici',
+        'agent-sdk/node_modules/typebox',
+        'agent-cli/node_modules/undici',
         'a/node_modules/b/node_modules/chalk',
       ]) {
         expect(existsSync(join(root, kept)), kept).toBe(true);
@@ -581,7 +519,7 @@ describe('isNonRuntimeFile', () => {
       'index.ts',
       'index.cts',
       'index.mts',
-      // pi-coding-agent's image pipeline resolves this by name at runtime.
+      // Binary assets a package can resolve by name at runtime.
       'photon_rs_bg.wasm',
       'package.json',
       'dark.json',

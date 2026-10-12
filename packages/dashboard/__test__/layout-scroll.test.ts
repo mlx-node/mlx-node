@@ -33,7 +33,6 @@ import { renderPage, stubApi, type RenderedPage } from './render.js';
 /** Overview is the index route, so `App` lands here with no navigation. */
 const ROUTES = {
   '/models': { models: [], modelsDir: '/tmp/models', warnings: [] },
-  '/sessions': { sessions: [], total: 0, tokens: 0, cwds: [] },
   '/downloads': { jobs: [] },
   '/cache': {
     disk: { totalBytes: 0, quotaBytes: 0, blocks: 0, objects: 0 },

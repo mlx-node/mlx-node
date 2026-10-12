@@ -1,6 +1,6 @@
 /**
  * Shared recharts primitives for the Metrics and Cache pages, matching the
- * conventions C9 established in `pages/session-detail.tsx`: recessive
+ * conventions for chart theming: recessive
  * ink-token axes, a popover-styled tooltip, and the `--viz-*` chart palette
  * (never shadcn `--chart-*`, which fail the dataviz contrast/CVD gates).
  */

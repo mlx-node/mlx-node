@@ -3,7 +3,7 @@
  *
  * It owns the SQLite handle exclusively, plus every route whose handler does
  * synchronous work — `node:sqlite` and drizzle are synchronous, and the model /
- * session / cache walks are synchronous `fs` too. All of that used to run on the
+ * trace / cache walks are synchronous `fs` too. All of that used to run on the
  * thread that also holds the transport and the download manager, where a single
  * heavy query froze download progress for its whole duration (measured: a trivial
  * RPC issued during a 1.5 s synchronous call waited 1449 ms) and delayed a cancel
@@ -18,7 +18,6 @@ import type { IngestSummary, WorkerApiContext } from '../api/context.js';
 import { dispatchWorker } from '../api/dispatch.js';
 import { failure, toFailure, type ApiResponse } from '../api/errors.js';
 import { openDashboardDb } from '../db/open.js';
-import { ingestSessions } from '../ingest/sessions.js';
 import { ingestTraces } from '../ingest/traces.js';
 import type { DbWorkerBoot, MainToWorker, WorkerToMain } from './protocol.js';
 
@@ -31,7 +30,7 @@ function requireParentPort(): MessagePort {
 }
 const port = requireParentPort();
 
-const { dbPath, modelsDir, sessionsRoot, tracesDir, cacheRoot, withdrawPort } = workerData as DbWorkerBoot;
+const { dbPath, modelsDir, tracesDir, cacheRoot, withdrawPort } = workerData as DbWorkerBoot;
 
 /**
  * Requests the transport thread stopped waiting for before this thread reached
@@ -79,18 +78,15 @@ const dash = openDashboardDb(dbPath);
 // `.then`).
 const doIngest = async (): Promise<IngestSummary> => {
   try {
-    const sessionsResult = await ingestSessions(dash, sessionsRoot);
     const tracesResult = await ingestTraces(dash, tracesDir, { retentionDays: RETENTION_DAYS });
-    return { sessions: sessionsResult, traces: tracesResult };
+    return { traces: tracesResult };
   } catch (err) {
     return {
-      sessions: { scanned: 0, updated: 0, removed: 0, warnings: [String(err)] },
-      traces: { files: 0, records: 0, pruned: 0, warnings: [] },
+      traces: { files: 0, records: 0, pruned: 0, warnings: [String(err)] },
     };
   }
 };
 let ingestChain: Promise<IngestSummary> = Promise.resolve({
-  sessions: { scanned: 0, updated: 0, removed: 0, warnings: [] },
   traces: { files: 0, records: 0, pruned: 0, warnings: [] },
 });
 const runIngest = (): Promise<IngestSummary> => {
@@ -104,7 +100,7 @@ const runIngest = (): Promise<IngestSummary> => {
  * in-flight one only ever looked harmless because `doIngest`'s catch swallowed
  * the resulting "database is not open".
  *
- * `ingestSessions`/`ingestTraces` have fully synchronous bodies today, so the
+ * `ingestTraces` has a fully synchronous body today, so the
  * chain advances on microtasks and no `close` message can be DELIVERED while it
  * runs — which makes this await invisible in a test right now. It is what keeps
  * the invariant true the day one of them awaits real I/O.
@@ -117,7 +113,7 @@ const drainIngest = async (): Promise<void> => {
   }
 };
 
-const ctx: WorkerApiContext = { dash, modelsDir, sessionsRoot, tracesDir, cacheRoot, runIngest };
+const ctx: WorkerApiContext = { dash, modelsDir, tracesDir, cacheRoot, runIngest };
 
 /**
  * Post a reply, or — when the payload defeats the structured clone algorithm (a

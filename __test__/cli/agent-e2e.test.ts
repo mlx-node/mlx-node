@@ -2,15 +2,14 @@
  * Gated end-to-end smoke for `mlx agent`: spawns the REAL built CLI as a
  * SUBPROCESS and asserts it produces a model answer, fully offline.
  *
- * Why a subprocess and not in-process `runAgent`: pi's `main()` calls
- * `process.exit()` on the print path, so driving it in-process would tear
- * down the test worker. The subprocess is exactly what a user runs —
- * `node packages/cli/dist/cli.js agent …` — with stdin ignored so the pi
+ * Why a subprocess and not in-process `run()`: the spawned agent binary is
+ * an interactive TUI, so driving it in-process would tear down the test
+ * worker. The subprocess is exactly what a user runs —
+ * `node packages/cli/dist/cli.js agent …` — with stdin ignored so the agent
  * print-mode wrapper never blocks reading it.
  *
- * Availability convention (mirrors `packages/agent/__test__/provider-live.test.ts`):
- * the smallest local qwen3.5 checkpoint, overridable via
- * `MLX_AGENT_TEST_MODEL`. Skips cleanly when no candidate model exists
+ * Availability convention: the smallest local qwen3.5 checkpoint,
+ * overridable via `MLX_AGENT_TEST_MODEL`. Skips cleanly when no candidate model exists
  * (CI has none) or when the CLI has not been built. GPU work never runs
  * concurrently — the suite already pins `maxWorkers`/`maxConcurrency` to 1.
  */
@@ -51,7 +50,7 @@ interface CliResult {
 
 function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<CliResult> {
   return new Promise((resolve, reject) => {
-    // stdin 'ignore' → the pi print-mode wrapper sees EOF immediately and
+    // stdin 'ignore' → the agent's print-mode sees EOF immediately and
     // never blocks reading stdin.
     const child = spawn(process.execPath, [CLI_ENTRY, ...args], {
       cwd: REPO_ROOT,

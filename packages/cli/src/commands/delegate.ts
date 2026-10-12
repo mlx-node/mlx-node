@@ -1,5 +1,5 @@
 /** A focused worker profile on the normal local agent runtime. */
-import { agentOptionConsumesNext, run as runAgent, scanAgentArgs, type AgentRunDeps } from './agent/index.js';
+import { agentOptionConsumesNext, run as runAgentCli, scanAgentArgs, type AgentRunDeps } from './agent/index.js';
 
 const AGENT_COMMANDS = new Set(['install', 'remove', 'uninstall', 'list', 'config', 'update']);
 
@@ -139,7 +139,7 @@ export function delegateAgentArgs(argv: string[]): string[] {
 }
 
 export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void> {
-  const { args, callerApproved } = parseDelegateArgs(argv);
+  const { args } = parseDelegateArgs(argv);
   if (scanAgentArgs(args).help) {
     console.log(`Usage: mlx delegate [--caller-approved] [agent options] 'PROMPT'
        mlx delegate github [--repo OWNER/REPO] [--pr NUMBER] [--caller-approved] [--allow-write] [agent options] 'TASK'
@@ -160,5 +160,5 @@ The github form supplies task context; --allow-write does not grant sandbox acce
 
 All mlx agent options follow:`);
   }
-  await runAgent(args, deps);
+  await runAgentCli(args, deps);
 }

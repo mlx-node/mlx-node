@@ -3,15 +3,15 @@
  */
 
 /**
- * Render guards for the three SPA pages that carry cold-tier logic in JSX.
+ * Render guards for the SPA pages that carry cold-tier logic in JSX.
  *
  * Before this file the suite imported only `ui/src/lib/{api,cold-tier,format,shell}`,
- * so `cache.tsx`, `overview.tsx` and `session-detail.tsx` could each be reverted
- * to their pre-fix content and the whole suite stayed green: the block-vs-object
- * counts, the cold-tier health tiles, the saturating hit rate and the per-session
- * cold reuse chips all live at the JSX call site, not in a helper. These tests
- * mount the real components against a stubbed `fetch` and assert on rendered
- * text, so a page reverting is a red test.
+ * so `cache.tsx` and `overview.tsx` could each be reverted to their pre-fix
+ * content and the whole suite stayed green: the block-vs-object counts, the
+ * cold-tier health tiles and the saturating hit rate all live at the JSX call
+ * site, not in a helper. These tests mount the real components against a
+ * stubbed `fetch` and assert on rendered text, so a page reverting is a red
+ * test.
  *
  * `happy-dom` is scoped to this file by the docblock above — the repo default
  * environment stays `node` for every other suite.
@@ -31,21 +31,13 @@ import type {
   DownloadsResponse,
   MetricsOverviewResponse,
   ModelsResponse,
-  SessionDetailResponse,
-  SessionMetricsResponse,
-  SessionRow,
-  SessionTraceMetric,
-  SessionTurnMetric,
-  SessionsResponse,
 } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
 import Overview from '@/pages/overview';
-import SessionDetail from '@/pages/session-detail';
-import Sessions from '@/pages/sessions';
 import { act, createElement } from 'react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter } from 'react-router-dom';
 import { toast } from 'sonner';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -563,33 +555,12 @@ describe('Cache page', () => {
 });
 
 describe('Overview page', () => {
-  function overviewRoutes(cache: CacheResponse, sessions?: SessionsResponse): Record<string, unknown> {
+  function overviewRoutes(cache: CacheResponse): Record<string, unknown> {
     const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
     const downloads: DownloadsResponse = { jobs: [] };
-    // Deliberately enormous, and deliberately UNRELATED to the session list.
-    // This route is the machine-wide one; nothing on the Sessions tile may read
-    // from it, so these numbers must not appear.
-    const metrics: MetricsOverviewResponse = {
-      range: { from: null, to: null },
-      tokensByDay: [],
-      throughputByModel: [],
-      throughputTrend: [],
-      mtpByModel: [],
-      modelShare: [],
-      totals: {
-        turns: 9_000,
-        traces: 9_000,
-        inputTokens: 1_500_000,
-        outputTokens: 500_000,
-        cachedTokens: 0,
-        reasoningTokens: 0,
-      },
-    };
     return {
       '/models': models,
-      '/sessions': sessions ?? { sessions: [], total: 0, tokens: 0, cwds: [] },
       '/downloads': downloads,
-      '/metrics/overview': metrics,
       '/cache': cache,
     };
   }
@@ -631,27 +602,6 @@ describe('Overview page', () => {
     // catches the label disappearing or reverting to a raw Math.round.
   });
 
-  it('takes both halves of the Sessions tile from the session list, not the machine-wide metrics', async () => {
-    // The reported shape: three sessions holding 1,672 tokens between them, in a
-    // dashboard whose machine has 2,000,000 tokens of history across every
-    // session directory it has ever indexed. The tile counted the three and then
-    // captioned them with the two million, and the caption did not move when the
-    // dashboard was pointed at a different --session-dir.
-    const sessions: SessionsResponse = { sessions: [], total: 3, tokens: 1_672, cwds: [] };
-    const text = await mount(
-      createElement(MemoryRouter, null, createElement(Overview)),
-      overviewRoutes(cacheFixture(), sessions),
-      // Anchored on a SIBLING tile, deliberately: settling on this tile's own
-      // wording would turn a regression into a 2s timeout instead of an
-      // assertion that names the number it found.
-      'hit rate',
-    );
-    expect(text).toContain('1,672 tokens · these sessions only');
-    // 1_500_000 + 500_000 formatted by formatCount. Its presence anywhere on the
-    // tile means the machine-wide route is still being read.
-    expect(text).not.toContain('2M');
-    expect(text).not.toContain('last 7 days');
-  });
 
   it('saturates the quota meter width the same way the label is saturated', async () => {
     // `Math.round(quotaFraction * 100)` renders a 99.9%-full quota as a 100%
@@ -668,73 +618,6 @@ describe('Overview page', () => {
     expect(widths).toContain('99%');
     expect(widths).not.toContain('100%');
     expect(mounted.text()).toContain('>99% of 9.5 MB');
-  });
-});
-
-describe('Sessions page — the directory filter', () => {
-  const OLD_DIR = '/tmp/only-old';
-  const RECENT_DIR = '/tmp/recent';
-
-  /**
-   * Exactly what the server hands the page once the index outgrows the 500-row
-   * cap: a full page of rows from ONE directory, a `total` that says 501 matched,
-   * and a directory list naming the one whose sessions all fell off the page.
-   * A shorter fixture would not reach the footnote, which is the moment the page
-   * tells the user to reach older sessions with this very filter.
-   */
-  function truncatedList(): SessionsResponse {
-    const sessions: SessionRow[] = Array.from({ length: 500 }, (_, i) => ({
-      id: `new-${i}`,
-      path: `${RECENT_DIR}/new-${i}.jsonl`,
-      cwd: RECENT_DIR,
-      name: `Session ${i}`,
-      created: 10_000 + i,
-      modified: 10_000 + i,
-      messageCount: 1,
-      firstMessage: null,
-      models: [],
-      inputTokens: 0,
-      outputTokens: 0,
-    }));
-    return { sessions, total: 501, tokens: 0, cwds: [OLD_DIR, RECENT_DIR] };
-  }
-
-  /**
-   * Open a Radix select by its trigger's aria-label and read the option labels.
-   * The listbox is portalled to `document.body`, and the trigger opens on a
-   * primary MOUSE pointerdown — nothing else in Radix's handler qualifies.
-   */
-  async function openOptions(label: string): Promise<string[]> {
-    const trigger = [...mounted!.container.querySelectorAll('button')].find(
-      (b) => b.getAttribute('aria-label') === label,
-    );
-    expect(trigger).toBeDefined();
-    const { act } = await import('react');
-    await act(async () => {
-      trigger?.dispatchEvent(
-        new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerId: 1, pointerType: 'mouse' }),
-      );
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(trigger?.getAttribute('aria-expanded')).toBe('true');
-    return [...document.body.querySelectorAll('[role="option"]')].map((o) => (o.textContent ?? '').trim());
-  }
-
-  it('offers every indexed directory, not only those on the page of rows it was served', async () => {
-    // The page's own footnote sends the user to this dropdown to reach older
-    // sessions. Building its options from the served rows makes that advice
-    // circular: the directories worth choosing are exactly the ones missing.
-    const text = await mount(
-      createElement(MemoryRouter, null, createElement(Sessions)),
-      { '/sessions': truncatedList() },
-      'Session 0',
-    );
-    expect(text).toContain('Showing the newest 500 of 501 matching sessions');
-    expect(text).not.toContain(OLD_DIR);
-
-    const options = await openOptions('Filter by directory');
-    expect(options).toContain(OLD_DIR);
-    expect(options).toContain(RECENT_DIR);
   });
 });
 
@@ -998,108 +881,6 @@ describe('Metrics page — model usage share', () => {
     // The endpoints stay reachable when they are actually true.
     expect(modelShareLabel(10_000, 10_000)).toBe('10,000 turns · 100%');
     expect(modelShareLabel(0, 10_000)).toBe('0 turns · 0%');
-  });
-});
-
-describe('Session detail page', () => {
-  function trace(overrides: Partial<SessionTraceMetric>): SessionTraceMetric {
-    return {
-      traceId: 't1',
-      ts: 1_700_000_000_000,
-      model: 'qwen3',
-      ttftMs: 120,
-      prefillTps: 900,
-      decodeTps: 60,
-      mtpCycles: null,
-      mtpMeanAccepted: null,
-      durationMs: 1000,
-      finishReason: 'stop',
-      coldHits: 0,
-      coldMisses: 0,
-      coldBytesWritten: 0,
-      coldBytesRestored: 0,
-      ...overrides,
-    };
-  }
-
-  function sessionRoutes(traces: SessionTraceMetric[]): Record<string, unknown> {
-    const detail: SessionDetailResponse = {
-      session: {
-        id: 'abc',
-        path: '/sessions/abc.jsonl',
-        cwd: '/work',
-        name: 'demo',
-        created: 1_700_000_000_000,
-        modified: 1_700_000_100_000,
-        messageCount: 2,
-        firstMessage: 'hello',
-      },
-      transcript: [],
-    };
-    // The chip row is gated on `turns.length > 0`, so a turn per trace.
-    const turns: SessionTurnMetric[] = traces.map((t) => ({
-      entryId: t.traceId,
-      traceId: t.traceId,
-      ts: t.ts,
-      model: t.model,
-      inputTokens: 10,
-      outputTokens: 20,
-      cachedTokens: 0,
-      reasoningTokens: 0,
-      ttftMs: t.ttftMs,
-      prefillTps: t.prefillTps,
-      decodeTps: t.decodeTps,
-      mtpCycles: null,
-      mtpMeanAccepted: null,
-      durationMs: t.durationMs,
-      finishReason: t.finishReason,
-      coldHits: t.coldHits,
-      coldMisses: t.coldMisses,
-      coldBytesWritten: t.coldBytesWritten,
-      coldBytesRestored: t.coldBytesRestored,
-    }));
-    const metrics: SessionMetricsResponse = { sessionId: 'abc', turns, traces };
-    return { '/sessions/abc': detail, '/sessions/abc/metrics': metrics };
-  }
-
-  function page() {
-    return createElement(
-      MemoryRouter,
-      { initialEntries: ['/sessions/abc'] },
-      createElement(
-        Routes,
-        null,
-        createElement(Route, { path: '/sessions/:id', element: createElement(SessionDetail) }),
-      ),
-    );
-  }
-
-  it('surfaces per-session cold reuse from the trace fields the API always returned', async () => {
-    const text = await mount(
-      page(),
-      sessionRoutes([
-        trace({ traceId: 't1', coldHits: 8000, coldMisses: 20, coldBytesRestored: 2 * MIB, coldBytesWritten: MIB }),
-        trace({ traceId: 't2', coldHits: 8189, coldMisses: 29, coldBytesRestored: 2 * MIB, coldBytesWritten: MIB }),
-      ]),
-      'Cold hit rate',
-    );
-    expect(text).toContain('Cold hit rate');
-    // 16189 / 16238 — the same non-rounding rule as the Cache page.
-    expect(text).toContain('>99%');
-    expect(text).toContain('Cold reuse');
-    expect(text).toContain('4.0 MB');
-    expect(text).toContain('2.0 MB written');
-  });
-
-  it('hides the cold chips entirely when the session recorded no cold lookups', async () => {
-    // Anchored on a SIBLING stat in the same row the cold chips would occupy.
-    // Without it these two negative assertions pass just as happily when the
-    // page never rendered at all — which is how this test read before, and is
-    // the exact defect class this file exists to catch.
-    const text = await mount(page(), sessionRoutes([trace({})]), 'TTFT');
-    expect(text).toContain('Turns');
-    expect(text).not.toContain('Cold hit rate');
-    expect(text).not.toContain('Cold reuse');
   });
 });
 

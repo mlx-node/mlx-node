@@ -14,8 +14,8 @@
  *
  * Two details are load-bearing, both verified by breaking them:
  *  - The `.ts` is used only when it actually EXISTS. Rewriting unconditionally
- *    also hits the `./x.js` specifiers inside `node_modules` (drizzle, the pi
- *    SDK), which have no `.ts` sibling — the worker then dies on startup. It also
+ *    also hits the `./x.js` specifiers inside `node_modules` (drizzle and
+ *    friends), which have no `.ts` sibling — the worker then dies on startup. It also
  *    keeps a genuine built artifact authoritative, so this can never mask a
  *    stale-dist problem.
  *  - `format` must be `module-typescript`, the format that means "ESM, strip the

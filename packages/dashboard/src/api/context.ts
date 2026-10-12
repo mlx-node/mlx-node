@@ -20,14 +20,12 @@ import type { DownloadManager } from '../download.js';
 import { ApiError } from './errors.js';
 
 export interface IngestSummary {
-  sessions: { scanned: number; updated: number; removed: number; warnings: string[] };
   traces: { files: number; records: number; pruned: number; warnings: string[] };
 }
 
 /** Resolved locations, readable from either thread (both are handed the same values). */
 export interface ApiPaths {
   modelsDir: string;
-  sessionsRoot: string;
   tracesDir: string;
   /** Cold-tier root; `undefined` lets `cache.ts` resolve the running-tier default. */
   cacheRoot: string | undefined;
@@ -36,7 +34,7 @@ export interface ApiPaths {
 /** The database worker's context: it alone holds the SQLite handle and the ingest chain. */
 export interface WorkerApiContext extends ApiPaths {
   dash: DashboardDb;
-  /** Serialized incremental rescan (sessions + traces). */
+  /** Serialized incremental rescan (traces). */
   runIngest: () => Promise<IngestSummary>;
 }
 

@@ -9,12 +9,6 @@ import {
   run,
 } from '../src/commands/delegate.js';
 
-const APPROVED_DEFAULT_ARGS = [
-  ...DELEGATE_DEFAULT_ARGS.slice(0, -2),
-  '--permission-mode',
-  'bypassPermissions',
-];
-
 describe('delegate agent arguments', () => {
   it('injects the worker profile and folds positionals into -p ahead of the parsed args', () => {
     const args = ['--reasoning-effort', 'high', '--resume', 'session-id', '@context.md', 'Explain this'];

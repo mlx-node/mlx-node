@@ -89,7 +89,7 @@ function shellQuote(arg: string): string {
  * Offer the catalog (default entry first), download the chosen repo, and
  * return its HF slug. Non-TTY sessions cannot prompt: throws with the
  * manual `mlx download model` commands instead — the caller must not
- * touch stdin on that path (pi print mode owns it).
+ * touch stdin on that path (the binary's print mode owns it).
  */
 export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
   const catalog = visibleCatalog();

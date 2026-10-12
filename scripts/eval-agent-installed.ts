@@ -86,8 +86,10 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
         'scripts/eval-agent-installed.ts',
         'packages/cli/dist/cli.js',
         'packages/cli/dist/commands/agent/index.js',
+        'packages/cli/dist/commands/agent/grok-build.js',
         'packages/cli/dist/commands/delegate.js',
-        'packages/agent/dist/run-agent.js',
+        'packages/agent/dist/delegate.js',
+        'packages/agent/dist/models.js',
         'packages/agent/dist/provider/model-host.js',
         'packages/agent/dist/provider/stream-adapter.js',
       ].map(async (path) => [path, sha256(await readFile(join(root, path), 'utf8'))]),
@@ -111,7 +113,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     plannedSamples: options.cases.length * options.repeat,
     inheritedInferenceEnvironment: Object.fromEntries(
       Object.entries(process.env).filter(([key]) =>
-        /^(MLX_(PAGED_|CACHE_LIMIT|IDLE_CLEAR|CONTINUOUS_BATCHING|SERVE_FORCE_SERIAL)|PI_CODING_AGENT_DIR$)/.test(key),
+        /^(MLX_(PAGED_|CACHE_LIMIT|IDLE_CLEAR|CONTINUOUS_BATCHING|SERVE_FORCE_SERIAL)|GROK_HOME$)/.test(key),
       ),
     ),
     note: 'Actual mlx CLI with normal saved settings, default model, tools, system prompt, paged cache, permissions and session persistence. RPC changes transport only. The detector rubric is a user task, not a system-prompt override. This measures CLI installation classification and read-tool/session behavior, not the dashboard HTTP completion path or live Codex instruction loading. File-layout/verdict-cache behavior is covered separately by service unit tests. Synthetic evidence and labels are fixed before this run.',

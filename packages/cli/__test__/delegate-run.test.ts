@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { run as runAgent, type AgentRunDeps } from '../src/commands/agent/index.js';
+import { run as runAgentCli, type AgentRunDeps } from '../src/commands/agent/index.js';
 import { delegateAgentArgs, run as runDelegate } from '../src/commands/delegate.js';
 
 function fixture() {
@@ -30,7 +30,7 @@ describe('delegate shares agent startup', () => {
     const delegate = fixture();
     const previous = process.exitCode;
     try {
-      await runAgent(delegateAgentArgs(args), agent.deps);
+      await runAgentCli(delegateAgentArgs(args), agent.deps);
       await runDelegate(args, delegate.deps);
       expect(delegate.launch).toHaveBeenCalledTimes(1);
       expect(delegate.launch.mock.calls[0]![0]).toEqual(agent.launch.mock.calls[0]![0]);

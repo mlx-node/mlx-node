@@ -13,8 +13,8 @@
  * immediately and revalidates in the background, so what you see is at worst one
  * round-trip stale and is corrected without ever collapsing the layout.
  *
- * Bounded because the key space is not: `/sessions/:id` grows with the session
- * list, and `/metrics/overview?from=…&to=…` mints a new key every time the range
+ * Bounded because the key space is not: `/metrics/overview?from=…&to=…`
+ * mints a new key every time the range
  * selector moves. Insertion order is the recency order — a read reinserts — so
  * evicting from the front is a true LRU.
  */

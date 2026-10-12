@@ -75,7 +75,7 @@ export function useJson<T>(path: string): AsyncState<T> {
         if (connection !== getConnectionGeneration()) return;
         // Cached before the `active` check, not after. A body that arrives once
         // the page has moved on is still the correct body for the path that
-        // asked for it, and that case is the common one: click into a session,
+        // asked for it, and that case is the common one: click into a page,
         // click straight back out, and the response lands on an unmounted
         // component. Discarding it there is what makes returning to a tab feel
         // like a first visit.

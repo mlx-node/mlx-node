@@ -136,8 +136,8 @@ const MTP_AUTO_DEFAULT_SUPPRESSED_MODELS: ReadonlySet<string> = new Set(['Nemotr
 /**
  * Stable, provider-neutral error raised before native inference when a
  * rendered prompt cannot fit in the model's physically available hot KV
- * window. The marker is intentionally the canonical string recognized by
- * pi's overflow recovery, so managed agent sessions compact and retry while
+ * window. The marker is intentionally the canonical string agent-side
+ * overflow recovery recognizes, so managed agent sessions compact and retry while
  * stateless HTTP callers receive a clean request error instead of a native
  * `BlockAllocator exhausted` failure.
  */

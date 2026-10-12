@@ -24,7 +24,7 @@ import {
 } from './handlers/downloads.js';
 import { handleHealth } from './handlers/health.js';
 import { handleIngest } from './handlers/ingest.js';
-import { handleMetricsOverview, handleSessionMetrics } from './handlers/metrics.js';
+import { handleMetricsOverview } from './handlers/metrics.js';
 import {
   handleCatalog,
   handleCatalogUpdates,
@@ -32,12 +32,6 @@ import {
   handleModels,
   handleCodingAgentModels,
 } from './handlers/models.js';
-import {
-  handleSessionDelete,
-  handleSessionDetail,
-  handleSessionRename,
-  handleSessionsList,
-} from './handlers/sessions.js';
 
 /** Which thread answers a route. */
 export type RouteThread = 'main' | 'worker';
@@ -115,11 +109,6 @@ export const ROUTES: Route[] = [
   mainRoute('POST', '/api/downloads', handleDownloadStart, { successStatus: 202 }),
   mainRoute('DELETE', '/api/downloads/:id', handleDownloadCancel),
   mainRoute('GET', '/api/downloads/:id/events', handleDownloadEventsUnsupported, { stream: true }),
-  workerRoute('GET', '/api/sessions', handleSessionsList),
-  workerRoute('GET', '/api/sessions/:id', handleSessionDetail),
-  workerRoute('PATCH', '/api/sessions/:id', handleSessionRename),
-  workerRoute('DELETE', '/api/sessions/:id', handleSessionDelete),
-  workerRoute('GET', '/api/sessions/:id/metrics', handleSessionMetrics),
   workerRoute('GET', '/api/metrics/overview', handleMetricsOverview),
   workerRoute('GET', '/api/cache', handleCacheGet),
   workerRoute('DELETE', '/api/cache', handleCacheDelete),
