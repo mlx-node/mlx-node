@@ -28,6 +28,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import semver from 'semver';
+
 /** Env override for a locally built or externally installed agent binary. */
 export const MLX_AGENT_BIN_ENV = 'MLX_AGENT_BIN';
 /** Env override to pin a specific release tag instead of resolving latest. */
@@ -144,21 +146,24 @@ const MLX_AGENT_R2_BASE = 'https://dl.portato.si';
 /** The R2 key holding the newest release tag, written by the release pipeline. */
 const MLX_AGENT_LATEST_KEY = 'latest';
 
+const TAG_PREFIX = 'mlx-agent-v';
+
+/** `mlx-agent-v0.2.0` → '0.2.0' when it is a valid semver tag, else null. */
+function tagVersion(tag: string): semver.SemVer | null {
+  if (!tag.startsWith(TAG_PREFIX)) return null;
+  return semver.parse(tag.slice(TAG_PREFIX.length));
+}
+
 /**
- * Compare `mlx-agent-vX.Y.Z` tags by version triplet (non-triplet tails sort
- * lexically). Returns <0, 0, >0.
+ * Compare `mlx-agent-vX.Y.Z` tags semantically. A malformed tag sorts below
+ * any valid one; two malformed tags are equal. Returns <0, 0, >0.
  */
 export function compareReleaseTags(a: string, b: string): number {
-  const parse = (t: string): number[] => {
-    const m = t.match(/^mlx-agent-v(\d+)\.(\d+)\.(\d+)/);
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [-1];
-  };
-  const pa = parse(a);
-  const pb = parse(b);
-  for (let i = 0; i < 3; i++) {
-    const d = (pa[i] ?? -1) - (pb[i] ?? -1);
-    if (d !== 0) return d;
-  }
+  const va = tagVersion(a);
+  const vb = tagVersion(b);
+  if (va && vb) return semver.compare(va, vb);
+  if (va) return 1;
+  if (vb) return -1;
   return 0;
 }
 
@@ -179,7 +184,7 @@ export async function resolveReleaseTag(): Promise<string> {
     });
     if (res.ok) {
       const tag = (await res.text()).trim();
-      if (/^mlx-agent-v\d/.test(tag)) return tag;
+      if (tagVersion(tag)) return tag;
     }
   } catch {
     // fall through to GitHub
@@ -192,7 +197,7 @@ export async function resolveReleaseTag(): Promise<string> {
     });
     if (res.ok) {
       const tag = ((await res.json()) as { tag_name?: string }).tag_name?.trim();
-      if (tag && /^mlx-agent-v\d/.test(tag)) return tag;
+      if (tag && tagVersion(tag)) return tag;
     }
   } catch {
     // fall through to the baked minimum

@@ -1671,6 +1671,7 @@ __metadata:
     "@mlx-node/tts": "workspace:*"
     "@napi-rs/keyring": "npm:^2.0.0"
     "@types/node": "npm:^26.4.0"
+    semver: "npm:^7.8.5"
   bin:
     mlx: ./dist/cli.js
   languageName: unknown
