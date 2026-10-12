@@ -80,6 +80,8 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import type { ChatConfig } from '@mlx-node/core';
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 
+import { TurnTraceModel, type TurnTraceDeps } from './turn-trace.js';
+
 /**
  * Tier-2 `prompt_cache_key` reuse is **ON by default** so the server
  * is immediately compatible with any stateless LLM agent
@@ -337,6 +339,17 @@ export interface SessionRegistryOptions {
    * apply it after request mapping, before dispatching into native decode.
    */
   maxOutputTokens?: number;
+  /**
+   * Friendly name the `ModelRegistry` bound this model under. Recorded as
+   * `model` on every per-turn metrics trace line this registry produces.
+   */
+  modelName?: string;
+  /**
+   * Test seams for the per-turn metrics-trace wrapper this registry installs
+   * on the model. Production callers leave it unset — the defaults read the
+   * native cold-tier counters and write to the standard trace directory.
+   */
+  traceDeps?: Omit<TurnTraceDeps, 'modelName'>;
 }
 
 /**
@@ -544,7 +557,11 @@ export class SessionRegistry {
   private readonly admissionWaiters: Array<() => void> = [];
 
   constructor(opts: SessionRegistryOptions) {
-    this.model = opts.model;
+    // Wrap the model ONCE so every `ChatSession` this registry allocates
+    // (warm slot, tier-2 hit, `createFreshSession`) dispatches through the
+    // per-turn trace recorder. This is the one funnel every serve-path turn
+    // — `/v1/responses` and `/v1/messages`, streaming or not — shares.
+    this.model = new TurnTraceModel(opts.model, { ...opts.traceDeps, modelName: opts.modelName });
     this.ttlSec = opts.ttlSec ?? 1800;
     this.maxQueueDepth = opts.maxQueueDepth;
     const requestedConcurrency = opts.maxConcurrentDispatches ?? 1;

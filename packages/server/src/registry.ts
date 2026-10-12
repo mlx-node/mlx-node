@@ -321,6 +321,7 @@ export class ModelRegistry {
           maxConcurrentDispatches: concurrentDispatchCapacity(model),
           samplingDefaults,
           maxOutputTokens,
+          modelName: name,
         }),
         refCount: 0,
         inFlight: 0,

@@ -34,6 +34,11 @@
       "types": "./dist/family-data.d.ts",
       "import": "./dist/family-data.js"
     },
+    "./cold-tier": {
+      "@mlx-node/source": "./src/cold-tier.ts",
+      "types": "./dist/cold-tier.d.ts",
+      "import": "./dist/cold-tier.js"
+    },
     "./model-detection": {
       "@mlx-node/source": "./src/model-detection.ts",
       "types": "./dist/model-detection.d.ts",
