@@ -7014,11 +7014,12 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
         }
 
         if meta.is_dir() {
-            if let Some(stripped) = name.strip_prefix(NATIVE_GGUF_ASSETS_TMP_PREFIX) {
-                // Abandoned publish temp: no pid is embedded, so a dead pid
-                // can never apply and age is the only gate.
-                let dead = native_gguf_embedded_pid(stripped).is_some_and(native_gguf_pid_dead);
-                if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
+            if name.starts_with(NATIVE_GGUF_ASSETS_TMP_PREFIX) {
+                // Abandoned publish temp: the name is `{prefix}{uuid}` — no
+                // pid is embedded, so do NOT parse one; an all-decimal uuid
+                // segment would read as a dead pid and bypass the age gate
+                // on a live publish temp. Age is the only gate.
+                if native_gguf_mtime_older(meta.modified().ok(), now) {
                     reclaimed += native_gguf_remove_logged(&path, "abandoned assets temp");
                 }
                 continue;
@@ -17227,6 +17228,12 @@ mod tests {
         let assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-abandoned");
         fs::create_dir_all(&assets_tmp).unwrap();
         native_sweep_age_dir(&assets_tmp);
+        // A FRESH assets temp whose uuid-looking suffix starts with an
+        // all-decimal segment must survive: that segment is not a pid (the
+        // name embeds none) and must not bypass the mtime grace.
+        let live_assets_tmp =
+            cache_root.join(".mlx-qwen4-assets-tmp-99999999-dead-beef-0123-456789abcdef");
+        fs::create_dir_all(&live_assets_tmp).unwrap();
         let assets_sidecar = cache_root.join(".mlx-qwen4-assets-v2-fedcba9876543210");
         fs::create_dir_all(&assets_sidecar).unwrap();
         fs::write(assets_sidecar.join("complete"), b"1").unwrap();
@@ -17259,6 +17266,7 @@ mod tests {
             &live_staging,
             &foreign_staging,
             &live_probe,
+            &live_assets_tmp,
             &assets_sidecar,
             &foreign,
             &photos,

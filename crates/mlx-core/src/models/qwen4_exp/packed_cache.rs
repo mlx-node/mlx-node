@@ -281,6 +281,27 @@ fn try_budget_lock(dir: &Path) -> Option<Option<File>> {
     }
 }
 
+/// Authoritative sibling spend for the under-root-lock recheck. A crash
+/// between `record` and the temp-file rename leaves a ledger inflated by a
+/// reservation that never became a `.pack`: if the sibling's budget lock is
+/// free (no live writer), reconcile the ledger to real pack bytes — phantom
+/// spend must not veto other identities' writes forever. A busy lock means a
+/// live writer, so its reservation is real pending spend and is trusted.
+fn reconciled_sibling_pack_spend(dir: &Path) -> u64 {
+    let real = pack_bytes(dir);
+    match try_budget_lock(dir) {
+        Some(guard) => {
+            if let Ok(mut ledger) = OpenOptions::new().write(true).open(dir.join("budget")) {
+                let _ = ledger.write_all(&real.to_le_bytes());
+                let _ = ledger.set_len(8);
+            }
+            drop(guard);
+            real
+        }
+        None => sibling_pack_estimate(dir),
+    }
+}
+
 fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) -> u64 {
     let Some(_guard) = try_budget_lock(dir) else {
         debug!(
@@ -486,6 +507,41 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
 fn writer_mutex() -> &'static std::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Remove the oldest `.pack` files in `dir` (by mtime — the recency witness
+/// stamped by verified reads) until the remaining pack bytes fit `headroom`,
+/// or nothing is left to shed. Returns the real remaining pack bytes, i.e.
+/// the new `used`. `exclude` protects the write's own target. Callers hold
+/// the dir's budget lock, so no concurrent writer can shed underneath us and
+/// `enforce_packed_total_cap`'s own-packs phase cannot (it never wins our
+/// flock) — this is the only place self-shedding can happen during a write.
+fn shed_oldest_packs(dir: &Path, exclude: &Path, headroom: u64) -> u64 {
+    let mut packs: Vec<(SystemTime, PathBuf, u64)> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|s| s == "pack") && p != exclude)
+                .filter_map(|p| {
+                    let meta = fs::metadata(&p).ok()?;
+                    Some((meta.modified().ok()?, p.clone(), meta.len()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    packs.sort_by_key(|(mtime, _, _)| *mtime);
+    let mut used: u64 = packs.iter().map(|(_, _, len)| len).sum();
+    for (_, path, len) in packs {
+        if used <= headroom {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            debug!("packed cache: shed {} to admit a new write", path.display());
+            used = used.saturating_sub(len);
+        }
+    }
+    used
 }
 
 impl PackedCache {
@@ -750,7 +806,7 @@ impl PackedCache {
         // size is not new spend and must not veto repairing a corrupt or
         // oversized entry.
         let target = self.path(key);
-        let used: u64 = fs::read_dir(&self.root)
+        let mut used: u64 = fs::read_dir(&self.root)
             .map_err(err)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -772,15 +828,19 @@ impl PackedCache {
         if recorded != Some(used) {
             record(&mut ledger, used)?;
         }
-        if used.saturating_add(reserve) > budget || !has_disk_space(&self.root, reserve) {
+        if !has_disk_space(&self.root, reserve) {
+            return Ok(());
+        }
+        // A chunk larger than the configured cap can never be admitted.
+        if total_cap.is_some_and(|cap| reserve > cap) {
             return Ok(());
         }
         // Bound the configured cap against ROOT-WIDE spend, not just this
         // dir's: sibling caches share the same cap. The whole estimate →
-        // evict → recheck → reserve critical section runs under a root-wide
-        // flock; without it two writers on different identity dirs could both
-        // admit writes that jointly overspend. A busy lock skips this chunk:
-        // cache writes never stall.
+        // evict → reconcile → shed → reserve critical section runs under a
+        // root-wide flock; without it two writers on different identity dirs
+        // could both admit writes that jointly overspend. A busy lock skips
+        // this chunk: cache writes never stall.
         // Lock order stays acyclic: own budget lock (held above) → root cap
         // lock → siblings' budget locks, non-blocking, inside enforce.
         let _root_guard = if let Some((cap, parent)) = total_cap.zip(self.root.parent()) {
@@ -792,21 +852,40 @@ impl PackedCache {
             // byte scan per tensor write would be too hot); only a plausible
             // overspend pays the real enforcement sweep.
             let estimate = root_pack_spend(parent, &self.root, used, sibling_pack_estimate);
-            if estimate.saturating_add(reserve) > cap {
-                // Evict LRU siblings under their budget locks, then recheck.
-                // The recheck is ledger-first (sibling_pack_estimate), not
-                // pack_bytes: a sibling's reservation is already accounted
-                // while its temp file is still writing, and that in-flight
-                // spend stays authoritative. Our own packs are safe: we hold
-                // this dir's budget lock and `used` is freshly reconciled.
-                enforce_packed_total_cap(parent, &self.root, cap);
-                let actual = root_pack_spend(parent, &self.root, used, sibling_pack_estimate);
-                if actual.saturating_add(reserve) > cap {
+            if estimate.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
+                // Evict LRU siblings down to `cap - reserve` — the target is
+                // the room this write needs, so admission can roll instead of
+                // wedging once aggregate usage reaches the cap.
+                enforce_packed_total_cap(parent, &self.root, cap - reserve);
+                // Authoritative recheck: reconcile each unheld sibling ledger
+                // to real pack bytes (a crashed reservation is phantom spend
+                // that would otherwise veto forever); a held budget lock
+                // means a live writer whose pending reservation is trusted.
+                let reconciled =
+                    root_pack_spend(parent, &self.root, used, reconciled_sibling_pack_spend);
+                let siblings = reconciled.saturating_sub(used);
+                // Shed our own oldest packs when self-shedding can admit the
+                // write: enforcement could not (it never wins the budget
+                // flock we hold). `headroom` bounds both the per-dir budget
+                // and the global cap net of sibling spend.
+                if used.saturating_add(reserve) > budget || reconciled.saturating_add(reserve) > cap
+                {
+                    let headroom = budget
+                        .min(cap.saturating_sub(siblings))
+                        .saturating_sub(reserve);
+                    used = shed_oldest_packs(&self.root, &target, headroom);
+                }
+                let actual = siblings.saturating_add(used);
+                if actual.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
                     return Ok(());
                 }
             }
             guard
         } else {
+            // No configured cap: the per-dir budget is the only bound.
+            if used.saturating_add(reserve) > budget {
+                return Ok(());
+            }
             None
         };
         // Reserve first: an interrupted write can overcount, never overspend.
@@ -1589,5 +1668,86 @@ mod tests {
             pack * 2,
             "the lock file must not be counted as spend"
         );
+    }
+
+    #[test]
+    fn total_cap_sheds_own_oldest_packs_to_admit_new_write() {
+        let temp = Temp::new();
+        let cache = PackedCache {
+            root: temp.0.join("cache"),
+            manifest: None,
+        };
+        let w = weight("affine");
+        for (key, seconds) in [("old", 300u64), ("mid", 200), ("new", 100)] {
+            cache.write(key, &w).unwrap();
+            age(&cache.path(key), seconds);
+        }
+        let pack = fs::metadata(cache.path("old")).unwrap().len();
+        // A cap that fits exactly two packs plus the pending write: the
+        // writer must shed its own oldest pack (enforcement cannot — it
+        // never wins the budget flock the writer holds), turning the dir
+        // into a true LRU instead of wedging once usage reaches the cap.
+        // ("nxt" stays 3 chars so reserve equals the existing pack size.)
+        cache
+            .write_with_total_cap("nxt", &w, Some(2 * pack + pack))
+            .unwrap();
+        assert!(!cache.path("old").exists(), "oldest pack is shed for room");
+        assert!(cache.path("mid").exists());
+        assert!(cache.path("new").exists());
+        assert!(cache.path("nxt").exists(), "the new write must be admitted");
+        // Ledger records reconciled used + reserve = 3 packs.
+        let mut n = [0u8; 8];
+        File::open(cache.root.join("budget"))
+            .unwrap()
+            .read_exact(&mut n)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(n), 3 * pack);
+    }
+
+    #[test]
+    fn crashed_sibling_reservation_is_reconciled_at_recheck() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        // Sibling identity dir with a small real pack but a ledger claiming
+        // u64::MAX: a crash between `record` and rename leaves phantom spend
+        // that must not veto other identities forever.
+        let sibling = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("a.pack"), vec![0_u8; 64]).unwrap();
+        let ledger_path = sibling.join("budget");
+        fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
+        let source = temp.0.join("b.gguf");
+        fs::write(&source, b"second").unwrap();
+        let b = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        let w = weight("affine");
+        // The sibling is fresh and manifest-less: nothing can evict it, so
+        // admission is possible only if the recheck reconciles the phantom
+        // ledger to its real pack bytes.
+        b.write_with_total_cap("k1", &w, Some(u64::MAX)).unwrap();
+        let pack = fs::metadata(b.path("k1")).unwrap().len();
+        fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
+        b.write_with_total_cap("k2", &w, Some(pack * 10)).unwrap();
+        assert!(
+            b.path("k2").exists(),
+            "a reconciled phantom reservation must not veto the write"
+        );
+        let mut n = [0u8; 8];
+        File::open(&ledger_path)
+            .unwrap()
+            .read_exact(&mut n)
+            .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(n),
+            64,
+            "the unheld sibling ledger is rewritten to real pack bytes"
+        );
+        // While the sibling's budget lock is held the ledger is a live
+        // writer's pending reservation and stays trusted: the write vetoes.
+        fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
+        let held = try_budget_lock(&sibling).unwrap().unwrap();
+        b.write_with_total_cap("k3", &w, Some(pack * 10)).unwrap();
+        assert!(!b.path("k3").exists());
+        drop(held);
     }
 }
