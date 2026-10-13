@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -157,9 +157,21 @@ export function probeAgentInstall(
   const pin = releasePin(env);
   if (pin !== undefined) {
     const pinnedBin = join(dirname(managed), agentBinName(pin));
-    return existsSync(pinnedBin)
-      ? { source: 'managed', path: pinnedBin, managedTag, bundledTag, effectiveTag: pin }
-      : { source: 'none', managedTag, bundledTag };
+    if (existsSync(pinnedBin)) {
+      // A cached pin still needs a lease: the launcher only spawns the
+      // returned path after serve startup and health checks, and an
+      // unpinned sweep in ANOTHER process could delete it in that window
+      // if the original installer's lease died with it. The marker covers
+      // install→launch for fresh downloads (written in downloadAgentBinary)
+      // and probe→launch for cache hits (written here).
+      try {
+        writeFileSync(`${pinnedBin}.lease-${process.pid}`, '', { flag: 'wx' });
+      } catch {
+        // lease already exists or dir unwritable — best-effort
+      }
+      return { source: 'managed', path: pinnedBin, managedTag, bundledTag, effectiveTag: pin };
+    }
+    return { source: 'none', managedTag, bundledTag };
   }
 
   // Bundled-vs-cache: the newer release tag wins. A freshly `mlx agent
@@ -629,23 +641,7 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
 export interface AcquireLockHooks {
   /** Retry deadline override (default 10s). */
   deadlineMs?: number;
-  /**
-   * Test seam: fires after a node failed the liveness probe and before it
-   * is captured for reclamation — lets a test interleave a new owner
-   * deterministically.
-   */
-  onAfterDeadProbe?: (node: string) => void | Promise<void>;
 }
-
-/**
- * Locks this process currently holds: logical lock path → bound node. The
- * socket/pipe only exists while the holder is alive and still holds, so a
- * connectable name IS proof of a live owner — no pid files, no staleness
- * heuristics, and nothing a thief can delete to impersonate a release.
- */
-const HELD_INSTALL_LOCKS = new Map<string, { server: Server; node: string; ino?: number }>();
-/** Unique captive suffix per reclaim attempt within this process. */
-let reclaimCounter = 0;
 
 /** True while a pid still exists (EPERM = alive, another user). */
 function pidAlive(pid: number): boolean {
@@ -658,25 +654,39 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
- * Where the lock node actually lives. Unix socket paths cap at ~104 bytes
- * (sun_path), so an over-long `.lock` path — a deep $HOME — is hashed into
- * tmpdir. Windows binds a named pipe instead: pipe names are not filesystem
- * objects, cannot be stale after the holder dies, and need no unlink.
+ * Locks this process currently holds: logical lock path → member record.
  */
-function lockNodePath(path: string): string {
-  if (process.platform === 'win32') {
-    return `\\\\.\\pipe\\mlx-agent-lock-${createHash('sha256').update(resolve(path)).digest('hex').slice(0, 32)}`;
-  }
-  if (Buffer.byteLength(path) < 100) return path;
-  const hash = createHash('sha256').update(resolve(path)).digest('hex').slice(0, 32);
-  return join(tmpdir(), `mlx-agent-lock-${hash}.sock`);
+const HELD_INSTALL_LOCKS = new Map<string, { server?: Server; marker: string }>();
+/** Per-acquire sequence so one process's concurrent acquires get distinct tickets. */
+let memberSeq = 0;
+
+/**
+ * The directory advertising lock members. Single-name locks cannot be
+ * reclaimed safely — every scheme eventually has to unlink or replace a
+ * name a live process may already hold — so the lock is a membership set
+ * instead: each contender binds `m-<pid>-<seq>` (unix socket; marker file +
+ * named pipe on Windows) and the lowest ticket among live members holds.
+ * Nobody ever removes a name owned by a live pid: a crashed member's marker
+ * refuses connections and its pid is dead, so deleting it is unconditional
+ * and race-free. The directory sits under tmpdir when `.lock.d` would
+ * exceed the ~104-byte socket path cap (member name adds ~14 bytes).
+ */
+function lockDirPath(path: string): { dir: string; legacy: string | undefined } {
+  const dir = `${path}.d`;
+  if (process.platform === 'win32') return { dir, legacy: undefined };
+  // Budget: `dir/m-<pid>-<seq>` must stay under the ~104-byte sun_path cap
+  // (macOS reports over-long socket paths as EINVAL), so an over-long
+  // `.lock.d` — a deep $HOME — is hashed into a short tmpdir name.
+  if (Buffer.byteLength(dir) < 85) return { dir, legacy: path };
+  const hash = createHash('sha256').update(resolve(dir)).digest('hex').slice(0, 16);
+  return { dir: join(tmpdir(), `a-${hash}.d`), legacy: path };
 }
 
-/** True while something accepts connections on `node` — i.e. a live holder. */
-function holderAlive(node: string): Promise<boolean> {
+/** True while something accepts connections on `node` — i.e. a live member. */
+function memberListening(node: string): Promise<boolean> {
   return new Promise((res) => {
     const sock = connect(node);
-    const timer = setTimeout(() => done(true), 250); // wedged listener: assume held, never steal
+    const timer = setTimeout(() => done(true), 250); // wedged listener: assume live, never evict
     const done = (alive: boolean) => {
       clearTimeout(timer);
       sock.destroy();
@@ -687,122 +697,132 @@ function holderAlive(node: string): Promise<boolean> {
   });
 }
 
+interface LockMember {
+  /** Sort key: (pid, seq) — the lower ticket holds. */
+  pid: number;
+  seq: number;
+  file: string;
+}
+
 /**
- * Prove the freshly bound `server` actually owns `node`: a third party can
- * unlink-and-rebind the name in the micro-gap before `listen` finished, so a
- * successful bind is necessary but not sufficient. We connect and send a
- * per-acquire token — only OUR server's handler recognizes it and emits
- * `self-verified`; landing on a competing holder's listener does not.
+ * Live-and-present members of `dir`: a marker counts while its pid is
+ * alive (a just-bound member may not be listening yet — provisional still
+ * counts, so its lower ticket is respected); dead-pid markers are swept
+ * unconditionally — the owner cannot exist.
  */
-function verifySelfBind(server: Server, node: string, token: string): Promise<boolean> {
-  return new Promise((res) => {
-    const timer = setTimeout(() => done(false), 250);
-    const done = (ok: boolean) => {
-      clearTimeout(timer);
-      server.off('self-verified', onVerified);
-      sock.destroy();
-      res(ok);
-    };
-    const onVerified = () => done(true);
-    const sock = connect(node);
-    server.once('self-verified', onVerified);
-    sock.once('error', () => done(false));
-    sock.on('connect', () => sock.write(token));
-  });
-}
-
-function tryListen(server: Server, node: string): Promise<boolean> {
-  return new Promise((res) => {
-    server.once('error', () => res(false));
-    server.listen(node, () => res(true));
-  });
+async function liveMembers(dir: string): Promise<LockMember[]> {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const members: LockMember[] = [];
+  for (const entry of entries) {
+    const m = /^m-(\d+)-(\d+)$/.exec(entry);
+    if (!m) continue;
+    const member = { pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
+    if (!pidAlive(member.pid)) {
+      rmSync(member.file, { force: true });
+      continue;
+    }
+    members.push(member);
+  }
+  // Presence while the pid is alive is authoritative: a member that has
+  // advertised (marker written, still binding) is provisionally holding
+  // its ticket, and one that fails or releases removes its own marker.
+  members.sort((a, b) => a.pid - b.pid || a.seq - b.seq);
+  return members;
 }
 
 /**
- * Serialize the install critical section across processes. `<dest>.lock` is
- * a bound unix socket (named pipe on Windows): `listen` is the atomic
- * test-and-set — exactly one binder owns the name — and `connect` is the
- * liveness probe, so a leftover node is reclaimed ONLY after it demonstrably
- * refuses connections (dead or crashed holder; a suspended holder still
- * accepts). Reclaiming removes the stale NAME, never a lock under a live
- * owner, and the token self-bind check catches the one remaining race where
- * a reclaimer unlinks between our bind and listen.
+ * Serialize the install critical section across processes. Membership
+ * protocol: write our marker (bound socket / pipe) FIRST, then scan — any
+ * contender whose scan overlaps our critical section sees our marker and
+ * waits, and our own scan sees every contender that advertised before us.
+ * The lowest live ticket wins; equal-or-higher tickets never block, so the
+ * lowest can never deadlock. A dead member's marker is deleted by the next
+ * scan unconditionally — no liveness probe is trusted to unlink anything.
+ *
+ * On Unix the marker is a listening unix socket so probes land harmlessly;
+ * on Windows it is an empty marker file plus nothing to probe — pid
+ * liveness is authoritative since named-pipe names die with the process.
  *
  * Once the deadline passes the caller must FAIL rather than proceed
- * unlocked: the pointer-flip/sweep section is unsafe to enter while a holder
- * may still be inside it, so this function throws instead of returning.
+ * unlocked: the pointer-flip/sweep section is unsafe to enter while a
+ * holder may still be inside it, so this function throws instead of
+ * returning.
  */
 export async function acquireInstallLock(path: string, hooks: AcquireLockHooks = {}): Promise<void> {
   const deadline = Date.now() + (hooks.deadlineMs ?? 10_000);
-  const node = lockNodePath(path);
-  // Recognized only by THIS acquire attempt's handler — a probe or a
-  // connection landing on a competitor's server never validates us.
-  const token = randomBytes(16).toString('hex');
-  while (true) {
-    const server = createServer((sock) => {
-      sock.once('data', (data) => {
-        if (data.toString() === token) server.emit('self-verified');
-        sock.destroy();
-      });
-      sock.once('error', () => {});
-    });
-    if (await tryListen(server, node)) {
-      if (await verifySelfBind(server, node, token)) {
-        // Remember our socket's inode so release never deletes a name that
-        // was re-bound by someone else (e.g. after a restore clobbered ours).
-        let ino: number | undefined;
-        try {
-          ino = lstatSync(node).ino;
-        } catch {
-          // named pipe or stat-less platform — no inode to guard
-        }
-        HELD_INSTALL_LOCKS.set(path, { server, node, ino });
+  const { dir, legacy } = lockDirPath(path);
+  mkdirSync(dir, { recursive: true });
+  const seq = memberSeq++;
+  const marker = join(dir, `m-${process.pid}-${seq}`);
+  let server: Server | undefined;
+  if (process.platform === 'win32') {
+    // Marker file only: there is no shared name to steal, and the pipe is
+    // unnecessary since pid liveness is authoritative on Windows.
+    try {
+      writeFileSync(marker, '', { flag: 'wx' });
+    } catch {
+      // exists from a stale scan race — reuse is fine, ticket is per-acquire
+    }
+  } else {
+    server = createServer((sock) => sock.destroy());
+    server.on('error', () => {}); // stray runtime errors must not crash the holder
+    await new Promise<void>((res, rej) => {
+      server!.once('error', rej);
+      server!.listen(marker, res);
+    }).catch(async (error) => {
+      // EADDRINUSE means a dead-pid marker survived a scan — remove and
+      // retry once; anything else fails the acquire outright.
+      server!.close();
+      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+        rmSync(marker, { force: true });
+        server = createServer((sock) => sock.destroy());
+        server.on('error', () => {});
+        await new Promise<void>((res, rej) => {
+          server!.once('error', rej);
+          server!.listen(marker, res);
+        });
         return;
       }
-      server.close();
-    }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `mlx agent: another install is in progress (${path}) — refusing to proceed without the install lock`,
-      );
-    }
-    if (!(await holderAlive(node))) {
-      await hooks.onAfterDeadProbe?.(node);
-      if (process.platform === 'win32') continue; // pipe names die with the holder — never stale
-      // Reclaim the stale name WITHOUT ever unlinking it on stale evidence:
-      // a second reclaimer can bind a live owner between our probe and our
-      // unlink. The node is moved whole into a private captive and judged
-      // THERE — a captive that still accepts connections is a live lock
-      // stolen mid-gap, so it is restored via link; only a captive that
-      // refuses gets removed.
-      // Captive lives in tmpdir with a short name: the probe connects to
-      // IT, so it must stay under sun_path no matter how long `node` is.
-      const captive = join(tmpdir(), `mlx-rc${process.pid.toString(36)}${(reclaimCounter++).toString(36)}`);
-      try {
-        renameSync(node, captive);
-      } catch {
-        // vanished or replaced between probe and capture — retry listen
-        continue;
+      throw error;
+    });
+  }
+  try {
+    while (true) {
+      if (Date.now() > deadline) {
+        throw new Error(
+          `mlx agent: another install is in progress (${path}) — refusing to proceed without the install lock`,
+        );
       }
-      try {
-        if (await holderAlive(captive)) {
-          // Captured a live owner's name — return it whole. rename replaces
-          // whatever a usurper bound while the name was free, so the real
-          // owner always regains the name; a usurper's own verifySelfBind
-          // (or its inode-checked release) cleans up its side.
-          try {
-            renameSync(captive, node);
-          } catch {
-            // restore failed — captive stays nameless; the owner still
-            // holds its server and this attempt retries like any observer
-          }
+      // Legacy single-file locks (this PR's earlier socket design, or a
+      // pre-pointer pid file): an acceptor counts as a live holder — its
+      // ticket predates all members, so we wait for it rather than steal.
+      if (legacy !== undefined && existsSync(legacy)) {
+        if (await memberListening(legacy)) {
+          await new Promise((r) => setTimeout(r, 50));
+          continue;
         }
-      } finally {
-        rmSync(captive, { force: true });
+        rmSync(legacy, { force: true });
       }
-      continue;
+      const members = await liveMembers(dir);
+      // Lowest ticket among present members wins. Members that appear only
+      // in a later scan advertised after our marker existed, so their own
+      // scans saw us — they will wait behind our ticket.
+      const ahead = (m: LockMember) => m.pid > process.pid || (m.pid === process.pid && m.seq > seq);
+      if (members.every((m) => (m.pid === process.pid && m.seq === seq) || ahead(m))) {
+        HELD_INSTALL_LOCKS.set(path, { server, marker });
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 50));
     }
-    await new Promise((r) => setTimeout(r, 50));
+  } catch (error) {
+    server?.close();
+    rmSync(marker, { force: true });
+    throw error;
   }
 }
 
@@ -811,11 +831,9 @@ export function releaseInstallLock(path: string): void {
     const held = HELD_INSTALL_LOCKS.get(path);
     if (!held) return;
     HELD_INSTALL_LOCKS.delete(path);
-    held.server.close();
-    if (process.platform === 'win32') return; // pipe names die with the process
-    // Delete only OUR inode: a usurper's name clobbered by a restore must
-    // not unlink the lock the real owner holds now.
-    if (held.ino !== undefined && lstatSync(held.node).ino === held.ino) rmSync(held.node, { force: true });
+    held.server?.close();
+    // Our own marker — unconditionally safe to remove.
+    rmSync(held.marker, { force: true });
   } catch {
     // lock cleanup is best-effort
   }

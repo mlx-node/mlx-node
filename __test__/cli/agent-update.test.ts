@@ -1,7 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, type Server } from 'node:net';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -127,6 +126,9 @@ describe('probeAgentInstall', () => {
         managedTag: 'mlx-agent-v0.3.0',
         effectiveTag: 'mlx-agent-v0.2.0',
       });
+      // A cache-hit pin must be leased too: another process's sweep can
+      // delete the binary between this probe and the actual spawn.
+      expect(existsSync(`${probe.path}.lease-${process.pid}`)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -394,61 +396,23 @@ describe('downloadAgentBinary', () => {
     }
   });
 
-  it('a name that gains a live owner mid-reclaim is restored, not unlinked', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
-    let intruder: Server | undefined;
-    try {
-      const lock = join(home, 'mlx-agent.lock');
-      // Incumbent looks dead. Between the failed probe and the capture, a
-      // new owner binds a live socket — the reclaim must return that name
-      // whole instead of unlinking it.
-      writeFileSync(lock, '999999');
-      let swapped = false;
-      await expect(
-        acquireInstallLock(lock, {
-          deadlineMs: 600,
-          onAfterDeadProbe: async () => {
-            if (swapped) return;
-            swapped = true;
-            rmSync(lock, { force: true });
-            intruder = createServer((s) => s.destroy());
-            await new Promise<void>((res, rej) => {
-              intruder!.once('error', rej);
-              intruder!.listen(lock, res);
-            });
-          },
-        }),
-      ).rejects.toThrow('install lock');
-      expect(swapped).toBe(true);
-      // The intruder's listener still owns the name — a connection lands.
-      const { connect } = await import('node:net');
-      const probe = await new Promise<boolean>((res) => {
-        const s = connect(lock);
-        s.once('connect', () => {
-          s.destroy();
-          res(true);
-        });
-        s.once('error', () => res(false));
-      });
-      expect(probe).toBe(true);
-      expect(intruder!.listening).toBe(true);
-    } finally {
-      intruder?.close();
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  it('reclaims a lock name left behind by a crashed holder', async () => {
+  it('reclaims membership markers left behind by crashed holders', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
-      // A dead holder's node — or the legacy plain lock file — refuses
-      // connections, so its name is unlinked and rebound.
+      const dir = `${lock}.d`;
+      mkdirSync(dir, { recursive: true });
+      // A dead member's marker and the legacy single-name lock are both
+      // reclaimed unconditionally: the owning pid cannot exist.
+      writeFileSync(join(dir, 'm-999999-0'), '');
       writeFileSync(lock, '999999');
       await acquireInstallLock(lock, { deadlineMs: 2_000 });
-      expect(existsSync(lock)).toBe(true);
-      releaseInstallLock(lock);
       expect(existsSync(lock)).toBe(false);
+      const members = readdirSync(dir);
+      expect(members).toHaveLength(1);
+      expect(members[0]).toMatch(/^m-\d+-\d+$/);
+      releaseInstallLock(lock);
+      expect(readdirSync(dir)).toEqual([]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
