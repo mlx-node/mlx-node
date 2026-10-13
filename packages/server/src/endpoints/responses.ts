@@ -56,6 +56,7 @@ import {
 } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
+import type { TracedChatConfig } from '../turn-trace.js';
 import {
   createVisibility,
   endJson,
@@ -2326,6 +2327,9 @@ export async function handleCreateResponse(
       sendBadRequest(res, err instanceof Error ? err.message : 'Invalid request input', 'input');
       return;
     }
+    // Stamp the requesting alias so the shared model wrapper attributes the
+    // turn to the name the client used, not the binding's first registration.
+    (config as TracedChatConfig).modelAlias = body.model;
 
     // New-only messages (what this request added). Instructions are
     // stored separately — persisting them as input messages would

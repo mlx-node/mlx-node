@@ -72,10 +72,28 @@ function safeSidecarStats(): ColdSidecarStats | undefined {
   }
 }
 
+/**
+ * `ChatConfig` plus the trace-only field the serve endpoints stamp per
+ * request: the registry name the request resolved through. The napi object
+ * boundary drops unknown props, so carrying it on the config costs nothing
+ * — and it is the only per-request handle a shared model wrapper has:
+ * aliased registrations reuse one `SessionRegistry`, so the registration
+ * name alone cannot attribute a turn to the alias the client asked for.
+ * Never written by model code; read only here.
+ */
+export interface TracedChatConfig extends ChatConfig {
+  modelAlias?: string;
+}
+
 /** Injectable seams for {@link TurnTraceModel} (unit tests). */
 export interface TurnTraceDeps {
-  /** Model name recorded on every trace line. Default: `'unknown'`. */
-  modelName?: string;
+  /**
+   * Fallback model name for turns the request did not stamp: a static
+   * registration name, or a resolver consulted per turn so an unregistered
+   * first alias does not leave traces attributed to a dead name. Either
+   * side may resolve to `'unknown'`.
+   */
+  modelName?: string | (() => string | undefined);
   /** Durable telemetry sink; defaults to a fresh {@link MetricsTrace}. */
   trace?: Pick<MetricsTrace, 'record'>;
   /** Process-wide cold-tier reader; defaults to the native addon. */
@@ -131,6 +149,8 @@ const SHARED_WATERMARKS: TurnWatermarks = { cold: {}, sidecar: {} };
 interface TurnContext {
   traceId: string;
   sessionId: string | undefined;
+  /** Registry name this request resolved through; wins over the binding name. */
+  modelAlias: string | undefined;
   startMs: number;
   cold: ColdCacheStats | undefined;
   sidecar: ColdSidecarStats | undefined;
@@ -270,6 +290,9 @@ export class TurnTraceModel implements SessionCapableModel {
     const ctx: TurnContext = {
       traceId: randomUUID(),
       sessionId: typeof config?.cacheOwnerId === 'string' ? config.cacheOwnerId : undefined,
+      // The requesting alias outranks the binding name: one SessionRegistry
+      // (and one wrapper) serves every alias of a model.
+      modelAlias: (config as TracedChatConfig | null | undefined)?.modelAlias,
       startMs: this.now(),
       cold,
       sidecar,
@@ -296,11 +319,13 @@ export class TurnTraceModel implements SessionCapableModel {
     try {
       const coldStats = this.deps.coldStats ?? safeColdStats;
       const sidecarStats = this.deps.sidecarStats ?? safeSidecarStats;
+      const dep = this.deps.modelName;
+      const fallback = typeof dep === 'function' ? dep() : dep;
       const rec: MetricsTraceInput = {
         traceId: ctx.traceId,
         ts: this.now(),
         sessionId: ctx.sessionId,
-        model: this.deps.modelName ?? 'unknown',
+        model: ctx.modelAlias ?? fallback ?? 'unknown',
         durationMs: Math.max(0, this.now() - ctx.startMs),
         finishReason: final.finishReason,
         promptTokens: final.promptTokens,

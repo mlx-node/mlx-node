@@ -321,7 +321,9 @@ export class ModelRegistry {
           maxConcurrentDispatches: concurrentDispatchCapacity(model),
           samplingDefaults,
           maxOutputTokens,
-          modelName: name,
+          // Resolve the trace name per turn — requests stamp their own alias,
+          // and the binding outlives `name` whenever aliases rebind it.
+          modelName: () => this.bindingDisplayName(model) ?? name,
         }),
         refCount: 0,
         inFlight: 0,
@@ -662,6 +664,18 @@ export class ModelRegistry {
    */
   getSessionRegistry(name: string): SessionRegistry | undefined {
     return this.models.get(name)?.sessionRegistry;
+  }
+
+  /**
+   * Any live name currently bound to `model`, or undefined once every alias
+   * is gone — the turn-trace fallback, so traces never attribute work to a
+   * name the registry already released while another alias survives.
+   */
+  private bindingDisplayName(model: ServableModel): string | undefined {
+    for (const [alias, entry] of this.models) {
+      if (entry.model === model) return alias;
+    }
+    return undefined;
   }
 
   /**

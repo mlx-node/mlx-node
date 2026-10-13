@@ -340,10 +340,11 @@ export interface SessionRegistryOptions {
    */
   maxOutputTokens?: number;
   /**
-   * Friendly name the `ModelRegistry` bound this model under. Recorded as
-   * `model` on every per-turn metrics trace line this registry produces.
+   * Fallback model name for traces on turns the request did not stamp with
+   * an alias — a static name, or a resolver consulted per turn so the
+   * surviving alias wins when the binding outlives its first name.
    */
-  modelName?: string;
+  modelName?: string | (() => string | undefined);
   /**
    * Test seams for the per-turn metrics-trace wrapper this registry installs
    * on the model. Production callers leave it unset — the defaults read the

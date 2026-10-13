@@ -104,6 +104,7 @@ import {
 } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
+import type { TracedChatConfig } from '../turn-trace.js';
 import {
   createVisibility,
   endJson,
@@ -1289,6 +1290,9 @@ export async function handleCreateMessage(
     const messages: ChatMessage[] = mappedMessages;
     const config: ChatConfig = mappedConfig;
     const stopSequences: string[] = mappedStopSequences;
+    // Stamp the requesting alias so the shared model wrapper attributes the
+    // turn to the name the client used, not the binding's first registration.
+    (config as TracedChatConfig).modelAlias = body.model;
 
     // Canonicalize every assistant fan-out's trailing tool block against its
     // declared sibling order. Several native session backends pair tool results

@@ -193,6 +193,47 @@ describe('TurnTraceModel', () => {
     expect(raw).not.toContain('rawText');
   });
 
+  it('attributes a turn to the requesting alias stamped on the config', async () => {
+    // One SessionRegistry (and one wrapper) serves every alias of a model;
+    // the request's modelAlias must win over the binding name.
+    const model = new TurnTraceModel(makeInner(), {
+      modelName: 'qwen-small',
+      trace: new MetricsTrace({ dir, now: () => FIXED_NOW }),
+      now: () => FIXED_NOW,
+      coldStats: () => coldStats(),
+      sidecarStats: () => sidecarStats(),
+      watermarks: { cold: {}, sidecar: {} },
+    });
+    await model.chatSessionContinue([{ role: 'user', content: 'hi' }], {
+      modelAlias: 'qwen-small-q4',
+    } as Parameters<typeof model.chatSessionContinue>[1]);
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].model).toBe('qwen-small-q4');
+  });
+
+  it('resolves the fallback modelName per turn so a surviving alias wins', async () => {
+    // Aliased models share one registry built under the FIRST name; when
+    // that name is unregistered the resolver must surface a live alias,
+    // not keep stamping the dead one.
+    let current: string | undefined = 'alias-a';
+    const model = new TurnTraceModel(makeInner(), {
+      modelName: () => current,
+      trace: new MetricsTrace({ dir, now: () => FIXED_NOW }),
+      now: () => FIXED_NOW,
+      coldStats: () => coldStats(),
+      sidecarStats: () => sidecarStats(),
+      watermarks: { cold: {}, sidecar: {} },
+    });
+    current = 'alias-b';
+    await model.chatSessionContinue([{ role: 'user', content: 'hi' }], null);
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].model).toBe('alias-b');
+  });
+
   it('sums overlapping turns without double-counting shared counter advances', async () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
     // One mutable counter both turns read. Timeline: slow begins (seeds at
