@@ -766,7 +766,8 @@ function memberListening(node: string): Promise<boolean> {
   });
 }
 
-interface LockMember {
+/** @internal Exported for tests; {@link acquireInstallLock} is the only production consumer. */
+export interface LockMember {
   /**
    * Bakery ticket: `1 + max(tickets seen at choose time)`, so a marker
    * that advertised AFTER us always sorts behind us. Ticket order — not
@@ -779,9 +780,10 @@ interface LockMember {
   file: string;
 }
 
-interface MemberScan {
+/** @internal Exported for tests; {@link acquireInstallLock} is the only production consumer. */
+export interface MemberScan {
   members: LockMember[];
-  /** A contender is mid-choose (its c- marker names a live pid). */
+  /** A contender is mid-choose, or the snapshot is stale and the caller must rescan. */
   choosing: boolean;
 }
 
@@ -814,7 +816,8 @@ const MEMBER_STALE_MS = 2_000;
  * stays authoritative (the recycled-pid stall is a known residual risk
  * there).
  */
-async function scanMembers(dir: string): Promise<MemberScan> {
+/** @internal Exported for tests; {@link acquireInstallLock} is the only production caller. */
+export async function scanMembers(dir: string): Promise<MemberScan> {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -857,7 +860,11 @@ async function scanMembers(dir: string): Promise<MemberScan> {
       try {
         fresh = Date.now() - statSync(member.file).mtimeMs <= MEMBER_STALE_MS;
       } catch {
-        // vanished mid-probe — nothing to sweep or keep
+        // Vanished mid-probe: a c- marker's owner may have just swapped it
+        // for a b- member our readdir snapshot predates, so the contender
+        // is NOT absent — report "still choosing" and force the caller to
+        // rescan rather than grant on a member list that missed the flip.
+        choosing = true;
         return;
       }
     }

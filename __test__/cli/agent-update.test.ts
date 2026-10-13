@@ -30,6 +30,7 @@ import {
   probeAgentInstall,
   releaseInstallLock,
   resolveAgentBinary,
+  scanMembers,
   resolveReleaseTag,
   MLX_AGENT_BIN_ENV,
   MLX_AGENT_TAG_ENV,
@@ -753,6 +754,35 @@ describe('downloadAgentBinary', () => {
       }
     },
   );
+
+  it('reports a vanished mid-probe marker as still choosing so the caller rescans', { timeout: 20_000 }, async () => {
+    // Unix-only: the stale-probe path (and the vanish race) only exists
+    // where markers are probed by socket; Windows keeps plain files.
+    if (process.platform === 'win32') return;
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dir = join(home, 'lock.d');
+      mkdirSync(dir, { recursive: true });
+      // A live-pid c- marker that is NOT a listening socket. The race:
+      // readdirSync snapshots it, the probe refuses, and the owner swaps
+      // it for a b- member before statSync runs. Dropping it as "absent"
+      // would let an acquirer grant on a member list that missed the new
+      // b- marker; the scan must instead say "still choosing".
+      const marker = join(dir, `c-${process.pid}-0`);
+      writeFileSync(marker, '');
+      // scanMembers runs its readdirSync synchronously at call time, so
+      // deleting right after the call guarantees the marker existed in the
+      // snapshot but is gone before the async probes complete — the exact
+      // readdir-then-unlink window a real contender's choose→bind swap hits.
+      const scanPromise = scanMembers(dir);
+      rmSync(marker, { force: true });
+      const scan = await scanPromise;
+      expect(scan.choosing).toBe(true);
+      expect(scan.members).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it('refuses to install while a live process holds the lock', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
