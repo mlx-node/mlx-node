@@ -231,6 +231,31 @@ describe('downloadAgentBinary', () => {
     }
   });
 
+  it('reuses an already-installed same-tag binary instead of renaming over it', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dest = managedAgentBinPath(home);
+      const versionedName = join(dirname(dest), `mlx-agent-v0.3.0${process.platform === 'win32' ? '.exe' : ''}`);
+
+      mockMirrors(makeTarball(home, 'first-install'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(readFileSync(versionedName, 'utf-8')).toBe('first-install');
+
+      // A second install of the SAME tag (the concurrent-first-launch case:
+      // both processes downloaded before either held the lock) adopts the
+      // existing binary — renaming over a running `<tag>.exe` fails on
+      // Windows. The pointer is repaired, the bytes are untouched.
+      rmSync(`${dest}.tag`, { force: true });
+      mockMirrors(makeTarball(home, 'second-install'));
+      const path = await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(path).toBe(versionedName);
+      expect(readFileSync(versionedName, 'utf-8')).toBe('first-install');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('proceeds through a stale lock left by a dead installer', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {

@@ -425,6 +425,12 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
   // sweep delete the version the other's pointer just selected.
   const locked = acquireInstallLock(`${dest}.lock`);
   try {
+    // Under the lock, a same-tag install may already be complete: two first
+    // launches can download the same release concurrently, and renaming
+    // over a running `<tag>.exe` on Windows fails with a sharing/access
+    // error. The versioned file lands atomically, so an existing path is a
+    // finished install — adopt it and only repair the pointer.
+    const alreadyInstalled = existsSync(versioned);
     // Atomic install: a sibling temp file renamed over the versioned path.
     // Truncating the live path fails ETXTBSY on Linux while an agent runs and
     // can expose a half-written binary to a concurrent launch everywhere else
@@ -432,9 +438,11 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     // why installs write a NEW filename per release instead of dest itself.
     const staged = join(dirname(dest), `.mlx-agent.tmp-${process.pid}`);
     try {
-      writeFileSync(staged, out.stdout, { mode: 0o700 });
-      renameSync(staged, versioned);
-      chmodSync(versioned, 0o700);
+      if (!alreadyInstalled) {
+        writeFileSync(staged, out.stdout, { mode: 0o700 });
+        renameSync(staged, versioned);
+        chmodSync(versioned, 0o700);
+      }
       // The pointer flips LAST and atomically (sibling tmp + rename): probes
       // either see the old tag with its binary still on disk, or the new tag
       // with this file already in place — never a tag naming a missing binary.

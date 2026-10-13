@@ -310,6 +310,95 @@ describe('TurnTraceModel', () => {
     expect(() => readFileSync(traceFile(dir), 'utf8')).toThrow();
   });
 
+  it('consumes a failed turn\'s counter increments instead of leaking them to the next record', async () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    // Timeline: marks seed at 10 → failed turn bumps +3 and throws →
+    // successful turn bumps +1 → records. Without discard-turn mark
+    // advances the success would report 4 (the failed turn's +3 folded in);
+    // with them it reports only its own +1.
+    let counter = 10;
+    const bump = (n: number) => {
+      counter += n;
+    };
+    const sharedMarks = { cold: {}, sidecar: {} };
+    const deps = {
+      modelName: 'qwen-small',
+      trace,
+      now: () => FIXED_NOW,
+      coldStats: () => coldStats({ hits: counter }),
+      sidecarStats: () => sidecarStats(),
+      watermarks: sharedMarks,
+    };
+    const failing = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          bump(3);
+          throw new Error('native exploded');
+        }),
+      }),
+      deps,
+    );
+    const passing = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          bump(1);
+          return makeResult();
+        }),
+      }),
+      deps,
+    );
+
+    await expect(failing.chatSessionContinue([])).rejects.toThrow('native exploded');
+    await passing.chatSessionContinue([]);
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.coldHits).toBe(1);
+  });
+
+  it('consumes an error-finish turn\'s increments the same way', async () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    let counter = 10;
+    const bump = (n: number) => {
+      counter += n;
+    };
+    const sharedMarks = { cold: {}, sidecar: {} };
+    const deps = {
+      modelName: 'qwen-small',
+      trace,
+      now: () => FIXED_NOW,
+      coldStats: () => coldStats({ hits: counter }),
+      sidecarStats: () => sidecarStats(),
+      watermarks: sharedMarks,
+    };
+    const erroring = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          bump(3);
+          return makeResult({ finishReason: 'error' });
+        }),
+      }),
+      deps,
+    );
+    const passing = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          bump(1);
+          return makeResult();
+        }),
+      }),
+      deps,
+    );
+
+    const errorResult = await erroring.chatSessionContinue([]);
+    expect(errorResult.finishReason).toBe('error');
+    await passing.chatSessionContinue([]);
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.coldHits).toBe(1);
+  });
+
   it('writes nothing at all when the sink is disabled', async () => {
     process.env.MLX_AGENT_METRICS = '0';
     const inner = makeInner();

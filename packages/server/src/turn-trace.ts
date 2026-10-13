@@ -14,14 +14,15 @@
  *
  * Turn boundaries: the cold-tier counters are process-wide and cumulative, so
  * the baseline is snapshotted INSIDE the wrapped call (the actual dispatch
- * moment) and diffed when the turn completes successfully. The per-turn
- * context — not shared state — holds the baseline, so a turn that throws,
- * aborts, or ends on `finishReason: 'error'` simply never diffs and cannot
- * leak its restores into the next successful turn's delta. On continuously
- * batched models (`maxConcurrentSequences() > 1`) two turns can overlap in
- * native flight: each turn then reports the counter advance since the
- * PREVIOUS record's high-water mark ({@link TurnWatermarks}), so attribution
- * between overlapping turns is approximate while the deltas still sum to the
+ * moment) and diffed when the turn completes successfully. A turn that
+ * throws, aborts, or ends on `finishReason: 'error'` never records — but it
+ * still ADVANCES the shared watermarks ({@link TurnTraceModel.discardTurn}),
+ * so its counter increments are consumed rather than inherited by the next
+ * successful turn's delta. On continuously batched models
+ * (`maxConcurrentSequences() > 1`) two turns can overlap in native flight:
+ * each turn then reports the counter advance since the PREVIOUS record's
+ * high-water mark ({@link TurnWatermarks}), so attribution between
+ * overlapping turns is approximate while the deltas still sum to the
  * counter's real advance — the dashboard SUMs these columns. `durationMs`
  * therefore measures the wrapped dispatch call itself; admission-lane queue
  * waits happen upstream and are not included.
@@ -394,6 +395,37 @@ export class TurnTraceModel implements SessionCapableModel {
     }
   }
 
+  /**
+   * Close a turn that will never record: thrown, aborted, errored, or ended
+   * on a stream that yielded no successful terminal event. Its cold/sidecar
+   * increments are real process advances — leaving the marks stale would
+   * fold them into the NEXT recorded turn's delta, attributing a failed
+   * turn's cache activity to whoever records next. Advancing the marks
+   * without recording consumes the increment: uncommitted turns stay
+   * unattributed on purpose.
+   */
+  private discardTurn(ctx: TurnContext): void {
+    if (ctx.done) return;
+    ctx.done = true;
+    try {
+      const marks = this.deps.watermarks ?? SHARED_WATERMARKS;
+      const advance = (mark: Record<string, number>, key: string, current: number | undefined): void => {
+        if (current === undefined) return;
+        mark[key] = current;
+      };
+      const cold = (this.deps.coldStats ?? safeColdStats)();
+      if (cold) {
+        for (const key of COLD_DELTA_KEYS) advance(marks.cold, key, cold[key]);
+      }
+      const sidecar = (this.deps.sidecarStats ?? safeSidecarStats)();
+      if (sidecar) {
+        for (const key of SIDECAR_DELTA_KEYS) advance(marks.sidecar, key, sidecar[key]);
+      }
+    } catch {
+      // Best-effort; a broken stat reader must never break inference.
+    }
+  }
+
   /** The shared body of the three non-streaming dispatch entry points. */
   private async dispatch(
     kind: 'chatSessionStart' | 'chatSessionContinue' | 'chatSessionContinueTool',
@@ -402,13 +434,19 @@ export class TurnTraceModel implements SessionCapableModel {
     signal?: AbortSignal,
   ): Promise<ChatResult> {
     const ctx = this.beginTurn(config);
-    const result = await this.inner[kind](messages, config, signal);
-    // Record only committed turns: `finishReason: 'error'` results are
-    // returned, not thrown, and mirror the stream-side non-record rule.
-    if (ctx !== null && result.finishReason !== 'error') {
-      this.finishTurn(ctx, result);
+    try {
+      const result = await this.inner[kind](messages, config, signal);
+      // Record only committed turns: `finishReason: 'error'` results are
+      // returned, not thrown, and mirror the stream-side non-record rule.
+      if (ctx !== null && result.finishReason !== 'error') {
+        this.finishTurn(ctx, result);
+      }
+      return result;
+    } finally {
+      // A turn that threw or returned 'error' never reached finishTurn —
+      // discard consumes its marks so its increments leak nowhere.
+      if (ctx !== null) this.discardTurn(ctx);
     }
-    return result;
   }
 
   /** The shared body of the three streaming dispatch entry points. */
@@ -419,11 +457,17 @@ export class TurnTraceModel implements SessionCapableModel {
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     const ctx = this.beginTurn(config);
-    for await (const event of this.inner[kind](messages, config, signal)) {
-      if (ctx !== null && event.done && event.finishReason !== 'error') {
-        this.finishTurn(ctx, event);
+    try {
+      for await (const event of this.inner[kind](messages, config, signal)) {
+        if (ctx !== null && event.done && event.finishReason !== 'error') {
+          this.finishTurn(ctx, event);
+        }
+        yield event;
       }
-      yield event;
+    } finally {
+      // Mid-stream throws, consumer abandonment, and error-terminal events
+      // all exit through here — the mark advance keeps the sums honest.
+      if (ctx !== null) this.discardTurn(ctx);
     }
   }
 
