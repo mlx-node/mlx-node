@@ -115,6 +115,7 @@ export function probeAgentInstall(
   repoRoot = findRepoRoot(),
   env = process.env,
   homeDir: string = homedir(),
+  bundledBin?: string,
 ): AgentInstallProbe {
   const managed = managedAgentBinPath(homeDir);
   // The pointer names the release whose versioned binary is live; a
@@ -146,14 +147,14 @@ export function probeAgentInstall(
   const vendored = repoRoot ? join(repoRoot, 'grok-build', 'target', 'release', agentBinName()) : undefined;
   if (vendored && existsSync(vendored)) return { source: 'vendored', path: vendored, managedTag };
 
-  const bundled = findBundledAppBinary();
+  const bundled = bundledBin ?? findBundledAppBinary();
   const bundledTag = bundled ? readAgentTag(bundled) : undefined;
 
   // An MLX_AGENT_TAG pin selects exactly that managed release — newer or
   // older than the pointer or bundle, the pin wins (developer env/vendored
-  // pins still shadow it). A pin the cache cannot satisfy resolves as
-  // 'none' so the launcher downloads that exact release instead of
-  // silently running whatever is cached.
+  // pins still shadow it). A pin neither the cache nor the bundle can
+  // satisfy resolves as 'none' so the launcher downloads that exact
+  // release instead of silently running whatever is cached.
   const pin = releasePin(env);
   if (pin !== undefined) {
     const pinnedBin = join(dirname(managed), agentBinName(pin));
@@ -161,15 +162,24 @@ export function probeAgentInstall(
       // A cached pin still needs a lease: the launcher only spawns the
       // returned path after serve startup and health checks, and an
       // unpinned sweep in ANOTHER process could delete it in that window
-      // if the original installer's lease died with it. The marker covers
-      // install→launch for fresh downloads (written in downloadAgentBinary)
-      // and probe→launch for cache hits (written here).
+      // if the original installer's lease died with it. This write is
+      // best-effort — it lands outside the install lock, so a sweep that
+      // already snapshotted the directory can still miss it. The launch
+      // path (resolveAgentBinary) re-leases under the lock and re-verifies
+      // the binary survived; the marker here only covers direct probe
+      // callers such as the evals harness.
       try {
         writeFileSync(`${pinnedBin}.lease-${process.pid}`, '', { flag: 'wx' });
       } catch {
         // lease already exists or dir unwritable — best-effort
       }
       return { source: 'managed', path: pinnedBin, managedTag, bundledTag, effectiveTag: pin };
+    }
+    // A pin naming the bundled release is already satisfied: the bundle
+    // ships that exact binary, so a managed-cache miss must not force a
+    // download — a packaged app launched offline would fail for nothing.
+    if (bundled !== undefined && bundledTag === pin) {
+      return { source: 'bundled', path: bundled, managedTag, bundledTag, effectiveTag: pin };
     }
     return { source: 'none', managedTag, bundledTag };
   }
@@ -202,17 +212,50 @@ export function probeAgentInstall(
  * Locate the agent binary, in priority order:
  *   1. `$MLX_AGENT_BIN` — developer / vendored-build override.
  *   2. `<repo>/grok-build/target/release/mlx-agent` — `yarn build:agent` output.
- *   3. `$MLX_AGENT_TAG` pin — exactly that managed release, ahead of
- *      bundled/latest (downloaded into the cache when absent).
+ *   3. `$MLX_AGENT_TAG` pin — exactly that release, ahead of bundled/latest:
+ *      the managed cache hit, else the bundled binary when its stamped tag
+ *      matches the pin, else a download into the cache.
  *   4. `…/Contents/Resources/native/mlx-agent` — bundled inside the packaged app.
  *   5. `~/.mlx-node/bin/<tag>` — the downloaded prebuilt the `.tag` pointer
  *      names (legacy: unversioned `~/.mlx-node/bin/mlx-agent`).
  *   6. Download a prebuilt release tarball into (5), then use it.
  */
-export async function resolveAgentBinary(repoRoot = findRepoRoot()): Promise<string> {
-  const probe = probeAgentInstall(repoRoot);
-  if (probe.path !== undefined) return probe.path;
-  return downloadAgentBinary(managedAgentBinPath());
+export async function resolveAgentBinary(
+  repoRoot = findRepoRoot(),
+  env = process.env,
+  homeDir: string = homedir(),
+): Promise<string> {
+  const managed = managedAgentBinPath(homeDir);
+  const probe = probeAgentInstall(repoRoot, env, homeDir);
+  const probed = probe.path;
+  if (probed === undefined) return downloadAgentBinary(managed);
+
+  const pin = releasePin(env);
+  if (pin === undefined || probe.source !== 'managed' || probe.effectiveTag !== pin) {
+    return probed;
+  }
+  // A pinned managed hit must be leased UNDER the install lock: the probe's
+  // unlocked lease can be missed by a sweep that snapshotted the directory
+  // just before it, and the same window can have deleted the binary
+  // outright — so re-verify before trusting the path. Serialization with
+  // the sweep's lease scan is what makes the marker reliable.
+  await acquireInstallLock(`${managed}.lock`);
+  let survived = false;
+  try {
+    survived = existsSync(probed);
+    if (survived) {
+      try {
+        writeFileSync(`${probed}.lease-${process.pid}`, '', { flag: 'wx' });
+      } catch {
+        // the probe already leased it, or the dir is unwritable — best-effort
+      }
+    }
+  } finally {
+    releaseInstallLock(`${managed}.lock`);
+  }
+  // Swept between probe and lock — the launcher must download the pin.
+  // The lock is released first: downloadAgentBinary acquires it itself.
+  return survived ? probed : downloadAgentBinary(managed);
 }
 
 /** Tag marker written beside a downloaded/bundled binary, e.g. `mlx-agent-v0.2.0`. */

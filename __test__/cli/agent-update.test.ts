@@ -14,6 +14,7 @@ import {
   managedAgentBinPath,
   probeAgentInstall,
   releaseInstallLock,
+  resolveAgentBinary,
   resolveReleaseTag,
   MLX_AGENT_BIN_ENV,
   MLX_AGENT_TAG_ENV,
@@ -27,6 +28,10 @@ const MANAGED = { source: 'managed', path: '/m/mlx-agent' } satisfies Partial<Ag
 function status(overrides: Partial<AgentInstallProbe> = {}): () => AgentInstallProbe {
   return () => ({ managedTag: 'mlx-agent-v0.2.0', effectiveTag: 'mlx-agent-v0.2.0', ...MANAGED, ...overrides });
 }
+
+const EXE = process.platform === 'win32' ? '.exe' : '';
+const versioned = (home: string, tag: string) => join(home, '.mlx-node', 'bin', `${tag}${EXE}`);
+const mkdirBin = (home: string) => mkdirSync(join(home, '.mlx-node', 'bin'), { recursive: true });
 
 describe('probeAgentInstall', () => {
   it('honors the MLX_AGENT_BIN pin', () => {
@@ -44,10 +49,6 @@ describe('probeAgentInstall', () => {
   it('rejects a missing MLX_AGENT_BIN path', () => {
     expect(() => probeAgentInstall(undefined, { [MLX_AGENT_BIN_ENV]: '/no/such/bin' })).toThrow(MLX_AGENT_BIN_ENV);
   });
-
-  const EXE = process.platform === 'win32' ? '.exe' : '';
-  const versioned = (home: string, tag: string) => join(home, '.mlx-node', 'bin', `${tag}${EXE}`);
-  const mkdirBin = (home: string) => mkdirSync(join(home, '.mlx-node', 'bin'), { recursive: true });
 
   it('resolves the versioned binary the .tag pointer names', () => {
     const root = mkdtempSync(join(tmpdir(), 'probe-'));
@@ -134,6 +135,37 @@ describe('probeAgentInstall', () => {
     }
   });
 
+  it('resolves the bundled binary when its stamped tag matches the pin', () => {
+    const root = mkdtempSync(join(tmpdir(), 'probe-'));
+    try {
+      mkdirBin(root);
+      writeFileSync(versioned(root, 'mlx-agent-v0.3.0'), 'v030');
+      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.3.0');
+      // The packaged app bundles exactly the pinned release, but the
+      // managed cache lacks it — a managed miss must not trigger a
+      // download when the bundle already carries that tag (offline
+      // launches would fail for nothing).
+      const bundled = join(root, 'app', 'native', `mlx-agent${EXE}`);
+      mkdirSync(dirname(bundled), { recursive: true });
+      writeFileSync(bundled, 'bundled-v020');
+      writeFileSync(`${bundled}.tag`, 'mlx-agent-v0.2.0');
+      const probe = probeAgentInstall(
+        root,
+        { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.2.0' },
+        root,
+        bundled,
+      );
+      expect(probe).toMatchObject({
+        source: 'bundled',
+        path: bundled,
+        bundledTag: 'mlx-agent-v0.2.0',
+        effectiveTag: 'mlx-agent-v0.2.0',
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('resolves none when the pinned release is not cached', () => {
     const root = mkdtempSync(join(tmpdir(), 'probe-'));
     try {
@@ -160,6 +192,73 @@ describe('probeAgentInstall', () => {
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveAgentBinary', () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  let savedTag: string | undefined;
+
+  beforeEach(() => {
+    savedTag = process.env[MLX_AGENT_TAG_ENV];
+    delete process.env[MLX_AGENT_TAG_ENV];
+    fetchSpy = vi.spyOn(globalThis, 'fetch');
+  });
+  afterEach(() => {
+    if (savedTag === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+    else process.env[MLX_AGENT_TAG_ENV] = savedTag;
+    fetchSpy.mockRestore();
+  });
+
+  it('leases a cached pinned binary under the install lock', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
+    try {
+      mkdirBin(home);
+      writeFileSync(versioned(home, 'mlx-agent-v0.2.0'), 'v020');
+      writeFileSync(`${managedAgentBinPath(home)}.tag`, 'mlx-agent-v0.3.0');
+      const env = { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.2.0' };
+      // `home` doubles as a non-repo root so the vendored probe stays cold.
+      const bin = await resolveAgentBinary(home, env, home);
+      expect(bin).toBe(versioned(home, 'mlx-agent-v0.2.0'));
+      // The serialized lease survives — it is what a concurrent unpinned
+      // sweep consults before deleting this binary.
+      expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(true);
+      // The lock is released once the lease is in place.
+      expect(existsSync(`${managedAgentBinPath(home)}.lock`)).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('downloads the pinned release when the cache cannot satisfy it', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
+    try {
+      mkdirBin(home);
+      writeFileSync(versioned(home, 'mlx-agent-v0.3.0'), 'v030');
+      writeFileSync(`${managedAgentBinPath(home)}.tag`, 'mlx-agent-v0.3.0');
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
+
+      const file = join(home, 'agent-bin');
+      writeFileSync(file, 'v020');
+      const packed = spawnSync('tar', ['-czf', '-', '-C', home, 'agent-bin']);
+      rmSync(file, { force: true });
+      expect(packed.status).toBe(0);
+      const sha = createHash('sha256').update(packed.stdout).digest('hex');
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        if (u.endsWith('.sha256')) return new Response(sha);
+        if (u.endsWith('.tar.gz')) return new Response(new Uint8Array(packed.stdout));
+        return new Response('nope', { status: 404 });
+      });
+
+      const bin = await resolveAgentBinary(home, process.env, home);
+      expect(bin).toBe(versioned(home, 'mlx-agent-v0.2.0'));
+      // A pinned download is a side-install: the unpinned pointer is untouched.
+      expect(readFileSync(`${managedAgentBinPath(home)}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });
