@@ -68,11 +68,15 @@ follows its ladder: 2-D weights with `K % 16 == 0`, excluding `in_proj_ba`
 An MLP is decided as one unit: a dense sibling in the checkpoint or one
 ineligible member sends all three projections to bf16, because the MLP
 installs all-or-nothing. A projection the checkpoint already stores as sym8
-is used as is — unrotated, the numerics of the `sym8` convert format itself;
-the rotation below applies to load-time requantization only, and the
-measured gate results are for the published GGUFs. The embedding and
-`lm_head` are never rewritten in either mode: the lookup and the joint
-head's row gather read packed rows directly.
+(`mlx convert --q-mode sym8`) is decoded to dense bf16, and its MLP with it:
+its one scale per row has already spent the error budget. Measured on the
+sym8 convert of Flash against the same bf16 reference, the max diff is 0.012
+served as stored (unrotated W8A8), 0.010 rotated and requantized, and 0.005
+dense — only dense passes the gate. This mirrors how mlx-lm treats a stored
+format it cannot serve to spec (fp8 checkpoints dequantize to bf16 at load).
+For sym8 speed on CLEF use the Q8_0 GGUF, which is both faster and inside
+the gate. The embedding and `lm_head` are never rewritten in either mode:
+the lookup and the joint head's row gather read packed rows directly.
 
 Each requantized projection whose input width `K` is a multiple of 1024 gets
 a QuaRot-style online Hadamard rotation: the dense weight is rotated along
