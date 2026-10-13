@@ -1445,17 +1445,30 @@ fn clef_sym8_eligible(prefix: &str, dense: &MxArray) -> Result<bool> {
 ///     quantized" and falls through to the dense `Linear` arm.
 ///
 /// Returns the sym8 rotations keyed by prefix (empty unless `Sym8` rotated
-/// something).
+/// something) and the net change in resident weight bytes: the rewritten
+/// arrays minus the packed sources they replaced (positive when a sub-8-bit
+/// checkpoint widens to int8 or bf16), for the caller's weight accounting.
 fn apply_clef_residency(
     params: &mut HashMap<String, MxArray>,
     per_layer_quant: &mut HashMap<String, PerLayerQuant>,
     default_plq: PerLayerQuant,
     residency: ClefResidency,
-) -> Result<HashMap<String, crate::quant::prism_hadamard::HadamardTransform>> {
+) -> Result<(
+    HashMap<String, crate::quant::prism_hadamard::HadamardTransform>,
+    i64,
+)> {
     let mut transforms = HashMap::new();
+    let mut byte_delta = 0i64;
     if !is_quantized_checkpoint(params) {
-        return Ok(transforms);
+        return Ok((transforms, byte_delta));
     }
+    let group_bytes = |params: &HashMap<String, MxArray>, prefix: &str| -> i64 {
+        ["weight", "scales", "biases"]
+            .iter()
+            .filter_map(|s| params.get(&format!("{prefix}.{s}")))
+            .map(|a| a.nbytes() as i64)
+            .sum()
+    };
     let mut prefixes: Vec<String> = params
         .keys()
         .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
@@ -1487,6 +1500,7 @@ fn apply_clef_residency(
         let Some(dense) = dequantize_source_head(params, &prefix, plq)? else {
             continue;
         };
+        let packed_bytes = group_bytes(params, &prefix);
         if residency == ClefResidency::Sym8 && clef_sym8_eligible(&prefix, &dense)? {
             let transform = clef_sym8_transform(dense.shape_at(1)?, &mut signs_by_width)?;
             // Rotate in f32: `apply` computes in f32 and casts back to its
@@ -1502,6 +1516,7 @@ fn apply_clef_residency(
             params.remove(&format!("{prefix}.biases"));
             per_layer_quant.insert(prefix.clone(), sym8_plq);
             requantized += 1;
+            byte_delta += group_bytes(params, &prefix) - packed_bytes;
             if let Some(t) = transform {
                 transforms.insert(prefix, t);
                 rotated += 1;
@@ -1512,6 +1527,7 @@ fn apply_clef_residency(
             params.remove(&format!("{prefix}.biases"));
             per_layer_quant.remove(&prefix);
             dequantized += 1;
+            byte_delta += group_bytes(params, &prefix) - packed_bytes;
         }
     }
     if requantized > 0 {
@@ -1536,7 +1552,7 @@ fn apply_clef_residency(
             }
         );
     }
-    Ok(transforms)
+    Ok((transforms, byte_delta))
 }
 
 /// Apply weights directly to a Qwen35Inner (no locks needed).
@@ -1586,7 +1602,9 @@ fn apply_weights_inner(
 /// f16-companion / calibrated / odd-shaped affine, mxfp, non-tileable
 /// K-quant, embedding, norms) remains for the caller's materialization pass.
 /// Count the checkpoint bytes BEFORE this call (the tiled copies have the
-/// same byte size as the released originals).
+/// same byte size as the released originals) and add the returned CLEF
+/// residency byte delta: the pre-pass replaces packed backbone groups with
+/// int8 or bf16 arrays of a different size.
 fn apply_weights_inner_with_residency(
     inner: &mut Qwen35Inner,
     params: &mut HashMap<String, MxArray>,
@@ -1608,7 +1626,7 @@ fn apply_weights_inner_with_residency(
     //     lm_head stay packed: the lookup/gather paths already read packed
     //     rows directly.
     clef: Option<ClefResidency>,
-) -> Result<PlainFp8Residency> {
+) -> Result<(PlainFp8Residency, i64)> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
@@ -1646,7 +1664,7 @@ fn apply_weights_inner_with_residency(
     // the prefix's sym8 rotation, if the pre-pass made one) and a
     // dequantized one falls through to the dense `Linear` arm.
     let mut per_layer_quant = per_layer_quant.clone();
-    let clef_transforms = match clef {
+    let (clef_transforms, clef_byte_delta) = match clef {
         Some(residency) => {
             if prism.is_some() {
                 return Err(Error::from_reason(
@@ -1655,7 +1673,7 @@ fn apply_weights_inner_with_residency(
             }
             apply_clef_residency(params, &mut per_layer_quant, default_plq, residency)?
         }
-        None => HashMap::new(),
+        None => (HashMap::new(), 0),
     };
     let clef = clef.is_some();
 
@@ -2312,7 +2330,7 @@ fn apply_weights_inner_with_residency(
     // Validate mandatory weights
     validate_mandatory_weights(&checkpoint_keys, config, inner.layers.len())?;
 
-    Ok(plain_fp8_residency.into_inner())
+    Ok((plain_fp8_residency.into_inner(), clef_byte_delta))
 }
 
 /// Validate mandatory weights presence for `apply_weights_inner`. `keys` is
@@ -2763,7 +2781,7 @@ async fn load_with_thread_impl(
                 });
 
                 // Apply weights (GPU finalize precompute reads now-resident pages).
-                let plain_fp8_residency = apply_weights_inner_with_residency(
+                let (plain_fp8_residency, clef_byte_delta) = apply_weights_inner_with_residency(
                     &mut inner,
                     &mut params,
                     &config,
@@ -2775,6 +2793,12 @@ async fn load_with_thread_impl(
                     prism_runtime.as_ref(),
                     clef_residency,
                 )?;
+                // The CLEF pre-pass swapped packed backbone groups for int8 or
+                // bf16 arrays; the pre-installation count above saw the
+                // packed sizes.
+                let text_weight_bytes = (text_weight_bytes as i64)
+                    .saturating_add(clef_byte_delta)
+                    .max(0) as u64;
                 inner.prism_hadamard = prism_runtime;
                 if clef {
                     // Presence is the contract: decide_json never runs the
@@ -5706,6 +5730,10 @@ mod tests {
         }
     }
 
+    fn map_nbytes(params: &HashMap<String, MxArray>) -> i64 {
+        params.values().map(|a| a.nbytes() as i64).sum()
+    }
+
     fn assert_dense_bf16(params: &HashMap<String, MxArray>, prefix: &str, shape: &[i64]) {
         let w = params.get(&format!("{prefix}.weight")).expect("weight");
         assert_eq!(w.dtype().unwrap(), DType::BFloat16, "{prefix} dtype");
@@ -5751,13 +5779,24 @@ mod tests {
             ("layers.0.mlp.up_proj".to_string(), clef_sym8_plq()),
         ]);
 
-        apply_clef_residency(
+        let (_, byte_delta) = apply_clef_residency(
             &mut params,
             &mut per_layer_quant,
             default_plq,
             ClefResidency::Sym8,
         )
         .unwrap();
+        // The returned delta is the map's real byte change (the loader adds
+        // it to the count it took before the pre-pass).
+        assert_eq!(
+            byte_delta,
+            map_nbytes(&params) - map_nbytes(&before),
+            "byte delta"
+        );
+        assert!(
+            byte_delta != 0,
+            "the 8-bit g32 groups do not requantize byte-neutral"
+        );
 
         // (a) the affine groups became sym8 storage with a Sym8 override.
         for (prefix, n, k) in [
@@ -5891,7 +5930,7 @@ mod tests {
         for residency in [ClefResidency::Sym8, ClefResidency::Bf16] {
             let mut untouched = params.clone();
             let mut per_layer_quant = HashMap::new();
-            let transforms =
+            let (transforms, byte_delta) =
                 apply_clef_residency(&mut untouched, &mut per_layer_quant, default_plq, residency)
                     .unwrap();
             let mut keys: Vec<&String> = untouched.keys().collect();
@@ -5905,6 +5944,7 @@ mod tests {
             );
             assert!(per_layer_quant.is_empty(), "{residency:?}");
             assert!(transforms.is_empty(), "{residency:?}");
+            assert_eq!(byte_delta, 0, "{residency:?}");
         }
     }
 
@@ -6008,13 +6048,19 @@ mod tests {
         // its override dropped; sym8 storage, embedding and lm_head stay.
         let mut params = before.clone();
         let mut per_layer_quant = overrides.clone();
-        apply_clef_residency(
+        let (_, byte_delta) = apply_clef_residency(
             &mut params,
             &mut per_layer_quant,
             default_plq,
             ClefResidency::Bf16,
         )
         .unwrap();
+        assert_eq!(
+            byte_delta,
+            map_nbytes(&params) - map_nbytes(&before),
+            "byte delta"
+        );
+        assert!(byte_delta > 0, "8-bit packed -> bf16 grows the map");
         assert_dense_bf16(&params, "layers.0.mlp.gate_proj", &[64, 128]);
         assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_qkvz", &[96, 128]);
         assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_ba", &[8, 128]);
@@ -6206,7 +6252,7 @@ mod tests {
             }
             {
                 let mut per_layer_quant = HashMap::new();
-                let transforms = apply_clef_residency(
+                let (transforms, _) = apply_clef_residency(
                     &mut params,
                     &mut per_layer_quant,
                     default_plq,
@@ -6254,7 +6300,7 @@ mod tests {
         let mut params = HashMap::new();
         insert_affine_group(&mut params, prefix, &dense, 8, 32);
         let mut per_layer_quant = HashMap::new();
-        let transforms = apply_clef_residency(
+        let (transforms, _) = apply_clef_residency(
             &mut params,
             &mut per_layer_quant,
             default_plq,
