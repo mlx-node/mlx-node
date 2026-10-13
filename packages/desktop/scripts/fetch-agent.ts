@@ -11,7 +11,7 @@
  * bit-identical to what a standalone CLI would fetch.
  */
 
-import { chmodSync, mkdirSync, renameSync } from 'node:fs';
+import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,17 +19,21 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..', '..');
 // `dist` — this script runs after `yarn build`, and the source condition does
 // not apply to the release scripts' oxnode invocation.
-const { downloadAgentBinary } = await import(
+const { downloadAgentBinary, resolveReleaseTag } = await import(
   join(REPO_ROOT, 'packages', 'cli', 'dist', 'commands', 'agent', 'grok-build.js')
 );
 
 const dest = join(HERE, '..', 'out', 'agent', 'mlx-agent');
 mkdirSync(dirname(dest), { recursive: true });
 // dest is the managed base path: the binary lands at the sibling
-// `mlx-agent-v<tag>` file the `.tag` pointer names. package.ts stages the
-// bundle under the unversioned name, so fold it back here — the `.tag`
-// marker already sits at `${dest}.tag`.
-const path = await downloadAgentBinary(dest);
+// `mlx-agent-v<tag>` file the `.tag` pointer names. Resolve the tag
+// explicitly and stamp `${dest}.tag` ourselves — a pinned build
+// (MLX_AGENT_TAG) side-installs and deliberately skips that pointer, so a
+// fresh pinned package would otherwise ship unversioned (or, in a reused
+// out/agent dir, carry an older build's tag).
+const tag = await resolveReleaseTag();
+const path = await downloadAgentBinary(dest, tag);
 renameSync(path, dest);
+writeFileSync(`${dest}.tag`, tag, { mode: 0o644 });
 chmodSync(dest, 0o755);
-console.log(`mlx-agent staged at ${dest}`);
+console.log(`mlx-agent staged at ${dest} (${tag})`);

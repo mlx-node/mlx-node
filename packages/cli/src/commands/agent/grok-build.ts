@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -768,6 +768,15 @@ interface MemberScan {
 }
 
 /**
+ * A `c-<pid>-<seq>` marker older than this is stale even when its pid is
+ * alive: the choose phase is two syscalls, so anything older is a crashed
+ * contender whose pid was recycled by an unrelated process. `b-`/`m-`
+ * members get a socket probe; `c-` markers are plain files, so mtime is
+ * the only ownership check that survives pid reuse there.
+ */
+const CHOOSING_STALE_MS = 5_000;
+
+/**
  * Live-and-present state of `dir`. Marker kinds:
  *   `b-<ticket>-<pid>-<seq>` — a bakery member (socket on unix, file on win).
  *   `m-<pid>-<seq>`          — a member from this lock's previous design;
@@ -776,8 +785,11 @@ interface MemberScan {
  *   `c-<pid>-<seq>`          — a contender between choosing a ticket and
  *                              advertising it; live ones force a rescan.
  * Anything whose pid is dead is swept unconditionally — the owner cannot
- * exist. A member counts while its pid is alive even before it finishes
- * binding: provisional still holds its ticket.
+ * exist. On unix a member ALSO has to answer on its socket path: a live
+ * pid with a dead socket is a recycled pid fronting a stale marker, and
+ * honoring it would wait out every acquire behind a lock nobody owns. On
+ * Windows the markers are plain files and pid liveness stays
+ * authoritative (the recycled-pid stall is a known residual risk there).
  */
 async function scanMembers(dir: string): Promise<MemberScan> {
   let entries: string[];
@@ -787,37 +799,49 @@ async function scanMembers(dir: string): Promise<MemberScan> {
     return { members: [], choosing: false };
   }
   const members: LockMember[] = [];
+  const pending: LockMember[] = [];
   let choosing = false;
   for (const entry of entries) {
     let m = /^b-(\d+)-(\d+)-(\d+)$/.exec(entry);
     if (m) {
       const member = { ticket: Number(m[1]), pid: Number(m[2]), seq: Number(m[3]), file: join(dir, entry) };
-      if (!pidAlive(member.pid)) {
-        rmSync(member.file, { force: true });
-      } else {
-        members.push(member);
-      }
+      if (pidAlive(member.pid)) pending.push(member);
+      else rmSync(member.file, { force: true });
       continue;
     }
     m = /^m-(\d+)-(\d+)$/.exec(entry);
     if (m) {
       const member = { ticket: 0, pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
-      if (!pidAlive(member.pid)) {
-        rmSync(member.file, { force: true });
-      } else {
-        members.push(member);
-      }
+      if (pidAlive(member.pid)) pending.push(member);
+      else rmSync(member.file, { force: true });
       continue;
     }
     m = /^c-(\d+)-(\d+)$/.exec(entry);
     if (m) {
-      if (!pidAlive(Number(m[1]))) {
+      let stale = false;
+      try {
+        stale = Date.now() - statSync(join(dir, entry)).mtimeMs > CHOOSING_STALE_MS;
+      } catch {
+        // vanished between readdir and stat — nothing to sweep
+      }
+      if (!pidAlive(Number(m[1])) || stale) {
         rmSync(join(dir, entry), { force: true });
       } else {
         choosing = true;
       }
     }
   }
+  // Probe live-pid members in parallel: the socket check is the cheap
+  // ECONNREFUSED path for recycled pids, so the extra round-trip per
+  // member is only paid when markers exist.
+  const sockets = await Promise.all(pending.map((m) => memberListening(m.file)));
+  pending.forEach((member, i) => {
+    if (process.platform !== 'win32' && !sockets[i]) {
+      rmSync(member.file, { force: true });
+    } else {
+      members.push(member);
+    }
+  });
   members.sort((a, b) => a.ticket - b.ticket || a.pid - b.pid || a.seq - b.seq);
   return { members, choosing };
 }

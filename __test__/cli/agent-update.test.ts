@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -524,28 +525,98 @@ describe('downloadAgentBinary', () => {
     { timeout: 20_000 },
     async () => {
       const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+      const lock = join(home, 'mlx-agent.lock');
+      const dir = `${lock}.d`;
+      const servers: Server[] = [];
+      // A live member marker must actually hold the name: on unix the
+      // marker is a listening socket (a live pid with a dead socket is a
+      // recycled pid and gets swept), on Windows a plain file.
+      const advertise = async (name: string): Promise<void> => {
+        const file = join(dir, name);
+        if (process.platform === 'win32') {
+          writeFileSync(file, '');
+          return;
+        }
+        const server = createServer((sock) => sock.destroy());
+        servers.push(server);
+        await new Promise<void>((res, rej) => {
+          server.once('error', rej);
+          server.listen(file, res);
+        });
+      };
       try {
-        const lock = join(home, 'mlx-agent.lock');
-        const dir = `${lock}.d`;
         mkdirSync(dir, { recursive: true });
         // A member from the previous `m-` protocol — live (our pid), high
         // seq. Under the superseded (pid, seq) ticket order this member
         // sorted "behind" a new acquire with a lower seq, letting a later
         // contender in while it held. Under bakery it maps to ticket 0 —
         // it advertised before any `b-` member — so we MUST queue.
-        writeFileSync(join(dir, `m-${process.pid}-999`), '');
+        await advertise(`m-${process.pid}-999`);
         await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
 
         // Same for a low bakery ticket under our pid: ticket 2 < whatever we
         // choose next, so the earlier advertiser wins regardless of seq.
-        rmSync(join(dir, `m-${process.pid}-999`));
-        writeFileSync(join(dir, `b-2-${process.pid}-999`), '');
+        for (const server of servers.splice(0)) {
+          server.close();
+        }
+        rmSync(join(dir, `m-${process.pid}-999`), { force: true });
+        await advertise(`b-2-${process.pid}-999`);
         await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
+      } finally {
+        for (const server of servers) {
+          server.close();
+        }
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'sweeps a dead-socket member whose pid was recycled by an unrelated process',
+    { timeout: 20_000 },
+    async () => {
+      // Windows markers are plain files — pid liveness is authoritative
+      // there, so the recycled-pid scenario cannot be reproduced.
+      if (process.platform === 'win32') return;
+      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+      try {
+        const lock = join(home, 'mlx-agent.lock');
+        const dir = `${lock}.d`;
+        mkdirSync(dir, { recursive: true });
+        // A bakery marker left by a crashed holder whose pid the OS handed
+        // to us: live pid, dead socket. pidAlive alone would pin every
+        // acquire behind a lock nobody owns — the refusal is what
+        // identifies the recycle.
+        writeFileSync(join(dir, `b-1-${process.pid}-0`), '');
+        await acquireInstallLock(lock, { deadlineMs: 2_000 });
+        releaseInstallLock(lock);
+        expect(existsSync(join(dir, `b-1-${process.pid}-0`))).toBe(false);
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
     },
   );
+
+  it('sweeps an aged choose marker even while its pid is alive', { timeout: 20_000 }, async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const lock = join(home, 'mlx-agent.lock');
+      const dir = `${lock}.d`;
+      mkdirSync(dir, { recursive: true });
+      // A `c-` marker is a plain file, so a recycled pid has no socket to
+      // disprove it — age is the bound. Choosing takes two syscalls;
+      // anything seconds old is debris.
+      const marker = join(dir, `c-${process.pid}-0`);
+      writeFileSync(marker, '');
+      const past = new Date(Date.now() - 60_000);
+      utimesSync(marker, past, past);
+      await acquireInstallLock(lock, { deadlineMs: 2_000 });
+      releaseInstallLock(lock);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it('refuses to install while a live process holds the lock', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
