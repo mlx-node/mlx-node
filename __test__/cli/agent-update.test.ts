@@ -327,13 +327,11 @@ describe('downloadAgentBinary', () => {
     try {
       const dest = managedAgentBinPath(home);
       mkdirSync(dirname(dest), { recursive: true });
-      const { utimesSync } = await import('node:fs');
       const lock = `${dest}.lock`;
-      // An aged lock whose recorded holder is dead is stolen — and with the
-      // new ownership rule a dead-pid lock is stolen regardless of age.
+      // A leftover node whose holder is gone refuses connections — the
+      // installer unlinks it and binds its own. (The legacy plain-file lock
+      // is reclaimed by the same probe.)
       writeFileSync(lock, '999999');
-      const stale = new Date(Date.now() - 60_000);
-      utimesSync(lock, stale, stale);
 
       mockMirrors(makeTarball(home, 'fake-agent-binary'));
       const path = await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
@@ -344,12 +342,13 @@ describe('downloadAgentBinary', () => {
     }
   });
 
-  it('steals a fresh lock whose recorded holder pid is dead', async () => {
+  it('reclaims a fresh lock node whose holder is dead', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const dest = managedAgentBinPath(home);
       mkdirSync(dirname(dest), { recursive: true });
-      // Fresh mtime, dead pid — ownership, not age, proves staleness.
+      // Fresh mtime, no listener — connection refusal, not age, proves
+      // staleness.
       writeFileSync(`${dest}.lock`, '999999');
 
       mockMirrors(makeTarball(home, 'fake-agent-binary'));
@@ -360,45 +359,35 @@ describe('downloadAgentBinary', () => {
     }
   });
 
-  it('a stolen-then-reattacked lock is restored, never deleted under a new owner', { timeout: 20_000 }, () => {
+  it('serializes concurrent acquirers: held while owned, reclaimable after release', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
-      // Incumbent judged stale: dead owner. Between the staleness read and
-      // the steal, a second installer acquires the lock (live pid = us).
-      writeFileSync(lock, '999999');
-      let swapped = false;
-      expect(() =>
-        acquireInstallLock(lock, {
-          deadlineMs: 400,
-          onBeforeStealCapture: () => {
-            if (swapped) return;
-            swapped = true;
-            rmSync(lock, { force: true });
-            writeFileSync(lock, String(process.pid));
-          },
-        }),
-      ).toThrow('install lock');
-      expect(swapped).toBe(true);
-      // The captured live lock went back whole — the would-be thief must
-      // never have unlinked a lock a second installer already held.
-      expect(readFileSync(lock, 'utf-8')).toBe(String(process.pid));
+      await acquireInstallLock(lock);
+      try {
+        // A live listener owns the name — a second acquirer can never unlink
+        // or bind over it, so it waits out its deadline and refuses.
+        await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
+      } finally {
+        releaseInstallLock(lock);
+      }
+      // The name frees on release — the next acquirer binds immediately.
+      await acquireInstallLock(lock, { deadlineMs: 2_000 });
+      releaseInstallLock(lock);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it('releaseInstallLock removes only the caller\u2019s own lock', () => {
+  it('reclaims a lock name left behind by a crashed holder', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
-      // A lock that names a DIFFERENT owner survives our release — an
-      // ex-holder whose lock was stolen must not unlink the thief's.
+      // A dead holder's node — or the legacy plain lock file — refuses
+      // connections, so its name is unlinked and rebound.
       writeFileSync(lock, '999999');
-      releaseInstallLock(lock);
-      expect(readFileSync(lock, 'utf-8')).toBe('999999');
-
-      writeFileSync(lock, String(process.pid));
+      await acquireInstallLock(lock, { deadlineMs: 2_000 });
+      expect(existsSync(lock)).toBe(true);
       releaseInstallLock(lock);
       expect(existsSync(lock)).toBe(false);
     } finally {
@@ -411,19 +400,19 @@ describe('downloadAgentBinary', () => {
     try {
       const dest = managedAgentBinPath(home);
       mkdirSync(dirname(dest), { recursive: true });
-      const { utimesSync } = await import('node:fs');
       const lock = `${dest}.lock`;
-      // This process is alive — even an AGED lock reads as genuinely held,
-      // so the install waits out its deadline and then refuses to proceed
-      // unlocked rather than stealing a slow holder's critical section.
-      writeFileSync(lock, String(process.pid));
-      const aged = new Date(Date.now() - 60_000);
-      utimesSync(lock, aged, aged);
-
-      mockMirrors(makeTarball(home, 'fake-agent-binary'));
-      await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.0')).rejects.toThrow('install lock');
-      // A refused install must not have touched the managed cache.
-      expect(existsSync(`${dest}.tag`)).toBe(false);
+      // The lock is a bound socket: a live holder accepts connections, so
+      // even an AGED file must read as genuinely held — the install waits
+      // out its deadline and refuses rather than proceeding unlocked.
+      await acquireInstallLock(lock);
+      try {
+        mockMirrors(makeTarball(home, 'fake-agent-binary'));
+        await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.0')).rejects.toThrow('install lock');
+        // A refused install must not have touched the managed cache.
+        expect(existsSync(`${dest}.tag`)).toBe(false);
+      } finally {
+        releaseInstallLock(lock);
+      }
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

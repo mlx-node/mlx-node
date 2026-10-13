@@ -21,9 +21,10 @@
  */
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { connect, createServer, type Server } from 'node:net';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -513,7 +514,7 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
   // this section WITHOUT the lock is worse than not installing — a merely
   // suspended holder plus an unlocked waiter can interleave sweeps and
   // leave the pointer naming a deleted binary — so the lock is mandatory.
-  acquireInstallLock(`${dest}.lock`);
+  await acquireInstallLock(`${dest}.lock`);
   try {
     // Under the lock, a same-tag install may already be complete: two first
     // launches can download the same release concurrently, and renaming
@@ -589,127 +590,140 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
   return versioned;
 }
 
-/** True while a recorded lock-holder pid still exists (EPERM = alive, another user). */
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
 /**
- * Test seam for {@link acquireInstallLock}: fires after a lock file was
- * judged dead-owned and before it is captured, so a test can interleave a
- * "new holder" deterministically.
+ * Test seam for {@link acquireInstallLock}.
  */
 export interface AcquireLockHooks {
   /** Retry deadline override (default 10s). */
   deadlineMs?: number;
-  onBeforeStealCapture?: () => void;
+}
+
+/**
+ * Locks this process currently holds: logical lock path → bound node. The
+ * socket/pipe only exists while the holder is alive and still holds, so a
+ * connectable name IS proof of a live owner — no pid files, no staleness
+ * heuristics, and nothing a thief can delete to impersonate a release.
+ */
+const HELD_INSTALL_LOCKS = new Map<string, { server: Server; node: string }>();
+
+/**
+ * Where the lock node actually lives. Unix socket paths cap at ~104 bytes
+ * (sun_path), so an over-long `.lock` path — a deep $HOME — is hashed into
+ * tmpdir. Windows binds a named pipe instead: pipe names are not filesystem
+ * objects, cannot be stale after the holder dies, and need no unlink.
+ */
+function lockNodePath(path: string): string {
+  if (process.platform === 'win32') {
+    return `\\\\.\\pipe\\mlx-agent-lock-${createHash('sha256').update(resolve(path)).digest('hex').slice(0, 32)}`;
+  }
+  if (Buffer.byteLength(path) < 100) return path;
+  const hash = createHash('sha256').update(resolve(path)).digest('hex').slice(0, 32);
+  return join(tmpdir(), `mlx-agent-lock-${hash}.sock`);
+}
+
+/** True while something accepts connections on `node` — i.e. a live holder. */
+function holderAlive(node: string): Promise<boolean> {
+  return new Promise((res) => {
+    const sock = connect(node);
+    const timer = setTimeout(() => done(true), 250); // wedged listener: assume held, never steal
+    const done = (alive: boolean) => {
+      clearTimeout(timer);
+      sock.destroy();
+      res(alive);
+    };
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+/**
+ * Prove the freshly bound `server` actually owns `node`: a third party can
+ * unlink-and-rebind the name in the micro-gap before `listen` finished, so a
+ * successful bind is necessary but not sufficient. We connect and send a
+ * per-acquire token — only OUR server's handler recognizes it and emits
+ * `self-verified`; landing on a competing holder's listener does not.
+ */
+function verifySelfBind(server: Server, node: string, token: string): Promise<boolean> {
+  return new Promise((res) => {
+    const timer = setTimeout(() => done(false), 250);
+    const done = (ok: boolean) => {
+      clearTimeout(timer);
+      server.off('self-verified', onVerified);
+      sock.destroy();
+      res(ok);
+    };
+    const onVerified = () => done(true);
+    const sock = connect(node);
+    server.once('self-verified', onVerified);
+    sock.once('error', () => done(false));
+    sock.on('connect', () => sock.write(token));
+  });
+}
+
+function tryListen(server: Server, node: string): Promise<boolean> {
+  return new Promise((res) => {
+    server.once('error', () => res(false));
+    server.listen(node, () => res(true));
+  });
 }
 
 /**
  * Serialize the install critical section across processes. `<dest>.lock` is
- * created by LINKING a fully written claim file (an atomic create that never
- * exposes a partially written owner) and records the holder's pid. A
- * leftover lock is stolen ONLY when its recorded owner is demonstrably dead
- * — never on age alone: a suspended or slow holder past any age threshold
- * would lose its lock and then delete the thief's lock in releaseInstallLock,
- * reopening the interleaved-sweep race the lock exists to prevent.
+ * a bound unix socket (named pipe on Windows): `listen` is the atomic
+ * test-and-set — exactly one binder owns the name — and `connect` is the
+ * liveness probe, so a leftover node is reclaimed ONLY after it demonstrably
+ * refuses connections (dead or crashed holder; a suspended holder still
+ * accepts). Reclaiming removes the stale NAME, never a lock under a live
+ * owner, and the token self-bind check catches the one remaining race where
+ * a reclaimer unlinks between our bind and listen.
  *
- * Stealing captures the incumbent with an atomic `rename` into a private
- * claim file, then judges the CAPTURED file — never `unlink`ing the shared
- * path on the strength of an earlier read. Two installers that both saw the
- * same stale lock therefore cannot delete each other's newly acquired lock:
- * the second captures whatever is NOW at the path, restores it via `link`
- * when it names a live owner, and consumes it only when it is still
- * dead-owned or ownerless. Once the deadline passes the caller must FAIL
- * rather than proceed unlocked: the pointer-flip/sweep section is unsafe to
- * enter while a holder may still be inside it, so this function throws
- * instead of returning.
+ * Once the deadline passes the caller must FAIL rather than proceed
+ * unlocked: the pointer-flip/sweep section is unsafe to enter while a holder
+ * may still be inside it, so this function throws instead of returning.
  */
-export function acquireInstallLock(path: string, hooks: AcquireLockHooks = {}): void {
+export async function acquireInstallLock(path: string, hooks: AcquireLockHooks = {}): Promise<void> {
   const deadline = Date.now() + (hooks.deadlineMs ?? 10_000);
-  // Abandoned claim/capture files from a crashed stealer block nothing
-  // (every name is unique); sweep only ones whose owner is dead.
-  try {
-    for (const entry of readdirSync(dirname(path))) {
-      const match = /^.+\.tmp-(\d+)-/.exec(entry);
-      if (match && !pidAlive(Number(match[1]))) rmSync(join(dirname(path), entry), { force: true });
-    }
-  } catch {
-    // sweep is best-effort
-  }
+  const node = lockNodePath(path);
+  // Recognized only by THIS acquire attempt's handler — a probe or a
+  // connection landing on a competitor's server never validates us.
+  const token = randomBytes(16).toString('hex');
   while (true) {
-    // Atomic create-with-content: link either creates `<dest>.lock` whole or
-    // fails EEXIST, so no reader ever sees a half-written owner.
-    const claim = `${path}.tmp-${process.pid}-${randomUUID()}`;
-    try {
-      writeFileSync(claim, String(process.pid), { mode: 0o600 });
-      linkSync(claim, path);
-      rmSync(claim, { force: true });
-      return;
-    } catch (error) {
-      rmSync(claim, { force: true });
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    }
-    try {
-      const holder = Number(readFileSync(path, 'utf-8').trim());
-      // Dead-owner steal: the recorded pid is gone (pid reuse accepted).
-      // An unreadable owner — empty or garbage — cannot prove a live
-      // holder either, so it is stolen the same way. Any lock whose owner
-      // is alive is left alone regardless of age.
-      if (!Number.isInteger(holder) || holder <= 0 || !pidAlive(holder)) {
-        hooks.onBeforeStealCapture?.();
-        // Capture THEN judge: whatever sits at `path` now — possibly a
-        // live lock acquired after our staleness read — is moved whole.
-        const captive = `${path}.tmp-${process.pid}-${randomUUID()}`;
-        try {
-          renameSync(path, captive);
-        } catch {
-          // vanished between read and capture — retry create
-          continue;
-        }
-        try {
-          const capturedPid = Number(readFileSync(captive, 'utf-8').trim());
-          if (Number.isInteger(capturedPid) && capturedPid > 0 && pidAlive(capturedPid)) {
-            // Captured a live holder's lock — put it back intact (link
-            // restores without overwriting anything created in between)
-            // and wait like any other observer.
-            try {
-              linkSync(captive, path);
-            } catch {
-              // a different holder already owns the path — our captive is
-              // superseded, drop it like a dead lock
-            }
-          }
-        } catch {
-          // captive unreadable — consume it below
-        } finally {
-          rmSync(captive, { force: true });
-        }
-        continue;
+    const server = createServer((sock) => {
+      sock.once('data', (data) => {
+        if (data.toString() === token) server.emit('self-verified');
+        sock.destroy();
+      });
+      sock.once('error', () => {});
+    });
+    if (await tryListen(server, node)) {
+      if (await verifySelfBind(server, node, token)) {
+        HELD_INSTALL_LOCKS.set(path, { server, node });
+        return;
       }
-    } catch {
-      // vanished or unreadable between checks — retry create
-      continue;
+      server.close();
     }
     if (Date.now() > deadline) {
       throw new Error(
         `mlx agent: another install is in progress (${path}) — refusing to proceed without the install lock`,
       );
     }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    if (!(await holderAlive(node))) {
+      // Stale name — dead holder or a legacy plain lock file. Safe to
+      // unlink: only a refusing-to-connect node gets removed.
+      if (process.platform !== 'win32') rmSync(node, { force: true });
+      continue;
+    }
+    await new Promise((r) => setTimeout(r, 50));
   }
 }
 
 export function releaseInstallLock(path: string): void {
   try {
-    // Delete only our own lock: a holder whose lock was stolen while it was
-    // suspended must not remove a lock another installer now owns.
-    if (Number(readFileSync(path, 'utf-8').trim()) === process.pid) rmSync(path, { force: true });
+    const held = HELD_INSTALL_LOCKS.get(path);
+    if (!held) return;
+    HELD_INSTALL_LOCKS.delete(path);
+    held.server.close();
+    if (process.platform !== 'win32') rmSync(held.node, { force: true });
   } catch {
     // lock cleanup is best-effort
   }
