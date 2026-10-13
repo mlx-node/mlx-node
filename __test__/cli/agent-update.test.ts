@@ -1588,10 +1588,13 @@ describe('launchGrokAgent server gating', () => {
   let savedAgentBin: string | undefined;
   let savedAgentTag: string | undefined;
 
+  const serveKills: ReturnType<typeof vi.fn>[] = [];
   const spawnServe = vi.fn((_argv: string[], _so: SpawnOptions) => {
+    const kill = vi.fn();
+    serveKills.push(kill);
     const child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(),
-      kill: vi.fn(),
+      kill,
     });
     child.stdout.end(`listening on ${serveBase}\n`);
     return child as unknown as ChildProcess;
@@ -1617,6 +1620,7 @@ describe('launchGrokAgent server gating', () => {
     await new Promise<void>((resolvePromise) => health.listen(0, '127.0.0.1', resolvePromise));
     serveBase = `http://127.0.0.1:${(health.address() as AddressInfo).port}`;
     spawnServe.mockClear();
+    serveKills.length = 0;
     spawnAgent.envs.length = 0;
   });
 
@@ -1650,5 +1654,68 @@ describe('launchGrokAgent server gating', () => {
     expect(code).toBe(0);
     expect(spawnServe).not.toHaveBeenCalled();
     expect(spawnAgent.envs[0]!.GROK_MODELS_BASE_URL).toBeUndefined();
+  });
+
+  it('kills the serve child when readiness fails', async () => {
+    // No banner line — the child lives but never reports a port. The
+    // rejection must still reap it, or `mlx agent` leaves an orphan serve
+    // consuming model memory.
+    spawnServe.mockImplementationOnce((_argv: string[], _so: SpawnOptions) => {
+      const kill = vi.fn();
+      serveKills.push(kill);
+      return Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(),
+        kill,
+      }) as unknown as ChildProcess;
+    });
+    await expect(
+      launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, serveReadyTimeoutMs: 50 }),
+    ).rejects.toThrow('timed out waiting for `mlx serve`');
+    expect(serveKills[0]!).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  it('kills the serve child when the agent fails to spawn', async () => {
+    // spawn() emits 'error' without 'exit' for a non-executable binary.
+    // Emitting inside the factory keeps the microtask ordered AFTER the
+    // launcher attaches its own 'error' listener.
+    const agentKill = vi.fn();
+    const agent = Object.assign(new EventEmitter(), { kill: agentKill }) as unknown as ChildProcess;
+    await expect(
+      launchGrokAgent({
+        argv: ['-p', 'hi'],
+        spawnServe,
+        spawnAgent: () => {
+          queueMicrotask(() => agent.emit('error', new Error('spawn EACCES')));
+          return agent;
+        },
+      }),
+    ).rejects.toThrow('spawn EACCES');
+    expect(serveKills[0]!).toHaveBeenCalledWith('SIGTERM');
+    expect(agentKill).not.toHaveBeenCalled();
+  });
+
+  it('forwards SIGTERM to both children and re-raises it', async () => {
+    const agentKill = vi.fn();
+    const agent = Object.assign(new EventEmitter(), { kill: agentKill }) as unknown as ChildProcess;
+    const baseline = new Set(process.listeners('SIGTERM'));
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const launch = launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent: () => agent });
+      // Poll: the listeners land only after serve readiness resolves.
+      let teardown: ((signal: 'SIGTERM') => void) | undefined;
+      for (let i = 0; i < 100 && teardown === undefined; i++) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+        teardown = process.listeners('SIGTERM').find((listener) => !baseline.has(listener));
+      }
+      expect(teardown).toBeDefined();
+      teardown!('SIGTERM');
+      expect(serveKills[0]!).toHaveBeenCalledWith('SIGTERM');
+      expect(agentKill).toHaveBeenCalledWith('SIGTERM');
+      expect(killSpy).toHaveBeenCalledWith(process.pid, 'SIGTERM');
+      agent.emit('exit', 143, 'SIGTERM');
+      await expect(launch).resolves.toBe(143);
+    } finally {
+      killSpy.mockRestore();
+    }
   });
 });

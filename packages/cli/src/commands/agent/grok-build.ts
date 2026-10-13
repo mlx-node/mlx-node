@@ -1597,8 +1597,15 @@ async function spawnInferenceServer(
     stdio: ['ignore', 'pipe', 'inherit'],
   });
 
-  const url = await waitForServe(child, opts.serveReadyTimeoutMs ?? 30_000);
-  return { child, url, token };
+  // A child that never reports a port would otherwise leak: nothing else
+  // retains the handle, so kill it before the launch path unwinds.
+  try {
+    const url = await waitForServe(child, opts.serveReadyTimeoutMs ?? 30_000);
+    return { child, url, token };
+  } catch (err) {
+    child.kill('SIGTERM');
+    throw err;
+  }
 }
 
 /**
@@ -1617,6 +1624,9 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
     };
 
     child.once('exit', (code) => fail(new Error(`mlx serve exited (${code}) before reporting a port`)));
+    // A spawn failure emits 'error' without 'exit' — surface it instead of
+    // hanging on the timeout.
+    child.once('error', fail);
     rl?.on('line', (line) => {
       const base = serveBannerBaseUrl(line);
       if (base === undefined) return;
@@ -1666,16 +1676,36 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));
   const agent = spawnAgent(bin, opts.argv, { stdio: 'inherit', env });
 
-  const code = await new Promise<number>((resolvePromise) => {
-    agent.once('exit', (c, signal) => resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1)));
-    // Parent Ctrl+C forwards to the TUI; serve dies with us.
-    const forward = (): void => {
-      agent.kill('SIGINT');
-    };
-    process.once('SIGINT', forward);
-    agent.once('exit', () => process.removeListener('SIGINT', forward));
-  });
+  // Ctrl+C forwards to the TUI; the agent's exit then drives ours, so the
+  // serve child is reaped in the finally below.
+  const forward = (): void => {
+    agent.kill('SIGINT');
+  };
+  // SIGTERM/SIGHUP end the process through the default disposition — which
+  // never reaches children. Tear both down, then re-raise so the launcher
+  // still dies with the same signal (process.once has already detached us).
+  const teardown = (signal: NodeJS.Signals): void => {
+    serve?.child?.kill(signal);
+    agent.kill(signal);
+    process.kill(process.pid, signal);
+  };
+  process.once('SIGINT', forward);
+  process.once('SIGTERM', teardown);
+  process.once('SIGHUP', teardown);
 
-  serve?.child?.kill('SIGTERM');
+  let code: number;
+  try {
+    code = await new Promise<number>((resolvePromise, reject) => {
+      agent.once('exit', (c, signal) => resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1)));
+      // A spawn failure emits 'error' with no 'exit' — rejecting routes it
+      // through the same teardown so the serve child is never orphaned.
+      agent.once('error', reject);
+    });
+  } finally {
+    process.removeListener('SIGINT', forward);
+    process.removeListener('SIGTERM', teardown);
+    process.removeListener('SIGHUP', teardown);
+    serve?.child?.kill('SIGTERM');
+  }
   return code;
 }
