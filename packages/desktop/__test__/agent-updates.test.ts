@@ -1,6 +1,14 @@
+import { EventEmitter } from 'node:events';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { createAgentUpdater, presentAgentUpdate, type AgentUpdateCheck } from '../src/main/agent-updates.js';
+import {
+  collectAgentUpdateResult,
+  createAgentUpdater,
+  presentAgentUpdate,
+  type AgentUpdateCheck,
+  type AgentUpdateChild,
+} from '../src/main/agent-updates.js';
 
 function harness() {
   const run = vi.fn<(args: string[]) => Promise<AgentUpdateCheck>>();
@@ -97,5 +105,74 @@ describe('agent updater', () => {
     await vi.advanceTimersByTimeAsync(6 * 60 * 60 * 1000);
     expect(run).toHaveBeenCalledTimes(1);
     expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Node can fire `exit` while piped `data` is still buffered, so the parse
+ * must wait for stream close: an early parse sees an empty status (silent
+ * "current") or a truncated JSON line (throw inside the event callback —
+ * an uncaught exception, not a rejection).
+ */
+describe('collectAgentUpdateResult', () => {
+  function fakeChild() {
+    const child = new EventEmitter();
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    const tap = Object.assign(child, { stdout, stderr }) as unknown as AgentUpdateChild & EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    return tap;
+  }
+
+  it('parses the status after exit when stdout still has data buffered', async () => {
+    const child = fakeChild();
+    const pending = collectAgentUpdateResult(child, true);
+    // exit first, status after — the broken order this guards.
+    child.emit('exit', 0);
+    child.stdout.emit('data', '{"updateAvailable":true,"latest":"mlx-agent-v0.3.0"}');
+    child.stderr.emit('close');
+    child.stdout.emit('close');
+    await expect(pending).resolves.toEqual({ updateAvailable: true, latest: 'mlx-agent-v0.3.0' });
+  });
+
+  it('rejects a --check that exits 0 with no status line', async () => {
+    const child = fakeChild();
+    const pending = collectAgentUpdateResult(child, true);
+    child.emit('exit', 0);
+    child.stdout.emit('close');
+    child.stderr.emit('close');
+    await expect(pending).rejects.toThrow('without a status line');
+  });
+
+  it('rejects malformed status JSON instead of throwing inside the event callback', async () => {
+    const child = fakeChild();
+    const pending = collectAgentUpdateResult(child, true);
+    child.emit('exit', 0);
+    child.stdout.emit('data', '{"updateAvailable":');
+    child.stdout.emit('close');
+    child.stderr.emit('close');
+    await expect(pending).rejects.toThrow('malformed status');
+  });
+
+  it('resolves {} for an install whose output is human text only', async () => {
+    const child = fakeChild();
+    const pending = collectAgentUpdateResult(child, false);
+    child.stdout.emit('data', 'mlx agent: updated to mlx-agent-v0.3.0 → /m/mlx-agent\n');
+    child.stdout.emit('close');
+    child.stderr.emit('close');
+    child.emit('exit', 0);
+    await expect(pending).resolves.toEqual({});
+  });
+
+  it('rejects a non-zero exit with the captured stderr', async () => {
+    const child = fakeChild();
+    const pending = collectAgentUpdateResult(child, true);
+    child.stderr.emit('data', 'checksum mismatch');
+    child.stderr.emit('close');
+    child.stdout.emit('close');
+    child.emit('exit', 1);
+    await expect(pending).rejects.toThrow('exited 1: checksum mismatch');
   });
 });

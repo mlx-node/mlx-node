@@ -59,6 +59,100 @@ function shortTag(tag: string): string {
   return tag.startsWith('mlx-agent-v') ? tag.slice('mlx-agent-v'.length) : tag;
 }
 
+/** @internal A piped child stdio stream — the subset {@link collectAgentUpdateResult} reads. */
+export interface AgentUpdateChildStream {
+  on(event: 'data', listener: (chunk: Buffer | string) => void): unknown;
+  once(event: 'close', listener: () => void): unknown;
+}
+
+/**
+ * @internal The piped `utilityProcess` (or Node child) running `mlx agent
+ * update`, narrowed to what the output collection needs so the Electron
+ * import stays in `index.ts` and tests can fake it.
+ */
+export interface AgentUpdateChild {
+  stdout?: AgentUpdateChildStream | null;
+  stderr?: AgentUpdateChildStream | null;
+  on(event: 'exit', listener: (code: number) => void): unknown;
+  on(event: 'error', listener: (...detail: unknown[]) => void): unknown;
+}
+
+/**
+ * Collect `mlx agent update` output from a piped child. The promise settles
+ * only when the process has exited AND every piped stream has closed — Node
+ * (and therefore utilityProcess) may fire `exit` while buffered `data` is
+ * still in flight, so parsing at `exit` can see an empty or truncated status
+ * line. `expectStatus` marks a `--check` run: it MUST end in the status JSON
+ * — absent or malformed output rejects rather than reporting "current". The
+ * install run prints human text, so no JSON still counts as success.
+ */
+export function collectAgentUpdateResult(child: AgentUpdateChild, expectStatus: boolean): Promise<AgentUpdateCheck> {
+  return new Promise((resolvePromise, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let openStreams = 0;
+    let exitCode: number | undefined;
+    let settled = false;
+
+    const finish = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      if (code !== 0) {
+        reject(new Error(`mlx agent update exited ${code}: ${stderr.trim() || stdout.trim()}`));
+        return;
+      }
+      // The install path prints human lines; the last JSON-looking line is
+      // the status when one exists.
+      const line = stdout
+        .trim()
+        .split('\n')
+        .reverse()
+        .find((l) => l.trimStart().startsWith('{'));
+      if (line === undefined) {
+        if (expectStatus) reject(new Error('mlx agent update exited 0 without a status line'));
+        else resolvePromise({});
+        return;
+      }
+      try {
+        resolvePromise(JSON.parse(line) as AgentUpdateCheck);
+      } catch (error) {
+        reject(
+          new Error(`mlx agent update returned malformed status: ${error instanceof Error ? error.message : String(error)}`),
+        );
+      }
+    };
+
+    const maybeFinish = (): void => {
+      if (exitCode !== undefined && openStreams === 0) finish(exitCode);
+    };
+
+    const tap = (stream: AgentUpdateChildStream | null | undefined, sink: (chunk: string) => void): void => {
+      if (stream === null || stream === undefined) return;
+      openStreams++;
+      stream.on('data', (chunk) => sink(chunk.toString()));
+      stream.once('close', () => {
+        openStreams--;
+        maybeFinish();
+      });
+    };
+    tap(child.stdout, (chunk) => {
+      stdout += chunk;
+    });
+    tap(child.stderr, (chunk) => {
+      stderr += chunk;
+    });
+    child.on('exit', (code) => {
+      exitCode = code;
+      maybeFinish();
+    });
+    child.on('error', (...detail: unknown[]) => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`mlx agent update child crashed: ${detail.join(' at ')}`));
+    });
+  });
+}
+
 export function createAgentUpdater(options: {
   run: AgentUpdateRunner;
   onChange(): void;

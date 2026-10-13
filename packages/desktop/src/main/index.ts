@@ -36,7 +36,13 @@ import electronUpdater from 'electron-updater';
 
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
-import { createAgentUpdater, presentAgentUpdate, type AgentUpdateCheck, type AgentUpdater } from './agent-updates.js';
+import {
+  collectAgentUpdateResult,
+  createAgentUpdater,
+  presentAgentUpdate,
+  type AgentUpdateCheck,
+  type AgentUpdater,
+} from './agent-updates.js';
 import { decideAutoStart } from './auto-start.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
@@ -564,42 +570,16 @@ function refreshAgentUpdates(): void {
 /**
  * `mlx agent update` inside a utilityProcess — Node-mode child, so `cli.js`
  * runs directly. `--check` prints the status JSON on its last stdout line;
- * install prints human text and `--check` is only needed for the result
- * shape, so both paths converge on "parse the last JSON line".
+ * install prints human text. The output collection (waiting for stdio to
+ * close, parsing the status) lives in `agent-updates.ts` so this file stays
+ * Electron plumbing only.
  */
 function runAgentUpdateCli(cliEntry: string, args: string[]): Promise<AgentUpdateCheck> {
-  return new Promise((resolvePromise, reject) => {
-    const child = utilityProcess.fork(cliEntry, ['agent', 'update', ...args], {
-      stdio: 'pipe',
-      serviceName: 'mlx-agent-update',
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (chunk: Buffer | string) => {
-      stdout += chunk.toString();
-    });
-    child.stderr?.on('data', (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-    });
-    child.on('exit', (code: number) => {
-      if (code === 0) {
-        // The install path prints human lines; the last JSON-looking line is
-        // the status when one exists. An install with no JSON still counts —
-        // the updater treats a clean exit as 'current'.
-        const line = stdout
-          .trim()
-          .split('\n')
-          .reverse()
-          .find((l) => l.trimStart().startsWith('{'));
-        resolvePromise(line === undefined ? {} : (JSON.parse(line) as AgentUpdateCheck));
-      } else {
-        reject(new Error(`mlx agent update exited ${code}: ${stderr.trim() || stdout.trim()}`));
-      }
-    });
-    child.on('error', (type: string, location: string) => {
-      reject(new Error(`mlx agent update child crashed: ${type} at ${location}`));
-    });
+  const child = utilityProcess.fork(cliEntry, ['agent', 'update', ...args], {
+    stdio: 'pipe',
+    serviceName: 'mlx-agent-update',
   });
+  return collectAgentUpdateResult(child, args.includes('--check'));
 }
 
 /**
