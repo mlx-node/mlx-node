@@ -173,11 +173,7 @@ export function probeAgentInstall(
       // path (resolveAgentBinary) re-leases under the lock and re-verifies
       // the binary survived; the marker here only covers direct probe
       // callers such as the evals harness.
-      try {
-        writeFileSync(`${pinnedBin}.lease-${process.pid}`, '', { flag: 'wx' });
-      } catch {
-        // lease already exists or dir unwritable — best-effort
-      }
+      writeLeaseMarker(pinnedBin);
       return { source: 'managed', path: pinnedBin, managedTag, bundledTag, effectiveTag: pin };
     }
     // A pin naming the bundled release is already satisfied: the bundle
@@ -260,13 +256,7 @@ export async function leasePinnedManaged(managed: string, probed: string): Promi
   let survived = false;
   try {
     survived = existsSync(probed);
-    if (survived) {
-      try {
-        writeFileSync(`${probed}.lease-${process.pid}`, '', { flag: 'wx' });
-      } catch {
-        // the probe already leased it, or the dir is unwritable — best-effort
-      }
-    }
+    if (survived) writeLeaseMarker(probed);
   } finally {
     releaseInstallLock(`${managed}.lock`);
   }
@@ -794,13 +784,7 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
     // to be spawned — without it, an unpinned sweep in ANOTHER process can
     // delete the side-install between our lock release and the pinner's
     // launch, and the pinned launch fails ENOENT.
-    if (sideInstall) {
-      try {
-        writeFileSync(`${versioned}.lease-${process.pid}`, '', { flag: 'wx' });
-      } catch {
-        // lease already exists or dir unwritable — best-effort
-      }
-    }
+    if (sideInstall) writeLeaseMarker(versioned);
     // Old versioned binaries accumulate (~100MB each). A still-running one
     // cannot be deleted on Windows — expected; leave it for the next sweep.
     // Keep: this install's tag, the pointer's target read before AND after
@@ -814,15 +798,49 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
     }
     try {
       const entries = readdirSync(dirname(dest));
+      const liveLeases: { entry: string; binary: string }[] = [];
+      // Unix socket nodes outlive their owner; sweeping a lease removes the
+      // marker AND the endpoint file (a Windows pipe name is not a file).
+      const removeLease = (marker: string): void => {
+        rmSync(marker, { force: true });
+        if (process.platform !== 'win32') rmSync(leaseProbePath(marker), { force: true });
+      };
       for (const entry of entries) {
         const lease = parseLeaseName(entry);
         if (lease === undefined) continue;
-        if (pidAlive(lease.pid)) {
-          keep.add(lease.binary);
-        } else {
+        if (pidAlive(lease.pid)) liveLeases.push({ entry, binary: lease.binary });
+        else {
           // pinner is gone — the lease is dead weight
-          rmSync(join(dirname(dest), entry), { force: true });
+          removeLease(join(dirname(dest), entry));
         }
+      }
+      // A live pid is not ownership: the OS can have recycled it onto an
+      // unrelated process, and honoring that lease pins a ~100MB binary
+      // forever. Like lock members, the lease is honored only while its
+      // probe endpoint ({@link leaseProbePath}) answers — the endpoint
+      // dies with the real pinner. A refused marker fresher than
+      // MEMBER_STALE_MS is a pinner whose endpoint is still binding, so
+      // it keeps its binary until the next sweep.
+      const leaseAnswers = await Promise.all(
+        liveLeases.map((l) => endpointAlive(leaseProbePath(join(dirname(dest), l.entry)))),
+      );
+      for (const [i, { entry, binary }] of liveLeases.entries()) {
+        const file = join(dirname(dest), entry);
+        if (leaseAnswers[i]) {
+          keep.add(binary);
+          continue;
+        }
+        try {
+          if (Date.now() - statSync(file).mtimeMs <= MEMBER_STALE_MS) {
+            keep.add(binary);
+            continue;
+          }
+        } catch {
+          // Vanished mid-probe — keep the binary; the next sweep re-decides.
+          keep.add(binary);
+          continue;
+        }
+        removeLease(file);
       }
       for (const entry of entries) {
         if (!entry.startsWith('mlx-agent-v') || entry.includes('.lease-') || keep.has(entry)) continue;
@@ -905,10 +923,32 @@ export function markerProbePath(node: string): string {
   return `\\\\.\\pipe\\mlx-agent-lock-${hash}`;
 }
 
-/** True while something accepts connections on `node`'s probe endpoint — i.e. a live member. */
-function memberListening(node: string): Promise<boolean> {
+/**
+ * Where a lease marker's liveness endpoint listens. The marker itself is a
+ * regular file — it must exist synchronously for callers that lease inside
+ * the install lock and release before the async bind finishes — so the
+ * socket sits BESIDE it at `${marker}.sock`, hashed into tmpdir past the
+ * ~104-byte sun_path cap (deep $HOME). Windows uses a derived named pipe
+ * like {@link markerProbePath}. Either way the endpoint dies with the
+ * pinner: a live pid whose endpoint refuses is a recycled pid fronting a
+ * stale lease, never authoritative.
+ * @internal Exported for tests; the sweep probes it in production.
+ */
+export function leaseProbePath(node: string): string {
+  if (process.platform === 'win32') {
+    const hash = createHash('sha256').update(resolve(node)).digest('hex').slice(0, 32);
+    return `\\\\.\\pipe\\mlx-agent-lease-${hash}`;
+  }
+  const sock = `${node}.sock`;
+  if (Buffer.byteLength(sock) < 100) return sock;
+  const hash = createHash('sha256').update(resolve(node)).digest('hex').slice(0, 32);
+  return join(tmpdir(), `mlx-agent-lease-${hash}`);
+}
+
+/** True while something accepts connections on `probe` — i.e. a live owner. */
+function endpointAlive(probe: string): Promise<boolean> {
   return new Promise((res) => {
-    const sock = connect(markerProbePath(node));
+    const sock = connect(probe);
     const timer = setTimeout(() => done(true), 250); // wedged listener: assume live, never evict
     const done = (alive: boolean) => {
       clearTimeout(timer);
@@ -917,6 +957,75 @@ function memberListening(node: string): Promise<boolean> {
     };
     sock.once('connect', () => done(true));
     sock.once('error', () => done(false));
+  });
+}
+
+/** True while something accepts connections on `node`'s probe endpoint — i.e. a live member. */
+function memberListening(node: string): Promise<boolean> {
+  return endpointAlive(markerProbePath(node));
+}
+
+/**
+ * Lease endpoints this process owns: marker path → in-flight bind. Lease
+ * servers are held for the process lifetime — a lease protects its binary
+ * only while the pinner is launchable. `unref` keeps the listener from
+ * pinning the event loop (`mlx agent update` must still exit).
+ */
+const HELD_LEASES = new Map<string, Promise<Server | undefined>>();
+
+/**
+ * Advertise that this process is about to launch `binary`: write the
+ * `<binary>.lease-<pid>` marker and bind its probe endpoint
+ * ({@link leaseProbePath}). The marker file exists synchronously so the
+ * sweep sees it before the async bind completes — a fresh marker that
+ * refuses is mid-bind and keeps its binary via the MEMBER_STALE_MS
+ * grace, exactly like lock members. Best-effort: an unwritable dir or a
+ * failed bind leaves a plain marker the next sweep ages out.
+ * @internal Exported for tests; production callers are the three lease sites.
+ */
+export function writeLeaseMarker(binary: string): void {
+  const marker = `${binary}.lease-${process.pid}`;
+  try {
+    writeFileSync(marker, '', { flag: 'wx' });
+  } catch {
+    // lease already exists or dir unwritable — best-effort
+  }
+  if (HELD_LEASES.has(marker)) return;
+  const bind = bindLeaseEndpoint(marker)
+    .then((server) => {
+      server.unref();
+      return server;
+    })
+    .catch(() => {
+      // No endpoint → the marker is honored only via the mid-bind grace
+      // and then swept; retry on the next lease attempt.
+      HELD_LEASES.delete(marker);
+      return undefined;
+    });
+  HELD_LEASES.set(marker, bind);
+}
+
+/**
+ * Bind `marker`'s probe endpoint. One EADDRINUSE retry clears a stale
+ * socket node our dead predecessor left (the marker file itself stays —
+ * removing it would open a window where a sweep sees NO lease at all).
+ */
+function bindLeaseEndpoint(marker: string): Promise<Server> {
+  const probe = leaseProbePath(marker);
+  const listen = (): Promise<Server> =>
+    new Promise<Server>((res, rej) => {
+      const server = createServer((sock) => sock.destroy());
+      server.on('error', () => {}); // stray runtime errors must not crash the holder
+      server.once('error', rej);
+      server.listen(probe, () => {
+        server.removeListener('error', rej);
+        res(server);
+      });
+    });
+  return listen().catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error;
+    if (process.platform !== 'win32') rmSync(probe, { force: true });
+    return listen();
   });
 }
 

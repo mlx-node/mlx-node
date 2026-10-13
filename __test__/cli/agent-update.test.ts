@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
-import { createServer, type AddressInfo, type Server } from 'node:net';
+import { connect, createServer, type AddressInfo, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -25,6 +25,8 @@ import {
   agentUpdateStatus,
   launchGrokAgent,
   leasePinnedManaged,
+  leaseProbePath,
+  writeLeaseMarker,
   applyAgentUpdate,
   downloadAgentBinary,
   managedAgentBinPath,
@@ -464,6 +466,75 @@ describe('downloadAgentBinary', () => {
       await downloadAgentBinary(dest, 'mlx-agent-v0.5.0');
       expect(existsSync(staleBin)).toBe(false);
       expect(existsSync(`${staleBin}.lease-999999`)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps an aged lease whose live pid cannot prove ownership (recycled pid)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      delete process.env[MLX_AGENT_TAG_ENV];
+      const dest = managedAgentBinPath(home);
+      mkdirBin(home);
+      const staleBin = versioned(home, 'mlx-agent-v0.1.0');
+      writeFileSync(staleBin, 'v010');
+      // A crashed pinner's marker whose pid the OS handed to us: live pid,
+      // no endpoint. Aged past the mid-bind grace so only a REAL owner —
+      // not merely a reused pid — protects the binary.
+      const lease = `${staleBin}.lease-${process.pid}`;
+      writeFileSync(lease, '');
+      const aged = new Date(Date.now() - 60_000);
+      utimesSync(lease, aged, aged);
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(existsSync(staleBin)).toBe(false);
+      expect(existsSync(lease)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an aged lease whose probe endpoint still answers', { timeout: 20_000 }, async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      delete process.env[MLX_AGENT_TAG_ENV];
+      const dest = managedAgentBinPath(home);
+      mkdirBin(home);
+      const bin = versioned(home, 'mlx-agent-v0.2.0');
+      writeFileSync(bin, 'v020');
+      writeLeaseMarker(bin);
+      const lease = `${bin}.lease-${process.pid}`;
+      expect(existsSync(lease)).toBe(true);
+      // The marker file lands synchronously; the endpoint binds async —
+      // poll for it so the sweep exercises the live-endpoint path rather
+      // than the fresh-marker grace.
+      const probe = leaseProbePath(lease);
+      for (let i = 0; i < 100; i++) {
+        const up = await new Promise<boolean>((res) => {
+          const sock = connect(probe);
+          sock.once('connect', () => {
+            sock.destroy();
+            res(true);
+          });
+          sock.once('error', () => res(false));
+        });
+        if (up) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      // Past the mid-bind grace: only a live endpoint may keep the lease.
+      const aged = new Date(Date.now() - 60_000);
+      utimesSync(lease, aged, aged);
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(existsSync(bin)).toBe(true);
+      expect(existsSync(lease)).toBe(true);
     } finally {
       if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
       else process.env[MLX_AGENT_TAG_ENV] = saved;
@@ -1280,6 +1351,36 @@ describe('mlx agent update (run)', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('updated to mlx-agent-v0.2.0'));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('mlx-agent-v0.3.0'));
     expect(process.exitCode).toBe(0);
+  });
+
+  it('update ends a piped run with the status JSON the desktop tray parses', async () => {
+    // The desktop's parse takes the LAST JSON stdout line — a fallback
+    // install below latest must surface updateAvailable there, not just
+    // in the human warning.
+    const applyUpdate = vi.fn(async () => ({
+      downloaded: true,
+      status: {
+        current: 'mlx-agent-v0.2.0',
+        latest: 'mlx-agent-v0.3.0',
+        updateAvailable: true,
+        managedPath: '/m/mlx-agent',
+        pinned: 'managed' as const,
+      },
+    }));
+    const isTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    Object.defineProperty(process.stdout, 'isTTY', { value: false, configurable: true });
+    try {
+      await run(['update'], { applyUpdate });
+    } finally {
+      if (isTTY !== undefined) Object.defineProperty(process.stdout, 'isTTY', isTTY);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    }
+    const last = log.mock.calls.at(-1)![0] as string;
+    expect(JSON.parse(last)).toMatchObject({
+      current: 'mlx-agent-v0.2.0',
+      latest: 'mlx-agent-v0.3.0',
+      updateAvailable: true,
+    });
   });
 
   it('update on a pinned env install warns that the pin shadows the download', async () => {
