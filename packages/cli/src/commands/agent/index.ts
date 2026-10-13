@@ -575,7 +575,9 @@ const PINNED_NOTICE: Readonly<Partial<Record<AgentUpdateStatus['pinned'], string
  * `update` subcommand was built for npm-style installs and can only corrupt a
  * download-managed binary, so the positional is intercepted here instead of
  * forwarded. `--check` emits the machine-readable status the desktop tray
- * consumes.
+ * consumes; an install run on a piped stdout also ends with the same status
+ * JSON as its last line — without it the tray's parse resolves to {} and
+ * reports "Up to Date" even when a fallback install still trails latest.
  */
 async function runAgentUpdate(scan: AgentArgScan, deps: AgentRunDeps): Promise<void> {
   // scan.help stays false for subcommand argv, so read the passthrough directly.
@@ -604,6 +606,9 @@ async function runAgentUpdate(scan: AgentArgScan, deps: AgentRunDeps): Promise<v
     }
     const pin = PINNED_NOTICE[status.pinned];
     if (pin !== undefined) console.warn(`mlx agent: warning — ${pin}`);
+    // Piped consumers (the desktop updater) parse the LAST stdout line;
+    // interactive terminals get the human lines above only.
+    if (!process.stdout.isTTY) console.log(JSON.stringify(status));
   } catch (error) {
     console.error(`mlx agent: update failed — ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;

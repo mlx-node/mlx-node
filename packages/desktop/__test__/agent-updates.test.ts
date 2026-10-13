@@ -57,15 +57,31 @@ describe('agent updater', () => {
     run.mockResolvedValue({ updateAvailable: true, latest: 'mlx-agent-v0.3.0' });
     updater.check();
     await vi.advanceTimersByTimeAsync(0);
+    // Older CLIs print human text only → the parsed result is {}.
+    run.mockResolvedValue({});
     updater.install();
     expect(updater.status()).toBe('installing');
-    run.mockResolvedValue({});
     await vi.advanceTimersByTimeAsync(0);
     expect(run).toHaveBeenLastCalledWith([]);
     expect(updater.status()).toBe('current');
     // A second install from current is a no-op — the menu routes it to check.
     updater.install();
     expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it('stays available when the install reports a fallback below latest', async () => {
+    // A CLI that fell back to an older candidate ends its piped stdout with
+    // updateAvailable: true — claiming 'current' would mask the shortfall
+    // until the next periodic check.
+    const { run, updater } = harness();
+    run.mockResolvedValue({ updateAvailable: true, latest: 'mlx-agent-v0.3.0' });
+    updater.check();
+    await vi.advanceTimersByTimeAsync(0);
+    run.mockResolvedValue({ updateAvailable: true, latest: 'mlx-agent-v0.3.0', current: 'mlx-agent-v0.2.0' });
+    updater.install();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(updater.status()).toBe('available');
+    expect(updater.latest()).toBe('mlx-agent-v0.3.0');
   });
 
   it('serialises concurrent checks and installs', async () => {

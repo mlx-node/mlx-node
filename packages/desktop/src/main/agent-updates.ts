@@ -84,7 +84,8 @@ export interface AgentUpdateChild {
  * still in flight, so parsing at `exit` can see an empty or truncated status
  * line. `expectStatus` marks a `--check` run: it MUST end in the status JSON
  * — absent or malformed output rejects rather than reporting "current". The
- * install run prints human text, so no JSON still counts as success.
+ * install run also ends with the status line when the CLI emits it; older CLIs
+ * print human text only, so no JSON still counts as success.
  */
 export function collectAgentUpdateResult(child: AgentUpdateChild, expectStatus: boolean): Promise<AgentUpdateCheck> {
   return new Promise((resolvePromise, reject) => {
@@ -211,8 +212,11 @@ export function createAgentUpdater(options: {
     install(): void {
       if (stopped || inFlight || status !== 'available') return;
       // A failed install keeps its own 'error' state rather than reverting to
-      // 'available'; the label already offers retry.
-      drive([], () => 'current');
+      // 'available'; the label already offers retry. The status line the CLI
+      // ends with is authoritative: a fallback install landing below latest
+      // reports updateAvailable — claiming 'current' would hide it until the
+      // next periodic check. Absent JSON (older CLI) stays 'current'.
+      drive([], (result) => (result.updateAvailable === true ? 'available' : 'current'));
     },
     stop(): void {
       stopped = true;
