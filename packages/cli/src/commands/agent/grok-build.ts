@@ -960,8 +960,9 @@ function isDigits(s: string): boolean {
  *   `c-<pid>-<seq>`          — contender mid-choose
  * Returns undefined for anything else — foreign files in the directory are
  * not markers and are never swept.
+ * @internal Exported for tests; {@link scanMembers} is the production consumer.
  */
-function parseLockMarker(entry: string): { member: LockMember; choosing: boolean } | undefined {
+export function parseLockMarker(entry: string): { member: LockMember; choosing: boolean } | undefined {
   const parts = entry.split('-');
   const kind = parts[0];
   if (kind === 'b' && parts.length === 4) {

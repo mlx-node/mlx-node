@@ -72,8 +72,14 @@ export async function runAppEval(
     generation: INSTALL_CHECK_GENERATION,
     enginePolicy: LAUNCHER_ENGINE_POLICY,
     inheritedInferenceEnvironment: Object.fromEntries(
-      Object.entries(process.env).filter(([key]) =>
-        /^(MLX_(PAGED_|CACHE_LIMIT|IDLE_CLEAR|CONTINUOUS_BATCHING|SERVE_FORCE_SERIAL)|GROK_HOME$)/.test(key),
+      Object.entries(process.env).filter(
+        ([key]) =>
+          key === 'GROK_HOME' ||
+          key.startsWith('MLX_PAGED_') ||
+          key.startsWith('MLX_CACHE_LIMIT') ||
+          key.startsWith('MLX_IDLE_CLEAR') ||
+          key.startsWith('MLX_CONTINUOUS_BATCHING') ||
+          key.startsWith('MLX_SERVE_FORCE_SERIAL'),
       ),
     ),
     sources,

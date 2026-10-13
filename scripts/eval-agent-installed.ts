@@ -113,8 +113,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     split: options.split,
     plannedSamples: options.cases.length * options.repeat,
     inheritedInferenceEnvironment: Object.fromEntries(
-      Object.entries(process.env).filter(([key]) =>
-        /^(MLX_(PAGED_|CACHE_LIMIT|IDLE_CLEAR|CONTINUOUS_BATCHING|SERVE_FORCE_SERIAL)|GROK_HOME$)/.test(key),
+      Object.entries(process.env).filter(
+        ([key]) =>
+          key === 'GROK_HOME' ||
+          key.startsWith('MLX_PAGED_') ||
+          key.startsWith('MLX_CACHE_LIMIT') ||
+          key.startsWith('MLX_IDLE_CLEAR') ||
+          key.startsWith('MLX_CONTINUOUS_BATCHING') ||
+          key.startsWith('MLX_SERVE_FORCE_SERIAL'),
       ),
     ),
     note: "Installed mlx-agent binary run headless (`-p`, streaming-messages-json) against a spawned `mlx serve`, the same process/env pairing `mlx agent` and `mlx delegate` perform; the serve is shared across cases so the model stays loaded, and each case is a fresh session. Default model follows the CLI's own selection (persisted pick, else first discovered); tools, system prompt, permissions and session persistence use the entrypoint's normal defaults. The detector rubric is a user task, not a system-prompt override. This measures agent installation classification and read-file/session behavior, not the dashboard HTTP completion path or live Codex instruction loading. File-layout/verdict-cache behavior is covered separately by service unit tests. Synthetic evidence and labels are fixed before this run.",

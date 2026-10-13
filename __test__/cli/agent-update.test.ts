@@ -28,6 +28,7 @@ import {
   downloadAgentBinary,
   managedAgentBinPath,
   markerProbePath,
+  parseLockMarker,
   probeAgentInstall,
   releaseInstallLock,
   resolveAgentBinary,
@@ -665,9 +666,16 @@ describe('downloadAgentBinary', () => {
         const watcher = setInterval(() => {
           if (swapped) return;
           try {
-            const ours = readdirSync(dir).find(
-              (e) => /^b-\d+-\d+-\d+$/.test(e) && e !== ahead && e !== `b-99-${process.pid}-0`,
-            );
+            const ours = readdirSync(dir).find((e) => {
+              const parsed = parseLockMarker(e);
+              return (
+                parsed !== undefined &&
+                !parsed.choosing &&
+                parsed.member.ticket > 0 &&
+                e !== ahead &&
+                e !== `b-99-${process.pid}-0`
+              );
+            });
             if (ours === undefined) return;
             swapped = true;
             rmSync(join(dir, ours), { force: true });
