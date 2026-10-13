@@ -326,7 +326,12 @@ const TAG_PREFIX = 'mlx-agent-v';
 /** `mlx-agent-v0.2.0` → '0.2.0' when it is a valid semver tag, else null. */
 function tagVersion(tag: string): semver.SemVer | null {
   if (!tag.startsWith(TAG_PREFIX)) return null;
-  return semver.parse(tag.slice(TAG_PREFIX.length));
+  const suffix = tag.slice(TAG_PREFIX.length);
+  const v = semver.parse(suffix);
+  // semver.parse normalizes ('v0.3.0', ' 0.3.0' all parse), but the tag
+  // string is used literally for the asset name, versioned filename, and
+  // .tag marker — only the canonical form is a real release tag.
+  return v !== null && v.version === suffix ? v : null;
 }
 
 /**

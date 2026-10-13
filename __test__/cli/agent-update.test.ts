@@ -846,7 +846,15 @@ describe('resolveReleaseTag', () => {
   });
 
   it('rejects a malformed pinned tag instead of looping the download', async () => {
-    for (const bad of ['v0.3.0', 'mlx-agent-latest', 'mlx-agent-v0.3']) {
+    for (const bad of [
+      'v0.3.0',
+      'mlx-agent-latest',
+      'mlx-agent-v0.3',
+      // semver.parse normalizes 'v0.3.0' and ' 0.3.0' to 0.3.0 — the pin is
+      // used literally, so only the canonical form may pass.
+      'mlx-agent-vv0.3.0',
+      'mlx-agent-v 0.3.0',
+    ]) {
       process.env[MLX_AGENT_TAG_ENV] = bad;
       await expect(resolveReleaseTag()).rejects.toThrow(MLX_AGENT_TAG_ENV);
     }
