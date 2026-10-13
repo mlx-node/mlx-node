@@ -1450,8 +1450,11 @@ fn clef_residency_units(prefixes: &[String]) -> Vec<Vec<String>> {
 }
 
 /// Decode a sym8-stored projection (int8 `[N,K]` weight, f32 `[N]` scales)
-/// in f32: `w = q * s[n]`. `mlx_dequantize` has no sym8 mode. A missing or
-/// malformed pair is left to the builder's own validation (`None`).
+/// in f32: `w = q * s[n]`. `mlx_dequantize` has no sym8 mode. Enforces the
+/// same storage contract as `try_build_sym8_quantized_linear` (which this
+/// path bypasses): a malformed pair fails loud rather than, say, a `[1]`
+/// scale broadcasting over every row into a silently wrong dense weight.
+/// `None` only when the pair is absent.
 fn dequantize_sym8_source(
     params: &HashMap<String, MxArray>,
     prefix: &str,
@@ -1462,12 +1465,30 @@ fn dequantize_sym8_source(
     ) else {
         return Ok(None);
     };
-    if weight.dtype()? != DType::Int8 || weight.ndim()? != 2 || scales.ndim()? != 1 {
-        return Ok(None);
+    let bad = |what: String| Error::from_reason(format!("sym8 layer '{prefix}': {what}"));
+    if params.contains_key(&format!("{prefix}.biases")) {
+        return Err(bad("unexpected .biases sidecar (sym8 is symmetric)".into()));
+    }
+    let w_shape = weight.shape()?;
+    if weight.dtype()? != DType::Int8 || w_shape.len() != 2 {
+        return Err(bad(format!(
+            "expected 2-D int8 [N,K] .weight, got {:?} {:?}",
+            weight.dtype()?,
+            &w_shape[..]
+        )));
+    }
+    let s_shape = scales.shape()?;
+    if scales.dtype()? != DType::Float32 || s_shape.len() != 1 || s_shape[0] != w_shape[0] {
+        return Err(bad(format!(
+            "expected 1-D f32 [N={}] .scales, got {:?} {:?}",
+            w_shape[0],
+            scales.dtype()?,
+            &s_shape[..]
+        )));
     }
     weight
         .astype(DType::Float32)?
-        .mul(&scales.astype(DType::Float32)?.expand_dims(1)?)
+        .mul(&scales.expand_dims(1)?)
         .map(Some)
 }
 
@@ -6256,6 +6277,53 @@ mod tests {
         assert_dense_bf16(&mixed, "layers.0.mlp.up_proj", &[32, 64]);
         assert_dense_bf16(&mixed, "layers.0.mlp.down_proj", &[64, 32]);
         assert!(per_layer_quant.is_empty());
+
+        // A malformed stored-sym8 pair fails loud instead of decoding into a
+        // silently wrong dense weight (the builder this path bypasses would
+        // have rejected each of these).
+        let (q, s) = crate::convert::sym8_quantize_store(&up, "layers.0.mlp.up_proj").unwrap();
+        let sym8_only = HashMap::from([("layers.0.mlp.up_proj".to_string(), clef_sym8_plq())]);
+        for (what, weight, scales, biases) in [
+            (
+                "[1] scale",
+                q.clone(),
+                MxArray::ones(&[1], Some(DType::Float32)).unwrap(),
+                None,
+            ),
+            (
+                "bf16 scales",
+                q.clone(),
+                s.astype(DType::BFloat16).unwrap(),
+                None,
+            ),
+            (
+                "stray biases",
+                q.clone(),
+                s.clone(),
+                Some(MxArray::zeros(&[32], Some(DType::Float32)).unwrap()),
+            ),
+        ] {
+            let mut bad = HashMap::from([
+                ("layers.0.mlp.up_proj.weight".to_string(), weight),
+                ("layers.0.mlp.up_proj.scales".to_string(), scales),
+            ]);
+            if let Some(b) = biases {
+                bad.insert("layers.0.mlp.up_proj.biases".to_string(), b);
+            }
+            let Err(err) = apply_clef_residency(
+                &mut bad,
+                &mut sym8_only.clone(),
+                default_plq,
+                ClefResidency::Sym8,
+            ) else {
+                panic!("{what}: a malformed sym8 pair must fail loud");
+            };
+            assert!(
+                err.reason.contains("sym8 layer 'layers.0.mlp.up_proj'"),
+                "{what}: {}",
+                err.reason
+            );
+        }
 
         // Loader level: the layer installs (dense MLP, sym8 GDN) and reaches
         // the completeness gate instead of the dense fallback's dtype guard.
