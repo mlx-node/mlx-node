@@ -1,6 +1,15 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -150,12 +159,7 @@ describe('probeAgentInstall', () => {
       mkdirSync(dirname(bundled), { recursive: true });
       writeFileSync(bundled, 'bundled-v020');
       writeFileSync(`${bundled}.tag`, 'mlx-agent-v0.2.0');
-      const probe = probeAgentInstall(
-        root,
-        { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.2.0' },
-        root,
-        bundled,
-      );
+      const probe = probeAgentInstall(root, { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.2.0' }, root, bundled);
       expect(probe).toMatchObject({
         source: 'bundled',
         path: bundled,
@@ -571,31 +575,32 @@ describe('downloadAgentBinary', () => {
     },
   );
 
-  it(
-    'sweeps a dead-socket member whose pid was recycled by an unrelated process',
-    { timeout: 20_000 },
-    async () => {
-      // Windows markers are plain files — pid liveness is authoritative
-      // there, so the recycled-pid scenario cannot be reproduced.
-      if (process.platform === 'win32') return;
-      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
-      try {
-        const lock = join(home, 'mlx-agent.lock');
-        const dir = `${lock}.d`;
-        mkdirSync(dir, { recursive: true });
-        // A bakery marker left by a crashed holder whose pid the OS handed
-        // to us: live pid, dead socket. pidAlive alone would pin every
-        // acquire behind a lock nobody owns — the refusal is what
-        // identifies the recycle.
-        writeFileSync(join(dir, `b-1-${process.pid}-0`), '');
-        await acquireInstallLock(lock, { deadlineMs: 2_000 });
-        releaseInstallLock(lock);
-        expect(existsSync(join(dir, `b-1-${process.pid}-0`))).toBe(false);
-      } finally {
-        rmSync(home, { recursive: true, force: true });
-      }
-    },
-  );
+  it('sweeps a dead-socket member whose pid was recycled by an unrelated process', { timeout: 20_000 }, async () => {
+    // Windows markers are plain files — pid liveness is authoritative
+    // there, so the recycled-pid scenario cannot be reproduced.
+    if (process.platform === 'win32') return;
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const lock = join(home, 'mlx-agent.lock');
+      const dir = `${lock}.d`;
+      mkdirSync(dir, { recursive: true });
+      // A bakery marker left by a crashed holder whose pid the OS handed
+      // to us: live pid, dead socket — and OLD (a fresh refusal is a
+      // member mid-bind, so only aged markers get swept). pidAlive alone
+      // would pin every acquire behind a lock nobody owns; the refusal
+      // plus age is what identifies the recycle.
+      const marker = join(dir, `b-1-${process.pid}-0`);
+      writeFileSync(marker, '');
+      const aged = new Date(Date.now() - 60_000);
+      const { utimesSync } = await import('node:fs');
+      utimesSync(marker, aged, aged);
+      await acquireInstallLock(lock, { deadlineMs: 2_000 });
+      releaseInstallLock(lock);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it('sweeps an aged choose marker even while its pid is alive', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));

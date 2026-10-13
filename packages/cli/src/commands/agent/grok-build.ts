@@ -775,6 +775,14 @@ interface MemberScan {
  * the only ownership check that survives pid reuse there.
  */
 const CHOOSING_STALE_MS = 5_000;
+/**
+ * A `b-`/`m-` marker is swept on a refused socket probe only when it is
+ * older than this: the marker file exists between bind() and listen()
+ * completing, so a fresh marker that refuses is a member mid-bind, and
+ * unlinking it would leave that acquirer scanning forever for a name that
+ * is gone. Recycled-pid markers are by definition old.
+ */
+const MEMBER_STALE_MS = 2_000;
 
 /**
  * Live-and-present state of `dir`. Marker kinds:
@@ -833,10 +841,20 @@ async function scanMembers(dir: string): Promise<MemberScan> {
   }
   // Probe live-pid members in parallel: the socket check is the cheap
   // ECONNREFUSED path for recycled pids, so the extra round-trip per
-  // member is only paid when markers exist.
+  // member is only paid when markers exist. A refused marker is swept only
+  // once it is too old to be a member still finishing bind()+listen().
   const sockets = await Promise.all(pending.map((m) => memberListening(m.file)));
   pending.forEach((member, i) => {
+    let fresh = false;
     if (process.platform !== 'win32' && !sockets[i]) {
+      try {
+        fresh = Date.now() - statSync(member.file).mtimeMs <= MEMBER_STALE_MS;
+      } catch {
+        // vanished mid-probe — nothing to sweep or keep
+        return;
+      }
+    }
+    if (process.platform !== 'win32' && !sockets[i] && !fresh) {
       rmSync(member.file, { force: true });
     } else {
       members.push(member);
