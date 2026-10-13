@@ -684,26 +684,71 @@ describe('downloadAgentBinary', () => {
     },
   );
 
-  it('sweeps an aged choose marker even while its pid is alive', { timeout: 20_000 }, async () => {
-    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
-    try {
+  it(
+    'keeps a live choose marker in the choosing set even when it is old',
+    { timeout: 20_000 },
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
       const lock = join(home, 'mlx-agent.lock');
       const dir = `${lock}.d`;
-      mkdirSync(dir, { recursive: true });
-      // A `c-` marker is a plain file, so a recycled pid has no socket to
-      // disprove it — age is the bound. Choosing takes two syscalls;
-      // anything seconds old is debris.
       const marker = join(dir, `c-${process.pid}-0`);
-      writeFileSync(marker, '');
-      const past = new Date(Date.now() - 60_000);
-      utimesSync(marker, past, past);
-      await acquireInstallLock(lock, { deadlineMs: 2_000 });
-      releaseInstallLock(lock);
-      expect(existsSync(marker)).toBe(false);
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
+      let server: Server | undefined;
+      try {
+        mkdirSync(dir, { recursive: true });
+        // A suspended contender is indistinguishable from a recycled pid
+        // by age alone — sweeping its live marker lets a later contender
+        // choose the same ticket and enter concurrently, so an OLD but
+        // owned marker must keep blocking until it advertises or dies.
+        if (process.platform === 'win32') {
+          writeFileSync(marker, '');
+        } else {
+          server = createServer((sock) => sock.destroy());
+          await new Promise<void>((res, rej) => {
+            server!.once('error', rej);
+            server!.listen(marker, res);
+          });
+        }
+        try {
+          const past = new Date(Date.now() - 60_000);
+          utimesSync(marker, past, past);
+        } catch {
+          // aging is best-effort — some filesystems refuse socket utimes
+        }
+        await expect(acquireInstallLock(lock, { deadlineMs: 1_000 })).rejects.toThrow('install lock');
+        expect(existsSync(marker)).toBe(true);
+      } finally {
+        server?.close();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    'sweeps a choose marker whose socket refuses — its pid was recycled',
+    { timeout: 20_000 },
+    async () => {
+      if (process.platform === 'win32') return;
+      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+      try {
+        const lock = join(home, 'mlx-agent.lock');
+        const dir = `${lock}.d`;
+        mkdirSync(dir, { recursive: true });
+        // A `c-` file that is not a listening socket: on unix a real
+        // contender binds one, so a live pid with a dead socket is debris
+        // fronting a recycled pid. Aged past the mid-bind grace so the
+        // sweep applies immediately.
+        const marker = join(dir, `c-${process.pid}-0`);
+        writeFileSync(marker, '');
+        const past = new Date(Date.now() - 60_000);
+        utimesSync(marker, past, past);
+        await acquireInstallLock(lock, { deadlineMs: 2_000 });
+        releaseInstallLock(lock);
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('refuses to install while a live process holds the lock', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));

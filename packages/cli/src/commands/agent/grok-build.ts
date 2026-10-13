@@ -781,16 +781,8 @@ interface MemberScan {
 }
 
 /**
- * A `c-<pid>-<seq>` marker older than this is stale even when its pid is
- * alive: the choose phase is two syscalls, so anything older is a crashed
- * contender whose pid was recycled by an unrelated process. `b-`/`m-`
- * members get a socket probe; `c-` markers are plain files, so mtime is
- * the only ownership check that survives pid reuse there.
- */
-const CHOOSING_STALE_MS = 5_000;
-/**
- * A `b-`/`m-` marker is swept on a refused socket probe only when it is
- * older than this: the marker file exists between bind() and listen()
+ * A `b-`/`m-`/`c-` marker is swept on a refused socket probe only when it
+ * is older than this: the marker file exists between bind() and listen()
  * completing, so a fresh marker that refuses is a member mid-bind, and
  * unlinking it would leave that acquirer scanning forever for a name that
  * is gone. Recycled-pid markers are by definition old.
@@ -804,13 +796,18 @@ const MEMBER_STALE_MS = 2_000;
  *                              honored as ticket 0 (its owner advertised
  *                              before any bakery member).
  *   `c-<pid>-<seq>`          — a contender between choosing a ticket and
- *                              advertising it; live ones force a rescan.
+ *                              advertising it (socket on unix, file on
+ *                              win); live ones force a rescan.
  * Anything whose pid is dead is swept unconditionally — the owner cannot
- * exist. On unix a member ALSO has to answer on its socket path: a live
+ * exist. On unix a marker ALSO has to answer on its socket path: a live
  * pid with a dead socket is a recycled pid fronting a stale marker, and
- * honoring it would wait out every acquire behind a lock nobody owns. On
- * Windows the markers are plain files and pid liveness stays
- * authoritative (the recycled-pid stall is a known residual risk there).
+ * honoring it would wait out every acquire behind a lock nobody owns. Age
+ * alone never sweeps a live marker — a suspended contender is
+ * indistinguishable from a recycled pid by liveness, and removing a LIVE
+ * `c-` lets a later contender choose the same ticket and enter
+ * concurrently. On Windows the markers are plain files and pid liveness
+ * stays authoritative (the recycled-pid stall is a known residual risk
+ * there).
  */
 async function scanMembers(dir: string): Promise<MemberScan> {
   let entries: string[];
@@ -820,44 +817,36 @@ async function scanMembers(dir: string): Promise<MemberScan> {
     return { members: [], choosing: false };
   }
   const members: LockMember[] = [];
-  const pending: LockMember[] = [];
-  let choosing = false;
+  const pending: { member: LockMember; choosing: boolean }[] = [];
   for (const entry of entries) {
     let m = /^b-(\d+)-(\d+)-(\d+)$/.exec(entry);
     if (m) {
       const member = { ticket: Number(m[1]), pid: Number(m[2]), seq: Number(m[3]), file: join(dir, entry) };
-      if (pidAlive(member.pid)) pending.push(member);
+      if (pidAlive(member.pid)) pending.push({ member, choosing: false });
       else rmSync(member.file, { force: true });
       continue;
     }
     m = /^m-(\d+)-(\d+)$/.exec(entry);
     if (m) {
       const member = { ticket: 0, pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
-      if (pidAlive(member.pid)) pending.push(member);
+      if (pidAlive(member.pid)) pending.push({ member, choosing: false });
       else rmSync(member.file, { force: true });
       continue;
     }
     m = /^c-(\d+)-(\d+)$/.exec(entry);
     if (m) {
-      let stale = false;
-      try {
-        stale = Date.now() - statSync(join(dir, entry)).mtimeMs > CHOOSING_STALE_MS;
-      } catch {
-        // vanished between readdir and stat — nothing to sweep
-      }
-      if (!pidAlive(Number(m[1])) || stale) {
-        rmSync(join(dir, entry), { force: true });
-      } else {
-        choosing = true;
-      }
+      const member = { ticket: -1, pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
+      if (pidAlive(member.pid)) pending.push({ member, choosing: true });
+      else rmSync(join(dir, entry), { force: true });
     }
   }
-  // Probe live-pid members in parallel: the socket check is the cheap
+  // Probe live-pid markers in parallel: the socket check is the cheap
   // ECONNREFUSED path for recycled pids, so the extra round-trip per
-  // member is only paid when markers exist. A refused marker is swept only
+  // marker is only paid when markers exist. A refused marker is swept only
   // once it is too old to be a member still finishing bind()+listen().
-  const sockets = await Promise.all(pending.map((m) => memberListening(m.file)));
-  pending.forEach((member, i) => {
+  const sockets = await Promise.all(pending.map((p) => memberListening(p.member.file)));
+  let choosing = false;
+  pending.forEach(({ member, choosing: isChoosing }, i) => {
     let fresh = false;
     if (process.platform !== 'win32' && !sockets[i]) {
       try {
@@ -869,9 +858,10 @@ async function scanMembers(dir: string): Promise<MemberScan> {
     }
     if (process.platform !== 'win32' && !sockets[i] && !fresh) {
       rmSync(member.file, { force: true });
-    } else {
-      members.push(member);
+      return;
     }
+    if (isChoosing) choosing = true;
+    else members.push(member);
   });
   members.sort((a, b) => a.ticket - b.ticket || a.pid - b.pid || a.seq - b.seq);
   return { members, choosing };
@@ -888,9 +878,11 @@ async function scanMembers(dir: string): Promise<MemberScan> {
  * by the next scan unconditionally — no liveness probe is trusted to
  * unlink anything.
  *
- * On Unix the marker is a listening unix socket so probes land harmlessly;
- * on Windows it is an empty marker file plus nothing to probe — pid
- * liveness is authoritative since named-pipe names die with the process.
+ * On Unix each marker — choose and member — is a listening unix socket so
+ * probes land harmlessly and a suspended contender stays live while a
+ * recycled pid fails the probe; on Windows they are empty marker files
+ * plus nothing to probe — pid liveness is authoritative since named-pipe
+ * names die with the process.
  *
  * Once the deadline passes the caller must FAIL rather than proceed
  * unlocked: the pointer-flip/sweep section is unsafe to enter while a
@@ -907,10 +899,39 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
   // seen — any member that advertised after us necessarily read a max that
   // includes ours, so arrival order is honored no matter how pids order.
   const choosing = join(dir, `c-${process.pid}-${seq}`);
-  try {
-    writeFileSync(choosing, '', { flag: 'wx' });
-  } catch {
-    // left over from a crashed choose — reuse it
+  let choosingServer: Server | undefined;
+  if (process.platform === 'win32') {
+    try {
+      writeFileSync(choosing, '', { flag: 'wx' });
+    } catch {
+      // left over from a crashed choose — reuse it
+    }
+  } else {
+    // A unix marker must answer on its socket path, or a live contender
+    // suspended mid-choose gets swept like a recycled pid and a later
+    // contender can choose the same ticket and enter concurrently.
+    choosingServer = createServer((sock) => sock.destroy());
+    choosingServer.on('error', () => {});
+    await new Promise<void>((res, rej) => {
+      choosingServer!.once('error', rej);
+      choosingServer!.listen(choosing, res);
+    }).catch(async (error) => {
+      choosingServer!.close();
+      choosingServer = undefined;
+      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+        // Stale socket from a crashed choose under our recycled pid —
+        // remove it and retry once, like the member bind below.
+        rmSync(choosing, { force: true });
+        choosingServer = createServer((sock) => sock.destroy());
+        choosingServer.on('error', () => {});
+        await new Promise<void>((res, rej) => {
+          choosingServer!.once('error', rej);
+          choosingServer!.listen(choosing, res);
+        });
+        return;
+      }
+      throw error;
+    });
   }
   const seen = await scanMembers(dir);
   const ticket = seen.members.reduce((max, m) => Math.max(max, m.ticket), 0) + 1;
@@ -947,6 +968,7 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
       throw error;
     });
   }
+  choosingServer?.close();
   rmSync(choosing, { force: true });
   try {
     while (true) {
@@ -992,6 +1014,7 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
     }
   } catch (error) {
     server?.close();
+    choosingServer?.close();
     rmSync(marker, { force: true });
     rmSync(choosing, { force: true });
     throw error;
