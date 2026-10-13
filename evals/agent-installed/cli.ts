@@ -13,7 +13,6 @@ import {
   managedAgentBinPath,
   probeAgentInstall,
   serveBannerBaseUrl,
-  MLX_AGENT_TAG_ENV,
 } from '../../packages/cli/src/commands/agent/grok-build.js';
 import { chooseDefaultModel, readPersistedDefaultModel } from '../../packages/cli/src/commands/agent/index.js';
 import { DELEGATE_DEFAULT_ARGS } from '../../packages/cli/src/commands/delegate.js';
@@ -163,21 +162,18 @@ export class AgentCli {
     if (probe.path === undefined) {
       throw new Error('No mlx-agent binary found. Build or install one before running the eval.');
     }
-    // A pinned managed hit is only leased best-effort by the probe — the
-    // marker was written outside the install lock, so a sweep that
-    // snapshotted just before it can still delete the binary during model
-    // discovery and serve startup. Re-lease under the lock and re-verify,
-    // like the launcher does in resolveAgentBinary; a swept pin fails here
-    // instead of at spawn with ENOENT.
+    // A managed hit — pinned or pointer-resolved — is only leased
+    // best-effort (or not at all) by the probe: the marker was written
+    // outside the install lock, so a sweep that snapshotted just before it
+    // can still delete the binary during model discovery and serve
+    // startup. Re-lease under the lock and re-verify, like the launcher
+    // does in resolveAgentBinary; a swept binary fails here instead of at
+    // spawn with ENOENT.
     let bin = probe.path;
-    if (
-      probe.source === 'managed' &&
-      probe.effectiveTag !== undefined &&
-      probe.effectiveTag === process.env[MLX_AGENT_TAG_ENV]
-    ) {
+    if (probe.source === 'managed') {
       bin = (await leasePinnedManaged(managedAgentBinPath(), probe.path)) ?? probe.path;
       if (!existsSync(bin)) {
-        throw new Error(`The pinned mlx-agent release was swept during eval startup: ${probe.path}`);
+        throw new Error(`The managed mlx-agent release was swept during eval startup: ${probe.path}`);
       }
     }
     this.bin = bin;
