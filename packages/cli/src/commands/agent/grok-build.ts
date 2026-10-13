@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, type Stats } from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -1166,8 +1166,39 @@ function parseLeaseName(entry: string): { binary: string; pid: number } | undefi
  * behind a lock nobody owns. Age alone never sweeps a live marker — a
  * suspended contender is indistinguishable from a recycled pid by
  * liveness, and removing a LIVE `c-` lets a later contender choose the
- * same ticket and enter concurrently.
+ * same ticket and enter concurrently. Every sweep path re-validates the
+ * node identity before unlinking ({@link removeIfUnchanged}): a dead pid
+ * can be recycled mid-scan and a new owner can rebind the same name, so
+ * removing by name alone could delete a live contender's marker.
  */
+
+/**
+ * Unlink `file` only when a fresh stat still names the SAME node observed
+ * at `baseline` (device + inode + mtime + ctime). Pid liveness is checked
+ * against the marker NAME, not the node — a recycled pid's new owner
+ * rebinds the identical name, so the unlink must refuse any replacement.
+ * Returns false when the node changed or vanished: the directory snapshot
+ * is stale and the caller must rescan rather than act on a member list
+ * that may already name a different owner.
+ * @internal Exported for tests; {@link scanMembers} is the production consumer.
+ */
+export function removeIfUnchanged(file: string, baseline: Stats): boolean {
+  try {
+    const now = statSync(file);
+    if (
+      now.dev !== baseline.dev ||
+      now.ino !== baseline.ino ||
+      now.mtimeMs !== baseline.mtimeMs ||
+      now.ctimeMs !== baseline.ctimeMs
+    ) {
+      return false;
+    }
+    rmSync(file, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
 /** @internal Exported for tests; {@link acquireInstallLock} is the only production caller. */
 export async function scanMembers(dir: string): Promise<MemberScan> {
   let entries: string[];
@@ -1178,24 +1209,38 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
   }
   const members: LockMember[] = [];
   const pending: { member: LockMember; choosing: boolean }[] = [];
+  let choosing = false;
   for (const entry of entries) {
     const marker = parseLockMarker(entry);
     if (marker === undefined) continue;
     const member = { ...marker.member, file: join(dir, entry) };
-    if (pidAlive(member.pid)) pending.push({ member, choosing: marker.choosing });
-    else rmSync(member.file, { force: true });
+    if (pidAlive(member.pid)) {
+      pending.push({ member, choosing: marker.choosing });
+      continue;
+    }
+    // Dead pid — but the pid may already be recycled and a new owner may
+    // have rebound this exact name. Only unlink the node we observed;
+    // anything else means the snapshot is stale, so force a rescan.
+    try {
+      if (!removeIfUnchanged(member.file, statSync(member.file))) choosing = true;
+    } catch {
+      // Gone before stat — another sweeper beat us, or a recycled pid is
+      // mid-rebind. The snapshot is stale either way: rescan.
+      choosing = true;
+    }
   }
   // Probe live-pid markers in parallel: the endpoint check is the cheap
   // ECONNREFUSED path for recycled pids, so the extra round-trip per
   // marker is only paid when markers exist. A refused marker is swept only
   // once it is too old to be an owner still finishing bind()+listen().
   const sockets = await Promise.all(pending.map((p) => memberListening(p.member.file)));
-  let choosing = false;
   pending.forEach(({ member, choosing: isChoosing }, i) => {
-    let fresh = false;
+    let fresh: boolean | undefined;
+    let baseline: Stats | undefined;
     if (!sockets[i]) {
       try {
-        fresh = Date.now() - statSync(member.file).mtimeMs <= MEMBER_STALE_MS;
+        baseline = statSync(member.file);
+        fresh = Date.now() - baseline.mtimeMs <= MEMBER_STALE_MS;
       } catch {
         // Vanished mid-probe: a c- marker's owner may have just swapped it
         // for a b- member our readdir snapshot predates, so the contender
@@ -1206,7 +1251,10 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
       }
     }
     if (!sockets[i] && !fresh) {
-      rmSync(member.file, { force: true });
+      // Same pid-reuse race as the dead-pid sweep: the refusal was probed
+      // against this node, so unlink only that node — a replacement owner
+      // is a live contender our member list missed.
+      if (!removeIfUnchanged(member.file, baseline!)) choosing = true;
       return;
     }
     if (isChoosing) choosing = true;

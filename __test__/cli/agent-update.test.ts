@@ -35,6 +35,7 @@ import {
   parseLockMarker,
   probeAgentInstall,
   releaseInstallLock,
+  removeIfUnchanged,
   resolveAgentBinary,
   scanMembers,
   resolveReleaseTag,
@@ -931,6 +932,55 @@ describe('downloadAgentBinary', () => {
       const scan = await scanPromise;
       expect(scan.choosing).toBe(true);
       expect(scan.members).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps a dead-pid marker without flagging a rescan', { timeout: 20_000 }, async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dir = join(home, 'lock.d');
+      mkdirSync(dir, { recursive: true });
+      // spawnSync's child is already reaped — its pid is dead by the time
+      // the scan reads liveness, so the marker must be gone and absent.
+      const deadPid = spawnSync(process.execPath, ['-e', '']).pid!;
+      const marker = join(dir, `c-${deadPid}-0`);
+      writeFileSync(marker, '');
+      const scan = await scanMembers(dir);
+      expect(existsSync(marker)).toBe(false);
+      expect(scan.choosing).toBe(false);
+      expect(scan.members).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('removeIfUnchanged unlinks only the observed node, never a replacement', () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const file = join(home, 'marker');
+      writeFileSync(file, 'stale');
+      const baseline = statSync(file);
+      expect(removeIfUnchanged(file, baseline)).toBe(true);
+      expect(existsSync(file)).toBe(false);
+
+      // The pid-reuse race the sweep guards: a new owner rebinds the same
+      // name between observation and unlink. The replacement node is a
+      // different inode/mtime — it must survive and force a rescan.
+      writeFileSync(file, 'live');
+      expect(removeIfUnchanged(file, baseline)).toBe(false);
+      expect(readFileSync(file, 'utf8')).toBe('live');
+
+      // An owner refresh (utimes) is also a changed node — do not unlink.
+      const liveBaseline = statSync(file);
+      utimesSync(file, new Date(), new Date());
+      expect(removeIfUnchanged(file, liveBaseline)).toBe(false);
+      expect(existsSync(file)).toBe(true);
+
+      // A vanished marker: nothing left to unlink, still stale.
+      rmSync(file, { force: true });
+      expect(removeIfUnchanged(file, liveBaseline)).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
