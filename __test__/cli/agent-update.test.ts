@@ -204,7 +204,7 @@ describe('downloadAgentBinary', () => {
     }
   });
 
-  it('flips the pointer to the new versioned binary and sweeps old versions', async () => {
+  it('flips the pointer to the new versioned binary and keeps the prior release', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const dest = managedAgentBinPath(home);
@@ -219,7 +219,9 @@ describe('downloadAgentBinary', () => {
       expect(current).toBe(versionedName('mlx-agent-v0.3.0'));
       expect(readFileSync(current, 'utf-8')).toBe('v030');
       expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
-      expect(existsSync(old)).toBe(false);
+      // The prior release survives the sweep — it is the rollback target a
+      // side-install's pointer dance can no longer destroy.
+      expect(existsSync(old)).toBe(true);
       // The install lock is released once the install completes.
       expect(existsSync(`${dest}.lock`)).toBe(false);
 
@@ -251,6 +253,69 @@ describe('downloadAgentBinary', () => {
       expect(readFileSync(versionedName, 'utf-8')).toBe('first-install');
       expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a pinned download as a side-install: pointer and prior release untouched', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      const dest = managedAgentBinPath(home);
+      const versionedName = (tag: string) => join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
+
+      // Active release: v0.3.0.
+      delete process.env[MLX_AGENT_TAG_ENV];
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+
+      // A pinned launch fetches v0.2.0 — it must not repoint the default or
+      // sweep the active release.
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
+      mockMirrors(makeTarball(home, 'v020'));
+      const path = await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
+      expect(path).toBe(versionedName('mlx-agent-v0.2.0'));
+      expect(readFileSync(path, 'utf-8')).toBe('v020');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      expect(existsSync(versionedName('mlx-agent-v0.3.0'))).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a later unpinned update keeps the prior release; side-installed binaries are reclaimed', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      const dest = managedAgentBinPath(home);
+      const versionedName = (tag: string) => join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
+
+      delete process.env[MLX_AGENT_TAG_ENV];
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+
+      // Side-install v0.2.0 for a pin.
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
+      mockMirrors(makeTarball(home, 'v020'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
+
+      // Later unpinned update to v0.4.0: the pointer's previous target
+      // (v0.3.0) survives as the rollback release. The side-installed
+      // v0.2.0 is reclaimed — the pin was process-local, and re-pinning
+      // downloads it again.
+      delete process.env[MLX_AGENT_TAG_ENV];
+      mockMirrors(makeTarball(home, 'v040'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.4.0');
+      expect(existsSync(versionedName('mlx-agent-v0.4.0'))).toBe(true);
+      expect(existsSync(versionedName('mlx-agent-v0.3.0'))).toBe(true);
+      expect(existsSync(versionedName('mlx-agent-v0.2.0'))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
       rmSync(home, { recursive: true, force: true });
     }
   });

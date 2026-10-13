@@ -362,7 +362,9 @@ async function releaseChecksum(tag: string, asset: string): Promise<string | und
  *
  * `dest` is the managed cache BASE path (`bin/mlx-agent`); the binary lands
  * at `bin/<tag>` and the `<dest>.tag` pointer flips to it last, so a running
- * previous version is never renamed over. Returns the versioned path.
+ * previous version is never renamed over. A download servicing the
+ * `MLX_AGENT_TAG` pin is a side-install: the pointer (the unpinned default
+ * release) is left alone. Returns the versioned path.
  */
 export async function downloadAgentBinary(dest: string, tag?: string): Promise<string> {
   tag ??= await resolveReleaseTag();
@@ -431,6 +433,15 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     // error. The versioned file lands atomically, so an existing path is a
     // finished install — adopt it and only repair the pointer.
     const alreadyInstalled = existsSync(versioned);
+    // A download for the MLX_AGENT_TAG pin is a SIDE-INSTALL: pinned probes
+    // resolve the versioned file directly, so repointing the pointer would
+    // silently change the default release for every unpinned launch (and
+    // let the sweep delete the previously active binary).
+    const pin = releasePin();
+    const sideInstall = pin !== undefined && pin === tag;
+    // Snapshot the pointer BEFORE the flip — it is the release unpinned
+    // launches currently run, so the sweep must keep it.
+    const prevPointer = readAgentTag(dest);
     // Atomic install: a sibling temp file renamed over the versioned path.
     // Truncating the live path fails ETXTBSY on Linux while an agent runs and
     // can expose a half-written binary to a concurrent launch everywhere else
@@ -445,14 +456,18 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
       }
       // The pointer flips LAST and atomically (sibling tmp + rename): probes
       // either see the old tag with its binary still on disk, or the new tag
-      // with this file already in place — never a tag naming a missing binary.
-      const stagedTag = `${dest}.tag.tmp-${process.pid}`;
-      try {
-        writeFileSync(stagedTag, tag, { mode: 0o600 });
-        renameSync(stagedTag, `${dest}.tag`);
-      } catch (error) {
-        rmSync(stagedTag, { force: true });
-        throw error;
+      // with this file already in place — never a tag naming a missing
+      // binary. Side-installs skip the flip: the pointer belongs to the
+      // unpinned default release.
+      if (!sideInstall) {
+        const stagedTag = `${dest}.tag.tmp-${process.pid}`;
+        try {
+          writeFileSync(stagedTag, tag, { mode: 0o600 });
+          renameSync(stagedTag, `${dest}.tag`);
+        } catch (error) {
+          rmSync(stagedTag, { force: true });
+          throw error;
+        }
       }
     } catch (error) {
       rmSync(staged, { force: true });
@@ -460,10 +475,14 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     }
     // Old versioned binaries accumulate (~100MB each). A still-running one
     // cannot be deleted on Windows — expected; leave it for the next sweep.
-    // The pointer is re-read here so a sweep can never remove the release a
-    // live pointer names, even if a third party flipped it mid-install.
+    // Keep: this install's tag, the pointer's target read before AND after
+    // the flip (a third party may have moved it), and the env pin — the
+    // sweep must never remove a binary a launch can still resolve.
     const live = readAgentTag(dest);
-    const keep = new Set([agentBinName(tag), ...(live !== undefined ? [agentBinName(live)] : [])]);
+    const keep = new Set([agentBinName(tag)]);
+    for (const t of [prevPointer, live, pin]) {
+      if (t !== undefined) keep.add(agentBinName(t));
+    }
     try {
       for (const entry of readdirSync(dirname(dest))) {
         if (!entry.startsWith('mlx-agent-v') || keep.has(entry)) continue;
