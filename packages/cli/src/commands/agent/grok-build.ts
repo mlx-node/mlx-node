@@ -341,6 +341,14 @@ async function fetchText(url: string): Promise<string | undefined> {
 
 /** How long a single archive-body fetch may run before we try the next mirror. */
 const ARCHIVE_FETCH_TIMEOUT_MS = 120_000;
+/**
+ * Hard cap on archive bytes buffered before verification — the digest is
+ * only checked AFTER the body lands, so an unbounded `arrayBuffer()` lets a
+ * misconfigured or hostile mirror exhaust the CLI's memory inside the fetch
+ * timeout. Well above the ~100MB binary; also the ceiling `tar`'s own
+ * `maxBuffer` assumes.
+ */
+const MAX_AGENT_ARCHIVE_BYTES = 256 * 1024 * 1024;
 
 /**
  * The checksum is fetched ONLY from the GitHub release — the trust anchor —
@@ -388,7 +396,7 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
   }
 
   mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
-  let tar: ArrayBuffer | null = null;
+  let tar: Buffer | null = null;
   for (const url of urls) {
     try {
       // Bounded: a mirror that stalls mid-body must not hang the launch or
@@ -398,8 +406,34 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
         signal: AbortSignal.timeout(ARCHIVE_FETCH_TIMEOUT_MS),
       });
       if (!r.ok || r.body === null) continue;
-      const buf = await r.arrayBuffer();
-      const digest = createHash('sha256').update(Buffer.from(buf)).digest('hex');
+      // A truthful oversized Content-Length short-circuits the stream; a
+      // lying or absent one is caught by the per-chunk cap below. Either
+      // way this mirror loses the race and the next one is tried.
+      const declared = Number(r.headers.get('content-length'));
+      if (Number.isFinite(declared) && declared > MAX_AGENT_ARCHIVE_BYTES) continue;
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let over = false;
+      const reader = r.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > MAX_AGENT_ARCHIVE_BYTES) {
+            over = true;
+            break;
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } finally {
+        if (over) {
+          reader.cancel().catch(() => {});
+        }
+      }
+      if (over) continue;
+      const buf = Buffer.concat(chunks);
+      const digest = createHash('sha256').update(buf).digest('hex');
       if (digest !== expected) continue;
       tar = buf;
       break;
@@ -424,8 +458,11 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
   }
   // The staged write → pointer flip → sweep sequence runs under a lockfile:
   // two concurrent installs of different tags must not let one process'
-  // sweep delete the version the other's pointer just selected.
-  const locked = acquireInstallLock(`${dest}.lock`);
+  // sweep delete the version the other's pointer just selected. Entering
+  // this section WITHOUT the lock is worse than not installing — a merely
+  // suspended holder plus an unlocked waiter can interleave sweeps and
+  // leave the pointer naming a deleted binary — so the lock is mandatory.
+  acquireInstallLock(`${dest}.lock`);
   try {
     // Under the lock, a same-tag install may already be complete: two first
     // launches can download the same release concurrently, and renaming
@@ -496,41 +533,65 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
       // cache dir unreadable — not fatal to a completed install
     }
   } finally {
-    releaseInstallLock(`${dest}.lock`, locked);
+    releaseInstallLock(`${dest}.lock`);
   }
   return versioned;
 }
 
+/** True while a recorded lock-holder pid still exists (EPERM = alive, another user). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 /**
  * Serialize the install critical section across processes. `<dest>.lock` is
- * created with `wx` (fails while held); a holder that died mid-install
- * leaves the file behind, so a lock older than the stale threshold is
- * stolen. Waiting past the deadline proceeds unlocked — an update that
- * eventually lands beats one that spins forever on a wedged lock.
+ * created with `wx` (fails while held) and records the holder's pid. A
+ * leftover lock is stolen only when ownership proves stale — the recorded
+ * holder is dead, or the file outlived the threshold with an unreadable or
+ * reused holder — never merely because a waiter timed out. Once the
+ * deadline passes the caller must FAIL rather than proceed unlocked: the
+ * pointer-flip/sweep section is unsafe to enter while a holder may still be
+ * inside it, so this function throws instead of returning.
  */
-function acquireInstallLock(path: string): boolean {
+function acquireInstallLock(path: string): void {
   const STALE_MS = 30_000;
   const DEADLINE_MS = 10_000;
   const deadline = Date.now() + DEADLINE_MS;
   while (true) {
     try {
       writeFileSync(path, String(process.pid), { flag: 'wx', mode: 0o600 });
-      return true;
+      return;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       try {
-        if (Date.now() - statSync(path).mtimeMs > STALE_MS) rmSync(path, { force: true });
+        const st = statSync(path);
+        const holder = Number(readFileSync(path, 'utf-8').trim());
+        // Stale ownership: the recorded pid is gone (pid reuse accepted) or
+        // the lock outlived its threshold — take it and retry the create.
+        if ((Number.isInteger(holder) && holder > 0 && !pidAlive(holder)) || Date.now() - st.mtimeMs > STALE_MS) {
+          rmSync(path, { force: true });
+          continue;
+        }
       } catch {
-        // vanished between checks — retry create
+        // vanished or unreadable between checks — retry create
+        continue;
       }
-      if (Date.now() > deadline) return false;
+      if (Date.now() > deadline) {
+        throw new Error(
+          `mlx agent: another install is in progress (${path}) — refusing to proceed without the install lock`,
+        );
+      }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
   }
 }
 
-function releaseInstallLock(path: string, held: boolean): void {
-  if (!held) return;
+function releaseInstallLock(path: string): void {
   try {
     rmSync(path, { force: true });
   } catch {

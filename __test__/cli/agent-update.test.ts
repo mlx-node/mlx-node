@@ -339,6 +339,92 @@ describe('downloadAgentBinary', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it('steals a fresh lock whose recorded holder pid is dead', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dest = managedAgentBinPath(home);
+      mkdirSync(dirname(dest), { recursive: true });
+      // Fresh mtime, dead pid — ownership, not age, proves staleness.
+      writeFileSync(`${dest}.lock`, '999999');
+
+      mockMirrors(makeTarball(home, 'fake-agent-binary'));
+      const path = await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(readFileSync(path, 'utf-8')).toBe('fake-agent-binary');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to install while a live process holds the lock', { timeout: 20_000 }, async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dest = managedAgentBinPath(home);
+      mkdirSync(dirname(dest), { recursive: true });
+      const lock = `${dest}.lock`;
+      // This process is alive — the lock reads as genuinely held, so the
+      // install waits out its deadline and then refuses to proceed
+      // unlocked rather than interleaving sweeps with a slow holder.
+      writeFileSync(lock, String(process.pid));
+
+      mockMirrors(makeTarball(home, 'fake-agent-binary'));
+      await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.0')).rejects.toThrow('install lock');
+      // A refused install must not have touched the managed cache.
+      expect(existsSync(`${dest}.tag`)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a mirror that declares an oversized Content-Length', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dest = managedAgentBinPath(home);
+      const tar = makeTarball(home, 'fake-agent-binary');
+      const sha = createHash('sha256').update(tar).digest('hex');
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        if (u.endsWith('.sha256')) return new Response(sha);
+        if (u.endsWith('.tar.gz')) {
+          if (u.includes('github.com')) return new Response('nope', { status: 404 });
+          // R2 lies: correct bytes, absurd declared size. The cap rejects it
+          // before a byte is buffered; GitHub's 404 then fails the install.
+          return new Response(new Uint8Array(tar), { headers: { 'content-length': '999999999' } });
+        }
+        return new Response('nope', { status: 404 });
+      });
+      await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.0')).rejects.toThrow('verified download failed');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a mirror that streams past the archive byte cap', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dest = managedAgentBinPath(home);
+      const sha = createHash('sha256').update(makeTarball(home, 'x')).digest('hex');
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        if (u.endsWith('.sha256')) return new Response(sha);
+        if (u.endsWith('.tar.gz')) {
+          if (u.includes('github.com')) return new Response('nope', { status: 404 });
+          // No Content-Length: only the streaming cap can stop this body.
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(300 * 1024 * 1024));
+              controller.close();
+            },
+          });
+          return new Response(body);
+        }
+        return new Response('nope', { status: 404 });
+      });
+      await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.0')).rejects.toThrow('verified download failed');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('resolveReleaseTag', () => {
