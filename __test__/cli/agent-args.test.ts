@@ -294,6 +294,16 @@ describe('scanAgentArgs', () => {
       expect(scan.passthrough).toEqual(['agent']);
     });
 
+    it('treats agent -h/--help as a one-shot — the binary prints subcommand help and exits', () => {
+      for (const argv of [['agent', '--help'], ['agent', '-h']]) {
+        const scan = scanAgentArgs(argv);
+        expect(scan.grokOneShot).toBe(true);
+        // Not mlx-level help: the binary prints the agent subcommand's own help.
+        expect(scan.help).toBe(false);
+        expect(scan.passthrough).toEqual(argv);
+      }
+    });
+
     it('detects a subcommand behind a stripped --models-dir pair', () => {
       const scan = scanAgentArgs(['--models-dir', '/x', 'models']);
       expect(scan.grokOneShot).toBe(true);
@@ -582,7 +592,7 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(0);
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', 'agent']);
-    expect(calls.launch[0]!.needsServer).toBeUndefined();
+    expect(calls.launch[0]!.needsServer).toBe(true);
     expect(calls.launch[0]!.modelsDir).toBe('/fake/models');
   });
 
@@ -760,7 +770,18 @@ describe('run() argv routing', () => {
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '-p', 'hi']);
     expect(calls.launch[0]!.modelsDir).toBe('/fake/models');
-    expect(calls.launch[0]!.needsServer).toBeUndefined();
+    expect(calls.launch[0]!.needsServer).toBe(true);
+  });
+
+  it('keeps the server path when --help is the VALUE of --system-prompt-override', async () => {
+    // The launcher's one-shot decision must come from this routing, not a
+    // raw argv rescan: a `--help` in a value slot is data for the binary.
+    const { deps, calls } = makeDeps();
+    await run(['--system-prompt-override', '--help', '-p', 'hi'], deps);
+    expect(calls.discover).toHaveLength(1);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '--system-prompt-override', '--help', '-p', 'hi']);
+    expect(calls.launch[0]!.needsServer).toBe(true);
   });
 
   it('forwards --models-dir to the launch options, stripped from argv', async () => {

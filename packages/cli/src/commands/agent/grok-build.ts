@@ -51,7 +51,12 @@ export interface GrokAgentLaunchOptions {
   argv: string[];
   /** Models directory for the spawned `mlx serve` (host resolves env/config itself when omitted). */
   modelsDir?: string;
-  /** Headless one-shots (`--version`, `--help`) need no server. */
+  /**
+   * Whether to spawn `mlx serve` before the agent. The CALLER decides from
+   * its value-aware argv scan — the launcher must never rescan `argv`
+   * itself: a `--help`-looking token inside another option's value slot
+   * (`--system-prompt-override --help`) is data, not a one-shot.
+   */
   needsServer?: boolean;
   /** Test seam: custom spawn for the agent binary. */
   spawnAgent?: (bin: string, argv: string[], opts: SpawnOptions) => ChildProcess;
@@ -1184,13 +1189,10 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
 export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<number> {
   const bin = await resolveAgentBinary();
 
-  // One-shots that exit inside the binary (help/version) skip the server.
-  const oneShot =
-    opts.argv.includes('--version') ||
-    opts.argv.includes('-v') ||
-    opts.argv.includes('--help') ||
-    opts.argv.includes('-h');
-  const needsServer = opts.needsServer !== false && !oneShot;
+  // Serving is the caller's routing decision — scanning `argv` again here
+  // would reclassify help/version tokens sitting in a value slot as
+  // one-shots and starve the turn of local inference.
+  const needsServer = opts.needsServer !== false;
 
   let serve: { child: ChildProcess; url: string; token: string } | undefined;
   if (opts.serveUrl !== undefined) {

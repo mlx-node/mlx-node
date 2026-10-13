@@ -68,8 +68,9 @@ export interface AgentArgScan {
   /**
    * The binary answers these BEFORE model resolution and exits — they need no
    * inference server: `--version`/`-v`, or any leading subcommand other than
-   * the interactive default (see {@link GROK_SUBCOMMANDS}). The launcher skips
-   * spawning `mlx serve` for them.
+   * the interactive default (see {@link GROK_SUBCOMMANDS}), plus `agent`
+   * itself when `-h`/`--help` follows (its help also exits early). The
+   * launcher skips spawning `mlx serve` for them.
    */
   grokOneShot: boolean;
   /** Args forwarded to the agent binary in their original order. */
@@ -311,7 +312,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     persistPagedCache,
     help: helpSeen && !isSubcommand,
     update: leadingCommand === 'update',
-    grokOneShot: versionSeen || (isSubcommand && leadingCommand !== 'agent'),
+    grokOneShot: versionSeen || (isSubcommand && (leadingCommand !== 'agent' || helpSeen)),
     passthrough,
   };
 }
@@ -681,5 +682,6 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   process.exitCode = await launch({
     argv: agentArgv,
     modelsDir,
+    needsServer: true,
   });
 }

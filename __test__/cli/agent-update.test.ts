@@ -1,5 +1,6 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import {
   existsSync,
   mkdirSync,
@@ -10,15 +11,18 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { createServer, type Server } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
+import { createServer, type AddressInfo, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
 import {
   acquireInstallLock,
   agentUpdateStatus,
+  launchGrokAgent,
   leasePinnedManaged,
   applyAgentUpdate,
   downloadAgentBinary,
@@ -1105,5 +1109,84 @@ describe('mlx agent update (run)', () => {
     await run(['update', '--help'], { applyUpdate });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('Usage: mlx agent update'));
     expect(applyUpdate).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `needsServer` is the CALLER's routing decision: `scanAgentArgs` walks argv
+ * value-aware, so a `--help`/`--version` token sitting in another option's
+ * value slot stays data. The launcher must honor `opts.needsServer` verbatim
+ * — a raw `argv.includes('--help')` rescan here would starve turns like
+ * `--system-prompt-override --help` of the inference host.
+ */
+describe('launchGrokAgent server gating', () => {
+  let root: string;
+  let health: ReturnType<typeof createHttpServer>;
+  let serveBase: string;
+  let savedAgentBin: string | undefined;
+  let savedAgentTag: string | undefined;
+
+  const spawnServe = vi.fn((_argv: string[], _so: SpawnOptions) => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      kill: vi.fn(),
+    });
+    child.stdout.end(`listening on ${serveBase}\n`);
+    return child as unknown as ChildProcess;
+  });
+
+  function spawnAgent(_bin: string, _argv: string[], so: SpawnOptions): ChildProcess {
+    spawnAgent.envs.push(so.env ?? {});
+    const agent = Object.assign(new EventEmitter(), { kill: vi.fn() }) as unknown as ChildProcess;
+    queueMicrotask(() => agent.emit('exit', 0));
+    return agent;
+  }
+  spawnAgent.envs = [] as NodeJS.ProcessEnv[];
+
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), 'launch-grok-'));
+    const bin = join(root, 'mlx-agent');
+    writeFileSync(bin, 'x');
+    savedAgentBin = process.env[MLX_AGENT_BIN_ENV];
+    savedAgentTag = process.env[MLX_AGENT_TAG_ENV];
+    process.env[MLX_AGENT_BIN_ENV] = bin;
+    delete process.env[MLX_AGENT_TAG_ENV];
+    health = createHttpServer((_, res) => res.end('ok'));
+    await new Promise<void>((resolvePromise) => health.listen(0, '127.0.0.1', resolvePromise));
+    serveBase = `http://127.0.0.1:${(health.address() as AddressInfo).port}`;
+    spawnServe.mockClear();
+    spawnAgent.envs.length = 0;
+  });
+
+  afterEach(async () => {
+    if (savedAgentBin === undefined) delete process.env[MLX_AGENT_BIN_ENV];
+    else process.env[MLX_AGENT_BIN_ENV] = savedAgentBin;
+    if (savedAgentTag === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+    else process.env[MLX_AGENT_TAG_ENV] = savedAgentTag;
+    await new Promise<void>((resolvePromise) => health.close(() => resolvePromise()));
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('serves on an unset needsServer even when argv contains a --help-looking token', async () => {
+    const code = await launchGrokAgent({
+      argv: ['--system-prompt-override', '--help', '-p', 'hi'],
+      spawnServe,
+      spawnAgent,
+    });
+    expect(code).toBe(0);
+    expect(spawnServe).toHaveBeenCalledOnce();
+    expect(spawnAgent.envs[0]!.GROK_MODELS_BASE_URL).toBe(`${serveBase}/v1`);
+  });
+
+  it('skips the server only when the caller sets needsServer: false', async () => {
+    const code = await launchGrokAgent({
+      argv: ['--version'],
+      needsServer: false,
+      spawnServe,
+      spawnAgent,
+    });
+    expect(code).toBe(0);
+    expect(spawnServe).not.toHaveBeenCalled();
+    expect(spawnAgent.envs[0]!.GROK_MODELS_BASE_URL).toBeUndefined();
   });
 });
