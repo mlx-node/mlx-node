@@ -228,9 +228,11 @@ export async function resolveAgentBinary(
   const managed = managedAgentBinPath(homeDir);
   const probe = probeAgentInstall(repoRoot, env, homeDir);
   const probed = probe.path;
-  if (probed === undefined) return downloadAgentBinary(managed);
-
+  // Pass the caller's pin through explicitly: resolveReleaseTag reads
+  // process.env, which can diverge from the env this call probed under.
   const pin = releasePin(env);
+  if (probed === undefined) return downloadAgentBinary(managed, pin, env);
+
   if (pin === undefined || probe.source !== 'managed' || probe.effectiveTag !== pin) {
     return probed;
   }
@@ -255,7 +257,7 @@ export async function resolveAgentBinary(
   }
   // Swept between probe and lock — the launcher must download the pin.
   // The lock is released first: downloadAgentBinary acquires it itself.
-  return survived ? probed : downloadAgentBinary(managed);
+  return survived ? probed : downloadAgentBinary(managed, pin, env);
 }
 
 /** Tag marker written beside a downloaded/bundled binary, e.g. `mlx-agent-v0.2.0`. */
@@ -490,7 +492,11 @@ async function releaseChecksum(tag: string, asset: string): Promise<string | und
  * `MLX_AGENT_TAG` pin is a side-install: the pointer (the unpinned default
  * release) is left alone. Returns the versioned path.
  */
-export async function downloadAgentBinary(dest: string, tag?: string): Promise<string> {
+export async function downloadAgentBinary(
+  dest: string,
+  tag?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
   tag ??= await resolveReleaseTag();
   const versioned = join(dirname(dest), agentBinName(tag));
   // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
@@ -590,7 +596,7 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
     // resolve the versioned file directly, so repointing the pointer would
     // silently change the default release for every unpinned launch (and
     // let the sweep delete the previously active binary).
-    const pin = releasePin();
+    const pin = releasePin(env);
     const sideInstall = pin !== undefined && pin === tag;
     // Snapshot the pointer BEFORE the flip — it is the release unpinned
     // launches currently run, so the sweep must keep it.
