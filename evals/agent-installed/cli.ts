@@ -8,7 +8,12 @@ import { StringDecoder } from 'node:string_decoder';
 
 import { parseLocalJson } from '../../packages/agent/src/delegate.js';
 import { agentConfigDir } from '../../packages/agent/src/paths.js';
-import { probeAgentInstall } from '../../packages/cli/src/commands/agent/grok-build.js';
+import {
+  leasePinnedManaged,
+  managedAgentBinPath,
+  probeAgentInstall,
+  MLX_AGENT_TAG_ENV,
+} from '../../packages/cli/src/commands/agent/grok-build.js';
 import { chooseDefaultModel, readPersistedDefaultModel } from '../../packages/cli/src/commands/agent/index.js';
 import { DELEGATE_DEFAULT_ARGS } from '../../packages/cli/src/commands/delegate.js';
 import {
@@ -157,7 +162,24 @@ export class AgentCli {
     if (probe.path === undefined) {
       throw new Error('No mlx-agent binary found. Build or install one before running the eval.');
     }
-    this.bin = probe.path;
+    // A pinned managed hit is only leased best-effort by the probe — the
+    // marker was written outside the install lock, so a sweep that
+    // snapshotted just before it can still delete the binary during model
+    // discovery and serve startup. Re-lease under the lock and re-verify,
+    // like the launcher does in resolveAgentBinary; a swept pin fails here
+    // instead of at spawn with ENOENT.
+    let bin = probe.path;
+    if (
+      probe.source === 'managed' &&
+      probe.effectiveTag !== undefined &&
+      probe.effectiveTag === process.env[MLX_AGENT_TAG_ENV]
+    ) {
+      bin = (await leasePinnedManaged(managedAgentBinPath(), probe.path)) ?? probe.path;
+      if (!existsSync(bin)) {
+        throw new Error(`The pinned mlx-agent release was swept during eval startup: ${probe.path}`);
+      }
+    }
+    this.bin = bin;
 
     const modelsDir = resolveModelsDir();
     const models = (await discoverLocalChatModels(modelsDir)).map((model) => model.name);

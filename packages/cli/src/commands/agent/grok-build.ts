@@ -236,11 +236,21 @@ export async function resolveAgentBinary(
   if (pin === undefined || probe.source !== 'managed' || probe.effectiveTag !== pin) {
     return probed;
   }
-  // A pinned managed hit must be leased UNDER the install lock: the probe's
-  // unlocked lease can be missed by a sweep that snapshotted the directory
-  // just before it, and the same window can have deleted the binary
-  // outright — so re-verify before trusting the path. Serialization with
-  // the sweep's lease scan is what makes the marker reliable.
+  // Swept between probe and lock → download the pin. The lock is released
+  // inside the helper first: downloadAgentBinary acquires it itself.
+  return (await leasePinnedManaged(managed, probed)) ?? downloadAgentBinary(managed, pin, env);
+}
+
+/**
+ * Serialize a cached pinned binary's lease against the install sweep and
+ * confirm it survived until the locked re-verify. The probe's unlocked
+ * lease can be missed by a sweep that snapshotted the directory just
+ * before it — and can lose the binary outright — so every caller that
+ * retains a pinned managed path (the launcher above, the evals harness)
+ * must run this before trusting it. Returns the path, or undefined when a
+ * sweep deleted it first and the caller must download or abort.
+ */
+export async function leasePinnedManaged(managed: string, probed: string): Promise<string | undefined> {
   await acquireInstallLock(`${managed}.lock`);
   let survived = false;
   try {
@@ -255,9 +265,7 @@ export async function resolveAgentBinary(
   } finally {
     releaseInstallLock(`${managed}.lock`);
   }
-  // Swept between probe and lock — the launcher must download the pin.
-  // The lock is released first: downloadAgentBinary acquires it itself.
-  return survived ? probed : downloadAgentBinary(managed, pin, env);
+  return survived ? probed : undefined;
 }
 
 /** Tag marker written beside a downloaded/bundled binary, e.g. `mlx-agent-v0.2.0`. */
@@ -962,11 +970,16 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
       }
       // Lowest ticket wins; equal tickets break on pid then seq. Members
       // that advertised after us carry a strictly higher ticket by the
-      // choose phase above.
+      // choose phase above. Our OWN marker must be in the scan: a unix
+      // member suspended past MEMBER_STALE_MS between node creation and
+      // listen gets swept as aged/refused, and resuming to an every()
+      // that contains only higher tickets would grant the lock a second
+      // time while another process holds it. Missing own marker → wait
+      // out the deadline rather than enter.
       const us = (m: LockMember) => m.ticket === ticket && m.pid === process.pid && m.seq === seq;
       const behind = (m: LockMember) =>
         m.ticket > ticket || (m.ticket === ticket && (m.pid > process.pid || (m.pid === process.pid && m.seq > seq)));
-      if (scan.members.every((m) => us(m) || behind(m))) {
+      if (scan.members.some(us) && scan.members.every((m) => us(m) || behind(m))) {
         HELD_INSTALL_LOCKS.set(path, { server, marker });
         return;
       }

@@ -19,6 +19,7 @@ import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 import {
   acquireInstallLock,
   agentUpdateStatus,
+  leasePinnedManaged,
   applyAgentUpdate,
   downloadAgentBinary,
   managedAgentBinPath,
@@ -262,6 +263,25 @@ describe('resolveAgentBinary', () => {
       expect(bin).toBe(versioned(home, 'mlx-agent-v0.2.0'));
       // A pinned download is a side-install: the unpinned pointer is untouched.
       expect(readFileSync(`${managedAgentBinPath(home)}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('leasePinnedManaged re-verifies under the lock and reports a swept binary', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
+    try {
+      mkdirBin(home);
+      const bin = versioned(home, 'mlx-agent-v0.2.0');
+      writeFileSync(bin, 'v020');
+      const managed = managedAgentBinPath(home);
+      // Present → locked lease written, path returned.
+      expect(await leasePinnedManaged(managed, bin)).toBe(bin);
+      expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(true);
+      // Swept before the locked recheck → undefined, so the caller
+      // downloads instead of spawning ENOENT.
+      rmSync(bin);
+      expect(await leasePinnedManaged(managed, bin)).toBeUndefined();
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -601,6 +621,68 @@ describe('downloadAgentBinary', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it(
+    'refuses the grant when our own marker was swept and only higher tickets remain',
+    { timeout: 20_000 },
+    async () => {
+      // On Windows nothing sweeps a live-pid marker, so the scenario is
+      // unix-only: a member suspended past the stale bound between socket
+      // node creation and listen gets its live marker removed; on resume,
+      // every() alone can pass over the winner's higher ticket.
+      if (process.platform === 'win32') return;
+      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+      const lock = join(home, 'mlx-agent.lock');
+      const dir = `${lock}.d`;
+      const servers: Server[] = [];
+      const listenAt = async (name: string): Promise<void> => {
+        const server = createServer((sock) => sock.destroy());
+        servers.push(server);
+        await new Promise<void>((res, rej) => {
+          server.once('error', rej);
+          server.listen(join(dir, name), res);
+        });
+      };
+      try {
+        mkdirSync(dir, { recursive: true });
+        // An ahead member keeps our acquire polling until the watcher
+        // fires; it is swept alongside our marker below.
+        const ahead = `b-1-${process.pid}-0`;
+        await listenAt(ahead);
+        let swapped = false;
+        // Simulate the racing sweeper: as soon as our marker exists,
+        // delete it plus the ahead member and advertise the winner's
+        // higher ticket — the state a suspended-then-resumed contender
+        // would find on its next scan.
+        const watcher = setInterval(() => {
+          if (swapped) return;
+          try {
+            const ours = readdirSync(dir).find(
+              (e) => /^b-\d+-\d+-\d+$/.test(e) && e !== ahead && e !== `b-99-${process.pid}-0`,
+            );
+            if (ours === undefined) return;
+            swapped = true;
+            rmSync(join(dir, ours), { force: true });
+            rmSync(join(dir, ahead), { force: true });
+            void listenAt(`b-99-${process.pid}-0`);
+          } catch {
+            // retry on the next tick
+          }
+        }, 5);
+        try {
+          await expect(acquireInstallLock(lock, { deadlineMs: 1_500 })).rejects.toThrow('install lock');
+          expect(swapped).toBe(true);
+        } finally {
+          clearInterval(watcher);
+        }
+      } finally {
+        for (const server of servers) {
+          server.close();
+        }
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('sweeps an aged choose marker even while its pid is alive', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
