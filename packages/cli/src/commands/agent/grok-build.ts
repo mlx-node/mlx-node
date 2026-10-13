@@ -234,7 +234,23 @@ export async function resolveAgentBinary(
   // Pass the caller's pin through explicitly: resolveReleaseCandidates reads
   // process.env, which can diverge from the env this call probed under.
   const pin = releasePin(env);
-  if (probed === undefined) return downloadAgentBinary(managed, pin, env);
+  // A fresh download holds the lock until installAgentRelease returns,
+  // then releases it — a concurrent updater's sweep can still delete the
+  // new binary before the launcher finishes serve startup and spawns
+  // (a same-tag retry keeps only its tag + the previous pointer). Same
+  // rule as the probe: no managed path leaves this function unleased.
+  const download = async (): Promise<string> => {
+    let path = await downloadAgentBinary(managed, pin, env);
+    if ((await leasePinnedManaged(managed, path)) === undefined) {
+      // Swept before the lease landed — retry once, then trust the result:
+      // a third party outpacing two consecutive downloads is pathological,
+      // and spawn fails ENOENT just as it would without this fix.
+      path = await downloadAgentBinary(managed, pin, env);
+      await leasePinnedManaged(managed, path);
+    }
+    return path;
+  };
+  if (probed === undefined) return download();
 
   // Any managed path — pinned or pointer-resolved — is leased under the
   // install lock before it is returned: the launcher spawns it only after
@@ -245,7 +261,7 @@ export async function resolveAgentBinary(
   if (probe.source !== 'managed') return probed;
   // Swept between probe and lock → download. The lock is released inside
   // the helper first: downloadAgentBinary acquires it itself.
-  return (await leasePinnedManaged(managed, probed)) ?? downloadAgentBinary(managed, pin, env);
+  return (await leasePinnedManaged(managed, probed)) ?? download();
 }
 
 /**

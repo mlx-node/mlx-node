@@ -280,6 +280,33 @@ describe('resolveAgentBinary', () => {
     }
   });
 
+  it('leases a cache miss too — the download is not safe from the next sweep', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
+    try {
+      mkdirBin(home);
+      const file = join(home, 'agent-bin');
+      writeFileSync(file, 'v030');
+      const packed = spawnSync('tar', ['-czf', '-', '-C', home, 'agent-bin']);
+      rmSync(file, { force: true });
+      const sha = createHash('sha256').update(packed.stdout).digest('hex');
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        if (u.endsWith('.sha256')) return new Response(sha);
+        if (u.endsWith('.tar.gz')) return new Response(new Uint8Array(packed.stdout));
+        return new Response('nope', { status: 404 });
+      });
+      // Nothing cached and metadata 404s → the download path must return
+      // the fallback (minimum) binary already leased under the lock, or a
+      // second install's sweep can remove it before the launcher finishes
+      // serve startup.
+      const bin = await resolveAgentBinary(home, {}, home);
+      expect(bin).toBe(versioned(home, MLX_AGENT_MIN_RELEASE));
+      expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('downloads the pinned release when the cache cannot satisfy it', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
     try {
@@ -305,6 +332,9 @@ describe('resolveAgentBinary', () => {
       expect(bin).toBe(versioned(home, 'mlx-agent-v0.2.0'));
       // A pinned download is a side-install: the unpinned pointer is untouched.
       expect(readFileSync(`${managedAgentBinPath(home)}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      // Freshly downloaded managed binaries carry the same locked lease as
+      // cache hits — a concurrent updater's sweep must see it before spawn.
+      expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(true);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
