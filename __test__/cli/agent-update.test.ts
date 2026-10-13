@@ -327,6 +327,8 @@ describe('downloadAgentBinary', () => {
       mkdirSync(dirname(dest), { recursive: true });
       const { utimesSync } = await import('node:fs');
       const lock = `${dest}.lock`;
+      // An aged lock whose recorded holder is dead is stolen — and with the
+      // new ownership rule a dead-pid lock is stolen regardless of age.
       writeFileSync(lock, '999999');
       const stale = new Date(Date.now() - 60_000);
       utimesSync(lock, stale, stale);
@@ -361,11 +363,14 @@ describe('downloadAgentBinary', () => {
     try {
       const dest = managedAgentBinPath(home);
       mkdirSync(dirname(dest), { recursive: true });
+      const { utimesSync } = await import('node:fs');
       const lock = `${dest}.lock`;
-      // This process is alive — the lock reads as genuinely held, so the
-      // install waits out its deadline and then refuses to proceed
-      // unlocked rather than interleaving sweeps with a slow holder.
+      // This process is alive — even an AGED lock reads as genuinely held,
+      // so the install waits out its deadline and then refuses to proceed
+      // unlocked rather than stealing a slow holder's critical section.
       writeFileSync(lock, String(process.pid));
+      const aged = new Date(Date.now() - 60_000);
+      utimesSync(lock, aged, aged);
 
       mockMirrors(makeTarball(home, 'fake-agent-binary'));
       await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.0')).rejects.toThrow('install lock');
@@ -458,6 +463,24 @@ describe('resolveReleaseTag', () => {
       return githubLatest('mlx-agent-v0.3.0');
     });
     await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+  });
+
+  it('falls through to GitHub when the R2 latest pointer streams past the byte cap', async () => {
+    fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      if (u.includes('github.com')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.3.0' }));
+      // A hostile R2 streams an unbounded body before the tag can be read;
+      // the cap rejects it instead of buffering it all.
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(8 * 1024 * 1024));
+            controller.close();
+          },
+        }),
+      );
+    });
+    expect(await resolveReleaseTag()).toBe('mlx-agent-v0.3.0');
   });
 
   it('falls back to the minimum when every discovered tag is below it', async () => {

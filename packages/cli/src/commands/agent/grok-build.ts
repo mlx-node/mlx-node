@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -303,11 +303,15 @@ export async function resolveReleaseTag(): Promise<string> {
       signal: AbortSignal.timeout(10_000),
     });
     if (res.ok) {
-      const tag = (await res.text()).trim();
+      // The tag pointer is a handful of bytes — cap the buffered body so a
+      // hostile mirror cannot stream an unbounded response before the
+      // GitHub fallback gets a chance.
+      const body = await readCappedBody(res, MAX_META_RESPONSE_BYTES);
+      const tag = body?.toString('utf-8').trim();
       // Syntax alone is not enough: a stale or rolled-back pointer can name a
       // release below this CLI's floor. Anything the pipeline publishes is
       // accepted once it clears the minimum.
-      if (tagVersion(tag) && compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0) return tag;
+      if (tag && tagVersion(tag) && compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0) return tag;
     }
   } catch {
     // fall through to GitHub
@@ -319,7 +323,9 @@ export async function resolveReleaseTag(): Promise<string> {
       signal: AbortSignal.timeout(10_000),
     });
     if (res.ok) {
-      const tag = ((await res.json()) as { tag_name?: string }).tag_name?.trim();
+      const body = await readCappedBody(res, MAX_META_RESPONSE_BYTES);
+      const tag =
+        body !== undefined ? (JSON.parse(body.toString('utf-8')) as { tag_name?: string }).tag_name?.trim() : undefined;
       if (tag && tagVersion(tag) && compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0) return tag;
     }
   } catch {
@@ -329,10 +335,55 @@ export async function resolveReleaseTag(): Promise<string> {
   return MLX_AGENT_MIN_RELEASE;
 }
 
+/**
+ * Byte cap for metadata fetches (the `latest` tag pointer, `.sha256`
+ * checksums, the releases API reply): a valid payload is a few KB, so
+ * anything bigger is a hostile or misconfigured mirror — `res.text()` /
+ * `res.json()` would otherwise buffer an unbounded body before the
+ * fallback gets a chance.
+ */
+const MAX_META_RESPONSE_BYTES = 64 * 1024;
+
+/**
+ * Read a response body with a hard byte ceiling. A truthful oversized
+ * Content-Length short-circuits without reading; a lying or absent one is
+ * caught mid-stream and the reader is cancelled. Returns undefined when
+ * the body exceeds `cap` so the caller falls through to the next source.
+ */
+async function readCappedBody(res: Response, cap: number): Promise<Buffer | undefined> {
+  if (res.body === null) return Buffer.alloc(0);
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > cap) return undefined;
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let over = false;
+  const reader = res.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) {
+        over = true;
+        break;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    if (over) {
+      reader.cancel().catch(() => {});
+    }
+  }
+  return over ? undefined : Buffer.concat(chunks);
+}
+
 async function fetchText(url: string): Promise<string | undefined> {
   try {
     const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(15_000) });
-    if (res.ok) return (await res.text()).trim();
+    if (!res.ok) return undefined;
+    const body = await readCappedBody(res, MAX_META_RESPONSE_BYTES);
+    if (body === undefined) return undefined;
+    return body.toString('utf-8').trim();
   } catch {
     // caller falls through
   }
@@ -551,15 +602,15 @@ function pidAlive(pid: number): boolean {
 /**
  * Serialize the install critical section across processes. `<dest>.lock` is
  * created with `wx` (fails while held) and records the holder's pid. A
- * leftover lock is stolen only when ownership proves stale — the recorded
- * holder is dead, or the file outlived the threshold with an unreadable or
- * reused holder — never merely because a waiter timed out. Once the
+ * leftover lock is stolen ONLY when its recorded owner is demonstrably dead
+ * — never on age alone: a suspended or slow holder past any age threshold
+ * would lose its lock and then delete the thief's lock in releaseInstallLock,
+ * reopening the interleaved-sweep race the lock exists to prevent. Once the
  * deadline passes the caller must FAIL rather than proceed unlocked: the
  * pointer-flip/sweep section is unsafe to enter while a holder may still be
  * inside it, so this function throws instead of returning.
  */
 function acquireInstallLock(path: string): void {
-  const STALE_MS = 30_000;
   const DEADLINE_MS = 10_000;
   const deadline = Date.now() + DEADLINE_MS;
   while (true) {
@@ -569,11 +620,12 @@ function acquireInstallLock(path: string): void {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       try {
-        const st = statSync(path);
         const holder = Number(readFileSync(path, 'utf-8').trim());
-        // Stale ownership: the recorded pid is gone (pid reuse accepted) or
-        // the lock outlived its threshold — take it and retry the create.
-        if ((Number.isInteger(holder) && holder > 0 && !pidAlive(holder)) || Date.now() - st.mtimeMs > STALE_MS) {
+        // Dead-owner steal: the recorded pid is gone (pid reuse accepted).
+        // An unreadable owner — empty or garbage — cannot prove a live
+        // holder either, so it is stolen the same way. Any lock whose owner
+        // is alive is left alone regardless of age.
+        if (!Number.isInteger(holder) || holder <= 0 || !pidAlive(holder)) {
           rmSync(path, { force: true });
           continue;
         }
