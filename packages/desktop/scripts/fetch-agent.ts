@@ -19,20 +19,21 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..', '..');
 // `dist` — this script runs after `yarn build`, and the source condition does
 // not apply to the release scripts' oxnode invocation.
-const { downloadAgentBinary, resolveReleaseTag } = await import(
+const { downloadAgentBinary, agentTagFromBinPath } = await import(
   join(REPO_ROOT, 'packages', 'cli', 'dist', 'commands', 'agent', 'grok-build.js')
 );
 
 const dest = join(HERE, '..', 'out', 'agent', 'mlx-agent');
 mkdirSync(dirname(dest), { recursive: true });
 // dest is the managed base path: the binary lands at the sibling
-// `mlx-agent-v<tag>` file the `.tag` pointer names. Resolve the tag
-// explicitly and stamp `${dest}.tag` ourselves — a pinned build
-// (MLX_AGENT_TAG) side-installs and deliberately skips that pointer, so a
-// fresh pinned package would otherwise ship unversioned (or, in a reused
-// out/agent dir, carry an older build's tag).
-const tag = await resolveReleaseTag();
-const path = await downloadAgentBinary(dest, tag);
+// `mlx-agent-v<tag>` file the `.tag` pointer names. No explicit tag — the
+// downloader walks its verified-candidate list, so a latest that verifies
+// but cannot be fetched still yields an older complete release instead of
+// failing the packaging run. The tag is read back from the installed path
+// rather than assumed: the pin (or a fallback) may name another release.
+const path = await downloadAgentBinary(dest);
+const tag = agentTagFromBinPath(path);
+if (tag === undefined) throw new Error(`cannot determine the release tag for ${path}`);
 renameSync(path, dest);
 writeFileSync(`${dest}.tag`, tag, { mode: 0o644 });
 chmodSync(dest, 0o755);

@@ -21,6 +21,7 @@ import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
 import {
   acquireInstallLock,
+  agentTagFromBinPath,
   agentUpdateStatus,
   launchGrokAgent,
   leasePinnedManaged,
@@ -1011,6 +1012,19 @@ describe('resolveReleaseTag', () => {
     expect(await resolveReleaseTag()).toBe('mlx-agent-v0.3.0');
   });
 
+  it('prefers the newer GitHub latest over a lagging but installable R2 pointer', async () => {
+    fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      if (u.endsWith('.sha256')) return new Response(DIGEST);
+      if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
+      // Mirror order is not version order: R2 still names the older v0.2.0
+      // while GitHub's latest is v0.3.0 — the newest verified tag must win.
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.2.0');
+      return githubLatest('mlx-agent-v0.3.0');
+    });
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+  });
+
   it('falls back to the minimum when every discovered tag is below it', async () => {
     fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
       const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
@@ -1128,8 +1142,8 @@ describe('agentUpdateStatus', () => {
 
 describe('applyAgentUpdate', () => {
   it('downloads into the managed path when newer and reports the new current', async () => {
-    const download = vi.fn(async (dest: string, tag: string) => {
-      writeFileSync(`${dest}.tag`, tag);
+    const download = vi.fn(async (dest: string, tag?: string) => {
+      writeFileSync(`${dest}.tag`, tag ?? 'unpinned');
       return dest;
     });
     const dir = mkdtempSync(join(tmpdir(), 'agent-update-'));
@@ -1159,6 +1173,42 @@ describe('applyAgentUpdate', () => {
     });
     expect(downloaded).toBe(false);
     expect(download).not.toHaveBeenCalled();
+  });
+
+  it('retries the candidate walk when the latest tag cannot be fetched', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-update-'));
+    try {
+      const managed = join(dir, 'mlx-agent');
+      const download = vi.fn(async (dest: string, tag?: string) => {
+        if (tag !== undefined) throw new Error('archive vanished between resolve and fetch');
+        // The fallback (undefined = candidate walk) lands the older release.
+        writeFileSync(`${dest}.tag`, 'mlx-agent-v0.2.0');
+        return join(dir, 'mlx-agent-v0.2.0');
+      });
+      const { status: s, downloaded } = await applyAgentUpdate({
+        probe: status({ managedTag: undefined, effectiveTag: undefined, source: 'none', path: undefined }),
+        resolveTag: async () => 'mlx-agent-v0.3.0',
+        managedPath: managed,
+        download,
+      });
+      expect(downloaded).toBe(true);
+      expect(download).toHaveBeenNthCalledWith(1, managed, 'mlx-agent-v0.3.0');
+      expect(download).toHaveBeenNthCalledWith(2, managed, undefined);
+      // current reports the ACTUALLY installed tag, not the requested one.
+      expect(s.current).toBe('mlx-agent-v0.2.0');
+      expect(s.latest).toBe('mlx-agent-v0.3.0');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('agentTagFromBinPath', () => {
+  it('reads the release tag back from a versioned install path', () => {
+    expect(agentTagFromBinPath('/cache/mlx-agent-v1.2.3')).toBe('mlx-agent-v1.2.3');
+    expect(agentTagFromBinPath('/cache/mlx-agent-v1.2.3.exe')).toBe('mlx-agent-v1.2.3');
+    expect(agentTagFromBinPath('/cache/mlx-agent')).toBeUndefined();
+    expect(agentTagFromBinPath('/cache/not-a-tag.bin')).toBeUndefined();
   });
 });
 

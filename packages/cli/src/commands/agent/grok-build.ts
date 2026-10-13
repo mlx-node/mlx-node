@@ -25,7 +25,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
@@ -383,10 +383,11 @@ function agentAssetName(tag: string): string {
 }
 
 /**
- * Ordered download candidates, best first: the `MLX_AGENT_TAG` override
- * alone (a pin requests exactly one release), then the R2 `latest`
- * pointer and GitHub's /releases/latest — each only when it verifies
- * installable — then the baked minimum as the unconditional last resort.
+ * Ordered download candidates, NEWEST verified first: the `MLX_AGENT_TAG`
+ * override alone (a pin requests exactly one release), then the R2
+ * `latest` pointer and GitHub's /releases/latest — each only when it
+ * verifies installable — sorted by version so mirror order never outranks
+ * a newer release, then the baked minimum as the last resort.
  * Fork releases can ship at any cadence and a CLI rebuild picks them up
  * with no pin bump.
  */
@@ -443,12 +444,16 @@ async function resolveReleaseCandidates(env: NodeJS.ProcessEnv = process.env): P
     // fall through to the baked minimum
   }
 
-  candidates.push(MLX_AGENT_MIN_RELEASE);
+  // Mirror order is not version order: a stale-but-valid R2 pointer must
+  // not outrank a newer GitHub latest — the NEWEST verified tag is what
+  // `latest` means, with the rest kept as fallbacks.
+  candidates.sort((a, b) => compareReleaseTags(b, a));
+  if (!candidates.includes(MLX_AGENT_MIN_RELEASE)) candidates.push(MLX_AGENT_MIN_RELEASE);
   return candidates;
 }
 
 /**
- * Which release tag to download — the first installable candidate. All
+ * Which release tag to download — the newest installable candidate. All
  * consumers (`mlx agent update` status, the desktop fetch step) get the
  * mirror-verification semantics for free.
  */
@@ -593,7 +598,10 @@ async function releaseArchiveReachable(tag: string, asset: string): Promise<bool
  * A tag is a download candidate only when its archive exists on some
  * mirror AND a parseable checksum exists on the GitHub release — the two
  * things downloadAgentBinary will need. Missing either means this tag can
- * only fail, so resolution must not stop here.
+ * only fail, so resolution must not stop here. Presence is deliberately
+ * all this checks: hashing a ~100MB body during resolution would tax every
+ * `update --check`, and a candidate that lies about its bytes is caught by
+ * the digest at download time, where the next candidate gets a turn.
  */
 async function releaseInstallable(tag: string, asset: string): Promise<boolean> {
   return (await releaseChecksum(tag, asset)) !== undefined && (await releaseArchiveReachable(tag, asset));
@@ -1266,7 +1274,8 @@ export interface AgentUpdateDeps {
   resolveTag?: () => Promise<string>;
   probe?: () => AgentInstallProbe;
   managedPath?: string;
-  download?: (dest: string, tag: string) => Promise<string>;
+  /** `tag === undefined` asks the downloader to walk its candidate list. */
+  download?: (dest: string, tag?: string) => Promise<string>;
 }
 
 /**
@@ -1314,8 +1323,31 @@ export async function applyAgentUpdate(
   const status = await agentUpdateStatus(deps);
   if (!status.updateAvailable) return { status, downloaded: false };
   const download = deps.download ?? downloadAgentBinary;
-  await download(status.managedPath, status.latest);
-  return { status: { ...status, current: status.latest, updateAvailable: false }, downloaded: true };
+  try {
+    await download(status.managedPath, status.latest);
+  } catch {
+    // The latest tag verified at resolve time but cannot be fetched now
+    // (corrupt mirror bytes, assets pulled mid-flight). Retry unpinned:
+    // the downloader walks its verified-candidate list, so an older
+    // complete release still lands rather than failing the update.
+    await download(status.managedPath, undefined);
+  }
+  // Report what actually installed — a fallback may have landed an older
+  // candidate, so `latest` is not the truth. The pin wins when set (side
+  // installs deliberately skip the pointer).
+  const current = releasePin() ?? readAgentTag(status.managedPath) ?? status.latest;
+  return { status: { ...status, current, updateAvailable: false }, downloaded: true };
+}
+
+/**
+ * The release tag a versioned install path encodes (`…/mlx-agent-v1.2.3[.exe]`).
+ * Lets packaging stamp the tag it actually downloaded rather than the tag
+ * it asked for — a candidate fallback may have landed an older release.
+ */
+export function agentTagFromBinPath(path: string): string | undefined {
+  const name = basename(path);
+  const tag = name.endsWith('.exe') ? name.slice(0, -'.exe'.length) : name;
+  return tagVersion(tag) !== null ? tag : undefined;
 }
 
 /**
