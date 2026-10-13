@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ChatResult, ColdCacheStats, ColdSidecarStats } from '@mlx-node/core';
-import type { ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { MetricsTrace, type MetricsTraceRecord } from '../../packages/server/src/metrics-trace.js';
@@ -538,6 +538,34 @@ describe('TurnTraceModel', () => {
     expect(model.supportsImages).toBeUndefined();
     expect(model.releaseCacheOwner).toBeUndefined();
   });
+
+  it.each([
+    { className: 'NemotronHModel', autoEnabled: false, enableMtp: undefined },
+    { className: 'Qwen35Model', autoEnabled: true, enableMtp: true },
+  ])(
+    'preserves the inner proto-walk MTP verdict for a getter-less $className',
+    async ({ className, autoEnabled, enableMtp }) => {
+      // The wrapper's own `TurnTraceModel` proto matches nothing, so
+      // `ChatSession`'s suppressed-class fallback must run on the INNER
+      // chain — the synthesized `mtpAutoEnabled` forwarder is what carries it.
+      const Ctor = { [className]: class {} }[className]!;
+      const inner = Object.assign(Object.create(Ctor.prototype) as object, makeInner(), {
+        hasMtpWeights: vi.fn(() => true),
+      }) as SessionCapableModel;
+      const model = new TurnTraceModel(inner, {
+        modelName: 'm',
+        trace: new MetricsTrace({ dir, now: () => FIXED_NOW }),
+        watermarks: { cold: {}, sidecar: {} },
+      });
+
+      expect(model.mtpAutoEnabled?.()).toBe(autoEnabled);
+
+      const session = new ChatSession(model);
+      await session.send('Hello');
+      const [, config] = (inner.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      expect(config?.enableMtp).toBe(enableMtp);
+    },
+  );
 });
 
 describe('SessionRegistry trace hook', () => {

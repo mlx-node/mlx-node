@@ -134,6 +134,35 @@ const NATIVE_DEFAULT_MAX_NEW_TOKENS = 2048;
 const MTP_AUTO_DEFAULT_SUPPRESSED_MODELS: ReadonlySet<string> = new Set(['NemotronHModel']);
 
 /**
+ * Whether an MTP-capable model wants `enableMtp` on for a caller who set
+ * nothing. `mtpAutoEnabled()` is authoritative in both directions when
+ * present; otherwise {@link MTP_AUTO_DEFAULT_SUPPRESSED_MODELS} is matched
+ * along the prototype CHAIN rather than by a bare `constructor.name`, so it
+ * still fires through the `makeStreamingModel` wrapper subclass that
+ * `@mlx-node/lm` actually hands to `ChatSession`.
+ *
+ * Exported for model wrappers that hide the inner prototype chain (the
+ * server's per-turn tracer): they forward this verdict for the model they
+ * wrap instead of letting the fallback see only their own class.
+ */
+export function mtpAutoDefaultAllowed(model: SessionCapableModel): boolean {
+  if (typeof model.mtpAutoEnabled === 'function') {
+    return model.mtpAutoEnabled();
+  }
+  for (
+    let proto: object | null = Object.getPrototypeOf(model) as object | null;
+    proto !== null;
+    proto = Object.getPrototypeOf(proto) as object | null
+  ) {
+    const name = (proto as { constructor?: { name?: string } }).constructor?.name;
+    if (name !== undefined && MTP_AUTO_DEFAULT_SUPPRESSED_MODELS.has(name)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Stable, provider-neutral error raised before native inference when a
  * rendered prompt cannot fit in the model's physically available hot KV
  * window. The marker is intentionally the canonical string agent-side
@@ -1910,29 +1939,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     return merged;
   }
 
-  /**
-   * Whether an MTP-capable model wants `enableMtp` on for a caller who set
-   * nothing. `mtpAutoEnabled()` is authoritative in both directions when
-   * present; otherwise {@link MTP_AUTO_DEFAULT_SUPPRESSED_MODELS} is matched
-   * along the prototype CHAIN rather than by a bare `constructor.name`, so it
-   * still fires through the `makeStreamingModel` wrapper subclass that
-   * `@mlx-node/lm` actually hands to `ChatSession`.
-   */
+  /** See {@link mtpAutoDefaultAllowed} for the getter-then-prototype-walk policy. */
   private mtpAutoDefaultAllowed(): boolean {
-    if (typeof this.model.mtpAutoEnabled === 'function') {
-      return this.model.mtpAutoEnabled();
-    }
-    for (
-      let proto: object | null = Object.getPrototypeOf(this.model) as object | null;
-      proto !== null;
-      proto = Object.getPrototypeOf(proto) as object | null
-    ) {
-      const name = (proto as { constructor?: { name?: string } }).constructor?.name;
-      if (name !== undefined && MTP_AUTO_DEFAULT_SUPPRESSED_MODELS.has(name)) {
-        return false;
-      }
-    }
-    return true;
+    return mtpAutoDefaultAllowed(this.model);
   }
 
   /**

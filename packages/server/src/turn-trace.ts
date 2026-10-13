@@ -43,7 +43,7 @@ import {
   type ColdSidecarStats,
   type PerformanceMetrics,
 } from '@mlx-node/core';
-import type { ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
+import { mtpAutoDefaultAllowed, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
 import { canonicalCacheRoot } from '@mlx-node/lm/cold-tier';
 
 import { MetricsTrace, type MetricsTraceInput } from './metrics-trace.js';
@@ -161,10 +161,12 @@ interface TurnContext {
  * Members of {@link SessionCapableModel} whose presence is optional and
  * whose calls are pure queries — forwarded verbatim so the wrapper is
  * invisible to `ChatSession` feature detection (`hasBlockPagedCache`,
- * `mtpAutoEnabled`, `applyChatTemplate`, …). The wrapper MUST NOT define
- * one the inner model lacks: `ChatSession.mtpAutoDefaultAllowed` treats a
- * missing `mtpAutoEnabled` as a proto-walk fallback, and `hasBlockPagedCache`
- * absent means "not paged". Mirroring presence exactly preserves both.
+ * `applyChatTemplate`, …). The wrapper MUST NOT define one the inner model
+ * lacks: `hasBlockPagedCache` absent means "not paged". The single exception
+ * is `mtpAutoEnabled`: when the inner lacks it, the constructor synthesizes a
+ * forwarder to {@link mtpAutoDefaultAllowed} so `ChatSession`'s proto-walk
+ * fallback (suppressed for `NemotronHModel`) still sees the INNER chain —
+ * the wrapper's own `TurnTraceModel` proto would silently re-enable MTP.
  */
 /** Cold-tier counters diffed per turn — the keys {@link TurnWatermarks.cold} tracks. */
 const COLD_DELTA_KEYS = [
@@ -255,6 +257,11 @@ export class TurnTraceModel implements SessionCapableModel {
       if (typeof member === 'function') {
         Object.defineProperty(this, name, { value: member.bind(inner) });
       }
+    }
+    // Synthesized, not mirrored: resolves the same verdict a bare ChatSession
+    // would reach by walking the inner's prototype chain.
+    if (typeof inner.mtpAutoEnabled !== 'function') {
+      Object.defineProperty(this, 'mtpAutoEnabled', { value: () => mtpAutoDefaultAllowed(inner) });
     }
   }
 
