@@ -21,8 +21,8 @@
  */
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -600,52 +600,116 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
+ * Test seam for {@link acquireInstallLock}: fires after a lock file was
+ * judged dead-owned and before it is captured, so a test can interleave a
+ * "new holder" deterministically.
+ */
+export interface AcquireLockHooks {
+  /** Retry deadline override (default 10s). */
+  deadlineMs?: number;
+  onBeforeStealCapture?: () => void;
+}
+
+/**
  * Serialize the install critical section across processes. `<dest>.lock` is
- * created with `wx` (fails while held) and records the holder's pid. A
+ * created by LINKING a fully written claim file (an atomic create that never
+ * exposes a partially written owner) and records the holder's pid. A
  * leftover lock is stolen ONLY when its recorded owner is demonstrably dead
  * — never on age alone: a suspended or slow holder past any age threshold
  * would lose its lock and then delete the thief's lock in releaseInstallLock,
- * reopening the interleaved-sweep race the lock exists to prevent. Once the
- * deadline passes the caller must FAIL rather than proceed unlocked: the
- * pointer-flip/sweep section is unsafe to enter while a holder may still be
- * inside it, so this function throws instead of returning.
+ * reopening the interleaved-sweep race the lock exists to prevent.
+ *
+ * Stealing captures the incumbent with an atomic `rename` into a private
+ * claim file, then judges the CAPTURED file — never `unlink`ing the shared
+ * path on the strength of an earlier read. Two installers that both saw the
+ * same stale lock therefore cannot delete each other's newly acquired lock:
+ * the second captures whatever is NOW at the path, restores it via `link`
+ * when it names a live owner, and consumes it only when it is still
+ * dead-owned or ownerless. Once the deadline passes the caller must FAIL
+ * rather than proceed unlocked: the pointer-flip/sweep section is unsafe to
+ * enter while a holder may still be inside it, so this function throws
+ * instead of returning.
  */
-function acquireInstallLock(path: string): void {
-  const DEADLINE_MS = 10_000;
-  const deadline = Date.now() + DEADLINE_MS;
+export function acquireInstallLock(path: string, hooks: AcquireLockHooks = {}): void {
+  const deadline = Date.now() + (hooks.deadlineMs ?? 10_000);
+  // Abandoned claim/capture files from a crashed stealer block nothing
+  // (every name is unique); sweep only ones whose owner is dead.
+  try {
+    for (const entry of readdirSync(dirname(path))) {
+      const match = /^.+\.tmp-(\d+)-/.exec(entry);
+      if (match && !pidAlive(Number(match[1]))) rmSync(join(dirname(path), entry), { force: true });
+    }
+  } catch {
+    // sweep is best-effort
+  }
   while (true) {
+    // Atomic create-with-content: link either creates `<dest>.lock` whole or
+    // fails EEXIST, so no reader ever sees a half-written owner.
+    const claim = `${path}.tmp-${process.pid}-${randomUUID()}`;
     try {
-      writeFileSync(path, String(process.pid), { flag: 'wx', mode: 0o600 });
+      writeFileSync(claim, String(process.pid), { mode: 0o600 });
+      linkSync(claim, path);
+      rmSync(claim, { force: true });
       return;
     } catch (error) {
+      rmSync(claim, { force: true });
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      try {
-        const holder = Number(readFileSync(path, 'utf-8').trim());
-        // Dead-owner steal: the recorded pid is gone (pid reuse accepted).
-        // An unreadable owner — empty or garbage — cannot prove a live
-        // holder either, so it is stolen the same way. Any lock whose owner
-        // is alive is left alone regardless of age.
-        if (!Number.isInteger(holder) || holder <= 0 || !pidAlive(holder)) {
-          rmSync(path, { force: true });
+    }
+    try {
+      const holder = Number(readFileSync(path, 'utf-8').trim());
+      // Dead-owner steal: the recorded pid is gone (pid reuse accepted).
+      // An unreadable owner — empty or garbage — cannot prove a live
+      // holder either, so it is stolen the same way. Any lock whose owner
+      // is alive is left alone regardless of age.
+      if (!Number.isInteger(holder) || holder <= 0 || !pidAlive(holder)) {
+        hooks.onBeforeStealCapture?.();
+        // Capture THEN judge: whatever sits at `path` now — possibly a
+        // live lock acquired after our staleness read — is moved whole.
+        const captive = `${path}.tmp-${process.pid}-${randomUUID()}`;
+        try {
+          renameSync(path, captive);
+        } catch {
+          // vanished between read and capture — retry create
           continue;
         }
-      } catch {
-        // vanished or unreadable between checks — retry create
+        try {
+          const capturedPid = Number(readFileSync(captive, 'utf-8').trim());
+          if (Number.isInteger(capturedPid) && capturedPid > 0 && pidAlive(capturedPid)) {
+            // Captured a live holder's lock — put it back intact (link
+            // restores without overwriting anything created in between)
+            // and wait like any other observer.
+            try {
+              linkSync(captive, path);
+            } catch {
+              // a different holder already owns the path — our captive is
+              // superseded, drop it like a dead lock
+            }
+          }
+        } catch {
+          // captive unreadable — consume it below
+        } finally {
+          rmSync(captive, { force: true });
+        }
         continue;
       }
-      if (Date.now() > deadline) {
-        throw new Error(
-          `mlx agent: another install is in progress (${path}) — refusing to proceed without the install lock`,
-        );
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    } catch {
+      // vanished or unreadable between checks — retry create
+      continue;
     }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `mlx agent: another install is in progress (${path}) — refusing to proceed without the install lock`,
+      );
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
 }
 
-function releaseInstallLock(path: string): void {
+export function releaseInstallLock(path: string): void {
   try {
-    rmSync(path, { force: true });
+    // Delete only our own lock: a holder whose lock was stolen while it was
+    // suspended must not remove a lock another installer now owns.
+    if (Number(readFileSync(path, 'utf-8').trim()) === process.pid) rmSync(path, { force: true });
   } catch {
     // lock cleanup is best-effort
   }

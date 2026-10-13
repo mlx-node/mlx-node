@@ -7,11 +7,13 @@ import { dirname, join } from 'node:path';
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
 import {
+  acquireInstallLock,
   agentUpdateStatus,
   applyAgentUpdate,
   downloadAgentBinary,
   managedAgentBinPath,
   probeAgentInstall,
+  releaseInstallLock,
   resolveReleaseTag,
   MLX_AGENT_BIN_ENV,
   MLX_AGENT_TAG_ENV,
@@ -353,6 +355,52 @@ describe('downloadAgentBinary', () => {
       mockMirrors(makeTarball(home, 'fake-agent-binary'));
       const path = await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
       expect(readFileSync(path, 'utf-8')).toBe('fake-agent-binary');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a stolen-then-reattacked lock is restored, never deleted under a new owner', { timeout: 20_000 }, () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const lock = join(home, 'mlx-agent.lock');
+      // Incumbent judged stale: dead owner. Between the staleness read and
+      // the steal, a second installer acquires the lock (live pid = us).
+      writeFileSync(lock, '999999');
+      let swapped = false;
+      expect(() =>
+        acquireInstallLock(lock, {
+          deadlineMs: 400,
+          onBeforeStealCapture: () => {
+            if (swapped) return;
+            swapped = true;
+            rmSync(lock, { force: true });
+            writeFileSync(lock, String(process.pid));
+          },
+        }),
+      ).toThrow('install lock');
+      expect(swapped).toBe(true);
+      // The captured live lock went back whole — the would-be thief must
+      // never have unlinked a lock a second installer already held.
+      expect(readFileSync(lock, 'utf-8')).toBe(String(process.pid));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('releaseInstallLock removes only the caller\u2019s own lock', () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const lock = join(home, 'mlx-agent.lock');
+      // A lock that names a DIFFERENT owner survives our release — an
+      // ex-holder whose lock was stolen must not unlink the thief's.
+      writeFileSync(lock, '999999');
+      releaseInstallLock(lock);
+      expect(readFileSync(lock, 'utf-8')).toBe('999999');
+
+      writeFileSync(lock, String(process.pid));
+      releaseInstallLock(lock);
+      expect(existsSync(lock)).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
