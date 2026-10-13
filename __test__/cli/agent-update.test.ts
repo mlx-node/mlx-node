@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -243,6 +244,37 @@ describe('resolveAgentBinary', () => {
       // The lock is released once the lease is in place.
       expect(existsSync(`${managedAgentBinPath(home)}.lock`)).toBe(false);
       expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('leases an unpinned managed hit the same way — the sweep protects it until spawn', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
+    try {
+      mkdirBin(home);
+      writeFileSync(versioned(home, 'mlx-agent-v0.3.0'), 'v030');
+      writeFileSync(`${managedAgentBinPath(home)}.tag`, 'mlx-agent-v0.3.0');
+      // No pin: the pointer resolves the managed cache — the same
+      // probe→spawn gap a concurrent updater's sweep can hit.
+      const bin = await resolveAgentBinary(home, {}, home);
+      expect(bin).toBe(versioned(home, 'mlx-agent-v0.3.0'));
+      expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(true);
+      expect(existsSync(`${managedAgentBinPath(home)}.lock`)).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not lease a non-managed path — no sweep can touch it', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
+    try {
+      const bin = join(home, 'custom-agent');
+      writeFileSync(bin, 'x');
+      const resolved = await resolveAgentBinary(home, { [MLX_AGENT_BIN_ENV]: bin }, home);
+      expect(resolved).toBe(bin);
+      expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -538,6 +570,28 @@ describe('downloadAgentBinary', () => {
     } finally {
       if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
       else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes a stale marker on re-lease so the mid-bind grace covers pid reuse', () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      mkdirBin(home);
+      const bin = versioned(home, 'mlx-agent-v0.2.0');
+      writeFileSync(bin, 'v020');
+      // Simulate the recycled-pid case: a marker OUR dead predecessor left,
+      // aged past the sweep's mid-bind grace.
+      const lease = `${bin}.lease-${process.pid}`;
+      writeFileSync(lease, '');
+      const aged = new Date(Date.now() - 60_000);
+      utimesSync(lease, aged, aged);
+      writeLeaseMarker(bin);
+      // Re-advertising must renew the mtime — without it a sweep between
+      // now and the async bind completing treats us as an aged refused
+      // marker and deletes the binary we are about to spawn.
+      expect(Date.now() - statSync(lease).mtimeMs).toBeLessThan(5_000);
+    } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });

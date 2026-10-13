@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -202,7 +202,9 @@ export function probeAgentInstall(
   // The cached binary is valid only while it satisfies this CLI's minimum
   // release: its marker records which tag produced it. An unmarked binary is
   // treated as stale — cheaper than trusting whatever was downloaded before
-  // markers existed.
+  // markers existed. No lease here: callers that RETAIN a managed path
+  // (resolveAgentBinary, the evals harness) re-lease under the install
+  // lock — the probe itself only reports.
   if (managedTag !== undefined && compareReleaseTags(managedTag, MLX_AGENT_MIN_RELEASE) >= 0) {
     return { source: 'managed', path: managedBin, managedTag, effectiveTag: managedTag };
   }
@@ -234,22 +236,27 @@ export async function resolveAgentBinary(
   const pin = releasePin(env);
   if (probed === undefined) return downloadAgentBinary(managed, pin, env);
 
-  if (pin === undefined || probe.source !== 'managed' || probe.effectiveTag !== pin) {
-    return probed;
-  }
-  // Swept between probe and lock → download the pin. The lock is released
-  // inside the helper first: downloadAgentBinary acquires it itself.
+  // Any managed path — pinned or pointer-resolved — is leased under the
+  // install lock before it is returned: the launcher spawns it only after
+  // serve startup, and an updater's sweep between probe and spawn can
+  // delete it (a fallback install keeps only its tag + the previous
+  // pointer). env/bundled/vendored paths are exempt: no sweep touches
+  // files outside the managed cache.
+  if (probe.source !== 'managed') return probed;
+  // Swept between probe and lock → download. The lock is released inside
+  // the helper first: downloadAgentBinary acquires it itself.
   return (await leasePinnedManaged(managed, probed)) ?? downloadAgentBinary(managed, pin, env);
 }
 
 /**
- * Serialize a cached pinned binary's lease against the install sweep and
- * confirm it survived until the locked re-verify. The probe's unlocked
- * lease can be missed by a sweep that snapshotted the directory just
- * before it — and can lose the binary outright — so every caller that
- * retains a pinned managed path (the launcher above, the evals harness)
- * must run this before trusting it. Returns the path, or undefined when a
- * sweep deleted it first and the caller must download or abort.
+ * Serialize a cached managed binary's lease against the install sweep and
+ * confirm it survived until the locked re-verify. Applies to pinned AND
+ * unpinned resolves: the probe's unlocked lease can be missed by a sweep
+ * that snapshotted the directory just before it — and can lose the binary
+ * outright — so every caller that retains a managed path (the launcher
+ * above, the evals harness) must run this before trusting it. Returns the
+ * path, or undefined when a sweep deleted it first and the caller must
+ * download or abort.
  */
 export async function leasePinnedManaged(managed: string, probed: string): Promise<string | undefined> {
   await acquireInstallLock(`${managed}.lock`);
@@ -988,7 +995,17 @@ export function writeLeaseMarker(binary: string): void {
   try {
     writeFileSync(marker, '', { flag: 'wx' });
   } catch {
-    // lease already exists or dir unwritable — best-effort
+    // lease already exists or dir unwritable — best-effort. When the pid was
+    // recycled the stale marker carries a stale mtime, which a sweep reads
+    // as "refused endpoint, past the mid-bind grace" and deletes before our
+    // async bind lands — re-advertise by refreshing mtime so the grace
+    // covers PID-reuse recovery too.
+    try {
+      const now = new Date();
+      utimesSync(marker, now, now);
+    } catch {
+      // not our marker after all — nothing to refresh
+    }
   }
   if (HELD_LEASES.has(marker)) return;
   const bind = bindLeaseEndpoint(marker)
