@@ -1424,24 +1424,38 @@ fn clef_sym8_eligible(prefix: &str, dense: &MxArray) -> Result<bool> {
 
 const CLEF_MLP_MEMBERS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
-/// Whether an MLP member may requantize: only when all three siblings are
-/// quantized in the checkpoint (`quantized` = the pre-pass's prefix set).
-/// The MLP installs all-or-nothing, so sym8 `gate|up` beside a dense `down`
-/// would be refused by the dense fallback's dtype guard; the whole MLP takes
-/// bf16 instead. Non-MLP prefixes always pass.
-fn clef_mlp_siblings_quantized(
-    quantized: &std::collections::HashSet<String>,
-    prefix: &str,
-) -> bool {
-    let Some(base) = CLEF_MLP_MEMBERS
-        .iter()
-        .find_map(|m| prefix.strip_suffix(&format!(".mlp.{m}")))
-    else {
-        return true;
-    };
+/// Group the pre-pass's prefixes into rewrite units: an MLP's quantized
+/// members form one unit, everything else is a unit of one. The MLP installs
+/// all-or-nothing, so its residency is decided once for the whole unit
+/// (`apply_clef_residency`): sym8 `gate|up` beside a bf16 `down` would be
+/// refused by the dense fallback's dtype guard.
+fn clef_residency_units(prefixes: &[String]) -> Vec<Vec<String>> {
+    let mut units: Vec<Vec<String>> = Vec::new();
+    let mut mlp_unit: HashMap<String, usize> = HashMap::new();
+    for prefix in prefixes {
+        let base = CLEF_MLP_MEMBERS
+            .iter()
+            .find_map(|m| prefix.strip_suffix(&format!(".mlp.{m}")));
+        match base.and_then(|b| mlp_unit.get(b).copied()) {
+            Some(i) => units[i].push(prefix.clone()),
+            None => {
+                if let Some(b) = base {
+                    mlp_unit.insert(b.to_string(), units.len());
+                }
+                units.push(vec![prefix.clone()]);
+            }
+        }
+    }
+    units
+}
+
+/// Whether an MLP unit is missing a member: a dense sibling in the
+/// checkpoint means the unit can never install as a quantized MLP.
+fn clef_mlp_unit_incomplete(unit: &[String]) -> bool {
     CLEF_MLP_MEMBERS
         .iter()
-        .all(|m| quantized.contains(&format!("{base}.mlp.{m}")))
+        .find_map(|m| unit[0].strip_suffix(&format!(".mlp.{m}")))
+        .is_some_and(|_| unit.len() != CLEF_MLP_MEMBERS.len())
 }
 
 /// CLEF residency pre-pass over the sanitized params map (see
@@ -1460,9 +1474,10 @@ fn clef_mlp_siblings_quantized(
 ///     (`QuantizedLinear::with_sym8_hadamard`), so forward computes
 ///     `(x · H_s)(W · H_s)^T = x W^T` with the int8 activation quant applied
 ///     to the outlier-spread `x · H_s`. Projections the sym8 ladder rejects
-///     (`clef_sym8_eligible`) and MLP members with a dense sibling
-///     (`clef_mlp_siblings_quantized`) keep the `Bf16` behaviour;
-///     projections already stored sym8 stay as they are.
+///     (`clef_sym8_eligible`) keep the `Bf16` behaviour, and an MLP is one
+///     unit (`clef_residency_units`): a dense sibling in the checkpoint or
+///     one ineligible member sends all three to bf16. Projections already
+///     stored sym8 stay as they are.
 ///   * `Bf16`: the packed source is decoded to bf16 and its sidecars
 ///     stripped; every `try_build_*` helper takes `.scales`-absent as "not
 ///     quantized" and falls through to the dense `Linear` arm.
@@ -1497,8 +1512,6 @@ fn apply_clef_residency(
         .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
         .collect();
     prefixes.sort();
-    // The checkpoint's quantized set, read before the loop rewrites `.scales`.
-    let quantized: std::collections::HashSet<String> = prefixes.iter().cloned().collect();
     let sym8_plq = PerLayerQuant {
         bits: SYM8_BITS,
         group_size: SYM8_GROUP_SIZE,
@@ -1511,51 +1524,59 @@ fn apply_clef_residency(
     let mut dequantized = 0usize;
     let mut kept: Vec<String> = Vec::new();
     let mut signs_by_width: HashMap<i64, MxArray> = HashMap::new();
-    for prefix in prefixes {
-        if prefix == "embedding" || prefix == "lm_head" {
+    for unit in clef_residency_units(&prefixes) {
+        if unit[0] == "embedding" || unit[0] == "lm_head" {
             continue;
         }
-        let plq = resolve_plq_for(per_layer_quant, &prefix, default_plq);
-        // Already sym8 storage: nothing to decode (`mlx_dequantize` has no
-        // sym8 mode) and nothing to gain.
-        if plq.mode == PerLayerMode::Sym8 && params.contains_key(&format!("{prefix}.scales")) {
-            kept.push(prefix);
-            continue;
-        }
-        let Some(dense) = dequantize_source_head(params, &prefix, plq)? else {
-            continue;
-        };
-        let packed_bytes = group_bytes(params, &prefix);
-        if residency == ClefResidency::Sym8
-            && clef_sym8_eligible(&prefix, &dense)?
-            && clef_mlp_siblings_quantized(&quantized, &prefix)
-        {
-            let transform = clef_sym8_transform(dense.shape_at(1)?, &mut signs_by_width)?;
-            // Rotate in f32: `apply` computes in f32 and casts back to its
-            // input dtype, so a bf16 input would round the rotated weight
-            // to bf16 before the int8 quantizer sees it.
-            let source = match &transform {
-                Some(t) => t.apply(&dense.astype(DType::Float32)?, false)?,
-                None => dense,
-            };
-            let (q, s) = crate::convert::sym8_quantize_store(&source, &prefix)?;
-            params.insert(format!("{prefix}.weight"), q);
-            params.insert(format!("{prefix}.scales"), s);
-            params.remove(&format!("{prefix}.biases"));
-            per_layer_quant.insert(prefix.clone(), sym8_plq);
-            requantized += 1;
-            byte_delta += group_bytes(params, &prefix) - packed_bytes;
-            if let Some(t) = transform {
-                transforms.insert(prefix, t);
-                rotated += 1;
+        // Decode the whole unit first: the residency is one decision per
+        // unit, and an MLP member's eligibility needs its dense shape.
+        let mut decoded: Vec<(String, MxArray)> = Vec::with_capacity(unit.len());
+        for prefix in &unit {
+            let plq = resolve_plq_for(per_layer_quant, prefix, default_plq);
+            // Already sym8 storage: nothing to decode (`mlx_dequantize` has
+            // no sym8 mode) and nothing to gain.
+            if plq.mode == PerLayerMode::Sym8 {
+                kept.push(prefix.clone());
+                continue;
             }
-        } else {
-            params.insert(format!("{prefix}.weight"), dense);
-            params.remove(&format!("{prefix}.scales"));
-            params.remove(&format!("{prefix}.biases"));
-            per_layer_quant.remove(&prefix);
-            dequantized += 1;
-            byte_delta += group_bytes(params, &prefix) - packed_bytes;
+            if let Some(dense) = dequantize_source_head(params, prefix, plq)? {
+                decoded.push((prefix.clone(), dense));
+            }
+        }
+        let mut unit_sym8 = residency == ClefResidency::Sym8 && !clef_mlp_unit_incomplete(&unit);
+        for (prefix, dense) in &decoded {
+            unit_sym8 = unit_sym8 && clef_sym8_eligible(prefix, dense)?;
+        }
+        for (prefix, dense) in decoded {
+            let packed_bytes = group_bytes(params, &prefix);
+            if unit_sym8 {
+                let transform = clef_sym8_transform(dense.shape_at(1)?, &mut signs_by_width)?;
+                // Rotate in f32: `apply` computes in f32 and casts back to
+                // its input dtype, so a bf16 input would round the rotated
+                // weight to bf16 before the int8 quantizer sees it.
+                let source = match &transform {
+                    Some(t) => t.apply(&dense.astype(DType::Float32)?, false)?,
+                    None => dense,
+                };
+                let (q, s) = crate::convert::sym8_quantize_store(&source, &prefix)?;
+                params.insert(format!("{prefix}.weight"), q);
+                params.insert(format!("{prefix}.scales"), s);
+                params.remove(&format!("{prefix}.biases"));
+                per_layer_quant.insert(prefix.clone(), sym8_plq);
+                requantized += 1;
+                byte_delta += group_bytes(params, &prefix) - packed_bytes;
+                if let Some(t) = transform {
+                    transforms.insert(prefix, t);
+                    rotated += 1;
+                }
+            } else {
+                params.insert(format!("{prefix}.weight"), dense);
+                params.remove(&format!("{prefix}.scales"));
+                params.remove(&format!("{prefix}.biases"));
+                per_layer_quant.remove(&prefix);
+                dequantized += 1;
+                byte_delta += group_bytes(params, &prefix) - packed_bytes;
+            }
         }
     }
     if requantized > 0 {
@@ -6132,6 +6153,42 @@ mod tests {
                 .dtype()
                 .unwrap(),
             DType::Int8
+        );
+
+        // All three quantized but one ineligible (plain FP8 is the one
+        // packed format with no group constraint, so `down_proj` can have
+        // K % 16 != 0): the whole MLP still takes bf16.
+        let mut fp8 = HashMap::new();
+        for (prefix, n, k, seed) in [
+            ("layers.0.mlp.gate_proj", 32, 64, 57),
+            ("layers.0.mlp.up_proj", 32, 64, 58),
+            ("layers.0.mlp.down_proj", 64, 24, 59),
+            ("layers.0.linear_attn.out_proj", 64, 64, 60),
+        ] {
+            let Some(dense) = clef_dense_or_skip(label, n, k, seed) else {
+                return;
+            };
+            let (w, s) =
+                crate::quant::fp8_weight::quantize_per_output_channel(&dense, prefix).unwrap();
+            fp8.insert(format!("{prefix}.weight"), w);
+            fp8.insert(format!("{prefix}.scales"), s);
+        }
+        let fp8_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 1,
+            mode: PerLayerMode::Fp8E4m3,
+            input_amax: None,
+            layout: Default::default(),
+        };
+        let mut per_layer_quant = HashMap::new();
+        apply_clef_residency(&mut fp8, &mut per_layer_quant, fp8_plq, ClefResidency::Sym8).unwrap();
+        assert_dense_bf16(&fp8, "layers.0.mlp.gate_proj", &[32, 64]);
+        assert_dense_bf16(&fp8, "layers.0.mlp.up_proj", &[32, 64]);
+        assert_dense_bf16(&fp8, "layers.0.mlp.down_proj", &[64, 24]);
+        assert_eq!(
+            fp8["layers.0.linear_attn.out_proj.weight"].dtype().unwrap(),
+            DType::Int8,
+            "a unit of one still requantizes"
         );
 
         // Loader level: the layer installs (dense MLP, sym8 GDN) and reaches

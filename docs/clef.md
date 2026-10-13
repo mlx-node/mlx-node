@@ -65,9 +65,14 @@ by their weight quantization (0.08 on Flash even under `bf16`).
 The requantization uses the same routine as `mlx convert --q-mode sym8` and
 follows its ladder: 2-D weights with `K % 16 == 0`, excluding `in_proj_ba`
 (and the split `in_proj_b` / `in_proj_a` halves), which stays dense bf16.
-A projection the checkpoint already stores as sym8 is used as is. The
-embedding and `lm_head` are never rewritten in either mode: the lookup and
-the joint head's row gather read packed rows directly.
+An MLP is decided as one unit: a dense sibling in the checkpoint or one
+ineligible member sends all three projections to bf16, because the MLP
+installs all-or-nothing. A projection the checkpoint already stores as sym8
+is used as is — unrotated, the numerics of the `sym8` convert format itself;
+the rotation below applies to load-time requantization only, and the
+measured gate results are for the published GGUFs. The embedding and
+`lm_head` are never rewritten in either mode: the lookup and the joint
+head's row gather read packed rows directly.
 
 Each requantized projection whose input width `K` is a multiple of 1024 gets
 a QuaRot-style online Hadamard rotation: the dense weight is rotated along
