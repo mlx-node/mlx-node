@@ -311,15 +311,25 @@ describe('downloadAgentBinary', () => {
 
       // Later unpinned update to v0.4.0: the pointer's previous target
       // (v0.3.0) survives as the rollback release. The side-installed
-      // v0.2.0 is reclaimed — the pin was process-local, and re-pinning
-      // downloads it again.
+      // v0.2.0 survives too — its lease names this (live) process, so a
+      // sweep must not delete a binary a pinned launch can still resolve.
       delete process.env[MLX_AGENT_TAG_ENV];
       mockMirrors(makeTarball(home, 'v040'));
       await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
       expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.4.0');
       expect(existsSync(versionedName('mlx-agent-v0.4.0'))).toBe(true);
       expect(existsSync(versionedName('mlx-agent-v0.3.0'))).toBe(true);
-      expect(existsSync(versionedName('mlx-agent-v0.2.0'))).toBe(false);
+      expect(existsSync(versionedName('mlx-agent-v0.2.0'))).toBe(true);
+
+      // A lease whose pinner is dead no longer protects the binary: the
+      // next sweep removes both it and the stale lease.
+      const staleBin = versionedName('mlx-agent-v0.1.0');
+      writeFileSync(staleBin, 'v010');
+      writeFileSync(`${staleBin}.lease-999999`, '');
+      mockMirrors(makeTarball(home, 'v050'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.5.0');
+      expect(existsSync(staleBin)).toBe(false);
+      expect(existsSync(`${staleBin}.lease-999999`)).toBe(false);
     } finally {
       if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
       else process.env[MLX_AGENT_TAG_ENV] = saved;

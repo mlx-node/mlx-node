@@ -571,19 +571,43 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
       rmSync(staged, { force: true });
       throw error;
     }
+    // A pinned side-install leaves a `<file>.lease-<pid>` marker: the pin
+    // is process-local, so nothing else records that this binary is about
+    // to be spawned — without it, an unpinned sweep in ANOTHER process can
+    // delete the side-install between our lock release and the pinner's
+    // launch, and the pinned launch fails ENOENT.
+    if (sideInstall) {
+      try {
+        writeFileSync(`${versioned}.lease-${process.pid}`, '', { flag: 'wx' });
+      } catch {
+        // lease already exists or dir unwritable — best-effort
+      }
+    }
     // Old versioned binaries accumulate (~100MB each). A still-running one
     // cannot be deleted on Windows — expected; leave it for the next sweep.
     // Keep: this install's tag, the pointer's target read before AND after
-    // the flip (a third party may have moved it), and the env pin — the
-    // sweep must never remove a binary a launch can still resolve.
+    // the flip (a third party may have moved it), the env pin, and every
+    // binary a live lease names — the sweep must never remove a binary a
+    // launch can still resolve.
     const live = readAgentTag(dest);
     const keep = new Set([agentBinName(tag)]);
     for (const t of [prevPointer, live, pin]) {
       if (t !== undefined) keep.add(agentBinName(t));
     }
     try {
-      for (const entry of readdirSync(dirname(dest))) {
-        if (!entry.startsWith('mlx-agent-v') || keep.has(entry)) continue;
+      const entries = readdirSync(dirname(dest));
+      for (const entry of entries) {
+        const lease = /^(.+)\.lease-(\d+)$/.exec(entry);
+        if (!lease) continue;
+        if (pidAlive(Number(lease[2]))) {
+          keep.add(lease[1]);
+        } else {
+          // pinner is gone — the lease is dead weight
+          rmSync(join(dirname(dest), entry), { force: true });
+        }
+      }
+      for (const entry of entries) {
+        if (!entry.startsWith('mlx-agent-v') || entry.includes('.lease-') || keep.has(entry)) continue;
         try {
           rmSync(join(dirname(dest), entry), { force: true });
         } catch {
@@ -622,6 +646,16 @@ export interface AcquireLockHooks {
 const HELD_INSTALL_LOCKS = new Map<string, { server: Server; node: string; ino?: number }>();
 /** Unique captive suffix per reclaim attempt within this process. */
 let reclaimCounter = 0;
+
+/** True while a pid still exists (EPERM = alive, another user). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 
 /**
  * Where the lock node actually lives. Unix socket paths cap at ~104 bytes
