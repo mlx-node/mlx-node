@@ -168,30 +168,36 @@ fn packed_dir_idle(dir: &Path) -> bool {
 }
 
 /// None keeps the dir (manifest-less dirs are never orphan-deleted: their
-/// staleness cannot be proven). The idle gate applies to every reason: a
-/// fresh dir keeps its packs until the grace window passes.
+/// staleness cannot be proven). The idle gate is a safety grace for the
+/// orphan reasons, never itself a reason: an idle dir whose manifest still
+/// recomputes to its name identity is a healthy cache, and deleting it would
+/// only force a full repack on the next load.
 fn packed_orphan_reason(dir: &Path) -> Option<&'static str> {
     let manifest = dir.join(".manifest");
     if !manifest.is_file() || !packed_dir_idle(dir) {
         return None;
     }
     match identity_from_manifest(dir) {
-        Err(_) => return Some("unreadable manifest or missing source"),
+        Err(_) => Some("unreadable manifest or missing source"),
         Ok(identity) if dir_name_identity(dir) != Some(identity.as_str()) => {
-            return Some("source fingerprint changed");
+            Some("source fingerprint changed")
         }
-        Ok(_) => {}
+        // Identity matches the dir name: the contents are still correct for
+        // their source — idleness alone is not an orphan reason.
+        Ok(_) => None,
     }
-    Some("idle beyond sweep grace")
 }
 
+/// Every count uses `symlink_metadata`: a symlinked entry counts only its own
+/// (tiny) link and the target is never followed — bytes outside the cache
+/// dir must not drive eviction or recorded spend.
 fn dir_size(dir: &Path) -> u64 {
     fs::read_dir(dir)
         .map(|entries| {
             entries
                 .flatten()
-                .filter_map(|e| e.metadata().ok())
-                .filter(|m| m.is_file())
+                .filter_map(|e| fs::symlink_metadata(e.path()).ok())
+                .filter(|m| m.is_file() || m.is_symlink())
                 .map(|m| m.len())
                 .sum()
         })
@@ -199,14 +205,14 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 /// Bytes actually held by .pack files — the same quantity the budget ledger
-/// records.
+/// records. A .pack that is itself a symlink contributes only its link bytes.
 fn pack_bytes(dir: &Path) -> u64 {
     fs::read_dir(dir)
         .map(|entries| {
             entries
                 .flatten()
                 .filter(|e| e.path().extension().is_some_and(|s| s == "pack"))
-                .filter_map(|e| e.metadata().ok())
+                .filter_map(|e| fs::symlink_metadata(e.path()).ok())
                 .map(|m| m.len())
                 .sum()
         })
@@ -314,6 +320,25 @@ fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) 
         );
         return 0;
     };
+    // A dir without a budget ledger whose manifest still recomputes to its
+    // dir-name identity sits in `new_at`'s creation window: the manifest is
+    // written eagerly but `budget` only appears at the first `write`.
+    // Deleting it would vanish a live load's cache root mid-write. A stale
+    // or mismatched manifest means abandonment, not creation — fall through
+    // to the caller's verdict.
+    if _guard.is_none()
+        && dir.is_dir()
+        && dir.join(".manifest").is_file()
+        && identity_from_manifest(dir)
+            .ok()
+            .is_some_and(|identity| dir_name_identity(dir) == Some(identity.as_str()))
+    {
+        debug!(
+            "packed cache: keeping {} (verified manifest without ledger is mid-creation)",
+            dir.display()
+        );
+        return 0;
+    }
     // Recheck under the held lock: the dir may have been rebuilt while we
     // waited, in which case our lock no longer proves staleness.
     if !still_stale(dir) {
@@ -439,7 +464,7 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
                     .map(|e| e.path())
                     .filter(|p| p.extension().is_some_and(|s| s == "pack"))
                     .filter_map(|p| {
-                        let m = fs::metadata(&p).ok()?;
+                        let m = fs::symlink_metadata(&p).ok()?;
                         Some((m.modified().ok()?, p, m.len()))
                     })
                     .collect()
@@ -528,7 +553,7 @@ fn shed_oldest_packs(dir: &Path, exclude: &Path, headroom: u64) -> u64 {
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|s| s == "pack") && p != exclude)
                 .filter_map(|p| {
-                    let meta = fs::metadata(&p).ok()?;
+                    let meta = fs::symlink_metadata(&p).ok()?;
                     Some((meta.modified().ok()?, p.clone(), meta.len()))
                 })
                 .collect()
@@ -812,7 +837,7 @@ impl PackedCache {
         // persisted on any of the early returns below while the old target
         // stays on disk, so the recorded value must never undercount reality.
         let target = self.path(key);
-        let target_len = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+        let target_len = fs::symlink_metadata(&target).map(|m| m.len()).unwrap_or(0);
         let mut used: u64 = fs::read_dir(&self.root)
             .map_err(err)?
             .filter_map(|e| e.ok())
@@ -821,7 +846,7 @@ impl PackedCache {
                 path.extension().is_some_and(|s| s == "pack") && path != target
             })
             .try_fold(0u64, |sum, e| {
-                sum.checked_add(e.metadata().map_err(err)?.len())
+                sum.checked_add(fs::symlink_metadata(e.path()).map_err(err)?.len())
                     .ok_or_else(|| err("Packed cache budget overflow"))
             })?;
         let real_used = used.saturating_add(target_len);
@@ -1382,6 +1407,85 @@ mod tests {
         assert!(!stale.exists());
         assert!(unknown.exists());
         assert!(cache.root.join(".manifest").is_file());
+    }
+
+    #[test]
+    fn idle_but_identity_matched_dir_is_never_an_orphan() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        // Age every witness past the sweep grace: the dir is as idle as a
+        // cache can be, yet its manifest still recomputes to the dir-name
+        // identity — a healthy-but-idle model cache, not an orphan.
+        age(&cache.root.join(".manifest"), 7200);
+        age_dir(&cache.root, 7200);
+        assert!(
+            packed_dir_idle(&cache.root),
+            "the fixture must read as idle for this regression to bite"
+        );
+        assert_eq!(packed_orphan_reason(&cache.root), None);
+        // And the full sweep must leave it alone.
+        sweep_packed_cache(&parent, &temp.0.join("nonexistent-current"));
+        assert!(cache.root.exists());
+        assert!(cache.root.join(".manifest").is_file());
+    }
+
+    #[test]
+    fn manifested_dir_without_ledger_is_mid_creation_and_survives_removal() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        // new_at writes .manifest long before the first write creates the
+        // budget ledger; that window is creation, not abandonment. With no
+        // ledger nothing can hold the lock, so without the mid-creation gate
+        // locked_remove would delete it.
+        assert!(cache.root.join(".manifest").is_file());
+        assert!(!cache.root.join("budget").exists());
+        // An always-stale verdict isolates the ledger gate: without the
+        // mid-creation check locked_remove would delete this dir.
+        assert_eq!(
+            locked_remove(&cache.root, "test stale", |_| true),
+            0,
+            "a manifested dir with no budget ledger is mid-creation"
+        );
+        assert!(cache.root.exists());
+        // Once a ledger exists the same verdict removes it.
+        fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
+        assert!(locked_remove(&cache.root, "test stale", |_| true) > 0);
+        assert!(!cache.root.exists());
+    }
+
+    #[test]
+    fn symlinked_entries_never_inflate_dir_or_pack_bytes() {
+        let temp = Temp::new();
+        let dir = temp.0.join("cache");
+        fs::create_dir(&dir).unwrap();
+        // A large file outside the cache dir, linked in as a .pack and as a
+        // regular entry, plus a symlinked directory: targets must never be
+        // counted.
+        let outside = temp.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("big.bin"), vec![0_u8; 1 << 20]).unwrap();
+        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join("linked.pack")).unwrap();
+        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join("linked.bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked-dir")).unwrap();
+        fs::write(dir.join("real.pack"), vec![0_u8; 64]).unwrap();
+        let link_len = |name: &str| fs::symlink_metadata(dir.join(name)).unwrap().len();
+        // A symlink contributes only its own link bytes — never the target's.
+        assert_eq!(pack_bytes(&dir), 64 + link_len("linked.pack"));
+        assert_eq!(
+            dir_size(&dir),
+            64 + link_len("linked.pack") + link_len("linked.bin") + link_len("linked-dir")
+        );
+        assert!(
+            pack_bytes(&dir) < 1 << 16,
+            "pack_bytes followed a symlink: {}",
+            pack_bytes(&dir)
+        );
     }
 
     // flock is per-process on BSD/macOS, so a held writer lock can only be

@@ -1440,6 +1440,76 @@ describe('DownloadManager', () => {
     expect(marker.assetsRevision).toBe(SHA_NEW);
   });
 
+  it('never writes through a LIVE final symlink during the sidecar refresh — the refresh re-downloads instead', async () => {
+    // Same-revision install whose marker records a sidecar the assets repo has
+    // since dropped (tokenizer.json) AND a stale assetsRevision: on a real dir
+    // the verified-done refresh would DELETE the stale sidecar and REWRITE the
+    // marker in place. With `<modelsDir>/<slug>` a live symlink into that
+    // external marked dir, those writes would land inside the foreign target —
+    // the exact boundary `deleteLocalModel` draws by unlinking only the link.
+    // The refresh must refuse the link; the job then takes the full download
+    // path whose publish swap replaces the LINK with an owned real directory.
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(external, 'tokenizer.json'), Buffer.alloc(20, 0xab));
+    writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
+    const externalMarker = join(external, DOWNLOAD_COMPLETE_MARKER);
+    writeFileSync(
+      externalMarker,
+      JSON.stringify({
+        repo: REPO,
+        revision: SHA_DEFAULT,
+        files: ['config.json', 'tokenizer.json', WEIGHT],
+        assetsRepo: ASSETS_REPO,
+        assetsRevision: SHA_OLD,
+        completedAt: 'x',
+      }),
+    );
+    symlinkSync(external, finalDir());
+
+    // Same primary revision (SHA_DEFAULT), so skip-detection reaches the
+    // refresh; the assets repo advanced and no longer supplies tokenizer.json,
+    // so the refresh wants to mutate — and must not, through the link.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(true);
+
+    // The refresh fell through to a real download+publish: the link was
+    // replaced by an owned REAL directory carrying the current marker.
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    expect(isModelInstalled(finalDir())).toBe(true);
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      assetsRepo?: string;
+      assetsRevision?: string;
+    };
+    expect(marker.assetsRepo).toBe(ASSETS_REPO);
+    expect(marker.assetsRevision).toBe(SHA_NEW);
+
+    // The external target is byte-for-byte intact: no sidecar was deleted and
+    // the marker was never rewritten through the link.
+    expect(readFileSync(join(external, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(readFileSync(join(external, 'tokenizer.json'))).toEqual(Buffer.alloc(20, 0xab));
+    expect(readFileSync(join(external, WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+    expect((JSON.parse(readFileSync(externalMarker, 'utf-8')) as { assetsRevision?: string }).assetsRevision).toBe(
+      SHA_OLD,
+    );
+
+    rmSync(external, { recursive: true, force: true });
+  });
+
   // macOS-only: the immutable flag is the one way to keep a file regular (so
   // the install still reads as installed and the refresh path really runs)
   // while making `rm` refuse it.

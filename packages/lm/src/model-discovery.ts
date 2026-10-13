@@ -1,8 +1,8 @@
 /** Shared, native-free discovery of local chat checkpoints. */
 
 import type { Dirent } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { readdir, realpath, stat } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 import {
   launchPresetFor,
@@ -323,20 +323,30 @@ export async function discoverLocalChatModels(
   const appendGguf = async (name: string, metadataRoot: string, scopeName: string): Promise<void> => {
     const path = join(metadataRoot, name);
     try {
-      const modelType = await detectModelType(path);
+      // `resolveDirentKind` admits a symlinked `.gguf`, but the loader
+      // canonicalizes the path it is handed (`prepare_native_gguf_inner`), so
+      // every check that looks BESIDE the file — family detection's sibling
+      // config.json, the `requiresAssets` gate, discovery metadata — must run
+      // against the resolved target's directory, not the link's. `realpath`
+      // also resolves a symlinked PARENT directory, covering a linked-in
+      // model dir wholesale. The recorded path stays the lexical link path:
+      // loading it reaches the same canonical file either way.
+      const canonical = await realpath(path);
+      const assetsRoot = dirname(canonical);
+      const modelType = await detectModelType(canonical);
       const family = familyDataFor(modelType);
       if (!supportedGgufName(name, modelType)) return;
       // A sibling config must agree with the target header, never a projector.
-      if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(path))) return;
+      if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(canonical))) return;
       if (
         family.ggufDiscovery?.requiresAssets &&
-        !(await hasGgufAssets(metadataRoot, (error) => reportFailure(error, path)))
+        !(await hasGgufAssets(assetsRoot, (error) => reportFailure(error, path)))
       ) {
         if (debug)
           console.warn(`[mlx] skip ${path}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
         return;
       }
-      await append(ggufModelName(name), path, metadataRoot, modelType, scopeName);
+      await append(ggufModelName(name), path, assetsRoot, modelType, scopeName);
     } catch (err) {
       reportFailure(err, path);
       if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);

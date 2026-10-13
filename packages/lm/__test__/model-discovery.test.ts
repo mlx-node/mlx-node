@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -196,5 +196,44 @@ describe('discoverLocalChatModels', () => {
       chmodSync(repository, 0o700);
     }
     expect(await discoverLocalChatModels(dir)).toHaveLength(1);
+  });
+
+  it('admits a symlinked Gemma4 GGUF whose required assets sit beside the TARGET', async () => {
+    // The loader canonicalizes the GGUF path, so the config.json/tokenizer.json
+    // it consumes live beside the link's TARGET, not the link. The assets gate
+    // must check there too: `resolveDirentKind` admits the link as a file, and
+    // requiring the assets beside the LINK would silently drop a checkpoint
+    // that loads fine.
+    const dir = join(tmp, 'gemma4-symlink-admitted');
+    const external = join(tmp, 'gemma4-symlink-target');
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(external);
+    const target = join(external, 'Gemma-4-26B-real.gguf');
+    writeFileSync(target, minimalGguf('gemma4'));
+    writeFileSync(join(external, 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    writeFileSync(join(external, 'tokenizer.json'), '{}');
+    const link = join(dir, 'Gemma-4-26B.gguf');
+    symlinkSync(target, link);
+
+    const models = await discoverLocalChatModels(dir);
+    // Recorded path stays the lexical link — loading it canonicalizes anyway.
+    expect(models).toEqual([expect.objectContaining({ path: link, modelType: 'gemma4' })]);
+  });
+
+  it('still skips a symlinked GGUF when the required assets are missing beside the TARGET', async () => {
+    // The negative half: a symlink must not relax the requiresAssets gate.
+    // Putting the assets beside the LINK (where the pre-fix check looked) is
+    // the sharper case — the loader never sees them, so the entry must stay
+    // skipped exactly like an asset-less real file.
+    const dir = join(tmp, 'gemma4-symlink-skipped');
+    const external = join(tmp, 'gemma4-symlink-no-assets');
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(external);
+    writeFileSync(join(external, 'Gemma-4-26B-real.gguf'), minimalGguf('gemma4'));
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    writeFileSync(join(dir, 'tokenizer.json'), '{}');
+    symlinkSync(join(external, 'Gemma-4-26B-real.gguf'), join(dir, 'Gemma-4-26B.gguf'));
+
+    await expect(discoverLocalChatModels(dir)).resolves.toEqual([]);
   });
 });

@@ -158,10 +158,10 @@ pub fn assets(first: &Path, store: &Store, c: &Config) -> Result<PathBuf> {
 }
 
 /// Per-sidecar flock shared with the native-GGUF sweep: a held lock makes the
-/// sweep skip the directory, so the hit check below cannot race a mid-flight
-/// eviction. `Some(_)` keeps the fd as a guard (inner None on non-Unix, where
-/// no sweep runs); `None` means contention — fall through to republish, which
-/// converges on the same content.
+/// sweep skip the directory, so the hit check and the publish below cannot
+/// race a mid-flight eviction. `Some(_)` keeps the fd as a guard (inner None
+/// on non-Unix, where no sweep runs); `None` means contention — the caller
+/// retries briefly rather than publishing into a possible mid-delete.
 #[cfg(unix)]
 fn assets_sidecar_lock(root: &Path, dir_name: &str) -> Option<Option<std::fs::File>> {
     use std::os::fd::AsRawFd;
@@ -193,9 +193,27 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     let identity = source_file_identity_digest(&source, &metadata);
     let dir_name = format!(".mlx-qwen4-assets-v2-{identity}");
     let dir = root.join(&dir_name);
-    if let Some(_guard) = assets_sidecar_lock(root, &dir_name)
-        && dir.join("complete").exists()
-    {
+    // Contention here is not an ordinary cache miss: a busy sidecar lock can
+    // be a capped-cache sweep mid-`remove_dir_all` on this very directory.
+    // Publishing unguarded could land `rename(temp, dir)` while the sweep's
+    // delete is in flight, returning a path that no longer exists. Spin
+    // briefly — a sweep's delete is short — and publish only under the lock.
+    const ASSETS_LOCK_RETRIES: u32 = 40;
+    const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut guard = assets_sidecar_lock(root, &dir_name);
+    for _ in 0..ASSETS_LOCK_RETRIES {
+        if guard.is_some() {
+            break;
+        }
+        std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
+        guard = assets_sidecar_lock(root, &dir_name);
+    }
+    let Some(_guard) = guard else {
+        return Err(Error::from_reason(format!(
+            "GGUF assets sidecar lock for {dir_name} stayed contended for ~2s; refusing to publish unguarded"
+        )));
+    };
+    if dir.join("complete").exists() {
         // Stamp recency on hits so the native-GGUF sweep's LRU never eats a
         // live sidecar directory; the held lock blocks that same sweep.
         if let Ok(file) = std::fs::OpenOptions::new()
@@ -206,8 +224,9 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         }
         return Ok(dir);
     }
-    // Publish a complete directory in one rename. Simultaneous loads may race,
-    // but neither reader can observe another load's partly written tokenizer.
+    // Publish a complete directory in one rename while the sidecar lock is
+    // held: the sweep cannot delete `dir` between the rename and the return.
+    // Simultaneous loads serialize on the lock rather than racing temp dirs.
     let temp = root.join(format!(".mlx-qwen4-assets-tmp-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&temp).map_err(|e| Error::from_reason(e.to_string()))?;
     let result = (|| -> Result<PathBuf> {
@@ -377,6 +396,64 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
         assert_eq!(store.bytes_read, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A busy sidecar lock is not an ordinary cache miss: it can be a capped
+    /// sweep mid-`remove_dir_all` on the very directory a publish would land
+    /// in. `assets_in` must spin on the lock and fail loudly rather than
+    /// publishing unguarded into a possible mid-delete (which could return a
+    /// phantom path the sweep then deletes).
+    #[test]
+    fn assets_in_never_publishes_while_the_sidecar_lock_is_held() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let (store, config) = tokenizer_fixture();
+
+        // Hold the same lock file the sweep would hold while deleting the
+        // sidecar: `.mlx-qwen4-assets-v2-{identity}.lock`. flock is
+        // per-open-description, so this fd blocks assets_sidecar_lock.
+        let canonical = source.canonicalize().unwrap();
+        let metadata = fs::metadata(&canonical).unwrap();
+        let dir_name = format!(
+            ".mlx-qwen4-assets-v2-{}",
+            source_file_identity_digest(&canonical, &metadata)
+        );
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(cache.join(format!("{dir_name}.lock")))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let err = assets_in(&source, &store, &config, &cache).unwrap_err();
+        assert!(
+            err.reason.contains("sidecar lock"),
+            "expected a contention error, got: {}",
+            err.reason
+        );
+        // Nothing may have been published or left behind while unguarded.
+        assert!(!cache.join(&dir_name).exists());
+        assert_eq!(
+            fs::read_dir(&cache).unwrap().count(),
+            1,
+            "only the lock file itself may exist"
+        );
+
+        // Once the lock frees, publishing proceeds normally.
+        drop(lock);
+        let published = assets_in(&source, &store, &config, &cache).unwrap();
+        assert_eq!(published, cache.join(&dir_name));
+        assert!(published.join("complete").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -6868,15 +6868,17 @@ fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<f
     None
 }
 
-/// Best-effort recursive size. Uses each entry's own metadata so symlinked
-/// targets outside the cache root are never counted (or deleted).
+/// Best-effort recursive size. `symlink_metadata` classifies each entry by
+/// its own link: a symlink counts only its link bytes and is never recursed
+/// or followed, so targets outside the cache root are never counted (or
+/// deleted).
 fn native_gguf_path_bytes(path: &Path) -> u64 {
     let mut total = 0_u64;
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
     };
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
             continue;
         };
         if meta.is_dir() {
@@ -17608,5 +17610,31 @@ mod tests {
         ] {
             assert!(!native_gguf_is_entry_name(&name), "{name}");
         }
+    }
+
+    /// Size accounting must never follow links: a symlink inside a cache
+    /// object counts only its own link bytes, and a symlinked directory is
+    /// never recursed — targets outside the cache root are not cache spend.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_path_bytes_never_follows_symlinks() {
+        let root = NativeSweepTestDir::new("links");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big.bin"), vec![0_u8; 1 << 20]).unwrap();
+        let dir = root.path().join("entry");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.safetensors"), vec![0_u8; 64]).unwrap();
+        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join("linked.bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked-dir")).unwrap();
+        let link_bytes: u64 = ["linked.bin", "linked-dir"]
+            .iter()
+            .map(|name| fs::symlink_metadata(dir.join(name)).unwrap().len())
+            .sum();
+        assert_eq!(native_gguf_path_bytes(&dir), 64 + link_bytes);
+        assert!(
+            native_gguf_path_bytes(&dir) < 1 << 16,
+            "a linked 1 MiB target was counted as cache spend"
+        );
     }
 }

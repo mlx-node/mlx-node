@@ -1063,7 +1063,10 @@ export class DownloadManager {
         (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
         (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)));
       // `refreshInstalledAssets` is the one pre-publish path that mutates the
-      // live install (stale-sidecar deletes, marker rewrite). A cancel accepted
+      // live install (stale-sidecar deletes, marker rewrite) — and only on a
+      // real dir: it refuses a symlinked install, so a needed refresh on a
+      // linked-in model re-downloads through the link-safe publish swap. A
+      // cancel accepted
       // during that await must still win over the done branch — and over the
       // fall-through below, which this single check also covers.
       if (job.cancelled) throw new Error('Download cancelled');
@@ -1438,6 +1441,14 @@ export class DownloadManager {
    *     verifies the bytes, finds them current, and used to return without
    *     recording that verification — the card offered the same update again.
    *
+   *   - a SYMLINKED `dir` is refused the refresh outright (returns false):
+   *     the deletions and the marker write follow the link and would mutate
+   *     the foreign target — the exact boundary `deleteLocalModel` draws by
+   *     unlinking only the link. Returning false sends the job down the full
+   *     download path, whose publish swap replaces the LINK with an owned real
+   *     directory (rename moves the link aside, `rm` unlinks it), so a needed
+   *     refresh still lands without ever writing into the external tree.
+   *
    * The deletions run BEFORE the marker is published, so an interrupted
    * refresh fails with the marker untouched and retries (see the ordering note
    * in the body).
@@ -1465,6 +1476,22 @@ export class DownloadManager {
     // repo forever — a badge update discovery can never clear.
     if (stale.length === 0 && installed.assetsRepo === plan.repo.name && installed.assetsRevision === plan.revision)
       return true;
+    // Everything past this line MUTATES `dir`. `lstat` (no-follow, same guard
+    // as `assertRealDirOrAbsent` and `recoverBackup`) refuses it when `dir` is
+    // a symlink into a marked external install: a live link is admitted as
+    // downloader-owned and a same-revision marker reads as current, so it
+    // reaches here — but nothing the downloader manages may write through it.
+    // Returning false re-downloads and publishes an owned real dir in the
+    // link's place; the external tree is never touched. A `dir` that vanished
+    // between the marker read and now takes the same path (a refresh cannot
+    // run on nothing, and publish handles the absent case).
+    let finalIsLink = false;
+    try {
+      finalIsLink = lstatSync(dir).isSymbolicLink();
+    } catch {
+      finalIsLink = true;
+    }
+    if (finalIsLink) return false;
     if (stale.length > 0) {
       // Pruning must never destroy the install. The resulting manifest has to
       // stay loadable — a config and a weight — and the case that matters is
