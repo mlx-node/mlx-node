@@ -404,19 +404,49 @@ describe('downloadAgentBinary', () => {
       mkdirSync(dir, { recursive: true });
       // A dead member's marker and the legacy single-name lock are both
       // reclaimed unconditionally: the owning pid cannot exist.
+      writeFileSync(join(dir, 'b-1-999999-0'), '');
       writeFileSync(join(dir, 'm-999999-0'), '');
+      writeFileSync(join(dir, 'c-999999-0'), '');
       writeFileSync(lock, '999999');
       await acquireInstallLock(lock, { deadlineMs: 2_000 });
       expect(existsSync(lock)).toBe(false);
       const members = readdirSync(dir);
       expect(members).toHaveLength(1);
-      expect(members[0]).toMatch(/^m-\d+-\d+$/);
+      expect(members[0]).toMatch(/^b-\d+-\d+-\d+$/);
       releaseInstallLock(lock);
       expect(readdirSync(dir)).toEqual([]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it(
+    'orders by bakery ticket, not pid order: an earlier advertiser always blocks us',
+    { timeout: 20_000 },
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+      try {
+        const lock = join(home, 'mlx-agent.lock');
+        const dir = `${lock}.d`;
+        mkdirSync(dir, { recursive: true });
+        // A member from the previous `m-` protocol — live (our pid), high
+        // seq. Under the superseded (pid, seq) ticket order this member
+        // sorted "behind" a new acquire with a lower seq, letting a later
+        // contender in while it held. Under bakery it maps to ticket 0 —
+        // it advertised before any `b-` member — so we MUST queue.
+        writeFileSync(join(dir, `m-${process.pid}-999`), '');
+        await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
+
+        // Same for a low bakery ticket under our pid: ticket 2 < whatever we
+        // choose next, so the earlier advertiser wins regardless of seq.
+        rmSync(join(dir, `m-${process.pid}-999`));
+        writeFileSync(join(dir, `b-2-${process.pid}-999`), '');
+        await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('refuses to install while a live process holds the lock', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));

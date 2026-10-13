@@ -664,12 +664,14 @@ let memberSeq = 0;
  * The directory advertising lock members. Single-name locks cannot be
  * reclaimed safely — every scheme eventually has to unlink or replace a
  * name a live process may already hold — so the lock is a membership set
- * instead: each contender binds `m-<pid>-<seq>` (unix socket; marker file +
- * named pipe on Windows) and the lowest ticket among live members holds.
- * Nobody ever removes a name owned by a live pid: a crashed member's marker
- * refuses connections and its pid is dead, so deleting it is unconditional
- * and race-free. The directory sits under tmpdir when `.lock.d` would
- * exceed the ~104-byte socket path cap (member name adds ~14 bytes).
+ * instead: each contender advertises `b-<ticket>-<pid>-<seq>` (unix
+ * socket; marker file on Windows) and the lowest ticket among live
+ * members holds, where tickets are bakery numbers (`1 + max(seen)`), not
+ * pids — pids wrap, so pid order is not arrival order. Nobody ever removes
+ * a name owned by a live pid: a crashed member's marker refuses
+ * connections and its pid is dead, so deleting it is unconditional and
+ * race-free. The directory sits under tmpdir when `.lock.d` would exceed
+ * the ~104-byte socket path cap (member name adds ~24 bytes).
  */
 function lockDirPath(path: string): { dir: string; legacy: string | undefined } {
   const dir = `${path}.d`;
@@ -698,51 +700,89 @@ function memberListening(node: string): Promise<boolean> {
 }
 
 interface LockMember {
-  /** Sort key: (pid, seq) — the lower ticket holds. */
+  /**
+   * Bakery ticket: `1 + max(tickets seen at choose time)`, so a marker
+   * that advertised AFTER us always sorts behind us. Ticket order — not
+   * pid order — is what makes arrival order win: pids wrap and get reused,
+   * so a later process can carry a lower pid than the current holder.
+   */
+  ticket: number;
   pid: number;
   seq: number;
   file: string;
 }
 
+interface MemberScan {
+  members: LockMember[];
+  /** A contender is mid-choose (its c- marker names a live pid). */
+  choosing: boolean;
+}
+
 /**
- * Live-and-present members of `dir`: a marker counts while its pid is
- * alive (a just-bound member may not be listening yet — provisional still
- * counts, so its lower ticket is respected); dead-pid markers are swept
- * unconditionally — the owner cannot exist.
+ * Live-and-present state of `dir`. Marker kinds:
+ *   `b-<ticket>-<pid>-<seq>` — a bakery member (socket on unix, file on win).
+ *   `m-<pid>-<seq>`          — a member from this lock's previous design;
+ *                              honored as ticket 0 (its owner advertised
+ *                              before any bakery member).
+ *   `c-<pid>-<seq>`          — a contender between choosing a ticket and
+ *                              advertising it; live ones force a rescan.
+ * Anything whose pid is dead is swept unconditionally — the owner cannot
+ * exist. A member counts while its pid is alive even before it finishes
+ * binding: provisional still holds its ticket.
  */
-async function liveMembers(dir: string): Promise<LockMember[]> {
+async function scanMembers(dir: string): Promise<MemberScan> {
   let entries: string[];
   try {
     entries = readdirSync(dir);
   } catch {
-    return [];
+    return { members: [], choosing: false };
   }
   const members: LockMember[] = [];
+  let choosing = false;
   for (const entry of entries) {
-    const m = /^m-(\d+)-(\d+)$/.exec(entry);
-    if (!m) continue;
-    const member = { pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
-    if (!pidAlive(member.pid)) {
-      rmSync(member.file, { force: true });
+    let m = /^b-(\d+)-(\d+)-(\d+)$/.exec(entry);
+    if (m) {
+      const member = { ticket: Number(m[1]), pid: Number(m[2]), seq: Number(m[3]), file: join(dir, entry) };
+      if (!pidAlive(member.pid)) {
+        rmSync(member.file, { force: true });
+      } else {
+        members.push(member);
+      }
       continue;
     }
-    members.push(member);
+    m = /^m-(\d+)-(\d+)$/.exec(entry);
+    if (m) {
+      const member = { ticket: 0, pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
+      if (!pidAlive(member.pid)) {
+        rmSync(member.file, { force: true });
+      } else {
+        members.push(member);
+      }
+      continue;
+    }
+    m = /^c-(\d+)-(\d+)$/.exec(entry);
+    if (m) {
+      if (!pidAlive(Number(m[1]))) {
+        rmSync(join(dir, entry), { force: true });
+      } else {
+        choosing = true;
+      }
+    }
   }
-  // Presence while the pid is alive is authoritative: a member that has
-  // advertised (marker written, still binding) is provisionally holding
-  // its ticket, and one that fails or releases removes its own marker.
-  members.sort((a, b) => a.pid - b.pid || a.seq - b.seq);
-  return members;
+  members.sort((a, b) => a.ticket - b.ticket || a.pid - b.pid || a.seq - b.seq);
+  return { members, choosing };
 }
 
 /**
- * Serialize the install critical section across processes. Membership
- * protocol: write our marker (bound socket / pipe) FIRST, then scan — any
- * contender whose scan overlaps our critical section sees our marker and
- * waits, and our own scan sees every contender that advertised before us.
- * The lowest live ticket wins; equal-or-higher tickets never block, so the
- * lowest can never deadlock. A dead member's marker is deleted by the next
- * scan unconditionally — no liveness probe is trusted to unlink anything.
+ * Serialize the install critical section across processes. Bakery
+ * protocol: advertise `c-<pid>-<seq>` while choosing, take ticket
+ * `1 + max(seen)`, then bind `b-<ticket>-<pid>-<seq>` and wait until ours
+ * is the lowest live ticket. Arrival order is preserved because any
+ * member advertised after us necessarily saw our ticket when choosing;
+ * a live `c-` marker forces waiters to rescan so a mid-choose contender
+ * cannot be leapfrogged by a stale max. A dead member's marker is deleted
+ * by the next scan unconditionally — no liveness probe is trusted to
+ * unlink anything.
  *
  * On Unix the marker is a listening unix socket so probes land harmlessly;
  * on Windows it is an empty marker file plus nothing to probe — pid
@@ -758,7 +798,19 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
   const { dir, legacy } = lockDirPath(path);
   mkdirSync(dir, { recursive: true });
   const seq = memberSeq++;
-  const marker = join(dir, `m-${process.pid}-${seq}`);
+  // Bakery choose phase: advertise `c-` first so no scanner computes a
+  // ticket while ours is unrecorded, then take `1 + max` of the tickets
+  // seen — any member that advertised after us necessarily read a max that
+  // includes ours, so arrival order is honored no matter how pids order.
+  const choosing = join(dir, `c-${process.pid}-${seq}`);
+  try {
+    writeFileSync(choosing, '', { flag: 'wx' });
+  } catch {
+    // left over from a crashed choose — reuse it
+  }
+  const seen = await scanMembers(dir);
+  const ticket = seen.members.reduce((max, m) => Math.max(max, m.ticket), 0) + 1;
+  const marker = join(dir, `b-${ticket}-${process.pid}-${seq}`);
   let server: Server | undefined;
   if (process.platform === 'win32') {
     // Marker file only: there is no shared name to steal, and the pipe is
@@ -791,6 +843,7 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
       throw error;
     });
   }
+  rmSync(choosing, { force: true });
   try {
     while (true) {
       if (Date.now() > deadline) {
@@ -808,12 +861,21 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
         }
         rmSync(legacy, { force: true });
       }
-      const members = await liveMembers(dir);
-      // Lowest ticket among present members wins. Members that appear only
-      // in a later scan advertised after our marker existed, so their own
-      // scans saw us — they will wait behind our ticket.
-      const ahead = (m: LockMember) => m.pid > process.pid || (m.pid === process.pid && m.seq > seq);
-      if (members.every((m) => (m.pid === process.pid && m.seq === seq) || ahead(m))) {
+      const scan = await scanMembers(dir);
+      if (scan.choosing) {
+        // A contender is mid-choose — its ticket may undercut ours. Rescan
+        // until it advertises (its c- marker dies with its pid if it never
+        // finishes, so this cannot hang).
+        await new Promise((r) => setTimeout(r, 50));
+        continue;
+      }
+      // Lowest ticket wins; equal tickets break on pid then seq. Members
+      // that advertised after us carry a strictly higher ticket by the
+      // choose phase above.
+      const us = (m: LockMember) => m.ticket === ticket && m.pid === process.pid && m.seq === seq;
+      const behind = (m: LockMember) =>
+        m.ticket > ticket || (m.ticket === ticket && (m.pid > process.pid || (m.pid === process.pid && m.seq > seq)));
+      if (scan.members.every((m) => us(m) || behind(m))) {
         HELD_INSTALL_LOCKS.set(path, { server, marker });
         return;
       }
@@ -822,6 +884,7 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
   } catch (error) {
     server?.close();
     rmSync(marker, { force: true });
+    rmSync(choosing, { force: true });
     throw error;
   }
 }
