@@ -934,11 +934,13 @@ export interface MemberScan {
 }
 
 /**
- * A `b-`/`m-`/`c-` marker is swept on a refused socket probe only when it
- * is older than this: the marker file exists between bind() and listen()
- * completing, so a fresh marker that refuses is a member mid-bind, and
- * unlinking it would leave that acquirer scanning forever for a name that
- * is gone. Recycled-pid markers are by definition old.
+ * A `b-`/`m-`/`c-` marker is swept on a refused endpoint probe only when
+ * it is older than this: on unix the marker node exists between bind()
+ * and listen() completing, so a fresh marker that refuses is a member
+ * mid-bind, and unlinking it would leave that acquirer scanning forever
+ * for a name that is gone. (On Windows the marker file is written only
+ * after its pipe is already listening, so the window cannot occur — the
+ * bound stays for symmetry.) Recycled-pid markers are by definition old.
  */
 const MEMBER_STALE_MS = 2_000;
 
@@ -1064,6 +1066,35 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
 }
 
 /**
+ * Bind a marker's probe endpoint — the unix socket at `marker` itself, or
+ * its derived named pipe on Windows. One EADDRINUSE retry: the name can
+ * outlive a dead owner's scan sweep (stale socket node; a same-name pipe
+ * an unrelated process happens to hold is unbindable but unremovable, so
+ * a second refusal fails the acquire outright rather than stealing it).
+ */
+async function bindMarkerListener(marker: string): Promise<Server> {
+  const probe = markerProbePath(marker);
+  const bind = (): Promise<Server> =>
+    new Promise<Server>((res, rej) => {
+      const server = createServer((sock) => sock.destroy());
+      server.on('error', () => {}); // stray runtime errors must not crash the holder
+      server.once('error', rej);
+      server.listen(probe, () => {
+        server.removeListener('error', rej);
+        res(server);
+      });
+    });
+  return bind().catch(async (error) => {
+    if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error;
+    // A dead-pid marker file can survive the scan that should have swept
+    // it — removing the file frees a stale unix socket node. On Windows
+    // the file is not the name; the retry just re-races the foreign pipe.
+    rmSync(marker, { force: true });
+    return bind();
+  });
+}
+
+/**
  * Serialize the install critical section across processes. Bakery
  * protocol: advertise `c-<pid>-<seq>` while choosing, take ticket
  * `1 + max(seen)`, then bind `b-<ticket>-<pid>-<seq>` and wait until ours
@@ -1155,12 +1186,12 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
       }
       // Lowest ticket wins; equal tickets break on pid then seq. Members
       // that advertised after us carry a strictly higher ticket by the
-      // choose phase above. Our OWN marker must be in the scan: a unix
-      // member suspended past MEMBER_STALE_MS between node creation and
-      // listen gets swept as aged/refused, and resuming to an every()
-      // that contains only higher tickets would grant the lock a second
-      // time while another process holds it. Missing own marker → wait
-      // out the deadline rather than enter.
+      // choose phase above. Our OWN marker must be in the scan: a member
+      // suspended past MEMBER_STALE_MS with an unanswerable endpoint gets
+      // swept as aged/refused, and resuming to an every() that contains
+      // only higher tickets would grant the lock a second time while
+      // another process holds it. Missing own marker → wait out the
+      // deadline rather than enter.
       const us = (m: LockMember) => m.ticket === ticket && m.pid === process.pid && m.seq === seq;
       const behind = (m: LockMember) =>
         m.ticket > ticket || (m.ticket === ticket && (m.pid > process.pid || (m.pid === process.pid && m.seq > seq)));

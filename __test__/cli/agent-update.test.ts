@@ -27,6 +27,7 @@ import {
   applyAgentUpdate,
   downloadAgentBinary,
   managedAgentBinPath,
+  markerProbePath,
   probeAgentInstall,
   releaseInstallLock,
   resolveAgentBinary,
@@ -563,21 +564,19 @@ describe('downloadAgentBinary', () => {
       const lock = join(home, 'mlx-agent.lock');
       const dir = `${lock}.d`;
       const servers: Server[] = [];
-      // A live member marker must actually hold the name: on unix the
-      // marker is a listening socket (a live pid with a dead socket is a
-      // recycled pid and gets swept), on Windows a plain file.
+      // A live member marker must actually hold its endpoint: on unix the
+      // marker is a listening socket, on Windows a named pipe plus the
+      // marker file — a live pid with a dead endpoint is a recycled pid
+      // and gets swept on both.
       const advertise = async (name: string): Promise<void> => {
         const file = join(dir, name);
-        if (process.platform === 'win32') {
-          writeFileSync(file, '');
-          return;
-        }
         const server = createServer((sock) => sock.destroy());
         servers.push(server);
         await new Promise<void>((res, rej) => {
           server.once('error', rej);
-          server.listen(file, res);
+          server.listen(markerProbePath(file), res);
         });
+        if (process.platform === 'win32') writeFileSync(file, '');
       };
       try {
         mkdirSync(dir, { recursive: true });
@@ -606,17 +605,14 @@ describe('downloadAgentBinary', () => {
     },
   );
 
-  it('sweeps a dead-socket member whose pid was recycled by an unrelated process', { timeout: 20_000 }, async () => {
-    // Windows markers are plain files — pid liveness is authoritative
-    // there, so the recycled-pid scenario cannot be reproduced.
-    if (process.platform === 'win32') return;
+  it('sweeps a dead-endpoint member whose pid was recycled by an unrelated process', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
       const dir = `${lock}.d`;
       mkdirSync(dir, { recursive: true });
       // A bakery marker left by a crashed holder whose pid the OS handed
-      // to us: live pid, dead socket — and OLD (a fresh refusal is a
+      // to us: live pid, dead endpoint — and OLD (a fresh refusal is a
       // member mid-bind, so only aged markers get swept). pidAlive alone
       // would pin every acquire behind a lock nobody owns; the refusal
       // plus age is what identifies the recycle.
@@ -637,22 +633,23 @@ describe('downloadAgentBinary', () => {
     'refuses the grant when our own marker was swept and only higher tickets remain',
     { timeout: 20_000 },
     async () => {
-      // On Windows nothing sweeps a live-pid marker, so the scenario is
-      // unix-only: a member suspended past the stale bound between socket
-      // node creation and listen gets its live marker removed; on resume,
-      // every() alone can pass over the winner's higher ticket.
-      if (process.platform === 'win32') return;
+      // A member suspended past the stale bound with an unanswerable
+      // endpoint gets its live marker removed; on resume, every() alone
+      // can pass over the winner's higher ticket. Runs on Windows too:
+      // the recycled-pid probe there is the derived named pipe.
       const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
       const lock = join(home, 'mlx-agent.lock');
       const dir = `${lock}.d`;
       const servers: Server[] = [];
       const listenAt = async (name: string): Promise<void> => {
+        const file = join(dir, name);
         const server = createServer((sock) => sock.destroy());
         servers.push(server);
         await new Promise<void>((res, rej) => {
           server.once('error', rej);
-          server.listen(join(dir, name), res);
+          server.listen(markerProbePath(file), res);
         });
+        if (process.platform === 'win32') writeFileSync(file, '');
       };
       try {
         mkdirSync(dir, { recursive: true });
@@ -707,15 +704,12 @@ describe('downloadAgentBinary', () => {
       // by age alone — sweeping its live marker lets a later contender
       // choose the same ticket and enter concurrently, so an OLD but
       // owned marker must keep blocking until it advertises or dies.
-      if (process.platform === 'win32') {
-        writeFileSync(marker, '');
-      } else {
-        server = createServer((sock) => sock.destroy());
-        await new Promise<void>((res, rej) => {
-          server!.once('error', rej);
-          server!.listen(marker, res);
-        });
-      }
+      server = createServer((sock) => sock.destroy());
+      await new Promise<void>((res, rej) => {
+        server!.once('error', rej);
+        server!.listen(markerProbePath(marker), res);
+      });
+      if (process.platform === 'win32') writeFileSync(marker, '');
       try {
         const past = new Date(Date.now() - 60_000);
         utimesSync(marker, past, past);
@@ -730,17 +724,16 @@ describe('downloadAgentBinary', () => {
     }
   });
 
-  it('sweeps a choose marker whose socket refuses — its pid was recycled', { timeout: 20_000 }, async () => {
-    if (process.platform === 'win32') return;
+  it('sweeps a choose marker whose endpoint refuses — its pid was recycled', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
       const dir = `${lock}.d`;
       mkdirSync(dir, { recursive: true });
-      // A `c-` file that is not a listening socket: on unix a real
-      // contender binds one, so a live pid with a dead socket is debris
-      // fronting a recycled pid. Aged past the mid-bind grace so the
-      // sweep applies immediately.
+      // A `c-` marker whose endpoint is not listening: a real contender
+      // binds one, so a live pid with a dead endpoint is debris fronting
+      // a recycled pid. Aged past the mid-bind grace so the sweep applies
+      // immediately.
       const marker = join(dir, `c-${process.pid}-0`);
       writeFileSync(marker, '');
       const past = new Date(Date.now() - 60_000);
@@ -754,9 +747,6 @@ describe('downloadAgentBinary', () => {
   });
 
   it('reports a vanished mid-probe marker as still choosing so the caller rescans', { timeout: 20_000 }, async () => {
-    // Unix-only: the stale-probe path (and the vanish race) only exists
-    // where markers are probed by socket; Windows keeps plain files.
-    if (process.platform === 'win32') return;
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const dir = join(home, 'lock.d');
