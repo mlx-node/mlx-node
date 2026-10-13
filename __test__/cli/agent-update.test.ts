@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -81,15 +82,19 @@ describe('probeAgentInstall', () => {
     }
   });
 
-  it('falls back to a legacy unversioned binary when the versioned file is absent', () => {
+  it('treats an orphaned .tag pointer as a broken cache, not a legacy binary', () => {
     const root = mkdtempSync(join(tmpdir(), 'probe-'));
     try {
       mkdirBin(root);
       const legacy = managedAgentBinPath(root);
+      // The versioned file the pointer names is gone; the leftover
+      // unversioned binary predates tagging, so it must NOT inherit the
+      // orphaned tag — reporting v0.2.0 would suppress the update that
+      // repairs this cache.
       writeFileSync(legacy, 'legacy');
       writeFileSync(`${legacy}.tag`, 'mlx-agent-v0.2.0');
       const probe = probeAgentInstall(root, {}, root);
-      expect(probe).toMatchObject({ source: 'managed', path: legacy, managedTag: 'mlx-agent-v0.2.0' });
+      expect(probe).toMatchObject({ source: 'none', managedTag: undefined });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -375,6 +380,50 @@ describe('downloadAgentBinary', () => {
       await acquireInstallLock(lock, { deadlineMs: 2_000 });
       releaseInstallLock(lock);
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a name that gains a live owner mid-reclaim is restored, not unlinked', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    let intruder: Server | undefined;
+    try {
+      const lock = join(home, 'mlx-agent.lock');
+      // Incumbent looks dead. Between the failed probe and the capture, a
+      // new owner binds a live socket — the reclaim must return that name
+      // whole instead of unlinking it.
+      writeFileSync(lock, '999999');
+      let swapped = false;
+      await expect(
+        acquireInstallLock(lock, {
+          deadlineMs: 600,
+          onAfterDeadProbe: async () => {
+            if (swapped) return;
+            swapped = true;
+            rmSync(lock, { force: true });
+            intruder = createServer((s) => s.destroy());
+            await new Promise<void>((res, rej) => {
+              intruder!.once('error', rej);
+              intruder!.listen(lock, res);
+            });
+          },
+        }),
+      ).rejects.toThrow('install lock');
+      expect(swapped).toBe(true);
+      // The intruder's listener still owns the name — a connection lands.
+      const { connect } = await import('node:net');
+      const probe = await new Promise<boolean>((res) => {
+        const s = connect(lock);
+        s.once('connect', () => {
+          s.destroy();
+          res(true);
+        });
+        s.once('error', () => res(false));
+      });
+      expect(probe).toBe(true);
+      expect(intruder!.listening).toBe(true);
+    } finally {
+      intruder?.close();
       rmSync(home, { recursive: true, force: true });
     }
   });

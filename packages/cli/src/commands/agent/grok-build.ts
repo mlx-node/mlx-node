@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, renameSync, writeFileSync } from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -121,8 +121,17 @@ export function probeAgentInstall(
   // versioned miss or a legacy install falls back to the unversioned base.
   const stamped = readAgentTag(managed);
   const versioned = stamped !== undefined ? join(dirname(managed), agentBinName(stamped)) : undefined;
+  // The unversioned base is a fallback ONLY for installs that predate
+  // pointers: when a pointer names a release whose versioned binary is
+  // gone, that is a broken cache — stamping the leftover legacy binary
+  // with the orphaned tag would both run the wrong release and suppress
+  // the update check that could repair it.
   const managedBin =
-    versioned !== undefined && existsSync(versioned) ? versioned : existsSync(managed) ? managed : undefined;
+    versioned !== undefined && existsSync(versioned)
+      ? versioned
+      : stamped === undefined && existsSync(managed)
+        ? managed
+        : undefined;
   // The tag counts only with a binary on disk — an orphaned pointer left by
   // a failed install must not suppress the next download.
   const managedTag = managedBin !== undefined ? stamped : undefined;
@@ -596,6 +605,12 @@ export async function downloadAgentBinary(dest: string, tag?: string): Promise<s
 export interface AcquireLockHooks {
   /** Retry deadline override (default 10s). */
   deadlineMs?: number;
+  /**
+   * Test seam: fires after a node failed the liveness probe and before it
+   * is captured for reclamation — lets a test interleave a new owner
+   * deterministically.
+   */
+  onAfterDeadProbe?: (node: string) => void | Promise<void>;
 }
 
 /**
@@ -604,7 +619,9 @@ export interface AcquireLockHooks {
  * connectable name IS proof of a live owner — no pid files, no staleness
  * heuristics, and nothing a thief can delete to impersonate a release.
  */
-const HELD_INSTALL_LOCKS = new Map<string, { server: Server; node: string }>();
+const HELD_INSTALL_LOCKS = new Map<string, { server: Server; node: string; ino?: number }>();
+/** Unique captive suffix per reclaim attempt within this process. */
+let reclaimCounter = 0;
 
 /**
  * Where the lock node actually lives. Unix socket paths cap at ~104 bytes
@@ -697,7 +714,15 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
     });
     if (await tryListen(server, node)) {
       if (await verifySelfBind(server, node, token)) {
-        HELD_INSTALL_LOCKS.set(path, { server, node });
+        // Remember our socket's inode so release never deletes a name that
+        // was re-bound by someone else (e.g. after a restore clobbered ours).
+        let ino: number | undefined;
+        try {
+          ino = lstatSync(node).ino;
+        } catch {
+          // named pipe or stat-less platform — no inode to guard
+        }
+        HELD_INSTALL_LOCKS.set(path, { server, node, ino });
         return;
       }
       server.close();
@@ -708,9 +733,39 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
       );
     }
     if (!(await holderAlive(node))) {
-      // Stale name — dead holder or a legacy plain lock file. Safe to
-      // unlink: only a refusing-to-connect node gets removed.
-      if (process.platform !== 'win32') rmSync(node, { force: true });
+      await hooks.onAfterDeadProbe?.(node);
+      if (process.platform === 'win32') continue; // pipe names die with the holder — never stale
+      // Reclaim the stale name WITHOUT ever unlinking it on stale evidence:
+      // a second reclaimer can bind a live owner between our probe and our
+      // unlink. The node is moved whole into a private captive and judged
+      // THERE — a captive that still accepts connections is a live lock
+      // stolen mid-gap, so it is restored via link; only a captive that
+      // refuses gets removed.
+      // Captive lives in tmpdir with a short name: the probe connects to
+      // IT, so it must stay under sun_path no matter how long `node` is.
+      const captive = join(tmpdir(), `mlx-rc${process.pid.toString(36)}${(reclaimCounter++).toString(36)}`);
+      try {
+        renameSync(node, captive);
+      } catch {
+        // vanished or replaced between probe and capture — retry listen
+        continue;
+      }
+      try {
+        if (await holderAlive(captive)) {
+          // Captured a live owner's name — return it whole. rename replaces
+          // whatever a usurper bound while the name was free, so the real
+          // owner always regains the name; a usurper's own verifySelfBind
+          // (or its inode-checked release) cleans up its side.
+          try {
+            renameSync(captive, node);
+          } catch {
+            // restore failed — captive stays nameless; the owner still
+            // holds its server and this attempt retries like any observer
+          }
+        }
+      } finally {
+        rmSync(captive, { force: true });
+      }
       continue;
     }
     await new Promise((r) => setTimeout(r, 50));
@@ -723,7 +778,10 @@ export function releaseInstallLock(path: string): void {
     if (!held) return;
     HELD_INSTALL_LOCKS.delete(path);
     held.server.close();
-    if (process.platform !== 'win32') rmSync(held.node, { force: true });
+    if (process.platform === 'win32') return; // pipe names die with the process
+    // Delete only OUR inode: a usurper's name clobbered by a restore must
+    // not unlink the lock the real owner holds now.
+    if (held.ino !== undefined && lstatSync(held.node).ino === held.ino) rmSync(held.node, { force: true });
   } catch {
     // lock cleanup is best-effort
   }
