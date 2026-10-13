@@ -329,11 +329,7 @@ export class TurnTraceModel implements SessionCapableModel {
         rec.coldEvictions = delta(marks.cold, 'evictions', cold.evictions);
         rec.coldCorruptions = delta(marks.cold, 'corruptions', cold.corruptions);
         rec.coldWriteErrors = delta(marks.cold, 'writeErrors', cold.writeErrors);
-        rec.coldRestoreDeclines = delta(
-          marks.cold,
-          'restoreDeclines',
-          cold.restoreDeclines,
-        );
+        rec.coldRestoreDeclines = delta(marks.cold, 'restoreDeclines', cold.restoreDeclines);
         // Absolutes, not deltas: a dropped write inside an aborted turn (or
         // in the last turn before a crash) can land in a delta attributed to
         // the NEXT record, and one at process end lands in none at all. The
@@ -364,30 +360,14 @@ export class TurnTraceModel implements SessionCapableModel {
       }
       const sidecar = sidecarStats();
       if (sidecar && ctx.sidecar) {
-        rec.coldSidecarCaptureReached = delta(
-          marks.sidecar,
-          'captureReached',
-          sidecar.captureReached,
-        );
+        rec.coldSidecarCaptureReached = delta(marks.sidecar, 'captureReached', sidecar.captureReached);
         rec.coldSidecarChainEmpty = delta(marks.sidecar, 'chainEmpty', sidecar.chainEmpty);
-        rec.coldSidecarBoundarySkips = delta(
-          marks.sidecar,
-          'boundarySkips',
-          sidecar.boundarySkips,
-        );
-        rec.coldSidecarAlreadyPersisted = delta(
-          marks.sidecar,
-          'alreadyPersisted',
-          sidecar.alreadyPersisted,
-        );
+        rec.coldSidecarBoundarySkips = delta(marks.sidecar, 'boundarySkips', sidecar.boundarySkips);
+        rec.coldSidecarAlreadyPersisted = delta(marks.sidecar, 'alreadyPersisted', sidecar.alreadyPersisted);
         rec.coldSidecarEnqueued = delta(marks.sidecar, 'enqueued', sidecar.enqueued);
         rec.coldSidecarQueueDrops = delta(marks.sidecar, 'queueDrops', sidecar.queueDrops);
         rec.coldSidecarInstalled = delta(marks.sidecar, 'installed', sidecar.installed);
-        rec.coldSidecarRestoreSuppressed = delta(
-          marks.sidecar,
-          'restoreSuppressed',
-          sidecar.restoreSuppressed,
-        );
+        rec.coldSidecarRestoreSuppressed = delta(marks.sidecar, 'restoreSuppressed', sidecar.restoreSuppressed);
       }
       this.trace.record(rec);
     } catch {
@@ -475,11 +455,7 @@ export class TurnTraceModel implements SessionCapableModel {
     return this.dispatch('chatSessionStart', messages, config, signal);
   }
 
-  chatSessionContinue(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): Promise<ChatResult> {
+  chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal): Promise<ChatResult> {
     return this.dispatch('chatSessionContinue', messages, config, signal);
   }
 
