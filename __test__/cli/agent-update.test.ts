@@ -536,6 +536,31 @@ describe('downloadAgentBinary', () => {
     }
   });
 
+  it('sweeps a fresh-mtime lease whose pinner is dead — liveness, not age, decides', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      delete process.env[MLX_AGENT_TAG_ENV];
+      const dest = managedAgentBinPath(home);
+      mkdirBin(home);
+      const staleBin = versioned(home, 'mlx-agent-v0.1.0');
+      writeFileSync(staleBin, 'v010');
+      // A marker a dead pinner JUST wrote (or another sweeper refreshed):
+      // mtime is no alibi — the recorded pid is dead, so both it and the
+      // binary it names go. 999999 cannot be live on any real host.
+      const lease = `${staleBin}.lease-999999`;
+      writeFileSync(lease, '');
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(existsSync(staleBin)).toBe(false);
+      expect(existsSync(lease)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('sweeps an aged lease whose live pid cannot prove ownership (recycled pid)', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     const saved = process.env[MLX_AGENT_TAG_ENV];

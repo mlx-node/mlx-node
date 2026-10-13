@@ -824,17 +824,33 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
       const liveLeases: { entry: string; binary: string }[] = [];
       // Unix socket nodes outlive their owner; sweeping a lease removes the
       // marker AND the endpoint file (a Windows pipe name is not a file).
-      const removeLease = (marker: string): void => {
-        rmSync(marker, { force: true });
+      // The marker unlink is identity-gated like scanMembers': a recycled
+      // pid can revive this same marker (writeLeaseMarker re-advertises on
+      // wx collision) between pidAlive and rmSync, and deleting it unprotects
+      // a binary a live pinner is about to launch.
+      const removeLease = (marker: string, baseline: Stats): boolean => {
+        if (!removeIfUnchanged(marker, baseline)) return false;
         if (process.platform !== 'win32') rmSync(leaseProbePath(marker), { force: true });
+        return true;
       };
       for (const entry of entries) {
         const lease = parseLeaseName(entry);
         if (lease === undefined) continue;
-        if (pidAlive(lease.pid)) liveLeases.push({ entry, binary: lease.binary });
-        else {
-          // pinner is gone — the lease is dead weight
-          removeLease(join(dirname(dest), entry));
+        const file = join(dirname(dest), entry);
+        // Baseline BEFORE pidAlive so the recheck covers the whole
+        // liveness→unlink window; a changed node is a live lease.
+        let baseline: Stats;
+        try {
+          baseline = statSync(file);
+        } catch {
+          continue; // vanished mid-scan — nothing to sweep
+        }
+        if (pidAlive(lease.pid)) {
+          liveLeases.push({ entry, binary: lease.binary });
+        } else if (!removeLease(file, baseline)) {
+          // pinner is gone — unless the marker was revived mid-scan;
+          // then the lease is live and its binary is protected.
+          keep.add(lease.binary);
         }
       }
       // A live pid is not ownership: the OS can have recycled it onto an
@@ -853,8 +869,10 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
           keep.add(binary);
           continue;
         }
+        let baseline: Stats;
         try {
-          if (Date.now() - statSync(file).mtimeMs <= MEMBER_STALE_MS) {
+          baseline = statSync(file);
+          if (Date.now() - baseline.mtimeMs <= MEMBER_STALE_MS) {
             keep.add(binary);
             continue;
           }
@@ -863,7 +881,9 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
           keep.add(binary);
           continue;
         }
-        removeLease(file);
+        // An aged refusal unlinks only the probed node: a revived or
+        // rebound marker is a live lease whose binary stays protected.
+        if (!removeLease(file, baseline)) keep.add(binary);
       }
       for (const entry of entries) {
         if (!entry.startsWith('mlx-agent-v') || entry.includes('.lease-') || keep.has(entry)) continue;
