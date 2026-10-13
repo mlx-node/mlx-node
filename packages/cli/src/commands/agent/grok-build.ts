@@ -233,7 +233,7 @@ export async function resolveAgentBinary(
   const managed = managedAgentBinPath(homeDir);
   const probe = probeAgentInstall(repoRoot, env, homeDir);
   const probed = probe.path;
-  // Pass the caller's pin through explicitly: resolveReleaseTag reads
+  // Pass the caller's pin through explicitly: resolveReleaseCandidates reads
   // process.env, which can diverge from the env this call probed under.
   const pin = releasePin(env);
   if (probed === undefined) return downloadAgentBinary(managed, pin, env);
@@ -383,14 +383,25 @@ function agentAssetName(tag: string): string {
 }
 
 /**
- * Which release tag to download: `MLX_AGENT_TAG` override, then the R2
- * `latest` pointer (the release pipeline maintains it), then GitHub's
- * /releases/latest, then the baked minimum. Fork releases can ship at any
- * cadence and a CLI rebuild picks them up with no pin bump.
+ * Ordered download candidates, best first: the `MLX_AGENT_TAG` override
+ * alone (a pin requests exactly one release), then the R2 `latest`
+ * pointer and GitHub's /releases/latest — each only when it verifies
+ * installable — then the baked minimum as the unconditional last resort.
+ * Fork releases can ship at any cadence and a CLI rebuild picks them up
+ * with no pin bump.
  */
-export async function resolveReleaseTag(): Promise<string> {
-  const pin = releasePin();
-  if (pin !== undefined) return pin;
+async function resolveReleaseCandidates(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
+  const pin = releasePin(env);
+  if (pin !== undefined) return [pin];
+  const candidates: string[] = [];
+  // A candidate must be a well-formed tag at/above the floor and not
+  // already queued — the R2 pointer usually names the same tag GitHub
+  // calls latest.
+  const usable = (tag: string | undefined): tag is string =>
+    tag !== undefined &&
+    !candidates.includes(tag) &&
+    tagVersion(tag) !== null &&
+    compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0;
 
   try {
     const res = await fetch(`${MLX_AGENT_R2_BASE}/${MLX_AGENT_LATEST_KEY}`, {
@@ -405,17 +416,11 @@ export async function resolveReleaseTag(): Promise<string> {
       const tag = body?.toString('utf-8').trim();
       // Syntax alone is not enough: a stale or rolled-back pointer can name
       // a release below this CLI's floor, and a misconfigured mirror can
-      // point at a tag with no GitHub release at all — downloadAgentBinary
-      // would then die on the missing checksum with no retry. Only a tag
-      // that actually owns this platform's checksum is accepted; anything
-      // else falls through to GitHub's own latest.
-      if (
-        tag &&
-        tagVersion(tag) &&
-        compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0 &&
-        (await releaseChecksum(tag, agentAssetName(tag))) !== undefined
-      )
-        return tag;
+      // point at a tag whose checksum is empty/malformed or whose archive
+      // never shipped — accepting it would send downloadAgentBinary to a
+      // dead end. Only a tag whose download can verify end-to-end is a
+      // candidate; anything else falls through to GitHub's own latest.
+      if (usable(tag) && (await releaseInstallable(tag, agentAssetName(tag)))) candidates.push(tag);
     }
   } catch {
     // fall through to GitHub
@@ -430,13 +435,26 @@ export async function resolveReleaseTag(): Promise<string> {
       const body = await readCappedBody(res, MAX_META_RESPONSE_BYTES);
       const tag =
         body !== undefined ? (JSON.parse(body.toString('utf-8')) as { tag_name?: string }).tag_name?.trim() : undefined;
-      if (tag && tagVersion(tag) && compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0) return tag;
+      // Same gate as the mirror: a mid-publish latest whose assets are
+      // still uploading must not win over an older, complete release.
+      if (usable(tag) && (await releaseInstallable(tag, agentAssetName(tag)))) candidates.push(tag);
     }
   } catch {
     // fall through to the baked minimum
   }
 
-  return MLX_AGENT_MIN_RELEASE;
+  candidates.push(MLX_AGENT_MIN_RELEASE);
+  return candidates;
+}
+
+/**
+ * Which release tag to download — the first installable candidate. All
+ * consumers (`mlx agent update` status, the desktop fetch step) get the
+ * mirror-verification semantics for free.
+ */
+export async function resolveReleaseTag(): Promise<string> {
+  const candidates = await resolveReleaseCandidates();
+  return candidates[0] ?? MLX_AGENT_MIN_RELEASE;
 }
 
 /**
@@ -512,9 +530,49 @@ const MAX_AGENT_ARCHIVE_BYTES = 256 * 1024 * 1024;
  * tarball with a tampered digest; GitHub is what the release pipeline
  * publishes first and what our credentials write. A mirror that cannot
  * produce bytes matching the GitHub checksum simply loses the race.
+ *
+ * Returns the normalized hex digest, or undefined: a 404, an empty sidecar,
+ * or a body with no 64-hex token (error page, truncated write) is not a
+ * checksum, and callers must treat the release as unverifiable rather than
+ * carry junk into the digest comparison. Accepts both the bare digest the
+ * pipeline writes and the `sha256sum` `<hex>[ *]<name>` form.
  */
 async function releaseChecksum(tag: string, asset: string): Promise<string | undefined> {
-  return fetchText(`https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}.sha256`);
+  const body = await fetchText(`https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}.sha256`);
+  return body !== undefined ? /\b([0-9a-fA-F]{64})\b/.exec(body)?.[1]?.toLowerCase() : undefined;
+}
+
+/**
+ * Can the archive be fetched from at least one mirror? A GET cancelled
+ * after the headers lands costs a few KB at most (HEAD would do, but some
+ * mirrors refuse it); presence is all this proves — the actual bytes are
+ * verified against the checksum at download time.
+ */
+async function releaseArchiveReachable(tag: string, asset: string): Promise<boolean> {
+  const urls = [
+    `${MLX_AGENT_R2_BASE}/${tag}/${asset}`,
+    `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}`,
+  ];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(10_000) });
+      res.body?.cancel().catch(() => {});
+      if (res.ok) return true;
+    } catch {
+      // try the next mirror
+    }
+  }
+  return false;
+}
+
+/**
+ * A tag is a download candidate only when its archive exists on some
+ * mirror AND a parseable checksum exists on the GitHub release — the two
+ * things downloadAgentBinary will need. Missing either means this tag can
+ * only fail, so resolution must not stop here.
+ */
+async function releaseInstallable(tag: string, asset: string): Promise<boolean> {
+  return (await releaseChecksum(tag, asset)) !== undefined && (await releaseArchiveReachable(tag, asset));
 }
 
 /**
@@ -534,8 +592,39 @@ export async function downloadAgentBinary(
   tag?: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
-  tag ??= await resolveReleaseTag();
-  const versioned = join(dirname(dest), agentBinName(tag));
+  if (tag !== undefined) return installAgentRelease(dest, tag, await fetchAgentRelease(dest, tag), env);
+  // Unpinned: walk the resolved candidates. Resolution already gated on a
+  // parseable checksum plus a reachable archive, but that probe raced the
+  // real download — a tag whose fetch/verify still fails yields to the
+  // next candidate instead of dead-ending the launch.
+  const failures: string[] = [];
+  for (const candidate of await resolveReleaseCandidates(env)) {
+    let binary: Buffer;
+    try {
+      binary = await fetchAgentRelease(dest, candidate);
+    } catch (error) {
+      failures.push(`${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    // Install failures (lock contention, fs errors) are not tag-specific —
+    // propagating beats retrying the same failure under another tag.
+    return installAgentRelease(dest, candidate, binary, env);
+  }
+  throw new Error(
+    `mlx agent: no local binary found and the verified download failed ` +
+      `(${failures.join('; ')}). ` +
+      `Set ${MLX_AGENT_BIN_ENV}, or run \`yarn build:agent\` in the mlx-node repo.`,
+  );
+}
+
+/**
+ * Fetch `tag`'s archive from the mirrors and unpack it. Returns the binary
+ * bytes ONLY when they hash to the GitHub-published checksum — R2 first,
+ * GitHub release as fallback, either mirror's mismatch falling through to
+ * the next. Throws when no mirror produces verified bytes (or a usable
+ * checksum does not exist), so the caller's next candidate gets a turn.
+ */
+async function fetchAgentRelease(dest: string, tag: string): Promise<Buffer> {
   const asset = agentAssetName(tag);
   const urls = [
     `${MLX_AGENT_R2_BASE}/${tag}/${asset}`,
@@ -544,11 +633,7 @@ export async function downloadAgentBinary(
 
   const expected = await releaseChecksum(tag, asset);
   if (!expected) {
-    throw new Error(
-      `mlx agent: cannot verify ${asset} — its .sha256 is missing on the GitHub release ` +
-        `(${MLX_AGENT_RELEASE_REPO} @ ${tag}). Set ${MLX_AGENT_BIN_ENV}, or run \`yarn build:agent\` ` +
-        `in the mlx-node repo.`,
-    );
+    throw new Error(`cannot verify ${asset} — its .sha256 is missing or malformed on the GitHub release`);
   }
 
   mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
@@ -598,20 +683,26 @@ export async function downloadAgentBinary(
     }
   }
   if (!tar) {
-    throw new Error(
-      `mlx agent: no local binary found and the verified download failed ` +
-        `(${asset} unavailable or checksum-mismatched on R2 and GitHub). ` +
-        `Set ${MLX_AGENT_BIN_ENV}, or run \`yarn build:agent\` in the mlx-node repo.`,
-    );
+    throw new Error(`verified download failed (${asset} unavailable or checksum-mismatched on R2 and GitHub)`);
   }
   const tmp = join(dirname(dest), `${asset}.tmp-${process.pid}`);
-  const { chmodSync, renameSync, readdirSync } = await import('node:fs');
-  writeFileSync(tmp, Buffer.from(tar), { mode: 0o600 });
+  writeFileSync(tmp, tar, { mode: 0o600 });
   const out = spawnSync('tar', ['-xzf', tmp, '-O'], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
   rmSync(tmp, { force: true });
   if (out.status !== 0 || out.stdout.length === 0) {
-    throw new Error(`mlx agent: downloaded ${asset} but failed to unpack it`);
+    throw new Error(`downloaded ${asset} but failed to unpack it`);
   }
+  return out.stdout;
+}
+
+/**
+ * Install verified `binary` bytes for `tag` into the managed cache under
+ * the install lock. Failures here are never retried with another tag —
+ * they are local (lock, fs), not mirror problems.
+ */
+async function installAgentRelease(dest: string, tag: string, binary: Buffer, env: NodeJS.ProcessEnv): Promise<string> {
+  const versioned = join(dirname(dest), agentBinName(tag));
+  const { chmodSync, renameSync, readdirSync } = await import('node:fs');
   // The staged write → pointer flip → sweep sequence runs under a lockfile:
   // two concurrent installs of different tags must not let one process'
   // sweep delete the version the other's pointer just selected. Entering
@@ -643,7 +734,7 @@ export async function downloadAgentBinary(
     const staged = join(dirname(dest), `.mlx-agent.tmp-${process.pid}`);
     try {
       if (!alreadyInstalled) {
-        writeFileSync(staged, out.stdout, { mode: 0o700 });
+        writeFileSync(staged, binary, { mode: 0o700 });
         renameSync(staged, versioned);
         chmodSync(versioned, 0o700);
       }

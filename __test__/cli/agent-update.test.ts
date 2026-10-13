@@ -689,71 +689,63 @@ describe('downloadAgentBinary', () => {
     },
   );
 
-  it(
-    'keeps a live choose marker in the choosing set even when it is old',
-    { timeout: 20_000 },
-    async () => {
-      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
-      const lock = join(home, 'mlx-agent.lock');
-      const dir = `${lock}.d`;
-      const marker = join(dir, `c-${process.pid}-0`);
-      let server: Server | undefined;
-      try {
-        mkdirSync(dir, { recursive: true });
-        // A suspended contender is indistinguishable from a recycled pid
-        // by age alone — sweeping its live marker lets a later contender
-        // choose the same ticket and enter concurrently, so an OLD but
-        // owned marker must keep blocking until it advertises or dies.
-        if (process.platform === 'win32') {
-          writeFileSync(marker, '');
-        } else {
-          server = createServer((sock) => sock.destroy());
-          await new Promise<void>((res, rej) => {
-            server!.once('error', rej);
-            server!.listen(marker, res);
-          });
-        }
-        try {
-          const past = new Date(Date.now() - 60_000);
-          utimesSync(marker, past, past);
-        } catch {
-          // aging is best-effort — some filesystems refuse socket utimes
-        }
-        await expect(acquireInstallLock(lock, { deadlineMs: 1_000 })).rejects.toThrow('install lock');
-        expect(existsSync(marker)).toBe(true);
-      } finally {
-        server?.close();
-        rmSync(home, { recursive: true, force: true });
-      }
-    },
-  );
-
-  it(
-    'sweeps a choose marker whose socket refuses — its pid was recycled',
-    { timeout: 20_000 },
-    async () => {
-      if (process.platform === 'win32') return;
-      const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
-      try {
-        const lock = join(home, 'mlx-agent.lock');
-        const dir = `${lock}.d`;
-        mkdirSync(dir, { recursive: true });
-        // A `c-` file that is not a listening socket: on unix a real
-        // contender binds one, so a live pid with a dead socket is debris
-        // fronting a recycled pid. Aged past the mid-bind grace so the
-        // sweep applies immediately.
-        const marker = join(dir, `c-${process.pid}-0`);
+  it('keeps a live choose marker in the choosing set even when it is old', { timeout: 20_000 }, async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const lock = join(home, 'mlx-agent.lock');
+    const dir = `${lock}.d`;
+    const marker = join(dir, `c-${process.pid}-0`);
+    let server: Server | undefined;
+    try {
+      mkdirSync(dir, { recursive: true });
+      // A suspended contender is indistinguishable from a recycled pid
+      // by age alone — sweeping its live marker lets a later contender
+      // choose the same ticket and enter concurrently, so an OLD but
+      // owned marker must keep blocking until it advertises or dies.
+      if (process.platform === 'win32') {
         writeFileSync(marker, '');
+      } else {
+        server = createServer((sock) => sock.destroy());
+        await new Promise<void>((res, rej) => {
+          server!.once('error', rej);
+          server!.listen(marker, res);
+        });
+      }
+      try {
         const past = new Date(Date.now() - 60_000);
         utimesSync(marker, past, past);
-        await acquireInstallLock(lock, { deadlineMs: 2_000 });
-        releaseInstallLock(lock);
-        expect(existsSync(marker)).toBe(false);
-      } finally {
-        rmSync(home, { recursive: true, force: true });
+      } catch {
+        // aging is best-effort — some filesystems refuse socket utimes
       }
-    },
-  );
+      await expect(acquireInstallLock(lock, { deadlineMs: 1_000 })).rejects.toThrow('install lock');
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      server?.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps a choose marker whose socket refuses — its pid was recycled', { timeout: 20_000 }, async () => {
+    if (process.platform === 'win32') return;
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const lock = join(home, 'mlx-agent.lock');
+      const dir = `${lock}.d`;
+      mkdirSync(dir, { recursive: true });
+      // A `c-` file that is not a listening socket: on unix a real
+      // contender binds one, so a live pid with a dead socket is debris
+      // fronting a recycled pid. Aged past the mid-bind grace so the
+      // sweep applies immediately.
+      const marker = join(dir, `c-${process.pid}-0`);
+      writeFileSync(marker, '');
+      const past = new Date(Date.now() - 60_000);
+      utimesSync(marker, past, past);
+      await acquireInstallLock(lock, { deadlineMs: 2_000 });
+      releaseInstallLock(lock);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it('reports a vanished mid-probe marker as still choosing so the caller rescans', { timeout: 20_000 }, async () => {
     // Unix-only: the stale-probe path (and the vanish race) only exists
@@ -856,11 +848,52 @@ describe('downloadAgentBinary', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it('an unpinned download falls through to the next candidate when the resolved tag fails to fetch', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      delete process.env[MLX_AGENT_TAG_ENV];
+      const dest = managedAgentBinPath(home);
+      const tar = makeTarball(home, 'v020');
+      const sha = createHash('sha256').update(tar).digest('hex');
+      // The R2 pointer names v0.3.0 and its presence probe answers — but the
+      // archive 404s when the real download GETs it (assets yanked between
+      // resolve and fetch, the race presence probes cannot close). GitHub
+      // latest offers v0.2.0, which must carry the launch.
+      let badArchiveGets = 0;
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        if (u.endsWith('.sha256')) return new Response(sha);
+        if (u.includes('releases/latest')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.2.0' }));
+        if (u.endsWith('.tar.gz')) {
+          if (u.includes('mlx-agent-v0.3.0')) {
+            badArchiveGets += 1;
+            return badArchiveGets === 1 ? new Response('probe-ok') : new Response('nope', { status: 404 });
+          }
+          return new Response(new Uint8Array(tar));
+        }
+        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+        return new Response('nope', { status: 404 });
+      });
+      const path = await downloadAgentBinary(dest, undefined, {});
+      expect(path).toBe(versioned(home, 'mlx-agent-v0.2.0'));
+      expect(readFileSync(path, 'utf-8')).toBe('v020');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.2.0');
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('resolveReleaseTag', () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
   let savedTag: string | undefined;
+
+  /** Any parseable digest — resolution only needs the shape, not the value. */
+  const DIGEST = 'a'.repeat(64);
 
   function githubLatest(tag: string): Response {
     return new Response(JSON.stringify({ tag_name: tag }), { status: 200 });
@@ -877,10 +910,11 @@ describe('resolveReleaseTag', () => {
     fetchSpy.mockRestore();
   });
 
-  it('accepts a valid R2 latest pointer whose GitHub release owns the checksum', async () => {
+  it('accepts a valid R2 latest pointer whose release verifies installable', async () => {
     fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
       const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
-      if (u.endsWith('.sha256')) return new Response('abc123');
+      if (u.endsWith('.sha256')) return new Response(DIGEST);
+      if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
       return new Response('nope', { status: 404 });
     });
@@ -893,15 +927,60 @@ describe('resolveReleaseTag', () => {
       // R2 names a well-formed, above-minimum tag that never shipped — its
       // checksum 404s, so the mirror's word is not trusted.
       if (u.includes('releases/download/mlx-agent-v9.9.9')) return new Response('nope', { status: 404 });
+      if (u.endsWith('.sha256')) return new Response(DIGEST);
+      if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v9.9.9');
       return githubLatest('mlx-agent-v0.3.0');
     });
     await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
   });
 
+  it('falls through to GitHub when the R2 tag checksum is empty or malformed', async () => {
+    for (const bad of ['', 'not-a-digest', '<html>404</html>']) {
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        // The mirrored tag's checksum sidecar exists but carries no usable
+        // digest — a 200 alone must not qualify the release.
+        if (u.includes('releases/download/mlx-agent-v9.9.9')) return new Response(bad);
+        if (u.endsWith('.sha256')) return new Response(DIGEST);
+        if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
+        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v9.9.9');
+        return githubLatest('mlx-agent-v0.3.0');
+      });
+      await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+    }
+  });
+
+  it('falls through to GitHub when the R2 tag archive is missing on both mirrors', async () => {
+    fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      if (u.endsWith('.sha256')) return new Response(DIGEST);
+      // The checksum shipped but no archive did — present-but-undownloadable.
+      if (u.includes('mlx-agent-v9.9.9') && u.endsWith('.tar.gz')) return new Response('nope', { status: 404 });
+      if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v9.9.9');
+      return githubLatest('mlx-agent-v0.3.0');
+    });
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+  });
+
+  it('falls back to the minimum when no discovered tag is installable', async () => {
+    fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      // Neither mirror can produce a checksum for the tags they name.
+      if (u.endsWith('.sha256')) return new Response('nope', { status: 404 });
+      if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+      return githubLatest('mlx-agent-v0.3.0');
+    });
+    await expect(resolveReleaseTag()).resolves.toBe(MLX_AGENT_MIN_RELEASE);
+  });
+
   it('falls through to GitHub when the R2 latest is below the minimum', async () => {
     fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
       const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      if (u.endsWith('.sha256')) return new Response(DIGEST);
+      if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.1.0');
       return githubLatest('mlx-agent-v0.3.0');
     });
@@ -911,7 +990,9 @@ describe('resolveReleaseTag', () => {
   it('falls through to GitHub when the R2 latest pointer streams past the byte cap', async () => {
     fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
       const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
-      if (u.includes('github.com')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.3.0' }));
+      if (u.endsWith('.sha256')) return new Response(DIGEST);
+      if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
+      if (u.includes('github.com')) return githubLatest('mlx-agent-v0.3.0');
       // A hostile R2 streams an unbounded body before the tag can be read;
       // the cap rejects it instead of buffering it all.
       return new Response(
