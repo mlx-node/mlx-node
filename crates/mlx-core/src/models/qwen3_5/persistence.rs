@@ -38,11 +38,11 @@ use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState};
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
-    PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint, release_tiled_kquant_sources,
-    try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
-    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
-    try_build_sym8_quantized_linear,
+    PerLayerQuant, SYM8_BITS, SYM8_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
+    release_tiled_kquant_sources, try_build_affine_quantized_linear_tiled,
+    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear_tiled,
+    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
+    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
 use crate::vision::qwen::processing::QwenImageProcessor;
 
@@ -1297,6 +1297,412 @@ fn missing_mtp_required_weights(
     missing
 }
 
+/// How the CLEF loader stores the quantized BACKBONE projections. A decide is
+/// one prefill forward — every weight is read exactly once at M = prompt
+/// length — so the choice is a GEMM-route choice, not a memory one. The
+/// embedding and lm_head are untouched in every mode (their packed row
+/// gathers are already the fast path).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClefResidency {
+    /// Requantize each eligible projection to sym8 (int8 `[N,K]` weight +
+    /// f32 `[N]` per-output-channel scale) and serve it with the W8A8 int8
+    /// kernels (`QuantizedLinear::forward_sym8`). Measured on M5 Max at the
+    /// 9B/27B CLEF shapes: 1.3-1.8x over the dense bf16 GEMM at every M in
+    /// 128..1024, where every weight-only packed route (affine qmm, tiled
+    /// a8g64/q4k, per-group W8A8) is slower than dense bf16 from M >= 256.
+    /// Requires GPU gen >= 17.
+    Sym8,
+    /// Dequantize to dense bf16 and run MLX's bf16 GEMM.
+    Bf16,
+    /// Keep the checkpoint's packed layout (no pre-pass).
+    Packed,
+}
+
+const CLEF_RESIDENCY_ENV: &str = "MLX_CLEF_RESIDENCY";
+const CLEF_KEEP_PACKED_ENV: &str = "MLX_CLEF_KEEP_PACKED";
+const CLEF_SYM8_EXCLUDE_ENV: &str = "MLX_CLEF_SYM8_EXCLUDE";
+const CLEF_SYM8_ROTATE_ENV: &str = "MLX_CLEF_SYM8_ROTATE";
+/// Hadamard block of the sym8 input rotation; a projection rotates only when
+/// its input width K is a multiple of it.
+const CLEF_SYM8_HADAMARD_BLOCK: i64 = 1024;
+
+/// What the CLEF loader does to the backbone at load: the resolved
+/// [`ClefResidency`] plus, under `Sym8`, the projection names that keep the
+/// dense bf16 route anyway (`MLX_CLEF_SYM8_EXCLUDE`) and whether the
+/// requantized projections get the input rotation (`MLX_CLEF_SYM8_ROTATE`).
+/// Env-free; built once per load by [`clef_residency_from_env`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClefResidencyPlan {
+    pub(crate) residency: ClefResidency,
+    /// Last path components (`down_proj`, `o_proj`, ...) of the projections
+    /// that keep the checkpoint's packed weight under `Sym8` (the weight-only
+    /// route, activations exact). Only consulted under `Sym8`.
+    pub(crate) sym8_exclude: Vec<String>,
+    /// Under `Sym8`, rotate each requantized projection with `K %
+    /// CLEF_SYM8_HADAMARD_BLOCK == 0` by a signed block Hadamard (QuaRot) on
+    /// both the weight (at requantization) and the activation (in forward),
+    /// so the per-token int8 activation quant sees outlier-free rows.
+    pub(crate) sym8_rotate: bool,
+}
+
+impl ClefResidencyPlan {
+    /// A plan with an empty exclusion list and rotation on (the production
+    /// path builds the struct directly from the environment).
+    #[cfg(test)]
+    fn new(residency: ClefResidency) -> Self {
+        Self {
+            residency,
+            sym8_exclude: Vec::new(),
+            sym8_rotate: true,
+        }
+    }
+}
+
+/// Parse `MLX_CLEF_SYM8_EXCLUDE`: comma-separated projection name suffixes,
+/// trimmed, empty entries dropped (`"down_proj, o_proj"` → two names).
+fn parse_clef_sym8_exclude(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse `MLX_CLEF_SYM8_ROTATE`: on unless set to `0` / `false` / `off`.
+fn parse_clef_sym8_rotate(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "off")
+    )
+}
+
+/// The sym8 rotation's sign vector for input width `k`: f32 `[k]` of ±1 from
+/// splitmix64 seeded by `k` alone, so every projection of one width shares
+/// one array and the rotation is bit-identical across processes.
+fn clef_sym8_sign_values(k: usize) -> Vec<f32> {
+    let mut state = (k as u64) ^ 0x9E37_79B9_7F4A_7C15;
+    (0..k)
+        .map(|_| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            if z >> 63 == 0 { 1.0 } else { -1.0 }
+        })
+        .collect()
+}
+
+/// The sym8 rotation for input width `k` (`None` unless `k` is a whole
+/// number of Hadamard blocks). `signs` memoizes the per-width sign array.
+fn clef_sym8_transform(
+    k: i64,
+    signs: &mut HashMap<i64, MxArray>,
+) -> Result<Option<crate::quant::prism_hadamard::HadamardTransform>> {
+    if k <= 0 || k % CLEF_SYM8_HADAMARD_BLOCK != 0 {
+        return Ok(None);
+    }
+    let signs = match signs.get(&k) {
+        Some(s) => s.clone(),
+        None => {
+            let s = MxArray::from_float32(&clef_sym8_sign_values(k as usize), &[k])?;
+            s.eval();
+            signs.insert(k, s.clone());
+            s
+        }
+    };
+    Ok(Some(crate::quant::prism_hadamard::HadamardTransform {
+        signs,
+        block_size: CLEF_SYM8_HADAMARD_BLOCK as i32,
+        gdn_permutation: None,
+    }))
+}
+
+/// Whether `prefix`'s last path component (`layers.3.mlp.down_proj` →
+/// `down_proj`) is on the sym8 exclusion list.
+fn clef_sym8_list_excluded(prefix: &str, sym8_exclude: &[String]) -> bool {
+    let name = prefix.rsplit('.').next().unwrap_or(prefix);
+    sym8_exclude.iter().any(|s| s == name)
+}
+
+/// Resolve the CLEF residency from its inputs (env-free; see
+/// [`clef_residency_from_env`]). Precedence: an explicit
+/// `MLX_CLEF_RESIDENCY` wins over the `MLX_CLEF_KEEP_PACKED` alias of
+/// `packed`; when neither is set a quantized checkpoint on a gen >= 17 GPU
+/// defaults to `sym8` and everything else to `bf16`. `sym8` on gen < 17
+/// (the int8 kernels need M5+, `try_build_sym8_quantized_linear` fail-louds)
+/// falls back to `bf16` with a warning. An unknown value is an error.
+fn resolve_clef_residency(
+    explicit: Option<&str>,
+    keep_packed: bool,
+    is_quantized: bool,
+    gpu_gen: i32,
+) -> Result<ClefResidency> {
+    let explicit = explicit.map(str::trim).filter(|v| !v.is_empty());
+    let requested = match explicit.map(str::to_ascii_lowercase).as_deref() {
+        Some("sym8") => ClefResidency::Sym8,
+        Some("bf16") => ClefResidency::Bf16,
+        Some("packed") => ClefResidency::Packed,
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "{CLEF_RESIDENCY_ENV}={other:?}: expected one of sym8, bf16, packed"
+            )));
+        }
+        None if keep_packed => ClefResidency::Packed,
+        None if is_quantized && gpu_gen >= 17 => ClefResidency::Sym8,
+        None => ClefResidency::Bf16,
+    };
+    if requested == ClefResidency::Sym8 && gpu_gen < 17 {
+        eprintln!(
+            "[clef] {CLEF_RESIDENCY_ENV}=sym8 needs an M5+ GPU (gen >= 17), got gen {gpu_gen}; \
+             using bf16 residency"
+        );
+        return Ok(ClefResidency::Bf16);
+    }
+    Ok(requested)
+}
+
+/// Load-time-only: sample the residency switches once per CLEF load. The
+/// inner loader takes the resolved plan so tests never read the environment.
+pub(crate) fn clef_residency_from_env(is_quantized: bool) -> Result<ClefResidencyPlan> {
+    let explicit = std::env::var(CLEF_RESIDENCY_ENV).ok();
+    let keep_packed = std::env::var_os(CLEF_KEEP_PACKED_ENV).is_some();
+    let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
+    let residency =
+        resolve_clef_residency(explicit.as_deref(), keep_packed, is_quantized, gpu_gen)?;
+    let sym8_exclude =
+        parse_clef_sym8_exclude(std::env::var(CLEF_SYM8_EXCLUDE_ENV).ok().as_deref());
+    let sym8_rotate = parse_clef_sym8_rotate(std::env::var(CLEF_SYM8_ROTATE_ENV).ok().as_deref());
+    Ok(ClefResidencyPlan {
+        residency,
+        sym8_exclude,
+        sym8_rotate,
+    })
+}
+
+/// Per-layer override lookup shared by `try_build_ql` and the CLEF residency
+/// pre-pass. For merged GDN projections (in_proj_qkvz, in_proj_ba) the source
+/// overrides may live under the split keys; if the two sides disagree we pick
+/// the higher-precision combination:
+///   1. higher `bits` wins,
+///   2. on equal bits, prefer Affine > Mxfp8 > Mxfp4 (most precise mode).
+fn resolve_plq_for(
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    prefix: &str,
+    default_plq: PerLayerQuant,
+) -> PerLayerQuant {
+    per_layer_quant
+        .get(prefix)
+        .copied()
+        .or_else(|| {
+            if prefix.ends_with(".in_proj_qkvz") {
+                let base = prefix.strip_suffix(".in_proj_qkvz")?;
+                let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
+                let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
+                merge_per_layer(qkv, z, "in_proj_qkvz", "qkv", "z")
+            } else if prefix.ends_with(".in_proj_ba") {
+                let base = prefix.strip_suffix(".in_proj_ba")?;
+                let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
+                let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
+                merge_per_layer(b_val, a_val, "in_proj_ba", "b", "a")
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default_plq)
+}
+
+/// Whether a CLEF backbone projection may be requantized to sym8. Mirrors the
+/// `mlx convert --q-mode sym8` ladder: `convert::sym8_eligible` (2-D `[N,K]`
+/// with `K % 16 == 0`, the int8 kernel contract) plus `should_quantize`'s
+/// `in_proj_ba` exclusion — applied to the merged key and to the split
+/// `in_proj_b` / `in_proj_a` halves that `merge_split_projections` fuses into
+/// it, so the pair is dense whether or not the merge happened. The
+/// embedding and lm_head are filtered before this is consulted.
+fn clef_sym8_eligible(prefix: &str, dense: &MxArray) -> Result<bool> {
+    if prefix.ends_with(".in_proj_ba")
+        || prefix.ends_with(".in_proj_b")
+        || prefix.ends_with(".in_proj_a")
+    {
+        return Ok(false);
+    }
+    let shape = dense.shape()?;
+    Ok(shape.len() == 2 && shape[1] % 16 == 0)
+}
+
+/// CLEF residency pre-pass over the sanitized params map (see
+/// [`ClefResidency`]). Every backbone projection except the embedding and
+/// lm_head is rewritten in place:
+///   * `Sym8`: the source (packed, or dense when the checkpoint is
+///     unquantized) is decoded to bf16 and requantized with the SAME routine
+///     `mlx convert --q-mode sym8` uses (`convert::sym8_quantize_store`):
+///     `{prefix}.weight` = int8 `[N,K]`, `{prefix}.scales` = f32 `[N]`, no
+///     `.biases`, and `per_layer_quant[prefix]` = Sym8 so `try_build_ql`
+///     takes the `PerLayerMode::Sym8` arm. With `plan.sym8_rotate` and
+///     `K % CLEF_SYM8_HADAMARD_BLOCK == 0` the dense weight is rotated in
+///     f32 along K first (`W' = W · H_s`, `clef_sym8_transform`) and the
+///     SAME transform is returned under the prefix for `try_build_ql` to
+///     attach (`QuantizedLinear::with_sym8_hadamard`), so forward computes
+///     `(x · H_s)(W · H_s)^T = x W^T` with the int8 activation quant applied
+///     to the outlier-spread `x · H_s`. Projections the sym8 ladder rejects
+///     (`clef_sym8_eligible`) keep the `Bf16` behaviour; projections named
+///     on `plan.sym8_exclude` (`clef_sym8_list_excluded`) keep their packed
+///     weight; projections already stored sym8 stay as they are.
+///   * `Bf16`: the packed source is decoded to bf16 and its sidecars
+///     stripped; every `try_build_*` helper takes `.scales`-absent as "not
+///     quantized" and falls through to the dense `Linear` arm.
+///   * `Packed`: no-op.
+///
+/// Returns the sym8 rotations keyed by prefix (empty unless `Sym8` rotated
+/// something).
+fn apply_clef_residency(
+    params: &mut HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    plan: &ClefResidencyPlan,
+) -> Result<HashMap<String, crate::quant::prism_hadamard::HadamardTransform>> {
+    let mut transforms = HashMap::new();
+    let residency = plan.residency;
+    if residency == ClefResidency::Packed {
+        return Ok(transforms);
+    }
+    let is_quantized = is_quantized_checkpoint(params);
+    // Quantized checkpoint: every packed group. Unquantized under an explicit
+    // `sym8`: every 2-D float `.weight` (norms are 1-D, conv1d 3-D).
+    let mut prefixes: Vec<String> = if is_quantized {
+        params
+            .keys()
+            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+            .collect()
+    } else if residency == ClefResidency::Sym8 {
+        params
+            .iter()
+            .filter(|(_, w)| {
+                w.ndim().ok() == Some(2)
+                    && matches!(
+                        w.dtype().ok(),
+                        Some(DType::Float32 | DType::Float16 | DType::BFloat16)
+                    )
+            })
+            .filter_map(|(k, _)| k.strip_suffix(".weight").map(str::to_string))
+            .collect()
+    } else {
+        return Ok(transforms);
+    };
+    prefixes.sort();
+    let sym8_plq = PerLayerQuant {
+        bits: SYM8_BITS,
+        group_size: SYM8_GROUP_SIZE,
+        mode: PerLayerMode::Sym8,
+        input_amax: None,
+        layout: Default::default(),
+    };
+    let mut requantized = 0usize;
+    let mut rotated = 0usize;
+    let mut dequantized = 0usize;
+    let mut list_excluded = 0usize;
+    let mut unmatched_exclusions: Vec<&String> = plan.sym8_exclude.iter().collect();
+    let mut kept: Vec<String> = Vec::new();
+    let mut signs_by_width: HashMap<i64, MxArray> = HashMap::new();
+    for prefix in prefixes {
+        if prefix == "embedding" || prefix == "lm_head" {
+            continue;
+        }
+        let plq = resolve_plq_for(per_layer_quant, &prefix, default_plq);
+        // Already sym8 storage: nothing to decode (`mlx_dequantize` has no
+        // sym8 mode) and nothing to gain.
+        if plq.mode == PerLayerMode::Sym8 && params.contains_key(&format!("{prefix}.scales")) {
+            kept.push(prefix);
+            continue;
+        }
+        // Listed under `Sym8`: the projection keeps the checkpoint's packed
+        // weight (weight-only route, exact activations). Dense bf16 is not an
+        // option here — the MLP installs all-or-nothing, so a dense
+        // `down_proj` beside sym8 `gate|up` would fail loud.
+        if residency == ClefResidency::Sym8 && clef_sym8_list_excluded(&prefix, &plan.sym8_exclude)
+        {
+            let name = prefix.rsplit('.').next().unwrap_or(&prefix);
+            unmatched_exclusions.retain(|s| *s != name);
+            list_excluded += 1;
+            continue;
+        }
+        let Some(dense) = dequantize_source_head(params, &prefix, plq)? else {
+            continue;
+        };
+        if residency == ClefResidency::Sym8 && clef_sym8_eligible(&prefix, &dense)? {
+            let transform = if plan.sym8_rotate {
+                clef_sym8_transform(dense.shape_at(1)?, &mut signs_by_width)?
+            } else {
+                None
+            };
+            // Rotate in f32: `apply` computes in f32 and casts back to its
+            // input dtype, so a bf16 input would round the rotated weight
+            // to bf16 before the int8 quantizer sees it.
+            let source = match &transform {
+                Some(t) => t.apply(&dense.astype(DType::Float32)?, false)?,
+                None => dense,
+            };
+            let (q, s) = crate::convert::sym8_quantize_store(&source, &prefix)?;
+            params.insert(format!("{prefix}.weight"), q);
+            params.insert(format!("{prefix}.scales"), s);
+            params.remove(&format!("{prefix}.biases"));
+            per_layer_quant.insert(prefix.clone(), sym8_plq);
+            requantized += 1;
+            if let Some(t) = transform {
+                transforms.insert(prefix, t);
+                rotated += 1;
+            }
+        } else {
+            params.insert(format!("{prefix}.weight"), dense);
+            params.remove(&format!("{prefix}.scales"));
+            params.remove(&format!("{prefix}.biases"));
+            per_layer_quant.remove(&prefix);
+            dequantized += 1;
+        }
+    }
+    if requantized > 0 {
+        // The bf16 intermediates are dead once the int8 pair is evaluated.
+        crate::array::memory::synchronize_and_clear_cache();
+    }
+    if residency == ClefResidency::Sym8 && !unmatched_exclusions.is_empty() {
+        warn!(
+            "CLEF {CLEF_SYM8_EXCLUDE_ENV}: no projection named {:?} (names match the last path \
+             component as loaded, e.g. in_proj_qkvz after the GDN merge)",
+            unmatched_exclusions
+        );
+    }
+    if requantized + dequantized + list_excluded > 0 {
+        info!(
+            "CLEF residency {:?}: requantized {} projections to sym8, dequantized {} to bf16 at \
+             load ({} kept packed by {CLEF_SYM8_EXCLUDE_ENV}={:?}; {} kept as stored; \
+             {CLEF_RESIDENCY_ENV}=sym8|bf16|packed, {CLEF_KEEP_PACKED_ENV}=1 is an alias of \
+             packed); sym8 hadamard rotation {}: {} rotated, {} unrotated{} \
+             ({CLEF_SYM8_ROTATE_ENV}=1|0){}",
+            residency,
+            requantized,
+            dequantized,
+            list_excluded,
+            plan.sym8_exclude.join(","),
+            kept.len(),
+            if plan.sym8_rotate { "on" } else { "off" },
+            rotated,
+            requantized - rotated,
+            if plan.sym8_rotate {
+                format!(" (K % {CLEF_SYM8_HADAMARD_BLOCK} != 0)")
+            } else {
+                String::new()
+            },
+            if kept.is_empty() {
+                String::new()
+            } else {
+                format!(" — kept: {}", kept.join(", "))
+            }
+        );
+    }
+    Ok(transforms)
+}
+
 /// Apply weights directly to a Qwen35Inner (no locks needed).
 ///
 /// Test seam over [`apply_weights_inner_with_residency`]. The production
@@ -1327,7 +1733,7 @@ fn apply_weights_inner(
         per_layer_quant,
         _has_vision,
         prism,
-        false,
+        None,
     )
     .map(drop)
 }
@@ -1355,18 +1761,17 @@ fn apply_weights_inner_with_residency(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
     prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
-    // CLEF decision-model load. Two behaviours hang off it:
+    // `Some` on a CLEF decision-model load. Two behaviours hang off it:
     //   * the residual stream is pinned to bf16 in `decide_clef`, so f16
     //     affine sidecars are stored bf16 to keep the bf16 QMM kernels
     //     (`promote_affine_sidecars_to_bf16`) — NOT bit-identical to the f32
     //     promote, scoped to the clef loader whose bf16 reference is the
     //     acceptance ground truth;
-    //   * unless `MLX_CLEF_KEEP_PACKED` is set, quantized BACKBONE weights are
-    //     dequantized to bf16 at load (decide is a single prefill — the
-    //     packed QMM kernels pay inline-dequant overhead per forward while
-    //     the dense GEMM does not). The embedding and lm_head stay packed:
-    //     the lookup/gather paths already read packed rows directly.
-    clef: bool,
+    //   * the quantized BACKBONE weights are rewritten per the resolved
+    //     `ClefResidencyPlan` (`apply_clef_residency`). The embedding and
+    //     lm_head stay packed: the lookup/gather paths already read packed
+    //     rows directly.
+    clef: Option<&ClefResidencyPlan>,
 ) -> Result<PlainFp8Residency> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -1398,94 +1803,34 @@ fn apply_weights_inner_with_residency(
         .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
         .unwrap_or(DType::BFloat16);
 
-    // Per-layer override lookup, shared by `try_build_ql` and the CLEF
-    // bf16-residency pre-pass. For merged GDN projections (in_proj_qkvz,
-    // in_proj_ba) the source overrides may live under the split keys; if
-    // the two sides disagree we pick the higher-precision combination:
-    //   1. higher `bits` wins,
-    //   2. on equal bits, prefer Affine > Mxfp8 > Mxfp4 (most precise mode).
-    let resolve_plq =
-        |per_layer_quant: &HashMap<String, PerLayerQuant>, prefix: &str| -> PerLayerQuant {
-            per_layer_quant
-                .get(prefix)
-                .copied()
-                .or_else(|| {
-                    if prefix.ends_with(".in_proj_qkvz") {
-                        let base = prefix.strip_suffix(".in_proj_qkvz")?;
-                        let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
-                        let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
-                        merge_per_layer(qkv, z, "in_proj_qkvz", "qkv", "z")
-                    } else if prefix.ends_with(".in_proj_ba") {
-                        let base = prefix.strip_suffix(".in_proj_ba")?;
-                        let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
-                        let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
-                        merge_per_layer(b_val, a_val, "in_proj_ba", "b", "a")
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(default_plq)
-        };
-
-    // CLEF bf16-residency pre-pass: a decide is ONE prefill — every weight is
-    // read exactly once, so the packed QMM kernels' inline dequant sits on
-    // the critical path (measured ~10-16% over the dense bf16 GEMM at the
-    // 420-token shape on M5 Max). Dequantize each quantized backbone
-    // projection to bf16 and strip its sidecars: every `try_build_*` helper
-    // takes `.scales`-absent as the "not quantized" signal and falls through
-    // to the dense `Linear` arm, so no forward-path change is needed and the
-    // `ensure_*` drift guards treat the projection as a plain bf16 tensor.
-    // Skipped: the embedding (its packed row lookup is already the fast
-    // path), the lm_head (`take_dequantized_rows` gathers packed rows for
-    // the ~dozen referenced vocab rows), and sym8 (an eager-int8 layout
-    // `mlx_dequantize` does not decode). `MLX_CLEF_KEEP_PACKED` restores
-    // packed residency for memory-constrained loads.
+    // CLEF residency pre-pass (`apply_clef_residency`): rewrites the backbone
+    // projections in place and updates the per-layer overrides the builders
+    // below read, so no forward-path change is needed — `try_build_ql`
+    // dispatches a requantized projection through its `Sym8` arm (attaching
+    // the prefix's sym8 rotation, if the pre-pass made one) and a
+    // dequantized one falls through to the dense `Linear` arm.
     let mut per_layer_quant = per_layer_quant.clone();
-    if clef && std::env::var_os("MLX_CLEF_KEEP_PACKED").is_none() && is_quantized_checkpoint(params)
-    {
-        let prefixes: Vec<String> = params
-            .keys()
-            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
-            .collect();
-        let mut dequantized = 0usize;
-        let mut skipped: Vec<String> = Vec::new();
-        for prefix in prefixes {
-            if prefix == "embedding" || prefix == "lm_head" {
-                continue;
+    let clef_transforms = match clef {
+        Some(plan) => {
+            if prism.is_some() {
+                return Err(Error::from_reason(
+                    "CLEF decision models do not support prism_hadamard checkpoints",
+                ));
             }
-            let plq = resolve_plq(&per_layer_quant, &prefix);
-            if plq.mode == PerLayerMode::Sym8 {
-                skipped.push(prefix);
-                continue;
-            }
-            let Some(dense) = dequantize_source_head(params, &prefix, plq)? else {
-                continue;
-            };
-            params.insert(format!("{prefix}.weight"), dense);
-            params.remove(&format!("{prefix}.scales"));
-            params.remove(&format!("{prefix}.biases"));
-            per_layer_quant.remove(&prefix);
-            dequantized += 1;
+            apply_clef_residency(params, &mut per_layer_quant, default_plq, plan)?
         }
-        if dequantized > 0 {
-            info!(
-                "CLEF bf16-resident weights: dequantized {} projections to bf16 at load \
-                 ({} skipped, MLX_CLEF_KEEP_PACKED=1 keeps packed residency){}",
-                dequantized,
-                skipped.len(),
-                if skipped.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — kept packed: {}", skipped.join(", "))
-                }
-            );
-        }
-    }
+        None => HashMap::new(),
+    };
+    let clef = clef.is_some();
+    // An explicit `sym8` on an unquantized checkpoint creates the only
+    // `.scales` groups there are: the layer loop must take its quantized arms
+    // (the dense arms' dtype guards would refuse the int8 weights).
+    let is_quantized = is_quantized || is_quantized_checkpoint(params);
 
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
      -> Result<Option<crate::models::quantized_linear::QuantizedLinear>> {
-        let plq = resolve_plq(&per_layer_quant, prefix);
+        let plq = resolve_plq_for(&per_layer_quant, prefix, default_plq);
         // int8 STORAGE with non-sym8 metadata = config drift — fail loud
         // before the int8 tensor can flow into the affine/mxfp builders.
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5")?;
@@ -1600,6 +1945,12 @@ fn apply_weights_inner_with_residency(
         let built = match built {
             Some(ql) => Some(ql.with_hadamard(prism.and_then(|r| r.projection(prefix)))?),
             None => None,
+        };
+        // The CLEF sym8 rotation made by the residency pre-pass for this
+        // prefix (never alongside a Prism runtime — rejected above).
+        let built = match (built, clef_transforms.get(prefix)) {
+            (Some(ql), Some(transform)) => Some(ql.with_sym8_hadamard(transform.clone())?),
+            (built, _) => built,
         };
         if let Some(linear) = built.as_ref() {
             plain_fp8_residency
@@ -2573,6 +2924,14 @@ async fn load_with_thread_impl(
                     .map(|a| a.nbytes() as u64)
                     .fold(0u64, |acc, v| acc.saturating_add(v));
 
+                // The residency switches are read once here; the inner loader
+                // takes the resolved plan (see `clef_residency_from_env`).
+                let clef_residency = if clef {
+                    Some(clef_residency_from_env(quantized)?)
+                } else {
+                    None
+                };
+
                 // Apply weights (GPU finalize precompute reads now-resident pages).
                 let plain_fp8_residency = apply_weights_inner_with_residency(
                     &mut inner,
@@ -2584,7 +2943,7 @@ async fn load_with_thread_impl(
                     &per_layer_quant,
                     has_vision,
                     prism_runtime.as_ref(),
-                    clef,
+                    clef_residency.as_ref(),
                 )?;
                 inner.prism_hadamard = prism_runtime;
                 if clef {
@@ -3385,7 +3744,7 @@ mod tests {
             &per_layer_quant,
             false,
             None,
-            false,
+            None,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -3662,7 +4021,7 @@ mod tests {
             &per_layer_quant,
             false,
             None,
-            false,
+            None,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -5393,5 +5752,944 @@ mod tests {
             .expect("absent mode is legacy-compatible")
             .expect("draft spec");
         assert_eq!(spec.mode, PerLayerMode::Affine);
+    }
+
+    #[test]
+    fn clef_residency_resolution_precedence_and_default() {
+        use ClefResidency::*;
+        let resolve = |explicit: Option<&str>, keep_packed: bool, quantized: bool, gpu_gen: i32| {
+            resolve_clef_residency(explicit, keep_packed, quantized, gpu_gen).unwrap()
+        };
+        // Default: quantized checkpoint on gen >= 17 → sym8; otherwise bf16.
+        assert_eq!(resolve(None, false, true, 17), Sym8);
+        assert_eq!(resolve(None, false, true, 16), Bf16);
+        assert_eq!(resolve(None, false, false, 17), Bf16);
+        // `MLX_CLEF_KEEP_PACKED` is an alias of `packed`; an explicit
+        // `MLX_CLEF_RESIDENCY` wins over it.
+        assert_eq!(resolve(None, true, true, 17), Packed);
+        assert_eq!(resolve(Some("sym8"), true, true, 17), Sym8);
+        assert_eq!(resolve(Some("bf16"), true, true, 17), Bf16);
+        assert_eq!(resolve(Some("packed"), false, true, 17), Packed);
+        // Explicit sym8 requantizes an unquantized checkpoint too.
+        assert_eq!(resolve(Some("sym8"), false, false, 17), Sym8);
+        // sym8 needs gen >= 17: fall back to bf16 (warning on stderr).
+        assert_eq!(resolve(Some("sym8"), false, true, 16), Bf16);
+        // Trimmed, case-insensitive; empty is unset.
+        assert_eq!(resolve(Some(" SYM8 "), false, true, 17), Sym8);
+        assert_eq!(resolve(Some(""), false, true, 17), Sym8);
+        let err = resolve_clef_residency(Some("fp8"), false, true, 17).unwrap_err();
+        assert!(err.reason.contains("MLX_CLEF_RESIDENCY"), "{}", err.reason);
+    }
+
+    /// Deterministic `[n, k]` bf16 weight with per-row outliers; `None` when
+    /// MLX/Metal is unavailable (the test then skips).
+    fn clef_dense_or_skip(label: &str, n: i64, k: i64, seed: u32) -> Option<MxArray> {
+        let mut state = seed;
+        let mut lcg = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let data: Vec<f32> = (0..n * k)
+            .map(|i| {
+                let v = lcg() * 0.05;
+                if i % 97 == 0 { v * 20.0 } else { v }
+            })
+            .collect();
+        match MxArray::from_float32(&data, &[n, k]).and_then(|a| a.astype(DType::BFloat16)) {
+            Ok(a) => Some(a),
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return None;
+                }
+                panic!("unexpected array construction failure in {label}: {msg}");
+            }
+        }
+    }
+
+    /// Affine-quantize `dense` at `bits`/`group_size` and insert the
+    /// `{prefix}.{weight,scales,biases}` group as a GGUF/`mlx convert`
+    /// checkpoint stores it.
+    fn insert_affine_group(
+        params: &mut HashMap<String, MxArray>,
+        prefix: &str,
+        dense: &MxArray,
+        bits: i32,
+        group_size: i32,
+    ) {
+        let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                dense.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed for {prefix}");
+        params.insert(
+            format!("{prefix}.weight"),
+            MxArray::from_handle(out_q, "qw").unwrap(),
+        );
+        params.insert(
+            format!("{prefix}.scales"),
+            MxArray::from_handle(out_s, "qs").unwrap(),
+        );
+        params.insert(
+            format!("{prefix}.biases"),
+            MxArray::from_handle(out_b, "qb").unwrap(),
+        );
+    }
+
+    /// The published Clef GGUFs import as affine 8-bit g32 everywhere; the
+    /// fixture mirrors that for one GDN layer plus the two head tables, and
+    /// adds one projection already stored sym8.
+    fn clef_affine_fixture(label: &str) -> Option<(HashMap<String, MxArray>, PerLayerQuant)> {
+        let mut params = HashMap::new();
+        for (prefix, n, k, seed) in [
+            ("layers.0.mlp.gate_proj", 64, 128, 1),
+            ("layers.0.linear_attn.in_proj_qkvz", 96, 128, 2),
+            ("layers.0.linear_attn.in_proj_ba", 8, 128, 3),
+            ("embedding", 48, 128, 4),
+            ("lm_head", 48, 128, 5),
+        ] {
+            let dense = clef_dense_or_skip(label, n, k, seed)?;
+            insert_affine_group(&mut params, prefix, &dense, 8, 32);
+        }
+        // A norm (1-D) and a projection already in sym8 storage.
+        params.insert(
+            "layers.0.input_layernorm.weight".to_string(),
+            MxArray::ones(&[128], Some(DType::BFloat16)).unwrap(),
+        );
+        let (q, s) = crate::convert::sym8_quantize_store(
+            &clef_dense_or_skip(label, 64, 128, 6)?,
+            "layers.0.mlp.up_proj",
+        )
+        .unwrap();
+        params.insert("layers.0.mlp.up_proj.weight".to_string(), q);
+        params.insert("layers.0.mlp.up_proj.scales".to_string(), s);
+        let default_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            input_amax: None,
+            layout: Default::default(),
+        };
+        Some((params, default_plq))
+    }
+
+    fn clef_sym8_plq() -> PerLayerQuant {
+        PerLayerQuant {
+            bits: SYM8_BITS,
+            group_size: SYM8_GROUP_SIZE,
+            mode: PerLayerMode::Sym8,
+            input_amax: None,
+            layout: Default::default(),
+        }
+    }
+
+    fn assert_dense_bf16(params: &HashMap<String, MxArray>, prefix: &str, shape: &[i64]) {
+        let w = params.get(&format!("{prefix}.weight")).expect("weight");
+        assert_eq!(w.dtype().unwrap(), DType::BFloat16, "{prefix} dtype");
+        assert_eq!(w.shape().unwrap().as_ref(), shape, "{prefix} shape");
+        assert!(
+            !params.contains_key(&format!("{prefix}.scales")),
+            "{prefix} scales"
+        );
+        assert!(
+            !params.contains_key(&format!("{prefix}.biases")),
+            "{prefix} biases"
+        );
+    }
+
+    fn assert_affine_untouched(
+        before: &HashMap<String, MxArray>,
+        after: &HashMap<String, MxArray>,
+        prefix: &str,
+    ) {
+        for suffix in ["weight", "scales", "biases"] {
+            let key = format!("{prefix}.{suffix}");
+            let (a, b) = (before.get(&key).expect(&key), after.get(&key).expect(&key));
+            assert_eq!(a.dtype().unwrap(), b.dtype().unwrap(), "{key} dtype");
+            assert_eq!(
+                a.shape().unwrap().as_ref(),
+                b.shape().unwrap().as_ref(),
+                "{key} shape"
+            );
+        }
+    }
+
+    #[test]
+    fn clef_sym8_residency_requantizes_affine_backbone_and_leaves_head_and_ba() {
+        let label = "clef_sym8_residency_requantizes_affine_backbone_and_leaves_head_and_ba";
+        let Some((before, default_plq)) = clef_affine_fixture(label) else {
+            return;
+        };
+        let mut params = before.clone();
+        let mut per_layer_quant = HashMap::from([
+            // A split-key override, as a GGUF import's per-tensor entries.
+            ("layers.0.linear_attn.in_proj_qkv".to_string(), default_plq),
+            ("layers.0.linear_attn.in_proj_z".to_string(), default_plq),
+            ("layers.0.mlp.up_proj".to_string(), clef_sym8_plq()),
+        ]);
+
+        apply_clef_residency(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            &ClefResidencyPlan::new(ClefResidency::Sym8),
+        )
+        .unwrap();
+
+        // (a) the affine groups became sym8 storage with a Sym8 override.
+        for (prefix, n, k) in [
+            ("layers.0.mlp.gate_proj", 64, 128),
+            ("layers.0.linear_attn.in_proj_qkvz", 96, 128),
+        ] {
+            let w = params.get(&format!("{prefix}.weight")).expect("weight");
+            assert_eq!(w.dtype().unwrap(), DType::Int8, "{prefix} weight dtype");
+            assert_eq!(
+                w.shape().unwrap().as_ref(),
+                &[n, k],
+                "{prefix} weight shape"
+            );
+            let s = params.get(&format!("{prefix}.scales")).expect("scales");
+            assert_eq!(s.dtype().unwrap(), DType::Float32, "{prefix} scales dtype");
+            assert_eq!(s.shape().unwrap().as_ref(), &[n], "{prefix} scales shape");
+            assert!(
+                !params.contains_key(&format!("{prefix}.biases")),
+                "{prefix} biases"
+            );
+            assert_eq!(
+                per_layer_quant.get(prefix),
+                Some(&clef_sym8_plq()),
+                "{prefix} plq"
+            );
+            // The merged-key entry wins over the split-key overrides.
+            assert_eq!(
+                resolve_plq_for(&per_layer_quant, prefix, default_plq).mode,
+                PerLayerMode::Sym8
+            );
+        }
+        // (b) in_proj_ba is dense bf16 (the sym8 ladder excludes it); the
+        // embedding and lm_head keep their packed groups.
+        assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_ba", &[8, 128]);
+        assert!(!per_layer_quant.contains_key("layers.0.linear_attn.in_proj_ba"));
+        assert_affine_untouched(&before, &params, "embedding");
+        assert_affine_untouched(&before, &params, "lm_head");
+        // Already-sym8 storage and the norm are left as stored.
+        assert_eq!(
+            params["layers.0.mlp.up_proj.weight"].dtype().unwrap(),
+            DType::Int8
+        );
+        assert_eq!(
+            per_layer_quant.get("layers.0.mlp.up_proj"),
+            Some(&clef_sym8_plq())
+        );
+        assert_eq!(
+            params["layers.0.input_layernorm.weight"].dtype().unwrap(),
+            DType::BFloat16
+        );
+
+        // (e) requant error is within int8 rounding of the dequantized
+        // affine source: |w - s[n] * q[n,k]| <= s[n] / 2 (+ bf16 slack).
+        let prefix = "layers.0.mlp.gate_proj";
+        let source = dequantize_source_head(&before, prefix, default_plq)
+            .unwrap()
+            .expect("affine source dequantizes")
+            .astype(DType::Float32)
+            .unwrap();
+        source.eval();
+        let w = source.to_float32().unwrap();
+        let q = params[&format!("{prefix}.weight")]
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let s = params[&format!("{prefix}.scales")].to_float32().unwrap();
+        let (n, k) = (64usize, 128usize);
+        for row in 0..n {
+            let scale = s[row];
+            assert!(scale > 0.0, "row {row} scale {scale}");
+            let mut row_max = 0f32;
+            for col in 0..k {
+                let i = row * k + col;
+                assert!(q[i].abs() <= 127.0, "q[{row},{col}] = {}", q[i]);
+                row_max = row_max.max((w[i] - scale * q[i]).abs());
+            }
+            assert!(
+                row_max <= scale / 2.0 + 1e-6,
+                "row {row}: max |w - s*q| = {row_max} > s/2 = {}",
+                scale / 2.0
+            );
+        }
+
+        // The rewritten group builds through the loader's Sym8 arm. The int8
+        // kernels need gen >= 17 (`try_build_sym8_quantized_linear` fail-louds
+        // below it), so only the storage contract is checked on older GPUs.
+        let plq = resolve_plq_for(&per_layer_quant, prefix, default_plq);
+        ensure_int8_storage_resolves_sym8(&params, prefix, plq.mode, "qwen3_5").unwrap();
+        let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
+        if gpu_gen < 17 {
+            eprintln!("[{label}] SKIP sym8 build: gpu gen {gpu_gen} < 17");
+            return;
+        }
+        let ql = try_build_sym8_quantized_linear(&params, prefix)
+            .unwrap()
+            .expect("sym8 group builds");
+        assert_eq!(ql.mode(), crate::models::quantized_linear::SYM8_MODE);
+        assert_eq!(ql.bits(), SYM8_BITS);
+        assert_eq!(ql.group_size(), SYM8_GROUP_SIZE);
+    }
+
+    #[test]
+    fn clef_sym8_exclude_list_keeps_named_projections_packed() {
+        // Parsing: trimmed, empty entries dropped, order kept.
+        assert!(parse_clef_sym8_exclude(None).is_empty());
+        assert!(parse_clef_sym8_exclude(Some(" , ")).is_empty());
+        assert_eq!(
+            parse_clef_sym8_exclude(Some(" down_proj, o_proj,,")),
+            vec!["down_proj".to_string(), "o_proj".to_string()]
+        );
+        // Matching is on the last path component only.
+        let list = vec!["down_proj".to_string()];
+        assert!(clef_sym8_list_excluded("layers.0.mlp.down_proj", &list));
+        assert!(!clef_sym8_list_excluded("layers.0.mlp.gate_proj", &list));
+        assert!(!clef_sym8_list_excluded(
+            "layers.0.mlp.down_proj.weight",
+            &list
+        ));
+        assert!(!clef_sym8_list_excluded("down_proj_x", &list));
+
+        let label = "clef_sym8_exclude_list_keeps_named_projections_packed";
+        let Some((mut params, default_plq)) = clef_affine_fixture(label) else {
+            return;
+        };
+        let Some(down) = clef_dense_or_skip(label, 128, 64, 7) else {
+            return;
+        };
+        insert_affine_group(&mut params, "layers.0.mlp.down_proj", &down, 8, 32);
+        let packed_before: Vec<MxArray> = ["weight", "scales", "biases"]
+            .iter()
+            .map(|s| params[&format!("layers.0.mlp.down_proj.{s}")].clone())
+            .collect();
+        let mut per_layer_quant =
+            HashMap::from([("layers.0.mlp.up_proj".to_string(), clef_sym8_plq())]);
+        let plan = ClefResidencyPlan {
+            residency: ClefResidency::Sym8,
+            sym8_exclude: list,
+            sym8_rotate: true,
+        };
+        apply_clef_residency(&mut params, &mut per_layer_quant, default_plq, &plan).unwrap();
+
+        // The listed name keeps its packed affine group untouched (the MLP
+        // installs all-or-nothing, so dense bf16 is not an option there) ...
+        for (s, before) in ["weight", "scales", "biases"].iter().zip(&packed_before) {
+            let after = &params[&format!("layers.0.mlp.down_proj.{s}")];
+            assert_eq!(after.dtype().unwrap(), before.dtype().unwrap(), "{s}");
+            assert_eq!(
+                after.shape().unwrap().to_vec(),
+                before.shape().unwrap().to_vec(),
+                "{s}"
+            );
+        }
+        assert!(!per_layer_quant.contains_key("layers.0.mlp.down_proj"));
+        // ... while its siblings still requantize to sym8.
+        for prefix in [
+            "layers.0.mlp.gate_proj",
+            "layers.0.linear_attn.in_proj_qkvz",
+        ] {
+            assert_eq!(
+                params[&format!("{prefix}.weight")].dtype().unwrap(),
+                DType::Int8,
+                "{prefix}"
+            );
+            assert_eq!(
+                per_layer_quant.get(prefix),
+                Some(&clef_sym8_plq()),
+                "{prefix}"
+            );
+        }
+        // The ladder's own exclusion and the already-sym8 storage are unchanged.
+        assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_ba", &[8, 128]);
+        assert_eq!(
+            params["layers.0.mlp.up_proj.weight"].dtype().unwrap(),
+            DType::Int8
+        );
+
+        // The list is ignored outside sym8: bf16 residency dequantizes
+        // everything the same way regardless.
+        let Some((mut params, default_plq)) = clef_affine_fixture(label) else {
+            return;
+        };
+        let mut per_layer_quant =
+            HashMap::from([("layers.0.mlp.up_proj".to_string(), clef_sym8_plq())]);
+        let plan = ClefResidencyPlan {
+            residency: ClefResidency::Bf16,
+            sym8_exclude: vec!["gate_proj".to_string()],
+            sym8_rotate: true,
+        };
+        apply_clef_residency(&mut params, &mut per_layer_quant, default_plq, &plan).unwrap();
+        assert_dense_bf16(&params, "layers.0.mlp.gate_proj", &[64, 128]);
+        assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_qkvz", &[96, 128]);
+    }
+
+    #[test]
+    fn clef_sym8_residency_on_unquantized_checkpoint_skips_odd_k_and_tables() {
+        let label = "clef_sym8_residency_on_unquantized_checkpoint_skips_odd_k_and_tables";
+        let mut params = HashMap::new();
+        for (prefix, n, k, seed) in [
+            ("layers.0.mlp.up_proj", 32, 64, 11),
+            // (c) K % 16 != 0 fails the sym8 kernel contract → stays dense.
+            ("layers.0.mlp.down_proj", 32, 24, 12),
+            ("layers.0.linear_attn.in_proj_b", 4, 64, 13),
+            ("embedding", 16, 64, 14),
+            ("lm_head", 16, 64, 15),
+        ] {
+            let Some(dense) = clef_dense_or_skip(label, n, k, seed) else {
+                return;
+            };
+            params.insert(format!("{prefix}.weight"), dense);
+        }
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::ones(&[64], Some(DType::BFloat16)).unwrap(),
+        );
+        let default_plq = default_per_layer_quant(
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            PerLayerMode::Affine,
+        );
+        let mut per_layer_quant = HashMap::new();
+
+        // bf16 residency on an unquantized checkpoint is a no-op.
+        let mut untouched = params.clone();
+        apply_clef_residency(
+            &mut untouched,
+            &mut per_layer_quant,
+            default_plq,
+            &ClefResidencyPlan::new(ClefResidency::Bf16),
+        )
+        .unwrap();
+        assert_eq!(untouched.len(), params.len());
+        assert!(
+            untouched
+                .values()
+                .all(|w| w.dtype().unwrap() == DType::BFloat16)
+        );
+        assert!(per_layer_quant.is_empty());
+
+        apply_clef_residency(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            &ClefResidencyPlan::new(ClefResidency::Sym8),
+        )
+        .unwrap();
+        let up = &params["layers.0.mlp.up_proj.weight"];
+        assert_eq!(up.dtype().unwrap(), DType::Int8);
+        assert_eq!(up.shape().unwrap().as_ref(), &[32, 64]);
+        assert_eq!(
+            params["layers.0.mlp.up_proj.scales"]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            &[32]
+        );
+        assert_eq!(
+            per_layer_quant.get("layers.0.mlp.up_proj"),
+            Some(&clef_sym8_plq())
+        );
+        assert_dense_bf16(&params, "layers.0.mlp.down_proj", &[32, 24]);
+        assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_b", &[4, 64]);
+        assert_dense_bf16(&params, "embedding", &[16, 64]);
+        assert_dense_bf16(&params, "lm_head", &[16, 64]);
+        assert_eq!(
+            params["final_norm.weight"].dtype().unwrap(),
+            DType::BFloat16
+        );
+        assert_eq!(per_layer_quant.len(), 1);
+    }
+
+    /// The loader-level contract for sym8 residency on a GGUF-shaped layer:
+    /// the GDN installs a sym8 `in_proj_qkvz` beside a dense bf16
+    /// `in_proj_ba` (unfused pair, the combination a `mlx convert --q-mode
+    /// sym8` checkpoint also produces), `out_proj` and the MLP are sym8, and
+    /// `finalize_after_load` accepts the mix.
+    #[test]
+    fn clef_sym8_residency_installs_sym8_projections_beside_dense_in_proj_ba() {
+        let label = "clef_sym8_residency_installs_sym8_projections_beside_dense_in_proj_ba";
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!("[{label}] SKIP: gpu gen < 17 (sym8 kernels need M5+)");
+            return;
+        }
+        let cfg = no_mtp_layer_cfg(); // hidden 64, intermediate 128, GDN layer 0
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let message = error.reason.to_string();
+                if message.contains("Metal")
+                    || message.contains("device")
+                    || message.contains("LayerKVPool")
+                {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {message}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {message}");
+            }
+        };
+        // GDN at this config: key_dim 32, value_dim 64 -> qkvz 192 rows, ba 8.
+        let mut params = HashMap::new();
+        for (prefix, n, k, seed) in [
+            ("layers.0.linear_attn.in_proj_qkvz", 192, 64, 21),
+            ("layers.0.linear_attn.in_proj_ba", 8, 64, 22),
+            ("layers.0.linear_attn.out_proj", 64, 64, 23),
+            ("layers.0.mlp.gate_proj", 128, 64, 24),
+            ("layers.0.mlp.up_proj", 128, 64, 25),
+            ("layers.0.mlp.down_proj", 64, 128, 26),
+        ] {
+            let Some(dense) = clef_dense_or_skip(label, n, k, seed) else {
+                return;
+            };
+            insert_affine_group(&mut params, prefix, &dense, 8, 32);
+        }
+
+        let error = apply_weights_inner_with_residency(
+            &mut inner,
+            &mut params,
+            &cfg,
+            8,
+            32,
+            Some(PerLayerMode::Affine),
+            &HashMap::new(),
+            false,
+            None,
+            Some(&ClefResidencyPlan::new(ClefResidency::Sym8)),
+        )
+        .expect_err("the intentionally partial checkpoint must fail completeness validation");
+        assert!(
+            error.reason.contains("missing mandatory weights"),
+            "must reach the final completeness gate: {}",
+            error.reason
+        );
+
+        let layer = &inner.layers[0];
+        let AttentionType::Linear(gdn) = &layer.attn else {
+            panic!("layer 0 must be a GDN layer");
+        };
+        let sym8 = crate::models::quantized_linear::SYM8_MODE.to_string();
+        assert_eq!(gdn.in_proj_modes(), (Some(sym8.clone()), None, None));
+        assert_eq!(gdn.out_proj_mode(), Some(sym8.as_str()));
+        match &layer.mlp {
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up,
+            } => {
+                for ql in [gate_proj, up_proj, down_proj] {
+                    assert_eq!(ql.mode(), sym8);
+                }
+                assert!(gate_up.is_none(), "sym8 projections never row-merge");
+            }
+            MLPVariant::Standard(_) => panic!("layer 0 MLP must be quantized"),
+        }
+    }
+
+    #[test]
+    fn clef_bf16_and_packed_residency_preserve_prior_behaviour() {
+        let label = "clef_bf16_and_packed_residency_preserve_prior_behaviour";
+        let Some((before, default_plq)) = clef_affine_fixture(label) else {
+            return;
+        };
+        let overrides = HashMap::from([
+            ("layers.0.mlp.gate_proj".to_string(), default_plq),
+            ("layers.0.mlp.up_proj".to_string(), clef_sym8_plq()),
+        ]);
+
+        // (d) bf16: every affine backbone group is decoded to dense bf16 and
+        // its override dropped; sym8 storage, embedding and lm_head stay.
+        let mut params = before.clone();
+        let mut per_layer_quant = overrides.clone();
+        apply_clef_residency(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            &ClefResidencyPlan::new(ClefResidency::Bf16),
+        )
+        .unwrap();
+        assert_dense_bf16(&params, "layers.0.mlp.gate_proj", &[64, 128]);
+        assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_qkvz", &[96, 128]);
+        assert_dense_bf16(&params, "layers.0.linear_attn.in_proj_ba", &[8, 128]);
+        assert!(!per_layer_quant.contains_key("layers.0.mlp.gate_proj"));
+        assert_eq!(
+            params["layers.0.mlp.up_proj.weight"].dtype().unwrap(),
+            DType::Int8
+        );
+        assert_eq!(
+            per_layer_quant.get("layers.0.mlp.up_proj"),
+            Some(&clef_sym8_plq())
+        );
+        assert_affine_untouched(&before, &params, "embedding");
+        assert_affine_untouched(&before, &params, "lm_head");
+
+        // (d) packed: no pre-pass at all.
+        let mut params = before.clone();
+        let mut per_layer_quant = overrides.clone();
+        apply_clef_residency(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            &ClefResidencyPlan::new(ClefResidency::Packed),
+        )
+        .unwrap();
+        let mut keys: Vec<&String> = params.keys().collect();
+        keys.sort();
+        let mut expected: Vec<&String> = before.keys().collect();
+        expected.sort();
+        assert_eq!(keys, expected);
+        for (key, value) in &params {
+            assert_eq!(
+                value.dtype().unwrap(),
+                before[key].dtype().unwrap(),
+                "{key}"
+            );
+        }
+        assert_eq!(per_layer_quant, overrides);
+    }
+
+    #[test]
+    fn clef_sym8_rotation_signs_are_deterministic_per_width() {
+        assert!(parse_clef_sym8_rotate(None));
+        assert!(parse_clef_sym8_rotate(Some("")));
+        assert!(parse_clef_sym8_rotate(Some("1")));
+        assert!(!parse_clef_sym8_rotate(Some("0")));
+        assert!(!parse_clef_sym8_rotate(Some(" FALSE ")));
+        assert!(!parse_clef_sym8_rotate(Some("off")));
+
+        for k in [1024usize, 2048, 4096] {
+            let a = clef_sym8_sign_values(k);
+            let b = clef_sym8_sign_values(k);
+            assert_eq!(a, b, "K={k} must be deterministic");
+            assert_eq!(a.len(), k);
+            assert!(a.iter().all(|&v| v == 1.0 || v == -1.0), "K={k} ±1 only");
+            let plus = a.iter().filter(|&&v| v == 1.0).count();
+            assert!(
+                (k * 2 / 5..=k * 3 / 5).contains(&plus),
+                "K={k}: {plus} of {k} are +1 — not a sign flip"
+            );
+        }
+        assert_ne!(
+            clef_sym8_sign_values(1024),
+            clef_sym8_sign_values(2048)[..1024],
+            "widths must not share a prefix"
+        );
+
+        let Some(_) = clef_dense_or_skip("clef_sym8_rotation_signs", 1, 16, 1) else {
+            return;
+        };
+        let mut cache = HashMap::new();
+        let t1 = clef_sym8_transform(1024, &mut cache).unwrap().unwrap();
+        let t2 = clef_sym8_transform(1024, &mut cache).unwrap().unwrap();
+        assert_eq!(
+            t1.signs.as_raw_ptr(),
+            t2.signs.as_raw_ptr(),
+            "one array per width"
+        );
+        assert_eq!(t1.block_size, 1024);
+        assert!(t1.gdn_permutation.is_none());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            t1.signs.to_float32().unwrap().as_ref(),
+            &clef_sym8_sign_values(1024)[..]
+        );
+        assert!(clef_sym8_transform(1040, &mut cache).unwrap().is_none());
+        assert!(clef_sym8_transform(512, &mut cache).unwrap().is_none());
+        assert!(clef_sym8_transform(0, &mut cache).unwrap().is_none());
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// bf16 `[m, k]` activations with per-column outliers (the pattern the
+    /// per-token int8 quant suffers from), as the backbone produces.
+    fn clef_outlier_x_or_skip(label: &str, m: i64, k: i64, seed: u32) -> Option<MxArray> {
+        let mut state = seed;
+        let mut lcg = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let data: Vec<f32> = (0..m * k)
+            .map(|i| {
+                let v = lcg();
+                if i % k % 131 == 0 { v * 40.0 } else { v }
+            })
+            .collect();
+        match MxArray::from_float32(&data, &[m, k]).and_then(|a| a.astype(DType::BFloat16)) {
+            Ok(a) => Some(a),
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return None;
+                }
+                panic!("unexpected array construction failure in {label}: {msg}");
+            }
+        }
+    }
+
+    fn max_abs_f32(a: &MxArray) -> f32 {
+        a.eval();
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .fold(0f32, |acc, v| acc.max(v.abs()))
+    }
+
+    /// With rotation on, a `K % 1024 == 0` projection requantizes from the
+    /// rotated weight and its built linear carries the matching transform:
+    /// (a) the rotation identity `(x H_s)(W H_s)^T == x W^T` holds on dense
+    /// matmuls, (b) the rotated sym8 forward matches the dense bf16 forward
+    /// of the ORIGINAL weight within the W8A8 tolerance, (c) `K % 1024 != 0`
+    /// requantizes without a transform and `sym8_rotate = false` makes none.
+    #[test]
+    fn clef_sym8_rotation_requantizes_rotated_weight_and_attaches_transform() {
+        let label = "clef_sym8_rotation_requantizes_rotated_weight_and_attaches_transform";
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!("[{label}] SKIP: gpu gen < 17 (sym8 kernels need M5+)");
+            return;
+        }
+        let default_plq = default_per_layer_quant(
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            PerLayerMode::Affine,
+        );
+        let (m, n) = (8i64, 48i64);
+        for k in [1024i64, 2048] {
+            let prefix = "layers.0.mlp.gate_proj";
+            let Some(dense) = clef_dense_or_skip(label, n, k, 31) else {
+                return;
+            };
+            let Some(x) = clef_outlier_x_or_skip(label, m, k, 32) else {
+                return;
+            };
+            let dense_f32 = dense.astype(DType::Float32).unwrap();
+            let x_f32 = x.astype(DType::Float32).unwrap();
+            let y_ref = x_f32
+                .matmul(&dense_f32.transpose(Some(&[1, 0])).unwrap())
+                .unwrap();
+            let y_scale = max_abs_f32(&y_ref);
+
+            // (a) the rotation identity, in f32 and with a bf16 activation.
+            let mut cache = HashMap::new();
+            let t = clef_sym8_transform(k, &mut cache).unwrap().unwrap();
+            let w_rot = t.apply(&dense_f32, false).unwrap();
+            assert_eq!(w_rot.dtype().unwrap(), DType::Float32);
+            let y_rot = t
+                .apply(&x_f32, false)
+                .unwrap()
+                .matmul(&w_rot.transpose(Some(&[1, 0])).unwrap())
+                .unwrap();
+            let identity_err = max_abs_f32(&y_rot.sub(&y_ref).unwrap()) / y_scale;
+            // Two f32 GEMMs at the GPU's reduced-precision f32 rate (~1e-3
+            // relative on gen 17); a wrong scale or sign would be O(1).
+            assert!(
+                identity_err < 2e-3,
+                "K={k}: f32 identity error {identity_err}"
+            );
+            let x_rot_bf16 = t.apply(&x, false).unwrap();
+            assert_eq!(x_rot_bf16.dtype().unwrap(), DType::BFloat16);
+            let y_rot_bf16 = x_rot_bf16
+                .astype(DType::Float32)
+                .unwrap()
+                .matmul(&w_rot.transpose(Some(&[1, 0])).unwrap())
+                .unwrap();
+            let identity_err_bf16 = max_abs_f32(&y_rot_bf16.sub(&y_ref).unwrap()) / y_scale;
+            assert!(
+                identity_err_bf16 < 1e-2,
+                "K={k}: bf16-activation identity error {identity_err_bf16}"
+            );
+
+            // (b) sym8 forwards, unrotated vs rotated, against the dense reference.
+            let mut errors = Vec::new();
+            for rotate in [false, true] {
+                let mut params = HashMap::from([(format!("{prefix}.weight"), dense.clone())]);
+                let mut per_layer_quant = HashMap::new();
+                let plan = ClefResidencyPlan {
+                    residency: ClefResidency::Sym8,
+                    sym8_exclude: Vec::new(),
+                    sym8_rotate: rotate,
+                };
+                let transforms =
+                    apply_clef_residency(&mut params, &mut per_layer_quant, default_plq, &plan)
+                        .unwrap();
+                assert_eq!(
+                    params[&format!("{prefix}.weight")].dtype().unwrap(),
+                    DType::Int8
+                );
+                assert_eq!(per_layer_quant.get(prefix), Some(&clef_sym8_plq()));
+                let ql = try_build_sym8_quantized_linear(&params, prefix)
+                    .unwrap()
+                    .expect("sym8 group builds");
+                let ql = if rotate {
+                    assert_eq!(transforms.len(), 1, "K={k}: one rotated projection");
+                    let t = transforms.get(prefix).expect("transform under the prefix");
+                    assert_eq!(t.signs.shape_at(0).unwrap(), k);
+                    ql.with_sym8_hadamard(t.clone()).unwrap()
+                } else {
+                    assert!(transforms.is_empty(), "K={k}: rotation off makes none");
+                    ql
+                };
+                assert_eq!(ql.has_hadamard(), rotate);
+                let y = ql.forward(&x).unwrap();
+                assert_eq!(y.dtype().unwrap(), DType::BFloat16, "forward stays bf16");
+                assert_eq!(y.shape().unwrap().as_ref(), &[m, n]);
+                let err =
+                    max_abs_f32(&y.astype(DType::Float32).unwrap().sub(&y_ref).unwrap()) / y_scale;
+                errors.push(err);
+            }
+            eprintln!(
+                "[{label}] K={k}: max|Δy|/max|y| unrotated={:.3e} rotated={:.3e}",
+                errors[0], errors[1]
+            );
+            assert!(
+                errors[1] < 5e-2,
+                "K={k}: rotated sym8 vs dense relative error {}",
+                errors[1]
+            );
+        }
+
+        // (c) K % 1024 != 0: sym8 without a transform.
+        let prefix = "layers.0.mlp.down_proj";
+        let Some(dense) = clef_dense_or_skip(label, n, 1040, 33) else {
+            return;
+        };
+        let mut params = HashMap::from([(format!("{prefix}.weight"), dense)]);
+        let mut per_layer_quant = HashMap::new();
+        let transforms = apply_clef_residency(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            &ClefResidencyPlan::new(ClefResidency::Sym8),
+        )
+        .unwrap();
+        assert!(transforms.is_empty());
+        assert_eq!(
+            params[&format!("{prefix}.weight")].dtype().unwrap(),
+            DType::Int8
+        );
+        assert_eq!(per_layer_quant.get(prefix), Some(&clef_sym8_plq()));
+
+        // `with_sym8_hadamard` refuses a width mismatch and a non-sym8 linear.
+        let mut cache = HashMap::new();
+        let t = clef_sym8_transform(1024, &mut cache).unwrap().unwrap();
+        let ql = try_build_sym8_quantized_linear(&params, prefix)
+            .unwrap()
+            .expect("sym8 group builds");
+        assert!(ql.with_sym8_hadamard(t.clone()).is_err());
+        let Some(affine_src) = clef_dense_or_skip(label, 16, 1024, 34) else {
+            return;
+        };
+        let mut affine = HashMap::new();
+        insert_affine_group(&mut affine, "p", &affine_src, 8, 32);
+        let ql = try_build_quantized_linear(&affine, "p", 32, 8).expect("affine builds");
+        assert!(ql.with_sym8_hadamard(t).is_err());
+    }
+
+    /// Loader-level: the transforms the pre-pass returns reach the built
+    /// projections through `try_build_ql` — `K % 1024 == 0` sites carry one,
+    /// the narrower `out_proj` / `down_proj` do not, and `in_proj_ba` stays
+    /// dense. `MLX_CLEF_SYM8_ROTATE=0` (plan field) attaches none.
+    #[test]
+    fn clef_sym8_rotation_reaches_installed_projections() {
+        let label = "clef_sym8_rotation_reaches_installed_projections";
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!("[{label}] SKIP: gpu gen < 17 (sym8 kernels need M5+)");
+            return;
+        }
+        let mut cfg = no_mtp_layer_cfg();
+        cfg.hidden_size = 1024; // GDN layer 0: key_dim 32, value_dim 64
+        for rotate in [true, false] {
+            let mut inner = match Qwen35Inner::new(cfg.clone()) {
+                Ok(inner) => inner,
+                Err(error) => {
+                    let message = error.reason.to_string();
+                    if message.contains("Metal")
+                        || message.contains("device")
+                        || message.contains("LayerKVPool")
+                    {
+                        eprintln!("skipping {label} (MLX/Metal unavailable): {message}");
+                        return;
+                    }
+                    panic!("unexpected Qwen35Inner::new failure in {label}: {message}");
+                }
+            };
+            let mut params = HashMap::new();
+            for (prefix, n, k, seed) in [
+                ("layers.0.linear_attn.in_proj_qkvz", 192, 1024, 41),
+                ("layers.0.linear_attn.in_proj_ba", 8, 1024, 42),
+                ("layers.0.linear_attn.out_proj", 1024, 64, 43),
+                ("layers.0.mlp.gate_proj", 128, 1024, 44),
+                ("layers.0.mlp.up_proj", 128, 1024, 45),
+                ("layers.0.mlp.down_proj", 1024, 128, 46),
+            ] {
+                let Some(dense) = clef_dense_or_skip(label, n, k, seed) else {
+                    return;
+                };
+                insert_affine_group(&mut params, prefix, &dense, 8, 32);
+            }
+            let plan = ClefResidencyPlan {
+                residency: ClefResidency::Sym8,
+                sym8_exclude: Vec::new(),
+                sym8_rotate: rotate,
+            };
+            let error = apply_weights_inner_with_residency(
+                &mut inner,
+                &mut params,
+                &cfg,
+                8,
+                32,
+                Some(PerLayerMode::Affine),
+                &HashMap::new(),
+                false,
+                None,
+                Some(&plan),
+            )
+            .expect_err("the intentionally partial checkpoint must fail completeness validation");
+            assert!(
+                error.reason.contains("missing mandatory weights"),
+                "must reach the final completeness gate: {}",
+                error.reason
+            );
+            let layer = &inner.layers[0];
+            let AttentionType::Linear(gdn) = &layer.attn else {
+                panic!("layer 0 must be a GDN layer");
+            };
+            let sym8 = crate::models::quantized_linear::SYM8_MODE.to_string();
+            assert_eq!(gdn.in_proj_modes(), (Some(sym8.clone()), None, None));
+            assert_eq!(gdn.out_proj_mode(), Some(sym8.as_str()));
+            // (qkvz, z, out_proj, ba): qkvz K=1024 rotates; out_proj K=64
+            // does not; the dense ba never does.
+            assert_eq!(
+                gdn.prism_hadamard_sites(),
+                (rotate, false, false, false),
+                "rotate={rotate}"
+            );
+            // gate/up K=1024 rotate; down K=128 does not.
+            assert_eq!(
+                layer.mlp.has_hadamard(),
+                Some((rotate, rotate, false)),
+                "rotate={rotate}"
+            );
+            if let MLPVariant::Quantized { gate_up, .. } = &layer.mlp {
+                assert!(gate_up.is_none(), "sym8 projections never row-merge");
+            } else {
+                panic!("layer 0 MLP must be quantized");
+            }
+        }
     }
 }

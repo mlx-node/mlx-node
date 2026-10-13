@@ -7601,8 +7601,13 @@ fn sym8_eligible(array: &MxArray) -> Result<bool> {
 ///
 /// This stores the [N,K] tensor — NOT the `[K,N]` transposed kernel operand
 /// `mlx_quantize_weight_int8` produces for the runtime; the loader re-derives
-/// that at load time.
-fn sym8_quantize_store(array: &MxArray, key_for_error: &str) -> Result<(MxArray, MxArray)> {
+/// that at load time. Also used by the CLEF loader's sym8 residency pre-pass
+/// (`qwen3_5::persistence::apply_clef_residency`), so the two emit the same
+/// storage.
+pub(crate) fn sym8_quantize_store(
+    array: &MxArray,
+    key_for_error: &str,
+) -> Result<(MxArray, MxArray)> {
     let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
     let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
     let ok =

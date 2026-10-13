@@ -24,6 +24,77 @@ directory. The joint head itself must sit in affine ggml blocks (the
 published files keep every head weight in Q8_0); a K-quant head weight is
 rejected at conversion.
 
+### Residency
+
+A decide is one prefill forward, so each backbone weight is read once at
+`M = prompt length`. The loader therefore rewrites the quantized backbone
+projections at load time instead of running the checkpoint's packed matmul
+kernels; `MLX_CLEF_RESIDENCY` selects the mode:
+
+| Mode     | Storage after load                                       | GEMM route                             |
+| -------- | -------------------------------------------------------- | -------------------------------------- |
+| `sym8`   | int8 `[N,K]` weight + f32 `[N]` per-output-channel scale | int8 W8A8 (per-token activation quant) |
+| `bf16`   | dense bf16                                               | MLX bf16 GEMM                          |
+| `packed` | the checkpoint's packed tensors (no pre-pass)            | affine / K-quant `quantized_matmul`    |
+
+The default is `sym8` for a quantized checkpoint on a gen >= 17 GPU (M5 and
+later) and `bf16` otherwise. Measured on an M5 Max at the 9B and 27B CLEF
+projection shapes, the sym8 GEMM alone is 1.3-1.8x faster than the dense bf16
+GEMM at every `M` from 128 to 1024, while every weight-only packed route
+(affine qmm, the tiled `a8g64@t64` / `q4k@t64` kernels, per-group W8A8) is
+slower than dense bf16 from `M >= 256`. The cost is the per-token int8
+activation quantization, which the rotation below keeps inside the
+acceptance gate. `sym8` on a GPU below gen 17 falls back to `bf16` with a
+warning. `MLX_CLEF_RESIDENCY=sym8` on an unquantized (bf16) checkpoint
+requantizes its dense weights.
+
+End to end on the published GGUFs (`ggml-org/Clef-GGUF` and
+`Clef-Flash-GGUF`, Q8_0, the six acceptance inputs, M5 Max, one process per
+run), against the bf16 real-weight results in
+[validation](validation/clef-real-weights.md):
+
+| Checkpoint     | Residency      | Sum of 6 decides | Resident MLX memory | Max abs probability diff |
+| -------------- | -------------- | ---------------: | ------------------: | -----------------------: |
+| Flash 9B Q8_0  | `bf16`         |          1.47 s  |             19.2 GB |                   0.0012 |
+| Flash 9B Q8_0  | `sym8` default |          1.14 s  |              9.3 GB |                   0.0071 |
+| CLEF 27B Q8_0  | `bf16`         |          8.60 s  |             61.8 GB |                   0.0049 |
+| CLEF 27B Q8_0  | `sym8` default |          6.78 s  |             27.3 GB |                   0.0047 |
+
+Every modal decision matched in every run. Without the rotation
+(`MLX_CLEF_SYM8_ROTATE=0`) sym8 is another ~10% faster but the max diff
+rises to 0.038 (9B) / 0.015 (27B), over the 0.01 gate. The Q4_K_M GGUFs are
+dominated by their weight quantization (0.08 on Flash even under `bf16`).
+
+The requantization uses the same routine as `mlx convert --q-mode sym8` and
+follows its ladder: 2-D weights with `K % 16 == 0`, excluding `in_proj_ba`
+(and the split `in_proj_b` / `in_proj_a` halves), which stays dense bf16.
+A projection the checkpoint already stores as sym8 is used as is. The
+embedding and `lm_head` are never rewritten in any mode: the lookup and the
+joint head's row gather read packed rows directly.
+
+`MLX_CLEF_SYM8_EXCLUDE=down_proj,o_proj` (comma-separated projection names,
+matched against the last path component) keeps the named projections on the
+checkpoint's packed weight (weight-only route, activations exact) under
+`sym8` while the rest requantize; use it to trade speed for accuracy per
+projection class. Packed rather than dense because the MLP installs
+all-or-nothing: a dense `down_proj` beside sym8 `gate|up` does not load.
+The loader summary logs how many it kept packed.
+
+`MLX_CLEF_SYM8_ROTATE=1|0` (default on) adds a QuaRot-style online Hadamard
+rotation to each requantized projection whose input width `K` is a multiple
+of 1024: the dense weight is rotated along `K` in f32 (`W' = W · H_s`, `H_s`
+a signed 1024-block Walsh-Hadamard with a fixed sign vector derived from `K`
+alone) before the int8 quantizer, and the built projection applies the same
+transform to its activation before the W8A8 kernels, so
+`(x · H_s)(W · H_s)^T = x W^T` while the per-token int8 activation quant sees
+outlier-spread rows. Sign vectors are deterministic per `K` (bit-identical
+across processes) and shared by every projection of one width. Projections
+with `K % 1024 != 0` requantize without rotation; the loader summary logs
+both counts.
+
+`MLX_CLEF_KEEP_PACKED=1` is an alias of `MLX_CLEF_RESIDENCY=packed`; an
+explicit `MLX_CLEF_RESIDENCY` takes precedence.
+
 ## TypeScript
 
 ```ts

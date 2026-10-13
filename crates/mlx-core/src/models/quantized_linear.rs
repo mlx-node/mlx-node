@@ -1433,6 +1433,36 @@ impl QuantizedLinear {
         self.hadamard.is_some()
     }
 
+    /// Attach the CLEF sym8 input rotation (QuaRot-style): `forward` runs
+    /// `x' = transform.apply(x)` before the W8A8 kernels, whose int8 weight
+    /// was quantized from the same rotation of the dense weight
+    /// (`qwen3_5::persistence::apply_clef_residency`), so `x' W'^T == x W^T`
+    /// up to the int8 rounding — now of an outlier-spread activation.
+    /// sym8-only, one transform per projection, sign width must equal K.
+    pub(crate) fn with_sym8_hadamard(mut self, transform: HadamardTransform) -> Result<Self> {
+        if self.mode != SYM8_MODE || self.s_w.is_none() {
+            return Err(Error::from_reason(format!(
+                "sym8 hadamard rotation requires a sym8 projection; '{}' is mode={}",
+                self.amax_key().unwrap_or("<unnamed>"),
+                self.mode
+            )));
+        }
+        if self.hadamard.is_some() {
+            return Err(Error::from_reason(
+                "sym8 hadamard rotation: projection already carries a transform",
+            ));
+        }
+        let k = self.weight.shape_at(1)?;
+        let width = transform.signs.shape_at(0)?;
+        if width != k || transform.gdn_permutation.is_some() {
+            return Err(Error::from_reason(format!(
+                "sym8 hadamard rotation: sign width {width} must equal K={k} with no GDN permutation"
+            )));
+        }
+        self.hadamard = Some(transform);
+        Ok(self)
+    }
+
     /// Construct a sym8 linear from pre-validated operands (see
     /// [`try_build_sym8_quantized_linear`] for the load-time validation).
     ///
@@ -1623,8 +1653,12 @@ impl QuantizedLinear {
         // transformed activation instead of rejecting the dtype; the
         // transform itself keeps its residual-dtype output contract so
         // same-input projections still share one cached result.
+        // Not for sym8: its `scales` is the f32 `s_w` by construction and
+        // the int8 kernels take the rotated bf16 activation directly
+        // (`mlx_w8a8_linear_nk` would only cast an f32 x back to bf16).
         let xp_owned;
         let x = if self.hadamard.is_some()
+            && self.mode != SYM8_MODE
             && self.scales.dtype()? == crate::array::DType::Float32
             && x.dtype()? != crate::array::DType::Float32
         {
