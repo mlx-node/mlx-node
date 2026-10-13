@@ -58,8 +58,28 @@ export function readAgentDefaultModel(
 ): string | undefined {
   try {
     const text = readFileSync(join(dir ?? agentConfigDir(env, home), 'config.toml'), 'utf8');
-    return text.match(/^\s*default\s*=\s*"([^"]+)"/m)?.[1];
+    return parseDefaultModelLine(text);
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Scan TOML lines for `default = "<value>"`, tolerating leading whitespace
+ * and anything after the closing quote (a `#` comment). Returns the first
+ * match — the picker writes its choice near the top of the file.
+ */
+function parseDefaultModelLine(text: string): string | undefined {
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('default')) continue;
+    let rest = line.slice('default'.length).trimStart();
+    if (!rest.startsWith('=')) continue;
+    rest = rest.slice(1).trimStart();
+    if (!rest.startsWith('"')) continue;
+    const end = rest.indexOf('"', 1);
+    if (end < 1) continue;
+    return rest.slice(1, end);
+  }
+  return undefined;
 }

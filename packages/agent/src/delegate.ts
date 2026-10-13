@@ -113,10 +113,14 @@ export async function localCompletion(
 }
 
 export function parseLocalJson(text: string): unknown {
-  return JSON.parse(
-    text
-      .trim()
-      .replace(/^```(?:json)?\s*\n?/, '')
-      .replace(/\n?```$/, ''),
-  );
+  let s = text.trim();
+  // Strip a leading ``` / ```json fence; the JSON may start on the same
+  // line after the tag or on the next — leading whitespace is dropped.
+  if (s.startsWith('```')) {
+    let rest = s.slice(3);
+    if (rest.startsWith('json')) rest = rest.slice(4);
+    s = rest.trimStart();
+  }
+  if (s.endsWith('```')) s = s.slice(0, -3);
+  return JSON.parse(s);
 }

@@ -12,6 +12,7 @@ import {
   leasePinnedManaged,
   managedAgentBinPath,
   probeAgentInstall,
+  serveBannerBaseUrl,
   MLX_AGENT_TAG_ENV,
 } from '../../packages/cli/src/commands/agent/grok-build.js';
 import { chooseDefaultModel, readPersistedDefaultModel } from '../../packages/cli/src/commands/agent/index.js';
@@ -228,10 +229,10 @@ export class AgentCli {
       };
       serve.once('exit', (code) => fail(new Error(`mlx serve exited (${code}) before reporting a port`)));
       rl?.on('line', (line) => {
-        const match = line.match(/listening on (http:\/\/\S+)/);
-        if (!match) return;
-        fetch(`${match[1]}/health`)
-          .then((res) => (res.ok ? `${match[1]}/v1` : Promise.reject(new Error(`health ${res.status}`))))
+        const base = serveBannerBaseUrl(line);
+        if (base === undefined) return;
+        fetch(`${base}/health`)
+          .then((res) => (res.ok ? `${base}/v1` : Promise.reject(new Error(`health ${res.status}`))))
           .then((ready) => {
             clearTimeout(timer);
             rl?.close();

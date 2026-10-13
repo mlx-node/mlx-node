@@ -537,9 +537,33 @@ const MAX_AGENT_ARCHIVE_BYTES = 256 * 1024 * 1024;
  * carry junk into the digest comparison. Accepts both the bare digest the
  * pipeline writes and the `sha256sum` `<hex>[ *]<name>` form.
  */
+/**
+ * Parse a `.sha256` sidecar into its digest: the bare 64-hex token the
+ * pipeline writes, or `sha256sum`'s `<hex>[ *]<name>` form. Anything else
+ * — error page, truncated write, a hex run embedded in prose — is not a
+ * checksum, so callers treat the release as unverifiable rather than
+ * carry junk into the digest comparison.
+ */
+function parseChecksumBody(body: string): string | undefined {
+  // The digest is always the FIRST token in every supported layout; take
+  // it character-precisely and require what follows to be whitespace/end.
+  if (body.length < 64) return undefined;
+  const hex = '0123456789abcdefABCDEF';
+  for (let i = 0; i < 64; i++) {
+    if (!hex.includes(body[i]!)) return undefined;
+  }
+  const rest = body.slice(64);
+  // Bare digest (possibly newline/space-terminated), or `sha256sum`'s
+  // ` *name` / `  name` — either way the next char must be whitespace.
+  if (rest.length > 0 && rest[0] !== ' ' && rest[0] !== '\t' && rest[0] !== '\n' && rest[0] !== '\r') {
+    return undefined;
+  }
+  return body.slice(0, 64).toLowerCase();
+}
+
 async function releaseChecksum(tag: string, asset: string): Promise<string | undefined> {
   const body = await fetchText(`https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}.sha256`);
-  return body !== undefined ? /\b([0-9a-fA-F]{64})\b/.exec(body)?.[1]?.toLowerCase() : undefined;
+  return body !== undefined ? parseChecksumBody(body) : undefined;
 }
 
 /**
@@ -783,10 +807,10 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
     try {
       const entries = readdirSync(dirname(dest));
       for (const entry of entries) {
-        const lease = /^(.+)\.lease-(\d+)$/.exec(entry);
-        if (!lease) continue;
-        if (pidAlive(Number(lease[2]))) {
-          keep.add(lease[1]);
+        const lease = parseLeaseName(entry);
+        if (lease === undefined) continue;
+        if (pidAlive(lease.pid)) {
+          keep.add(lease.binary);
         } else {
           // pinner is gone — the lease is dead weight
           rmSync(join(dirname(dest), entry), { force: true });
@@ -839,7 +863,7 @@ let memberSeq = 0;
  * reclaimed safely — every scheme eventually has to unlink or replace a
  * name a live process may already hold — so the lock is a membership set
  * instead: each contender advertises `b-<ticket>-<pid>-<seq>` (unix
- * socket; marker file on Windows) and the lowest ticket among live
+ * socket; marker file backed by a named pipe on Windows) and the lowest ticket among live
  * members holds, where tickets are bakery numbers (`1 + max(seen)`), not
  * pids — pids wrap, so pid order is not arrival order. Nobody ever removes
  * a name owned by a live pid: a crashed member's marker refuses
@@ -858,10 +882,25 @@ function lockDirPath(path: string): { dir: string; legacy: string | undefined } 
   return { dir: join(tmpdir(), `a-${hash}.d`), legacy: path };
 }
 
-/** True while something accepts connections on `node` — i.e. a live member. */
+/**
+ * Where a marker's liveness endpoint listens. On unix the marker path IS
+ * a bound socket; on Windows files cannot be bound, so each marker owns a
+ * named pipe derived from its path — pipe names die with their owner,
+ * which is what proves the recorded pid still holds the marker (a
+ * recycled pid never created the pipe and answers refused). The hash
+ * keeps names short and unique per lock+marker.
+ */
+/** @internal Exported for tests; {@link memberListening} probes it in production. */
+export function markerProbePath(node: string): string {
+  if (process.platform !== 'win32') return node;
+  const hash = createHash('sha256').update(resolve(node)).digest('hex').slice(0, 32);
+  return `\\\\.\\pipe\\mlx-agent-lock-${hash}`;
+}
+
+/** True while something accepts connections on `node`'s probe endpoint — i.e. a live member. */
 function memberListening(node: string): Promise<boolean> {
   return new Promise((res) => {
-    const sock = connect(node);
+    const sock = connect(markerProbePath(node));
     const timer = setTimeout(() => done(true), 250); // wedged listener: assume live, never evict
     const done = (alive: boolean) => {
       clearTimeout(timer);
@@ -903,8 +942,63 @@ export interface MemberScan {
  */
 const MEMBER_STALE_MS = 2_000;
 
+/** Decimal digits only — leading zeros are fine, signs are not. */
+function isDigits(s: string): boolean {
+  if (s.length === 0) return false;
+  for (const c of s) {
+    if (c < '0' || c > '9') return false;
+  }
+  return true;
+}
+
 /**
- * Live-and-present state of `dir`. Marker kinds:
+ * Parse one lock-directory entry. Marker layouts:
+ *   `b-<ticket>-<pid>-<seq>` — bakery member, kind 'member'
+ *   `m-<pid>-<seq>`          — legacy member (this PR's first design), ticket 0
+ *   `c-<pid>-<seq>`          — contender mid-choose
+ * Returns undefined for anything else — foreign files in the directory are
+ * not markers and are never swept.
+ */
+function parseLockMarker(entry: string): { member: LockMember; choosing: boolean } | undefined {
+  const parts = entry.split('-');
+  const kind = parts[0];
+  if (kind === 'b' && parts.length === 4) {
+    const [ticket, pid, seq] = parts.slice(1);
+    if (!isDigits(ticket!) || !isDigits(pid!) || !isDigits(seq!)) return undefined;
+    return {
+      member: { ticket: Number(ticket), pid: Number(pid), seq: Number(seq), file: '' },
+      choosing: false,
+    };
+  }
+  if ((kind === 'm' || kind === 'c') && parts.length === 3) {
+    const [pid, seq] = parts.slice(1);
+    if (!isDigits(pid!) || !isDigits(seq!)) return undefined;
+    // Legacy m- members predate bakery tickets (ticket 0 — ahead of all b-);
+    // c- contenders are choosing (ticket -1 — never a member yet).
+    return {
+      member: { ticket: kind === 'm' ? 0 : -1, pid: Number(pid), seq: Number(seq), file: '' },
+      choosing: kind === 'c',
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Parse a `<versioned>.lease-<pid>` name. The versioned part is whatever
+ * precedes the LAST `.lease-` separator, so binary names containing dots
+ * (`mlx-agent-v1.2.3.exe`) parse correctly.
+ */
+function parseLeaseName(entry: string): { binary: string; pid: number } | undefined {
+  const sep = entry.lastIndexOf('.lease-');
+  if (sep < 0) return undefined;
+  const binary = entry.slice(0, sep);
+  const pid = entry.slice(sep + '.lease-'.length);
+  if (binary.length === 0 || !isDigits(pid)) return undefined;
+  return { binary, pid: Number(pid) };
+}
+
+/**
+ * Live-and-present state of `dir`. Marker kinds (see {@link parseLockMarker}):
  *   `b-<ticket>-<pid>-<seq>` — a bakery member (socket on unix, file on win).
  *   `m-<pid>-<seq>`          — a member from this lock's previous design;
  *                              honored as ticket 0 (its owner advertised
@@ -913,15 +1007,13 @@ const MEMBER_STALE_MS = 2_000;
  *                              advertising it (socket on unix, file on
  *                              win); live ones force a rescan.
  * Anything whose pid is dead is swept unconditionally — the owner cannot
- * exist. On unix a marker ALSO has to answer on its socket path: a live
- * pid with a dead socket is a recycled pid fronting a stale marker, and
- * honoring it would wait out every acquire behind a lock nobody owns. Age
- * alone never sweeps a live marker — a suspended contender is
- * indistinguishable from a recycled pid by liveness, and removing a LIVE
- * `c-` lets a later contender choose the same ticket and enter
- * concurrently. On Windows the markers are plain files and pid liveness
- * stays authoritative (the recycled-pid stall is a known residual risk
- * there).
+ * exist. A marker ALSO has to answer on its probe endpoint (unix socket /
+ * Windows named pipe): a live pid with a dead endpoint is a recycled pid
+ * fronting a stale marker, and honoring it would wait out every acquire
+ * behind a lock nobody owns. Age alone never sweeps a live marker — a
+ * suspended contender is indistinguishable from a recycled pid by
+ * liveness, and removing a LIVE `c-` lets a later contender choose the
+ * same ticket and enter concurrently.
  */
 /** @internal Exported for tests; {@link acquireInstallLock} is the only production caller. */
 export async function scanMembers(dir: string): Promise<MemberScan> {
@@ -934,36 +1026,21 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
   const members: LockMember[] = [];
   const pending: { member: LockMember; choosing: boolean }[] = [];
   for (const entry of entries) {
-    let m = /^b-(\d+)-(\d+)-(\d+)$/.exec(entry);
-    if (m) {
-      const member = { ticket: Number(m[1]), pid: Number(m[2]), seq: Number(m[3]), file: join(dir, entry) };
-      if (pidAlive(member.pid)) pending.push({ member, choosing: false });
-      else rmSync(member.file, { force: true });
-      continue;
-    }
-    m = /^m-(\d+)-(\d+)$/.exec(entry);
-    if (m) {
-      const member = { ticket: 0, pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
-      if (pidAlive(member.pid)) pending.push({ member, choosing: false });
-      else rmSync(member.file, { force: true });
-      continue;
-    }
-    m = /^c-(\d+)-(\d+)$/.exec(entry);
-    if (m) {
-      const member = { ticket: -1, pid: Number(m[1]), seq: Number(m[2]), file: join(dir, entry) };
-      if (pidAlive(member.pid)) pending.push({ member, choosing: true });
-      else rmSync(join(dir, entry), { force: true });
-    }
+    const marker = parseLockMarker(entry);
+    if (marker === undefined) continue;
+    const member = { ...marker.member, file: join(dir, entry) };
+    if (pidAlive(member.pid)) pending.push({ member, choosing: marker.choosing });
+    else rmSync(member.file, { force: true });
   }
-  // Probe live-pid markers in parallel: the socket check is the cheap
+  // Probe live-pid markers in parallel: the endpoint check is the cheap
   // ECONNREFUSED path for recycled pids, so the extra round-trip per
   // marker is only paid when markers exist. A refused marker is swept only
-  // once it is too old to be a member still finishing bind()+listen().
+  // once it is too old to be an owner still finishing bind()+listen().
   const sockets = await Promise.all(pending.map((p) => memberListening(p.member.file)));
   let choosing = false;
   pending.forEach(({ member, choosing: isChoosing }, i) => {
     let fresh = false;
-    if (process.platform !== 'win32' && !sockets[i]) {
+    if (!sockets[i]) {
       try {
         fresh = Date.now() - statSync(member.file).mtimeMs <= MEMBER_STALE_MS;
       } catch {
@@ -975,7 +1052,7 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
         return;
       }
     }
-    if (process.platform !== 'win32' && !sockets[i] && !fresh) {
+    if (!sockets[i] && !fresh) {
       rmSync(member.file, { force: true });
       return;
     }
@@ -997,11 +1074,13 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
  * by the next scan unconditionally — no liveness probe is trusted to
  * unlink anything.
  *
- * On Unix each marker — choose and member — is a listening unix socket so
- * probes land harmlessly and a suspended contender stays live while a
- * recycled pid fails the probe; on Windows they are empty marker files
- * plus nothing to probe — pid liveness is authoritative since named-pipe
- * names die with the process.
+ * On Unix each marker — choose and member — is a listening unix socket;
+ * on Windows the marker is an empty file plus a named pipe derived from
+ * its path ({@link markerProbePath}). Either way the endpoint dies with
+ * its owner, so a live pid with a refused endpoint is a recycled pid
+ * fronting a stale marker — never authoritative. The pipe is bound
+ * BEFORE the marker file is written so a fresh marker's mtime always
+ * post-dates a probeable endpoint.
  *
  * Once the deadline passes the caller must FAIL rather than proceed
  * unlocked: the pointer-flip/sweep section is unsafe to enter while a
@@ -1020,6 +1099,9 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
   const choosing = join(dir, `c-${process.pid}-${seq}`);
   let choosingServer: Server | undefined;
   if (process.platform === 'win32') {
+    // The pipe is the probeable proof — it is bound BEFORE the marker
+    // file so a scanner never sees an unanswerable marker as live.
+    choosingServer = await bindMarkerListener(choosing);
     try {
       writeFileSync(choosing, '', { flag: 'wx' });
     } catch {
@@ -1029,63 +1111,20 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
     // A unix marker must answer on its socket path, or a live contender
     // suspended mid-choose gets swept like a recycled pid and a later
     // contender can choose the same ticket and enter concurrently.
-    choosingServer = createServer((sock) => sock.destroy());
-    choosingServer.on('error', () => {});
-    await new Promise<void>((res, rej) => {
-      choosingServer!.once('error', rej);
-      choosingServer!.listen(choosing, res);
-    }).catch(async (error) => {
-      choosingServer!.close();
-      choosingServer = undefined;
-      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
-        // Stale socket from a crashed choose under our recycled pid —
-        // remove it and retry once, like the member bind below.
-        rmSync(choosing, { force: true });
-        choosingServer = createServer((sock) => sock.destroy());
-        choosingServer.on('error', () => {});
-        await new Promise<void>((res, rej) => {
-          choosingServer!.once('error', rej);
-          choosingServer!.listen(choosing, res);
-        });
-        return;
-      }
-      throw error;
-    });
+    choosingServer = await bindMarkerListener(choosing);
   }
   const seen = await scanMembers(dir);
   const ticket = seen.members.reduce((max, m) => Math.max(max, m.ticket), 0) + 1;
   const marker = join(dir, `b-${ticket}-${process.pid}-${seq}`);
-  let server: Server | undefined;
+  const server = await bindMarkerListener(marker);
   if (process.platform === 'win32') {
-    // Marker file only: there is no shared name to steal, and the pipe is
-    // unnecessary since pid liveness is authoritative on Windows.
+    // Pipe bound first — the marker file only advertises ticket/pid/seq;
+    // the pipe is what proves the recorded pid owns it.
     try {
       writeFileSync(marker, '', { flag: 'wx' });
     } catch {
       // exists from a stale scan race — reuse is fine, ticket is per-acquire
     }
-  } else {
-    server = createServer((sock) => sock.destroy());
-    server.on('error', () => {}); // stray runtime errors must not crash the holder
-    await new Promise<void>((res, rej) => {
-      server!.once('error', rej);
-      server!.listen(marker, res);
-    }).catch(async (error) => {
-      // EADDRINUSE means a dead-pid marker survived a scan — remove and
-      // retry once; anything else fails the acquire outright.
-      server!.close();
-      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
-        rmSync(marker, { force: true });
-        server = createServer((sock) => sock.destroy());
-        server.on('error', () => {});
-        await new Promise<void>((res, rej) => {
-          server!.once('error', rej);
-          server!.listen(marker, res);
-        });
-        return;
-      }
-      throw error;
-    });
   }
   choosingServer?.close();
   rmSync(choosing, { force: true });
@@ -1140,6 +1179,22 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
   }
 }
 
+/**
+ * Extract `http://host:port` from an `mlx serve` banner line like
+ * `… listening on http://127.0.0.1:9821 …`. Anything before the marker is
+ * skipped (timestamps, log prefixes); the URL ends at whitespace or EOL.
+ */
+export function serveBannerBaseUrl(line: string): string | undefined {
+  const marker = 'listening on http://';
+  const start = line.indexOf(marker);
+  if (start < 0) return undefined;
+  const urlStart = start + marker.length - 'http://'.length;
+  let end = urlStart;
+  while (end < line.length && line.charCodeAt(end) > 32) end++;
+  return end > urlStart ? line.slice(urlStart, end) : undefined;
+}
+
+/** @internal Exported for tests; {@link downloadAgentBinary} is the only production caller. */
 export function releaseInstallLock(path: string): void {
   try {
     const held = HELD_INSTALL_LOCKS.get(path);
@@ -1279,12 +1334,12 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
 
     child.once('exit', (code) => fail(new Error(`mlx serve exited (${code}) before reporting a port`)));
     rl?.on('line', (line) => {
-      const match = line.match(/listening on (http:\/\/\S+)/);
-      if (!match) return;
-      const url = `${match[1]!}/v1`;
+      const base = serveBannerBaseUrl(line);
+      if (base === undefined) return;
+      const url = `${base}/v1`;
       // Health check: the banner prints before the listener is guaranteed
       // accept-ready under every platform, so confirm once.
-      fetch(`${match[1]}/health`)
+      fetch(`${base}/health`)
         .then((res) => (res.ok ? url : Promise.reject(new Error(`health ${res.status}`))))
         .then((ready) => {
           clearTimeout(timer);

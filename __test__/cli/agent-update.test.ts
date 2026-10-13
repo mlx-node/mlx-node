@@ -541,7 +541,13 @@ describe('downloadAgentBinary', () => {
       expect(existsSync(lock)).toBe(false);
       const members = readdirSync(dir);
       expect(members).toHaveLength(1);
-      expect(members[0]).toMatch(/^b-\d+-\d+-\d+$/);
+      // The surviving marker is our b-<ticket>-<pid>-<seq> socket.
+      const parts = members[0]!.split('-');
+      expect(parts[0]).toBe('b');
+      expect(parts).toHaveLength(4);
+      expect(parts[1]!.length > 0 && Number.isInteger(Number(parts[1]))).toBe(true);
+      expect(parts[2]).toBe(String(process.pid));
+      expect(parts[3]!.length > 0 && Number.isInteger(Number(parts[3]))).toBe(true);
       releaseInstallLock(lock);
       expect(readdirSync(dir)).toEqual([]);
     } finally {
