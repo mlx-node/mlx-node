@@ -373,6 +373,16 @@ function releasePin(env: NodeJS.ProcessEnv = process.env): string | undefined {
 }
 
 /**
+ * The platform's release asset for `tag`. Linux releases are musl-only: the
+ * static binary runs on gnu and musl hosts alike.
+ */
+function agentAssetName(tag: string): string {
+  const platform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
+  const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+  return `mlx-agent-${tag}-${platform}-${arch}.tar.gz`;
+}
+
+/**
  * Which release tag to download: `MLX_AGENT_TAG` override, then the R2
  * `latest` pointer (the release pipeline maintains it), then GitHub's
  * /releases/latest, then the baked minimum. Fork releases can ship at any
@@ -393,10 +403,19 @@ export async function resolveReleaseTag(): Promise<string> {
       // GitHub fallback gets a chance.
       const body = await readCappedBody(res, MAX_META_RESPONSE_BYTES);
       const tag = body?.toString('utf-8').trim();
-      // Syntax alone is not enough: a stale or rolled-back pointer can name a
-      // release below this CLI's floor. Anything the pipeline publishes is
-      // accepted once it clears the minimum.
-      if (tag && tagVersion(tag) && compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0) return tag;
+      // Syntax alone is not enough: a stale or rolled-back pointer can name
+      // a release below this CLI's floor, and a misconfigured mirror can
+      // point at a tag with no GitHub release at all — downloadAgentBinary
+      // would then die on the missing checksum with no retry. Only a tag
+      // that actually owns this platform's checksum is accepted; anything
+      // else falls through to GitHub's own latest.
+      if (
+        tag &&
+        tagVersion(tag) &&
+        compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0 &&
+        (await releaseChecksum(tag, agentAssetName(tag))) !== undefined
+      )
+        return tag;
     }
   } catch {
     // fall through to GitHub
@@ -517,10 +536,7 @@ export async function downloadAgentBinary(
 ): Promise<string> {
   tag ??= await resolveReleaseTag();
   const versioned = join(dirname(dest), agentBinName(tag));
-  // Linux releases are musl-only: the static binary runs on gnu and musl hosts alike.
-  const platform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux-musl';
-  const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-  const asset = `mlx-agent-${tag}-${platform}-${arch}.tar.gz`;
+  const asset = agentAssetName(tag);
   const urls = [
     `${MLX_AGENT_R2_BASE}/${tag}/${asset}`,
     `https://github.com/${MLX_AGENT_RELEASE_REPO}/releases/download/${tag}/${asset}`,

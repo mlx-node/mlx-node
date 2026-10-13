@@ -877,8 +877,25 @@ describe('resolveReleaseTag', () => {
     fetchSpy.mockRestore();
   });
 
-  it('accepts a valid R2 latest pointer at or above the minimum', async () => {
-    fetchSpy.mockResolvedValue(new Response('mlx-agent-v0.3.0'));
+  it('accepts a valid R2 latest pointer whose GitHub release owns the checksum', async () => {
+    fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      if (u.endsWith('.sha256')) return new Response('abc123');
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+      return new Response('nope', { status: 404 });
+    });
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+  });
+
+  it('falls through to GitHub latest when the R2 tag has no release assets', async () => {
+    fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+      const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+      // R2 names a well-formed, above-minimum tag that never shipped — its
+      // checksum 404s, so the mirror's word is not trusted.
+      if (u.includes('releases/download/mlx-agent-v9.9.9')) return new Response('nope', { status: 404 });
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v9.9.9');
+      return githubLatest('mlx-agent-v0.3.0');
+    });
     await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
   });
 
