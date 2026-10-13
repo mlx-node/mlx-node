@@ -18,7 +18,10 @@
  * throws, aborts, or ends on `finishReason: 'error'` never records — but it
  * still ADVANCES the shared watermarks ({@link TurnTraceModel.discardTurn}),
  * so its counter increments are consumed rather than inherited by the next
- * successful turn's delta. On continuously batched models
+ * successful turn's delta. That advance is floored at the oldest LIVE turn's
+ * baseline: a failure finishing mid-overlap consumes only up to what a
+ * survivor will still see, never the survivor's own increments. On
+ * continuously batched models
  * (`maxConcurrentSequences() > 1`) two turns can overlap in native flight:
  * each turn then reports the counter advance since the PREVIOUS record's
  * high-water mark ({@link TurnWatermarks}), so attribution between
@@ -107,6 +110,15 @@ export interface TurnWatermarks {
   cold: Record<string, number>;
   /** Field-name → last recorded counter value for the sidecar counters. */
   sidecar: Record<string, number>;
+  /**
+   * Begin snapshots of turns still in flight. {@link TurnTraceModel.discardTurn}
+   * floors its mark advance at the oldest live baseline so a failed turn
+   * cannot consume counter increments a surviving turn will still diff — a
+   * failure finishing mid-overlap would otherwise eat a concurrent success's
+   * hits/misses and the dashboard would undercount real cache activity.
+   * Lazily created when absent, so injected literals keep working.
+   */
+  live?: Set<{ cold: ColdCacheStats | undefined; sidecar: ColdSidecarStats | undefined }>;
 }
 
 /** Process-wide default: every `TurnTraceModel` in the serve process shares it. */
@@ -255,7 +267,7 @@ export class TurnTraceModel implements SessionCapableModel {
         if (typeof value === 'number') marks.sidecar[key] ??= value;
       }
     }
-    return {
+    const ctx: TurnContext = {
       traceId: randomUUID(),
       sessionId: typeof config?.cacheOwnerId === 'string' ? config.cacheOwnerId : undefined,
       startMs: this.now(),
@@ -263,6 +275,8 @@ export class TurnTraceModel implements SessionCapableModel {
       sidecar,
       done: false,
     };
+    (marks.live ??= new Set()).add(ctx);
+    return ctx;
   }
 
   /**
@@ -278,6 +292,7 @@ export class TurnTraceModel implements SessionCapableModel {
   private finishTurn(ctx: TurnContext, final: TurnFinal): void {
     if (ctx.done) return;
     ctx.done = true;
+    (this.deps.watermarks ?? SHARED_WATERMARKS).live?.delete(ctx);
     try {
       const coldStats = this.deps.coldStats ?? safeColdStats;
       const sidecarStats = this.deps.sidecarStats ?? safeSidecarStats;
@@ -383,23 +398,44 @@ export class TurnTraceModel implements SessionCapableModel {
    * turn's cache activity to whoever records next. Advancing the marks
    * without recording consumes the increment: uncommitted turns stay
    * unattributed on purpose.
+   *
+   * The advance is floored per field at the oldest OTHER live turn's begin
+   * snapshot: increments that could still belong to a survivor's window are
+   * left for it. A dead-owner rule keyed on the counter's current value alone
+   * would eat a concurrent success's own increments and undercount.
    */
   private discardTurn(ctx: TurnContext): void {
     if (ctx.done) return;
     ctx.done = true;
     try {
       const marks = this.deps.watermarks ?? SHARED_WATERMARKS;
-      const advance = (mark: Record<string, number>, key: string, current: number | undefined): void => {
+      marks.live?.delete(ctx);
+      // Field-wise floor: the oldest surviving turn's begin baseline for the
+      // SAME counter struct (cold and sidecar share field names like
+      // `enqueued`), so that turn's whole window stays reportable.
+      const advance = (
+        mark: Record<string, number>,
+        key: string,
+        which: 'cold' | 'sidecar',
+        current: number | undefined,
+      ): void => {
         if (current === undefined) return;
-        mark[key] = current;
+        let floor = current;
+        if (marks.live) {
+          for (const live of marks.live) {
+            const begin = (live[which] as Record<string, unknown> | undefined)?.[key];
+            if (typeof begin === 'number' && begin < floor) floor = begin;
+          }
+        }
+        mark[key] = Math.max(mark[key] ?? floor, floor);
       };
       const cold = (this.deps.coldStats ?? safeColdStats)();
       if (cold) {
-        for (const key of COLD_DELTA_KEYS) advance(marks.cold, key, cold[key]);
+        for (const key of COLD_DELTA_KEYS) advance(marks.cold, key, 'cold', cold[key]);
       }
       const sidecar = (this.deps.sidecarStats ?? safeSidecarStats)();
       if (sidecar) {
-        for (const key of SIDECAR_DELTA_KEYS) advance(marks.sidecar, key, sidecar[key]);
+        for (const key of SIDECAR_DELTA_KEYS) advance(marks.sidecar, key, 'sidecar', sidecar[key]);
       }
     } catch {
       // Best-effort; a broken stat reader must never break inference.

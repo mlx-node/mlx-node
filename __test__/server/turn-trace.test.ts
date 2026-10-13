@@ -356,6 +356,62 @@ describe('TurnTraceModel', () => {
     expect(lines[0]!.coldHits).toBe(1);
   });
 
+  it('a failed turn mid-overlap consumes nothing still inside a live turn\u2019s window', async () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    // Timeline: slow begins (seeds at 10) → fast begins → fast bumps +3 and
+    // throws → slow bumps +3 and finishes (reads 16). The failed turn's
+    // discard must floor its mark advance at slow's baseline (10): keying on
+    // the current counter (13) would eat +3 of slow's own window and slow
+    // would record 3 instead of the real 6.
+    let counter = 10;
+    const bump = (n: number) => {
+      counter += n;
+    };
+    const sharedMarks = { cold: {}, sidecar: {} };
+    const deps = {
+      modelName: 'qwen-small',
+      trace,
+      now: () => FIXED_NOW,
+      coldStats: () => coldStats({ hits: counter }),
+      sidecarStats: () => sidecarStats(),
+      watermarks: sharedMarks,
+    };
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((res) => {
+      releaseSlow = res;
+    });
+    const slow = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          await slowGate;
+          bump(3);
+          return makeResult();
+        }),
+      }),
+      deps,
+    );
+    const fast = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          bump(3);
+          throw new Error('native exploded');
+        }),
+      }),
+      deps,
+    );
+
+    const slowTurn = slow.chatSessionContinue([]);
+    // Let slow's begin snapshot land before fast dispatches.
+    await Promise.resolve();
+    await expect(fast.chatSessionContinue([])).rejects.toThrow('native exploded');
+    releaseSlow();
+    await slowTurn;
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.coldHits).toBe(6);
+  });
+
   it("consumes an error-finish turn's increments the same way", async () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
     let counter = 10;
