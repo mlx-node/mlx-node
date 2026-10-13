@@ -593,7 +593,12 @@ async function runAgentUpdate(scan: AgentArgScan, deps: AgentRunDeps): Promise<v
     }
     const { status, downloaded } = await (deps.applyUpdate ?? applyAgentUpdate)(updateDeps);
     if (downloaded) {
-      console.log(`mlx agent: updated to ${status.latest} → ${status.managedPath}`);
+      // current is the tag that actually installed — a candidate fallback
+      // may have landed an older release than latest.
+      console.log(`mlx agent: updated to ${status.current ?? status.latest} → ${status.managedPath}`);
+      if (status.updateAvailable) {
+        console.warn(`mlx agent: warning — latest ${status.latest} could not be fetched; installed ${status.current}`);
+      }
     } else {
       console.log(`mlx agent: already up to date (${status.latest})`);
     }

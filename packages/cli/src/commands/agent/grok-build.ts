@@ -1336,7 +1336,17 @@ export async function applyAgentUpdate(
   // candidate, so `latest` is not the truth. The pin wins when set (side
   // installs deliberately skip the pointer).
   const current = releasePin() ?? readAgentTag(status.managedPath) ?? status.latest;
-  return { status: { ...status, current, updateAvailable: false }, downloaded: true };
+  return {
+    status: {
+      ...status,
+      current,
+      // Availability is recomputed from what landed: a fallback that
+      // installed below latest must still read as updatable, or callers
+      // report "updated to latest" while running the older release.
+      updateAvailable: compareReleaseTags(status.latest, current) > 0,
+    },
+    downloaded: true,
+  };
 }
 
 /**

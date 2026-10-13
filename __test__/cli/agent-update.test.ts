@@ -1194,9 +1194,12 @@ describe('applyAgentUpdate', () => {
       expect(downloaded).toBe(true);
       expect(download).toHaveBeenNthCalledWith(1, managed, 'mlx-agent-v0.3.0');
       expect(download).toHaveBeenNthCalledWith(2, managed, undefined);
-      // current reports the ACTUALLY installed tag, not the requested one.
+      // current reports the ACTUALLY installed tag, not the requested one —
+      // and the update must still read as available: the installed release
+      // trails latest, so callers must not claim "updated to latest".
       expect(s.current).toBe('mlx-agent-v0.2.0');
       expect(s.latest).toBe('mlx-agent-v0.3.0');
+      expect(s.updateAvailable).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1259,6 +1262,23 @@ describe('mlx agent update (run)', () => {
     }));
     await run(['update'], { applyUpdate });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('updated to mlx-agent-v0.3.0'));
+    expect(process.exitCode).toBe(0);
+  });
+
+  it('update reports the installed tag and warns when a fallback lands below latest', async () => {
+    const applyUpdate = vi.fn(async () => ({
+      downloaded: true,
+      status: {
+        current: 'mlx-agent-v0.2.0',
+        latest: 'mlx-agent-v0.3.0',
+        updateAvailable: true,
+        managedPath: '/m/mlx-agent',
+        pinned: 'managed' as const,
+      },
+    }));
+    await run(['update'], { applyUpdate });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('updated to mlx-agent-v0.2.0'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('mlx-agent-v0.3.0'));
     expect(process.exitCode).toBe(0);
   });
 
