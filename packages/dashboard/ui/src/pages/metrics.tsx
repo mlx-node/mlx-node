@@ -179,7 +179,9 @@ export default function Metrics() {
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Metrics</h1>
-          <p className="text-muted-foreground text-sm">Throughput, token, and acceptance trends across recorded traces.</p>
+          <p className="text-muted-foreground text-sm">
+            Throughput, token, and acceptance trends across recorded traces.
+          </p>
         </div>
         <Select value={rangeKey} onValueChange={setRangeKey}>
           <SelectTrigger className="w-40" aria-label="Date range">

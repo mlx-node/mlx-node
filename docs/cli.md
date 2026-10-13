@@ -510,20 +510,20 @@ IQ3_S         y = d*(1+2*sc)   * (+-grid4[idx][j])    9-bit idx (qh), one sign b
 IQ1_S/M       y = d*(2*sc+1) * (grid[idx][j] +- 1/8)  computed as d*(2*sc+1)/8 * (8*g +- 1)
 ```
 
-| source | mlx-node   | ggml   | note                                |
-| ------ | ---------- | ------ | ----------------------------------- |
-| Q6_K   | 6.5625 bpw | 6.5625 | exact parity                        |
-| Q4_K   | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales      |
-| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason                 |
-| Q2_K   | 3.1250 bpw | 2.6250 | +0.5 for unpacked (sc, m) nibbles   |
-| Q3_K   | 3.5625 bpw | 3.4375 | +0.125 for unpacked sub-scales      |
-| IQ2_XXS | 2.0625 bpw | 2.0625 | native words, exact parity        |
-| IQ2_XS | 2.3125 bpw | 2.3125 | native words, exact parity          |
-| IQ2_S  | 2.5625 bpw | 2.5625 | native words, exact parity          |
-| IQ3_XXS | 3.0625 bpw | 3.0625 | native words, exact parity        |
-| IQ3_S  | 3.5625 bpw | 3.4375 | +4 B/256 for whole-byte scale nibbles |
-| IQ1_S  | 1.5625 bpw | 1.5625 | native words, exact parity          |
-| IQ1_M  | 1.8125 bpw | 1.7500 | +2 B/256 for the explicit f16 `d`   |
+| source  | mlx-node   | ggml   | note                                  |
+| ------- | ---------- | ------ | ------------------------------------- |
+| Q6_K    | 6.5625 bpw | 6.5625 | exact parity                          |
+| Q4_K    | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales        |
+| Q5_K    | 5.6250 bpw | 5.5000 | +0.125, same reason                   |
+| Q2_K    | 3.1250 bpw | 2.6250 | +0.5 for unpacked (sc, m) nibbles     |
+| Q3_K    | 3.5625 bpw | 3.4375 | +0.125 for unpacked sub-scales        |
+| IQ2_XXS | 2.0625 bpw | 2.0625 | native words, exact parity            |
+| IQ2_XS  | 2.3125 bpw | 2.3125 | native words, exact parity            |
+| IQ2_S   | 2.5625 bpw | 2.5625 | native words, exact parity            |
+| IQ3_XXS | 3.0625 bpw | 3.0625 | native words, exact parity            |
+| IQ3_S   | 3.5625 bpw | 3.4375 | +4 B/256 for whole-byte scale nibbles |
+| IQ1_S   | 1.5625 bpw | 1.5625 | native words, exact parity            |
+| IQ1_M   | 1.8125 bpw | 1.7500 | +2 B/256 for the explicit f16 `d`     |
 
 The sub-scales are stored unpacked rather than in ggml's 6-bit (4-bit for Q2_K)
 packing: packing would preserve the exact ggml density but breaks the affine
@@ -659,18 +659,18 @@ kl_topk          0.13782  (K=512, teacher tail mass 0.04045)
 top1_agreement   77.64%
 ```
 
-| Flag            | Purpose                                                                                                                            |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)                                                                       |
-| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                                                                             |
-| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)                                                                      |
-| `--cache`       | Teacher cache directory (required in both modes)                                                                                   |
-| `--rows`        | Dataset rows to capture (default `64`)                                                                                             |
-| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                                                                                   |
-| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary)                                                          |
-| `--logit-chunk` | Positions per head projection (default `64`)                                                                                       |
-| `--kv-format`   | Candidate flat K/V cache format, `int8` or `bf16` (dense qwen3_5; unset = the load default, int8 on Metal at head 256)             |
-| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting                                                               |
+| Flag            | Purpose                                                                                                                |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)                                                           |
+| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                                                                 |
+| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)                                                          |
+| `--cache`       | Teacher cache directory (required in both modes)                                                                       |
+| `--rows`        | Dataset rows to capture (default `64`)                                                                                 |
+| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                                                                       |
+| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary)                                              |
+| `--logit-chunk` | Positions per head projection (default `64`)                                                                           |
+| `--kv-format`   | Candidate flat K/V cache format, `int8` or `bf16` (dense qwen3_5; unset = the load default, int8 on Metal at head 256) |
+| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting                                                   |
 
 **Reading the numbers.** `nll`, `perplexity` and `top1_agreement` are exact over
 the full vocabulary. `kl_topk` is a KL over a `K+1`-way partition: one term per

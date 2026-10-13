@@ -422,7 +422,6 @@ describe('cloud provider SDK exclusion', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-
 });
 
 /**

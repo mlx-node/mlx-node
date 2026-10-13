@@ -602,7 +602,6 @@ describe('Overview page', () => {
     // catches the label disappearing or reverting to a raw Math.round.
   });
 
-
   it('saturates the quota meter width the same way the label is saturated', async () => {
     // `Math.round(quotaFraction * 100)` renders a 99.9%-full quota as a 100%
     // bar. `percentInt` caps it at 99 so the bar and the label agree.

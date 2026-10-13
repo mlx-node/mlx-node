@@ -571,8 +571,7 @@ export async function agentUpdateStatus(deps: AgentUpdateDeps = {}): Promise<Age
   // or bundle — anything else on disk still needs the pinned download.
   const pin = releasePin();
   const pinnedInstalled =
-    pin !== undefined &&
-    (install.effectiveTag === pin || existsSync(join(dirname(managedPath), agentBinName(pin))));
+    pin !== undefined && (install.effectiveTag === pin || existsSync(join(dirname(managedPath), agentBinName(pin))));
   return {
     current,
     latest,

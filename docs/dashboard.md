@@ -51,12 +51,12 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 
 ## Pages
 
-| Page           | Content                                                                                                 | Actions                                                                  |
-| -------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Overview       | Stat tiles (models/disk, cache size + hit rate, active downloads)                                       | —                                                                        |
-| Models         | Local table: name, family, quant, size, ctx window                                                      | delete; install from the recommended catalog (live port-pushed progress) |
-| Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                               |
-| Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                                       |
+| Page     | Content                                                                         | Actions                                                                  |
+| -------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Overview | Stat tiles (models/disk, cache size + hit rate, active downloads)               | —                                                                        |
+| Models   | Local table: name, family, quant, size, ctx window                              | delete; install from the recommended catalog (live port-pushed progress) |
+| Metrics  | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share | date range                                                               |
+| Cache    | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend      | clear all, evict older-than-N-days                                       |
 
 Every catalog entry installs its Unsloth UD-Q4_K_XL GGUF (one variant out of
 the repo's dozens) plus the base-model tokenizer sidecars fetched from the

@@ -383,8 +383,7 @@ describe('local model coding-agent setup', () => {
     const dir = join(home, 'custom agent #配置');
     await mkdir(dir);
     await writeFile(join(dir, 'config.toml'), '[models]\ndefault = "chosen"\n');
-    env.GROK_HOME =
-      kind === 'file-url' ? pathToFileURL(dir).href : kind === 'tilde' ? '~/custom agent #配置' : dir;
+    env.GROK_HOME = kind === 'file-url' ? pathToFileURL(dir).href : kind === 'tilde' ? '~/custom agent #配置' : dir;
     await mkdir(join(home, '.claude'));
     await writeFile(join(home, '.claude', 'CLAUDE.md'), 'Use yarn.');
     await service.start('detect', 'claude');

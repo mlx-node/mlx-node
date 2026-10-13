@@ -734,7 +734,7 @@ describe('dashboard api — cache trend scoping', () => {
     symlinkSync(cacheRoot, linkRoot);
     const linked = createDashboardRuntime({
       dbPath: ':memory:',
-        tracesDir,
+      tracesDir,
       modelsDir,
       cacheRoot: linkRoot,
     });
@@ -964,7 +964,7 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
 
     defaulted = createDashboardRuntime({
       dbPath: ':memory:',
-        tracesDir,
+      tracesDir,
       modelsDir,
       // Exactly what the app's Control Panel entry passes.
       cacheRoot: undefined,

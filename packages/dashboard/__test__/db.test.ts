@@ -189,9 +189,7 @@ describe('dashboard db', () => {
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
     // Everything complete except the single dropped column under test.
-    raw.exec(
-      [fixtureTable('traces', traces, ['source_file']), fixtureTable('trace_files', traceFiles)].join('\n'),
-    );
+    raw.exec([fixtureTable('traces', traces, ['source_file']), fixtureTable('trace_files', traceFiles)].join('\n'));
     raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.source_file']);
@@ -248,9 +246,7 @@ describe('dashboard db', () => {
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
     // traces is missing the `model` column; every other table is complete.
-    raw.exec(
-      [fixtureTable('traces', traces, ['model']), fixtureTable('trace_files', traceFiles)].join('\n'),
-    );
+    raw.exec([fixtureTable('traces', traces, ['model']), fixtureTable('trace_files', traceFiles)].join('\n'));
     raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.model']);
@@ -566,7 +562,10 @@ describe('dashboard db', () => {
     // Grow the file past the header page so real data leaf pages exist.
     const seed = openDashboardDb(file);
     for (let i = 0; i < 500; i++) {
-      seed.db.insert(traces).values({ traceId: `t${i}`, ts: i, model: 'x'.repeat(40) }).run();
+      seed.db
+        .insert(traces)
+        .values({ traceId: `t${i}`, ts: i, model: 'x'.repeat(40) })
+        .run();
     }
     seed.close();
 

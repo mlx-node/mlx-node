@@ -32,13 +32,7 @@ describe('delegate agent arguments', () => {
   });
 
   it('keeps agent metadata and package commands usable without prompt mode', () => {
-    for (const args of [
-      ['--help'],
-      ['--version'],
-      ['export', 'session.jsonl'],
-      ['config'],
-      ['update'],
-    ]) {
+    for (const args of [['--help'], ['--version'], ['export', 'session.jsonl'], ['config'], ['update']]) {
       expect(delegateAgentArgs(args)).toEqual(args);
     }
   });

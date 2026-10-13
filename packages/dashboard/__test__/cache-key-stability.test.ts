@@ -79,10 +79,7 @@ describe('request paths survive a remount', () => {
 
   async function pathsAcrossTwoMounts(element: ReactElement, settled: (t: string) => boolean, match: RegExp) {
     const calls: string[] = [];
-    dispose = stubApi(
-      { '/metrics/overview': EMPTY_METRICS },
-      { onCall: (call: ApiCall) => calls.push(call.path) },
-    );
+    dispose = stubApi({ '/metrics/overview': EMPTY_METRICS }, { onCall: (call: ApiCall) => calls.push(call.path) });
 
     const first = await renderPage(createElement(MemoryRouter, null, element), settled);
     first.unmount();

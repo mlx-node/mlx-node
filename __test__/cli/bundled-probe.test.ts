@@ -1,11 +1,10 @@
-import { describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  compareReleaseTags,
-  findBundledAppBinary,
-} from '../../packages/cli/src/commands/agent/grok-build.js';
+
+import { describe, expect, it } from 'vitest';
+
+import { compareReleaseTags, findBundledAppBinary } from '../../packages/cli/src/commands/agent/grok-build.js';
 
 describe('findBundledAppBinary', () => {
   it('finds Contents/Resources/native/mlx-agent from inside the bundled app', () => {

@@ -251,7 +251,9 @@ describe('discoverMlxModels', () => {
       }
       const entries = await discoverMlxModels(root);
       expect(entries.map((e) => e.discovered.path).sort()).toEqual([direct, first].sort());
-      expect(entries.every((e) => e.discovered.modelType === 'qwen4_exp' && e.agentModel.input.length === 1)).toBe(true);
+      expect(entries.every((e) => e.discovered.modelType === 'qwen4_exp' && e.agentModel.input.length === 1)).toBe(
+        true,
+      );
       await writeFile(join(split, 'config.json'), JSON.stringify({ model_type: 'qwen4_exp' }));
       await writeFile(join(split, 'model.safetensors'), 'converted weights');
       expect((await discoverMlxModels(root)).map((e) => e.discovered.path).sort()).toEqual([direct, split].sort());

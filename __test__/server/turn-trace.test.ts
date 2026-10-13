@@ -310,7 +310,7 @@ describe('TurnTraceModel', () => {
     expect(() => readFileSync(traceFile(dir), 'utf8')).toThrow();
   });
 
-  it('consumes a failed turn\'s counter increments instead of leaking them to the next record', async () => {
+  it("consumes a failed turn's counter increments instead of leaking them to the next record", async () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
     // Timeline: marks seed at 10 → failed turn bumps +3 and throws →
     // successful turn bumps +1 → records. Without discard-turn mark
@@ -356,7 +356,7 @@ describe('TurnTraceModel', () => {
     expect(lines[0]!.coldHits).toBe(1);
   });
 
-  it('consumes an error-finish turn\'s increments the same way', async () => {
+  it("consumes an error-finish turn's increments the same way", async () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
     let counter = 10;
     const bump = (n: number) => {

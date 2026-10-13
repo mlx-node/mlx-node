@@ -208,8 +208,7 @@ describe('downloadAgentBinary', () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const dest = managedAgentBinPath(home);
-      const versionedName = (tag: string) =>
-        join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
+      const versionedName = (tag: string) => join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
 
       mockMirrors(makeTarball(home, 'v020'));
       const old = await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
