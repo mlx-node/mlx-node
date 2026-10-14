@@ -25,10 +25,7 @@ on:
         type: boolean
         default: false
   push:
-    # TEMPORARY bootstrap: a workflow is only dispatchable once it exists on
-    # the default branch, so the first release is produced by a push to this
-    # branch. Remove the branch entry before merging.
-    branches: [main, ci/faster-build-test]
+    branches: [main]
     paths:
       # A submodule pointer bump shows up as a change to the gitlink path.
       - crates/mlx-sys/mlx
