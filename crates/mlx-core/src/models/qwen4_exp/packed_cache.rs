@@ -160,11 +160,18 @@ fn dir_name_identity(dir: &Path) -> Option<&str> {
 /// .pack, in-flight .tmp); a present-but-unreadable mtime counts as fresh
 /// (None) so the dir is never deleted on a bad clock.
 fn packed_dir_mtime(dir: &Path) -> Option<SystemTime> {
-    // symlink_metadata: a link's own mtime counts, its target never does.
+    // symlink_metadata at both levels: a link's own mtime counts, its target
+    // never does — a dangling link must not void recency and a hot external
+    // target must not keep the dir artificially fresh.
     let mut newest = fs::symlink_metadata(dir).ok()?.modified().ok()?;
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
-        newest = newest.max(entry.metadata().ok()?.modified().ok()?);
+        newest = newest.max(
+            fs::symlink_metadata(entry.path())
+                .ok()?
+                .modified()
+                .ok()?,
+        );
     }
     Some(newest)
 }

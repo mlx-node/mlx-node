@@ -2349,6 +2349,53 @@ describe('DownloadManager', () => {
     expect(hub.downloaded).toEqual([]);
   });
 
+  it('restores an owned dead-owner SYMLINK backup whose final dir is missing, keeping the model present when the follow-up fails', async () => {
+    // An owned symlinked finalDir can legitimately end up as a rollback backup:
+    // publish admits the link (isDownloaderOwned follows it), then renames the
+    // LINK aside before installing staged content. A crash between those renames
+    // leaves the backup a symlink into a marked external install — ownership
+    // still proves through the link, so the sweep restores it. Every catalog
+    // entry carries an assetsRepo, so the restored link's sidecar refresh is
+    // refused (a refresh never writes through a live link) and the job takes the
+    // full path anyway; the rollback's payoff is that an ERROR mid-download now
+    // leaves the canonical path pointing at the complete install instead of
+    // reporting the model missing.
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(external, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', WEIGHT], completedAt: 'x' }),
+    );
+    mkdirSync(stagingRoot(), { recursive: true });
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.55555555-5555-5555-5555-555555555555`);
+    symlinkSync(external, backup);
+    expect(existsSync(finalDir())).toBe(false);
+    hub.failOn = [WEIGHT];
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    // The backup LINK was renamed back onto finalDir before the download failed:
+    // the canonical path resolves to the complete external install, and the link
+    // itself is intact in .staging only as long as it took to be promoted.
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(backupDirs()).toEqual([]);
+    // The error came from the weight fetch — the job genuinely attempted the
+    // follow-up download (the refresh-refusal path), not a preflight refuse.
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+
+    rmSync(external, { recursive: true, force: true });
+  });
+
   it('reaps a leaked dead-owner publish backup when its final dir already exists', async () => {
     // A complete owned install already present.
     mkdirSync(finalDir(), { recursive: true });
@@ -2785,12 +2832,9 @@ describe('DownloadManager', () => {
     const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
     writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
     writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
-    writeFileSync(
-      join(external, DOWNLOAD_COMPLETE_MARKER),
-      // repo + revision MATCH the resolved snapshot so pre-fix skip-detection would
-      // read the foreign marker as already-installed and emit `done` through the link.
-      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', WEIGHT], completedAt: 'x' }),
-    );
+    // NO marker: the target is a FOREIGN install — `isDownloaderOwned` follows the
+    // backup link, finds nothing it ever wrote, and the dead-owner backup fails
+    // the restore gate even though it parses and its owner is dead.
     // A dead-owner (pid 999999999) rollback backup that is a SYMLINK into `external`.
     mkdirSync(stagingRoot(), { recursive: true });
     const backup = join(stagingRoot(), `${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`);

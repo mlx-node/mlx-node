@@ -1251,14 +1251,19 @@ export class DownloadManager {
    * backup:
    *
    *   - finalDir is a proven owned-complete REAL dir → the backup is redundant → rm;
-   *   - finalDir is ABSENT (a crashed swap) AND the backup is itself an OWNED REAL
-   *     directory (no-follow: `lstat().isDirectory()` + our marker) → restore it by
-   *     renaming it back into place. A FOREIGN-SYMLINK backup is NEVER restored: a
-   *     prior `overwrite` publish could have renamed a symlinked finalDir to its
-   *     backup, and restoring that link at finalDir would let skip-detection follow
-   *     it and report a false `done` through the foreign target;
+   *   - finalDir is ABSENT (a crashed swap) AND the backup proves OWNED → restore
+   *     it by renaming it back into place. Ownership here is `isDownloaderOwned`,
+   *     which stat-FOLLOWS a symlink: an owned REAL dir and an owned LINK into a
+   *     marked install both roll back. Restoring the link is safe because the
+   *     publish swap can legitimately rename an admitted symlinked finalDir to its
+   *     backup — the rollback reinstates exactly what the ownership preflight
+   *     admitted — and post-restore skip-detection still re-reads the target's
+   *     marker against THIS job's repo+revision, so a link into a marked install
+   *     of a different model is just re-swapped aside, never reported `done`. A
+   *     FOREIGN-symlink backup (unmarked or dangling target) fails ownership and
+   *     is never promoted;
    *   - otherwise (foreign symlink / unowned dir / incomplete-owned dir, OR — with
-   *     finalDir absent — a non-owned/symlink backup) → RETAIN the backup untouched
+   *     finalDir absent — a non-owned backup) → RETAIN the backup untouched
    *     and never clobber whatever occupies finalDir. Never throws.
    */
   private async recoverBackup(slug: string, finalDir: string): Promise<void> {
@@ -1293,9 +1298,11 @@ export class DownloadManager {
       try {
         if (finalOwnedComplete) {
           await rm(backupPath, { recursive: true, force: true }); // redundant backup
-        } else if (finalAbsent && lstatSync(backupPath).isDirectory() && isDownloaderOwned(backupPath)) {
-          // Restore a crashed swap — but ONLY an owned REAL-directory backup, so a
-          // foreign-symlink backup is never promoted onto finalDir.
+        } else if (finalAbsent && isDownloaderOwned(backupPath)) {
+          // Restore a crashed swap. `isDownloaderOwned` stat-follows a symlink
+          // backup into the marked install it points at — the same proof that
+          // admitted that link as finalDir — so owned real dirs and owned links
+          // both roll back, while foreign/dangling links fail ownership.
           await rename(backupPath, finalDir);
         }
         // else foreign symlink / unowned dir / incomplete-owned → retain untouched
