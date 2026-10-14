@@ -1,5 +1,5 @@
 /** Native-free metadata and discovery for optional speculative draft checkpoints. */
-import { type Dirent, readdirSync, readFileSync, statSync } from 'node:fs';
+import { type Dirent, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 export const QWEN38_DFLASH2 = {
@@ -66,20 +66,48 @@ export function isDFlash2Companion(path: string): boolean {
 export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir?: string): string | undefined {
   if (modelType !== 'qwen3_5') return undefined;
   const isGguf = modelPath.toLowerCase().endsWith('.gguf');
+  // Discovery records the lexical symlink path, and the recorded model path
+  // must stay lexical, so searches run against BOTH the lexical dir and the
+  // symlink target's dir while return values keep the lexical spelling. A
+  // companion beside the real GGUF is found either way; basename checks stay
+  // lexical — a link named "qwen3.8-27b-*.gguf" is the caller's claim of
+  // which family it wants, whatever the target file is called.
+  let resolved = modelPath;
+  try {
+    resolved = realpathSync(modelPath);
+  } catch {
+    // Unresolvable path: fall back to lexical-only lookup rather than
+    // disabling companion search.
+  }
   const modelDir = isGguf ? dirname(modelPath) : modelPath;
+  const resolvedDir = isGguf ? dirname(resolved) : resolved;
   const embedded = join(modelDir, 'draft');
   if (isDFlash2Companion(embedded)) return embedded;
+  if (resolvedDir !== modelDir) {
+    const resolvedEmbedded = join(resolvedDir, 'draft');
+    if (isDFlash2Companion(resolvedEmbedded)) return resolvedEmbedded;
+  }
 
   const targetName = /(?:^|[-_.])qwen3[._-]8[-_.]27b(?:[-_.]|$)/i;
   if (!targetName.test(basename(modelPath)) && !(isGguf && targetName.test(basename(modelDir)))) return undefined;
   const slug = QWEN38_DFLASH2.hfRepo.split('/')[1].toLowerCase();
   const roots = modelsDir === undefined ? [isGguf ? modelDir : dirname(modelDir)] : [modelsDir];
+  // The linked target's own directory and its parent get the same searches —
+  // a companion shipped beside the real file attaches identically to a
+  // linked entry.
+  if (resolvedDir !== modelDir) {
+    roots.push(resolvedDir);
+    if (modelsDir === undefined && !isGguf) roots.push(dirname(resolvedDir));
+  }
   // A sibling config identifies a downloaded model repository. Its parent
   // can hold the shared companion; a standalone GGUF's containing directory
   // is already the model store, so do not search above it. An explicit store
   // always takes precedence over this repository inference.
   if (modelsDir === undefined && isGguf && regularFile(join(modelDir, 'config.json'))) {
     roots.push(dirname(modelDir));
+  }
+  if (modelsDir === undefined && isGguf && resolvedDir !== modelDir && regularFile(join(resolvedDir, 'config.json'))) {
+    roots.push(dirname(resolvedDir));
   }
   for (const root of roots) {
     try {

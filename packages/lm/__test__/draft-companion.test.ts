@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -88,6 +88,25 @@ describe('DFlash2 companion discovery', () => {
     rmSync(join(root, 'qwen3.8-27b-dflash2'));
     symlinkSync(join(root, 'loose-file'), join(root, 'qwen3.8-27b-dflash2'));
     expect(findDFlash2Draft(target, 'qwen3_5')).toBeUndefined();
+  });
+
+  it('finds the embedded draft beside a symlinked GGUF target', () => {
+    // Discovery records the lexical link path; the companion lives beside the
+    // real target, so modelDir must derive from the resolved path.
+    const external = mkdtempSync(join(tmpdir(), 'mlx-draft-external-'));
+    try {
+      const realGguf = join(external, 'weights.gguf');
+      writeFileSync(realGguf, 'weights');
+      const embedded = join(external, 'draft');
+      writeDraft(embedded);
+      const link = join(root, 'Qwen3.8-27B-UD-Q4_K_XL.gguf');
+      symlinkSync(realGguf, link);
+      // The draft is found through the target's directory, so the returned
+      // path is the target side's canonical spelling.
+      expect(findDFlash2Draft(link, 'qwen3_5')).toBe(realpathSync(embedded));
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
   });
 
   it('ignores incomplete, empty, and wrong-architecture companion weights', () => {
