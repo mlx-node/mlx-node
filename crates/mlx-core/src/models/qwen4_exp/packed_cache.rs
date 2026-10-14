@@ -144,6 +144,14 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
     manifest
 }
 
+/// A cache dir on disk is a REAL directory — never a symlink. `Path::is_dir`
+/// follows links, so a `.mlx-qwen4-packed-v2-*` symlink would admit its
+/// external target into sizing (`read_dir` walks it) and eviction. The
+/// producers only ever emit real dirs, so links are foreign.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
 fn dir_name_identity(dir: &Path) -> Option<&str> {
     dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)
 }
@@ -152,7 +160,8 @@ fn dir_name_identity(dir: &Path) -> Option<&str> {
 /// .pack, in-flight .tmp); a present-but-unreadable mtime counts as fresh
 /// (None) so the dir is never deleted on a bad clock.
 fn packed_dir_mtime(dir: &Path) -> Option<SystemTime> {
-    let mut newest = fs::metadata(dir).ok()?.modified().ok()?;
+    // symlink_metadata: a link's own mtime counts, its target never does.
+    let mut newest = fs::symlink_metadata(dir).ok()?.modified().ok()?;
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         newest = newest.max(entry.metadata().ok()?.modified().ok()?);
@@ -192,6 +201,9 @@ fn packed_orphan_reason(dir: &Path) -> Option<&'static str> {
 /// (tiny) link and the target is never followed — bytes outside the cache
 /// dir must not drive eviction or recorded spend.
 fn dir_size(dir: &Path) -> u64 {
+    if !is_real_dir(dir) {
+        return 0;
+    }
     fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -205,8 +217,12 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 /// Bytes actually held by .pack files — the same quantity the budget ledger
-/// records. A .pack that is itself a symlink contributes only its link bytes.
+/// records. A .pack that is itself a symlink contributes only its link bytes,
+/// and a symlinked `dir` is foreign: read_dir would traverse its target.
 fn pack_bytes(dir: &Path) -> u64 {
+    if !is_real_dir(dir) {
+        return 0;
+    }
     fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -252,7 +268,7 @@ fn root_pack_spend(
             entries
                 .flatten()
                 .map(|e| e.path())
-                .filter(|p| p != current && p.is_dir() && dir_name_identity(p).is_some())
+                .filter(|p| p != current && is_real_dir(p) && dir_name_identity(p).is_some())
                 .map(|p| sibling_bytes(&p))
                 .sum()
         })
@@ -327,7 +343,7 @@ fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) 
     // or mismatched manifest means abandonment, not creation — fall through
     // to the caller's verdict.
     if _guard.is_none()
-        && dir.is_dir()
+        && is_real_dir(dir)
         && dir.join(".manifest").is_file()
         && identity_from_manifest(dir)
             .ok()
@@ -361,7 +377,9 @@ fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) 
 }
 
 fn remove_packed_dir(dir: &Path, reason: &str) -> u64 {
-    locked_remove(dir, reason, |d| packed_orphan_reason(d).is_some())
+    locked_remove(dir, reason, |d| {
+        is_real_dir(d) && packed_orphan_reason(d).is_some()
+    })
 }
 
 /// Best-effort mtime stamp; keeps the dir young for idle-expiry and LRU.
@@ -413,7 +431,7 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
             entries
                 .flatten()
                 .map(|e| e.path())
-                .filter(|p| p.is_dir() && dir_name_identity(p).is_some())
+                .filter(|p| is_real_dir(p) && dir_name_identity(p).is_some())
                 .map(|p| {
                     let mtime = packed_dir_mtime(&p);
                     (p, mtime)
@@ -441,7 +459,8 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
             continue;
         }
         let removed = locked_remove(dir, "total cap LRU eviction", |d| {
-            dir_name_identity(d).is_some()
+            is_real_dir(d)
+                && dir_name_identity(d).is_some()
                 && d.join(".manifest").is_file()
                 && packed_dir_mtime(d)
                     .is_some_and(|mtime| snapshot.is_some_and(|snap| mtime <= snap))
@@ -501,7 +520,7 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
-            if dir == current || !dir.is_dir() || dir_name_identity(&dir).is_none() {
+            if dir == current || !is_real_dir(&dir) || dir_name_identity(&dir).is_none() {
                 continue;
             }
             if let Some(reason) = packed_orphan_reason(&dir) {
@@ -1486,6 +1505,34 @@ mod tests {
             "pack_bytes followed a symlink: {}",
             pack_bytes(&dir)
         );
+    }
+
+    #[test]
+    fn symlinked_identity_dir_is_foreign_to_sweep_and_spend() {
+        let temp = Temp::new();
+        let parent = temp.0.join("root");
+        fs::create_dir(&parent).unwrap();
+        // Bytes outside the cache root must never be counted or deleted.
+        let outside = temp.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("big.pack"), vec![0_u8; 1 << 20]).unwrap();
+        // A root-level entry whose NAME claims an identity but whose inode is
+        // a symlink: foreign — invisible to sizing and immune to the sweep.
+        let link = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        assert!(link.is_symlink(), "the sweep must never touch a link");
+        assert_eq!(
+            fs::canonicalize(&link).unwrap(),
+            outside.canonicalize().unwrap(),
+            "the link target is intact"
+        );
+        // Sizing ignores the link's target bytes entirely.
+        assert_eq!(root_pack_spend(&parent, &cache.root, 0, pack_bytes), 0);
+        assert_eq!(reconciled_sibling_pack_spend(&link), 0);
+        assert_eq!(sibling_pack_estimate(&link), 0);
     }
 
     // flock is per-process on BSD/macOS, so a held writer lock can only be

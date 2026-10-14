@@ -66,10 +66,13 @@ on macOS. Deleting that cache is safe while the model is stopped.
 
 Each identity directory also carries a `.manifest` recording its canonical
 source directory and packed file list. Opening the cache sweeps sibling
-`.mlx-qwen4-packed-v2-*` directories: one is orphaned when its manifest cannot
-prove liveness (missing or unreadable source) or records a different identity
-than its directory name, or when its newest `budget`/`.manifest`/`.pack` mtime
-is older than one hour. Removal requires a non-blocking lock on that
+`.mlx-qwen4-packed-v2-*` directories: one is orphaned only when its manifest
+cannot prove liveness (missing or unreadable source) or records a different
+identity than its directory name — and only once the newest
+`budget`/`.manifest`/`.pack` mtime is also older than one hour. The hour is a
+grace gate for real orphan reasons, never an expiry on its own: a healthy
+manifested dir stays cached indefinitely until `MLX_QWEN4_PACKED_CACHE_MAX_GB`
+evicts it. Removal requires a non-blocking lock on that
 directory's `budget` ledger — a live writer holds it — and directories without
 a manifest are never removed, since nothing can prove them stale. Under the
 same lock, the ledger's `used` figure is reconciled against the `.pack` bytes

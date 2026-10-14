@@ -6873,6 +6873,10 @@ fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<f
 /// or followed, so targets outside the cache root are never counted (or
 /// deleted).
 fn native_gguf_path_bytes(path: &Path) -> u64 {
+    // A symlinked path is foreign: read_dir on it would traverse the target.
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return 0;
+    }
     let mut total = 0_u64;
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
