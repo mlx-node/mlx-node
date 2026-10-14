@@ -1031,6 +1031,17 @@ struct ReadGuard {
     _flock: Option<File>,
 }
 
+impl ReadGuard {
+    /// A read is guarded only while BOTH exclusions hold: the in-process
+    /// registry entry stops same-process deleters (flock is per-process) and
+    /// the SH flock stops foreign ones. Either leg missing means a deleter
+    /// can proceed concurrently — the caller must report a cache miss
+    /// instead of reading unguarded, or an open could race remove_dir_all.
+    fn live(&self) -> bool {
+        self.dir.is_some() && self._flock.is_some()
+    }
+}
+
 impl Drop for ReadGuard {
     fn drop(&mut self) {
         let Some(dir) = self.dir.take() else {
@@ -1047,20 +1058,19 @@ impl Drop for ReadGuard {
 }
 
 fn read_guard(root: &Path) -> ReadGuard {
-    // Register before flocking/opening: a deleter already inside
-    // remove_dir_all holds the registry lock, so try_lock fails and this
-    // read degrades to unguarded instead of straddling the delete.
-    let dir = match packed_readers().try_lock() {
-        Ok(mut registry) => {
-            *registry.entry(root.to_path_buf()).or_insert(0) += 1;
-            Some(root.to_path_buf())
-        }
-        Err(std::sync::TryLockError::Poisoned(p)) => {
-            *p.into_inner().entry(root.to_path_buf()).or_insert(0) += 1;
-            Some(root.to_path_buf())
-        }
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    };
+    // Readers BLOCK on the registry mutex — its critical sections are tiny
+    // (a count bump, or a whole remove_dir_all a deleter holds it through).
+    // A blocking lock still cannot straddle a delete: either we register
+    // before the deleter's try_lock (it sees the count and skips) or after
+    // it finishes (the dir is gone and the open misses). try_lock would be
+    // wrong here — a parallel reader's brief bump would fail the lock and
+    // spuriously degrade a healthy read to a miss.
+    let mut registry = packed_readers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *registry.entry(root.to_path_buf()).or_insert(0) += 1;
+    drop(registry);
+    let dir = Some(root.to_path_buf());
     let flock = File::open(root.join("budget")).ok().and_then(|file| {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
             return None;
@@ -1241,6 +1251,12 @@ impl PackedCache {
         // removal and report a miss), or this guard makes both of its locks
         // fail and the dir survives until the read finishes.
         let _guard = read_guard(&self.root);
+        if !_guard.live() {
+            // Contention = miss: the dir may already be inside a foreign or
+            // same-process removal. Failing the open path as NotFound gives
+            // the caller a clean rebuild instead of a mid-read delete.
+            return Ok(None);
+        }
         let mut file = match File::open(self.path(key)) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
@@ -2586,6 +2602,24 @@ mod tests {
         // witnesses: an evictor racing this read sees a live dir.
         assert!(cache.read("key").is_err());
         assert!(!packed_dir_idle(&cache.root));
+    }
+
+    // A read whose guard cannot take BOTH exclusions reports a miss instead
+    // of racing remove_dir_all: here the ledger is absent, so the flock leg
+    // has nothing to pin and the guard is not live.
+    #[test]
+    fn read_reports_miss_when_exclusion_is_incomplete() {
+        let temp = Temp::new();
+        let cache = PackedCache {
+            root: temp.0.join("cache"),
+            manifest: None,
+        };
+        cache.write(&pack_name('a'), &weight("affine")).unwrap();
+        fs::remove_file(cache.root.join("budget")).unwrap();
+        assert!(cache.read(&pack_name('a')).unwrap().is_none());
+        // With the ledger restored both legs hold and reads hit again.
+        fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
+        assert!(cache.read(&pack_name('a')).unwrap().is_some());
     }
 
     #[test]
