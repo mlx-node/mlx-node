@@ -142,25 +142,29 @@ mlx_array* mlx_array_from_metal_buffer_view(
   // Capture by value (raw pointer) — MTL::Buffer is reference-counted
   // and the retain() above guarantees the pointer stays valid until
   // this lambda runs.
-  mlx::core::Deleter retain_release = [mtl_buffer](mlx::core::allocator::Buffer) {
-    mtl_buffer->release();
-  };
+  mlx::core::allocator::Deleter retain_release =
+      [mtl_buffer](mlx::core::allocator::Buffer) { mtl_buffer->release(); };
 #else
   // Non-macOS: there is no MTL::Buffer to retain/release. We still take
   // the no-op path so the file compiles for `cfg(not(target_os = "macos"))`
   // unit tests, but the function returns null above before reaching
   // this point because `mlx::core::metal::is_available()` is false.
-  mlx::core::Deleter retain_release = [](mlx::core::allocator::Buffer) {};
+  mlx::core::allocator::Deleter retain_release =
+      [](mlx::core::allocator::Buffer) {};
 #endif
 
   // Construct array from existing buffer pointer. `allocator::Buffer{ptr}`
   // wraps the MTL::Buffer* as MLX's allocator::Buffer (same as
-  // `MetalAllocator::make_buffer` returns).
+  // `MetalAllocator::make_buffer` returns). `allocator::Data(buffer, deleter)`
+  // is the non-owning form: MLX never passes it to `allocator().free`, it
+  // runs our deleter instead (upstream #4634).
   try {
     mlx::core::Shape shape = make_shape(dims, ndim);
     auto buf = mlx::core::allocator::Buffer{metal_buffer_ptr};
     auto* arr = new mlx::core::array(
-        buf, std::move(shape), dtype, std::move(retain_release));
+        mlx::core::allocator::Data(buf, std::move(retain_release)),
+        std::move(shape),
+        dtype);
     return reinterpret_cast<mlx_array*>(arr);
   } catch (...) {
     // Construction failed AFTER we retained — release the bumped
