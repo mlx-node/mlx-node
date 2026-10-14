@@ -1204,8 +1204,13 @@ impl PackedCache {
         }
         // One guard for the whole batch: per-chunk guards would let a
         // writer's shed_oldest_packs interleave between two chunk opens and
-        // delete a pack this batch has not reached yet.
+        // delete a pack this batch has not reached yet. A non-live guard
+        // means a deleter can proceed concurrently right now — report
+        // all-miss rather than racing remove_dir_all between chunks.
         let _batch_guard = read_guard(&self.root);
+        if !_batch_guard.live() {
+            return Ok(requests.iter().map(|_| None).collect());
+        }
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(4)

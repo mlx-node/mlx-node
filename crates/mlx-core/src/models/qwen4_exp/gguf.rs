@@ -247,7 +247,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     if dir.join("complete").exists() {
         let mut leased = false;
         for _ in 0..ASSETS_LOCK_RETRIES {
-            if native_gguf_lease_in_use(root, &dir, Some(&dir_name), None) {
+            if native_gguf_lease_in_use(root, &dir, Some(&dir_name)) {
                 leased = true;
                 break;
             }
@@ -270,7 +270,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         // republishing — moving the path out from under a live reader).
         // Live dirs have no lock file and are already pid-gated, so this
         // lease is registry-only.
-        native_gguf_lease_in_use(root, &live_dir, None, None);
+        native_gguf_lease_in_use(root, &live_dir, None);
         stamp_complete(&live_dir.join("complete"));
         return Ok(live_dir);
     }
@@ -287,7 +287,9 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
         guard = assets_sidecar_lock(root, &dir_name);
     }
-    let Some(mut guard) = guard else {
+    // `_guard` keeps the exclusive sidecar lock held for the rest of this
+    // scope — the publish below must stay serialized against sweeps.
+    let Some(_guard) = guard else {
         return Err(Error::from_reason(format!(
             "GGUF assets sidecar lock for {dir_name} stayed contended for ~2s; refusing to publish unguarded"
         )));
@@ -295,8 +297,10 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     // Recheck under the exclusive lock — a publish may have completed while
     // the lease attempts and lock spin were running.
     if dir.join("complete").exists() {
-        // `lease_in_use` adopts the held EX fd by downgrading it to SH.
-        let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name), guard.take());
+        // Lease pins the separate `{dir_name}.lease` sentinel — never the
+        // writer lock this path holds (a retained SH would brick later
+        // republishes; flock is per-open-description).
+        let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name));
         stamp_complete(&dir.join("complete"));
         return Ok(dir);
     }
@@ -367,13 +371,13 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     }
     // Whatever path the caller will hand to the model is a load output:
     // lease it for the process lifetime (see the hit path above). `dir`
-    // adopts the still-held EX fd as its shared lease; `live_dir` has no
-    // lock file, so its lease is registry-only.
+    // A published result leases `dir` (its `.lease` sentinel); `live_dir`
+    // has no lock file, so its lease is registry-only.
     if let Ok(path) = &result {
         if *path == dir {
-            let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name), guard.take());
+            let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name));
         } else if *path == live_dir {
-            native_gguf_lease_in_use(root, &live_dir, None, None);
+            native_gguf_lease_in_use(root, &live_dir, None);
         }
     }
     result
@@ -521,13 +525,13 @@ mod tests {
             serde_json::to_value(&config).unwrap()
         );
         assert!(output.join("complete").is_file());
-        // The sidecar dir plus its hit-path lock file — nothing else may be
-        // written beside the read-only source or in the cache root.
+        // The sidecar dir plus its lock and lease sentinels — nothing else
+        // may be written beside the read-only source or in the cache root.
         let names: Vec<String> = fs::read_dir(&cache)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(names.len(), 3, "{names:?}");
         assert_eq!(store.bytes_read, 0);
         fs::remove_dir_all(root).unwrap();
     }
