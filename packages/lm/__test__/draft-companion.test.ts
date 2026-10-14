@@ -128,6 +128,28 @@ describe('DFlash2 companion discovery', () => {
     }
   });
 
+  it('searches the resolved repo parent for a symlinked GGUF even with an explicit models dir', () => {
+    // The GGUF symlink lives in the store, its target in an external
+    // repository directory (config.json sibling), and the shared companion
+    // sits beside that repository. An explicit modelsDir names the store —
+    // it must not suppress the resolved repo parent, matching the directory
+    // target behavior above.
+    const external = mkdtempSync(join(tmpdir(), 'mlx-draft-external-repo-'));
+    try {
+      const repo = join(external, 'qwen-repo');
+      mkdirSync(repo);
+      writeFileSync(join(repo, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      const realGguf = join(repo, 'weights.gguf');
+      writeFileSync(realGguf, 'weights');
+      writeDraft(join(external, 'Qwen3.8-27B-DFlash2'));
+      const link = join(root, 'Qwen3.8-27B-UD-Q4_K_XL.gguf');
+      symlinkSync(realGguf, link);
+      expect(findDFlash2Draft(link, 'qwen3_5', root)).toBe(join(realpathSync(external), 'Qwen3.8-27B-DFlash2'));
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
   it('ignores incomplete, empty, and wrong-architecture companion weights', () => {
     writeDraft();
     rmSync(join(draft, 'model.safetensors'));

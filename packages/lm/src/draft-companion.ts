@@ -113,8 +113,13 @@ export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir
   if (modelsDir === undefined && isGguf && regularFile(join(modelDir, 'config.json'))) {
     roots.push(dirname(modelDir));
   }
-  if (modelsDir === undefined && isGguf && resolvedDir !== modelDir && regularFile(join(resolvedDir, 'config.json'))) {
-    roots.push(dirname(resolvedDir));
+  // The resolved repo parent is searched even with an explicit store: a
+  // symlinked GGUF's target legitimately lives outside `modelsDir`, matching
+  // the resolved-dir branch above for directory targets. The config.json
+  // sibling check still confines the inference to real repositories.
+  if (isGguf && resolvedDir !== modelDir && regularFile(join(resolvedDir, 'config.json'))) {
+    const resolvedParent = dirname(resolvedDir);
+    if (!roots.includes(resolvedParent)) roots.push(resolvedParent);
   }
   for (const root of roots) {
     try {

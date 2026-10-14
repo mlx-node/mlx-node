@@ -7038,6 +7038,44 @@ fn native_gguf_in_use(dir: &Path) -> bool {
     native_gguf_in_use_dir(dir)
 }
 
+/// Provisional lease for the prepare-return path: registers a reference the
+/// caller intends to hand to the loader, and releases it on drop unless
+/// `disarm` ran. A prepare cancelled at the post-publish sweep await must
+/// not leave a registered reference — the pinned dir (published or staging
+/// fallback) would otherwise stay cap-exempt for the process lifetime.
+struct PreparedDirLease {
+    dir: PathBuf,
+    armed: bool,
+}
+
+impl PreparedDirLease {
+    fn armed(dir: PathBuf) -> Self {
+        Self { dir, armed: true }
+    }
+
+    /// Ownership transferred to the caller: the reference stays registered.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedDirLease {
+    fn drop(&mut self) {
+        if self.armed {
+            native_gguf_unlease_in_use(&self.dir);
+        }
+    }
+}
+
+/// Test-only pause inside `prepare_native_gguf_inner`: fires after the
+/// provisional lease registers and before the post-publish sweep. The
+/// prepare then sleeps long enough for the test to abort its task — an
+/// async sleep, never a blocking receive, because this future may run on a
+/// single-threaded runtime whose only worker a blocking wait would starve.
+#[cfg(all(test, unix))]
+static POST_LEASE_SWEEP_PAUSE: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>> =
+    std::sync::Mutex::new(None);
+
 /// Release ONE reference on `dir`'s lease: the entry — and its shared
 /// flock — drops only when the last reference goes, so a failed recheck
 /// after a racing second lease cannot unpin the dir under that model.
@@ -7667,29 +7705,31 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 // (nonzero, no leading zeros, within `pid_t` range —
                 // `native_gguf_valid_pid`), and `-g{n}` is the generation a
                 // second same-identity refusal lands on while an earlier
-                // live dir stays leased. A live pid means a load output
-                // this process still reads: keep it while the lease registry
-                // holds a reference — a leased live dir is never counted
-                // toward the cap and never deleted. Once the last reference
-                // is released (a failed load's unlease), the live-pid dir is
-                // reclaimable like debris: `native_gguf_in_use_delete_guard`
-                // serializes the check against a racing leaser so removal
-                // can only observe never-leased or fully-released state.
-                // Only a dead pid or an unleased live pid makes it debris,
-                // so like the assets-tmp names no entry lock exists for the
-                // live name and removal runs directly under the guard —
-                // pid death and the lease registry are the whole gate.
+                // live dir stays leased. The producer emits only the base
+                // name or the canonical `-g2`..`-g63` (the 1..64 scan starts
+                // at the base name), so a `-g` tail outside that exact range
+                // and spelling — `-g0`, `-g01`, `-g999` — is a foreign dir
+                // that merely shares the prefix: treat the whole suffix as
+                // identity-pid text, which can only parse for a name the
+                // producer could never emit.
                 let live_suffix = suffix
                     .rsplit_once('-')
                     .map(|(base, tail)| {
                         tail.strip_prefix('g')
-                            .filter(|digits| {
-                                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-                            })
+                            .and_then(|digits| digits.parse::<u32>().ok())
+                            .filter(|generation| (2..64).contains(generation))
+                            .map(|generation| tail == format!("g{generation}"))
+                            .filter(|&canonical| canonical)
                             .map(|_| base)
                             .unwrap_or(suffix)
                     })
                     .unwrap_or(suffix);
+                // A live pid means a load output this process still reads:
+                // keep it while the lease registry holds a reference — never
+                // counted toward the cap, never age-deleted. Our pid with no
+                // surviving lease is reclaimable through the in-use delete
+                // guard; a foreign live pid's lease state is not visible to
+                // this registry, so pid liveness stays its whole gate.
                 if let Some((identity, pid_text)) = live_suffix.rsplit_once('-')
                     && native_gguf_is_hex64(identity)
                     && let Some(pid) = native_gguf_valid_pid(pid_text)
@@ -7699,11 +7739,6 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                     } else if pid == std::process::id()
                         && let Some(_in_use) = native_gguf_in_use_delete_guard(&path)
                     {
-                        // OUR live pid with no surviving lease: a failed load
-                        // gave the reference back, so the dir is reclaimable.
-                        // A foreign live pid's lease state is not visible to
-                        // this registry — pid liveness stays the whole gate
-                        // for those.
                         reclaimed += native_gguf_remove_logged(&path, "unleased assets live dir");
                     }
                 }
@@ -8928,16 +8963,33 @@ async fn prepare_native_gguf_inner(
     // process too); a cap-refused staging dir registers without a sentinel
     // (its name owns no lock file). A failed keyed lease fails the load —
     // never hand a model a directory the sweep can remove.
-    if prepared_dir == output_dir {
+    let provisional_lease = if prepared_dir == output_dir {
         if !native_gguf_lease_in_use_retry(cache_root, &prepared_dir, &cache_key) {
             return Err(Error::from_reason(format!(
                 "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
                 prepared_dir.display()
             )));
         }
+        PreparedDirLease::armed(prepared_dir.clone())
     } else {
         // Staging/live fallback dirs own no sentinel — registry-only.
         native_gguf_lease_in_use(cache_root, &prepared_dir, None);
+        PreparedDirLease::armed(prepared_dir.clone())
+    };
+
+    // Deterministic pause for the cancellation regression: prepare parks
+    // here holding an armed lease until the test aborts the task. The sleep
+    // yields the executor, so the abort lands while the lease is armed.
+    #[cfg(all(test, unix))]
+    {
+        let pause = POST_LEASE_SWEEP_PAUSE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(at_pause) = pause {
+            let _ = at_pause.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
     }
 
     // Re-run the sweep now that the new entry's bytes are on disk: the
@@ -8945,7 +8997,8 @@ async fn prepare_native_gguf_inner(
     // enforced again. The published key is exempt from cap eviction, and a
     // refused publish is harmless here: a live-pid staging dir never counts
     // toward the cap, and a completed one (the load output) is protected by
-    // the lease registered above.
+    // the armed lease registered above — if this await is cancelled the
+    // guard's Drop releases it rather than leaking a cap-exempt dir.
     {
         let sweep_root = cache_root.to_path_buf();
         let sweep_key = cache_key.clone();
@@ -8961,6 +9014,9 @@ async fn prepare_native_gguf_inner(
             Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
         }
     }
+    // The lease survives the return: the caller hands `prepared_dir` to the
+    // loader, which owns the reference from here on.
+    provisional_lease.disarm();
     Ok(prepared_dir)
 }
 
@@ -18813,6 +18869,82 @@ mod tests {
             !prepared.exists(),
             "an unleased refused staging dir must be reclaimable while the pid lives"
         );
+    }
+
+    /// Codex round-9 regression: the provisional lease registers before the
+    /// post-publish sweep so the sweep cannot delete a refused staging dir —
+    /// but a task cancelled at that await must not leak the reference either.
+    /// `PreparedDirLease`'s Drop releases it, so an aborted prepare leaves no
+    /// cap-exempt pin.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_aborted_prepare_releases_provisional_lease() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0.0000001");
+        let root = NativeSweepTestDir::new("abort-lease");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let (at_pause, paused) = std::sync::mpsc::sync_channel::<()>(1);
+        *POST_LEASE_SWEEP_PAUSE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(at_pause);
+
+        let prepare_input = input.clone();
+        let prepare_root = cache_root.clone();
+        let task = tokio::spawn(async move {
+            prepare_qwen35_native_gguf_in(&prepare_input, &prepare_root).await
+        });
+        // The prepare parked exactly once: after its provisional lease, before
+        // the post-publish sweep await. The wait runs on the blocking pool so
+        // this single-threaded runtime keeps driving the spawned prepare.
+        let reached = tokio::task::spawn_blocking(move || {
+            paused.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("pause waiter task failed");
+        assert!(reached.is_ok(), "prepare must reach the post-lease pause");
+        // Abort while the prepare is suspended in the armed-lease window: the
+        // runtime drops the future, and `PreparedDirLease` must unlease.
+        task.abort();
+        let outcome = task.await;
+
+        // Whatever directory the aborted attempt prepared, no reference may
+        // survive it — the registry must be clean of same-pid entries.
+        let staged = fs::read_dir(&cache_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(NATIVE_GGUF_STAGING_INFIX))
+            })
+            .map(|entry| entry.path());
+        match outcome {
+            Err(_) => {
+                let dir = staged.expect("the aborted prepare staged a conversion");
+                assert!(
+                    !native_gguf_in_use_dir(&dir),
+                    "an aborted prepare must not leave a registered lease"
+                );
+                sweep_native_gguf_cache(&cache_root, "no-such-key");
+                assert!(
+                    !dir.exists(),
+                    "an unleased refused staging dir is reclaimable"
+                );
+            }
+            // The sweep await resolving before the abort landed means the
+            // lease legitimately belongs to this "caller": return it the way
+            // a real caller's cleanup would and assert the same invariant.
+            Ok(Ok(dir)) => {
+                native_gguf_unlease_in_use(&dir);
+                assert!(!native_gguf_in_use_dir(&dir));
+            }
+            Ok(Err(error)) => panic!("prepare failed instead of parking: {error}"),
+        }
     }
 
     /// Same gate for the qwen4_exp tokenizer fallback: a live-pid
