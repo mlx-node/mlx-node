@@ -403,8 +403,36 @@ fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
     Some(unsafe { stat.assume_init() })
 }
 
+/// Producer identities are exactly 64 lowercase hex chars (the blake-style
+/// source fingerprint). Anything else under the prefix — `.mlx-qwen4-packed-
+/// v2-backup`, a typo, a manual copy — is foreign: never sized, never swept,
+/// never evicted.
 fn dir_name_identity(dir: &Path) -> Option<&str> {
-    dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)
+    let suffix = dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)?;
+    if suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Some(suffix);
+    }
+    None
+}
+
+/// `libc::stat` timestamps are signed: a restored or manually stamped file
+/// can carry a pre-epoch mtime, and casting a negative `st_mtime` to u64
+/// wraps to a near-`u64::MAX` duration whose epoch addition panics. Clamp
+/// negative values to UNIX_EPOCH — such a file is simply the oldest.
+fn stat_mtime(stat: &libc::stat) -> SystemTime {
+    if stat.st_mtime < 0 || stat.st_mtime_nsec < 0 {
+        return SystemTime::UNIX_EPOCH;
+    }
+    // A corrupt far-future mtime must read as FRESH (kept, never swept):
+    // the conservative failure is retention, not deletion.
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(stat.st_mtime as u64))
+        .and_then(|t| t.checked_add(Duration::from_nanos(stat.st_mtime_nsec as u64)))
+        .unwrap_or_else(SystemTime::now)
 }
 
 /// Newest mtime over the dir and every direct entry (.manifest, budget,
@@ -806,10 +834,7 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
             })
             .filter_map(|name| {
                 let stat = dir_stat(&dirfd, name)?;
-                let mtime = SystemTime::UNIX_EPOCH
-                    + Duration::from_secs(stat.st_mtime as u64)
-                    + Duration::from_nanos(stat.st_mtime_nsec as u64);
-                Some((mtime, name.clone(), stat.st_size as u64))
+                Some((stat_mtime(&stat), name.clone(), stat.st_size as u64))
             })
             .collect();
         packs.sort_by_key(|(t, _, _)| *t);
@@ -866,10 +891,7 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
                 if Path::new(&name).extension().is_some_and(|s| s == "tmp")
                     && let Some(stat) = dir_stat(&dirfd, &name)
                     && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
-                    && SystemTime::UNIX_EPOCH
-                        + Duration::from_secs(stat.st_mtime as u64)
-                        + Duration::from_nanos(stat.st_mtime_nsec as u64)
-                        < SystemTime::now() - PACKED_SWEEP_MIN_AGE
+                    && stat_mtime(&stat) < SystemTime::now() - PACKED_SWEEP_MIN_AGE
                     && dir_unlinkat(&dirfd, &name).is_ok()
                 {
                     debug!(
@@ -1009,10 +1031,7 @@ fn shed_oldest_packs(dir: &Path, dirfd: &File, exclude: &OsStr, headroom: u64) -
         })
         .filter_map(|name| {
             let stat = dir_stat(dirfd, name)?;
-            let mtime = SystemTime::UNIX_EPOCH
-                + Duration::from_secs(stat.st_mtime as u64)
-                + Duration::from_nanos(stat.st_mtime_nsec as u64);
-            Some((mtime, name.clone(), stat.st_size as u64))
+            Some((stat_mtime(&stat), name.clone(), stat.st_size as u64))
         })
         .collect();
     packs.sort_by_key(|(mtime, _, _)| *mtime);
@@ -2263,6 +2282,43 @@ mod tests {
         drop(guard);
         assert!(locked_remove(&stale, "test", |_| true) > 0);
         assert!(!stale.exists());
+    }
+
+    // Names under the prefix that don't match the 64-hex producer grammar
+    // are foreign: an aged `.mlx-qwen4-packed-v2-backup` with a malformed
+    // manifest must survive the sweep, and a pack stamped before the epoch
+    // must order as oldest rather than panic.
+    #[test]
+    fn sweep_leaves_non_identity_prefixed_dirs_and_handles_pre_epoch_packs() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let foreign = parent.join(format!("{DIR_PREFIX}backup"));
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join(".manifest"), "not a manifest\n").unwrap();
+        age(&foreign.join(".manifest"), 7200);
+        age_dir(&foreign, 7200);
+        sweep_packed_cache(&parent, &parent.join("current"));
+        assert!(foreign.exists());
+        // st_mtime before the epoch used to wrap into a panic-inducing
+        // duration; it now orders as the oldest entry.
+        let cache_dir = parent.join(format!("{DIR_PREFIX}{}", "d".repeat(64)));
+        fs::create_dir(&cache_dir).unwrap();
+        let pack = cache_dir.join("old.pack");
+        fs::write(&pack, b"x").unwrap();
+        let epoch_minus_one = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        OpenOptions::new()
+            .write(true)
+            .open(&pack)
+            .unwrap()
+            .set_modified(epoch_minus_one)
+            .unwrap();
+        let stat = dir_stat(
+            &open_dir_nofollow(&cache_dir).unwrap(),
+            OsStr::new("old.pack"),
+        )
+        .unwrap();
+        assert_eq!(stat_mtime(&stat), SystemTime::UNIX_EPOCH);
     }
 
     #[test]
