@@ -389,16 +389,23 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         }
         // Uncapped: a markerless `dir` a model still leases is promoted past
         // rather than replaced — the lease probe needs no entry lock, which
-        // `_guard` already holds.
-        if dir.exists() && crate::utils::gguf::native_gguf_output_delete_guard(root, &dir).is_none()
-        {
-            return promote_live(&temp);
+        // `_guard` already holds. An unleased remnant is debris removed under
+        // the guard: rename over a nonempty dir fails with EEXIST, and the
+        // guard must stay live through the remove so a racing leaser can
+        // only observe the replacement, never straddle it.
+        let dir_guard = if dir.exists() {
+            match crate::utils::gguf::native_gguf_output_delete_guard(root, &dir) {
+                Some(guard) => Some(guard),
+                None => return promote_live(&temp),
+            }
+        } else {
+            None
+        };
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| Error::from_reason(e.to_string()))?;
         }
-        if let Err(e) = std::fs::rename(&temp, &dir)
-            && !dir.join("complete").exists()
-        {
-            return Err(Error::from_reason(e.to_string()));
-        }
+        std::fs::rename(&temp, &dir).map_err(|e| Error::from_reason(e.to_string()))?;
+        drop(dir_guard);
         Ok(dir.clone())
     })();
     // Remove the temp in every outcome that did not rename it away (to `dir`

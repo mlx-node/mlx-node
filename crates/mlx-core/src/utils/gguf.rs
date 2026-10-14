@@ -6979,9 +6979,15 @@ fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<f
 // SH would deadlock) that defeats every foreign process's LOCK_EX try-flock
 // in `native_gguf_locked_remove`. There is no model Drop hook, so the lease is
 // process-lifetime bounded — the same bound the `assets-live` pid gate uses.
-fn native_gguf_in_use_sidecars() -> &'static std::sync::Mutex<HashMap<PathBuf, Option<fs::File>>> {
-    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Option<fs::File>>>> =
-        std::sync::OnceLock::new();
+//
+// Entries are REFCOUNTED: two racing prepares can lease the same dir and
+// one's failed recheck must not drop the lease the other's already-loaded
+// model holds — `unlease` releases only that caller's reference.
+fn native_gguf_in_use_sidecars()
+-> &'static std::sync::Mutex<HashMap<PathBuf, (u64, Option<fs::File>)>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, (u64, Option<fs::File>)>>,
+    > = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -7004,7 +7010,7 @@ fn native_gguf_in_use_key(dir: &Path) -> PathBuf {
 /// in the packed cache.
 fn native_gguf_in_use_delete_guard(
     dir: &Path,
-) -> Option<std::sync::MutexGuard<'static, HashMap<PathBuf, Option<fs::File>>>> {
+) -> Option<std::sync::MutexGuard<'static, HashMap<PathBuf, (u64, Option<fs::File>)>>> {
     let registry = match native_gguf_in_use_sidecars().try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
@@ -7031,14 +7037,20 @@ fn native_gguf_in_use(dir: &Path) -> bool {
     native_gguf_in_use_dir(dir)
 }
 
-/// Drop `dir`'s lease (registry entry and its shared flock). Used when a
-/// leased dir's `complete` marker vanished anyway — the dir turned out to be
-/// debris, and pinning its lock file would only block same-key republishes.
+/// Release ONE reference on `dir`'s lease: the entry — and its shared
+/// flock — drops only when the last reference goes, so a failed recheck
+/// after a racing second lease cannot unpin the dir under that model.
 pub(crate) fn native_gguf_unlease_in_use(dir: &Path) {
     let mut registry = native_gguf_in_use_sidecars()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    registry.remove(&native_gguf_in_use_key(dir));
+    match registry.get_mut(&native_gguf_in_use_key(dir)) {
+        Some((count, _)) if *count > 1 => *count -= 1,
+        Some(_) => {
+            registry.remove(&native_gguf_in_use_key(dir));
+        }
+        None => {}
+    }
 }
 
 /// Lease sentinel name for `key`: a SEPARATE file from `.{key}.lock`.
@@ -7068,36 +7080,42 @@ pub(crate) fn native_gguf_lease_in_use(root: &Path, dir: &Path, key: Option<&str
     let mut registry = native_gguf_in_use_sidecars()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    if registry.contains_key(&native_gguf_in_use_key(dir)) {
+    let registry_key = native_gguf_in_use_key(dir);
+    if let Some((count, _)) = registry.get_mut(&registry_key) {
+        // Another lease already pins this dir — add a reference; a later
+        // unlease from this path releases only this one.
+        *count += 1;
         return true;
     }
-    #[allow(unused_mut)]
     let mut file: Option<fs::File> = None;
     #[cfg(unix)]
     {
         if let Some(key) = key {
             let lease_path = root.join(native_gguf_lease_name(key));
-            // An unreadable sentinel degrades to a registry-only lease: the
-            // in-process guard still works; cross-process keeps whatever the
-            // per-dir locks already did before leases.
-            if let Ok(opened) = OpenOptions::new()
+            // Fail closed for a KEYED lease: an unopenable or unflockable
+            // sentinel means no cross-process leg, and a registry-only entry
+            // would silently report a protection the model does not have.
+            // `false` routes the caller to the exclusive path, which
+            // rechecks under the writer lock.
+            let Ok(opened) = OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&lease_path)
-            {
-                if unsafe { libc::flock(opened.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-                    // A deleter holds the lease sentinel exclusively.
-                    return false;
-                }
-                file = Some(opened);
+            else {
+                return false;
+            };
+            if unsafe { libc::flock(opened.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+                // A deleter holds the lease sentinel exclusively.
+                return false;
             }
+            file = Some(opened);
         }
     }
     #[cfg(not(unix))]
     let _ = (root, key);
-    registry.insert(native_gguf_in_use_key(dir), file);
+    registry.insert(registry_key, (1, file));
     true
 }
 
@@ -7114,7 +7132,7 @@ pub(crate) fn native_gguf_output_delete_guard(
     cache_root: &Path,
     output_dir: &Path,
 ) -> Option<(
-    std::sync::MutexGuard<'static, HashMap<PathBuf, Option<fs::File>>>,
+    std::sync::MutexGuard<'static, HashMap<PathBuf, (u64, Option<fs::File>)>>,
     Option<fs::File>,
 )> {
     let registry = native_gguf_in_use_delete_guard(output_dir)?;
@@ -19004,6 +19022,74 @@ mod tests {
         let published = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
         assert_eq!(published, output);
         assert!(output.join("model.safetensors").is_file());
+    }
+
+    /// A keyed lease whose `.lease` sentinel cannot be opened fails closed:
+    /// no registry entry, `false`, and the delete guard stays winnable —
+    /// a registry-only entry would silently claim cross-process protection
+    /// the model does not have.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_keyed_lease_fails_closed_on_unopenable_sentinel() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let root = NativeSweepTestDir::new("sentinel-fail-closed");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let entry_name = native_sweep_entry_name("blocked");
+        let output = cache_root.join(&entry_name);
+        fs::create_dir_all(&output).unwrap();
+        // A directory at the sentinel path: opening it for write fails.
+        fs::create_dir_all(cache_root.join(native_gguf_lease_name(&entry_name))).unwrap();
+
+        assert!(!native_gguf_lease_in_use(
+            &cache_root,
+            &output,
+            Some(&entry_name)
+        ));
+        assert!(
+            native_gguf_in_use_delete_guard(&output).is_some(),
+            "a failed keyed lease must not leave a registry entry behind"
+        );
+    }
+
+    /// Leases are refcounted: a racing second lease survives the first
+    /// caller's release, so a failed recheck can never unpin a dir another
+    /// load still owns.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_unlease_releases_one_reference_at_a_time() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let root = NativeSweepTestDir::new("lease-refcount");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let entry_name = native_sweep_entry_name("refcounted");
+        let output = cache_root.join(&entry_name);
+        fs::create_dir_all(&output).unwrap();
+
+        assert!(native_gguf_lease_in_use(
+            &cache_root,
+            &output,
+            Some(&entry_name)
+        ));
+        assert!(native_gguf_lease_in_use(
+            &cache_root,
+            &output,
+            Some(&entry_name)
+        ));
+
+        native_gguf_unlease_in_use(&output);
+        assert!(
+            native_gguf_in_use_delete_guard(&output).is_none(),
+            "one released reference must keep the surviving lease"
+        );
+
+        native_gguf_unlease_in_use(&output);
+        assert!(
+            native_gguf_in_use_delete_guard(&output).is_some(),
+            "the last released reference drops the lease"
+        );
     }
 
     /// A busy `native_gguf_sidecar_mutex` means a same-process `assets_in`
