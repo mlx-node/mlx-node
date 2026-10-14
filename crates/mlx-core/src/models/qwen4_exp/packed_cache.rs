@@ -104,43 +104,129 @@ fn packed_identity(files: impl Iterator<Item = PathBuf>) -> Result<String> {
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Lowercase-hex encode raw bytes — the `.manifest` `path_hex=`/`file_hex=`
+/// shape. The plain `path=`/`file=` lines carry raw OS bytes for readability,
+/// but the manifest is line-delimited: a newline inside a filename splits one
+/// record into bogus lines and non-UTF-8 bytes cannot round-trip through a
+/// reader that inspects text. The hex twins are authoritative on parse; a
+/// present-but-corrupt hex field is a corrupt manifest (Err), never license
+/// to trust the lossy line.
+fn packed_hex_encode(bytes: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0x0f) as usize]);
+    }
+    out
+}
+
+/// Strict decode of `packed_hex_encode` output: even length, lowercase hex
+/// only. `None` means malformed.
+fn packed_hex_decode(field: &[u8]) -> Option<Vec<u8>> {
+    if !field.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |byte: u8| -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    };
+    field
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
+}
+
 /// Recompute an identity dir's source fingerprint from its `.manifest`. Any
 /// missing source file or unreadable manifest is Err so callers can treat the
-/// dir as orphaned.
+/// dir as orphaned. `path_hex=`/`file_hex=` lines (raw OS bytes as hex) are
+/// preferred over the lossy `path=`/`file=` lines they twin; pre-hex
+/// manifests keep working through the raw fields.
 fn identity_from_manifest(dir: &Path) -> Result<String> {
     let data = fs::read(dir.join(".manifest")).map_err(err)?;
-    let mut lines = data.split(|&b| b == b'\n');
-    let base = lines
-        .next()
-        .and_then(|line| line.strip_prefix(b"path=".as_slice()))
-        .map(|raw| PathBuf::from(OsStr::from_bytes(raw)))
-        .ok_or_else(|| err("packed manifest missing path="))?;
-    let files: Vec<PathBuf> = lines
-        .filter_map(|line| line.strip_prefix(b"file=".as_slice()))
-        .map(|raw| base.join(OsStr::from_bytes(raw)))
-        .collect();
+    let mut path_raw = None;
+    let mut path_hex = None;
+    let mut file_raws: Vec<&[u8]> = Vec::new();
+    let mut file_hexes: Vec<&[u8]> = Vec::new();
+    for line in data.split(|&b| b == b'\n') {
+        if let Some(raw) = line.strip_prefix(b"path_hex=".as_slice()) {
+            path_hex = Some(raw);
+        } else if let Some(raw) = line.strip_prefix(b"path=".as_slice()) {
+            path_raw = Some(raw);
+        } else if let Some(raw) = line.strip_prefix(b"file_hex=".as_slice()) {
+            file_hexes.push(raw);
+        } else if let Some(raw) = line.strip_prefix(b"file=".as_slice()) {
+            file_raws.push(raw);
+        }
+    }
+    let base = if let Some(hex) = path_hex {
+        packed_hex_decode(hex)
+            .map(|bytes| PathBuf::from(OsStr::from_bytes(&bytes)))
+            .ok_or_else(|| err("packed manifest has corrupt path_hex="))?
+    } else {
+        path_raw
+            .map(|raw| PathBuf::from(OsStr::from_bytes(raw)))
+            .ok_or_else(|| err("packed manifest missing path="))?
+    };
+    let files: Vec<PathBuf> = if !file_hexes.is_empty() {
+        let mut files = Vec::with_capacity(file_hexes.len());
+        for hex in file_hexes {
+            let bytes = packed_hex_decode(hex)
+                .ok_or_else(|| err("packed manifest has corrupt file_hex="))?;
+            files.push(base.join(OsStr::from_bytes(&bytes)));
+        }
+        files
+    } else {
+        file_raws
+            .iter()
+            .map(|raw| base.join(OsStr::from_bytes(raw)))
+            .collect()
+    };
     if files.is_empty() {
         return Err(err("packed manifest lists no files"));
     }
     packed_identity(files.into_iter())
 }
 
-/// Serialize canonical source paths into `.manifest` bytes: the common base
-/// on `path=` and each file relative to it on `file=` lines.
+/// Serialize canonical source paths into `.manifest` bytes: the hex twins
+/// come first (`path_hex=`, then every `file_hex=`), the raw `path=`/`file=`
+/// display lines last. A raw line whose bytes contain a newline is omitted
+/// entirely — a newline is the only byte that can forge a record line, and a
+/// path holding "\nfile_hex=evil" would inject an earlier authoritative-
+/// looking line into the same file. The raw lines keep readable manifests
+/// where names allow; the hex twins carry the same bytes losslessly so
+/// newline-bearing or non-UTF-8 names cannot split or mangle a record.
 fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
     let base = canonical
         .first()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_default();
-    let mut manifest = b"path=".to_vec();
-    manifest.extend_from_slice(base.as_os_str().as_bytes());
+    let mut manifest = b"path_hex=".to_vec();
+    manifest.extend_from_slice(&packed_hex_encode(base.as_os_str().as_bytes()));
     manifest.push(b'\n');
+    let mut raw = Vec::new();
+    if !base.as_os_str().as_bytes().contains(&b'\n') {
+        raw.extend_from_slice(b"path=");
+        raw.extend_from_slice(base.as_os_str().as_bytes());
+        raw.push(b'\n');
+    }
     for path in canonical {
         let rel = path.strip_prefix(&base).unwrap_or(path);
-        manifest.extend_from_slice(b"file=");
-        manifest.extend_from_slice(rel.as_os_str().as_bytes());
+        manifest.extend_from_slice(b"file_hex=");
+        manifest.extend_from_slice(&packed_hex_encode(rel.as_os_str().as_bytes()));
         manifest.push(b'\n');
+        if !rel.as_os_str().as_bytes().contains(&b'\n') {
+            raw.extend_from_slice(b"file=");
+            raw.extend_from_slice(rel.as_os_str().as_bytes());
+            raw.push(b'\n');
+        }
     }
+    manifest.extend_from_slice(&raw);
     manifest
 }
 
@@ -1391,9 +1477,19 @@ mod tests {
         let canonical = source.canonicalize().unwrap();
         assert_eq!(
             manifest.lines().next().unwrap(),
-            format!("path={}", canonical.parent().unwrap().display())
+            format!(
+                "path_hex={}",
+                String::from_utf8(packed_hex_encode(
+                    canonical.parent().unwrap().as_os_str().as_bytes()
+                ))
+                .unwrap()
+            ),
+            "the authoritative hex record leads the manifest:\n{manifest}"
         );
-        assert_eq!(manifest.lines().nth(1).unwrap(), "file=source.gguf");
+        assert!(
+            manifest.lines().any(|line| line == "file=source.gguf"),
+            "the raw file record follows its hex twin:\n{manifest}"
+        );
         assert_eq!(
             identity_from_manifest(&cache.root).unwrap(),
             dir_name_identity(&cache.root).unwrap()
@@ -1408,6 +1504,42 @@ mod tests {
         assert_eq!(
             packed_orphan_reason(&cache.root),
             Some("unreadable manifest or missing source")
+        );
+    }
+
+    /// A raw `file=` line carries the filename's bytes verbatim, so a name
+    /// holding `\nfile_hex=6262` would otherwise split into a bogus
+    /// authoritative-looking record. `pack_manifest` must omit the raw line
+    /// for that file and let only its real `file_hex=` twin stand, so the
+    /// recomputed identity still matches the dir name.
+    #[test]
+    fn manifest_omits_raw_lines_that_could_inject_records() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("a\nfile_hex=6262\npath_hex=6262.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        let manifest = fs::read_to_string(cache.root.join(".manifest")).unwrap();
+        assert!(
+            manifest.lines().all(|line| !line.starts_with("file=")),
+            "the newline-bearing filename must not emit a raw record:\n{manifest}"
+        );
+        assert_eq!(
+            manifest
+                .lines()
+                .filter(|line| line.starts_with("file_hex="))
+                .count(),
+            1,
+            "only the authoritative file record may exist:\n{manifest}"
+        );
+        assert!(
+            !manifest.lines().any(|line| line == "file_hex=6262"),
+            "the injected record must never be written:\n{manifest}"
+        );
+        assert_eq!(
+            identity_from_manifest(&cache.root).unwrap(),
+            dir_name_identity(&cache.root).unwrap(),
+            "the real file still verifies through its hex twin"
         );
     }
 

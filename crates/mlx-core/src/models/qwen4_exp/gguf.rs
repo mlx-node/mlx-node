@@ -213,16 +213,38 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
             "GGUF assets sidecar lock for {dir_name} stayed contended for ~2s; refusing to publish unguarded"
         )));
     };
+    // A cap-refused publish lands at this deterministic same-pid name instead
+    // of `dir`: the uuid temp it replaces could never be found again, and the
+    // sweep's `assets-live` grammar keeps it unconditionally while this pid
+    // lives (never counted toward the cap, never age-deleted) — it is a load
+    // output. The live dir has no lock of its own; the `{dir_name}.lock`
+    // guard above serializes every check/rename touching it in this process
+    // because only the sidecar for `identity` can ever produce it.
+    let live_dir_name = format!(
+        ".mlx-qwen4-assets-live-{}-{}",
+        dir_name
+            .strip_prefix(".mlx-qwen4-assets-v2-")
+            .unwrap_or(identity.as_str()),
+        std::process::id()
+    );
+    let live_dir = root.join(&live_dir_name);
+    let stamp_complete = |complete: &std::path::Path| {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(complete) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+    };
     if dir.join("complete").exists() {
         // Stamp recency on hits so the native-GGUF sweep's LRU never eats a
         // live sidecar directory; the held lock blocks that same sweep.
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .open(dir.join("complete"))
-        {
-            let _ = file.set_modified(std::time::SystemTime::now());
-        }
+        stamp_complete(&dir.join("complete"));
         return Ok(dir);
+    }
+    if live_dir.join("complete").exists() {
+        // The completed refused publish from an earlier load in this
+        // process; reuse it rather than rebuilding (and rather than
+        // republishing — moving the path out from under a live reader).
+        stamp_complete(&live_dir.join("complete"));
+        return Ok(live_dir);
     }
     // Publish a complete directory in one rename while the sidecar lock is
     // held: the sweep cannot delete `dir` between the rename and the return.
@@ -247,14 +269,28 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         // count→evict→publish section: admission counts the root under the
         // root-wide flock, so a sidecar cannot land between a sibling
         // conversion's admission count and its entry rename. Refusal
-        // returns `Ok(temp)`: the temp already contains `complete`, so the
-        // load reads it in place — and the sweep's `.mlx-qwen4-assets-tmp-`
-        // grammar only ages it out after 24 h. The cap lock nests inside
-        // the sidecar lock, matching `prepare_native_gguf_inner`'s
-        // key-lock → admission-flock order.
+        // returns `Ok(temp)`, which the caller promotes to `live_dir` — a
+        // name the next load can find and the sweep keeps while this pid
+        // lives, unlike the uuid temp it replaced (age-deleted at 24 h even
+        // mid-load). The cap lock nests inside the sidecar lock, matching
+        // `prepare_native_gguf_inner`'s key-lock → admission-flock order.
         if let Some(cap) = native_gguf_cache_cap_bytes() {
-            return native_gguf_publish_with_cap(root, &temp, &dir, cap)
-                .map_err(|e| Error::from_reason(e.to_string()));
+            let published = native_gguf_publish_with_cap(root, &temp, &dir, cap)
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+            if published == temp {
+                // Admission refused: rename `temp` onto `live_dir` under the
+                // sidecar lock. A pre-existing `live_dir` is always a
+                // markerless remnant — a completed one (a live previous
+                // refusal) would have hit the check above — so it was never
+                // a load output and is safe to clear.
+                if live_dir.exists() {
+                    std::fs::remove_dir_all(&live_dir)
+                        .map_err(|e| Error::from_reason(e.to_string()))?;
+                }
+                std::fs::rename(&temp, &live_dir).map_err(|e| Error::from_reason(e.to_string()))?;
+                return Ok(live_dir);
+            }
+            return Ok(published);
         }
         if let Err(e) = std::fs::rename(&temp, &dir)
             && !dir.join("complete").exists()
@@ -263,8 +299,9 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         }
         Ok(dir)
     })();
-    // Keep the temp only when a refused admission returned it as the load
-    // path; every other outcome either renamed it away or failed.
+    // Remove the temp in every outcome that did not rename it away (to `dir`
+    // or `live_dir`); a refusal never returns the temp path itself anymore,
+    // so a surviving `Ok(temp)` result cannot occur.
     if result.as_ref().is_ok_and(|path| *path != temp) || result.is_err() {
         let _ = std::fs::remove_dir_all(&temp);
     }
@@ -476,9 +513,11 @@ mod tests {
 
     /// With `MLX_NATIVE_GGUF_CACHE_MAX_GB` set the sidecar publish runs the
     /// shared cap-admission section instead of a bare rename: a cap that
-    /// cannot fit the sidecar refuses admission and returns the completed
-    /// temp dir (swept only by the 24 h tmp grammar), while a roomy cap
-    /// still publishes under the versioned name.
+    /// cannot fit the sidecar refuses admission and the completed temp is
+    /// promoted to `.mlx-qwen4-assets-live-{identity}-{pid}` — a name later
+    /// loads in this process reuse, kept unconditionally by the sweep while
+    /// the pid lives — while a roomy cap still publishes under the
+    /// versioned name.
     #[test]
     fn assets_in_publish_respects_the_cache_cap() {
         use crate::utils::gguf::{SweepEnvVar, sweep_env_lock};
@@ -490,14 +529,15 @@ mod tests {
         fs::write(&source, b"weights").unwrap();
         let (store, config) = tokenizer_fixture();
 
-        // Tiny cap: admission refuses, the load path is the temp dir, and
-        // nothing is published under the versioned sidecar name.
+        // Tiny cap: admission refuses, the temp is promoted to the per-pid
+        // live dir, and nothing is published under the versioned name.
         let _env = SweepEnvVar::set_max_gb("0.0000001");
         let refused = assets_in(&source, &store, &config, &cache).unwrap();
         let refused_name = refused.file_name().unwrap().to_string_lossy();
         assert!(
-            refused_name.starts_with(".mlx-qwen4-assets-tmp-"),
-            "a refused admission returns the temp dir, got {}",
+            refused_name.starts_with(".mlx-qwen4-assets-live-")
+                && refused_name.ends_with(&std::process::id().to_string()),
+            "a refused admission returns the per-pid live dir, got {}",
             refused.display()
         );
         assert!(refused.join("complete").is_file());
@@ -510,10 +550,31 @@ mod tests {
             "no sidecar dir may be published over the cap"
         );
 
-        // Roomy cap: the normal publish path still lands.
+        // Later loads in this process reuse the completed live dir — even
+        // with a roomy cap, the completed refusal is never republished under
+        // the versioned name while a live reader may hold the path.
+        let reused = assets_in(&source, &store, &config, &cache).unwrap();
+        assert_eq!(reused, refused);
         drop(_env);
         let _env = SweepEnvVar::set_max_gb("64");
-        let published = assets_in(&source, &store, &config, &cache).unwrap();
+        assert_eq!(
+            assets_in(&source, &store, &config, &cache).unwrap(),
+            refused,
+            "a completed live dir is a hit, never republished"
+        );
+        assert!(
+            fs::read_dir(&cache).unwrap().flatten().all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mlx-qwen4-assets-v2-")
+                || entry.file_name().to_string_lossy().ends_with(".lock")),
+            "the versioned sidecar name stays unpublished while the live dir is served"
+        );
+
+        // Roomy cap: the normal publish path still lands for a fresh source.
+        let other = root.join("other.gguf");
+        fs::write(&other, b"other-weights").unwrap();
+        let published = assets_in(&other, &store, &config, &cache).unwrap();
         assert_eq!(published.parent(), Some(cache.as_path()));
         assert!(
             published

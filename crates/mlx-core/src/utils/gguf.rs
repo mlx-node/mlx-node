@@ -6682,6 +6682,13 @@ const NATIVE_GGUF_CACHE_MAX_GB_ENV: &str = "MLX_NATIVE_GGUF_CACHE_MAX_GB";
 const NATIVE_GGUF_ONE_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const NATIVE_GGUF_ASSETS_PREFIX: &str = ".mlx-qwen4-assets-v2-";
 const NATIVE_GGUF_ASSETS_TMP_PREFIX: &str = ".mlx-qwen4-assets-tmp-";
+/// `.mlx-qwen4-assets-live-{identity}-{pid}`: a cap-refused tokenizer
+/// sidecar publish promoted to a deterministic same-pid name so later loads
+/// in this process reuse it (the uuid temp name could never be found again).
+/// It is a load output, so the sweep keeps it while the pid lives — never
+/// counted toward the cap, never age-deleted — and only pid death gates its
+/// removal.
+const NATIVE_GGUF_ASSETS_LIVE_PREFIX: &str = ".mlx-qwen4-assets-live-";
 const NATIVE_GGUF_STAGING_INFIX: &str = ".staging-";
 const NATIVE_GGUF_WRITE_PROBE_PREFIX: &str = ".write-probe-";
 const NATIVE_GGUF_LOCK_SUFFIX: &str = ".lock";
@@ -7317,6 +7324,29 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 }
                 continue;
             }
+            if let Some(suffix) = name.strip_prefix(NATIVE_GGUF_ASSETS_LIVE_PREFIX) {
+                // `{prefix}{identity}-{pid}` where identity is the same hex64
+                // the sidecar name carries and pid is the canonical
+                // `std::process::id()` rendering (nonzero, no leading zeros —
+                // `0` parses dead on Unix and producers never emit it). A
+                // live pid means a load output this process still reads:
+                // keep unconditionally — never counted toward the cap, never
+                // age-deleted; it is bounded at one dir per identity per
+                // live pid. Only a dead pid makes it debris, so like the
+                // assets-tmp names no entry lock exists for the live name
+                // and removal runs directly — pid death is the whole gate.
+                if let Some((identity, pid_text)) = suffix.rsplit_once('-')
+                    && native_gguf_is_hex64(identity)
+                    && let Ok(pid) = pid_text.parse::<u32>()
+                    && pid != 0
+                    && pid.to_string() == pid_text
+                    && native_gguf_pid_dead(pid)
+                {
+                    reclaimed += native_gguf_remove_logged(&path, "orphaned assets live dir");
+                }
+                // A malformed suffix is foreign tooling: keep either way.
+                continue;
+            }
             if name.starts_with(NATIVE_GGUF_ASSETS_PREFIX)
                 && native_gguf_is_hex64(&name[NATIVE_GGUF_ASSETS_PREFIX.len()..])
             {
@@ -7349,11 +7379,24 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                     continue;
                 };
                 let dead = native_gguf_pid_dead(pid);
-                if dead || native_gguf_mtime_older(meta.modified().ok(), now) {
+                // A live-pid staging dir carrying `.complete` is a LOAD
+                // OUTPUT: a cap-refused publish hands it to a loader that
+                // reopens its files later in the process, so the age gate
+                // alone must never delete it while the pid lives. Live-pid
+                // dirs are removable only as mid-write/failed debris —
+                // aged AND markerless. Dead-pid dirs delete regardless of
+                // the marker: their owner is gone, so nothing can still
+                // read from them.
+                if dead
+                    || (native_gguf_mtime_older(meta.modified().ok(), now)
+                        && !path.join(".complete").is_file())
+                {
                     // Re-derive the verdict under the held entry lock: a
                     // writer that restarted since the snapshot owns the lock
-                    // anyway, but the mtime gate must not stand on a
-                    // pre-lock reading.
+                    // anyway, but the mtime and marker gates must not stand
+                    // on a pre-lock reading — a publish completing between
+                    // the snapshot and the flock would land `.complete`
+                    // before the dir is handed to a loader.
                     reclaimed += native_gguf_locked_remove(
                         cache_root,
                         &path,
@@ -7362,10 +7405,11 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                         |dir| {
                             let now = std::time::SystemTime::now();
                             native_gguf_pid_dead(pid)
-                                || fs::symlink_metadata(dir)
+                                || (fs::symlink_metadata(dir)
                                     .and_then(|meta| meta.modified())
                                     .ok()
                                     .is_some_and(|mtime| native_gguf_mtime_older(Some(mtime), now))
+                                    && !dir.join(".complete").is_file())
                         },
                     );
                 }
@@ -8182,10 +8226,11 @@ async fn prepare_native_gguf_inner(
     // completed: a cap-refused publish returns its staging dir to the
     // loader, and the next load misses the entry key again — without reuse
     // every reload re-converts and retains ANOTHER multi-GB copy (live-pid
-    // staging dirs are never counted toward the cap nor swept). Only
-    // same-pid dirs are eligible: a live foreign-pid dir belongs to a peer
-    // mid-write, and a dead-pid dir can be swept mid-load — the sweep reaps
-    // both under the entry lock we currently hold.
+    // staging dirs are never counted toward the cap, and the sweep keeps a
+    // completed one while this pid lives). Only same-pid dirs are eligible:
+    // a live foreign-pid dir belongs to a peer mid-write, and a dead-pid dir
+    // can be swept mid-load — the sweep reaps both under the entry lock we
+    // currently hold.
     let staging_prefix = format!(".{cache_key}{NATIVE_GGUF_STAGING_INFIX}");
     let staging_hit = fs::read_dir(cache_root)
         .ok()
@@ -8204,10 +8249,17 @@ async fn prepare_native_gguf_inner(
             (fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) && entry_is_current(&path))
                 .then_some(path)
         });
-    // A reused staging dir still flows through admission below: freed cap
-    // space publishes it as the real entry; refusal keeps it in place.
+    // A reused staging dir is returned as-is and NEVER republished:
+    // `native_gguf_publish_with_cap` would `rename` it to `output_dir`,
+    // moving the path out from under an in-process model that an earlier
+    // load already handed this same path to and that still opens its files
+    // later — unlink-under-mmap protects only already-open mappings, not
+    // future opens of the moved path. Forgoing the promotion costs cap
+    // space but correctness for live readers wins.
     let staging_dir = match staging_hit {
-        Some(dir) => dir,
+        Some(dir) => {
+            return Ok(dir);
+        }
         None => {
             // `Some(dir)` means an explicitly authoritative config source to the
             // converter. A standalone GGUF has no config by design, so pass `None` in
@@ -8316,18 +8368,33 @@ async fn prepare_native_gguf_inner(
             // field and non-UTF-8 bytes are lossy, so the sweep could stat the wrong
             // file and delete a healthy entry. The hex twins carry the raw OS bytes
             // (Unix; lossy-text bytes elsewhere) and are preferred at parse time.
-            // The marker is additive — the format digit stays put and the text
-            // fields remain for readability and older readers.
+            // Every authoritative field precedes the raw display lines, which are
+            // written last — and a raw line is omitted entirely when its OS bytes
+            // contain a newline. A newline is the only byte that can forge a record
+            // line: a path holding "\nsource_hex=evil" would inject an earlier
+            // authoritative-looking line that first-match field parsing would
+            // honor, so with no raw line written there is nothing to inject into.
             let source_hex = native_gguf_hex_encode(&native_gguf_os_bytes(&input_path));
             let companion_hex = companion
                 .map(|path| native_gguf_hex_encode(&native_gguf_os_bytes(path)))
                 .unwrap_or_else(|| "none".to_string());
+            let source_line = if native_gguf_os_bytes(&input_path).contains(&b'\n') {
+                String::new()
+            } else {
+                format!("source={}\n", input_path.display())
+            };
+            let companion_line = match companion {
+                Some(path) if !native_gguf_os_bytes(path).contains(&b'\n') => {
+                    format!("companion={companion_path}\n")
+                }
+                Some(_) => String::new(),
+                None => "companion=none\n".to_string(),
+            };
             let marker = staging_dir.join(".complete");
             if let Err(error) = fs::write(
                 marker,
                 format!(
-                    "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_hex={source_hex}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion={companion_path}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n",
-                    input_path.display(),
+                    "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource_hex={source_hex}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n{source_line}{companion_line}",
                     source_identity_digest,
                     metadata.len(),
                     modified,
@@ -8401,45 +8468,12 @@ async fn prepare_native_gguf_inner(
         output_dir.clone()
     };
 
-    // Any other same-pid staging dir for this key is superseded now:
-    // keeping verified copies would leak one multi-GB dir per reload —
-    // live-pid staging dirs are never counted toward the cap nor swept
-    // while the pid lives. Only `entry_is_current` dirs are removed: a
-    // verified dir is provably a completed duplicate of what the loader
-    // will read, while an unverified one (a failed cleanup, a dir a
-    // hypothetical in-process caller still owns) is left for the sweep's
-    // age gate rather than deleted on sight — belt and braces even though
-    // the process mutex + key lock mean no same-pid writer is mid-publish.
-    // An earlier load may still mmap a dir removed here, but
-    // unlink-under-mmap is safe on Unix. Best effort: failures are logged,
-    // never fatal.
-    if let Ok(entries) = fs::read_dir(cache_root) {
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let Some(suffix) = name.strip_prefix(&staging_prefix) else {
-                continue;
-            };
-            if native_gguf_writer_pid_suffix(suffix) != Some(std::process::id()) {
-                continue;
-            }
-            let path = entry.path();
-            if path == prepared_dir
-                || !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir())
-                || !entry_is_current(&path)
-            {
-                continue;
-            }
-            native_gguf_remove_logged(&path, "superseded by the newly staged conversion");
-        }
-    }
-
     // Re-run the sweep now that the new entry's bytes are on disk: the
     // pre-conversion sweep could not account for them, so the cap must be
     // enforced again. The published key is exempt from cap eviction, and a
-    // refused publish is harmless here: the live-pid staging dir is never
-    // counted toward the cap nor removed by name.
+    // refused publish is harmless here: a live-pid staging dir never counts
+    // toward the cap, and a completed one (the load output) survives the
+    // staging gate's age check while this process lives.
     {
         let sweep_root = cache_root.to_path_buf();
         let sweep_key = cache_key.clone();
@@ -17631,6 +17665,28 @@ mod tests {
             "eeeeeeeeeeee4eee8eeeeeeeeeeeeeee"
         ));
         fs::create_dir_all(&live_staging).unwrap();
+        // A live-pid staging dir WITH `.complete` is a load output an
+        // in-process model reopens later: the age gate alone must never
+        // delete it while the pid lives.
+        let live_staging_complete = cache_root.join(format!(
+            ".{}.staging-{}-{}",
+            native_sweep_entry_name("livedone"),
+            std::process::id(),
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"
+        ));
+        fs::create_dir_all(&live_staging_complete).unwrap();
+        fs::write(live_staging_complete.join(".complete"), b"marker").unwrap();
+        native_sweep_age_dir(&live_staging_complete);
+        // A live-pid staging dir WITHOUT `.complete` and older than the
+        // grace is mid-write/failed debris: still deleted.
+        let live_staging_debris = cache_root.join(format!(
+            ".{}.staging-{}-{}",
+            native_sweep_entry_name("debris"),
+            std::process::id(),
+            "bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb"
+        ));
+        fs::create_dir_all(&live_staging_debris).unwrap();
+        native_sweep_age_dir(&live_staging_debris);
         // Staging dirs the producer cannot emit are foreign and never
         // removed: a malformed embedded key, a missing uuid suffix, or a
         // dead pid followed by trailing junk after the uuid.
@@ -17715,6 +17771,28 @@ mod tests {
         fs::create_dir_all(&assets_sidecar).unwrap();
         fs::write(assets_sidecar.join("complete"), b"1").unwrap();
         native_sweep_age_file(&assets_sidecar.join("complete"));
+        // A cap-refused sidecar publish promoted to `assets-live`: a load
+        // output, so a live pid keeps it unconditionally — however old, never
+        // counted, never deleted — while a dead pid's copy is orphaned debris.
+        let live_assets = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}",
+            "e".repeat(64),
+            std::process::id()
+        ));
+        fs::create_dir_all(&live_assets).unwrap();
+        fs::write(live_assets.join("complete"), b"1").unwrap();
+        native_sweep_age_dir(&live_assets);
+        let dead_assets_live = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}",
+            "f".repeat(64),
+            dead_test_pid()
+        ));
+        fs::create_dir_all(&dead_assets_live).unwrap();
+        fs::write(dead_assets_live.join("complete"), b"1").unwrap();
+        // Malformed `assets-live` suffixes are foreign and kept either way.
+        let foreign_assets_live = cache_root.join(".mlx-qwen4-assets-live-garbage-123");
+        fs::create_dir_all(&foreign_assets_live).unwrap();
+        native_sweep_age_dir(&foreign_assets_live);
         // Unknown dot-directory: foreign tooling, never touched.
         let foreign = cache_root.join(".unrelated-tooling");
         fs::create_dir_all(&foreign).unwrap();
@@ -17732,7 +17810,14 @@ mod tests {
             .unwrap();
         assert_eq!(prepared, live, "the current cache must remain a hit");
 
-        for gone in [&orphan, &outdated, &unverifiable, &markerless] {
+        for gone in [
+            &orphan,
+            &outdated,
+            &unverifiable,
+            &markerless,
+            &live_staging_debris,
+            &dead_assets_live,
+        ] {
             assert!(!gone.exists(), "{} should have been swept", gone.display());
         }
         for kept in [
@@ -17741,6 +17826,7 @@ mod tests {
             &healthy,
             &held,
             &live_staging,
+            &live_staging_complete,
             &foreign_staging,
             &foreign_staging_nouuid,
             &foreign_staging_extra,
@@ -17753,6 +17839,8 @@ mod tests {
             &foreign_assets_tmp,
             &foreign_assets_tmp_v3,
             &assets_sidecar,
+            &live_assets,
+            &foreign_assets_live,
             &foreign,
             &photos,
         ] {
@@ -18054,7 +18142,10 @@ mod tests {
     /// never counts toward the cap and is never swept while the pid lives.
     /// The next prepare misses the entry key again, so it must REUSE the
     /// verified same-pid staging dir — not stage a second conversion and
-    /// leak another copy per reload.
+    /// leak another copy per reload — and must NOT republish it: renaming a
+    /// path a live load already holds would break readers that still open
+    /// its files later (unlink-under-mmap covers only already-open files),
+    /// so the entry name stays absent even when cap space exists.
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
@@ -18078,12 +18169,24 @@ mod tests {
             "the tiny cap must refuse the first publish, got {}",
             first.display()
         );
+        // With headroom for a republish, a reused staging dir must STILL be
+        // returned in place: publish would move the path out from under any
+        // in-process model already loading from it.
+        drop(_env);
+        let _env = SweepEnvVar::set_max_gb("64");
         let second = prepare_qwen35_native_gguf_in(&input, &cache_root)
             .await
             .unwrap();
         assert_eq!(
             second, first,
             "a verified same-pid staging dir is reused, not duplicated"
+        );
+        let name = first.file_name().unwrap().to_str().unwrap();
+        let entry_name: String = name[1..name.find(NATIVE_GGUF_STAGING_INFIX).unwrap()].to_string();
+        assert!(native_gguf_is_entry_name(&entry_name), "{entry_name}");
+        assert!(
+            !cache_root.join(&entry_name).exists(),
+            "a reused staging dir is never republished, even with cap space"
         );
         let staging_count = fs::read_dir(&cache_root)
             .unwrap()
@@ -18159,6 +18262,62 @@ mod tests {
             native_gguf_entry_stale_reason(&entry, &mut digests),
             Some("corrupt source_hex record"),
             "malformed hex fails closed instead of trusting the text field"
+        );
+    }
+
+    /// A `source=` line carries raw path bytes, and marker fields are read
+    /// first-match-wins: a source filename containing
+    /// `\nsource_identity_sha256=…` would inject an authoritative-looking
+    /// record ABOVE the real one and shadow it. The writer must omit the raw
+    /// `source=` line whenever the path bytes contain a newline — the only
+    /// byte that can forge a record — and order every authoritative field
+    /// first regardless. The hex twin still verifies the real source.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_marker_omits_raw_lines_that_could_inject_records() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0");
+        let root = NativeSweepTestDir::new("inject");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        // Both a malformed and a valid-looking injected record in one name:
+        // `source_hex=zz` (not hex) and a full-width sha256 of zeros.
+        let hostile = input.with_file_name(format!(
+            "weights\nsource_hex=zz\nsource_identity_sha256={}\ncompanion_hex=00.gguf",
+            "0".repeat(64)
+        ));
+        fs::rename(&input, &hostile).unwrap();
+
+        let prepared = prepare_qwen35_native_gguf_in(&hostile, &cache_root)
+            .await
+            .unwrap();
+        let marker = fs::read_to_string(prepared.join(".complete")).unwrap();
+        assert!(
+            !marker.lines().any(|line| line.starts_with("source=")),
+            "a newline-bearing source path must not emit a raw record:\n{marker}"
+        );
+        assert!(
+            !marker.lines().any(|line| line.starts_with("companion="))
+                || marker.lines().any(|line| line == "companion=none"),
+            "only the `none` sentinel may appear as a raw companion line:\n{marker}"
+        );
+        // The only `source_hex=` line is the authoritative one — no injected
+        // record can sit anywhere in the marker.
+        assert_eq!(
+            marker
+                .lines()
+                .filter(|line| line.starts_with("source_hex="))
+                .count(),
+            1,
+            "{marker}"
+        );
+        let mut digests = NativeGgufSweepDigests::default();
+        assert_eq!(
+            native_gguf_entry_stale_reason(&prepared, &mut digests),
+            None,
+            "the real source still verifies through its hex twin"
         );
     }
 
