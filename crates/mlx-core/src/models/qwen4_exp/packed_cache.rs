@@ -1108,6 +1108,10 @@ impl PackedCache {
         if requests.len() > 24 || total.is_none_or(|n| n > MAX_READ_BYTES) {
             return Err(err("Packed batch exceeds staging budget"));
         }
+        // One guard for the whole batch: per-chunk guards would let a
+        // writer's shed_oldest_packs interleave between two chunk opens and
+        // delete a pack this batch has not reached yet.
+        let _batch_guard = read_guard(&self.root);
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(4)
