@@ -5,7 +5,7 @@
   "assets": {
     "aarch64-apple-darwin": {
       "file": "mlx-aarch64-apple-darwin.tar.gz",
-      "sha256": ""
+      "sha256": "5df68ae36a6a8e164b3985aabed1dce7d17437506e54b6283e5a03bb1b888e0e"
     }
   }
 }
