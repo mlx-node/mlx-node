@@ -8366,6 +8366,71 @@ async fn prepare_native_gguf_inner(
     );
     let output_dir = cache_root.join(&cache_key);
 
+    // The verified-current predicate is shared by the hit fast-path, the
+    // under-lock hit, and the same-pid staging reuse below: marker identity
+    // plus the required payloads (and the companion file when one is
+    // paired) — the exact check the publish path used before handing the
+    // dir to a loader.
+    let entry_is_current = |dir: &Path| {
+        qwen35_native_cache_is_current(
+            dir,
+            &source_identity_digest,
+            &asset_digest,
+            cache_dtype,
+            family.required_files(),
+        ) && (companion.is_none() || dir.join(family.companion_filename()).is_file())
+    };
+
+    // Sweep stale/orphaned siblings once per prepare. The sweep needs no
+    // locks of its own — every decision behind native_gguf_locked_remove
+    // re-derives state under the per-entry try-flock and skips on busy —
+    // so it runs before the exclusive path: a cache hit on a contended key
+    // must sweep too, and it can no longer reach the under-lock sweep.
+    // A sweep failure or panic must never fail a load, so it runs on a
+    // blocking thread behind catch_unwind.
+    {
+        let sweep_root = cache_root.to_path_buf();
+        let sweep_key = cache_key.clone();
+        let swept = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sweep_native_gguf_cache(&sweep_root, &sweep_key);
+            }))
+        })
+        .await;
+        match swept {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
+            Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
+        }
+    }
+
+    // Hit fast-path BEFORE the exclusive lock: loaded models hold a
+    // process-lifetime LOCK_SH on this key's sentinel, so an unconditional
+    // LOCK_EX here would block a second process sharing the cache until the
+    // first exits — an unbounded hang, not a serialization delay. A shared
+    // lease suffices for a verified hit: winning SH proves no deleter or
+    // publisher holds EX, the registered lease then keeps the dir for the
+    // model's lifetime, and the recheck under the lease catches a dir that
+    // vanished before the lease landed. A foreign-held EX (writer or
+    // deleter) fails the lease — fall through to the exclusive path, which
+    // spins on the same lock and rechecks current-ness under it. Runs
+    // without the prepare mutex: same-process prepare concurrency on a hit
+    // adds only registrations, and the registry handles those.
+    if entry_is_current(&output_dir)
+        && native_gguf_lease_in_use(cache_root, &output_dir, Some(&cache_key), None)
+    {
+        if entry_is_current(&output_dir) {
+            // Stamp the marker mtime so the capped-LRU sweep treats this
+            // verified hit as recently used instead of a deletion candidate.
+            native_gguf_stamp_mtime(&output_dir.join(".complete"));
+            return Ok(output_dir);
+        }
+        // The dir vanished or changed before the lease landed: release the
+        // stale registration (it would pin the lock file against same-key
+        // republishes) and take the exclusive path.
+        native_gguf_unlease_in_use(&output_dir);
+    }
+
     // The process lock closes the same-process flock ambiguity on BSD/macOS;
     // the persistent per-key flock extends serialization across processes.
     // Both are acquired before the marker check, so a queued caller observes
@@ -8410,39 +8475,6 @@ async fn prepare_native_gguf_inner(
             "GGUF source changed while acquiring the native cache lock; retry the load".to_string(),
         ));
     }
-
-    // Sweep stale/orphaned siblings once per prepare while both locks are
-    // held (safe on hits and misses). A sweep failure or panic must never
-    // fail a load, so it runs on a blocking thread behind catch_unwind.
-    {
-        let sweep_root = cache_root.to_path_buf();
-        let sweep_key = cache_key.clone();
-        let swept = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                sweep_native_gguf_cache(&sweep_root, &sweep_key);
-            }))
-        })
-        .await;
-        match swept {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
-            Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
-        }
-    }
-
-    // The verified-current predicate is shared by the published-entry hit
-    // and the same-pid staging reuse below: marker identity plus the
-    // required payloads (and the companion file when one is paired) — the
-    // exact check the publish path used before handing the dir to a loader.
-    let entry_is_current = |dir: &Path| {
-        qwen35_native_cache_is_current(
-            dir,
-            &source_identity_digest,
-            &asset_digest,
-            cache_dtype,
-            family.required_files(),
-        ) && (companion.is_none() || dir.join(family.companion_filename()).is_file())
-    };
 
     if entry_is_current(&output_dir) {
         // Stamp the marker mtime so the capped-LRU sweep treats this verified
