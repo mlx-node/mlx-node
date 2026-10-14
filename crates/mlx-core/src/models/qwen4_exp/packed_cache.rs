@@ -2399,7 +2399,7 @@ mod tests {
         // duration; it now orders as the oldest entry.
         let cache_dir = parent.join(format!("{DIR_PREFIX}{}", "d".repeat(64)));
         fs::create_dir(&cache_dir).unwrap();
-        let pack = cache_dir.join(&pack_file('0'));
+        let pack = cache_dir.join(pack_file('0'));
         fs::write(&pack, b"x").unwrap();
         let epoch_minus_one = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
         OpenOptions::new()
@@ -2518,21 +2518,21 @@ mod tests {
         // Eldest with a manifest and past the idle grace: the only eviction.
         let oldest = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
         fs::create_dir(&oldest).unwrap();
-        fs::write(oldest.join(&pack_file('a')), vec![0_u8; 100]).unwrap();
+        fs::write(oldest.join(pack_file('a')), vec![0_u8; 100]).unwrap();
         fs::write(oldest.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-        age(&oldest.join(&pack_file('a')), 7200);
+        age(&oldest.join(pack_file('a')), 7200);
         age(&oldest.join(".manifest"), 7200);
         age_dir(&oldest, 7200);
         // Fresh manifest dir and manifest-less dir both survive the cap: the
         // idle grace shields the first, the manifest requirement the second.
         let fresh = parent.join(format!("{DIR_PREFIX}{}", "b".repeat(64)));
         fs::create_dir(&fresh).unwrap();
-        fs::write(fresh.join(&pack_file('b')), vec![0_u8; 100]).unwrap();
+        fs::write(fresh.join(pack_file('b')), vec![0_u8; 100]).unwrap();
         fs::write(fresh.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
         let bare = parent.join(format!("{DIR_PREFIX}{}", "c".repeat(64)));
         fs::create_dir(&bare).unwrap();
-        fs::write(bare.join(&pack_file('c')), vec![0_u8; 100]).unwrap();
-        age(&bare.join(&pack_file('c')), 7200);
+        fs::write(bare.join(pack_file('c')), vec![0_u8; 100]).unwrap();
+        age(&bare.join(pack_file('c')), 7200);
         age_dir(&bare, 7200);
         let cache = PackedCache {
             root: temp.0.join("current"),
@@ -2738,7 +2738,7 @@ mod tests {
         // that must not veto other identities forever.
         let sibling = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
         fs::create_dir(&sibling).unwrap();
-        fs::write(sibling.join(&pack_file('a')), vec![0_u8; 64]).unwrap();
+        fs::write(sibling.join(pack_file('a')), vec![0_u8; 64]).unwrap();
         let ledger_path = sibling.join("budget");
         fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
         let source = temp.0.join("b.gguf");
