@@ -1121,6 +1121,61 @@ describe('downloadAgentBinary', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it('a floored walk skips candidates at or below the installed release', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      delete process.env[MLX_AGENT_TAG_ENV];
+      const dest = managedAgentBinPath(home);
+      const tar = makeTarball(home, 'v030');
+      const sha = createHash('sha256').update(tar).digest('hex');
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        if (u.endsWith('.sha256')) return new Response(sha);
+        if (u.includes('releases/latest')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.2.9' }));
+        if (u.endsWith('.tar.gz')) return new Response(new Uint8Array(tar));
+        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+        return new Response('nope', { status: 404 });
+      });
+      // Candidates v0.3.0, v0.2.9, v0.2.0 — only v0.3.0 beats the v0.2.9
+      // floor; the walk must land there, never on an older complete release.
+      const path = await downloadAgentBinary(dest, undefined, {}, 'mlx-agent-v0.2.9');
+      expect(path).toBe(versioned(home, 'mlx-agent-v0.3.0'));
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a floored walk fails instead of installing an older candidate', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const saved = process.env[MLX_AGENT_TAG_ENV];
+    try {
+      delete process.env[MLX_AGENT_TAG_ENV];
+      const dest = managedAgentBinPath(home);
+      fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
+        const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
+        if (u.endsWith('.sha256')) return new Response('a'.repeat(64));
+        if (u.includes('releases/latest')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.3.0' }));
+        if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
+        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+        return new Response('nope', { status: 404 });
+      });
+      // Every candidate is at or below the v0.4.0 floor: the walk refuses
+      // to move the pointer backward rather than "updating" to an older tag.
+      await expect(downloadAgentBinary(dest, undefined, {}, 'mlx-agent-v0.4.0')).rejects.toThrow(
+        'no release newer than mlx-agent-v0.4.0',
+      );
+      expect(existsSync(`${dest}.tag`)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = saved;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('resolveReleaseTag', () => {
@@ -1423,13 +1478,59 @@ describe('applyAgentUpdate', () => {
       });
       expect(downloaded).toBe(true);
       expect(download).toHaveBeenNthCalledWith(1, managed, 'mlx-agent-v0.3.0');
-      expect(download).toHaveBeenNthCalledWith(2, managed, undefined);
+      expect(download).toHaveBeenNthCalledWith(2, managed, undefined, undefined);
       // current reports the ACTUALLY installed tag, not the requested one —
       // and the update must still read as available: the installed release
       // trails latest, so callers must not claim "updated to latest".
       expect(s.current).toBe('mlx-agent-v0.2.0');
       expect(s.latest).toBe('mlx-agent-v0.3.0');
       expect(s.updateAvailable).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('floors the fallback walk at the installed release so it cannot downgrade', async () => {
+    const download = vi.fn(async (dest: string, tag?: string) => {
+      if (tag !== undefined) throw new Error('latest archive corrupt');
+      return dest;
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'agent-update-'));
+    try {
+      const managed = join(dir, 'mlx-agent');
+      // Managed v0.4.0 with v0.5.0 latest whose fetch fails: the candidate
+      // walk may offer v0.3.0/v0.2.0, but anything at or below the install
+      // is a downgrade — the floor must reach the downloader.
+      const { status: s } = await applyAgentUpdate({
+        probe: status({ managedTag: 'mlx-agent-v0.4.0', effectiveTag: 'mlx-agent-v0.4.0' }),
+        resolveTag: async () => 'mlx-agent-v0.5.0',
+        managedPath: managed,
+        download,
+      });
+      expect(download).toHaveBeenNthCalledWith(2, managed, undefined, 'mlx-agent-v0.4.0');
+      // A pinned install whose managed cache is NEWER than the pin still
+      // floors at the cache tag — unpinning must not expose a downgrade.
+      const pinnedDownload = vi.fn(async (dest: string, tag?: string) => {
+        if (tag !== undefined) throw new Error('latest archive corrupt');
+        return dest;
+      });
+      const saved = process.env[MLX_AGENT_TAG_ENV];
+      try {
+        // A pin naming an uninstalled tag keeps the update eligible; the
+        // floor is still the managed cache's v0.4.0, not the pin.
+        process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.6.0';
+        await applyAgentUpdate({
+          probe: status({ managedTag: 'mlx-agent-v0.4.0', effectiveTag: 'mlx-agent-v0.3.0' }),
+          resolveTag: async () => 'mlx-agent-v0.5.0',
+          managedPath: managed,
+          download: pinnedDownload,
+        });
+        expect(pinnedDownload).toHaveBeenNthCalledWith(2, managed, undefined, 'mlx-agent-v0.4.0');
+      } finally {
+        if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+        else process.env[MLX_AGENT_TAG_ENV] = saved;
+      }
+      expect(s.newestInstalled).toBe('mlx-agent-v0.4.0');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1470,6 +1571,7 @@ describe('mlx agent update (run)', () => {
       updateAvailable: true,
       managedPath: '/m/mlx-agent',
       pinned: 'managed' as const,
+      newestInstalled: 'mlx-agent-v0.2.0',
     }));
     const applyUpdate = vi.fn();
     await run(['update', '--check'], { updateStatus, applyUpdate });
@@ -1488,6 +1590,7 @@ describe('mlx agent update (run)', () => {
         updateAvailable: false,
         managedPath: '/m/mlx-agent',
         pinned: 'managed' as const,
+        newestInstalled: null,
       },
     }));
     await run(['update'], { applyUpdate });
@@ -1504,6 +1607,7 @@ describe('mlx agent update (run)', () => {
         updateAvailable: true,
         managedPath: '/m/mlx-agent',
         pinned: 'managed' as const,
+        newestInstalled: null,
       },
     }));
     await run(['update'], { applyUpdate });
@@ -1524,6 +1628,7 @@ describe('mlx agent update (run)', () => {
         updateAvailable: true,
         managedPath: '/m/mlx-agent',
         pinned: 'managed' as const,
+        newestInstalled: null,
       },
     }));
     const isTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
@@ -1551,6 +1656,7 @@ describe('mlx agent update (run)', () => {
         updateAvailable: false,
         managedPath: '/m/mlx-agent',
         pinned: 'env' as const,
+        newestInstalled: null,
       },
     }));
     await run(['update'], { applyUpdate });

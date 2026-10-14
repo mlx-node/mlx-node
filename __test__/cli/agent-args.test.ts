@@ -724,6 +724,7 @@ describe('run() argv routing', () => {
         updateAvailable: false,
         managedPath: '/m/mlx-agent',
         pinned: 'managed' as const,
+        newestInstalled: null,
       },
     }));
     const prevExitCode = process.exitCode;
@@ -749,6 +750,7 @@ describe('run() argv routing', () => {
         updateAvailable: false,
         managedPath: '/m/mlx-agent',
         pinned: 'managed' as const,
+        newestInstalled: null,
       },
     }));
     const prevExitCode = process.exitCode;

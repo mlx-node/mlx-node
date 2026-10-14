@@ -636,14 +636,22 @@ export async function downloadAgentBinary(
   dest: string,
   tag?: string,
   env: NodeJS.ProcessEnv = process.env,
+  floor?: string,
 ): Promise<string> {
   if (tag !== undefined) return installAgentRelease(dest, tag, await fetchAgentRelease(dest, tag), env);
   // Unpinned: walk the resolved candidates. Resolution already gated on a
   // parseable checksum plus a reachable archive, but that probe raced the
   // real download — a tag whose fetch/verify still fails yields to the
-  // next candidate instead of dead-ending the launch.
+  // next candidate instead of dead-ending the launch. `floor` is the
+  // update path's downgrade guard: a candidate at or below the installed
+  // release is skipped, so a failed latest keeps the working install
+  // instead of flipping the pointer backward. Launch passes no floor —
+  // repairing an empty/broken cache to ANY fetchable release beats none.
   const failures: string[] = [];
+  let eligible = false;
   for (const candidate of await resolveReleaseCandidates(env)) {
+    if (floor !== undefined && compareReleaseTags(candidate, floor) <= 0) continue;
+    eligible = true;
     let binary: Buffer;
     try {
       binary = await fetchAgentRelease(dest, candidate);
@@ -654,6 +662,9 @@ export async function downloadAgentBinary(
     // Install failures (lock contention, fs errors) are not tag-specific —
     // propagating beats retrying the same failure under another tag.
     return installAgentRelease(dest, candidate, binary, env);
+  }
+  if (!eligible) {
+    throw new Error(`mlx agent: no release newer than ${floor} is fetchable — the installed version was kept.`);
   }
   throw new Error(
     `mlx agent: no local binary found and the verified download failed ` +
@@ -1477,6 +1488,12 @@ export interface AgentUpdateStatus {
    * pin is removed — the CLI warns about this case.
    */
   pinned: AgentInstallProbe['source'];
+  /**
+   * Newest release tag on disk (the managed cache OR the effective install,
+   * whichever is newer) — the floor a fallback update must beat, or the
+   * pointer/install would move backward. Null when nothing is installed.
+   */
+  newestInstalled: string | null;
 }
 
 /** Injectable seams so tests never touch the network or $HOME. */
@@ -1484,8 +1501,12 @@ export interface AgentUpdateDeps {
   resolveTag?: () => Promise<string>;
   probe?: () => AgentInstallProbe;
   managedPath?: string;
-  /** `tag === undefined` asks the downloader to walk its candidate list. */
-  download?: (dest: string, tag?: string) => Promise<string>;
+  /**
+   * `tag === undefined` asks the downloader to walk its candidate list;
+   * `floor` skips candidates at or below the installed release so a
+   * fallback can never downgrade it.
+   */
+  download?: (dest: string, tag?: string, floor?: string) => Promise<string>;
 }
 
 /**
@@ -1518,6 +1539,7 @@ export async function agentUpdateStatus(deps: AgentUpdateDeps = {}): Promise<Age
     updateAvailable: pin !== undefined ? !pinnedInstalled : newest === null || compareReleaseTags(latest, newest) > 0,
     managedPath,
     pinned: install.source,
+    newestInstalled: newest,
   };
 }
 
@@ -1532,15 +1554,17 @@ export async function applyAgentUpdate(
 ): Promise<{ status: AgentUpdateStatus; downloaded: boolean }> {
   const status = await agentUpdateStatus(deps);
   if (!status.updateAvailable) return { status, downloaded: false };
-  const download = deps.download ?? downloadAgentBinary;
+  const download = deps.download ?? ((dest, tag, floor) => downloadAgentBinary(dest, tag, process.env, floor));
   try {
     await download(status.managedPath, status.latest);
   } catch {
     // The latest tag verified at resolve time but cannot be fetched now
     // (corrupt mirror bytes, assets pulled mid-flight). Retry unpinned:
     // the downloader walks its verified-candidate list, so an older
-    // complete release still lands rather than failing the update.
-    await download(status.managedPath, undefined);
+    // complete release still lands rather than failing the update — but
+    // only above the pre-update install: a candidate at or below it is a
+    // downgrade, and keeping the working release beats flipping backward.
+    await download(status.managedPath, undefined, status.newestInstalled ?? undefined);
   }
   // Report what actually installed — a fallback may have landed an older
   // candidate, so `latest` is not the truth. The pin wins when set (side
