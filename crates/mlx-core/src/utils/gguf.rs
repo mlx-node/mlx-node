@@ -6966,6 +6966,146 @@ fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<f
     None
 }
 
+// ── In-use sidecar leases ──────────────────────────────────────────────────
+// A published `.mlx-qwen4-assets-v2-*` dir handed to a loaded model stays in
+// use for the process lifetime: the model opens `tokenizer.json` lazily on
+// first request, possibly days after `assets_in` returned. Recency stamping
+// only marks prepare hits, so an LRU eviction could otherwise delete the
+// directory out from under a running model. The registry below is the
+// in-process guard (a held shared flock cannot exclude a same-process
+// deleter on every platform); the `Option<fs::File>` each entry retains is
+// the cross-process guard — a LOCK_SH on the sidecar's `{key}.lock` sentinel
+// that defeats every foreign process's LOCK_EX try-flock in
+// `native_gguf_try_entry_lock`. There is no model Drop hook, so the lease is
+// process-lifetime bounded — the same bound the `assets-live` pid gate uses.
+fn native_gguf_in_use_sidecars() -> &'static std::sync::Mutex<HashMap<PathBuf, Option<fs::File>>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Option<fs::File>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Registry key for `dir`: canonical when the dir exists, parent-canonical
+/// plus the bare name otherwise — stable across a delete so `unlease` still
+/// finds the entry after the directory is gone.
+fn native_gguf_in_use_key(dir: &Path) -> PathBuf {
+    dir.canonicalize().unwrap_or_else(|_| {
+        dir.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .map(|parent| parent.join(dir.file_name().unwrap_or_else(|| std::ffi::OsStr::new(""))))
+            .unwrap_or_else(|| dir.to_path_buf())
+    })
+}
+
+/// Exclusive side for deletion paths: `Some(guard)` only while the registry
+/// is locked AND `dir` is not leased as in-use. Hold the guard through the
+/// unlink so a leaser racing in is refused registration and can only
+/// observe the removal, never straddle it — mirrors `packed_deletion_guard`
+/// in the packed cache.
+fn native_gguf_in_use_delete_guard(
+    dir: &Path,
+) -> Option<std::sync::MutexGuard<'static, HashMap<PathBuf, Option<fs::File>>>> {
+    let registry = match native_gguf_in_use_sidecars().try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        // A lease is mid-registration or another delete is running.
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    if registry.contains_key(&native_gguf_in_use_key(dir)) {
+        return None;
+    }
+    Some(registry)
+}
+
+/// True when `dir` is registered as handed to a loaded model.
+#[cfg(all(test, unix))]
+fn native_gguf_in_use(dir: &Path) -> bool {
+    native_gguf_in_use_sidecars()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains_key(&native_gguf_in_use_key(dir))
+}
+
+/// Drop `dir`'s lease (registry entry and its shared flock). Used when a
+/// leased dir's `complete` marker vanished anyway — the dir turned out to be
+/// debris, and pinning its lock file would only block same-key republishes.
+pub(crate) fn native_gguf_unlease_in_use(dir: &Path) {
+    let mut registry = native_gguf_in_use_sidecars()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    registry.remove(&native_gguf_in_use_key(dir));
+}
+
+/// Register `dir` as a load output for the process lifetime, holding a
+/// shared flock on `key`'s lock file so foreign deleters lose their
+/// `LOCK_EX` try-flock on the same sentinel. `fd` is an already-locked
+/// descriptor for that same file (the publisher's exclusive guard): its
+/// claim is downgraded EX→SH and adopted rather than opening a second
+/// descriptor — an exclusive claim pinned forever would block foreign
+/// readers' shared locks, so a failed downgrade drops the fd and registers
+/// `None` (registry-only). `key: None` registers without any flock — the
+/// `assets-live-{identity}-{pid}` dirs have no lock file and are already
+/// kept unconditionally by the pid-liveness gate. `false` means a foreign
+/// process holds the lock exclusively (a deleter or publisher): register
+/// nothing — the caller's recheck decides whether the dir still exists.
+pub(crate) fn native_gguf_lease_in_use(
+    root: &Path,
+    dir: &Path,
+    key: Option<&str>,
+    fd: Option<fs::File>,
+) -> bool {
+    let mut registry = native_gguf_in_use_sidecars()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if registry.contains_key(&native_gguf_in_use_key(dir)) {
+        // Already leased; the caller's fd is a redundant claim — drop it.
+        return true;
+    }
+    #[allow(unused_mut)]
+    let mut file = fd;
+    let adopted = file.is_some();
+    #[cfg(unix)]
+    {
+        if file.is_none()
+            && let Some(key) = key
+        {
+            let lock_path = root.join(native_gguf_lock_name(key));
+            // An unreadable sentinel degrades to a registry-only lease: the
+            // in-process guard still works; cross-process keeps whatever the
+            // per-dir locks already did before leases.
+            if let Ok(opened) = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                file = Some(opened);
+            }
+        }
+        if let Some(opened) = &file
+            && unsafe { libc::flock(opened.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0
+        {
+            if adopted {
+                // The adopted writer fd could not be downgraded: releasing
+                // it frees the exclusive claim rather than pinning EX —
+                // a forever-EX would block foreign readers' shared locks.
+                debug!(
+                    "native GGUF sidecar lease could not downgrade to shared: {}",
+                    dir.display()
+                );
+            } else {
+                // A foreign process holds the sentinel exclusively.
+                return false;
+            }
+            file = None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (root, key);
+    registry.insert(native_gguf_in_use_key(dir), file);
+    true
+}
+
 /// Best-effort recursive size. `symlink_metadata` classifies each entry by
 /// its own link: a symlink counts only its link bytes and is never recursed
 /// or followed, so targets outside the cache root are never counted (or
@@ -7123,12 +7263,19 @@ fn native_gguf_entry_stale_reason(
 
 /// A stale entry may be deleted only after winning a non-blocking flock on
 /// its own `.{key}.lock`: a held lock means a live writer, so the entry is
-/// skipped and left for a later sweep. `still_deletable` runs AFTER the lock
-/// is won — a cache hit stamps its marker under the same lock file, so a
-/// recency snapshot taken before the flock cannot prove the entry is still
-/// dead once we hold it. The guard stays alive across the removal itself —
-/// dropping it first would let a writer publish into a half-deleted
-/// directory.
+/// skipped and left for a later sweep. A dir leased as in-use (a sidecar
+/// handed to a loaded model) is skipped before the flock is even tried —
+/// the registry covers same-process deleters and its retained LOCK_SH makes
+/// the try-flock fail for foreign processes too, so every caller of this
+/// function (the sweep's stale pass and the capped-LRU passes in both the
+/// sweep and `native_gguf_publish_with_cap`) gets the exclusion for free.
+/// `still_deletable` runs AFTER the lock is won — a cache hit stamps its
+/// marker under the same lock file, so a recency snapshot taken before the
+/// flock cannot prove the entry is still dead once we hold it. The guards
+/// stay alive across the removal itself — dropping them first would let a
+/// writer publish into a half-deleted directory, or a leaser register a
+/// mid-delete path. Lock order stays acyclic: the in-use registry is taken
+/// before the entry flock, the same order `native_gguf_lease_in_use` uses.
 fn native_gguf_locked_remove(
     cache_root: &Path,
     path: &Path,
@@ -7136,6 +7283,14 @@ fn native_gguf_locked_remove(
     reason: &str,
     still_deletable: impl Fn(&Path) -> bool,
 ) -> u64 {
+    let Some(_in_use) = native_gguf_in_use_delete_guard(path) else {
+        debug!(
+            "native GGUF cache sweep keeps '{}' (in use by a loaded model or \
+             another removal in flight)",
+            path.display()
+        );
+        return 0;
+    };
     let Some(_guard) = native_gguf_try_entry_lock(cache_root, key) else {
         return 0;
     };
@@ -18132,6 +18287,84 @@ mod tests {
             }) > 0
         );
         assert!(!entry.exists());
+    }
+
+    /// A published sidecar handed to a loaded model stays in use for the
+    /// process lifetime — the model reopens `tokenizer.json` lazily, long
+    /// after `assets_in` stamped its last recency. Leased dirs must survive
+    /// `native_gguf_locked_remove` and the capped-LRU pass while an
+    /// identical unleased dir is evicted.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_in_use_sidecar_survives_locked_remove_and_lru() {
+        let root = NativeSweepTestDir::new("inuse");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        let name_a = format!(".mlx-qwen4-assets-v2-{}", "a".repeat(64));
+        let name_b = format!(".mlx-qwen4-assets-v2-{}", "b".repeat(64));
+        let dir_a = cache_root.join(&name_a);
+        let dir_b = cache_root.join(&name_b);
+        for (dir, marker) in [(&dir_a, "complete"), (&dir_b, "complete")] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("tokenizer.json"), vec![0_u8; 1024]).unwrap();
+            let marker = dir.join(marker);
+            fs::write(&marker, b"1").unwrap();
+            native_sweep_age_file(&marker);
+        }
+        assert!(native_gguf_lease_in_use(
+            &cache_root,
+            &dir_a,
+            Some(&name_a),
+            None
+        ));
+        assert!(native_gguf_in_use(&dir_a));
+        assert!(!native_gguf_in_use(&dir_b));
+        // locked_remove skips the leased dir before even trying the flock —
+        // and on this platform the held LOCK_SH would defeat the EX try too.
+        let still_stale = |_: &Path| true;
+        assert_eq!(
+            native_gguf_locked_remove(&cache_root, &dir_a, &name_a, "test", still_stale),
+            0,
+            "a leased in-use sidecar is never deleted"
+        );
+        assert!(dir_a.exists());
+        // The unleased twin is deletable through the same path.
+        assert!(native_gguf_locked_remove(&cache_root, &dir_b, &name_b, "test", still_stale) > 0);
+        assert!(!dir_b.exists());
+        // The capped-LRU pass skips the leased dir while reclaiming enough
+        // from other entries to fit — the recheck keeps it even though its
+        // marker reads older than the sweep grace.
+        let other = cache_root.join(native_sweep_entry_name("victim"));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("model.safetensors"), vec![0_u8; 2048]).unwrap();
+        let other_marker = other.join(".complete");
+        fs::write(&other_marker, b"stale-shape").unwrap();
+        native_sweep_age_file(&other_marker);
+        let now = std::time::SystemTime::now();
+        let lru = vec![
+            (
+                dir_a.clone(),
+                native_gguf_object_recency(&dir_a, "complete"),
+                name_a.clone(),
+                "complete",
+            ),
+            (
+                other.clone(),
+                native_gguf_object_recency(&other, ".complete"),
+                other.file_name().unwrap().to_str().unwrap().to_string(),
+                ".complete",
+            ),
+        ];
+        let total = native_gguf_path_bytes(&dir_a) + native_gguf_path_bytes(&other);
+        let (reclaimed, _) = native_gguf_evict_lru(&cache_root, lru, now, total, |t| t <= 1024);
+        assert!(dir_a.exists(), "an in-use sidecar is not LRU-evictable");
+        assert!(!other.exists());
+        assert!(reclaimed >= 2048);
+        // Once the lease is released the same dir evicts normally.
+        native_gguf_unlease_in_use(&dir_a);
+        assert!(!native_gguf_in_use(&dir_a));
+        assert!(native_gguf_locked_remove(&cache_root, &dir_a, &name_a, "test", still_stale) > 0);
+        assert!(!dir_a.exists());
     }
 
     #[test]

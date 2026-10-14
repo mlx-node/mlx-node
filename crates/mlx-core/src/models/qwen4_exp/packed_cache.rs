@@ -516,28 +516,64 @@ fn pack_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Bytes the sweep deliberately retains in `{uuid}.tmp` crash leftovers:
+/// regular files younger than `PACKED_SWEEP_MIN_AGE` — the same freshness
+/// gate the sweep applies before unlinking one. Aged tmps and non-regular
+/// files are debris, not spend: the sweep reclaims them on its next pass.
+/// These count toward admission estimates (a writer that crashed between
+/// reservation and rename still owns the bytes on disk, and repeated
+/// interrupted writes must not sail past the configured cap) but never the
+/// `budget` ledger, which records committed `.pack` bytes only — the same
+/// split `reconciled_sibling_pack_spend` and `shed_oldest_packs` keep.
+fn retained_tmp_bytes(dir: &Path) -> u64 {
+    if !is_real_dir(dir) {
+        return 0;
+    }
+    let cutoff = SystemTime::now() - PACKED_SWEEP_MIN_AGE;
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|s| s == "tmp"))
+                .filter_map(|e| fs::symlink_metadata(e.path()).ok())
+                .filter(|m| m.is_file() && m.modified().is_ok_and(|t| t > cutoff))
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// Best-effort sibling spend estimate: the ledger u64 when it reads, else a
-/// live .pack byte count. A ledger value can lag reality (a skipped/failed
-/// replacement write leaves the old target on disk but absent from `used`),
-/// so a readable ledger is floored at the real byte count — the estimate can
-/// overcount pending spend, never undercount. Advisory only — the sibling's
-/// flock stays with its writer and any failure degrades to the byte count,
-/// never to an error.
+/// live .pack byte count, plus retained `.tmp` bytes in both cases — a crash
+/// between reservation and rename owns those bytes and the sweep keeps them
+/// for the whole grace, so they are spend either way. A ledger value can lag
+/// reality (a skipped/failed replacement write leaves the old target on disk
+/// but absent from `used`), so a readable ledger is floored at the real byte
+/// count — the estimate can overcount pending spend, never undercount (a
+/// live writer's in-flight `.tmp` momentarily doubles its own reservation,
+/// which is the safe direction). Advisory only — the sibling's flock stays
+/// with its writer and any failure degrades to the byte count, never to an
+/// error.
 fn sibling_pack_estimate(dir: &Path) -> u64 {
     let mut n = [0u8; 8];
     let from_ledger = File::open(dir.join("budget"))
         .and_then(|mut f| f.read_exact(&mut n))
         .is_ok();
-    if from_ledger {
-        u64::from_le_bytes(n).max(pack_bytes(dir))
+    let packs = pack_bytes(dir);
+    let committed = if from_ledger {
+        u64::from_le_bytes(n).max(packs)
     } else {
-        pack_bytes(dir)
-    }
+        packs
+    };
+    committed.saturating_add(retained_tmp_bytes(dir))
 }
 
 /// Root-wide spend: `current_used` for `current` plus `sibling_bytes` over
-/// every other identity dir under `parent`. Read errors count as 0 — this is
-/// an advisory estimate, never a load failure.
+/// every other identity dir under `parent`. Both inputs are expected to
+/// include retained `.tmp` leftovers — `sibling_pack_estimate`/
+/// `reconciled_sibling_pack_spend` already add them, and the writer passes
+/// `used + retained_tmp_bytes` as `current_used`. Read errors count as 0 —
+/// this is an advisory estimate, never a load failure.
 fn root_pack_spend(
     parent: &Path,
     current: &Path,
@@ -635,13 +671,18 @@ fn reconciled_sibling_pack_spend(dir: &Path) -> u64 {
     // reservation is trusted.
     match try_budget_lock(dir) {
         Some(guard) => {
+            // The ledger records committed `.pack` bytes only — rewrite it
+            // to exactly that. Retained `.tmp` leftovers were never
+            // reservations: they inflate the returned spend estimate, not
+            // the ledger.
             let real = pack_bytes(dir);
             if let Ok(mut ledger) = OpenOptions::new().write(true).open(dir.join("budget")) {
                 let _ = ledger.write_all(&real.to_le_bytes());
                 let _ = ledger.set_len(8);
             }
+            let spend = real.saturating_add(retained_tmp_bytes(dir));
             drop(guard);
-            real
+            spend
         }
         None => sibling_pack_estimate(dir),
     }
@@ -1413,10 +1454,20 @@ impl PackedCache {
             if guard.is_none() {
                 return Ok(());
             }
+            // Retained `.tmp` leftovers spend cap room exactly like packs —
+            // a crashed writer's staged bytes sit on disk for the whole
+            // sweep grace — so every root estimate adds them on top of the
+            // pack-only `used`/ledger values.
+            let tmp = retained_tmp_bytes(&self.root);
             // The fast path estimates siblings from their ledgers (a full
             // byte scan per tensor write would be too hot); only a plausible
             // overspend pays the real enforcement sweep.
-            let estimate = root_pack_spend(parent, &self.root, used, sibling_pack_estimate);
+            let estimate = root_pack_spend(
+                parent,
+                &self.root,
+                used.saturating_add(tmp),
+                sibling_pack_estimate,
+            );
             if estimate.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
                 // Evict LRU siblings down to `cap - reserve` — the target is
                 // the room this write needs, so admission can roll instead of
@@ -1426,9 +1477,13 @@ impl PackedCache {
                 // to real pack bytes (a crashed reservation is phantom spend
                 // that would otherwise veto forever); a held budget lock
                 // means a live writer whose pending reservation is trusted.
-                let reconciled =
-                    root_pack_spend(parent, &self.root, used, reconciled_sibling_pack_spend);
-                let siblings = reconciled.saturating_sub(used);
+                let reconciled = root_pack_spend(
+                    parent,
+                    &self.root,
+                    used.saturating_add(tmp),
+                    reconciled_sibling_pack_spend,
+                );
+                let siblings = reconciled.saturating_sub(used.saturating_add(tmp));
                 // Shed our own oldest packs when self-shedding can admit the
                 // write: enforcement could not (it never wins the budget
                 // flock we hold). `headroom` bounds both the per-dir budget
@@ -1440,7 +1495,7 @@ impl PackedCache {
                     // reader, so this needs the in-process guard too.
                     if let Some(_reader_exclusion) = packed_deletion_guard(&self.root) {
                         let headroom = budget
-                            .min(cap.saturating_sub(siblings))
+                            .min(cap.saturating_sub(siblings).saturating_sub(tmp))
                             .saturating_sub(reserve);
                         used = shed_oldest_packs(
                             &self.root,
@@ -1450,7 +1505,9 @@ impl PackedCache {
                         );
                     }
                 }
-                let actual = siblings.saturating_add(used);
+                // `.tmp` bytes shed with nothing — they stay spend until the
+                // sweep ages them out.
+                let actual = siblings.saturating_add(used).saturating_add(tmp);
                 if actual.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
                     return Ok(());
                 }
@@ -2692,5 +2749,82 @@ mod tests {
         // And sibling estimates floor a stale-low ledger at real bytes.
         fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
         assert_eq!(sibling_pack_estimate(&cache.root), pack);
+    }
+
+    /// A `{uuid}.tmp` crash leftover is kept by the sweep for the whole
+    /// grace, so it must count as spend in every admission estimate —
+    /// otherwise repeated interrupted writes sail past the configured cap.
+    /// Retained = regular and inside the sweep grace; aged-out leftovers and
+    /// non-regular `.tmp` names are debris, never spend.
+    #[test]
+    fn retained_tmp_files_count_toward_admission_estimates() {
+        let temp = Temp::new();
+        let dir = temp.0.join("cache");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("real.pack"), vec![0_u8; 128]).unwrap();
+        fs::write(dir.join("leftover.tmp"), vec![0_u8; 512]).unwrap();
+        let stale_tmp = dir.join("stale.tmp");
+        fs::write(&stale_tmp, vec![0_u8; 256]).unwrap();
+        age(&stale_tmp, 2 * PACKED_SWEEP_MIN_AGE.as_secs());
+        fs::create_dir(dir.join("weird.tmp")).unwrap();
+        let outside = temp.0.join("outside.bin");
+        fs::write(&outside, vec![0_u8; 1 << 20]).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked.tmp")).unwrap();
+        assert_eq!(pack_bytes(&dir), 128);
+        assert_eq!(retained_tmp_bytes(&dir), 512);
+        // No ledger: estimate = pack bytes + retained tmp bytes.
+        assert_eq!(sibling_pack_estimate(&dir), 640);
+        assert_eq!(reconciled_sibling_pack_spend(&dir), 640);
+        // A ledger reservation does not hide the tmp spend either, and the
+        // reconcile rewrites the ledger to pack bytes only — `.tmp`
+        // leftovers were never reservations.
+        fs::write(dir.join("budget"), 64u64.to_le_bytes()).unwrap();
+        assert_eq!(sibling_pack_estimate(&dir), 128 + 512);
+        assert_eq!(reconciled_sibling_pack_spend(&dir), 640);
+        let mut n = [0u8; 8];
+        File::open(dir.join("budget"))
+            .unwrap()
+            .read_exact(&mut n)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(n), 128);
+        // The writer's own dir counts the same way through root_pack_spend.
+        assert_eq!(
+            root_pack_spend(&temp.0, &dir, 128 + 512, sibling_pack_estimate),
+            640
+        );
+        // And admission itself must see the retained bytes: a cap with room
+        // for the write beside the pack alone must veto once the tmp spend
+        // is counted, then admit after the leftover ages out.
+        let w = weight("affine");
+        let cache = PackedCache {
+            root: dir.clone(),
+            manifest: None,
+        };
+        // The write reservation equals a published pack's length — measure
+        // it once in a scratch dir.
+        let reserve = {
+            let probe = PackedCache {
+                root: temp.0.join("probe"),
+                manifest: None,
+            };
+            probe.write("k", &w).unwrap();
+            fs::metadata(probe.path("k")).unwrap().len()
+        };
+        fs::remove_file(dir.join("budget")).unwrap();
+        cache
+            .write_with_total_cap("k", &w, Some(128 + reserve))
+            .unwrap();
+        assert!(
+            !cache.path("k").exists(),
+            "a retained crash leftover must veto admission over the cap"
+        );
+        fs::remove_file(dir.join("leftover.tmp")).unwrap();
+        cache
+            .write_with_total_cap("k", &w, Some(128 + reserve))
+            .unwrap();
+        assert!(
+            cache.path("k").exists(),
+            "once the leftover is gone the same cap admits the write"
+        );
     }
 }

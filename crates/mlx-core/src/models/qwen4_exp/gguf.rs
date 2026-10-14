@@ -1,8 +1,8 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
-    GgufMetaValue, native_gguf_cache_cap_bytes, native_gguf_cache_root,
-    native_gguf_publish_with_cap, native_gguf_sidecar_mutex, source_file_identity_digest,
-    write_embedded_gpt2_tokenizer,
+    GgufMetaValue, native_gguf_cache_cap_bytes, native_gguf_cache_root, native_gguf_lease_in_use,
+    native_gguf_publish_with_cap, native_gguf_sidecar_mutex, native_gguf_unlease_in_use,
+    source_file_identity_digest, write_embedded_gpt2_tokenizer,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -210,32 +210,12 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     let identity = source_file_identity_digest(&source, &metadata);
     let dir_name = format!(".mlx-qwen4-assets-v2-{identity}");
     let dir = root.join(&dir_name);
-    // Contention here is not an ordinary cache miss: a busy sidecar lock can
-    // be a capped-cache sweep mid-`remove_dir_all` on this very directory.
-    // Publishing unguarded could land `rename(temp, dir)` while the sweep's
-    // delete is in flight, returning a path that no longer exists. Spin
-    // briefly — a sweep's delete is short — and publish only under the lock.
-    const ASSETS_LOCK_RETRIES: u32 = 40;
-    const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
-    let mut guard = assets_sidecar_lock(root, &dir_name);
-    for _ in 0..ASSETS_LOCK_RETRIES {
-        if guard.is_some() {
-            break;
-        }
-        std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
-        guard = assets_sidecar_lock(root, &dir_name);
-    }
-    let Some(_guard) = guard else {
-        return Err(Error::from_reason(format!(
-            "GGUF assets sidecar lock for {dir_name} stayed contended for ~2s; refusing to publish unguarded"
-        )));
-    };
     // A cap-refused publish lands at this deterministic same-pid name instead
     // of `dir`: the uuid temp it replaces could never be found again, and the
     // sweep's `assets-live` grammar keeps it unconditionally while this pid
     // lives (never counted toward the cap, never age-deleted) — it is a load
     // output. The live dir has no lock of its own; the `{dir_name}.lock`
-    // guard above serializes every check/rename touching it in this process
+    // guard below serializes every check/rename touching it in this process
     // because only the sidecar for `identity` can ever produce it.
     let live_dir_name = format!(
         ".mlx-qwen4-assets-live-{}-{}",
@@ -250,19 +230,79 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
             let _ = file.set_modified(std::time::SystemTime::now());
         }
     };
+    const ASSETS_LOCK_RETRIES: u32 = 40;
+    const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+    // The hit path never needs the exclusive lock: a `complete` dir is a
+    // load output a model may keep opening for the whole process lifetime
+    // (recency stamping only marks hits, so an idle-but-live model would
+    // otherwise watch the capped LRU sweep delete its tokenizer dir out
+    // from under it), so the hit leases `dir` — registered in-process and
+    // pinned cross-process by a LOCK_SH on the sidecar lock file, which
+    // every deleter's LOCK_EX try-flock loses to. Winning SH before any
+    // deleter's EX means the dir cannot be mid-delete now; a recheck under
+    // the lease catches a dir that vanished before the lease landed. A
+    // foreign-held EX makes the lease fail — fall through to the exclusive
+    // publish path, which spins on the same lock and either hits `complete`
+    // under EX or republishes.
     if dir.join("complete").exists() {
-        // Stamp recency on hits so the native-GGUF sweep's LRU never eats a
-        // live sidecar directory; the held lock blocks that same sweep.
-        stamp_complete(&dir.join("complete"));
-        return Ok(dir);
+        let mut leased = false;
+        for _ in 0..ASSETS_LOCK_RETRIES {
+            if native_gguf_lease_in_use(root, &dir, Some(&dir_name), None) {
+                leased = true;
+                break;
+            }
+            std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
+        }
+        if leased {
+            if dir.join("complete").exists() {
+                stamp_complete(&dir.join("complete"));
+                return Ok(dir);
+            }
+            // The dir vanished before the lease landed: drop the stale
+            // registration (it would pin the lock file against same-key
+            // republishes) and fall through to the exclusive publish path.
+            native_gguf_unlease_in_use(&dir);
+        }
     }
     if live_dir.join("complete").exists() {
         // The completed refused publish from an earlier load in this
         // process; reuse it rather than rebuilding (and rather than
         // republishing — moving the path out from under a live reader).
+        // Live dirs have no lock file and are already pid-gated, so this
+        // lease is registry-only.
+        native_gguf_lease_in_use(root, &live_dir, None, None);
         stamp_complete(&live_dir.join("complete"));
         return Ok(live_dir);
     }
+    // Contention here is not an ordinary cache miss: a busy sidecar lock can
+    // be a capped-cache sweep mid-`remove_dir_all` on this very directory.
+    // Publishing unguarded could land `rename(temp, dir)` while the sweep's
+    // delete is in flight, returning a path that no longer exists. Spin
+    // briefly — a sweep's delete is short — and publish only under the lock.
+    let mut guard = assets_sidecar_lock(root, &dir_name);
+    for _ in 0..ASSETS_LOCK_RETRIES {
+        if guard.is_some() {
+            break;
+        }
+        std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
+        guard = assets_sidecar_lock(root, &dir_name);
+    }
+    let Some(mut guard) = guard else {
+        return Err(Error::from_reason(format!(
+            "GGUF assets sidecar lock for {dir_name} stayed contended for ~2s; refusing to publish unguarded"
+        )));
+    };
+    // Recheck under the exclusive lock — a publish may have completed while
+    // the lease attempts and lock spin were running.
+    if dir.join("complete").exists() {
+        // `lease_in_use` adopts the held EX fd by downgrading it to SH.
+        let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name), guard.take());
+        stamp_complete(&dir.join("complete"));
+        return Ok(dir);
+    }
+    // A dir registered earlier that lost its marker anyway is debris:
+    // release its lease before a republish replaces it.
+    native_gguf_unlease_in_use(&dir);
     // Publish a complete directory in one rename while the sidecar lock is
     // held: the sweep cannot delete `dir` between the rename and the return.
     // Simultaneous loads serialize on the lock rather than racing temp dirs.
@@ -301,11 +341,14 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
                 // refusal) would have hit the check above — so it was never
                 // a load output and is safe to clear.
                 if live_dir.exists() {
+                    // Release any stale lease first — a registered remnant
+                    // was in use once, but a markerless one is debris.
+                    native_gguf_unlease_in_use(&live_dir);
                     std::fs::remove_dir_all(&live_dir)
                         .map_err(|e| Error::from_reason(e.to_string()))?;
                 }
                 std::fs::rename(&temp, &live_dir).map_err(|e| Error::from_reason(e.to_string()))?;
-                return Ok(live_dir);
+                return Ok(live_dir.clone());
             }
             return Ok(published);
         }
@@ -314,13 +357,24 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         {
             return Err(Error::from_reason(e.to_string()));
         }
-        Ok(dir)
+        Ok(dir.clone())
     })();
     // Remove the temp in every outcome that did not rename it away (to `dir`
     // or `live_dir`); a refusal never returns the temp path itself anymore,
     // so a surviving `Ok(temp)` result cannot occur.
     if result.as_ref().is_ok_and(|path| *path != temp) || result.is_err() {
         let _ = std::fs::remove_dir_all(&temp);
+    }
+    // Whatever path the caller will hand to the model is a load output:
+    // lease it for the process lifetime (see the hit path above). `dir`
+    // adopts the still-held EX fd as its shared lease; `live_dir` has no
+    // lock file, so its lease is registry-only.
+    if let Ok(path) = &result {
+        if *path == dir {
+            let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name), guard.take());
+        } else if *path == live_dir {
+            native_gguf_lease_in_use(root, &live_dir, None, None);
+        }
     }
     result
 }
@@ -717,8 +771,18 @@ mod tests {
         );
         drop(sidecar_guard);
 
-        // The mutex was the only thing protecting the aged dir: unlocked,
-        // the sweep's capped-LRU pass deletes it.
+        // The returned dir is now leased as in-use (a loaded model may hold
+        // the path for the whole process lifetime): the sweep's capped-LRU
+        // pass skips it even unlocked.
+        sweep_native_gguf_cache(&cache, "no-such-key");
+        assert!(
+            dir.join("complete").is_file(),
+            "an in-use leased sidecar survives the capped-LRU sweep"
+        );
+
+        // Releasing the lease restores normal eviction: the next pass
+        // deletes the aged dir.
+        native_gguf_unlease_in_use(&dir);
         sweep_native_gguf_cache(&cache, "no-such-key");
         assert!(!dir.exists());
         fs::remove_dir_all(root).unwrap();
