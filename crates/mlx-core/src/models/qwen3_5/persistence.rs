@@ -1309,7 +1309,7 @@ pub(crate) enum ClefResidency {
     /// 9B/27B CLEF shapes: 1.27-1.29x end to end over dense bf16 at half the
     /// resident memory, where every weight-only packed route (affine qmm, tiled
     /// a8g64/q4k, per-group W8A8) is slower than dense bf16 from M >= 256.
-    /// Needs GPU gen >= 17 (the int8 kernels).
+    /// Needs the NAX tensor ops (the int8 kernels are `mpp::tensor_ops`).
     Sym8,
     /// Dequantize to dense bf16 and run MLX's bf16 GEMM.
     Bf16,
@@ -1361,11 +1361,14 @@ fn clef_sym8_transform(
     }))
 }
 
-/// A quantized checkpoint on a gen >= 17 GPU takes `Sym8`; everything else
-/// (older GPU, or an unquantized checkpoint, whose bf16 weights are the
-/// acceptance ground truth) takes `Bf16`.
-pub(crate) fn resolve_clef_residency(is_quantized: bool, gpu_gen: i32) -> ClefResidency {
-    if is_quantized && gpu_gen >= 17 {
+/// A quantized checkpoint on a device that can run the NAX tensor ops takes
+/// `Sym8`; everything else (no NAX — older GPU, a gen-17 `p` part, or a
+/// runtime below macOS 26.2, see `metal::is_nax_available` — or an
+/// unquantized checkpoint, whose bf16 weights are the acceptance ground
+/// truth) takes `Bf16`. The int8 W8A8 kernels have no dense fallback, so
+/// the generation number alone is not the right gate.
+pub(crate) fn resolve_clef_residency(is_quantized: bool, nax_available: bool) -> ClefResidency {
+    if is_quantized && nax_available {
         ClefResidency::Sym8
     } else {
         ClefResidency::Bf16
@@ -2881,7 +2884,7 @@ async fn load_with_thread_impl(
 
                 let clef_residency = clef.then(|| {
                     resolve_clef_residency(quantized, unsafe {
-                        mlx_sys::mlx_gpu_architecture_gen()
+                        mlx_sys::mlx_metal_is_nax_available()
                     })
                 });
 
@@ -5714,12 +5717,14 @@ mod tests {
     }
 
     #[test]
-    fn clef_residency_defaults_to_sym8_on_quantized_gen17() {
+    fn clef_residency_defaults_to_sym8_only_with_nax() {
         use ClefResidency::*;
-        assert_eq!(resolve_clef_residency(true, 17), Sym8);
-        assert_eq!(resolve_clef_residency(true, 18), Sym8);
-        assert_eq!(resolve_clef_residency(true, 16), Bf16);
-        assert_eq!(resolve_clef_residency(false, 17), Bf16);
+        assert_eq!(resolve_clef_residency(true, true), Sym8);
+        // No NAX (gen < 17, a gen-17 `p` part, or a pre-26.2 runtime): the
+        // int8 kernels cannot run, so the quantized checkpoint stays bf16.
+        assert_eq!(resolve_clef_residency(true, false), Bf16);
+        assert_eq!(resolve_clef_residency(false, true), Bf16);
+        assert_eq!(resolve_clef_residency(false, false), Bf16);
     }
 
     /// Deterministic `[n, k]` bf16 weight with per-row outliers; `None` when

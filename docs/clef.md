@@ -36,9 +36,11 @@ kernels:
 | `sym8` | int8 `[N,K]` weight + f32 `[N]` per-output-channel scale | int8 W8A8 (per-token activation quant) |
 | `bf16` | dense bf16                                               | MLX bf16 GEMM                          |
 
-`sym8` is taken for a quantized checkpoint on a gen >= 17 GPU (M5 and later)
-and `bf16` otherwise (older GPU, or an unquantized checkpoint, which is left
-as stored). Measured on an M5 Max at the 9B and 27B CLEF projection shapes,
+`sym8` is taken for a quantized checkpoint when the device can run the NAX
+tensor ops (M5-class GPUs on macOS 26.2 or later; the int8 kernels are
+`mpp::tensor_ops` with no dense fallback) and `bf16` otherwise (no NAX, or an
+unquantized checkpoint, which is left as stored). Measured on an M5 Max at
+the 9B and 27B CLEF projection shapes,
 the sym8 GEMM alone is 1.3-1.8x faster than the dense bf16 GEMM at every `M`
 from 128 to 1024, while every weight-only packed route (affine qmm, the tiled
 `a8g64@t64` / `q4k@t64` kernels, per-group W8A8) is slower than dense bf16
