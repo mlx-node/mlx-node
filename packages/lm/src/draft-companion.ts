@@ -97,7 +97,14 @@ export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir
   // linked entry.
   if (resolvedDir !== modelDir) {
     roots.push(resolvedDir);
-    if (modelsDir === undefined && !isGguf) roots.push(dirname(resolvedDir));
+    if (!isGguf) {
+      // A symlinked model DIRECTORY resolves to the target itself: the
+      // companion beside the real checkpoint lives in the target's parent,
+      // which an explicit modelsDir must not suppress — callers pass the
+      // symlink's store while the real dir can live outside it.
+      const resolvedParent = dirname(resolvedDir);
+      if (!roots.includes(resolvedParent)) roots.push(resolvedParent);
+    }
   }
   // A sibling config identifies a downloaded model repository. Its parent
   // can hold the shared companion; a standalone GGUF's containing directory

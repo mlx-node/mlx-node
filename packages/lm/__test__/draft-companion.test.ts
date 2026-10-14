@@ -109,6 +109,27 @@ describe('DFlash2 companion discovery', () => {
     }
   });
 
+  it('searches beside a symlinked model directory even with an explicit models dir', () => {
+    // Production callers pass modelsDir — the symlink's store — while the
+    // real checkpoint dir can live outside it. The companion beside the real
+    // target is found through dirname(resolvedDir), which the explicit
+    // modelsDir must not suppress.
+    const external = mkdtempSync(join(tmpdir(), 'mlx-draft-external-dir-'));
+    try {
+      const realTarget = join(external, 'real-model');
+      mkdirSync(realTarget);
+      writeFileSync(join(realTarget, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      writeDraft(join(external, 'Qwen3.8-27B-DFlash2'));
+      const link = join(root, 'qwen3.8-27b-link');
+      symlinkSync(realTarget, link);
+      expect(findDFlash2Draft(link, 'qwen3_5', root)).toBe(
+        join(realpathSync(external), 'Qwen3.8-27B-DFlash2'),
+      );
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
   it('ignores incomplete, empty, and wrong-architecture companion weights', () => {
     writeDraft();
     rmSync(join(draft, 'model.safetensors'));
