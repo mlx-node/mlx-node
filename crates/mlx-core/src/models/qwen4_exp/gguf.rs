@@ -274,11 +274,17 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
             // The completed refused publish from an earlier load in this
             // process; reuse it rather than rebuilding (and rather than
             // republishing — moving the path out from under a live reader).
-            // Live dirs have no lock file and are already pid-gated, so this
-            // lease is registry-only.
+            // Live dirs have no lock file, so this lease is registry-only.
+            // Lease BEFORE the marker recheck: the sweep can now reclaim an
+            // unleased live dir, so the lease must land first and the
+            // recheck decides whether the dir still exists — the same
+            // vanished-under-lease pattern the `dir` hit path uses above.
             native_gguf_lease_in_use(root, &candidate, None);
-            stamp_complete(&candidate.join("complete"));
-            return Ok(candidate);
+            if candidate.join("complete").exists() {
+                stamp_complete(&candidate.join("complete"));
+                return Ok(candidate);
+            }
+            native_gguf_unlease_in_use(&candidate);
         }
         // Generations are allocated densely — the first missing one ends the
         // search.

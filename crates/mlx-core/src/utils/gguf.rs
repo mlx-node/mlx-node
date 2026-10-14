@@ -6685,10 +6685,11 @@ const NATIVE_GGUF_ASSETS_TMP_PREFIX: &str = ".mlx-qwen4-assets-tmp-";
 /// `.mlx-qwen4-assets-live-{identity}-{pid}`: a cap-refused tokenizer
 /// sidecar publish promoted to a deterministic same-pid name so later loads
 /// in this process reuse it (the uuid temp name could never be found again).
-/// It is a load output, so the sweep keeps it while the pid lives — never
-/// counted toward the cap, never age-deleted — and only pid death gates its
-/// removal: refused fallback dirs are process-lifetime bounded (the sweep
-/// reaps them on pid death, the latest at process exit).
+/// It is a load output, so the sweep keeps it while the pid lives AND the
+/// lease registry holds a reference — never counted toward the cap, never
+/// age-deleted. Releasing the last reference (a failed load's unlease) makes
+/// it reclaimable; dead-pid dirs are debris either way, so a refused
+/// fallback is bounded by the shorter of lease lifetime and pid lifetime.
 const NATIVE_GGUF_ASSETS_LIVE_PREFIX: &str = ".mlx-qwen4-assets-live-";
 const NATIVE_GGUF_STAGING_INFIX: &str = ".staging-";
 const NATIVE_GGUF_WRITE_PROBE_PREFIX: &str = ".write-probe-";
@@ -7460,8 +7461,9 @@ fn native_gguf_evict_lru(
 /// hands to the loader: `output_dir` on a published admission, or
 /// `staging_dir` itself when eligible LRU eviction cannot make `incoming`
 /// bytes fit — the staged conversion is complete, so refusing only chooses
-/// where it is read from; the refused fallback is process-lifetime bounded,
-/// reclaimed by the dead-pid staging sweep at the latest on process exit.
+/// where it is read from; the refused fallback is bounded by its lease —
+/// reclaimed by the staging sweep once the last registry reference is
+/// released, or by the dead-pid gate at the latest on process exit.
 ///
 /// Sidecar eviction needs the same in-process exclusion as the sweep's
 /// deletion: BSD flock is per-process, so the per-sidecar lock inside
@@ -7666,11 +7668,17 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 // `native_gguf_valid_pid`), and `-g{n}` is the generation a
                 // second same-identity refusal lands on while an earlier
                 // live dir stays leased. A live pid means a load output
-                // this process still reads: keep unconditionally — never
-                // counted toward the cap, never age-deleted. Only a dead
-                // pid makes it debris, so like the assets-tmp names no entry
-                // lock exists for the live name and removal runs directly —
-                // pid death is the whole gate.
+                // this process still reads: keep it while the lease registry
+                // holds a reference — a leased live dir is never counted
+                // toward the cap and never deleted. Once the last reference
+                // is released (a failed load's unlease), the live-pid dir is
+                // reclaimable like debris: `native_gguf_in_use_delete_guard`
+                // serializes the check against a racing leaser so removal
+                // can only observe never-leased or fully-released state.
+                // Only a dead pid or an unleased live pid makes it debris,
+                // so like the assets-tmp names no entry lock exists for the
+                // live name and removal runs directly under the guard —
+                // pid death and the lease registry are the whole gate.
                 let live_suffix = suffix
                     .rsplit_once('-')
                     .map(|(base, tail)| {
@@ -7685,9 +7693,19 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 if let Some((identity, pid_text)) = live_suffix.rsplit_once('-')
                     && native_gguf_is_hex64(identity)
                     && let Some(pid) = native_gguf_valid_pid(pid_text)
-                    && native_gguf_pid_dead(pid)
                 {
-                    reclaimed += native_gguf_remove_logged(&path, "orphaned assets live dir");
+                    if native_gguf_pid_dead(pid) {
+                        reclaimed += native_gguf_remove_logged(&path, "orphaned assets live dir");
+                    } else if pid == std::process::id()
+                        && let Some(_in_use) = native_gguf_in_use_delete_guard(&path)
+                    {
+                        // OUR live pid with no surviving lease: a failed load
+                        // gave the reference back, so the dir is reclaimable.
+                        // A foreign live pid's lease state is not visible to
+                        // this registry — pid liveness stays the whole gate
+                        // for those.
+                        reclaimed += native_gguf_remove_logged(&path, "unleased assets live dir");
+                    }
                 }
                 // A malformed suffix is foreign tooling: keep either way.
                 continue;
@@ -7726,13 +7744,19 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 let dead = native_gguf_pid_dead(pid);
                 // A live-pid staging dir carrying `.complete` is a LOAD
                 // OUTPUT: a cap-refused publish hands it to a loader that
-                // reopens its files later in the process, so the age gate
-                // alone must never delete it while the pid lives. Live-pid
-                // dirs are removable only as mid-write/failed debris —
-                // aged AND markerless. Dead-pid dirs delete regardless of
-                // the marker: their owner is gone, so nothing can still
-                // read from them.
+                // reopens its files later in the process, so a live pid
+                // alone must keep it — the lease state of a FOREIGN pid's
+                // dir is not visible to this registry. For our OWN pid the
+                // registry lease is the live leg: `native_gguf_locked_remove`
+                // refuses removal while any reference remains, and an
+                // unleased `.complete` dir — the lease a failed load
+                // released — is reclaimable debris rather than a permanently
+                // cap-exempt conversion. Markerless live-pid dirs are
+                // removable only as mid-write/failed debris — aged AND
+                // markerless. Dead-pid dirs delete regardless of the marker:
+                // their owner is gone, so nothing can still read from them.
                 if dead
+                    || (pid == std::process::id() && path.join(".complete").is_file())
                     || (native_gguf_mtime_older(meta.modified().ok(), now)
                         && !path.join(".complete").is_file())
                 {
@@ -7741,7 +7765,9 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                     // anyway, but the mtime and marker gates must not stand
                     // on a pre-lock reading — a publish completing between
                     // the snapshot and the flock would land `.complete`
-                    // before the dir is handed to a loader.
+                    // before the dir is handed to a loader, and the lease
+                    // probes inside `native_gguf_locked_remove` are what
+                    // keep a live load output safe.
                     reclaimed += native_gguf_locked_remove(
                         cache_root,
                         &path,
@@ -7750,6 +7776,7 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                         |dir| {
                             let now = std::time::SystemTime::now();
                             native_gguf_pid_dead(pid)
+                                || (pid == std::process::id() && dir.join(".complete").is_file())
                                 || (fs::symlink_metadata(dir)
                                     .and_then(|meta| meta.modified())
                                     .ok()
@@ -8897,7 +8924,8 @@ async fn prepare_native_gguf_inner(
     // enforced again. The published key is exempt from cap eviction, and a
     // refused publish is harmless here: a live-pid staging dir never counts
     // toward the cap, and a completed one (the load output) survives the
-    // staging gate's age check while this process lives.
+    // staging gate while the lease this load registers just below holds a
+    // reference.
     {
         let sweep_root = cache_root.to_path_buf();
         let sweep_key = cache_key.clone();
@@ -9241,13 +9269,18 @@ mod tests {
         assert_eq!(config["dflash_config"]["num_hidden_layers"], 1);
         assert!(!with_draft.join("vision.safetensors").exists());
         fs::remove_file(with_draft.join("draft.safetensors")).unwrap();
-        assert_eq!(
-            prepare_muse_glimmer_native_gguf_in(&input, &cache)
-                .await
-                .unwrap(),
-            with_draft
-        );
-        assert!(with_draft.join("draft.safetensors").is_file());
+        // A still-leased entry is a load output: damaging it does not make
+        // it replaceable, so republish refuses and the load reads a fresh
+        // staging conversion that carries the repaired payload.
+        let refusal = prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            .await
+            .unwrap();
+        assert_ne!(refusal, with_draft);
+        assert!(refusal.join("draft.safetensors").is_file());
+        // The staging load output is leased like a published dir; release
+        // this attempt's references so the test leaves nothing pinned.
+        native_gguf_unlease_in_use(&refusal);
+        native_gguf_unlease_in_use(&with_draft);
 
         // Missing or changed companions never select the previously prepared
         // target-plus-draft cache. Source assets remain untouched throughout.
@@ -9518,11 +9551,16 @@ mod tests {
             output
         );
         fs::remove_file(output.join("vision.safetensors")).unwrap();
-        assert_eq!(
-            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
-            output
-        );
-        assert!(output.join("vision.safetensors").is_file());
+        // A still-leased entry is a load output: republish refuses while the
+        // lease stands, so the load reads a fresh staging conversion that
+        // carries the repaired payload.
+        let refusal = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+        assert_ne!(refusal, output);
+        assert!(refusal.join("vision.safetensors").is_file());
+        // The staging load output is leased like a published dir; release
+        // this attempt's references so the test leaves nothing pinned.
+        native_gguf_unlease_in_use(&refusal);
+        native_gguf_unlease_in_use(&output);
         // Same-length media mutation invalidates the cache by source identity.
         let companion = source.join("mmproj-gemma.gguf");
         let mut bytes = fs::read(&companion).unwrap();
@@ -18106,8 +18144,8 @@ mod tests {
         ));
         fs::create_dir_all(&live_staging).unwrap();
         // A live-pid staging dir WITH `.complete` is a load output an
-        // in-process model reopens later: the age gate alone must never
-        // delete it while the pid lives.
+        // in-process model reopens later: the registry lease keeps it while
+        // the pid lives — once released it is reclaimable debris.
         let live_staging_complete = cache_root.join(format!(
             ".{}.staging-{}-{}",
             native_sweep_entry_name("livedone"),
@@ -18117,6 +18155,7 @@ mod tests {
         fs::create_dir_all(&live_staging_complete).unwrap();
         fs::write(live_staging_complete.join(".complete"), b"marker").unwrap();
         native_sweep_age_dir(&live_staging_complete);
+        native_gguf_lease_in_use(&cache_root, &live_staging_complete, None);
         // A live-pid staging dir WITHOUT `.complete` and older than the
         // grace is mid-write/failed debris: still deleted.
         let live_staging_debris = cache_root.join(format!(
@@ -18233,8 +18272,9 @@ mod tests {
         fs::write(assets_sidecar.join("complete"), b"1").unwrap();
         native_sweep_age_file(&assets_sidecar.join("complete"));
         // A cap-refused sidecar publish promoted to `assets-live`: a load
-        // output, so a live pid keeps it unconditionally — however old, never
-        // counted, never deleted — while a dead pid's copy is orphaned debris.
+        // output, so a live pid keeps it while its lease reference stands —
+        // however old, never counted, never deleted — while a dead pid's
+        // copy is orphaned debris either way.
         let live_assets = cache_root.join(format!(
             ".mlx-qwen4-assets-live-{}-{}",
             "e".repeat(64),
@@ -18243,6 +18283,7 @@ mod tests {
         fs::create_dir_all(&live_assets).unwrap();
         fs::write(live_assets.join("complete"), b"1").unwrap();
         native_sweep_age_dir(&live_assets);
+        native_gguf_lease_in_use(&cache_root, &live_assets, None);
         let dead_assets_live = cache_root.join(format!(
             ".mlx-qwen4-assets-live-{}-{}",
             "f".repeat(64),
@@ -18267,6 +18308,7 @@ mod tests {
         fs::create_dir_all(&live_assets_live_gen).unwrap();
         fs::write(live_assets_live_gen.join("complete"), b"1").unwrap();
         native_sweep_age_dir(&live_assets_live_gen);
+        native_gguf_lease_in_use(&cache_root, &live_assets_live_gen, None);
         // Malformed `assets-live` suffixes are foreign and kept either way.
         let foreign_assets_live = cache_root.join(".mlx-qwen4-assets-live-garbage-123");
         fs::create_dir_all(&foreign_assets_live).unwrap();
@@ -18720,10 +18762,93 @@ mod tests {
             !cache_root.join(entry_name).exists(),
             "nothing may be published over the cap"
         );
+        // The load model keeps its lease for the process lifetime; the test
+        // must not leave the reference behind for other tests.
+        native_gguf_unlease_in_use(&prepared);
+    }
+
+    /// Codex round-7 regression: a refused publish hands the loader a
+    /// completed staging dir that never counts toward the cap. When a
+    /// downstream init failure releases that reference, the dir is
+    /// reclaimable debris — not a permanently cap-exempt conversion the
+    /// sweep keeps until pid death.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_unleased_refusal_staging_is_reclaimed() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0.0000001");
+        let root = NativeSweepTestDir::new("release-refusal");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert!(
+            prepared
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains(NATIVE_GGUF_STAGING_INFIX),
+            "a refused publish must return the staging dir"
+        );
+        // The load failure path: give the attempt's reference back.
+        native_gguf_unlease_in_use(&prepared);
+        assert!(!native_gguf_in_use_dir(&prepared));
+        sweep_native_gguf_cache(&cache_root, "no-such-key");
+        assert!(
+            !prepared.exists(),
+            "an unleased refused staging dir must be reclaimable while the pid lives"
+        );
+    }
+
+    /// Same gate for the qwen4_exp tokenizer fallback: a live-pid
+    /// `assets-live` dir whose last lease reference was released is swept;
+    /// one that is still leased survives however old it is.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_sweep_drops_unleased_assets_live_dir() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0");
+        let root = NativeSweepTestDir::new("live-unlease");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let still_leased = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}",
+            "a".repeat(64),
+            std::process::id()
+        ));
+        fs::create_dir_all(&still_leased).unwrap();
+        fs::write(still_leased.join("complete"), b"1").unwrap();
+        native_sweep_age_dir(&still_leased);
+        native_gguf_lease_in_use(&cache_root, &still_leased, None);
+
+        let released = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}",
+            "b".repeat(64),
+            std::process::id()
+        ));
+        fs::create_dir_all(&released).unwrap();
+        fs::write(released.join("complete"), b"1").unwrap();
+        native_sweep_age_dir(&released);
+        native_gguf_lease_in_use(&cache_root, &released, None);
+        native_gguf_unlease_in_use(&released);
+
+        sweep_native_gguf_cache(&cache_root, "no-such-key");
+        assert!(still_leased.exists(), "a leased live dir must survive");
+        assert!(
+            !released.exists(),
+            "a live-pid live dir whose lease was released is reclaimable"
+        );
+        native_gguf_unlease_in_use(&still_leased);
     }
 
     /// A cap-refused publish hands the loader a completed staging dir that
-    /// never counts toward the cap and is never swept while the pid lives.
+    /// never counts toward the cap and is never swept while its lease holds.
     /// The next prepare misses the entry key again, so it must REUSE the
     /// verified same-pid staging dir — not stage a second conversion and
     /// leak another copy per reload — and must NOT republish it: renaming a
