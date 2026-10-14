@@ -6696,7 +6696,7 @@ const NATIVE_GGUF_CAP_LOCK_NAME: &str = ".mlx-native-gguf-cap.lock";
 /// Optional total size cap for the whole native-GGUF cache root. Parsed like
 /// `cache_limit.rs`'s GiB knobs: a finite float > 0 enables an LRU eviction;
 /// `<=0`, unset or unparseable means unlimited.
-fn native_gguf_cache_cap_bytes() -> Option<u64> {
+pub(crate) fn native_gguf_cache_cap_bytes() -> Option<u64> {
     let raw = std::env::var(NATIVE_GGUF_CACHE_MAX_GB_ENV).ok()?;
     match raw.trim().parse::<f64>() {
         Ok(gib) if gib.is_finite() && gib > 0.0 => Some((gib * NATIVE_GGUF_ONE_GIB).round() as u64),
@@ -6797,6 +6797,77 @@ fn native_gguf_writer_pid_suffix(suffix: &str) -> Option<u32> {
         Some(pid)
     } else {
         None
+    }
+}
+
+/// Lowercase-hex encode raw bytes — the `.complete` marker's
+/// `source_hex=`/`companion_hex=` shape. Hand-rolled so no dependency is
+/// needed for two fields.
+fn native_gguf_hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Strict decode of `native_gguf_hex_encode` output: even length, lowercase
+/// hex only. `None` means malformed — callers must not fall back to a lossy
+/// field on a present-but-corrupt twin (a corrupt optional field means a
+/// corrupt marker).
+fn native_gguf_hex_decode(field: &str) -> Option<Vec<u8>> {
+    let bytes = field.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |byte: u8| -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    };
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
+}
+
+/// Raw OS bytes of a path for the marker's hex fields. On Unix these are the
+/// exact filename bytes (`OsStrExt::as_bytes`), so non-UTF-8 and
+/// newline-bearing paths round-trip losslessly. On non-Unix there is no
+/// exposed raw-bytes API, so `to_string_lossy` is encoded — still
+/// deterministic and no worse than the legacy text field it twins.
+fn native_gguf_os_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+/// Rebuild a path from `native_gguf_os_bytes` output — the inverse of the
+/// encode above. Non-Unix expects valid UTF-8 (the encode was lossy text);
+/// invalid bytes mean a foreign or corrupt field, reported by the caller.
+fn native_gguf_path_from_os_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(|text| PathBuf::from(text))
     }
 }
 
@@ -6960,10 +7031,24 @@ fn native_gguf_entry_stale_reason(
     {
         return Some("outdated cache format");
     }
-    let source = PathBuf::from(match field("source=") {
-        Some(source) => source,
-        None => return Some("unreadable source record"),
-    });
+    // `source_hex=` is the lossless twin of `source=` (raw OS bytes): a
+    // `Path::display` value truncates at the first newline and lossy-mangles
+    // non-UTF-8 names, so the text field alone could stat the wrong file and
+    // delete a healthy entry as "source GGUF is gone". Prefer the hex field;
+    // a present-but-malformed one is a corrupt marker, not license to trust
+    // the lossy text — fail closed as unverifiable.
+    let source = match field("source_hex=") {
+        Some(hex) => match native_gguf_hex_decode(&hex)
+            .and_then(|bytes| native_gguf_path_from_os_bytes(&bytes))
+        {
+            Some(source) => source,
+            None => return Some("corrupt source_hex record"),
+        },
+        None => PathBuf::from(match field("source=") {
+            Some(source) => source,
+            None => return Some("unreadable source record"),
+        }),
+    };
     let source_meta = match fs::metadata(&source) {
         Ok(meta) => meta,
         Err(_) => return Some("source GGUF is gone"),
@@ -6976,17 +7061,28 @@ fn native_gguf_entry_stale_reason(
     if Some(identity.as_str()) != field("source_identity_sha256=").as_deref() {
         return Some("source GGUF changed");
     }
-    let companion = match field("companion=") {
-        Some(companion) => companion,
-        None => return Some("unverifiable companion record"),
+    // `companion_hex=` keeps the "none" sentinel literally; only a real path
+    // is hex-decoded. Present-but-malformed hex fails closed like the source
+    // twin above.
+    let companion = match field("companion_hex=") {
+        Some(hex) if hex == "none" => None,
+        Some(hex) => match native_gguf_hex_decode(&hex)
+            .and_then(|bytes| native_gguf_path_from_os_bytes(&bytes))
+        {
+            Some(companion) => Some(companion),
+            None => return Some("corrupt companion_hex record"),
+        },
+        None => match field("companion=") {
+            Some(companion) if companion == "none" => None,
+            Some(companion) => Some(PathBuf::from(companion)),
+            None => return Some("unverifiable companion record"),
+        },
     };
-    let companion_actual = if companion == "none" {
-        "none".to_string()
-    } else {
-        let path = PathBuf::from(&companion);
-        fs::metadata(&path)
+    let companion_actual = match companion {
+        None => "none".to_string(),
+        Some(path) => fs::metadata(&path)
             .map(|meta| source_file_identity_digest(&path, &meta))
-            .unwrap_or_else(|_| "none".to_string())
+            .unwrap_or_else(|_| "none".to_string()),
     };
     if Some(companion_actual.as_str()) != field("companion_sha256=").as_deref() {
         return Some("companion GGUF changed");
@@ -7095,7 +7191,7 @@ fn native_gguf_evict_lru(
 /// bytes fit — the staged conversion is complete, so refusing only chooses
 /// where it is read from, and the dead-pid staging sweep reclaims it after
 /// this process exits.
-fn native_gguf_publish_with_cap(
+pub(crate) fn native_gguf_publish_with_cap(
     cache_root: &Path,
     staging_dir: &Path,
     output_dir: &Path,
@@ -8061,141 +8157,192 @@ async fn prepare_native_gguf_inner(
         }
     }
 
-    if qwen35_native_cache_is_current(
-        &output_dir,
-        &source_identity_digest,
-        &asset_digest,
-        cache_dtype,
-        family.required_files(),
-    ) && (companion.is_none() || output_dir.join(family.companion_filename()).is_file())
-    {
+    // The verified-current predicate is shared by the published-entry hit
+    // and the same-pid staging reuse below: marker identity plus the
+    // required payloads (and the companion file when one is paired) — the
+    // exact check the publish path used before handing the dir to a loader.
+    let entry_is_current = |dir: &Path| {
+        qwen35_native_cache_is_current(
+            dir,
+            &source_identity_digest,
+            &asset_digest,
+            cache_dtype,
+            family.required_files(),
+        ) && (companion.is_none() || dir.join(family.companion_filename()).is_file())
+    };
+
+    if entry_is_current(&output_dir) {
         // Stamp the marker mtime so the capped-LRU sweep treats this verified
         // hit as recently used instead of a deletion candidate.
         native_gguf_stamp_mtime(&output_dir.join(".complete"));
         return Ok(output_dir);
     }
 
-    // `Some(dir)` means an explicitly authoritative config source to the
-    // converter. A standalone GGUF has no config by design, so pass `None` in
-    // that case: the converter still uses the GGUF parent for optional assets,
-    // while allowing config/tokenizer reconstruction from header metadata.
-    let has_sibling_config = parent.join("config.json").is_file();
-    let config_source_dir = has_sibling_config.then(|| parent.to_string_lossy().into_owned());
-    let staging_dir = cache_root.join(format!(
-        ".{cache_key}.staging-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let conversion = convert_gguf_to_safetensors(GgufConversionOptions {
-        input_path: input_path.to_string_lossy().into_owned(),
-        output_dir: staging_dir.to_string_lossy().into_owned(),
-        config_source_dir,
-        dtype: Some("bfloat16".to_string()),
-        verbose: Some(true),
-        quantize: Some(false),
-        quant_bits: None,
-        quant_group_size: None,
-        quant_mode: None,
-        quant_recipe: None,
-        imatrix_path: None,
-        output_filename: None,
-        vlm_key_prefix: None,
-        quant_mxfp: None,
-        import_k_quants: Some(true),
-        native_qwen35_layout: Some(native_qwen35_layout),
-    })
-    .await;
-    if let Err(error) = conversion {
-        fs::remove_dir_all(&staging_dir).ok();
-        return Err(error);
-    }
+    // Before converting, look for a staging directory this process already
+    // completed: a cap-refused publish returns its staging dir to the
+    // loader, and the next load misses the entry key again — without reuse
+    // every reload re-converts and retains ANOTHER multi-GB copy (live-pid
+    // staging dirs are never counted toward the cap nor swept). Only
+    // same-pid dirs are eligible: a live foreign-pid dir belongs to a peer
+    // mid-write, and a dead-pid dir can be swept mid-load — the sweep reaps
+    // both under the entry lock we currently hold.
+    let staging_prefix = format!(".{cache_key}{NATIVE_GGUF_STAGING_INFIX}");
+    let staging_hit = fs::read_dir(cache_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let suffix = name.strip_prefix(&staging_prefix)?;
+            if native_gguf_writer_pid_suffix(suffix) != Some(std::process::id()) {
+                return None;
+            }
+            let path = entry.path();
+            // `symlink_metadata` classifies no-follow: a staging-named
+            // symlink is foreign and never a reuse candidate.
+            (fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) && entry_is_current(&path))
+                .then_some(path)
+        });
+    // A reused staging dir still flows through admission below: freed cap
+    // space publishes it as the real entry; refusal keeps it in place.
+    let staging_dir = match staging_hit {
+        Some(dir) => dir,
+        None => {
+            // `Some(dir)` means an explicitly authoritative config source to the
+            // converter. A standalone GGUF has no config by design, so pass `None` in
+            // that case: the converter still uses the GGUF parent for optional assets,
+            // while allowing config/tokenizer reconstruction from header metadata.
+            let has_sibling_config = parent.join("config.json").is_file();
+            let config_source_dir =
+                has_sibling_config.then(|| parent.to_string_lossy().into_owned());
+            let staging_dir = cache_root.join(format!(
+                ".{cache_key}.staging-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            let conversion = convert_gguf_to_safetensors(GgufConversionOptions {
+                input_path: input_path.to_string_lossy().into_owned(),
+                output_dir: staging_dir.to_string_lossy().into_owned(),
+                config_source_dir,
+                dtype: Some("bfloat16".to_string()),
+                verbose: Some(true),
+                quantize: Some(false),
+                quant_bits: None,
+                quant_group_size: None,
+                quant_mode: None,
+                quant_recipe: None,
+                imatrix_path: None,
+                output_filename: None,
+                vlm_key_prefix: None,
+                quant_mxfp: None,
+                import_k_quants: Some(true),
+                native_qwen35_layout: Some(native_qwen35_layout),
+            })
+            .await;
+            if let Err(error) = conversion {
+                fs::remove_dir_all(&staging_dir).ok();
+                return Err(error);
+            }
 
-    if let Some(companion) = companion {
-        let result = convert_gguf_to_safetensors(GgufConversionOptions {
-            input_path: companion.to_string_lossy().into_owned(),
-            output_dir: staging_dir.to_string_lossy().into_owned(),
-            config_source_dir: Some(parent.to_string_lossy().into_owned()),
-            dtype: Some("bfloat16".to_string()),
-            verbose: Some(true),
-            quantize: Some(false),
-            quant_bits: None,
-            quant_group_size: None,
-            quant_mode: None,
-            quant_recipe: None,
-            imatrix_path: None,
-            output_filename: Some(family.companion_filename().to_string()),
-            vlm_key_prefix: None,
-            quant_mxfp: None,
-            import_k_quants: Some(true),
-            native_qwen35_layout: None,
-        })
-        .await;
-        if let Err(error) = result {
-            fs::remove_dir_all(&staging_dir).ok();
-            return Err(error);
-        }
-    }
+            if let Some(companion) = companion {
+                let result = convert_gguf_to_safetensors(GgufConversionOptions {
+                    input_path: companion.to_string_lossy().into_owned(),
+                    output_dir: staging_dir.to_string_lossy().into_owned(),
+                    config_source_dir: Some(parent.to_string_lossy().into_owned()),
+                    dtype: Some("bfloat16".to_string()),
+                    verbose: Some(true),
+                    quantize: Some(false),
+                    quant_bits: None,
+                    quant_group_size: None,
+                    quant_mode: None,
+                    quant_recipe: None,
+                    imatrix_path: None,
+                    output_filename: Some(family.companion_filename().to_string()),
+                    vlm_key_prefix: None,
+                    quant_mxfp: None,
+                    import_k_quants: Some(true),
+                    native_qwen35_layout: None,
+                })
+                .await;
+                if let Err(error) = result {
+                    fs::remove_dir_all(&staging_dir).ok();
+                    return Err(error);
+                }
+            }
 
-    let final_asset_digest = match qwen35_native_asset_digest(parent) {
-        Ok(digest) => digest,
-        Err(error) => {
-            fs::remove_dir_all(&staging_dir).ok();
-            return Err(error);
+            let final_asset_digest = match qwen35_native_asset_digest(parent) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    fs::remove_dir_all(&staging_dir).ok();
+                    return Err(error);
+                }
+            };
+            if final_asset_digest != asset_digest
+                || native_gguf_companion_digest(companion).as_ref().ok() != Some(&companion_digest)
+            {
+                fs::remove_dir_all(&staging_dir).ok();
+                return Err(Error::from_reason(
+                    "GGUF sibling config/tokenizer assets changed during native GGUF preparation; \
+                     discarded the staged cache, retry the load"
+                        .to_string(),
+                ));
+            }
+            let final_metadata = match fs::metadata(&input_path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    fs::remove_dir_all(&staging_dir).ok();
+                    return Err(Error::from_reason(format!(
+                        "Failed to restat GGUF path '{}' after native preparation: {error}",
+                        input_path.display()
+                    )));
+                }
+            };
+            if source_file_identity_digest(&input_path, &final_metadata) != source_identity_digest {
+                fs::remove_dir_all(&staging_dir).ok();
+                return Err(Error::from_reason(
+                    "GGUF source changed during native preparation; discarded the staged cache, \
+                     retry the load"
+                        .to_string(),
+                ));
+            }
+            // Record the companion's canonical path (or `none`) so the sweep can
+            // recompute its identity digest; entries published before this field
+            // existed fail verification and rebuild once they age out.
+            let companion_path = companion
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            // `source`/`companion` are `Path::display` text: a newline truncates the
+            // field and non-UTF-8 bytes are lossy, so the sweep could stat the wrong
+            // file and delete a healthy entry. The hex twins carry the raw OS bytes
+            // (Unix; lossy-text bytes elsewhere) and are preferred at parse time.
+            // The marker is additive — the format digit stays put and the text
+            // fields remain for readability and older readers.
+            let source_hex = native_gguf_hex_encode(&native_gguf_os_bytes(&input_path));
+            let companion_hex = companion
+                .map(|path| native_gguf_hex_encode(&native_gguf_os_bytes(path)))
+                .unwrap_or_else(|| "none".to_string());
+            let marker = staging_dir.join(".complete");
+            if let Err(error) = fs::write(
+                marker,
+                format!(
+                    "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_hex={source_hex}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion={companion_path}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n",
+                    input_path.display(),
+                    source_identity_digest,
+                    metadata.len(),
+                    modified,
+                    asset_digest
+                ),
+            ) {
+                fs::remove_dir_all(&staging_dir).ok();
+                return Err(Error::from_reason(format!(
+                    "Failed to finalize native GGUF cache '{}': {error}",
+                    output_dir.display()
+                )));
+            }
+            staging_dir
         }
     };
-    if final_asset_digest != asset_digest
-        || native_gguf_companion_digest(companion).as_ref().ok() != Some(&companion_digest)
-    {
-        fs::remove_dir_all(&staging_dir).ok();
-        return Err(Error::from_reason(
-            "GGUF sibling config/tokenizer assets changed during native GGUF preparation; \
-             discarded the staged cache, retry the load"
-                .to_string(),
-        ));
-    }
-    let final_metadata = match fs::metadata(&input_path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            fs::remove_dir_all(&staging_dir).ok();
-            return Err(Error::from_reason(format!(
-                "Failed to restat GGUF path '{}' after native preparation: {error}",
-                input_path.display()
-            )));
-        }
-    };
-    if source_file_identity_digest(&input_path, &final_metadata) != source_identity_digest {
-        fs::remove_dir_all(&staging_dir).ok();
-        return Err(Error::from_reason(
-            "GGUF source changed during native preparation; discarded the staged cache, \
-             retry the load"
-                .to_string(),
-        ));
-    }
-    // Record the companion's canonical path (or `none`) so the sweep can
-    // recompute its identity digest; entries published before this field
-    // existed fail verification and rebuild once they age out.
-    let companion_path = companion
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "none".to_string());
-    let marker = staging_dir.join(".complete");
-    if let Err(error) = fs::write(
-        marker,
-        format!(
-            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion={companion_path}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n",
-            input_path.display(),
-            source_identity_digest,
-            metadata.len(),
-            modified,
-            asset_digest
-        ),
-    ) {
-        fs::remove_dir_all(&staging_dir).ok();
-        return Err(Error::from_reason(format!(
-            "Failed to finalize native GGUF cache '{}': {error}",
-            output_dir.display()
-        )));
-    }
-
     // The format and asset digest are part of the directory key, so a current
     // cache is never replaced. Only a prior interrupted/corrupt build can
     // occupy this exact path; remove it while both locks are held, then publish
@@ -8253,6 +8400,41 @@ async fn prepare_native_gguf_inner(
         })?;
         output_dir.clone()
     };
+
+    // Any other same-pid staging dir for this key is superseded now:
+    // keeping verified copies would leak one multi-GB dir per reload —
+    // live-pid staging dirs are never counted toward the cap nor swept
+    // while the pid lives. Only `entry_is_current` dirs are removed: a
+    // verified dir is provably a completed duplicate of what the loader
+    // will read, while an unverified one (a failed cleanup, a dir a
+    // hypothetical in-process caller still owns) is left for the sweep's
+    // age gate rather than deleted on sight — belt and braces even though
+    // the process mutex + key lock mean no same-pid writer is mid-publish.
+    // An earlier load may still mmap a dir removed here, but
+    // unlink-under-mmap is safe on Unix. Best effort: failures are logged,
+    // never fatal.
+    if let Ok(entries) = fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix(&staging_prefix) else {
+                continue;
+            };
+            if native_gguf_writer_pid_suffix(suffix) != Some(std::process::id()) {
+                continue;
+            }
+            let path = entry.path();
+            if path == prepared_dir
+                || !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir())
+                || !entry_is_current(&path)
+            {
+                continue;
+            }
+            native_gguf_remove_logged(&path, "superseded by the newly staged conversion");
+        }
+    }
+
     // Re-run the sweep now that the new entry's bytes are on disk: the
     // pre-conversion sweep could not account for them, so the cap must be
     // enforced again. The published key is exempt from cap eviction, and a
@@ -8277,6 +8459,44 @@ async fn prepare_native_gguf_inner(
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+/// Serialize tests that mutate `MLX_NATIVE_GGUF_CACHE_MAX_GB` across the
+/// crate: the prepare mutex only serializes code inside
+/// `prepare_native_gguf_inner`, not the env writes around it. Shared with
+/// `models::qwen4_exp::gguf` asset-sidecar tests.
+#[cfg(all(test, unix))]
+pub(crate) fn sweep_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// RAII guard restoring `MLX_NATIVE_GGUF_CACHE_MAX_GB` on drop; pair with
+/// `sweep_env_lock` for the whole test.
+#[cfg(all(test, unix))]
+pub(crate) struct SweepEnvVar(Option<std::ffi::OsString>);
+
+#[cfg(all(test, unix))]
+impl SweepEnvVar {
+    pub(crate) fn set_max_gb(value: &str) -> Self {
+        let prior = std::env::var_os(NATIVE_GGUF_CACHE_MAX_GB_ENV);
+        unsafe {
+            std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, value);
+        }
+        Self(prior)
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for SweepEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(prior) => std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, prior),
+                None => std::env::remove_var(NATIVE_GGUF_CACHE_MAX_GB_ENV),
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -17148,41 +17368,6 @@ mod tests {
 
     // ── Native GGUF cache sweep tests (issue 173) ───────────────────────────
 
-    /// Serialize tests that mutate `MLX_NATIVE_GGUF_CACHE_MAX_GB`: the prepare
-    /// mutex only serializes code inside `prepare_native_gguf_inner`, not the
-    /// env writes around it.
-    #[cfg(unix)]
-    fn sweep_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    #[cfg(unix)]
-    struct SweepEnvVar(Option<std::ffi::OsString>);
-
-    #[cfg(unix)]
-    impl SweepEnvVar {
-        fn set_max_gb(value: &str) -> Self {
-            let prior = std::env::var_os(NATIVE_GGUF_CACHE_MAX_GB_ENV);
-            unsafe {
-                std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, value);
-            }
-            Self(prior)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for SweepEnvVar {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(prior) => std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, prior),
-                    None => std::env::remove_var(NATIVE_GGUF_CACHE_MAX_GB_ENV),
-                }
-            }
-        }
-    }
-
     #[cfg(unix)]
     struct NativeSweepTestDir(PathBuf);
 
@@ -17862,6 +18047,118 @@ mod tests {
         assert!(
             !cache_root.join(entry_name).exists(),
             "nothing may be published over the cap"
+        );
+    }
+
+    /// A cap-refused publish hands the loader a completed staging dir that
+    /// never counts toward the cap and is never swept while the pid lives.
+    /// The next prepare misses the entry key again, so it must REUSE the
+    /// verified same-pid staging dir — not stage a second conversion and
+    /// leak another copy per reload.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_cap_refused_staging_is_reused_not_duplicated() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0.0000001");
+        let root = NativeSweepTestDir::new("reuse");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let first = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains(NATIVE_GGUF_STAGING_INFIX),
+            "the tiny cap must refuse the first publish, got {}",
+            first.display()
+        );
+        let second = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert_eq!(
+            second, first,
+            "a verified same-pid staging dir is reused, not duplicated"
+        );
+        let staging_count = fs::read_dir(&cache_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(NATIVE_GGUF_STAGING_INFIX))
+            })
+            .count();
+        assert_eq!(staging_count, 1, "no second staging dir may accumulate");
+    }
+
+    /// `Path::display` truncates at a newline and lossy-mangles non-UTF-8
+    /// names, so a `source=` text field can point at a file that does not
+    /// exist — the sweep would then delete a healthy entry as "source GGUF
+    /// is gone". The `source_hex=` twin carries the raw bytes; a
+    /// present-but-malformed hex field is a corrupt marker, not license to
+    /// trust the lossy text.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_marker_hex_paths_survive_newline_source_names() {
+        let root = NativeSweepTestDir::new("hex");
+        let dir = root.path().join("model");
+        fs::create_dir_all(&dir).unwrap();
+        // macOS/Linux permit a newline in a filename; the legacy `source=`
+        // line then ends mid-path.
+        let source = dir.join("multi\nline.gguf");
+        fs::write(&source, b"gguf").unwrap();
+        let cache_root = root.path().join("cache");
+        let entry = cache_root.join(native_sweep_entry_name("hexed"));
+        fs::create_dir_all(&entry).unwrap();
+        let canonical = source.canonicalize().unwrap();
+        let meta = fs::metadata(&canonical).unwrap();
+        let identity = source_file_identity_digest(&canonical, &meta);
+        let assets = qwen35_native_asset_digest(canonical.parent().unwrap()).unwrap();
+        let source_hex = native_gguf_hex_encode(&native_gguf_os_bytes(&canonical));
+        let marker = format!(
+            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_hex={source_hex}\nsource_identity_sha256={identity}\nsize={}\nmodified_ns=1\nassets_sha256={assets}\nlayout=tiled\ncompanion=none\ncompanion_hex=none\ncompanion_sha256=none\ndtype=bf16\n",
+            canonical.display(),
+            meta.len(),
+        );
+        fs::write(entry.join(".complete"), &marker).unwrap();
+
+        let mut digests = NativeGgufSweepDigests::default();
+        assert_eq!(
+            native_gguf_entry_stale_reason(&entry, &mut digests),
+            None,
+            "the hex field must verify the newline-bearing source path"
+        );
+
+        // Drop the hex twins: the truncated text field alone cannot verify.
+        let text_only = marker
+            .lines()
+            .filter(|line| !line.contains("_hex="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(entry.join(".complete"), &text_only).unwrap();
+        let mut digests = NativeGgufSweepDigests::default();
+        assert_eq!(
+            native_gguf_entry_stale_reason(&entry, &mut digests),
+            Some("source GGUF is gone"),
+            "the lossy text field alone truncates at the newline"
+        );
+
+        let corrupt = marker.replace(&format!("source_hex={source_hex}"), "source_hex=zz-not-hex");
+        assert_ne!(corrupt, marker);
+        fs::write(entry.join(".complete"), corrupt).unwrap();
+        let mut digests = NativeGgufSweepDigests::default();
+        assert_eq!(
+            native_gguf_entry_stale_reason(&entry, &mut digests),
+            Some("corrupt source_hex record"),
+            "malformed hex fails closed instead of trusting the text field"
         );
     }
 

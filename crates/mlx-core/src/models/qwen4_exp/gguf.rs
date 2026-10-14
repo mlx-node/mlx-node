@@ -1,7 +1,7 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
-    GgufMetaValue, native_gguf_cache_root, source_file_identity_digest,
-    write_embedded_gpt2_tokenizer,
+    GgufMetaValue, native_gguf_cache_cap_bytes, native_gguf_cache_root,
+    native_gguf_publish_with_cap, source_file_identity_digest, write_embedded_gpt2_tokenizer,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -243,6 +243,19 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         .map_err(|e| Error::from_reason(e.to_string()))?;
         std::fs::write(temp.join("complete"), b"1")
             .map_err(|e| Error::from_reason(e.to_string()))?;
+        // With a cap configured the rename runs inside the shared
+        // count→evict→publish section: admission counts the root under the
+        // root-wide flock, so a sidecar cannot land between a sibling
+        // conversion's admission count and its entry rename. Refusal
+        // returns `Ok(temp)`: the temp already contains `complete`, so the
+        // load reads it in place — and the sweep's `.mlx-qwen4-assets-tmp-`
+        // grammar only ages it out after 24 h. The cap lock nests inside
+        // the sidecar lock, matching `prepare_native_gguf_inner`'s
+        // key-lock → admission-flock order.
+        if let Some(cap) = native_gguf_cache_cap_bytes() {
+            return native_gguf_publish_with_cap(root, &temp, &dir, cap)
+                .map_err(|e| Error::from_reason(e.to_string()));
+        }
         if let Err(e) = std::fs::rename(&temp, &dir)
             && !dir.join("complete").exists()
         {
@@ -250,7 +263,11 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         }
         Ok(dir)
     })();
-    let _ = std::fs::remove_dir_all(&temp);
+    // Keep the temp only when a refused admission returned it as the load
+    // path; every other outcome either renamed it away or failed.
+    if result.as_ref().is_ok_and(|path| *path != temp) || result.is_err() {
+        let _ = std::fs::remove_dir_all(&temp);
+    }
     result
 }
 
@@ -453,6 +470,58 @@ mod tests {
         drop(lock);
         let published = assets_in(&source, &store, &config, &cache).unwrap();
         assert_eq!(published, cache.join(&dir_name));
+        assert!(published.join("complete").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// With `MLX_NATIVE_GGUF_CACHE_MAX_GB` set the sidecar publish runs the
+    /// shared cap-admission section instead of a bare rename: a cap that
+    /// cannot fit the sidecar refuses admission and returns the completed
+    /// temp dir (swept only by the 24 h tmp grammar), while a roomy cap
+    /// still publishes under the versioned name.
+    #[test]
+    fn assets_in_publish_respects_the_cache_cap() {
+        use crate::utils::gguf::{SweepEnvVar, sweep_env_lock};
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let (store, config) = tokenizer_fixture();
+
+        // Tiny cap: admission refuses, the load path is the temp dir, and
+        // nothing is published under the versioned sidecar name.
+        let _env = SweepEnvVar::set_max_gb("0.0000001");
+        let refused = assets_in(&source, &store, &config, &cache).unwrap();
+        let refused_name = refused.file_name().unwrap().to_string_lossy();
+        assert!(
+            refused_name.starts_with(".mlx-qwen4-assets-tmp-"),
+            "a refused admission returns the temp dir, got {}",
+            refused.display()
+        );
+        assert!(refused.join("complete").is_file());
+        assert!(
+            fs::read_dir(&cache).unwrap().flatten().all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mlx-qwen4-assets-v2-")
+                || entry.file_name().to_string_lossy().ends_with(".lock")),
+            "no sidecar dir may be published over the cap"
+        );
+
+        // Roomy cap: the normal publish path still lands.
+        drop(_env);
+        let _env = SweepEnvVar::set_max_gb("64");
+        let published = assets_in(&source, &store, &config, &cache).unwrap();
+        assert_eq!(published.parent(), Some(cache.as_path()));
+        assert!(
+            published
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".mlx-qwen4-assets-v2-")
+        );
         assert!(published.join("complete").is_file());
         fs::remove_dir_all(root).unwrap();
     }

@@ -98,7 +98,7 @@ limit reclaims the allocator freelist and re-polls before erroring.
 | `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
 | `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
-| `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead). Unset, `<=0` or unparseable means unlimited. |
+| `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting). Unset, `<=0` or unparseable means unlimited. |
 | `MLX_QWEN4_IGNORE_MEMORY_PRESSURE` | `=1` skips the macOS bootstrap memory-pressure gate — diagnostic only; the free/file-backed headroom checks still apply. |
 
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
