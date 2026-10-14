@@ -191,8 +191,10 @@ mlx-rs
 outputs
 test-output
 test-integration-output
-Cargo.lock
 *.node
+# Prebuilt MLX tarball cache (crates/mlx-sys/build.rs; CI points
+# MLX_PREBUILT_CACHE_DIR here so rust-cache's target/ cleanup can't touch it).
+/.mlx-prebuilt/
 /docs/superpowers/plans/*.md
 # subagent-driven-development scratch ledger + briefs/reports
 /.superpowers/

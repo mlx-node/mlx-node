@@ -32,6 +32,16 @@
 //      deployment floor. Failures abort the build loudly instead
 //      of shipping a broken pairing.
 //
+// Prebuilt MLX (crates/mlx-sys/build.rs "Prebuilt MLX"): when mlx-sys links
+// a downloaded libmlx.a instead of building it, the baked METAL_PATH is the
+// producer's sentinel `.../mlx-prebuilt/<release_tag>/kernels/mlx.metallib`,
+// which names the release, not a local dir. It resolves to the unpacked
+// artifact `<cache root>/<release_tag>/<triple>/lib/mlx.metallib` (same
+// cache-root rule as build.rs). The mlx-sys OUT_DIR — where
+// paged_attn.metallib still comes from — is then read from the second path
+// the bridge bakes, `<OUT_DIR>/paged_attn.metallib`
+// (`MLX_NODE_PAGED_ATTN_METALLIB` in mlx_paged_dispatch.cpp).
+//
 // Stale dirs are deliberately NOT deleted: they are live cargo cache for
 // other toolchains/branches, and deleting them forces a full MLX rebuild.
 import { readdirSync, readFileSync, statSync, type Stats } from 'node:fs';
@@ -148,17 +158,26 @@ export function resolveTargetRoot(opts: {
 /** The exact mlx-sys build a native addon linked against, read from the addon itself. */
 export interface MetallibBinding {
   /**
-   * The METAL_PATH the addon references at runtime (cmake kernels build-tree
-   * file, path normalized). This is the origin file; `installCopyPath` is a
-   * cmake-install duplicate of it.
+   * 'source': MLX was cmake-built by mlx-sys; `bakedPath` is the kernels
+   * build-tree file. 'prebuilt': mlx-sys linked a downloaded MLX; `bakedPath`
+   * is the unpacked artifact's `lib/mlx.metallib` (there is no second copy,
+   * so `installCopyPath` equals it).
+   */
+  kind: 'source' | 'prebuilt';
+  /**
+   * The mlx.metallib the addon's MLX was built with (path normalized). For
+   * 'source' this is the METAL_PATH origin file and `installCopyPath` its
+   * cmake-install duplicate.
    */
   bakedPath: string;
-  /** `.../mlx-sys-<hash>/out` — OUT_DIR of the bound mlx-sys build. */
+  /** `.../mlx-sys-<hash>/out` — OUT_DIR of the bound mlx-sys build (origin of paged_attn.metallib). */
   outDir: string;
-  /** `.../out/lib` — install dir holding copies of both metallibs. */
+  /** `.../out/lib` — install dir holding copies of both metallibs ('source') or of paged_attn.metallib ('prebuilt'). */
   libDir: string;
-  /** `.../out/lib/mlx.metallib` — cmake-install copy of `bakedPath`. */
+  /** `.../out/lib/mlx.metallib` — cmake-install copy of `bakedPath`; same file as `bakedPath` for 'prebuilt'. */
   installCopyPath: string;
+  /** `mlx-prebuilt-<sha12>` for 'prebuilt'. */
+  prebuiltTag?: string;
 }
 
 /**
@@ -170,52 +189,156 @@ export interface MetallibBinding {
  */
 const BAKED_METAL_PATH_RE = /^(\/.+\/mlx-sys-[0-9a-f]+\/out)\/build\/mlx\/backend\/metal\/kernels\/{1,2}mlx\.metallib$/;
 
+/**
+ * METAL_PATH of a prebuilt libmlx.a: build.rs (`MLX_PREBUILT_EXPORT`) sets
+ * `MLX_METAL_PATH` to `<producer OUT_DIR>/mlx-prebuilt/<release_tag>/kernels`
+ * (it must be a real dir on the producer, MLX writes the metallib there), so
+ * only the tail is meaningful; the prefix is the producer's machine.
+ */
+const PREBUILT_METAL_PATH_RE = /^(?:\/.*)?\/mlx-prebuilt\/(mlx-prebuilt-[0-9a-f]{12})\/kernels\/{1,2}mlx\.metallib$/;
+
+/**
+ * `MLX_NODE_PAGED_ATTN_METALLIB` baked by build.rs into the bridge
+ * (mlx_paged_dispatch.cpp): the OUT_DIR origin of paged_attn.metallib, which
+ * names the mlx-sys build even when the METAL_PATH is a prebuilt sentinel.
+ */
+const PAGED_ORIGIN_RE = /^(\/.+\/mlx-sys-[0-9a-f]+\/out)\/paged_attn\.metallib$/;
+
 /** Longest plausible baked path; bounds the NUL-terminated-string expansion. */
 const MAX_BAKED_PATH_BYTES = 4096;
 
+/** Prebuilt triple the sentinel form is produced for (build.rs builds no other). */
+export const PREBUILT_TRIPLE = 'aarch64-apple-darwin';
+
 /**
- * Extract the baked METAL_PATH from an addon binary. Returns undefined when
- * the binary carries no baked path (Metal not built in); throws when it
- * carries more than one distinct path — that would mean two different MLX
- * builds were linked and no single metallib can be authoritative.
+ * Environment the prebuilt cache location depends on. Mirrors
+ * `prebuilt_cache_root` in crates/mlx-sys/build.rs, which must stay in step:
+ * `MLX_PREBUILT_DIR` (an unpacked dir, used as is) > `MLX_PREBUILT_CACHE_DIR`
+ * > `CARGO_TARGET_DIR` > `CARGO_BUILD_TARGET_DIR` (each `/mlx-prebuilt`) >
+ * `<repo>/target/mlx-prebuilt`. Empty values read as unset, like cargo.
  */
-export function extractBakedMetallibBinding(addonBinary: Buffer): MetallibBinding | undefined {
-  const needle = Buffer.from('mlx.metallib');
-  const bindings = new Map<string, MetallibBinding>();
-  let at = addonBinary.indexOf(needle);
+export interface PrebuiltResolveOptions {
+  env: Record<string, string | undefined>;
+  /** Repository root (`<repo>/target/mlx-prebuilt` is the default cache). */
+  repoRoot: string;
+  triple?: string;
+}
+
+/** `<unpacked prebuilt>/lib/mlx.metallib` for a release tag. */
+export function resolvePrebuiltMetallibPath(releaseTag: string, opts: PrebuiltResolveOptions): string {
+  const nonEmpty = (v: string | undefined): string | undefined => (v !== undefined && v !== '' ? v : undefined);
+  const explicitDir = nonEmpty(opts.env['MLX_PREBUILT_DIR']);
+  if (explicitDir !== undefined) return join(explicitDir, 'lib', 'mlx.metallib');
+  const explicitCache = nonEmpty(opts.env['MLX_PREBUILT_CACHE_DIR']);
+  const targetDir = nonEmpty(opts.env['CARGO_TARGET_DIR']) ?? nonEmpty(opts.env['CARGO_BUILD_TARGET_DIR']);
+  const cacheRoot =
+    explicitCache ??
+    (targetDir !== undefined ? join(targetDir, 'mlx-prebuilt') : join(opts.repoRoot, 'target', 'mlx-prebuilt'));
+  return join(cacheRoot, releaseTag, opts.triple ?? PREBUILT_TRIPLE, 'lib', 'mlx.metallib');
+}
+
+/** Every NUL-terminated C string in `binary` containing `needle`, deduplicated. */
+function bakedStringsContaining(binary: Buffer, needle: string): string[] {
+  const bytes = Buffer.from(needle);
+  const found = new Set<string>();
+  let at = binary.indexOf(bytes);
   while (at !== -1) {
     // Expand the hit to its enclosing NUL-terminated C string (bounded: a
     // hit inside non-string data must not walk megabytes backwards).
     let start = at;
     const startFloor = Math.max(0, at - MAX_BAKED_PATH_BYTES);
-    while (start > startFloor && addonBinary[start - 1] !== 0) start--;
-    let end = at + needle.length;
-    const endCap = Math.min(addonBinary.length, end + MAX_BAKED_PATH_BYTES);
-    while (end < endCap && addonBinary[end] !== 0) end++;
-    const candidate = addonBinary.subarray(start, end).toString('utf-8');
-    const match = BAKED_METAL_PATH_RE.exec(candidate);
-    if (match) {
-      const outDir = match[1]!;
-      const libDir = join(outDir, 'lib');
-      bindings.set(candidate, {
-        // normalize() collapses the `kernels//mlx.metallib` double slash
-        bakedPath: normalize(candidate),
-        outDir,
-        libDir,
-        installCopyPath: join(libDir, 'mlx.metallib'),
-      });
-    }
-    at = addonBinary.indexOf(needle, at + needle.length);
+    while (start > startFloor && binary[start - 1] !== 0) start--;
+    let end = at + bytes.length;
+    const endCap = Math.min(binary.length, end + MAX_BAKED_PATH_BYTES);
+    while (end < endCap && binary[end] !== 0) end++;
+    found.add(binary.subarray(start, end).toString('utf-8'));
+    at = binary.indexOf(bytes, at + bytes.length);
   }
-  if (bindings.size === 0) return undefined;
-  if (bindings.size > 1) {
+  return [...found];
+}
+
+/**
+ * Extract the baked MLX binding from an addon binary. Returns undefined when
+ * the binary carries no baked METAL_PATH (Metal not built in); throws when it
+ * carries more than one distinct path — that would mean two different MLX
+ * builds were linked and no single metallib can be authoritative — or when a
+ * prebuilt sentinel comes without the bridge's paged_attn.metallib origin
+ * (the only pointer to the mlx-sys OUT_DIR in that mode).
+ *
+ * `prebuilt` is needed to resolve the sentinel form; without it a prebuilt
+ * addon throws.
+ */
+export function extractBakedMetallibBinding(
+  addonBinary: Buffer,
+  prebuilt?: PrebuiltResolveOptions,
+): MetallibBinding | undefined {
+  const metalPaths = bakedStringsContaining(addonBinary, 'mlx.metallib').filter(
+    (s) => BAKED_METAL_PATH_RE.test(s) || PREBUILT_METAL_PATH_RE.test(s),
+  );
+  if (metalPaths.length === 0) return undefined;
+  if (metalPaths.length > 1) {
     throw new Error(
-      `[build.ts metallib gate] the addon bakes ${bindings.size} distinct METAL_PATH strings — ` +
+      `[build.ts metallib gate] the addon bakes ${metalPaths.length} distinct METAL_PATH strings — ` +
         `cannot bind a single metallib to it:\n` +
-        [...bindings.keys()].map((p) => `  ${p}`).join('\n'),
+        metalPaths.map((p) => `  ${p}`).join('\n'),
     );
   }
-  return bindings.values().next().value;
+  const pagedOrigins = bakedStringsContaining(addonBinary, 'paged_attn.metallib')
+    .map((s) => PAGED_ORIGIN_RE.exec(s)?.[1])
+    .filter((s): s is string => s !== undefined);
+  if (pagedOrigins.length > 1) {
+    throw new Error(
+      `[build.ts metallib gate] the addon bakes ${pagedOrigins.length} distinct paged_attn.metallib ` +
+        `origins — cannot bind a single mlx-sys build to it:\n` +
+        pagedOrigins.map((p) => `  ${p}`).join('\n'),
+    );
+  }
+  const pagedOutDir = pagedOrigins[0];
+  const metalPath = metalPaths[0]!;
+
+  const sourceMatch = BAKED_METAL_PATH_RE.exec(metalPath);
+  if (sourceMatch) {
+    const outDir = sourceMatch[1]!;
+    if (pagedOutDir !== undefined && pagedOutDir !== outDir) {
+      throw new Error(
+        `[build.ts metallib gate] the addon's METAL_PATH names the mlx-sys build ${outDir} but its ` +
+          `paged_attn.metallib origin names ${pagedOutDir} — two different mlx-sys builds were linked.`,
+      );
+    }
+    const libDir = join(outDir, 'lib');
+    return {
+      kind: 'source',
+      // normalize() collapses the `kernels//mlx.metallib` double slash
+      bakedPath: normalize(metalPath),
+      outDir,
+      libDir,
+      installCopyPath: join(libDir, 'mlx.metallib'),
+    };
+  }
+
+  const releaseTag = PREBUILT_METAL_PATH_RE.exec(metalPath)![1]!;
+  if (pagedOutDir === undefined) {
+    throw new Error(
+      `[build.ts metallib gate] the addon links prebuilt MLX ${releaseTag} (METAL_PATH ${metalPath}) ` +
+        `but bakes no paged_attn.metallib origin (MLX_NODE_PAGED_ATTN_METALLIB), so the mlx-sys build ` +
+        `that produced it cannot be identified. The bridge predates prebuilt support; re-run the native build.`,
+    );
+  }
+  if (prebuilt === undefined) {
+    throw new Error(
+      `[build.ts metallib gate] the addon links prebuilt MLX ${releaseTag}, but no environment was ` +
+        `given to resolve its unpacked location.`,
+    );
+  }
+  const metallibPath = resolvePrebuiltMetallibPath(releaseTag, prebuilt);
+  return {
+    kind: 'prebuilt',
+    bakedPath: metallibPath,
+    outDir: pagedOutDir,
+    libDir: join(pagedOutDir, 'lib'),
+    installCopyPath: metallibPath,
+    prebuiltTag: releaseTag,
+  };
 }
 
 export interface SelectedMetallib {
@@ -223,8 +346,12 @@ export interface SelectedMetallib {
   outDir: string;
   libDir: string;
   metallibPath: string;
-  /** 'baked' = authoritative binding from the addon binary; 'scan' = heuristic fallback. */
-  source: 'baked' | 'scan';
+  /**
+   * 'baked' = authoritative binding from the addon binary (MLX built by this
+   * mlx-sys run); 'prebuilt' = authoritative binding to a downloaded MLX
+   * release; 'scan' = heuristic fallback.
+   */
+  source: 'baked' | 'prebuilt' | 'scan';
 }
 
 /**
@@ -280,9 +407,24 @@ export function selectMetallib(opts: {
    */
   strict?: boolean;
   warn?: (msg: string) => void;
+  /** Needed to resolve a prebuilt-MLX addon; see {@link PrebuiltResolveOptions}. */
+  prebuilt?: PrebuiltResolveOptions;
 }): SelectedMetallib {
   const warn = opts.warn ?? (() => {});
-  const binding = extractBakedMetallibBinding(opts.addonBinary);
+  const binding = extractBakedMetallibBinding(opts.addonBinary, opts.prebuilt);
+  if (binding?.kind === 'prebuilt') {
+    // One file only: the unpacked release artifact. Its sibling
+    // paged_attn.metallib still comes from the mlx-sys OUT_DIR.
+    if (statSize(binding.bakedPath) === undefined) {
+      throw new Error(
+        `[build.ts metallib gate] ${opts.addonPath} links prebuilt MLX ${binding.prebuiltTag} ` +
+          `(mlx-sys build ${binding.outDir}), but ${binding.bakedPath} does not exist. The prebuilt ` +
+          `cache was removed, or MLX_PREBUILT_DIR / MLX_PREBUILT_CACHE_DIR / CARGO_TARGET_DIR differ ` +
+          `from the cargo build's environment; re-run the native build with the same environment.`,
+      );
+    }
+    return { outDir: binding.outDir, libDir: binding.libDir, metallibPath: binding.bakedPath, source: 'prebuilt' };
+  }
   if (binding) {
     const bakedSize = statSize(binding.bakedPath);
     const installSize = statSize(binding.installCopyPath);

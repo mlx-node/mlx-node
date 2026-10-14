@@ -182,6 +182,8 @@ mlx-node/
 
 `vp run build:native` is the **canonical native build** — runs the napi-rs pipeline through `packages/core/build.ts` (executed via `oxnode`). Running `cargo build` directly does **not** produce the `.node` addon.
 
+`crates/mlx-sys/build.rs` links upstream MLX from a prebuilt release artifact (`libmlx.a` + headers + `mlx.metallib`, pinned in `crates/mlx-sys/mlx-prebuilt.json`, downloaded once per machine into `target/mlx-prebuilt/`) when the submodule matches the pin, and otherwise cmake-builds the submodule (~10 min per profile). The bridge, its preambles and `paged_attn.metallib` are always built from source. Knobs and bump procedure: [mlx-fork.md](mlx-fork.md) "Prebuilt MLX".
+
 ## Adding a new native operation
 
 1. Add FFI declaration in `crates/mlx-sys/src/lib.rs`.

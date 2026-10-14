@@ -219,11 +219,17 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     profile,
     strict,
     warn: (msg) => console.warn(msg),
+    // A prebuilt-MLX addon (crates/mlx-sys/build.rs "Prebuilt MLX") bakes a
+    // release sentinel instead of a local path; the unpacked artifact is
+    // found by the same env rule build.rs used.
+    prebuilt: { env: process.env, repoRoot: join(__dirname, '../..'), triple },
   });
   console.log(
-    picked.source === 'baked'
-      ? `Metallib bound via the addon's baked METAL_PATH: ${picked.metallibPath}`
-      : `Metallib selected by directory scan (no baked METAL_PATH): ${picked.metallibPath}`,
+    {
+      baked: `Metallib bound via the addon's baked METAL_PATH: ${picked.metallibPath}`,
+      prebuilt: `Metallib bound via the addon's prebuilt-MLX sentinel: ${picked.metallibPath}`,
+      scan: `Metallib selected by directory scan (no baked METAL_PATH): ${picked.metallibPath}`,
+    }[picked.source],
   );
 
   // Hard gates: never ship a truncated or stale-pin metallib (wrong kernels
