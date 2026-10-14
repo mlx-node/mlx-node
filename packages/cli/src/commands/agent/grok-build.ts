@@ -852,6 +852,31 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
         }
       })();
     const baseReclaimable = live !== undefined && !selectsDest;
+    // The same protection covers an override selecting ANY managed entry:
+    // an older versioned binary named by $MLX_AGENT_BIN (directly or via a
+    // symlink) is just as unlaunchable when swept. External overrides live
+    // outside this directory — the sweep never reaches them. Compare in
+    // BOTH path spaces: realpath resolves the override's parent components
+    // too (/var → /private/var on macOS), so a symlinked target matches only
+    // in the canonical space while a direct path matches only textually.
+    if (envBin !== undefined) {
+      const dirs = new Set([dirname(dest)]);
+      try {
+        dirs.add(realpathSync(dirname(dest)));
+      } catch {
+        // managed dir itself unreadable — textual form only
+      }
+      const abs = resolve(envBin);
+      let real = '';
+      try {
+        real = realpathSync(abs);
+      } catch {
+        // missing or dangling override — only the textual form can match
+      }
+      for (const p of [abs, real]) {
+        if (p.length > 0 && dirs.has(dirname(p))) keep.add(basename(p));
+      }
+    }
     try {
       const entries = readdirSync(dirname(dest));
       const liveLeases: { entry: string; binary: string }[] = [];

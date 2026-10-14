@@ -506,6 +506,46 @@ describe('downloadAgentBinary', () => {
     }
   });
 
+  it('keeps an MLX_AGENT_BIN override selecting an older versioned cache entry', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const savedBin = process.env[MLX_AGENT_BIN_ENV];
+    try {
+      const dest = managedAgentBinPath(home);
+      const versionedName = (tag: string) => join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
+
+      // Pointer on v0.3.0; a leftover v0.2.0 the override does NOT name
+      // plus v0.2.1 that the override selects via a symlink.
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      writeFileSync(versionedName('mlx-agent-v0.2.0'), 'v020');
+      writeFileSync(versionedName('mlx-agent-v0.2.1'), 'v021');
+      const link = join(home, 'agent-link');
+      symlinkSync(versionedName('mlx-agent-v0.2.1'), link);
+      process.env[MLX_AGENT_BIN_ENV] = link;
+
+      mockMirrors(makeTarball(home, 'v040'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
+      // The symlink's target inside the managed cache is a launchable
+      // override — sweeping it would leave $MLX_AGENT_BIN dangling.
+      expect(existsSync(versionedName('mlx-agent-v0.2.1'))).toBe(true);
+      // The entry the override does NOT name is reclaimed as usual.
+      expect(existsSync(versionedName('mlx-agent-v0.2.0'))).toBe(false);
+      expect(existsSync(versionedName('mlx-agent-v0.4.0'))).toBe(true);
+
+      // A DIRECT override pointing at the older versioned file gets the
+      // same protection — not just symlinks.
+      writeFileSync(versionedName('mlx-agent-v0.1.0'), 'v010');
+      process.env[MLX_AGENT_BIN_ENV] = versionedName('mlx-agent-v0.1.0');
+      mockMirrors(makeTarball(home, 'v050'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.5.0');
+      expect(existsSync(versionedName('mlx-agent-v0.1.0'))).toBe(true);
+    } finally {
+      if (savedBin === undefined) delete process.env[MLX_AGENT_BIN_ENV];
+      else process.env[MLX_AGENT_BIN_ENV] = savedBin;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('reuses an already-installed same-tag binary instead of renaming over it', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
