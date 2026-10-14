@@ -7096,6 +7096,47 @@ pub(crate) fn native_gguf_lease_in_use(root: &Path, dir: &Path, key: Option<&str
     true
 }
 
+/// Republish-side companion to `native_gguf_locked_remove` for the callers
+/// that already hold the writer sentinel (`.{key}.lock`) exclusively:
+/// probes the two lease legs — the in-use registry and the `.{key}.lease`
+/// sentinel — before an existing `output_dir` is replaced. `None` means a
+/// loaded model (this or another process) still owns the directory, so the
+/// publish must keep it and hand the load the staging path instead. Hold
+/// the returned guard through the `remove_dir_all` + `rename` so a racing
+/// leaser can only observe the replacement, never straddle it.
+#[allow(clippy::type_complexity)]
+fn native_gguf_output_delete_guard(
+    cache_root: &Path,
+    output_dir: &Path,
+) -> Option<(
+    std::sync::MutexGuard<'static, HashMap<PathBuf, Option<fs::File>>>,
+    Option<fs::File>,
+)> {
+    let registry = native_gguf_in_use_delete_guard(output_dir)?;
+    #[cfg(unix)]
+    {
+        let key = output_dir.file_name()?.to_str()?;
+        let lease_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(cache_root.join(native_gguf_lease_name(key)))
+            .ok()?;
+        // SAFETY: `lease_file` owns the descriptor across this try-flock;
+        // losing it means a loaded model holds the lease — keep the dir.
+        if unsafe { libc::flock(lease_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return None;
+        }
+        Some((registry, Some(lease_file)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cache_root;
+        Some((registry, None))
+    }
+}
+
 /// Best-effort recursive size. `symlink_metadata` classifies each entry by
 /// its own link: a symlink counts only its link bytes and is never recursed
 /// or followed, so targets outside the cache root are never counted (or
@@ -7407,7 +7448,17 @@ pub(crate) fn native_gguf_publish_with_cap(
     // Only a prior interrupted/corrupt build can occupy this exact path
     // (format and asset digests are in the key, so a current cache is never
     // replaced). Remove it inside the section so the freed bytes are
-    // accounted before admission is decided.
+    // accounted before admission is decided. A live `.{key}.lease` or an
+    // in-use registration means a loaded model owns the dir — keep it and
+    // return the staging path, exactly as an unreadable root refuses below.
+    let _output_guard = if output_dir.exists() {
+        match native_gguf_output_delete_guard(cache_root, output_dir) {
+            Some(guard) => Some(guard),
+            None => return Ok(staging_dir.to_path_buf()),
+        }
+    } else {
+        None
+    };
     if output_dir.exists() {
         fs::remove_dir_all(output_dir)?;
     }
@@ -8738,23 +8789,37 @@ async fn prepare_native_gguf_inner(
             ))
         })?
     } else {
-        if output_dir.exists() {
-            fs::remove_dir_all(&output_dir).map_err(|error| {
+        // Same lease guard as the capped publish: an existing output_dir a
+        // loaded model still leases is kept, and the load proceeds from
+        // staging (its name owns no sentinel — the registry leg alone pins
+        // it while this process lives).
+        let uncapped_guard = output_dir
+            .exists()
+            .then(|| native_gguf_output_delete_guard(cache_root, &output_dir))
+            .flatten();
+        let prepared = if output_dir.exists() && uncapped_guard.is_none() {
+            staging_dir.clone()
+        } else {
+            if output_dir.exists() {
+                fs::remove_dir_all(&output_dir).map_err(|error| {
+                    fs::remove_dir_all(&staging_dir).ok();
+                    Error::from_reason(format!(
+                        "Failed to remove incomplete native GGUF cache '{}': {error}",
+                        output_dir.display()
+                    ))
+                })?;
+            }
+            fs::rename(&staging_dir, &output_dir).map_err(|error| {
                 fs::remove_dir_all(&staging_dir).ok();
                 Error::from_reason(format!(
-                    "Failed to remove incomplete native GGUF cache '{}': {error}",
+                    "Failed to publish native GGUF cache '{}' atomically: {error}",
                     output_dir.display()
                 ))
             })?;
-        }
-        fs::rename(&staging_dir, &output_dir).map_err(|error| {
-            fs::remove_dir_all(&staging_dir).ok();
-            Error::from_reason(format!(
-                "Failed to publish native GGUF cache '{}' atomically: {error}",
-                output_dir.display()
-            ))
-        })?;
-        output_dir.clone()
+            output_dir.clone()
+        };
+        drop(uncapped_guard);
+        prepared
     };
 
     // Re-run the sweep now that the new entry's bytes are on disk: the
@@ -18861,6 +18926,47 @@ mod tests {
             "nothing may be published over the cap"
         );
         drop(held_lock);
+    }
+
+    /// A published dir a loaded model still leases is never removed to make
+    /// room for a same-key republish: `native_gguf_publish_with_cap` keeps
+    /// it and hands the load the staging dir — the same refusal an
+    /// unreadable root produces. Once the lease drops, the same publish
+    /// replaces the dir normally.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_publish_with_cap_preserves_a_leased_output_dir() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let root = NativeSweepTestDir::new("leased-output");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let entry_name = native_sweep_entry_name("leased");
+        let output = cache_root.join(&entry_name);
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join(".complete"), b"marker").unwrap();
+
+        let staging = cache_root.join(format!(".{entry_name}-staging-leased"));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("model.safetensors"), vec![0_u8; 64]).unwrap();
+        fs::write(staging.join(".complete"), b"marker").unwrap();
+
+        // Admission always fits — only the lease leg is under test.
+        let cap = u64::MAX;
+        assert!(native_gguf_lease_in_use(
+            &cache_root,
+            &output,
+            Some(&entry_name)
+        ));
+
+        let refused = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
+        assert_eq!(refused, staging, "a leased output dir refuses the publish");
+        assert!(output.join(".complete").is_file());
+
+        native_gguf_unlease_in_use(&output);
+        let published = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
+        assert_eq!(published, output);
+        assert!(output.join("model.safetensors").is_file());
     }
 
     /// A busy `native_gguf_sidecar_mutex` means a same-process `assets_in`
