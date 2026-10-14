@@ -3144,21 +3144,31 @@ impl PagedKVCacheAdapter {
         for (layer, (keys, values)) in layer_kv.iter().enumerate() {
             // Match the normal attention write path exactly:
             // [B, H, T, D] -> [B, T, H, D] -> [B*T, H, D]. The final
-            // reshape is load-bearing, not cosmetic. A bare transpose/squeeze
-            // leaves a strided view whose backing Metal buffer is still laid
-            // out as [H, T, D], while `reshape_and_cache` consumes a contiguous
-            // [T, H, D] buffer and has no stride metadata. That silently
-            // transposes tokens and heads for multi-head sliding groups.
+            // `deep_copy` is load-bearing, not cosmetic. A transpose leaves a
+            // strided view whose backing Metal buffer is still laid out as
+            // [H, T, D], and with B == 1 the reshape is only a squeeze that
+            // MLX serves as another view (upstream `collapse_contiguous_dims`
+            // skips unit dims since ml-explore/mlx#4366; before that the
+            // reshape happened to copy). `reshape_and_cache` consumes a
+            // contiguous [T, H, D] buffer and has no stride metadata, so a
+            // view here silently transposes tokens and heads for multi-head
+            // sliding groups. `deep_copy` runs `copy_gpu(General)` into a
+            // fresh row-contiguous buffer regardless of how the view is laid
+            // out.
             let keys = keys
                 .transpose(Some(&[0, 2, 1, 3]))
                 .map_err(|error| format!("restore sliding keys transpose: {error}"))?
                 .reshape(&[live_tokens as i64, num_kv_heads, head_size])
-                .map_err(|error| format!("restore sliding keys reshape: {error}"))?;
+                .map_err(|error| format!("restore sliding keys reshape: {error}"))?
+                .deep_copy()
+                .map_err(|error| format!("restore sliding keys copy: {error}"))?;
             let values = values
                 .transpose(Some(&[0, 2, 1, 3]))
                 .map_err(|error| format!("restore sliding values transpose: {error}"))?
                 .reshape(&[live_tokens as i64, num_kv_heads, head_size])
-                .map_err(|error| format!("restore sliding values reshape: {error}"))?;
+                .map_err(|error| format!("restore sliding values reshape: {error}"))?
+                .deep_copy()
+                .map_err(|error| format!("restore sliding values copy: {error}"))?;
             if let Err(error) =
                 self.update_keys_values(layer as u32, &keys, &values, first_live_position)
             {
