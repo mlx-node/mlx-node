@@ -7038,6 +7038,65 @@ fn native_gguf_in_use(dir: &Path) -> bool {
     native_gguf_in_use_dir(dir)
 }
 
+/// Cache keys with an in-flight conversion: a prepare arms its key before
+/// staging so a concurrent same-process sweep cannot delete a completed-
+/// but-not-yet-leased staging dir or a freshly renamed output in the gap
+/// before the provisional lease registers. The lease takes over once armed;
+/// the guard drops on every error/abort path in between. Cross-process
+/// readers are already covered: their sweeps keep foreign live-pid dirs and
+/// flock is per-open-description across processes.
+fn native_gguf_in_flight_keys() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// `true` when `key` has an in-flight prepare; a contended registry counts
+/// as in-flight — a sweep that cannot read the set keeps the dir.
+fn native_gguf_key_in_flight(key: &str) -> bool {
+    match native_gguf_in_flight_keys().try_lock() {
+        Ok(keys) => keys.contains(key),
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner().contains(key),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+    }
+}
+
+/// RAII half: arms the key in the registry and clears it on drop.
+struct InFlightPrepare {
+    key: String,
+    armed: bool,
+}
+
+impl InFlightPrepare {
+    fn arm(key: String) -> Self {
+        native_gguf_in_flight_keys()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(key.clone());
+        Self { key, armed: true }
+    }
+
+    /// The provisional lease now protects the dir: clear the in-flight flag.
+    fn disarm(mut self) {
+        native_gguf_in_flight_keys()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.key);
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightPrepare {
+    fn drop(&mut self) {
+        if self.armed {
+            native_gguf_in_flight_keys()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&self.key);
+        }
+    }
+}
+
 /// Provisional lease for the prepare-return path: registers a reference the
 /// caller intends to hand to the loader, and releases it on drop unless
 /// `disarm` ran. A prepare cancelled at the post-publish sweep await must
@@ -7403,6 +7462,13 @@ fn native_gguf_locked_remove(
         );
         return 0;
     };
+    // A key mid-conversion is kept: the staging `.complete` output or the
+    // freshly renamed published dir may not carry its lease yet, and the
+    // writer flock cannot serialize same-process sweeps on BSD/macOS where
+    // flock is per-process.
+    if native_gguf_key_in_flight(key) {
+        return 0;
+    }
     let Some(_guard) = native_gguf_try_entry_lock(cache_root, key) else {
         return 0;
     };
@@ -8716,8 +8782,22 @@ async fn prepare_native_gguf_inner(
             let path = entry.path();
             // `symlink_metadata` classifies no-follow: a staging-named
             // symlink is foreign and never a reuse candidate.
-            (fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) && entry_is_current(&path))
-                .then_some(path)
+            if !(fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir())
+                && entry_is_current(&path))
+            {
+                return None;
+            }
+            // Lease before trusting the path: an unleased same-pid `.complete`
+            // dir is sweep debris — a concurrent prepare's pre-mutex sweep
+            // can delete it between this check and the lease. Registry-only
+            // (staging names own no sentinel), rechecked under the lease.
+            let _ = native_gguf_lease_in_use(cache_root, &path, None);
+            if entry_is_current(&path) {
+                Some(path)
+            } else {
+                native_gguf_unlease_in_use(&path);
+                None
+            }
         });
     // A reused staging dir is returned as-is and NEVER republished:
     // `native_gguf_publish_with_cap` would `rename` it to `output_dir`,
@@ -8726,13 +8806,19 @@ async fn prepare_native_gguf_inner(
     // later — unlink-under-mmap protects only already-open mappings, not
     // future opens of the moved path. Forgoing the promotion costs cap
     // space but correctness for live readers wins.
+    //
+    // Arm this key as in-flight BEFORE the conversion path below: from here
+    // until the provisional lease registers, a concurrent same-process sweep
+    // sees the key in-flight and cannot delete the completed-but-unleased
+    // staging output. The flock and process mutex cannot close that gap —
+    // the pre-mutex sweep takes neither, and macOS flock does not exclude
+    // same-process fds.
+    let in_flight = InFlightPrepare::arm(cache_key.clone());
     let staging_dir = match staging_hit {
         Some(dir) => {
-            // Same-pid staging dirs are kept while this process lives, but
-            // registering marks the dir in-use the same way published dirs
-            // are: no lock sentinel exists for staging names, so this lease
-            // is registry-only (key: None).
-            let _ = native_gguf_lease_in_use(cache_root, &dir, None);
+            // The reuse candidate carries its registry lease from the scan
+            // above — the same hand-off the hit fast-path uses for published
+            // entries.
             return Ok(dir);
         }
         None => {
@@ -8979,6 +9065,11 @@ async fn prepare_native_gguf_inner(
         native_gguf_lease_in_use(cache_root, &prepared_dir, None);
         PreparedDirLease::armed(prepared_dir.clone())
     };
+    // The registered lease now protects `prepared_dir`: drop the in-flight
+    // conversion flag so a sweep may reclaim this dir only via the lease
+    // gates. (An in-flight arm without a following lease — impossible: the
+    // exclusive path always reaches this block before returning.)
+    in_flight.disarm();
 
     // Deterministic pause for the cancellation regression: prepare parks
     // here holding an armed lease until the test aborts the task. The sleep
@@ -18961,6 +19052,45 @@ mod tests {
         assert!(
             !dir.exists(),
             "an unleased refused staging dir is reclaimable"
+        );
+    }
+
+    /// Round-11 regression: a concurrent prepare's pre-mutex sweep can reach
+    /// a completed staging dir while its own prepare has not leased it yet
+    /// (macOS flock does not exclude same-process fds). The in-flight key
+    /// registry is the gap's protection: a key mid-conversion keeps its
+    /// completed-but-unleased staging output, and only disarming makes it
+    /// reclaimable.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_sweep_keeps_staging_of_in_flight_key() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0");
+        let root = NativeSweepTestDir::new("in-flight");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let entry = native_sweep_entry_name("inflight");
+        let staged = cache_root.join(format!(
+            ".{entry}.staging-{}-{}",
+            std::process::id(),
+            "bbbbbbbbbbb24bbb8bbbbbbbbbbbbbbb"
+        ));
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join(".complete"), b"marker").unwrap();
+
+        let in_flight = InFlightPrepare::arm(entry.to_string());
+        sweep_native_gguf_cache(&cache_root, "no-such-key");
+        assert!(
+            staged.exists(),
+            "an in-flight key's completed staging dir must survive a sweep"
+        );
+        in_flight.disarm();
+        sweep_native_gguf_cache(&cache_root, "no-such-key");
+        assert!(
+            !staged.exists(),
+            "once disarmed, the unleased staging dir is reclaimable"
         );
     }
 
