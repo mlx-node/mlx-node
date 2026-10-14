@@ -8919,13 +8919,33 @@ async fn prepare_native_gguf_inner(
         prepared
     };
 
+    // Lease the returned dir BEFORE the post-publish sweep: the sweep's
+    // same-pid `.complete` staging gate deletes unleased staging dirs, so a
+    // cap-refused `prepared_dir` must already carry its registry reference
+    // when the sweep runs. A published entry pins its own `.{key}.lease`
+    // sentinel — never the writer lock, or the held SH would brick same-key
+    // republishes (flock is per-open-description, so it excludes this
+    // process too); a cap-refused staging dir registers without a sentinel
+    // (its name owns no lock file). A failed keyed lease fails the load —
+    // never hand a model a directory the sweep can remove.
+    if prepared_dir == output_dir {
+        if !native_gguf_lease_in_use_retry(cache_root, &prepared_dir, &cache_key) {
+            return Err(Error::from_reason(format!(
+                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
+                prepared_dir.display()
+            )));
+        }
+    } else {
+        // Staging/live fallback dirs own no sentinel — registry-only.
+        native_gguf_lease_in_use(cache_root, &prepared_dir, None);
+    }
+
     // Re-run the sweep now that the new entry's bytes are on disk: the
     // pre-conversion sweep could not account for them, so the cap must be
     // enforced again. The published key is exempt from cap eviction, and a
     // refused publish is harmless here: a live-pid staging dir never counts
-    // toward the cap, and a completed one (the load output) survives the
-    // staging gate while the lease this load registers just below holds a
-    // reference.
+    // toward the cap, and a completed one (the load output) is protected by
+    // the lease registered above.
     {
         let sweep_root = cache_root.to_path_buf();
         let sweep_key = cache_key.clone();
@@ -8940,22 +8960,6 @@ async fn prepare_native_gguf_inner(
             Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
             Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
         }
-    }
-    // Lease the returned dir for the loaded model's lifetime: a published
-    // entry pins its own `.{key}.lease` sentinel — never the writer lock,
-    // or the held SH would brick same-key republishes (flock is
-    // per-open-description, so it excludes this process too); a cap-refused
-    // staging dir registers without a sentinel (its name owns no lock file).
-    if prepared_dir == output_dir {
-        if !native_gguf_lease_in_use_retry(cache_root, &prepared_dir, &cache_key) {
-            return Err(Error::from_reason(format!(
-                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
-                prepared_dir.display()
-            )));
-        }
-    } else {
-        // Staging/live fallback dirs own no sentinel — registry-only.
-        native_gguf_lease_in_use(cache_root, &prepared_dir, None);
     }
     Ok(prepared_dir)
 }
