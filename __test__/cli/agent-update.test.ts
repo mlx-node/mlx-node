@@ -22,6 +22,7 @@ import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
 import {
   acquireInstallLock,
+  lockDirPath,
   agentTagFromBinPath,
   agentUpdateStatus,
   launchGrokAgent,
@@ -713,7 +714,7 @@ describe('downloadAgentBinary', () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
-      const dir = `${lock}.d`;
+      const dir = lockDirPath(lock).dir;
       mkdirSync(dir, { recursive: true });
       // A dead member's marker and the legacy single-name lock are both
       // reclaimed unconditionally: the owning pid cannot exist.
@@ -725,13 +726,14 @@ describe('downloadAgentBinary', () => {
       expect(existsSync(lock)).toBe(false);
       const members = readdirSync(dir);
       expect(members).toHaveLength(1);
-      // The surviving marker is our b-<ticket>-<pid>-<seq> socket.
+      // The surviving marker is our b-<ticket>-<pid>-<seq>-<nonce> socket.
       const parts = members[0]!.split('-');
       expect(parts[0]).toBe('b');
-      expect(parts).toHaveLength(4);
+      expect(parts).toHaveLength(5);
       expect(parts[1]!.length > 0 && Number.isInteger(Number(parts[1]))).toBe(true);
       expect(parts[2]).toBe(String(process.pid));
       expect(parts[3]!.length > 0 && Number.isInteger(Number(parts[3]))).toBe(true);
+      expect(parts[4]!).toMatch(/^[0-9a-f]{10}$/);
       releaseInstallLock(lock);
       expect(readdirSync(dir)).toEqual([]);
     } finally {
@@ -745,7 +747,7 @@ describe('downloadAgentBinary', () => {
     async () => {
       const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
       const lock = join(home, 'mlx-agent.lock');
-      const dir = `${lock}.d`;
+      const dir = lockDirPath(lock).dir;
       const servers: Server[] = [];
       // A live member marker must actually hold its endpoint: on unix the
       // marker is a listening socket, on Windows a named pipe plus the
@@ -792,7 +794,7 @@ describe('downloadAgentBinary', () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
-      const dir = `${lock}.d`;
+      const dir = lockDirPath(lock).dir;
       mkdirSync(dir, { recursive: true });
       // A bakery marker left by a crashed holder whose pid the OS handed
       // to us: live pid, dead endpoint — and OLD (a fresh refusal is a
@@ -822,7 +824,7 @@ describe('downloadAgentBinary', () => {
       // the recycled-pid probe there is the derived named pipe.
       const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
       const lock = join(home, 'mlx-agent.lock');
-      const dir = `${lock}.d`;
+      const dir = lockDirPath(lock).dir;
       const servers: Server[] = [];
       const listenAt = async (name: string): Promise<void> => {
         const file = join(dir, name);
@@ -885,7 +887,7 @@ describe('downloadAgentBinary', () => {
   it('keeps a live choose marker in the choosing set even when it is old', { timeout: 20_000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     const lock = join(home, 'mlx-agent.lock');
-    const dir = `${lock}.d`;
+    const dir = lockDirPath(lock).dir;
     const marker = join(dir, `c-${process.pid}-0`);
     let server: Server | undefined;
     try {
@@ -918,7 +920,7 @@ describe('downloadAgentBinary', () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {
       const lock = join(home, 'mlx-agent.lock');
-      const dir = `${lock}.d`;
+      const dir = lockDirPath(lock).dir;
       mkdirSync(dir, { recursive: true });
       // A `c-` marker whose endpoint is not listening: a real contender
       // binds one, so a live pid with a dead endpoint is debris fronting
@@ -957,6 +959,31 @@ describe('downloadAgentBinary', () => {
       const scan = await scanPromise;
       expect(scan.choosing).toBe(true);
       expect(scan.members).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('nonced marker names still sweep on a dead pid and parse as contenders', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dir = join(home, 'lock.d');
+      mkdirSync(dir, { recursive: true });
+      const deadPid = spawnSync(process.execPath, ['-e', '']).pid!;
+      const marker = join(dir, `b-3-${deadPid}-7-deadbeef99`);
+      writeFileSync(marker, '');
+      // A nonce belongs to its dead owner — this name can never be rebound
+      // by a live process, so the sweep's unlink-by-name cannot hit a
+      // replacement mid-flight. Parsing must still see through the suffix.
+      expect(parseLockMarker(`b-3-${deadPid}-7-deadbeef99`)).toMatchObject({
+        member: { ticket: 3, pid: deadPid, seq: 7 },
+        choosing: false,
+      });
+      expect(parseLockMarker(`c-${deadPid}-7-deadbeef99`)).toMatchObject({ choosing: true });
+      expect(parseLockMarker(`b-3-${deadPid}-7`)).toMatchObject({ member: { ticket: 3 } });
+      const scan = await scanMembers(dir);
+      expect(existsSync(marker)).toBe(false);
+      expect(scan).toEqual({ members: [], choosing: false });
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

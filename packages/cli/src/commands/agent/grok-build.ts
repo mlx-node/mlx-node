@@ -937,27 +937,38 @@ function pidAlive(pid: number): boolean {
 const HELD_INSTALL_LOCKS = new Map<string, { server?: Server; marker: string }>();
 /** Per-acquire sequence so one process's concurrent acquires get distinct tickets. */
 let memberSeq = 0;
+/**
+ * Per-process token carried in every marker name. A pid the OS recycles can
+ * collide on pid+seq with a dead owner — it cannot collide on a random
+ * nonce it never knew, so a live process can never rebind a stale marker's
+ * name and the sweep's unlink-by-name cannot remove a live replacement.
+ */
+const instanceNonce = randomBytes(5).toString('hex');
 
 /**
  * The directory advertising lock members. Single-name locks cannot be
  * reclaimed safely — every scheme eventually has to unlink or replace a
  * name a live process may already hold — so the lock is a membership set
- * instead: each contender advertises `b-<ticket>-<pid>-<seq>` (unix
- * socket; marker file backed by a named pipe on Windows) and the lowest ticket among live
- * members holds, where tickets are bakery numbers (`1 + max(seen)`), not
- * pids — pids wrap, so pid order is not arrival order. Nobody ever removes
- * a name owned by a live pid: a crashed member's marker refuses
- * connections and its pid is dead, so deleting it is unconditional and
- * race-free. The directory sits under tmpdir when `.lock.d` would exceed
- * the ~104-byte socket path cap (member name adds ~24 bytes).
+ * instead: each contender advertises `b-<ticket>-<pid>-<seq>-<nonce>`
+ * (unix socket; marker file backed by a named pipe on Windows) and the
+ * lowest ticket among live members holds, where tickets are bakery
+ * numbers (`1 + max(seen)`), not pids — pids wrap, so pid order is not
+ * arrival order. Nobody ever removes a name owned by a live process: the
+ * nonce is drawn fresh per process, so a name a dead pid's recycled
+ * successor could rebind does not exist, and deleting a stale marker by
+ * name is unconditional and race-free. The directory sits under tmpdir
+ * when `.lock.d` would exceed the ~104-byte socket path cap (member name
+ * adds ~32 bytes).
  */
-function lockDirPath(path: string): { dir: string; legacy: string | undefined } {
+/** @internal Exported for tests; {@link acquireInstallLock} is the only production caller. */
+export function lockDirPath(path: string): { dir: string; legacy: string | undefined } {
   const dir = `${path}.d`;
   if (process.platform === 'win32') return { dir, legacy: undefined };
-  // Budget: `dir/m-<pid>-<seq>` must stay under the ~104-byte sun_path cap
-  // (macOS reports over-long socket paths as EINVAL), so an over-long
-  // `.lock.d` — a deep $HOME — is hashed into a short tmpdir name.
-  if (Buffer.byteLength(dir) < 85) return { dir, legacy: path };
+  // Budget: `dir/b-<ticket>-<pid>-<seq>-<nonce>` must stay under the
+  // ~104-byte sun_path cap (macOS reports over-long socket paths as
+  // EINVAL), so an over-long `.lock.d` — a deep $HOME — is hashed into a
+  // short tmpdir name. The name itself runs ~32 bytes worst case.
+  if (Buffer.byteLength(dir) < 70) return { dir, legacy: path };
   const hash = createHash('sha256').update(resolve(dir)).digest('hex').slice(0, 16);
   return { dir: join(tmpdir(), `a-${hash}.d`), legacy: path };
 }
@@ -1136,9 +1147,15 @@ function isDigits(s: string): boolean {
 
 /**
  * Parse one lock-directory entry. Marker layouts:
- *   `b-<ticket>-<pid>-<seq>` — bakery member, kind 'member'
- *   `m-<pid>-<seq>`          — legacy member (this PR's first design), ticket 0
- *   `c-<pid>-<seq>`          — contender mid-choose
+ *   `b-<ticket>-<pid>-<seq>-<nonce>` — bakery member, kind 'member'
+ *   `b-<ticket>-<pid>-<seq>`        — member without an ownership nonce
+ *   `m-<pid>-<seq>`                 — legacy member (this PR's first design), ticket 0
+ *   `c-<pid>-<seq>-<nonce>`         — contender mid-choose
+ *   `c-<pid>-<seq>`                 — contender without an ownership nonce
+ * The nonce ({@link instanceNonce}) makes the name un-rebindable: unlinking
+ * a nonced name can never remove a live process's marker, so sweeps are
+ * free of the stat→unlink replacement race. The nonce-free forms are kept
+ * parseable — a marker written before this change still counts/sweeps.
  * Returns undefined for anything else — foreign files in the directory are
  * not markers and are never swept.
  * @internal Exported for tests; {@link scanMembers} is the production consumer.
@@ -1146,7 +1163,7 @@ function isDigits(s: string): boolean {
 export function parseLockMarker(entry: string): { member: LockMember; choosing: boolean } | undefined {
   const parts = entry.split('-');
   const kind = parts[0];
-  if (kind === 'b' && parts.length === 4) {
+  if (kind === 'b' && (parts.length === 4 || parts.length === 5)) {
     const [ticket, pid, seq] = parts.slice(1);
     if (!isDigits(ticket!) || !isDigits(pid!) || !isDigits(seq!)) return undefined;
     return {
@@ -1154,7 +1171,7 @@ export function parseLockMarker(entry: string): { member: LockMember; choosing: 
       choosing: false,
     };
   }
-  if ((kind === 'm' || kind === 'c') && parts.length === 3) {
+  if ((kind === 'm' && parts.length === 3) || (kind === 'c' && (parts.length === 3 || parts.length === 4))) {
     const [pid, seq] = parts.slice(1);
     if (!isDigits(pid!) || !isDigits(seq!)) return undefined;
     // Legacy m- members predate bakery tickets (ticket 0 — ahead of all b-);
@@ -1183,11 +1200,14 @@ function parseLeaseName(entry: string): { binary: string; pid: number } | undefi
 
 /**
  * Live-and-present state of `dir`. Marker kinds (see {@link parseLockMarker}):
- *   `b-<ticket>-<pid>-<seq>` — a bakery member (socket on unix, file on win).
+ *   `b-<ticket>-<pid>-<seq>-<nonce>` — a bakery member (socket on unix,
+ *                              file on win); the nonce is the owner's
+ *                              per-process token, so no live process can
+ *                              rebind a stale marker's name.
  *   `m-<pid>-<seq>`          — a member from this lock's previous design;
  *                              honored as ticket 0 (its owner advertised
  *                              before any bakery member).
- *   `c-<pid>-<seq>`          — a contender between choosing a ticket and
+ *   `c-<pid>-<seq>-<nonce>`  — a contender between choosing a ticket and
  *                              advertising it (socket on unix, file on
  *                              win); live ones force a rescan.
  * Anything whose pid is dead is swept unconditionally — the owner cannot
@@ -1197,17 +1217,18 @@ function parseLeaseName(entry: string): { binary: string; pid: number } | undefi
  * behind a lock nobody owns. Age alone never sweeps a live marker — a
  * suspended contender is indistinguishable from a recycled pid by
  * liveness, and removing a LIVE `c-` lets a later contender choose the
- * same ticket and enter concurrently. Every sweep path re-validates the
- * node identity before unlinking ({@link removeIfUnchanged}): a dead pid
- * can be recycled mid-scan and a new owner can rebind the same name, so
- * removing by name alone could delete a live contender's marker.
+ * same ticket and enter concurrently. Nonced marker names make unlinking
+ * safe by name alone — a replacement owner draws its own nonce, so it
+ * cannot rebind the dead marker's name and the stat→unlink window has no
+ * replacement to hit. The identity recheck ({@link removeIfUnchanged})
+ * stays anyway: legacy nonce-free markers can still be rebinded mid-scan.
  */
 
 /**
  * Unlink `file` only when a fresh stat still names the SAME node observed
- * at `baseline` (device + inode + mtime + ctime). Pid liveness is checked
- * against the marker NAME, not the node — a recycled pid's new owner
- * rebinds the identical name, so the unlink must refuse any replacement.
+ * at `baseline` (device + inode + mtime + ctime). A nonced marker name
+ * cannot be rebound by a live process ({@link instanceNonce}), but a
+ * legacy nonce-free one can — the unlink must refuse any replacement.
  * Returns false when the node changed or vanished: the directory snapshot
  * is stale and the caller must rescan rather than act on a member list
  * that may already name a different owner.
@@ -1249,9 +1270,9 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
       pending.push({ member, choosing: marker.choosing });
       continue;
     }
-    // Dead pid — but the pid may already be recycled and a new owner may
-    // have rebound this exact name. Only unlink the node we observed;
-    // anything else means the snapshot is stale, so force a rescan.
+    // Dead pid — unlink the node we observed. A nonced name can never be
+    // rebound by a live process; a legacy name still can, so refuse any
+    // replacement and force a rescan when the snapshot is stale.
     try {
       if (!removeIfUnchanged(member.file, statSync(member.file))) choosing = true;
     } catch {
@@ -1282,9 +1303,9 @@ export async function scanMembers(dir: string): Promise<MemberScan> {
       }
     }
     if (!sockets[i] && !fresh) {
-      // Same pid-reuse race as the dead-pid sweep: the refusal was probed
-      // against this node, so unlink only that node — a replacement owner
-      // is a live contender our member list missed.
+      // Same rule as the dead-pid sweep: the refusal was probed against
+      // this node, so unlink only that node — a rebind (possible only for
+      // legacy nonce-free names) is a live contender we missed.
       if (!removeIfUnchanged(member.file, baseline!)) choosing = true;
       return;
     }
@@ -1326,9 +1347,9 @@ async function bindMarkerListener(marker: string): Promise<Server> {
 
 /**
  * Serialize the install critical section across processes. Bakery
- * protocol: advertise `c-<pid>-<seq>` while choosing, take ticket
- * `1 + max(seen)`, then bind `b-<ticket>-<pid>-<seq>` and wait until ours
- * is the lowest live ticket. Arrival order is preserved because any
+ * protocol: advertise `c-<pid>-<seq>-<nonce>` while choosing, take ticket
+ * `1 + max(seen)`, then bind `b-<ticket>-<pid>-<seq>-<nonce>` and wait
+ * until ours is the lowest live ticket. Arrival order is preserved because any
  * member advertised after us necessarily saw our ticket when choosing;
  * a live `c-` marker forces waiters to rescan so a mid-choose contender
  * cannot be leapfrogged by a stale max. A dead member's marker is deleted
@@ -1357,7 +1378,7 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
   // ticket while ours is unrecorded, then take `1 + max` of the tickets
   // seen — any member that advertised after us necessarily read a max that
   // includes ours, so arrival order is honored no matter how pids order.
-  const choosing = join(dir, `c-${process.pid}-${seq}`);
+  const choosing = join(dir, `c-${process.pid}-${seq}-${instanceNonce}`);
   let choosingServer: Server | undefined;
   if (process.platform === 'win32') {
     // The pipe is the probeable proof — it is bound BEFORE the marker
@@ -1376,7 +1397,7 @@ export async function acquireInstallLock(path: string, hooks: AcquireLockHooks =
   }
   const seen = await scanMembers(dir);
   const ticket = seen.members.reduce((max, m) => Math.max(max, m.ticket), 0) + 1;
-  const marker = join(dir, `b-${ticket}-${process.pid}-${seq}`);
+  const marker = join(dir, `b-${ticket}-${process.pid}-${seq}-${instanceNonce}`);
   const server = await bindMarkerListener(marker);
   if (process.platform === 'win32') {
     // Pipe bound first — the marker file only advertises ticket/pid/seq;
