@@ -1,7 +1,8 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
     GgufMetaValue, native_gguf_cache_cap_bytes, native_gguf_cache_root,
-    native_gguf_publish_with_cap, source_file_identity_digest, write_embedded_gpt2_tokenizer,
+    native_gguf_publish_with_cap, native_gguf_sidecar_mutex, source_file_identity_digest,
+    write_embedded_gpt2_tokenizer,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -185,23 +186,21 @@ fn assets_sidecar_lock(_root: &Path, _dir_name: &str) -> Option<Option<std::fs::
     Some(None)
 }
 
-/// Serialize the whole `assets_in` check/build/publish section within this
-/// process. `assets_sidecar_lock`'s BSD flock does not: a second fd from the
-/// same process "acquires" LOCK_EX while the first holds it (the per-process
-/// ambiguity `qwen35_native_prepare_mutex` closes for prepares), which would
-/// let two loads both miss the `complete` checks and race temp dirs — the
-/// loser's publish could remove the dir the winner already returned.
-fn assets_in_process_mutex() -> &'static std::sync::Mutex<()> {
-    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
-}
-
 fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<PathBuf> {
-    // Lock order matches `prepare_native_gguf_inner`: process mutex →
-    // sidecar flock → cap flock. A std Mutex held across a blocking flock is
-    // fine here — `assets_in` is synchronous by design — and a poisoned
-    // mutex still serializes.
-    let _process_lock = assets_in_process_mutex()
+    // Serialize the whole hit-check → build → publish section within this
+    // process. `assets_sidecar_lock`'s BSD flock cannot do either job: a
+    // second fd from the same process "acquires" LOCK_EX while the first
+    // holds it — racing loads would both miss the `complete` checks and the
+    // loser's publish could remove the dir the winner returned — and the
+    // sweep's `native_gguf_try_entry_lock` would trivially win against this
+    // process's own fd, deleting the dir between the hit check and first
+    // use. `native_gguf_sidecar_mutex` closes both gaps; the sweep only
+    // try-locks it and skips its pass on contention. Lock order matches
+    // `prepare_native_gguf_inner`: process mutex → sidecar flock → cap
+    // flock. A std Mutex held across a blocking flock is fine here —
+    // `assets_in` is synchronous by design — and a poisoned mutex still
+    // serializes.
+    let _process_lock = native_gguf_sidecar_mutex()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let source = first
@@ -360,6 +359,10 @@ mod tests {
 
     #[test]
     fn asset_cache_rebuilds_after_same_size_same_mtime_source_replacement() {
+        use crate::utils::gguf::sweep_env_lock;
+        // Serialize against native-GGUF sweep tests: `assets_in` holding the
+        // sidecar mutex would make their `try_lock` skip the sweep.
+        let _env_guard = sweep_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let cache = root.join("cache");
         fs::create_dir_all(&cache).unwrap();
@@ -404,6 +407,8 @@ mod tests {
 
     #[test]
     fn asset_cache_hit_stamps_complete_marker_recency() {
+        use crate::utils::gguf::sweep_env_lock;
+        let _env_guard = sweep_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let cache = root.join("cache");
         fs::create_dir_all(&cache).unwrap();
@@ -429,6 +434,8 @@ mod tests {
 
     #[test]
     fn asset_cache_never_writes_beside_read_only_source() {
+        use crate::utils::gguf::sweep_env_lock;
+        let _env_guard = sweep_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let source = root.join("source");
         let cache = root.join("cache");
@@ -478,7 +485,9 @@ mod tests {
     /// phantom path the sweep then deletes).
     #[test]
     fn assets_in_never_publishes_while_the_sidecar_lock_is_held() {
+        use crate::utils::gguf::sweep_env_lock;
         use std::os::fd::AsRawFd;
+        let _env_guard = sweep_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let cache = root.join("cache");
         fs::create_dir_all(&cache).unwrap();
@@ -605,7 +614,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Concurrent same-process loads serialize on `assets_in_process_mutex`:
+    /// Concurrent same-process loads serialize on `native_gguf_sidecar_mutex`:
     /// the sidecar flock alone does not (a BSD flock is per-process — a
     /// second same-process fd "acquires" LOCK_EX while the first holds it).
     /// Without serialization both callers could miss the `complete` checks,
@@ -657,6 +666,61 @@ mod tests {
         let tokenizer: Value =
             serde_json::from_slice(&fs::read(first.join("tokenizer.json")).unwrap()).unwrap();
         assert_eq!(tokenizer["model"]["vocab"]["old"], 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The shared `native_gguf_sidecar_mutex` closes the same-process gap
+    /// the sidecar flock cannot: BSD flock is per-process, so the sweep's
+    /// `native_gguf_try_entry_lock` would win against this process's own fd
+    /// and delete a published sidecar between `assets_in`'s hit check and
+    /// the caller's first use. Holding the mutex must make
+    /// `sweep_native_gguf_cache` skip entirely — it only try-locks — and
+    /// the eviction must land once the mutex frees.
+    #[test]
+    fn assets_in_survives_concurrent_in_process_sweep() {
+        use crate::utils::gguf::{
+            SweepEnvVar, native_gguf_sidecar_mutex, sweep_env_lock, sweep_native_gguf_cache,
+        };
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let (store, config) = tokenizer_fixture();
+
+        // Publish the versioned sidecar under a roomy cap, then shrink the
+        // cap below its size and age the recency marker past the 24h sweep
+        // grace: a deletion candidate through the capped-LRU pass.
+        let _env = SweepEnvVar::set_max_gb("64");
+        let dir = assets_in(&source, &store, &config, &cache).unwrap();
+        assert!(dir.join("complete").is_file());
+        let _env = SweepEnvVar::set_max_gb("0.0000001");
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+        OpenOptions::new()
+            .write(true)
+            .open(dir.join("complete"))
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+
+        // While the mutex is held the sweep must skip: try_lock reports
+        // WouldBlock on a held std Mutex even from the same thread, so the
+        // call returns at once and the deletion candidate survives.
+        let sidecar_guard = native_gguf_sidecar_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        sweep_native_gguf_cache(&cache, "no-such-key");
+        assert!(
+            dir.join("complete").is_file(),
+            "the sweep must skip while a sidecar publish could be in flight"
+        );
+        drop(sidecar_guard);
+
+        // The mutex was the only thing protecting the aged dir: unlocked,
+        // the sweep's capped-LRU pass deletes it.
+        sweep_native_gguf_cache(&cache, "no-such-key");
+        assert!(!dir.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

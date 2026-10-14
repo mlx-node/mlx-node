@@ -7288,11 +7288,39 @@ pub(crate) fn native_gguf_publish_with_cap(
     Ok(output_dir.to_path_buf())
 }
 
+/// In-process exclusion between `assets_in` (tokenizer-sidecar load and
+/// publish in `models::qwen4_exp::gguf`) and this sweep's deletion paths.
+/// The per-object flocks cover other processes but not this one: BSD flock
+/// is per-process, so `native_gguf_try_entry_lock` trivially wins against
+/// an fd held by the same process — without this mutex a sweep could
+/// remove a sidecar dir between `assets_in`'s hit check and the caller's
+/// first use. The lock order stays acyclic: `assets_in` takes this mutex
+/// → its per-sidecar flock → the cap flock inside
+/// `native_gguf_publish_with_cap`; the sweep only ever try-locks this
+/// mutex (skipping its pass on contention, never blocking a caller); the
+/// prepare path takes the tokio prepare mutex → key flock → cap flock and
+/// never touches this mutex.
+pub(crate) fn native_gguf_sidecar_mutex() -> &'static std::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// Sweep stale, orphaned and over-capital entries from the native GGUF cache
 /// root. Runs under the process mutex and the caller's per-key lock; every
 /// gate is conservative so a load can never be broken by the sweep and every
-/// failure is logged and swallowed by the caller.
-fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
+/// failure is logged and swallowed by the caller. The sweep is best-effort
+/// and re-runs on every prepare: when `assets_in` holds
+/// `native_gguf_sidecar_mutex` (its whole hit-check → publish section) the
+/// sweep skips entirely — deleting nothing while a sidecar path may be in
+/// flight beats blocking on a possibly multi-second sidecar build.
+pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
+    let _sidecar_guard = match native_gguf_sidecar_mutex().try_lock() {
+        Ok(guard) => guard,
+        // A sidecar load/publish is in flight: this pass is expendable.
+        Err(std::sync::TryLockError::WouldBlock) => return,
+        // A poisoned mutex must not disable the sweep forever.
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+    };
     let Ok(entries) = fs::read_dir(cache_root) else {
         return;
     };

@@ -238,6 +238,16 @@ fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
+/// Unlink `path` only when it is a symlink — `fs::remove_file` removes just
+/// the link, never its target. Any other occupant or lookup failure is left
+/// for the caller's `create_dir_all` to surface. Prevents a planted link
+/// from redirecting dir creation and writes outside the cache root.
+fn unlink_if_symlink(path: &Path) {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn dir_name_identity(dir: &Path) -> Option<&str> {
     dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)
 }
@@ -713,9 +723,17 @@ impl PackedCache {
         let dir = root.join(format!("{DIR_PREFIX}{identity}"));
         // Eagerly create the identity dir and record its provenance so the
         // sweep can re-verify staleness later. A missing/failed manifest is
-        // harmless: manifest-less dirs are never orphan-deleted.
+        // harmless: manifest-less dirs are never orphan-deleted. The dir
+        // must be REAL: `create_dir_all` accepts a symlink to an external
+        // directory, which would route the manifest and every later .pack/
+        // budget/.tmp write through the link — outside the root, invisible
+        // to the sweep and the total cap — so a planted link is unlinked
+        // first (the external target is never touched) and the manifest is
+        // published only when the dir verifies as real (covers a link
+        // re-planted between unlink and create).
         let manifest = pack_manifest(&canonical);
-        if fs::create_dir_all(&dir).is_ok() {
+        unlink_if_symlink(&dir);
+        if fs::create_dir_all(&dir).is_ok() && is_real_dir(&dir) {
             let _ = fs::write(dir.join(".manifest"), &manifest);
         }
         let cache = Self {
@@ -880,7 +898,19 @@ impl PackedCache {
         if weight.bytes()? > MAX_READ_BYTES || weight.scales.is_none() {
             return Ok(());
         }
+        // new_at verified the dir is real, but a link could be swapped in
+        // after construction: unlink one found here, then recheck — a dir
+        // that is still not real after creation (a hostile occupant) makes
+        // the write skip rather than follow a link outside the cache root.
+        unlink_if_symlink(&self.root);
         fs::create_dir_all(&self.root).map_err(err)?;
+        if !is_real_dir(&self.root) {
+            debug!(
+                "packed cache: skipping write, {} is not a real directory",
+                self.root.display()
+            );
+            return Ok(());
+        }
         // A sweep may have deleted the .manifest (or the whole dir) between
         // new_at and this write; republish so the recreated dir stays
         // verifiable instead of becoming an unaccountable manifest-less dir.
@@ -1672,6 +1702,50 @@ mod tests {
         assert_eq!(root_pack_spend(&parent, &cache.root, 0, pack_bytes), 0);
         assert_eq!(reconciled_sibling_pack_spend(&link), 0);
         assert_eq!(sibling_pack_estimate(&link), 0);
+    }
+
+    /// When the cache's OWN identity name is occupied by a symlink,
+    /// `new_at` must unlink it and create a real dir. `create_dir_all`
+    /// accepts a link-to-dir, which would land the manifest and every later
+    /// write in the external target while the sweep and the cap count the
+    /// link itself as foreign — an escaped, uncounted, unswept cache.
+    #[test]
+    fn packed_cache_new_at_replaces_symlinked_identity_dir() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        // The real identity dir for `source` is unlinked and replaced with a
+        // symlink whose target carries a marker; construction must admit no
+        // bytes outside the root.
+        let identity = packed_identity(BTreeSet::from([source.clone()]).into_iter()).unwrap();
+        let expected = parent.join(format!("{DIR_PREFIX}{identity}"));
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        assert_eq!(cache.root, expected);
+        fs::remove_dir_all(&cache.root).unwrap();
+        let outside = temp.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("marker"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, &cache.root).unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        assert!(
+            is_real_dir(&cache.root),
+            "the link must be replaced by a real dir"
+        );
+        assert_ne!(
+            fs::canonicalize(&cache.root).unwrap(),
+            outside.canonicalize().unwrap(),
+            "the real dir must not resolve to the external target"
+        );
+        assert!(cache.root.join(".manifest").is_file());
+        cache.write("key", &weight("affine")).unwrap();
+        assert!(cache.path("key").is_file());
+        // The external target is untouched: the marker survives and nothing
+        // the cache wrote landed there.
+        assert_eq!(fs::read(outside.join("marker")).unwrap(), b"keep");
+        assert!(!outside.join(".manifest").exists());
+        assert!(!outside.join("key.pack").exists());
     }
 
     // flock is per-process on BSD/macOS, so a held writer lock can only be
