@@ -1,7 +1,9 @@
+import { spawn } from 'node:child_process';
+
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { detectionCases, selectedText } from '../../../evals/agent-installed/cases.js';
-import { cliInvocation, JsonLines } from '../../../evals/agent-installed/cli.js';
+import { AgentCli, cliInvocation, JsonLines } from '../../../evals/agent-installed/cli.js';
 import { evaluateCase, grade, summarize } from '../../../evals/agent-installed/evaluate.js';
 import { physicalFootprint } from '../../../evals/agent-installed/process-memory.js';
 import { evalOptions } from '../../../scripts/eval-agent-installed.js';
@@ -139,6 +141,35 @@ describe('agent-installed eval oracle and execution', () => {
     expect(physicalFootprint('Physical footprint: 27.0G\nPhysical footprint (peak): 28.2G\n')).toBe(28.2 * 2 ** 30);
     expect(physicalFootprint('Physical footprint: 512M\n')).toBe(512 * 2 ** 20);
     expect(physicalFootprint('Permission denied')).toBeUndefined();
+  });
+
+  it('refuses to start after close() so no serve child escapes the memoized shutdown', async () => {
+    const cli = new AgentCli('/repo', 'agent', '/tmp/workspace', '/tmp/output');
+    const closed = cli.close();
+    // The runner memoizes close(); a late start() must throw instead of
+    // spawning a serve child the already-resolved promise would never kill.
+    await expect(cli.start()).rejects.toThrow('Evaluation stopped.');
+    await closed;
+  });
+
+  it('close() outwaits a stalled agent child instead of clearing the hard-kill timer on serve exit', async () => {
+    const cli = new AgentCli('/repo', 'agent', '/tmp/workspace', '/tmp/output');
+    const serve = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000)']);
+    const agent = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => setTimeout(() => process.exit(0), 400)); setInterval(() => {}, 1000)']);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    Object.assign(cli, { child: serve, active: { child: agent, reject: () => {} } });
+    const events: string[] = [];
+    serve.once('close', () => events.push('serve'));
+    agent.once('close', () => events.push('agent'));
+    try {
+      await cli.close();
+    } finally {
+      serve.kill('SIGKILL');
+      agent.kill('SIGKILL');
+    }
+    // The 400ms-stalled agent must close before close() resolves — previously
+    // serve's prompt exit cleared the SIGKILL fallback and returned early.
+    expect(events).toEqual(['serve', 'agent']);
   });
 
   it('keeps stream-json events intact across byte boundaries and Unicode line separators', () => {

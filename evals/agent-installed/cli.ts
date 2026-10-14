@@ -158,6 +158,7 @@ export class AgentCli {
    * random `--auth-token`, the serve URL fed back through `GROK_*_BASE_URL`.
    */
   async start(): Promise<AgentState> {
+    if (this.closing) throw new Error('Evaluation stopped.');
     const probe = probeAgentInstall(this.root);
     if (probe.path === undefined) {
       throw new Error('No mlx-agent binary found. Build or install one before running the eval.');
@@ -187,6 +188,10 @@ export class AgentCli {
     // `withDefaultModel`; the eval never substitutes its own choice.
     this.modelId = chooseDefaultModel(models, readPersistedDefaultModel()).modelId;
 
+    // Cancellation can land during the awaits above, before `this.child`
+    // exists; spawning after that point produces a child the runner's
+    // already-resolved close() will never kill.
+    if (this.closing) throw new Error('Evaluation stopped.');
     this.serveToken = randomBytes(24).toString('base64url');
     const cliEntry = join(this.root, 'packages', 'cli', 'dist', 'cli.js');
     const serve = spawn(
@@ -198,6 +203,12 @@ export class AgentCli {
     serve.stdout!.on('data', (chunk: Buffer) => appendFileSync(join(this.output, 'serve.log'), chunk));
     serve.stderr!.on('data', (chunk: Buffer) => appendFileSync(join(this.output, 'serve.log'), chunk));
     this.serveUrl = await this.waitForServe(serve, 60_000);
+    // close() that ran before `this.child` was assigned already resolved and
+    // is memoized by the runner — the late serve child is reaped here instead.
+    if (this.closing) {
+      await this.stopChild(serve);
+      throw new Error('Evaluation stopped.');
+    }
 
     this.agentEnv = {
       ...process.env,
@@ -344,27 +355,27 @@ export class AgentCli {
     return undefined;
   }
 
-  /** Kill the serve child; any in-flight case is rejected first. */
+  /** Kill the serve child and any in-flight case child; the case is rejected first. */
   async close(): Promise<void> {
     this.closing = true;
     this.fail(new Error('Evaluation stopped.'));
-    const exited = this.child
-      ? new Promise<void>((done) => {
-          if (this.child.exitCode !== null || this.child.killed) return done();
-          this.child.once('close', () => done());
-        })
-      : Promise.resolve();
-    this.active?.child.kill('SIGTERM');
-    this.child?.kill('SIGTERM');
-    const kill = setTimeout(() => {
-      this.active?.child.kill('SIGKILL');
-      this.child?.kill('SIGKILL');
-    }, 10_000);
-    try {
-      await exited;
-    } finally {
-      clearTimeout(kill);
-    }
+    // Both children must actually close before the hard-kill fallback can be
+    // disarmed: a stalled agent outliving a promptly-exiting serve would keep
+    // its pipes — and this process — alive after close() returned.
+    await Promise.all([this.stopChild(this.active?.child), this.stopChild(this.child)]);
+  }
+
+  /** SIGTERM, escalating to SIGKILL after 10s; resolves once the child closes. */
+  private stopChild(child?: ChildProcess): Promise<void> {
+    if (child === undefined || child.exitCode !== null) return Promise.resolve();
+    return new Promise<void>((done) => {
+      const force = setTimeout(() => child.kill('SIGKILL'), 10_000);
+      child.once('close', () => {
+        clearTimeout(force);
+        done();
+      });
+      child.kill('SIGTERM');
+    });
   }
 }
 
