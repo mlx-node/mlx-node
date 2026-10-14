@@ -9,6 +9,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -483,6 +484,17 @@ describe('downloadAgentBinary', () => {
       process.env[MLX_AGENT_BIN_ENV] = dest;
       mockMirrors(makeTarball(home, 'v030'));
       await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(existsSync(dest)).toBe(true);
+      expect(readFileSync(dest, 'utf-8')).toBe('legacy-binary');
+
+      // A symlinked override must protect it the same way: resolve()
+      // normalizes text but never dereferences, so the comparison has to
+      // match the override's real path against dest.
+      const link = join(home, 'agent-link');
+      symlinkSync(dest, link);
+      process.env[MLX_AGENT_BIN_ENV] = link;
+      mockMirrors(makeTarball(home, 'v040'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
       expect(existsSync(dest)).toBe(true);
       expect(readFileSync(dest, 'utf-8')).toBe('legacy-binary');
     } finally {

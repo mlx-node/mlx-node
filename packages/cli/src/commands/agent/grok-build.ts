@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, type Stats } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync, type Stats } from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -839,7 +839,19 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
     // lease naming it protects it like any other binary.
     const baseName = basename(dest);
     const envBin = env[MLX_AGENT_BIN_ENV];
-    const baseReclaimable = live !== undefined && (envBin === undefined || resolve(envBin) !== resolve(dest));
+    // resolve() normalizes text but never dereferences: an override that
+    // symlinks to the managed base must still count as selecting it, or
+    // the sweep deletes the target and leaves the pin dangling.
+    const selectsDest =
+      envBin !== undefined &&
+      (() => {
+        try {
+          return realpathSync(resolve(envBin)) === realpathSync(dest);
+        } catch {
+          return resolve(envBin) === resolve(dest);
+        }
+      })();
+    const baseReclaimable = live !== undefined && !selectsDest;
     try {
       const entries = readdirSync(dirname(dest));
       const liveLeases: { entry: string; binary: string }[] = [];
