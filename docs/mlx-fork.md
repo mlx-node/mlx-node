@@ -82,8 +82,9 @@ parent  2. move the gitlink, fix API drift, yarn build:native
         3. golden gates, every route                  must be equal, or attributed
         4. dev suites                                 cargo test, vp test
         5. metallib markers + canaries
-        6. benches, ABBA against the old addon
-fork    7. force-push it to fork main before the parent PR  (CI clones the gitlink)
+        6. prebuilt MLX release + mlx-prebuilt.json   same PR
+        7. benches, ABBA against the old addon
+fork    8. force-push it to fork main before the parent PR  (CI clones the gitlink)
 ```
 
 **1. Rebase.** In the fork clone (`origin` = ml-explore/mlx, `me` = mlx-node/mlx):
@@ -91,7 +92,7 @@ fork    7. force-push it to fork main before the parent PR  (CI clones the gitli
 the patches in order from `git log --reverse origin/main..me/main`. Fork `main` carries the
 patch stack; it does not mirror upstream. Drop a patch only when upstream has the same
 change. Check that the standalone CMake build passes with `CMAKE_OSX_DEPLOYMENT_TARGET=26.2`
-and builds the NAX kernels (no `NAX kernels require` warning). Step 7 is
+and builds the NAX kernels (no `NAX kernels require` warning). Step 8 is
 `git push --force-with-lease=main:<old me/main> me HEAD:main`.
 
 **2. Parent.** `git -C crates/mlx-sys/mlx checkout <new sha>`, then `yarn build:native`.
@@ -174,9 +175,73 @@ check on the built file. The GEMM canaries in `crates/mlx-core/src/test_support.
 print a line when they gate tests off. A canary that starts or stops firing means MLX's
 GEMM accuracy on this machine changed.
 
-**6. Benches.** Same machine, cooled, ABBA order, old addon vs new:
+**6. Prebuilt MLX.** `crates/mlx-sys/mlx-prebuilt.json` pins the release that holds the
+cmake output for the new commit; update it in the same PR (see below). Until then every
+build of the PR compiles MLX from source and says so (`mlx-sys: building MLX from source
+(mlx submodule is at <sha> but mlx-prebuilt.json pins <sha>)`).
+
+**7. Benches.** Same machine, cooled, ABBA order, old addon vs new:
 `scripts/benchmark-model.ts` (decode and prefill), `docs/research/splash-qwen38/benchmark.ts`
 (DFlash2; compare ms per verify cycle when transcripts differ), and
 `crates/mlx-core/tests/qwen35_paged_prefill_operator_bench.rs` for D=256 prefill.
 The K-quant, mixed-affine and segmented SDPA kernels are prebuilt, so they add no
 JIT compile to the first run after a bump.
+
+## Prebuilt MLX
+
+`crates/mlx-sys/build.rs` links upstream MLX either from its own cmake build of the
+submodule (~10 min per cargo profile) or from a **prebuilt artifact** downloaded once per
+machine. Only MLX itself is prebuilt: the bridge (`libmlx_ffi.a`), its preambles and
+`paged_attn.metallib` stay source-built.
+
+```
+artifact (mlx-<triple>.tar.gz)        pin (crates/mlx-sys/mlx-prebuilt.json)
+├── lib/libmlx.a                      repo          mlx-node/mlx-node
+├── lib/libjaccl.a                    mlx_commit    <full sha of the submodule>
+├── lib/mlx.metallib                  release_tag   mlx-prebuilt-<sha12>
+├── include/{mlx,metal_cpp,jaccl}     assets.<triple>.{file,sha256}
+└── manifest.json                     ("" sha256 = never download, build from source)
+```
+
+Auto mode (default) uses the artifact only when all of these hold: target
+`aarch64-apple-darwin` with Metal, the pin has a non-empty `sha256`, the submodule HEAD
+equals `mlx_commit` and is clean, the download succeeds, the digest matches (a mismatch
+panics; it is never silently rebuilt) and the artifact's `deployment_target` equals the
+build's. Otherwise it builds from source and prints the reason as a `cargo:warning`.
+The cache is `$MLX_PREBUILT_CACHE_DIR`, else `$CARGO_TARGET_DIR/mlx-prebuilt`, else
+`target/mlx-prebuilt`, unpacked at `<cache>/<release_tag>/<triple>/` with a `.release-tag`
+marker; it is shared across cargo profiles. `MLX_PREBUILT_DIR` and `MLX_PREBUILT_CACHE_DIR`
+must be the same for `cargo` and `yarn build:native` (`packages/core/metallib-select.ts`
+resolves the shipped `mlx.metallib` from them).
+
+| env                            | effect                                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------------------ |
+| `MLX_PREBUILT=0`               | source build, no download                                                                  |
+| `MLX_PREBUILT_DIR=<dir>`       | use an unpacked artifact as is (no pin/commit check; needs `lib/libmlx.a`, `include/mlx`)  |
+| `MLX_PREBUILT_EXPORT=<dir>`    | source build, then write the artifact set into `<dir>` (what the release workflow does)    |
+| `MLX_PREBUILT_CACHE_DIR=<dir>` | cache root override                                                                        |
+| `GITHUB_TOKEN` / `GH_TOKEN`    | sent as `Authorization: Bearer` on the download (rate limits); anonymous retry if rejected |
+
+MLX bakes `${MLX_METAL_PATH}/mlx.metallib` into `libmlx.a` as its last-resort load path
+(`device.cpp`), and the same variable is where cmake writes and installs the metallib
+from. An exported build sets it to `<OUT_DIR>/mlx-prebuilt/<release_tag>/kernels`, so
+the string in a prebuilt `libmlx.a` names the producer's machine but ends in
+`mlx-prebuilt/<release_tag>/kernels/mlx.metallib`; `metallib-select.ts` reads that tail
+and ships `<cache>/<release_tag>/<triple>/lib/mlx.metallib`. The bridge additionally bakes
+`<OUT_DIR>/paged_attn.metallib` (`MLX_NODE_PAGED_ATTN_METALLIB`), which names the mlx-sys
+build for `paged_attn.metallib` and is a last-resort runtime lookup, like MLX's. In
+prebuilt mode `build.rs` copies `mlx.metallib` next to the cargo test binaries
+(`target/<profile>/{,deps/}`) because the baked path does not exist locally.
+
+**Bump procedure.** After moving the gitlink: run the `MLX Prebuilt` workflow on the PR
+branch (`gh workflow run mlx-prebuilt.yml --ref <branch>`; `.github/workflows/mlx-prebuilt.yml`
+builds with `MLX_PREBUILT_EXPORT`, tars the export dir, publishes release
+`mlx-prebuilt-<sha12>` and prints the sha256 in the job summary), then set
+`mlx_commit`, `release_tag` and `assets.aarch64-apple-darwin.sha256` in
+`crates/mlx-sys/mlx-prebuilt.json` in the same PR. Locally the same artifact comes from
+
+```sh
+MLX_PREBUILT=0 MLX_PREBUILT_EXPORT=/tmp/mlx-prebuilt-export cargo build --release -p mlx-sys
+tar -C /tmp/mlx-prebuilt-export -czf mlx-aarch64-apple-darwin.tar.gz .
+shasum -a 256 mlx-aarch64-apple-darwin.tar.gz
+```

@@ -98,6 +98,12 @@ std::filesystem::path paged_attn_metallib_path() {
       // Cargo test binary at target/<profile>/deps/ — metallib copied
       // by build.rs to the parent target/<profile>/.
       bin_dir.parent_path() / "paged_attn.metallib",
+#ifdef MLX_NODE_PAGED_ATTN_METALLIB
+      // Last resort: the build-tree origin build.rs compiled, as MLX's own
+      // METAL_PATH. The same string lets packages/core/metallib-select.ts
+      // bind the addon to the mlx-sys build it linked against.
+      std::filesystem::path(MLX_NODE_PAGED_ATTN_METALLIB),
+#endif
   };
   for (const auto& candidate : candidates) {
     if (std::filesystem::exists(candidate)) {

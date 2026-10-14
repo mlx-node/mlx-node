@@ -24,9 +24,24 @@ concurrency:
       format('run-{0}', github.run_id) }}
   cancel-in-progress: true
 
+# Job graph (PR / push):
+#
+#   lint-ts (ubuntu) ──────────────────────────────────────────┐
+#   clippy  (macos) ───────────────────────────────────────────┤
+#   rust-lib (macos) ──────────────────────────────────────────┤
+#   rust-int (macos) ──────────────────────────────────────────┼─▶ publish (ubuntu, main only)
+#   build (macos) ─┬─▶ ts-test (macos) ────────────────────────┤
+#                  └─▶ model-test ×N (macos; main / label) ────┘
+#
+# The Rust test legs do NOT wait for `build`: they need no .node addon, only
+# a tokenizer.json (fetched with curl), so they start at t=0 in parallel with
+# the native build. Each macOS cargo job has its own rust-cache `shared-key`
+# so it restores the dependency set it actually compiles.
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 1
+  # rust-cache strips incremental artifacts before saving and every job starts
+  # from a fresh checkout, so incremental codegen only costs time and disk here.
+  CARGO_INCREMENTAL: 0
   # Deployment floor of every macOS build product (metallib min-OS stamp,
   # libmlx, .node). Without it the floor silently tracks the runner image's
   # macOS version and ratchets with runner updates. 26.2 is the lowest target
@@ -43,8 +58,55 @@ env:
   # min-OS stamp aborts instead of silently skipping the deployment-floor check.
   # Local `yarn build:native` leaves it unset and keeps the lenient dev behavior.
   MLX_METALLIB_STRICT: '1'
+  # Where crates/mlx-sys/build.rs unpacks the prebuilt MLX tarball (see
+  # crates/mlx-sys/mlx-prebuilt.json and .github/workflows/mlx-prebuilt.yml).
+  # Its default lives under `target/`, but Swatinem/rust-cache caches `target/`
+  # wholesale and its pre-save cleanup deletes every FILE under non-profile
+  # subdirectories — the unpacked `lib/*.a` + headers would be stripped to
+  # empty dirs. Moving it next to the workspace lets `actions/cache` own it
+  # (keyed on the pin file) without rust-cache touching it.
+  MLX_PREBUILT_CACHE_DIR: ${{ github.workspace }}/.mlx-prebuilt
 
 jobs:
+  # TypeScript typecheck + lint and `cargo fmt --check` need neither Metal nor
+  # a compiled MLX, so they run on a Linux runner and stay out of the small
+  # macOS pool. `cargo fmt` only parses sources (no build.rs, no submodule).
+  lint-ts:
+    name: Lint (TS + rustfmt)
+    # Keep required lint checks in a replacement model-e2e run too.
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'yarn'
+
+      - name: Setup Rust (rustfmt only)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          components: rustfmt
+          cache: false
+          rustflags: ''
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: TypeCheck
+        run: yarn typecheck
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   build:
     name: Build
     # Build on every push / PR sync / reopen / dispatch. Skip only label events
@@ -57,6 +119,10 @@ jobs:
       github.event.action != 'labeled' ||
       github.event.label.name == 'model-e2e'
     runs-on: macos-26
+    env:
+      # build.rs downloads the prebuilt MLX asset with curl; an authenticated
+      # request avoids anonymous GitHub rate limits.
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -76,6 +142,17 @@ jobs:
           cache: false
           rustflags: ''
 
+      # PR artifacts never ship (publish only runs on main / dispatch), so PRs
+      # trade the fat-LTO single-codegen-unit release profile for a parallel
+      # one: the 3-core runner spends ~18 min in a single rustc thread on
+      # mlx-core otherwise. Runs BEFORE rust-cache so the CARGO_* values are
+      # part of its env hash and PR/main builds keep separate dep caches.
+      - name: Use a parallel release profile on pull requests
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=thin" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
@@ -83,10 +160,22 @@ jobs:
           # rustup proxy installed by setup-rust-toolchain and leaves
           # cargo resolving to rustup-init's usage screen.
           cache-bin: false
-          # Bumped after switching toolchain action; forces fresh
-          # caches and orphans the poisoned v0-rust archives.
-          prefix-key: v1-rust
+          # v2: Cargo.lock is now committed; the v1 caches were built against a
+          # floating resolution and never matched the current dependency set.
+          prefix-key: v2-rust
+          # One stable key per job kind, reused across runs and branches.
+          shared-key: build
+          # A red PR still seeds the dependency cache for the fix-up push.
+          cache-on-failure: true
 
+      - name: Cache prebuilt MLX
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
+
+      # Only used when build.rs falls back to the source cmake build (MLX's
+      # FetchContent pulls from github.com).
       - name: Configure GitHub token for CMake downloads
         run: |
           echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
@@ -106,7 +195,6 @@ jobs:
         id: reuse
         if: github.event.action == 'labeled'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Pass through env (not inline ${{ }}) — branch names are untrusted.
           SHA: ${{ github.event.pull_request.head.sha }}
           BRANCH: ${{ github.head_ref }}
@@ -129,11 +217,12 @@ jobs:
             echo "No reusable build for $SHA; building natively."
           fi
 
+      # `yarn build` = napi build (cargo, release) + `tsc -b`. napi forwards no
+      # `--locked` here; the committed Cargo.lock plus `--locked` on every direct
+      # cargo invocation in the other jobs is what pins the resolution.
       - name: Build native module
         if: steps.reuse.outputs.reused != 'true'
         run: yarn build
-        env:
-          CARGO_INCREMENTAL: 1
 
       - uses: actions/upload-artifact@v7
         with:
@@ -152,31 +241,69 @@ jobs:
           path: |
             packages/core/mlx.metallib
             packages/core/paged_attn.metallib
-  test:
-    name: ${{ matrix.test }}
-    # A model-e2e opt-in can replace an active PR run, so it must also finish
-    # the required unit/integration checks. Unrelated label events stay idle.
+
+  clippy:
+    name: Clippy
+    # Keep required lint checks in a replacement model-e2e run too.
     if: >-
       github.event.action != 'labeled' ||
       github.event.label.name == 'model-e2e'
     runs-on: macos-26
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        test:
-          - 'yarn build:ts && yarn test'
-          - 'cargo test'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          node-version: '24'
-          cache: 'yarn'
+          toolchain: stable
+          components: clippy
+          target: aarch64-apple-darwin
+          cache: false
+          rustflags: ''
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v2-rust
+          shared-key: clippy
+          cache-on-failure: true
+
+      - name: Cache prebuilt MLX
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
+
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  # mlx-core's unit tests (`--lib`, ~4k tests, serial under RUST_TEST_THREADS=1)
+  # plus its doc-tests. No native addon, no model checkpoint, no Node: the only
+  # fixture any non-ignored Rust test reads is a tokenizer.json (see
+  # crates/mlx-core/tests/common/mod.rs::find_tokenizer_dir), fetched below.
+  rust-lib:
+    name: cargo test (mlx-core lib)
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    runs-on: macos-26
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -189,19 +316,179 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          # Don't cache ~/.cargo/bin — restoring it overwrites the
-          # rustup proxy installed by setup-rust-toolchain and leaves
-          # cargo resolving to rustup-init's usage screen.
           cache-bin: false
-          # Bumped after switching toolchain action; forces fresh
-          # caches and orphans the poisoned v0-rust archives.
-          prefix-key: v1-rust
+          prefix-key: v2-rust
+          shared-key: rust-lib
+          cache-on-failure: true
+
+      - name: Cache prebuilt MLX
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
 
       - name: Configure GitHub token for CMake downloads
         run: |
           echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
           echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
           chmod 600 ~/.netrc
+
+      # tokenizer.json is what `find_tokenizer_dir` keys on; tokenizer_config.json
+      # carries the chat template that the synthetic MoE/MTP session test
+      # (crates/mlx-core/tests/common/mod.rs) copies next to it — without it
+      # that test fails on a missing template instead of skipping.
+      - name: Fetch Qwen3 tokenizer files
+        env:
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+        run: |
+          set -euo pipefail
+          dir=.cache/models/qwen3-0.6b
+          mkdir -p "$dir"
+          for f in tokenizer.json tokenizer_config.json; do
+            url="https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/$f"
+            # Public repo; the token only lifts anonymous rate limits when set.
+            if [ -n "${HUGGINGFACE_TOKEN:-}" ]; then
+              curl -fsSL --retry 3 -H "Authorization: Bearer $HUGGINGFACE_TOKEN" -o "$dir/$f" "$url"
+            else
+              curl -fsSL --retry 3 -o "$dir/$f" "$url"
+            fi
+            test -s "$dir/$f"
+          done
+
+      - name: cargo test --lib
+        run: cargo test --locked -p mlx-core --lib
+        env:
+          RUST_BACKTRACE: 1
+          # This leg runs on a Metal runner, so a test that self-skips because
+          # it found no GPU has not passed — it reported a green it never
+          # earned. `metal_device_absent` withdraws the skip licence when this
+          # is set, turning that case into a failure instead.
+          #
+          # The `model-test` leg sets the same var, but only around its `--lib`
+          # filter step, which names a few tests. Every OTHER Metal-gated test in
+          # the crate runs here or in `rust-int` — including the ladder-retention
+          # pair, which became skippable when arming the ladder started requiring
+          # a paged adapter. Scoping this to the leg rather than to a name list
+          # means a test that grows a Metal dependency later is covered on the
+          # day it does, without anyone remembering to add it.
+          MLX_TEST_REQUIRE_METAL: '1'
+
+      - name: cargo test --doc
+        run: cargo test --locked -p mlx-core --doc
+        env:
+          RUST_BACKTRACE: 1
+          MLX_TEST_REQUIRE_METAL: '1'
+
+  # Everything the plain `cargo test` used to run EXCEPT mlx-core's `--lib`
+  # and `--doc` (those are `rust-lib`): every crate's integration-test targets
+  # (`tests/*.rs`, incl. mlx-paged-attn's paged_ops_smoke), the unit tests of
+  # the other crates, and their doc-tests. `--test '*'` is used instead of
+  # `--tests` because `--tests` also selects the lib/bin unit-test harnesses
+  # and would re-run mlx-core's 4k unit tests here.
+  rust-int:
+    name: cargo test (integration + other crates)
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    runs-on: macos-26
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+          cache: false
+          rustflags: ''
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v2-rust
+          shared-key: rust-int
+          cache-on-failure: true
+
+      - name: Cache prebuilt MLX
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
+
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
+      # tokenizer.json is what `find_tokenizer_dir` keys on; tokenizer_config.json
+      # carries the chat template that the synthetic MoE/MTP session test
+      # (crates/mlx-core/tests/common/mod.rs) copies next to it — without it
+      # that test fails on a missing template instead of skipping.
+      - name: Fetch Qwen3 tokenizer files
+        env:
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+        run: |
+          set -euo pipefail
+          dir=.cache/models/qwen3-0.6b
+          mkdir -p "$dir"
+          for f in tokenizer.json tokenizer_config.json; do
+            url="https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/$f"
+            # Public repo; the token only lifts anonymous rate limits when set.
+            if [ -n "${HUGGINGFACE_TOKEN:-}" ]; then
+              curl -fsSL --retry 3 -H "Authorization: Bearer $HUGGINGFACE_TOKEN" -o "$dir/$f" "$url"
+            else
+              curl -fsSL --retry 3 -o "$dir/$f" "$url"
+            fi
+            test -s "$dir/$f"
+          done
+
+      - name: cargo test (integration targets, all crates)
+        run: cargo test --locked --workspace --test '*'
+        env:
+          RUST_BACKTRACE: 1
+          MLX_TEST_REQUIRE_METAL: '1'
+
+      - name: cargo test (unit tests of crates other than mlx-core)
+        run: cargo test --locked --workspace --exclude mlx-core --lib --bins
+        env:
+          RUST_BACKTRACE: 1
+          MLX_TEST_REQUIRE_METAL: '1'
+
+      - name: cargo test (doc-tests of crates other than mlx-core)
+        run: cargo test --locked --workspace --exclude mlx-core --doc
+        env:
+          RUST_BACKTRACE: 1
+          MLX_TEST_REQUIRE_METAL: '1'
+
+  # Vitest suite against the `build` job's addon. Needs the converted bf16
+  # Qwen3-0.6B checkpoint (tokenizer, trainer, batch-generate tests) and the
+  # gsm8k dataset (`__test__/utils/dataset.test.ts`). No Rust toolchain: the
+  # addon arrives as an artifact and nothing under __test__ shells out to cargo.
+  ts-test:
+    name: yarn test
+    # A model-e2e opt-in can replace an active PR run, so it must also finish
+    # the required unit/integration checks. Unrelated label events stay idle.
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    runs-on: macos-26
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'yarn'
 
       - name: Install dependencies
         run: yarn install --immutable
@@ -214,36 +501,42 @@ jobs:
         with:
           name: mlx-metallib
           path: packages/core/
-      - name: Run tests
+
+      # Raw HuggingFace downloads only. The converted `-mlx-bf16` output is
+      # NOT cached: conversion depends on the code under test. Bump the `-vN`
+      # salt to invalidate.
+      - name: Cache Qwen3-0.6B download
+        uses: actions/cache@v6
+        with:
+          path: .cache/models/qwen3-0.6b
+          key: hf-${{ runner.os }}-qwen3-0.6b-v1
+
+      - name: Cache gsm8k dataset
+        uses: actions/cache@v6
+        with:
+          path: data/openai-gsm8k
+          key: hf-${{ runner.os }}-dataset-openai-gsm8k-v1
+
+      - name: Prepare fixtures and run tests
         run: |
+          set -euo pipefail
           # `yarn mlx` runs the CLI from source, but the CLI imports
           # `@mlx-node/server/host/paths`, and that export map resolves into
-          # `dist/`. A fresh runner has no `dist/`, so the first `yarn mlx` below
-          # cannot resolve it until TypeScript is built. The `yarn build:ts` in
-          # one matrix leg's own command runs too late — and the `cargo test` leg
-          # never builds TS at all.
+          # `dist/`. A fresh runner has no `dist/`, so `yarn mlx` cannot resolve
+          # it until TypeScript is built. One `tsc -b` here serves the fixture
+          # steps AND `yarn test` (it used to run twice).
           yarn build:ts
+          # `mlx download model` is a no-op when the output dir already holds a
+          # complete download (cache hit above); `download dataset` is not, so
+          # it is guarded on its two outputs.
           yarn mlx download model --output .cache/models/qwen3-0.6b
           yarn mlx convert --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
-          yarn mlx download dataset
-          ${{ matrix.test }}
+          if [ ! -s data/openai-gsm8k/train.jsonl ] || [ ! -s data/openai-gsm8k/test.jsonl ]; then
+            yarn mlx download dataset
+          fi
+          yarn test
         env:
-          RUST_BACKTRACE: 1
-          CARGO_INCREMENTAL: 1
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
-          # This leg runs on a Metal runner, so a test that self-skips because
-          # it found no GPU has not passed — it reported a green it never
-          # earned. `metal_device_absent` withdraws the skip licence when this
-          # is set, turning that case into a failure instead.
-          #
-          # The `model-test` leg sets the same var, but only around its `--lib`
-          # filter step, which names two tests. Every OTHER Metal-gated test in
-          # the crate runs here — including the ladder-retention pair, which
-          # became skippable when arming the ladder started requiring a paged
-          # adapter. Scoping this to the leg rather than to a name list means a
-          # test that grows a Metal dependency later is covered on the day it
-          # does, without anyone remembering to add it.
-          MLX_TEST_REQUIRE_METAL: '1'
 
   # Heavy real-model end-to-end leg — reuses the `build` job's native addon +
   # metallib artifacts (no second native build). Each matrix leg downloads +
@@ -279,6 +572,8 @@ jobs:
       (github.event.action != 'labeled' &&
        contains(github.event.pull_request.labels.*.name, 'model-e2e'))
     runs-on: macos-26
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -428,7 +723,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-          prefix-key: v1-rust
+          prefix-key: v2-rust
+          # One cache shared by every matrix leg: they all compile the same
+          # debug mlx-core test targets.
+          shared-key: e2e
+          cache-on-failure: true
+
+      - name: Cache prebuilt MLX
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
+
+      # The per-family checkpoints (1.5-3 GB each) are deliberately NOT cached:
+      # together with the five rust-cache keys they would blow through the
+      # 10 GB per-repo cache budget and evict the dependency caches, which are
+      # worth far more per run than a HuggingFace download.
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -451,7 +761,6 @@ jobs:
       - name: Download + convert ${{ matrix.name }} checkpoint and run its tests
         env:
           RUST_BACKTRACE: 1
-          CARGO_INCREMENTAL: 1
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
         run: |
           set -euo pipefail
@@ -472,12 +781,13 @@ jobs:
             echo "::notice::Skipping nemotron_h leg: needs a self-hosted runner (~38 GB disk / ~42 GB memory)."
             exit 0
           fi
-          # Same reason as the `test` job: `yarn mlx` needs @mlx-node/server's
+          # Same reason as the `ts-test` job: `yarn mlx` needs @mlx-node/server's
           # `dist/` to exist before it can resolve. The `yarn build:ts` further
           # down only runs on the `ts` leg, and only after these downloads.
           yarn build:ts
           src=".cache/models/${{ matrix.slug }}"
           out=".cache/models/${{ matrix.slug }}-mlx-bf16"
+          # No-op when the cache restored a complete download above.
           yarn mlx download model -m "${{ matrix.model }}" --output "$src"
           if [ -n "${{ matrix.mtype }}" ]; then
             yarn mlx convert --input "$src" -d bf16 -m "${{ matrix.mtype }}" --output "$out"
@@ -491,7 +801,7 @@ jobs:
             yarn build:ts
             GEMMA4_QAT_MODEL_PATH="$ckpt" yarn test ${{ matrix.tests }}
             MLX_PAGED_PREFILL_CHUNK_SIZE=64 MLX_TEST_MODEL_PATH="$ckpt" \
-              cargo test -p mlx-core --test gemma4_grouped_cold_tier_parity \
+              cargo test --locked -p mlx-core --test gemma4_grouped_cold_tier_parity \
                 -- --ignored --exact --test-threads=1 --nocapture \
                 gemma4_grouped_cold_tier_restart_parity
           else
@@ -515,7 +825,7 @@ jobs:
               # CI=true makes a missing/wrong value fail instead of self-skip.
               export MLX_PAGED_PREFILL_CHUNK_SIZE=512
             fi
-            cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --test-threads=1 --nocapture
+            cargo test --locked -p mlx-core ${{ matrix.tests }} -- --ignored --test-threads=1 --nocapture
             # Ignored UNIT tests, selected by name. Empty for legs that set no
             # `lib_tests:`, in which case nothing extra runs. See the comment on
             # that matrix key for why this is not folded into the line above.
@@ -551,7 +861,7 @@ jobs:
             if [ -n "${{ matrix.lib_tests }}" ]; then
               want=$(echo "${{ matrix.lib_tests }}" | wc -w | tr -d ' ')
               MLX_TEST_REQUIRE_METAL=1 \
-                cargo test -p mlx-core --lib -- --ignored --exact --test-threads=1 --nocapture \
+                cargo test --locked -p mlx-core --lib -- --ignored --exact --test-threads=1 --nocapture \
                 ${{ matrix.lib_tests }} 2>&1 | tee /tmp/lib_tests.log
               if ! grep -qE "test result: ok\. $want passed" /tmp/lib_tests.log; then
                 echo "::error::lib_tests expected $want test(s) to run; the filter matched a"
@@ -570,11 +880,11 @@ jobs:
             fi
             if [ -n "${{ matrix.stage1_rust }}" ]; then
               QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
-                cargo test -p mlx-core --test "${{ matrix.stage1_rust }}" \
+                cargo test --locked -p mlx-core --test "${{ matrix.stage1_rust }}" \
                   -- --ignored --test-threads=1 --nocapture
               QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
                 MLX_DISABLE_PERIODIC_CLEAR=1 \
-                cargo test -p mlx-core --test "${{ matrix.stage1_rust }}" \
+                cargo test --locked -p mlx-core --test "${{ matrix.stage1_rust }}" \
                   -- --ignored --test-threads=1 --nocapture
             fi
             if [ -n "${{ matrix.stage1_ts }}" ]; then
@@ -583,7 +893,7 @@ jobs:
             fi
             if [ -n "${{ matrix.stage2_rust }}" ]; then
               QWEN35_STAGE2_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=2 \
-                cargo test -p mlx-core --test "${{ matrix.stage2_rust }}" \
+                cargo test --locked -p mlx-core --test "${{ matrix.stage2_rust }}" \
                   -- --ignored --test-threads=1 --nocapture
             fi
             if [ -n "${{ matrix.stage0_ts }}" ]; then
@@ -591,67 +901,6 @@ jobs:
                 yarn test ${{ matrix.stage0_ts }}
             fi
           fi
-
-  lint:
-    name: Rust Lint
-    # Keep required lint checks in a replacement model-e2e run too.
-    if: >-
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'model-e2e'
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-          cache: 'yarn'
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-          target: aarch64-apple-darwin
-          cache: false
-          rustflags: ''
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Don't cache ~/.cargo/bin — restoring it overwrites the
-          # rustup proxy installed by setup-rust-toolchain and leaves
-          # cargo resolving to rustup-init's usage screen.
-          cache-bin: false
-          # Bumped after switching toolchain action; forces fresh
-          # caches and orphans the poisoned v0-rust archives.
-          prefix-key: v1-rust
-
-      - name: Configure GitHub token for CMake downloads
-        run: |
-          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
-          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
-          chmod 600 ~/.netrc
-
-      - name: Install dependencies
-        run: yarn install --immutable
-
-      - name: TypeCheck
-        run: yarn typecheck
-
-      - name: Lint
-        run: yarn lint
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-        env:
-          CARGO_INCREMENTAL: 1
 
   publish:
     name: Publish
@@ -661,16 +910,24 @@ jobs:
       id-token: write
       packages: write
     needs:
-      - test
-      - lint
+      - build
+      - lint-ts
+      - clippy
+      - rust-lib
+      - rust-int
+      - ts-test
       - model-test
     # Allow skipped model tests, but stop on workflow cancellation or failed
     # checks. Label-only opt-ins do not republish unchanged artifacts.
     if: >-
       !cancelled() &&
       github.event.action != 'labeled' &&
-      needs.test.result == 'success' &&
-      needs.lint.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.lint-ts.result == 'success' &&
+      needs.clippy.result == 'success' &&
+      needs.rust-lib.result == 'success' &&
+      needs.rust-int.result == 'success' &&
+      needs.ts-test.result == 'success' &&
       needs.model-test.result != 'failure' &&
       needs.model-test.result != 'cancelled'
     steps:
