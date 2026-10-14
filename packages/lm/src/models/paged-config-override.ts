@@ -14,7 +14,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { tmpdir } from 'node:os';
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
-import { ggufArchitecture, prepareMuseGlimmerGguf } from '@mlx-node/core';
+import { ggufArchitecture, prepareMuseGlimmerGguf, releaseNativeGgufLease } from '@mlx-node/core';
 
 import { CHAT_FAMILY_IDS } from '../family-data.js';
 
@@ -53,6 +53,15 @@ export class PagedConfigOverrideManager {
   private readonly tempDirPrefix: string;
   private readonly preserveEmbeddedGemmaDraft: boolean;
   private readonly overrides = new Map<string, Promise<string>>();
+  /**
+   * Override path → the prepared native-cache dirs its weights resolve to.
+   * `prepare` leases one reference per resolve attempt, so the map holds a
+   * list: two resolves of the same source produce two references even though
+   * the prepared dir is identical. The loader releases on its own init
+   * failure, and `claimPreparedLease` hands each reference to the host so a
+   * failed `loadModelFn` can give it back.
+   */
+  private readonly preparedLeases = new Map<string, string[]>();
   private readonly activeResolves = new Set<Promise<string>>();
   private rootPromise: Promise<string> | undefined;
   private cleanupPromise: Promise<void> | undefined;
@@ -115,8 +124,29 @@ export class PagedConfigOverrideManager {
       // A symlink to the GGUF would canonicalize back to the original config.
       // Prepare once, then overlay the packed cache so paging/persistence
       // directives reach the loader and the DFlash sidecar stays attached.
+      // `prepare` leases the cache dir against the cap; a resolve failure must
+      // release this attempt's reference — the loader is never reached, so the
+      // lease would pin a multi-GB entry for the process lifetime.
       const prepared = await prepareMuseGlimmerGguf(sourcePath);
-      return this.resolveInternal(prepared, modelType, persistPagedCache);
+      let resolved: string;
+      try {
+        resolved = await this.resolveInternal(prepared, modelType, persistPagedCache);
+      } catch (error) {
+        releaseNativeGgufLease(prepared);
+        throw error;
+      }
+      // Ownership survives resolve: the overlay still serves the prepared
+      // weights, so the lease stays held — `claimPreparedLease` hands the
+      // pair to the loader so its own failure can release this reference.
+      // One entry per resolve attempt: a memoized overlay can serve several
+      // attempts, each carrying its own reference.
+      const leases = this.preparedLeases.get(resolved);
+      if (leases === undefined) {
+        this.preparedLeases.set(resolved, [prepared]);
+      } else {
+        leases.push(prepared);
+      }
+      return resolved;
     }
     let config: Record<string, unknown>;
     try {
@@ -192,6 +222,21 @@ export class PagedConfigOverrideManager {
     }
   }
 
+  /**
+   * Return one prepared native-cache dir whose lease `resolvedPath` carries,
+   * and drop this manager's ownership of that reference. The host calls this
+   * once per resolved load attempt: a successful model keeps the lease for
+   * its lifetime; a failed load must call `releaseNativeGgufLease` on the
+   * returned dir so the reference this resolve acquired is given back.
+   */
+  claimPreparedLease(resolvedPath: string): string | undefined {
+    const leases = this.preparedLeases.get(resolvedPath);
+    if (leases === undefined) return undefined;
+    const prepared = leases.shift();
+    if (leases.length === 0) this.preparedLeases.delete(resolvedPath);
+    return prepared;
+  }
+
   /** Remove this manager's temporary root without affecting other managers. */
   cleanup(): Promise<void> {
     if (this.cleanupPromise !== undefined) return this.cleanupPromise;
@@ -205,6 +250,13 @@ export class PagedConfigOverrideManager {
     this.activeResolves.clear();
     await Promise.allSettled(this.overrides.values());
     this.overrides.clear();
+    // Any reference still here was never claimed by a load attempt — no
+    // loader owns it, so release it rather than pinning the cache entry
+    // against the cap until process exit.
+    for (const leases of this.preparedLeases.values()) {
+      for (const prepared of leases) releaseNativeGgufLease(prepared);
+    }
+    this.preparedLeases.clear();
     if (this.rootPromise === undefined) return;
 
     const root = await this.rootPromise.catch(() => undefined);

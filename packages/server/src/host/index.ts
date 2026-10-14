@@ -40,6 +40,7 @@
 
 import type { Server } from 'node:http';
 
+import { releaseNativeGgufLease } from '@mlx-node/core';
 import {
   loadModel as loadModelNative,
   PagedConfigOverrideManager,
@@ -332,7 +333,19 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     // Resolve against the source directory before creating the paged config overlay.
     const draftModelPath = findDFlash2Draft(path, entry.modelType, modelsDir);
     const resolvedPath = await pagedConfigOverrides.resolve(path, entry.modelType);
-    return draftModelPath === undefined ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, { draftModelPath });
+    // A muse_glimmer .gguf resolve leased the prepared native-cache dir; that
+    // reference is this attempt's. A successful load keeps it pinned for the
+    // model's lifetime — a failed one must give it back, or each retry pins
+    // another multi-GB cache entry against the cap until process exit.
+    const leasedDir = pagedConfigOverrides.claimPreparedLease(resolvedPath);
+    try {
+      return draftModelPath === undefined
+        ? await loadModelFn(resolvedPath)
+        : await loadModelFn(resolvedPath, { draftModelPath });
+    } catch (error) {
+      if (leasedDir !== undefined) releaseNativeGgufLease(leasedDir);
+      throw error;
+    }
   };
   const controller = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);
   ctrlRef.current = controller;

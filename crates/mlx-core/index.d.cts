@@ -5640,6 +5640,16 @@ export interface RecResult {
 }
 
 /**
+ * Release ONE lease reference `prepare_*`/`assets` took on `dir`. Model
+ * loaders already release on failed init; this binding exists for hosts
+ * that transform the prepared path (config overlays) before handing a
+ * different directory to the loader — their load failure must reach this
+ * release or the prepared entry pins against the cap for the process
+ * lifetime. Unleasing an unleased path is a no-op.
+ */
+export declare function releaseNativeGgufLease(dir: string): void;
+
+/**
  * Reset MLX's peak-memory counter to the current active level.
  * Useful for measuring per-request peak memory in a long-running
  * process — call before a request, sample

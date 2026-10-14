@@ -932,6 +932,7 @@ module.exports.quantizedQmvMicrobench = nativeBinding.quantizedQmvMicrobench;
 module.exports.qwen3AsrAudioDevices = nativeBinding.qwen3AsrAudioDevices;
 module.exports.Qwen3AsrCaptureSource = nativeBinding.Qwen3AsrCaptureSource;
 module.exports.qwen3AsrInputDevices = nativeBinding.qwen3AsrInputDevices;
+module.exports.releaseNativeGgufLease = nativeBinding.releaseNativeGgufLease;
 module.exports.resetPeakMemory = nativeBinding.resetPeakMemory;
 module.exports.resetProfilingData = nativeBinding.resetProfilingData;
 module.exports.saveToXlsx = nativeBinding.saveToXlsx;

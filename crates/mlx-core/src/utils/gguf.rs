@@ -8266,6 +8266,17 @@ pub async fn prepare_muse_glimmer_gguf(model_path: String) -> Result<String> {
         .into_owned())
 }
 
+/// Release ONE lease reference `prepare_*`/`assets` took on `dir`. Model
+/// loaders already release on failed init; this binding exists for hosts
+/// that transform the prepared path (config overlays) before handing a
+/// different directory to the loader — their load failure must reach this
+/// release or the prepared entry pins against the cap for the process
+/// lifetime. Unleasing an unleased path is a no-op.
+#[napi]
+pub fn release_native_gguf_lease(dir: String) {
+    native_gguf_unlease_in_use(Path::new(&dir));
+}
+
 impl NativeGgufFamily {
     fn layout(self) -> &'static str {
         match self {

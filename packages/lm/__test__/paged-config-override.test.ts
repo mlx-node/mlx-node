@@ -63,6 +63,51 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     },
   );
 
+  // Codex round-6: each resolve of a muse_glimmer .gguf acquires one prepared-dir
+  // lease reference. `claimPreparedLease` hands references out one per load
+  // attempt, and `cleanup()` releases whatever was never claimed — otherwise a
+  // resolve whose load never ran would pin a multi-GB cache entry for the
+  // process lifetime.
+  it('hands out one prepared lease per resolve attempt and releases unclaimed ones on cleanup', async () => {
+    const prepared = await makeModelDir({ model_type: 'muse_glimmer', use_block_paged_cache: false });
+    const input = join(prepared, 'Muse-Glimmer-Q4_K_M.gguf');
+    vi.spyOn(core, 'prepareMuseGlimmerGguf').mockResolvedValue(prepared);
+    const release = vi.spyOn(core, 'releaseNativeGgufLease').mockImplementation(() => {});
+    const manager = new PagedConfigOverrideManager();
+
+    const first = await manager.resolve(input, 'muse_glimmer');
+    const second = await manager.resolve(input, 'muse_glimmer');
+    expect(first).toBe(second); // one memoized overlay, two lease references
+
+    // Repeated failed retries: each claim yields the prepared dir so the host
+    // can release exactly that attempt's reference.
+    expect(manager.claimPreparedLease(first)).toBe(prepared);
+    expect(manager.claimPreparedLease(first)).toBe(prepared);
+    expect(manager.claimPreparedLease(first)).toBeUndefined();
+
+    // cleanup() releases any resolve-acquired reference no load ever claimed.
+    const manager2 = new PagedConfigOverrideManager();
+    const third = await manager2.resolve(input, 'muse_glimmer');
+    expect(manager2.claimPreparedLease(third)).toBe(prepared);
+    await manager2.resolve(input, 'muse_glimmer'); // claim left pending
+    await manager2.cleanup();
+    expect(release).toHaveBeenCalledWith(prepared);
+  });
+
+  it('releases the prepared lease when overlay creation fails after prepare', async () => {
+    const prepared = await makeModelDir({ model_type: 'muse_glimmer', use_block_paged_cache: false });
+    const input = join(prepared, 'Muse-Glimmer-Q4_K_M.gguf');
+    vi.spyOn(core, 'prepareMuseGlimmerGguf').mockResolvedValue(prepared);
+    const release = vi.spyOn(core, 'releaseNativeGgufLease').mockImplementation(() => {});
+    // A separator inside the prefix makes the mkdtemp parent path nonexistent,
+    // so createOverride deterministically throws AFTER prepare leased the dir.
+    const manager = new PagedConfigOverrideManager({ tempDirPrefix: join('nonexistent-parent-dir', 'overrides-') });
+    cleanups.push(() => manager.cleanup());
+
+    await expect(manager.resolve(input, 'muse_glimmer')).rejects.toThrow();
+    expect(release).toHaveBeenCalledWith(prepared);
+  });
+
   it('does not prepare GGUF weights for an unmanaged family', async () => {
     const prepare = vi.spyOn(core, 'prepareMuseGlimmerGguf');
     const manager = new PagedConfigOverrideManager({ modelTypes: ['qwen3_5'] });
