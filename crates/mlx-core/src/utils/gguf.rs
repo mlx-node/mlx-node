@@ -18798,6 +18798,13 @@ mod tests {
                 .contains(NATIVE_GGUF_STAGING_INFIX),
             "a refused publish must return the staging dir"
         );
+        // The post-publish sweep runs AFTER the lease registers: an extra
+        // sweep with the reference still held must keep the load output.
+        sweep_native_gguf_cache(&cache_root, "no-such-key");
+        assert!(
+            prepared.join(".complete").is_file(),
+            "a leased refused staging dir must survive the sweep while the pid lives"
+        );
         // The load failure path: give the attempt's reference back.
         native_gguf_unlease_in_use(&prepared);
         assert!(!native_gguf_in_use_dir(&prepared));
