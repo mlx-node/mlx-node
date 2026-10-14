@@ -123,11 +123,17 @@ export const BASE_KERNEL_MARKERS = [
 ] as const;
 
 /**
- * NAX gen-17 kernel names of the current MLX pin (e091d6784). Their absence
+ * NAX gen-17 kernel names of the current MLX pin (bcad39304). Their absence
  * means a stale or NAX-less metallib was selected; `steel_attention_dsplit` is
- * absent from the previous pin (053e43fe).
+ * absent from the pin before last (053e43fe) and `steel_gemm_thin_nax`
+ * (upstream #4654) from the previous one (e091d6784).
  */
-export const NAX_KERNEL_MARKERS = ['affine_qmv_wide', 'steel_gemm_segmented_nax', 'steel_attention_dsplit'] as const;
+export const NAX_KERNEL_MARKERS = [
+  'affine_qmv_wide',
+  'steel_gemm_segmented_nax',
+  'steel_attention_dsplit',
+  'steel_gemm_thin_nax',
+] as const;
 
 export function hostAppleTriple(arch: string = process.arch): string {
   return arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
