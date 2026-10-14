@@ -325,6 +325,11 @@ pub struct Qwen4ExpModel {
 impl Qwen4ExpModel {
     #[napi]
     pub async fn load(model_path: String, options: Option<Qwen4ExpLoadOptions>) -> Result<Self> {
+        // `gguf::assets` leases the returned sidecar for the model's
+        // lifetime; when init fails, the caller must release that reference
+        // or the dir is pinned against the cache cap forever.
+        let leased_assets = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let leased_assets_init = std::sync::Arc::clone(&leased_assets);
         let (thread, ready) = ModelThread::spawn_with_scheduler(
             move || {
                 let path = PathBuf::from(model_path);
@@ -332,6 +337,9 @@ impl Qwen4ExpModel {
                 let (mut config, assets) = if weights.gguf {
                     let c = gguf::config(&weights)?;
                     let a = gguf::assets(&path, &weights, &c)?;
+                    *leased_assets_init
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(a.clone());
                     (c, a)
                 } else {
                     let raw = std::fs::read(path.join("config.json"))
@@ -415,9 +423,29 @@ impl Qwen4ExpModel {
             residency,
             prefill_chunk_size,
             supports_images,
-        ) = ready
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))??;
+        ) = match ready.await {
+            Ok(Ok(init)) => init,
+            Ok(Err(error)) => {
+                if let Some(dir) = leased_assets
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                {
+                    crate::utils::gguf::native_gguf_unlease_in_use(&dir);
+                }
+                return Err(error);
+            }
+            Err(e) => {
+                if let Some(dir) = leased_assets
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                {
+                    crate::utils::gguf::native_gguf_unlease_in_use(&dir);
+                }
+                return Err(Error::from_reason(e.to_string()));
+            }
+        };
         Ok(Self {
             thread,
             config,

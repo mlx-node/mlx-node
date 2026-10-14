@@ -470,7 +470,15 @@ impl Qwen3_5MoeModel {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
         {
             let cache = crate::utils::gguf::prepare_qwen35_moe_native_gguf(source).await?;
-            return persistence::load_with_thread(&cache.to_string_lossy()).await;
+            // A failed init must release the lease prepare took (see the
+            // dense loader for why the dir would otherwise pin forever).
+            return match persistence::load_with_thread(&cache.to_string_lossy()).await {
+                Ok(model) => Ok(model),
+                Err(error) => {
+                    crate::utils::gguf::native_gguf_unlease_in_use(&cache);
+                    Err(error)
+                }
+            };
         }
         persistence::load_with_thread(&path).await
     }

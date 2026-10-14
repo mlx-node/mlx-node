@@ -45,22 +45,35 @@ impl ClefModel {
     #[napi]
     pub async fn load(path: String) -> Result<Self> {
         let source = std::path::Path::new(&path);
-        let prepared = if source.is_file()
+        let leased = if source.is_file()
             && source
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
         {
-            crate::utils::gguf::prepare_clef_native_gguf(source)
-                .await?
-                .to_string_lossy()
-                .into_owned()
+            match crate::utils::gguf::prepare_clef_native_gguf(source).await {
+                Ok(prepared) => Some(prepared),
+                Err(error) => return Err(error),
+            }
         } else {
-            path
+            None
         };
-        Ok(Self {
-            backbone: persistence::load_clef_with_thread(&prepared).await?,
-        })
+        let prepared_path = leased
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(path);
+        // A failed backbone init must release the lease prepare took — a
+        // pinned multi-GB entry would otherwise defeat the cache cap for the
+        // rest of the process.
+        match persistence::load_clef_with_thread(&prepared_path).await {
+            Ok(backbone) => Ok(Self { backbone }),
+            Err(error) => {
+                if let Some(dir) = leased {
+                    crate::utils::gguf::native_gguf_unlease_in_use(&dir);
+                }
+                Err(error)
+            }
+        }
     }
     /// Receives raw JSON to retain HTTP object ordering and number spelling.
     #[napi]

@@ -3157,6 +3157,10 @@ impl Gemma4Model {
     ) -> Result<Self> {
         let source = Path::new(model_path);
         let mut draft_model_path = options.and_then(|o| o.draft_model_path);
+        // `leased` keeps the prepared cache dir so a failed init can release
+        // the lease prepare took — otherwise a multi-GB entry is pinned
+        // against the cap for the process lifetime.
+        let mut leased: Option<PathBuf> = None;
         let model_path = if let Some(gguf) = crate::utils::gguf::resolve_gemma4_gguf_source(source)?
         {
             // Preserve sibling draft discovery when the target moves into its
@@ -3166,10 +3170,10 @@ impl Gemma4Model {
                     resolve_draft_model_path(gguf.parent().unwrap_or(Path::new(".")), None)?
                         .map(|path| path.to_string_lossy().into_owned());
             }
-            crate::utils::gguf::prepare_gemma4_native_gguf(&gguf)
-                .await?
-                .to_string_lossy()
-                .into_owned()
+            let prepared = crate::utils::gguf::prepare_gemma4_native_gguf(&gguf).await?;
+            let path = prepared.to_string_lossy().into_owned();
+            leased = Some(prepared);
+            path
         } else {
             model_path.to_string()
         };
@@ -3235,9 +3239,21 @@ impl Gemma4Model {
             paged_active,
             max_concurrent_sequences,
             draft_active,
-        ) = init_rx
-            .await
-            .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+        ) = match init_rx.await {
+            Ok(Ok(init)) => init,
+            Ok(Err(error)) => {
+                if let Some(dir) = leased {
+                    crate::utils::gguf::native_gguf_unlease_in_use(&dir);
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if let Some(dir) = leased {
+                    crate::utils::gguf::native_gguf_unlease_in_use(&dir);
+                }
+                return Err(napi::Error::from_reason("Model thread exited during load"));
+            }
+        };
 
         Ok(Gemma4Model {
             thread: Some(thread),

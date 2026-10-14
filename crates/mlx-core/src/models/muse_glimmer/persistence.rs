@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -738,13 +738,17 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
 }
 
 pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerModel> {
+    // `leased` keeps the prepared cache dir so a failed init can release the
+    // lease prepare took — otherwise a multi-GB entry pins against the cap
+    // for the process lifetime.
+    let mut leased: Option<PathBuf> = None;
     let model_path = if let Some(gguf) =
         crate::utils::gguf::resolve_muse_glimmer_gguf_source(Path::new(model_path))?
     {
-        crate::utils::gguf::prepare_muse_glimmer_native_gguf(&gguf)
-            .await?
-            .to_string_lossy()
-            .into_owned()
+        let prepared = crate::utils::gguf::prepare_muse_glimmer_native_gguf(&gguf).await?;
+        let path = prepared.to_string_lossy().into_owned();
+        leased = Some(prepared);
+        path
     } else {
         model_path.to_string()
     };
@@ -792,9 +796,23 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
         context_limits,
         cache_limit_guard,
         pool_cache_limit_guard,
-    ) = init_rx
-        .await
-        .map_err(|_| Error::from_reason("Muse-Glimmer model thread exited during load"))??;
+    ) = match init_rx.await {
+        Ok(Ok(init)) => init,
+        Ok(Err(error)) => {
+            if let Some(dir) = leased {
+                crate::utils::gguf::native_gguf_unlease_in_use(&dir);
+            }
+            return Err(error);
+        }
+        Err(_) => {
+            if let Some(dir) = leased {
+                crate::utils::gguf::native_gguf_unlease_in_use(&dir);
+            }
+            return Err(Error::from_reason(
+                "Muse-Glimmer model thread exited during load",
+            ));
+        }
+    };
     Ok(MuseGlimmerModel {
         thread,
         model_assets_path,
