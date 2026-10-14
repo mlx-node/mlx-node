@@ -419,6 +419,39 @@ fn dir_name_identity(dir: &Path) -> Option<&str> {
     None
 }
 
+/// Producer chunk files are `{chunk_key}.pack` where chunk_key is a SHA-256
+/// hexdigest — 64 lowercase hex chars. A `backup.pack` or `notes.pack`
+/// dropped inside an identity dir is foreign: never counted as spend and
+/// never a deletion candidate.
+fn is_pack_name(name: &OsStr) -> bool {
+    let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".pack")) else {
+        return false;
+    };
+    stem.len() == 64
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Producer staging files are `{Uuid::new_v4()}.tmp` — 36 chars:
+/// 8-4-4-4-12 lowercase hex separated by dashes, version nibble `4` at
+/// position 14, variant `[89ab]` at 19. A `notes.tmp` or `snapshot.tmp` in
+/// the dir is foreign: never counted as retained spend and never unlinked
+/// by the stale-tmp reaper.
+fn is_tmp_name(name: &OsStr) -> bool {
+    let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let b = stem.as_bytes();
+    b.len() == 36
+        && [8usize, 13, 18, 23].iter().all(|&i| b[i] == b'-')
+        && b[14] == b'4'
+        && matches!(b[19], b'8' | b'9' | b'a' | b'b')
+        && b.iter().enumerate().all(|(i, c)| {
+            [8usize, 13, 18, 23].contains(&i) || (c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        })
+}
+
 /// `libc::stat` timestamps are signed: a restored or manually stamped file
 /// can carry a pre-epoch mtime, and casting a negative `st_mtime` to u64
 /// wraps to a near-`u64::MAX` duration whose epoch addition panics. Clamp
@@ -508,7 +541,7 @@ fn pack_bytes(dir: &Path) -> u64 {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| e.path().extension().is_some_and(|s| s == "pack"))
+                .filter(|e| is_pack_name(&e.file_name()))
                 .filter_map(|e| fs::symlink_metadata(e.path()).ok())
                 .map(|m| m.len())
                 .sum()
@@ -534,7 +567,7 @@ fn retained_tmp_bytes(dir: &Path) -> u64 {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| e.path().extension().is_some_and(|s| s == "tmp"))
+                .filter(|e| is_tmp_name(&e.file_name()))
                 .filter_map(|e| fs::symlink_metadata(e.path()).ok())
                 .filter(|m| m.is_file() && m.modified().is_ok_and(|t| t > cutoff))
                 .map(|m| m.len())
@@ -868,11 +901,7 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
             .unwrap_or_default();
         let mut packs: Vec<(SystemTime, OsString, u64)> = names
             .iter()
-            .filter(|name| {
-                Path::new(name.as_os_str())
-                    .extension()
-                    .is_some_and(|s| s == "pack")
-            })
+            .filter(|name| is_pack_name(name.as_os_str()))
             .filter_map(|name| {
                 let stat = dir_stat(&dirfd, name)?;
                 Some((stat_mtime(&stat), name.clone(), stat.st_size as u64))
@@ -929,7 +958,7 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let path = current.join(&name);
-                if Path::new(&name).extension().is_some_and(|s| s == "tmp")
+                if is_tmp_name(&name)
                     && let Some(stat) = dir_stat(&dirfd, &name)
                     && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
                     && stat_mtime(&stat) < SystemTime::now() - PACKED_SWEEP_MIN_AGE
@@ -1064,12 +1093,7 @@ fn shed_oldest_packs(dir: &Path, dirfd: &File, exclude: &OsStr, headroom: u64) -
         .unwrap_or_default();
     let mut packs: Vec<(SystemTime, OsString, u64)> = names
         .iter()
-        .filter(|name| {
-            Path::new(name.as_os_str())
-                .extension()
-                .is_some_and(|s| s == "pack")
-                && name.as_os_str() != exclude
-        })
+        .filter(|name| is_pack_name(name.as_os_str()) && name.as_os_str() != exclude)
         .filter_map(|name| {
             let stat = dir_stat(dirfd, name)?;
             Some((stat_mtime(&stat), name.clone(), stat.st_size as u64))
@@ -1408,10 +1432,7 @@ impl PackedCache {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name())
             .filter(|name| {
-                Path::new(name.as_os_str())
-                    .extension()
-                    .is_some_and(|s| s == "pack")
-                    && name.as_os_str() != OsStr::new(&target_name)
+                is_pack_name(name.as_os_str()) && name.as_os_str() != OsStr::new(&target_name)
             })
             .try_fold(0u64, |sum, name| {
                 let len = dir_stat(&dirfd, &name)
@@ -1765,6 +1786,23 @@ mod tests {
         }
     }
 
+    /// Grammar-valid pack STEM (see `is_pack_name`): 64 lowercase hex —
+    /// use as a `write`/`path` key or append `.pack` for a file name.
+    fn pack_name(letter: char) -> String {
+        letter.to_string().repeat(64)
+    }
+
+    /// Grammar-valid pack FILE name: `pack_name` plus the extension.
+    fn pack_file(letter: char) -> String {
+        format!("{}.pack", pack_name(letter))
+    }
+
+    /// Grammar-valid staging name (see `is_tmp_name`): a v4 UUID —
+    /// version nibble `4` at index 14, variant `8` at index 19.
+    fn tmp_name(seed: &str) -> String {
+        format!("{seed}-0000-4000-8000-000000000000.tmp")
+    }
+
     fn age(path: &Path, seconds: u64) {
         let old = SystemTime::now() - Duration::from_secs(seconds);
         let file = OpenOptions::new().write(true).open(path).unwrap();
@@ -2043,7 +2081,7 @@ mod tests {
         // A manifest-less sibling is never orphan-deleted.
         let unknown = parent.join(format!("{DIR_PREFIX}{}", "b".repeat(64)));
         fs::create_dir(&unknown).unwrap();
-        fs::write(unknown.join("leftover.pack"), b"data").unwrap();
+        fs::write(unknown.join(pack_file('9')), b"data").unwrap();
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"weights").unwrap();
         let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
@@ -2113,16 +2151,16 @@ mod tests {
         let outside = temp.0.join("outside");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("big.bin"), vec![0_u8; 1 << 20]).unwrap();
-        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join("linked.pack")).unwrap();
+        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join(pack_file('e'))).unwrap();
         std::os::unix::fs::symlink(outside.join("big.bin"), dir.join("linked.bin")).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("linked-dir")).unwrap();
-        fs::write(dir.join("real.pack"), vec![0_u8; 64]).unwrap();
+        fs::write(dir.join(pack_file('f')), vec![0_u8; 64]).unwrap();
         let link_len = |name: &str| fs::symlink_metadata(dir.join(name)).unwrap().len();
         // A symlink contributes only its own link bytes — never the target's.
-        assert_eq!(pack_bytes(&dir), 64 + link_len("linked.pack"));
+        assert_eq!(pack_bytes(&dir), 64 + link_len(&pack_file('e')));
         assert_eq!(
             dir_size(&dir),
-            64 + link_len("linked.pack") + link_len("linked.bin") + link_len("linked-dir")
+            64 + link_len(&pack_file('e')) + link_len("linked.bin") + link_len("linked-dir")
         );
         assert!(
             pack_bytes(&dir) < 1 << 16,
@@ -2361,7 +2399,7 @@ mod tests {
         // duration; it now orders as the oldest entry.
         let cache_dir = parent.join(format!("{DIR_PREFIX}{}", "d".repeat(64)));
         fs::create_dir(&cache_dir).unwrap();
-        let pack = cache_dir.join("old.pack");
+        let pack = cache_dir.join(&pack_file('0'));
         fs::write(&pack, b"x").unwrap();
         let epoch_minus_one = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
         OpenOptions::new()
@@ -2372,7 +2410,7 @@ mod tests {
             .unwrap();
         let stat = dir_stat(
             &open_dir_nofollow(&cache_dir).unwrap(),
-            OsStr::new("old.pack"),
+            OsStr::new(&pack_file('0')),
         )
         .unwrap();
         assert_eq!(stat_mtime(&stat), SystemTime::UNIX_EPOCH);
@@ -2386,11 +2424,11 @@ mod tests {
             manifest: None,
         };
         let w = weight("affine");
-        cache.write("k1", &w).unwrap();
-        cache.write("k2", &w).unwrap();
+        cache.write(&pack_name('a'), &w).unwrap();
+        cache.write(&pack_name('b'), &w).unwrap();
         // Simulated external cleanup inflates the recorded spend.
-        fs::remove_file(cache.path("k1")).unwrap();
-        cache.write("k3", &w).unwrap();
+        fs::remove_file(cache.path(&pack_name('a'))).unwrap();
+        cache.write(&pack_name('c'), &w).unwrap();
         let mut n = [0u8; 8];
         File::open(cache.root.join("budget"))
             .unwrap()
@@ -2405,16 +2443,16 @@ mod tests {
         // Recorded spend = reconciled used + exact reserve for the new pack,
         // which now equals the true on-disk bytes.
         assert_eq!(u64::from_le_bytes(n), actual);
-        cache.write("k4", &w).unwrap();
+        cache.write(&pack_name('d'), &w).unwrap();
         File::open(cache.root.join("budget"))
             .unwrap()
             .read_exact(&mut n)
             .unwrap();
         assert_eq!(
             u64::from_le_bytes(n),
-            fs::metadata(cache.path("k4")).unwrap().len()
-                + fs::metadata(cache.path("k2")).unwrap().len()
-                + fs::metadata(cache.path("k3")).unwrap().len()
+            fs::metadata(cache.path(&pack_name('d'))).unwrap().len()
+                + fs::metadata(cache.path(&pack_name('b'))).unwrap().len()
+                + fs::metadata(cache.path(&pack_name('c'))).unwrap().len()
         );
     }
 
@@ -2426,16 +2464,20 @@ mod tests {
             manifest: None,
         };
         let w = weight("affine");
-        for (key, seconds) in [("old", 300u64), ("mid", 200), ("new", 100)] {
-            cache.write(key, &w).unwrap();
-            age(&cache.path(key), seconds);
+        for (key, seconds) in [
+            (pack_name('a'), 300u64),
+            (pack_name('b'), 200),
+            (pack_name('c'), 100),
+        ] {
+            cache.write(&key, &w).unwrap();
+            age(&cache.path(&key), seconds);
         }
-        let pack = fs::metadata(cache.path("old")).unwrap().len();
+        let pack = fs::metadata(cache.path(&pack_name('a'))).unwrap().len();
         // Cap fits exactly two packs plus ledger bytes: shed only the oldest.
         enforce_packed_total_cap(&temp.0, &cache.root, 2 * pack + 64);
-        assert!(!cache.path("old").exists());
-        assert!(cache.path("mid").exists());
-        assert!(cache.path("new").exists());
+        assert!(!cache.path(&pack_name('a')).exists());
+        assert!(cache.path(&pack_name('b')).exists());
+        assert!(cache.path(&pack_name('c')).exists());
         // Ledger re-reconciled to actual bytes.
         let mut n = [0u8; 8];
         File::open(cache.root.join("budget"))
@@ -2458,8 +2500,8 @@ mod tests {
         assert!(cache.root.join(".manifest").is_file());
         // Crash leftovers in the current dir leave through the sweep once
         // aged; a fresh .tmp (a plausibly live writer) is kept.
-        let stale_tmp = cache.root.join("old.tmp");
-        let live_tmp = cache.root.join("live.tmp");
+        let stale_tmp = cache.root.join(tmp_name("00000000"));
+        let live_tmp = cache.root.join(tmp_name("11111111"));
         fs::write(&stale_tmp, b"x").unwrap();
         fs::write(&live_tmp, b"x").unwrap();
         age(&stale_tmp, 7200);
@@ -2476,21 +2518,21 @@ mod tests {
         // Eldest with a manifest and past the idle grace: the only eviction.
         let oldest = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
         fs::create_dir(&oldest).unwrap();
-        fs::write(oldest.join("a.pack"), vec![0_u8; 100]).unwrap();
+        fs::write(oldest.join(&pack_file('a')), vec![0_u8; 100]).unwrap();
         fs::write(oldest.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-        age(&oldest.join("a.pack"), 7200);
+        age(&oldest.join(&pack_file('a')), 7200);
         age(&oldest.join(".manifest"), 7200);
         age_dir(&oldest, 7200);
         // Fresh manifest dir and manifest-less dir both survive the cap: the
         // idle grace shields the first, the manifest requirement the second.
         let fresh = parent.join(format!("{DIR_PREFIX}{}", "b".repeat(64)));
         fs::create_dir(&fresh).unwrap();
-        fs::write(fresh.join("b.pack"), vec![0_u8; 100]).unwrap();
+        fs::write(fresh.join(&pack_file('b')), vec![0_u8; 100]).unwrap();
         fs::write(fresh.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
         let bare = parent.join(format!("{DIR_PREFIX}{}", "c".repeat(64)));
         fs::create_dir(&bare).unwrap();
-        fs::write(bare.join("c.pack"), vec![0_u8; 100]).unwrap();
-        age(&bare.join("c.pack"), 7200);
+        fs::write(bare.join(&pack_file('c')), vec![0_u8; 100]).unwrap();
+        age(&bare.join(&pack_file('c')), 7200);
         age_dir(&bare, 7200);
         let cache = PackedCache {
             root: temp.0.join("current"),
@@ -2613,22 +2655,26 @@ mod tests {
         assert_ne!(a.root, b.root);
         let w = weight("affine");
         // Under the cap the write goes through and the ledger reserves it.
-        a.write_with_total_cap("k1", &w, Some(u64::MAX)).unwrap();
-        let pack = fs::metadata(a.path("k1")).unwrap().len();
+        a.write_with_total_cap(&pack_name('e'), &w, Some(u64::MAX))
+            .unwrap();
+        let pack = fs::metadata(a.path(&pack_name('e'))).unwrap().len();
         assert!(pack > 0);
         // A sibling ledger reservation counts toward the shared cap: b's
         // write is vetoed even though its own dir is empty, and no eviction
         // can free it (a's dir is fresh).
-        b.write_with_total_cap("k1", &w, Some(pack)).unwrap();
-        assert!(!b.path("k1").exists());
+        b.write_with_total_cap(&pack_name('e'), &w, Some(pack))
+            .unwrap();
+        assert!(!b.path(&pack_name('e')).exists());
         // A busy root cap lock skips the chunk instead of stalling; the next
         // write after the guard drops succeeds.
         let guard = packed_root_cap_lock(&parent).unwrap();
-        a.write_with_total_cap("k2", &w, Some(u64::MAX)).unwrap();
-        assert!(!a.path("k2").exists());
+        a.write_with_total_cap(&pack_name('f'), &w, Some(u64::MAX))
+            .unwrap();
+        assert!(!a.path(&pack_name('f')).exists());
         drop(guard);
-        a.write_with_total_cap("k2", &w, Some(u64::MAX)).unwrap();
-        assert!(a.path("k2").exists());
+        a.write_with_total_cap(&pack_name('f'), &w, Some(u64::MAX))
+            .unwrap();
+        assert!(a.path(&pack_name('f')).exists());
         // The cap lock file itself is never treated as a cache dir.
         assert!(parent.join(".mlx-qwen4-packed-cap.lock").is_file());
         assert_eq!(
@@ -2646,23 +2692,33 @@ mod tests {
             manifest: None,
         };
         let w = weight("affine");
-        for (key, seconds) in [("old", 300u64), ("mid", 200), ("new", 100)] {
-            cache.write(key, &w).unwrap();
-            age(&cache.path(key), seconds);
+        for (key, seconds) in [
+            (pack_name('a'), 300u64),
+            (pack_name('b'), 200),
+            (pack_name('c'), 100),
+        ] {
+            cache.write(&key, &w).unwrap();
+            age(&cache.path(&key), seconds);
         }
-        let pack = fs::metadata(cache.path("old")).unwrap().len();
+        let pack = fs::metadata(cache.path(&pack_name('a'))).unwrap().len();
         // A cap that fits exactly two packs plus the pending write: the
         // writer must shed its own oldest pack (enforcement cannot — it
         // never wins the budget flock the writer holds), turning the dir
         // into a true LRU instead of wedging once usage reaches the cap.
-        // ("nxt" stays 3 chars so reserve equals the existing pack size.)
+        // (pack names must satisfy is_pack_name: 64 lowercase hex.)
         cache
-            .write_with_total_cap("nxt", &w, Some(2 * pack + pack))
+            .write_with_total_cap(&pack_name('d'), &w, Some(2 * pack + pack))
             .unwrap();
-        assert!(!cache.path("old").exists(), "oldest pack is shed for room");
-        assert!(cache.path("mid").exists());
-        assert!(cache.path("new").exists());
-        assert!(cache.path("nxt").exists(), "the new write must be admitted");
+        assert!(
+            !cache.path(&pack_name('a')).exists(),
+            "oldest pack is shed for room"
+        );
+        assert!(cache.path(&pack_name('b')).exists());
+        assert!(cache.path(&pack_name('c')).exists());
+        assert!(
+            cache.path(&pack_name('d')).exists(),
+            "the new write must be admitted"
+        );
         // Ledger records reconciled used + reserve = 3 packs.
         let mut n = [0u8; 8];
         File::open(cache.root.join("budget"))
@@ -2682,7 +2738,7 @@ mod tests {
         // that must not veto other identities forever.
         let sibling = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
         fs::create_dir(&sibling).unwrap();
-        fs::write(sibling.join("a.pack"), vec![0_u8; 64]).unwrap();
+        fs::write(sibling.join(&pack_file('a')), vec![0_u8; 64]).unwrap();
         let ledger_path = sibling.join("budget");
         fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
         let source = temp.0.join("b.gguf");
@@ -2692,8 +2748,9 @@ mod tests {
         // The sibling is fresh and manifest-less: nothing can evict it, so
         // admission is possible only if the recheck reconciles the phantom
         // ledger to its real pack bytes.
-        b.write_with_total_cap("k1", &w, Some(u64::MAX)).unwrap();
-        let pack = fs::metadata(b.path("k1")).unwrap().len();
+        b.write_with_total_cap(&pack_name('e'), &w, Some(u64::MAX))
+            .unwrap();
+        let pack = fs::metadata(b.path(&pack_name('e'))).unwrap().len();
         fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
         b.write_with_total_cap("k2", &w, Some(pack * 10)).unwrap();
         assert!(
@@ -2727,13 +2784,15 @@ mod tests {
             manifest: None,
         };
         let w = weight("affine");
-        cache.write("k1", &w).unwrap();
-        let pack = fs::metadata(cache.path("k1")).unwrap().len();
+        cache.write(&pack_name('a'), &w).unwrap();
+        let pack = fs::metadata(cache.path(&pack_name('a'))).unwrap().len();
         // A vetoed REPLACEMENT write leaves the old target on disk: the
         // ledger reconcile must record real spend (target included), not the
         // ex-target `used` — an undercounted ledger would let siblings
         // overspend the configured cap.
-        cache.write_with_total_cap("k1", &w, Some(1)).unwrap();
+        cache
+            .write_with_total_cap(&pack_name('a'), &w, Some(1))
+            .unwrap();
         let mut n = [0u8; 8];
         File::open(cache.root.join("budget"))
             .unwrap()
@@ -2745,7 +2804,7 @@ mod tests {
             u64::from_le_bytes(n),
             pack
         );
-        assert!(cache.path("k1").exists());
+        assert!(cache.path(&pack_name('a')).exists());
         // And sibling estimates floor a stale-low ledger at real bytes.
         fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
         assert_eq!(sibling_pack_estimate(&cache.root), pack);
@@ -2761,15 +2820,15 @@ mod tests {
         let temp = Temp::new();
         let dir = temp.0.join("cache");
         fs::create_dir(&dir).unwrap();
-        fs::write(dir.join("real.pack"), vec![0_u8; 128]).unwrap();
-        fs::write(dir.join("leftover.tmp"), vec![0_u8; 512]).unwrap();
-        let stale_tmp = dir.join("stale.tmp");
+        fs::write(dir.join(pack_file('f')), vec![0_u8; 128]).unwrap();
+        fs::write(dir.join(tmp_name("22222222")), vec![0_u8; 512]).unwrap();
+        let stale_tmp = dir.join(tmp_name("33333333"));
         fs::write(&stale_tmp, vec![0_u8; 256]).unwrap();
         age(&stale_tmp, 2 * PACKED_SWEEP_MIN_AGE.as_secs());
-        fs::create_dir(dir.join("weird.tmp")).unwrap();
+        fs::create_dir(dir.join(tmp_name("44444444"))).unwrap();
         let outside = temp.0.join("outside.bin");
         fs::write(&outside, vec![0_u8; 1 << 20]).unwrap();
-        std::os::unix::fs::symlink(&outside, dir.join("linked.tmp")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(tmp_name("55555555"))).unwrap();
         assert_eq!(pack_bytes(&dir), 128);
         assert_eq!(retained_tmp_bytes(&dir), 512);
         // No ledger: estimate = pack bytes + retained tmp bytes.
@@ -2818,7 +2877,7 @@ mod tests {
             !cache.path("k").exists(),
             "a retained crash leftover must veto admission over the cap"
         );
-        fs::remove_file(dir.join("leftover.tmp")).unwrap();
+        fs::remove_file(dir.join(tmp_name("22222222"))).unwrap();
         cache
             .write_with_total_cap("k", &w, Some(128 + reserve))
             .unwrap();
