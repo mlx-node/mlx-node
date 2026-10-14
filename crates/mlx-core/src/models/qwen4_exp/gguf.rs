@@ -264,15 +264,27 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
             native_gguf_unlease_in_use(&dir);
         }
     }
-    if live_dir.join("complete").exists() {
-        // The completed refused publish from an earlier load in this
-        // process; reuse it rather than rebuilding (and rather than
-        // republishing — moving the path out from under a live reader).
-        // Live dirs have no lock file and are already pid-gated, so this
-        // lease is registry-only.
-        native_gguf_lease_in_use(root, &live_dir, None);
-        stamp_complete(&live_dir.join("complete"));
-        return Ok(live_dir);
+    for generation in 1..64_u32 {
+        let candidate = if generation == 1 {
+            live_dir.clone()
+        } else {
+            root.join(format!("{live_dir_name}-g{generation}"))
+        };
+        if candidate.join("complete").exists() {
+            // The completed refused publish from an earlier load in this
+            // process; reuse it rather than rebuilding (and rather than
+            // republishing — moving the path out from under a live reader).
+            // Live dirs have no lock file and are already pid-gated, so this
+            // lease is registry-only.
+            native_gguf_lease_in_use(root, &candidate, None);
+            stamp_complete(&candidate.join("complete"));
+            return Ok(candidate);
+        }
+        // Generations are allocated densely — the first missing one ends the
+        // search.
+        if !candidate.exists() {
+            break;
+        }
     }
     // Contention here is not an ordinary cache miss: a busy sidecar lock can
     // be a capped-cache sweep mid-`remove_dir_all` on this very directory.
@@ -304,9 +316,39 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         stamp_complete(&dir.join("complete"));
         return Ok(dir);
     }
-    // A dir registered earlier that lost its marker anyway is debris:
-    // release its lease before a republish replaces it.
-    native_gguf_unlease_in_use(&dir);
+    // A markerless `dir` may still be leased by a loaded model — marker loss
+    // proves damage, not that nobody holds the path. Never unlease it: the
+    // publish guard below refuses a leased dir, and an unleased markerless
+    // dir is debris the publish may replace.
+    //
+    // Fallback for a refused publish: rename `temp` onto the first
+    // generation of the per-pid live name that is not leased. A completed
+    // live dir would have hit the reuse check above, so an existing
+    // unleased one is debris and is replaced; a leased one is kept and the
+    // next `-g{n}` name is tried. Live names are pid-gated by the sweep —
+    // per-process collisions are impossible.
+    let promote_live = |temp: &std::path::Path| -> Result<PathBuf> {
+        for generation in 1..64_u32 {
+            let candidate_name = if generation == 1 {
+                live_dir_name.clone()
+            } else {
+                format!("{live_dir_name}-g{generation}")
+            };
+            let candidate = root.join(&candidate_name);
+            if crate::utils::gguf::native_gguf_in_use_dir(&candidate) {
+                continue;
+            }
+            if candidate.exists() {
+                std::fs::remove_dir_all(&candidate)
+                    .map_err(|e| Error::from_reason(e.to_string()))?;
+            }
+            std::fs::rename(temp, &candidate).map_err(|e| Error::from_reason(e.to_string()))?;
+            return Ok(candidate);
+        }
+        Err(Error::from_reason(
+            "every .mlx-qwen4-assets-live generation for this source is leased",
+        ))
+    };
     // Publish a complete directory in one rename while the sidecar lock is
     // held: the sweep cannot delete `dir` between the rename and the return.
     // Simultaneous loads serialize on the lock rather than racing temp dirs.
@@ -339,22 +381,18 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
             let published = native_gguf_publish_with_cap(root, &temp, &dir, cap)
                 .map_err(|e| Error::from_reason(e.to_string()))?;
             if published == temp {
-                // Admission refused: rename `temp` onto `live_dir` under the
-                // sidecar lock. A pre-existing `live_dir` is always a
-                // markerless remnant — a completed one (a live previous
-                // refusal) would have hit the check above — so it was never
-                // a load output and is safe to clear.
-                if live_dir.exists() {
-                    // Release any stale lease first — a registered remnant
-                    // was in use once, but a markerless one is debris.
-                    native_gguf_unlease_in_use(&live_dir);
-                    std::fs::remove_dir_all(&live_dir)
-                        .map_err(|e| Error::from_reason(e.to_string()))?;
-                }
-                std::fs::rename(&temp, &live_dir).map_err(|e| Error::from_reason(e.to_string()))?;
-                return Ok(live_dir.clone());
+                // Admission refused — or `dir` is still leased. Either way
+                // the temp promotes to the first unleased live generation.
+                return promote_live(&temp);
             }
             return Ok(published);
+        }
+        // Uncapped: a markerless `dir` a model still leases is promoted past
+        // rather than replaced — the lease probe needs no entry lock, which
+        // `_guard` already holds.
+        if dir.exists() && crate::utils::gguf::native_gguf_output_delete_guard(root, &dir).is_none()
+        {
+            return promote_live(&temp);
         }
         if let Err(e) = std::fs::rename(&temp, &dir)
             && !dir.join("complete").exists()
@@ -370,14 +408,15 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         let _ = std::fs::remove_dir_all(&temp);
     }
     // Whatever path the caller will hand to the model is a load output:
-    // lease it for the process lifetime (see the hit path above). `dir`
-    // A published result leases `dir` (its `.lease` sentinel); `live_dir`
-    // has no lock file, so its lease is registry-only.
+    // lease it for the process lifetime (see the hit path above). A
+    // published result leases `dir` (its `.lease` sentinel); live dirs —
+    // the base name and every `-g{n}` generation — have no lock file, so
+    // their lease is registry-only.
     if let Ok(path) = &result {
         if *path == dir {
             let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name));
-        } else if *path == live_dir {
-            native_gguf_lease_in_use(root, &live_dir, None);
+        } else {
+            native_gguf_lease_in_use(root, path, None);
         }
     }
     result
@@ -669,6 +708,64 @@ mod tests {
                 .starts_with(".mlx-qwen4-assets-v2-")
         );
         assert!(published.join("complete").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Marker loss proves damage, not disuse: a leased live dir whose
+    /// `complete` marker was deleted must survive the next republish, which
+    /// lands on the next `-g{n}` generation instead of deleting the path a
+    /// loaded model still holds. The same rule covers a leased markerless
+    /// `dir` — the publish guard refuses it into the live name too.
+    #[test]
+    fn assets_in_marker_loss_never_deletes_a_leased_dir() {
+        use crate::utils::gguf::{SweepEnvVar, sweep_env_lock};
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0.0000001");
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let (store, config) = tokenizer_fixture();
+
+        // First load lands on the per-pid live name under the tiny cap and
+        // stays leased for the process lifetime.
+        let live = assets_in(&source, &store, &config, &cache).unwrap();
+        assert!(
+            live.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".mlx-qwen4-assets-live-"),
+            "cap-refused publish promotes to the live dir, got {}",
+            live.display()
+        );
+        assert!(live.join("complete").is_file());
+
+        // External damage: the marker goes away while the lease stands.
+        fs::remove_file(live.join("complete")).unwrap();
+
+        // The rebuild must keep the leased path and land on generation 2.
+        let rebuilt = assets_in(&source, &store, &config, &cache).unwrap();
+        assert!(
+            rebuilt
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&format!("-{}-g2", std::process::id())),
+            "a second refusal lands on the next live generation, got {}",
+            rebuilt.display()
+        );
+        assert!(rebuilt.join("complete").is_file());
+        assert!(
+            live.exists(),
+            "a markerless but still-leased live dir is never deleted"
+        );
+
+        // A third load reuses the completed generation-2 dir.
+        assert_eq!(
+            assets_in(&source, &store, &config, &cache).unwrap(),
+            rebuilt
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

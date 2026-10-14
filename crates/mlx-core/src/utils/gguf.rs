@@ -7018,12 +7018,17 @@ fn native_gguf_in_use_delete_guard(
 }
 
 /// True when `dir` is registered as handed to a loaded model.
-#[cfg(all(test, unix))]
-fn native_gguf_in_use(dir: &Path) -> bool {
+pub(crate) fn native_gguf_in_use_dir(dir: &Path) -> bool {
     native_gguf_in_use_sidecars()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .contains_key(&native_gguf_in_use_key(dir))
+}
+
+/// True when `dir` is registered as handed to a loaded model.
+#[cfg(all(test, unix))]
+fn native_gguf_in_use(dir: &Path) -> bool {
+    native_gguf_in_use_dir(dir)
 }
 
 /// Drop `dir`'s lease (registry entry and its shared flock). Used when a
@@ -7105,7 +7110,7 @@ pub(crate) fn native_gguf_lease_in_use(root: &Path, dir: &Path, key: Option<&str
 /// the returned guard through the `remove_dir_all` + `rename` so a racing
 /// leaser can only observe the replacement, never straddle it.
 #[allow(clippy::type_complexity)]
-fn native_gguf_output_delete_guard(
+pub(crate) fn native_gguf_output_delete_guard(
     cache_root: &Path,
     output_dir: &Path,
 ) -> Option<(
@@ -7620,17 +7625,30 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 continue;
             }
             if let Some(suffix) = name.strip_prefix(NATIVE_GGUF_ASSETS_LIVE_PREFIX) {
-                // `{prefix}{identity}-{pid}` where identity is the same hex64
-                // the sidecar name carries and pid is the canonical
-                // `std::process::id()` rendering (nonzero, no leading zeros,
-                // within `pid_t` range — `native_gguf_valid_pid`). A
-                // live pid means a load output this process still reads:
-                // keep unconditionally — never counted toward the cap, never
-                // age-deleted; it is bounded at one dir per identity per
-                // live pid. Only a dead pid makes it debris, so like the
-                // assets-tmp names no entry lock exists for the live name
-                // and removal runs directly — pid death is the whole gate.
-                if let Some((identity, pid_text)) = suffix.rsplit_once('-')
+                // `{prefix}{identity}-{pid}` or `{prefix}{identity}-{pid}-g{n}`
+                // where identity is the same hex64 the sidecar name carries,
+                // pid is the canonical `std::process::id()` rendering
+                // (nonzero, no leading zeros, within `pid_t` range —
+                // `native_gguf_valid_pid`), and `-g{n}` is the generation a
+                // second same-identity refusal lands on while an earlier
+                // live dir stays leased. A live pid means a load output
+                // this process still reads: keep unconditionally — never
+                // counted toward the cap, never age-deleted. Only a dead
+                // pid makes it debris, so like the assets-tmp names no entry
+                // lock exists for the live name and removal runs directly —
+                // pid death is the whole gate.
+                let live_suffix = suffix
+                    .rsplit_once('-')
+                    .map(|(base, tail)| {
+                        tail.strip_prefix('g')
+                            .filter(|digits| {
+                                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+                            })
+                            .map(|_| base)
+                            .unwrap_or(suffix)
+                    })
+                    .unwrap_or(suffix);
+                if let Some((identity, pid_text)) = live_suffix.rsplit_once('-')
                     && native_gguf_is_hex64(identity)
                     && let Some(pid) = native_gguf_valid_pid(pid_text)
                     && native_gguf_pid_dead(pid)
@@ -18174,6 +18192,23 @@ mod tests {
         ));
         fs::create_dir_all(&dead_assets_live).unwrap();
         fs::write(dead_assets_live.join("complete"), b"1").unwrap();
+        // A second-generation live dir (`-g{n}`) from a dead pid is swept
+        // exactly like the base name; a live-pid generation stays.
+        let dead_assets_live_gen = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}-g3",
+            "c".repeat(64),
+            dead_test_pid()
+        ));
+        fs::create_dir_all(&dead_assets_live_gen).unwrap();
+        fs::write(dead_assets_live_gen.join("complete"), b"1").unwrap();
+        let live_assets_live_gen = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}-g2",
+            "e".repeat(64),
+            std::process::id()
+        ));
+        fs::create_dir_all(&live_assets_live_gen).unwrap();
+        fs::write(live_assets_live_gen.join("complete"), b"1").unwrap();
+        native_sweep_age_dir(&live_assets_live_gen);
         // Malformed `assets-live` suffixes are foreign and kept either way.
         let foreign_assets_live = cache_root.join(".mlx-qwen4-assets-live-garbage-123");
         fs::create_dir_all(&foreign_assets_live).unwrap();
@@ -18228,6 +18263,7 @@ mod tests {
             &markerless,
             &live_staging_debris,
             &dead_assets_live,
+            &dead_assets_live_gen,
         ] {
             assert!(!gone.exists(), "{} should have been swept", gone.display());
         }
@@ -18254,6 +18290,7 @@ mod tests {
             &foreign_assets_tmp_v3,
             &assets_sidecar,
             &live_assets,
+            &live_assets_live_gen,
             &foreign_assets_live,
             &foreign_assets_live_pidmax,
             &foreign_assets_live_pidu32max,
