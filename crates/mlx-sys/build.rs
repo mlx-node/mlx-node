@@ -1225,9 +1225,16 @@ fn main() -> io::Result<()> {
     // install tree (`out/lib` next to `mlx.metallib`). Prebuilt mode: the
     // prebuilt dir is shared across profiles, so nothing profile-specific
     // is written there; the install copy goes to `OUT_DIR/lib` instead
-    // (same `out/lib` contract for build.ts), and the prebuilt
-    // `mlx.metallib` is copied next to the test binaries too, since the
-    // path MLX baked into libmlx.a names the producer's machine.
+    // (same `out/lib` contract for build.ts).
+    //
+    // `mlx.metallib` is copied next to the test binaries in BOTH modes.
+    // MLX loads a colocated `mlx.metallib` before the path baked into
+    // libmlx.a, so once any build has put one there, every later build in
+    // the same target dir runs against it: a source build after a prebuilt
+    // one (or after a submodule bump) would otherwise pair fresh kernels
+    // with a stale library and fail with "Unable to load kernel". Keeping
+    // the copy in step with the linked libmlx closes that; prebuilt mode
+    // needs it anyway, since its baked path names the producer's machine.
     if let Some(paged_metallib) = paged_metallib_path.as_ref() {
         let paged_dests: Vec<PathBuf> = if prebuilt {
             let lib = out_dir_path.join("lib");
@@ -1248,9 +1255,7 @@ fn main() -> io::Result<()> {
         }
         let sinks = test_binary_sinks(&out_dir_path);
         copy_to_sinks(paged_metallib, &sinks);
-        if prebuilt {
-            copy_to_sinks(&mlx_root.join("lib").join("mlx.metallib"), &sinks);
-        }
+        copy_to_sinks(&mlx_root.join("lib").join("mlx.metallib"), &sinks);
     }
 
     println!("cargo:rustc-link-lib=static=mlx");
