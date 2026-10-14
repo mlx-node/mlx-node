@@ -8448,6 +8448,12 @@ async fn prepare_native_gguf_inner(
         // Stamp the marker mtime so the capped-LRU sweep treats this verified
         // hit as recently used instead of a deletion candidate.
         native_gguf_stamp_mtime(&output_dir.join(".complete"));
+        // Lease before returning: the loader may first open tokenizer.json
+        // days later and an LRU eviction would delete the dir out from under
+        // it. The SH flock cannot fail — this prepare holds the sentinel's
+        // blocking EX lock, and a same-process SH try-flock always wins —
+        // so the registration is unconditional here.
+        let _ = native_gguf_lease_in_use(cache_root, &output_dir, Some(&cache_key), None);
         return Ok(output_dir);
     }
 
@@ -8487,6 +8493,11 @@ async fn prepare_native_gguf_inner(
     // space but correctness for live readers wins.
     let staging_dir = match staging_hit {
         Some(dir) => {
+            // Same-pid staging dirs are kept while this process lives, but
+            // registering marks the dir in-use the same way published dirs
+            // are: no lock sentinel exists for staging names, so this lease
+            // is registry-only (key: None).
+            let _ = native_gguf_lease_in_use(cache_root, &dir, None, None);
             return Ok(dir);
         }
         None => {
@@ -8717,6 +8728,14 @@ async fn prepare_native_gguf_inner(
             Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
             Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
         }
+    }
+    // Lease the returned dir for the loaded model's lifetime: a published
+    // entry gets the SH sentinel (key: Some), a cap-refused staging dir
+    // registers without one (its name owns no lock file).
+    if prepared_dir == output_dir {
+        let _ = native_gguf_lease_in_use(cache_root, &prepared_dir, Some(&cache_key), None);
+    } else {
+        let _ = native_gguf_lease_in_use(cache_root, &prepared_dir, None, None);
     }
     Ok(prepared_dir)
 }
