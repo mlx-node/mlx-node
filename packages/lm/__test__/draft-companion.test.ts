@@ -122,9 +122,7 @@ describe('DFlash2 companion discovery', () => {
       writeDraft(join(external, 'Qwen3.8-27B-DFlash2'));
       const link = join(root, 'qwen3.8-27b-link');
       symlinkSync(realTarget, link);
-      expect(findDFlash2Draft(link, 'qwen3_5', root)).toBe(
-        join(realpathSync(external), 'Qwen3.8-27B-DFlash2'),
-      );
+      expect(findDFlash2Draft(link, 'qwen3_5', root)).toBe(join(realpathSync(external), 'Qwen3.8-27B-DFlash2'));
     } finally {
       rmSync(external, { recursive: true, force: true });
     }
