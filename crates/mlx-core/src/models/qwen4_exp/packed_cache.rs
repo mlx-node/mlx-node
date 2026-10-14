@@ -598,9 +598,16 @@ fn try_budget_lock_dirfd(dirfd: &File) -> Option<Option<File>> {
 /// spend must not veto other identities' writes forever. A busy lock means a
 /// live writer, so its reservation is real pending spend and is trusted.
 fn reconciled_sibling_pack_spend(dir: &Path) -> u64 {
-    let real = pack_bytes(dir);
+    // Lock BEFORE scanning: a writer that publishes between the scan and the
+    // lock would leave the scan stale, and rewriting the ledger under the
+    // now-free lock would erase its fresh reservation — the authoritative
+    // recheck would then undercount real spend and over-admit. Scanning and
+    // rewriting under the held flock keeps the ledger we write equal to what
+    // is on disk at handoff; a busy lock means a live writer whose pending
+    // reservation is trusted.
     match try_budget_lock(dir) {
         Some(guard) => {
+            let real = pack_bytes(dir);
             if let Ok(mut ledger) = OpenOptions::new().write(true).open(dir.join("budget")) {
                 let _ = ledger.write_all(&real.to_le_bytes());
                 let _ = ledger.set_len(8);
