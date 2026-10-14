@@ -1,8 +1,8 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
     GgufMetaValue, native_gguf_cache_cap_bytes, native_gguf_cache_root, native_gguf_lease_in_use,
-    native_gguf_publish_with_cap, native_gguf_sidecar_mutex, native_gguf_unlease_in_use,
-    source_file_identity_digest, write_embedded_gpt2_tokenizer,
+    native_gguf_lease_in_use_retry, native_gguf_publish_with_cap, native_gguf_sidecar_mutex,
+    native_gguf_unlease_in_use, source_file_identity_digest, write_embedded_gpt2_tokenizer,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -311,8 +311,14 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     if dir.join("complete").exists() {
         // Lease pins the separate `{dir_name}.lease` sentinel — never the
         // writer lock this path holds (a retained SH would brick later
-        // republishes; flock is per-open-description).
-        let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name));
+        // republishes; flock is per-open-description). The writer lock is
+        // held, so a `false` means the sentinel itself failed: fail the load
+        // rather than return a sidecar nothing protects from eviction.
+        if !native_gguf_lease_in_use_retry(root, &dir, &dir_name) {
+            return Err(Error::from_reason(format!(
+                "Failed to lease GGUF assets sidecar '{dir_name}' for the loaded model; retry the load"
+            )));
+        }
         stamp_complete(&dir.join("complete"));
         return Ok(dir);
     }
@@ -416,12 +422,17 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     }
     // Whatever path the caller will hand to the model is a load output:
     // lease it for the process lifetime (see the hit path above). A
-    // published result leases `dir` (its `.lease` sentinel); live dirs —
-    // the base name and every `-g{n}` generation — have no lock file, so
-    // their lease is registry-only.
+    // published result must not return unleased — nothing would stop a
+    // sweep evicting it under the live model. Live dirs — the base name
+    // and every `-g{n}` generation — have no lock file, so their lease is
+    // registry-only.
     if let Ok(path) = &result {
         if *path == dir {
-            let _ = native_gguf_lease_in_use(root, &dir, Some(&dir_name));
+            if !native_gguf_lease_in_use_retry(root, &dir, &dir_name) {
+                return Err(Error::from_reason(format!(
+                    "Failed to lease GGUF assets sidecar '{dir_name}' for the loaded model; retry the load"
+                )));
+            }
         } else {
             native_gguf_lease_in_use(root, path, None);
         }
@@ -772,6 +783,45 @@ mod tests {
         assert_eq!(
             assets_in(&source, &store, &config, &cache).unwrap(),
             rebuilt
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A published sidecar must never be returned without its keyed lease:
+    /// an unopenable `.{dir_name}.lease` sentinel (a directory there blocks
+    /// the open) turns every hit and publish return into an error — the
+    /// model must not hold a directory a foreign sweep can evict.
+    #[test]
+    fn assets_in_never_returns_a_sidecar_its_lease_could_not_pin() {
+        use crate::utils::gguf::sweep_env_lock;
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        // Uncapped so the keyed-lease path is exercised: a tiny cap would
+        // promote to a registry-only live dir and return successfully.
+        unsafe {
+            std::env::remove_var("MLX_NATIVE_GGUF_CACHE_MAX_GB");
+        }
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let (store, config) = tokenizer_fixture();
+
+        let canonical = source.canonicalize().unwrap();
+        let metadata = fs::metadata(&canonical).unwrap();
+        let dir_name = format!(
+            ".mlx-qwen4-assets-v2-{}",
+            source_file_identity_digest(&canonical, &metadata)
+        );
+        // A directory at the sentinel path: opening it for write fails on
+        // every platform, so the keyed lease fails closed.
+        fs::create_dir_all(cache.join(format!("{dir_name}.lease"))).unwrap();
+
+        let err = assets_in(&source, &store, &config, &cache).unwrap_err();
+        assert!(
+            err.reason.contains("lease"),
+            "the load must fail rather than return an unleasable sidecar, got: {}",
+            err.reason
         );
         fs::remove_dir_all(root).unwrap();
     }

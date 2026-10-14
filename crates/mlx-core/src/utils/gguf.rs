@@ -7119,6 +7119,22 @@ pub(crate) fn native_gguf_lease_in_use(root: &Path, dir: &Path, key: Option<&str
     true
 }
 
+/// Bounded retry around a keyed lease: a transient sentinel failure — fd
+/// pressure, or a deleter's brief EX try-flock between `still_deletable`
+/// and the unlink — clears in milliseconds, so spin ~2s (the budget the
+/// sidecar lock uses) before declaring the lease unavailable. A `false`
+/// here must NEVER downgrade to an unprotected return: callers fail the
+/// load instead of handing a model a directory an eviction can remove.
+pub(crate) fn native_gguf_lease_in_use_retry(root: &Path, dir: &Path, key: &str) -> bool {
+    for _ in 0..40 {
+        if native_gguf_lease_in_use(root, dir, Some(key)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
 /// Republish-side companion to `native_gguf_locked_remove` for the callers
 /// that already hold the writer sentinel (`.{key}.lock`) exclusively:
 /// probes the two lease legs — the in-use registry and the `.{key}.lease`
@@ -8580,16 +8596,23 @@ async fn prepare_native_gguf_inner(
     }
 
     if entry_is_current(&output_dir) {
-        // Stamp the marker mtime so the capped-LRU sweep treats this verified
-        // hit as recently used instead of a deletion candidate.
-        native_gguf_stamp_mtime(&output_dir.join(".complete"));
         // Lease before returning: the loader may first open tokenizer.json
         // days later and an LRU eviction would delete the dir out from under
         // it. The lease pins the separate `.{key}.lease` sentinel — sharing
         // the writer lock would block every same-key republish, since BSD
         // flock is per-open-description and a retained SH defeats this
-        // process's own EX try-locks too.
-        let _ = native_gguf_lease_in_use(cache_root, &output_dir, Some(&cache_key));
+        // process's own EX try-locks too. The writer lock is held, so a
+        // `false` can only be a sentinel open/flock failure: fail the load
+        // rather than return a directory nothing protects from eviction.
+        if !native_gguf_lease_in_use_retry(cache_root, &output_dir, &cache_key) {
+            return Err(Error::from_reason(format!(
+                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
+                output_dir.display()
+            )));
+        }
+        // Stamp the marker mtime so the capped-LRU sweep treats this verified
+        // hit as recently used instead of a deletion candidate.
+        native_gguf_stamp_mtime(&output_dir.join(".complete"));
         return Ok(output_dir);
     }
 
@@ -8885,9 +8908,15 @@ async fn prepare_native_gguf_inner(
     // per-open-description, so it excludes this process too); a cap-refused
     // staging dir registers without a sentinel (its name owns no lock file).
     if prepared_dir == output_dir {
-        let _ = native_gguf_lease_in_use(cache_root, &prepared_dir, Some(&cache_key));
+        if !native_gguf_lease_in_use_retry(cache_root, &prepared_dir, &cache_key) {
+            return Err(Error::from_reason(format!(
+                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
+                prepared_dir.display()
+            )));
+        }
     } else {
-        let _ = native_gguf_lease_in_use(cache_root, &prepared_dir, None);
+        // Staging/live fallback dirs own no sentinel — registry-only.
+        native_gguf_lease_in_use(cache_root, &prepared_dir, None);
     }
     Ok(prepared_dir)
 }
