@@ -48,4 +48,16 @@ describe('resolveSSEDrainTimeoutMs', () => {
     // Log-once: the warning fires on the first invalid read only.
     expect(warn).toHaveBeenCalledTimes(1);
   });
+
+  it('accepts Node\'s max timer delay and rejects anything above it', () => {
+    process.env[ENV] = '2147483647';
+    expect(resolveSSEDrainTimeoutMs()).toBe(2_147_483_647);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Above 2^31-1 Node clamps the setTimeout delay to 1 ms — a configured
+    // multi-week timeout would silently become instant teardown.
+    process.env[ENV] = '2147483648';
+    expect(resolveSSEDrainTimeoutMs()).toBe(DEFAULT_SSE_DRAIN_TIMEOUT_MS);
+    process.env[ENV] = '3000000000';
+    expect(resolveSSEDrainTimeoutMs()).toBe(DEFAULT_SSE_DRAIN_TIMEOUT_MS);
+  });
 });

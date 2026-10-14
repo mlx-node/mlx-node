@@ -6687,7 +6687,8 @@ const NATIVE_GGUF_ASSETS_TMP_PREFIX: &str = ".mlx-qwen4-assets-tmp-";
 /// in this process reuse it (the uuid temp name could never be found again).
 /// It is a load output, so the sweep keeps it while the pid lives — never
 /// counted toward the cap, never age-deleted — and only pid death gates its
-/// removal.
+/// removal: refused fallback dirs are process-lifetime bounded (the sweep
+/// reaps them on pid death, the latest at process exit).
 const NATIVE_GGUF_ASSETS_LIVE_PREFIX: &str = ".mlx-qwen4-assets-live-";
 const NATIVE_GGUF_STAGING_INFIX: &str = ".staging-";
 const NATIVE_GGUF_WRITE_PROBE_PREFIX: &str = ".write-probe-";
@@ -6720,6 +6721,20 @@ fn native_gguf_mtime_older(
     mtime
         .and_then(|modified| now.duration_since(modified).ok())
         .is_some_and(|age| age > NATIVE_GGUF_SWEEP_MIN_AGE)
+}
+
+/// A pid field in the producer grammar: the canonical decimal rendering of
+/// `std::process::id()` — nonzero, no leading zeros — and bounded by
+/// `pid_t`, since the value is fed to `kill(pid_t)` later. Anything above
+/// `pid_t::MAX` is a value no `kill` can address as a process pid (it would
+/// probe a process group or hit ESRCH unconditionally), so it is foreign —
+/// not a writer pid — regardless of how it parses.
+fn native_gguf_valid_pid(pid_text: &str) -> Option<u32> {
+    let pid = pid_text.parse::<u32>().ok()?;
+    if pid == 0 || pid > libc::pid_t::MAX as u32 || pid.to_string() != pid_text {
+        return None;
+    }
+    Some(pid)
 }
 
 /// True when `pid` no longer exists (or cannot be signaled by us). A live pid
@@ -6782,7 +6797,8 @@ fn native_gguf_is_uuid_text(field: &str) -> bool {
 
 /// The `{pid}-{simple-uuid}` suffix producers append after
 /// `.{key}.staging-` and `.write-probe-`: the canonical decimal
-/// `std::process::id()` rendering (nonzero, no leading zeros), one hyphen,
+/// `std::process::id()` rendering (nonzero, no leading zeros, within
+/// `pid_t` range — `native_gguf_valid_pid`), one hyphen,
 /// then `Uuid::new_v4().simple()` — 32 lowercase hex with the version
 /// nibble (index 12) fixed to `4` and the variant nibble (index 16) in
 /// `89ab`. Anything else is foreign, even under a valid key: `0` parses
@@ -6790,10 +6806,7 @@ fn native_gguf_is_uuid_text(field: &str) -> bool {
 /// Returns the pid for the liveness probe.
 fn native_gguf_writer_pid_suffix(suffix: &str) -> Option<u32> {
     let (pid_text, uuid_text) = suffix.split_once('-')?;
-    let pid = pid_text.parse::<u32>().ok()?;
-    if pid == 0 || pid.to_string() != pid_text {
-        return None;
-    }
+    let pid = native_gguf_valid_pid(pid_text)?;
     let is_hex = |byte: u8| matches!(byte, b'0'..=b'9' | b'a'..=b'f');
     let bytes = uuid_text.as_bytes();
     if uuid_text.len() == 32
@@ -7196,8 +7209,8 @@ fn native_gguf_evict_lru(
 /// hands to the loader: `output_dir` on a published admission, or
 /// `staging_dir` itself when eligible LRU eviction cannot make `incoming`
 /// bytes fit — the staged conversion is complete, so refusing only chooses
-/// where it is read from, and the dead-pid staging sweep reclaims it after
-/// this process exits.
+/// where it is read from; the refused fallback is process-lifetime bounded,
+/// reclaimed by the dead-pid staging sweep at the latest on process exit.
 pub(crate) fn native_gguf_publish_with_cap(
     cache_root: &Path,
     staging_dir: &Path,
@@ -7327,8 +7340,8 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
             if let Some(suffix) = name.strip_prefix(NATIVE_GGUF_ASSETS_LIVE_PREFIX) {
                 // `{prefix}{identity}-{pid}` where identity is the same hex64
                 // the sidecar name carries and pid is the canonical
-                // `std::process::id()` rendering (nonzero, no leading zeros —
-                // `0` parses dead on Unix and producers never emit it). A
+                // `std::process::id()` rendering (nonzero, no leading zeros,
+                // within `pid_t` range — `native_gguf_valid_pid`). A
                 // live pid means a load output this process still reads:
                 // keep unconditionally — never counted toward the cap, never
                 // age-deleted; it is bounded at one dir per identity per
@@ -7337,9 +7350,7 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 // and removal runs directly — pid death is the whole gate.
                 if let Some((identity, pid_text)) = suffix.rsplit_once('-')
                     && native_gguf_is_hex64(identity)
-                    && let Ok(pid) = pid_text.parse::<u32>()
-                    && pid != 0
-                    && pid.to_string() == pid_text
+                    && let Some(pid) = native_gguf_valid_pid(pid_text)
                     && native_gguf_pid_dead(pid)
                 {
                     reclaimed += native_gguf_remove_logged(&path, "orphaned assets live dir");
@@ -17725,6 +17736,27 @@ mod tests {
         ));
         fs::create_dir_all(&foreign_staging_lead0).unwrap();
         native_sweep_age_dir(&foreign_staging_lead0);
+        // Pids above `pid_t::MAX` are foreign even though they parse as u32:
+        // `kill(pid as pid_t, 0)` would probe a process group (negative pid)
+        // or ESRCH a value no process can own, misreading a foreign dir as
+        // dead writer debris. Neither `pid_t::MAX + 1` nor `u32::MAX` is a
+        // writer pid.
+        let foreign_staging_pidmax = cache_root.join(format!(
+            ".{}.staging-{}-{}",
+            native_sweep_entry_name("pidmax"),
+            i32::MAX as u32 + 1,
+            "cccccccccccc4ccc8ccccccccccccccc"
+        ));
+        fs::create_dir_all(&foreign_staging_pidmax).unwrap();
+        native_sweep_age_dir(&foreign_staging_pidmax);
+        let foreign_staging_pidu32max = cache_root.join(format!(
+            ".{}.staging-{}-{}",
+            native_sweep_entry_name("pidu32max"),
+            u32::MAX,
+            "bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb"
+        ));
+        fs::create_dir_all(&foreign_staging_pidu32max).unwrap();
+        native_sweep_age_dir(&foreign_staging_pidu32max);
         let dead_probe = cache_root.join(format!(
             ".write-probe-{}-{}",
             dead_test_pid(),
@@ -17793,6 +17825,32 @@ mod tests {
         let foreign_assets_live = cache_root.join(".mlx-qwen4-assets-live-garbage-123");
         fs::create_dir_all(&foreign_assets_live).unwrap();
         native_sweep_age_dir(&foreign_assets_live);
+        // `assets-live` pids beyond `pid_t::MAX` are foreign for the same
+        // reason as the staging names above — without the bound the first
+        // would read as a dead pid and be removed unconditionally.
+        let foreign_assets_live_pidmax = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}",
+            "d".repeat(64),
+            i32::MAX as u32 + 1
+        ));
+        fs::create_dir_all(&foreign_assets_live_pidmax).unwrap();
+        fs::write(foreign_assets_live_pidmax.join("complete"), b"1").unwrap();
+        let foreign_assets_live_pidu32max = cache_root.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}",
+            "a".repeat(64),
+            u32::MAX
+        ));
+        fs::create_dir_all(&foreign_assets_live_pidu32max).unwrap();
+        fs::write(foreign_assets_live_pidu32max.join("complete"), b"1").unwrap();
+        native_sweep_age_dir(&foreign_assets_live_pidu32max);
+        // A write probe with an out-of-`pid_t` pid is foreign too.
+        let foreign_probe_pidu32max = cache_root.join(format!(
+            ".write-probe-{}-{}",
+            u32::MAX,
+            "9999999999994999899999999999999"
+        ));
+        fs::write(&foreign_probe_pidu32max, b"p").unwrap();
+        native_sweep_age_file(&foreign_probe_pidu32max);
         // Unknown dot-directory: foreign tooling, never touched.
         let foreign = cache_root.join(".unrelated-tooling");
         fs::create_dir_all(&foreign).unwrap();
@@ -17832,8 +17890,11 @@ mod tests {
             &foreign_staging_extra,
             &foreign_staging_pid0,
             &foreign_staging_lead0,
+            &foreign_staging_pidmax,
+            &foreign_staging_pidu32max,
             &live_probe,
             &foreign_probe,
+            &foreign_probe_pidu32max,
             &live_assets_tmp,
             &foreign_assets,
             &foreign_assets_tmp,
@@ -17841,6 +17902,8 @@ mod tests {
             &assets_sidecar,
             &live_assets,
             &foreign_assets_live,
+            &foreign_assets_live_pidmax,
+            &foreign_assets_live_pidu32max,
             &foreign,
             &photos,
         ] {

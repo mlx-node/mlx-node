@@ -185,7 +185,25 @@ fn assets_sidecar_lock(_root: &Path, _dir_name: &str) -> Option<Option<std::fs::
     Some(None)
 }
 
+/// Serialize the whole `assets_in` check/build/publish section within this
+/// process. `assets_sidecar_lock`'s BSD flock does not: a second fd from the
+/// same process "acquires" LOCK_EX while the first holds it (the per-process
+/// ambiguity `qwen35_native_prepare_mutex` closes for prepares), which would
+/// let two loads both miss the `complete` checks and race temp dirs — the
+/// loser's publish could remove the dir the winner already returned.
+fn assets_in_process_mutex() -> &'static std::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<PathBuf> {
+    // Lock order matches `prepare_native_gguf_inner`: process mutex →
+    // sidecar flock → cap flock. A std Mutex held across a blocking flock is
+    // fine here — `assets_in` is synchronous by design — and a poisoned
+    // mutex still serializes.
+    let _process_lock = assets_in_process_mutex()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let source = first
         .canonicalize()
         .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -584,6 +602,61 @@ mod tests {
                 .starts_with(".mlx-qwen4-assets-v2-")
         );
         assert!(published.join("complete").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Concurrent same-process loads serialize on `assets_in_process_mutex`:
+    /// the sidecar flock alone does not (a BSD flock is per-process — a
+    /// second same-process fd "acquires" LOCK_EX while the first holds it).
+    /// Without serialization both callers could miss the `complete` checks,
+    /// build racing temp dirs, and the loser's publish could remove the dir
+    /// the winner already returned.
+    #[test]
+    fn assets_in_serializes_concurrent_same_process_loads() {
+        use crate::utils::gguf::{SweepEnvVar, sweep_env_lock};
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0");
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<PathBuf>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = &barrier;
+                    let source = &source;
+                    let cache = &cache;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let (store, config) = tokenizer_fixture();
+                        assets_in(source, &store, &config, cache)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let first = results[0].as_ref().unwrap();
+        let second = results[1].as_ref().unwrap();
+        assert_eq!(
+            first, second,
+            "both concurrent loads must land on the same directory"
+        );
+        assert!(
+            first.join("complete").is_file(),
+            "the returned path must still be a completed sidecar"
+        );
+        assert_eq!(
+            fs::read(first.join("tokenizer.json")).unwrap(),
+            fs::read(second.join("tokenizer.json")).unwrap(),
+            "both returned paths must serve identical content"
+        );
+        let tokenizer: Value =
+            serde_json::from_slice(&fs::read(first.join("tokenizer.json")).unwrap()).unwrap();
+        assert_eq!(tokenizer["model"]["vocab"]["old"], 0);
         fs::remove_dir_all(root).unwrap();
     }
 }

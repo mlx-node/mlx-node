@@ -97,6 +97,8 @@ let warnedInvalidSSEDrainTimeout = false;
  * whitespace padding — a typo'd timeout is indistinguishable from a
  * deliberate one, so anything outside `^[0-9]+$` (and non-positive /
  * non-safe-integer results) falls back to the default and warns once.
+ * Values above 2^31-1 pass every integer check but Node clamps them to
+ * a 1 ms `setTimeout` delay, so they fall back too.
  * Exported for unit tests.
  */
 export function resolveSSEDrainTimeoutMs(): number {
@@ -104,7 +106,8 @@ export function resolveSSEDrainTimeoutMs(): number {
   const normalized = raw?.trim();
   if (normalized == null || normalized === '') return DEFAULT_SSE_DRAIN_TIMEOUT_MS;
   const parsed = /^[0-9]+$/.test(normalized) ? Number(normalized) : NaN;
-  if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  // 2^31-1 is Node's maximum timer delay; above it setTimeout clamps to 1 ms.
+  if (Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 2_147_483_647) return parsed;
   if (!warnedInvalidSSEDrainTimeout) {
     warnedInvalidSSEDrainTimeout = true;
     console.warn(
