@@ -7068,13 +7068,16 @@ impl Drop for PreparedDirLease {
 }
 
 /// Test-only pause inside `prepare_native_gguf_inner`: fires after the
-/// provisional lease registers and before the post-publish sweep. The
+/// provisional lease registers and before the post-publish sweep — and only
+/// for the prepare running against the expected cache root, so a parallel
+/// cargo-test prepare on a different root cannot steal the pause. The
 /// prepare then sleeps long enough for the test to abort its task — an
 /// async sleep, never a blocking receive, because this future may run on a
 /// single-threaded runtime whose only worker a blocking wait would starve.
 #[cfg(all(test, unix))]
-static POST_LEASE_SWEEP_PAUSE: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>> =
-    std::sync::Mutex::new(None);
+static POST_LEASE_SWEEP_PAUSE: std::sync::Mutex<
+    Option<(PathBuf, std::sync::mpsc::SyncSender<()>)>,
+> = std::sync::Mutex::new(None);
 
 /// Release ONE reference on `dir`'s lease: the entry — and its shared
 /// flock — drops only when the last reference goes, so a failed recheck
@@ -8979,14 +8982,26 @@ async fn prepare_native_gguf_inner(
 
     // Deterministic pause for the cancellation regression: prepare parks
     // here holding an armed lease until the test aborts the task. The sleep
-    // yields the executor, so the abort lands while the lease is armed.
+    // yields the executor, so the abort lands while the lease is armed. The
+    // hook is consumed only by the root the test armed it for.
     #[cfg(all(test, unix))]
     {
-        let pause = POST_LEASE_SWEEP_PAUSE
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take();
-        if let Some(at_pause) = pause {
+        let armed_pause = {
+            let mut pause = POST_LEASE_SWEEP_PAUSE
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            // The guard must not live across the sleep await — the prepare
+            // future stays Send only while no lock guard is borrowed.
+            if pause
+                .as_ref()
+                .is_some_and(|(root, _)| *root == cache_root.to_path_buf())
+            {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, at_pause)) = armed_pause {
             let _ = at_pause.send(());
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
@@ -18887,9 +18902,13 @@ mod tests {
         let cache_root = root.path().join("cache");
 
         let (at_pause, paused) = std::sync::mpsc::sync_channel::<()>(1);
+        // The hook key must match the canonical root prepare works with —
+        // the dir does not exist yet, so create it before canonicalizing.
+        fs::create_dir_all(&cache_root).unwrap();
         *POST_LEASE_SWEEP_PAUSE
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(at_pause);
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some((cache_root.canonicalize().unwrap(), at_pause));
 
         let prepare_input = input.clone();
         let prepare_root = cache_root.clone();
@@ -18909,6 +18928,16 @@ mod tests {
         // runtime drops the future, and `PreparedDirLease` must unlease.
         task.abort();
         let outcome = task.await;
+        // The pause's sleep makes the abort deterministic: only a cancelled
+        // JoinError may satisfy this test — a completed or failed prepare
+        // never exercises the drop path.
+        assert!(
+            outcome
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is_cancelled()),
+            "the armed-lease abort must surface as a cancelled task: {outcome:?}"
+        );
 
         // Whatever directory the aborted attempt prepared, no reference may
         // survive it — the registry must be clean of same-pid entries.
@@ -18923,28 +18952,16 @@ mod tests {
                     .is_some_and(|name| name.contains(NATIVE_GGUF_STAGING_INFIX))
             })
             .map(|entry| entry.path());
-        match outcome {
-            Err(_) => {
-                let dir = staged.expect("the aborted prepare staged a conversion");
-                assert!(
-                    !native_gguf_in_use_dir(&dir),
-                    "an aborted prepare must not leave a registered lease"
-                );
-                sweep_native_gguf_cache(&cache_root, "no-such-key");
-                assert!(
-                    !dir.exists(),
-                    "an unleased refused staging dir is reclaimable"
-                );
-            }
-            // The sweep await resolving before the abort landed means the
-            // lease legitimately belongs to this "caller": return it the way
-            // a real caller's cleanup would and assert the same invariant.
-            Ok(Ok(dir)) => {
-                native_gguf_unlease_in_use(&dir);
-                assert!(!native_gguf_in_use_dir(&dir));
-            }
-            Ok(Err(error)) => panic!("prepare failed instead of parking: {error}"),
-        }
+        let dir = staged.expect("the aborted prepare staged a conversion");
+        assert!(
+            !native_gguf_in_use_dir(&dir),
+            "an aborted prepare must not leave a registered lease"
+        );
+        sweep_native_gguf_cache(&cache_root, "no-such-key");
+        assert!(
+            !dir.exists(),
+            "an unleased refused staging dir is reclaimable"
+        );
     }
 
     /// Same gate for the qwen4_exp tokenizer fallback: a live-pid
