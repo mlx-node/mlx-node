@@ -439,6 +439,61 @@ describe('downloadAgentBinary', () => {
     }
   });
 
+  it('sweeps the legacy unversioned binary once a versioned pointer is live', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    try {
+      const dest = managedAgentBinPath(home);
+      // A pre-pointer install: unversioned binary, no .tag.
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, 'legacy-binary');
+
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      // The pointer now resolves every launch to the versioned name — the
+      // migrated unversioned binary is dead weight and must not linger.
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      expect(existsSync(dest)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the unversioned base while there is no pointer, and when MLX_AGENT_BIN selects it', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
+    const savedTag = process.env[MLX_AGENT_TAG_ENV];
+    const savedBin = process.env[MLX_AGENT_BIN_ENV];
+    try {
+      const dest = managedAgentBinPath(home);
+      const versionedName = (tag: string) => join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, 'legacy-binary');
+
+      // A pinned side-install on a pointer-less legacy install leaves no
+      // .tag — the unversioned base is still the resolvable default and
+      // must survive the sweep.
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
+      mockMirrors(makeTarball(home, 'v020'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
+      expect(existsSync(dest)).toBe(true);
+      expect(existsSync(versionedName('mlx-agent-v0.2.0'))).toBe(true);
+
+      // With the pointer now live, an $MLX_AGENT_BIN that selects exactly
+      // the base path protects it — sweeping would break the user's pin.
+      delete process.env[MLX_AGENT_TAG_ENV];
+      process.env[MLX_AGENT_BIN_ENV] = dest;
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(existsSync(dest)).toBe(true);
+      expect(readFileSync(dest, 'utf-8')).toBe('legacy-binary');
+    } finally {
+      if (savedTag === undefined) delete process.env[MLX_AGENT_TAG_ENV];
+      else process.env[MLX_AGENT_TAG_ENV] = savedTag;
+      if (savedBin === undefined) delete process.env[MLX_AGENT_BIN_ENV];
+      else process.env[MLX_AGENT_BIN_ENV] = savedBin;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('reuses an already-installed same-tag binary instead of renaming over it', async () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-dl-'));
     try {

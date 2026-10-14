@@ -830,6 +830,16 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
     for (const t of [prevPointer, live, pin]) {
       if (t !== undefined) keep.add(agentBinName(t));
     }
+    // The unversioned base name is a legacy-install leftover: a live
+    // pointer means nothing resolves it any more (probe falls back to the
+    // base ONLY when the pointer is absent), so the ~100MB migrated binary
+    // joins the sweep. Keep it while there is no pointer — it may still be
+    // the running default — or when $MLX_AGENT_BIN selects exactly this
+    // path: sweeping the user's override would break a working pin. A live
+    // lease naming it protects it like any other binary.
+    const baseName = basename(dest);
+    const envBin = env[MLX_AGENT_BIN_ENV];
+    const baseReclaimable = live !== undefined && (envBin === undefined || resolve(envBin) !== resolve(dest));
     try {
       const entries = readdirSync(dirname(dest));
       const liveLeases: { entry: string; binary: string }[] = [];
@@ -897,7 +907,8 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
         if (!removeLease(file, baseline)) keep.add(binary);
       }
       for (const entry of entries) {
-        if (!entry.startsWith('mlx-agent-v') || entry.includes('.lease-') || keep.has(entry)) continue;
+        if (entry === baseName ? !baseReclaimable : !entry.startsWith('mlx-agent-v')) continue;
+        if (entry.includes('.lease-') || keep.has(entry)) continue;
         try {
           rmSync(join(dirname(dest), entry), { force: true });
         } catch {
