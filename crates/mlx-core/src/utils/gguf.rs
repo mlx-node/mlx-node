@@ -6685,6 +6685,13 @@ const NATIVE_GGUF_ASSETS_TMP_PREFIX: &str = ".mlx-qwen4-assets-tmp-";
 const NATIVE_GGUF_STAGING_INFIX: &str = ".staging-";
 const NATIVE_GGUF_WRITE_PROBE_PREFIX: &str = ".write-probe-";
 const NATIVE_GGUF_LOCK_SUFFIX: &str = ".lock";
+/// Root-wide admission lock for the size cap: one flock serializes the whole
+/// count→evict→publish critical section across processes, so two prepares on
+/// different keys cannot each publish under the cap while jointly exceeding
+/// it. The name already matches the sweep's unconditional keep rule
+/// (`starts_with('.') && ends_with(".lock")`), and the file is never
+/// unlinked: flock mutual exclusion depends on a stable inode.
+const NATIVE_GGUF_CAP_LOCK_NAME: &str = ".mlx-native-gguf-cap.lock";
 
 /// Optional total size cap for the whole native-GGUF cache root. Parsed like
 /// `cache_limit.rs`'s GiB knobs: a finite float > 0 enables an LRU eviction;
@@ -7040,6 +7047,131 @@ fn native_gguf_stamp_mtime(path: &Path) {
     }
 }
 
+/// Evict least-recently-used eligible directories until `fits` accepts the
+/// remaining root total — the sweep uses `fits = total <= cap`, admission
+/// `total + incoming <= cap`. Each `(path, recency, lock_key, marker)` entry
+/// faces the same gates as the stale sweep: a snapshot recency inside the
+/// mtime grace is skipped, and `native_gguf_locked_remove` re-derives the
+/// recency under the won entry flock because a concurrent cache hit
+/// re-stamps the marker under that same lock. A held lock means a live
+/// writer or an open/flock failure, so the entry counts but is left in
+/// place. Shared by `sweep_native_gguf_cache` and the publish-admission
+/// critical section so their eviction eligibility can never drift.
+/// Returns `(reclaimed_bytes, remaining_total)`.
+fn native_gguf_evict_lru(
+    cache_root: &Path,
+    mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String, &'static str)>,
+    now: std::time::SystemTime,
+    mut total: u64,
+    fits: impl Fn(u64) -> bool,
+) -> (u64, u64) {
+    let mut reclaimed = 0_u64;
+    lru.sort_by_key(|(_, recency, _, _)| *recency);
+    for (path, recency, key, marker) in lru {
+        if fits(total) {
+            break;
+        }
+        if !native_gguf_mtime_older(recency, now) {
+            continue;
+        }
+        let bytes =
+            native_gguf_locked_remove(cache_root, &path, &key, "over cache size cap", |dir| {
+                native_gguf_mtime_older(
+                    native_gguf_object_recency(dir, marker),
+                    std::time::SystemTime::now(),
+                )
+            });
+        reclaimed = reclaimed.saturating_add(bytes);
+        total = total.saturating_sub(bytes);
+    }
+    (reclaimed, total)
+}
+
+/// Publish `staging_dir` as `output_dir` under the configured total cap,
+/// holding `cache_root`'s admission flock across the count→evict→rename
+/// section. Runs on a blocking thread. Returns the directory the caller
+/// hands to the loader: `output_dir` on a published admission, or
+/// `staging_dir` itself when eligible LRU eviction cannot make `incoming`
+/// bytes fit — the staged conversion is complete, so refusing only chooses
+/// where it is read from, and the dead-pid staging sweep reclaims it after
+/// this process exits.
+fn native_gguf_publish_with_cap(
+    cache_root: &Path,
+    staging_dir: &Path,
+    output_dir: &Path,
+    cap: u64,
+) -> std::io::Result<PathBuf> {
+    let _cap_lock = Qwen35NativeCacheLock::acquire(&cache_root.join(NATIVE_GGUF_CAP_LOCK_NAME))?;
+    // Only a prior interrupted/corrupt build can occupy this exact path
+    // (format and asset digests are in the key, so a current cache is never
+    // replaced). Remove it inside the section so the freed bytes are
+    // accounted before admission is decided.
+    if output_dir.exists() {
+        fs::remove_dir_all(output_dir)?;
+    }
+    let incoming = native_gguf_path_bytes(staging_dir);
+    // Count every published byte the sweep's cap pass would count: entry
+    // dirs matching the cache-key grammar and `.mlx-qwen4-assets-v2-*`
+    // sidecars. All other names — lock files, staging dirs, write probes,
+    // assets temps, foreign tooling — are skipped exactly as the sweep
+    // skips them. `symlink_metadata` classifies with no-follow: a symlinked
+    // dir is foreign. `staging_dir`/`output_dir` cannot appear under this
+    // grammar (dot-name / already removed) but are excluded explicitly so
+    // the intent is local.
+    let now = std::time::SystemTime::now();
+    let mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String, &'static str)> = Vec::new();
+    let mut total = 0_u64;
+    let Ok(entries) = fs::read_dir(cache_root) else {
+        // Fail closed without touching anything: an unreadable root means
+        // the count cannot be trusted, so publish is refused and the load
+        // reads from staging rather than sailing past the cap.
+        return Ok(staging_dir.to_path_buf());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == staging_dir || path == output_dir {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let (key, marker) = if !name.starts_with('.') && native_gguf_is_entry_name(&name) {
+            (name, ".complete")
+        } else if name.starts_with(NATIVE_GGUF_ASSETS_PREFIX)
+            && native_gguf_is_hex64(&name[NATIVE_GGUF_ASSETS_PREFIX.len()..])
+        {
+            (name, "complete")
+        } else {
+            continue;
+        };
+        let recency = native_gguf_object_recency(&path, marker);
+        total = total.saturating_add(native_gguf_path_bytes(&path));
+        lru.push((path, recency, key, marker));
+    }
+    let admits = |total: u64| total.saturating_add(incoming) <= cap;
+    if !admits(total) {
+        let (_, remaining) = native_gguf_evict_lru(cache_root, lru, now, total, admits);
+        total = remaining;
+    }
+    if !admits(total) {
+        debug!(
+            "native GGUF cache cap {cap} bytes cannot admit {} bytes into '{}'; \
+             loading from the staged directory instead of publishing",
+            incoming,
+            cache_root.display()
+        );
+        return Ok(staging_dir.to_path_buf());
+    }
+    fs::rename(staging_dir, output_dir)?;
+    Ok(output_dir.to_path_buf())
+}
+
 /// Sweep stale, orphaned and over-capital entries from the native GGUF cache
 /// root. Runs under the process mutex and the caller's per-key lock; every
 /// gate is conservative so a load can never be broken by the sweep and every
@@ -7199,26 +7331,9 @@ fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
     if let Some(cap) = native_gguf_cache_cap_bytes()
         && total > cap
     {
-        lru.sort_by_key(|(_, recency, _, _)| *recency);
-        for (path, recency, key, marker) in lru {
-            if total <= cap {
-                break;
-            }
-            if !native_gguf_mtime_older(recency, now) {
-                continue;
-            }
-            // Recheck recency under the held entry lock for the same reason
-            // as the stale sweep above.
-            let bytes =
-                native_gguf_locked_remove(cache_root, &path, &key, "over cache size cap", |dir| {
-                    native_gguf_mtime_older(
-                        native_gguf_object_recency(dir, marker),
-                        std::time::SystemTime::now(),
-                    )
-                });
-            reclaimed = reclaimed.saturating_add(bytes);
-            total = total.saturating_sub(bytes);
-        }
+        let (evicted, _) =
+            native_gguf_evict_lru(cache_root, lru, now, total, |remaining| remaining <= cap);
+        reclaimed = reclaimed.saturating_add(evicted);
     }
 
     if reclaimed > 0 {
@@ -8085,25 +8200,64 @@ async fn prepare_native_gguf_inner(
     // cache is never replaced. Only a prior interrupted/corrupt build can
     // occupy this exact path; remove it while both locks are held, then publish
     // the complete staging directory with one atomic rename.
-    if output_dir.exists() {
-        fs::remove_dir_all(&output_dir).map_err(|error| {
+    //
+    // With a cap configured, remnant removal, the aggregate count, admission
+    // LRU eviction and the rename run as one critical section under the
+    // root-wide admission flock: two prepares on different keys each hold
+    // only their own per-key lock, so without the shared section both could
+    // publish "under the cap" while jointly exceeding it. The flock is
+    // BLOCKING — unlike the packed cache's skip-on-busy, the staged dir is
+    // the load output itself, so the load cannot skip; it only decides
+    // where the bytes land. Blocking is bounded because publish runs once
+    // per conversion and the section is a fast scan + rename. Lock order
+    // stays acyclic: process mutex → per-key flock → admission flock (the
+    // sweep never takes the admission flock; it only removes).
+    let prepared_dir = if let Some(cap) = native_gguf_cache_cap_bytes() {
+        let root = cache_root.to_path_buf();
+        let staging = staging_dir.clone();
+        let output = output_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            native_gguf_publish_with_cap(&root, &staging, &output, cap)
+        })
+        .await
+        .map_err(|error| {
             fs::remove_dir_all(&staging_dir).ok();
             Error::from_reason(format!(
-                "Failed to remove incomplete native GGUF cache '{}': {error}",
+                "Failed to publish native GGUF cache '{}': {error}",
+                output_dir.display()
+            ))
+        })?
+        .map_err(|error| {
+            fs::remove_dir_all(&staging_dir).ok();
+            Error::from_reason(format!(
+                "Failed to publish native GGUF cache '{}': {error}",
+                output_dir.display()
+            ))
+        })?
+    } else {
+        if output_dir.exists() {
+            fs::remove_dir_all(&output_dir).map_err(|error| {
+                fs::remove_dir_all(&staging_dir).ok();
+                Error::from_reason(format!(
+                    "Failed to remove incomplete native GGUF cache '{}': {error}",
+                    output_dir.display()
+                ))
+            })?;
+        }
+        fs::rename(&staging_dir, &output_dir).map_err(|error| {
+            fs::remove_dir_all(&staging_dir).ok();
+            Error::from_reason(format!(
+                "Failed to publish native GGUF cache '{}' atomically: {error}",
                 output_dir.display()
             ))
         })?;
-    }
-    fs::rename(&staging_dir, &output_dir).map_err(|error| {
-        fs::remove_dir_all(&staging_dir).ok();
-        Error::from_reason(format!(
-            "Failed to publish native GGUF cache '{}' atomically: {error}",
-            output_dir.display()
-        ))
-    })?;
+        output_dir.clone()
+    };
     // Re-run the sweep now that the new entry's bytes are on disk: the
     // pre-conversion sweep could not account for them, so the cap must be
-    // enforced again. The published key is exempt from cap eviction.
+    // enforced again. The published key is exempt from cap eviction, and a
+    // refused publish is harmless here: the live-pid staging dir is never
+    // counted toward the cap nor removed by name.
     {
         let sweep_root = cache_root.to_path_buf();
         let sweep_key = cache_key.clone();
@@ -8119,7 +8273,7 @@ async fn prepare_native_gguf_inner(
             Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
         }
     }
-    Ok(output_dir)
+    Ok(prepared_dir)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -17640,5 +17794,192 @@ mod tests {
             native_gguf_path_bytes(&dir) < 1 << 16,
             "a linked 1 MiB target was counted as cache spend"
         );
+    }
+
+    // Env-var serialization guard held across awaits: same rationale as the
+    // sweep tests above.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_cap_lock_file_survives_sweeps() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("1");
+        let root = NativeSweepTestDir::new("caplock");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert!(
+            !prepared
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with('.'),
+            "a roomy cap must still publish the entry dir"
+        );
+        let cap_lock = cache_root.join(NATIVE_GGUF_CAP_LOCK_NAME);
+        // Even aged far beyond the mtime grace, the admission lock file is
+        // neither deleted nor counted: the keep rule is unconditional and
+        // flock mutual exclusion depends on the stable inode.
+        native_sweep_age_file(&cap_lock);
+        sweep_native_gguf_cache(&cache_root, "no-such-key");
+        assert!(cap_lock.is_file());
+        assert!(prepared.join(".complete").is_file());
+    }
+
+    /// When the cap cannot admit the converted bytes even after LRU
+    /// eviction, publish is refused but the load still succeeds: it reads
+    /// the completed conversion straight from the staging directory, which
+    /// the dead-pid staging sweep reclaims once this process exits.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_cap_admission_refusal_loads_from_staging() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("0.0000001");
+        let root = NativeSweepTestDir::new("refuse");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        let name = prepared.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with('.') && name.contains(NATIVE_GGUF_STAGING_INFIX),
+            "a refused publish must return the staging dir, got {}",
+            prepared.display()
+        );
+        assert!(
+            prepared.join(".complete").is_file(),
+            "the staged conversion is load-ready"
+        );
+        let entry_name = &name[1..name.find(NATIVE_GGUF_STAGING_INFIX).unwrap()];
+        assert!(native_gguf_is_entry_name(entry_name), "{entry_name}");
+        assert!(
+            !cache_root.join(entry_name).exists(),
+            "nothing may be published over the cap"
+        );
+    }
+
+    /// Admission evicts the least-recently-used eligible siblings needed to
+    /// fit the incoming conversion — under the admission flock, so the
+    /// counted bytes and the rename are one atomic decision.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_cap_admission_evicts_lru_to_publish() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("64");
+        let root = NativeSweepTestDir::new("admit");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        // Measure one conversion's real on-disk size first; the sibling and
+        // the cap are sized so admission MUST evict to publish.
+        let measured = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        let incoming = native_gguf_path_bytes(&measured);
+        fs::remove_dir_all(&measured).unwrap();
+
+        let sibling = cache_root.join(native_sweep_entry_name("lru"));
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("model.safetensors"), vec![0_u8; 4096]).unwrap();
+        fs::write(
+            sibling.join(".complete"),
+            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
+        )
+        .unwrap();
+        native_sweep_age_file(&sibling.join(".complete"));
+        let sibling_bytes = native_gguf_path_bytes(&sibling);
+        // sibling alone fits (the pre-conversion sweep keeps it), sibling +
+        // incoming does not (admission must evict), incoming alone fits.
+        let cap_bytes = sibling_bytes + incoming - 1;
+        unsafe {
+            std::env::set_var(
+                NATIVE_GGUF_CACHE_MAX_GB_ENV,
+                format!("{}", cap_bytes as f64 / NATIVE_GGUF_ONE_GIB),
+            );
+        }
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert_eq!(prepared, measured, "admission must publish the entry");
+        assert!(prepared.join(".complete").is_file());
+        assert!(
+            !sibling.exists(),
+            "the aged LRU sibling must be evicted to admit the publish"
+        );
+        assert!(prepared.exists());
+    }
+
+    /// A sibling whose `.{key}.lock` a live writer holds is never evictable:
+    /// admission must refuse the publish rather than delete a locked entry.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gguf_cap_admission_never_evicts_a_held_entry_lock() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let _env = SweepEnvVar::set_max_gb("64");
+        let root = NativeSweepTestDir::new("held");
+        let input = root.source();
+        let cache_root = root.path().join("cache");
+
+        let measured = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        let incoming = native_gguf_path_bytes(&measured);
+        fs::remove_dir_all(&measured).unwrap();
+
+        let sibling_name = native_sweep_entry_name("locked");
+        let sibling = cache_root.join(&sibling_name);
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("model.safetensors"), vec![0_u8; 4096]).unwrap();
+        fs::write(
+            sibling.join(".complete"),
+            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
+        )
+        .unwrap();
+        native_sweep_age_file(&sibling.join(".complete"));
+        let sibling_bytes = native_gguf_path_bytes(&sibling);
+        let held_lock =
+            Qwen35NativeCacheLock::acquire(&cache_root.join(format!(".{sibling_name}.lock")))
+                .unwrap();
+        // Same shape as the eviction test: eviction would admit, but the
+        // held lock must protect the sibling — so publish is refused.
+        let cap_bytes = sibling_bytes + incoming - 1;
+        unsafe {
+            std::env::set_var(
+                NATIVE_GGUF_CACHE_MAX_GB_ENV,
+                format!("{}", cap_bytes as f64 / NATIVE_GGUF_ONE_GIB),
+            );
+        }
+
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        let name = prepared.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with('.') && name.contains(NATIVE_GGUF_STAGING_INFIX),
+            "a locked sibling forces the staged-dir fallback, got {}",
+            prepared.display()
+        );
+        assert!(prepared.join(".complete").is_file());
+        assert!(
+            sibling.exists(),
+            "an entry under a held writer lock is never evicted"
+        );
+        let entry_name = &name[1..name.find(NATIVE_GGUF_STAGING_INFIX).unwrap()];
+        assert!(native_gguf_is_entry_name(entry_name), "{entry_name}");
+        assert!(
+            !cache_root.join(entry_name).exists(),
+            "nothing may be published over the cap"
+        );
+        drop(held_lock);
     }
 }
