@@ -172,6 +172,22 @@ describe('agent-installed eval oracle and execution', () => {
     expect(events).toEqual(['serve', 'agent']);
   });
 
+  it('close() resolves when a child already exited by signal (exitCode stays null)', async () => {
+    const cli = new AgentCli('/repo', 'agent', '/tmp/workspace', '/tmp/output');
+    const serve = spawn(process.execPath, ['-e', 'process.kill(process.pid, "SIGKILL")']);
+    await new Promise((resolve) => serve.once('close', resolve));
+    expect(serve.exitCode).toBeNull();
+    expect(serve.signalCode).toBe('SIGKILL');
+    Object.assign(cli, { child: serve });
+    // A signal-only termination must not wait for a 'close' that already fired.
+    await expect(
+      Promise.race([
+        cli.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('close() hung on signal-killed child')), 3000)),
+      ]),
+    ).resolves.toBeUndefined();
+  });
+
   it('keeps stream-json events intact across byte boundaries and Unicode line separators', () => {
     const receive = vi.fn();
     const stream = new JsonLines(receive);

@@ -367,7 +367,10 @@ export class AgentCli {
 
   /** SIGTERM, escalating to SIGKILL after 10s; resolves once the child closes. */
   private stopChild(child?: ChildProcess): Promise<void> {
-    if (child === undefined || child.exitCode !== null) return Promise.resolve();
+    // Signal kills (e.g. OOM) leave exitCode null — the termination lives in
+    // signalCode, and without this the 'close' listener below never fires.
+    if (child === undefined || child.exitCode !== null || child.signalCode !== null)
+      return Promise.resolve();
     return new Promise<void>((done) => {
       const force = setTimeout(() => child.kill('SIGKILL'), 10_000);
       child.once('close', () => {
