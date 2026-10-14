@@ -613,6 +613,19 @@ fn reconciled_sibling_pack_spend(dir: &Path) -> u64 {
 }
 
 fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) -> u64 {
+    // In-process exclusion first: a same-process reader's SH flock cannot
+    // stop this process's EX request, so the flock alone would let us delete
+    // a dir mid-read. The registry lock is held through remove_dir_all so a
+    // reader racing in is refused registration and can only observe the
+    // deletion — the window between the under-lock staleness recheck and
+    // the unlink stays exclusive.
+    let Some(_reader_exclusion) = packed_deletion_guard(dir) else {
+        debug!(
+            "packed cache: keeping {} (verified read in flight)",
+            dir.display()
+        );
+        return 0;
+    };
     let Some(_guard) = try_budget_lock(dir) else {
         debug!(
             "packed cache: keeping {} (writer holds budget lock)",
@@ -765,6 +778,15 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
             }
             return;
         };
+        // Same exclusion as locked_remove: unlinking packs a verified read
+        // has not opened yet forces a rebuild. A reader active right now
+        // means this whole shed pass defers.
+        let Some(_reader_exclusion) = packed_deletion_guard(current) else {
+            if reclaimed > 0 {
+                info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
+            }
+            return;
+        };
         let names: Vec<OsString> = fs::read_dir(current)
             .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
@@ -861,6 +883,99 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
 fn writer_mutex() -> &'static std::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// In-process reader registry, keyed by cache dir. `read_verified` bumps
+/// its dir's count for the whole read; every deletion path (sweep/LRU
+/// `locked_remove`, own-pack shedding) must hold this lock while it
+/// unlinks — which atomically covers both "reader already counted" (skip
+/// the delete) and "deletion already in flight" (the reader's try_lock
+/// fails, it proceeds unguarded and observes the removal). Needed because
+/// BSD flock is per-process: the budget ledger lock alone cannot exclude a
+/// same-process reader.
+fn packed_readers() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Exclusive side for deletion paths: Some(guard) only while the registry
+/// can be locked AND no reader holds this dir. Hold the guard through the
+/// unlink so a reader racing in is refused the registry lock and goes
+/// unguarded — it can only observe the deletion, never straddle it.
+fn packed_deletion_guard(
+    dir: &Path,
+) -> Option<std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, usize>>> {
+    let mut registry = match packed_readers().try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        // A reader is mid-registration or another delete is running.
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    if registry.get(dir).is_some_and(|&n| n > 0) {
+        return None;
+    }
+    // Vacant entries accumulate one per deleted dir; reap while held.
+    registry.retain(|_, n| *n > 0);
+    Some(registry)
+}
+
+/// Held through a verified read: a per-dir in-process count plus an SH
+/// flock on the dir's budget ledger. Every deletion path must win
+/// packed_deletion_guard AND an EX flock on this ledger, so a read already
+/// in flight makes both sides fail — the dir cannot be removed out from
+/// under an open. A read that loses the race proceeds unguarded and simply
+/// observes the removal (miss or fd-survives), never corrupt data.
+struct ReadGuard {
+    dir: Option<PathBuf>,
+    _flock: Option<File>,
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        let Some(dir) = self.dir.take() else {
+            return;
+        };
+        let mut registry = match packed_readers().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(n) = registry.get_mut(&dir) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
+fn read_guard(root: &Path) -> ReadGuard {
+    // Register before flocking/opening: a deleter already inside
+    // remove_dir_all holds the registry lock, so try_lock fails and this
+    // read degrades to unguarded instead of straddling the delete.
+    let dir = match packed_readers().try_lock() {
+        Ok(mut registry) => {
+            *registry.entry(root.to_path_buf()).or_insert(0) += 1;
+            Some(root.to_path_buf())
+        }
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            *p.into_inner().entry(root.to_path_buf()).or_insert(0) += 1;
+            Some(root.to_path_buf())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    let flock = File::open(root.join("budget")).ok().and_then(|file| {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return None;
+        }
+        // The ledger could have been unlinked between open and flock; only a
+        // lock on the inode the evictor will open excludes it.
+        let held = file.metadata().ok();
+        let live = fs::metadata(root.join("budget")).ok();
+        match (held, live) {
+            (Some(a), Some(b)) if a.dev() == b.dev() && a.ino() == b.ino() => Some(file),
+            _ => None,
+        }
+    });
+    ReadGuard { dir, _flock: flock }
 }
 
 /// Remove the oldest `.pack` files in `dir` (by mtime — the recency witness
@@ -1023,14 +1138,22 @@ impl PackedCache {
     }
 
     fn read_verified(&self, key: &str, payload_limit: u64) -> Result<Option<VerifiedChunk>> {
+        // Deletion exclusion for the whole read: an mtime stamp alone is an
+        // unlocked witness — an evictor can pass its under-lock staleness
+        // recheck before the stamp lands and still remove_dir_all. The guard
+        // is taken BEFORE the open so deletion is atomic against the read:
+        // either the evictor won its locks first (the read may observe the
+        // removal and report a miss), or this guard makes both of its locks
+        // fail and the dir survives until the read finishes.
+        let _guard = read_guard(&self.root);
         let mut file = match File::open(self.path(key)) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(err(e)),
         };
-        // Stamp at read start, not only at verified-hit: eviction rechecks
-        // mtimes under its lock, so a read already in flight must look fresh
-        // or a long verify can be deleted mid-stream.
+        // Stamp at read start, not only at verified-hit: the idle-expiry
+        // snapshot taken before the evictor's lock must also see this read
+        // as recent, and freshness matters for LRU order too.
         stamp_mtime(&self.path(key));
         stamp_mtime(&self.root.join("budget"));
         let len = file.metadata().map_err(err)?.len();
@@ -1282,11 +1405,20 @@ impl PackedCache {
                 // and the global cap net of sibling spend.
                 if used.saturating_add(reserve) > budget || reconciled.saturating_add(reserve) > cap
                 {
-                    let headroom = budget
-                        .min(cap.saturating_sub(siblings))
-                        .saturating_sub(reserve);
-                    used =
-                        shed_oldest_packs(&self.root, &dirfd, OsStr::new(&target_name), headroom);
+                    // Shed only when no verified read is in flight; the
+                    // budget flock we hold cannot exclude a same-process
+                    // reader, so this needs the in-process guard too.
+                    if let Some(_reader_exclusion) = packed_deletion_guard(&self.root) {
+                        let headroom = budget
+                            .min(cap.saturating_sub(siblings))
+                            .saturating_sub(reserve);
+                        used = shed_oldest_packs(
+                            &self.root,
+                            &dirfd,
+                            OsStr::new(&target_name),
+                            headroom,
+                        );
+                    }
                 }
                 let actual = siblings.saturating_add(used);
                 if actual.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
@@ -2095,6 +2227,30 @@ mod tests {
         child.kill().unwrap();
         let _ = child.wait();
         let _cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        assert!(!stale.exists());
+    }
+
+    // An in-flight verified read holds packed_readers shared; BSD flock is
+    // per-process so the budget lock alone cannot exclude same-process
+    // readers — locked_remove must defer while a read guard is live.
+    #[test]
+    fn locked_remove_defers_while_a_verified_read_is_in_flight() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let stale = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        fs::write(stale.join("budget"), 0u64.to_le_bytes()).unwrap();
+        age(&stale.join(".manifest"), 7200);
+        age(&stale.join("budget"), 7200);
+        age_dir(&stale, 7200);
+        assert!(packed_orphan_reason(&stale).is_some());
+        let guard = read_guard(&stale);
+        assert_eq!(locked_remove(&stale, "test", |_| true), 0);
+        assert!(stale.exists());
+        drop(guard);
+        assert!(locked_remove(&stale, "test", |_| true) > 0);
         assert!(!stale.exists());
     }
 
