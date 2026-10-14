@@ -2,10 +2,10 @@
 //! Opening a Store only fingerprints source metadata. Entries are created on
 //! demand, atomically, and contain at most one bounded row/expert chunk.
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -248,6 +248,161 @@ fn unlink_if_symlink(path: &Path) {
     }
 }
 
+// ── Descriptor-relative I/O ────────────────────────────────────────────────
+// A path check cannot pin what it validated: an actor able to mutate the
+// cache parent could `rename` the real identity dir away and plant a
+// symlink between the check and any `dir.join(name)` open, redirecting
+// .manifest/budget/.tmp/.pack writes outside the cache root. Every write
+// under `self.root` therefore runs relative to a directory fd opened once
+// with O_DIRECTORY|O_NOFOLLOW: the fd pins THE validated inode, and a
+// swapped path afterwards resolves nothing (writes then land in the — now
+// unlinked — real dir and are reclaimed on close, never in the link's
+// target). Names are bare filenames; the reject is a hard error, never an
+// escape.
+
+/// `name` must be a bare filename usable as an `openat`/`renameat`/
+/// `unlinkat`/`fstatat` argument: no NUL, no path separator.
+fn dir_c_name(name: &OsStr) -> io::Result<std::ffi::CString> {
+    if name.as_bytes().contains(&b'/') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "dir-relative name contains a separator",
+        ));
+    }
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "dir-relative name contains NUL"))
+}
+
+/// Open `path` as a real directory without following a trailing symlink —
+/// the descriptor-relative root for all writes under it. `None` on any
+/// failure (symlink, missing, non-dir): callers treat that exactly like
+/// the old not-a-real-dir check.
+fn open_dir_nofollow(path: &Path) -> Option<File> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` outlives the call; the fd is wrapped in `File`,
+    // which owns it.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a freshly opened descriptor this function owns.
+    Some(unsafe { File::from_raw_fd(fd) })
+}
+
+fn dir_open_at(
+    dirfd: &File,
+    name: &OsStr,
+    flags: libc::c_int,
+    mode: libc::c_int,
+) -> io::Result<File> {
+    let c_name = dir_c_name(name)?;
+    // SAFETY: `dirfd` is an open directory descriptor and `c_name` is a
+    // live NUL-terminated name; the returned fd is owned by `File`.
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a freshly opened descriptor this function owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Create-or-truncate `name` inside `dirfd` and write `contents`.
+/// O_NOFOLLOW keeps a planted link at `name` from redirecting the write.
+fn dir_write_file(dirfd: &File, name: &str, contents: &[u8]) -> io::Result<()> {
+    let mut file = dir_open_at(
+        dirfd,
+        OsStr::new(name),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o644,
+    )?;
+    file.write_all(contents)
+}
+
+/// Open `name` inside `dirfd` for the `budget` ledger: read-write when the
+/// ledger must be (re)created, read-only otherwise. O_NOFOLLOW keeps a
+/// planted link from redirecting the flock and bytes outside the pinned
+/// dir.
+fn dir_open_file(dirfd: &File, name: &str, create: bool) -> io::Result<File> {
+    let flags = if create {
+        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    } else {
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    };
+    dir_open_at(dirfd, OsStr::new(name), flags, 0o644)
+}
+
+/// `create_new` staging temp inside `dirfd`: O_EXCL keeps a pre-existing
+/// name (or planted link) from being opened.
+fn dir_create_new_file(dirfd: &File, name: &str) -> io::Result<File> {
+    dir_open_at(
+        dirfd,
+        OsStr::new(name),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o644,
+    )
+}
+
+/// Atomic `rename` inside the pinned dir — both endpoints relative to
+/// `dirfd`, so a swapped `self.root` path cannot redirect either side.
+fn dir_renameat(dirfd: &File, from: &str, to: &str) -> io::Result<()> {
+    let c_from = dir_c_name(OsStr::new(from))?;
+    let c_to = dir_c_name(OsStr::new(to))?;
+    // SAFETY: `dirfd` is an open directory descriptor; both names are live
+    // NUL-terminated strings for the duration of the call.
+    let result = unsafe {
+        libc::renameat(
+            dirfd.as_raw_fd(),
+            c_from.as_ptr(),
+            dirfd.as_raw_fd(),
+            c_to.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Unlink `name` inside the pinned dir. Errors are surfaced so callers can
+/// tell a real removal from a miss.
+fn dir_unlinkat(dirfd: &File, name: &OsStr) -> io::Result<()> {
+    let c_name = dir_c_name(name)?;
+    // SAFETY: `dirfd` is an open directory descriptor and `c_name` is a
+    // live NUL-terminated name; flag 0 removes files only, never dirs.
+    let result = unsafe { libc::unlinkat(dirfd.as_raw_fd(), c_name.as_ptr(), 0) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `lstat` relative to the pinned dir: a symlink at `name` reports its own
+/// metadata, never the target's — same contract as `fs::symlink_metadata`.
+fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
+    let c_name = dir_c_name(name).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `dirfd` is an open directory descriptor, `c_name` is a live
+    // NUL-terminated name, and `stat` is valid memory to fill.
+    let result = unsafe {
+        libc::fstatat(
+            dirfd.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: fstatat returned success, so `stat` is fully initialized.
+    Some(unsafe { stat.assume_init() })
+}
+
 fn dir_name_identity(dir: &Path) -> Option<&str> {
     dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)
 }
@@ -262,12 +417,7 @@ fn packed_dir_mtime(dir: &Path) -> Option<SystemTime> {
     let mut newest = fs::symlink_metadata(dir).ok()?.modified().ok()?;
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
-        newest = newest.max(
-            fs::symlink_metadata(entry.path())
-                .ok()?
-                .modified()
-                .ok()?,
-        );
+        newest = newest.max(fs::symlink_metadata(entry.path()).ok()?.modified().ok()?);
     }
     Some(newest)
 }
@@ -406,6 +556,37 @@ fn try_budget_lock(dir: &Path) -> Option<Option<File>> {
     let live = fs::metadata(&path).ok();
     match (held, live) {
         (Some(a), Some(b)) if a.dev() == b.dev() && a.ino() == b.ino() => Some(Some(file)),
+        _ => None,
+    }
+}
+
+/// `try_budget_lock` relative to a pinned dir fd: the ledger is opened
+/// through `dirfd` so the flock lands on the inode `try_budget_lock`'s
+/// path-open could no longer prove (a swapped `dir` would open some other
+/// dir's ledger). Same returns: Some(Some(file)) holds the lock, Some(None)
+/// means no ledger, None means a live writer or an error.
+fn try_budget_lock_dirfd(dirfd: &File) -> Option<Option<File>> {
+    let file = match dir_open_at(
+        dirfd,
+        OsStr::new("budget"),
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o644,
+    )
+    .or_else(|_| dir_open_file(dirfd, "budget", false))
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    // The ledger could have been unlinked and recreated between openat and
+    // flock; only act on the inode we actually hold.
+    let held = file.metadata().ok();
+    let live = dir_stat(dirfd, OsStr::new("budget"));
+    match (held, live) {
+        (Some(a), Some(b)) if a.dev() == b.st_dev as u64 && a.ino() == b.st_ino => Some(Some(file)),
         _ => None,
     }
 }
@@ -572,42 +753,55 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
         reclaimed += removed;
     }
     if total > cap {
-        // Shed oldest .pack files in the current dir under its own budget lock.
-        let Some(_guard) = try_budget_lock(current) else {
+        // Shed oldest .pack files in the current dir under its own budget
+        // lock. Both the lock and the unlinks anchor to a pinned dir fd: a
+        // `current` path swapped for a symlink since its check cannot make
+        // the ledger open or the deletions follow it outside the root.
+        let dirfd = open_dir_nofollow(current);
+        let guard = dirfd.as_ref().and_then(try_budget_lock_dirfd);
+        let (Some(dirfd), Some(_guard)) = (dirfd, guard) else {
             if reclaimed > 0 {
                 info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
             }
             return;
         };
-        let mut packs: Vec<(SystemTime, PathBuf, u64)> = fs::read_dir(current)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|s| s == "pack"))
-                    .filter_map(|p| {
-                        let m = fs::symlink_metadata(&p).ok()?;
-                        Some((m.modified().ok()?, p, m.len()))
-                    })
-                    .collect()
-            })
+        let names: Vec<OsString> = fs::read_dir(current)
+            .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
+        let mut packs: Vec<(SystemTime, OsString, u64)> = names
+            .iter()
+            .filter(|name| {
+                Path::new(name.as_os_str())
+                    .extension()
+                    .is_some_and(|s| s == "pack")
+            })
+            .filter_map(|name| {
+                let stat = dir_stat(&dirfd, name)?;
+                let mtime = SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(stat.st_mtime as u64)
+                    + Duration::from_nanos(stat.st_mtime_nsec as u64);
+                Some((mtime, name.clone(), stat.st_size as u64))
+            })
+            .collect();
         packs.sort_by_key(|(t, _, _)| *t);
-        for (_, path, len) in packs {
+        let mut remaining: u64 = packs.iter().map(|(_, _, len)| len).sum();
+        for (_, name, len) in packs {
             if total <= cap {
                 break;
             }
-            if fs::remove_file(&path).is_ok() {
-                debug!("packed cache: shed {} (total cap)", path.display());
+            if dir_unlinkat(&dirfd, &name).is_ok() {
+                debug!(
+                    "packed cache: shed {} (total cap)",
+                    current.join(&name).display()
+                );
                 total = total.saturating_sub(len);
+                remaining = remaining.saturating_sub(len);
                 reclaimed += len;
             }
         }
-        // Re-reconcile the ledger after removals.
-        let _ = OpenOptions::new()
-            .write(true)
-            .open(current.join("budget"))
-            .and_then(|mut f| f.write_all(&pack_bytes(current).to_le_bytes()));
+        // Re-reconcile the ledger after removals — relative to the same
+        // pinned fd so the bytes land on the inode this pass touched.
+        let _ = dir_write_file(&dirfd, "budget", &remaining.to_le_bytes());
     }
     if reclaimed > 0 {
         info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
@@ -632,13 +826,22 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
         }
         // Crash-leftover `{uuid}.tmp` files carry no ledger bytes: drop them
         // once they age past the sweep grace (a live writer's tmp is fresh).
-        if let Ok(entries) = fs::read_dir(current) {
+        // The fd pins the validated inode: age checks and unlinks stay
+        // inside it even if the `current` path was swapped for a link.
+        if let Some(dirfd) = open_dir_nofollow(current)
+            && let Ok(entries) = fs::read_dir(current)
+        {
             for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|s| s == "tmp")
-                    && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
-                    && mtime < SystemTime::now() - PACKED_SWEEP_MIN_AGE
-                    && fs::remove_file(&path).is_ok()
+                let name = entry.file_name();
+                let path = current.join(&name);
+                if Path::new(&name).extension().is_some_and(|s| s == "tmp")
+                    && let Some(stat) = dir_stat(&dirfd, &name)
+                    && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+                    && SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(stat.st_mtime as u64)
+                        + Duration::from_nanos(stat.st_mtime_nsec as u64)
+                        < SystemTime::now() - PACKED_SWEEP_MIN_AGE
+                    && dir_unlinkat(&dirfd, &name).is_ok()
                 {
                     debug!(
                         "packed cache: removed {} (stale staging tmp)",
@@ -667,28 +870,40 @@ fn writer_mutex() -> &'static std::sync::Mutex<()> {
 /// the dir's budget lock, so no concurrent writer can shed underneath us and
 /// `enforce_packed_total_cap`'s own-packs phase cannot (it never wins our
 /// flock) — this is the only place self-shedding can happen during a write.
-fn shed_oldest_packs(dir: &Path, exclude: &Path, headroom: u64) -> u64 {
-    let mut packs: Vec<(SystemTime, PathBuf, u64)> = fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|s| s == "pack") && p != exclude)
-                .filter_map(|p| {
-                    let meta = fs::symlink_metadata(&p).ok()?;
-                    Some((meta.modified().ok()?, p.clone(), meta.len()))
-                })
-                .collect()
-        })
+/// `dirfd` pins `dir`'s validated inode: sizing and unlinks run relative to
+/// it, so a `dir` path swapped for a symlink between the open and this call
+/// sheds nothing outside the cache root.
+fn shed_oldest_packs(dir: &Path, dirfd: &File, exclude: &OsStr, headroom: u64) -> u64 {
+    let names: Vec<OsString> = fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
         .unwrap_or_default();
+    let mut packs: Vec<(SystemTime, OsString, u64)> = names
+        .iter()
+        .filter(|name| {
+            Path::new(name.as_os_str())
+                .extension()
+                .is_some_and(|s| s == "pack")
+                && name.as_os_str() != exclude
+        })
+        .filter_map(|name| {
+            let stat = dir_stat(dirfd, name)?;
+            let mtime = SystemTime::UNIX_EPOCH
+                + Duration::from_secs(stat.st_mtime as u64)
+                + Duration::from_nanos(stat.st_mtime_nsec as u64);
+            Some((mtime, name.clone(), stat.st_size as u64))
+        })
+        .collect();
     packs.sort_by_key(|(mtime, _, _)| *mtime);
     let mut used: u64 = packs.iter().map(|(_, _, len)| len).sum();
-    for (_, path, len) in packs {
+    for (_, name, len) in packs {
         if used <= headroom {
             break;
         }
-        if fs::remove_file(&path).is_ok() {
-            debug!("packed cache: shed {} to admit a new write", path.display());
+        if dir_unlinkat(dirfd, &name).is_ok() {
+            debug!(
+                "packed cache: shed {} to admit a new write",
+                dir.join(&name).display()
+            );
             used = used.saturating_sub(len);
         }
     }
@@ -730,11 +945,16 @@ impl PackedCache {
         // to the sweep and the total cap — so a planted link is unlinked
         // first (the external target is never touched) and the manifest is
         // published only when the dir verifies as real (covers a link
-        // re-planted between unlink and create).
+        // re-planted between unlink and create). The write goes through a
+        // dir fd opened O_DIRECTORY|O_NOFOLLOW: the validated inode stays
+        // pinned for the write, so a link swapped in between the check and
+        // the open still cannot redirect it outside the root.
         let manifest = pack_manifest(&canonical);
         unlink_if_symlink(&dir);
-        if fs::create_dir_all(&dir).is_ok() && is_real_dir(&dir) {
-            let _ = fs::write(dir.join(".manifest"), &manifest);
+        if fs::create_dir_all(&dir).is_ok()
+            && let Some(dirfd) = open_dir_nofollow(&dir)
+        {
+            let _ = dir_write_file(&dirfd, ".manifest", &manifest);
         }
         let cache = Self {
             root: dir,
@@ -808,6 +1028,11 @@ impl PackedCache {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(err(e)),
         };
+        // Stamp at read start, not only at verified-hit: eviction rechecks
+        // mtimes under its lock, so a read already in flight must look fresh
+        // or a long verify can be deleted mid-stream.
+        stamp_mtime(&self.path(key));
+        stamp_mtime(&self.root.join("budget"));
         let len = file.metadata().map_err(err)?.len();
         // All bounds and the checksum are checked before creating MLX arrays.
         if !(44..=44 + MAX_HEADER as u64 + MAX_READ_BYTES).contains(&len) {
@@ -902,22 +1127,30 @@ impl PackedCache {
         // after construction: unlink one found here, then recheck — a dir
         // that is still not real after creation (a hostile occupant) makes
         // the write skip rather than follow a link outside the cache root.
+        // The check alone cannot pin what it validated, so the dir is
+        // opened once O_DIRECTORY|O_NOFOLLOW and every open/write/rename/
+        // unlink below runs relative to the fd: a link planted after this
+        // point resolves nothing, and a dir deleted after the open just
+        // lands the bytes in an unlinked inode the OS reclaims on close.
         unlink_if_symlink(&self.root);
         fs::create_dir_all(&self.root).map_err(err)?;
-        if !is_real_dir(&self.root) {
+        let Some(dirfd) = open_dir_nofollow(&self.root) else {
             debug!(
                 "packed cache: skipping write, {} is not a real directory",
                 self.root.display()
             );
             return Ok(());
-        }
+        };
         // A sweep may have deleted the .manifest (or the whole dir) between
         // new_at and this write; republish so the recreated dir stays
         // verifiable instead of becoming an unaccountable manifest-less dir.
+        // A symlink at `.manifest` is not a manifest, and O_NOFOLLOW keeps
+        // the republish from writing through it.
         if let Some(manifest) = &self.manifest
-            && !self.root.join(".manifest").is_file()
+            && dir_stat(&dirfd, OsStr::new(".manifest"))
+                .is_none_or(|stat| (stat.st_mode & libc::S_IFMT) != libc::S_IFREG)
         {
-            let _ = fs::write(self.root.join(".manifest"), manifest);
+            let _ = dir_write_file(&dirfd, ".manifest", manifest);
         }
         // Serialize outside the lock so the ledger can reserve exact bytes.
         let mut header = Header {
@@ -953,13 +1186,7 @@ impl PackedCache {
         let _in_process = writer_mutex()
             .lock()
             .map_err(|_| err("Packed writer mutex poisoned"))?;
-        let mut ledger = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join("budget"))
-            .map_err(err)?;
+        let mut ledger = dir_open_file(&dirfd, "budget", true).map_err(err)?;
         if unsafe { libc::flock(ledger.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Ok(());
         }
@@ -978,17 +1205,25 @@ impl PackedCache {
         // oversized entry. `real_used` includes them: the ledger can be
         // persisted on any of the early returns below while the old target
         // stays on disk, so the recorded value must never undercount reality.
-        let target = self.path(key);
-        let target_len = fs::symlink_metadata(&target).map(|m| m.len()).unwrap_or(0);
+        let target_name = format!("{key}.pack");
+        let target_len = dir_stat(&dirfd, OsStr::new(&target_name))
+            .map(|stat| stat.st_size as u64)
+            .unwrap_or(0);
         let mut used: u64 = fs::read_dir(&self.root)
             .map_err(err)?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                let path = e.path();
-                path.extension().is_some_and(|s| s == "pack") && path != target
+            .map(|e| e.file_name())
+            .filter(|name| {
+                Path::new(name.as_os_str())
+                    .extension()
+                    .is_some_and(|s| s == "pack")
+                    && name.as_os_str() != OsStr::new(&target_name)
             })
-            .try_fold(0u64, |sum, e| {
-                sum.checked_add(fs::symlink_metadata(e.path()).map_err(err)?.len())
+            .try_fold(0u64, |sum, name| {
+                let len = dir_stat(&dirfd, &name)
+                    .map(|stat| stat.st_size as u64)
+                    .ok_or_else(|| err("Packed cache entry vanished"))?;
+                sum.checked_add(len)
                     .ok_or_else(|| err("Packed cache budget overflow"))
             })?;
         let real_used = used.saturating_add(target_len);
@@ -1003,7 +1238,9 @@ impl PackedCache {
         if recorded != Some(real_used) {
             record(&mut ledger, real_used)?;
         }
-        if !has_disk_space(&self.root, reserve) {
+        // fstatvfs on the pinned fd: a swapped path could point at a volume
+        // with different space than the inode the write will land in.
+        if !has_disk_space(&dirfd, reserve) {
             return Ok(());
         }
         // A chunk larger than the configured cap can never be admitted.
@@ -1048,7 +1285,8 @@ impl PackedCache {
                     let headroom = budget
                         .min(cap.saturating_sub(siblings))
                         .saturating_sub(reserve);
-                    used = shed_oldest_packs(&self.root, &target, headroom);
+                    used =
+                        shed_oldest_packs(&self.root, &dirfd, OsStr::new(&target_name), headroom);
                 }
                 let actual = siblings.saturating_add(used);
                 if actual.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
@@ -1078,13 +1316,9 @@ impl PackedCache {
             .chain_update(&header)
             .chain_update(&data)
             .finalize();
-        let temp = self.root.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let temp_name = format!("{}.tmp", uuid::Uuid::new_v4());
         let result = (|| {
-            let mut f = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temp)
-                .map_err(err)?;
+            let mut f = dir_create_new_file(&dirfd, &temp_name).map_err(err)?;
             f.write_all(MAGIC).map_err(err)?;
             f.write_all(&(header.len() as u32).to_le_bytes())
                 .map_err(err)?;
@@ -1092,9 +1326,9 @@ impl PackedCache {
             f.write_all(&header).map_err(err)?;
             f.write_all(&data).map_err(err)?;
             drop(f);
-            fs::rename(&temp, self.path(key)).map_err(err)
+            dir_renameat(&dirfd, &temp_name, &target_name).map_err(err)
         })();
-        let _ = fs::remove_file(temp);
+        let _ = dir_unlinkat(&dirfd, OsStr::new(&temp_name));
         result
     }
 }
@@ -1147,14 +1381,16 @@ impl VerifiedChunk {
     }
 }
 
-fn has_disk_space(path: &Path, needed: u64) -> bool {
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
+/// Free-space check on the writer's pinned dir fd: the reservation guards
+/// the volume the fd's inode actually lives on, not whatever `self.root`
+/// might resolve to after a swap.
+fn has_disk_space(dirfd: &File, needed: u64) -> bool {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+    // SAFETY: `dirfd` is an open descriptor and `stat` is valid memory to fill.
+    if unsafe { libc::fstatvfs(dirfd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return false;
     }
+    // SAFETY: fstatvfs returned success, so `stat` is fully initialized.
     let stat = unsafe { stat.assume_init() };
     (stat.f_bavail as u64).saturating_mul(stat.f_frsize) >= FREE_RESERVE + needed
 }
@@ -1748,6 +1984,58 @@ mod tests {
         assert!(!outside.join("key.pack").exists());
     }
 
+    /// `new_at` validates the identity dir by path, but a path check cannot
+    /// pin the inode: rename the real dir aside and plant a symlink to an
+    /// external dir at `cache.root`, and every `dir.join(name)` write would
+    /// follow it outside the cache root. `write` re-validates by opening the
+    /// dir O_DIRECTORY|O_NOFOLLOW and then does ALL child opens/writes/
+    /// renames/unlinks relative to that fd — the swap either keeps the fd's
+    /// inode (writes land in the renamed-aside real dir) or makes the open
+    /// fail (write skips, and the replanted link is unlinked and replaced by
+    /// a fresh real dir first). In every case the external target stays
+    /// byte-for-byte untouched.
+    #[test]
+    fn packed_cache_writes_stay_in_the_validated_inode() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+
+        // Swap the validated dir for a link: real dir aside, link planted.
+        let aside = temp.0.join("renamed-aside");
+        fs::rename(&cache.root, &aside).unwrap();
+        let outside = temp.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("marker"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, &cache.root).unwrap();
+
+        cache.write("key", &weight("affine")).unwrap();
+
+        // The external target absorbed nothing: no republished manifest, no
+        // budget ledger, no staging temp, no pack.
+        assert_eq!(fs::read(outside.join("marker")).unwrap(), b"keep");
+        let names: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![OsString::from("marker")],
+            "descriptor-relative writes must not reach the link target"
+        );
+        // The write either recreated a real dir at the path (link unlinked)
+        // or landed in the pinned aside inode — never through the link.
+        if is_real_dir(&cache.root) {
+            assert!(cache.path("key").is_file());
+        } else {
+            assert!(aside.join("key.pack").is_file());
+        }
+        assert!(aside.join(".manifest").is_file());
+    }
+
     // flock is per-process on BSD/macOS, so a held writer lock can only be
     // observed from a second process.
     #[test]
@@ -1954,6 +2242,28 @@ mod tests {
         // Identity verifies and the stamped pack keeps the dir's newest mtime
         // inside the grace window (the dir mtime itself is also fresh).
         assert_eq!(packed_orphan_reason(&cache.root), None);
+    }
+
+    #[test]
+    fn read_stamps_witnesses_before_verification_completes() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        cache.write("key", &weight("affine")).unwrap();
+        let mut corrupt = fs::read(cache.path("key")).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        fs::write(cache.path("key"), corrupt).unwrap();
+        age(&cache.path("key"), 7200);
+        age(&cache.root.join("budget"), 7200);
+        age(&cache.root.join(".manifest"), 7200);
+        age_dir(&cache.root, 7200);
+        assert!(packed_dir_idle(&cache.root));
+        // Even though verification fails, the open already refreshed the
+        // witnesses: an evictor racing this read sees a live dir.
+        assert!(cache.read("key").is_err());
+        assert!(!packed_dir_idle(&cache.root));
     }
 
     #[test]

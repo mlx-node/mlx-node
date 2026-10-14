@@ -7172,7 +7172,10 @@ fn native_gguf_stamp_mtime(path: &Path) {
 /// re-stamps the marker under that same lock. A held lock means a live
 /// writer or an open/flock failure, so the entry counts but is left in
 /// place. Shared by `sweep_native_gguf_cache` and the publish-admission
-/// critical section so their eviction eligibility can never drift.
+/// critical section so their eviction eligibility can never drift. The
+/// caller is responsible for withholding `"complete"`-marker sidecar dirs
+/// from `lru` whenever `native_gguf_sidecar_mutex` could not be taken —
+/// see `native_gguf_publish_with_cap`.
 /// Returns `(reclaimed_bytes, remaining_total)`.
 fn native_gguf_evict_lru(
     cache_root: &Path,
@@ -7211,6 +7214,21 @@ fn native_gguf_evict_lru(
 /// bytes fit — the staged conversion is complete, so refusing only chooses
 /// where it is read from; the refused fallback is process-lifetime bounded,
 /// reclaimed by the dead-pid staging sweep at the latest on process exit.
+///
+/// Sidecar eviction needs the same in-process exclusion as the sweep's
+/// deletion: BSD flock is per-process, so the per-sidecar lock inside
+/// `native_gguf_locked_remove` cannot exclude a concurrent same-process
+/// `assets_in` mid hit-check — this pass could evict the very dir it is
+/// about to return. `native_gguf_sidecar_mutex` is therefore try-locked
+/// before the LRU pass: taken, no `assets_in` is between its checks and a
+/// returned path, so sidecars are evictable; busy (an `assets_in` is
+/// active, or this very call is running inside `assets_in`'s publish
+/// section — a re-lock would deadlock, and mid-sidecar-work callers must
+/// not evict other sidecars anyway) or poisoned, `"complete"`-marker
+/// candidates are withheld from this pass. Admission may then refuse, which
+/// the caller's live_dir/staging fallback already handles. Plain
+/// `".complete"` entries evict either way: same-process prepares serialize
+/// on the tokio prepare mutex and other processes on the per-key flock.
 pub(crate) fn native_gguf_publish_with_cap(
     cache_root: &Path,
     staging_dir: &Path,
@@ -7270,6 +7288,16 @@ pub(crate) fn native_gguf_publish_with_cap(
         total = total.saturating_add(native_gguf_path_bytes(&path));
         lru.push((path, recency, key, marker));
     }
+    // try_lock covers both failure modes conservatively: WouldBlock means a
+    // same-process `assets_in` (or this call running inside one's publish
+    // section) may still be between its hit check and first use, and a
+    // poisoned mutex is not proof of exclusion either. The binding is held
+    // through the eviction pass so the exclusion ends only when the pass
+    // does. Busy → sidecars are counted but not evictable this pass.
+    let _sidecar_guard = native_gguf_sidecar_mutex().try_lock().ok();
+    if _sidecar_guard.is_none() {
+        lru.retain(|(_, _, _, marker)| *marker != "complete");
+    }
     let admits = |total: u64| total.saturating_add(incoming) <= cap;
     if !admits(total) {
         let (_, remaining) = native_gguf_evict_lru(cache_root, lru, now, total, admits);
@@ -7289,17 +7317,21 @@ pub(crate) fn native_gguf_publish_with_cap(
 }
 
 /// In-process exclusion between `assets_in` (tokenizer-sidecar load and
-/// publish in `models::qwen4_exp::gguf`) and this sweep's deletion paths.
-/// The per-object flocks cover other processes but not this one: BSD flock
-/// is per-process, so `native_gguf_try_entry_lock` trivially wins against
-/// an fd held by the same process — without this mutex a sweep could
+/// publish in `models::qwen4_exp::gguf`) and every deletion path that can
+/// remove sidecar dirs: both this sweep's removals AND the publish
+/// admission's LRU eviction inside `native_gguf_publish_with_cap`. The
+/// per-object flocks cover other processes but not this one: BSD flock is
+/// per-process, so `native_gguf_try_entry_lock` trivially wins against an
+/// fd held by the same process — without this mutex either deleter could
 /// remove a sidecar dir between `assets_in`'s hit check and the caller's
 /// first use. The lock order stays acyclic: `assets_in` takes this mutex
 /// → its per-sidecar flock → the cap flock inside
-/// `native_gguf_publish_with_cap`; the sweep only ever try-locks this
-/// mutex (skipping its pass on contention, never blocking a caller); the
-/// prepare path takes the tokio prepare mutex → key flock → cap flock and
-/// never touches this mutex.
+/// `native_gguf_publish_with_cap`; the sweep and the admission path only
+/// ever try-lock this mutex (the sweep skips its whole pass on contention,
+/// admission merely withholds sidecars from that pass's eviction — never
+/// blocking a caller); the prepare path takes the tokio prepare mutex →
+/// key flock → cap flock and try-locks this mutex only inside the
+/// publish's admission section.
 pub(crate) fn native_gguf_sidecar_mutex() -> &'static std::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     MUTEX.get_or_init(|| std::sync::Mutex::new(()))
@@ -7506,7 +7538,10 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
 
     // Optional total cap: evict least-recently-used eligible directories until
     // the root fits. The mtime grace and the lock gate apply exactly as in the
-    // stale sweep, and the current key never enters the eviction list.
+    // stale sweep, and the current key never enters the eviction list. The
+    // sidecar mutex is held (or its poison recovered) for the whole pass, so
+    // `"complete"`-marker sidecars stay fully evictable here — unlike the
+    // publish-admission call site, which withholds them when try-lock fails.
     if let Some(cap) = native_gguf_cache_cap_bytes()
         && total > cap
     {
@@ -18528,5 +18563,66 @@ mod tests {
             "nothing may be published over the cap"
         );
         drop(held_lock);
+    }
+
+    /// A busy `native_gguf_sidecar_mutex` means a same-process `assets_in`
+    /// may be between its sidecar hit check and first use — and its
+    /// per-sidecar flock cannot exclude this process's eviction (BSD flock
+    /// is per-process). Admission must therefore withhold `"complete"`-marker
+    /// sidecar dirs from the LRU pass and refuse the publish instead of
+    /// evicting a possibly in-use dir; once the mutex frees, the same
+    /// admission evicts it.
+    #[cfg(unix)]
+    #[test]
+    fn native_gguf_cap_admission_keeps_busy_sidecars() {
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let root = NativeSweepTestDir::new("busy-sidecar");
+        let cache_root = root.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        // An oversized, aged sidecar the LRU pass would evict first if it
+        // were eligible — recency sorts oldest first and no other evictable
+        // entry can make the publish fit.
+        let sidecar_name = format!("{NATIVE_GGUF_ASSETS_PREFIX}{}", "c".repeat(64));
+        let sidecar = cache_root.join(&sidecar_name);
+        fs::create_dir_all(&sidecar).unwrap();
+        fs::write(sidecar.join("tokenizer.json"), vec![0_u8; 4096]).unwrap();
+        fs::write(sidecar.join("complete"), b"1").unwrap();
+        native_sweep_age_file(&sidecar.join("complete"));
+        let sidecar_bytes = native_gguf_path_bytes(&sidecar);
+
+        let staging = cache_root.join(format!(".staging-tmp-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("model.safetensors"), vec![0_u8; 128]).unwrap();
+        let output = cache_root.join(native_sweep_entry_name("admitted"));
+        let incoming = native_gguf_path_bytes(&staging);
+        // incoming alone admits; sidecar + incoming does not — publish can
+        // only succeed by evicting the sidecar.
+        let cap = sidecar_bytes + incoming - 1;
+        assert!(incoming <= cap);
+
+        let held = native_gguf_sidecar_mutex()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let prepared = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
+        assert_eq!(
+            prepared, staging,
+            "with the sidecar mutex held, admission must refuse rather than evict"
+        );
+        assert!(
+            sidecar.join("complete").is_file(),
+            "a possibly in-use sidecar must survive the admission pass"
+        );
+        drop(held);
+
+        // Mutex free: no same-process `assets_in` is active, so the aged
+        // sidecar is an ordinary LRU eviction again.
+        let prepared = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
+        assert_eq!(
+            prepared, output,
+            "admission must evict the now-safe sidecar"
+        );
+        assert!(!sidecar.exists());
+        assert!(output.join("model.safetensors").is_file());
     }
 }
