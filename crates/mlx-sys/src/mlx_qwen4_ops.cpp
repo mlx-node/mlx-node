@@ -289,6 +289,41 @@ mlx_array *mlx_qwen4_prefill_ple_conv(mlx_array *full, mlx_array *weight) {
 #endif
   return nullptr;
 }
+// `load_vector` as upstream MLX computes it since ml-explore/mlx f8aaf49d4
+// (#4516): the activation sum that folds the affine bias is accumulated in
+// `U` (float), element by element for 8 bits and per group of eight for
+// 5 bits, instead of adding the `T` (half) inputs together first. The
+// vendored `kquant.h` keeps the older half-precision sum because the K-quant
+// kernels and their goldens are built on it; this kernel must track MLX's
+// own gather_qmv bit for bit, so it carries the current form.
+static const char *kAffineLoadVectorFsum = R"(
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector_fsum(const device T* x, thread U* x_thread) {
+  static_assert(bits == 5 || bits == 8, "affine expert GEMV supports 5 and 8 bits");
+  U sum = 0;
+  if (bits == 5) {
+    for (int i = 0; i < values_per_thread; i += 8) {
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 32.0f;
+      x_thread[i + 2] = x[i + 2] / 4.0f;
+      x_thread[i + 3] = x[i + 3] / 128.0f;
+      x_thread[i + 4] = x[i + 4] / 16.0f;
+      x_thread[i + 5] = x[i + 5] / 2.0f;
+      x_thread[i + 6] = x[i + 6] / 64.0f;
+      x_thread[i + 7] = x[i + 7] / 8.0f;
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      sum += x[i];
+      x_thread[i] = x[i];
+    }
+  }
+  return sum;
+}
+)";
+
 // Affine expert GEMV keeps the half precision scale/bias banks in place. The
 // generic gather promotes entire banks when BF16 activations meet F16 scales.
 // Promote only the small activation, and preserve MLX's per-row accumulation.
@@ -335,7 +370,7 @@ mlx_array *mlx_qwen4_affine_expert_gemv(mlx_array *x, mlx_array *ids,
           int col = base + lane * VP;
           if (col < K) {
             float values[VP];
-            float sum = load_vector<C,float,VP,BITS>(x + size_t(assignment)*K + col,values);
+            float sum = load_vector_fsum<C,float,VP,BITS>(x + size_t(assignment)*K + col,values);
             for (int r = 0; r < 2 && first+r < N; ++r) {
               size_t row = size_t(expert)*N + first+r;
               auto codes = (const device uint8_t*)w + row*(K*BP/VP) + col*BP/VP;
@@ -352,7 +387,7 @@ mlx_array *mlx_qwen4_affine_expert_gemv(mlx_array *x, mlx_array *ids,
     )",
         std::string(mlx::core::quantized_preamble::gemm()) +
             mlx::core::quantized_preamble::quantized_utils() +
-            mlx::core::quantized_preamble::kquant());
+            mlx::core::quantized_preamble::kquant() + kAffineLoadVectorFsum);
     auto result = kernel(
         {astype(input, compute_type), selected, w, s, b}, {{rows, 1, n}},
         {input.dtype()}, {32, ((n + 3) / 4) * 2, rows}, {32, 2, 1},
