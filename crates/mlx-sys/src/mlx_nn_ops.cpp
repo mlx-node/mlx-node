@@ -898,20 +898,6 @@ size_t mlx_array_split_indices(mlx_array* handle,
   return count;
 }
 
-// Keep the old single-output version for backwards compatibility
-mlx_array* mlx_array_split(mlx_array* handle,
-                           int32_t indices_or_sections,
-                           int32_t axis) {
-  // Note: This is a simplified version that returns the first split
-  // In a full implementation, we'd need to return multiple handles
-  auto arr = reinterpret_cast<array*>(handle);
-  auto splits = mlx::core::split(*arr, indices_or_sections, axis);
-  if (splits.size() > 0) {
-    return reinterpret_cast<mlx_array*>(new array(std::move(splits[0])));
-  }
-  return nullptr;
-}
-
 mlx_array* mlx_array_tile(mlx_array* handle,
                           const int32_t* reps,
                           size_t reps_len) {
