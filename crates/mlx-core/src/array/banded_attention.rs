@@ -38,7 +38,6 @@
 //! the eventual fused kernel will do internally.
 
 use super::{DType, MxArray, scaled_dot_product_attention};
-use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 /// Build the `[T, T]` band mask with `0` inside the band and `-inf` outside.
@@ -84,150 +83,6 @@ pub(crate) fn build_band_mask(t: i64, band: i32) -> Result<MxArray> {
 
     // where(in_band, 0, -inf)  → [T, T] f32
     in_band.where_(&zero, &neg_inf)
-}
-
-/// Softmax along the last axis using MLX's fused primitive (no array dep on
-/// `crate::nn::Activations`, to keep `array` self-contained).
-fn softmax_last_axis(x: &MxArray) -> Result<MxArray> {
-    let handle = unsafe { sys::mlx_array_softmax(x.handle.0, -1) };
-    MxArray::from_handle(handle, "banded_attention_softmax")
-}
-
-/// Bidirectional banded attention with per-head sinks (reference impl).
-///
-/// Shapes:
-/// - `q`:  `[B, num_q_heads, T, head_dim]`
-/// - `k`:  `[B, num_kv_heads, T, head_dim]`
-/// - `v`:  `[B, num_kv_heads, T, head_dim]`
-/// - `sinks`: `[num_q_heads]`
-/// - returns `[B, num_q_heads, T, head_dim]`
-///
-/// Requires `num_q_heads % num_kv_heads == 0`. K and V must share their first
-/// three dimensions (batch, num_kv_heads, T). Query and key sequence lengths
-/// must match (this is bidirectional self-attention, not cross-attention).
-pub fn banded_attention_reference(
-    q: &MxArray,
-    k: &MxArray,
-    v: &MxArray,
-    sinks: &MxArray,
-    band: i32,
-) -> Result<MxArray> {
-    if band < 0 {
-        return Err(Error::from_reason(format!(
-            "banded_attention_reference: band must be non-negative, got {band}"
-        )));
-    }
-
-    // Shape extraction + validation.
-    if q.ndim()? != 4 || k.ndim()? != 4 || v.ndim()? != 4 {
-        return Err(Error::from_reason(
-            "banded_attention_reference: Q, K, V must be 4D [B, H, T, D]",
-        ));
-    }
-    if sinks.ndim()? != 1 {
-        return Err(Error::from_reason(
-            "banded_attention_reference: sinks must be 1D [num_q_heads]",
-        ));
-    }
-
-    let q_shape = q.shape()?;
-    let k_shape = k.shape()?;
-    let v_shape = v.shape()?;
-    let sinks_shape = sinks.shape()?;
-    let q_shape = q_shape.as_ref();
-    let k_shape = k_shape.as_ref();
-    let v_shape = v_shape.as_ref();
-    let sinks_shape = sinks_shape.as_ref();
-
-    let b = q_shape[0];
-    let h_q = q_shape[1];
-    let t_q = q_shape[2];
-    let d = q_shape[3];
-
-    let h_kv = k_shape[1];
-    let t_kv = k_shape[2];
-
-    if k_shape[0] != b || v_shape[0] != b {
-        return Err(Error::from_reason(
-            "banded_attention_reference: batch dim must match between Q, K, V",
-        ));
-    }
-    if k_shape[1] != h_kv || v_shape[1] != h_kv {
-        return Err(Error::from_reason(
-            "banded_attention_reference: num_kv_heads must match between K and V",
-        ));
-    }
-    if k_shape[2] != t_kv || v_shape[2] != t_kv {
-        return Err(Error::from_reason(
-            "banded_attention_reference: sequence length must match between K and V",
-        ));
-    }
-    if t_q != t_kv {
-        return Err(Error::from_reason(format!(
-            "banded_attention_reference: Q/K sequence lengths must match (self-attn), got T_q={t_q}, T_kv={t_kv}"
-        )));
-    }
-    if k_shape[3] != d || v_shape[3] != d {
-        return Err(Error::from_reason(
-            "banded_attention_reference: head_dim must match between Q, K, V",
-        ));
-    }
-    if h_q % h_kv != 0 {
-        return Err(Error::from_reason(format!(
-            "banded_attention_reference: num_q_heads ({h_q}) must be a multiple of num_kv_heads ({h_kv})"
-        )));
-    }
-    if sinks_shape[0] != h_q {
-        return Err(Error::from_reason(format!(
-            "banded_attention_reference: sinks length ({}) must equal num_q_heads ({h_q})",
-            sinks_shape[0]
-        )));
-    }
-
-    let group_size = (h_q / h_kv) as i32;
-    let t = t_q;
-    let dtype = q.dtype()?;
-
-    // Repeat K, V along the head axis when GQA. `mlx::core::repeat` is
-    // repeat_interleave-style: each element is repeated `group_size` times in
-    // place, so head h_q == h_kv*group_size + r maps back to KV head h_kv.
-    let (k_expanded, v_expanded) = if group_size == 1 {
-        (k.clone(), v.clone())
-    } else {
-        (k.repeat(group_size, 1)?, v.repeat(group_size, 1)?)
-    };
-
-    // logits = (Q @ K^T) * scale, computed as Q @ K.transpose(-1, -2).
-    // K^T over last two dims: swap dims 2 and 3.
-    let k_t = k_expanded.transpose(Some(&[0, 1, 3, 2]))?;
-    let scale = 1.0 / (d as f64).sqrt();
-    let logits = q.matmul(&k_t)?.mul_scalar(scale)?;
-
-    // Build band mask [T, T] in f32 and reshape to [1, 1, T, T] for broadcast.
-    // Cast to logits dtype to avoid the f32-promotes-bf16 footgun.
-    let band_mask = build_band_mask(t, band)?
-        .reshape(&[1, 1, t, t])?
-        .astype(dtype)?;
-    let masked_logits = logits.add(&band_mask)?;
-
-    // sinks: [H_q] → [1, H_q, 1, 1] → broadcast to [B, H_q, T, 1], cast to logits dtype.
-    let sinks_col = sinks
-        .reshape(&[1, h_q, 1, 1])?
-        .astype(dtype)?
-        .broadcast_to(&[b, h_q, t, 1])?;
-
-    // Concatenate sink as the last "virtual" key column → [B, H_q, T, T+1].
-    let with_sinks = MxArray::concatenate(&masked_logits, &sinks_col, -1)?;
-
-    // Softmax along the augmented key axis. Sink absorbs some mass; real-key
-    // weights now sum to (1 - sink_weight) instead of 1.
-    let attn_with_sinks = softmax_last_axis(&with_sinks)?;
-
-    // Slice off the sink column to recover [B, H_q, T, T] attention weights.
-    let attn_kv = attn_with_sinks.slice(&[0, 0, 0, 0], &[b, h_q, t, t])?;
-
-    // out = attn @ V  → [B, H_q, T, D]
-    attn_kv.matmul(&v_expanded)
 }
 
 /// Build the `[H_q, T, T+1]` augmented mask used by `banded_attention`.
@@ -418,6 +273,151 @@ pub fn banded_attention(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_sys as sys;
+
+    /// Softmax along the last axis using MLX's fused primitive (no array dep on
+    /// `crate::nn::Activations`, to keep `array` self-contained).
+    fn softmax_last_axis(x: &MxArray) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_softmax(x.handle.0, -1) };
+        MxArray::from_handle(handle, "banded_attention_softmax")
+    }
+
+    /// Bidirectional banded attention with per-head sinks (reference impl).
+    ///
+    /// Shapes:
+    /// - `q`:  `[B, num_q_heads, T, head_dim]`
+    /// - `k`:  `[B, num_kv_heads, T, head_dim]`
+    /// - `v`:  `[B, num_kv_heads, T, head_dim]`
+    /// - `sinks`: `[num_q_heads]`
+    /// - returns `[B, num_q_heads, T, head_dim]`
+    ///
+    /// Requires `num_q_heads % num_kv_heads == 0`. K and V must share their first
+    /// three dimensions (batch, num_kv_heads, T). Query and key sequence lengths
+    /// must match (this is bidirectional self-attention, not cross-attention).
+    fn banded_attention_reference(
+        q: &MxArray,
+        k: &MxArray,
+        v: &MxArray,
+        sinks: &MxArray,
+        band: i32,
+    ) -> Result<MxArray> {
+        if band < 0 {
+            return Err(Error::from_reason(format!(
+                "banded_attention_reference: band must be non-negative, got {band}"
+            )));
+        }
+
+        // Shape extraction + validation.
+        if q.ndim()? != 4 || k.ndim()? != 4 || v.ndim()? != 4 {
+            return Err(Error::from_reason(
+                "banded_attention_reference: Q, K, V must be 4D [B, H, T, D]",
+            ));
+        }
+        if sinks.ndim()? != 1 {
+            return Err(Error::from_reason(
+                "banded_attention_reference: sinks must be 1D [num_q_heads]",
+            ));
+        }
+
+        let q_shape = q.shape()?;
+        let k_shape = k.shape()?;
+        let v_shape = v.shape()?;
+        let sinks_shape = sinks.shape()?;
+        let q_shape = q_shape.as_ref();
+        let k_shape = k_shape.as_ref();
+        let v_shape = v_shape.as_ref();
+        let sinks_shape = sinks_shape.as_ref();
+
+        let b = q_shape[0];
+        let h_q = q_shape[1];
+        let t_q = q_shape[2];
+        let d = q_shape[3];
+
+        let h_kv = k_shape[1];
+        let t_kv = k_shape[2];
+
+        if k_shape[0] != b || v_shape[0] != b {
+            return Err(Error::from_reason(
+                "banded_attention_reference: batch dim must match between Q, K, V",
+            ));
+        }
+        if k_shape[1] != h_kv || v_shape[1] != h_kv {
+            return Err(Error::from_reason(
+                "banded_attention_reference: num_kv_heads must match between K and V",
+            ));
+        }
+        if k_shape[2] != t_kv || v_shape[2] != t_kv {
+            return Err(Error::from_reason(
+                "banded_attention_reference: sequence length must match between K and V",
+            ));
+        }
+        if t_q != t_kv {
+            return Err(Error::from_reason(format!(
+                "banded_attention_reference: Q/K sequence lengths must match (self-attn), got T_q={t_q}, T_kv={t_kv}"
+            )));
+        }
+        if k_shape[3] != d || v_shape[3] != d {
+            return Err(Error::from_reason(
+                "banded_attention_reference: head_dim must match between Q, K, V",
+            ));
+        }
+        if h_q % h_kv != 0 {
+            return Err(Error::from_reason(format!(
+                "banded_attention_reference: num_q_heads ({h_q}) must be a multiple of num_kv_heads ({h_kv})"
+            )));
+        }
+        if sinks_shape[0] != h_q {
+            return Err(Error::from_reason(format!(
+                "banded_attention_reference: sinks length ({}) must equal num_q_heads ({h_q})",
+                sinks_shape[0]
+            )));
+        }
+
+        let group_size = (h_q / h_kv) as i32;
+        let t = t_q;
+        let dtype = q.dtype()?;
+
+        // Repeat K, V along the head axis when GQA. `mlx::core::repeat` is
+        // repeat_interleave-style: each element is repeated `group_size` times in
+        // place, so head h_q == h_kv*group_size + r maps back to KV head h_kv.
+        let (k_expanded, v_expanded) = if group_size == 1 {
+            (k.clone(), v.clone())
+        } else {
+            (k.repeat(group_size, 1)?, v.repeat(group_size, 1)?)
+        };
+
+        // logits = (Q @ K^T) * scale, computed as Q @ K.transpose(-1, -2).
+        // K^T over last two dims: swap dims 2 and 3.
+        let k_t = k_expanded.transpose(Some(&[0, 1, 3, 2]))?;
+        let scale = 1.0 / (d as f64).sqrt();
+        let logits = q.matmul(&k_t)?.mul_scalar(scale)?;
+
+        // Build band mask [T, T] in f32 and reshape to [1, 1, T, T] for broadcast.
+        // Cast to logits dtype to avoid the f32-promotes-bf16 footgun.
+        let band_mask = build_band_mask(t, band)?
+            .reshape(&[1, 1, t, t])?
+            .astype(dtype)?;
+        let masked_logits = logits.add(&band_mask)?;
+
+        // sinks: [H_q] → [1, H_q, 1, 1] → broadcast to [B, H_q, T, 1], cast to logits dtype.
+        let sinks_col = sinks
+            .reshape(&[1, h_q, 1, 1])?
+            .astype(dtype)?
+            .broadcast_to(&[b, h_q, t, 1])?;
+
+        // Concatenate sink as the last "virtual" key column → [B, H_q, T, T+1].
+        let with_sinks = MxArray::concatenate(&masked_logits, &sinks_col, -1)?;
+
+        // Softmax along the augmented key axis. Sink absorbs some mass; real-key
+        // weights now sum to (1 - sink_weight) instead of 1.
+        let attn_with_sinks = softmax_last_axis(&with_sinks)?;
+
+        // Slice off the sink column to recover [B, H_q, T, T] attention weights.
+        let attn_kv = attn_with_sinks.slice(&[0, 0, 0, 0], &[b, h_q, t, t])?;
+
+        // out = attn @ V  → [B, H_q, T, D]
+        attn_kv.matmul(&v_expanded)
+    }
 
     fn deterministic_data(len: usize, phase: f32) -> Vec<f32> {
         (0..len)
