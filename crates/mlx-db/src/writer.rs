@@ -3,63 +3,9 @@
 //! Handles inserting and updating training runs, steps, generations, and tool calls.
 
 use sqlx::SqlitePool;
-use uuid::Uuid;
 
 use crate::error::DbError;
 use crate::types::{EngineStepMetrics, GenerationRecord, StepRecord, ToolCallRecord};
-
-/// Start a new training run
-pub async fn start_run(
-    pool: &SqlitePool,
-    name: Option<&str>,
-    model_name: &str,
-    model_path: Option<&str>,
-    config: &str,
-) -> Result<String, DbError> {
-    let run_id = Uuid::new_v4().to_string();
-    let started_at = chrono_now_ms()?;
-
-    sqlx::query(
-        "INSERT INTO training_runs (id, name, model_name, model_path, config, started_at, status) VALUES (?, ?, ?, ?, ?, ?, 'running')",
-    )
-    .bind(&run_id)
-    .bind(name)
-    .bind(model_name)
-    .bind(model_path)
-    .bind(config)
-    .bind(started_at)
-    .execute(pool)
-    .await
-    .map_err(|e| DbError::Write(format!("Failed to start run: {}", e)))?;
-
-    Ok(run_id)
-}
-
-/// End a training run
-pub async fn end_run(pool: &SqlitePool, run_id: &str, status: &str) -> Result<(), DbError> {
-    let ended_at = chrono_now_ms()?;
-
-    sqlx::query("UPDATE training_runs SET ended_at = ?, status = ? WHERE id = ?")
-        .bind(ended_at)
-        .bind(status)
-        .bind(run_id)
-        .execute(pool)
-        .await
-        .map_err(|e| DbError::Write(format!("Failed to end run: {}", e)))?;
-
-    Ok(())
-}
-
-/// Resume an existing run (set status back to running)
-pub async fn resume_run(pool: &SqlitePool, run_id: &str) -> Result<(), DbError> {
-    sqlx::query("UPDATE training_runs SET status = 'running', ended_at = NULL WHERE id = ?")
-        .bind(run_id)
-        .execute(pool)
-        .await
-        .map_err(|e| DbError::Write(format!("Failed to resume run: {}", e)))?;
-
-    Ok(())
-}
 
 /// Record a complete training step with all generations
 ///
@@ -158,48 +104,6 @@ pub async fn record_step(
         .map_err(|e| DbError::Transaction(format!("Failed to commit transaction: {}", e)))?;
 
     Ok(step_id)
-}
-
-/// Write a log entry to the database
-pub async fn write_log(
-    pool: &SqlitePool,
-    run_id: Option<&str>,
-    level: &str,
-    target: &str,
-    message: &str,
-    file: Option<&str>,
-    line: Option<u32>,
-) -> Result<(), DbError> {
-    let created_at = chrono_now_ms()?;
-
-    sqlx::query(
-        "INSERT INTO logs (run_id, level, target, message, file, line, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(run_id)
-    .bind(level)
-    .bind(target)
-    .bind(message)
-    .bind(file)
-    .bind(line.map(|l| l as i64))
-    .bind(created_at)
-    .execute(pool)
-    .await
-    .map_err(|e| DbError::Write(format!("Failed to write log: {}", e)))?;
-
-    Ok(())
-}
-
-/// Increment the total_steps counter for a training run
-///
-/// Called after each step is recorded to keep total_steps accurate even on crash.
-pub async fn increment_run_steps(pool: &SqlitePool, run_id: &str) -> Result<(), DbError> {
-    sqlx::query("UPDATE training_runs SET total_steps = total_steps + 1 WHERE id = ?")
-        .bind(run_id)
-        .execute(pool)
-        .await
-        .map_err(|e| DbError::Write(format!("Failed to increment steps: {}", e)))?;
-
-    Ok(())
 }
 
 /// Get current timestamp in milliseconds
