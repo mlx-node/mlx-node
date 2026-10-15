@@ -478,11 +478,6 @@ impl Default for PPDocLayoutV3Config {
 }
 
 impl PPDocLayoutV3Config {
-    /// Get the intermediate channel sizes from the backbone (for stages in out_features)
-    pub fn backbone_output_channels(&self) -> Vec<i32> {
-        self.backbone_config.output_channels()
-    }
-
     /// Fix up derived fields after deserialization.
     ///
     /// HuggingFace derives `num_labels` from `id2label` when not explicitly provided.
@@ -708,7 +703,7 @@ mod tests {
     #[test]
     fn test_backbone_output_channels() {
         let config = PPDocLayoutV3Config::default();
-        let channels = config.backbone_output_channels();
+        let channels = config.backbone_config.output_channels();
         assert_eq!(channels, vec![128, 512, 1024, 2048]);
     }
 
