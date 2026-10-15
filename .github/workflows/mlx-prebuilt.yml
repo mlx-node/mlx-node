@@ -163,40 +163,6 @@ jobs:
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
           du -h "$ASSET"
 
-      - name: Emit pin snippet
-        if: steps.existing.outputs.skip != 'true'
-        env:
-          MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
-          TAG: ${{ steps.meta.outputs.release_tag }}
-          SHA256: ${{ steps.pkg.outputs.sha256 }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          snippet="$(cat <<EOF
-          {
-            "repo": "$GITHUB_REPOSITORY",
-            "mlx_commit": "$MLX_COMMIT",
-            "release_tag": "$TAG",
-            "assets": {
-              "$TARGET": {
-                "file": "$ASSET",
-                "sha256": "$SHA256"
-              }
-            }
-          }
-          EOF
-          )"
-          {
-            echo "## MLX prebuilt \`$TAG\`"
-            echo
-            echo "Paste into \`crates/mlx-sys/mlx-prebuilt.json\` (merge the \`assets\` map if other targets exist):"
-            echo
-            echo '```json'
-            echo "$snippet"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice title=mlx-prebuilt.json::$TARGET sha256=$SHA256 release_tag=$TAG mlx_commit=$MLX_COMMIT"
-
       # `--prerelease` is REQUIRED. packages/desktop ships electron-updater
       # against this repo's GitHub releases; both GitHub's "latest" pointer
       # and electron-updater's stable channel skip prereleases, so a
@@ -253,8 +219,49 @@ jobs:
             :
           elif has_asset; then
             echo "::notice::Release $TAG gained $ASSET from a concurrent run; keeping its bytes."
-            exit 0
           else
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$ASSET" "$ASSET.sha256"
           fi
           echo "::notice::Published $ASSET to release $TAG"
+
+      # The snippet names the digest of the asset that is actually on the
+      # release, read back from its `.sha256` sidecar — not this run's local
+      # tarball. When a concurrent run won the race above, the two archives
+      # differ (manifest.json `built_at`, tar metadata) and the local digest
+      # would make every consumer download panic on a sha256 mismatch.
+      - name: Emit pin snippet
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/published && mkdir /tmp/published
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET.sha256" --dir /tmp/published
+          SHA256="$(awk '{print $1}' "/tmp/published/$ASSET.sha256")"
+          test -n "$SHA256"
+          snippet="$(cat <<EOF
+          {
+            "repo": "$GITHUB_REPOSITORY",
+            "mlx_commit": "$MLX_COMMIT",
+            "release_tag": "$TAG",
+            "assets": {
+              "$TARGET": {
+                "file": "$ASSET",
+                "sha256": "$SHA256"
+              }
+            }
+          }
+          EOF
+          )"
+          {
+            echo "## MLX prebuilt \`$TAG\`"
+            echo
+            echo "Paste into \`crates/mlx-sys/mlx-prebuilt.json\` (merge the \`assets\` map if other targets exist):"
+            echo
+            echo '```json'
+            echo "$snippet"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=mlx-prebuilt.json::$TARGET sha256=$SHA256 release_tag=$TAG mlx_commit=$MLX_COMMIT"
