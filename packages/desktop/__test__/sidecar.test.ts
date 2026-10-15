@@ -66,8 +66,6 @@ async function realHost(overrides: Partial<SidecarHost> = {}): Promise<SidecarHo
     boundModel: 'a-model',
     models: [{ name: 'a-model', path: '/models/a-model', modelType: 'qwen3' }],
     logDir: null,
-    health: () => ({ status: 'ok', nonce }),
-    loadModel: async () => {},
     close: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
@@ -257,7 +255,7 @@ describe('requests', () => {
     });
     const running = runSidecar(h.deps);
 
-    h.deliver({ kind: 'mlx:request', id: 4, payload: { op: 'health' } });
+    h.deliver({ kind: 'mlx:request', id: 4, payload: { op: 'info' } });
     await tick();
 
     // The supervisor only sends a request once it has seen a serving `/health`,
@@ -282,22 +280,6 @@ describe('requests', () => {
 
     expect(h.sent.length).toBe(before);
   });
-
-  it('propagates a load failure as a failed response, not a crash', async () => {
-    const host = await realHost({
-      loadModel: () => Promise.reject(new Error('Model "ghost" not found under /models.')),
-    });
-    const h = harness(async () => host);
-    await runSidecar(h.deps);
-
-    h.deliver({ kind: 'mlx:request', id: 3, payload: { op: 'load', name: 'ghost' } });
-    await tick();
-
-    const reply = h.sent.find((message) => message.kind === 'mlx:response');
-    expect(reply?.ok).toBe(false);
-    expect(String(reply?.error)).toContain('not found');
-    expect(h.exits).toEqual([]);
-  });
 });
 
 describe('handleSidecarRequest', () => {
@@ -311,11 +293,6 @@ describe('handleSidecarRequest', () => {
     const value = (await handleSidecarRequest(host, { op: 'models' })) as unknown[];
     expect(value).toEqual([{ name: 'm', path: '/p', modelType: 'gemma4' }]);
     expect(() => structuredClone(value)).not.toThrow();
-  });
-
-  it('refuses a load with no name', async () => {
-    const host = await realHost();
-    await expect(handleSidecarRequest(host, { op: 'load' })).rejects.toThrow(/requires a model name/);
   });
 });
 
