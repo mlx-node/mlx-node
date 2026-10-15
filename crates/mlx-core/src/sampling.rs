@@ -604,12 +604,6 @@ pub fn sample(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArra
     sample_compiled(logits, config)
 }
 
-/// Sample using non-compiled operations (fallback)
-pub fn sample_uncompiled(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArray> {
-    let filtered = apply_sampling(logits, config)?;
-    filtered.categorical(Some(-1))
-}
-
 /// Sample using optimized path - fully compiled C++ implementation.
 ///
 /// This is faster because the ENTIRE sampling chain runs as one fused operation:
