@@ -96,8 +96,7 @@ pub(crate) struct MusePagedRuntime {
 /// rollback returns the live window into (L-SETTLE, `engine::spec_paged`).
 /// The rung walk is not — a captured cold checkpoint is durable and no
 /// rollback retracts it. Both run under [`Self::Committed`] here, so that
-/// basis is this family's POST-COMMIT settle, and a chunk written inside an
-/// open verify cycle takes [`Self::Suppressed`] instead (I9).
+/// basis is this family's POST-COMMIT settle (I9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MusePagedSettle {
     /// Settle at the write cursor — every recorded token is committed (the
@@ -111,15 +110,7 @@ pub(crate) enum MusePagedSettle {
     ///
     /// Still carries the rung walk, so this is the settle a speculative
     /// owner runs once the commit has landed, never inside its cycle.
-    #[allow(dead_code)]
     Committed(u32),
-    /// No settle: pending pool writes are still evaluated (a compute flush,
-    /// not a durable action), but no rung is captured and nothing is pruned
-    /// — the shape of a verify write whose rows a commit may still retract;
-    /// the owner settles post-commit at the committed frontier. The only
-    /// mode lawful inside an open verify cycle.
-    #[allow(dead_code)]
-    Suppressed,
 }
 
 /// Trained and physically available active-context limits for one loaded
@@ -1007,8 +998,8 @@ impl MuseGlimmerInner {
     }
 
     /// The per-step KV settle at the tail of [`Self::run_paged_layer_loop`]:
-    /// evaluate pending pool writes, then — unless suppressed — capture cold
-    /// checkpoint rungs and prune the sliding groups at the settle basis.
+    /// evaluate pending pool writes, then capture cold checkpoint rungs and
+    /// prune the sliding groups at the settle basis.
     fn settle_paged_kv_step(&mut self, seq_id: SeqId, settle: MusePagedSettle) -> Result<()> {
         self.paged
             .as_mut()
@@ -1017,7 +1008,6 @@ impl MuseGlimmerInner {
             .eval_pending_pool_writes_all()
             .map_err(Error::from_reason)?;
         let committed_tokens = match settle {
-            MusePagedSettle::Suppressed => return Ok(()),
             MusePagedSettle::Cursor => None,
             MusePagedSettle::Committed(tokens) => Some(tokens),
         };
@@ -2244,90 +2234,6 @@ mod spec_paged_settle_tests {
             "the committed-basis settle must capture the same rungs at committed == cursor"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A suppressed settle must defer BOTH durable actions — no rung capture,
-    /// no sliding prune — until the owner settles at the committed frontier
-    /// (I9), at which point the deferred settle prunes and captures what is
-    /// still within the sliding read window. Mutation this catches: the
-    /// `Suppressed` arm falling through to either settling basis.
-    #[test]
-    fn suppressed_settle_defers_prune_and_checkpoints_to_the_committed_settle() {
-        let Some(mut inner) = maybe_tiny_inner() else {
-            eprintln!(
-                "skipping suppressed_settle_defers_prune_and_checkpoints_to_the_committed_settle: \
-                 Metal unavailable"
-            );
-            return;
-        };
-        let root = std::env::temp_dir().join(format!(
-            "mlx-muse-spec-paged-suppress-{}",
-            std::process::id()
-        ));
-        attach_cold_tier(&mut inner, &root);
-
-        let seq_id = 31;
-        inner
-            .paged
-            .as_mut()
-            .expect("tiny paged runtime")
-            .coordinator
-            .reset_scheduled_request(seq_id)
-            .expect("reset");
-        inner.set_active_paged_owner(seq_id);
-        let mut next_token = 0u32;
-        for chunk_len in SCHEDULE {
-            let tokens: Vec<u32> = (next_token..next_token + chunk_len).collect();
-            let first_position = next_token;
-            next_token += chunk_len;
-            inner
-                .run_paged_layer_loop(
-                    &tokens,
-                    first_position,
-                    true,
-                    MusePagedSettle::Suppressed,
-                    None,
-                )
-                .expect("suppressed paged layer loop");
-        }
-        assert_eq!(
-            captured_rungs(&inner, seq_id),
-            Vec::new(),
-            "a suppressed settle must capture no checkpoint rungs"
-        );
-        for (group_id, ids) in block_ids_per_group(&inner, seq_id).into_iter().enumerate() {
-            let mut unique = ids.clone();
-            unique.sort_unstable();
-            unique.dedup();
-            assert_eq!(
-                unique.len(),
-                ids.len(),
-                "a suppressed settle must prune nothing in group {group_id} (no null aliasing)"
-            );
-        }
-
-        // The deferred committed settle prunes and captures. The 8-token rung
-        // is past its sliding read window by now (deferring until commit
-        // forfeits it — acceptance-lossy, never correctness); the 32 rung is
-        // exactly the committed frontier and must be captured.
-        inner
-            .settle_paged_kv_step(seq_id, MusePagedSettle::Committed(next_token))
-            .expect("deferred committed settle");
-        assert_eq!(
-            captured_rungs(&inner, seq_id),
-            vec![(32u32, (0..32).collect::<Vec<u32>>())],
-            "the deferred settle must capture the on-frontier rung"
-        );
-        let sliding_ids = block_ids_per_group(&inner, seq_id)
-            .pop()
-            .expect("sliding group");
-        assert_eq!(
-            sliding_ids[0], sliding_ids[1],
-            "the deferred settle must null the blocks the window has passed"
-        );
-
-        inner.release_paged_request(seq_id).expect("release");
         let _ = std::fs::remove_dir_all(&root);
     }
 
