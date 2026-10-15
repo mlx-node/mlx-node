@@ -22,12 +22,6 @@ impl SwitchLinear {
         Ok(Self { weight })
     }
 
-    pub fn from_weight(weight: &MxArray) -> Self {
-        Self {
-            weight: weight.clone(),
-        }
-    }
-
     /// Forward pass using gather_mm.
     pub fn forward(&self, x: &MxArray, indices: &MxArray, sorted: bool) -> Result<MxArray> {
         let weight_t = self.weight.transpose(Some(&[0, 2, 1]))?;
