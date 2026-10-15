@@ -178,6 +178,7 @@ impl VerifyTicket {
 
     /// The attention frontier the cycle opened at — where a reject-all
     /// commit returns the cursor to.
+    #[cfg(test)]
     pub(crate) fn pre_attn_tokens(&self) -> u64 {
         self.pre_attn_tokens
     }
@@ -483,14 +484,14 @@ fn committed_attn_tokens<C: SpecPagedCache + ?Sized>(
 /// cycle, whatever its basis. Conformance harness for a driver that settles
 /// only post-commit; a driver that settles per chunk at the committed basis
 /// is lawful (see L-SETTLE) and belongs in [`NoDurableSettleInCycle`].
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct NoSettleInCycle<C> {
     inner: C,
     /// Sequences with an open verify cycle.
     open_cycles: std::collections::HashSet<u32>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl<C> NoSettleInCycle<C> {
     pub(crate) fn new(inner: C) -> Self {
         Self {
@@ -517,6 +518,7 @@ impl<C> NoSettleInCycle<C> {
     }
 }
 
+#[cfg(test)]
 impl<C: SpecPagedCache> SpecPagedCache for NoSettleInCycle<C> {
     fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> Result<bool, String> {
         self.inner.reserve_lookahead(seq_id, rows)
@@ -588,7 +590,7 @@ impl<C: SpecPagedCache> SpecPagedCache for NoSettleInCycle<C> {
 ///
 /// A committed-basis settle from a non-durable cache passes through, with
 /// the L-SETTLE proof behind it.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct NoDurableSettleInCycle<C> {
     inner: C,
     /// Open cycles, each mapped to the committed frontier it opened at —
@@ -596,7 +598,7 @@ pub(crate) struct NoDurableSettleInCycle<C> {
     open_cycles: std::collections::HashMap<u32, u64>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl<C> NoDurableSettleInCycle<C> {
     pub(crate) fn new(inner: C) -> Self {
         Self {
@@ -608,20 +610,9 @@ impl<C> NoDurableSettleInCycle<C> {
     pub(crate) fn inner(&self) -> &C {
         &self.inner
     }
-
-    /// Mutable access to the wrapped cache, with the same caveat as
-    /// [`NoSettleInCycle::inner_mut`]: it is the way a family core performs
-    /// the write an `open_core_write_cycle` cycle wraps, and calls made on
-    /// it are outside the checker.
-    pub(crate) fn inner_mut(&mut self) -> &mut C {
-        &mut self.inner
-    }
-
-    pub(crate) fn into_inner(self) -> C {
-        self.inner
-    }
 }
 
+#[cfg(test)]
 impl<C: SpecPagedCache> SpecPagedCache for NoDurableSettleInCycle<C> {
     fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> Result<bool, String> {
         self.inner.reserve_lookahead(seq_id, rows)
