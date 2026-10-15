@@ -16,7 +16,6 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
     let build_metal = target_os == "macos" && env::var_os("MLX_DISABLE_METAL").is_none();
     if !build_metal {
-        println!("cargo:rustc-env=PAGED_ATTN_METALLIB=");
         return;
     }
 
