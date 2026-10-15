@@ -129,15 +129,15 @@ export default defineConfig({
     env: { MLX_AGENT_METRICS: '0' },
     watch: false,
     testTimeout: 120000, // 2 minutes
-    // Two lanes. Vitest runs the group of projects with the default
-    // `maxWorkers` first and the `maxWorkers: 1` project after it, so the two
-    // never overlap: parallel pure-TS files, then one addon file at a time.
+    // Two lanes that never overlap: `sequence.groupOrder` makes Vitest finish
+    // every pure-TS file (parallel) before the first addon file (serial).
     projects: [
       {
         extends: true,
         test: {
           name: 'pure-ts',
           include: LANES.pureTs,
+          sequence: { groupOrder: 0 },
         },
       },
       {
@@ -149,6 +149,7 @@ export default defineConfig({
           // processes trips the GPU watchdog (SIGABRT, see ci.yml).
           maxWorkers: 1,
           maxConcurrency: 1,
+          sequence: { groupOrder: 1 },
         },
       },
     ],
