@@ -20,9 +20,8 @@
 //!
 //! // Query recorded data
 //! const runs = await store.listRuns();
-//! const topGens = await store.getGenerationsByReward(runId, 10, 10);
+//! const gens = await store.getGenerations(runId, step);
 //! const stats = await store.getRewardStats(runId);
-//! await store.exportJsonl(runId, './analysis.jsonl');
 //! ```
 
 mod reader;
