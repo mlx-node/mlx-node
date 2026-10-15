@@ -178,7 +178,6 @@ Remaining scaffolding:
 
 | Scaffolding                                                      | State                                                                                                                                                                 |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `copy_blocks` copy-on-write kernel                               | compiled into the metallib; no dispatcher, no callers (`metal/copy_blocks.rs`)                                                                                        |
 | `SequenceBlockTable::replace_block` ("for copy-on-write")        | test-only callers (`block_table.rs:63`)                                                                                                                               |
 | Varlen kernel (`cu_seqlens_q`, N ragged sequences)               | Qwen3 mixed scheduler steps and family-specific single-request paths; Qwen3 builds one physical-table row and one genuine cumulative-query boundary per request       |
 | Duplicated-row prefill layout (per-row heterogeneous `seq_lens`) | env-gated escape hatches only: gemma4 `MLX_GEMMA4_PAGED_PREFILL_ROUTE=legacy`, lfm2 `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION=1`; qwen3.5 always uses the varlen bridge |

@@ -299,7 +299,6 @@ fn compile_paged_attn_metallib(
     for file in [
         "attention/paged_attention.metal",
         "cache/reshape_and_cache.metal",
-        "cache/copy_blocks.metal",
     ] {
         let args = vec![
             "-I".to_string(),
