@@ -376,14 +376,6 @@ pub fn set_memory_limit(limit: f64) -> f64 {
     if rc != 0 { 0.0 } else { prev as f64 }
 }
 
-/// Get current memory limit.
-/// Returns 0.0 if the shim caught an exception. Internal Rust-only function.
-pub fn get_memory_limit() -> f64 {
-    let mut v: u64 = 0;
-    let rc = unsafe { sys::mlx_get_memory_limit(&mut v) };
-    if rc != 0 { 0.0 } else { v as f64 }
-}
-
 /// Set cache limit (controls memory pool/cache size).
 /// This limits how much memory MLX pre-allocates for caching.
 /// Returns the previous limit in bytes on success, or
@@ -655,41 +647,6 @@ pub fn materialize_weights(arrays: &[&super::MxArray]) -> napi::Result<WeightsRe
         arrays: total,
         bytes: total_bytes as u64,
     })
-}
-
-/// Check if memory is safe for autograd graph construction
-///
-/// Returns (is_safe, memory_info_message) where:
-/// - is_safe: true if available memory > required_mb AND > 10% of limit
-/// - memory_info_message: formatted string with current memory state
-///
-/// # Arguments
-/// * `required_mb` - Minimum required memory in megabytes
-///
-/// # Example
-/// ```ignore
-/// let (is_safe, msg) = check_memory_safety(1000.0); // Need 1GB buffer
-/// if !is_safe {
-///     warn!("Memory pressure: {}", msg);
-///     heavy_cleanup();
-/// }
-/// ```
-pub fn check_memory_safety(required_mb: f64) -> (bool, String) {
-    let active = get_active_memory() / 1e6;
-    let cache = get_cache_memory() / 1e6;
-    let peak = get_peak_memory() / 1e6;
-    let limit = get_memory_limit() / 1e6;
-    let available = limit - active - cache;
-
-    // Safe if: available > required AND available > 10% of limit
-    let is_safe = available > required_mb && available > (limit * 0.1);
-
-    let msg = format!(
-        "active={:.0}MB cache={:.0}MB peak={:.0}MB available={:.0}MB/{:.0}MB",
-        active, cache, peak, available, limit
-    );
-
-    (is_safe, msg)
 }
 
 #[cfg(test)]
