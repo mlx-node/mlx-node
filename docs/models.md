@@ -198,9 +198,8 @@ The output contains `model.safetensors`, `vision.safetensors`, and
 `draft.safetensors`. The current inference path is text-only; the converter
 preserves the vision sidecar, but Muse image/video execution is not wired yet.
 
-When `draft.safetensors` is present, `hasMtpWeights()` and
-`autoEnablesMtp()` return true and `ChatSession` enables DFlash unless a call
-sets `enableMtp: false`. Muse DFlash uses the checkpoint's 16-token parallel
+When `draft.safetensors` is present, `hasMtpWeights()` returns true and
+`ChatSession` enables DFlash unless a call sets `enableMtp: false`. Muse DFlash uses the checkpoint's 16-token parallel
 infill block by default. An explicit `mtpDepth` clamps to `[1, 16]`; leaving
 both depth knobs unset enables the measured target-AR fallback guard.
 
