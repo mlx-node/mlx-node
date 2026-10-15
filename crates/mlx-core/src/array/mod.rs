@@ -20,9 +20,7 @@ mod shape;
 pub use attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 pub use banded_attention::{banded_attention, banded_attention_reference};
 pub(crate) use handle::{MxHandle, check_handle};
-pub use padding::{
-    LeftPaddedSequences, PaddedSequences, left_pad_sequences, pad_float_sequences, pad_sequences,
-};
+pub use padding::{PaddedSequences, pad_float_sequences, pad_sequences};
 
 // Re-exports from memory submodule (used across the crate)
 pub use memory::{
