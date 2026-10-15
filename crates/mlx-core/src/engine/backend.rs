@@ -2027,21 +2027,6 @@ pub(crate) trait DsparkStepper {
     /// iteration boundary on the continue path (the analog of
     /// [`MtpStepper::eval_step_with_chained_hidden`]'s placement).
     fn eval_boundary(&self, token: &MxArray);
-
-    /// The stepper's current target-state frontier ([`SpecFrontier`]), or
-    /// `None` when it cannot name one (missing caches, or active target
-    /// caches disagreeing with each other). The draft-model targets are
-    /// pure attention, so `recurrent_tokens` is `None`; `attn_tokens` is
-    /// the common offset every ACTIVE target cache sits at — the same
-    /// per-cache totals `gemma4::layer_cache::commit_after_verify`
-    /// validates on every commit. REQUIRED, like
-    /// [`MtpStepper::frontier`]: the
-    /// [`crate::engine::spec_paged::SpecPagedCache`] facade's `frontier` is
-    /// the CACHE-side, `seq_id`-keyed method and does not route through this
-    /// hook. It stays required so every stepper can answer the question
-    /// `run_mtp_turn`'s debug asserts put to [`MtpStepper`].
-    #[allow(dead_code)]
-    fn frontier(&self) -> Option<SpecFrontier>;
 }
 
 /// Per-family training backend the model-neutral training-command handler
