@@ -884,7 +884,6 @@ module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer;
 module.exports.Qwen4ExpModel = nativeBinding.Qwen4ExpModel;
 module.exports.ResponseStore = nativeBinding.ResponseStore;
 module.exports.SftTrainingEngine = nativeBinding.SftTrainingEngine;
-module.exports.Tensor = nativeBinding.Tensor;
 module.exports.TextDetModel = nativeBinding.TextDetModel;
 module.exports.TextRecModel = nativeBinding.TextRecModel;
 module.exports.TtsNativeModel = nativeBinding.TtsNativeModel;

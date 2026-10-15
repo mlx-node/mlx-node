@@ -752,7 +752,6 @@ module.exports.Qwen3_5Model = nativeBinding.Qwen3_5Model;
 module.exports.Qwen3Model = nativeBinding.Qwen3Model;
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer;
 module.exports.SftTrainingEngine = nativeBinding.SftTrainingEngine;
-module.exports.Tensor = nativeBinding.Tensor;
 module.exports.TextDetModel = nativeBinding.TextDetModel;
 module.exports.TextRecModel = nativeBinding.TextRecModel;
 module.exports.VlmChatResult = nativeBinding.VlmChatResult;

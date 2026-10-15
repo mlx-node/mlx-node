@@ -2508,68 +2508,6 @@ export declare class SftTrainingEngine {
 }
 
 /**
- * A tensor that tracks gradients for automatic differentiation
- *
- * This is a wrapper around MxArray that provides:
- * - Gradient tracking
- * - Automatic gradient accumulation
- * - Integration with manual backward passes
- */
-export declare class Tensor {
-  /** Create a tensor from float32 data */
-  static fromFloat32(data: Float32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
-  /** Create a tensor from int32 data */
-  static fromInt32(data: Int32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
-  /** Get the shape of the underlying data */
-  dataShape(): BigInt64Array;
-  /** Get the shape of the gradient (if it exists) */
-  gradShape(): BigInt64Array | null;
-  /** Check if gradient exists */
-  hasGrad(): boolean;
-  /** Check if this tensor requires gradients */
-  get requiresGrad(): boolean;
-  /** Set whether this tensor requires gradients */
-  set requiresGrad(requiresGrad: boolean);
-  /** Zero out the gradient */
-  zeroGrad(): void;
-  /**
-   * Accumulate gradient
-   *
-   * If gradient already exists, add to it. Otherwise, set it.
-   * Note: This takes ownership of the gradient array.
-   */
-  accumulateGrad(grad: MxArray): void;
-  /** Get the shape of the tensor */
-  shape(): BigInt64Array;
-  /** Convert data to Float32 array */
-  toFloat32(): Float32Array;
-  /** Convert gradient to Float32 array (if it exists) */
-  gradToFloat32(): Float32Array | null;
-  /** Convert to Int32 array */
-  toInt32(): Int32Array;
-  /**
-   * Detach this tensor from the computation graph
-   *
-   * Returns a new tensor with the same data but no gradient tracking
-   */
-  detach(): Tensor;
-  /** Create a tensor of zeros */
-  static zeros(
-    shape: BigInt64Array,
-    dtype?: DType | undefined | null,
-    requiresGrad?: boolean | undefined | null,
-  ): Tensor;
-  /** Create a tensor of ones */
-  static ones(
-    shape: BigInt64Array,
-    dtype?: DType | undefined | null,
-    requiresGrad?: boolean | undefined | null,
-  ): Tensor;
-  /** Evaluate the underlying array */
-  eval(): void;
-}
-
-/**
  * PP-OCRv5 Text Detection model (DBNet with PPHGNetV2 backbone).
  *
  * Detects text lines in document images and returns bounding boxes.
