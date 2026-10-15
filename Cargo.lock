@@ -2089,6 +2089,7 @@ dependencies = [
  "half",
  "image",
  "libc",
+ "memchr",
  "mimalloc-safe",
  "minijinja",
  "mlx-db",

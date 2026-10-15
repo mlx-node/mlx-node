@@ -14,6 +14,7 @@ cmake = "0.1.58"
 futures = "0.3.34"
 half = "2.7"
 libc = "0.2.189"
+memchr = "2.8"
 mimalloc-safe = { version = "0.1" }
 parquet = { version = "60.0", features = ["arrow"] }
 rand = "0.10.2"

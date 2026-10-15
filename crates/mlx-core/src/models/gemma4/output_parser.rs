@@ -305,7 +305,9 @@ impl<'a> DslParser<'a> {
         // an ASCII byte never appears as a UTF-8 continuation byte.
         let haystack = self.src.as_bytes();
         let needle = DSL_STRING_DELIM.as_bytes();
-        let close = find_subslice(&haystack[start..], needle).ok_or_else(|| {
+        // SIMD-accelerated substring search — safe through multi-byte UTF-8
+        // content for the same reason as above.
+        let close = memchr::memmem::find(&haystack[start..], needle).ok_or_else(|| {
             DslParseError(format!("unterminated quoted string at position {}", start))
         })?;
         let body = &self.src[start..start + close];
@@ -1163,20 +1165,6 @@ fn extract_balanced_braces(s: &str) -> Option<String> {
         i += 1;
     }
     None
-}
-
-/// Byte-level `memmem` replacement — finds the first occurrence of
-/// `needle` in `haystack`. Used so we can search for ASCII delimiters
-/// through UTF-8 payloads without ever having to take a `&str` slice at
-/// a non-boundary position. Returns the byte offset into `haystack`.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    if haystack.len() < needle.len() {
-        return None;
-    }
-    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 // ---------------------------------------------------------------------------

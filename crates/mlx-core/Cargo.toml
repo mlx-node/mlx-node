@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 futures = { workspace = true }
 half = { workspace = true }
 libc = { workspace = true }
+memchr = { workspace = true }
 mlx-sys = { workspace = true }
 napi = { workspace = true }
 napi-derive = { workspace = true }
