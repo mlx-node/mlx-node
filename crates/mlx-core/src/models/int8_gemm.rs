@@ -32,6 +32,7 @@ use napi::bindgen_prelude::*;
 ///
 /// Returns `Err` when the op is unsupported (gen < 17 or `K % 16 != 0`) or on a
 /// kernel/FFI failure — the caller is expected to fall back to a bf16 `matmul`.
+#[cfg(test)]
 pub fn matmul_int8(x: &MxArray, w: &MxArray) -> Result<MxArray> {
     let mut out: *mut sys::mlx_array = std::ptr::null_mut();
     let ok = unsafe { sys::mlx_matmul_int8(x.as_raw_ptr(), w.as_raw_ptr(), &mut out) };
@@ -58,6 +59,7 @@ pub fn matmul_int8(x: &MxArray, w: &MxArray) -> Result<MxArray> {
 ///
 /// This helper remains useful for tests and legacy `[K,N]` kernel callers.
 /// Sym8 checkpoints instead store `[N,K]` and use the native-layout wrappers.
+#[cfg(test)]
 pub fn quantize_weight_int8(w: &MxArray) -> Result<(MxArray, MxArray)> {
     let mut out_w_i8: *mut sys::mlx_array = std::ptr::null_mut();
     let mut out_s_w: *mut sys::mlx_array = std::ptr::null_mut();
@@ -86,6 +88,7 @@ pub fn quantize_weight_int8(w: &MxArray) -> Result<(MxArray, MxArray)> {
 /// Fail-loud: `Err` on non-2D / non-int8 input (corrupt sym8 checkpoint) or
 /// FFI failure. The result is eval'd C++-side, so the transpose copy is
 /// materialized ONCE at load, never per forward.
+#[cfg(test)]
 pub fn sym8_kernel_operand(w_i8_nk: &MxArray) -> Result<MxArray> {
     let mut out: *mut sys::mlx_array = std::ptr::null_mut();
     let ok = unsafe { sys::mlx_sym8_kernel_operand(w_i8_nk.as_raw_ptr(), &mut out) };
@@ -112,6 +115,7 @@ pub fn sym8_kernel_operand(w_i8_nk: &MxArray) -> Result<MxArray> {
 ///
 /// The result is narrowed to bf16 **inside C++** before return, so a downstream
 /// bf16 residual add is not promoted to f32 by an f32 scale.
+#[cfg(test)]
 pub fn int8_w8a8_matmul(x: &MxArray, w_i8: &MxArray, s_w: &MxArray) -> Result<MxArray> {
     let mut out: *mut sys::mlx_array = std::ptr::null_mut();
     let ok = unsafe {
@@ -172,6 +176,7 @@ pub fn int8_w8a8_matmul_nk(x: &MxArray, w_nk: &MxArray, s_w: &MxArray) -> Result
 /// narrowed to bf16 inside C++ (so a downstream bf16 residual add is not promoted
 /// to f32 by an f32 scale). Returns `Err` when unsupported (gen < 17 or
 /// `K % 16 != 0`) or on a kernel/FFI failure — the caller falls back to bf16.
+#[cfg(test)]
 pub fn int8_w8a8_qmv(x: &MxArray, w_i8: &MxArray, s_w: &MxArray) -> Result<MxArray> {
     let mut out: *mut sys::mlx_array = std::ptr::null_mut();
     let ok = unsafe {
@@ -212,6 +217,7 @@ pub fn int8_w8a8_qmv(x: &MxArray, w_i8: &MxArray, s_w: &MxArray) -> Result<MxArr
 /// caller sees one dispatch rule) reroutes back to the W8A8 qmv for
 /// same-binary A/B. Returns `Err` when unsupported (gen < 17 or
 /// `K % 16 != 0`) or on a kernel/FFI failure.
+#[cfg(test)]
 pub fn int8_w8a16_qmv(
     x: &MxArray,
     w_kn: &MxArray,
@@ -279,6 +285,7 @@ pub fn int8_w8a16_qmv_nk(x: &MxArray, w_nk: &MxArray, s_w: &MxArray) -> Result<M
 ///
 /// Returns `Err` when unsupported (gen<17, `bits != 8`, or `K % group_size != 0`)
 /// or on a kernel/FFI failure — the caller is expected to fall back.
+#[cfg(test)]
 pub fn affine_w8a8_matmul(
     x: &MxArray,
     packed_w: &MxArray,
