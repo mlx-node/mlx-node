@@ -218,41 +218,6 @@ impl MxArray {
         }
     }
 
-    /// Extract float32 value at specific 2D index [row, col] without copying entire array
-    /// More efficient than to_float32_noeval()[row * cols + col] for large arrays
-    pub fn item_at_float32_2d(&self, row: usize, col: usize) -> Result<f32> {
-        let cols = self.shape_at(1)? as usize;
-        let flat_index = row * cols + col;
-        self.item_at_float32(flat_index)
-    }
-
-    /// Repeat the entire tensor along a specific axis
-    /// E.g., [1, heads, seq, dim] with repeat_along_axis(0, 4) -> [4, heads, seq, dim]
-    pub fn repeat_along_axis(&self, axis: i32, times: i32) -> Result<MxArray> {
-        if times <= 1 {
-            return Ok(self.clone());
-        }
-
-        let ndim = self.ndim()? as usize;
-        let axis_usize = if axis < 0 {
-            (ndim as i32 + axis) as usize
-        } else {
-            axis as usize
-        };
-
-        if axis_usize >= ndim {
-            return Err(Error::from_reason(format!(
-                "axis {} out of bounds for array with {} dimensions",
-                axis, ndim
-            )));
-        }
-
-        // Build tile reps: [1, 1, ..., times, ..., 1]
-        let mut reps = vec![1i32; ndim];
-        reps[axis_usize] = times;
-        self.tile(&reps)
-    }
-
     #[napi]
     pub fn dtype(&self) -> Result<DType> {
         let code = unsafe { sys::mlx_array_dtype(self.handle.0) };
