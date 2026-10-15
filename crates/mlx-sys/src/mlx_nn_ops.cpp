@@ -202,39 +202,6 @@ int64_t mlx_array_shape_at(mlx_array* handle, size_t axis) {
   return shape[axis];
 }
 
-// Get batch and sequence length for 2D arrays (common pattern in transformers)
-// Returns true on success, false if not 2D array
-bool mlx_array_get_batch_seq_len(mlx_array* handle, int64_t* batch, int64_t* seq_len) {
-  auto arr = reinterpret_cast<array*>(handle);
-  if (!arr || !batch || !seq_len) {
-    return false;
-  }
-  const Shape& shape = arr->shape();
-  if (shape.size() != 2) {
-    return false;
-  }
-  *batch = shape[0];
-  *seq_len = shape[1];
-  return true;
-}
-
-// Get batch, sequence length, and hidden size for 3D arrays (common pattern in transformers)
-// Returns true on success, false if not 3D array
-bool mlx_array_get_batch_seq_hidden(mlx_array* handle, int64_t* batch, int64_t* seq_len, int64_t* hidden) {
-  auto arr = reinterpret_cast<array*>(handle);
-  if (!arr || !batch || !seq_len || !hidden) {
-    return false;
-  }
-  const Shape& shape = arr->shape();
-  if (shape.size() != 3) {
-    return false;
-  }
-  *batch = shape[0];
-  *seq_len = shape[1];
-  *hidden = shape[2];
-  return true;
-}
-
 } // extern "C" — temporarily close for C++ template
 
 // Read a scalar element from an evaluated array at the given index, casting to
@@ -573,14 +540,6 @@ mlx_array* mlx_array_random_normal(const int64_t* shape,
   Shape target_shape = make_shape(shape, ndim);
   array arr =
       mlx::core::random::normal(target_shape, to_mlx_dtype(dtype), mean, std);
-  return reinterpret_cast<mlx_array*>(new array(std::move(arr)));
-}
-
-mlx_array* mlx_array_random_bernoulli(const int64_t* shape,
-                                      size_t ndim,
-                                      float prob) {
-  Shape target_shape = make_shape(shape, ndim);
-  array arr = mlx::core::random::bernoulli(prob, target_shape);
   return reinterpret_cast<mlx_array*>(new array(std::move(arr)));
 }
 
@@ -959,24 +918,6 @@ mlx_array* mlx_array_cos(mlx_array* handle) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
-mlx_array* mlx_array_tan(mlx_array* handle) {
-  auto arr = reinterpret_cast<array*>(handle);
-  array result = mlx::core::tan(*arr);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
-mlx_array* mlx_array_sinh(mlx_array* handle) {
-  auto arr = reinterpret_cast<array*>(handle);
-  array result = mlx::core::sinh(*arr);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
-mlx_array* mlx_array_cosh(mlx_array* handle) {
-  auto arr = reinterpret_cast<array*>(handle);
-  array result = mlx::core::cosh(*arr);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
 mlx_array* mlx_array_tanh(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
   array result = mlx::core::tanh(*arr);
@@ -1024,24 +965,6 @@ mlx_array* mlx_array_remainder(mlx_array* lhs, mlx_array* rhs) {
 mlx_array* mlx_array_reciprocal(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
   array result = reciprocal(*arr);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
-mlx_array* mlx_array_arcsin(mlx_array* handle) {
-  auto arr = reinterpret_cast<array*>(handle);
-  array result = arcsin(*arr);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
-mlx_array* mlx_array_arccos(mlx_array* handle) {
-  auto arr = reinterpret_cast<array*>(handle);
-  array result = arccos(*arr);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
-mlx_array* mlx_array_arctan(mlx_array* handle) {
-  auto arr = reinterpret_cast<array*>(handle);
-  array result = arctan(*arr);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
