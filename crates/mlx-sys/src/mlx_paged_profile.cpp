@@ -158,20 +158,31 @@ mlx_array* mlx_array_from_metal_buffer_view(
   // `MetalAllocator::make_buffer` returns). `allocator::Data(buffer, deleter)`
   // is the non-owning form: MLX never passes it to `allocator().free`, it
   // runs our deleter instead (upstream #4634).
+  //
+  // Exactly one release of the retained reference on every path. Once the
+  // `Data` holds the deleter, its destructor runs it — whether the `array`
+  // constructor throws before taking it or after (the moved-from `Data`
+  // is empty and releases nothing) — so the catch below must release only
+  // when the failure happened before the `Data` existed.
+  bool data_owns_release = false;
   try {
     mlx::core::Shape shape = make_shape(dims, ndim);
     auto buf = mlx::core::allocator::Buffer{metal_buffer_ptr};
-    auto* arr = new mlx::core::array(
-        mlx::core::allocator::Data(buf, std::move(retain_release)),
-        std::move(shape),
-        dtype);
+    mlx::core::allocator::Data data(buf, std::move(retain_release));
+    data_owns_release = true;
+    auto* arr = new mlx::core::array(std::move(data), std::move(shape), dtype);
     return reinterpret_cast<mlx_array*>(arr);
   } catch (...) {
-    // Construction failed AFTER we retained — release the bumped
-    // refcount so the buffer doesn't leak. Without this, repeated
-    // failure on the same buffer would slowly leak refcounts.
+    // Construction failed AFTER we retained but BEFORE the deleter was
+    // handed over — release the bumped refcount so the buffer doesn't
+    // leak. Without this, repeated failure on the same buffer would
+    // slowly leak refcounts.
 #if defined(__APPLE__)
-    mtl_buffer->release();
+    if (!data_owns_release) {
+      mtl_buffer->release();
+    }
+#else
+    (void)data_owns_release;
 #endif
     return nullptr;
   }
