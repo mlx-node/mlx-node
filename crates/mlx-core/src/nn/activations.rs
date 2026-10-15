@@ -145,13 +145,6 @@ impl Activations {
         MxArray::from_handle(handle, "log_softmax")
     }
 
-    /// Swish/SwiGLU: Used in gated variants
-    pub fn swiglu(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
-        // swiglu(gate, up) = silu(gate) * up
-        let silu_gate = Self::silu(gate)?;
-        silu_gate.mul(up)
-    }
-
     /// Hard Swish: x * clamp(x + 3, 0, 6) / 6
     /// Used in PP-LCNet (MobileNet-style architectures).
     pub fn hard_swish(input: &MxArray) -> Result<MxArray> {
