@@ -386,14 +386,6 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
 
     // Gradient computation (callback-based - this is the MLX-native approach)
-    pub fn mlx_compute_gradients(
-        loss_fn: LossFunctionPtr,
-        context: *mut std::os::raw::c_void,
-        input_handles: *const *mut mlx_array,
-        input_count: usize,
-        output_handles: *mut *mut mlx_array,
-    ) -> usize;
-
     pub fn mlx_value_and_gradients(
         loss_fn: LossFunctionPtr,
         context: *mut std::os::raw::c_void,

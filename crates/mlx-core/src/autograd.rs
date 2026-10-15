@@ -229,76 +229,6 @@ where
     Ok((loss_value, gradients?))
 }
 
-/// Compute only gradients (not loss value) of a scalar loss function
-///
-/// Similar to `value_and_grad` but only returns gradients, which can be
-/// slightly more efficient if you don't need the loss value.
-pub fn compute_gradients<F>(params: Vec<&MxArray>, loss_fn: F) -> Result<Vec<MxArray>>
-where
-    F: FnMut(&[MxArray]) -> Result<MxArray> + 'static,
-{
-    if params.is_empty() {
-        return Err(Error::from_reason(
-            "compute_gradients: params cannot be empty".to_string(),
-        ));
-    }
-
-    // Extract handles from parameters
-    let input_handles: Vec<*mut sys::mlx_array> = params.iter().map(|p| p.handle.0).collect();
-    let input_count = input_handles.len();
-
-    // Allocate space for gradient handles
-    let mut grad_handles: Vec<*mut sys::mlx_array> = vec![std::ptr::null_mut(); input_count];
-
-    // Create context with loss function
-    let mut context = Box::new(LossFunctionContext {
-        loss_fn: Some(Box::new(loss_fn)),
-        error: None,
-    });
-    let context_ptr = &mut *context as *mut LossFunctionContext as *mut c_void;
-
-    // Call MLX autograd (compute_gradients version)
-    let num_grads = unsafe {
-        sys::mlx_compute_gradients(
-            loss_function_callback,
-            context_ptr,
-            input_handles.as_ptr(),
-            input_count,
-            grad_handles.as_mut_ptr(),
-        )
-    };
-
-    // Check for errors
-    if let Some(error) = context.error {
-        return Err(Error::from_reason(format!(
-            "compute_gradients: loss function failed: {}",
-            error
-        )));
-    }
-
-    if num_grads == 0 {
-        return Err(Error::from_reason(
-            "compute_gradients: MLX autograd failed (returned 0)".to_string(),
-        ));
-    }
-
-    if num_grads != input_count {
-        return Err(Error::from_reason(format!(
-            "compute_gradients: expected {} gradients, got {}",
-            input_count, num_grads
-        )));
-    }
-
-    // Convert handles to MxArrays
-    let gradients: Result<Vec<MxArray>> = grad_handles
-        .into_iter()
-        .enumerate()
-        .map(|(i, handle)| MxArray::from_handle(handle, &format!("gradient_{}", i)))
-        .collect();
-
-    gradients
-}
-
 // ============================================================================
 // Gradient Checkpointing
 // ============================================================================
@@ -681,20 +611,6 @@ mod tests {
         assert!(
             (get_scalar(&grads[0]) - 0.5).abs() < 1e-5,
             "gradient should be 0.5"
-        );
-    }
-
-    #[test]
-    fn test_compute_gradients_only() {
-        // Test compute_gradients (gradients without loss value)
-        let x = scalar(3.0);
-
-        let grads = compute_gradients(vec![&x], |params| to_scalar(params[0].square()?)).unwrap();
-
-        assert_eq!(grads.len(), 1);
-        assert!(
-            (get_scalar(&grads[0]) - 6.0).abs() < 1e-5,
-            "gradient should be 6.0"
         );
     }
 
