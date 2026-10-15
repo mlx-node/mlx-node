@@ -122,26 +122,6 @@ mlx_array* mlx_paged_attention_forward(
   return nullptr;
 }
 
-mlx_array* mlx_paged_attention_forward_with_route(
-    mlx_array*,
-    mlx_array*,
-    mlx_array*,
-    mlx_array*,
-    mlx_array*,
-    mlx_array*,
-    mlx_array*,
-    float,
-    float,
-    int,
-    int,
-    int,
-    int,
-    int,
-    uint8_t,
-    uint8_t) {
-  return nullptr;
-}
-
 mlx_array* mlx_paged_attention_forward_with_plan(
     mlx_array*,
     mlx_array*,

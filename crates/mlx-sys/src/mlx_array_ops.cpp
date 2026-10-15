@@ -497,32 +497,6 @@ mlx_array* mlx_array_slice(mlx_array* handle,
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
-// Optimized slice assignment along a single axis - no allocation for shape access
-// Returns new array with the slice updated
-mlx_array* mlx_array_slice_assign_axis(mlx_array* src_handle,
-                                        mlx_array* update_handle,
-                                        size_t axis,
-                                        int64_t start,
-                                        int64_t end) {
-  auto src = reinterpret_cast<array*>(src_handle);
-  auto update = reinterpret_cast<array*>(update_handle);
-
-  // Access shape directly without allocation
-  const Shape& shape = src->shape();
-  size_t ndim = shape.size();
-
-  // Build start and stop shapes
-  Shape start_shape(ndim, 0);
-  Shape stop_shape = shape;
-
-  start_shape[axis] = start;
-  stop_shape[axis] = end;
-
-  // Perform slice update and return new array
-  array result = slice_update(*src, *update, std::move(start_shape), std::move(stop_shape));
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
 // Optimized in-place slice assignment along a single axis - no allocation
 // Modifies src directly
 void mlx_array_slice_assign_axis_inplace(mlx_array* src_handle,
@@ -682,17 +656,6 @@ bool mlx_array_to_int8(mlx_array* handle, int8_t* out, size_t len) {
     std::cerr << "[MLX] mlx_array_to_int8: " << e.what() << std::endl;
     return false;
   }
-}
-
-// Compute D = beta * C + alpha * (A @ B)
-// This is a fused operation that's more efficient than separate matmul and add
-mlx_array* mlx_array_addmm(mlx_array* c_handle, mlx_array* a_handle, mlx_array* b_handle,
-                           float alpha, float beta) {
-  auto c = reinterpret_cast<array*>(c_handle);
-  auto a = reinterpret_cast<array*>(a_handle);
-  auto b = reinterpret_cast<array*>(b_handle);
-  array result = addmm(*c, *a, *b, alpha, beta);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
 }  // extern "C"

@@ -285,44 +285,6 @@ mlx_array* mlx_array_from_metal_buffer_view(
 }
 #endif
 
-// Get Metal device information as JSON string
-// Returns a JSON string with device properties like max_recommended_working_set_size
-const char* mlx_metal_device_info() {
-  // Static buffer to hold the JSON string
-  static std::string info_json;
-
-  if (!mlx::core::metal::is_available()) {
-    info_json = "{\"available\": false}";
-    return info_json.c_str();
-  }
-
-  try {
-    const auto& device_info = mlx::core::gpu::device_info();
-
-    // Build JSON string manually
-    std::ostringstream json;
-    json << "{";
-    json << "\"available\": true";
-
-    // Get max_recommended_working_set_size (this is the key we need for wired_limit)
-    auto it = device_info.find("max_recommended_working_set_size");
-    if (it != device_info.end()) {
-      // The value is a variant<string, size_t>, extract size_t
-      if (const auto* val = std::get_if<size_t>(&it->second)) {
-        json << ", \"max_recommended_working_set_size\": " << *val;
-      }
-    }
-
-    json << "}";
-
-    info_json = json.str();
-    return info_json.c_str();
-  } catch (const std::exception& e) {
-    info_json = "{\"available\": true, \"error\": \"" + std::string(e.what()) + "\"}";
-    return info_json.c_str();
-  }
-}
-
 // Set the wired memory limit. Writes the previous limit through `out_old_limit`
 // (which may be null). Wired memory cannot be paged out (important for Metal
 // GPU). Uses mlx::core::set_wired_limit (not metal-specific).

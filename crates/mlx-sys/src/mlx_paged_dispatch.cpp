@@ -857,28 +857,12 @@ bool grouped_d512_test_probe_enabled() {
   return enabled;
 }
 
-std::atomic<uint64_t>& grouped_d128_test_probe_counter() {
-  static std::atomic<uint64_t> counter{0};
-  return counter;
-}
-
-bool grouped_d128_test_probe_enabled() {
-  static const bool enabled = []() {
-    const char* value = std::getenv("MLX_PAGED_GROUPED_D128_TEST_PROBE");
-    return value != nullptr && std::string(value) == "1";
-  }();
-  return enabled;
-}
-
 void record_grouped_route_for_test(GroupedPagedAttentionKind kind) {
   if (kind == GroupedPagedAttentionKind::Qwen35D256) {
     record_grouped_qwen35_route_for_test();
   } else if (kind == GroupedPagedAttentionKind::D512Direct &&
              grouped_d512_test_probe_enabled()) {
     grouped_d512_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
-  } else if (kind == GroupedPagedAttentionKind::D128Direct &&
-             grouped_d128_test_probe_enabled()) {
-    grouped_d128_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -898,22 +882,6 @@ extern "C" void mlx_paged_grouped_d512_test_probe_reset() {
 
 extern "C" uint64_t mlx_paged_grouped_d512_test_probe_count() {
   return grouped_d512_test_probe_counter().load(std::memory_order_relaxed);
-}
-
-extern "C" void mlx_paged_grouped_gemma4_test_probe_reset() {
-  mlx_paged_grouped_d512_test_probe_reset();
-}
-
-extern "C" uint64_t mlx_paged_grouped_gemma4_test_probe_count() {
-  return mlx_paged_grouped_d512_test_probe_count();
-}
-
-extern "C" void mlx_paged_grouped_d128_test_probe_reset() {
-  grouped_d128_test_probe_counter().store(0, std::memory_order_relaxed);
-}
-
-extern "C" uint64_t mlx_paged_grouped_d128_test_probe_count() {
-  return grouped_d128_test_probe_counter().load(std::memory_order_relaxed);
 }
 
 extern "C" uint32_t mlx_paged_grouped_d128_max_stripes(
