@@ -62,8 +62,10 @@
 //! same at both speeds.
 //!
 //! The metric-B rows are not rounded to look alike: `gdn_replay_tokens` and the
-//! blind-turn count are EQUAL between the arms, in all 324 cells of
-//! `the_publisher_arm_never_costs_hot_path_replay`'s sweep, for the structural
+//! blind-turn count are EQUAL between the arms, in every cell of
+//! `the_publisher_arm_never_costs_hot_path_replay`'s sweep (all 324 cells of
+//! the full `CAPACITY_SWEEP` when it was measured; the gate now runs the four
+//! caps that decide when the blinding arm is reached), for the structural
 //! reason set out in `prune_gdn_checkpoints`'s doc. The victim ORDER moves metric
 //! A only. What moves metric B is capacity: six owners in five slots collapses
 //! under either arm, and every `CAPACITY_SWEEP` variant at limit 6 or above
@@ -605,8 +607,12 @@ fn print_decision_table(fixture: &Fixture, caps: Caps, queue: u32, order: Order)
     }
 }
 
-/// Everything the two reviewers said the sweep never looked at.
+/// Everything the two reviewers said the sweep never looked at. A report, not
+/// a gate: it asserts nothing, so it only runs on request.
+///
+///   cargo test -p mlx-core retention_sim::decision_tables -- --ignored --nocapture
 #[test]
+#[ignore = "policy report, not a gate; run with --ignored --nocapture to print the tables"]
 fn decision_tables() {
     for order in [Order::RoundRobin, Order::Burst(4)] {
         for fixture in [Fixture::AGENT, Fixture::CHAT, Fixture::PRIOR_PASS] {
@@ -782,10 +788,16 @@ fn small_config_shell() -> Qwen3_5Config {
     }
 }
 
-/// The measurement. Prints every arm under `--nocapture`; the assertions at the
-/// end are the floors that keep the numbers from rotting.
+/// The measurement: every counter, both arms, every capacity variant, for
+/// every fixture, plus what a slot costs. A report, not a gate — the floors
+/// that keep its numbers from rotting are
+/// `multi_owner_sweep_measures_both_consumers`, which runs only the cells it
+/// asserts on.
+///
+///   cargo test -p mlx-core retention_sim::multi_owner_sweep_report -- --ignored --nocapture
 #[test]
-fn multi_owner_sweep_measures_both_consumers() {
+#[ignore = "policy report, not a gate; run with --ignored --nocapture to print the tables"]
+fn multi_owner_sweep_report() {
     println!("\nowners axis for every table below: {}", owner_axis());
     for fixture in [Fixture::AGENT, Fixture::CHAT, Fixture::PRIOR_PASS] {
         print_detail(&fixture, Caps::SHIPPED, QUEUE_BLOCKS_PER_TURN);
@@ -811,7 +823,15 @@ fn multi_owner_sweep_measures_both_consumers() {
         mib(bytes_27b * GDN_PREFIX_CHECKPOINT_LIMIT),
         mib(bytes_0_8b * GDN_PREFIX_CHECKPOINT_LIMIT)
     );
+}
 
+/// The floors that keep `multi_owner_sweep_report`'s numbers from rotting:
+/// the shipped caps, round-robin, on the cells the constants below were
+/// measured on — one agent owner, one to `SIZED_FLEET_OWNERS` agent owners,
+/// one and two chat owners. Each constant's doc says which mutation it was
+/// verified to catch.
+#[test]
+fn multi_owner_sweep_measures_both_consumers() {
     let agent_1 = run(
         &Fixture::AGENT,
         1,
@@ -1169,12 +1189,44 @@ fn the_two_arms_disagree_about_who_pays() {
 /// Metric B is the one a user feels: a re-forwarded prefix is GPU time on the
 /// turn they are waiting for, while metric A is an SSD write only a restart
 /// reads. Equality here is what makes the sidecar gain free.
+///
+/// The argument is about WHEN the blinding arm is reached, so the caps that
+/// matter are the ones that change that: the shipped pair; `limit 4 per-owner
+/// 4`, the implicit-root persist call site, where one full ladder is the whole
+/// store and the global cap fires as soon as a second owner publishes over
+/// it; `limit 5 per-owner 2`, where the per-owner cap is the tighter one and
+/// most evictions never reach the global arms; `limit 13 per-owner 2`, a
+/// wide global ladder over a tight per-owner one, so the global cap fires
+/// late and only after every owner is already at its own cap; and `limit 24
+/// per-owner 4`, where the global cap never fires at six owners and both
+/// arms are literally the same code path. The intermediate limits in
+/// [`CAPACITY_SWEEP`] move the printed numbers in `multi_owner_sweep_report`,
+/// not where the arms could differ.
 #[test]
 fn the_publisher_arm_never_costs_hot_path_replay() {
+    const CAPS: [Caps; 5] = [
+        Caps::SHIPPED,
+        Caps {
+            limit: 4,
+            per_owner: 4,
+        },
+        Caps {
+            limit: 5,
+            per_owner: 2,
+        },
+        Caps {
+            limit: 13,
+            per_owner: 2,
+        },
+        Caps {
+            limit: 24,
+            per_owner: 4,
+        },
+    ];
     let mut cells = 0usize;
     for order in [Order::RoundRobin, Order::Burst(4)] {
         for fixture in [Fixture::AGENT, Fixture::CHAT, Fixture::PRIOR_PASS] {
-            for caps in CAPACITY_SWEEP {
+            for caps in CAPS {
                 for owners in SWEEP_OWNERS {
                     let applied = run(
                         &fixture,
@@ -1214,7 +1266,7 @@ fn the_publisher_arm_never_costs_hot_path_replay() {
     println!("hot path identical in all {cells} cells");
     assert_eq!(
         cells,
-        2 * 3 * CAPACITY_SWEEP.len() * SWEEP_OWNERS.len(),
+        2 * 3 * CAPS.len() * SWEEP_OWNERS.len(),
         "the sweep shrank"
     );
 }
@@ -1288,39 +1340,46 @@ fn the_publisher_arm_buys_cold_sidecars() {
 /// owns — so the first arm returns `None` on every iteration and the second arm
 /// is the whole search. ChatSession, the server's single-session path and a
 /// non-delegating agent all live here, and none of them may pay for this.
+///
+/// Shipped caps only. With one owner the per-owner cap (never above the
+/// global limit in any variant) is enforced first, so the store never exceeds
+/// the global limit and `prune_gdn_checkpoints` never reads `active_owner_id`
+/// at all — the equality holds for every `Caps` for the same reason, and the
+/// capacity variants add nothing a second cap pair would not. The scope
+/// equivalence the control arm rests on is pinned directly by
+/// `an_absent_active_owner_is_the_unrestricted_arm`.
 #[test]
 fn one_owner_is_the_same_policy_either_way() {
     for order in [Order::RoundRobin, Order::Burst(4)] {
         for fixture in [Fixture::AGENT, Fixture::CHAT, Fixture::PRIOR_PASS] {
-            for caps in CAPACITY_SWEEP {
-                let applied = run(
-                    &fixture,
-                    1,
-                    SWEEP_TURNS,
-                    caps,
-                    Policy::ProtectsPublisher,
-                    QUEUE_BLOCKS_PER_TURN,
-                    order,
-                );
-                let control = run(
-                    &fixture,
-                    1,
-                    SWEEP_TURNS,
-                    caps,
-                    Policy::Unrestricted,
-                    QUEUE_BLOCKS_PER_TURN,
-                    order,
-                );
-                assert_eq!(
-                    applied,
-                    control,
-                    "{} {} limit {} per-owner {}: the single-owner path changed",
-                    fixture.label,
-                    order.label(),
-                    caps.limit,
-                    caps.per_owner,
-                );
-            }
+            let caps = Caps::SHIPPED;
+            let applied = run(
+                &fixture,
+                1,
+                SWEEP_TURNS,
+                caps,
+                Policy::ProtectsPublisher,
+                QUEUE_BLOCKS_PER_TURN,
+                order,
+            );
+            let control = run(
+                &fixture,
+                1,
+                SWEEP_TURNS,
+                caps,
+                Policy::Unrestricted,
+                QUEUE_BLOCKS_PER_TURN,
+                order,
+            );
+            assert_eq!(
+                applied,
+                control,
+                "{} {} limit {} per-owner {}: the single-owner path changed",
+                fixture.label,
+                order.label(),
+                caps.limit,
+                caps.per_owner,
+            );
         }
     }
 }

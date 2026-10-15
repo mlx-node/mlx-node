@@ -693,7 +693,9 @@ which means one entry per owner and still over cap — strictly more live owners
 slots. Below that point nobody goes blind under either order
 (`one_subagent_turn_leaves_every_sibling_a_checkpoint`), and the measured hot-path cost
 of the preference is zero: identical replayed prefix tokens and identical blind turns
-in all 108 cells of `retention_sim::the_publisher_arm_never_costs_hot_path_replay`.
+in every cell of `retention_sim::the_publisher_arm_never_costs_hot_path_replay` (the
+gate runs the four caps that decide when the blinding arm is reached; the full
+`CAPACITY_SWEEP` report behind `--ignored` showed the same).
 Past that point — six live owners in five slots — 28 of 40 agent turns re-forward their
 whole cached prefix, under either order. That cliff is the count bound, not the victim
 search, and moving it is a memory decision at ~75 MiB per slot.

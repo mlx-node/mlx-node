@@ -208,6 +208,30 @@ fn tile_supported(q_heads: i64, kv_heads: i64, rows: i64, total: i64) -> bool {
 /// simdgroup-matrix tile kernel, and the vector routes) stays within a few
 /// BF16 ulps of the f64 reference over the same dequantized rows, over
 /// prefix boundaries, block widths and sharp softmaxes.
+///
+/// The prefixes are the shape boundaries of the kernels, not a sweep (the
+/// f64 reference is O(prefix) per case, so every long prefix costs seconds):
+///
+/// - 1: `n <= 9` keys; the block kernels' 32 partitions are mostly empty
+///   (chunk 1) and the vector route is one-pass.
+/// - 87: every partition holds one masked partial tile (chunk 3); the
+///   vector route is still one-pass.
+/// - 1019: for 2-4 rows the total is 1021-1023, so every tile partition but
+///   the last is exactly one full unmasked 32-key tile (chunk == tile_n) and
+///   the vector route is one-pass just under MLX's 1024-key two-pass switch;
+///   for 8 rows (wider than the device's query chunk) the head chunk stays
+///   one-pass while the tail crosses 1024, which is the int8 `split` verify
+///   route.
+/// - 1024: the total crosses 1024 for every layout — two-pass vector route,
+///   and a tile partition of one full tile plus a masked tail (chunk 33).
+/// - 6219: the long one: several full tiles plus a masked tail per
+///   partition on every tile size (16/32 simdgroup-matrix, 32/64 tensor-op),
+///   GQA two-pass on every device class.
+///
+/// `q_std` 64 is the sharp-softmax axis (one dominant key per row, so the
+/// BF16 P of the block kernels is tested at its coarsest); 1 is the broad
+/// one. The layouts cover M = rows x gqa of 16, 24 (both gqa), 48 and 64,
+/// which is every tile size the plans can choose.
 #[test]
 #[cfg(target_os = "macos")]
 fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
@@ -217,7 +241,7 @@ fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
     }
     seed_rng(0x1A7_0001);
     const HKV: i64 = 4;
-    let prefixes = [1_i64, 7, 31, 33, 87, 1023, 1024, 4095, 4096, 6219];
+    let prefixes = [1_i64, 87, 1019, 1024, 6219];
     let layouts: [(i64, Vec<i64>); 2] = [(24, vec![4, 8]), (32, vec![2, 3, 8])];
     let mut worst = [(0f32, 0f64); 3];
     let mut checked = [0usize; 3];
@@ -225,7 +249,7 @@ fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
     for (q_heads, rows_list) in &layouts {
         for &rows in rows_list {
             for &prefix in &prefixes {
-                for (set, q_std) in [1.0f64, 8.0, 64.0].into_iter().enumerate() {
+                for (set, q_std) in [1.0f64, 64.0].into_iter().enumerate() {
                     let seed = prefix as f64 * 0.37 + rows as f64 + set as f64 * 100.0;
                     let c = make_case(*q_heads, HKV, rows, prefix, seed, q_std);
                     let expected =
@@ -307,7 +331,14 @@ fn int8_verify_routes_match_the_dequantized_reference() -> Result<()> {
 }
 
 /// The decode row (one query, no causal mask) through the production int8
-/// entry over short and long prefixes, on both GQA layouts.
+/// entry over short and long prefixes, on both GQA layouts and the
+/// gqa = 1 one.
+///
+/// Prefixes: 1 (one-pass, a single prefix row), 1000 (one-pass, just under
+/// MLX's 1024-key two-pass switch) and 9000 (two-pass wherever the layout
+/// two-passes at all, and past the 8192-key step where MLX's partition
+/// policy doubles the partition count for the low-simdgroup layouts, so the
+/// reduction kernel sees a different partition count than at 1024-8192).
 #[test]
 #[cfg(target_os = "macos")]
 fn int8_decode_row_matches_the_dequantized_reference() -> Result<()> {
@@ -317,7 +348,7 @@ fn int8_decode_row_matches_the_dequantized_reference() -> Result<()> {
     seed_rng(0x1A7_0002);
     let mut worst = (0f32, 0f64);
     for (q_heads, kv_heads) in [(24_i64, 4_i64), (32, 8), (8, 8)] {
-        for prefix in [1_i64, 5, 255, 1000, 5000, 9000] {
+        for prefix in [1_i64, 1000, 9000] {
             let c = make_case(
                 q_heads,
                 kv_heads,
@@ -349,6 +380,15 @@ fn int8_decode_row_matches_the_dequantized_reference() -> Result<()> {
 /// alone predicts (the f64 reference over int8 rows against the f64
 /// reference over the BF16 rows). The kernel adds nothing material beyond
 /// the quantization itself.
+///
+/// Two blocks through the production (automatic) route: 1024 prefix rows,
+/// the two-pass vector switch, where the calibrated crossover decides
+/// between the vector and block kernels, with a broad softmax; and 8192,
+/// the crossover's ceiling (`kSegmentedBlockMinKeysCeiling`), so a block
+/// kernel is taken wherever the device has one (the simdgroup-matrix tile
+/// kernel's partition count steps from 32 to 64 there,
+/// `segmented_verify_tile_partitions`), and the softmax is sharp — the
+/// regime where the block kernels' BF16 P is coarsest.
 #[test]
 #[cfg(target_os = "macos")]
 fn int8_verify_error_against_bf16_is_the_quantization_noise() -> Result<()> {
@@ -359,7 +399,7 @@ fn int8_verify_error_against_bf16_is_the_quantization_noise() -> Result<()> {
     const Q_HEADS: i64 = 24;
     const HKV: i64 = 4;
     const ROWS: i64 = 8;
-    for (prefix, q_std) in [(1024_i64, 1.0f64), (1024, 8.0), (8192, 1.0), (8192, 8.0)] {
+    for (prefix, q_std) in [(1024_i64, 1.0f64), (8192, 8.0)] {
         let c = make_case(Q_HEADS, HKV, ROWS, prefix, prefix as f64 + q_std, q_std);
         let (pk, pv) = bf16_f64(&c.bf16_prefix.0, &c.bf16_prefix.1);
         let (nk, nv) = bf16_f64(&c.bf16_new.0, &c.bf16_new.1);

@@ -496,162 +496,223 @@ fn full_bank_preparation_reuses_streamed_expert_chunks_after_restart() {
     );
 }
 
+/// One prefill-contract case: which fixture (`""` is the F32 root, `bf16`,
+/// `bf16/paged`), whether to open its GGUF file (the GGUF layout transforms:
+/// split gate/up experts, tiled GDN heads, combined PLE table) or the
+/// safetensors directory, and the chunk width.
+///
+/// The prefill tests below used to run the full fixture x layout x width
+/// cross product; each case builds two decoders and forwards the prompt
+/// through both, so the grids are now the distinct mechanisms only. With the
+/// fixtures' `indexer_budget` of 8 and `indexer_compress_ratio` of 4:
+///
+/// - width 2: windows shorter than one compressed index block, so the first
+///   chunk forms no block and the tail carries across windows; every chunk
+///   of the 36-token prompt below the budget takes the dense BF16
+///   `attention_window`, the rest the sparse singleton path.
+/// - width 7: the first chunk is a dense window (BF16) that splits an index
+///   block (7 = 4 + 3); every later chunk is past the budget; a 36-token
+///   prompt ends on a 1-token chunk, the singleton `layer_with_norm` path
+///   inside `prefill_chunk`.
+/// - width 32: crosses the budget inside one chunk, leaves a 4-token tail;
+///   `batched_prefill_*` prepares the fixture under `policy = "auto"` here,
+///   the slotted-expert tier.
+/// - width 64 / 128: past the resident-bank threshold (`prepare_fixture_hot`
+///   with `plan.resident`), over a 126-token prompt: two chunks, or one.
+struct PrefillCase {
+    fixture: &'static str,
+    gguf: bool,
+    width: usize,
+}
+
+impl PrefillCase {
+    const fn new(fixture: &'static str, gguf: bool, width: usize) -> Self {
+        Self {
+            fixture,
+            gguf,
+            width,
+        }
+    }
+
+    fn source(&self) -> PathBuf {
+        if self.fixture.is_empty() {
+            fixture()
+        } else {
+            fixture().join(self.fixture)
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        let source = self.source();
+        if self.gguf {
+            source.join("model.gguf")
+        } else {
+            source
+        }
+    }
+
+    fn config(&self) -> config::Config {
+        let raw =
+            serde_json::from_slice(&std::fs::read(self.source().join("config.json")).unwrap())
+                .unwrap();
+        config::Config::parse(&raw).unwrap()
+    }
+
+    /// Two fresh decoders over the same checkpoint.
+    fn decoders(&self) -> (decoder::Decoder, decoder::Decoder) {
+        let config = self.config();
+        let path = self.path();
+        let a = decoder::Decoder::new(
+            config.clone(),
+            weights::Store::open_fixture(&path, None).unwrap(),
+        )
+        .unwrap();
+        let b = decoder::Decoder::new(config, weights::Store::open_fixture(&path, None).unwrap())
+            .unwrap();
+        (a, b)
+    }
+}
+
+/// `prefill_chunk` with batching off (one `layer` per token inside the chunk
+/// loop) against `step` one token at a time: exact logits, history and
+/// continuation. F32 and BF16, both layouts, a width below the indexer
+/// compress ratio (the first chunk forms no index block), a width that ends
+/// on a 1-token chunk and one that crosses the indexer budget inside a chunk.
 #[test]
 fn chunked_prefill_preserves_singleton_logits_and_continuation() {
-    for source in [fixture(), fixture().join("bf16")] {
-        for path in [source.clone(), source.join("model.gguf")] {
-            for width in [2, 7, 16, 32] {
-                let raw =
-                    serde_json::from_slice(&std::fs::read(source.join("config.json")).unwrap())
-                        .unwrap();
-                let config = config::Config::parse(&raw).unwrap();
-                let mut single = decoder::Decoder::new(
-                    config.clone(),
-                    weights::Store::open_fixture(&path, None).unwrap(),
-                )
-                .unwrap();
-                let mut chunked = decoder::Decoder::new(
-                    config,
-                    weights::Store::open_fixture(&path, None).unwrap(),
-                )
-                .unwrap();
-                chunked.batch_prefill = false;
-                let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(2);
-                for chunk in tokens.chunks(width) {
-                    let mut want = None;
-                    for &token in chunk {
-                        want = Some(single.step(token).unwrap());
-                    }
-                    let got = chunked.prefill_chunk(chunk, None, true).unwrap();
-                    assert_eq!(
-                        &*got.to_float32().unwrap(),
-                        &*want.unwrap().to_float32().unwrap(),
-                        "{path:?}, chunk width {width}"
-                    );
-                    assert_eq!(chunked.history, single.history);
-                }
-                assert_eq!(
-                    &*chunked.step(11).unwrap().to_float32().unwrap(),
-                    &*single.step(11).unwrap().to_float32().unwrap()
-                );
+    for case in [
+        PrefillCase::new("", false, 7),
+        PrefillCase::new("", true, 32),
+        PrefillCase::new("bf16", true, 2),
+        PrefillCase::new("bf16", true, 7),
+        PrefillCase::new("bf16", false, 32),
+    ] {
+        let (path, width) = (case.path(), case.width);
+        let (mut single, mut chunked) = case.decoders();
+        chunked.batch_prefill = false;
+        let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(2);
+        for chunk in tokens.chunks(width) {
+            let mut want = None;
+            for &token in chunk {
+                want = Some(single.step(token).unwrap());
             }
+            let got = chunked.prefill_chunk(chunk, None, true).unwrap();
+            assert_eq!(
+                &*got.to_float32().unwrap(),
+                &*want.unwrap().to_float32().unwrap(),
+                "{path:?}, chunk width {width}"
+            );
+            assert_eq!(chunked.history, single.history);
         }
+        assert_eq!(
+            &*chunked.step(11).unwrap().to_float32().unwrap(),
+            &*single.step(11).unwrap().to_float32().unwrap()
+        );
     }
 }
 
+/// Batched prefill (`attention_batch` + `mlp_batch`, or the window carry)
+/// against the unbatched chunk, across the expert tiers the width selects:
+/// demand-loaded experts (safetensors' combined `gate_up_proj` and GGUF's
+/// split `ffn_gate/up_exps`), `policy = "auto"` slots at width 32, and
+/// resident banks at 64 / 128 over a 126-token prompt. The F32 root fixture
+/// holds the exact tolerance; BF16 allows the TF32 window.
 #[test]
 fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continuation() {
-    for source in [
-        fixture(),
-        fixture().join("bf16"),
-        fixture().join("bf16/paged"),
+    for case in [
+        PrefillCase::new("", false, 7),
+        PrefillCase::new("", true, 64),
+        PrefillCase::new("bf16", true, 7),
+        PrefillCase::new("bf16", false, 32),
+        PrefillCase::new("bf16/paged", true, 2),
+        PrefillCase::new("bf16/paged", true, 32),
+        PrefillCase::new("bf16/paged", false, 128),
     ] {
-        for path in [source.clone(), source.join("model.gguf")] {
-            for width in [2, 7, 32, 64, 128] {
-                let raw =
-                    serde_json::from_slice(&std::fs::read(source.join("config.json")).unwrap())
-                        .unwrap();
-                let config = config::Config::parse(&raw).unwrap();
-                let mut scalar = decoder::Decoder::new(
-                    config.clone(),
-                    weights::Store::open_fixture(&path, None).unwrap(),
-                )
-                .unwrap();
-                let mut batched = decoder::Decoder::new(
-                    config,
-                    weights::Store::open_fixture(&path, None).unwrap(),
-                )
-                .unwrap();
-                scalar.batch_prefill = false;
-                if width >= 64 {
-                    batched.weights.plan.resident = true;
-                    batched.weights.prepare_fixture_hot().unwrap();
-                } else if width == 32 {
-                    // Assembled fixed projections with demand-loaded experts
-                    // must preserve the same prompt/continuation contract.
-                    batched.weights.plan.resident = false;
-                    batched.weights.plan.policy = "auto".into();
-                    batched.weights.prepare_fixture_hot().unwrap();
-                }
-                let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8]
-                    .repeat(if width >= 64 { 7 } else { 2 });
-                let tolerance = if source == fixture() { 0.0001 } else { 0.04 };
-                for chunk in tokens.chunks(width) {
-                    let want = scalar.prefill_chunk(chunk, None, true).unwrap();
-                    let got = batched.prefill_chunk(chunk, None, true).unwrap();
-                    let a = want.to_float32().unwrap();
-                    let b = got.to_float32().unwrap();
-                    let error = a
-                        .iter()
-                        .zip(b.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0f32, f32::max);
-                    assert!(error < tolerance, "{path:?}, width={width}, error={error}");
-                    assert_eq!(scalar.history, batched.history);
-                }
-                let a = scalar.step(11).unwrap().to_float32().unwrap();
-                let b = batched.step(11).unwrap().to_float32().unwrap();
-                let error = a
-                    .iter()
-                    .zip(b.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max);
-                assert!(
-                    error < tolerance,
-                    "continuation {path:?}, width={width}, error={error}"
-                );
-            }
+        let (path, width) = (case.path(), case.width);
+        let (mut scalar, mut batched) = case.decoders();
+        scalar.batch_prefill = false;
+        if width >= 64 {
+            batched.weights.plan.resident = true;
+            batched.weights.prepare_fixture_hot().unwrap();
+        } else if width == 32 {
+            // Assembled fixed projections with demand-loaded experts
+            // must preserve the same prompt/continuation contract.
+            batched.weights.plan.resident = false;
+            batched.weights.plan.policy = "auto".into();
+            batched.weights.prepare_fixture_hot().unwrap();
         }
+        let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8]
+            .repeat(if width >= 64 { 7 } else { 2 });
+        let tolerance = if case.fixture.is_empty() {
+            0.0001
+        } else {
+            0.04
+        };
+        for chunk in tokens.chunks(width) {
+            let want = scalar.prefill_chunk(chunk, None, true).unwrap();
+            let got = batched.prefill_chunk(chunk, None, true).unwrap();
+            let a = want.to_float32().unwrap();
+            let b = got.to_float32().unwrap();
+            let error = a
+                .iter()
+                .zip(b.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(error < tolerance, "{path:?}, width={width}, error={error}");
+            assert_eq!(scalar.history, batched.history);
+        }
+        let a = scalar.step(11).unwrap().to_float32().unwrap();
+        let b = batched.step(11).unwrap().to_float32().unwrap();
+        let error = a
+            .iter()
+            .zip(b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            error < tolerance,
+            "continuation {path:?}, width={width}, error={error}"
+        );
     }
 }
 
+/// The window carry with asynchronous MLP submission against per-row
+/// batching with synchronous evaluation, over a 126-token prompt: exact
+/// logits, history, every retained frontier row, and continuation. A width
+/// that opens with a dense sub-budget window (7), one of 32-token windows
+/// (32, 32, 32, 30) and the whole prompt as one window; F32 (no dense
+/// window) and both BF16 fixtures, both layouts.
 #[test]
 fn contiguous_prompt_windows_preserve_rows_frontiers_and_continuation() {
-    for source in [
-        fixture(),
-        fixture().join("bf16"),
-        fixture().join("bf16/paged"),
+    for case in [
+        PrefillCase::new("", true, 7),
+        PrefillCase::new("bf16", false, 32),
+        PrefillCase::new("bf16/paged", false, 7),
+        PrefillCase::new("bf16/paged", true, 128),
     ] {
-        for path in [source.clone(), source.join("model.gguf")] {
-            for width in [2, 7, 32, 128] {
-                let raw =
-                    serde_json::from_slice(&std::fs::read(source.join("config.json")).unwrap())
-                        .unwrap();
-                let config = config::Config::parse(&raw).unwrap();
-                let mut rows = decoder::Decoder::new(
-                    config.clone(),
-                    weights::Store::open_fixture(&path, None).unwrap(),
-                )
-                .unwrap();
-                let mut window = decoder::Decoder::new(
-                    config,
-                    weights::Store::open_fixture(&path, None).unwrap(),
-                )
-                .unwrap();
-                rows.window_carry = false;
-                rows.async_prefill = false;
-                window.async_prefill = true;
-                let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(7);
-                for chunk in tokens.chunks(width) {
-                    let expected = rows.prefill_chunk(chunk, None, true).unwrap();
-                    let actual = window.prefill_chunk(chunk, None, true).unwrap();
-                    assert_eq!(
-                        &*expected.to_float32().unwrap(),
-                        &*actual.to_float32().unwrap(),
-                        "{path:?}, width={width}"
-                    );
-                    assert_eq!(rows.history, window.history);
-                    assert_eq!(rows.last_chunk_hidden.len(), window.last_chunk_hidden.len());
-                    for (a, b) in rows.last_chunk_hidden.iter().zip(&window.last_chunk_hidden) {
-                        assert_eq!(&*a.to_float32().unwrap(), &*b.to_float32().unwrap());
-                    }
-                }
-                assert_eq!(
-                    &*rows.step(11).unwrap().to_float32().unwrap(),
-                    &*window.step(11).unwrap().to_float32().unwrap()
-                );
+        let (path, width) = (case.path(), case.width);
+        let (mut rows, mut window) = case.decoders();
+        rows.window_carry = false;
+        rows.async_prefill = false;
+        window.async_prefill = true;
+        let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(7);
+        for chunk in tokens.chunks(width) {
+            let expected = rows.prefill_chunk(chunk, None, true).unwrap();
+            let actual = window.prefill_chunk(chunk, None, true).unwrap();
+            assert_eq!(
+                &*expected.to_float32().unwrap(),
+                &*actual.to_float32().unwrap(),
+                "{path:?}, width={width}"
+            );
+            assert_eq!(rows.history, window.history);
+            assert_eq!(rows.last_chunk_hidden.len(), window.last_chunk_hidden.len());
+            for (a, b) in rows.last_chunk_hidden.iter().zip(&window.last_chunk_hidden) {
+                assert_eq!(&*a.to_float32().unwrap(), &*b.to_float32().unwrap());
             }
         }
+        assert_eq!(
+            &*rows.step(11).unwrap().to_float32().unwrap(),
+            &*window.step(11).unwrap().to_float32().unwrap()
+        );
     }
 }
 
