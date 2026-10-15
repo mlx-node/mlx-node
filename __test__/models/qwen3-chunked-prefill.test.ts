@@ -118,11 +118,14 @@ describe('Qwen3Model - Chunked Prefill', () => {
         return;
       }
 
-      // Create a longer prompt to test chunking
+      // Create a longer prompt to test chunking (~300 prompt tokens).
       const longContent = Array(100).fill('Hello world.').join(' ');
       const messages: ChatMessage[] = [{ role: 'user', content: longContent }];
 
-      const chunkSizes = [64, 128, 256, 512, 1024, 2048];
+      // 64 → many chunks with a partial tail, 256 → two chunks, 2048 → single
+      // pass (every size ≥ the prompt length is the same single pass, so
+      // 512/1024 added nothing over 2048).
+      const chunkSizes = [64, 256, 2048];
       const results: Uint32Array[] = [];
 
       for (const chunkSize of chunkSizes) {

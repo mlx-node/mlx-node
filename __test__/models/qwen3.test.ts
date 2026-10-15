@@ -1,6 +1,9 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { Qwen3Model } from '@mlx-node/core';
 import { QWEN3_CONFIGS, getQwen3Config } from '@mlx-node/lm';
-import { describe, it, expect } from 'vite-plus/test';
+import { describe, it, expect, beforeAll } from 'vite-plus/test';
 
 describe('Qwen3 Model', () => {
   describe('Model Configuration', () => {
@@ -25,20 +28,35 @@ describe('Qwen3 Model', () => {
   });
 
   describe('Text Generation', () => {
-    it('should generate text from prompt (requires model files)', async () => {
-      // Note: This test requires a real pretrained model with tokenizer
-      // It will be skipped if the model is not available
-      const modelPath = process.env.QWEN3_MODEL_PATH;
+    // Same checkpoint resolution as the sibling real-weights tests
+    // (`qwen3-generate-batch*.test.ts`, `qwen3-chunked-prefill.test.ts`):
+    // `QWEN3_MODEL_PATH` first, then the converted checkpoint the `test` CI
+    // job produces at `.cache/models/qwen3-0.6b-mlx-bf16`. Skips when neither
+    // exists. Loaded once for every test in this block.
+    let model: Qwen3Model | null = null;
 
-      if (!modelPath) {
-        console.log('  ⏭️  Skipping text generation test (set QWEN3_MODEL_PATH to enable)');
+    beforeAll(async () => {
+      const envModelPath = process.env.QWEN3_MODEL_PATH;
+      const defaultModelPath = path.join(process.cwd(), '.cache/models/qwen3-0.6b-mlx-bf16');
+
+      let modelPath: string | null = null;
+      if (envModelPath && fs.existsSync(envModelPath)) {
+        modelPath = envModelPath;
+      } else if (fs.existsSync(defaultModelPath)) {
+        modelPath = defaultModelPath;
+      } else {
+        console.log('  ⏭️  Skipping text generation tests (no model found)');
+        console.log(`     Set QWEN3_MODEL_PATH or place model at: ${defaultModelPath}`);
         return;
       }
 
-      // Load model with tokenizer
-      const model = await Qwen3Model.load(modelPath);
+      model = await Qwen3Model.load(modelPath);
+    }, 60_000);
 
-      // Generate text using the new message-based API
+    it('should generate text from prompt (requires model files)', async () => {
+      if (!model) return;
+
+      // Generate text using the message-based API
       const messages = [{ role: 'user', content: 'Hello, how are you?' }];
       const result = await model.generate(messages, {
         maxNewTokens: 20,
@@ -67,14 +85,8 @@ describe('Qwen3 Model', () => {
       // instead of panicking the model thread on Vec::with_capacity(-1 as
       // usize) == usize::MAX. Requires a real model since the guard runs
       // inside generate_sync on the model thread (post-load).
-      const modelPath = process.env.QWEN3_MODEL_PATH;
+      if (!model) return;
 
-      if (!modelPath) {
-        console.log('  ⏭️  Skipping nonpositive-budget reject test (set QWEN3_MODEL_PATH to enable)');
-        return;
-      }
-
-      const model = await Qwen3Model.load(modelPath);
       const messages = [{ role: 'user', content: 'Hello' }];
 
       // Both 0 and a negative budget must reject (not panic, not resolve).

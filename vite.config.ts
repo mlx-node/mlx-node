@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import type { Plugin } from 'vite-plus';
 import { defineConfig } from 'vite-plus';
 
+import { classify } from './scripts/test-lanes.js';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** Condition a workspace package declares for its own TypeScript source. */
@@ -69,6 +71,10 @@ function workspaceSource(): Plugin {
   };
 }
 
+// Lane membership is computed from each test file's import graph at config
+// load (~0.1 s); see scripts/test-lanes.ts for the rules.
+const LANES = classify();
+
 export default defineConfig({
   fmt: {
     printWidth: 120,
@@ -121,14 +127,30 @@ export default defineConfig({
     // Tests must never write inference telemetry to the developer's real
     // ~/.mlx-node. metrics-trace.test.ts manages this var itself (temp dirs).
     env: { MLX_AGENT_METRICS: '0' },
-    maxConcurrency: 1,
     watch: false,
     testTimeout: 120000, // 2 minutes
-    maxWorkers: 1,
-    include: [
-      '__test__/**/*.{test,spec}.ts',
-      'examples/**/*.{test,spec}.ts',
-      'packages/*/__test__/**/*.{test,spec}.ts',
+    // Two lanes. Vitest runs the group of projects with the default
+    // `maxWorkers` first and the `maxWorkers: 1` project after it, so the two
+    // never overlap: parallel pure-TS files, then one addon file at a time.
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'pure-ts',
+          include: LANES.pureTs,
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'addon',
+          include: LANES.addon,
+          // Metal must not be oversubscribed: concurrent GPU work from several
+          // processes trips the GPU watchdog (SIGABRT, see ci.yml).
+          maxWorkers: 1,
+          maxConcurrency: 1,
+        },
+      },
     ],
   },
   plugins: [workspaceSource()],

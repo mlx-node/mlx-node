@@ -39,101 +39,9 @@ describe('GRPO Integration Tests', () => {
     }
   });
 
-  describe('End-to-End Training', () => {
-    it('should complete a full training run with multiple epochs', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 2,
-        maxCompletionLength: 5,
-        numEpochs: 2,
-        batchSize: 2,
-        logInterval: 1,
-        saveInterval: 1000, // Don't save during test
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        logJsonl: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          return Float32Array.from(outputs.map((o) => o.completion.rawText.split(',').length / 10));
-        },
-      });
-
-      const dataset = [
-        { prompt: [{ role: 'user', content: 'Test 1' }], answer: '42' },
-        { prompt: [{ role: 'user', content: 'Test 2' }], answer: '43' },
-        { prompt: [{ role: 'user', content: 'Test 3' }], answer: '44' },
-      ];
-
-      // Should complete without errors
-      await expect(trainer.train(dataset as any)).resolves.not.toThrow();
-    });
-
-    it('should generate diverse completions across training', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 4,
-        maxCompletionLength: 8,
-        temperature: 0.9, // High temperature for diversity
-        numEpochs: 1,
-        batchSize: 1,
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        logJsonl: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          // Reward longer completions
-          return Float32Array.from(outputs.map((o) => o.completion.rawText.split(',').length));
-        },
-      });
-
-      const dataset = [
-        { prompt: [{ role: 'user', content: 'Question 1' }], answer: 'Answer 1' },
-        { prompt: [{ role: 'user', content: 'Question 2' }], answer: 'Answer 2' },
-      ];
-
-      await trainer.train(dataset as any);
-
-      // Test passed if no errors thrown
-      expect(true).toBe(true);
-    });
-
-    it('should handle training with varying reward values', async () => {
-      let rewardCallCount = 0;
-
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 3,
-        maxCompletionLength: 6,
-        numEpochs: 1,
-        batchSize: 2,
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        logJsonl: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          rewardCallCount++;
-          // Varying rewards: some high, some low
-          return Float32Array.from(outputs.map((_, i) => Math.sin(i) * 5 + 5));
-        },
-      });
-
-      const dataset = [
-        { prompt: [{ role: 'user', content: 'A' }], answer: '1' },
-        { prompt: [{ role: 'user', content: 'B' }], answer: '2' },
-        { prompt: [{ role: 'user', content: 'C' }], answer: '3' },
-        { prompt: [{ role: 'user', content: 'D' }], answer: '4' },
-      ];
-
-      await trainer.train(dataset as any);
-
-      // Reward function should be called for each batch (2 batches)
-      expect(rewardCallCount).toBeGreaterThan(0);
-    });
-  });
+  // `train()` loop coverage (epochs × batches, partial batch, batch > dataset,
+  // empty dataset) lives in `grpo-trainer.test.ts` → 'GRPOTrainer - train()',
+  // which asserts the exact reward-call sizes instead of "did not throw".
 
   describe('Generation and Scoring Pipeline', () => {
     it('should generate, score, and compute loss correctly', async () => {
@@ -211,33 +119,10 @@ describe('GRPO Integration Tests', () => {
     });
   });
 
+  // Loss math per type and clip-epsilon handling: `crates/mlx-core/src/grpo/loss.rs` →
+  // `test_grpo_loss_basic`, `test_bnpo_loss_computation`, `test_clip_epsilon_symmetric`,
+  // `test_clip_epsilon_asymmetric`. Only the `lossType` plumbing is exercised here.
   describe('Loss Computation Variants', () => {
-    it('should compute GRPO loss correctly', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 4,
-        maxCompletionLength: 6,
-        lossType: 'grpo',
-        clipEpsilon: 0.2,
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          return Float32Array.from(outputs.map((_, i) => i * 0.5));
-        },
-      });
-
-      const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
-
-      const metrics = await trainer.trainStep(promptMessages);
-
-      expect(isFinite(metrics.loss)).toBe(true);
-      expect(metrics.meanReward).toBeDefined();
-      expect(Math.abs(metrics.meanAdvantage)).toBeLessThan(1e-4); // Should be ~0
-    });
-
     it('should work with different loss types', async () => {
       const lossTypes: Array<'grpo' | 'bnpo'> = ['grpo', 'bnpo'];
 
@@ -265,143 +150,13 @@ describe('GRPO Integration Tests', () => {
         expect(metrics.step).toBe(1);
       }
     });
-
-    it('should handle different clip epsilons', async () => {
-      const epsilons = [0.1, 0.2, 0.3];
-
-      for (const epsilon of epsilons) {
-        const trainer = await GRPOTrainer.create({
-          modelPath: tempModel.modelPath,
-          modelName: 'qwen3-0.6b',
-          groupSize: 2,
-          maxCompletionLength: 4,
-          clipEpsilon: epsilon,
-          logInterval: 1000,
-          saveInterval: 1000,
-          outputDir: TEST_OUTPUT_DIR,
-          logConsole: false,
-          rewardFunction: (outputs: RewardOutput[]) => {
-            return Float32Array.from(outputs.map((_, i) => i + 1.0));
-          },
-        });
-
-        const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
-
-        const metrics = await trainer.trainStep(promptMessages);
-
-        expect(isFinite(metrics.loss)).toBe(true);
-      }
-    });
   });
 
-  describe('Advantage Computation', () => {
-    it('should normalize advantages per group', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 4,
-        maxCompletionLength: 5,
-        advantageNormalization: true,
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          // Varying rewards within group
-          return Float32Array.from(outputs.map((_, i) => i + 1.0));
-        },
-      });
-
-      const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
-
-      const metrics = await trainer.trainStep(promptMessages);
-
-      // Mean advantage should be close to 0 with group normalization
-      expect(Math.abs(metrics.meanAdvantage)).toBeLessThan(1e-4);
-    });
-
-    it('should handle uniform rewards correctly', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 3,
-        maxCompletionLength: 4,
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          // All same reward
-          return Float32Array.from(outputs.map(() => 5.0));
-        },
-      });
-
-      const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
-
-      const metrics = await trainer.trainStep(promptMessages);
-
-      // With uniform rewards, std should be 0
-      expect(metrics.stdReward).toBeCloseTo(0, 5);
-      expect(metrics.meanReward).toBeCloseTo(5.0, 5);
-    });
-  });
-
-  describe('Batch Processing', () => {
-    it('should handle large batches correctly', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 2,
-        maxCompletionLength: 5,
-        numEpochs: 1,
-        batchSize: 5,
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        logJsonl: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          return Float32Array.from(outputs.map(() => Math.random()));
-        },
-      });
-
-      // Create 10 examples - should result in 2 batches
-      const dataset = Array.from({ length: 10 }, (_, i) => ({
-        prompt: [{ role: 'user', content: `Question ${i}` }],
-        answer: `Answer ${i}`,
-      }));
-
-      await trainer.train(dataset as any);
-
-      // Should complete without errors
-      expect(true).toBe(true);
-    });
-
-    it('should handle batch size larger than dataset', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 2,
-        maxCompletionLength: 5,
-        numEpochs: 1,
-        batchSize: 20, // Larger than dataset
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        logJsonl: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          return Float32Array.from(outputs.map(() => 1.0));
-        },
-      });
-
-      const dataset = [{ prompt: [{ role: 'user', content: 'Test' }], answer: '42' }];
-
-      await trainer.train(dataset as any);
-
-      expect(true).toBe(true);
-    });
-  });
+  // Group-normalised advantages (zero mean, uniform → 0) and reward mean/std:
+  // `crates/mlx-core/src/grpo/advantages.rs` → `test_compute_advantages_basic`,
+  // `test_uniform_rewards_zero_advantage`; `crates/mlx-core/src/grpo/engine.rs` →
+  // `test_compute_reward_stats`. Metric plumbing is checked in 'Metrics Tracking' below
+  // and in `grpo-trainer.test.ts` → 'Integration'.
 
   describe('Sampling Configuration', () => {
     it('should respect temperature settings', async () => {
@@ -466,31 +221,6 @@ describe('GRPO Integration Tests', () => {
   });
 
   describe('Error Handling', () => {
-    it('should handle empty dataset gracefully', async () => {
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelName: 'qwen3-0.6b',
-        groupSize: 2,
-        maxCompletionLength: 5,
-        numEpochs: 1,
-        batchSize: 2,
-        logInterval: 1000,
-        saveInterval: 1000,
-        outputDir: TEST_OUTPUT_DIR,
-        logConsole: false,
-        logJsonl: false,
-        rewardFunction: (outputs: RewardOutput[]) => {
-          return Float32Array.from(outputs.map(() => 1.0));
-        },
-      });
-
-      const dataset: any[] = [];
-
-      await trainer.train(dataset);
-
-      expect(true).toBe(true);
-    });
-
     it('should throw error when reward function returns wrong count', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,

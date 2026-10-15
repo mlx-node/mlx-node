@@ -588,6 +588,11 @@ jobs:
             stage0_ts: __test__/server/concurrent-stage0-e2e.test.ts
             stage1_rust: concurrent_batched_parity
             stage1_ts: __test__/server/concurrent-stage1-e2e.test.ts
+            # TS paged gates keyed on QWEN3_PAGED_PARITY_MODEL_PATH (opt-in by
+            # design; zero-delta has no Rust twin). Nothing set it before.
+            paged_ts: >-
+              __test__/models/qwen3-paged-parity.test.ts
+              __test__/models/qwen3-paged-zero-delta.test.ts
             stage2_rust: ''
             # `*_metallib_names` also carry the `#[ignore]`d build-every-
             # pipeline gates (minutes of Metal compiler time; a pin-bump
@@ -609,6 +614,7 @@ jobs:
             stage0_ts: ''
             stage1_rust: ''
             stage1_ts: ''
+            paged_ts: ''
             stage2_rust: qwen3_5_concurrent_batched_parity
             tests: >-
               --test qwen3_5_paged_vs_flat_parity
@@ -649,6 +655,7 @@ jobs:
             stage0_ts: ''
             stage1_rust: ''
             stage1_ts: ''
+            paged_ts: ''
             stage2_rust: ''
             tests: >-
               --test lfm2_paged_vs_flat_parity
@@ -668,6 +675,7 @@ jobs:
             stage0_ts: ''
             stage1_rust: ''
             stage1_ts: ''
+            paged_ts: ''
             stage2_rust: ''
             tests: __test__/models/gemma4-qat-e2e.test.ts
           # nemotron_h ingests a modelopt NVFP4 source; it is not a recipe run.
@@ -699,6 +707,7 @@ jobs:
             stage0_ts: ''
             stage1_rust: ''
             stage1_ts: ''
+            paged_ts: ''
             stage2_rust: ''
             tests: >-
               --test nemotron_h_paged_vs_flat_parity
@@ -907,6 +916,9 @@ jobs:
             if [ -n "${{ matrix.stage0_ts }}" ]; then
               QWEN3_STAGE0_MODEL_PATH="$ckpt" MLX_PAGED_PREFILL_CHUNK_SIZE=512 \
                 yarn test ${{ matrix.stage0_ts }}
+            fi
+            if [ -n "${{ matrix.paged_ts }}" ]; then
+              QWEN3_PAGED_PARITY_MODEL_PATH="$ckpt" yarn test ${{ matrix.paged_ts }}
             fi
           fi
 
