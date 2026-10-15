@@ -121,58 +121,6 @@ pub fn compute_advantages(
     Ok(advantages)
 }
 
-/// Group statistics result
-pub struct GroupStats {
-    pub mean: MxArray,
-    pub std: MxArray,
-}
-
-/// Compute group-level statistics for rewards
-///
-/// # Arguments
-/// * `rewards` - Reward values, shape (B*G,)
-/// * `num_generations` - Number of completions per prompt
-///
-/// # Returns
-/// Object with mean and std per group
-pub fn compute_group_stats(rewards: &MxArray, num_generations: i32) -> Result<GroupStats> {
-    let rewards_shape = rewards.shape()?;
-    let total_size = rewards_shape[0];
-    let batch_size = total_size / (num_generations as i64);
-
-    // Reshape to (B, G)
-    let rewards_reshaped = rewards.reshape(&[batch_size, num_generations as i64])?;
-
-    // Compute mean and std per group
-    let mean = rewards_reshaped.mean(Some(&[1]), Some(false))?; // shape: (B,)
-    let std = rewards_reshaped.std(Some(&[1]), Some(false), Some(0))?; // shape: (B,)
-
-    Ok(GroupStats { mean, std })
-}
-
-/// Normalize rewards to zero-mean and unit variance
-///
-/// This is a simpler whitening operation that normalizes globally
-///
-/// # Arguments
-/// * `rewards` - Input rewards
-///
-/// # Returns
-/// Normalized rewards
-pub fn normalize_rewards(rewards: &MxArray) -> Result<MxArray> {
-    let mean = rewards.mean(None, Some(false))?;
-
-    // Compute std across all axes
-    let rewards_shape = rewards.shape()?;
-    let all_axes: Vec<i32> = (0..rewards_shape.len() as i32).collect();
-    let std = rewards.std(Some(&all_axes), Some(false), Some(0))?;
-
-    let centered = rewards.sub(&mean.broadcast_to(&rewards_shape)?)?;
-    let std_plus_eps = std.add_scalar(1e-4)?;
-
-    centered.div(&std_plus_eps.broadcast_to(&rewards_shape)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,47 +358,5 @@ mod tests {
         let rewards = array_from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0]);
         let result = compute_advantages(&rewards, 2, "none".to_string());
         assert!(result.is_err());
-    }
-
-    // =========================================================================
-    // Group Stats Tests
-    // =========================================================================
-
-    #[test]
-    fn test_compute_group_stats() {
-        let rewards = array_from_f32(&[1.0, 3.0, 2.0, 6.0]);
-        let stats = compute_group_stats(&rewards, 2).unwrap();
-
-        let means = to_f32_vec(&stats.mean);
-        let stds = to_f32_vec(&stats.std);
-
-        // Group 1: [1, 3], mean=2, std=1
-        // Group 2: [2, 6], mean=4, std=2
-        assert!((means[0] - 2.0).abs() < 1e-5);
-        assert!((means[1] - 4.0).abs() < 1e-5);
-        assert!((stds[0] - 1.0).abs() < 1e-5);
-        assert!((stds[1] - 2.0).abs() < 1e-5);
-    }
-
-    // =========================================================================
-    // Normalize Rewards Tests
-    // =========================================================================
-
-    #[test]
-    fn test_normalize_rewards() {
-        // [1, 2, 3, 4] → mean=2.5, std≈1.118
-        let rewards = array_from_f32(&[1.0, 2.0, 3.0, 4.0]);
-        let normalized = normalize_rewards(&rewards).unwrap();
-        let values = to_f32_vec(&normalized);
-
-        // After normalization: (x - 2.5) / (1.118 + eps)
-        let mean = 2.5_f32;
-        let std = 1.118_034_f32;
-        let scale = 1.0 / (std + 1e-4);
-
-        assert!((values[0] - (1.0 - mean) * scale).abs() < 1e-3);
-        assert!((values[1] - (2.0 - mean) * scale).abs() < 1e-3);
-        assert!((values[2] - (3.0 - mean) * scale).abs() < 1e-3);
-        assert!((values[3] - (4.0 - mean) * scale).abs() < 1e-3);
     }
 }
