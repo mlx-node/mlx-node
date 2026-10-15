@@ -21,7 +21,7 @@ Native NAPI addon providing low-level bindings to Apple's [MLX](https://github.c
 | **Vision-Language**   | `VLModel`                                     | PaddleOCR-VL architecture — OCR, chat, batch inference                                    |
 | **Document Pipeline** | 5 model classes                               | DocLayout (25 categories), TextDet, TextRec, DocOrientation, DocUnwarp                    |
 | **Training**          | `GrpoTrainingEngine`, `SftTrainingEngine`     | GRPO/DAPO/Dr.GRPO/BNPO and SFT with autograd, gradient accumulation, NaN recovery         |
-| **Optimizers**        | Adam, AdamW, SGD, RMSprop                     | Full optimizer suite with weight decay and gradient clipping                              |
+| **Optimizers**        | AdamW                                         | Decoupled weight decay with gradient norm clipping                                        |
 | **Tokenization**      | `Qwen3Tokenizer`                              | HuggingFace tokenizers + Jinja2 chat templates                                            |
 | **Sampling**          | Configurable pipeline                         | Temperature, top-k/p, min-p, repetition penalty                                           |
 | **Conversion**        | `convertModel`, `convertGgufToSafetensors`    | Dtype casting, 4/8-bit quantization, MXFP8, quantization recipes, GGUF import             |

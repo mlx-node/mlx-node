@@ -39,7 +39,7 @@ Capabilities:
 
 ## Optimizers
 
-`Adam`, `AdamW`, `SGD`, `RMSprop` (`crates/mlx-core/src/optimizers/`).
+`AdamW` (`crates/mlx-core/src/optimizers/`). With no optimizer configured, training applies plain SGD updates.
 
 ## Autograd
 

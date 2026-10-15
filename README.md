@@ -128,7 +128,7 @@ const dataset = await loadLocalGsm8kDataset('train', { limit: 100 });
 await trainer.train(dataset);
 ```
 
-Available GRPO loss types are `grpo`, `dapo`, `dr_grpo`, and `bnpo`. Training supports custom and built-in rewards, gradient accumulation, checkpoint resume, and the Adam/AdamW, SGD, and RMSprop optimizers.
+Available GRPO loss types are `grpo`, `dapo`, `dr_grpo`, and `bnpo`. Training supports custom and built-in rewards, gradient accumulation, checkpoint resume, and the AdamW optimizer (or plain SGD updates when no optimizer is configured).
 
 The repository also contains a Ratatui frontend for watching and controlling a training run:
 
