@@ -4867,17 +4867,6 @@ export interface ParserConfig {
   collapseEmptyRows?: boolean;
 }
 
-/** Parse tool calls from text (NAPI export) */
-export declare function parseToolCallsFromText(text: string): ParseToolCallsResult;
-
-/** Result of parsing tool calls from text */
-export interface ParseToolCallsResult {
-  /** Cleaned text with tool_call tags removed */
-  text: string;
-  /** Parsed tool calls */
-  toolCalls: Array<ToolCallResult>;
-}
-
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
 
