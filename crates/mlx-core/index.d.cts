@@ -1297,12 +1297,6 @@ export declare class OutputStore {
    * Returns pre-computed aggregates for restoring TUI state on resume.
    */
   getRunAggregates(runId: string): Promise<RunAggregates>;
-  /**
-   * Get recent generations for sample panel restoration
-   *
-   * Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
-   */
-  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>;
   /** Get store configuration */
   get config(): OutputStoreConfig;
   /** Record from RewardOutput JSON (direct integration with training engine) */
@@ -1337,19 +1331,6 @@ export declare class OutputStore {
   ): Promise<Array<StepSummary>>;
   /** Get all generations for a step */
   getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>;
-  /** Get top/bottom generations by reward */
-  getGenerationsByReward(
-    runId: string,
-    topN?: number | undefined | null,
-    bottomN?: number | undefined | null,
-    stepRange?: Array<number> | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get generations with specific finish reason */
-  getGenerationsByFinishReason(
-    runId: string,
-    finishReason: string,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
   /** Get generations containing tool calls */
   getGenerationsWithToolCalls(
     runId: string,
@@ -1366,10 +1347,6 @@ export declare class OutputStore {
   ): Promise<Array<GenerationWithToolCalls>>;
   /** Get reward distribution statistics */
   getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>;
-  /** Export to JSONL file */
-  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>;
-  /** Execute raw SQL query (for advanced users) */
-  queryRaw(sql: string): Promise<string>;
 }
 
 export declare class PcmPlayer {
