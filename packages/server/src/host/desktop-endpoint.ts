@@ -1,6 +1,6 @@
 /** Native-free discovery of the desktop's existing inference host. */
 import { randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 
 import { resolveMlxNodeHome } from './paths.js';
@@ -65,27 +65,4 @@ export async function publishDesktopEndpoint(
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   };
-}
-
-/** Only a missing file or a proven dead owner permits standalone inference. */
-export async function readDesktopEndpoint(path = desktopEndpointPath()): Promise<DesktopEndpoint | undefined> {
-  let endpoint: DesktopEndpoint;
-  try {
-    const stat = await lstat(path);
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) {
-      throw new Error('Desktop inference credentials must be a private, user-owned file. Restart the mlx-node app.');
-    }
-    endpoint = JSON.parse(await readFile(path, 'utf8')) as DesktopEndpoint;
-    validate(endpoint);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
-  }
-  try {
-    process.kill(endpoint.pid, 0);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return undefined;
-    throw error;
-  }
-  return endpoint;
 }
