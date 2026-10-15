@@ -276,14 +276,6 @@ pub(crate) struct BlockTelemetry {
     pub allocated_blocks: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(test)]
-pub(crate) struct BlockAdmission {
-    pub admitted: bool,
-    pub watermark_blocks: u32,
-    pub reserved_blocks: u32,
-}
-
 /// Unified-memory view used by hybrid admission. Paged blocks and recurrent
 /// state are deliberately expressed in bytes so one cannot be admitted by a
 /// budget that ignores the other.
@@ -338,35 +330,6 @@ pub(crate) fn memory_admission_decision(
         watermark_bytes,
         reserved_block_bytes,
         reserved_state_bytes,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn block_admission_decision(
-    telemetry: BlockTelemetry,
-    existing_unallocated: u32,
-    candidate_blocks: u32,
-    has_live_rows: bool,
-    watermark_fraction: f64,
-) -> BlockAdmission {
-    let fraction = if watermark_fraction.is_finite() {
-        watermark_fraction.clamp(0.0, 1.0)
-    } else {
-        0.05
-    };
-    let watermark_blocks = if has_live_rows {
-        ((telemetry.total_blocks as f64) * fraction).ceil() as u32
-    } else {
-        0
-    };
-    let reserved_blocks = existing_unallocated.saturating_add(candidate_blocks);
-    BlockAdmission {
-        admitted: reserved_blocks.saturating_add(watermark_blocks)
-            <= telemetry
-                .free_blocks
-                .saturating_add(telemetry.reclaimable_blocks),
-        watermark_blocks,
-        reserved_blocks,
     }
 }
 
@@ -758,34 +721,6 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             })
     }
 
-    #[cfg(test)]
-    pub fn try_reserve_blocks(
-        &mut self,
-        telemetry: BlockTelemetry,
-        candidate_blocks: u32,
-        watermark_fraction: f64,
-    ) -> BlockAdmission {
-        let existing_unallocated = self.unallocated_reserved_blocks();
-        let decision = block_admission_decision(
-            telemetry,
-            existing_unallocated,
-            candidate_blocks,
-            self.has_live_turns(),
-            watermark_fraction,
-        );
-        self.stats.block_capacity = telemetry.total_blocks;
-        self.stats.free_blocks = telemetry.free_blocks;
-        self.stats.reclaimable_blocks = telemetry.reclaimable_blocks;
-        self.stats.allocated_blocks = telemetry.allocated_blocks;
-        self.stats.watermark_blocks = decision.watermark_blocks;
-        self.stats.reserved_blocks = decision.reserved_blocks;
-        if !decision.admitted {
-            self.stats.admission_deferred_blocks =
-                self.stats.admission_deferred_blocks.saturating_add(1);
-        }
-        decision
-    }
-
     pub fn try_reserve_memory(
         &mut self,
         telemetry: MemoryTelemetry,
@@ -1024,11 +959,6 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 
     pub fn stats(&self) -> &SchedulerStats {
         &self.stats
-    }
-
-    #[cfg(test)]
-    pub fn maintenance_due(&self, cadence: u64) -> bool {
-        cadence != 0 && self.global_step != 0 && self.global_step.is_multiple_of(cadence)
     }
 
     fn earliest_control_order(&self) -> Option<u64> {
@@ -1799,8 +1729,6 @@ mod tests {
             scheduler.stats().decode_batch_occupancy_hist.get(&2),
             Some(&4)
         );
-        assert!(scheduler.maintenance_due(2));
-        assert!(!scheduler.maintenance_due(3));
         let js = scheduler.stats().to_js();
         assert_eq!(js.max_batch_occupancy, 2);
         assert_eq!(js.decode_batch_occupancy_hist[0].occupancy, 2);
@@ -1894,90 +1822,6 @@ mod tests {
                 .expect("older turn runs first"),
             SchedulerAction::Stepped { .. }
         ));
-    }
-
-    #[test]
-    fn block_admission_reserves_growth_and_watermark_before_allocation() {
-        let mut scheduler = Scheduler::<_, (), ()>::new(2, 8).expect("scheduler");
-        scheduler
-            .enqueue_turn(turn(1, 4, &[4], None).with_block_reservation(6, 2, 2))
-            .expect("enqueue reserved row");
-
-        // A has four unallocated blocks left. B asks for five. Both the
-        // existing reservation and the 10% watermark are individually
-        // decisive: ignoring either would incorrectly admit B into ten free
-        // blocks (5 + 2 <= 10, or 4 + 5 <= 10).
-        let deferred = scheduler.try_reserve_blocks(
-            BlockTelemetry {
-                total_blocks: 20,
-                free_blocks: 10,
-                reclaimable_blocks: 0,
-                allocated_blocks: 10,
-            },
-            5,
-            0.10,
-        );
-        assert_eq!(
-            deferred,
-            BlockAdmission {
-                admitted: false,
-                watermark_blocks: 2,
-                reserved_blocks: 9,
-            }
-        );
-        assert_eq!(scheduler.stats().admission_deferred_blocks, 1);
-        assert_eq!(scheduler.stats().free_blocks, 10);
-
-        let admitted = scheduler.try_reserve_blocks(
-            BlockTelemetry {
-                total_blocks: 20,
-                free_blocks: 10,
-                reclaimable_blocks: 0,
-                allocated_blocks: 10,
-            },
-            4,
-            0.10,
-        );
-        assert!(admitted.admitted);
-        assert_eq!(admitted.reserved_blocks + admitted.watermark_blocks, 10);
-    }
-
-    #[test]
-    fn first_block_admission_has_no_watermark_but_still_must_fit() {
-        assert_eq!(
-            block_admission_decision(
-                BlockTelemetry {
-                    total_blocks: 100,
-                    free_blocks: 8,
-                    reclaimable_blocks: 0,
-                    allocated_blocks: 92,
-                },
-                0,
-                8,
-                false,
-                0.05,
-            ),
-            BlockAdmission {
-                admitted: true,
-                watermark_blocks: 0,
-                reserved_blocks: 8,
-            }
-        );
-        assert!(
-            !block_admission_decision(
-                BlockTelemetry {
-                    total_blocks: 100,
-                    free_blocks: 8,
-                    reclaimable_blocks: 0,
-                    allocated_blocks: 92,
-                },
-                0,
-                9,
-                false,
-                0.05,
-            )
-            .admitted
-        );
     }
 
     #[test]
