@@ -10,7 +10,7 @@ import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi, mutate } from '../ui/src/lib/api.js';
-import { coldObjectCounts, evictPreview, histogramObjectTotal } from '../ui/src/lib/cold-tier.js';
+import { coldObjectCounts, evictPreview } from '../ui/src/lib/cold-tier.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -352,7 +352,7 @@ describe('cold-tier object counting (Cache page ↔ scan)', () => {
     expect(counts.sidecars).toBe(info.sidecarCount);
     // THE INVARIANT: whatever the chart totals is what `objects` reports. A
     // tile driven by `blocks` disagrees with this chart by `sidecars`.
-    expect(counts.objects).toBe(histogramObjectTotal(info.ageHistogram));
+    expect(counts.objects).toBe(info.ageHistogram.reduce((n, b) => n + b.count, 0));
     expect(counts.objects).toBe(6);
     expect(counts.blocks).toBe(4);
     expect(counts.sidecars).toBe(2);
