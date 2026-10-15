@@ -31,7 +31,8 @@ concurrency:
 #   rust-lib (macos) ──────────────────────────────────────────┤
 #   rust-int (macos) ──────────────────────────────────────────┼─▶ publish (ubuntu, main only)
 #   build (macos) ─┬─▶ ts-test (macos) ────────────────────────┤
-#                  └─▶ model-test ×N (macos; main / label) ────┘
+#                  └─▶ model-test ×N (macos; main / label) ────┤
+#   done (ubuntu, always) ◀── every job above; the one required status
 #
 # The Rust test legs do NOT wait for `build`: they need no .node addon, only
 # a tokenizer.json (fetched with curl), so they start at t=0 in parallel with
@@ -901,6 +902,27 @@ jobs:
                 yarn test ${{ matrix.stage0_ts }}
             fi
           fi
+
+  # Single required status for branch protection: mark only `done` as
+  # required and the job list above can change without touching the rule.
+  # `contains(needs.*.result, 'failure')` ignores "skipped", so legs that do
+  # not run on a given event (model-test on unlabeled PRs, everything on an
+  # unrelated label event) do not block. Modeled on vite-plus's `done` job.
+  done:
+    name: done
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - lint-ts
+      - build
+      - clippy
+      - rust-lib
+      - rust-int
+      - ts-test
+      - model-test
+    steps:
+      - run: exit 1
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
 
   publish:
     name: Publish
