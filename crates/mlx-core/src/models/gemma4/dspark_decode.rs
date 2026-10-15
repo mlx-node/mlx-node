@@ -32,7 +32,7 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, SpecFrontier, TurnOutput, WholeTurnArgs,
+    ResetScope, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::TurnStreaming;
 use crate::engine::dspark_turn::{DsparkTurnArgs, PagedDsparkBackend, run_dspark_turn};
@@ -524,16 +524,6 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         // decode eval pattern: token only, never the logits).
         MxArray::async_eval_arrays(&[token]);
     }
-
-    fn frontier(&self) -> Option<SpecFrontier> {
-        // Pure-attention target: the frontier is the row count every KV
-        // group agrees on; the drafter's private context cache is not target
-        // state.
-        self.inner
-            .kv_cache_coordinator
-            .as_ref()?
-            .spec_frontier(self.state.seq_id)
-    }
 }
 
 /// Per-turn stepper dispatch: [`DsparkBackend::DsparkDecode`] is ONE
@@ -638,13 +628,6 @@ impl DsparkStepper for Gemma4DraftStepper<'_> {
         match self {
             Self::Dspark(stepper) => stepper.eval_boundary(token),
             Self::Assistant(stepper) => stepper.eval_boundary(token),
-        }
-    }
-
-    fn frontier(&self) -> Option<SpecFrontier> {
-        match self {
-            Self::Dspark(stepper) => stepper.frontier(),
-            Self::Assistant(stepper) => stepper.frontier(),
         }
     }
 }
