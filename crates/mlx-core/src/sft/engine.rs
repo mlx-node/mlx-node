@@ -638,45 +638,6 @@ impl SftTrainingEngine {
         }
         Ok(state.generation)
     }
-
-    /// Get the underlying Qwen3 model for checkpointing
-    ///
-    /// NOTE: With the model thread architecture, direct model access is no longer
-    /// supported. Use save_checkpoint() on the model directly instead.
-    #[napi]
-    pub fn get_model(&self) -> Result<Qwen3Model> {
-        Err(Error::new(
-            Status::GenericFailure,
-            "get_model() is no longer supported with the model thread architecture. \
-             Use model.saveModel(path) or the SaveCheckpoint command instead.",
-        ))
-    }
-
-    /// Get the underlying Qwen3.5 dense model for checkpointing
-    ///
-    /// NOTE: With the model thread architecture, direct model access is no longer
-    /// supported. Use save_checkpoint() on the model directly instead.
-    #[napi]
-    pub fn get_qwen35_model(&self) -> Result<Qwen3_5Model> {
-        Err(Error::new(
-            Status::GenericFailure,
-            "get_qwen35_model() is no longer supported with the model thread architecture. \
-             Use model.saveModel(path) or the SaveCheckpoint command instead.",
-        ))
-    }
-
-    /// Get the underlying Qwen3.5 MoE model for checkpointing
-    ///
-    /// NOTE: With the model thread architecture, direct model access is no longer
-    /// supported. Use save_checkpoint() on the model directly instead.
-    #[napi]
-    pub fn get_qwen35_moe_model(&self) -> Result<Qwen3_5MoeModel> {
-        Err(Error::new(
-            Status::GenericFailure,
-            "get_qwen35_moe_model() is no longer supported with the model thread architecture. \
-             Use model.saveModel(path) or the SaveCheckpoint command instead.",
-        ))
-    }
 }
 
 // =============================================================================
