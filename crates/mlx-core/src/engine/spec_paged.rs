@@ -281,9 +281,7 @@ impl Drop for VerifyTicket {
 /// declare `true` — muse included: both `MusePagedSettle::Cursor` and
 /// `MusePagedSettle::Committed` reach
 /// `remember_sliding_cold_checkpoints_at_frontier`, so muse has NO mode that
-/// prunes without capturing, and the one muse mode lawful inside an open
-/// cycle is `MusePagedSettle::Suppressed` — pending-write eval alone, no rung
-/// and no prune, which is not a settle through this facade at all.
+/// prunes without capturing.
 ///
 /// [`NoDurableSettleInCycle`] is the executable form of this law.
 /// [`NoSettleInCycle`] enforces the stricter shape — no settle of any kind
