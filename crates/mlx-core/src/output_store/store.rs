@@ -248,18 +248,6 @@ impl OutputStore {
         reader::get_run_aggregates(&self.pool, &run_id).await
     }
 
-    /// Get recent generations for sample panel restoration
-    ///
-    /// Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
-    #[napi]
-    pub async fn get_recent_generations(
-        &self,
-        run_id: String,
-        limit: i64,
-    ) -> Result<Vec<GenerationRecord>> {
-        reader::get_recent_generations(&self.pool, &run_id, limit).await
-    }
-
     /// Get store configuration
     #[napi(getter)]
     pub fn config(&self) -> OutputStoreConfig {
@@ -407,29 +395,6 @@ impl OutputStore {
         reader::get_generations(&self.pool, &run_id, step).await
     }
 
-    /// Get top/bottom generations by reward
-    #[napi]
-    pub async fn get_generations_by_reward(
-        &self,
-        run_id: String,
-        top_n: Option<i64>,
-        bottom_n: Option<i64>,
-        step_range: Option<Vec<i64>>,
-    ) -> Result<Vec<GenerationWithToolCalls>> {
-        reader::get_generations_by_reward(&self.pool, &run_id, top_n, bottom_n, step_range).await
-    }
-
-    /// Get generations with specific finish reason
-    #[napi]
-    pub async fn get_generations_by_finish_reason(
-        &self,
-        run_id: String,
-        finish_reason: String,
-        limit: Option<i64>,
-    ) -> Result<Vec<GenerationWithToolCalls>> {
-        reader::get_generations_by_finish_reason(&self.pool, &run_id, &finish_reason, limit).await
-    }
-
     /// Get generations containing tool calls
     #[napi]
     pub async fn get_generations_with_tool_calls(
@@ -462,29 +427,6 @@ impl OutputStore {
         step_range: Option<Vec<i64>>,
     ) -> Result<RewardStats> {
         reader::get_reward_stats(&self.pool, &run_id, step_range).await
-    }
-
-    /// Export to JSONL file
-    #[napi]
-    pub async fn export_jsonl(
-        &self,
-        run_id: String,
-        output_path: String,
-        include_tool_calls: Option<bool>,
-    ) -> Result<i64> {
-        reader::export_jsonl(
-            &self.pool,
-            &run_id,
-            &output_path,
-            include_tool_calls.unwrap_or(true),
-        )
-        .await
-    }
-
-    /// Execute raw SQL query (for advanced users)
-    #[napi]
-    pub async fn query_raw(&self, sql: String) -> Result<String> {
-        reader::query_raw(&self.pool, &sql).await
     }
 }
 

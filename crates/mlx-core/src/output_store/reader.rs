@@ -66,34 +66,6 @@ pub async fn get_generations(
     Ok(gens.into_iter().map(Into::into).collect())
 }
 
-/// Get top/bottom generations by reward
-pub async fn get_generations_by_reward(
-    pool: &SqlitePool,
-    run_id: &str,
-    top_n: Option<i64>,
-    bottom_n: Option<i64>,
-    step_range: Option<Vec<i64>>,
-) -> Result<Vec<GenerationWithToolCalls>> {
-    let range_slice = step_range.as_deref();
-    let gens = db_reader::get_generations_by_reward(pool, run_id, top_n, bottom_n, range_slice)
-        .await
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    Ok(gens.into_iter().map(Into::into).collect())
-}
-
-/// Get generations with specific finish reason
-pub async fn get_generations_by_finish_reason(
-    pool: &SqlitePool,
-    run_id: &str,
-    finish_reason: &str,
-    limit: Option<i64>,
-) -> Result<Vec<GenerationWithToolCalls>> {
-    let gens = db_reader::get_generations_by_finish_reason(pool, run_id, finish_reason, limit)
-        .await
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    Ok(gens.into_iter().map(Into::into).collect())
-}
-
 /// Get generations containing tool calls
 pub async fn get_generations_with_tool_calls(
     pool: &SqlitePool,
@@ -141,25 +113,6 @@ pub async fn get_reward_stats(
     Ok(stats.into())
 }
 
-/// Export to JSONL file
-pub async fn export_jsonl(
-    pool: &SqlitePool,
-    run_id: &str,
-    output_path: &str,
-    include_tool_calls: bool,
-) -> Result<i64> {
-    db_reader::export_jsonl(pool, run_id, output_path, include_tool_calls)
-        .await
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
-}
-
-/// Execute raw SQL query
-pub async fn query_raw(pool: &SqlitePool, sql: &str) -> Result<String> {
-    db_reader::query_raw(pool, sql)
-        .await
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
-}
-
 // =============================================================================
 // TUI Resume State Functions
 // =============================================================================
@@ -182,16 +135,4 @@ pub async fn get_run_aggregates(pool: &SqlitePool, run_id: &str) -> Result<RunAg
         .await
         .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
     Ok(aggregates.into())
-}
-
-/// Get recent generations for sample panel restoration
-pub async fn get_recent_generations(
-    pool: &SqlitePool,
-    run_id: &str,
-    limit: i64,
-) -> Result<Vec<super::types::GenerationRecord>> {
-    let gens = db_reader::get_recent_generations(pool, run_id, limit)
-        .await
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    Ok(gens.into_iter().map(Into::into).collect())
 }
