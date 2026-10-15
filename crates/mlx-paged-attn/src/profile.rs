@@ -50,9 +50,6 @@
 
 use crate::metal::MetalDtype;
 
-#[cfg(not(target_os = "macos"))]
-use std::marker::PhantomData;
-
 /// Default fraction of total memory we let the model + KV pool use
 /// (matches vLLM's `gpu_memory_utilization=0.85` default).
 pub const DEFAULT_KV_MEMORY_UTILIZATION: f64 = 0.85;
@@ -103,9 +100,6 @@ pub enum ProfileError {
     /// `MLX_KV_SAFETY_MARGIN_BYTES` parsed but couldn't be converted to
     /// u64.
     InvalidSafetyMargin(String),
-    /// The caller-supplied dummy forward closure returned an error string.
-    /// We propagate verbatim so model wiring bugs are easy to debug.
-    DummyForwardFailed(String),
     /// After subtracting peak + safety margin, no budget remains for KV
     /// blocks. Either the model's weights + activations alone exceed the
     /// utilization-fraction budget, or the safety margin is too large.
@@ -159,9 +153,6 @@ impl std::fmt::Display for ProfileError {
                 f,
                 "invalid {ENV_SAFETY}={s}: must parse as non-negative integer bytes"
             ),
-            ProfileError::DummyForwardFailed(s) => {
-                write!(f, "dummy forward closure failed: {s}")
-            }
             ProfileError::InsufficientMemory {
                 total_bytes,
                 budget_bytes,
@@ -659,206 +650,6 @@ pub fn load_time_pool_sizing_with_reserved(
             bpb,
             extra_reserved_bytes.saturating_add(crate::layer_kv_pool::RESTORE_STAGING_BYTES),
         );
-        Err(ProfileError::TotalMemoryUnavailable)
-    }
-}
-
-/// Reset the MLX peak-memory counter. Called immediately before the
-/// caller's dummy forward so the post-forward `mlx_get_peak_memory()` read
-/// reflects only the model's max footprint during one max-seq forward.
-///
-/// Returns `Err(MetalUnavailable)` if the C++ shim caught an exception
-/// (-1 return). This is the failure mode the bug report flagged: previously
-/// this was an infallible `()` return that swallowed exceptions through
-/// the catch-all into a no-op, leaving the peak counter undefined and
-/// letting the auto-sizer consume an unrelated stale value as a real
-/// measurement.
-#[cfg(target_os = "macos")]
-fn reset_peak_memory() -> Result<(), ProfileError> {
-    let rc = unsafe { mlx_sys::mlx_reset_peak_memory() };
-    if rc != 0 {
-        return Err(ProfileError::MetalUnavailable);
-    }
-    Ok(())
-}
-
-/// Read MLX's peak memory counter (in bytes). Includes weights +
-/// activations + intermediate buffers — everything the allocator counted
-/// as "in flight at once" since the last `mlx_reset_peak_memory()`.
-///
-/// Returns `Err(MetalUnavailable)` if the C++ shim caught an exception
-/// (-1 return). This is the critical failure path the bug report flagged:
-/// previously the caller would consume the ambiguous sentinel `0` from a
-/// caught exception as a real "peak=0 MiB" measurement, oversizing the
-/// KV pool to billions of blocks. The fallible-FFI contract makes the
-/// failure observable and the auto-sizer short-circuits with a clean
-/// `MetalUnavailable` instead.
-#[cfg(target_os = "macos")]
-fn read_peak_memory() -> Result<u64, ProfileError> {
-    let mut peak: u64 = 0;
-    let rc = unsafe { mlx_sys::mlx_get_peak_memory(&mut peak) };
-    if rc != 0 {
-        return Err(ProfileError::MetalUnavailable);
-    }
-    Ok(peak)
-}
-
-/// Run a caller-supplied dummy forward, measure peak memory, and compute
-/// the auto-sized block count.
-///
-/// `dummy_forward(max_position_embeddings)` MUST:
-/// 1. Construct synthetic input shaped `(batch=1, seq=max_position_embeddings)`
-///    using the value passed in (NOT a hard-coded constant — the
-///    auto-sizer derives the right number from the model config and
-///    threads it through here so callers can't accidentally desync the
-///    profile shape from the runtime serving shape).
-/// 2. Run the model forward through to logits.
-/// 3. Call MLX `eval()` so the lazy graph materializes (peak memory only
-///    accounts for materialized data — without `eval()` the graph never
-///    moves the counter).
-///
-/// This is caller-supplied because the model loader is a model-specific
-/// concern; each model plugs its own loader into this slot.
-/// Passing `max_position_embeddings` as a closure argument (rather than
-/// expecting the caller to capture it) ensures it always reaches the
-/// closure body and matches the value the auto-sizer used in its
-/// budget math.
-///
-/// The peak-memory and budget math is also clamped against MLX's GPU-
-/// visible working-set bound (`MTLDevice
-/// recommendedMaxWorkingSetSize`). On Apple Silicon this is normally
-/// ~75% of unified memory — without the clamp, sizing the pool against
-/// raw `hw.memsize` would over-commit the GPU, surface as
-/// `MTLBuffer` allocation failures during serving rather than at
-/// profile time. The clamp is silent (we just take the smaller of the
-/// two budgets) but logged so the chosen budget is auditable.
-///
-/// Logging: emits an `info!`-level line on success with the measured peak,
-/// physical/working-set budgets, the chosen budget, and resulting block
-/// count. Errors are returned to the caller — we don't `error!` here
-/// because the caller often wants to fall back to a static heuristic on
-/// `TotalMemoryUnavailable`.
-#[allow(clippy::too_many_arguments)]
-pub fn profile_run_and_compute_num_blocks<F>(
-    dummy_forward: F,
-    max_position_embeddings: u32,
-    num_layers: u32,
-    num_kv_heads: u32,
-    head_size: u32,
-    kv_dtype: MetalDtype,
-    block_size: u32,
-) -> Result<u32, ProfileError>
-where
-    F: FnOnce(u32) -> Result<(), String>,
-{
-    let total = read_total_memory_bytes()?;
-    let util = read_util_env()?;
-    let safety_margin = read_safety_margin_env()?;
-    let bpb = bytes_per_block(num_layers, num_kv_heads, head_size, block_size, kv_dtype)?;
-
-    #[cfg(target_os = "macos")]
-    {
-        // FAST-PATH GUARD: sysctl(`hw.memsize`) succeeds even on macOS
-        // hosts where Metal is unavailable (CPU-only MLX build, no GPU,
-        // sandbox without IOAccelerator, virtualized environment). The
-        // downstream `reset_peak_memory` / `read_peak_memory` /
-        // `read_working_set_bytes` calls all resolve through
-        // `mlx::core::metal::allocator()`, which lazily constructs a
-        // `MetalAllocator` keyed off `device(Device::gpu)` — and that
-        // constructor THROWS when the GPU device cannot be created.
-        //
-        // The fallible-FFI contract on those shims now turns a caught
-        // exception into a -1 return, which `reset_peak_memory()` /
-        // `read_peak_memory()` translate into
-        // `ProfileError::MetalUnavailable`. So the auto-sizer is safe
-        // even without this fast-path gate: the bug fix removed the
-        // possibility of consuming a sentinel-zero as a real measurement.
-        //
-        // We keep the gate anyway as an optimization — when Metal init
-        // is known-broken upfront we avoid one exception throw + cerr
-        // line per memory call (the catch-all fallback is correct but
-        // noisy). When the gate is bypassed (degraded-Metal host where
-        // `mlx_metal_is_available()` lies and reports true), the
-        // fallible contract still catches the failure cleanly through
-        // `read_peak_memory`'s `Err` propagation below.
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            // Run the dummy forward closure with the supplied max_seq so
-            // platform-portable model-loading bugs surface deterministically
-            // even on no-Metal hosts. The closure's return value is
-            // intentionally discarded — the auto-sizer can't compute a
-            // useful budget without GPU memory APIs, so the result would
-            // not be actionable here regardless.
-            let _ = dummy_forward(max_position_embeddings);
-            return Err(ProfileError::MetalUnavailable);
-        }
-
-        // The fallible memory FFI catches the degraded-Metal case where
-        // `mlx_metal_is_available()` returned true but the underlying
-        // allocator init still throws. `?` propagates `MetalUnavailable`
-        // immediately — we MUST NOT proceed with a stale or zero peak
-        // (the bug report's scenario: peak_non_kv = 0 MiB +
-        // working_set_bytes = none → the formula treats it as a real
-        // measurement and oversizes the KV pool to millions of blocks).
-        reset_peak_memory()?;
-        dummy_forward(max_position_embeddings).map_err(ProfileError::DummyForwardFailed)?;
-        let peak = read_peak_memory()?;
-        // Clamp against MLX's recommended working-set bound. Apple Silicon
-        // reports ~75% of unified memory as the upper bound MTLDevice will
-        // happily commit — past that we get `MTLBuffer` allocation
-        // failures during serving rather than at profile time.
-        //
-        // `read_working_set_bytes` is fallible by the same FFI contract
-        // as `read_peak_memory`: a -1 return means the C++ shim caught
-        // an exception (degraded Metal). Propagate it as
-        // `MetalUnavailable` rather than silently masking it as
-        // `None` — masking would produce an oversized KV pool that
-        // defers MTLBuffer allocation failure to serving time.
-        let working_set = read_working_set_bytes()?;
-        let (num_blocks, kv_bytes, physical_bytes, working_set_bytes) =
-            compute_num_blocks_with_working_set(
-                total,
-                working_set,
-                peak,
-                util,
-                safety_margin,
-                bpb,
-            )?;
-
-        let total_mib = total / (1024 * 1024);
-        let peak_mib = peak / (1024 * 1024);
-        let kv_mib = kv_bytes / (1024 * 1024);
-        let phys_mib = physical_bytes / (1024 * 1024);
-        // `n/a` when no working-set bound was reported (CPU-only build
-        // or device_info missing the entry); the formula then falls
-        // through to the physical budget alone.
-        let ws_str = match working_set_bytes {
-            Some(b) => format!("{} MiB", b / (1024 * 1024)),
-            None => "n/a".to_string(),
-        };
-        // MEMORY: log via eprintln rather than tracing because mlx-paged-attn
-        // is lower in the dependency tree than the workspace tracing setup
-        // and we don't want to drag tracing-subscriber into this crate.
-        // Callers (mlx-core) bridge into `tracing::info!` from their wrappers
-        // when desirable.
-        eprintln!(
-            "[paged-profile] total {total_mib} MiB, peak_non_kv {peak_mib} MiB, util {util:.3}, \
-             safety_margin {safety_margin} B, physical_budget {phys_mib} MiB, \
-             working_set_budget {ws_str}, kv_budget {kv_mib} MiB, num_blocks {num_blocks}, \
-             block_size {block_size}, bytes_per_block {bpb}, max_seq {max_position_embeddings}"
-        );
-        Ok(num_blocks)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Surface the unsupported platform — callers should fall back to a
-        // static heuristic. We still call the dummy forward closure so any
-        // platform-portable model-loading bugs surface deterministically
-        // even without MLX/Metal (the closure receives a pre-platform-checked
-        // failure and can pass through `Err`s from its own loader).
-        let _ = dummy_forward(max_position_embeddings);
-        let _ = (total, util, safety_margin, bpb);
-        let _: PhantomData<F> = PhantomData;
         Err(ProfileError::TotalMemoryUnavailable)
     }
 }
