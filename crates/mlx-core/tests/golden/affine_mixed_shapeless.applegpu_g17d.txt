@@ -1,4 +1,4 @@
-# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, re-captured on pin c23b1113f after upstream e7838d5e3 and 8056817bd.
+# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, re-captured on pin bcad39304 after upstream 494c8a6c9.
 # One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url, then the route.
 applegpu_g17s = machine
 applegpu_g17d = route
@@ -113,7 +113,7 @@ dkp3zJpR native
 dkp3zJpR native
 dkp3zJpR native
 dkp3zJpR native
-yhBDLoCw promoted
-yhBDLoCw promoted
+6QGtnmrE promoted
+6QGtnmrE promoted
 G4zZulKz native
 G4zZulKz native
