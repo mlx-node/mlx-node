@@ -20,14 +20,12 @@
 
 pub(crate) mod command_buffer;
 mod copy_blocks;
-mod kv_scale;
 mod mlx_integration;
 mod paged_attention;
 mod reshape_and_cache;
 mod state;
 
 pub use copy_blocks::CopyBlocksParams;
-pub use kv_scale::{KvScaleManager, KvScaleStats};
 pub use mlx_integration::{MlxMetalBuffer, is_metal_extraction_supported, synchronize_mlx};
 pub use paged_attention::{
     PagedAttentionOutput, PagedAttentionParams, PagedAttentionRouteHint,
