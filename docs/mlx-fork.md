@@ -175,10 +175,13 @@ check on the built file. The GEMM canaries in `crates/mlx-core/src/test_support.
 print a line when they gate tests off. A canary that starts or stops firing means MLX's
 GEMM accuracy on this machine changed.
 
-**6. Prebuilt MLX.** `crates/mlx-sys/mlx-prebuilt.json` pins the release that holds the
-cmake output for the new commit; update it in the same PR (see below). Until then every
-build of the PR compiles MLX from source and says so (`mlx-sys: building MLX from source
-(mlx submodule is at <sha> but mlx-prebuilt.json pins <sha>)`).
+**6. Prebuilt MLX.** Pushing the gitlink bump runs `.github/workflows/mlx-prebuilt.yml`
+(on any branch of this repo) and publishes release `mlx-prebuilt-<sha12>`; paste the
+sha256 it prints into `crates/mlx-sys/mlx-prebuilt.json` in the same PR (see below).
+Until then every build of the PR compiles MLX from source and says so (`mlx-sys:
+building MLX from source (mlx submodule is at <sha> but mlx-prebuilt.json pins <sha>)`).
+The workflow needs the commit reachable from the fork (step 8, or push the rebase
+branch to the fork first).
 
 **7. Benches.** Same machine, cooled, ABBA order, old addon vs new:
 `scripts/benchmark-model.ts` (decode and prefill), `docs/research/splash-qwen38/benchmark.ts`
@@ -233,10 +236,10 @@ build for `paged_attn.metallib` and is a last-resort runtime lookup, like MLX's.
 prebuilt mode `build.rs` copies `mlx.metallib` next to the cargo test binaries
 (`target/<profile>/{,deps/}`) because the baked path does not exist locally.
 
-**Bump procedure.** After moving the gitlink: run the `MLX Prebuilt` workflow on the PR
-branch (`gh workflow run mlx-prebuilt.yml --ref <branch>`; `.github/workflows/mlx-prebuilt.yml`
+**Bump procedure.** Push the moved gitlink: `.github/workflows/mlx-prebuilt.yml` runs on
+that push (any branch; `gh workflow run mlx-prebuilt.yml` also works once it is on main),
 builds with `MLX_PREBUILT_EXPORT`, tars the export dir, publishes release
-`mlx-prebuilt-<sha12>` and prints the sha256 in the job summary), then set
+`mlx-prebuilt-<sha12>` and prints the sha256 in the job summary. Then set
 `mlx_commit`, `release_tag` and `assets.aarch64-apple-darwin.sha256` in
 `crates/mlx-sys/mlx-prebuilt.json` in the same PR. Locally the same artifact comes from
 

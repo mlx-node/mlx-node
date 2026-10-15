@@ -7,13 +7,14 @@ name: MLX Prebuilt
 # `crates/mlx-sys/mlx-prebuilt.json`; `MLX_PREBUILT=0` forces a source build).
 #
 # Flow after a submodule bump:
-#   1. this workflow runs on the push to main (the gitlink path
-#      `crates/mlx-sys/mlx` changes) and uploads
-#      `mlx-prebuilt-<12 hex>` with the tarball + its `.sha256`;
-#   2. a follow-up PR pastes the printed JSON into `mlx-prebuilt.json`
+#   1. pushing the gitlink change (`crates/mlx-sys/mlx`) on ANY branch runs
+#      this workflow, which uploads `mlx-prebuilt-<12 hex>` with the tarball
+#      + its `.sha256` (releases are keyed by the mlx commit, so a PR branch
+#      and main produce the same tag; the first one wins);
+#   2. the same PR pastes the printed JSON into `mlx-prebuilt.json`
 #      (new `mlx_commit`, `release_tag`, `sha256`). Until then build.rs sees
-#      an empty digest / commit mismatch and falls back to the source build,
-#      so CI stays green either way.
+#      a commit mismatch and falls back to the source build, so CI stays
+#      green either way.
 #
 # Releases are IMMUTABLE by default: if the tag already carries the asset the
 # job exits early. `force_reupload` re-publishes over an existing tag.
@@ -25,7 +26,11 @@ on:
         type: boolean
         default: false
   push:
-    branches: [main]
+    # Every branch of this repo: a bump PR needs its release before it can
+    # pin it, and `workflow_dispatch` only sees workflows on the default
+    # branch. Tag pushes are excluded (no `tags:` key). Forks cannot create
+    # releases here, so the job is also gated on the repository below.
+    branches: ['**']
     paths:
       # A submodule pointer bump shows up as a change to the gitlink path.
       - crates/mlx-sys/mlx
@@ -53,6 +58,9 @@ env:
 jobs:
   prebuilt:
     name: mlx ${{ matrix.target }}
+    # A fork's GITHUB_TOKEN cannot write releases to this repo, and a release
+    # in the fork itself would be useless: the pin names mlx-node/mlx-node.
+    if: github.repository == 'mlx-node/mlx-node'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
