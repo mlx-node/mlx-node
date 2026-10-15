@@ -296,16 +296,6 @@ impl<M> KVCacheCoordinator<M> {
             .ok()
             .map(|index| &self.routes[index])
     }
-
-    pub fn manager_for_layer(&self, layer_index: usize) -> Option<&M> {
-        let route = self.route_for_layer(layer_index)?;
-        self.manager(route.group_id)
-    }
-
-    pub fn manager_for_layer_mut(&mut self, layer_index: usize) -> Option<&mut M> {
-        let group_id = self.route_for_layer(layer_index)?.group_id;
-        self.manager_mut(group_id)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,13 +873,14 @@ mod tests {
         let sliding_alias = coordinator.route_for_layer(2).unwrap();
         assert_eq!(sliding_alias.physical_layer_index, 0);
         assert_eq!(sliding_alias.physical_layer_ordinal, 0);
+        let sliding_alias_group = sliding_alias.group_id;
         assert_eq!(
-            coordinator.manager_for_layer(2).map(String::as_str),
+            coordinator.manager(sliding_alias_group).map(String::as_str),
             Some("manager-1")
         );
 
         let full_alias_group = coordinator.route_for_layer(3).unwrap().group_id;
-        *coordinator.manager_for_layer_mut(3).unwrap() = "full-mutated".to_string();
+        *coordinator.manager_mut(full_alias_group).unwrap() = "full-mutated".to_string();
         assert_eq!(
             coordinator.manager(full_alias_group).map(String::as_str),
             Some("full-mutated")
