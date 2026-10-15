@@ -119,16 +119,6 @@ impl Conv2d {
     pub fn bias(&self) -> Option<MxArray> {
         self.bias.as_ref().map(|b| (**b).clone())
     }
-
-    /// Get the stride
-    pub fn get_stride(&self) -> (u32, u32) {
-        self.stride
-    }
-
-    /// Get the padding
-    pub fn get_padding(&self) -> (u32, u32) {
-        self.padding
-    }
 }
 
 /// Standalone Conv2d forward function
