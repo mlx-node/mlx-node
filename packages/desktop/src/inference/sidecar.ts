@@ -102,8 +102,6 @@ export interface SidecarHost {
   boundModel: string;
   models: readonly { name: string; path: string; modelType: string }[];
   logDir: string | null;
-  health(): unknown;
-  loadModel(name: string): Promise<void>;
   close(opts?: { timeoutMs?: number }): Promise<void>;
 }
 
@@ -213,22 +211,17 @@ export function isPermanentStartupFailure(error: unknown): boolean {
  * The ops are deliberately not "anything the HTTP API can do". The sidecar's HTTP
  * port is the inference surface and the Control Panel window reaches it directly;
  * this channel exists for the things a *supervisor* needs and an HTTP client cannot
- * get — what was discovered on disk, and an out-of-band model swap that runs under
- * the same drain/writer brackets the HTTP path uses.
+ * get — what was discovered on disk.
  *
  * - `{ op: 'info' }` — static facts settled at startup: url, port, models dir,
  *   bound model, log dir.
- * - `{ op: 'health' }` — the same body `GET /health` returns, without a round trip
- *   through the socket.
  * - `{ op: 'models' }` — everything discovered under the models dir, alphabetical.
- * - `{ op: 'load'; name: string }` — make `name` the resident model. Rejects for a
- *   name that was not discovered.
  */
 export async function handleSidecarRequest(host: SidecarHost, payload: unknown): Promise<unknown> {
   if (typeof payload !== 'object' || payload === null) {
     throw new Error(`malformed request payload (${payload === null ? 'null' : typeof payload})`);
   }
-  const request = payload as { op?: unknown; name?: unknown };
+  const request = payload as { op?: unknown };
   switch (request.op) {
     case 'info':
       return {
@@ -238,19 +231,12 @@ export async function handleSidecarRequest(host: SidecarHost, payload: unknown):
         boundModel: host.boundModel,
         logDir: host.logDir,
       };
-    case 'health':
-      return host.health();
     case 'models':
       // Projected field by field rather than passed through. Every reply crosses
       // a structured clone, and `DiscoveredModel` carries a `preset` whose shape
       // is the server package's business — a non-clonable member added there
       // would break this channel with an error naming neither side.
       return host.models.map((model) => ({ name: model.name, path: model.path, modelType: model.modelType }));
-    case 'load': {
-      if (typeof request.name !== 'string') throw new Error('load requires a model name');
-      await host.loadModel(request.name);
-      return { boundModel: request.name };
-    }
     default:
       throw new Error(`unknown op ${JSON.stringify(request.op)}`);
   }
