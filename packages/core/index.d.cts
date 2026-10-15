@@ -2455,27 +2455,6 @@ export declare class SftTrainingEngine {
    * correction step separately.
    */
   restoreState(step: number, epoch: number): void;
-  /**
-   * Get the underlying Qwen3 model for checkpointing
-   *
-   * NOTE: With the model thread architecture, direct model access is no longer
-   * supported. Use save_checkpoint() on the model directly instead.
-   */
-  getModel(): Qwen3Model;
-  /**
-   * Get the underlying Qwen3.5 dense model for checkpointing
-   *
-   * NOTE: With the model thread architecture, direct model access is no longer
-   * supported. Use save_checkpoint() on the model directly instead.
-   */
-  getQwen35Model(): Qwen35Model;
-  /**
-   * Get the underlying Qwen3.5 MoE model for checkpointing
-   *
-   * NOTE: With the model thread architecture, direct model access is no longer
-   * supported. Use save_checkpoint() on the model directly instead.
-   */
-  getQwen35MoeModel(): Qwen35MoeModel;
 }
 
 /**
