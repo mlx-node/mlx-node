@@ -250,27 +250,6 @@ impl Qwen3Model {
         })?;
         Ok(promise)
     }
-
-    /// Validate that a set of parameters has all required weights with correct shapes
-    ///
-    /// This is useful for validating parameters before loading them into a model,
-    /// or for checking that saved weights are valid before training.
-    ///
-    /// # Arguments
-    /// * `params` - HashMap of parameter names to MxArray values
-    ///
-    /// # Returns
-    /// * Ok(()) if all validations pass
-    /// * Err with descriptive message if validation fails
-    #[napi]
-    pub fn validate_parameters(&self, params: HashMap<String, &MxArray>) -> Result<()> {
-        let owned_params: HashMap<String, MxArray> = params
-            .iter()
-            .map(|(k, v)| (k.clone(), (*v).clone()))
-            .collect();
-        let config = self.get_config();
-        validate_loaded_parameters(&owned_params, &config)
-    }
 }
 
 /// Create a random-init Qwen3 model and save it to disk.
