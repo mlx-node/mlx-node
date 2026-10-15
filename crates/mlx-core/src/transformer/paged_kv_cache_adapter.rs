@@ -84,8 +84,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "macos")]
-use mlx_paged_attn::metal::KvScaleManager;
 use mlx_paged_attn::{
     BlockAllocator, LayerKVPool, PagedAttentionConfig, PhysicalBlock, PrefixKeys,
     SequenceBlockTable,
@@ -784,7 +782,7 @@ pub(crate) struct PagedRaggedRow {
 /// the established single-row code does not pay a hash lookup at every layer.
 /// Switching sequences moves that whole workspace into/out of `requests`.
 /// Nothing in this struct is model-global: the allocator, physical K/V pool,
-/// cold-tier manager, scale manager, and native pool dependency chain remain
+/// cold-tier manager, and native pool dependency chain remain
 /// on the adapter itself.
 pub struct PagedRequestState {
     block_table: SequenceBlockTable,
@@ -972,37 +970,11 @@ pub struct PagedKVCacheAdapter {
     /// per-adapter so a test can drive a specific depth without a global.
     cold_capture_budget: ColdCaptureBudget,
 
-    /// Optional FP8 K/V scale manager. When `Some`, the adapter
-    /// reads per-layer K/V scales from the manager and threads them into
-    /// `update_keys_values` and `k_scale_array` / `v_scale_array`. When
-    /// `None` (the default for every model wired so far — none of which
-    /// run with `use_fp8_cache: Some(true)`), the adapter falls back to
-    /// `1.0` everywhere via the placeholder accessors and
-    /// `update_keys_values`. Configured via [`Self::set_scale_manager`].
-    ///
-    /// The manager is wrapped in `Arc<Mutex<...>>` so callers can hold
-    /// their own clone for orchestration (e.g. EMA updates from a separate
-    /// warmup pass) while the adapter shares ownership for the inference
-    /// path. EMA state (the `k_running_max` / `v_running_max` HashMaps
-    /// inside `KvScaleManager`) is mutated through `update_layer_ema`, so
-    /// `Mutex` is the conservative choice over `RwLock` here.
-    #[cfg(target_os = "macos")]
-    scale_manager: Option<Arc<Mutex<KvScaleManager>>>,
-
-    /// Memoized `[1]` fp32 scale arrays handed to `paged_kv_write` /
-    /// `paged_attention`, keyed by `(layer_idx, is_key, scale.to_bits())`.
-    /// `k_scale_array`/`v_scale_array` run twice per layer per token on the
-    /// eager paged path; keying on the scale BITS keeps the cache honest
-    /// under a live `KvScaleManager` (EMA updates produce a new key rather
-    /// than a stale array). With no manager (all production wiring) the
-    /// map holds exactly one `1.0` entry per layer per kind.
-    scale_arrays: std::collections::HashMap<(u32, bool, u32), MxArray>,
-
     /// Shared `[1]` fp32 `1.0` scale array returned by
-    /// [`Self::k_scale_array`] / [`Self::v_scale_array`] when no scale
-    /// manager is installed. The decode write path requests a K and a V
-    /// scale per layer per token, so allocating a fresh constant array at
-    /// each call produced ~2×num_layers node creations per step.
+    /// [`Self::k_scale_array`] / [`Self::v_scale_array`]. The decode write
+    /// path requests a K and a V scale per layer per token, so allocating a
+    /// fresh constant array at each call produced ~2×num_layers node
+    /// creations per step.
     #[cfg(target_os = "macos")]
     unit_kv_scale_array: MxArray,
 
@@ -1033,9 +1005,8 @@ pub struct PagedKVCacheAdapter {
     /// Optional hook invoked once per successful pool grow with the pool's
     /// new total K/V bytes (all layers, both sides). The cache-limit pool
     /// re-registration lands through this (see `set_pool_growth_notifier`);
-    /// `None` (the default) is a no-op. Follows the `set_scale_manager` /
-    /// `set_cold_tier` ownership pattern: the adapter shares the `Arc` with
-    /// its caller.
+    /// `None` (the default) is a no-op. Follows the `set_cold_tier`
+    /// ownership pattern: the adapter shares the `Arc` with its caller.
     pool_growth_notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 
     /// Test-only override for the pre-grow headroom probe: receives the
@@ -1229,9 +1200,6 @@ impl PagedKVCacheAdapter {
             aux_prefix_unbacked: false,
             cold_capture: ColdCaptureOutcome::default(),
             cold_capture_budget: ColdCaptureBudget::default(),
-            #[cfg(target_os = "macos")]
-            scale_manager: None,
-            scale_arrays: std::collections::HashMap::new(),
             #[cfg(target_os = "macos")]
             unit_kv_scale_array,
             #[cfg(target_os = "macos")]
@@ -3674,14 +3642,9 @@ impl PagedKVCacheAdapter {
     /// }
     /// ```
     ///
-    /// FP8 scale management: when [`Self::set_scale_manager`]
-    /// has wired in a [`KvScaleManager`], `update_keys_values` reads the
-    /// per-layer `k_scale` / `v_scale` from the manager and threads them
-    /// into the `reshape_and_cache` Metal kernel. When no manager is
-    /// configured (the default for every paged-cache caller in the tree
-    /// today, all of which run with `use_fp8_cache: Some(false)`), the
-    /// adapter falls back to `1.0` for both scales — a no-op for the
-    /// non-FP8 kernel template.
+    /// FP8 scales: `k_scale` / `v_scale` passed to the `reshape_and_cache`
+    /// Metal kernel are always `1.0` — a no-op for the non-FP8 kernel
+    /// template.
     #[cfg(target_os = "macos")]
     pub fn update_keys_values(
         &mut self,
@@ -3770,9 +3733,7 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        // Read per-layer FP8 scales from `KvScaleManager` when configured.
-        // Defaults to 1.0 (no-op for non-FP8 caches) when no manager is set.
-        let (k_scale, v_scale) = self.read_layer_scales(layer_idx)?;
+        let (k_scale, v_scale) = (1.0, 1.0);
 
         // SAFETY: keys/values are valid `MxArray`s held by the caller for
         // the duration of this call; `as_raw_ptr` returns the borrowed
@@ -5044,16 +5005,9 @@ impl PagedKVCacheAdapter {
             }
         };
 
-        // 5b. Read per-layer FP8 K/V scales from the configured
-        //     `KvScaleManager` (or `(1.0, 1.0)` when no manager is wired).
-        //     Symmetric with the write path in `update_keys_values`: the
-        //     gather kernel must dequantize cache bytes with the same
-        //     scales the write kernel quantized them with, otherwise an
-        //     FP8 cache produced by a calibrated manager would be read
-        //     back through unit scales and corrupt decode output.
-        //     `read_layer_scales` propagates poisoned-mutex errors instead
-        //     of silently falling back to 1.0.
-        let (k_scale, v_scale) = self.read_layer_scales(layer_idx)?;
+        // 5b. Unit FP8 K/V scales, symmetric with the write path in
+        //     `update_keys_values`.
+        let (k_scale, v_scale) = (1.0, 1.0);
 
         // 6. Dispatch and wrap output in an MLX view over the Metal buffer.
         //    This avoids the old GPU → host → MLX copy in the decode hot path.
@@ -7403,162 +7357,34 @@ impl PagedKVCacheAdapter {
     /// always `[1]` and the dtype is always `Float32` — the C++ validator
     /// in `mlx_paged_ops.cpp` rejects anything else.
     ///
-    /// When [`Self::set_scale_manager`] has installed
-    /// a [`KvScaleManager`], the returned scalar is the manager's
-    /// per-layer `k_scale(layer_idx)`. When no manager is configured (the
-    /// default for every adapter in the tree today, all of which run
-    /// non-FP8 caches), the returned scalar is `1.0`. That makes the
-    /// FP8-uncalibrated path a no-op for the kernel template
-    /// (`fp8_value = fp32_value * 1.0`) while leaving the production wiring
-    /// point in place for future FP8 enablement.
-    pub fn k_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
-        #[cfg(target_os = "macos")]
-        if self.scale_manager.is_none() {
-            return Ok(self.unit_kv_scale_array.clone());
-        }
-        let scale = self.lookup_k_scale(layer_idx)?;
-        self.cached_scale_array(layer_idx, true, scale)
+    /// The returned scalar is always `1.0`, a no-op for the kernel
+    /// template (`fp8_value = fp32_value * 1.0`).
+    #[cfg(target_os = "macos")]
+    pub fn k_scale_array(&mut self, _layer_idx: u32) -> Result<MxArray, String> {
+        Ok(self.unit_kv_scale_array.clone())
     }
 
     /// Return a `[1]` fp32 V scale MxArray for `layer_idx`. See
     /// [`Self::k_scale_array`] for the FP8 contract.
-    pub fn v_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
-        #[cfg(target_os = "macos")]
-        if self.scale_manager.is_none() {
-            return Ok(self.unit_kv_scale_array.clone());
-        }
-        let scale = self.lookup_v_scale(layer_idx)?;
-        self.cached_scale_array(layer_idx, false, scale)
-    }
-
-    /// Memoizes a `[1]` fp32 array for `scale` under
-    /// `(layer_idx, is_key, scale.to_bits())`. The eager paged path calls
-    /// `k_scale_array`/`v_scale_array` twice per layer per token; keying on
-    /// the scale BITS keeps the cache honest under a live `KvScaleManager`
-    /// (an EMA update produces a new key rather than a stale array).
-    fn cached_scale_array(
-        &mut self,
-        layer_idx: u32,
-        is_key: bool,
-        scale: f32,
-    ) -> Result<MxArray, String> {
-        let key = (layer_idx, is_key, scale.to_bits());
-        if let Some(cached) = self.scale_arrays.get(&key) {
-            return Ok(cached.clone());
-        }
-        let array = MxArray::from_float32(&[scale], &[1])
-            .map_err(|e| format!("scale_array: failed to build scale array: {e}"))?;
-        self.scale_arrays.insert(key, array.clone());
-        Ok(array)
-    }
-
-    /// Install a shared `KvScaleManager` for FP8 K/V calibration.
-    ///
-    /// Once set, [`Self::k_scale_array`], [`Self::v_scale_array`], and
-    /// the per-layer scales threaded through [`Self::update_keys_values`]
-    /// read from the manager. Repeated calls overwrite the previous
-    /// manager — the typical caller pattern is "construct once at adapter
-    /// init, never replace", so this method is safe to leave permissive.
-    ///
-    /// Pass `None` to remove a previously-installed manager and revert to
-    /// the unit-scale (`1.0`) fallback.
-    ///
-    /// The manager is wrapped in `Arc<Mutex<...>>` so the caller can hold
-    /// its own clone for orchestration (e.g. driving an EMA warmup pass
-    /// from a calibration runner) while the adapter shares ownership for
-    /// the inference path.
-    #[cfg(all(test, target_os = "macos"))]
-    pub fn set_scale_manager(&mut self, manager: Option<Arc<Mutex<KvScaleManager>>>) {
-        self.scale_manager = manager;
-    }
-
-    /// Borrow the installed scale manager for orchestration use (e.g.
-    /// driving EMA calibration from a warmup pass, or persisting calibrated
-    /// scales to disk via `KvScaleManager::get_all_scales`). Returns
-    /// `None` when no manager is configured.
-    ///
-    /// Returns an `Arc` clone so the caller can extend the manager's
-    /// lifetime past `&self` borrows (e.g. take the lock in a different
-    /// task / thread).
-    #[cfg(all(test, target_os = "macos"))]
-    pub fn scale_manager(&self) -> Option<Arc<Mutex<KvScaleManager>>> {
-        self.scale_manager.as_ref().map(Arc::clone)
-    }
-
-    /// Read `(k_scale, v_scale)` for `layer_idx` from the installed manager,
-    /// falling back to `(1.0, 1.0)` when no manager is configured.
-    ///
-    /// `Result` here propagates a poisoned `Mutex` as a `String` error —
-    /// silently returning unit scales would hide a programming error
-    /// (e.g. a panicked calibration thread leaving the manager in an
-    /// inconsistent state).
     #[cfg(target_os = "macos")]
-    fn read_layer_scales(&self, layer_idx: u32) -> Result<(f32, f32), String> {
-        match &self.scale_manager {
-            Some(manager) => {
-                let guard = manager
-                    .lock()
-                    .map_err(|e| format!("KvScaleManager mutex poisoned: {e}"))?;
-                Ok((guard.k_scale(layer_idx), guard.v_scale(layer_idx)))
-            }
-            None => Ok((1.0, 1.0)),
-        }
+    pub fn v_scale_array(&mut self, _layer_idx: u32) -> Result<MxArray, String> {
+        Ok(self.unit_kv_scale_array.clone())
     }
 
-    /// Helper for [`Self::k_scale_array`] / [`Self::v_scale_array`].
-    ///
-    /// When a `KvScaleManager` is configured but its `Mutex` is poisoned,
-    /// return `Err` rather than silently falling back to `1.0`. A unit-scale
-    /// fallback would let `k_scale_array` / `v_scale_array` initialize the
-    /// compiled paged graph with placeholder scales after a
-    /// calibration/orchestration panic, while the runtime write path
-    /// (`update_keys_values` → `read_layer_scales`) fails closed on the same
-    /// poison — the asymmetry could silently corrupt FP8 K/V writes for the
-    /// affected layers.
-    ///
-    /// The `1.0` fallback is reserved for the `None` case (no manager
-    /// configured), which is the documented non-FP8 behavior.
-    #[cfg(target_os = "macos")]
-    fn lookup_k_scale(&self, layer_idx: u32) -> Result<f32, String> {
-        self.lookup_scale(layer_idx, /* is_key */ true)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn lookup_v_scale(&self, layer_idx: u32) -> Result<f32, String> {
-        self.lookup_scale(layer_idx, /* is_key */ false)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn lookup_scale(&self, layer_idx: u32, is_key: bool) -> Result<f32, String> {
-        let Some(manager) = self.scale_manager.as_ref() else {
-            return Ok(1.0);
-        };
-        let guard = manager.lock().map_err(|e| {
-            format!(
-                "KvScaleManager mutex poisoned during {}scale lookup at layer {layer_idx}: {e}",
-                if is_key { "k_" } else { "v_" },
-            )
-        })?;
-        Ok(if is_key {
-            guard.k_scale(layer_idx)
-        } else {
-            guard.v_scale(layer_idx)
-        })
-    }
-
-    /// Non-macOS scale lookup (no manager available; always 1.0). The
-    /// scale-array accessors are public on every platform because the
-    /// callers (compiled paged init in `qwen3_5/model.rs` and friends) live
-    /// behind `#[cfg(target_os = "macos")]` already; this stub keeps the
-    /// non-macOS surface compiling for tooling cross-checks.
+    /// Non-macOS `k_scale_array`: the callers live behind
+    /// `#[cfg(target_os = "macos")]`; this keeps the non-macOS surface
+    /// compiling for tooling cross-checks.
     #[cfg(not(target_os = "macos"))]
-    fn lookup_k_scale(&self, _layer_idx: u32) -> Result<f32, String> {
-        Ok(1.0)
+    pub fn k_scale_array(&mut self, _layer_idx: u32) -> Result<MxArray, String> {
+        MxArray::from_float32(&[1.0], &[1])
+            .map_err(|e| format!("scale_array: failed to build scale array: {e}"))
     }
 
+    /// Non-macOS `v_scale_array`. See the non-macOS `k_scale_array`.
     #[cfg(not(target_os = "macos"))]
-    fn lookup_v_scale(&self, _layer_idx: u32) -> Result<f32, String> {
-        Ok(1.0)
+    pub fn v_scale_array(&mut self, _layer_idx: u32) -> Result<MxArray, String> {
+        MxArray::from_float32(&[1.0], &[1])
+            .map_err(|e| format!("scale_array: failed to build scale array: {e}"))
     }
 }
 
@@ -17650,23 +17476,16 @@ mod tests {
         adapter.release_request().unwrap();
     }
 
-    /// Default behavior: `k_scale_array` / `v_scale_array` return a
-    /// `[1]` fp32 array containing `1.0` whenever no `KvScaleManager` has
-    /// been wired in (the production default for every adapter caller in
-    /// the tree today, all of which run with `use_fp8_cache: Some(false)`).
+    /// `k_scale_array` / `v_scale_array` return a `[1]` fp32 array
+    /// containing `1.0`.
     /// The unit test pins:
     /// - shape `[1]` and dtype `Float32` (the strict factory contract;
     ///   wrong shape/dtype throws at the C++ paged-ops validator),
     /// - **scalar value `1.0`** (the no-op contract; a regression returning
     ///   `[2.0]` would silently scale every paged write by 2x without
     ///   any other test catching it),
-    /// - **cross-layer consistency** (layer 0 must equal layer 1; with
-    ///   no manager configured every layer must hand out the same `1.0`
-    ///   scalar, so any divergence is a regression in the fallback path).
-    ///
-    /// Tests that exercise the manager-driven path live below; this one
-    /// guards the default fall-through for backward compatibility with all
-    /// the existing non-FP8 callers.
+    /// - **cross-layer consistency** (layer 0 must equal layer 1; every
+    ///   layer must hand out the same `1.0` scalar).
     ///
     /// The accessor body builds a CPU-side fp32 array via `from_float32`,
     /// which routes through `allocator::malloc` and on macOS goes through
@@ -17714,7 +17533,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{label} dtype: {e:?}"));
             assert_eq!(dtype, DType::Float32, "{label} must be float32");
             // Scalar VALUE check. The factory contract says these are
-            // no-op placeholders = 1.0 in the default-no-manager path.
+            // no-op placeholders = 1.0.
             // A regression returning [2.0f32] would still pass shape+dtype
             // but break paged kernels by silently scaling K/V writes.
             // `item_at_float32(0)` reads the CPU buffer directly (no GPU
@@ -17723,357 +17542,23 @@ mod tests {
             let val = arr
                 .item_at_float32(0)
                 .unwrap_or_else(|e| panic!("{label} item_at_float32(0): {e:?}"));
-            assert_eq!(
-                val, 1.0_f32,
-                "{label} default fallback must be exactly 1.0 (got {val})"
-            );
+            assert_eq!(val, 1.0_f32, "{label} must be exactly 1.0 (got {val})");
         }
 
-        // Cross-layer consistency under the no-manager fallback: every
-        // layer must hand out `1.0`, so layer 0 must equal layer 1.
+        // Cross-layer consistency: every layer must hand out `1.0`, so
+        // layer 0 must equal layer 1.
         let k0_val = k0.item_at_float32(0).unwrap();
         let k1_val = k1.item_at_float32(0).unwrap();
         let v0_val = v0.item_at_float32(0).unwrap();
         let v1_val = v1.item_at_float32(0).unwrap();
         assert_eq!(
             k0_val, k1_val,
-            "k_scale must be identical across layers without a manager (both default to 1.0)"
+            "k_scale must be identical across layers (both 1.0)"
         );
         assert_eq!(
             v0_val, v1_val,
-            "v_scale must be identical across layers without a manager (both default to 1.0)"
+            "v_scale must be identical across layers (both 1.0)"
         );
-    }
-
-    /// When a `KvScaleManager` is wired in via
-    /// [`PagedKVCacheAdapter::set_scale_manager`], `k_scale_array` and
-    /// `v_scale_array` MUST return the per-layer scales the manager holds
-    /// (not the no-manager fallback `1.0`). This test pins:
-    /// - the manager's `set_scales(layer, k, v)` flows through to the
-    ///   adapter's accessors, and
-    /// - **distinct layers can hold distinct scales** — the placeholder
-    ///   returned `1.0` for every layer, so a regression that ignored
-    ///   `layer_idx` would silently corrupt FP8 K/V writes for every
-    ///   non-zero layer.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn k_v_scale_arrays_use_manager_when_configured() {
-        use mlx_paged_attn::metal::KvScaleManager;
-
-        let allocator = new_allocator(8, 16);
-        let Some(mut adapter) = maybe_adapter(allocator, 16) else {
-            eprintln!("skipping k_v_scale_arrays_use_manager_when_configured: Metal unavailable");
-            return;
-        };
-
-        // Configure the manager with three distinct (k, v) per-layer scales.
-        // Pick non-trivial values so a regression that ignores layer_idx
-        // (e.g. returning a fixed scalar) is caught by both the per-layer
-        // value check below and the cross-layer inequality assertion.
-        let mut manager = KvScaleManager::new(4);
-        manager.set_scales(0, 0.5, 0.25);
-        manager.set_scales(1, 2.0, 1.5);
-        manager.set_scales(2, 8.0, 4.0);
-        manager.set_scales(3, 0.125, 0.0625);
-        let manager_arc = Arc::new(Mutex::new(manager));
-        adapter.set_scale_manager(Some(Arc::clone(&manager_arc)));
-
-        // Per-layer scale check. `MxArray::from_float32` is constructed
-        // synchronously in the accessor — the value is in the CPU buffer
-        // immediately, no GPU eval needed.
-        for (layer, expected_k, expected_v) in [
-            (0u32, 0.5_f32, 0.25_f32),
-            (1, 2.0, 1.5),
-            (2, 8.0, 4.0),
-            (3, 0.125, 0.0625),
-        ] {
-            let k_arr = adapter
-                .k_scale_array(layer)
-                .unwrap_or_else(|e| panic!("k_scale_array({layer}): {e}"));
-            let v_arr = adapter
-                .v_scale_array(layer)
-                .unwrap_or_else(|e| panic!("v_scale_array({layer}): {e}"));
-
-            assert_eq!(k_arr.ndim().unwrap(), 1);
-            assert_eq!(k_arr.shape_at(0).unwrap(), 1);
-            assert_eq!(k_arr.dtype().unwrap(), DType::Float32);
-            assert_eq!(v_arr.ndim().unwrap(), 1);
-            assert_eq!(v_arr.shape_at(0).unwrap(), 1);
-            assert_eq!(v_arr.dtype().unwrap(), DType::Float32);
-
-            let k_val = k_arr.item_at_float32(0).unwrap();
-            let v_val = v_arr.item_at_float32(0).unwrap();
-            assert_eq!(
-                k_val, expected_k,
-                "k_scale_array({layer}) must equal manager scale ({expected_k}); got {k_val}"
-            );
-            assert_eq!(
-                v_val, expected_v,
-                "v_scale_array({layer}) must equal manager scale ({expected_v}); got {v_val}"
-            );
-        }
-
-        // Cross-layer divergence: layer 0 vs layer 1 must produce DIFFERENT
-        // scale values (the placeholder regression would have made them
-        // identical at 1.0).
-        let k0 = adapter
-            .k_scale_array(0)
-            .unwrap()
-            .item_at_float32(0)
-            .unwrap();
-        let k1 = adapter
-            .k_scale_array(1)
-            .unwrap()
-            .item_at_float32(0)
-            .unwrap();
-        assert_ne!(
-            k0, k1,
-            "manager-driven k_scale must differ between layers when set_scales installed distinct \
-             values (regression: accessor ignored layer_idx)"
-        );
-
-        // The orchestration arc stays usable after `set_scale_manager`
-        // (callers retain control of the manager for warmup-pass writes).
-        // A `lock()` here verifies the adapter didn't move ownership
-        // exclusively into its own field.
-        let _guard = manager_arc.lock().expect("orchestration arc lock");
-    }
-
-    /// Clearing the scale manager via `set_scale_manager(None)`
-    /// reverts the adapter to the unit-scale fallback. This is important
-    /// for test/dev workflows that want to swap a calibrated manager out
-    /// (e.g. comparing FP8 vs. uncalibrated baseline) without recreating
-    /// the adapter.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn set_scale_manager_none_reverts_to_one() {
-        use mlx_paged_attn::metal::KvScaleManager;
-
-        let allocator = new_allocator(8, 16);
-        let Some(mut adapter) = maybe_adapter(allocator, 16) else {
-            eprintln!("skipping set_scale_manager_none_reverts_to_one: Metal unavailable");
-            return;
-        };
-
-        // First install a non-trivial manager.
-        let mut manager = KvScaleManager::new(2);
-        manager.set_scales(0, 4.0, 8.0);
-        manager.set_scales(1, 16.0, 32.0);
-        adapter.set_scale_manager(Some(Arc::new(Mutex::new(manager))));
-        assert_eq!(
-            adapter
-                .k_scale_array(0)
-                .unwrap()
-                .item_at_float32(0)
-                .unwrap(),
-            4.0_f32,
-            "manager-driven scale should be active",
-        );
-
-        // Then clear it.
-        adapter.set_scale_manager(None);
-        assert_eq!(
-            adapter
-                .k_scale_array(0)
-                .unwrap()
-                .item_at_float32(0)
-                .unwrap(),
-            1.0_f32,
-            "set_scale_manager(None) must revert to the unit-scale fallback",
-        );
-        assert_eq!(
-            adapter
-                .v_scale_array(1)
-                .unwrap()
-                .item_at_float32(0)
-                .unwrap(),
-            1.0_f32,
-            "set_scale_manager(None) must revert v_scale to 1.0 too",
-        );
-    }
-
-    /// `scale_manager()` round-trips the installed Arc so a
-    /// caller (e.g. a calibration runner that drives EMA updates from a
-    /// background task) can recover the same handle the adapter holds.
-    /// Without this accessor, a caller would either need to track the Arc
-    /// out-of-band or be locked into the construction-time installation.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn scale_manager_accessor_round_trips() {
-        use mlx_paged_attn::metal::KvScaleManager;
-
-        let allocator = new_allocator(8, 16);
-        let Some(mut adapter) = maybe_adapter(allocator, 16) else {
-            eprintln!("skipping scale_manager_accessor_round_trips: Metal unavailable");
-            return;
-        };
-
-        // No manager → accessor returns None.
-        assert!(
-            adapter.scale_manager().is_none(),
-            "scale_manager() must return None before set_scale_manager()",
-        );
-
-        // Install one and check the accessor returns a clone of the same Arc.
-        let manager = Arc::new(Mutex::new(KvScaleManager::new(2)));
-        adapter.set_scale_manager(Some(Arc::clone(&manager)));
-        let from_accessor = adapter
-            .scale_manager()
-            .expect("scale_manager() must return Some after set_scale_manager(Some(_))");
-        assert!(
-            Arc::ptr_eq(&manager, &from_accessor),
-            "scale_manager() must return a clone of the same Arc that was installed",
-        );
-
-        // Mutating through the accessor's clone is visible to subsequent
-        // adapter calls — the typical EMA / calibration flow.
-        from_accessor.lock().unwrap().set_scales(0, 7.0, 11.0);
-        let k0 = adapter
-            .k_scale_array(0)
-            .unwrap()
-            .item_at_float32(0)
-            .unwrap();
-        let v0 = adapter
-            .v_scale_array(0)
-            .unwrap()
-            .item_at_float32(0)
-            .unwrap();
-        assert_eq!(
-            k0, 7.0,
-            "mutation through scale_manager() handle must be visible to k_scale_array",
-        );
-        assert_eq!(
-            v0, 11.0,
-            "mutation through scale_manager() handle must be visible to v_scale_array",
-        );
-    }
-
-    /// `read_layer_scales` (the per-`update_keys_values` lookup)
-    /// returns `(1.0, 1.0)` when no manager is configured and returns the
-    /// per-layer scales when one is. Surfaces the same path that
-    /// [`PagedKVCacheAdapter::update_keys_values`] uses to feed
-    /// `LayerKVPool::write_kv` — keeping a unit test on this internal
-    /// helper means a regression in the manager wiring is caught without
-    /// a full kernel-dispatch test.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn read_layer_scales_falls_back_to_one_without_manager() {
-        let allocator = new_allocator(8, 16);
-        let Some(adapter) = maybe_adapter(allocator, 16) else {
-            eprintln!("skipping read_layer_scales_falls_back_to_one: Metal unavailable");
-            return;
-        };
-        let (k, v) = adapter
-            .read_layer_scales(0)
-            .expect("read_layer_scales must succeed without a manager");
-        assert_eq!(k, 1.0_f32);
-        assert_eq!(v, 1.0_f32);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn read_layer_scales_uses_manager_when_configured() {
-        use mlx_paged_attn::metal::KvScaleManager;
-
-        let allocator = new_allocator(8, 16);
-        let Some(mut adapter) = maybe_adapter(allocator, 16) else {
-            eprintln!("skipping read_layer_scales_uses_manager_when_configured: Metal unavailable");
-            return;
-        };
-
-        let mut manager = KvScaleManager::new(2);
-        manager.set_scales(0, 0.75, 0.5);
-        manager.set_scales(1, 3.0, 5.0);
-        adapter.set_scale_manager(Some(Arc::new(Mutex::new(manager))));
-
-        let (k0, v0) = adapter.read_layer_scales(0).unwrap();
-        assert_eq!(k0, 0.75);
-        assert_eq!(v0, 0.5);
-        let (k1, v1) = adapter.read_layer_scales(1).unwrap();
-        assert_eq!(k1, 3.0);
-        assert_eq!(v1, 5.0);
-    }
-
-    /// When a `KvScaleManager` is wired
-    /// into the adapter but its `Mutex` becomes poisoned, both
-    /// `k_scale_array` and `v_scale_array` MUST surface an error rather
-    /// than silently fall back to `1.0`. The previous behavior (return
-    /// `1.0` and only log via `tracing::error!`) was inconsistent with
-    /// the runtime write path (`update_keys_values` → `read_layer_scales`)
-    /// which fails closed on the same poison; that asymmetry could
-    /// silently corrupt the compiled paged graph initialization with
-    /// placeholder unit scales while the corresponding writes would have
-    /// already aborted.
-    ///
-    /// We poison the mutex by panicking inside a `lock().unwrap()` block
-    /// in a spawned thread, then assert the propagated error contains
-    /// "poisoned" so a future refactor can rely on that token in the
-    /// message.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn k_v_scale_arrays_propagate_poisoned_manager_error() {
-        use mlx_paged_attn::metal::KvScaleManager;
-        use std::thread;
-
-        let allocator = new_allocator(8, 16);
-        let Some(mut adapter) = maybe_adapter(allocator, 16) else {
-            eprintln!(
-                "skipping k_v_scale_arrays_propagate_poisoned_manager_error: Metal unavailable"
-            );
-            return;
-        };
-
-        let manager_arc = Arc::new(Mutex::new(KvScaleManager::new(2)));
-        adapter.set_scale_manager(Some(Arc::clone(&manager_arc)));
-
-        // Poison the mutex by panicking while holding the lock in a
-        // separate thread. After the panic propagates and the thread
-        // joins with `Err`, subsequent `manager_arc.lock()` calls return
-        // `Err(PoisonError)`.
-        let poisoner = Arc::clone(&manager_arc);
-        let join_result = thread::spawn(move || {
-            let _guard = poisoner.lock().expect("acquire lock pre-poison");
-            panic!("intentional panic to poison the KvScaleManager mutex");
-        })
-        .join();
-        assert!(
-            join_result.is_err(),
-            "spawned thread must have panicked to poison the mutex"
-        );
-        assert!(
-            manager_arc.lock().is_err(),
-            "mutex must be poisoned after the spawned thread's panic"
-        );
-
-        // Both accessors must propagate the poison error rather than
-        // returning a `[1.0]` placeholder. (`MxArray` doesn't implement
-        // `Debug`, so we can't use `expect_err` here — match on the
-        // returned `Result` and pull the message out manually.)
-        let k_err = match adapter.k_scale_array(0) {
-            Ok(_) => panic!("k_scale_array must surface poisoned-mutex error, got Ok"),
-            Err(e) => e,
-        };
-        assert!(
-            k_err.contains("poisoned"),
-            "k_scale_array error must mention 'poisoned' (got: {k_err})"
-        );
-        let v_err = match adapter.v_scale_array(0) {
-            Ok(_) => panic!("v_scale_array must surface poisoned-mutex error, got Ok"),
-            Err(e) => e,
-        };
-        assert!(
-            v_err.contains("poisoned"),
-            "v_scale_array error must mention 'poisoned' (got: {v_err})"
-        );
-
-        // After clearing the manager, the accessors must succeed again
-        // (the `None` branch is the only place `1.0` is allowed to be
-        // returned without a successful manager lock).
-        adapter.set_scale_manager(None);
-        let k_ok = adapter
-            .k_scale_array(0)
-            .expect("k_scale_array must succeed after set_scale_manager(None)");
-        assert_eq!(k_ok.item_at_float32(0).unwrap(), 1.0_f32);
     }
 }
 

@@ -19,13 +19,11 @@
 //! - `paged_attention_{type}_cache_{type}_hs{head}_bs{block}_nt256_nsl32_ps{partition}[_alibi]`
 
 pub(crate) mod command_buffer;
-mod kv_scale;
 mod mlx_integration;
 mod paged_attention;
 mod reshape_and_cache;
 mod state;
 
-pub use kv_scale::{KvScaleManager, KvScaleStats};
 pub use mlx_integration::{MlxMetalBuffer, is_metal_extraction_supported, synchronize_mlx};
 pub use paged_attention::{
     PagedAttentionOutput, PagedAttentionParams, PagedAttentionRouteHint,

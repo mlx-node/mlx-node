@@ -1643,10 +1643,8 @@ impl LayerKVPool {
             q_stride,
             kv_block_stride,
             kv_head_stride,
-            // Per-layer FP8 K/V scales threaded from `KvScaleManager` via
-            // `PagedKVCacheAdapter::read_layer_scales`, mirroring the write
-            // path in `LayerKVPool::write_kv`. Caller passes 1.0 when no
-            // manager is configured (non-FP8 path).
+            // Per-layer FP8 K/V scales, mirroring the write path in
+            // `LayerKVPool::write_kv`. `PagedKVCacheAdapter` passes 1.0.
             k_scale,
             v_scale,
             // 0 means full context; positive values mask K/V older than

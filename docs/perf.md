@@ -622,7 +622,7 @@ This path and its numerical regressions were not removed with the Metal shader.
 | NVFP4                      | `--q-recipe unsloth --q-mode nvfp4`; low-class FFNs use NVFP4 4/16 weight storage with standard MLX A16 quantized matmul in the fixed DGX class map                  |
 | FP8 E4M3 import            | Source `.weight_scale_inv` checkpoints are dequantized **before** expert stacking; no re-quantization after stacking                                                 |
 | Plain FP8 weights          | Unsloth DGX high class: `fp8_e4m3` raw U8 weights + per-output BF16 scales; current runtime dequantizes once to BF16 and runs A16 matmul/gather-mm (not native W8A8) |
-| FP8 KV cache               | Paged-adapter only — `KVCacheDType::Fp8` with per-layer scale management via `KvScaleManager`. FP8 KV is intentionally rejected by the flat-path attach.             |
+| FP8 KV cache               | Paged-adapter only — `KVCacheDType::Fp8` with unit (`1.0`) per-layer K/V scales (no calibration). FP8 KV is intentionally rejected by the flat-path attach.         |
 | ggml K-quants              | `--gguf-kquant` on a GGUF import; modes `q6k` / `q4k` / `q5k`. Consume-only — the bridge's `mlx_quantize` throws; producing needs ggml's `make_qkx2_quants`          |
 | Symmetric ggml Q4_0 / Q8_0 | GGUF import, automatic. `w = d*(q - Z)` has no stored offset, so `.biases` is omitted and rebuilt from `symmetric_zero_point` in `config.json`                       |
 
