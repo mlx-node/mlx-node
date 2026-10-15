@@ -21,11 +21,11 @@ fn slice_last_dim(x: &MxArray, start: i64, stop: i64) -> Result<MxArray> {
     MxArray::from_handle(handle, "slice_last_dim")
 }
 
-/// Apply 2D multidimensional RoPE (or 1D fallback) to `inputs`.
+/// Apply 2D multidimensional RoPE to `inputs`.
 ///
 /// # Arguments
 /// - `inputs` — `[B, L, N_heads, head_dim]`
-/// - `positions` — `[B, L, 2]` for 2D spatial RoPE, or `[B, L]` for 1D fallback
+/// - `positions` — `[B, L, 2]` spatial positions
 /// - `base_frequency` — RoPE base (default 100.0 for the vision encoder)
 pub fn apply_multidimensional_rope(
     inputs: &MxArray,
@@ -34,38 +34,10 @@ pub fn apply_multidimensional_rope(
 ) -> Result<MxArray> {
     let head_dim = inputs.shape_at(inputs.ndim()? - 1)?;
     let pos_ndim = positions.ndim()?;
-
-    if pos_ndim == 2 {
-        // 1D fallback: positions is [B, L]
-        let half = head_dim / 2;
-
-        let freq_exponents = {
-            let exps = MxArray::arange(0.0, half as f64, None, Some(DType::Float32))?;
-            exps.mul_scalar(2.0 / head_dim as f64)?
-        };
-        let base = MxArray::scalar_float(base_frequency)?;
-        let timescale = base.power(&freq_exponents)?;
-
-        // positions: [B, L] -> [B, L, 1]
-        let pos_f32 = positions.astype(DType::Float32)?;
-        let pos_exp = pos_f32.expand_dims(-1)?;
-        let sinusoid_inp = pos_exp.div(&timescale)?;
-
-        let cos_val = sinusoid_inp.cos()?;
-        let sin_val = sinusoid_inp.sin()?;
-
-        // [B, L, half] -> [B, L, head_dim]
-        let cos_val = MxArray::concatenate(&cos_val, &cos_val, -1)?;
-        let sin_val = MxArray::concatenate(&sin_val, &sin_val, -1)?;
-
-        // Cast to inputs dtype and expand for N_heads: [B, L, 1, head_dim]
-        let in_dtype = inputs.dtype()?;
-        let cos_val = cos_val.astype(in_dtype)?.expand_dims(2)?;
-        let sin_val = sin_val.astype(in_dtype)?.expand_dims(2)?;
-
-        let rotated = rotate_half(inputs)?;
-        let result = inputs.mul(&cos_val)?.add(&rotated.mul(&sin_val)?)?;
-        return Ok(result);
+    if pos_ndim != 3 {
+        return Err(Error::from_reason(format!(
+            "apply_multidimensional_rope: expected positions of rank 3 [B, L, 2], got rank {pos_ndim}"
+        )));
     }
 
     // 2D RoPE: positions is [B, L, 2]
