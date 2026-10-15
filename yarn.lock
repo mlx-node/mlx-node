@@ -51,82 +51,82 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-darwin-arm64@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-darwin-arm64@npm:0.50.0"
+"@ast-grep/napi-darwin-arm64@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-darwin-arm64@npm:0.51.0"
   conditions: os=darwin & cpu=arm64
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-darwin-x64@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-darwin-x64@npm:0.50.0"
+"@ast-grep/napi-darwin-x64@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-darwin-x64@npm:0.51.0"
   conditions: os=darwin & cpu=x64
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-linux-arm64-gnu@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-linux-arm64-gnu@npm:0.50.0"
+"@ast-grep/napi-linux-arm64-gnu@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-linux-arm64-gnu@npm:0.51.0"
   conditions: os=linux & cpu=arm64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-linux-arm64-musl@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-linux-arm64-musl@npm:0.50.0"
+"@ast-grep/napi-linux-arm64-musl@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-linux-arm64-musl@npm:0.51.0"
   conditions: os=linux & cpu=arm64 & libc=musl
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-linux-x64-gnu@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-linux-x64-gnu@npm:0.50.0"
+"@ast-grep/napi-linux-x64-gnu@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-linux-x64-gnu@npm:0.51.0"
   conditions: os=linux & cpu=x64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-linux-x64-musl@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-linux-x64-musl@npm:0.50.0"
+"@ast-grep/napi-linux-x64-musl@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-linux-x64-musl@npm:0.51.0"
   conditions: os=linux & cpu=x64 & libc=musl
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-win32-arm64-msvc@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-win32-arm64-msvc@npm:0.50.0"
+"@ast-grep/napi-win32-arm64-msvc@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-win32-arm64-msvc@npm:0.51.0"
   conditions: os=win32 & cpu=arm64
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-win32-ia32-msvc@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-win32-ia32-msvc@npm:0.50.0"
+"@ast-grep/napi-win32-ia32-msvc@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-win32-ia32-msvc@npm:0.51.0"
   conditions: os=win32 & cpu=ia32
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-win32-x64-msvc@npm:0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi-win32-x64-msvc@npm:0.50.0"
+"@ast-grep/napi-win32-x64-msvc@npm:0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi-win32-x64-msvc@npm:0.51.0"
   conditions: os=win32 & cpu=x64
   languageName: node
   linkType: hard
 
-"@ast-grep/napi@npm:^0.50.0":
-  version: 0.50.0
-  resolution: "@ast-grep/napi@npm:0.50.0"
+"@ast-grep/napi@npm:^0.51.0":
+  version: 0.51.0
+  resolution: "@ast-grep/napi@npm:0.51.0"
   dependencies:
-    "@ast-grep/napi-darwin-arm64": "npm:0.50.0"
-    "@ast-grep/napi-darwin-x64": "npm:0.50.0"
-    "@ast-grep/napi-linux-arm64-gnu": "npm:0.50.0"
-    "@ast-grep/napi-linux-arm64-musl": "npm:0.50.0"
-    "@ast-grep/napi-linux-x64-gnu": "npm:0.50.0"
-    "@ast-grep/napi-linux-x64-musl": "npm:0.50.0"
-    "@ast-grep/napi-win32-arm64-msvc": "npm:0.50.0"
-    "@ast-grep/napi-win32-ia32-msvc": "npm:0.50.0"
-    "@ast-grep/napi-win32-x64-msvc": "npm:0.50.0"
+    "@ast-grep/napi-darwin-arm64": "npm:0.51.0"
+    "@ast-grep/napi-darwin-x64": "npm:0.51.0"
+    "@ast-grep/napi-linux-arm64-gnu": "npm:0.51.0"
+    "@ast-grep/napi-linux-arm64-musl": "npm:0.51.0"
+    "@ast-grep/napi-linux-x64-gnu": "npm:0.51.0"
+    "@ast-grep/napi-linux-x64-musl": "npm:0.51.0"
+    "@ast-grep/napi-win32-arm64-msvc": "npm:0.51.0"
+    "@ast-grep/napi-win32-ia32-msvc": "npm:0.51.0"
+    "@ast-grep/napi-win32-x64-msvc": "npm:0.51.0"
   dependenciesMeta:
     "@ast-grep/napi-darwin-arm64":
       optional: true
@@ -146,7 +146,7 @@ __metadata:
       optional: true
     "@ast-grep/napi-win32-x64-msvc":
       optional: true
-  checksum: 10c0/6f7df983ec57f8bd716efc59318ca198cff012fb8490879f629f64b6f77752b8c4989123e62345dc5298e83e25fb0de6fbe89d91c8df7ec0798e19a9d2174915
+  checksum: 10c0/ec059275bf829656f4464738d634c7f6719d81b09008695b15f6ac6e8cf33dec2d516c8f73b368451113c02571e17e2a8917bb50410e2bdad73650c7cdf269b3
   languageName: node
   linkType: hard
 
@@ -7396,7 +7396,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "mlx-node@workspace:."
   dependencies:
-    "@ast-grep/napi": "npm:^0.50.0"
+    "@ast-grep/napi": "npm:^0.51.0"
     "@mlx-node/asr": "workspace:*"
     "@mlx-node/cli": "workspace:*"
     "@mlx-node/internal-tools": "workspace:*"
