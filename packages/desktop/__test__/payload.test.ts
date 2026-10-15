@@ -27,7 +27,6 @@ import { PayloadError, checkAddonMinOs, checkMetallibPair } from '../scripts/pay
 const PAGED_KERNELS = [
   'paged_attention_bfloat16_t_cache_bfloat16_t_hs128_bs16_nt256_nsl32_ps0',
   'reshape_and_cache_kv_bfloat16_t_cache_bfloat16_t',
-  'copy_blocks_bfloat16_t',
 ];
 const MLX_BASE = [...BASE_KERNEL_MARKERS];
 const MLX_NAX = [...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS, ...NAX_KERNEL_MARKERS];
