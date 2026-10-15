@@ -285,24 +285,6 @@ where
         .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
 }
 
-/// Send a command and block until the response arrives.
-///
-/// Use this from synchronous NAPI methods (e.g. training ops that must
-/// run sequentially). Same pattern as [`send_and_await`] but calls
-/// `blocking_recv()` instead of `.await`.
-pub fn send_and_block<Cmd, T, F, C>(thread: &ModelThread<Cmd>, make_cmd: F) -> napi::Result<T>
-where
-    Cmd: Send + 'static,
-    T: Send + 'static,
-    F: FnOnce(ResponseTx<T>) -> C,
-    C: Into<Cmd>,
-{
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    thread.send(make_cmd(tx))?;
-    rx.blocking_recv()
-        .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
-}
-
 #[cfg(test)]
 mod tests {
     use super::{LoopControl, ModelThread, ResponseTx, send_and_await, stream_channel};
@@ -460,7 +442,7 @@ mod tests {
     /// H1a shape pin: a reset-style command queued behind an in-flight
     /// turn must park a *future*, never the calling thread. This is the
     /// dispatch shape `chat_napi_thread_reset!` uses via
-    /// [`send_and_await`] — the old `send_and_block` path would freeze
+    /// [`send_and_await`] — a blocking `blocking_recv()` dispatch would freeze
     /// the caller (the Node event loop in production) on the first
     /// `poll`-equivalent instead of returning `Pending`.
     ///
@@ -517,8 +499,8 @@ mod tests {
             futures::pin_mut!(reset);
 
             // Queued behind the occupied turn: polling returns Pending
-            // instead of blocking the calling thread (`send_and_block`
-            // would never return here).
+            // instead of blocking the calling thread (a `blocking_recv()`
+            // dispatch would never return here).
             assert!(
                 futures::poll!(reset.as_mut()).is_pending(),
                 "reset resolved while the in-flight turn still held the model thread"
