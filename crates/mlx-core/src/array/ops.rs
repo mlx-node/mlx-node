@@ -352,35 +352,6 @@ impl MxArray {
         MxArray::from_handle(handle, "isfinite")
     }
 
-    /// Check if array contains any NaN values (GPU-native)
-    ///
-    /// Returns true if any element is NaN. Uses GPU reduction instead of
-    /// transferring entire array to CPU for checking.
-    /// Only transfers a single scalar value (4 bytes).
-    pub fn has_nan(&self) -> Result<bool> {
-        let nan_mask = self.isnan()?;
-        // Cast bool to int32 and sum - if sum > 0, there's at least one NaN
-        let nan_int = nan_mask.astype(DType::Int32)?;
-        let sum = nan_int.sum(None, None)?;
-        sum.eval();
-        let count = sum.item_at_int32(0)?;
-        Ok(count > 0)
-    }
-
-    /// Check if array contains any Inf values (GPU-native)
-    ///
-    /// Returns true if any element is +Inf or -Inf. Uses GPU reduction instead of
-    /// transferring entire array to CPU for checking.
-    /// Only transfers a single scalar value (4 bytes).
-    pub fn has_inf(&self) -> Result<bool> {
-        let inf_mask = self.isinf()?;
-        let inf_int = inf_mask.astype(DType::Int32)?;
-        let sum = inf_int.sum(None, None)?;
-        sum.eval();
-        let count = sum.item_at_int32(0)?;
-        Ok(count > 0)
-    }
-
     /// Detach tensor from the computation graph (no gradients flow through).
     /// Used for MoE routing indices during training.
     pub fn stop_gradient(&self) -> Result<MxArray> {
