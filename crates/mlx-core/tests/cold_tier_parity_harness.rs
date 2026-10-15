@@ -284,10 +284,6 @@ pub struct ColdTierParitySpec {
     /// `paged_cache_memory_mb` forced into both clones — bounded so the test
     /// stays light.
     pub pool_memory_mb: u32,
-    /// Extra `config.json` overrides applied on top of the fixed set
-    /// (`use_block_paged_cache`, `persist_paged_cache`, `paged_cache_memory_mb`,
-    /// `paged_block_size`) for families that need more to reach the paged path.
-    pub extra_config: Vec<(String, serde_json::Value)>,
     /// Single-turn prompt run by the warm-up turns and by instance 1 (capture).
     /// Also by instances 2 and 3 unless [`Self::restore_prompt`] is set.
     pub prompt: &'static str,
@@ -365,7 +361,6 @@ impl ColdTierParitySpec {
             model_path_env: "MLX_TEST_MODEL_PATH",
             block_size: DEFAULT_BLOCK_SIZE,
             pool_memory_mb: 256,
-            extra_config: Vec::new(),
             prompt: DEFAULT_PROMPT,
             restore_prompt: None,
             max_new_tokens: 32,
@@ -380,17 +375,6 @@ impl ColdTierParitySpec {
     /// See [`Self::expect_sidecar_install`].
     pub fn expecting_sidecar_install(mut self) -> Self {
         self.expect_sidecar_install = true;
-        self
-    }
-
-    /// Add one `config.json` override applied to both clones.
-    pub fn with_config(mut self, key: &str, value: serde_json::Value) -> Self {
-        self.extra_config.push((key.to_string(), value));
-        self
-    }
-
-    pub fn with_block_size(mut self, block_size: u32) -> Self {
-        self.block_size = block_size;
         self
     }
 
@@ -589,9 +573,6 @@ fn clone_model_dir(
         // size the restore assertion is stated in terms of.
         cfg["paged_cache_memory_mb"] = serde_json::Value::from(spec.pool_memory_mb);
         cfg["paged_block_size"] = serde_json::Value::from(spec.block_size);
-        for (key, value) in &spec.extra_config {
-            cfg[key.as_str()] = value.clone();
-        }
         let pretty = serde_json::to_string_pretty(&cfg)
             .map_err(|e| format!("serialize config.json: {e}"))?;
         fs::write(&cfg_path, pretty)
