@@ -657,19 +657,6 @@ export class SFTTrainer {
   }
 
   /**
-   * Get the underlying model for inference
-   */
-  getModel(): TrainableModel {
-    if (this.model instanceof Qwen35MoeModel) {
-      return this.engine.getQwen35MoeModel();
-    }
-    if (this.model instanceof Qwen35Model) {
-      return this.engine.getQwen35Model();
-    }
-    return this.engine.getModel();
-  }
-
-  /**
    * Get the tokenizer
    */
   getTokenizer(): Qwen3Tokenizer {
