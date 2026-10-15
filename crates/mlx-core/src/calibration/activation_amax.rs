@@ -78,8 +78,7 @@ impl ActivationAmaxCollector {
     /// CALLING thread is armed ([`Self::arm_current_thread`]).
     ///
     /// `max|x|` is the scalar reduction `x.abs().max()` (all axes), read as f32
-    /// — the same `abs -> max -> item` sequence the KV-scale calibrator uses
-    /// (`crates/mlx-paged-attn/src/metal/kv_scale.rs:187`). The merge keeps the
+    /// via an `abs -> max -> item` sequence. The merge keeps the
     /// running maximum per key (inserts when absent).
     ///
     /// The fold is NON-FINITE-PRESERVING: once a key has seen an inf/NaN sample it
