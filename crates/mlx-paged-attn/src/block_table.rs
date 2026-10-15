@@ -122,37 +122,6 @@ impl SequenceBlockTable {
         self.blocks.iter().map(|b| b.block_id).collect()
     }
 
-    /// Check if the last block is full
-    pub fn is_last_block_full(&self) -> bool {
-        let tokens_in_last_block = self.num_tokens % self.block_size;
-        tokens_in_last_block == 0 && self.num_tokens > 0
-    }
-
-    /// Get the number of free slots in the last block
-    pub fn free_slots_in_last_block(&self) -> u32 {
-        if self.blocks.is_empty() {
-            0
-        } else {
-            let tokens_in_last_block = self.num_tokens % self.block_size;
-            if tokens_in_last_block == 0 && self.num_tokens > 0 {
-                0 // Block is full
-            } else {
-                self.block_size - tokens_in_last_block
-            }
-        }
-    }
-
-    /// Calculate how many new blocks are needed for additional tokens
-    pub fn blocks_needed(&self, new_tokens: u32) -> u32 {
-        let free_slots = self.free_slots_in_last_block();
-        if new_tokens <= free_slots {
-            0
-        } else {
-            let remaining = new_tokens - free_slots;
-            remaining.div_ceil(self.block_size)
-        }
-    }
-
     /// Calculate the slot index for a given token position
     pub fn slot_index(&self, token_pos: u32) -> (u32, u32) {
         let block_idx = token_pos / self.block_size;
@@ -193,15 +162,7 @@ mod tests {
 
         // Add tokens
         table.set_num_tokens(20);
-        assert!(!table.is_last_block_full());
-        assert_eq!(table.free_slots_in_last_block(), 12);
-        assert_eq!(table.blocks_needed(10), 0); // Fits in current block
-        assert_eq!(table.blocks_needed(15), 1); // Needs one more block
-
-        // Fill the block
-        table.set_num_tokens(32);
-        assert!(table.is_last_block_full());
-        assert_eq!(table.free_slots_in_last_block(), 0);
+        assert_eq!(table.num_tokens(), 20);
     }
 
     #[test]
