@@ -155,8 +155,7 @@ describe('ingestTraces', () => {
   /**
    * The ingest mapping is written one line per column, so a field the agent
    * emits and this list forgets is dropped in silence — which is what happened
-   * to seven of the eight `coldSidecar*` counters (only `restoreSuppressed` was
-   * mapped). `coldSidecarInstalled` is the one that cannot be re-derived from
+   * to the `coldSidecar*` counters. `coldSidecarInstalled` is the one that cannot be re-derived from
    * anything else in the row: every `install_*_cold_sidecar` early-return falls
    * through to a full O(prefix) replay that produces CORRECT state, so a
    * regression from "restored and used" to "restored and silently re-derived"
@@ -167,7 +166,7 @@ describe('ingestTraces', () => {
    * subsets, so a column wired to its neighbour — or to the block counter that
    * shares its name — cannot round-trip.
    */
-  it('stores every cold sidecar counter, not just the suppressed one', async () => {
+  it('stores every cold sidecar counter', async () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, '2026-07-27-sidecar.jsonl'),
@@ -193,7 +192,6 @@ describe('ingestTraces', () => {
         coldSidecarEnqueued: 15,
         coldSidecarQueueDrops: 16,
         coldSidecarInstalled: 17,
-        coldSidecarRestoreSuppressed: 18,
       })}\n`,
     );
     await ingestTraces(dash, dir);
@@ -207,7 +205,6 @@ describe('ingestTraces', () => {
     expect(row.coldSidecarEnqueued).toBe(15);
     expect(row.coldSidecarQueueDrops).toBe(16);
     expect(row.coldSidecarInstalled).toBe(17);
-    expect(row.coldSidecarRestoreSuppressed).toBe(18);
   });
 
   // A record from a build that predates the sidecar counters must ingest them as
@@ -219,7 +216,6 @@ describe('ingestTraces', () => {
     const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-bbb')).all()[0];
     expect(row.coldSidecarCaptureReached).toBeNull();
     expect(row.coldSidecarInstalled).toBeNull();
-    expect(row.coldSidecarRestoreSuppressed).toBeNull();
   });
 
   // Finding #7: older JSONL without the new fields ingests them as NULL, not 0.

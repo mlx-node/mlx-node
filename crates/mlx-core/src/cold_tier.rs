@@ -248,19 +248,6 @@ pub struct ColdSidecarTelemetry {
     /// "restored and used" to "restored and re-derived from scratch" is
     /// invisible, and that regression is the whole feature.
     pub installed: u64,
-    /// Restores a family THREW AWAY after the walk had already served them.
-    ///
-    /// The second read-side counter, and a different event from
-    /// `ColdCacheStats::restore_declines`: there the walk refused to hand
-    /// anything back, here it handed something back and the family released it
-    /// and restarted the turn cold (gemma4's large-sliding suppression, which
-    /// does a `release_request` + `reset_for_new_request` + forced-miss
-    /// re-lookup). Both end at "the prefix was recomputed", so they are
-    /// indistinguishable downstream — and only this one is preceded by real
-    /// `hits` and `bytes_restored`, which is what makes it look like reuse
-    /// worked. Split from the walk's counter so a suppression that starts
-    /// firing on every turn cannot hide inside a decline count.
-    pub restore_suppressed: u64,
 }
 
 /// The counters behind [`ColdSidecarTelemetry`].
@@ -277,7 +264,6 @@ pub struct ColdSidecarCounters {
     enqueued: AtomicU64,
     queue_drops: AtomicU64,
     installed: AtomicU64,
-    restore_suppressed: AtomicU64,
 }
 
 impl ColdSidecarCounters {
@@ -290,7 +276,6 @@ impl ColdSidecarCounters {
             enqueued: AtomicU64::new(0),
             queue_drops: AtomicU64::new(0),
             installed: AtomicU64::new(0),
-            restore_suppressed: AtomicU64::new(0),
         }
     }
 
@@ -335,16 +320,6 @@ impl ColdSidecarCounters {
         self.installed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a restored prefix a family discarded rather than reuse.
-    ///
-    /// Recorded at the point the family commits to the discard — after the
-    /// decision to suppress is final and before the adapter is reset — so a
-    /// turn that merely evaluated the suppression rule and kept its prefix
-    /// never lands here.
-    pub fn record_restore_suppressed(&self) {
-        self.restore_suppressed.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn snapshot(&self) -> ColdSidecarTelemetry {
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
         ColdSidecarTelemetry {
@@ -355,7 +330,6 @@ impl ColdSidecarCounters {
             enqueued: load(&self.enqueued),
             queue_drops: load(&self.queue_drops),
             installed: load(&self.installed),
-            restore_suppressed: load(&self.restore_suppressed),
         }
     }
 }
@@ -1106,11 +1080,6 @@ pub struct ColdSidecarStatsJs {
     /// O(prefix) replay" — every other counter, and text parity itself, is
     /// satisfied by the replay.
     pub installed: f64,
-    /// Restores a family THREW AWAY after the walk served them, restarting the
-    /// turn cold. Unlike `ColdCacheStats.restoreDeclines` this one comes AFTER
-    /// real `coldHits` and `coldBytesRestored`, so the turn looks like it
-    /// reused a prefix right up to the point where it recomputed all of it.
-    pub restore_suppressed: f64,
 }
 
 /// Return the process-wide sidecar counters. Unlike [`cold_cache_stats`] this
@@ -1132,7 +1101,6 @@ pub fn cold_sidecar_stats() -> ColdSidecarStatsJs {
         enqueued,
         queue_drops,
         installed,
-        restore_suppressed,
     } = cold_sidecar_telemetry();
     ColdSidecarStatsJs {
         capture_reached: capture_reached as f64,
@@ -1142,7 +1110,6 @@ pub fn cold_sidecar_stats() -> ColdSidecarStatsJs {
         enqueued: enqueued as f64,
         queue_drops: queue_drops as f64,
         installed: installed as f64,
-        restore_suppressed: restore_suppressed as f64,
     }
 }
 
@@ -2091,22 +2058,6 @@ mod tests {
                 enqueued: 1,
                 queue_drops: 1,
                 installed: 1,
-                ..Default::default()
-            }
-        );
-
-        counters.record_restore_suppressed();
-        assert_eq!(
-            counters.snapshot(),
-            ColdSidecarTelemetry {
-                capture_reached: 1,
-                chain_empty: 1,
-                boundary_skips: 1,
-                already_persisted: 1,
-                enqueued: 1,
-                queue_drops: 1,
-                installed: 1,
-                restore_suppressed: 1,
             }
         );
     }
@@ -2159,9 +2110,6 @@ mod tests {
         for _ in 0..7 {
             counters.record_install();
         }
-        for _ in 0..8 {
-            counters.record_restore_suppressed();
-        }
         let after = cold_sidecar_stats();
         assert_eq!(after.capture_reached - before.capture_reached, 1.0);
         assert_eq!(after.chain_empty - before.chain_empty, 2.0);
@@ -2170,7 +2118,6 @@ mod tests {
         assert_eq!(after.enqueued - before.enqueued, 5.0);
         assert_eq!(after.queue_drops - before.queue_drops, 6.0);
         assert_eq!(after.installed - before.installed, 7.0);
-        assert_eq!(after.restore_suppressed - before.restore_suppressed, 8.0);
 
         // …and it must agree with the plain-Rust reader the parity harness
         // uses, so the two can never report different truths about the same
@@ -2184,10 +2131,6 @@ mod tests {
         assert_eq!(mirror.enqueued, telemetry.enqueued as f64);
         assert_eq!(mirror.queue_drops, telemetry.queue_drops as f64);
         assert_eq!(mirror.installed, telemetry.installed as f64);
-        assert_eq!(
-            mirror.restore_suppressed,
-            telemetry.restore_suppressed as f64
-        );
     }
 
     /// A real manager, a real write failure, and the counter read back through

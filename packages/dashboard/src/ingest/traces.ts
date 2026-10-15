@@ -57,7 +57,6 @@ interface ParsedTrace {
   coldSidecarEnqueued?: unknown;
   coldSidecarQueueDrops?: unknown;
   coldSidecarInstalled?: unknown;
-  coldSidecarRestoreSuppressed?: unknown;
 }
 
 const DAY_MS = 86_400_000;
@@ -329,8 +328,7 @@ export async function ingestTraces(
             coldWriteErrors: numOrNull(trace.coldWriteErrors),
             coldWriteErrorsTotal: numOrNull(trace.coldWriteErrorsTotal),
             coldRestoreDeclines: numOrNull(trace.coldRestoreDeclines),
-            // All eight `ColdSidecarStats` counters, not just the suppressed
-            // one: this mapping is written a line per column, so a field the
+            // All seven `ColdSidecarStats` counters: this mapping is written a line per column, so a field the
             // agent emits and this list forgets is discarded in silence — and
             // `coldSidecarInstalled` is the one nothing else can stand in for.
             // Every `install_*_cold_sidecar` early-return falls through to a
@@ -344,7 +342,6 @@ export async function ingestTraces(
             coldSidecarEnqueued: numOrNull(trace.coldSidecarEnqueued),
             coldSidecarQueueDrops: numOrNull(trace.coldSidecarQueueDrops),
             coldSidecarInstalled: numOrNull(trace.coldSidecarInstalled),
-            coldSidecarRestoreSuppressed: numOrNull(trace.coldSidecarRestoreSuppressed),
             sourceFile: name,
           })
           .onConflictDoNothing()

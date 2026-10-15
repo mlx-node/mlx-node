@@ -718,7 +718,7 @@ ColdCacheStats    coldCacheStats()     hits misses enqueued queueDrops bytesWrit
 
 ColdSidecarStats  coldSidecarStats()   captureReached chainEmpty boundarySkips
   (out-of-pool                         alreadyPersisted enqueued queueDrops installed
-   state)                              restoreSuppressed
+   state)
         │
         └── per-turn delta ──> ~/.mlx-node/metrics/traces/<date>-<pid>.jsonl
                                cold<Field> / coldSidecar<Field>

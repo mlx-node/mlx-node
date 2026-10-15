@@ -167,7 +167,7 @@ describe('dashboard db', () => {
     const seed = openDashboardDb(file);
     seed.close();
     const bump = new DatabaseSync(file);
-    bump.exec('PRAGMA user_version = 8;'); // > SCHEMA_VERSION (7)
+    bump.exec('PRAGMA user_version = 9;'); // > SCHEMA_VERSION (8)
     bump.close();
 
     const dash = openDashboardDb(file);
@@ -190,7 +190,7 @@ describe('dashboard db', () => {
     const raw = new DatabaseSync(file);
     // Everything complete except the single dropped column under test.
     raw.exec([fixtureTable('traces', traces, ['source_file']), fixtureTable('trace_files', traceFiles)].join('\n'));
-    raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.source_file']);
 
@@ -221,7 +221,7 @@ describe('dashboard db', () => {
     const raw = new DatabaseSync(file);
     // Every other table complete; NO traces table at all.
     raw.exec(fixtureTable('trace_files', traceFiles));
-    raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces']);
 
@@ -247,7 +247,7 @@ describe('dashboard db', () => {
     const raw = new DatabaseSync(file);
     // traces is missing the `model` column; every other table is complete.
     raw.exec([fixtureTable('traces', traces, ['model']), fixtureTable('trace_files', traceFiles)].join('\n'));
-    raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.model']);
 
@@ -282,7 +282,7 @@ describe('dashboard db', () => {
         `CREATE VIEW traces AS SELECT ${columnNames(traces).join(', ')} FROM traces_backing;`,
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces']);
 
@@ -318,7 +318,7 @@ describe('dashboard db', () => {
         `CREATE VIRTUAL TABLE traces USING fts5(${columnNames(traces).join(', ')});`,
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces']);
 
@@ -349,7 +349,7 @@ describe('dashboard db', () => {
     raw.exec(
       [fixtureTable('traces', traces, ['queue_ms', 'resident']), fixtureTable('trace_files', traceFiles)].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.queue_ms', 'traces.resident']);
 
@@ -393,7 +393,7 @@ describe('dashboard db', () => {
     const raw = new DatabaseSync(file);
     // Full traces, but NO trace_files watermark table.
     raw.exec(fixtureTable('traces', traces));
-    raw.exec('PRAGMA user_version = 7;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['trace_files']);
 
@@ -445,7 +445,7 @@ describe('dashboard db', () => {
       );`,
     );
     raw.exec("INSERT INTO traces (trace_id, ts, cold_hits) VALUES ('legacy-1', 1, 7);");
-    raw.exec('PRAGMA user_version = 2;'); // five SCHEMA_VERSIONs back
+    raw.exec('PRAGMA user_version = 2;'); // six SCHEMA_VERSIONs back
     raw.close();
 
     // Opening does not throw and does not wedge: quarantine + rebuild.
@@ -474,7 +474,6 @@ describe('dashboard db', () => {
         coldWriteErrors: 5,
         coldWriteErrorsTotal: 6,
         coldRestoreDeclines: 7,
-        coldSidecarRestoreSuppressed: 8,
         // The sidecar counters. Distinct values again, and distinct from the
         // object-scoped `coldEnqueued` (4) and `coldQueueDrops` (1) they are a
         // subset of — so a column wired to its block-level namesake cannot
@@ -501,7 +500,6 @@ describe('dashboard db', () => {
     expect(rows[0].coldWriteErrors).toBe(5);
     expect(rows[0].coldWriteErrorsTotal).toBe(6);
     expect(rows[0].coldRestoreDeclines).toBe(7);
-    expect(rows[0].coldSidecarRestoreSuppressed).toBe(8);
     expect(rows[0].coldSidecarCaptureReached).toBe(9);
     expect(rows[0].coldSidecarChainEmpty).toBe(10);
     expect(rows[0].coldSidecarBoundarySkips).toBe(11);
@@ -519,7 +517,7 @@ describe('dashboard db', () => {
     // live schema via `fixtureTable`, so a new column lands in all of them at
     // once and each keeps exactly the one gap `expectFixtureGaps` pins.
     const uv = first.sqlite.prepare('PRAGMA user_version').get() as { user_version: number };
-    expect(uv.user_version).toBe(7);
+    expect(uv.user_version).toBe(8);
     first.close();
 
     // Reopening the rebuilt file validates in place: no second quarantine.

@@ -734,9 +734,6 @@ fn sidecar_telemetry_delta(
         enqueued: after.enqueued.saturating_sub(before.enqueued),
         queue_drops: after.queue_drops.saturating_sub(before.queue_drops),
         installed: after.installed.saturating_sub(before.installed),
-        restore_suppressed: after
-            .restore_suppressed
-            .saturating_sub(before.restore_suppressed),
     }
 }
 
@@ -1056,8 +1053,7 @@ where
     let sidecar_delta = sidecar_telemetry_delta(&sidecar_before, &sidecar_after);
     eprintln!(
         "[{}] sidecar telemetry over instances 1+2: capture_reached={} chain_empty={} \
-         boundary_skips={} already_persisted={} enqueued={} queue_drops={} installed={} \
-         restore_suppressed={}",
+         boundary_skips={} already_persisted={} enqueued={} queue_drops={} installed={}",
         spec.family,
         sidecar_delta.capture_reached,
         sidecar_delta.chain_empty,
@@ -1065,8 +1061,7 @@ where
         sidecar_delta.already_persisted,
         sidecar_delta.enqueued,
         sidecar_delta.queue_drops,
-        sidecar_delta.installed,
-        sidecar_delta.restore_suppressed
+        sidecar_delta.installed
     );
 
     // ---- 1b-diagnostic. The ladder, printed BEFORE any assertion ----------

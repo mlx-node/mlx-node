@@ -73,7 +73,6 @@ export const COLD_SIDECAR_FIELDS = [
   'coldSidecarEnqueued',
   'coldSidecarQueueDrops',
   'coldSidecarInstalled',
-  'coldSidecarRestoreSuppressed',
 ] as const;
 
 /** Every cold-tier per-turn delta field, in native-struct order. */
@@ -292,17 +291,6 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
    * `coldCorruptions` and the output text are all identical either way.
    */
   coldSidecarInstalled?: number;
-  /**
-   * Restored prefixes a family THREW AWAY this turn, releasing the request and
-   * restarting the turn cold (gemma4's large-sliding-restore suppression).
-   *
-   * A different event from {@link coldRestoreDeclines}: there the walk refused
-   * to serve anything, here it served and the family discarded it. This one is
-   * therefore preceded by real `coldHits` and `coldBytesRestored`, so the turn
-   * reads as successful reuse right up to the point where it recomputes the
-   * whole prompt anyway.
-   */
-  coldSidecarRestoreSuppressed?: number;
 }
 
 export type MetricsTraceInput = Omit<MetricsTraceRecord, 'v'>;

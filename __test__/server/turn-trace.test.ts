@@ -50,7 +50,6 @@ function sidecarStats(overrides: Partial<ColdSidecarStats> = {}): ColdSidecarSta
     enqueued: 3,
     queueDrops: 0,
     installed: 4,
-    restoreSuppressed: 0,
     ...overrides,
   };
 }
