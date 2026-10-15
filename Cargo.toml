@@ -51,3 +51,13 @@ mlx-tts = { path = "crates/mlx-tts" }
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The test suite's cost is host-side f64 reference loops and synthetic weight
+# generation (K-quant parity gates, int8 SDPA references, retention
+# simulations), not GPU work: the MLX C++ side is always built Release. At
+# opt-level 0 those loops dominate CI (one unit test = 336 s; the K-quant
+# integration binaries = 92% of their job). Measured on the hot tests:
+# 255 s -> 34 s and 253 s -> 30 s for ~1.5x the mlx-core compile time.
+# Debug assertions and overflow checks stay on (inherited from `dev`).
+[profile.test]
+opt-level = 2
