@@ -952,6 +952,7 @@ fn resolve_mlx_source(
         "MLX_PREBUILT",
         "MLX_PREBUILT_DIR",
         "MLX_PREBUILT_EXPORT",
+        "MLX_PREBUILT_PROBE",
         "MLX_PREBUILT_CACHE_DIR",
     ] {
         println!("cargo:rerun-if-env-changed={key}");
@@ -1326,6 +1327,21 @@ fn main() -> io::Result<()> {
                 let build_key = prebuilt_build_key(&manifest_dir, &portable)
                     .unwrap_or_else(|error| panic!("mlx-sys: prebuilt build key: {error}"));
                 let tag = release_tag_for(&commit, &build_key);
+                // Probe: the release workflow asks for the tag BEFORE paying
+                // for the cmake build, so it can skip a run whose release
+                // already exists. mlx-sys is an rlib, so stopping here with
+                // no link directives still lets `cargo build -p mlx-sys`
+                // succeed; MLX_PREBUILT_PROBE is rerun-if-env-changed, so
+                // the next real build re-runs this script.
+                if let Some(probe) = env_non_empty("MLX_PREBUILT_PROBE") {
+                    let json = format!(
+                        "{{\n  \"mlx_commit\": \"{commit}\",\n  \"build_key\": \"{build_key}\",\n  \"release_tag\": \"{tag}\"\n}}\n"
+                    );
+                    std::fs::write(&probe, json)
+                        .unwrap_or_else(|error| panic!("mlx-sys: write {probe}: {error}"));
+                    println!("cargo:warning=mlx-sys: MLX_PREBUILT_PROBE wrote {tag} to {probe}; not building");
+                    std::process::exit(0);
+                }
                 (dir, commit, build_key, tag)
             });
             let (dst, defines, sentinel) = build_mlx_from_source(

@@ -21,8 +21,8 @@ name: MLX Prebuilt
 #      green either way.
 #
 # Releases are IMMUTABLE by default: if the tag already carries the asset
-# nothing is uploaded (checked after the build, since the tag needs the
-# build key). `force_reupload` re-publishes over an existing tag.
+# nothing is built or uploaded (the tag is probed from build.rs in seconds,
+# before the cmake build). `force_reupload` re-publishes over an existing tag.
 on:
   workflow_dispatch:
     inputs:
@@ -97,25 +97,22 @@ jobs:
           echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
           chmod 600 ~/.netrc
 
-      # `cargo build -p mlx-sys` is enough to run build.rs end to end (no NAPI
-      # addon involved). MLX_PREBUILT=0 forces the source cmake build and
-      # MLX_PREBUILT_EXPORT makes build.rs copy the finished artifact set
-      # (lib/libmlx.a, lib/libjaccl.a, lib/mlx.metallib, include/**,
-      # manifest.json) into the given directory. manifest.json carries the
-      # release tag build.rs derived for this checkout.
-      - name: Build MLX from source
+      # The tag (mlx commit + cmake build key) is derived by build.rs before
+      # it touches cmake. MLX_PREBUILT_PROBE makes it write that and stop, so
+      # the immutability gate below runs in seconds instead of after the
+      # 8-13 min source build.
+      - name: Probe the release tag
+        id: meta
         env:
           MLX_PREBUILT: '0'
           MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
-        run: cargo build --release --locked -p mlx-sys --target ${{ matrix.target }}
-
-      - name: Read the release tag from the manifest
-        id: meta
+          MLX_PREBUILT_PROBE: ${{ github.workspace }}/probe.json
         run: |
           set -euo pipefail
-          test -f prebuilt-out/manifest.json
+          cargo build --release --locked -p mlx-sys --target ${{ matrix.target }}
+          test -f probe.json
           for key in mlx_commit release_tag build_key; do
-            value="$(jq -r ".$key // empty" prebuilt-out/manifest.json)"
+            value="$(jq -r ".$key // empty" probe.json)"
             test -n "$value"
             echo "$key=$value" >> "$GITHUB_OUTPUT"
             echo "$key: $value"
@@ -148,6 +145,27 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `cargo build -p mlx-sys` is enough to run build.rs end to end (no NAPI
+      # addon involved). MLX_PREBUILT=0 forces the source cmake build and
+      # MLX_PREBUILT_EXPORT makes build.rs copy the finished artifact set
+      # (lib/libmlx.a, lib/libjaccl.a, lib/mlx.metallib, include/**,
+      # manifest.json) into the given directory. The manifest must name the
+      # tag the probe did: the gate above was evaluated for that tag.
+      - name: Build MLX from source
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          MLX_PREBUILT: '0'
+          MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
+          TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p mlx-sys --target ${{ matrix.target }}
+          built="$(jq -r '.release_tag // empty' prebuilt-out/manifest.json)"
+          if [ "$built" != "$TAG" ]; then
+            echo "::error::manifest names $built but the probe said $TAG"
+            exit 1
           fi
 
       - name: Package

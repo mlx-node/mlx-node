@@ -227,6 +227,7 @@ profiles.
 | `MLX_PREBUILT=0`               | source build, no download                                                                  |
 | `MLX_PREBUILT_DIR=<dir>`       | use an unpacked artifact as is (no pin/commit check; needs `lib/libmlx.a`, `include/mlx`)  |
 | `MLX_PREBUILT_EXPORT=<dir>`    | source build, then write the artifact set into `<dir>` (what the release workflow does)    |
+| `MLX_PREBUILT_PROBE=<file>`    | with `MLX_PREBUILT_EXPORT`: write `{mlx_commit, build_key, release_tag}` to `<file>` and stop before cmake (the workflow's pre-build gate) |
 | `MLX_PREBUILT_CACHE_DIR=<dir>` | cache root override                                                                        |
 | `GITHUB_TOKEN` / `GH_TOKEN`    | sent as `Authorization: Bearer` on the download (rate limits); anonymous retry if rejected |
 
