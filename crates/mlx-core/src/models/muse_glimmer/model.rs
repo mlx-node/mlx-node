@@ -1795,11 +1795,6 @@ impl MuseGlimmerModel {
     }
 
     #[napi]
-    pub fn auto_enables_mtp(&self) -> bool {
-        self.has_dflash
-    }
-
-    #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
     }

@@ -768,7 +768,6 @@ export declare class MuseGlimmerModel {
   /** Resolved tokenizer/config directory, including the native cache after a GGUF load. */
   modelAssetsPath(): string;
   hasMtpWeights(): boolean;
-  autoEnablesMtp(): boolean;
   hasBlockPagedCache(): boolean;
   maxConcurrentSequences(): number;
   /**
