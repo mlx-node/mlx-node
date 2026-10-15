@@ -610,6 +610,10 @@ impl<C> NoDurableSettleInCycle<C> {
     pub(crate) fn inner(&self) -> &C {
         &self.inner
     }
+
+    pub(crate) fn into_inner(self) -> C {
+        self.inner
+    }
 }
 
 #[cfg(test)]
