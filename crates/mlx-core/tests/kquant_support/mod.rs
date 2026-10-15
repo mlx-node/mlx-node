@@ -568,11 +568,3 @@ pub fn tiled_family(m: i64, n: i64, k: i64, kq: &KQuant, gemm: &'static str) -> 
         "qmv_wide_t64"
     }
 }
-
-/// float32 qmm reaches NAX only when `MLX_ENABLE_TF32` is unset or nonzero.
-pub fn tf32_enabled() -> bool {
-    match std::env::var("MLX_ENABLE_TF32") {
-        Ok(v) => v.trim().parse::<i32>().is_ok_and(|n| n != 0),
-        Err(_) => true,
-    }
-}
