@@ -12,7 +12,6 @@
  * mangles an envelope shows up as an API-behaviour failure.
  */
 
-import { parseJsonBody } from '../../src/api/context.js';
 import type { ApiResponse } from '../../src/api/errors.js';
 import type { ApiCall } from '../../src/runtime.js';
 
@@ -39,10 +38,21 @@ export interface TestClient {
   fetch(path: string, init?: TestRequestInit): Promise<TestResponse>;
 }
 
+/** Wire JSON rules for a raw payload: empty is `null`, anything else must be valid JSON. */
+function parseJsonBody(raw: string): { body: unknown } | { bodyError: string } {
+  const trimmed = raw.trim();
+  if (trimmed === '') return { body: null };
+  try {
+    return { body: JSON.parse(trimmed) };
+  } catch {
+    return { bodyError: 'Invalid JSON in request body' };
+  }
+}
+
 export function createTestClient(caller: ApiCaller): TestClient {
   return {
     async fetch(path: string, init?: TestRequestInit): Promise<TestResponse> {
-      // `rawBody` goes through the same `parseJsonBody` a transport uses, so an
+      // `rawBody` is parsed the way a raw-string transport would, so an
       // unparseable payload reaches the handler as `bodyError` data rather than
       // throwing at read time — which is what keeps a handler's own 404 ahead of
       // a body-parse 400.

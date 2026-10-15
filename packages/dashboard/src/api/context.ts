@@ -91,21 +91,6 @@ export function requireBody(req: ApiRequest): unknown {
   return req.body;
 }
 
-/**
- * Apply the wire JSON rules a transport needs: an empty payload is `null` (not a
- * parse error), anything else must be valid JSON. Shared so every transport
- * agrees on the shape handed to {@link ApiRequest.body}.
- */
-export function parseJsonBody(raw: string): { body: unknown } | { bodyError: string } {
-  const trimmed = raw.trim();
-  if (trimmed === '') return { body: null };
-  try {
-    return { body: JSON.parse(trimmed) };
-  } catch {
-    return { bodyError: 'Invalid JSON in request body' };
-  }
-}
-
 export function toNum(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'bigint') return Number(value);
