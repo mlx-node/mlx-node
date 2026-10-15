@@ -38,7 +38,6 @@ pub mod response_store;
 pub mod sampling;
 pub mod sft;
 pub mod stream;
-pub mod tensor;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tokenizer;
