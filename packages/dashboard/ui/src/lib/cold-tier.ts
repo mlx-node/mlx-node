@@ -52,17 +52,6 @@ export function coldObjectCounts(disk: DiskCountsLike | undefined): ColdObjectCo
 }
 
 /**
- * Total objects across every age bucket — the histogram's own count of what it
- * is charting. Equal to `coldObjectCounts(disk).objects` for any scan; the two
- * disagreeing is precisely the defect this module exists to prevent.
- */
-export function histogramObjectTotal(buckets: readonly AgeBucketLike[]): number {
-  let total = 0;
-  for (const bucket of buckets) total += bucket.count;
-  return total;
-}
-
-/**
  * Predicted eviction for a day threshold, summed from the age histogram. The
  * evict thresholds (1/7/30) align to the histogram bucket boundaries, so this
  * is exact at scan time (the server removes by mtime at request time). Counts
