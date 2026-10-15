@@ -1910,29 +1910,6 @@ mlx_array* mlx_paged_attention_forward_with_plan(
   }
 }
 
-mlx_array* mlx_paged_attention_forward_with_route(
-    mlx_array* q_ptr,
-    mlx_array* k_pool_ptr,
-    mlx_array* v_pool_ptr,
-    mlx_array* block_table_ptr,
-    mlx_array* seq_lens_ptr,
-    mlx_array* k_scale_ptr,
-    mlx_array* v_scale_ptr,
-    float scale,
-    float softcap,
-    int sliding_window,
-    int block_size,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_size,
-    uint8_t kv_dtype_raw,
-    uint8_t route_hint) {
-  return mlx_paged_attention_forward_with_plan(
-      q_ptr, k_pool_ptr, v_pool_ptr, block_table_ptr, seq_lens_ptr,
-      k_scale_ptr, v_scale_ptr, scale, softcap, sliding_window, block_size,
-      num_q_heads, num_kv_heads, head_size, kv_dtype_raw, route_hint, 0);
-}
-
 mlx_array* mlx_paged_attention_forward(
     mlx_array* q_ptr,
     mlx_array* k_pool_ptr,
@@ -1949,7 +1926,7 @@ mlx_array* mlx_paged_attention_forward(
     int num_kv_heads,
     int head_size,
     uint8_t kv_dtype_raw) {
-  return mlx_paged_attention_forward_with_route(
+  return mlx_paged_attention_forward_with_plan(
       q_ptr,
       k_pool_ptr,
       v_pool_ptr,
@@ -1965,7 +1942,8 @@ mlx_array* mlx_paged_attention_forward(
       num_kv_heads,
       head_size,
       kv_dtype_raw,
-      /*route_hint=*/0);
+      /*route_hint=*/0,
+      /*grouped_stripes=*/0);
 }
 
 /// Production FFI: emit a `PagedAttentionVarlen` MLX Custom primitive and
@@ -6406,14 +6384,6 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
   }
 }
 
-/// Backward-compatible wrapper: defaults to V1 (seq_len=8). Kept so
-/// any external caller that still binds the original symbol gets the
-/// hardened logic without re-binding. The Rust test calls the `_v`
-/// variant directly so it can drive both V1 and V2.
-extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
-  return mlx_paged_phase2_stress_mixed_graph_v(iterations, /*seq_len=*/8);
-}
-
 } // extern "C"
 
 // =============================================================================
@@ -7171,15 +7141,6 @@ int mlx_paged_grouped_d512_graph_parity(
       /*route_hint=*/1,
       grouped_stripes,
       "mlx_paged_grouped_d512_graph_parity");
-}
-
-/// Compatibility wrapper for the original Gemma 4 16Q/1KV parity probe.
-int mlx_paged_grouped_gemma4_graph_parity(int context_len, uint32_t grouped_stripes) {
-  return mlx_paged_grouped_d512_graph_parity(
-      /*num_q_heads=*/16,
-      /*num_kv_heads=*/1,
-      context_len,
-      grouped_stripes);
 }
 
 } // extern "C"
