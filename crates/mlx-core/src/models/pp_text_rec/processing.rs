@@ -73,21 +73,6 @@ impl TextRecImageProcessor {
         self.process_rgb_single(&rgb_img, rgb_img.width(), rgb_img.height())
     }
 
-    /// Process raw RGB image data (single image, no padding).
-    ///
-    /// The output width equals the actual resized width (based on aspect ratio),
-    /// clamped to `max_width`. No zero-padding is applied.
-    ///
-    /// # Arguments
-    /// * `rgb_data` - Raw RGB pixel data
-    /// * `width` - Image width
-    /// * `height` - Image height
-    pub fn process_crop(&self, rgb_data: &[u8], width: u32, height: u32) -> Result<MxArray> {
-        let img = image::RgbImage::from_raw(width, height, rgb_data.to_vec())
-            .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid RGB data dimensions"))?;
-        self.process_rgb_single(&img, width, height)
-    }
-
     /// Process a single RGB image without zero-padding.
     ///
     /// Resizes to target_height, computes width from aspect ratio (clamped to max_width),
