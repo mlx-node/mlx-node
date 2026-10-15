@@ -6,13 +6,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Configuration for creating a database connection
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DbConfig {
-    /// Local SQLite file path (e.g., "training_outputs.db")
-    pub local_path: String,
-}
-
 /// A training run record
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrainingRunRecord {
