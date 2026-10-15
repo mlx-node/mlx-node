@@ -152,68 +152,6 @@ impl TextDetImageProcessor {
 
         Ok((pixel_values, orig_h, orig_w, round_h, round_w))
     }
-
-    /// Process raw image bytes (RGB, already decoded).
-    ///
-    /// # Arguments
-    /// * `rgb_data` - Raw RGB pixel data
-    /// * `width` - Image width
-    /// * `height` - Image height
-    ///
-    /// Returns (pixel_values, resized_h, resized_w)
-    pub fn process_crop(
-        &self,
-        rgb_data: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<(MxArray, u32, u32)> {
-        if width == 0 || height == 0 {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "Image dimensions must be non-zero, got {}x{}",
-                    width, height
-                ),
-            ));
-        }
-
-        // Compute resize ratio using PaddleOCR's DetResizeForTest logic
-        let ratio = self.compute_ratio(height, width);
-        let new_h = (height as f64 * ratio) as u32;
-        let new_w = (width as f64 * ratio) as u32;
-
-        // Round to nearest multiple of 32 (not ceil) -- matches PaddleOCR
-        let round_w = ((new_w as f64 / 32.0).round() as u32 * 32).max(32);
-        let round_h = ((new_h as f64 / 32.0).round() as u32 * 32).max(32);
-
-        // Create image from raw data and resize directly to rounded dimensions
-        let img = image::RgbImage::from_raw(width, height, rgb_data.to_vec())
-            .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid RGB data dimensions"))?;
-        let resized = image::imageops::resize(&img, round_w, round_h, RESIZE_FILTER);
-
-        let h = round_h as usize;
-        let w = round_w as usize;
-        let mut pixel_data: Vec<f32> = vec![0.0; h * w * 3];
-
-        // Channel mapping: RGB->BGR (same as process)
-        let channel_map = [2usize, 1, 0];
-
-        for y in 0..h {
-            for x in 0..w {
-                let pixel = resized.get_pixel(x as u32, y as u32);
-                for c in 0..3 {
-                    let src_c = channel_map[c];
-                    let val = pixel[src_c] as f32 / 255.0;
-                    let normalized = (val - self.mean[c]) / self.std[c];
-                    pixel_data[(y * w + x) * 3 + c] = normalized;
-                }
-            }
-        }
-
-        let pixel_values = MxArray::from_float32(&pixel_data, &[1, h as i64, w as i64, 3])?;
-
-        Ok((pixel_values, round_h, round_w))
-    }
 }
 
 #[cfg(test)]

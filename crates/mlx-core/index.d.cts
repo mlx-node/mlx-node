@@ -2582,19 +2582,6 @@ export declare class TextDetModel {
    * * Vec of TextBox with bounding boxes and confidence scores
    */
   detect(imageData: Buffer, threshold?: number | undefined | null): Array<TextBox>;
-  /**
-   * Detect text lines from raw RGB pixel data.
-   *
-   * # Arguments
-   * * `rgb_data` - Raw RGB pixel data
-   * * `width` - Image width
-   * * `height` - Image height
-   * * `threshold` - Optional detection threshold (default from config)
-   *
-   * # Returns
-   * * Vec of TextBox with bounding boxes and confidence scores
-   */
-  detectCrop(rgbData: Uint8Array, width: number, height: number, threshold?: number | undefined | null): Array<TextBox>;
 }
 
 /**
@@ -2631,18 +2618,6 @@ export declare class TextRecModel {
    * * Vec of RecResult with recognized text and confidence scores
    */
   recognizeBatch(images: Array<Buffer>): Array<RecResult>;
-  /**
-   * Recognize text from raw RGB crop data.
-   *
-   * # Arguments
-   * * `rgb_data` - Raw RGB pixel data of a cropped text line
-   * * `width` - Image width
-   * * `height` - Image height
-   *
-   * # Returns
-   * * RecResult with recognized text and confidence score
-   */
-  recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
 export declare class TtsNativeModel {

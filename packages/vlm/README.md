@@ -272,7 +272,7 @@ const buffer = documentToXlsx(doc);
 | --------------------- | ------------------------------------------------------------------------------- |
 | `VLModel`             | PaddleOCR-VL vision-language model — `chat()`, `ocr()`, `ocrBatch()`, `batch()` |
 | `DocLayoutModel`      | PP-DocLayoutV3 layout detection — `detect()`                                    |
-| `TextDetModel`        | PP-OCRv5 text detection — `detect()`, `detectCrop()`                            |
+| `TextDetModel`        | PP-OCRv5 text detection — `detect()`                                            |
 | `TextRecModel`        | PP-OCRv5 text recognition — `recognize()`, `recognizeBatch()`                   |
 | `DocOrientationModel` | Orientation classifier — `classify()`, `classifyAndRotate()`                    |
 | `DocUnwarpModel`      | Document dewarping — `unwarp()`                                                 |
