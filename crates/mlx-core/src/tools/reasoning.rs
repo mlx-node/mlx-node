@@ -478,11 +478,6 @@ fn missing_open_close(
     straddle
 }
 
-/// Check if text contains any thinking tags
-pub fn has_thinking(text: &str) -> bool {
-    text.contains("<think>") || text.contains("<longcat_think>")
-}
-
 /// Parse both tool calls and thinking from generated text
 ///
 /// Convenience function that extracts both structured components.
