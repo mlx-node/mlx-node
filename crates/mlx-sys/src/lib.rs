@@ -305,17 +305,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_ndim(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_shape(handle: *mut mlx_array, out: *mut i64);
     pub fn mlx_array_shape_at(handle: *mut mlx_array, axis: usize) -> i64;
-    pub fn mlx_array_get_batch_seq_len(
-        handle: *mut mlx_array,
-        batch: *mut i64,
-        seq_len: *mut i64,
-    ) -> bool;
-    pub fn mlx_array_get_batch_seq_hidden(
-        handle: *mut mlx_array,
-        batch: *mut i64,
-        seq_len: *mut i64,
-        hidden: *mut i64,
-    ) -> bool;
     pub fn mlx_array_item_at_int32(handle: *mut mlx_array, index: usize, out: *mut i32) -> bool;
     pub fn mlx_array_item_at_uint32(handle: *mut mlx_array, index: usize, out: *mut u32) -> bool;
     pub fn mlx_array_item_at_float32(handle: *mut mlx_array, index: usize, out: *mut f32) -> bool;
@@ -384,7 +373,6 @@ unsafe extern "C-unwind" {
         std: f32,
         dtype: i32,
     ) -> *mut mlx_array;
-    pub fn mlx_array_random_bernoulli(shape: *const i64, ndim: usize, prob: f32) -> *mut mlx_array;
     pub fn mlx_array_randint(shape: *const i64, ndim: usize, low: i32, high: i32)
     -> *mut mlx_array;
     pub fn mlx_array_categorical(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
@@ -535,9 +523,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_power(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_sin(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_cos(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_tan(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_sinh(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_cosh(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_tanh(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_erf(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_floor(handle: *mut mlx_array) -> *mut mlx_array;
@@ -546,9 +531,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_floor_divide(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_remainder(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_reciprocal(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_arcsin(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_arccos(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_arctan(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log10(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log2(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log1p(handle: *mut mlx_array) -> *mut mlx_array;

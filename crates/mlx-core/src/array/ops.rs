@@ -212,24 +212,6 @@ impl MxArray {
     }
 
     #[napi]
-    pub fn tan(&self) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_array_tan(self.handle.0) };
-        MxArray::from_handle(handle, "tan")
-    }
-
-    #[napi]
-    pub fn sinh(&self) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_array_sinh(self.handle.0) };
-        MxArray::from_handle(handle, "sinh")
-    }
-
-    #[napi]
-    pub fn cosh(&self) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_array_cosh(self.handle.0) };
-        MxArray::from_handle(handle, "cosh")
-    }
-
-    #[napi]
     pub fn tanh(&self) -> Result<MxArray> {
         let handle = unsafe { sys::mlx_array_tanh(self.handle.0) };
         MxArray::from_handle(handle, "tanh")
@@ -278,26 +260,6 @@ impl MxArray {
     pub fn reciprocal(&self) -> Result<MxArray> {
         let handle = unsafe { sys::mlx_array_reciprocal(self.handle.0) };
         MxArray::from_handle(handle, "reciprocal")
-    }
-
-    // Inverse trigonometric operations
-
-    #[napi]
-    pub fn arcsin(&self) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_array_arcsin(self.handle.0) };
-        MxArray::from_handle(handle, "arcsin")
-    }
-
-    #[napi]
-    pub fn arccos(&self) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_array_arccos(self.handle.0) };
-        MxArray::from_handle(handle, "arccos")
-    }
-
-    #[napi]
-    pub fn arctan(&self) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_array_arctan(self.handle.0) };
-        MxArray::from_handle(handle, "arctan")
     }
 
     // Logarithmic variants

@@ -1,10 +1,8 @@
-use super::handle::MxHandle;
 use super::{DType, MxArray};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::ffi::CStr;
-use std::sync::Arc;
 
 const MLX_EVAL_ERROR_CAPACITY: usize = 4096;
 
@@ -140,14 +138,6 @@ impl MxArray {
     }
 
     #[napi]
-    pub fn eval_async<'a>(&self, env: &'a Env) -> Result<PromiseRaw<'a, ()>> {
-        let task = env.spawn(AsyncEvalTaskHandle {
-            mx_array_handle: self.handle.clone(),
-        })?;
-        Ok(task.promise_object())
-    }
-
-    #[napi]
     pub fn size(&self) -> Result<u64> {
         Ok(unsafe { sys::mlx_array_size(self.handle.0) as u64 })
     }
@@ -185,47 +175,6 @@ impl MxArray {
             )));
         }
         Ok(dim)
-    }
-
-    /// Get batch and sequence length for 2D arrays (common pattern in transformers)
-    /// More efficient than calling shape() and extracting dimensions
-    #[napi]
-    pub fn get_batch_seq_len(&self) -> Result<Vec<i64>> {
-        let mut batch: i64 = 0;
-        let mut seq_len: i64 = 0;
-        let ok =
-            unsafe { sys::mlx_array_get_batch_seq_len(self.handle.0, &mut batch, &mut seq_len) };
-        if ok {
-            Ok(vec![batch, seq_len])
-        } else {
-            Err(Error::from_reason(
-                "Array must be 2D to extract batch and sequence length",
-            ))
-        }
-    }
-
-    /// Get batch, sequence length, and hidden size for 3D arrays (common pattern in transformers)
-    /// More efficient than calling shape() and extracting dimensions
-    #[napi]
-    pub fn get_batch_seq_hidden(&self) -> Result<Vec<i64>> {
-        let mut batch: i64 = 0;
-        let mut seq_len: i64 = 0;
-        let mut hidden: i64 = 0;
-        let ok = unsafe {
-            sys::mlx_array_get_batch_seq_hidden(
-                self.handle.0,
-                &mut batch,
-                &mut seq_len,
-                &mut hidden,
-            )
-        };
-        if ok {
-            Ok(vec![batch, seq_len, hidden])
-        } else {
-            Err(Error::from_reason(
-                "Array must be 3D to extract batch, sequence length, and hidden size",
-            ))
-        }
     }
 
     /// Extract scalar int32 value without allocating a Vec
@@ -417,23 +366,5 @@ impl MxArray {
                 "Failed to extract uint16 from array (must be bf16 or f16 dtype)",
             ))
         }
-    }
-}
-
-struct AsyncEvalTaskHandle {
-    mx_array_handle: Arc<MxHandle>,
-}
-
-impl Task for AsyncEvalTaskHandle {
-    type Output = ();
-    type JsValue = ();
-
-    fn compute(&mut self) -> napi::Result<Self::Output> {
-        unsafe { sys::mlx_array_eval(self.mx_array_handle.0) };
-        Ok(())
-    }
-
-    fn resolve(&mut self, _env: napi::Env, _output: Self::Output) -> napi::Result<Self::JsValue> {
-        Ok(())
     }
 }

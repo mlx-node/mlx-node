@@ -41,13 +41,6 @@ impl MxArray {
     }
 
     #[napi]
-    pub fn random_bernoulli(shape: &[i64], prob: f64) -> Result<Self> {
-        let handle =
-            unsafe { sys::mlx_array_random_bernoulli(shape.as_ptr(), shape.len(), prob as f32) };
-        MxArray::from_handle(handle, "random_bernoulli")
-    }
-
-    #[napi]
     pub fn randint(shape: &[i64], low: i32, high: i32) -> Result<Self> {
         let handle = unsafe { sys::mlx_array_randint(shape.as_ptr(), shape.len(), low, high) };
         MxArray::from_handle(handle, "randint")

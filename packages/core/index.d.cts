@@ -901,7 +901,6 @@ export declare class MxArray {
    */
   copy(): MxArray;
   eval(): void;
-  evalAsync(): Promise<undefined>;
   size(): bigint;
   ndim(): number;
   shape(): BigInt64Array;
@@ -912,16 +911,6 @@ export declare class MxArray {
    * Note: axis is u32 because NAPI doesn't support usize, but internally converted to usize
    */
   shapeAt(axis: number): number;
-  /**
-   * Get batch and sequence length for 2D arrays (common pattern in transformers)
-   * More efficient than calling shape() and extracting dimensions
-   */
-  getBatchSeqLen(): Array<number>;
-  /**
-   * Get batch, sequence length, and hidden size for 3D arrays (common pattern in transformers)
-   * More efficient than calling shape() and extracting dimensions
-   */
-  getBatchSeqHidden(): Array<number>;
   dtype(): DType;
   /**
    * Copy entire array from GPU to CPU as Float32Array
@@ -1001,9 +990,6 @@ export declare class MxArray {
   power(other: MxArray): MxArray;
   sin(): MxArray;
   cos(): MxArray;
-  tan(): MxArray;
-  sinh(): MxArray;
-  cosh(): MxArray;
   tanh(): MxArray;
   /** Error function: erf(x) = (2/sqrt(pi)) * integral(0..x, exp(-t^2) dt) */
   erf(): MxArray;
@@ -1013,9 +999,6 @@ export declare class MxArray {
   floorDivide(other: MxArray): MxArray;
   remainder(other: MxArray): MxArray;
   reciprocal(): MxArray;
-  arcsin(): MxArray;
-  arccos(): MxArray;
-  arctan(): MxArray;
   log10(): MxArray;
   log2(): MxArray;
   log1p(): MxArray;
@@ -1042,7 +1025,6 @@ export declare class MxArray {
   isfinite(): MxArray;
   static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
   static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
-  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
   static randint(shape: BigInt64Array, low: number, high: number): MxArray;
   /**
    * Sample from categorical distribution
