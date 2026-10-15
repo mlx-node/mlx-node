@@ -1,4 +1,4 @@
-# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, re-captured on pin c23b1113f after upstream e7838d5e3 and 8056817bd.
+# Golden values of bridge outputs, one route per line. native: proven bit-identical to the MLX fork (pin 053e43fec). promoted: MLX's own F32 QuantizedMatmul graph, re-captured on pin bcad39304 after upstream 494c8a6c9.
 # One line per case in the gate test's order: first 6 bytes of SHA-256 over dtype, shape and output bytes, base64url, then the route.
 applegpu_g17s = machine
 applegpu_g17g = route
@@ -45,8 +45,8 @@ NhxaN7Ll promoted
 4WMQiXgP promoted
 TISj9b5g promoted
 uMpvY60H promoted
-NprGj3OP promoted
-gbg8Byl3 promoted
+VI4sGFwn promoted
+OYpeBXzX promoted
 -MjVx9DK promoted
 I-Qfbz3X promoted
 3xVolvCN native
@@ -312,12 +312,12 @@ lQVUjd_N promoted
 gnXsGxCT promoted
 Nz3Fon2l promoted
 qyYpK9Sp promoted
-1h-3j5lG promoted
-THQc2e0E promoted
-Tjb_PEcS promoted
+9RllkZdJ promoted
+cdeeh3EX promoted
+HmWJz19G promoted
 lebWnbFH promoted
-fcHIvsZG promoted
-n2ioTlm7 promoted
+Sd3ESsjg promoted
+46MtaBu7 promoted
 ba7q9ATm promoted
 E1qnW-sk native
 x67sj5qU promoted
@@ -362,7 +362,7 @@ K6wH7Cum promoted
 Uo2ZRcLN promoted
 X1X9qWDG promoted
 WVp6HDLZ promoted
-_MVT2kOR promoted
+GtoiHqRa promoted
 W1wsJnz5 promoted
 f-U-TLbl promoted
 oGEoFOlj promoted
@@ -628,10 +628,10 @@ k2wRjgI8 promoted
 hCdaxMsZ promoted
 HajFvS2O promoted
 lofyo195 promoted
-FTxj8lvK promoted
+5tx-YbJK promoted
 lBY0OwrW promoted
 9zEUIeg7 promoted
-jCJiZzTK promoted
+mIBNCxJ6 promoted
 j9CGRDf5 promoted
 nv4AQws7 promoted
 HSg0XJhF promoted
@@ -943,11 +943,11 @@ d1zyLBcF promoted
 e9GpoQ-W promoted
 JdzNAwoA promoted
 7hpGC4pF promoted
-xKG7zh_o promoted
-gtq6ly7U promoted
-JW5hoEpj promoted
-TXfglarV promoted
-x9HCL1aC promoted
+fNVbbZCA promoted
+_jZY-4R4 promoted
+RxXrc9Sl promoted
+lD929LMM promoted
+ojD1JxxL promoted
 XqItgFpl promoted
 UqYhZW0j promoted
 AgMRjoDW promoted
@@ -991,7 +991,7 @@ Tl31rzwK promoted
 skNfFDW- promoted
 VV0hrnm- promoted
 8HqyjbNk promoted
-wDHl8Hsm promoted
+SfkYYd5L promoted
 bz2tA2Gm promoted
 Pk8oc7vm promoted
 3KRAcqXG promoted
@@ -1259,10 +1259,10 @@ ze-EPQd1 promoted
 f5WgqOEK promoted
 alNqYrKN promoted
 85CDDcKu promoted
-JeP1_TRt promoted
+1WcGICTh promoted
 zrj6_Dx3 promoted
-xdr-OITp promoted
-YyJ_hVXK promoted
+tZRGOAOv promoted
+CaU2-cuo promoted
 b0fqP3FA promoted
 j3IqpfTe promoted
 bxPwFfEp promoted
@@ -1528,10 +1528,10 @@ jYcCOK4Q promoted
 9lspFIAw promoted
 oaSuELQC promoted
 -SG6u2fU promoted
-gx76M_HK promoted
+2xezi0JH promoted
 _POl_r5G promoted
-fI016Nzn promoted
-vuLgLo1w promoted
-EUCG4nQV promoted
+Lt6nGQWJ promoted
+iUtJC9YC promoted
+qH66u_Q- promoted
 MpzDtv-9 promoted
 7HB7nhAk promoted
