@@ -172,128 +172,12 @@ fn rotate_half(x: &MxArray, ndim: usize, last_dim: i64) -> Result<MxArray> {
     MxArray::concatenate_many(vec![&neg_x2, &x1], Some(-1))
 }
 
-/// Apply multimodal rotary position embedding to Q and K (internal)
-///
-/// Uses split+concat pattern matching Python mlx-vlm for minimal FFI overhead.
-/// cos/sin shape: [3, batch, seq_len, head_dim] where dim 0 = [temporal, height, width]
-///
-/// The mrope_section (e.g. [16, 24, 24]) defines how the head_dim is partitioned.
-/// Each section i selects from spatial dimension i%3. After doubling (for sin/cos halves),
-/// we split the last axis at cumulative indices and pick the right spatial row for each part,
-/// then concatenate back. This mirrors Python's:
-///   mrope_section = cumsum(mrope_section * 2)[:-1]
-///   cos = concat([m[i%3] for i,m in enumerate(split(cos, mrope_section, axis=-1))], axis=-1)
-///
-/// Note: Internal implementation detail, not exposed to TypeScript.
-pub fn apply_multimodal_rotary_pos_emb(
-    q: &MxArray,
-    k: &MxArray,
-    cos: &MxArray,
-    sin: &MxArray,
-    mrope_section: Vec<i32>,
-) -> Result<(MxArray, MxArray)> {
-    // Compute cumulative section boundaries
-    // e.g., [16, 24, 24] -> cumsum([32, 48, 48]) = [32, 80, 128]
-    let mut boundaries: Vec<i64> = Vec::new();
-    let mut cumsum = 0i64;
-    for &s in &mrope_section {
-        cumsum += (s * 2) as i64;
-        boundaries.push(cumsum);
-    }
-
-    let cos_shape = cos.shape()?; // 1 FFI call — cache and reuse below
-    let batch_size = cos_shape[1];
-    let seq_len = cos_shape[2];
-    let head_dim = cos_shape[3];
-
-    // Split cos/sin by mRoPE sections and interleave
-    // For each section i, take cos/sin from position i mod 3
-    let mut cos_parts: Vec<MxArray> = Vec::new();
-    let mut sin_parts: Vec<MxArray> = Vec::new();
-
-    let mut start = 0i64;
-    for (idx, &end) in boundaries.iter().enumerate() {
-        let section_idx = idx % 3;
-
-        // Extract section from cos/sin at position section_idx
-        let cos_section = cos.slice_axis(0, section_idx as i64, section_idx as i64 + 1)?;
-        let sin_section = sin.slice_axis(0, section_idx as i64, section_idx as i64 + 1)?;
-
-        // Squeeze to remove the first dimension: [batch, seq_len, head_dim]
-        let cos_section = cos_section.squeeze(Some(&[0]))?;
-        let sin_section = sin_section.squeeze(Some(&[0]))?;
-
-        // Slice the head_dim dimension
-        let cos_slice = cos_section.slice_axis(2, start, end)?;
-        let sin_slice = sin_section.slice_axis(2, start, end)?;
-
-        cos_parts.push(cos_slice);
-        sin_parts.push(sin_slice);
-
-        start = end;
-    }
-
-    // Concatenate parts
-    let cos_refs: Vec<&MxArray> = cos_parts.iter().collect();
-    let sin_refs: Vec<&MxArray> = sin_parts.iter().collect();
-    let cos_final = MxArray::concatenate_many(cos_refs, Some(-1))?;
-    let sin_final = MxArray::concatenate_many(sin_refs, Some(-1))?;
-
-    // Unsqueeze to [batch, 1, seq_len, head_dim] for broadcasting with heads
-    let cos_final = cos_final.reshape(&[batch_size, 1, seq_len, head_dim])?;
-    let sin_final = sin_final.reshape(&[batch_size, 1, seq_len, head_dim])?;
-
-    // rotary_dim == head_dim (from cos_shape, already cached above)
-    let rotary_dim = head_dim;
-    let q_shape = q.shape()?; // 1 FFI call
-    let q_dim = q_shape[3];
-    let q_ndim = q_shape.len();
-
-    // Split Q and K into rotary and pass-through parts
-    let q_rot = q.slice_axis(3, 0, rotary_dim)?;
-    let q_pass = if rotary_dim < q_dim {
-        Some(q.slice_axis(3, rotary_dim, q_dim)?)
-    } else {
-        None
-    };
-
-    let k_rot = k.slice_axis(3, 0, rotary_dim)?;
-    let k_pass = if rotary_dim < q_dim {
-        Some(k.slice_axis(3, rotary_dim, q_dim)?)
-    } else {
-        None
-    };
-
-    // Apply rotary: q_rot * cos + rotate_half(q_rot) * sin
-    // Pass pre-computed ndim and last_dim to avoid .shape() calls inside rotate_half
-    let q_rotated = rotate_half(&q_rot, q_ndim, rotary_dim)?;
-    let k_rotated = rotate_half(&k_rot, q_ndim, rotary_dim)?;
-
-    let q_embed = q_rot.mul(&cos_final)?.add(&q_rotated.mul(&sin_final)?)?;
-    let k_embed = k_rot.mul(&cos_final)?.add(&k_rotated.mul(&sin_final)?)?;
-
-    // Concatenate rotary and pass-through parts
-    let q_out = if let Some(q_pass) = q_pass {
-        MxArray::concatenate_many(vec![&q_embed, &q_pass], Some(-1))?
-    } else {
-        q_embed
-    };
-
-    let k_out = if let Some(k_pass) = k_pass {
-        MxArray::concatenate_many(vec![&k_embed, &k_pass], Some(-1))?
-    } else {
-        k_embed
-    };
-
-    Ok((q_out, k_out))
-}
-
 /// Apply INTERLEAVED multimodal rotary position embedding to Q and K (internal).
 ///
 /// Used by Qwen3.5-VL (`qwen3_5` / `qwen3_5_moe`). Unlike PaddleOCR-VL, whose
-/// multimodal RoPE assigns the head_dim to spatial axes in CONTIGUOUS chunks
-/// (see [`apply_multimodal_rotary_pos_emb`]), Qwen3.5-VL assigns each inv_freq
-/// index to a spatial axis with a STRIDE-3 INTERLEAVE. This mirrors mlx-vlm's
+/// multimodal RoPE assigns the head_dim to spatial axes in CONTIGUOUS chunks,
+/// Qwen3.5-VL assigns each inv_freq index to a spatial axis with a STRIDE-3
+/// INTERLEAVE. This mirrors mlx-vlm's
 /// `_interleaved_position_selector` (rope_utils.py):
 ///   selector[idx] = 1 (height) for idx in 1, 4, 7, … up to `mrope_section[1] * 3`
 ///   selector[idx] = 2 (width)  for idx in 2, 5, 8, … up to `mrope_section[2] * 3`
@@ -303,12 +187,11 @@ pub fn apply_multimodal_rotary_pos_emb(
 ///
 /// The per-frequency axis selection is performed with a `take_along_axis` gather
 /// over axis 0 (the `[temporal, height, width]` axis) of the doubled cos/sin,
-/// followed by the same `rotate_half` application as the sectioned path.
+/// followed by the standard `rotate_half` application.
 ///
 /// For TEXT tokens (temporal == height == width) every axis row of cos/sin is
 /// bit-identical, so any selector picks identical values — this produces output
-/// bit-identical to the sectioned [`apply_multimodal_rotary_pos_emb`]. See
-/// `test_interleaved_text_invariance`.
+/// bit-identical to plain single-axis RoPE. See `test_interleaved_text_invariance`.
 ///
 /// `cos`/`sin` shape: `[3, batch, seq_len, head_dim]` (axis 0 = t/h/w).
 /// `q`/`k` shape: `[batch, heads, seq_len, q_head_dim]` where `q_head_dim >=
@@ -406,7 +289,7 @@ pub fn apply_interleaved_rotary(
     cos_final: &MxArray,
     sin_final: &MxArray,
 ) -> Result<(MxArray, MxArray)> {
-    // Standard rotate_half application (identical to the sectioned path tail).
+    // Standard rotate_half application.
     let cos_shape = cos_final.shape()?; // 1 FFI call
     let rotary_dim = cos_shape[3];
     let q_shape = q.shape()?; // 1 FFI call
@@ -1053,23 +936,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_mrope_output_shapes() {
-        // Test apply_multimodal_rotary_pos_emb preserves tensor shapes
-        let q = MxArray::random_uniform(&[1, 4, 2, 32], 0.0, 1.0, Some(DType::Float32)).unwrap();
-        let k = MxArray::random_uniform(&[1, 4, 2, 32], 0.0, 1.0, Some(DType::Float32)).unwrap();
-        let cos = MxArray::ones(&[3, 1, 2, 32], Some(DType::Float32)).unwrap();
-        let sin = MxArray::zeros(&[3, 1, 2, 32], Some(DType::Float32)).unwrap();
-
-        let (q_out, k_out) =
-            apply_multimodal_rotary_pos_emb(&q, &k, &cos, &sin, vec![4, 6, 6]).unwrap();
-
-        let q_out_shape: Vec<i64> = q_out.shape().unwrap().as_ref().to_vec();
-        let k_out_shape: Vec<i64> = k_out.shape().unwrap().as_ref().to_vec();
-        assert_eq!(q_out_shape, vec![1, 4, 2, 32]);
-        assert_eq!(k_out_shape, vec![1, 4, 2, 32]);
-    }
-
-    #[test]
     fn test_ernie_language_model_creation() {
         // Test creating ERNIELanguageModel
         let config = test_text_config();
@@ -1272,8 +1138,9 @@ mod tests {
     #[test]
     fn test_interleaved_text_invariance() {
         // Hard gate / safety net: for TEXT tokens (temporal == height == width)
-        // the interleaved apply MUST be bit-identical to the existing sectioned
-        // apply, proving the text path cannot regress.
+        // the interleaved apply MUST be bit-identical to plain single-axis RoPE
+        // (every axis row of cos/sin is identical, so the selector is a no-op),
+        // proving the text path cannot regress.
         //
         // Realistic qwen3_5 rotary geometry: rope_dims = 64 -> half_dim = 32,
         // mrope_section = [11, 11, 10] (sum 32). cos/sin are built from a real
@@ -1315,21 +1182,31 @@ mod tests {
         )
         .unwrap();
 
-        let (q_sec, k_sec) =
-            apply_multimodal_rotary_pos_emb(&q, &k, &cos, &sin, vec![11, 11, 10]).unwrap();
+        // Reference: rotate with the temporal-axis row only.
+        let cos_t = cos
+            .slice_axis(0, 0, 1)
+            .unwrap()
+            .reshape(&[1, 1, seq_len, rope_dims as i64])
+            .unwrap();
+        let sin_t = sin
+            .slice_axis(0, 0, 1)
+            .unwrap()
+            .reshape(&[1, 1, seq_len, rope_dims as i64])
+            .unwrap();
+        let (q_ref, k_ref) = apply_interleaved_rotary(&q, &k, &cos_t, &sin_t).unwrap();
         let (q_int, k_int) =
             apply_multimodal_rotary_pos_emb_interleaved(&q, &k, &cos, &sin, vec![11, 11, 10])
                 .unwrap();
 
         assert_eq!(
-            q_sec.to_float32().unwrap().as_ref(),
+            q_ref.to_float32().unwrap().as_ref(),
             q_int.to_float32().unwrap().as_ref(),
-            "interleaved Q must equal sectioned Q for text tokens (t==h==w)"
+            "interleaved Q must equal single-axis RoPE Q for text tokens (t==h==w)"
         );
         assert_eq!(
-            k_sec.to_float32().unwrap().as_ref(),
+            k_ref.to_float32().unwrap().as_ref(),
             k_int.to_float32().unwrap().as_ref(),
-            "interleaved K must equal sectioned K for text tokens (t==h==w)"
+            "interleaved K must equal single-axis RoPE K for text tokens (t==h==w)"
         );
     }
 
