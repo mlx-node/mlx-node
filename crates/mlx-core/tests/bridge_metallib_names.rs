@@ -7,6 +7,15 @@
 //! loader, each segmented function-constant specialization included.
 //!
 //!   cargo test -p mlx-core --release --test bridge_metallib_names
+//!
+//! The name-set checks and the 7-pipeline affine-mixed build are the every-PR
+//! gate. The segmented SDPA build specializes ~1400 pipelines (Metal compiler
+//! time: ~25 s on an M-series laptop, ~50 s on a hosted runner) and catches a
+//! pin-bump defect class — a function present but refusing to load or
+//! specialize on this OS — so it is `#[ignore]`d and runs in CI's
+//! `model-test` lane (`.github/workflows/ci.yml`, the `qwen3` leg):
+//!
+//!   cargo test -p mlx-core --test bridge_metallib_names -- --ignored
 
 #![cfg(target_os = "macos")]
 
@@ -91,8 +100,10 @@ fn every_affine_mixed_kernel_is_in_the_metallib() {
 }
 
 /// A function that is present but refuses to load or specialize on this OS
-/// fails here, not mid-request.
+/// fails here, not mid-request. Pin-bump gate, not a per-PR one: see the
+/// module docs.
 #[test]
+#[ignore = "builds every pipeline (~minutes); run in the model-e2e lane: cargo test -p mlx-core --test bridge_metallib_names -- --ignored"]
 fn every_segmented_sdpa_specialization_builds_a_pipeline() {
     let c = check("segmented_sdpa", true);
     assert!(c.report.is_empty(), "{}", c.report);

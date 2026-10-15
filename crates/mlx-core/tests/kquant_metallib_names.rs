@@ -6,6 +6,15 @@
 //! holds no K-quant function the dispatcher cannot name.
 //!
 //!   cargo test -p mlx-core --release --test kquant_metallib_names
+//!
+//! The name-set check is the every-PR gate. Building a pipeline for each of
+//! the ~2800 names is Metal compiler time (~2 min on an M-series laptop, far
+//! longer on a hosted runner) and catches a different defect class: a
+//! function that is present but refuses to load on this OS, which changes on
+//! a metallib / MLX pin bump, not per PR. That test is `#[ignore]`d and runs
+//! in CI's `model-test` lane (`.github/workflows/ci.yml`, the `qwen3` leg):
+//!
+//!   cargo test -p mlx-core --test kquant_metallib_names -- --ignored
 
 #![cfg(target_os = "macos")]
 
@@ -107,7 +116,9 @@ fn every_dispatchable_kernel_is_in_the_metallib() {
 
 /// Builds a pipeline for every kernel this device can request, so a function
 /// that is present but refuses to load on this OS fails here, not mid-request.
+/// Pin-bump gate, not a per-PR one: see the module docs.
 #[test]
+#[ignore = "builds every pipeline (~minutes); run in the model-e2e lane: cargo test -p mlx-core --test kquant_metallib_names -- --ignored"]
 fn every_dispatchable_kernel_builds_a_pipeline() {
     let c = check(true);
     assert!(c.report.is_empty(), "{}", c.report);

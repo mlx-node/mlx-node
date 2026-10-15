@@ -405,32 +405,51 @@ fn affine_tiled_routes_match_exact_and_mlx() {
     }
 }
 
-/// Every tiled route is deterministic: the same matmul evaluated 24 times on
-/// fixed data gives the same bits each time. The shapes are Gemma-4-E2B's
-/// (narrow N down to 256, K up to 12288) and the Qwen3.5-4B widths, the
-/// heights the routes split on (decode M = 1 in bf16 and f32, the qmv_wide
-/// widths, the three tensor-op tiers, the GEMM at M = 39 and 64) — a greedy
-/// decode that flips between two outputs run to run is what this guards.
+/// Every tiled route is deterministic: the same matmul evaluated repeatedly
+/// on fixed data gives the same bits each time — a greedy decode that flips
+/// between two outputs run to run is what this guards.
+///
+/// Run-to-run variation can only come from scheduling, and the one
+/// scheduling-dependent piece of code on these routes is the row tiers'
+/// split-K epilogue (kquant_m8_nax.h: fp32 partials, an atomic arrival
+/// counter, the last arriver summing in split order). `qmv_t64` reduces its
+/// k-splits inside the threadgroup, `qmv_wide_t64` does not split, and the
+/// GEMM's split-K goes through MLX's strided reduce. So the grid is one row
+/// per kernel family — decode M = 1 in bf16 and f32 (two `qmv_t64`
+/// instantiations), `qmv_wide_t64` at M = 3, the three tensor-op tiers at
+/// M = 8 / 12 / 24, the GEMM at M = 39 (partial tile) and 64 — on the shapes
+/// that put the tiers into distinct split classes, both affine contracts
+/// (the 8-bit one's partials bound changes the split count):
+///
+///   (1536, 256)    narrowest Gemma-4-E2B N: 4 tiles, every tier falls back
+///                  to the vector route / GEMM below the grid target
+///   (12288, 1536)  long K, 24 tiles: the deepest split (K / 32 = 384 units)
+///   (2560, 12288)  short K, 192 tiles: the shallowest split (1-2), i.e. the
+///                  epilogue with no or one partner partition
+///   (4096, 2560)   the Qwen3.5-4B width: a middle split count
+///
+/// (M5 Max: the three tiers at splits 1, 2, 4 and 8, `qmv_t64` in both
+/// dtypes, `qmv_wide_t64`, `qmm_t_nax_t64` and `qmm_t_splitk_t64` all reached.)
+///
+/// This replaced a 14-shape x 24-repeat sweep that arrived with the kernels
+/// (#183) and has no recorded catch of its own. The route each case took is
+/// printed so a GPU where the grid rule lands differently still shows what
+/// was exercised.
 #[cfg(target_os = "macos")]
 #[test]
 fn affine_tiled_routes_are_deterministic() {
     assert!(gpu_gen() > 0, "no Metal device");
-    const REPEATS: usize = 24;
-    let shapes: [(i64, i64); 14] = [
-        (1536, 256),
-        (1536, 512),
-        (1536, 2048),
-        (1536, 4096),
-        (1536, 6144),
-        (1536, 8960),
-        (1536, 12288),
-        (12288, 1536),
-        (256, 1536),
-        (6144, 1536),
-        (2048, 1536),
-        (2560, 12288),
-        (2560, 9216),
-        (4096, 2560),
+    const REPEATS: usize = 3;
+    let shapes: [(i64, i64); 4] = [(1536, 256), (12288, 1536), (2560, 12288), (4096, 2560)];
+    let tiers = [
+        "qmv_t64",
+        "qmv_wide_t64",
+        "qmm_m8_nax_t64",
+        "qmm_m16_nax_t64",
+        "qmm_m32_nax_t64",
+        "qmm_t_nax_t64",
+        "qmm_t_t64",
+        "qmm_t_splitk_t64",
     ];
     let mut routes = Vec::new();
     for (ki, &(bits, group)) in KQUANT_AFFINE_MODES.iter().enumerate() {
@@ -456,6 +475,15 @@ fn affine_tiled_routes_are_deterministic() {
                 let what = format!("{} K={k} N={n} M={m} {dtype:?}", kq.mode);
                 start_counting();
                 let (_, _, first) = read_output(&what, qmm_tiled(&x, &t, &kq, GPU));
+                let took = tiers
+                    .iter()
+                    .find(|f| family_count(f) > 0)
+                    .copied()
+                    .unwrap_or("?");
+                let splits = [1u64, 2, 4, 8]
+                    .into_iter()
+                    .find(|s| family_count(&format!("qmm_m8_nax_splits{s}")) > 0)
+                    .unwrap_or(0);
                 stop_counting();
                 for i in 1..REPEATS {
                     let (_, _, again) = read_output(&what, qmm_tiled(&x, &t, &kq, GPU));
@@ -464,6 +492,7 @@ fn affine_tiled_routes_are_deterministic() {
                         "{what}: evaluation {i} differs from the first"
                     );
                 }
+                println!("  {what:<40} {took:<17} splits={splits}");
                 routes.push(what);
             }
         }

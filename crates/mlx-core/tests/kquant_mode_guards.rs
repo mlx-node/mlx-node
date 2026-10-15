@@ -553,10 +553,17 @@ fn expect_shape(what: &str, want: &[i64], attempt: Attempt) {
     }
 }
 
-/// Evaluate an op result and read it back element by element as float32.
+/// Evaluate an op result and read it back as float32, one bulk copy.
 ///
-/// Element-wise rather than `mlx_array_to_float32`, which materialises through
-/// `add(arr, zeros)` — the same reason `kquant_ggml_parity.rs` reads this way.
+/// This used to read one element per FFI call (`mlx_array_item_at_float32`)
+/// because `mlx_array_to_float32` once materialised through `add(arr, zeros)`.
+/// It no longer does: `copy_to_buffer_as` (mlx_common.h) is `flatten` +
+/// `astype`, both no-ops on a contiguous float32 output, then a memcpy; and
+/// `mlx_array_to_uint16` flattens on the CPU and memcpys the raw 16-bit
+/// pattern. Neither path dispatches an arithmetic kernel, so the kernel-family
+/// counters some callers read around `compare_devices` are untouched, and the
+/// 16-bit widening happens here on the host, exactly as `read_scalar` did it.
+/// Any other dtype falls back to the per-element read.
 fn expect_f32(what: &str, handle: *mut mlx_sys::mlx_array) -> Vec<f32> {
     assert!(!handle.is_null(), "{what} was rejected at construction");
     if let Err(why) = eval(handle) {
@@ -564,13 +571,41 @@ fn expect_f32(what: &str, handle: *mut mlx_sys::mlx_array) -> Vec<f32> {
         panic!("{what} was rejected: {why}");
     }
     // SAFETY: `handle` is a live, evaluated array.
-    let len = unsafe { mlx_sys::mlx_array_size(handle) };
-    let mut out = vec![0f32; len];
-    for (i, slot) in out.iter_mut().enumerate() {
-        // SAFETY: i < len == array size.
-        let ok = unsafe { mlx_sys::mlx_array_item_at_float32(handle, i, slot) };
-        assert!(ok, "{what}: mlx_array_item_at_float32 failed at index {i}");
-    }
+    let (len, code) = unsafe {
+        (
+            mlx_sys::mlx_array_size(handle),
+            mlx_sys::mlx_array_dtype(handle),
+        )
+    };
+    let out = if code == DType::Float32 as i32 {
+        let mut v = vec![0f32; len];
+        // SAFETY: `v` holds `len` elements.
+        let ok = unsafe { mlx_sys::mlx_array_to_float32(handle, v.as_mut_ptr(), len) };
+        assert!(ok, "{what}: mlx_array_to_float32 failed");
+        v
+    } else if code == DType::Float16 as i32 || code == DType::BFloat16 as i32 {
+        let mut bits = vec![0u16; len];
+        // SAFETY: `bits` holds `len` elements.
+        let ok = unsafe { mlx_sys::mlx_array_to_uint16(handle, bits.as_mut_ptr(), len) };
+        assert!(ok, "{what}: mlx_array_to_uint16 failed");
+        if code == DType::Float16 as i32 {
+            bits.iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect()
+        } else {
+            bits.iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect()
+        }
+    } else {
+        let mut v = vec![0f32; len];
+        for (i, slot) in v.iter_mut().enumerate() {
+            // SAFETY: i < len == array size.
+            let ok = unsafe { mlx_sys::mlx_array_item_at_float32(handle, i, slot) };
+            assert!(ok, "{what}: mlx_array_item_at_float32 failed at index {i}");
+        }
+        v
+    };
     drop_array(handle);
     out
 }

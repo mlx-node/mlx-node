@@ -589,10 +589,17 @@ jobs:
             stage1_rust: concurrent_batched_parity
             stage1_ts: __test__/server/concurrent-stage1-e2e.test.ts
             stage2_rust: ''
+            # `*_metallib_names` also carry the `#[ignore]`d build-every-
+            # pipeline gates (minutes of Metal compiler time; a pin-bump
+            # defect class, not a per-PR one). They need Metal and no
+            # checkpoint; this is the smallest leg that runs on every main
+            # push. Their cheap name-set tests still run in `rust-int`.
             tests: >-
               --test qwen3_paged_vs_flat_parity
               --test qwen3_cold_tier_parity
               --test qwen3_prefill_cancel
+              --test kquant_metallib_names
+              --test bridge_metallib_names
           - name: qwen3_5-dense
             model: Qwen/Qwen3.5-0.8B
             slug: qwen3.5-0.8b

@@ -459,6 +459,14 @@ fn routes_m8(n: i64, k: i64, bits: i32) -> bool {
 /// Every mode on every Qwen3.8 verify shape, tiled, against the CPU
 /// reference (row-major), with the route observed through the kernel-family
 /// counter, no zero outputs, and the split count reported.
+///
+/// Not a subset of `kquant_tiled.rs::m8_nax_tiled_matches_cpu_and_row_major_tensor_op`
+/// (same modes, shapes and tolerance): this one feeds outlier activations
+/// (`heavy`: ~1 % of the channels at 24x, as hidden states carry them) on
+/// every other shape, draws sub-scales from the full signed range (-32..32,
+/// not -8..8), goes through the production `mlx_quantized_matmul` entry on
+/// the process-wide default device, and still compares against the CPU on a
+/// host without the tensor op, where the tiled test skips.
 #[test]
 fn m8_nax_matches_cpu_on_every_mode_and_shape() {
     let _guard = DEVICE_LOCK.lock().unwrap();
@@ -542,8 +550,17 @@ fn m8_nax_matches_cpu_on_every_mode_and_shape() {
     }
 }
 
-/// Twenty evaluations of one tiled matmul, on the split shapes, are
+/// Repeated evaluations of one tiled matmul, on the split shapes, are
 /// byte-identical.
+///
+/// What can vary run to run is scheduling, and the only scheduling-dependent
+/// code in the kernel is the split-K epilogue (kquant_m8_nax.h: partials, the
+/// atomic arrival counter, the last arriver summing in split order), which is
+/// shared by every mode — the per-mode decode is straight-line. So the sweep
+/// is per decode class, not per mode: one plain mode (q4k), one codebook mode
+/// (iq4nl: a threadgroup table staged before the loop) and one grid mode
+/// (iq2xxs: the grid tables), on a shape that splits on every GPU
+/// (K = 5120, N = 1024: 16 tiles) and the long-K Qwen3.8 down projection.
 #[test]
 fn m8_nax_is_deterministic() {
     let _guard = DEVICE_LOCK.lock().unwrap();
@@ -551,7 +568,12 @@ fn m8_nax_is_deterministic() {
         eprintln!("skipping: no GPU device");
         return;
     }
-    for (fi, fmt) in FORMATS.iter().enumerate() {
+    const REPEATS: usize = 3;
+    for (fi, fmt) in FORMATS
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.mode, "q4k" | "iq4nl" | "iq2xxs"))
+    {
         for (k, n) in [(17408i64, 5120i64), (5120, 1024)] {
             let w = Weights::new(*fmt, n, k, 0xde_0000 + fi as u32).tiled();
             let x = bf16_x(&activation_bits(8, k, 0x77 + fi as u32, true), k);
@@ -562,7 +584,7 @@ fn m8_nax_is_deterministic() {
                 .find(|s| family(&format!("qmm_m8_nax_splits{s}")) > 0)
                 .unwrap_or(0);
             counting(false);
-            for i in 1..20 {
+            for i in 1..REPEATS {
                 let again = read_u16(qmm(&x, &w));
                 assert!(
                     again == first,
@@ -571,7 +593,7 @@ fn m8_nax_is_deterministic() {
                 );
             }
             println!(
-                "  {:<6} K={k:>5} N={n:>5} splits={splits}  20 evaluations identical",
+                "  {:<6} K={k:>5} N={n:>5} splits={splits}  {REPEATS} evaluations identical",
                 fmt.mode
             );
         }

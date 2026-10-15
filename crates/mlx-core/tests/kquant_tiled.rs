@@ -699,26 +699,39 @@ fn padded_merge_is_invisible_in_every_mode() {
     }
 }
 
-/// (e) Twenty evaluations of the tiled M = 1 and M = 8 routes are
+/// (e) Repeated evaluations of the tiled M = 1 and M = 8 routes are
 /// byte-identical.
+///
+/// Run-to-run variation can only come from scheduling. `qmv_t64` reduces its
+/// k-splits inside the threadgroup in a fixed order, and `qmm_m8_nax_t64`'s
+/// split-K epilogue (partials, atomic arrival counter, last arriver summing
+/// in split order; kquant_m8_nax.h) is the same code for every mode — the
+/// per-mode decode is straight-line. So this runs one mode per decode class
+/// (plain q4k, codebook iq4nl, grid iq2xxs) rather than all fifteen; the
+/// split shapes themselves are `kquant_m8_nax.rs::m8_nax_is_deterministic`'s.
 #[cfg(target_os = "macos")]
 #[test]
 fn tiled_routes_are_deterministic() {
     assert!(gpu_gen() > 0, "no Metal device");
-    for (ki, kq) in KQUANTS.iter().enumerate() {
+    const REPEATS: usize = 3;
+    for (ki, kq) in KQUANTS
+        .iter()
+        .enumerate()
+        .filter(|(_, kq)| matches!(kq.mode, "q4k" | "iq4nl" | "iq2xxs"))
+    {
         let (k, n) = (17408i64, 5120i64);
         let w = weights(kq, &[n], k, 0x7e00 + ki as u32);
         let t = tiled(&w, kq);
         for m in [1i64, 8] {
             let x = activation(&[m, k], 0x7f00 + ki as u32 + m as u32, DType::BFloat16);
             let (_, _, first) = read_output("first", qmm_tiled(&x, &t, kq, GPU));
-            for i in 1..20 {
+            for i in 1..REPEATS {
                 let (_, _, again) = read_output("again", qmm_tiled(&x, &t, kq, GPU));
                 assert!(again == first, "{} M={m}: evaluation {i} differs", kq.mode);
             }
         }
         println!(
-            "  {:<6} M=1 and M=8 tiled: 20 evaluations identical",
+            "  {:<6} M=1 and M=8 tiled: {REPEATS} evaluations identical",
             kq.mode
         );
     }
