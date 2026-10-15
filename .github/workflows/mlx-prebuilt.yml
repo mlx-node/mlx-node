@@ -121,8 +121,12 @@ jobs:
             echo "$key: $value"
           done
 
-      # Immutability gate. A release whose asset already exists is final unless
-      # the operator explicitly asked to overwrite it.
+      # Immutability gate. A release that already carries BOTH the tarball and
+      # its `.sha256` sidecar is final unless the operator explicitly asked to
+      # overwrite it. `gh release create` uploads assets one API call each, so
+      # a run that died between the two leaves a tarball without a sidecar;
+      # such a release is treated as incomplete and the steps below repair
+      # the sidecar without touching the tarball.
       - name: Check for an existing release
         id: existing
         env:
@@ -131,16 +135,16 @@ jobs:
         run: |
           set -euo pipefail
           exists=false
-          has_asset=false
+          complete=false
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > /tmp/assets.txt 2>/dev/null; then
             exists=true
-            if grep -qx "$ASSET" /tmp/assets.txt; then
-              has_asset=true
+            if grep -qx "$ASSET" /tmp/assets.txt && grep -qx "$ASSET.sha256" /tmp/assets.txt; then
+              complete=true
             fi
           fi
           echo "release_exists=$exists" >> "$GITHUB_OUTPUT"
-          if [ "$exists" = true ] && [ "$has_asset" = true ] && [ "$FORCE" != true ]; then
-            echo "::notice::Release $TAG already carries $ASSET; nothing to publish (set force_reupload to overwrite)."
+          if [ "$exists" = true ] && [ "$complete" = true ] && [ "$FORCE" != true ]; then
+            echo "::notice::Release $TAG already carries $ASSET and its .sha256; nothing to publish (set force_reupload to overwrite)."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -189,7 +193,7 @@ jobs:
           Prebuilt MLX C++ library for \`crates/mlx-sys\` — **not an application release**.
 
           - mlx fork commit: https://github.com/mlx-node/mlx/commit/$MLX_COMMIT
-          - cmake build key: \`$BUILD_KEY\` (portable defines + \`crates/mlx-sys/cmake/\`)
+          - cmake build key: \`$BUILD_KEY\` (portable defines + \`crates/mlx-sys/cmake/\` + build.rs key revision)
           - built from mlx-node commit: $GITHUB_SHA
           - \`MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET\`
           - contents: \`lib/libmlx.a\`, \`lib/libjaccl.a\`, \`lib/mlx.metallib\`, \`include/**\`, \`manifest.json\`
@@ -218,17 +222,19 @@ jobs:
                  "$ASSET" "$ASSET.sha256"; then
             :
           elif has_asset; then
-            echo "::notice::Release $TAG gained $ASSET from a concurrent run; keeping its bytes."
+            echo "::notice::Release $TAG already carries $ASSET (concurrent run or earlier partial upload); keeping its bytes."
           else
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$ASSET" "$ASSET.sha256"
           fi
           echo "::notice::Published $ASSET to release $TAG"
 
       # The snippet names the digest of the asset that is actually on the
-      # release, read back from its `.sha256` sidecar — not this run's local
-      # tarball. When a concurrent run won the race above, the two archives
-      # differ (manifest.json `built_at`, tar metadata) and the local digest
-      # would make every consumer download panic on a sha256 mismatch.
+      # release — not this run's local tarball. When a concurrent run won the
+      # race above, the two archives differ (manifest.json `built_at`, tar
+      # metadata) and the local digest would make every consumer download
+      # panic on a sha256 mismatch. The digest is computed from the published
+      # tarball itself; a missing `.sha256` sidecar (upload died between the
+      # two assets) is written from it so the release becomes complete.
       - name: Emit pin snippet
         if: steps.existing.outputs.skip != 'true'
         env:
@@ -238,9 +244,21 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf /tmp/published && mkdir /tmp/published
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET.sha256" --dir /tmp/published
-          SHA256="$(awk '{print $1}' "/tmp/published/$ASSET.sha256")"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir /tmp/published
+          SHA256="$(shasum -a 256 "/tmp/published/$ASSET" | awk '{print $1}')"
           test -n "$SHA256"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qx "$ASSET.sha256"; then
+            echo "$SHA256  $ASSET" > "/tmp/published/$ASSET.sha256"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "/tmp/published/$ASSET.sha256"
+            echo "::notice::Release $TAG lacked $ASSET.sha256; uploaded it from the published tarball."
+          else
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET.sha256" --dir /tmp/published
+            sidecar="$(awk '{print $1}' "/tmp/published/$ASSET.sha256")"
+            if [ "$sidecar" != "$SHA256" ]; then
+              echo "::error::$ASSET.sha256 on $TAG ($sidecar) does not match the published tarball ($SHA256)"
+              exit 1
+            fi
+          fi
           snippet="$(cat <<EOF
           {
             "repo": "$GITHUB_REPOSITORY",

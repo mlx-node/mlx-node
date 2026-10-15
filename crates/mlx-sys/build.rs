@@ -697,12 +697,20 @@ fn portable_cmake_defines(
     defines
 }
 
-/// sha256 over the portable cmake defines and every file under
-/// `crates/mlx-sys/cmake/` (they run inside MLX's configure). Together with
-/// the submodule commit this is everything that decides the artifact's
-/// bytes, up to the toolchain.
+/// Revision of the artifact-shaping logic that is NOT captured by the
+/// portable defines or `cmake/`: the macOS toolchain selection and
+/// `-isysroot` flags in `build_mlx_from_source`, and the export layout in
+/// `export_prebuilt`. Those use host-specific paths, so they cannot be
+/// hashed into the key directly. BUMP THIS when changing any of them, or
+/// the workflow computes the existing immutable tag and keeps the old asset.
+const PREBUILT_BUILD_KEY_REVISION: u32 = 1;
+
+/// sha256 over the portable cmake defines, every file under
+/// `crates/mlx-sys/cmake/` (they run inside MLX's configure) and
+/// `PREBUILT_BUILD_KEY_REVISION`. Together with the submodule commit this is
+/// everything that decides the artifact's bytes, up to the toolchain.
 fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::Result<String> {
-    let mut canonical = String::new();
+    let mut canonical = format!("revision={PREBUILT_BUILD_KEY_REVISION}\n");
     for (key, value) in defines {
         canonical.push_str(&format!("-D{key}={value}\n"));
     }
@@ -1182,6 +1190,11 @@ fn copy_to_sinks(file: &Path, sinks: &[PathBuf]) {
 fn main() -> io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=mlx");
+    // `cmake/` feeds the prebuilt build key (`prebuilt_build_key`) in every
+    // mode, not only the source build's configure, so an edit there must
+    // re-run this script or a restored target keeps a prebuilt whose key no
+    // longer matches.
+    println!("cargo:rerun-if-changed=cmake");
     // The deployment-target floor participates in both the CMake configure
     // and the paged-attn metallib compile; changing it must re-run this
     // script or the caches keep the old floor.
