@@ -6,16 +6,6 @@
 
 use serde_json::Value;
 
-/// Default `paged_block_size` (tokens per block): every family's read site
-/// resolves an unset field as `unwrap_or(16)`.
-pub const DEFAULT_PAGED_BLOCK_SIZE: u32 = 16;
-
-/// The historical fixed `paged_cache_memory_mb` default (2 GiB), used by the
-/// qwen3 / lfm2 / k2_horizon `unwrap_or(2048)` read sites. Families with
-/// context-aware auto sizing (qwen3_5 dense/MoE, gemma4, muse_glimmer,
-/// nemotron_h) resolve their own per-checkpoint default instead.
-pub const DEFAULT_PAGED_CACHE_MEMORY_MB: u32 = 2048;
-
 /// The flat block-paged KV cache options shared by every paged-capable model
 /// family's `config.json` surface.
 ///
@@ -43,8 +33,7 @@ pub struct PagedCacheConfig {
     #[serde(default)]
     pub paged_cache_initial_memory_mb: Option<u32>,
 
-    /// Paged block size in tokens. Universally read as `unwrap_or(16)`
-    /// ([`DEFAULT_PAGED_BLOCK_SIZE`]).
+    /// Paged block size in tokens. Universally read as `unwrap_or(16)`.
     #[serde(default)]
     pub paged_block_size: Option<u32>,
 
