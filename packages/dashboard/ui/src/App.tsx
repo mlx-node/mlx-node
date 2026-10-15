@@ -1,5 +1,4 @@
 import { Toaster } from '@/components/ui/sonner';
-import { TooltipProvider } from '@/components/ui/tooltip';
 import { hasDismissedOnboarding } from '@/lib/onboarding';
 import type { ModelsResponse } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
@@ -190,7 +189,7 @@ function Layout() {
 
 export default function App() {
   return (
-    <TooltipProvider>
+    <>
       <BrowserRouter>
         <Routes>
           <Route path="welcome" element={<Models onboarding />} />
@@ -204,6 +203,6 @@ export default function App() {
         </Routes>
       </BrowserRouter>
       <Toaster />
-    </TooltipProvider>
+    </>
   );
 }
