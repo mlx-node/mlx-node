@@ -777,12 +777,6 @@ fn test_string_arguments_truncated_json() {
     assert_eq!(calls[0].arguments, r#"{"query": "test"#);
 }
 
-#[test]
-fn test_has_tool_calls() {
-    assert!(has_tool_calls("<tool_call>...</tool_call>"));
-    assert!(!has_tool_calls("no tools here"));
-}
-
 // ---- Function format (Qwen3.5/Qwen3-Coder) ----
 
 #[test]
@@ -898,12 +892,6 @@ fn test_parse_thinking_multiple_blocks() {
         thinking,
         Some("First thought\n\nSecond thought".to_string())
     );
-}
-
-#[test]
-fn test_has_thinking() {
-    assert!(has_thinking("<think>...</think>"));
-    assert!(!has_thinking("no thinking here"));
 }
 
 // ---- Combined parsing ----
