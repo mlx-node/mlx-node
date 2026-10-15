@@ -11,7 +11,8 @@
 pub mod array;
 pub mod audio;
 pub mod autograd;
-pub mod benchmarks;
+#[cfg(test)]
+mod benchmarks;
 pub mod cache_limit;
 pub mod calibration;
 pub mod cold_tier;
