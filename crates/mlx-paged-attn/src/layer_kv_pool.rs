@@ -1053,8 +1053,8 @@ impl LayerKVPool {
     /// The returned `Buffer` is a clone of the pool's handle (a Metal
     /// retain): it stays valid even if a later [`Self::grow_to`] swaps the
     /// pool's buffers, but it then addresses the *old*, smaller allocation.
-    #[cfg(target_os = "macos")]
-    pub fn key_cache(&self, layer_idx: u32) -> Option<Buffer> {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn key_cache(&self, layer_idx: u32) -> Option<Buffer> {
         self.inner_read()
             .layers
             .get(layer_idx as usize)
@@ -1063,8 +1063,8 @@ impl LayerKVPool {
 
     /// Get the value cache buffer for a layer. `None` if `layer_idx` is
     /// out of range. Same retain semantics as [`Self::key_cache`].
-    #[cfg(target_os = "macos")]
-    pub fn value_cache(&self, layer_idx: u32) -> Option<Buffer> {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn value_cache(&self, layer_idx: u32) -> Option<Buffer> {
         self.inner_read()
             .layers
             .get(layer_idx as usize)
