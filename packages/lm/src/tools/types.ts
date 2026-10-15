@@ -117,55 +117,6 @@ export interface ToolCall {
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 /**
- * Chat message with tool calling support
- *
- * This extends the basic ChatMessage to support tool calls and responses.
- */
-export interface ChatMessageWithTools {
-  /** Message role */
-  role: ChatRole;
-  /** Message content */
-  content: string;
-  /** Tool calls made by the assistant (for assistant messages) */
-  toolCalls?: ToolCall[];
-  /** Tool call ID this message is responding to (for tool messages) */
-  toolCallId?: string;
-  /** Reasoning content for thinking mode (used with <think> tags) */
-  reasoningContent?: string;
-}
-
-/**
- * Options for applying chat template with tools
- */
-export interface ApplyChatTemplateOptions {
-  /** Whether to add generation prompt at end (default: true) */
-  addGenerationPrompt?: boolean;
-  /** Array of tool definitions for function calling */
-  tools?: ToolDefinition[];
-  /**
-   * Control thinking mode behavior.
-   *
-   * @remarks
-   * **Counter-intuitive semantics** (from Qwen3's Jinja2 template):
-   * - `undefined` or `true`: Model thinks naturally (no tags added)
-   * - `false`: Adds empty `<think>\n\n</think>\n\n` tags to **disable** thinking
-   *
-   * The default is `false` for tool use, which disables thinking to avoid
-   * verbose reasoning during tool calls.
-   *
-   * @example
-   * ```typescript
-   * // Allow model to think (default behavior without tools)
-   * { enableThinking: true }
-   *
-   * // Disable thinking (adds empty <think></think> tags)
-   * { enableThinking: false }
-   * ```
-   */
-  enableThinking?: boolean;
-}
-
-/**
  * Create a tool definition with automatic JSON stringification of properties.
  *
  * This helper handles the NAPI-RS limitation where `properties` must be a JSON string.
