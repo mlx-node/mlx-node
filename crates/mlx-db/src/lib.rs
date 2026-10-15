@@ -19,12 +19,7 @@
 //!
 //! ### Async (for mlx-core/Node.js)
 //!
-//! ```ignore
-//! use mlx_db::{AsyncDb, reader, writer};
-//!
-//! let db = AsyncDb::local("outputs.db").await?;
-//! let runs = reader::list_runs(db.pool(), None, None).await?;
-//! ```
+//! Reader and writer functions take a `&SqlitePool` opened by the caller.
 //!
 //! ### Sync (for mlx-tui)
 //!
@@ -44,21 +39,19 @@ pub mod types;
 pub mod writer;
 
 // Re-export main types for convenience
-pub use connection::{AsyncDb, SyncDbReader};
+pub use connection::SyncDbReader;
 pub use error::DbError;
 pub use types::*;
 
 // Re-export commonly used reader functions
 pub use reader::{
-    get_generations_filtered, get_log_count, get_logs, get_recent_generations,
-    get_recent_step_metrics, get_run, get_run_aggregates, get_step_summaries,
-    get_tool_calls_for_generation, list_runs,
+    get_generations_filtered, get_logs, get_recent_generations, get_recent_step_metrics, get_run,
+    get_run_aggregates, get_step_summaries, list_runs,
 };
 
 // Re-export writer functions
 pub use writer::{
-    CleanupStats, delete_all_after_step, delete_steps_after, increment_run_steps, record_step,
-    record_step_from_outputs, write_log,
+    CleanupStats, delete_all_after_step, delete_steps_after, record_step, record_step_from_outputs,
 };
 
 // Re-export training types

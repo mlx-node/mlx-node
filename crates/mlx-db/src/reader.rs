@@ -724,44 +724,10 @@ pub async fn get_logs(
     Ok(rows.into_iter().map(|r| r.into()).collect())
 }
 
-/// Get count of logs matching filter
-pub async fn get_log_count(
-    pool: &SqlitePool,
-    run_id: Option<&str>,
-    min_level: Option<&str>,
-) -> Result<i64, DbError> {
-    let mut builder: QueryBuilder<Sqlite> =
-        QueryBuilder::new("SELECT COUNT(*) FROM logs WHERE 1=1");
-
-    if let Some(rid) = run_id {
-        builder.push(" AND run_id = ");
-        builder.push_bind(rid);
-    }
-
-    if let Some(level) = min_level {
-        let levels = match level.to_uppercase().as_str() {
-            "ERROR" => vec!["ERROR"],
-            "WARN" => vec!["ERROR", "WARN"],
-            "INFO" => vec!["ERROR", "WARN", "INFO"],
-            _ => vec!["ERROR", "WARN", "INFO", "DEBUG"],
-        };
-        builder.push(" AND level IN (");
-        let mut separated = builder.separated(", ");
-        for l in levels {
-            separated.push_bind(l);
-        }
-        separated.push_unseparated(")");
-    }
-
-    let count: i64 = builder.build_query_scalar().fetch_one(pool).await?;
-
-    Ok(count)
-}
-
 // === Helper functions ===
 
 /// Get tool calls for a specific generation
-pub async fn get_tool_calls_for_generation(
+async fn get_tool_calls_for_generation(
     pool: &SqlitePool,
     gen_id: i64,
 ) -> Result<Vec<ToolCallRecord>, DbError> {
