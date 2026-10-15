@@ -402,9 +402,6 @@ function formatElement(label: string, text: string, order: number): string {
       return `$$\n${trimmed}\n$$\n`;
     case 'code_txt':
       return `\`\`\`\n${trimmed}\n\`\`\`\n`;
-    case 'figure':
-    case 'chart':
-      return trimmed ? `[${label}: ${trimmed}]\n` : `[${label}]\n`;
     case 'header':
     case 'footer':
       return `<!-- ${label}: ${trimmed} -->\n`;
@@ -413,8 +410,6 @@ function formatElement(label: string, text: string, order: number): string {
       return `[^note-${order}]: ${trimmed}\n`;
     case 'list':
       return `${trimmed}\n`;
-    case 'seal':
-      return `[seal: ${trimmed}]\n`;
     default:
       return `${trimmed}\n`;
   }
