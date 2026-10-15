@@ -116,37 +116,6 @@ impl TextRecModel {
         Ok(results)
     }
 
-    /// Recognize text from raw RGB crop data.
-    ///
-    /// # Arguments
-    /// * `rgb_data` - Raw RGB pixel data of a cropped text line
-    /// * `width` - Image width
-    /// * `height` - Image height
-    ///
-    /// # Returns
-    /// * RecResult with recognized text and confidence score
-    #[napi]
-    pub fn recognize_crop(&self, rgb_data: &[u8], width: u32, height: u32) -> Result<RecResult> {
-        let pixel_values = self.image_processor.process_crop(rgb_data, width, height)?;
-        let logits = self.forward(&pixel_values)?;
-        let decoded = ctc_greedy_decode(&logits)?;
-
-        if decoded.is_empty() {
-            return Ok(RecResult {
-                text: String::new(),
-                score: 0.0,
-            });
-        }
-
-        let (indices, scores) = &decoded[0];
-        let (text, score) = self.dictionary.decode_with_score(indices, scores);
-
-        Ok(RecResult {
-            text,
-            score: score as f64,
-        })
-    }
-
     /// Run the full model forward pass.
     fn forward(&self, pixel_values: &MxArray) -> Result<MxArray> {
         // Backbone: extract features (only last stage for text rec)
