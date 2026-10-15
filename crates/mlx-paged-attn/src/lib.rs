@@ -61,12 +61,3 @@ pub use cold_cache::*;
 pub use config::*;
 pub use layer_kv_pool::{LayerKVPool, RESTORE_STAGING_BYTES};
 pub use prefix_registry::{PrefixKeys, chain_hashes, chain_hashes_per_block, hash_tokens};
-
-/// Path to the compiled Metal library (set at build time)
-/// Only valid on macOS; empty string on other platforms
-#[cfg(target_os = "macos")]
-pub const METALLIB_PATH: &str = env!("PAGED_ATTN_METALLIB");
-
-/// Placeholder for non-macOS platforms
-#[cfg(not(target_os = "macos"))]
-pub const METALLIB_PATH: &str = "";
