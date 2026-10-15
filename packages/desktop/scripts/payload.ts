@@ -11,7 +11,7 @@ import { join } from 'node:path';
 
 import {
   assertAddonMinOs,
-  assertMetallibComplete,
+  assertMetallibIntegrity,
   assertMlxMetallibCarriesNax,
   assertPagedMetallibIntegrity,
 } from '../../core/metallib-select.js';
@@ -122,18 +122,23 @@ export function checkAddonMinOs(addonPath: string): void {
 }
 
 /**
- * `paged_attn.metallib` passes the same gate `yarn build:native` applies
- * (packages/core/metallib-select.ts): it holds the K-quant (NAX included),
- * segmented SDPA and mixed-affine kernels, which have no JIT fallback, so an
- * older library clears any size floor and then throws on first use. An
- * `mlx.metallib` without MLX's NAX kernels (an MLX_METAL_NO_NAX build), or
- * either file shorter than its MTLB header declares, fails.
+ * Both metallibs pass the same gates `yarn build:native` applies
+ * (packages/core/metallib-select.ts). `paged_attn.metallib` holds the K-quant
+ * (NAX included), segmented SDPA and mixed-affine kernels, which have no JIT
+ * fallback, so an older library clears any size floor and then throws on
+ * first use. `mlx.metallib` must carry the kernel names of the CURRENT MLX
+ * pin (`NAX_KERNEL_MARKERS`), not only some NAX kernels: a library left over
+ * from the previous pin has the latter and would otherwise ship. Either file
+ * shorter than its MTLB header declares fails. Size floors are applied per
+ * file in `resolvePayload`.
  */
 export function checkMetallibPair(mlxMetallibPath: string, pagedMetallibPath: string): void {
   try {
     const mlxMetallib = readFileSync(mlxMetallibPath);
+    // First for its diagnosis (MLX_METAL_NO_NAX build vs. stale pin); the
+    // integrity gate repeats it after the pin-marker check.
     assertMlxMetallibCarriesNax(mlxMetallib, mlxMetallibPath);
-    assertMetallibComplete(mlxMetallib, mlxMetallibPath);
+    assertMetallibIntegrity(mlxMetallib, { path: mlxMetallibPath, minBytes: 0 });
     assertPagedMetallibIntegrity(readFileSync(pagedMetallibPath), {
       path: pagedMetallibPath,
       minBytes: MIN_BYTES['paged_attn.metallib'],

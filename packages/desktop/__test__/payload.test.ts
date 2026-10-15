@@ -20,6 +20,7 @@ import {
   KQUANT_KERNEL_MARKERS,
   KQUANT_NAX_KERNEL_MARKERS,
   MLX_NAX_ONLY_MARKERS,
+  NAX_KERNEL_MARKERS,
 } from '../../core/metallib-select.js';
 import { PayloadError, checkAddonMinOs, checkMetallibPair } from '../scripts/payload.js';
 
@@ -29,7 +30,9 @@ const PAGED_KERNELS = [
   'copy_blocks_bfloat16_t',
 ];
 const MLX_BASE = [...BASE_KERNEL_MARKERS];
-const MLX_NAX = [...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS];
+const MLX_NAX = [...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS, ...NAX_KERNEL_MARKERS];
+/** The previous pin's library: NAX kernels, but not every name of the current pin. */
+const MLX_PREVIOUS_PIN = [...BASE_KERNEL_MARKERS, ...MLX_NAX_ONLY_MARKERS, ...NAX_KERNEL_MARKERS.slice(0, -1)];
 const PAGED_BASE = [...PAGED_KERNELS, ...KQUANT_KERNEL_MARKERS, ...BRIDGE_KERNEL_MARKERS];
 const PAGED_NAX = [...PAGED_BASE, ...KQUANT_NAX_KERNEL_MARKERS];
 
@@ -108,6 +111,12 @@ describe('checkMetallibPair', () => {
     for (const paged of [PAGED_BASE, PAGED_NAX]) {
       expect(() => checkMetallibPair(...pair(library(MLX_BASE), library(paged)))).toThrow(/has no NAX kernels/);
     }
+  });
+
+  it("rejects the previous pin's mlx.metallib (NAX kernels, but not the current pin's names)", () => {
+    expect(() => checkMetallibPair(...pair(library(MLX_PREVIOUS_PIN), library(PAGED_NAX)))).toThrow(
+      NAX_KERNEL_MARKERS[NAX_KERNEL_MARKERS.length - 1],
+    );
   });
 
   it('rejects an mlx.metallib with some NAX kernels, or no MTLB magic', () => {
