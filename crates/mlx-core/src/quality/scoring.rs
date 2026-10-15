@@ -348,6 +348,21 @@ mod tests {
         array.to_float32().unwrap().to_vec()
     }
 
+    /// Reference KL(P || Q) over log-probabilities: sum over the last axis,
+    /// mean over the rest.
+    fn kl_divergence(log_p: &MxArray, log_q: &MxArray) -> MxArray {
+        let pointwise = log_p
+            .exp()
+            .unwrap()
+            .mul(&log_p.sub(log_q).unwrap())
+            .unwrap();
+        pointwise
+            .sum(Some(&[-1]), None)
+            .unwrap()
+            .mean(None, None)
+            .unwrap()
+    }
+
     /// THE gating property: a checkpoint scored against a reference captured
     /// from ITSELF has zero divergence. Asserted EXACTLY — every KL term is
     /// `p_v * (x - x)` on bit-identical inputs, so any tolerance here would be
@@ -504,7 +519,7 @@ mod tests {
 
     /// Cross-check the fifteen lines of reductions above against the in-tree
     /// loss implementations. At full support the partial KL IS the KL, so
-    /// `Losses::kl_divergence` over both log-softmaxes must agree; and the NLL is
+    /// a reference KL over both log-softmaxes must agree; and the NLL is
     /// cross-entropy with class-index targets. Catches an argument-order flip in
     /// the KL or an NLL that dropped the logsumexp normaliser.
     #[test]
@@ -524,20 +539,17 @@ mod tests {
             .into_report(1, VOCAB as u32, "oracle".to_string(), false)
             .unwrap();
 
-        let oracle_kl = read_row(
-            &Losses::kl_divergence(
-                &teacher.log_softmax(-1).unwrap(),
-                &student.log_softmax(-1).unwrap(),
-            )
-            .unwrap(),
-        )[0] as f64;
+        let oracle_kl = read_row(&kl_divergence(
+            &teacher.log_softmax(-1).unwrap(),
+            &student.log_softmax(-1).unwrap(),
+        ))[0] as f64;
         let oracle_nll =
             read_row(&Losses::cross_entropy(&student, &targets, None, None, None).unwrap())[0]
                 as f64;
 
         assert!(
             (report.mean_kl_topk - oracle_kl).abs() < 1e-6,
-            "KL {} vs Losses::kl_divergence {oracle_kl}",
+            "KL {} vs reference KL {oracle_kl}",
             report.mean_kl_topk
         );
         assert!(
