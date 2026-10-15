@@ -219,10 +219,6 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     profile,
     strict,
     warn: (msg) => console.warn(msg),
-    // A prebuilt-MLX addon (crates/mlx-sys/build.rs "Prebuilt MLX") bakes a
-    // release sentinel instead of a local path; the unpacked artifact is
-    // found by the same env rule build.rs used.
-    prebuilt: { env: process.env, repoRoot: join(__dirname, '../..'), triple },
   });
   console.log(
     {

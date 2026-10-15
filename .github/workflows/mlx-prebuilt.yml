@@ -1,23 +1,28 @@
 name: MLX Prebuilt
 
 # Builds the MLX C++ library (libmlx.a + libjaccl.a + mlx.metallib + headers)
-# ONCE per mlx-fork commit and publishes it as a GitHub prerelease asset.
+# ONCE per (mlx-fork commit, cmake build inputs) and publishes it as a GitHub
+# prerelease asset.
 # `crates/mlx-sys/build.rs` then downloads that asset instead of running the
 # ~18 min cmake build in every CI job (see the pin file
 # `crates/mlx-sys/mlx-prebuilt.json`; `MLX_PREBUILT=0` forces a source build).
 #
 # Flow after a submodule bump:
-#   1. pushing the gitlink change (`crates/mlx-sys/mlx`) on ANY branch runs
-#      this workflow, which uploads `mlx-prebuilt-<12 hex>` with the tarball
-#      + its `.sha256` (releases are keyed by the mlx commit, so a PR branch
-#      and main produce the same tag; the first one wins);
+#   1. pushing the gitlink change (`crates/mlx-sys/mlx`) — or a change to
+#      build.rs / cmake/ — on ANY branch runs this workflow, which uploads
+#      `mlx-prebuilt-<mlx sha12>-<build key8>` with the tarball + its
+#      `.sha256`. The tag is derived by build.rs (`release_tag` in the
+#      exported manifest.json) from the submodule commit AND a hash of the
+#      portable cmake defines + `crates/mlx-sys/cmake/`, so the same inputs
+#      always name the same release and the first publisher wins;
 #   2. the same PR pastes the printed JSON into `mlx-prebuilt.json`
 #      (new `mlx_commit`, `release_tag`, `sha256`). Until then build.rs sees
 #      a commit mismatch and falls back to the source build, so CI stays
 #      green either way.
 #
-# Releases are IMMUTABLE by default: if the tag already carries the asset the
-# job exits early. `force_reupload` re-publishes over an existing tag.
+# Releases are IMMUTABLE by default: if the tag already carries the asset
+# nothing is uploaded (checked after the build, since the tag needs the
+# build key). `force_reupload` re-publishes over an existing tag.
 on:
   workflow_dispatch:
     inputs:
@@ -92,23 +97,36 @@ jobs:
           echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
           chmod 600 ~/.netrc
 
-      - name: Resolve mlx commit and release tag
+      # `cargo build -p mlx-sys` is enough to run build.rs end to end (no NAPI
+      # addon involved). MLX_PREBUILT=0 forces the source cmake build and
+      # MLX_PREBUILT_EXPORT makes build.rs copy the finished artifact set
+      # (lib/libmlx.a, lib/libjaccl.a, lib/mlx.metallib, include/**,
+      # manifest.json) into the given directory. manifest.json carries the
+      # release tag build.rs derived for this checkout.
+      - name: Build MLX from source
+        env:
+          MLX_PREBUILT: '0'
+          MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
+        run: cargo build --release --locked -p mlx-sys --target ${{ matrix.target }}
+
+      - name: Read the release tag from the manifest
         id: meta
         run: |
           set -euo pipefail
-          MLX_COMMIT="$(git -C crates/mlx-sys/mlx rev-parse HEAD)"
-          TAG="mlx-prebuilt-${MLX_COMMIT:0:12}"
-          echo "mlx_commit=$MLX_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "mlx commit: $MLX_COMMIT"
-          echo "release tag: $TAG"
+          test -f prebuilt-out/manifest.json
+          for key in mlx_commit release_tag build_key; do
+            value="$(jq -r ".$key // empty" prebuilt-out/manifest.json)"
+            test -n "$value"
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+            echo "$key: $value"
+          done
 
       # Immutability gate. A release whose asset already exists is final unless
       # the operator explicitly asked to overwrite it.
       - name: Check for an existing release
         id: existing
         env:
-          TAG: ${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
           FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
         run: |
           set -euo pipefail
@@ -122,30 +140,17 @@ jobs:
           fi
           echo "release_exists=$exists" >> "$GITHUB_OUTPUT"
           if [ "$exists" = true ] && [ "$has_asset" = true ] && [ "$FORCE" != true ]; then
-            echo "::notice::Release $TAG already carries $ASSET; nothing to do (set force_reupload to overwrite)."
+            echo "::notice::Release $TAG already carries $ASSET; nothing to publish (set force_reupload to overwrite)."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
-
-      # `cargo build -p mlx-sys` is enough to run build.rs end to end (no NAPI
-      # addon involved). MLX_PREBUILT=0 forces the source cmake build and
-      # MLX_PREBUILT_EXPORT makes build.rs copy the finished artifact set
-      # (lib/libmlx.a, lib/libjaccl.a, lib/mlx.metallib, include/**,
-      # manifest.json) into the given directory.
-      - name: Build MLX from source
-        if: steps.existing.outputs.skip != 'true'
-        env:
-          MLX_PREBUILT: '0'
-          MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
-        run: cargo build --release --locked -p mlx-sys --target ${{ matrix.target }}
 
       - name: Package
         if: steps.existing.outputs.skip != 'true'
         id: pkg
         run: |
           set -euo pipefail
-          test -f prebuilt-out/manifest.json
           test -f prebuilt-out/lib/libmlx.a
           test -f prebuilt-out/lib/mlx.metallib
           test -d prebuilt-out/include/mlx
@@ -162,7 +167,7 @@ jobs:
         if: steps.existing.outputs.skip != 'true'
         env:
           MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
-          TAG: ${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
           SHA256: ${{ steps.pkg.outputs.sha256 }}
           TARGET: ${{ matrix.target }}
         run: |
@@ -197,12 +202,20 @@ jobs:
       # and electron-updater's stable channel skip prereleases, so a
       # `mlx-prebuilt-*` release must never become "latest". The tag also
       # must not match `v*` (desktop-release.yml triggers on `tags: ['v*']`).
+      #
+      # Two branches can carry the same inputs and race here: both pass the
+      # gate above, one `gh release create` wins. The loser re-checks the
+      # asset and keeps the winner's bytes — `--clobber` only runs on an
+      # explicit force_reupload, never as a fallback, or the sha256 the
+      # winner printed would stop matching the asset.
       - name: Create or update release
         if: steps.existing.outputs.skip != 'true'
         env:
           MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
-          TAG: ${{ steps.meta.outputs.tag }}
+          BUILD_KEY: ${{ steps.meta.outputs.build_key }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
           RELEASE_EXISTS: ${{ steps.existing.outputs.release_exists }}
+          FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
@@ -210,6 +223,7 @@ jobs:
           Prebuilt MLX C++ library for \`crates/mlx-sys\` — **not an application release**.
 
           - mlx fork commit: https://github.com/mlx-node/mlx/commit/$MLX_COMMIT
+          - cmake build key: \`$BUILD_KEY\` (portable defines + \`crates/mlx-sys/cmake/\`)
           - built from mlx-node commit: $GITHUB_SHA
           - \`MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET\`
           - contents: \`lib/libmlx.a\`, \`lib/libjaccl.a\`, \`lib/mlx.metallib\`, \`include/**\`, \`manifest.json\`
@@ -217,21 +231,30 @@ jobs:
           \`crates/mlx-sys/build.rs\` downloads the asset named in
           \`crates/mlx-sys/mlx-prebuilt.json\`, checks its sha256, and links
           against it instead of running the cmake build. It refuses the prebuilt
-          when the checked-out submodule commit differs from \`mlx_commit\`, and
-          falls back to a source build when the digest is empty or the download
-          fails. \`MLX_PREBUILT=0\` always forces a source build.
+          when the checked-out submodule commit or the cmake build inputs differ
+          from what the pinned tag encodes, and falls back to a source build when
+          the digest is empty or the download fails. \`MLX_PREBUILT=0\` always
+          forces a source build.
           EOF
-          if [ "$RELEASE_EXISTS" != true ]; then
-            # A matrix sibling may have created the tag in the meantime; fall
-            # through to the upload below in that case.
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --prerelease \
-              --title "MLX prebuilt ${MLX_COMMIT:0:12}" \
-              --notes-file /tmp/notes.md \
-              --target "$GITHUB_SHA" \
-              "$ASSET" "$ASSET.sha256" \
-            || gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ASSET" "$ASSET.sha256"
-          else
+          has_asset() {
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null \
+              | grep -qx "$ASSET"
+          }
+          if [ "$FORCE" = true ]; then
+            if [ "$RELEASE_EXISTS" != true ]; then
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+                --title "MLX prebuilt ${MLX_COMMIT:0:12}" --notes-file /tmp/notes.md --target "$GITHUB_SHA"
+            fi
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ASSET" "$ASSET.sha256"
+          elif [ "$RELEASE_EXISTS" != true ] \
+            && gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+                 --title "MLX prebuilt ${MLX_COMMIT:0:12}" --notes-file /tmp/notes.md --target "$GITHUB_SHA" \
+                 "$ASSET" "$ASSET.sha256"; then
+            :
+          elif has_asset; then
+            echo "::notice::Release $TAG gained $ASSET from a concurrent run; keeping its bytes."
+            exit 0
+          else
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$ASSET" "$ASSET.sha256"
           fi
           echo "::notice::Published $ASSET to release $TAG"
