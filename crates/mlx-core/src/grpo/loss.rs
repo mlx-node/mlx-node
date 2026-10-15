@@ -338,47 +338,6 @@ pub fn grpo_loss(
     Ok(scaled_loss)
 }
 
-/// Compute importance sampling ratios for GRPO
-///
-/// # Arguments
-/// * `per_token_logps` - Current policy log probabilities, shape (B, T)
-/// * `old_per_token_logps` - Old policy log probabilities, shape (B, T)
-/// * `level` - "token" for per-token ratios, "sequence" for per-sequence ratios
-/// * `completion_mask` - Binary mask for valid tokens, shape (B, T)
-///
-/// # Returns
-/// * Importance sampling ratios, shape (B, T) for token-level or (B, 1) for sequence-level
-pub fn compute_importance_ratios(
-    per_token_logps: &MxArray,
-    old_per_token_logps: &MxArray,
-    level: String,
-    completion_mask: &MxArray,
-) -> Result<MxArray> {
-    let log_ratio = per_token_logps.sub(old_per_token_logps)?;
-
-    match level.as_str() {
-        "token" => {
-            // Token-level: exp(log_ratio)
-            log_ratio.exp()
-        }
-        "sequence" => {
-            // Sequence-level: exp(mean(log_ratio over valid tokens))
-            let masked_ratio = log_ratio.mul(completion_mask)?;
-            let sum_ratio = masked_ratio.sum(Some(&[1]), Some(true))?;
-
-            let sum_mask = completion_mask.sum(Some(&[1]), Some(true))?;
-            let clamped_sum_mask = sum_mask.maximum(&MxArray::scalar_float(1.0)?)?;
-
-            let mean_log_ratio = sum_ratio.div(&clamped_sum_mask)?;
-            mean_log_ratio.exp()
-        }
-        _ => Err(Error::new(
-            Status::InvalidArg,
-            format!("Unknown level: {}. Use 'token' or 'sequence'", level),
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,11 +355,6 @@ mod tests {
     // Helper to get f32 value from scalar MxArray
     fn to_scalar(arr: &MxArray) -> f32 {
         arr.to_float32().unwrap()[0]
-    }
-
-    // Helper to get f32 values from MxArray
-    fn to_f32_vec(arr: &MxArray) -> Vec<f32> {
-        arr.to_float32().unwrap().to_vec()
     }
 
     // Helper to create default config
@@ -586,55 +540,6 @@ mod tests {
     }
 
     // ==================== Importance Sampling ====================
-
-    #[test]
-    fn test_token_level_importance() {
-        // Log ratio of 0.5 means ratio = exp(0.5) ≈ 1.649
-        let per_token_logps = array_2d(&[-0.5, -0.5], 1, 2);
-        let old_per_token_logps = array_2d(&[-1.0, -1.0], 1, 2);
-        let completion_mask = array_2d(&[1.0, 1.0], 1, 2);
-
-        let ratios = compute_importance_ratios(
-            &per_token_logps,
-            &old_per_token_logps,
-            "token".to_string(),
-            &completion_mask,
-        )
-        .unwrap();
-
-        let values = to_f32_vec(&ratios);
-        let expected = (0.5_f32).exp();
-        assert!(
-            (values[0] - expected).abs() < 1e-5,
-            "Expected {} but got {}",
-            expected,
-            values[0]
-        );
-    }
-
-    #[test]
-    fn test_sequence_level_importance() {
-        // Sequence-level: mean of log ratios, then exp
-        let per_token_logps = array_2d(&[-0.5, -1.5], 1, 2);
-        let old_per_token_logps = array_2d(&[-1.0, -1.0], 1, 2);
-        let completion_mask = array_2d(&[1.0, 1.0], 1, 2);
-
-        let ratios = compute_importance_ratios(
-            &per_token_logps,
-            &old_per_token_logps,
-            "sequence".to_string(),
-            &completion_mask,
-        )
-        .unwrap();
-
-        // Log ratios: [0.5, -0.5], mean = 0.0, exp(0) = 1.0
-        let values = to_f32_vec(&ratios);
-        assert!(
-            (values[0] - 1.0).abs() < 1e-5,
-            "Expected 1.0 but got {}",
-            values[0]
-        );
-    }
 
     #[test]
     fn test_importance_ratio_clipping() {
