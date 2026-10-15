@@ -2139,20 +2139,6 @@ export declare class Qwen3Model {
    * * `save_path` - Directory to save the model
    */
   saveModel(savePath: string): Promise<undefined>;
-  /**
-   * Validate that a set of parameters has all required weights with correct shapes
-   *
-   * This is useful for validating parameters before loading them into a model,
-   * or for checking that saved weights are valid before training.
-   *
-   * # Arguments
-   * * `params` - HashMap of parameter names to MxArray values
-   *
-   * # Returns
-   * * Ok(()) if all validations pass
-   * * Err with descriptive message if validation fails
-   */
-  validateParameters(params: Record<string, MxArray>): void;
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
