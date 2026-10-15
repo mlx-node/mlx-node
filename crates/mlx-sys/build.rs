@@ -714,21 +714,37 @@ fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::
     for (key, value) in defines {
         canonical.push_str(&format!("-D{key}={value}\n"));
     }
+    // Recursive, like the workflow's `cmake/**` trigger: a new include under
+    // a subdirectory must move the key, or the publisher keeps the old asset.
     let cmake_dir = manifest_dir.join("cmake");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&cmake_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_file())
-        .collect();
+    let mut files = Vec::new();
+    walk_files(&cmake_dir, &mut files)?;
     files.sort();
     for file in files {
-        let name = file.file_name().unwrap().to_string_lossy().into_owned();
-        canonical.push_str(&format!("cmake/{name}={}\n", sha256_file(&file)?));
+        let rel = file
+            .strip_prefix(&cmake_dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        canonical.push_str(&format!("cmake/{rel}={}\n", sha256_file(&file)?));
     }
     let tmp = env::temp_dir().join(format!("mlx-prebuilt-key-{}.txt", std::process::id()));
     std::fs::write(&tmp, canonical)?;
     let key = sha256_file(&tmp);
     let _ = std::fs::remove_file(&tmp);
     key
+}
+
+fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            walk_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// `(HEAD sha, dirty)` of the submodule checkout, or the git error.
