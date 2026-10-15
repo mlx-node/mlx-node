@@ -276,12 +276,6 @@ export interface ColdTierHealth {
    */
   restoreDeclines: number;
   /**
-   * Restores a family threw away after the walk served them. Also summed, and
-   * the eighth of the `ColdSidecarStats` family below — unprefixed because it
-   * is read beside `restoreDeclines`, the other way reuse is refused.
-   */
-  restoreSuppressed: number;
-  /**
    * Turns that entered a family's sidecar capture. Every other `sidecar*`
    * counter is a sub-count of this one. Only the hybrid families
    * (gemma4 / qwen3_5 / qwen3_5_moe) ever enter it, so `0` beside real block

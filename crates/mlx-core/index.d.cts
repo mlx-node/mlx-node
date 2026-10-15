@@ -3373,13 +3373,6 @@ export interface ColdSidecarStats {
    * satisfied by the replay.
    */
   installed: number;
-  /**
-   * Restores a family THREW AWAY after the walk served them, restarting the
-   * turn cold. Unlike `ColdCacheStats.restoreDeclines` this one comes AFTER
-   * real `coldHits` and `coldBytesRestored`, so the turn looks like it
-   * reused a prefix right up to the point where it recomputed all of it.
-   */
-  restoreSuppressed: number;
 }
 
 /**

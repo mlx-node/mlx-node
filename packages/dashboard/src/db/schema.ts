@@ -62,7 +62,7 @@ export const traces = sqliteTable('traces', {
    */
   coldRestoreDeclines: integer('cold_restore_declines'),
   /**
-   * The eight `ColdSidecarStats` counters — the recurrent / sliding-window
+   * The seven `ColdSidecarStats` counters — the recurrent / sliding-window
    * state that lives OUTSIDE the paged pool. Every one is a per-turn DELTA
    * (the trace writer differences the native snapshot across the turn), so
    * every one SUMS. None has a cumulative `*_total` twin, and MAX would not
@@ -95,11 +95,6 @@ export const traces = sqliteTable('traces', {
    * `cold_corruptions` — reads identically either way.
    */
   coldSidecarInstalled: integer('cold_sidecar_installed'),
-  /**
-   * Restores a family threw away after the walk served them. Preceded by real
-   * `coldHits`, which is what makes it the harder of the two to spot.
-   */
-  coldSidecarRestoreSuppressed: integer('cold_sidecar_restore_suppressed'),
   sourceFile: text('source_file'),
 });
 

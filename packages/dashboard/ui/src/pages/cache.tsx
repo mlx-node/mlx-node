@@ -124,12 +124,7 @@ export default function Cache() {
       : 0;
   const corruptionsSeen = (health?.corruptionsTotal ?? 0) > 0 || (health?.corruptions ?? 0) > 0;
   const writeErrorsSeen = (health?.writeErrorsTotal ?? 0) > 0 || (health?.writeErrors ?? 0) > 0;
-  // The two ways reuse is refused, summed for the hit-rate tile only: both end
-  // with the prefix recomputed, and at the tile's altitude the operator needs
-  // to know a refusal happened at all. The health card below keeps them apart,
-  // because the causes are unrelated (the walk found no backed boundary vs a
-  // family threw away a prefix it had).
-  const refusals = (health?.restoreDeclines ?? 0) + (health?.restoreSuppressed ?? 0);
+  const refusals = health?.restoreDeclines ?? 0;
 
   const sidecarCaptures = health?.sidecarCaptureReached ?? 0;
   const sidecarInstalled = health?.sidecarInstalled ?? 0;
@@ -540,7 +535,7 @@ export default function Cache() {
               <HealthStat
                 label="Restore declines"
                 value={formatNumber(health?.restoreDeclines ?? 0)}
-                hint={`${formatNumber(health?.restoreSuppressed ?? 0)} suppressed after restore · neither counts as a lookup`}
+                hint="refused before lookup · not counted as a lookup"
                 loading={cache.loading}
               />
               {/*
