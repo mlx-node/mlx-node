@@ -172,15 +172,6 @@ pub(crate) fn parse_tool_calls_with(
     (cleaned_text, tool_calls)
 }
 
-/// Result of parsing tool calls from text
-#[napi(object)]
-pub struct ParseToolCallsResult {
-    /// Cleaned text with tool_call tags removed
-    pub text: String,
-    /// Parsed tool calls
-    pub tool_calls: Vec<ToolCallResult>,
-}
-
 /// Structured completion information aligned with ChatResult.
 /// Contains pre-parsed tool calls, thinking, and clean text.
 #[napi(object)]
@@ -210,16 +201,6 @@ pub struct RewardOutput {
     pub prompt: String,
     /// Structured completion data aligned with ChatResult
     pub completion: CompletionInfo,
-}
-
-/// Parse tool calls from text (NAPI export)
-#[napi]
-pub fn parse_tool_calls_from_text(text: String) -> ParseToolCallsResult {
-    let (cleaned_text, tool_calls) = parse_tool_calls(&text);
-    ParseToolCallsResult {
-        text: cleaned_text,
-        tool_calls,
-    }
 }
 
 /// Build RewardOutput array from generation results.

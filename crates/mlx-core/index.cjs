@@ -772,6 +772,5 @@ module.exports.formatDocument = nativeBinding.formatDocument;
 module.exports.getExpectedWeightKeys = nativeBinding.getExpectedWeightKeys;
 module.exports.OutputFormat = nativeBinding.OutputFormat;
 module.exports.parsePaddleResponse = nativeBinding.parsePaddleResponse;
-module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText;
 module.exports.parseVlmOutput = nativeBinding.parseVlmOutput;
 module.exports.saveToXlsx = nativeBinding.saveToXlsx;

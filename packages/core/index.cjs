@@ -928,7 +928,6 @@ module.exports.memoryStats = nativeBinding.memoryStats;
 module.exports.MultimodalContentOrder = nativeBinding.MultimodalContentOrder;
 module.exports.OutputFormat = nativeBinding.OutputFormat;
 module.exports.parsePaddleResponse = nativeBinding.parsePaddleResponse;
-module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText;
 module.exports.parseVlmOutput = nativeBinding.parseVlmOutput;
 module.exports.preflightMuseDflashGguf = nativeBinding.preflightMuseDflashGguf;
 module.exports.prepareMuseGlimmerGguf = nativeBinding.prepareMuseGlimmerGguf;
