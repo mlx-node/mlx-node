@@ -8,7 +8,7 @@ use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, SpecFrontier, TurnOutput, WholeTurnArgs,
+    ResetScope, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::TurnStreaming;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
@@ -412,10 +412,6 @@ impl Qwen35DFlash2Stepper<'_> {
         self.next_position = self.next_position.saturating_add(keep as i32);
         Ok(())
     }
-
-    fn attention_frontier(&self) -> Option<u64> {
-        flat_attention_frontier(self.inner).and_then(|frontier| u64::try_from(frontier).ok())
-    }
 }
 
 impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
@@ -681,13 +677,6 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         self.context.collect_arrays(&mut arrays);
         arrays.push(token);
         MxArray::async_eval_arrays(&arrays);
-    }
-
-    fn frontier(&self) -> Option<SpecFrontier> {
-        Some(SpecFrontier {
-            attn_tokens: self.attention_frontier()?,
-            recurrent_tokens: Some(self.next_position.max(0) as u64),
-        })
     }
 }
 
@@ -1222,12 +1211,23 @@ impl Qwen35Inner {
 mod tests {
     use super::*;
     use crate::array::DType;
+    use crate::engine::backend::SpecFrontier;
     use crate::engine::extract_chat_params;
     use crate::engine::types::ChatConfig;
     use crate::models::quantized_linear::LinearProj;
     use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
     use crate::nn::Linear;
     use rand::SeedableRng;
+
+    impl Qwen35DFlash2Stepper<'_> {
+        fn frontier(&self) -> Option<SpecFrontier> {
+            Some(SpecFrontier {
+                attn_tokens: flat_attention_frontier(self.inner)
+                    .and_then(|frontier| u64::try_from(frontier).ok())?,
+                recurrent_tokens: Some(self.next_position.max(0) as u64),
+            })
+        }
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct ArTrace {
