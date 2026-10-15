@@ -5125,32 +5125,6 @@ export interface QianfanOcrConfig {
   minDynamicPatch: number;
 }
 
-/** Microbench result for the production quantized qmv dispatch path. */
-export interface QmvQuantizedMicrobenchResult {
-  /** Median `quantized_matmul` wall-clock per call, in nanoseconds. */
-  medianNs: number;
-  /** A tiny materialized checksum of the final output, used to keep the call live. */
-  checksum: number;
-}
-
-/**
- * Run the production quantized-qmv microbench in the current process.
- *
- * To compare `MLX_MTP_SMALL_M_QMV=0` versus `1`, call this from separate
- * processes. MLX caches the env-backed dispatch predicate statically.
- */
-export declare function quantizedQmvMicrobench(
-  k: number,
-  n: number,
-  m: number,
-  groupSize: number,
-  bits: number,
-  mode: string,
-  dtype: DType,
-  warmup?: number | undefined | null,
-  iters?: number | undefined | null,
-): QmvQuantizedMicrobenchResult;
-
 /**
  * Qwen3.5 model configuration (dense variant).
  *
