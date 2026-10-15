@@ -2588,79 +2588,6 @@ fn test_gemma4_sliding_checkpoint_cadence_crosses_unaligned_compute_chunk() {
 }
 
 #[test]
-fn test_gemma4_sliding_restore_default_is_checkpoint_bounded() {
-    let cfg = super::Gemma4Config {
-        sliding_window: 1024,
-        ..paged_tiny_config(Some(true))
-    };
-
-    assert_eq!(
-        super::gemma4_large_sliding_restore_suppression_limit_for_override(&cfg, 16, None, 1024),
-        None
-    );
-    assert_eq!(
-        super::gemma4_large_sliding_restore_suppression_limit_for_override(&cfg, 16, None, 24_336),
-        Some(super::Gemma4SlidingRestoreSuppression {
-            limit: 1024,
-            source: "default"
-        })
-    );
-}
-
-#[test]
-fn test_gemma4_sliding_restore_env_limit_overrides_default() {
-    let cfg = super::Gemma4Config {
-        sliding_window: 1024,
-        ..paged_tiny_config(Some(true))
-    };
-
-    assert_eq!(
-        super::parse_gemma4_sliding_restore_limit("32768"),
-        Some(super::Gemma4SlidingRestoreLimitOverride::Cap(32_768))
-    );
-    assert_eq!(
-        super::parse_gemma4_sliding_restore_limit(" 44512 "),
-        Some(super::Gemma4SlidingRestoreLimitOverride::Cap(44_512))
-    );
-    assert_eq!(super::parse_gemma4_sliding_restore_limit(""), None);
-    assert_eq!(
-        super::parse_gemma4_sliding_restore_limit("off"),
-        Some(super::Gemma4SlidingRestoreLimitOverride::Uncapped)
-    );
-
-    assert_eq!(
-        super::gemma4_large_sliding_restore_suppression_limit_for_override(
-            &cfg,
-            16,
-            Some(super::Gemma4SlidingRestoreLimitOverride::Cap(32_768)),
-            32_768
-        ),
-        None
-    );
-    assert_eq!(
-        super::gemma4_large_sliding_restore_suppression_limit_for_override(
-            &cfg,
-            16,
-            Some(super::Gemma4SlidingRestoreLimitOverride::Cap(32_768)),
-            44_512
-        ),
-        Some(super::Gemma4SlidingRestoreSuppression {
-            limit: 32_768,
-            source: "env"
-        })
-    );
-    assert_eq!(
-        super::gemma4_large_sliding_restore_suppression_limit_for_override(
-            &cfg,
-            16,
-            Some(super::Gemma4SlidingRestoreLimitOverride::Uncapped),
-            1_000_000
-        ),
-        None
-    );
-}
-
-#[test]
 fn test_ple_oov_masking() {
     // Simulate token IDs where some exceed PLE vocab or are negative
     let input_ids = MxArray::from_int32(&[5, 100, 262143, 0, -1], &[1, 5]).unwrap();
@@ -4035,15 +3962,6 @@ fn test_gemma4_mid_prompt_prefix_hit_uses_near_prefill_checkpoint() {
         .expect("near checkpoint hit");
     assert_eq!(hit.prefix_len, checkpoint_len);
     assert_eq!(cached_prefix_len - hit.prefix_len, 800);
-    assert_eq!(
-        super::gemma4_large_sliding_restore_suppression_limit(
-            &inner.config,
-            block_size,
-            cached_prefix_len - hit.prefix_len
-        ),
-        None,
-        "a one-window prefill checkpoint should prevent cold-prefill suppression"
-    );
 }
 
 #[test]
