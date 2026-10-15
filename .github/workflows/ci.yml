@@ -906,12 +906,20 @@ jobs:
   # Single required status for branch protection: mark only `done` as
   # required and the job list above can change without touching the rule.
   # `contains(needs.*.result, 'failure')` ignores "skipped", so legs that do
-  # not run on a given event (model-test on unlabeled PRs, everything on an
-  # unrelated label event) do not block. Modeled on vite-plus's `done` job.
+  # not run on a given event (model-test on unlabeled PRs) do not block.
+  # Modeled on vite-plus's `done` job.
+  #
+  # An unrelated label event skips every job above; `done` must NOT run
+  # there, or it would post a green required check for a commit nothing
+  # validated (a check run on the same head SHA satisfies the rule). The
+  # same gate the other jobs use keeps that event free of a `done` check
+  # run, and the all-skipped guard below rejects the case anyway.
   done:
     name: done
     runs-on: ubuntu-latest
-    if: always()
+    if: >-
+      always() &&
+      (github.event.action != 'labeled' || github.event.label.name == 'model-e2e')
     needs:
       - lint-ts
       - build
@@ -922,7 +930,10 @@ jobs:
       - model-test
     steps:
       - run: exit 1
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        if: >-
+          ${{ contains(needs.*.result, 'failure') ||
+              contains(needs.*.result, 'cancelled') ||
+              !contains(needs.*.result, 'success') }}
 
   publish:
     name: Publish
