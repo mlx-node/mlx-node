@@ -66,28 +66,6 @@ impl SparseMoeBlock {
         })
     }
 
-    pub fn new_quantized(
-        config: &Qwen3_5MoeConfig,
-        gate: QuantizedLinear,
-        switch_mlp: SwitchGLU,
-        shared_expert: MLPVariant,
-        shared_expert_gate: QuantizedLinear,
-    ) -> Result<Self> {
-        let num_experts = config.num_experts;
-        let num_experts_per_tok = config.num_experts_per_tok;
-        let norm_topk_prob = config.norm_topk_prob;
-
-        Ok(Self {
-            gate: LinearProj::Quantized(gate),
-            switch_mlp,
-            shared_expert,
-            shared_expert_gate: LinearProj::Quantized(shared_expert_gate),
-            num_experts,
-            num_experts_per_tok,
-            norm_topk_prob,
-        })
-    }
-
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         let shape = x.shape()?;
         if shape.len() != 3 {
@@ -215,6 +193,7 @@ impl SparseMoeBlock {
         self.shared_expert_gate.set_weight(w, "shared_expert_gate")
     }
 
+    #[cfg(test)]
     pub fn switch_mlp_mut(&mut self) -> &mut SwitchGLU {
         &mut self.switch_mlp
     }
