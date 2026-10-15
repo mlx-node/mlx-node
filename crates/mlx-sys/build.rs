@@ -616,8 +616,111 @@ fn prebuilt_cache_root(manifest_dir: &Path) -> PathBuf {
         .join("mlx-prebuilt")
 }
 
-fn release_tag_for(commit: &str) -> String {
-    format!("mlx-prebuilt-{}", &commit[..commit.len().min(12)])
+/// `mlx-prebuilt-<mlx sha12>-<build key8>`. The release is keyed by every
+/// input that shapes the artifact: the submodule commit and the cmake build
+/// key (`prebuilt_build_key`). Changing a cmake define or a file under
+/// `cmake/` without moving the submodule therefore names a NEW release, and
+/// a pin that still names the old one falls back to the source build instead
+/// of linking an artifact built from other inputs.
+fn release_tag_for(commit: &str, build_key: &str) -> String {
+    format!(
+        "mlx-prebuilt-{}-{}",
+        &commit[..commit.len().min(12)],
+        &build_key[..build_key.len().min(8)]
+    )
+}
+
+/// The cmake defines that are the same on every machine for a given target
+/// (no compiler paths, no SDK root, no OUT_DIR). `build_mlx_from_source`
+/// starts from this list, and `prebuilt_build_key` hashes it, so the two
+/// cannot drift apart.
+fn portable_cmake_defines(
+    build_metal: bool,
+    target_os: &str,
+    target_arch: &str,
+    deployment_target: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut defines: Vec<(String, String)> = Vec::new();
+    let mut define = |key: &str, value: &str| defines.push((key.to_string(), value.to_string()));
+    // CMakeCache.txt from an older mlx-sys may still name the deleted
+    // metal-residency/overlay.cmake; configure fails until it is cleared.
+    define("CMAKE_PROJECT_INCLUDE", "");
+    define("MLX_BUILD_TESTS", "OFF");
+    define("MLX_BUILD_EXAMPLES", "OFF");
+    define("MLX_BUILD_BENCHMARKS", "OFF");
+    define("MLX_BUILD_PYTHON_BINDINGS", "OFF");
+    define("BUILD_SHARED_LIBS", "OFF");
+    define("MLX_BUILD_METAL", if build_metal { "ON" } else { "OFF" });
+    // `CMAKE_OSX_ARCHITECTURES` is an Apple-only knob; setting it on Linux
+    // confuses the GCC/CUDA toolchain. Only emit it on macOS.
+    if target_os == "macos" {
+        // napi-rs invokes Cargo with an explicit Darwin target even when that
+        // target is the native Apple-silicon host. Some CMake launches then
+        // retain an x86_64 host processor while honoring the arm64 compiler
+        // flags, and upstream MLX rejects the configure before it can inspect
+        // CMAKE_OSX_ARCHITECTURES. Pin both views of the target architecture.
+        let arch = if target_arch == "aarch64" {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        define("CMAKE_SYSTEM_NAME", "Darwin");
+        define("CMAKE_SYSTEM_PROCESSOR", arch);
+        define("CMAKE_OSX_ARCHITECTURES", arch);
+        // A -D define overrides a stale CMAKE_OSX_DEPLOYMENT_TARGET already
+        // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache), which
+        // the environment variable alone cannot.
+        if let Some(deployment_target) = deployment_target {
+            define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
+        }
+    } else if target_os == "linux" {
+        // Linux/CUDA build. The MLX submodule's CMake auto-detects the GPU
+        // architecture, but on a GPU-less / headless configure host the
+        // detection query is empty and FATALs. Pass the arch explicitly for
+        // determinism (`121a` is what MLX auto-detected on the GB10 host;
+        // override via MLX_CUDA_ARCHITECTURES). Release build type so the
+        // benchmark numbers are not skewed by an unoptimized default.
+        //
+        // `switch-exhaustiveness.cmake` is deliberately not applied here: it
+        // rewrites the composed flags with `-Wno-everything`, which only
+        // clang understands, and nvcc drives host compilation through GCC.
+        // A `switch` over QuantizationMode that misses an enumerator is
+        // therefore a build error on macOS only. CUDA sources are compiled
+        // nowhere else in CI, so any such switch has to be walked by hand.
+        let cuda_archs = env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_else(|_| "121a".into());
+        define("MLX_BUILD_CUDA", "ON");
+        define("MLX_BUILD_METAL", "OFF");
+        define("MLX_BUILD_CPU", "ON");
+        define("MLX_CUDA_ARCHITECTURES", &cuda_archs);
+        define("CMAKE_BUILD_TYPE", "Release");
+    }
+    defines
+}
+
+/// sha256 over the portable cmake defines and every file under
+/// `crates/mlx-sys/cmake/` (they run inside MLX's configure). Together with
+/// the submodule commit this is everything that decides the artifact's
+/// bytes, up to the toolchain.
+fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::Result<String> {
+    let mut canonical = String::new();
+    for (key, value) in defines {
+        canonical.push_str(&format!("-D{key}={value}\n"));
+    }
+    let cmake_dir = manifest_dir.join("cmake");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&cmake_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file())
+        .collect();
+    files.sort();
+    for file in files {
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        canonical.push_str(&format!("cmake/{name}={}\n", sha256_file(&file)?));
+    }
+    let tmp = env::temp_dir().join(format!("mlx-prebuilt-key-{}.txt", std::process::id()));
+    std::fs::write(&tmp, canonical)?;
+    let key = sha256_file(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    key
 }
 
 /// `(HEAD sha, dirty)` of the submodule checkout, or the git error.
@@ -864,8 +967,7 @@ fn resolve_mlx_source(
                  {recorded}, this build targets {wanted}"
             );
         }
-        let label = prebuilt_manifest_field(&dir, "mlx_commit")
-            .map(|commit| release_tag_for(&commit))
+        let label = prebuilt_manifest_field(&dir, "release_tag")
             .unwrap_or_else(|| "<no manifest.json>".to_string());
         return MlxSource::Prebuilt {
             label: format!("{label} (MLX_PREBUILT_DIR)"),
@@ -901,18 +1003,36 @@ fn resolve_mlx_source(
             "no trusted sha256 pinned for {triple} in {PREBUILT_PIN_FILE}"
         ));
     };
-    match submodule_state(mlx_dir) {
+    let head = match submodule_state(mlx_dir) {
         Err(error) => return source(&format!("mlx submodule: {error}")),
         Ok((_, true)) => return source("mlx submodule has local modifications"),
         Ok((head, false)) if head != pin.mlx_commit => {
             return source(&format!(
-                "mlx submodule is at {} but {PREBUILT_PIN_FILE} pins {}; run the `MLX Prebuilt` \
-                 workflow and update the pin (docs/mlx-fork.md, \"Prebuilt MLX\")",
+                "mlx submodule is at {} but {PREBUILT_PIN_FILE} pins {}; push the gitlink bump so \
+                 the `MLX Prebuilt` workflow publishes its release, then update the pin \
+                 (docs/mlx-fork.md, \"Prebuilt MLX\")",
                 &head[..12],
                 &pin.mlx_commit[..12.min(pin.mlx_commit.len())]
             ));
         }
-        Ok(_) => {}
+        Ok((head, false)) => head,
+    };
+    // The tag encodes the cmake build inputs too: a pin left pointing at a
+    // release built with other defines (or another `cmake/` include) is
+    // refused rather than linked.
+    let defines = portable_cmake_defines(build_metal, "macos", "aarch64", Some(deployment_target));
+    let build_key = match prebuilt_build_key(manifest_dir, &defines) {
+        Ok(key) => key,
+        Err(error) => return source(&format!("cannot compute the prebuilt build key: {error}")),
+    };
+    let expected_tag = release_tag_for(&head, &build_key);
+    if pin.release_tag != expected_tag {
+        return source(&format!(
+            "{PREBUILT_PIN_FILE} pins release {} but this checkout's MLX build inputs name {}; the \
+             cmake defines or crates/mlx-sys/cmake/ changed since that release was built, so a \
+             push of build.rs publishes the new one and the pin needs updating",
+            pin.release_tag, expected_tag
+        ));
     }
 
     let unpack_dir = prebuilt_cache_root(manifest_dir)
@@ -922,6 +1042,26 @@ fn resolve_mlx_source(
         && let Err(error) = fetch_prebuilt(&pin, &asset_file, &sha256, &unpack_dir)
     {
         return source(&error);
+    }
+    // The archive's own manifest must agree with the pin; the digest only
+    // proves the bytes are the release's, not that the release is the
+    // right one.
+    for (field, want) in [
+        ("mlx_commit", head.as_str()),
+        ("triple", triple),
+        ("release_tag", expected_tag.as_str()),
+    ] {
+        match prebuilt_manifest_field(&unpack_dir, field) {
+            Some(ref have) if have == want => {}
+            have => {
+                return source(&format!(
+                    "prebuilt {} records {field} {} but this build needs {want}; the asset does not \
+                     match the pin",
+                    pin.release_tag,
+                    have.as_deref().unwrap_or("<missing>")
+                ));
+            }
+        }
     }
     match prebuilt_manifest_deployment_target(&unpack_dir) {
         Some(recorded) if recorded == deployment_target => {}
@@ -961,10 +1101,13 @@ fn json_escape(value: &str) -> String {
 /// Write the prebuilt artifact set from a finished cmake install tree
 /// (`MLX_PREBUILT_EXPORT`). No `build/` tree, bridge library or
 /// `paged_attn.metallib`: those stay source-built on the consumer.
+#[allow(clippy::too_many_arguments)]
 fn export_prebuilt(
     dst: &Path,
     export_dir: &Path,
     mlx_commit: &str,
+    release_tag: &str,
+    build_key: &str,
     triple: &str,
     deployment_target: &str,
     metal_path_sentinel: &str,
@@ -997,7 +1140,8 @@ fn export_prebuilt(
         .collect::<Vec<_>>()
         .join(",\n");
     let manifest = format!(
-        "{{\n  \"mlx_commit\": \"{mlx_commit}\",\n  \"triple\": \"{triple}\",\n  \
+        "{{\n  \"mlx_commit\": \"{mlx_commit}\",\n  \"release_tag\": \"{release_tag}\",\n  \
+         \"build_key\": \"{build_key}\",\n  \"triple\": \"{triple}\",\n  \
          \"deployment_target\": \"{deployment_target}\",\n  \"metal_path_sentinel\": \"{}\",\n  \
          \"built_at\": \"{built_at}\",\n  \"cmake_defines\": [\n{defines}\n  ]\n}}\n",
         json_escape(metal_path_sentinel)
@@ -1144,7 +1288,16 @@ fn main() -> io::Result<()> {
                         "mlx-sys: MLX_PREBUILT_EXPORT needs the submodule commit, but {error}"
                     ),
                 };
-                (dir, commit)
+                let portable = portable_cmake_defines(
+                    build_metal,
+                    &target_os,
+                    &target_arch,
+                    deployment_target.as_deref(),
+                );
+                let build_key = prebuilt_build_key(&manifest_dir, &portable)
+                    .unwrap_or_else(|error| panic!("mlx-sys: prebuilt build key: {error}"));
+                let tag = release_tag_for(&commit, &build_key);
+                (dir, commit, build_key, tag)
             });
             let (dst, defines, sentinel) = build_mlx_from_source(
                 &manifest_dir,
@@ -1159,21 +1312,22 @@ fn main() -> io::Result<()> {
                 export
                     .as_ref()
                     .filter(|_| build_metal)
-                    .map(|(_, commit)| release_tag_for(commit)),
+                    .map(|(_, _, _, tag)| tag.clone()),
             );
-            if let Some((export_dir, commit)) = export {
+            if let Some((export_dir, commit, build_key, tag)) = export {
                 export_prebuilt(
                     &dst,
                     &export_dir,
                     &commit,
+                    &tag,
+                    &build_key,
                     &triple,
                     deployment_target.as_deref().unwrap_or(""),
                     sentinel.as_deref().unwrap_or(""),
                     &defines,
                 )?;
                 println!(
-                    "cargo:warning=mlx-sys: exported prebuilt MLX {} to {}",
-                    release_tag_for(&commit),
+                    "cargo:warning=mlx-sys: exported prebuilt MLX {tag} to {}",
                     export_dir.display()
                 );
             }
@@ -1224,8 +1378,12 @@ fn main() -> io::Result<()> {
     // Source mode: `paged_attn.metallib` goes into every lib dir of the
     // install tree (`out/lib` next to `mlx.metallib`). Prebuilt mode: the
     // prebuilt dir is shared across profiles, so nothing profile-specific
-    // is written there; the install copy goes to `OUT_DIR/lib` instead
-    // (same `out/lib` contract for build.ts).
+    // is written there; instead `OUT_DIR/lib` gets `paged_attn.metallib`
+    // plus a hard link (copy if the cache is on another volume) of the
+    // prebuilt `mlx.metallib`, so `OUT_DIR/lib` holds both metallibs in
+    // both modes and build.ts never has to re-derive the cache location
+    // from the environment (a relative MLX_PREBUILT_CACHE_DIR or
+    // CARGO_TARGET_DIR resolves differently under cargo and under yarn).
     //
     // `mlx.metallib` is copied next to the test binaries in BOTH modes.
     // MLX loads a colocated `mlx.metallib` before the path baked into
@@ -1240,6 +1398,12 @@ fn main() -> io::Result<()> {
             let lib = out_dir_path.join("lib");
             std::fs::create_dir_all(&lib)
                 .map_err(|error| build_file_error("create", &lib, error))?;
+            let src = mlx_root.join("lib").join("mlx.metallib");
+            let dst = lib.join("mlx.metallib");
+            let _ = std::fs::remove_file(&dst);
+            if std::fs::hard_link(&src, &dst).is_err() {
+                std::fs::copy(&src, &dst).map_err(|error| build_file_error("copy", &dst, error))?;
+            }
             vec![lib]
         } else {
             lib_dirs.clone()
@@ -1422,20 +1586,10 @@ fn build_mlx_from_source(
     deployment_target: Option<&str>,
     export_release_tag: Option<String>,
 ) -> (PathBuf, Vec<(String, String)>, Option<String>) {
-    let is_macos = target_os == "macos";
     let mut cfg = cmake::Config::new(mlx_dir);
-    let mut defines: Vec<(String, String)> = Vec::new();
+    let mut defines =
+        portable_cmake_defines(build_metal, target_os, target_arch, deployment_target);
     let mut define = |key: &str, value: &str| defines.push((key.to_string(), value.to_string()));
-
-    // CMakeCache.txt from an older mlx-sys may still name the deleted
-    // metal-residency/overlay.cmake; configure fails until it is cleared.
-    define("CMAKE_PROJECT_INCLUDE", "");
-    define("MLX_BUILD_TESTS", "OFF");
-    define("MLX_BUILD_EXAMPLES", "OFF");
-    define("MLX_BUILD_BENCHMARKS", "OFF");
-    define("MLX_BUILD_PYTHON_BINDINGS", "OFF");
-    define("BUILD_SHARED_LIBS", "OFF");
-    define("MLX_BUILD_METAL", if build_metal { "ON" } else { "OFF" });
 
     // MLX bakes `${MLX_METAL_PATH}/mlx.metallib` into libmlx.a as the
     // last-resort load path (`device.cpp` `default_mtllib_path`) AND
@@ -1456,30 +1610,8 @@ fn build_mlx_from_source(
         format!("{}/mlx.metallib", kernels.display())
     });
 
-    // `CMAKE_OSX_ARCHITECTURES` is an Apple-only knob; setting it on Linux
-    // confuses the GCC/CUDA toolchain. Only emit it on macOS.
-    if is_macos {
-        // napi-rs invokes Cargo with an explicit Darwin target even when that
-        // target is the native Apple-silicon host. Some CMake launches then
-        // retain an x86_64 host processor while honoring the arm64 compiler
-        // flags, and upstream MLX rejects the configure before it can inspect
-        // CMAKE_OSX_ARCHITECTURES. Pin both views of the target architecture.
-        let arch = if target_arch == "aarch64" {
-            "arm64"
-        } else {
-            "x86_64"
-        };
-        define("CMAKE_SYSTEM_NAME", "Darwin");
-        define("CMAKE_SYSTEM_PROCESSOR", arch);
-        define("CMAKE_OSX_ARCHITECTURES", arch);
-        // A -D define overrides a stale CMAKE_OSX_DEPLOYMENT_TARGET already
-        // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache), which
-        // the environment variable alone cannot.
-        if let Some(deployment_target) = deployment_target {
-            define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
-        }
-    }
-
+    // Machine-specific defines (tool paths, SDK) follow; they are deliberately
+    // not part of `portable_cmake_defines` and so not of the build key.
     if target_os == "macos" {
         let default_c_compiler = xcrun_find("clang").unwrap_or_else(|| "clang".to_string());
         let default_ar = xcrun_find("ar").unwrap_or_else(|| "/usr/bin/ar".to_string());
@@ -1530,26 +1662,6 @@ fn build_mlx_from_source(
                 .to_str()
                 .expect("switch-exhaustiveness.cmake path is not valid UTF-8"),
         );
-    } else if target_os == "linux" {
-        // Linux/CUDA build. The MLX submodule's CMake auto-detects the GPU
-        // architecture, but on a GPU-less / headless configure host the
-        // detection query is empty and FATALs. Pass the arch explicitly for
-        // determinism (`121a` is what MLX auto-detected on the GB10 host;
-        // override via MLX_CUDA_ARCHITECTURES). Release build type so the
-        // benchmark numbers are not skewed by an unoptimized default.
-        //
-        // `switch-exhaustiveness.cmake` is deliberately not applied here: it
-        // rewrites the composed flags with `-Wno-everything`, which only
-        // clang understands, and nvcc drives host compilation through GCC.
-        // A `switch` over QuantizationMode that misses an enumerator is
-        // therefore a build error on macOS only. CUDA sources are compiled
-        // nowhere else in CI, so any such switch has to be walked by hand.
-        let cuda_archs = env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_else(|_| "121a".into());
-        define("MLX_BUILD_CUDA", "ON");
-        define("MLX_BUILD_METAL", "OFF");
-        define("MLX_BUILD_CPU", "ON");
-        define("MLX_CUDA_ARCHITECTURES", &cuda_archs);
-        define("CMAKE_BUILD_TYPE", "Release");
     }
 
     // Defines are applied together: `define` above only records them, so
