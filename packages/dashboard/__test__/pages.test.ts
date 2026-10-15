@@ -120,7 +120,6 @@ function cacheFixture(overrides: CacheFixtureOverrides = {}): CacheResponse {
       writeErrors: 0,
       writeErrorsTotal: 0,
       restoreDeclines: 0,
-      restoreSuppressed: 0,
       // A healthy hybrid run: the capture ran on every turn, wrote its sidecar
       // once and re-found it thereafter, and the restore side installed what it
       // was handed. `sidecarEnqueued` / `sidecarQueueDrops` sit UNDER the
@@ -250,7 +249,6 @@ describe('Cache page', () => {
             writeErrors: 42,
             writeErrorsTotal: 42,
             restoreDeclines: 0,
-            restoreSuppressed: 0,
           },
         }),
       },
@@ -286,16 +284,14 @@ describe('Cache page', () => {
             writeErrors: 0,
             writeErrorsTotal: 0,
             restoreDeclines: 3,
-            restoreSuppressed: 1,
           },
         }),
       },
       'mlx-paged-v1',
     );
-    expect(text).toContain('4 restores refused · no lookup was performed');
+    expect(text).toContain('3 restores refused · no lookup was performed');
     expect(text).not.toContain('no lookups recorded for this cache');
-    // And the card keeps the two causes apart, since the fixes differ.
-    expect(text).toContain('1 suppressed after restore · neither counts as a lookup');
+    expect(text).toContain('refused before lookup · not counted as a lookup');
   });
 
   it('flags a non-zero cumulative corruption total even when the window delta is 0', async () => {
@@ -313,7 +309,6 @@ describe('Cache page', () => {
             writeErrors: 0,
             writeErrorsTotal: 0,
             restoreDeclines: 0,
-            restoreSuppressed: 0,
           },
         }),
       },

@@ -516,7 +516,6 @@ describe('dashboard api — cache trend scoping', () => {
       writeErrors: number;
       writeErrorsTotal: number;
       restoreDeclines: number;
-      restoreSuppressed: number;
       sidecarCaptureReached: number;
       sidecarChainEmpty: number;
       sidecarBoundarySkips: number;
@@ -569,10 +568,9 @@ describe('dashboard api — cache trend scoping', () => {
         coldWriteErrors: 3,
         coldWriteErrorsTotal: 6,
         coldRestoreDeclines: 2,
-        coldSidecarRestoreSuppressed: 1,
-        // Every sidecar counter is a per-turn DELTA, so all eight SUM. The two
+        // Every sidecar counter is a per-turn DELTA, so all seven SUM. The two
         // attributed rows carry different values for each so a reducer swapped
-        // to MAX changes a number in the assertions below, and the eight sums
+        // to MAX changes a number in the assertions below, and the seven sums
         // are pairwise distinct so a column aliased to a neighbour does too.
         // `coldSidecarEnqueued`/`coldSidecarQueueDrops` stay under the
         // object-scoped `coldEnqueued`/`coldQueueDrops` above, which they are a
@@ -605,7 +603,6 @@ describe('dashboard api — cache trend scoping', () => {
         // the same reason `coldCorruptionsTotal` carries 2 and 5.
         coldWriteErrorsTotal: 9,
         coldRestoreDeclines: 5,
-        coldSidecarRestoreSuppressed: 2,
         coldSidecarCaptureReached: 4,
         coldSidecarChainEmpty: 3,
         coldSidecarBoundarySkips: 9,
@@ -627,7 +624,6 @@ describe('dashboard api — cache trend scoping', () => {
         coldWriteErrors: 500,
         coldWriteErrorsTotal: 900,
         coldRestoreDeclines: 400,
-        coldSidecarRestoreSuppressed: 300,
         // Another root's sidecar traffic, an order of magnitude larger, so a
         // projection that lost the `cold_root = ?` filter cannot look plausible.
         coldSidecarCaptureReached: 900,
@@ -803,12 +799,11 @@ describe('dashboard api — cache trend scoping', () => {
     // a decline is normal on any prompt's first turn — a "did it ever happen"
     // latch would be pinned on from the first minute and mean nothing.
     expect(body.health.restoreDeclines).toBe(7);
-    expect(body.health.restoreSuppressed).toBe(3);
   });
 
   /**
-   * The other seven `coldSidecar*` counters, which the ingest mapping dropped
-   * on the floor while only `restoreSuppressed` reached a column.
+   * The seven `coldSidecar*` counters, which the ingest mapping once dropped
+   * on the floor.
    *
    * `sidecarInstalled` is the reason this matters: every
    * `install_*_cold_sidecar` early-return falls through to a full O(prefix)
@@ -817,9 +812,9 @@ describe('dashboard api — cache trend scoping', () => {
    * tokens, corruptions and the emitted text all unchanged. Nothing else in
    * the payload moves.
    *
-   * All eight are per-turn DELTAS — none has a per-process cumulative twin —
+   * All seven are per-turn DELTAS — none has a per-process cumulative twin —
    * so every one SUMS. The fixture's two attributed rows carry different
-   * values for each counter, and the eight sums are pairwise distinct, so
+   * values for each counter, and the seven sums are pairwise distinct, so
    * swapping any reducer to MAX or aliasing any column to a neighbour changes
    * a number here. The other root's much larger traffic pins the scope.
    */

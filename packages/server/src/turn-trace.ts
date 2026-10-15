@@ -191,7 +191,6 @@ const SIDECAR_DELTA_KEYS = [
   'enqueued',
   'queueDrops',
   'installed',
-  'restoreSuppressed',
 ] as const;
 
 const OPTIONAL_MEMBER_NAMES = [
@@ -414,7 +413,6 @@ export class TurnTraceModel implements SessionCapableModel {
         rec.coldSidecarEnqueued = delta(marks.sidecar, 'enqueued', sidecar.enqueued);
         rec.coldSidecarQueueDrops = delta(marks.sidecar, 'queueDrops', sidecar.queueDrops);
         rec.coldSidecarInstalled = delta(marks.sidecar, 'installed', sidecar.installed);
-        rec.coldSidecarRestoreSuppressed = delta(marks.sidecar, 'restoreSuppressed', sidecar.restoreSuppressed);
       }
       this.trace.record(rec);
     } catch {

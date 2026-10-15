@@ -155,7 +155,6 @@ function cacheFixture(): CacheResponse {
       writeErrors: 0,
       writeErrorsTotal: 0,
       restoreDeclines: 0,
-      restoreSuppressed: 0,
       sidecarCaptureReached: 20,
       sidecarChainEmpty: 1,
       sidecarBoundarySkips: 2,

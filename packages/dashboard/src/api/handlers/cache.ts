@@ -64,7 +64,7 @@ import { ApiError } from '../errors.js';
  *    is read-only, full or unmounted otherwise produces a spotless payload:
  *    zero drops, zero corruptions, and a hit rate computed over a cache that
  *    is storing nothing.
- *  - `restoreDeclines` / `restoreSuppressed` — restores that were refused. A
+ *  - `restoreDeclines` — restores that were refused. A
  *    refusal performs no block lookup, so it moves neither `hits` nor `misses`
  *    and lands in `trend` as an absent row, which the UI would otherwise render
  *    as "no lookups recorded" — "nothing ran", when the truth is the opposite.
@@ -148,7 +148,6 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
               COALESCE(SUM(cold_write_errors), 0) AS writeErrors,
               COALESCE(MAX(cold_write_errors_total), 0) AS writeErrorsTotal,
               COALESCE(SUM(cold_restore_declines), 0) AS restoreDeclines,
-              COALESCE(SUM(cold_sidecar_restore_suppressed), 0) AS restoreSuppressed,
               COALESCE(SUM(cold_sidecar_capture_reached), 0) AS sidecarCaptureReached,
               COALESCE(SUM(cold_sidecar_chain_empty), 0) AS sidecarChainEmpty,
               COALESCE(SUM(cold_sidecar_boundary_skips), 0) AS sidecarBoundarySkips,
@@ -200,12 +199,11 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
       writeErrors: toInt(health?.writeErrors),
       writeErrorsTotal: toInt(health?.writeErrorsTotal),
       // SUM, not MAX, and deliberately so: unlike corruptions and write
-      // errors these two have a legitimate non-zero steady state (any prompt's
+      // errors this one has a legitimate non-zero steady state (any prompt's
       // first turn declines), so a "did it ever happen" latch would be pinned
       // on from the first minute and carry no information.
       restoreDeclines: toInt(health?.restoreDeclines),
-      restoreSuppressed: toInt(health?.restoreSuppressed),
-      // The other seven `ColdSidecarStats` counters. Every one is a per-turn
+      // The seven `ColdSidecarStats` counters. Every one is a per-turn
       // DELTA, so every one SUMS — none has a cumulative `*_total` twin, and
       // MAX would not stand in for one: over deltas it reports the busiest
       // single turn rather than "did this ever happen".
@@ -213,9 +211,7 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
       // `sidecarEnqueued` / `sidecarQueueDrops` are the sidecar SHARE of the
       // object-scoped `enqueued` / `queueDrops` above (a sidecar admission
       // bumps both counters), so a consumer reads them as a subset and never
-      // adds the pairs. `restoreSuppressed` is the eighth of this family and
-      // keeps its unprefixed name because it is read beside `restoreDeclines`,
-      // the other way reuse is refused.
+      // adds the pairs.
       sidecarCaptureReached: toInt(health?.sidecarCaptureReached),
       sidecarChainEmpty: toInt(health?.sidecarChainEmpty),
       sidecarBoundarySkips: toInt(health?.sidecarBoundarySkips),
