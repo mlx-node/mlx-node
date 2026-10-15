@@ -70,14 +70,11 @@ use std::collections::VecDeque;
 /// regression reads here as a capacity regression — `retention_sim` sweeps
 /// `PRE_FSYNC_BLOCKS_PER_TURN` for exactly that reason.
 ///
-/// The fleet size this is paired with lives in another language, so the pairing
-/// is a gate rather than a paragraph: `cold_tier::gdn_prefix_checkpoint_limit`
-/// publishes this number and
-/// `packages/agent/__test__/gdn-checkpoint-capacity.test.ts` holds
-/// `MAX_CONCURRENCY + 1` against it. Every Rust gate here is blind to a
-/// TypeScript-only edit — `retention_sim`'s sweep bound is a fixed 5, not this
-/// cap, deliberately — so that test is the only thing standing between a raised
-/// `MAX_CONCURRENCY` and the six-owner cliff described above.
+/// The fleet this was sized for — the pi subagent extension's four child loops
+/// plus the root — was removed with the pi runtime, so nothing outside this
+/// crate pins the pairing any more. A caller that runs more than five
+/// concurrent owners against one model lands past the six-owner cliff described
+/// above; `retention_sim`'s sweep bound is a fixed 5, not this cap, deliberately.
 pub(crate) const GDN_PREFIX_CHECKPOINT_LIMIT: usize = 5;
 
 /// One prefill publishes a ladder of block-aligned prefix checkpoints rather

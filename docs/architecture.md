@@ -50,7 +50,7 @@ is a single hop, not the bottom of a ladder.
 takes bytes from the weights and the paged pool. This is why the sliding-window and
 GDN checkpoint stores derive their limits from a byte budget
 (`GEMMA4_SLIDING_CHECKPOINT_MEMORY_BUDGET_BYTES`,
-`GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES`, `cold_tier::gdn_prefix_checkpoint_limit`)
+`GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES`, `GDN_PREFIX_CHECKPOINT_LIMIT`)
 rather than from a tuned count — and why raising one is never free. The same pressure
 runs the other way: oversizing the paged pool tanks long-context decode through
 residency thrash, and pool bytes sit **outside** the MLX cache-limit budget, so the
