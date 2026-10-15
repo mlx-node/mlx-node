@@ -54,26 +54,6 @@ impl Head {
         }
     }
 
-    /// Forward pass: produces probability map.
-    ///
-    /// Input: [B, H, W, C] where H,W are at stride-4 relative to input image
-    /// Output: [B, H*4, W*4, 1] probability map at original resolution
-    pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
-        // Conv + BN + ReLU
-        let x = self.conv1.forward(input)?;
-        let x = self.bn1.forward(&x)?;
-        let x = Activations::relu(&x)?;
-
-        // Deconv (2x upsample) + BN + ReLU
-        let x = self.deconv1.forward(&x)?;
-        let x = self.bn2.forward(&x)?;
-        let x = Activations::relu(&x)?;
-
-        // Deconv (2x upsample) + Sigmoid
-        let x = self.deconv2.forward(&x)?;
-        Activations::sigmoid(&x)
-    }
-
     /// Forward pass with intermediate feature return (for PFHeadLocal).
     ///
     /// Returns (sigmoid_output, intermediate_features) where intermediate_features
