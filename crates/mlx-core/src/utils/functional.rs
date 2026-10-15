@@ -330,28 +330,6 @@ pub fn transformer_block_functional(
     h.add(&mlp_out)
 }
 
-/// Functional Qwen3 forward pass returning hidden states (before LM head)
-///
-/// This function runs the transformer layers and final norm but stops before the LM head.
-/// Used for chunked training where we want to process the LM head in smaller batches
-/// to avoid memory issues with large vocabulary sizes.
-///
-/// # Arguments
-/// * `config` - Model configuration
-/// * `params` - All model parameters as a dictionary (name -> MxArray)
-/// * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-///
-/// # Returns
-/// * Hidden states, shape: [batch_size, seq_len, hidden_size]
-pub fn qwen3_forward_hidden_states(
-    config: &Qwen3Config,
-    params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-) -> Result<MxArray> {
-    let mut ckpt = autograd::CheckpointContexts::new();
-    qwen3_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
-}
-
 /// Qwen3 forward with optional gradient checkpointing.
 pub fn qwen3_forward_hidden_states_impl(
     config: &Qwen3Config,
@@ -441,180 +419,6 @@ pub fn qwen3_forward_hidden_states_impl(
         .ok_or_else(|| Error::from_reason("Missing final_norm.weight"))?;
 
     rms_norm_functional(&hidden_states, final_norm_weight, config.rms_norm_eps)
-}
-
-/// Functional Qwen3 forward pass returning hidden states with batch chunking (memory optimization)
-///
-/// This function processes the transformer layers in batch chunks to reduce peak memory
-/// from O(batch × heads × seq²) for attention. Instead of processing all 16 sequences
-/// (batch=4 × group=4) at once, it processes 4 sequences at a time.
-///
-/// # Memory Savings
-/// For batch=4, groupSize=4, seq=1024, hidden=1024, heads=16:
-/// - Full batch: 16 × 16 × 1024² × 4 bytes ≈ 1 GB per attention layer
-/// - Chunked (chunk_size=4): 4 × 16 × 1024² × 4 bytes ≈ 256 MB per attention layer
-/// - 24 layers total: ~24 GB → ~6 GB peak (75% reduction)
-///
-/// # Arguments
-/// * `config` - Model configuration
-/// * `params` - All model parameters as a dictionary (name -> MxArray)
-/// * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-/// * `chunk_size` - Number of sequences to process at once (default: 4 if <= 0)
-///
-/// # Returns
-/// * Hidden states, shape: [batch_size, seq_len, hidden_size]
-pub fn qwen3_forward_hidden_states_chunked(
-    config: &Qwen3Config,
-    params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-    chunk_size: i64,
-) -> Result<MxArray> {
-    let batch_size = input_ids.shape_at(0)?;
-    let seq_len = input_ids.shape_at(1)?;
-
-    // Default chunk_size to 4 if invalid
-    let chunk_size = if chunk_size <= 0 { 4 } else { chunk_size };
-
-    // Skip chunking for small batches (no memory benefit)
-    if batch_size <= chunk_size {
-        return qwen3_forward_hidden_states(config, params, input_ids);
-    }
-
-    // Get embedding and final norm weights
-    let embedding_weight = params
-        .get("embedding.weight")
-        .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
-    let final_norm_weight = params
-        .get("final_norm.weight")
-        .ok_or_else(|| Error::from_reason("Missing final_norm.weight"))?;
-
-    // Pre-extract layer params (avoid repeated HashMap lookups in chunks)
-    let num_layers = config.num_layers as usize;
-    let layer_params: Vec<TransformerBlockParams<'_>> = (0..num_layers)
-        .map(|i| get_layer_params(params, i, config))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Process batch in chunks
-    let mut chunk_results: Vec<MxArray> = Vec::new();
-    let mut start = 0i64;
-
-    while start < batch_size {
-        let end = (start + chunk_size).min(batch_size);
-
-        // Slice input_ids for this chunk: [start:end, :]
-        let chunk_input = input_ids.slice(&[start, 0], &[end, seq_len])?;
-
-        // 1. Embedding lookup
-        let mut hidden = embedding_functional(embedding_weight, &chunk_input)?;
-
-        // 2. Process all transformer layers (this is where memory is saved)
-        for layer_param in layer_params.iter().take(num_layers) {
-            hidden = transformer_block_functional(
-                &hidden,
-                layer_param,
-                config.num_heads as u32,
-                config.num_kv_heads as u32,
-                config.head_dim as u32,
-                config.rope_theta,
-                config.use_qk_norm,
-                config.rms_norm_eps,
-                0, // offset (no KV caching for training)
-            )?;
-        }
-
-        // 3. Final layer norm
-        hidden = rms_norm_functional(&hidden, final_norm_weight, config.rms_norm_eps)?;
-
-        // Note: We do NOT call eval() here during autograd.
-        // The computation graph must be preserved for backpropagation.
-        // Memory savings come from processing smaller tensors, not from eval().
-
-        chunk_results.push(hidden);
-        start = end;
-    }
-
-    // Concatenate all chunks: Vec<[chunk, T, H]> -> [B, T, H]
-    if chunk_results.len() == 1 {
-        chunk_results
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::from_reason("expected exactly one chunk result"))
-    } else {
-        let refs: Vec<&MxArray> = chunk_results.iter().collect();
-        MxArray::concatenate_many(refs, Some(0))
-    }
-}
-
-/// Functional Qwen3 forward pass
-///
-/// This is the core function for autograd - it traces the entire forward pass
-/// from parameters to logits, allowing MLX to compute gradients automatically.
-///
-/// # Arguments
-/// * `config` - Model configuration
-/// * `params` - All model parameters as a dictionary (name -> MxArray)
-/// * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-///
-/// # Returns
-/// * Logits, shape: [batch_size, seq_len, vocab_size]
-pub fn qwen3_forward_functional(
-    config: &Qwen3Config,
-    params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-) -> Result<MxArray> {
-    // 1. Embedding lookup
-    let embedding_weight = params
-        .get("embedding.weight")
-        .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
-
-    let mut hidden_states = embedding_functional(embedding_weight, input_ids)?;
-
-    // 2. Transformer layers
-    let num_layers = config.num_layers as usize;
-    for layer_idx in 0..num_layers {
-        // Get layer parameters
-        let layer_params = get_layer_params(params, layer_idx, config)?;
-
-        // Forward through transformer block
-        hidden_states = transformer_block_functional(
-            &hidden_states,
-            &layer_params,
-            config.num_heads as u32,
-            config.num_kv_heads as u32,
-            config.head_dim as u32, // Use explicit head_dim from config (critical for Qwen3!)
-            config.rope_theta,
-            config.use_qk_norm,
-            config.rms_norm_eps,
-            0, // offset (no KV caching for training)
-        )?;
-    }
-
-    // 3. Final layer norm
-    let final_norm_weight = params
-        .get("final_norm.weight")
-        .ok_or_else(|| Error::from_reason("Missing final_norm.weight"))?;
-
-    hidden_states = rms_norm_functional(&hidden_states, final_norm_weight, config.rms_norm_eps)?;
-
-    // 4. LM head (handle tied embeddings like stateful model)
-    let logits = if config.tie_word_embeddings {
-        // When tie_word_embeddings=true, use embedding.weight transposed
-        // This matches model.rs: hidden_states.matmul(&embedding_weight.transpose([1, 0]))
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        hidden_states.matmul(&embedding_weight_t)?
-    } else {
-        // When tie_word_embeddings=false, use separate lm_head weight
-        let lm_head_weight = params
-            .get("lm_head.weight")
-            .ok_or_else(|| Error::from_reason("Missing lm_head.weight"))?;
-        linear_functional(&hidden_states, lm_head_weight, None)?
-    };
-
-    // Clamp logits to prevent overflow in cross-entropy loss computation
-    // TRL uses dtype-aware log_softmax (logsumexp unstable in BF16), but clamping
-    // provides an additional safety margin. Range [-100, 100] is safe for both
-    // FP32 (exp(88.7) = max) and BF16 precision.
-    logits.clip(Some(-100.0), Some(100.0))
 }
 
 /// Chunked LM head with selective log-softmax for memory efficiency.
@@ -1712,6 +1516,23 @@ mod forward_pass_equivalence_tests {
         Ok(logits)
     }
 
+    /// Functional forward through the production autograd dispatch path.
+    fn functional_forward(
+        config: &Qwen3Config,
+        params: &HashMap<String, MxArray>,
+        input_ids: &MxArray,
+    ) -> MxArray {
+        let mut ckpt = autograd::CheckpointContexts::new();
+        forward_functional_dispatch(
+            &ModelType::Qwen3(config.clone()),
+            params,
+            input_ids,
+            false,
+            &mut ckpt,
+        )
+        .unwrap()
+    }
+
     /// Create a tiny model config for fast testing
     fn tiny_config() -> Qwen3Config {
         Qwen3Config {
@@ -1775,7 +1596,7 @@ mod forward_pass_equivalence_tests {
         stateful_output.eval();
 
         // Run functional forward pass
-        let functional_output = qwen3_forward_functional(&config, &params, &input_ids).unwrap();
+        let functional_output = functional_forward(&config, &params, &input_ids);
         functional_output.eval();
 
         // Compare shapes (convert BigInt64Array to Vec<i64> for comparison)
@@ -1816,7 +1637,7 @@ mod forward_pass_equivalence_tests {
             let stateful_output = stateful_forward_reference(&inner, &input_ids).unwrap();
             stateful_output.eval();
 
-            let functional_output = qwen3_forward_functional(&config, &params, &input_ids).unwrap();
+            let functional_output = functional_forward(&config, &params, &input_ids);
             functional_output.eval();
 
             // Compare
@@ -1851,7 +1672,7 @@ mod forward_pass_equivalence_tests {
             let stateful_output = stateful_forward_reference(&inner, &input_ids).unwrap();
             stateful_output.eval();
 
-            let functional_output = qwen3_forward_functional(&config, &params, &input_ids).unwrap();
+            let functional_output = functional_forward(&config, &params, &input_ids);
             functional_output.eval();
 
             // Compare
@@ -1887,7 +1708,7 @@ mod forward_pass_equivalence_tests {
         let stateful_output = stateful_forward_reference(&inner, &input_ids).unwrap();
         stateful_output.eval();
 
-        let functional_output = qwen3_forward_functional(&config, &params, &input_ids).unwrap();
+        let functional_output = functional_forward(&config, &params, &input_ids);
         functional_output.eval();
 
         // Compare
@@ -2157,241 +1978,5 @@ mod chunked_lm_head_tests {
             // Log probs should be <= 0
             assert!(v <= 0.0, "Log prob at {} should be <= 0, got {}", i, v);
         }
-    }
-}
-
-#[cfg(test)]
-mod chunked_forward_tests {
-    use super::*;
-    use crate::models::qwen3::{Qwen3Config, Qwen3Inner};
-
-    /// Construct the tiny test model with a pinned MLX RNG seed, so the
-    /// chunked-vs-full comparisons below run on the same weights every time.
-    ///
-    /// Same reason as `forward_pass_equivalence_tests::seeded_inner`:
-    /// `Qwen3Inner::new` draws from MLX's global RNG, whose key is seeded once
-    /// from wall-clock milliseconds and never reset, so an unseeded run builds
-    /// different weights in every process and the margin left by the
-    /// `atol + rtol * |y|` bound drifts with the draw.
-    fn seeded_inner(config: Qwen3Config) -> Qwen3Inner {
-        unsafe { mlx_sys::mlx_seed(0xF0E9_3D01u64) };
-        Qwen3Inner::new(config).unwrap()
-    }
-
-    /// Helper to check if two arrays are close within tolerance
-    fn arrays_close(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        for (x, y) in a.iter().zip(b.iter()) {
-            let tol = atol + rtol * y.abs();
-            if (x - y).abs() > tol {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Create a tiny model config for fast testing
-    fn tiny_config() -> Qwen3Config {
-        Qwen3Config {
-            vocab_size: 100,
-            hidden_size: 32,
-            num_layers: 2,
-            num_heads: 4,
-            num_kv_heads: 2,
-            intermediate_size: 64,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-            max_position_embeddings: 128,
-            head_dim: 8, // 32 / 4 = 8
-            use_qk_norm: true,
-            tie_word_embeddings: false,
-            pad_token_id: 0,
-            eos_token_id: 1,
-            bos_token_id: 0,
-            paged_cache_memory_mb: None,
-            paged_block_size: None,
-            // Explicit opt-out: chunked-forward tests assert numerical
-            // equality against the full flat forward. The block-paged
-            // adapter is a different codepath, so stay on the flat path.
-            use_block_paged_cache: Some(false),
-            persist_paged_cache: None,
-        }
-    }
-
-    #[test]
-    fn test_chunked_forward_matches_full() {
-        // Chunked forward should produce identical results to full forward
-        let config = tiny_config();
-        let inner = seeded_inner(config.clone());
-        let params = inner.get_parameters_sync().unwrap();
-
-        // Create input with batch_size > chunk_size to trigger chunking
-        // batch=8, seq=4, chunk_size=2 -> 4 chunks
-        let batch = 8;
-        let seq = 4;
-        let input_data: Vec<i32> = (0..batch * seq).map(|i| i % 50).collect();
-        let input_ids = MxArray::from_int32(&input_data, &[batch as i64, seq as i64]).unwrap();
-
-        // Full forward (no chunking)
-        let full_result = qwen3_forward_hidden_states(&config, &params, &input_ids).unwrap();
-        full_result.eval();
-
-        // Chunked forward with chunk_size=2
-        let chunked_result =
-            qwen3_forward_hidden_states_chunked(&config, &params, &input_ids, 2).unwrap();
-        chunked_result.eval();
-
-        // Compare shapes (convert BigInt64Array to Vec for comparison)
-        let full_shape: Vec<i64> = full_result.shape().unwrap().to_vec();
-        let chunked_shape: Vec<i64> = chunked_result.shape().unwrap().to_vec();
-        assert_eq!(
-            full_shape, chunked_shape,
-            "Shapes must match: {:?} vs {:?}",
-            full_shape, chunked_shape
-        );
-
-        // Compare values
-        let full_data = full_result.to_float32().unwrap();
-        let chunked_data = chunked_result.to_float32().unwrap();
-
-        assert!(
-            arrays_close(&full_data, &chunked_data, 1e-4, 1e-4),
-            "Chunked should match full. Max diff: {}",
-            full_data
-                .iter()
-                .zip(chunked_data.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max)
-        );
-    }
-
-    #[test]
-    fn test_chunked_forward_various_chunk_sizes() {
-        let config = tiny_config();
-        let inner = seeded_inner(config.clone());
-        let params = inner.get_parameters_sync().unwrap();
-
-        let batch = 12;
-        let seq = 4;
-        let input_data: Vec<i32> = (0..batch * seq).map(|i| i % 50).collect();
-        let input_ids = MxArray::from_int32(&input_data, &[batch as i64, seq as i64]).unwrap();
-
-        // Reference: full forward
-        let full_result = qwen3_forward_hidden_states(&config, &params, &input_ids).unwrap();
-        full_result.eval();
-        let full_data = full_result.to_float32().unwrap();
-
-        // Test various chunk sizes
-        for chunk_size in [1, 2, 3, 4, 6, 12] {
-            let chunked_result =
-                qwen3_forward_hidden_states_chunked(&config, &params, &input_ids, chunk_size)
-                    .unwrap();
-            chunked_result.eval();
-            let chunked_data = chunked_result.to_float32().unwrap();
-
-            assert!(
-                arrays_close(&full_data, &chunked_data, 1e-4, 1e-4),
-                "Chunk size {} failed. Max diff: {}",
-                chunk_size,
-                full_data
-                    .iter()
-                    .zip(chunked_data.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max)
-            );
-        }
-    }
-
-    #[test]
-    fn test_chunked_forward_small_batch_skips_chunking() {
-        // When batch_size <= chunk_size, should skip chunking (identical path)
-        let config = tiny_config();
-        let inner = seeded_inner(config.clone());
-        let params = inner.get_parameters_sync().unwrap();
-
-        let batch = 2;
-        let seq = 4;
-        let input_data: Vec<i32> = (0..batch * seq).map(|i| i % 50).collect();
-        let input_ids = MxArray::from_int32(&input_data, &[batch as i64, seq as i64]).unwrap();
-
-        // Full forward
-        let full_result = qwen3_forward_hidden_states(&config, &params, &input_ids).unwrap();
-        full_result.eval();
-
-        // Chunked with chunk_size > batch_size (should skip chunking)
-        let chunked_result =
-            qwen3_forward_hidden_states_chunked(&config, &params, &input_ids, 4).unwrap();
-        chunked_result.eval();
-
-        let full_data = full_result.to_float32().unwrap();
-        let chunked_data = chunked_result.to_float32().unwrap();
-
-        assert!(
-            arrays_close(&full_data, &chunked_data, 1e-5, 1e-5),
-            "Small batch test failed"
-        );
-    }
-
-    #[test]
-    fn test_chunked_forward_output_shape() {
-        let config = tiny_config();
-        let inner = seeded_inner(config.clone());
-        let params = inner.get_parameters_sync().unwrap();
-
-        let batch = 8;
-        let seq = 6;
-        let input_data: Vec<i32> = (0..batch * seq).map(|i| i % 50).collect();
-        let input_ids = MxArray::from_int32(&input_data, &[batch as i64, seq as i64]).unwrap();
-
-        let result = qwen3_forward_hidden_states_chunked(&config, &params, &input_ids, 2).unwrap();
-        result.eval();
-
-        let shape: Vec<i64> = result.shape().unwrap().to_vec();
-        assert_eq!(shape.len(), 3, "Output should be 3D");
-        assert_eq!(shape[0], batch as i64, "Batch size should match");
-        assert_eq!(shape[1], seq as i64, "Sequence length should match");
-        assert_eq!(
-            shape[2], config.hidden_size as i64,
-            "Hidden size should match"
-        );
-    }
-
-    #[test]
-    fn test_chunked_forward_with_tied_embeddings() {
-        // Test with tied word embeddings (affects LM head path but not hidden states)
-        let mut config = tiny_config();
-        config.tie_word_embeddings = true;
-
-        let inner = seeded_inner(config.clone());
-        let params = inner.get_parameters_sync().unwrap();
-
-        let batch = 6;
-        let seq = 4;
-        let input_data: Vec<i32> = (0..batch * seq).map(|i| i % 50).collect();
-        let input_ids = MxArray::from_int32(&input_data, &[batch as i64, seq as i64]).unwrap();
-
-        // Full forward
-        let full_result = qwen3_forward_hidden_states(&config, &params, &input_ids).unwrap();
-        full_result.eval();
-
-        // Chunked forward
-        let chunked_result =
-            qwen3_forward_hidden_states_chunked(&config, &params, &input_ids, 2).unwrap();
-        chunked_result.eval();
-
-        let full_data = full_result.to_float32().unwrap();
-        let chunked_data = chunked_result.to_float32().unwrap();
-
-        assert!(
-            arrays_close(&full_data, &chunked_data, 1e-4, 1e-4),
-            "Tied embeddings test failed. Max diff: {}",
-            full_data
-                .iter()
-                .zip(chunked_data.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max)
-        );
     }
 }
