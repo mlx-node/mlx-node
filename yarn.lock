@@ -4595,44 +4595,44 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@vitest/browser-preview@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/browser-preview@npm:5.0.4"
+"@vitest/browser-preview@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/browser-preview@npm:5.0.5"
   dependencies:
     "@testing-library/dom": "npm:^10.4.2"
     "@testing-library/user-event": "npm:^14.6.7"
-    "@vitest/browser": "npm:5.0.4"
+    "@vitest/browser": "npm:5.0.5"
   peerDependencies:
-    vitest: 5.0.4
-  checksum: 10c0/d525aeb2cc8df8a789ecb6c9163746a67e1ddf94203880b6150ab7f15f0169f2397b71f573438abc3fc5f96dabf4cc67b26ff755142b854c980210f2597a1fb1
+    vitest: 5.0.5
+  checksum: 10c0/124f5333f8616d48684e0417549680d9d0924be2bf637d6ae33b54e87cb94f38c8461e88c7bd47850ca28d8070013a6bcb615960e836c74d463e4734e8f67c48
   languageName: node
   linkType: hard
 
-"@vitest/browser@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/browser@npm:5.0.4"
+"@vitest/browser@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/browser@npm:5.0.5"
   dependencies:
     "@blazediff/core": "npm:1.10.0"
-    "@vitest/mocker": "npm:5.0.4"
-    "@vitest/ui": "npm:5.0.4"
-    "@vitest/utils": "npm:5.0.4"
+    "@vitest/mocker": "npm:5.0.5"
+    "@vitest/ui": "npm:5.0.5"
+    "@vitest/utils": "npm:5.0.5"
     magic-string: "npm:^1.4.3"
     pngjs: "npm:^7.0.0"
     sirv: "npm:^3.0.2"
     tinyrainbow: "npm:^3.2.0"
     ws: "npm:^8.22.0"
   peerDependencies:
-    vitest: 5.0.4
-  checksum: 10c0/a633be29a46998fe69c6e67c23cfbc78afb6fb1903aebc0cbf833b974ab58c50beb36193239da1ca4fa4b90b92451aee156efb2d51b87bfb14783a7b9d3d1c12
+    vitest: 5.0.5
+  checksum: 10c0/04e1a02bf752ecc86f01676a1f95dfcadc5472a4c0835ecb42aa0e0f6226cac8e0b6a1325cdc2c3d973b489dafdc97e22a039aac1abfff55bb9fb192b89e280f
   languageName: node
   linkType: hard
 
-"@vitest/mocker@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/mocker@npm:5.0.4"
+"@vitest/mocker@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/mocker@npm:5.0.5"
   dependencies:
     "@jridgewell/trace-mapping": "npm:0.3.31"
-    "@vitest/spy": "npm:5.0.4"
+    "@vitest/spy": "npm:5.0.5"
     estree-walker: "npm:^3.0.3"
     magic-string: "npm:^1.4.3"
   peerDependencies:
@@ -4643,117 +4643,117 @@ __metadata:
       optional: true
     vite:
       optional: true
-  checksum: 10c0/8caf945abf041cdcc8f10204af49d7442833c875a72b9dbcad11c27f9d4b1bd7b9150b6792528830ef878e758a93d1be966501284ea45aa3539b02cfacf1bb07
+  checksum: 10c0/5d5573d6015ef948d6cb193feb025874b6776f35964745c6beb3e556467b6dbfcbb103c4ce01d2d50b7fb43b83f56172c5074e0dd3da4dc5673ea1870b69a722
   languageName: node
   linkType: hard
 
-"@vitest/pretty-format@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/pretty-format@npm:5.0.4"
+"@vitest/pretty-format@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/pretty-format@npm:5.0.5"
   dependencies:
     tinyrainbow: "npm:^3.2.0"
-  checksum: 10c0/706bcf32a5906d64274d6bb0663f40309733590b6e0c590adb718a2818ffd2d0f3eaa6dd3e5e7f74d725eb3c30fd81ba45c28e3a784fb6f0153ed1ee5258f27b
+  checksum: 10c0/7d484e42542e3e04ee669cfd2632c001ca3c4493477c4fc539c3c1465cb511b9c46789f63aacf0fd40c312c023add17933b0864eb02d8640e44b69ffdad853c5
   languageName: node
   linkType: hard
 
-"@vitest/snapshot@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/snapshot@npm:5.0.4"
+"@vitest/snapshot@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/snapshot@npm:5.0.5"
   dependencies:
-    "@vitest/pretty-format": "npm:5.0.4"
-    "@vitest/utils": "npm:5.0.4"
+    "@vitest/pretty-format": "npm:5.0.5"
+    "@vitest/utils": "npm:5.0.5"
     magic-string: "npm:^1.4.3"
     pathe: "npm:^2.0.3"
-  checksum: 10c0/b82bdf21eee669af8241f692b2efd16a0d2dc0e340185eff818ada1a06651c4a190725ff458e4dac1ddf7c7ec9c8683e65a49c711d8476ae82f800cda0ab1c23
+  checksum: 10c0/3b3e8b900f57a375a52a1b0f9c25e8bdec75bf1b76ede16b2d33939442c0fcd232b24afa417e42a04aa522cddd537811ccf18e5254b952b4bb23ce69cfe70143
   languageName: node
   linkType: hard
 
-"@vitest/spy@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/spy@npm:5.0.4"
-  checksum: 10c0/f427195965fe1ddc92977e0a8458a245edd4636cfa1d6f02a30303c6c2b5a52641e89428cac0e05ec0f56d52e6d0820646eb14f0fb2476890fee5bfd639d8718
+"@vitest/spy@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/spy@npm:5.0.5"
+  checksum: 10c0/a48d92e38497e587cbb17b0ddb85604abaddf367e1cd4e373000ab080198511253fd35bf6a0e9a973e052e728c3235070a0b33ba6f2da1998aa5d65b64299783
   languageName: node
   linkType: hard
 
-"@vitest/ui@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/ui@npm:5.0.4"
+"@vitest/ui@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/ui@npm:5.0.5"
   dependencies:
-    "@vitest/utils": "npm:5.0.4"
+    "@vitest/utils": "npm:5.0.5"
     fflate: "npm:^0.8.3"
     flatted: "npm:^3.4.4"
     pathe: "npm:^2.0.3"
     sirv: "npm:^3.0.2"
     tinyrainbow: "npm:^3.2.0"
   peerDependencies:
-    vitest: 5.0.4
-  checksum: 10c0/31eadce4c065a3d3ffb6c78e99395a4a5b3af5188f7d749c894a50ba7c9697b828a5f01db1982dc31bd7740a3443a0e1acf5055038411ff5337b9fdc17521650
+    vitest: 5.0.5
+  checksum: 10c0/93f26d0fa82f5fd5a4ac1a830a23424f6dd060e88a1352818eef8bfc8441039be400b2b596c6ca14f54425173f6875dc23e8a233be681379a06abf6b91906b9e
   languageName: node
   linkType: hard
 
-"@vitest/utils@npm:5.0.4":
-  version: 5.0.4
-  resolution: "@vitest/utils@npm:5.0.4"
+"@vitest/utils@npm:5.0.5":
+  version: 5.0.5
+  resolution: "@vitest/utils@npm:5.0.5"
   dependencies:
-    "@vitest/pretty-format": "npm:5.0.4"
+    "@vitest/pretty-format": "npm:5.0.5"
     convert-source-map: "npm:^2.0.0"
     tinyrainbow: "npm:^3.2.0"
-  checksum: 10c0/1049e791cfdaffb0a391ea2c303362fa8944677637ac3b105ba687adb0eab447702820fddeb58ba66a8d50ff15d35581db5033ca487bfddf9b41926c7c7b700f
+  checksum: 10c0/424e7e2e8e2481385bc66a327531ae8c99fd63080778e17b8a75223bbd9d61d5c6d162db8e31ec7d6f17e6206cdc95e8d3d08b1fc8be3c9f50ee0ddf6862b641
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-darwin-arm64@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-darwin-arm64@npm:1.2.0"
+"@voidzero-dev/vite-plus-darwin-arm64@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-darwin-arm64@npm:1.3.0"
   conditions: os=darwin & cpu=arm64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-darwin-x64@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:1.2.0"
+"@voidzero-dev/vite-plus-darwin-x64@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:1.3.0"
   conditions: os=darwin & cpu=x64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-arm64-gnu@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-linux-arm64-gnu@npm:1.2.0"
+"@voidzero-dev/vite-plus-linux-arm64-gnu@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-gnu@npm:1.3.0"
   conditions: os=linux & cpu=arm64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.2.0"
+"@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.3.0"
   conditions: os=linux & cpu=arm64 & libc=musl
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-x64-gnu@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-linux-x64-gnu@npm:1.2.0"
+"@voidzero-dev/vite-plus-linux-x64-gnu@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-linux-x64-gnu@npm:1.3.0"
   conditions: os=linux & cpu=x64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-x64-musl@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:1.2.0"
+"@voidzero-dev/vite-plus-linux-x64-musl@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:1.3.0"
   conditions: os=linux & cpu=x64 & libc=musl
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-win32-arm64-msvc@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-win32-arm64-msvc@npm:1.2.0"
+"@voidzero-dev/vite-plus-win32-arm64-msvc@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-win32-arm64-msvc@npm:1.3.0"
   conditions: os=win32 & cpu=arm64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.2.0"
+"@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.3.0"
   conditions: os=win32 & cpu=x64
   languageName: node
   linkType: hard
@@ -7423,7 +7423,7 @@ __metadata:
     "@std/toml": "npm:@jsr/std__toml@^1.0.11"
     "@types/node": "npm:^26.4.0"
     octokit: "npm:^5.0.5"
-    openai: "npm:7.19.0"
+    openai: "npm:7.34.0"
     oxc-parser: "npm:^0.154.0"
     prettier: "npm:^3.9.6"
     typescript: "npm:^7.0.2"
@@ -7605,9 +7605,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"openai@npm:7.19.0":
-  version: 7.19.0
-  resolution: "openai@npm:7.19.0"
+"openai@npm:7.34.0":
+  version: 7.34.0
+  resolution: "openai@npm:7.34.0"
   peerDependencies:
     "@aws-sdk/credential-provider-node": ">=3.972.0 <4"
     "@smithy/hash-node": ">=4.3.0 <5"
@@ -7628,7 +7628,7 @@ __metadata:
       optional: true
     zod:
       optional: true
-  checksum: 10c0/027f21e9dd47bfc76f411775d18e17bb0d7c25a1f29d0bc5832a304b598509b44809b1d33ce231fa7657a9f6d38cda0304c15cd4eb7864aa8f3d50ebd4b7ed52
+  checksum: 10c0/3ed2dd9fdd94bf1ffe8495b18c14354a21b18461a9fc5ef4558c0c3d5121d98062dd2b8721c5f894fa1411a5e4c1322ee2ae16a89003afb22011ad6697c07bc4
   languageName: node
   linkType: hard
 
@@ -9216,34 +9216,34 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite-plus@npm:1.2.0":
-  version: 1.2.0
-  resolution: "vite-plus@npm:1.2.0"
+"vite-plus@npm:1.3.0":
+  version: 1.3.0
+  resolution: "vite-plus@npm:1.3.0"
   dependencies:
     "@oxc-project/types": "npm:=0.154.0"
     "@oxlint/plugins": "npm:=1.88.0"
-    "@vitest/browser": "npm:5.0.4"
-    "@vitest/browser-preview": "npm:5.0.4"
-    "@vitest/mocker": "npm:5.0.4"
-    "@vitest/pretty-format": "npm:5.0.4"
-    "@vitest/snapshot": "npm:5.0.4"
-    "@vitest/spy": "npm:5.0.4"
-    "@vitest/utils": "npm:5.0.4"
-    "@voidzero-dev/vite-plus-darwin-arm64": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-darwin-x64": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:1.2.0"
+    "@vitest/browser": "npm:5.0.5"
+    "@vitest/browser-preview": "npm:5.0.5"
+    "@vitest/mocker": "npm:5.0.5"
+    "@vitest/pretty-format": "npm:5.0.5"
+    "@vitest/snapshot": "npm:5.0.5"
+    "@vitest/spy": "npm:5.0.5"
+    "@vitest/utils": "npm:5.0.5"
+    "@voidzero-dev/vite-plus-darwin-arm64": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-darwin-x64": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:1.3.0"
     oxfmt: "npm:=0.73.0"
     oxlint: "npm:=1.88.0"
     oxlint-tsgolint: "npm:=7.0.2004"
-    vite: "npm:@voidzero-dev/vite-plus-core@1.2.0"
-    vitest: "npm:5.0.4"
+    vite: "npm:@voidzero-dev/vite-plus-core@1.3.0"
+    vitest: "npm:5.0.5"
   peerDependencies:
-    "@vitest/browser-playwright": 5.0.4
+    "@vitest/browser-playwright": 5.0.5
     "@vitest/browser-webdriverio": ^5.0.0-beta.5 || >=5.0.0
     playwright: "*"
   dependenciesMeta:
@@ -9273,24 +9273,24 @@ __metadata:
   bin:
     vp: ./bin/vp
     vpr: ./bin/vpr
-  checksum: 10c0/fdea87a390a63e1442793e6e71016e0223b6c6e579eac26b006ab8540f01dda940a2f6a546adbb7802e41322bca1be2d1205d1881f7c680380902e549dc8f05d
+  checksum: 10c0/044b40c629041602c8f39d27063461a3305192babb36523a18cb04de800db5e45f561a6ee72f28712426516f967dd4eb9643d32981723e6a2a3bb9f1a75a5be8
   languageName: node
   linkType: hard
 
-"vite@npm:@voidzero-dev/vite-plus-core@1.2.0":
-  version: 1.2.0
-  resolution: "@voidzero-dev/vite-plus-core@npm:1.2.0"
+"vite@npm:@voidzero-dev/vite-plus-core@1.3.0":
+  version: 1.3.0
+  resolution: "@voidzero-dev/vite-plus-core@npm:1.3.0"
   dependencies:
     "@oxc-project/runtime": "npm:=0.154.0"
     "@oxc-project/types": "npm:=0.154.0"
-    "@voidzero-dev/vite-plus-darwin-arm64": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-darwin-x64": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:1.2.0"
-    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:1.2.0"
+    "@voidzero-dev/vite-plus-darwin-arm64": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-darwin-x64": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:1.3.0"
+    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:1.3.0"
     fsevents: "npm:~2.3.3"
     lightningcss: "npm:^1.33.0"
     postcss: "npm:^8.5.29"
@@ -9379,16 +9379,16 @@ __metadata:
       optional: true
     yaml:
       optional: true
-  checksum: 10c0/8bf87399a64be4f800d83966c25b0868bcfdfa9108472727027df2f44a227514f1e1f1871461ed6b0a2c9b05782f6bbd2013f8d281847acd9dd99306a71fd63f
+  checksum: 10c0/7eeffaeda07fc778091cff25295e970575913031c00c8aec28784642f9b367efc7ca3246875b222f80e81f773ade7d8f3178cff1da823e08a6121289d7768d45
   languageName: node
   linkType: hard
 
-"vitest@npm:5.0.4":
-  version: 5.0.4
-  resolution: "vitest@npm:5.0.4"
+"vitest@npm:5.0.5":
+  version: 5.0.5
+  resolution: "vitest@npm:5.0.5"
   dependencies:
     "@types/chai": "npm:^5.2.2"
-    "@vitest/mocker": "npm:5.0.4"
+    "@vitest/mocker": "npm:5.0.5"
     chai: "npm:^6.3.0"
     es-module-lexer: "npm:^2.3.2"
     expect-type: "npm:^1.4.0"
@@ -9404,12 +9404,12 @@ __metadata:
     "@edge-runtime/vm": "*"
     "@opentelemetry/api": ^1.9.0
     "@types/node": ^22.0.0 || >=24.0.0
-    "@vitest/browser-playwright": 5.0.4
-    "@vitest/browser-preview": 5.0.4
+    "@vitest/browser-playwright": 5.0.5
+    "@vitest/browser-preview": 5.0.5
     "@vitest/browser-webdriverio": ^5.0.0-beta.5 || >=5.0.0
-    "@vitest/coverage-istanbul": 5.0.4
-    "@vitest/coverage-v8": 5.0.4
-    "@vitest/ui": 5.0.4
+    "@vitest/coverage-istanbul": 5.0.5
+    "@vitest/coverage-v8": 5.0.5
+    "@vitest/ui": 5.0.5
     happy-dom: "*"
     jsdom: "*"
     vite: ^6.4.0 || ^7.0.0 || ^8.0.0
@@ -9440,7 +9440,7 @@ __metadata:
       optional: false
   bin:
     vitest: ./vitest.mjs
-  checksum: 10c0/6f5ed473233caa068b86bc4fa4e9de723938dbd51255eb02e7e55c6a88ec8c0e4f47cb5baa77614223b8d66646a814956c003552ccc1c4a96ed9d66722756e4a
+  checksum: 10c0/b6e38164490c4ca0c2bbc4e74ec8f9052a344caab3f3bf0e8c4485b6493af0f789d7aafd41f4128f66d576f50d3c860f0674322add2b4d348b6ea250ec8c77c8
   languageName: node
   linkType: hard
 
