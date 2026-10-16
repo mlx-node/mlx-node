@@ -32,7 +32,7 @@ interface Sample extends Record<Metric, number> {
   accountedMs: number;
   promptTokens: number;
   cachedTokens: number;
-  inputSha256: string;
+  fixtureSha256: string;
   textSha256: string;
   addonSha256?: string;
   args?: unknown;
@@ -76,7 +76,7 @@ export async function report(out: string): Promise<void> {
         check(sample.name === expected.name && sample.run === run, 'case or repetition mismatch');
         check(sample.cachedTokens === 0, 'cached tokens');
         check(sample.promptTokens === expected.promptTokens, 'prompt tokens');
-        check(sample.inputSha256 === expected.tokenIdsSha256, 'input token IDs');
+        check(sample.fixtureSha256 === expected.tokenIdsSha256, 'fixture case');
         check(sample.generatedTokens === protocol.outputTokens, 'generated tokens');
         if (runtime === 'mlx') {
           check(sample.addonSha256 === environment.addon['mlx-core.darwin-arm64.node'], 'native addon changed');

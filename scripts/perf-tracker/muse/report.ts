@@ -19,7 +19,7 @@ import {
   writeJson,
   type CompareRow,
 } from '../common.js';
-import type { JobRecord } from './guard.js';
+import { jobSpans, type JobRecord } from './guard.js';
 import {
   BASELINE,
   PROTOCOL,
@@ -256,6 +256,20 @@ async function audit(out: string, setup: Setup, rows: Sample[]) {
     }
   }
   const attempts = existsSync(join(out, 'attempts')) ? (await readdir(join(out, 'attempts'))).sort() : [];
+  // Gap from the end of the previous guarded job (any, failed attempts too) to each sample's start.
+  const spans = await jobSpans(out);
+  const gaps = rows
+    .map((row) => spans.find((span) => span.label === row.id && !span.attempt))
+    .filter((span) => span !== undefined)
+    .sort((a, b) => a.start - b.start)
+    .map((own) => {
+      const before = spans.filter((span) => span.start < own.start).map((span) => span.end);
+      return { id: own.label, gapMs: before.length ? own.start - Math.max(...before) : null };
+    });
+  for (const { id, gapMs } of gaps) {
+    assert(gapMs === null || gapMs >= setup.cooldown * 1000, `${id}: started ${gapMs} ms after the previous job`);
+  }
+  const measuredGaps = gaps.flatMap(({ gapMs }) => (gapMs === null ? [] : [gapMs]));
   return {
     sampleChecks,
     maxProcessTreeRssBytes: Math.max(...rss),
@@ -268,6 +282,11 @@ async function audit(out: string, setup: Setup, rows: Sample[]) {
       ? { min: Math.min(...gpuBefore), median: median(gpuBefore), max: Math.max(...gpuBefore) }
       : null,
     retriedAttempts: attempts,
+    cooldown: {
+      seconds: setup.cooldown,
+      minGapMs: measuredGaps.length ? Math.min(...measuredGaps) : null,
+      gaps,
+    },
     tuning,
   };
 }

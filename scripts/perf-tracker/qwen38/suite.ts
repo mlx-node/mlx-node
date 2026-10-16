@@ -5,7 +5,7 @@ import { rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MODELS_DIR, ROOT, readJson, type FixtureManifest } from '../common.js';
+import { MODELS_DIR, ROOT, readJson, type FixtureManifest, type LlamaIdentity } from '../common.js';
 
 export const HERE = dirname(fileURLToPath(import.meta.url));
 export const FIXTURE = 'qwen38-oxc-review-v1';
@@ -81,14 +81,29 @@ export interface Sample {
   [field: string]: unknown;
 }
 
-export interface Provenance {
-  host: { os: string; chip: string; gpuCores: number; memoryBytes: number };
-  tree: { commit: string; mlx: string; dirty: boolean };
-  llama: { commit: string; sha256: string; dylibs: Record<string, string> };
+// Everything a fresh runtime process reads; `model.sha256` is absent from the per-block check.
+export interface Identity {
+  tree: {
+    commit: string;
+    mlx: string;
+    dirty: boolean;
+    status?: string;
+    patch?: string;
+    untracked?: Record<string, string>;
+  };
   addon: Record<string, string>;
-  model: { path: string; bytes: number; sha256: string };
+  llama: LlamaIdentity;
+  model: { path: string; realpath: string; size: number; mtimeMs: number; ino: number; sha256?: string };
+  sidecars: Record<string, string>;
+  scripts: Record<string, string>;
+}
+
+export const IDENTITY_KEYS = ['tree', 'addon', 'llama', 'model', 'sidecars', 'scripts'] as const;
+
+export interface Provenance extends Identity {
+  host: { os: string; chip: string; gpuCores: number; memoryBytes: number };
   tokenizer: { verified: boolean };
-  matrix?: { startedAt: string; finishedAt?: string };
+  matrix?: { startedAt: string; finishedAt?: string; postRunVerified?: boolean };
   [field: string]: unknown;
 }
 

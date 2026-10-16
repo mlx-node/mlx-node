@@ -42,7 +42,8 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(HERE, 'worker.ts');
-const SCRIPTS = ['run.ts', 'worker.ts', 'report.ts', 'suite.ts', 'baseline.csv', '../common.ts'];
+const RENDER = join(HERE, 'render.ts');
+const SCRIPTS = ['run.ts', 'worker.ts', 'render.ts', 'report.ts', 'suite.ts', 'baseline.csv', '../common.ts'];
 const STEPS = ['preflight', 'prewarm', 'matrix', 'report', 'all'];
 
 const exists = (path: string) =>
@@ -75,11 +76,16 @@ async function modelFiles(manifest: Manifest) {
     if (sha256 !== expected) throw new Error(`${path}: SHA-256 ${sha256}, expected ${expected}`);
     return { path, bytes: (await stat(path)).size, sha256 };
   };
+  // Unpinned, but they change the mlx-node prompt IDs; render.ts checks them.
+  const recorded = async (path: string) =>
+    (await exists(path)) ? { path, bytes: (await stat(path)).size, sha256: await sha256File(path) } : null;
   const marker = join(MODEL_DIR, '.mlx-download-complete.json');
   return {
     gguf: await pinned(MODEL_FILE, manifest.model.sha256),
     tokenizer: await pinned(join(MODEL_DIR, 'tokenizer.json'), manifest.model.tokenizerSha256),
     config: await pinned(join(MODEL_DIR, 'config.json'), manifest.model.configSha256),
+    tokenizerConfig: await recorded(join(MODEL_DIR, 'tokenizer_config.json')),
+    chatTemplate: await recorded(join(MODEL_DIR, 'chat_template.jinja')),
     mmproj: { path: MMPROJ_FILE, bytes: (await stat(MMPROJ_FILE)).size, sha256: await sha256File(MMPROJ_FILE) },
     download: (await exists(marker)) ? await readJson<unknown>(marker) : null,
   };
@@ -138,6 +144,7 @@ async function preflight(out: string, allowDirty: boolean) {
   }
   const { manifest, path, cases } = await readFixture();
   const current = await identity(manifest, allowDirty);
+  const render = JSON.parse(sh('oxnode', [RENDER], { cwd: ROOT })) as unknown;
   const provenance = {
     suite: 'gemma4',
     createdAt: new Date().toISOString(),
@@ -149,6 +156,7 @@ async function preflight(out: string, allowDirty: boolean) {
       path,
       payloadSha256: manifest.payload.sha256,
       cases: cases.map(({ name, promptTokens, sha256 }) => ({ name, promptTokens, tokenIdsSha256: sha256 })),
+      render,
     },
     protocol: manifest.protocol,
     childEnv: { prewarm: {}, matrix: manifest.protocol.mlxEnv },
@@ -224,6 +232,22 @@ async function prewarm(out: string, allowDirty: boolean) {
   }
 }
 
+// The cooldown runs before each job, so it also holds after a resume. A kept
+// sample's completedAt stands in for its exit; a worker log without a sample is
+// an attempt that ended at an unknown time, so the wait restarts from now.
+async function lastFinish(out: string): Promise<number> {
+  const raw = join(out, 'raw');
+  const files = await readdir(raw);
+  let latest = 0;
+  for (const file of files.filter((name) => name.endsWith('.json'))) {
+    latest = Math.max(latest, Date.parse((await readJson<{ completedAt: string }>(join(raw, file))).completedAt));
+  }
+  const unfinished = files.some(
+    (name) => name.endsWith('.worker.log') && !files.includes(name.replace(/\.worker\.log$/, '.json')),
+  );
+  return unfinished ? Date.now() : latest;
+}
+
 async function matrix(out: string, allowDirty: boolean) {
   const manifest = await readManifest();
   const provenance = await readProvenance(out, allowDirty);
@@ -235,6 +259,8 @@ async function matrix(out: string, allowDirty: boolean) {
     pilotsDone = Math.max(pilotsDone, Date.parse((await readJson<{ completedAt: string }>(path)).completedAt));
   }
   stayAwake();
+  const cooldown = manifest.protocol.cooldownSeconds * 1000;
+  let finished = await lastFinish(out);
   const settle = PILOT_SETTLE_MS - (Date.now() - pilotsDone);
   if (settle > 0) {
     console.log(JSON.stringify({ event: 'settle', seconds: Math.ceil(settle / 1000) }));
@@ -264,8 +290,10 @@ async function matrix(out: string, allowDirty: boolean) {
             console.log(JSON.stringify({ event: 'skip', id }));
             continue;
           }
+          const wait = cooldown - (Date.now() - finished);
+          if (wait > 0) await sleep(wait);
           await sample(out, runtime, name, run, env);
-          await sleep(manifest.protocol.cooldownSeconds * 1000);
+          finished = Date.now();
         }
       }
     }

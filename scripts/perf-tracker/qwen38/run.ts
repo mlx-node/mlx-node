@@ -3,8 +3,8 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { lstat, mkdir, readdir, readFile, readlink, realpath, rm, stat } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
 
 import {
@@ -12,7 +12,6 @@ import {
   addonIdentity,
   assertCleanEnv,
   assertCleanTree,
-  assertFileSha256,
   hostInfo,
   hostSnapshot,
   llamaIdentity,
@@ -30,6 +29,8 @@ import { report } from './report.js';
 import { LlamaServer, MlxWorker, type Runner } from './runtimes.js';
 import {
   FIXTURE,
+  HERE,
+  IDENTITY_KEYS,
   KIND,
   LOAD_COOLDOWN_SECONDS,
   MODEL_PATH,
@@ -40,6 +41,7 @@ import {
   paths,
   readManifest,
   writeJsonAtomic,
+  type Identity,
   type Provenance,
   type Runtime,
   type Sample,
@@ -48,27 +50,83 @@ import {
 const STEPS = ['preflight', 'prewarm', 'check-ids', 'matrix', 'report', 'all'] as const;
 type Step = (typeof STEPS)[number];
 
-function checkout(allowDirty: boolean) {
+const SIDECARS = ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
+
+async function fileHashes(dir: string, names: readonly string[]): Promise<Record<string, string>> {
+  const hashes: Record<string, string> = {};
+  for (const name of names) {
+    if (existsSync(join(dir, name))) hashes[name] = await sha256File(join(dir, name));
+  }
+  return hashes;
+}
+
+// A resumed dirty run must still measure the same patch, so hash content, not the file list.
+async function checkout(allowDirty: boolean): Promise<Identity['tree']> {
   try {
     return { ...assertCleanTree(), dirty: false };
   } catch (error) {
     if (!allowDirty || !(error instanceof Error) || !error.message.startsWith('The measured checkout must be clean')) {
       throw error;
     }
+    const untracked: Record<string, string> = {};
+    const listed = sh('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: ROOT });
+    for (const path of listed.split('\0').filter(Boolean).sort()) {
+      const full = join(ROOT, path);
+      untracked[path] = (await lstat(full)).isSymbolicLink() ? `-> ${await readlink(full)}` : await sha256File(full);
+    }
+    const diff = ['diff', 'HEAD', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'];
     return {
       commit: sh('git', ['rev-parse', 'HEAD'], { cwd: ROOT }),
       mlx: sh('git', ['rev-parse', 'HEAD'], { cwd: join(ROOT, 'crates/mlx-sys/mlx') }),
       dirty: true,
       status: sh('git', ['status', '--porcelain', '--ignore-submodules=none'], { cwd: ROOT }),
+      patch: sha256(sh('git', diff, { cwd: ROOT })),
+      untracked,
     };
   }
 }
 
-async function assertModel(expected: { bytes: number; sha256: string }): Promise<void> {
-  const { size } = await stat(MODEL_PATH);
-  if (size !== expected.bytes) throw new Error(`${MODEL_PATH}: ${size} bytes, expected ${expected.bytes}`);
-  console.log(`Hashing ${MODEL_PATH}`);
-  await assertFileSha256(MODEL_PATH, expected.sha256);
+// Workers spawned per block import these, so an edit mid-run would change later blocks.
+async function scriptHashes(): Promise<Record<string, string>> {
+  const paths = [
+    ...(await readdir(HERE)).map((name) => join(HERE, name)),
+    join(ROOT, 'scripts/perf-tracker/common.ts'),
+    join(ROOT, 'scripts/fixtures', `${FIXTURE}.json`),
+  ].sort();
+  const hashes: Record<string, string> = {};
+  for (const path of paths) {
+    if ((await lstat(path)).isFile()) hashes[relative(ROOT, path)] = await sha256File(path);
+  }
+  return hashes;
+}
+
+// The 17.5 GB GGUF hash takes about a minute, so blocks compare its size, mtime and inode.
+async function identity(allowDirty: boolean, hashModel: boolean): Promise<Identity> {
+  const { size, mtimeMs, ino } = await stat(MODEL_PATH);
+  if (hashModel) console.log(`Hashing ${MODEL_PATH}`);
+  return {
+    tree: await checkout(allowDirty),
+    addon: await addonIdentity(),
+    llama: await llamaIdentity(),
+    model: {
+      path: MODEL_PATH,
+      realpath: await realpath(MODEL_PATH),
+      size,
+      mtimeMs,
+      ino,
+      ...(hashModel ? { sha256: await sha256File(MODEL_PATH) } : {}),
+    },
+    sidecars: await fileHashes(dirname(MODEL_PATH), SIDECARS),
+    scripts: await scriptHashes(),
+  };
+}
+
+async function verifyIdentity(recorded: Identity, allowDirty: boolean, hashModel: boolean, when: string) {
+  const current = await identity(allowDirty, hashModel);
+  const { sha256: _sha256, ...model } = recorded.model;
+  const expected = hashModel ? recorded : { ...recorded, model };
+  const changed = IDENTITY_KEYS.filter((key) => !isDeepStrictEqual(current[key], expected[key]));
+  if (changed.length) throw new Error(`${when}: ${changed.join(', ')} changed since preflight`);
 }
 
 function assertHostReady(): void {
@@ -89,12 +147,7 @@ async function verifyTokenizer(tokenizer: string) {
   if (!output.includes('Current native tokenizer/template matches all pinned inputs.')) {
     throw new Error(`Tokenizer verification did not run:\n${output}`);
   }
-  const files: Record<string, string> = {};
-  for (const name of ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja']) {
-    const path = join(dirname(tokenizer), name);
-    if (existsSync(path)) files[name] = await sha256File(path);
-  }
-  return { tokenizer, files, verified: true, output };
+  return { tokenizer, files: await fileHashes(dirname(tokenizer), SIDECARS), verified: true, output };
 }
 
 async function preflight(out: string, allowDirty: boolean): Promise<void> {
@@ -103,24 +156,18 @@ async function preflight(out: string, allowDirty: boolean): Promise<void> {
   if (existsSync(files.samples)) throw new Error(`${out} already holds samples; preflight a new --out directory`);
   const manifest = await readManifest();
   assertHostReady();
-  const tree = checkout(allowDirty);
-  const llama = await llamaIdentity();
-  const addon = await addonIdentity();
   const fixture = await loadFixture(FIXTURE);
-  await assertModel(manifest.model);
+  const recorded = await identity(allowDirty, true);
+  if (recorded.model.size !== manifest.model.bytes || recorded.model.sha256 !== manifest.model.sha256) {
+    throw new Error(
+      `${MODEL_PATH}: ${recorded.model.size} bytes, SHA-256 ${recorded.model.sha256}; not the pinned GGUF`,
+    );
+  }
   const tokenizer = await verifyTokenizer(join(dirname(MODEL_PATH), 'tokenizer.json'));
   await writeJson(files.provenance, {
     preflightAt: new Date().toISOString(),
     host: hostInfo(),
-    tree,
-    addon,
-    llama,
-    model: {
-      path: MODEL_PATH,
-      realpath: await realpath(MODEL_PATH),
-      bytes: manifest.model.bytes,
-      sha256: manifest.model.sha256,
-    },
+    ...recorded,
     fixture: {
       id: manifest.id,
       payload: fixture.manifest.payload,
@@ -187,22 +234,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
   if (!existsSync(files.provenance)) throw new Error(`${files.provenance} is missing; run preflight first`);
   const provenance = await readJson<Provenance>(files.provenance);
   assertHostReady();
-  const tree = checkout(allowDirty);
-  if (
-    tree.commit !== provenance.tree.commit ||
-    tree.mlx !== provenance.tree.mlx ||
-    tree.dirty !== provenance.tree.dirty
-  ) {
-    throw new Error('The checkout changed since preflight');
-  }
-  const llama = await llamaIdentity();
-  if (llama.sha256 !== provenance.llama.sha256 || !isDeepStrictEqual(llama.dylibs, provenance.llama.dylibs)) {
-    throw new Error('llama.cpp binaries changed since preflight');
-  }
-  if (!isDeepStrictEqual(await addonIdentity(), provenance.addon)) {
-    throw new Error('The mlx-node addon changed since preflight');
-  }
-  await assertModel(provenance.model);
+  await verifyIdentity(provenance, allowDirty, true, 'matrix start');
   const { cases } = await loadFixture(FIXTURE);
 
   const repetitions = Array.from({ length: protocol.repetitions }, (_, index) => index + 1);
@@ -240,6 +272,8 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
         if (!missing.length) continue;
         const kind = KIND[runtime];
         const block = `block-${item.name}-${stamp}`;
+        await verifyIdentity(provenance, allowDirty, false, `${kind}-${block}`);
+        progress.emit({ event: 'identity_verified', label: `${kind}-${block}`, gguf: 'size, mtime, inode' });
         await admit(policy, progress, `${kind}-${block}-load`, LOAD_COOLDOWN_SECONDS);
         let runner: Runner;
         if (runtime === 'mlx-node') {
@@ -306,18 +340,20 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
       }
     }
     if (completed.size !== expected.size) throw new Error('Incomplete measurement matrix');
+    provenance.postRun = hostSnapshot();
+    await verifyIdentity(provenance, allowDirty, true, 'post-run');
+    progress.emit({ event: 'identity_verified', label: 'post-run', gguf: 'sha256' });
     progress.emit({ event: 'complete', samples: samples.length });
   } finally {
     await stopGpu();
     caffeinate.kill();
   }
-  provenance.matrix.finishedAt = new Date().toISOString();
-  provenance.postRun = hostSnapshot();
+  provenance.matrix = { ...provenance.matrix, finishedAt: new Date().toISOString(), postRunVerified: true };
   await writeJson(files.provenance, provenance);
 }
 
-async function printReport(out: string): Promise<void> {
-  const rows = await report(out);
+async function printReport(out: string, allowDirty: boolean): Promise<void> {
+  const rows = await report(out, allowDirty);
   console.log(
     '| Prompt tokens | mlx-node prefill | llama.cpp prefill | Ratio | mlx-node decode | llama.cpp decode | Ratio |',
   );
@@ -346,7 +382,7 @@ async function main(): Promise<void> {
       `Usage: LLAMA_SERVER=/path/to/llama-server oxnode scripts/perf-tracker/qwen38/run.ts <${STEPS.join('|')}> [--out <dir>]\n` +
         'Without --out a new run directory is created; with --out the step continues or reports that run.\n' +
         'all = preflight, prewarm, matrix, report. check-ids is an optional untimed native prompt-ID check.\n' +
-        '--allow-dirty records an uncommitted checkout instead of refusing it (development only).',
+        '--allow-dirty measures or reports an uncommitted checkout instead of refusing it (development only).',
     );
     if (!values.help) process.exitCode = 1;
     return;
@@ -359,7 +395,7 @@ async function main(): Promise<void> {
   if (step === 'prewarm' || step === 'all') await prewarm(out);
   if (step === 'check-ids') await checkIds(out);
   if (step === 'matrix' || step === 'all') await matrix(out, allowDirty);
-  if (step === 'report' || step === 'all') await printReport(out);
+  if (step === 'report' || step === 'all') await printReport(out, allowDirty);
 }
 
 main().catch((error: unknown) => {

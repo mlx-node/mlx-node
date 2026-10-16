@@ -10,7 +10,17 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 import type { ChatConfig, ChatMessage } from '../../../packages/core/index.cjs';
-import { ROOT, assertCleanEnv, llamaServerPath, sha256, sha256File, sleep, writeJson } from '../common.js';
+import {
+  ADDON_PATH,
+  ROOT,
+  assertCleanEnv,
+  assertLoadedAddon,
+  llamaServerPath,
+  sha256,
+  sha256File,
+  sleep,
+  writeJson,
+} from '../common.js';
 import { MODEL_FILE, PILOT_RUN, RUNTIMES, readFixture, sampleId, samplePath, type Runtime } from './suite.js';
 
 type Core = typeof import('../../../packages/core/index.cjs');
@@ -54,6 +64,7 @@ async function mlx() {
   const { Gemma4Model, getMemorySnapshot, resetPeakMemory } = (await import(
     pathToFileURL(join(ROOT, 'packages/core/index.cjs')).href
   )) as Core;
+  assertLoadedAddon();
   const started = performance.now();
   const model = await Gemma4Model.load(MODEL_FILE);
   const loadMs = performance.now() - started;
@@ -91,7 +102,7 @@ async function mlx() {
   const sample = {
     runtime,
     env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('MLX_'))),
-    addonSha256: await sha256File(join(ROOT, 'packages/core/mlx-core.darwin-arm64.node')),
+    addonSha256: await sha256File(ADDON_PATH),
     name: data!.name,
     n,
     run,
@@ -110,7 +121,7 @@ async function mlx() {
     generatedTokens: result.numTokens,
     cachedTokens: result.cachedTokens,
     textSha256: sha256(result.rawText),
-    inputSha256: data!.sha256,
+    fixtureSha256: data!.sha256,
     completedAt: new Date().toISOString(),
     result,
   };
@@ -247,7 +258,7 @@ async function llama() {
       generatedTokens: t.predicted_n,
       cachedTokens: t.cache_n,
       textSha256: sha256(result.content),
-      inputSha256: data!.sha256,
+      fixtureSha256: data!.sha256,
       completedAt: new Date().toISOString(),
       result,
     };

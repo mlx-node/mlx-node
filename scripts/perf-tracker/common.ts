@@ -2,7 +2,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, realpathSync } from 'node:fs';
 import { mkdir, readdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,8 +92,9 @@ export async function llamaIdentity(path = llamaServerPath()): Promise<LlamaIden
   return { path, sha256: await sha256File(path), version: version.trim(), commit, dylibs };
 }
 
-// Any of these changes the measured path; MTL_/METAL_ also switch on Metal validation layers.
-const ENV_PREFIXES = ['MLX_', 'NAPI_RS_', 'MUSE_', 'INT8_QMV_', 'GGML_', 'LLAMA_ARG_', 'MTL_', 'METAL_'];
+// Any of these changes the measured path; MTL_/METAL_ switch on Metal validation layers and
+// DYLD_ redirects the libraries of both runtimes.
+const ENV_PREFIXES = ['MLX_', 'NAPI_RS_', 'MUSE_', 'INT8_QMV_', 'GGML_', 'LLAMA_ARG_', 'MTL_', 'METAL_', 'DYLD_'];
 
 export function assertCleanEnv(allowed: readonly string[] = []): void {
   const inherited = Object.keys(process.env).filter(
@@ -117,6 +118,18 @@ export async function addonIdentity(): Promise<Record<string, string>> {
   const identity: Record<string, string> = {};
   for (const file of files) identity[file] = await sha256File(join(core, file));
   return identity;
+}
+
+export const ADDON_PATH = join(ROOT, 'packages/core/mlx-core.darwin-arm64.node');
+
+// index.cjs tries darwin-universal bindings before the arm64 file, so a stale
+// universal binary would load while the provenance hashes the arm64 one.
+export function assertLoadedAddon(expected = ADDON_PATH): void {
+  const report = process.report.getReport() as { sharedObjects?: string[] };
+  const addons = (report.sharedObjects ?? []).filter((path) => /mlx-core\.[^/]*\.node$/.test(path));
+  if (addons.length !== 1 || realpathSync(addons[0]) !== realpathSync(expected)) {
+    throw new Error(`Expected the addon ${expected}, loaded: ${addons.join(', ') || 'none'}`);
+  }
 }
 
 export function gpuUtilization(): number {

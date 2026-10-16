@@ -70,11 +70,17 @@ const tokens = (count: number) => count.toLocaleString('en-US');
 
 // Refuses an incomplete or off-protocol run, then writes samples.csv,
 // summary.json, chart.svg and compare.md.
-export async function report(out: string): Promise<SummaryRow[]> {
+export async function report(out: string, allowDirty: boolean): Promise<SummaryRow[]> {
   const manifest = await readManifest();
   const { outputTokens, repetitions } = manifest.protocol;
   const files = paths(out);
   const provenance = await readJson<Provenance>(files.provenance);
+  if (provenance.matrix?.postRunVerified !== true) {
+    throw new Error(`${out}: the matrix has not passed its post-run identity check`);
+  }
+  if (provenance.tree.dirty && !allowDirty) {
+    throw new Error(`${out} measured an uncommitted checkout; pass --allow-dirty to report it`);
+  }
   const events = (await readFile(files.progress, 'utf8'))
     .split('\n')
     .filter(Boolean)

@@ -2,10 +2,10 @@
 
 import { spawn } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, openSync, statSync } from 'node:fs';
-import { mkdir, readdir, rename } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
-import { ROOT, sh, utcStamp, writeJson } from '../common.js';
+import { ROOT, sh, sleep, utcStamp, writeJson } from '../common.js';
 
 const MEMORY_SHARE = 0.45;
 const MIN_AVAILABLE_PERCENT = 20;
@@ -23,11 +23,50 @@ export interface JobRecord {
   reason: string | null;
   maxRssBytes: number;
   elapsedMs: number;
+  started?: string;
   finished: string;
   hostBefore?: unknown;
 }
 
 export const jobPassed = (record: JobRecord) => record.code === 0 && record.reason === null;
+
+export interface JobSpan {
+  label: string;
+  start: number;
+  end: number;
+  attempt: boolean;
+}
+
+// Every guarded job of a run, failed attempts included, by start time.
+// Records written before `started` existed carry only finished and elapsedMs.
+export async function jobSpans(dir: string): Promise<JobSpan[]> {
+  const files = (await readdir(dir)).filter((name) => name.endsWith('.job.json')).map((name) => join(dir, name));
+  const attempts = join(dir, 'attempts');
+  const archived: string[] = [];
+  if (existsSync(attempts)) {
+    for (const attempt of await readdir(attempts)) {
+      const names = await readdir(join(attempts, attempt));
+      archived.push(...names.filter((name) => name.endsWith('.job.json')).map((name) => join(attempts, attempt, name)));
+    }
+  }
+  const spans: JobSpan[] = [];
+  for (const path of [...files, ...archived]) {
+    const record = JSON.parse(await readFile(path, 'utf8')) as JobRecord;
+    const end = Date.parse(record.finished);
+    const start = record.started ? Date.parse(record.started) : end - record.elapsedMs;
+    spans.push({ label: record.label, start, end, attempt: archived.includes(path) });
+  }
+  return spans.sort((a, b) => a.start - b.start);
+}
+
+// Measured from the last recorded job end, so the spacing also holds across
+// an interrupt and resume.
+export async function waitForCooldown(dir: string, seconds: number): Promise<void> {
+  const spans = await jobSpans(dir);
+  if (!spans.length) return;
+  const wait = Math.max(...spans.map((span) => span.end)) + seconds * 1000 - Date.now();
+  if (wait > 0) await sleep(wait);
+}
 
 // A rerun of a failed job must not append to the failed attempt's resource or
 // tuning logs, so its files move to attempts/ first.
@@ -137,6 +176,7 @@ export async function guarded(options: {
     reason,
     maxRssBytes: maxRss,
     elapsedMs: Date.now() - started,
+    started: new Date(started).toISOString(),
     finished: new Date().toISOString(),
     hostBefore: options.hostBefore,
   };

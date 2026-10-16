@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
-import { ROOT, assertCleanEnv, loadFixture, writeJson } from '../common.js';
+import { ROOT, assertCleanEnv, assertLoadedAddon, loadFixture, writeJson } from '../common.js';
 import { FIXTURE, MODEL_PATH, readManifest } from './suite.js';
 
 interface StreamEvent {
@@ -49,6 +49,7 @@ const { memoryStats, Qwen3Tokenizer } = (await import(pathToFileURL(join(ROOT, '
   memoryStats: () => unknown;
   Qwen3Tokenizer: { fromPretrained(path: string): Promise<Tokenizer> };
 };
+assertLoadedAddon();
 
 const loadStart = performance.now();
 // loadModel attaches a qwen3.8-27b-dflash2 directory found beside the GGUF;

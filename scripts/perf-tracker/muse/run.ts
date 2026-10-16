@@ -23,10 +23,9 @@ import {
   sh,
   sha256,
   sha256File,
-  sleep,
   writeJson,
 } from '../common.js';
-import { guarded, jobPassed, type JobRecord } from './guard.js';
+import { guarded, jobPassed, waitForCooldown, type JobRecord } from './guard.js';
 import { report } from './report.js';
 import {
   BOOTSTRAP,
@@ -360,6 +359,7 @@ async function matrix(out: string, provenance: Provenance) {
       String(job.run),
       ...(job.speculation === 'dflash' ? ['--spec'] : []),
     ];
+    await waitForCooldown(out, PROTOCOL.cooldownSeconds);
     await progress({ event: 'start', completed: index, total: jobs.length, id: job.id, at: at() });
     const record = await guarded({
       dir: out,
@@ -398,7 +398,6 @@ async function matrix(out: string, provenance: Provenance) {
       wallMs: sample.wallMs,
       outputSha256: sample.outputSha256,
     });
-    if (index < jobs.length - 1) await sleep(PROTOCOL.cooldownSeconds * 1000);
   }
   await progress({ event: 'matrix-complete', completed: jobs.length, total: jobs.length, at: at() });
 }

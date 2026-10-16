@@ -33,8 +33,8 @@ The first run of each suite after a native GGUF cache format change also convert
   the GPU is at most 5% busy before its 6k and 16k rows; the other suites record the load instead of waiting.
 - Do not change the protocol: fixtures, llama.cpp arguments, token counts, order, warmups and cooldowns. A changed
   protocol is a new fixture version and a new tracker row, not a rerun.
-- Do not export `MLX_*`, `NAPI_RS_*`, `MUSE_*`, `INT8_QMV_*`, `GGML_*`, `LLAMA_ARG_*`, `MTL_*` or `METAL_*`. The runners
-  refuse them and set the protocol variables for their own workers.
+- Do not export `MLX_*`, `NAPI_RS_*`, `MUSE_*`, `INT8_QMV_*`, `GGML_*`, `LLAMA_ARG_*`, `MTL_*`, `METAL_*` or `DYLD_*`.
+  The runners refuse them and set the protocol variables for their own workers.
 - Do not change the checkout, the addon or the llama.cpp build during a run. Each suite hashes them before and after.
 - Never post to GitHub or push an asset branch without asking the user first.
 
@@ -52,7 +52,8 @@ The first run of each suite after a native GGUF cache format change also convert
    ```
 
    The runners refuse another llama.cpp commit. `PERF_TRACKER_ANY_LLAMA=1` measures another build on purpose; such a
-   run is not comparable with earlier entries.
+   run is not comparable with earlier entries. The runners record the hashes of `llama-server` and its dylibs, but
+   they cannot see build flags. Use exactly the flags above.
 
 2. Put the checkpoints under `<repo>/.cache/models/` (or point `MODELS_DIR` at another folder):
 
@@ -67,10 +68,11 @@ The first run of each suite after a native GGUF cache format change also convert
    mlx download -m <source repo> -g <file> -o .cache/models/<folder>
    ```
 
-   Preflight checks every hash. It also checks the sidecar files next to each GGUF (`tokenizer.json`,
-   `tokenizer_config.json`, `config.json`, `chat_template.jinja`): Gemma against the hashes in its fixture manifest,
-   Qwen and Muse by rendering the fixture messages and comparing the token IDs. Sidecars that render other IDs make
-   the run incomparable, so fix them before measuring.
+   Preflight checks every model hash. The sidecar files next to each GGUF (`tokenizer.json`, `tokenizer_config.json`,
+   `config.json`, `chat_template.jinja`) decide the prompt token IDs on the mlx-node side. Before the matrix, each
+   suite renders the fixture messages with them and compares the token IDs with the pinned IDs (Qwen and Gemma in
+   `preflight`, Muse in `finalize`). Sidecars that render other IDs make the run incomparable, so fix them before
+   measuring.
 
 3. Fetch the public fixtures (Muse re-renders the Gemma fixture with its own template):
 
