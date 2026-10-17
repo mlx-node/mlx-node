@@ -1,17 +1,30 @@
 /// <reference types="node" />
 
 import { appendFileSync } from 'node:fs';
-import { rename, writeFile } from 'node:fs/promises';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MODELS_DIR, ROOT, readJson, type FixtureManifest, type LlamaIdentity } from '../common.js';
+import {
+  MODELS_DIR,
+  ROOT,
+  fileHashes,
+  readJson,
+  sh,
+  sha256,
+  writeJson,
+  type FixtureCase,
+  type FixtureManifest,
+  type LlamaIdentity,
+  type TreeIdentity,
+} from '../common.js';
 
 export const HERE = dirname(fileURLToPath(import.meta.url));
 export const FIXTURE = 'qwen38-oxc-review-v1';
 export const MODEL_PATH = join(MODELS_DIR, 'qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf');
 export const PORT = 18789;
 export const LOAD_COOLDOWN_SECONDS = 10;
+export const SIDECARS = ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
 
 export const RUNTIMES = ['mlx-node', 'llama.cpp'] as const;
 export type Runtime = (typeof RUNTIMES)[number];
@@ -89,14 +102,7 @@ export interface Sample {
 
 // Everything a fresh runtime process reads; `model.sha256` is absent from the per-block check.
 export interface Identity {
-  tree: {
-    commit: string;
-    mlx: string;
-    dirty: boolean;
-    status?: string;
-    patch?: string;
-    untracked?: Record<string, string>;
-  };
+  tree: TreeIdentity;
   addon: Record<string, string>;
   llama: LlamaIdentity;
   model: { path: string; realpath: string; size: number; mtimeMs: number; ino: number; sha256?: string };
@@ -122,6 +128,47 @@ export const paths = (out: string) => ({
   raw: join(out, 'raw'),
   system: join(out, 'system'),
 });
+
+export async function verifyTokenizer(tokenizer: string) {
+  const output = sh('oxnode', [
+    join(ROOT, 'scripts/benchmark-fixture.ts'),
+    'verify',
+    '--fixture',
+    'qwen38',
+    '--tokenizer',
+    tokenizer,
+  ]);
+  if (!output.includes('Current native tokenizer/template matches all pinned inputs.')) {
+    throw new Error(`Tokenizer verification did not run:\n${output}`);
+  }
+  return { tokenizer, files: await fileHashes(dirname(tokenizer), SIDECARS), verified: true, output };
+}
+
+export interface IdCheck {
+  name: string;
+  promptTokens: number;
+  identical: boolean;
+  trace: string;
+}
+
+// The admitted-prompt trace hashes each u32 token ID little-endian.
+export async function checkAdmittedIds(trace: string, cases: readonly FixtureCase[], out: string): Promise<IdCheck[]> {
+  const admitted = (await readFile(trace, 'utf8')).split('\n').filter((line) => line.includes('admitted_prompt'));
+  if (admitted.length !== cases.length)
+    throw new Error(`Traced ${admitted.length} admitted prompts for ${cases.length}`);
+  const checks = cases.map((item, index) => {
+    const ids = Buffer.alloc(item.tokenIds.length * 4);
+    item.tokenIds.forEach((id, offset) => ids.writeUInt32LE(id, offset * 4));
+    const identical = admitted[index].includes(`is_delta=false tokens=${item.tokenIds.length} sha256=${sha256(ids)}`);
+    return { name: item.name, promptTokens: item.tokenIds.length, identical, trace: admitted[index] };
+  });
+  await writeJson(join(out, 'check-ids.json'), checks);
+  for (const check of checks) {
+    if (!check.identical)
+      throw new Error(`${check.name}: native session admitted different prompt IDs: ${check.trace}`);
+  }
+  return checks;
+}
 
 export async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   await writeFile(`${path}.tmp`, `${JSON.stringify(value, null, 2)}\n`);

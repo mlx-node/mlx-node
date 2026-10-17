@@ -15,7 +15,17 @@ import {
   type ChartSeries,
   type CompareRow,
 } from '../common.js';
-import { HERE, KIND, RUNTIMES, paths, readManifest, type Provenance, type Runtime, type Sample } from './suite.js';
+import {
+  HERE,
+  KIND,
+  RUNTIMES,
+  paths,
+  readManifest,
+  type Manifest,
+  type Provenance,
+  type Runtime,
+  type Sample,
+} from './suite.js';
 
 export const CSV_COLUMNS = [
   'runtime',
@@ -58,11 +68,18 @@ export interface SummaryRow {
 
 const tokens = (count: number) => count.toLocaleString('en-US');
 
-// Refuses an incomplete or off-protocol run, then writes samples.csv,
-// summary.json, chart.svg and compare.md.
-export async function report(out: string, allowDirty: boolean): Promise<SummaryRow[]> {
+export interface Summary {
+  manifest: Manifest;
+  provenance: Provenance;
+  samples: Sample[];
+  summary: SummaryRow[];
+}
+
+// Refuses an incomplete or off-protocol run.
+export async function summarize(out: string, allowDirty: boolean, outputLength?: number): Promise<Summary> {
   const manifest = await readManifest();
-  const { outputTokens, repetitions } = manifest.protocol;
+  const { repetitions } = manifest.protocol;
+  const outputTokens = outputLength ?? manifest.protocol.outputTokens;
   const files = paths(out);
   const provenance = await readJson<Provenance>(files.provenance);
   if (provenance.matrix?.postRunVerified !== true) {
@@ -140,24 +157,45 @@ export async function report(out: string, allowDirty: boolean): Promise<SummaryR
       decodeRatio: mlx.decodeTokensPerSecond.median / llama.decodeTokensPerSecond.median,
     };
   });
+  return { manifest, provenance, samples, summary };
+}
 
-  await writeFile(
-    join(out, 'samples.csv'),
-    toCsv(
-      CSV_COLUMNS,
-      samples.map((sample) => ({
-        runtime: sample.runtime,
-        prompt_tokens: sample.promptTokens,
-        repetition: sample.run,
-        output_tokens: sample.numTokens,
-        cached_tokens: sample.cachedTokens,
-        prefill_tokens_per_second: sample.performance.prefillTokensPerSecond,
-        decode_tokens_per_second: sample.performance.decodeTokensPerSecond,
-        ttft_ms: sample.performance.ttftMs,
-        wall_ms: sample.wallMs,
-      })),
-    ),
+export function samplesCsv(samples: readonly Sample[]): string {
+  return toCsv(
+    CSV_COLUMNS,
+    samples.map((sample) => ({
+      runtime: sample.runtime,
+      prompt_tokens: sample.promptTokens,
+      repetition: sample.run,
+      output_tokens: sample.numTokens,
+      cached_tokens: sample.cachedTokens,
+      prefill_tokens_per_second: sample.performance.prefillTokensPerSecond,
+      decode_tokens_per_second: sample.performance.decodeTokensPerSecond,
+      ttft_ms: sample.performance.ttftMs,
+      wall_ms: sample.wallMs,
+    })),
   );
+}
+
+export function printSummary(rows: readonly SummaryRow[]): void {
+  console.log(
+    '| Prompt tokens | mlx-node prefill | llama.cpp prefill | Ratio | mlx-node decode | llama.cpp decode | Ratio |',
+  );
+  console.log('|---:|---:|---:|---:|---:|---:|---:|');
+  for (const row of rows) {
+    const [mlx, llama] = [row['mlx-node'], row['llama.cpp']];
+    console.log(
+      `| ${row.promptTokens.toLocaleString('en-US')} | ${mlx.prefillTokensPerSecond.median.toFixed(1)} | ${llama.prefillTokensPerSecond.median.toFixed(1)} | ${row.prefillRatio.toFixed(3)}× | ${mlx.decodeTokensPerSecond.median.toFixed(2)} | ${llama.decodeTokensPerSecond.median.toFixed(2)} | ${row.decodeRatio.toFixed(3)}× |`,
+    );
+  }
+}
+
+// Refuses an incomplete or off-protocol run, then writes samples.csv,
+// summary.json, chart.svg and compare.md.
+export async function report(out: string, allowDirty: boolean): Promise<SummaryRow[]> {
+  const { manifest, provenance, samples, summary } = await summarize(out, allowDirty);
+  const { outputTokens, repetitions } = manifest.protocol;
+  await writeFile(join(out, 'samples.csv'), samplesCsv(samples));
   await writeJson(join(out, 'summary.json'), summary);
 
   const measuredAt = provenance.matrix?.startedAt.slice(0, 10) ?? 'unknown date';

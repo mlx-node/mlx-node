@@ -1,9 +1,9 @@
 #!/usr/bin/env oxnode
 /// <reference types="node" />
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { lstat, mkdir, readdir, readFile, readlink, realpath, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, rm, stat } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
 
@@ -11,23 +11,23 @@ import {
   ROOT,
   addonIdentity,
   assertCleanEnv,
+  assertHostReady,
   assertLatestMain,
   fetchLatestLlama,
-  assertCleanTree,
+  fileHashes,
   hostInfo,
   hostSnapshot,
   llamaIdentity,
   loadFixture,
   outDir,
   readJson,
-  sh,
-  sha256,
   sha256File,
+  treeIdentity,
   utcStamp,
   writeJson,
 } from '../common.js';
 import { admit, recordGpu, snapshot } from './admission.js';
-import { report } from './report.js';
+import { printSummary, report } from './report.js';
 import { LlamaServer, MlxWorker, type Runner } from './runtimes.js';
 import {
   FIXTURE,
@@ -36,12 +36,15 @@ import {
   KIND,
   LOAD_COOLDOWN_SECONDS,
   MODEL_PATH,
+  SIDECARS,
   admissionPolicy,
+  checkAdmittedIds,
   PORT,
   Progress,
   RUNTIMES,
   paths,
   readManifest,
+  verifyTokenizer,
   writeJsonAtomic,
   type Identity,
   type Provenance,
@@ -51,42 +54,6 @@ import {
 
 const STEPS = ['preflight', 'prewarm', 'check-ids', 'matrix', 'report', 'all'] as const;
 type Step = (typeof STEPS)[number];
-
-const SIDECARS = ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
-
-async function fileHashes(dir: string, names: readonly string[]): Promise<Record<string, string>> {
-  const hashes: Record<string, string> = {};
-  for (const name of names) {
-    if (existsSync(join(dir, name))) hashes[name] = await sha256File(join(dir, name));
-  }
-  return hashes;
-}
-
-// A resumed dirty run must still measure the same patch, so hash content, not the file list.
-async function checkout(allowDirty: boolean): Promise<Identity['tree']> {
-  try {
-    return { ...assertCleanTree(), dirty: false };
-  } catch (error) {
-    if (!allowDirty || !(error instanceof Error) || !error.message.startsWith('The measured checkout must be clean')) {
-      throw error;
-    }
-    const untracked: Record<string, string> = {};
-    const listed = sh('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: ROOT });
-    for (const path of listed.split('\0').filter(Boolean).sort()) {
-      const full = join(ROOT, path);
-      untracked[path] = (await lstat(full)).isSymbolicLink() ? `-> ${await readlink(full)}` : await sha256File(full);
-    }
-    const diff = ['diff', 'HEAD', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'];
-    return {
-      commit: sh('git', ['rev-parse', 'HEAD'], { cwd: ROOT }),
-      mlx: sh('git', ['rev-parse', 'HEAD'], { cwd: join(ROOT, 'crates/mlx-sys/mlx') }),
-      dirty: true,
-      status: sh('git', ['status', '--porcelain', '--ignore-submodules=none'], { cwd: ROOT }),
-      patch: sha256(sh('git', diff, { cwd: ROOT })),
-      untracked,
-    };
-  }
-}
 
 // Workers spawned per block import these, so an edit mid-run would change later blocks.
 async function scriptHashes(): Promise<Record<string, string>> {
@@ -107,7 +74,7 @@ async function identity(allowDirty: boolean, hashModel: boolean): Promise<Identi
   const { size, mtimeMs, ino } = await stat(MODEL_PATH);
   if (hashModel) console.log(`Hashing ${MODEL_PATH}`);
   return {
-    tree: await checkout(allowDirty),
+    tree: await treeIdentity(allowDirty),
     addon: await addonIdentity(),
     llama: await llamaIdentity(),
     model: {
@@ -131,27 +98,6 @@ async function verifyIdentity(recorded: Identity, allowDirty: boolean, hashModel
   if (changed.length) throw new Error(`${when}: ${changed.join(', ')} changed since preflight`);
 }
 
-function assertHostReady(): void {
-  const power = sh('pmset', ['-g', 'batt']).split('\n')[0];
-  if (!power.includes("'AC Power'")) throw new Error(`Measure on AC power: ${power}`);
-  if (spawnSync('lsof', ['-nP', `-iTCP:${PORT}`, '-sTCP:LISTEN']).status === 0) throw new Error(`Port ${PORT} is busy`);
-}
-
-async function verifyTokenizer(tokenizer: string) {
-  const output = sh('oxnode', [
-    join(ROOT, 'scripts/benchmark-fixture.ts'),
-    'verify',
-    '--fixture',
-    'qwen38',
-    '--tokenizer',
-    tokenizer,
-  ]);
-  if (!output.includes('Current native tokenizer/template matches all pinned inputs.')) {
-    throw new Error(`Tokenizer verification did not run:\n${output}`);
-  }
-  return { tokenizer, files: await fileHashes(dirname(tokenizer), SIDECARS), verified: true, output };
-}
-
 async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean): Promise<void> {
   assertCleanEnv();
   const latestMain = assertLatestMain();
@@ -159,7 +105,7 @@ async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean)
   const files = paths(out);
   if (existsSync(files.samples)) throw new Error(`${out} already holds samples; preflight a new --out directory`);
   const manifest = await readManifest();
-  assertHostReady();
+  assertHostReady(PORT);
   const fixture = await loadFixture(FIXTURE);
   const recorded = await identity(allowDirty, true);
   if (recorded.model.size !== manifest.model.bytes || recorded.model.sha256 !== manifest.model.sha256) {
@@ -202,7 +148,6 @@ async function prewarm(out: string): Promise<void> {
   await writeJson(join(out, 'prewarm.json'), { loaded, tokenizer });
 }
 
-// The admitted-prompt trace hashes each u32 token ID little-endian.
 async function checkIds(out: string): Promise<void> {
   assertCleanEnv();
   const { protocol } = await readManifest();
@@ -220,20 +165,7 @@ async function checkIds(out: string): Promise<void> {
   } finally {
     await worker.close();
   }
-  const admitted = (await readFile(trace, 'utf8')).split('\n').filter((line) => line.includes('admitted_prompt'));
-  if (admitted.length !== cases.length)
-    throw new Error(`Traced ${admitted.length} admitted prompts for ${cases.length}`);
-  const checks = cases.map((item, index) => {
-    const ids = Buffer.alloc(item.tokenIds.length * 4);
-    item.tokenIds.forEach((id, offset) => ids.writeUInt32LE(id, offset * 4));
-    const identical = admitted[index].includes(`is_delta=false tokens=${item.tokenIds.length} sha256=${sha256(ids)}`);
-    return { name: item.name, promptTokens: item.tokenIds.length, identical, trace: admitted[index] };
-  });
-  await writeJson(join(out, 'check-ids.json'), checks);
-  for (const check of checks) {
-    if (!check.identical)
-      throw new Error(`${check.name}: native session admitted different prompt IDs: ${check.trace}`);
-  }
+  await checkAdmittedIds(trace, cases, out);
   console.log('Native session prompt IDs match the pinned IDs for all cases.');
 }
 
@@ -244,7 +176,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
   const files = paths(out);
   if (!existsSync(files.provenance)) throw new Error(`${files.provenance} is missing; run preflight first`);
   const provenance = await readJson<Provenance>(files.provenance);
-  assertHostReady();
+  assertHostReady(PORT);
   await verifyIdentity(provenance, allowDirty, true, 'matrix start');
   const { cases } = await loadFixture(FIXTURE);
 
@@ -364,17 +296,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
 }
 
 async function printReport(out: string, allowDirty: boolean): Promise<void> {
-  const rows = await report(out, allowDirty);
-  console.log(
-    '| Prompt tokens | mlx-node prefill | llama.cpp prefill | Ratio | mlx-node decode | llama.cpp decode | Ratio |',
-  );
-  console.log('|---:|---:|---:|---:|---:|---:|---:|');
-  for (const row of rows) {
-    const [mlx, llama] = [row['mlx-node'], row['llama.cpp']];
-    console.log(
-      `| ${row.promptTokens.toLocaleString('en-US')} | ${mlx.prefillTokensPerSecond.median.toFixed(1)} | ${llama.prefillTokensPerSecond.median.toFixed(1)} | ${row.prefillRatio.toFixed(3)}× | ${mlx.decodeTokensPerSecond.median.toFixed(2)} | ${llama.decodeTokensPerSecond.median.toFixed(2)} | ${row.decodeRatio.toFixed(3)}× |`,
-    );
-  }
+  printSummary(await report(out, allowDirty));
   console.log(['samples.csv', 'summary.json', 'chart.svg', 'compare.md'].map((name) => join(out, name)).join('\n'));
 }
 

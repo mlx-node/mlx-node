@@ -33,6 +33,16 @@ export interface Runner {
   close(): Promise<void>;
 }
 
+export interface WorkerOptions {
+  worker?: string;
+  timeoutMs?: number;
+}
+
+export interface ServerOptions {
+  model?: string;
+  timeoutMs?: number;
+}
+
 function waitExit(child: ChildProcess, ms: number): Promise<boolean> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -63,6 +73,8 @@ class Inbox {
   private readonly items: Record<string, unknown>[] = [];
   private readonly waiters: ((item: Record<string, unknown>) => void)[] = [];
 
+  constructor(private readonly timeoutMs: number) {}
+
   push(item: Record<string, unknown>): void {
     const waiter = this.waiters.shift();
     if (waiter) waiter(item);
@@ -79,8 +91,8 @@ class Inbox {
         };
         const timer = setTimeout(() => {
           this.waiters.splice(this.waiters.indexOf(waiter), 1);
-          reject(new Error(`No mlx worker event within ${RESPONSE_TIMEOUT_MS / 1000} s`));
-        }, RESPONSE_TIMEOUT_MS);
+          reject(new Error(`No mlx worker event within ${this.timeoutMs / 1000} s`));
+        }, this.timeoutMs);
         this.waiters.push(waiter);
       }));
     if (event.event === 'eof') throw new Error('mlx worker exited; inspect its log');
@@ -90,13 +102,14 @@ class Inbox {
 
 export class MlxWorker implements Runner {
   loaded: Record<string, unknown> = {};
-  private readonly inbox = new Inbox();
+  private readonly inbox: Inbox;
   private readonly child: ChildProcess;
   private readonly log: number;
 
-  private constructor(block: string, out: string, env: Record<string, string>) {
+  private constructor(block: string, out: string, env: Record<string, string>, worker: string, timeoutMs: number) {
+    this.inbox = new Inbox(timeoutMs);
     this.log = openSync(join(out, 'raw', `mlx-${block}.log`), 'w');
-    this.child = spawn('oxnode', [join(HERE, 'mlx-worker.ts'), out], {
+    this.child = spawn('oxnode', [worker, out], {
       cwd: ROOT,
       env: { ...process.env, ...env },
       stdio: ['pipe', 'pipe', this.log],
@@ -119,8 +132,13 @@ export class MlxWorker implements Runner {
     lines.on('close', () => this.inbox.push({ event: 'eof' }));
   }
 
-  static async start(block: string, out: string, env: Record<string, string>): Promise<MlxWorker> {
-    const worker = new MlxWorker(block, out, env);
+  static async start(
+    block: string,
+    out: string,
+    env: Record<string, string>,
+    { worker: script = join(HERE, 'mlx-worker.ts'), timeoutMs = RESPONSE_TIMEOUT_MS }: WorkerOptions = {},
+  ): Promise<MlxWorker> {
+    const worker = new MlxWorker(block, out, env, script, timeoutMs);
     try {
       worker.loaded = await worker.inbox.next();
       if (worker.loaded.event !== 'loaded')
@@ -161,9 +179,11 @@ export class LlamaServer implements Runner {
     block: string,
     private readonly out: string,
     protocolArgs: readonly string[],
+    model: string,
+    private readonly timeoutMs: number,
   ) {
     // --no-webui is not in the fixture's argument list but was on the measured command line.
-    const args = ['-m', MODEL_PATH, '--host', '127.0.0.1', '--port', String(PORT), ...protocolArgs, '--no-webui'];
+    const args = ['-m', model, '--host', '127.0.0.1', '--port', String(PORT), ...protocolArgs, '--no-webui'];
     const binary = llamaServerPath();
     this.args = [binary, ...args];
     const log = openSync(join(out, 'raw', `llama-${block}.log`), 'w');
@@ -171,9 +191,14 @@ export class LlamaServer implements Runner {
     closeSync(log);
   }
 
-  static async start(block: string, out: string, protocolArgs: readonly string[]): Promise<LlamaServer> {
+  static async start(
+    block: string,
+    out: string,
+    protocolArgs: readonly string[],
+    { model = MODEL_PATH, timeoutMs = RESPONSE_TIMEOUT_MS }: ServerOptions = {},
+  ): Promise<LlamaServer> {
     const started = performance.now();
-    const server = new LlamaServer(block, out, protocolArgs);
+    const server = new LlamaServer(block, out, protocolArgs, model, timeoutMs);
     try {
       let ready = false;
       for (let attempt = 0; attempt < 600 && !ready; attempt++) {
@@ -246,7 +271,7 @@ export class LlamaServer implements Runner {
           method: 'POST',
           agent: false,
           headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-          timeout: RESPONSE_TIMEOUT_MS,
+          timeout: this.timeoutMs,
         },
         (response) => {
           response.setEncoding('utf8');

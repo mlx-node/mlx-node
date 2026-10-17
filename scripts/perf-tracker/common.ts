@@ -3,7 +3,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readdirSync, realpathSync } from 'node:fs';
-import { mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -11,7 +11,7 @@ export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const LLAMA_RELEASES = join(ROOT, '.cache/llama.cpp');
 export const MODELS_DIR = resolve(process.env.MODELS_DIR ?? join(ROOT, '.cache/models'));
 
-export type Suite = 'qwen38' | 'gemma4' | 'muse';
+export type Suite = 'qwen38' | 'gemma4' | 'flash-next';
 
 export const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
@@ -156,7 +156,7 @@ export async function llamaIdentity(path = llamaServerPath()): Promise<LlamaIden
 
 // Any of these changes the measured path; MTL_/METAL_ switch on Metal validation layers and
 // DYLD_ redirects the libraries of both runtimes.
-const ENV_PREFIXES = ['MLX_', 'NAPI_RS_', 'MUSE_', 'INT8_QMV_', 'GGML_', 'LLAMA_ARG_', 'MTL_', 'METAL_', 'DYLD_'];
+const ENV_PREFIXES = ['MLX_', 'NAPI_RS_', 'INT8_QMV_', 'GGML_', 'LLAMA_ARG_', 'MTL_', 'METAL_', 'DYLD_'];
 
 export function assertCleanEnv(allowed: readonly string[] = []): void {
   const inherited = Object.keys(process.env).filter(
@@ -172,6 +172,49 @@ export function assertCleanTree(): { commit: string; mlx: string } {
     commit: sh('git', ['rev-parse', 'HEAD'], { cwd: ROOT }),
     mlx: sh('git', ['rev-parse', 'HEAD'], { cwd: join(ROOT, 'crates/mlx-sys/mlx') }),
   };
+}
+
+export interface TreeIdentity {
+  commit: string;
+  mlx: string;
+  dirty: boolean;
+  status?: string;
+  patch?: string;
+  untracked?: Record<string, string>;
+}
+
+// A resumed dirty run must still measure the same patch, so hash content, not the file list.
+export async function treeIdentity(allowDirty: boolean): Promise<TreeIdentity> {
+  try {
+    return { ...assertCleanTree(), dirty: false };
+  } catch (error) {
+    if (!allowDirty || !(error instanceof Error) || !error.message.startsWith('The measured checkout must be clean')) {
+      throw error;
+    }
+    const untracked: Record<string, string> = {};
+    const listed = sh('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: ROOT });
+    for (const path of listed.split('\0').filter(Boolean).sort()) {
+      const full = join(ROOT, path);
+      untracked[path] = (await lstat(full)).isSymbolicLink() ? `-> ${await readlink(full)}` : await sha256File(full);
+    }
+    const diff = ['diff', 'HEAD', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'];
+    return {
+      commit: sh('git', ['rev-parse', 'HEAD'], { cwd: ROOT }),
+      mlx: sh('git', ['rev-parse', 'HEAD'], { cwd: join(ROOT, 'crates/mlx-sys/mlx') }),
+      dirty: true,
+      status: sh('git', ['status', '--porcelain', '--ignore-submodules=none'], { cwd: ROOT }),
+      patch: sha256(sh('git', diff, { cwd: ROOT })),
+      untracked,
+    };
+  }
+}
+
+export async function fileHashes(dir: string, names: readonly string[]): Promise<Record<string, string>> {
+  const hashes: Record<string, string> = {};
+  for (const name of names) {
+    if (existsSync(join(dir, name))) hashes[name] = await sha256File(join(dir, name));
+  }
+  return hashes;
 }
 
 export async function addonIdentity(): Promise<Record<string, string>> {
@@ -192,6 +235,12 @@ export function assertLoadedAddon(expected = ADDON_PATH): void {
   if (addons.length !== 1 || realpathSync(addons[0]) !== realpathSync(expected)) {
     throw new Error(`Expected the addon ${expected}, loaded: ${addons.join(', ') || 'none'}`);
   }
+}
+
+export function assertHostReady(port: number): void {
+  const power = sh('pmset', ['-g', 'batt']).split('\n')[0];
+  if (!power.includes("'AC Power'")) throw new Error(`Measure on AC power: ${power}`);
+  if (spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN']).status === 0) throw new Error(`Port ${port} is busy`);
 }
 
 export function gpuUtilization(): number {
