@@ -1,7 +1,7 @@
 /// <reference types="node" />
 
 import { appendFileSync, existsSync } from 'node:fs';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -183,30 +183,41 @@ export async function writeJsonAtomic(path: string, value: unknown): Promise<voi
 }
 
 // A cell is one runtime on one case: one process, its warmup and every repetition. A resume moves
-// the samples of a partly done cell to discarded/<stamp>/, so the cell reruns in full.
+// a partly done cell to discarded/<stamp>/, so the cell reruns in full. Its files are found on disk,
+// not only through samples.json: a crash after a result file is written but before its row is
+// added would otherwise leave a file that the rerun overwrites.
 export async function discardPartialCells(
   out: string,
   samples: readonly Sample[],
   repetitions: number,
   stamp: string,
 ): Promise<Sample[]> {
-  const cell = (sample: Sample) => `${sample.runtime}/${sample.name}`;
+  const cell = (runtime: Runtime, name: string) => `${runtime}/${name}`;
   const counts = new Map<string, number>();
-  for (const sample of samples) counts.set(cell(sample), (counts.get(cell(sample)) ?? 0) + 1);
-  const partial = samples.filter((sample) => counts.get(cell(sample))! < repetitions);
-  if (!partial.length) return [...samples];
+  for (const { runtime, name } of samples) {
+    counts.set(cell(runtime, name), (counts.get(cell(runtime, name)) ?? 0) + 1);
+  }
+  const incomplete = (runtime: Runtime, name: string) => (counts.get(cell(runtime, name)) ?? 0) < repetitions;
+  const prefixes = [
+    ['raw', { mlx: 'mlx-node', llama: 'llama.cpp' }],
+    ['system', { [KIND['mlx-node']]: 'mlx-node', [KIND['llama.cpp']]: 'llama.cpp' }],
+  ] as const satisfies readonly (readonly [string, Record<string, Runtime>])[];
+  const moves: [string, string][] = [];
+  for (const [folder, runtimes] of prefixes) {
+    if (!existsSync(join(out, folder))) continue;
+    for (const file of await readdir(join(out, folder))) {
+      const match = /^([A-Za-z]+)-(\d+)-(.+)\.json$/.exec(file);
+      const runtime = match ? (runtimes as Record<string, Runtime>)[match[1]] : undefined;
+      if (match && runtime && incomplete(runtime, match[3])) moves.push([folder, file]);
+    }
+  }
+  const partial = samples.filter(({ runtime, name }) => incomplete(runtime, name));
+  if (!partial.length && !moves.length) return [...samples];
   const dir = join(out, 'discarded', stamp);
   await writeJson(join(dir, 'samples.json'), partial);
-  for (const { runtime, name, run } of partial) {
-    const moves = [
-      ['raw', `${runtime === 'mlx-node' ? 'mlx' : 'llama'}-${run}-${name}.json`],
-      ['system', `${KIND[runtime]}-${run}-${name}.json`],
-    ];
-    for (const [folder, file] of moves) {
-      if (!existsSync(join(out, folder, file))) continue;
-      await mkdir(join(dir, folder), { recursive: true });
-      await rename(join(out, folder, file), join(dir, folder, file));
-    }
+  for (const [folder, file] of moves) {
+    await mkdir(join(dir, folder), { recursive: true });
+    await rename(join(out, folder, file), join(dir, folder, file));
   }
   const kept = samples.filter((sample) => !partial.includes(sample));
   await writeJsonAtomic(paths(out).samples, kept);
