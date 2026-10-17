@@ -57,16 +57,17 @@ that cache on the file path, inode, ctime and device.
 
 ## Flash Next rules
 
-| Topic         | Rule                                                                                                                                                                                        |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Disk          | The four splits must be real files on the internal SSD. Preflight refuses a USB disk or a link, and records the volume.                                                                     |
-| Output tokens | 256 in every row. mlx-node caps this model's context at 32,768 tokens, so 32,488 + 512 cannot run.                                                                                          |
-| Weight budget | mlx-node's automatic budget: no `MLX_QWEN4_*` variable is set. It is sized from free memory at each load, so it can differ per block. `compare.md` lists it per load.                       |
-| Leftovers     | Before each load the runner waits up to 60 s for any other `llama-server` or mlx worker to exit, then stops. A leftover model process would shrink the budget.                              |
-| Prompt IDs    | `prewarm` traces the IDs the native session admits and compares them with the pinned IDs. So `all` includes the proof that `qwen38` runs as `check-ids`; `matrix` refuses a run without it. |
-| Fixture       | The Qwen3.8 fixture as is: same messages, same token IDs.                                                                                                                                   |
-| Agreement     | `compare.md` shows how many characters both runtimes generated identically. Information only, not a gate.                                                                                   |
-| Baseline      | The first entry has no `baseline.csv`. `compare.md` says so instead of a before/after table.                                                                                                |
+| Topic         | Rule                                                                                                                                                                                                              |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Disk          | The four splits must be real files on the internal SSD. Preflight refuses a USB disk or a link, and records the volume.                                                                                           |
+| Output tokens | 256 in every row. mlx-node caps this model's context at 32,768 tokens, so 32,488 + 512 cannot run.                                                                                                                |
+| Weight budget | `MLX_QWEN4_RESIDENCY=full`: every hot weight stays resident, as llama.cpp keeps every weight resident. The automatic budget keeps a reserve and streams experts from SSD (73 tok/s prefill at 6k; 16k timed out). |
+| Free memory   | The full load needs about 100 GiB available (free + file-backed pages): 80 GiB hot weights + 16 GiB reserve + 4 GiB working. If the load refuses, close apps and run the step again.                              |
+| Leftovers     | Before each load the runner waits up to 60 s for any other `llama-server` or mlx worker to exit, then stops. A leftover model process would shrink the budget.                                                    |
+| Prompt IDs    | `prewarm` traces the IDs the native session admits and compares them with the pinned IDs. So `all` includes the proof that `qwen38` runs as `check-ids`; `matrix` refuses a run without it.                       |
+| Fixture       | The Qwen3.8 fixture as is: same messages, same token IDs.                                                                                                                                                         |
+| Agreement     | `compare.md` shows how many characters both runtimes generated identically. Information only, not a gate.                                                                                                         |
+| Baseline      | The first entry has no `baseline.csv`. `compare.md` says so instead of a before/after table.                                                                                                                      |
 
 ## One-time setup
 

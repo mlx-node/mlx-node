@@ -19,7 +19,10 @@ interface Model extends SessionModel {
 
 const out = process.argv[2];
 if (!out) throw new Error('Usage: oxnode scripts/perf-tracker/flash-next/mlx-worker.ts <out dir>');
-assertCleanEnv(['MLX_INFERENCE_TRACE', 'MLX_INFERENCE_TRACE_FILE']);
+assertCleanEnv([...Object.keys(PROTOCOL.mlxEnv), 'MLX_INFERENCE_TRACE', 'MLX_INFERENCE_TRACE_FILE']);
+for (const [name, value] of Object.entries(PROTOCOL.mlxEnv)) {
+  if (process.env[name] !== value) throw new Error(`The mlx worker needs ${name}=${value}`);
+}
 const provenance = await readJson<Provenance>(join(out, 'provenance.json'));
 const { cases } = await loadFixture(FIXTURE);
 const { loadModel } = (await import(pathToFileURL(join(ROOT, 'packages/lm/src/models/model-loader.ts')).href)) as {
@@ -31,7 +34,7 @@ const { memoryStats, Qwen3Tokenizer } = (await import(pathToFileURL(join(ROOT, '
 };
 assertLoadedAddon();
 
-// The automatic weight budget is sized from free memory at this moment.
+// Full residency is admitted only if free memory covers the hot weights and mlx-node's reserve now.
 const beforeLoad = {
   at: new Date().toISOString(),
   pressureLevel: Number(sh('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'])),
@@ -41,6 +44,7 @@ const loadStart = performance.now();
 const model = await loadModel(provenance.model.splits[0].path, PROTOCOL.mlxLoadOptions);
 const loadMs = performance.now() - loadStart;
 if (typeof model.residencyInfo !== 'function') throw new Error('The GGUF did not load as a qwen4_exp model');
+if (!model.residencyInfo().fullHotResidency) throw new Error('mlx-node did not admit full hot-path residency');
 const assets = model.modelAssetsPath();
 console.log(
   JSON.stringify({

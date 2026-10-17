@@ -84,9 +84,11 @@ export const PROTOCOL = {
   ],
   // Untimed prewarm only: info-level libllama logs carry the buffer sizes and backend notes.
   llamaPrewarmArgs: ['-lv', '4'],
-  mlxEnv: {} as Record<string, string>,
+  // llama.cpp keeps every weight resident; the automatic budget keeps a reserve and streams experts from SSD.
+  mlxEnv: { MLX_QWEN4_RESIDENCY: 'full' } as Record<string, string>,
   mlxLoadOptions: { autoLoadDraft: false },
-  weightBudget: 'mlx-node automatic budget; no MLX_QWEN4_* variable is set; recorded per load',
+  weightBudget:
+    'mlx-node full hot-path residency (MLX_QWEN4_RESIDENCY=full); the load fails instead of streaming experts',
   kvCache: { 'mlx-node': 'BF16 block-paged', 'llama.cpp': 'F16' },
   sampling: 'Greedy, high thinking, retain historical reasoning; no MTP or other speculation.',
 };

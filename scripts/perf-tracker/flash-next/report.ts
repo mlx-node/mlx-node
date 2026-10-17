@@ -187,7 +187,7 @@ export async function report(out: string, allowDirty: boolean): Promise<FlashSum
       ...history,
       '### mlx-node weight budget per load',
       '',
-      'Automatic: no `MLX_QWEN4_*` variable is set, so mlx-node sizes it from free memory at each load.',
+      'Full hot-path residency (`MLX_QWEN4_RESIDENCY=full`): every hot weight stays resident, as in llama.cpp. The budget is what mlx-node admitted for each load.',
       '',
       '| Prompt tokens | Process | Budget GiB | Hot weights GiB | Full hot residency | Prefill window | Free at load GiB |',
       '|---:|---:|---:|---:|:---:|---:|---:|',
