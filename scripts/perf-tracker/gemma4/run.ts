@@ -12,6 +12,8 @@ import {
   ROOT,
   addonIdentity,
   assertCleanEnv,
+  assertLatestMain,
+  fetchLatestLlama,
   assertCleanTree,
   hostInfo,
   hostSnapshot,
@@ -52,23 +54,6 @@ const exists = (path: string) =>
     () => false,
   );
 
-async function llamaBuild() {
-  const identity = await llamaIdentity();
-  const dir = dirname(identity.path);
-  let source: { checkout: string; head: string } | undefined;
-  try {
-    source = { checkout: sh('git', ['rev-parse', '--show-toplevel'], { cwd: dir }), head: '' };
-  } catch {
-    // A llama-server outside a git checkout has only its reported commit.
-  }
-  if (source) {
-    source.head = sh('git', ['rev-parse', 'HEAD'], { cwd: source.checkout });
-    const status = sh('git', ['status', '--porcelain'], { cwd: source.checkout });
-    if (status) throw new Error(`The llama.cpp checkout must be clean:\n${status}`);
-  }
-  return { ...identity, source };
-}
-
 async function modelFiles(manifest: Manifest) {
   if (manifest.model.file !== basename(MODEL_FILE)) throw new Error(`${manifestPath}: unexpected model file`);
   const pinned = async (path: string, expected: string) => {
@@ -108,7 +93,7 @@ async function identity(manifest: Manifest, allowDirty: boolean) {
   return {
     checkout: checkout(allowDirty),
     addon: await addonIdentity(),
-    llama: await llamaBuild(),
+    llama: await llamaIdentity(),
     model: await modelFiles(manifest),
     scripts,
   };
@@ -139,6 +124,8 @@ async function assertUnchanged(manifest: Manifest, provenance: Provenance) {
 
 async function preflight(out: string, allowDirty: boolean) {
   assertCleanEnv();
+  const latestMain = assertLatestMain();
+  await fetchLatestLlama();
   if ((await exists(join(out, 'raw'))) && (await readdir(join(out, 'raw'))).length) {
     throw new Error(`${out}/raw already holds samples; use a new --out`);
   }
@@ -148,6 +135,7 @@ async function preflight(out: string, allowDirty: boolean) {
   const provenance = {
     suite: 'gemma4',
     createdAt: new Date().toISOString(),
+    latestMain,
     dirty: current.checkout.dirty,
     host: hostInfo(),
     ...current,
@@ -317,9 +305,10 @@ async function main() {
   const [step] = positionals;
   if (values.help || positionals.length !== 1 || !STEPS.includes(step)) {
     console.log(
-      'Usage: LLAMA_SERVER=/path/to/llama-server oxnode scripts/perf-tracker/gemma4/run.ts <step> [--out <dir>]\n' +
+      'Usage: oxnode scripts/perf-tracker/gemma4/run.ts <step> [--out <dir>]\n' +
         'Steps: preflight | prewarm | matrix | report | all (preflight, prewarm, matrix, report).\n' +
         'Without --out a new run directory is created; with --out the step continues or reports that run.\n' +
+        'Preflight requires HEAD to contain origin/main and installs the newest llama.cpp macOS arm64 release.\n' +
         '--allow-dirty: development only; provenance records dirty: true.',
     );
     process.exitCode = values.help ? 0 : 1;

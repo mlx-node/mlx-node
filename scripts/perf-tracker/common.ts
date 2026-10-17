@@ -2,13 +2,13 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream, realpathSync } from 'node:fs';
-import { mkdir, readdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { createReadStream, existsSync, readdirSync, realpathSync } from 'node:fs';
+import { mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-export const LLAMA_COMMIT = 'a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92';
+export const LLAMA_RELEASES = join(ROOT, '.cache/llama.cpp');
 export const MODELS_DIR = resolve(process.env.MODELS_DIR ?? join(ROOT, '.cache/models'));
 
 export type Suite = 'qwen38' | 'gemma4' | 'muse';
@@ -54,42 +54,104 @@ export async function outDir(suite: Suite, given?: string): Promise<string> {
   return dir;
 }
 
-export function llamaServerPath(): string {
-  const path = process.env.LLAMA_SERVER;
-  if (!path) {
-    throw new Error(`Set LLAMA_SERVER to a llama-server built at llama.cpp ${LLAMA_COMMIT.slice(0, 12)}`);
+// The tracker compares the latest mlx-node main with the latest llama.cpp release.
+export function assertLatestMain(): string {
+  sh('git', ['fetch', '--quiet', 'origin', 'main'], { cwd: ROOT });
+  const main = sh('git', ['rev-parse', 'refs/remotes/origin/main'], { cwd: ROOT });
+  if (spawnSync('git', ['merge-base', '--is-ancestor', main, 'HEAD'], { cwd: ROOT }).status !== 0) {
+    throw new Error(`HEAD does not contain origin/main ${main.slice(0, 12)}; rebase onto the latest main first`);
   }
-  return resolve(path);
+  return main;
+}
+
+interface ReleaseAsset {
+  name: string;
+  browser_download_url: string;
+  digest?: string | null;
+}
+
+// Installs the newest llama.cpp release that ships a macOS arm64 build; a release
+// whose assets are still uploading is skipped for the one before it.
+export async function fetchLatestLlama(): Promise<string> {
+  const token = process.env.GITHUB_TOKEN;
+  const response = await fetch('https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20', {
+    headers: { accept: 'application/vnd.github+json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!response.ok) throw new Error(`GitHub llama.cpp releases: HTTP ${response.status}`);
+  const releases = (await response.json()) as { tag_name: string; draft: boolean; assets: ReleaseAsset[] }[];
+  for (const release of releases) {
+    const tag = release.tag_name;
+    if (release.draft || !/^b\d+$/.test(tag)) continue;
+    const asset = release.assets.find((item) => item.name === `llama-${tag}-bin-macos-arm64.tar.gz`);
+    if (asset) return installLlama(tag, asset);
+  }
+  throw new Error('None of the latest 20 llama.cpp releases has a macOS arm64 build');
+}
+
+async function installLlama(tag: string, asset: ReleaseAsset): Promise<string> {
+  const dir = join(LLAMA_RELEASES, tag);
+  const server = join(dir, `llama-${tag}`, 'llama-server');
+  if (existsSync(server)) return server;
+  const expected = asset.digest?.replace(/^sha256:/, '');
+  if (!expected) throw new Error(`${asset.name}: the release lists no SHA-256 digest`);
+  const response = await fetch(asset.browser_download_url, { signal: AbortSignal.timeout(600_000) });
+  if (!response.ok) throw new Error(`${asset.name}: HTTP ${response.status}`);
+  const data = Buffer.from(await response.arrayBuffer());
+  if (sha256(data) !== expected) throw new Error(`${asset.name}: SHA-256 does not match the release digest`);
+  const staging = `${dir}.partial`;
+  await rm(staging, { recursive: true, force: true });
+  await mkdir(staging, { recursive: true });
+  const archive = join(staging, asset.name);
+  await writeFile(archive, data);
+  const entries = sh('tar', ['-tzf', archive]).split('\n');
+  if (entries.some((entry) => !entry.startsWith(`llama-${tag}/`) || entry.split('/').includes('..'))) {
+    throw new Error(`${asset.name}: unexpected archive layout`);
+  }
+  sh('tar', ['-xzf', archive, '-C', staging]);
+  await rm(archive);
+  await rename(staging, dir);
+  return server;
+}
+
+// The newest release fetchLatestLlama() installed; every suite's preflight fetches it first.
+export function llamaServerPath(): string {
+  const tags = existsSync(LLAMA_RELEASES) ? readdirSync(LLAMA_RELEASES).filter((name) => /^b\d+$/.test(name)) : [];
+  const tag = tags.sort((a, b) => Number(b.slice(1)) - Number(a.slice(1)))[0];
+  if (!tag) throw new Error(`No llama.cpp release in ${LLAMA_RELEASES}; run a suite's preflight step first`);
+  return join(LLAMA_RELEASES, tag, `llama-${tag}`, 'llama-server');
 }
 
 export interface LlamaIdentity {
   path: string;
   sha256: string;
   version: string;
+  build: number;
   commit: string;
   dylibs: Record<string, string>;
 }
 
-// A different llama.cpp build is a different comparison; PERF_TRACKER_ANY_LLAMA=1
-// records it instead of refusing.
 export async function llamaIdentity(path = llamaServerPath()): Promise<LlamaIdentity> {
   // llama-server prints its version to stderr.
   const result = spawnSync(path, ['--version'], { encoding: 'utf8' });
   if (result.error) throw result.error;
   const version = `${result.stdout}${result.stderr}`;
-  const commit = /commit ([0-9a-f]+)/.exec(version)?.[1] ?? '';
-  if (!commit || (!LLAMA_COMMIT.startsWith(commit) && process.env.PERF_TRACKER_ANY_LLAMA !== '1')) {
-    throw new Error(
-      `llama-server reports commit "${commit}", expected ${LLAMA_COMMIT.slice(0, 12)}; set PERF_TRACKER_ANY_LLAMA=1 to measure another build`,
-    );
-  }
+  const match = /build (\d+), commit ([0-9a-f]+)/.exec(version);
+  if (!match) throw new Error(`${path}: unexpected --version output: ${version.trim()}`);
   // llama-server is a small launcher; the measured code is in the dylibs beside it.
   const dir = dirname(await realpath(path));
   const dylibs: Record<string, string> = {};
   for (const entry of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
     if (entry.isFile() && entry.name.endsWith('.dylib')) dylibs[entry.name] = await sha256File(join(dir, entry.name));
   }
-  return { path, sha256: await sha256File(path), version: version.trim(), commit, dylibs };
+  return {
+    path,
+    sha256: await sha256File(path),
+    version: version.trim(),
+    build: Number(match[1]),
+    commit: match[2],
+    dylibs,
+  };
 }
 
 // Any of these changes the measured path; MTL_/METAL_ switch on Metal validation layers and

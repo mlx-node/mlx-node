@@ -1,6 +1,6 @@
 ---
 name: perf-tracker
-description: Rerun the mlx-node vs llama.cpp benchmarks tracked in GitHub issue #142 (Qwen3.8 27B, Gemma 4 12B, Muse-Glimmer 30B DFlash off/on) with the pinned protocol, compare against the previous entry, and draft the dated issue comment. Use when asked to rerun or refresh the #142 benchmark, to check a prefill/decode regression against llama.cpp, or to measure a commit before a release.
+description: Run the mlx-node vs llama.cpp benchmarks tracked in GitHub issue #142 (Qwen3.8 27B, Gemma 4 12B, Muse-Glimmer 30B DFlash off/on), always comparing the latest mlx-node main with the latest llama.cpp prebuilt release, then compare against the previous entry and draft the dated issue comment. Use when asked to rerun or refresh the #142 benchmark, to check prefill/decode against llama.cpp, or to measure a commit before a release.
 ---
 
 # mlx-node vs llama.cpp performance tracker
@@ -8,25 +8,31 @@ description: Rerun the mlx-node vs llama.cpp benchmarks tracked in GitHub issue 
 Issue [#142](https://github.com/mlx-node/mlx-node/issues/142) is the index. Each suite replays a real coding-agent
 history through both runtimes with identical token IDs and reports prefill and decode tokens/second.
 
+**Always compare the latest of both:** mlx-node at `origin/main` HEAD, and llama.cpp at its newest `bNNNNN` GitHub
+release, as the prebuilt macOS arm64 binary. Preflight enforces both.
+
 ```
-worktree at the commit under test ─► build ─► preflight ─► prewarm ─► matrix ─► report
-                                                                                  │
-                     compare.md + chart.svg + samples.csv ◄───────────────────────┘
-                                   │
-                                   ▼
-                     draft the #142 comment ─► ask the user ─► post
+worktree at origin/main ─► build ─► preflight ─► prewarm ─► matrix ─► report
+                                       │                                 │
+             HEAD contains origin/main ┤                                 ▼
+  newest llama.cpp release downloaded ─┘          compare.md + chart.svg + samples.csv
+                                                                 │
+                                                                 ▼
+                                       draft the #142 comment ─► ask the user ─► post
 ```
 
-| Suite    | Entry                                    | Workload                                | Samples | Time with an idle GPU |
-| -------- | ---------------------------------------- | --------------------------------------- | ------: | --------------------- |
-| `qwen38` | `scripts/perf-tracker/qwen38/run.ts all` | 6,219 / 18,754 / 32,488 tokens, 512 out |      18 | about 1 h             |
-| `gemma4` | `scripts/perf-tracker/gemma4/run.ts all` | 7,733 / 40,528 / 66,904 tokens, 256 out |      18 | about 35 min          |
-| `muse`   | `scripts/perf-tracker/muse/run.ts all`   | 7,254 / 36,325 / 60,547 tokens, 96 out  |      36 | about 1.5 h           |
+| Suite    | Entry                                    | Workload                                | Samples | Time      |
+| -------- | ---------------------------------------- | --------------------------------------- | ------: | --------- |
+| `qwen38` | `scripts/perf-tracker/qwen38/run.ts all` | 6,219 / 18,754 / 32,488 tokens, 512 out |      18 | about 1 h |
+| `gemma4` | `scripts/perf-tracker/gemma4/run.ts all` | 7,733 / 40,528 / 66,904 tokens, 256 out |      18 | 35 min    |
+| `muse`   | `scripts/perf-tracker/muse/run.ts all`   | 7,254 / 36,325 / 60,547 tokens, 96 out  |      36 | 1.5 h     |
 
 The first run of each suite after a native GGUF cache format change also converts the checkpoint (`prewarm`, not timed).
 
 ## Rules
 
+- Measure the latest code on both sides. Never build llama.cpp yourself and never pin an older llama.cpp build:
+  preflight downloads the newest release. Preflight also refuses a HEAD that does not contain `origin/main`.
 - Measure a clean, dedicated worktree. Never measure in the shared main checkout. Preflight refuses a dirty tree;
   `--allow-dirty` exists only to develop the scripts and marks the run `dirty: true`.
 - Run one suite at a time. Do not run builds, tests or other inference at the same time. The Qwen suite waits until
@@ -37,25 +43,18 @@ The first run of each suite after a native GGUF cache format change also convert
   protocol is a new fixture version and a new tracker row, not a rerun.
 - Do not export `MLX_*`, `NAPI_RS_*`, `MUSE_*`, `INT8_QMV_*`, `GGML_*`, `LLAMA_ARG_*`, `MTL_*`, `METAL_*` or `DYLD_*`.
   The runners refuse them and set the protocol variables for their own workers.
-- Do not change the checkout, the addon or the llama.cpp build during a run. Each suite hashes them before and after.
+- Do not change the checkout, the addon or the llama.cpp install during a run. Each suite hashes them before and after.
 - Never post to GitHub or push an asset branch without asking the user first.
 
 ## One-time setup
 
-1. Build the pinned llama.cpp (commit `a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92`, build 10610):
+1. llama.cpp needs no setup. Preflight reads the GitHub releases of `ggml-org/llama.cpp`, takes the newest `bNNNNN`
+   release that has `llama-bNNNNN-bin-macos-arm64.tar.gz`, checks its SHA-256 against the release digest, and
+   extracts it to `<repo>/.cache/llama.cpp/bNNNNN/`. Set `GITHUB_TOKEN` if the API rate limit stops it. Later steps
+   use the newest installed release, and provenance records its build number, commit and file hashes.
 
-   ```bash
-   git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-   git checkout a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92
-   cmake -B build-bench -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
-     -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=ON
-   cmake --build build-bench --target llama-server -j
-   export LLAMA_SERVER=$PWD/build-bench/bin/llama-server
-   ```
-
-   The runners refuse another llama.cpp commit. `PERF_TRACKER_ANY_LLAMA=1` measures another build on purpose; such a
-   run is not comparable with earlier entries. The runners record the hashes of `llama-server` and its dylibs, but
-   they cannot see build flags. Use exactly the flags above.
+   A new llama.cpp release can change CLI flags, defaults or `/completion` fields. If llama-server fails to start or
+   `report` refuses its samples, read the llama.cpp changes before you touch the protocol.
 
 2. Put the checkpoints under `<repo>/.cache/models/` (or point `MODELS_DIR` at another folder):
 
@@ -86,7 +85,8 @@ The first run of each suite after a native GGUF cache format change also convert
 ## Prepare the checkout under test
 
 ```bash
-git worktree add --detach .worktrees/perf-<date> <commit>
+git fetch origin main
+git worktree add --detach .worktrees/perf-<date> origin/main
 cd .worktrees/perf-<date>
 git submodule update --init crates/mlx-sys/mlx
 vp install
@@ -96,13 +96,12 @@ git status --short                                            # must print nothi
 ```
 
 - `26.2` is the deployment floor; a lower value stops the native build.
-- The scripts import mlx-node from the checkout that contains them. To measure a commit older than these scripts,
-  make a measurement branch at that commit with only `scripts/perf-tracker/` added, and commit it.
+- To measure a branch or PR, rebase it onto the latest `origin/main` first and commit everything.
+- If `origin/main` moves during a long session, the next preflight refuses; rebase and rebuild, then start again.
 
 ## Run
 
 ```bash
-export LLAMA_SERVER=/path/to/llama.cpp/build-bench/bin/llama-server
 oxnode scripts/perf-tracker/gemma4/run.ts all
 oxnode scripts/perf-tracker/qwen38/run.ts all
 oxnode scripts/perf-tracker/muse/run.ts all
@@ -118,21 +117,22 @@ oxnode scripts/perf-tracker/muse/run.ts all
 
 ## Outputs and checks
 
-| File              | Content                                                                   |
-| ----------------- | ------------------------------------------------------------------------- |
-| `provenance.json` | OS, chip, commits, addon/metallib/llama/model hashes, host load snapshots |
-| `samples.csv`     | one row per measured request, same columns as the #142 CSV for that suite |
-| `summary.json`    | medians, min/max and mlx-node/llama.cpp ratios per cell                   |
-| `chart.svg`       | prefill and decode medians with min–max whiskers                          |
-| `compare.md`      | new medians against `scripts/perf-tracker/<suite>/baseline.csv`           |
+| File              | Content                                                                          |
+| ----------------- | -------------------------------------------------------------------------------- |
+| `provenance.json` | OS, chip, commits, `origin/main`, addon/llama release/model hashes, host load    |
+| `samples.csv`     | one row per measured request, same columns as the #142 CSV for that suite        |
+| `summary.json`    | medians, min/max and mlx-node/llama.cpp ratios per cell                          |
+| `chart.svg`       | prefill and decode medians with min–max whiskers                                 |
+| `compare.md`      | new medians against `scripts/perf-tracker/<suite>/baseline.csv` (previous entry) |
 
 Before you trust the numbers:
 
 1. Confirm that `report` finished. It refuses runs with a wrong token count, cached prompt tokens or a changed
    identity hash.
 2. Read the host load in `provenance.json` and the per-sample logs. Name any busy process in the write-up.
-3. Read `compare.md` for both runtimes. The llama.cpp build is the control: if llama.cpp moved too, suspect the host
-   (OS, load, heat) before mlx-node.
+3. Both runtimes are new versions in each entry, so both can move. The main result is the mlx-node/llama.cpp ratio
+   per cell. `compare.md` shows how each runtime moved since the previous entry; when both move the same way, suspect
+   the host (OS, load, heat) before either runtime.
 4. Look at a few generated texts. They must read as a code review. Greedy outputs can differ from earlier runs.
 
 ## Publish to issue #142 (ask the user first)
@@ -144,7 +144,7 @@ Before you trust the numbers:
    - a headline with the ratios, the chart, and the median table with ratios;
    - request time (Gemma, Muse) and the DFlash effect (Muse);
    - conditions: machine, OS, power, load, workload, matched settings, repetitions, timing;
-   - revisions: mlx-node commit, MLX submodule, llama.cpp commit, checkpoint hash;
+   - revisions: mlx-node commit, MLX submodule, llama.cpp release tag and commit, checkpoint hash;
    - the change against the previous entry (`compare.md`) and what changed in between;
    - the samples CSV and the fingerprints in `<details>` blocks.
 3. Update the model's row in the issue body (latest measurement and link). Keep every older entry.

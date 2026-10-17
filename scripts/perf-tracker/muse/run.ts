@@ -12,6 +12,8 @@ import {
   ROOT,
   addonIdentity,
   assertCleanEnv,
+  assertLatestMain,
+  fetchLatestLlama,
   assertCleanTree,
   assertFileSha256,
   hostInfo,
@@ -54,7 +56,8 @@ const USAGE = `Usage: oxnode scripts/perf-tracker/muse/run.ts <step> [--out <dir
 
 Steps, in order: ${STEPS.join(', ')}; "all" runs them and skips the finished ones.
 Without --out, preflight and all start a new run directory; other steps continue --out.
-LLAMA_SERVER names a llama-server built at llama.cpp a14dba686aaa; MODELS_DIR defaults to <repo>/.cache/models.
+Preflight requires HEAD to contain origin/main and installs the newest llama.cpp macOS arm64 release.
+MODELS_DIR defaults to <repo>/.cache/models.
   --allow-dirty  development only: preflight a dirty checkout and record dirty: true
   --archived     report only: re-report a run whose inputs and checkout have since moved
                  (skips rehashing and the source check)`;
@@ -133,6 +136,8 @@ function workerEnv(out: string, extra: Record<string, string> = {}): NodeJS.Proc
 
 async function preflight(out: string, allowDirty: boolean) {
   const source = sourceState(allowDirty);
+  const latestMain = assertLatestMain();
+  await fetchLatestLlama();
   await assertFileSha256(RUNNER, RUNNER_SHA256);
   for (const file of ['packages/lm/dist/index.js', 'packages/lm/dist/chat-session.js']) {
     if (!existsSync(join(ROOT, file))) throw new Error(`Missing ${file}; build the TypeScript packages first`);
@@ -152,6 +157,7 @@ async function preflight(out: string, allowDirty: boolean) {
     createdAt: new Date().toISOString(),
     host: hostInfo(),
     source,
+    latestMain,
     oxnode: { path: oxnode, version: sh(oxnode, ['--version']) },
     nodeOnPath: sh('node', ['--version']),
     addon,

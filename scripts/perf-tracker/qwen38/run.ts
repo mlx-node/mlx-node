@@ -11,6 +11,8 @@ import {
   ROOT,
   addonIdentity,
   assertCleanEnv,
+  assertLatestMain,
+  fetchLatestLlama,
   assertCleanTree,
   hostInfo,
   hostSnapshot,
@@ -152,6 +154,8 @@ async function verifyTokenizer(tokenizer: string) {
 
 async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean): Promise<void> {
   assertCleanEnv();
+  const latestMain = assertLatestMain();
+  await fetchLatestLlama();
   const files = paths(out);
   if (existsSync(files.samples)) throw new Error(`${out} already holds samples; preflight a new --out directory`);
   const manifest = await readManifest();
@@ -166,6 +170,7 @@ async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean)
   const tokenizer = await verifyTokenizer(join(dirname(MODEL_PATH), 'tokenizer.json'));
   await writeJson(files.provenance, {
     preflightAt: new Date().toISOString(),
+    latestMain,
     host: hostInfo(),
     ...recorded,
     fixture: {
@@ -386,7 +391,8 @@ async function main(): Promise<void> {
   const step = positionals[0] as Step;
   if (values.help || positionals.length !== 1 || !STEPS.includes(step)) {
     console.log(
-      `Usage: LLAMA_SERVER=/path/to/llama-server oxnode scripts/perf-tracker/qwen38/run.ts <${STEPS.join('|')}> [--out <dir>]\n` +
+      `Usage: oxnode scripts/perf-tracker/qwen38/run.ts <${STEPS.join('|')}> [--out <dir>]\n` +
+        'Preflight requires HEAD to contain origin/main and installs the newest llama.cpp macOS arm64 release.\n' +
         'Without --out a new run directory is created; with --out the step continues or reports that run.\n' +
         'all = preflight, prewarm, matrix, report. check-ids is an optional untimed native prompt-ID check.\n' +
         '--allow-dirty measures or reports an uncommitted checkout instead of refusing it (development only).\n' +
