@@ -15,17 +15,7 @@ import {
   type ChartSeries,
   type CompareRow,
 } from '../common.js';
-import {
-  HERE,
-  KIND,
-  POLICY,
-  RUNTIMES,
-  paths,
-  readManifest,
-  type Provenance,
-  type Runtime,
-  type Sample,
-} from './suite.js';
+import { HERE, KIND, RUNTIMES, paths, readManifest, type Provenance, type Runtime, type Sample } from './suite.js';
 
 export const CSV_COLUMNS = [
   'runtime',
@@ -113,7 +103,7 @@ export async function report(out: string, allowDirty: boolean): Promise<SummaryR
     ) {
       throw new Error(`${label}: token accounting or speculation differs from the protocol`);
     }
-    if (POLICY[item.promptTokens] === 'no-other-local-llm') {
+    if (provenance.protocol.admission[item.promptTokens] === 'no-other-local-llm') {
       if (!events.some((event) => event.event === 'llm_isolation_confirmed' && event.label === label)) {
         throw new Error(`${label}: no recorded no-other-local-LLM admission`);
       }
@@ -180,12 +170,15 @@ export async function report(out: string, allowDirty: boolean): Promise<SummaryR
     renderChart({
       title: 'Qwen3.8 27B UD-Q4_K_XL · mlx-node vs llama.cpp',
       subtitle: `${measuredAt} · ${host} · mlx-node ${commit} · llama.cpp ${provenance.llama.commit.slice(0, 12)}`,
-      groups: summary.map((row) => `${tokens(row.promptTokens)}${POLICY[row.promptTokens] === 'gpu-idle' ? '' : '*'}`),
+      groups: summary.map(
+        (row) =>
+          `${tokens(row.promptTokens)}${provenance.protocol.admission[row.promptTokens] === 'gpu-idle' ? '' : '*'}`,
+      ),
       panels: [
         { title: 'Prefill', unit: 'tok/s', series: series('prefillTokensPerSecond') },
         { title: 'Decode', unit: 'tok/s', series: series('decodeTokensPerSecond') },
       ],
-      note: `Median of ${repetitions} runs, ${outputTokens} output tokens; whiskers are min–max. *Background graphics allowed, no other local LLM; other rows start at GPU idle.`,
+      note: `Median of ${repetitions} runs, ${outputTokens} output tokens; whiskers are min–max. *Background graphics allowed, no other local LLM${provenance.protocol.desktopLoad ? '' : '; other rows start at GPU idle'}.`,
     }),
   );
 
@@ -209,6 +202,12 @@ export async function report(out: string, allowDirty: boolean): Promise<SummaryR
       '',
       `Before: issue #142 initial benchmark (mlx-node ${manifest.measuredRevisions['mlx-node'].slice(0, 12)}, llama.cpp ${manifest.measuredRevisions['llama.cpp'].slice(0, 12)}; Apple M5 Max, 40 GPU cores, 128 GiB).`,
       `After: mlx-node ${commit}, llama.cpp ${provenance.llama.commit.slice(0, 12)}; ${host}. Medians of ${repetitions} runs, tokens/second.`,
+      ...(provenance.protocol.desktopLoad
+        ? [
+            '',
+            'Admission: --desktop-load. Every row ran with desktop graphics and no other local LLM; the 6,219 and 18,754 rows did not wait for GPU idle as the baseline did.',
+          ]
+        : []),
       '',
       compareTable('Prefill', compare('prefill')),
       compareTable('Decode', compare('decode')),

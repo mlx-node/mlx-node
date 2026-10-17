@@ -30,7 +30,9 @@ The first run of each suite after a native GGUF cache format change also convert
 - Measure a clean, dedicated worktree. Never measure in the shared main checkout. Preflight refuses a dirty tree;
   `--allow-dirty` exists only to develop the scripts and marks the run `dirty: true`.
 - Run one suite at a time. Do not run builds, tests or other inference at the same time. The Qwen suite waits until
-  the GPU is at most 5% busy before its 6k and 16k rows; the other suites record the load instead of waiting.
+  the GPU is at most 5% busy before its 6k and 16k rows; the other suites record the load instead of waiting. If the
+  desktop never reaches GPU idle and the user accepts it, `qwen38/run.ts all --desktop-load` admits every row like the
+  32k row (no other local LLM). The run records this; say so in the write-up.
 - Do not change the protocol: fixtures, llama.cpp arguments, token counts, order, warmups and cooldowns. A changed
   protocol is a new fixture version and a new tracker row, not a rerun.
 - Do not export `MLX_*`, `NAPI_RS_*`, `MUSE_*`, `INT8_QMV_*`, `GGML_*`, `LLAMA_ARG_*`, `MTL_*`, `METAL_*` or `DYLD_*`.

@@ -34,7 +34,7 @@ import {
   KIND,
   LOAD_COOLDOWN_SECONDS,
   MODEL_PATH,
-  POLICY,
+  admissionPolicy,
   PORT,
   Progress,
   RUNTIMES,
@@ -150,7 +150,7 @@ async function verifyTokenizer(tokenizer: string) {
   return { tokenizer, files: await fileHashes(dirname(tokenizer), SIDECARS), verified: true, output };
 }
 
-async function preflight(out: string, allowDirty: boolean): Promise<void> {
+async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean): Promise<void> {
   assertCleanEnv();
   const files = paths(out);
   if (existsSync(files.samples)) throw new Error(`${out} already holds samples; preflight a new --out directory`);
@@ -174,7 +174,13 @@ async function preflight(out: string, allowDirty: boolean): Promise<void> {
       cases: fixture.cases.map(({ name, promptTokens, sha256: idsSha256 }) => ({ name, promptTokens, idsSha256 })),
     },
     tokenizer,
-    protocol: { ...manifest.protocol, port: PORT, loadCooldownSeconds: LOAD_COOLDOWN_SECONDS, admission: POLICY },
+    protocol: {
+      ...manifest.protocol,
+      port: PORT,
+      loadCooldownSeconds: LOAD_COOLDOWN_SECONDS,
+      admission: admissionPolicy(desktopLoad),
+      desktopLoad,
+    },
     snapshot: hostSnapshot(),
   });
 }
@@ -266,7 +272,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
       progress.emit({ event: 'resumed', savedSamples: samples.length, remaining: expected.size - samples.length });
     }
     for (const [index, item] of cases.entries()) {
-      const policy = POLICY[item.promptTokens];
+      const policy = provenance.protocol.admission[item.promptTokens];
       for (const runtime of index % 2 === 0 ? RUNTIMES : [...RUNTIMES].reverse()) {
         const missing = repetitions.filter((run) => !completed.has(key(runtime, item.name, run)));
         if (!missing.length) continue;
@@ -373,6 +379,7 @@ async function main(): Promise<void> {
     options: {
       out: { type: 'string' },
       'allow-dirty': { type: 'boolean', default: false },
+      'desktop-load': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -382,7 +389,9 @@ async function main(): Promise<void> {
       `Usage: LLAMA_SERVER=/path/to/llama-server oxnode scripts/perf-tracker/qwen38/run.ts <${STEPS.join('|')}> [--out <dir>]\n` +
         'Without --out a new run directory is created; with --out the step continues or reports that run.\n' +
         'all = preflight, prewarm, matrix, report. check-ids is an optional untimed native prompt-ID check.\n' +
-        '--allow-dirty measures or reports an uncommitted checkout instead of refusing it (development only).',
+        '--allow-dirty measures or reports an uncommitted checkout instead of refusing it (development only).\n' +
+        '--desktop-load (preflight/all): admit every row with no other local LLM instead of waiting for GPU idle;\n' +
+        '  the run records it and its 6k/16k rows are not comparable with GPU-idle entries.',
     );
     if (!values.help) process.exitCode = 1;
     return;
@@ -391,7 +400,7 @@ async function main(): Promise<void> {
   const out = await outDir('qwen38', values.out);
   const allowDirty = values['allow-dirty'];
   console.log(`qwen38 ${step}: ${out}`);
-  if (step === 'preflight' || step === 'all') await preflight(out, allowDirty);
+  if (step === 'preflight' || step === 'all') await preflight(out, allowDirty, values['desktop-load']);
   if (step === 'prewarm' || step === 'all') await prewarm(out);
   if (step === 'check-ids') await checkIds(out);
   if (step === 'matrix' || step === 'all') await matrix(out, allowDirty);

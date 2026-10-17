@@ -26,6 +26,12 @@ export const POLICY: Readonly<Record<number, Policy>> = {
   32488: 'no-other-local-llm',
 };
 
+// --desktop-load applies the 32,488-token rule to every row, for a desktop that never reaches GPU idle.
+export function admissionPolicy(desktopLoad: boolean): Readonly<Record<number, Policy>> {
+  if (!desktopLoad) return POLICY;
+  return Object.fromEntries(Object.keys(POLICY).map((tokens) => [tokens, 'no-other-local-llm' as const]));
+}
+
 export interface Protocol {
   repetitions: number;
   outputTokens: number;
@@ -103,6 +109,7 @@ export const IDENTITY_KEYS = ['tree', 'addon', 'llama', 'model', 'sidecars', 'sc
 export interface Provenance extends Identity {
   host: { os: string; chip: string; gpuCores: number; memoryBytes: number };
   tokenizer: { verified: boolean };
+  protocol: { admission: Record<string, Policy>; desktopLoad: boolean };
   matrix?: { startedAt: string; finishedAt?: string; postRunVerified?: boolean };
   [field: string]: unknown;
 }
