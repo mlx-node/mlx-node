@@ -43,6 +43,13 @@ that cache on the file path, inode, ctime and device.
   every row like the 32k row (no other local LLM). The run records this; say so in the write-up.
 - Do not change the protocol: fixtures, llama.cpp arguments, token counts, order, warmups and cooldowns. A changed
   protocol is a new fixture version and a new tracker row, not a rerun.
+- Every suite starts llama-server with `-ctxcp 0 -cram 0` on top of the fixture's arguments. Each measured request is
+  a single cold request, and context checkpoints and the RAM prompt cache only help a later request reuse the prompt;
+  the checkpoints still copy state twice in each timed prefill. Provenance records the final arguments, and
+  `compare.md` says so when the baseline ran without them.
+- mlx-node's reuse features that have a switch are off. Its small remaining reuse work has no switch and counts
+  against mlx-node: one extra GDN checkpoint chunk in the Qwen3.8 27B prefill, one extra forward of the last token
+  when Gemma stops on length, and about 1 ms of block hashing per request.
 - Do not export `MLX_*`, `NAPI_RS_*`, `INT8_QMV_*`, `GGML_*`, `LLAMA_ARG_*`, `MTL_*`, `METAL_*` or `DYLD_*`. The
   runners refuse them and set the protocol variables for their own workers.
 - Do not change the checkout, the addon or the llama.cpp install during a run. Each suite hashes them before and after.
@@ -116,6 +123,7 @@ git status --short                                            # must print nothi
 - `26.2` is the deployment floor; a lower value stops the native build.
 - To measure a branch or PR, rebase it onto the latest `origin/main` first and commit everything.
 - If `origin/main` moves during a long session, the next preflight refuses; rebase and rebuild, then start again.
+- Rebuild after every checkout change (`yarn build` above), before preflight. See check 2 below.
 
 ## Run
 
@@ -126,8 +134,11 @@ oxnode scripts/perf-tracker/flash-next/run.ts all --model-dir <internal SSD fold
 ```
 
 - Each `all` makes `.cache/benchmarks/perf-tracker/<suite>-<UTC stamp>/` and keeps the Mac awake with `caffeinate`.
-- Single steps take `--out <run dir>`. After a failure, run the failed step again with the same `--out`; finished
-  samples are kept. Flash Next reads `--model-dir` only in `preflight`; later steps read it from `provenance.json`.
+- Single steps take `--out <run dir>`. After a failure, run the failed step again with the same `--out`. Flash Next
+  reads `--model-dir` only in `preflight`; later steps read it from `provenance.json`.
+- Resume keeps finished cells. A cell is one runtime on one case: one process, its warmup and all repetitions. A cell
+  that stopped partway moves to `discarded/<stamp>/` and reruns in full, and `report` refuses a cell whose samples
+  come from more than one process. Gemma runs every sample in its own process, so it keeps each finished sample.
 - `report --out <run dir>` rebuilds the outputs of a finished run.
 - Qwen3.8 27B only: `check-ids --out <run dir>` (about 2 min, untimed) proves that the native session admits exactly
   the pinned prompt IDs. Run the steps one by one to include it: `preflight`, `prewarm`, `check-ids`, `matrix`,
@@ -138,7 +149,7 @@ oxnode scripts/perf-tracker/flash-next/run.ts all --model-dir <internal SSD fold
 
 | File              | Content                                                                          |
 | ----------------- | -------------------------------------------------------------------------------- |
-| `provenance.json` | OS, chip, commits, `origin/main`, addon/llama release/model hashes, host load    |
+| `provenance.json` | OS, chip, commits, `origin/main`, addon/llama/model hashes, llama.cpp args, load |
 | `samples.csv`     | one row per measured request, same columns as the #142 CSV for that suite        |
 | `summary.json`    | medians, min/max and mlx-node/llama.cpp ratios per cell                          |
 | `chart.svg`       | prefill and decode medians with min–max whiskers                                 |
@@ -151,11 +162,13 @@ Before you trust the numbers:
 
 1. Confirm that `report` finished. It refuses runs with a wrong token count, cached prompt tokens or a changed
    identity hash.
-2. Read the host load in `provenance.json` and the per-sample logs. Name any busy process in the write-up.
-3. Both runtimes are new versions in each entry, so both can move. The main result is the mlx-node/llama.cpp ratio
+2. The addon hash proves the addon did not change during the run. It does not prove which commit built it, so
+   rebuild after every checkout change.
+3. Read the host load in `provenance.json` and the per-sample logs. Name any busy process in the write-up.
+4. Both runtimes are new versions in each entry, so both can move. The main result is the mlx-node/llama.cpp ratio
    per cell. `compare.md` shows how each runtime moved since the previous entry; when both move the same way, suspect
    the host (OS, load, heat) before either runtime.
-4. Look at a few generated texts. They must read as a code review. Greedy outputs can differ from earlier runs.
+5. Look at a few generated texts. They must read as a code review. Greedy outputs can differ from earlier runs.
 
 ## Publish to issue #142 (ask the user first)
 

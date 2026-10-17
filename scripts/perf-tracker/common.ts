@@ -122,6 +122,21 @@ export function llamaServerPath(): string {
   return join(LLAMA_RELEASES, tag, `llama-${tag}`, 'llama-server');
 }
 
+// Every measured request is a single cold request. Context checkpoints and the RAM prompt cache
+// only help a later request reuse the prompt, yet the checkpoints copy state twice in each timed prefill.
+export const LLAMA_SINGLE_REQUEST_ARGS = ['-ctxcp', '0', '-cram', '0'] as const;
+
+const hasSingleRequestArgs = (args: readonly string[]) =>
+  args.some((_, start) => LLAMA_SINGLE_REQUEST_ARGS.every((arg, offset) => args[start + offset] === arg));
+
+export function singleRequestNote(runArgs: readonly string[], baselineArgs: readonly string[]): string[] {
+  if (!hasSingleRequestArgs(runArgs) || hasSingleRequestArgs(baselineArgs)) return [];
+  return [
+    '',
+    `llama.cpp ran with \`${LLAMA_SINGLE_REQUEST_ARGS.join(' ')}\` (no context checkpoints, no RAM prompt cache); the baseline ran with llama.cpp defaults, which add two state copies to each prefill.`,
+  ];
+}
+
 export interface LlamaIdentity {
   path: string;
   sha256: string;

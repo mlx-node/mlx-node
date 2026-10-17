@@ -33,6 +33,7 @@ import {
   PILOT_RUN,
   PILOT_SETTLE_MS,
   REPETITIONS,
+  llamaServerArgs,
   manifestPath,
   readFixture,
   readManifest,
@@ -146,7 +147,7 @@ async function preflight(out: string, allowDirty: boolean) {
       cases: cases.map(({ name, promptTokens, sha256 }) => ({ name, promptTokens, tokenIdsSha256: sha256 })),
       render,
     },
-    protocol: manifest.protocol,
+    protocol: { ...manifest.protocol, llamaServerArgs: llamaServerArgs(manifest.protocol) },
     childEnv: { prewarm: {}, matrix: manifest.protocol.mlxEnv },
     before: hostSnapshot(),
   };

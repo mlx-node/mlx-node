@@ -38,6 +38,7 @@ import {
   RUNTIMES,
   admissionPolicy,
   checkAdmittedIds,
+  discardPartialCells,
   paths,
   readManifest,
   verifyTokenizer,
@@ -257,12 +258,12 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
   const expected = new Set(
     RUNTIMES.flatMap((runtime) => cases.flatMap((item) => repetitions.map((run) => key(runtime, item.name, run)))),
   );
-  const samples = existsSync(files.samples) ? await readJson<Sample[]>(files.samples) : [];
-  const completed = new Set(samples.map((sample) => key(sample.runtime, sample.name, sample.run)));
-  if (completed.size !== samples.length || ![...completed].every((id) => expected.has(id))) {
+  const saved = existsSync(files.samples) ? await readJson<Sample[]>(files.samples) : [];
+  const savedIds = new Set(saved.map((sample) => key(sample.runtime, sample.name, sample.run)));
+  if (savedIds.size !== saved.length || ![...savedIds].every((id) => expected.has(id))) {
     throw new Error(`${files.samples} does not belong to this matrix`);
   }
-  for (const sample of samples) {
+  for (const sample of saved) {
     if (sample.numTokens !== PROTOCOL.outputTokens || sample.cachedTokens !== 0) {
       throw new Error(`${files.samples} holds a sample outside the protocol`);
     }
@@ -272,19 +273,25 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
   await mkdir(files.system, { recursive: true });
   const progress = new Progress(files.progress);
   const stamp = utcStamp();
+  const samples = await discardPartialCells(out, saved, protocol.repetitions, stamp);
+  const completed = new Set(samples.map((sample) => key(sample.runtime, sample.name, sample.run)));
   provenance.matrix = { startedAt: provenance.matrix?.startedAt ?? new Date().toISOString() };
   await writeJson(files.provenance, provenance);
   const caffeinate = stayAwake();
   const stopGpu = recordGpu(files.gpu, () => progress.last);
   try {
-    if (samples.length) {
-      progress.emit({ event: 'resumed', savedSamples: samples.length, remaining: expected.size - samples.length });
+    if (saved.length) {
+      progress.emit({
+        event: 'resumed',
+        savedSamples: samples.length,
+        discardedSamples: saved.length - samples.length,
+        remaining: expected.size - samples.length,
+      });
     }
     for (const [index, item] of cases.entries()) {
       const policy = provenance.protocol.admission[item.promptTokens];
       for (const runtime of index % 2 === 0 ? RUNTIMES : [...RUNTIMES].reverse()) {
-        const missing = repetitions.filter((run) => !completed.has(key(runtime, item.name, run)));
-        if (!missing.length) continue;
+        if (repetitions.every((run) => completed.has(key(runtime, item.name, run)))) continue;
         const kind = KIND[runtime];
         const block = `block-${item.name}-${stamp}`;
         await verifyIdentity(provenance, allowDirty, false, `${kind}-${block}`);
@@ -323,7 +330,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
             name: item.name,
             performance: warm.performance,
           });
-          for (const run of missing) {
+          for (const run of repetitions) {
             const before = await admit(policy, progress, `${kind}-${run}-${item.name}`, protocol.cooldownSeconds);
             progress.emit({
               event: 'sample_start',
@@ -345,10 +352,11 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
               tokens: _i,
               ...compact
             } = result;
-            samples.push(compact as Sample);
+            const sample = { ...compact, block } as Sample;
+            samples.push(sample);
             completed.add(key(runtime, item.name, run));
             await writeJsonAtomic(files.samples, samples);
-            progress.emit(compact);
+            progress.emit(sample);
           }
         } finally {
           await runner.close();

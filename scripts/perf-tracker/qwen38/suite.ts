@@ -1,11 +1,12 @@
 /// <reference types="node" />
 
-import { appendFileSync } from 'node:fs';
-import { readFile, rename, writeFile } from 'node:fs/promises';
+import { appendFileSync, existsSync } from 'node:fs';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  LLAMA_SINGLE_REQUEST_ARGS,
   MODELS_DIR,
   ROOT,
   fileHashes,
@@ -62,6 +63,11 @@ export interface Manifest extends FixtureManifest {
   measuredRevisions: Record<Runtime, string>;
 }
 
+export const llamaServerArgs = (protocol: Protocol): string[] => [
+  ...protocol.llamaServerArgs,
+  ...LLAMA_SINGLE_REQUEST_ARGS,
+];
+
 export async function readManifest(): Promise<Manifest> {
   const manifest = await readJson<Manifest>(join(ROOT, 'scripts/fixtures', `${FIXTURE}.json`));
   const pinned = manifest.protocol.admissionPolicyByPromptTokens;
@@ -97,6 +103,7 @@ export interface Sample {
   promptTokens: number;
   cachedTokens: number;
   performance: Performance;
+  block?: string;
   [field: string]: unknown;
 }
 
@@ -115,7 +122,7 @@ export const IDENTITY_KEYS = ['tree', 'addon', 'llama', 'model', 'sidecars', 'sc
 export interface Provenance extends Identity {
   host: { os: string; chip: string; gpuCores: number; memoryBytes: number };
   tokenizer: { verified: boolean };
-  protocol: { admission: Record<string, Policy>; desktopLoad: boolean };
+  protocol: { admission: Record<string, Policy>; desktopLoad: boolean; llamaServerArgs: string[] };
   matrix?: { startedAt: string; finishedAt?: string; postRunVerified?: boolean };
   [field: string]: unknown;
 }
@@ -173,6 +180,37 @@ export async function checkAdmittedIds(trace: string, cases: readonly FixtureCas
 export async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   await writeFile(`${path}.tmp`, `${JSON.stringify(value, null, 2)}\n`);
   await rename(`${path}.tmp`, path);
+}
+
+// A cell is one runtime on one case: one process, its warmup and every repetition. A resume moves
+// the samples of a partly done cell to discarded/<stamp>/, so the cell reruns in full.
+export async function discardPartialCells(
+  out: string,
+  samples: readonly Sample[],
+  repetitions: number,
+  stamp: string,
+): Promise<Sample[]> {
+  const cell = (sample: Sample) => `${sample.runtime}/${sample.name}`;
+  const counts = new Map<string, number>();
+  for (const sample of samples) counts.set(cell(sample), (counts.get(cell(sample)) ?? 0) + 1);
+  const partial = samples.filter((sample) => counts.get(cell(sample))! < repetitions);
+  if (!partial.length) return [...samples];
+  const dir = join(out, 'discarded', stamp);
+  await writeJson(join(dir, 'samples.json'), partial);
+  for (const { runtime, name, run } of partial) {
+    const moves = [
+      ['raw', `${runtime === 'mlx-node' ? 'mlx' : 'llama'}-${run}-${name}.json`],
+      ['system', `${KIND[runtime]}-${run}-${name}.json`],
+    ];
+    for (const [folder, file] of moves) {
+      if (!existsSync(join(out, folder, file))) continue;
+      await mkdir(join(dir, folder), { recursive: true });
+      await rename(join(out, folder, file), join(dir, folder, file));
+    }
+  }
+  const kept = samples.filter((sample) => !partial.includes(sample));
+  await writeJsonAtomic(paths(out).samples, kept);
+  return kept;
 }
 
 // One NDJSON line per event; `last` feeds the GPU log's phase column.

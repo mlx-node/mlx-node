@@ -10,6 +10,7 @@ import {
   range,
   readJson,
   renderChart,
+  singleRequestNote,
   toCsv,
   writeJson,
   type ChartSeries,
@@ -134,6 +135,9 @@ export async function summarize(out: string, allowDirty: boolean, outputLength?:
   const summary = manifest.cases.map((item) => {
     const cell = (runtime: Runtime): Cell => {
       const runs = samples.filter((sample) => sample.runtime === runtime && sample.name === item.name);
+      if (new Set(runs.map(({ pid }) => pid)).size !== 1 || new Set(runs.map(({ block }) => block)).size !== 1) {
+        throw new Error(`${runtime} ${item.name}: the samples come from more than one process`);
+      }
       const stat = (metric: Metric): Stat => {
         const values = runs.map((sample) => sample.performance[metric]);
         return { ...range(values), samples: values };
@@ -246,6 +250,7 @@ export async function report(out: string, allowDirty: boolean): Promise<SummaryR
             'Admission: --desktop-load. Every row ran with desktop graphics and no other local LLM; the 6,219 and 18,754 rows did not wait for GPU idle as the baseline did.',
           ]
         : []),
+      ...singleRequestNote(provenance.protocol.llamaServerArgs, manifest.protocol.llamaServerArgs),
       '',
       compareTable('Prefill', compare('prefill')),
       compareTable('Decode', compare('decode')),

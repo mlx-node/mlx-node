@@ -21,7 +21,16 @@ import {
   sleep,
   writeJson,
 } from '../common.js';
-import { MODEL_FILE, PILOT_RUN, RUNTIMES, readFixture, sampleId, samplePath, type Runtime } from './suite.js';
+import {
+  MODEL_FILE,
+  PILOT_RUN,
+  RUNTIMES,
+  llamaServerArgs,
+  readFixture,
+  sampleId,
+  samplePath,
+  type Runtime,
+} from './suite.js';
 
 type Core = typeof import('../../../packages/core/index.cjs');
 
@@ -179,7 +188,7 @@ async function llama() {
   const args = [
     '-m',
     MODEL_FILE,
-    ...protocol.llamaServerArgs,
+    ...llamaServerArgs(protocol),
     '--host',
     '127.0.0.1',
     '--port',

@@ -4,7 +4,17 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { compareTable, parseCsv, range, readJson, renderChart, toCsv, writeJson, type CompareRow } from '../common.js';
+import {
+  compareTable,
+  parseCsv,
+  range,
+  readJson,
+  renderChart,
+  singleRequestNote,
+  toCsv,
+  writeJson,
+  type CompareRow,
+} from '../common.js';
 import { LABEL, REPETITIONS, RUNTIMES, readManifest, sampleId, samplePath, type Runtime } from './suite.js';
 
 const BASELINE = join(dirname(fileURLToPath(import.meta.url)), 'baseline.csv');
@@ -57,6 +67,7 @@ interface Provenance {
   completedAt?: string;
   host: { os: string; chip: string; gpuCores: number; memoryBytes: number };
   addon: Record<string, string>;
+  protocol: { llamaServerArgs: string[] };
 }
 
 export async function report(out: string): Promise<void> {
@@ -206,6 +217,7 @@ export async function report(out: string): Promise<void> {
       `## Gemma 4 12B IT QAT Q4_0: this run vs ${BASELINE_DATE}`,
       '',
       `Before = medians of the ${BASELINE_DATE} samples in \`scripts/perf-tracker/gemma4/baseline.csv\`; after = medians of this run. Prompt tokens · runtime.`,
+      ...singleRequestNote(environment.protocol.llamaServerArgs, protocol.llamaServerArgs),
       '',
       compareTable('Prefill, tokens/second', compare('prefill_tokens_per_second', 'prefillTps')),
       compareTable('Decode, tokens/second', compare('decode_tokens_per_second', 'decodeTps')),

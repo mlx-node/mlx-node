@@ -3,7 +3,7 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MODELS_DIR, type LlamaIdentity, type TreeIdentity } from '../common.js';
+import { LLAMA_SINGLE_REQUEST_ARGS, MODELS_DIR, type LlamaIdentity, type TreeIdentity } from '../common.js';
 import type { IdCheck, Policy } from '../qwen38/suite.js';
 
 export const HERE = dirname(fileURLToPath(import.meta.url));
@@ -78,10 +78,7 @@ export const PROTOCOL = {
     'mmap',
     '--spec-type',
     'none',
-    '-ctxcp',
-    '0',
-    '-cram',
-    '0',
+    ...LLAMA_SINGLE_REQUEST_ARGS,
     '--no-warmup',
     '--perf',
   ],

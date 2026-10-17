@@ -2,7 +2,15 @@
 
 import { join } from 'node:path';
 
-import { MODELS_DIR, ROOT, loadFixture, readJson, type FixtureCase, type FixtureManifest } from '../common.js';
+import {
+  LLAMA_SINGLE_REQUEST_ARGS,
+  MODELS_DIR,
+  ROOT,
+  loadFixture,
+  readJson,
+  type FixtureCase,
+  type FixtureManifest,
+} from '../common.js';
 
 export const FIXTURE = 'gemma4-oxc-review-v1';
 export const MODEL_DIR = join(MODELS_DIR, 'gemma-4-12b-it-qat-q4_0-gguf');
@@ -33,6 +41,11 @@ export interface Manifest extends FixtureManifest {
   cases: (FixtureManifest['cases'][number] & { historicalMessages: number; toolResults: number })[];
   protocol: Protocol;
 }
+
+export const llamaServerArgs = (protocol: Protocol): string[] => [
+  ...protocol.llamaServerArgs,
+  ...LLAMA_SINGLE_REQUEST_ARGS,
+];
 
 export const manifestPath = join(ROOT, 'scripts/fixtures', `${FIXTURE}.json`);
 
