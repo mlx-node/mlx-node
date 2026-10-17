@@ -33,7 +33,7 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 unicode-width = "0.2.2"
 unicode-ident = "1.0.24"
 unicode-normalization = "0.1.25"
-rust_xlsxwriter = "0.99.0"
+rust_xlsxwriter = "0.100.0"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
