@@ -45,6 +45,8 @@ export const ASSET_FILES = ['tokenizer.json', 'tokenizer_config.json', 'chat_tem
 
 // The first load fills the packed weight cache, so the untimed prewarm may run for a long time.
 export const PREWARM_TIMEOUT_MS = 2 * 3_600_000;
+// mlx-node prefill runs at 15–75 tok/s on this model, so one 32,488-token sample can exceed the shared 1,200 s limit.
+export const SAMPLE_TIMEOUT_MS = 3_600_000;
 
 // Repetitions, warmup tokens and cooldowns come from the qwen38 fixture's protocol.
 export const PROTOCOL = {

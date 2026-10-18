@@ -130,7 +130,7 @@ export async function report(out: string, allowDirty: boolean): Promise<FlashSum
         { title: 'Prefill', unit: 'tok/s', series: series('prefillTokensPerSecond') },
         { title: 'Decode', unit: 'tok/s', series: series('decodeTokensPerSecond') },
       ],
-      note: `Median of ${repetitions} runs, ${PROTOCOL.outputTokens} output tokens; whiskers min–max; mlx-node auto budget ${budget}. *No other local LLM${provenance.protocol.desktopLoad ? '' : '; other rows start at GPU idle'}.`,
+      note: `Median of ${repetitions} runs, ${PROTOCOL.outputTokens} output tokens; whiskers min–max; mlx-node full residency, budget ${budget}. *No other local LLM${provenance.protocol.desktopLoad ? '' : '; other rows start at GPU idle'}.`,
     }),
   );
 

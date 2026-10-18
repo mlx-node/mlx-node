@@ -54,6 +54,7 @@ import {
   IDENTITY_KEYS,
   PREWARM_TIMEOUT_MS,
   PROTOCOL,
+  SAMPLE_TIMEOUT_MS,
   SOURCE,
   SPLITS,
   WORKER,
@@ -305,7 +306,10 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
         await writeJson(join(files.system, `${kind}-${block}-load.json`), { before: load });
         let runner: Runner;
         if (runtime === 'mlx-node') {
-          const worker = await MlxWorker.start(block, out, PROTOCOL.mlxEnv, { worker: WORKER });
+          const worker = await MlxWorker.start(block, out, PROTOCOL.mlxEnv, {
+            worker: WORKER,
+            timeoutMs: SAMPLE_TIMEOUT_MS,
+          });
           progress.emit({ event: 'loaded', runtime, run: block, metadata: worker.loaded });
           try {
             await checkLoaded(worker.loaded as Loaded, cases, proof.assetFiles);
