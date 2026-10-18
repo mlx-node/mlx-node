@@ -1269,6 +1269,45 @@ pub(super) fn prefill_scratch(c: &super::config::Config, tokens: usize) -> u64 {
     per_token.saturating_mul(t).saturating_add(window.max(qsa))
 }
 
+/// Recurrent matrices, convolution windows, the compressed indexer history
+/// and PLE windows one sequence keeps as F32 arrays outside the page pool.
+pub(super) fn row_state_bytes(c: &super::config::Config) -> u64 {
+    let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count();
+    let full = c.num_hidden_layers - linear;
+    (linear
+        * (c.linear_num_value_heads * c.linear_key_head_dim * c.linear_value_head_dim * 4
+            + (2 * c.linear_num_key_heads * c.linear_key_head_dim
+                + c.linear_num_value_heads * c.linear_value_head_dim)
+                * c.linear_conv_kernel_dim
+                * 4)
+        + full * c.indexer_head_dim * c.effective_context_limit() / c.indexer_compress_ratio * 4
+        + c.ple_layer_ids.len()
+            * c.hc_count
+            * c.hidden_size
+            * c.ple_conv_kernel_size
+            * c.ngram_size
+            * 4) as u64
+}
+
+/// F32 draft-layer K/V per token.
+pub(super) fn draft_kv_bytes_per_token(c: &super::config::Config) -> u64 {
+    (c.num_key_value_heads * c.head_dim * 8) as u64
+}
+
+/// Verify snapshots of up to four accepted frontiers plus the draft K/V of
+/// `tokens`.
+pub(super) fn draft_state_bytes(c: &super::config::Config, tokens: u64) -> u64 {
+    4 * row_state_bytes(c) + tokens * draft_kv_bytes_per_token(c)
+}
+
+/// What the working allowance leaves for scheduled rows and draft state once
+/// the page pool and one prefill window's scratch have their share.
+pub(super) fn scheduled_state_budget(pool_bytes: u64, prefill_scratch: u64) -> u64 {
+    WORKING_BYTES
+        .saturating_sub(pool_bytes)
+        .saturating_sub(prefill_scratch)
+}
+
 /// The prefill window the current plan's scratch allowance admits; computed
 /// again whenever the plan changes (a mapped process that moved to slots
 /// has a smaller allowance than the one its load admitted).
@@ -1317,4 +1356,77 @@ fn runtime_slices_cannot_exceed_bootstrap_admission() {
         }
         assert_eq!(prefill_slice(admitted, Some("256")), admitted.min(256));
     }
+}
+
+/// Flash Next geometry (48 layers, 12 full attention, K/V 2 x 256, 32,768
+/// context): one 32k MTP owner fits the working budget beside the 1 GiB page
+/// pool and the 1024-token prefill window, two do not, four AR rows do.
+/// MUTATION: stop subtracting `prefill_scratch` in `scheduled_state_budget`;
+/// two 32k MTP owners then fit and the `2 * mtp_32k > budget` assertion fails.
+#[test]
+fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
+    let c = super::config::Config::parse(&serde_json::json!({
+        "model_type": "qwen4_exp_text",
+        "hidden_size": 2560,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "vocab_size": 248320,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 640,
+        "shared_expert_intermediate_size": 640,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "hc_count": 4,
+        "hc_lowrank": 320,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 262144,
+        "full_attention_interval": 4,
+        "indexer_n_heads": 4,
+        "indexer_head_dim": 128,
+        "indexer_budget": 2048,
+        "indexer_compress_ratio": 4,
+        "ple_layer_ids": [2],
+        "ple_embed_dim": 2560,
+        "ple_conv_kernel_size": 4,
+        "ngram_size": 3,
+        "heads_per_ngram": 8,
+        "ngram_vocab_size_base": 20000000u64,
+        "split_ngram_parts": 128,
+        "eos_token_id": 248044
+    }))
+    .unwrap();
+    assert_eq!(c.effective_context_limit(), 32_768);
+    assert_eq!(row_state_bytes(&c), 169_967_616);
+    assert_eq!(draft_kv_bytes_per_token(&c), 4096);
+    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+        12,
+        2,
+        256,
+        32,
+        mlx_paged_attn::metal::MetalDtype::BFloat16,
+    )
+    .unwrap();
+    assert_eq!(bytes_per_block, 786_432);
+    let blocks = (1024u64 << 20) / bytes_per_block;
+    assert_eq!(blocks, 1365);
+    let budget = scheduled_state_budget(blocks * bytes_per_block, prefill_scratch(&c, 1024));
+    let row = row_state_bytes(&c);
+    let mtp_16k = row + draft_state_bytes(&c, 18_754 + 255);
+    let mtp_32k = row + draft_state_bytes(&c, 32_488 + 255);
+    assert!(
+        mtp_16k <= mtp_32k && mtp_32k <= budget,
+        "one 32k MTP owner ({mtp_32k} B) must fit the {budget} B working budget"
+    );
+    assert!(
+        2 * mtp_32k > budget,
+        "two 32k MTP owners ({} B) must wait for a row to be reclaimed from the {budget} B budget",
+        2 * mtp_32k
+    );
+    assert!(4 * row <= budget, "four AR rows must fit");
 }

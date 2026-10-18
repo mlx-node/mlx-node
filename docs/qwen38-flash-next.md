@@ -242,8 +242,10 @@ Paged K/V writes accept read-only contiguous offset views while preserving stric
 mutable-pool validation. GDN recurrent state remains F32, and BF16 rounding
 boundaries are retained where required for parity.
 
-The shared scheduler supports up to four live owners, subject to attention-page
-and recurrent-state admission. QSA K/V uses a pool capped at 1 GiB. The effective
+The shared scheduler supports up to four live owners. QSA K/V pages are admitted
+against a pool capped at 1 GiB; recurrent rows and MTP draft state are admitted
+against the 4 GiB working allowance left after that pool and the prefill window,
+and a turn is refused only when that allowance cannot hold its state. The effective
 context is bounded by cache geometry, the trained limit, and 32,768 tokens;
 inspect `contextLimits()` for the admitted geometry. Multi-owner decode keeps stateful attention per owner and batches stateless
 MLP projections across ready rows. Warm continuation reuses that

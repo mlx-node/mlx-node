@@ -4,7 +4,7 @@ use super::{Inner, Step};
 use crate::array::MxArray;
 use crate::engine::backend::{PagedBackend, PagedPrefix};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket,
+    HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket, ScheduledStateCapacity,
 };
 use crate::engine::paged_stepper::PagedStepper;
 use crate::models::qwen4_exp::runtime_flags;
@@ -357,13 +357,6 @@ impl HybridSchedulerBackend for Inner {
             .reserve_rows(queries as u32)
             .is_ok())
     }
-    fn scheduled_draft_state_bytes(&self, tokens: u32) -> u64 {
-        4 * self.recurrent_state_bytes()
-            + tokens as u64
-                * self.decoder.config.num_key_value_heads as u64
-                * self.decoder.config.head_dim as u64
-                * 8
-    }
     fn propose_scheduled(
         &mut self,
         seq: SeqId,
@@ -412,30 +405,37 @@ impl HybridSchedulerBackend for Inner {
     fn max_position_embeddings(&self) -> i32 {
         self.decoder.config.effective_context_limit() as i32
     }
-    fn recurrent_state_bytes(&self) -> u64 {
+    fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
         let c = &self.decoder.config;
-        // Include the maximum indexer history and convolution windows as well
-        // as F32 recurrent matrices in scheduler admission accounting.
-        let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count();
-        let full = c.num_hidden_layers - linear;
-        (linear
-            * (c.linear_num_value_heads * c.linear_key_head_dim * c.linear_value_head_dim * 4
-                + (2 * c.linear_num_key_heads * c.linear_key_head_dim
-                    + c.linear_num_value_heads * c.linear_value_head_dim)
-                    * c.linear_conv_kernel_dim
-                    * 4)
-            + full * c.indexer_head_dim * c.effective_context_limit() / c.indexer_compress_ratio
-                * 4
-            + c.ple_layer_ids.len()
-                * c.hc_count
-                * c.hidden_size
-                * c.ple_conv_kernel_size
-                * c.ngram_size
-                * 4) as u64
+        let pool = self.decoder.paged.as_ref().map_or(0, |p| {
+            p.bytes_per_block()
+                .unwrap_or(0)
+                .saturating_mul(u64::from(p.block_capacity()))
+        });
+        let row = super::memory::row_state_bytes(c);
+        Some(ScheduledStateCapacity {
+            budget: super::memory::scheduled_state_budget(
+                pool,
+                super::memory::prefill_scratch(c, self.decoder.prefill_chunk_size),
+            ),
+            held: (self.rows.len() + usize::from(self.active_seq.is_some())) as u64 * row
+                + self.mtp.held_bytes(c),
+        })
     }
-    fn scheduled_recurrent_bytes(&self) -> u64 {
-        (self.rows.len() + usize::from(self.active_seq.is_some())) as u64
-            * self.recurrent_state_bytes()
+    fn scheduled_state_candidate_bytes(&self, seq: SeqId, tokens: u32, speculative: bool) -> u64 {
+        let c = &self.decoder.config;
+        let row = if self.has_scheduled_recurrent(seq) {
+            0
+        } else {
+            super::memory::row_state_bytes(c)
+        };
+        let draft = if speculative {
+            let held = self.mtp.owner_frontier(seq).unwrap_or(0) as u64;
+            super::memory::draft_state_bytes(c, u64::from(tokens).saturating_sub(held))
+        } else {
+            0
+        };
+        row + draft
     }
     fn has_scheduled_recurrent(&self, seq: SeqId) -> bool {
         self.active_seq == Some(seq) || self.rows.contains_key(&seq)
