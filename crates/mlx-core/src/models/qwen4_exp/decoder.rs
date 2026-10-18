@@ -1271,7 +1271,8 @@ impl Decoder {
     }
     fn moe(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
         if i == 0 {
-            self.weights.wire_mapped_banks()?;
+            let main = self.gguf();
+            self.weights.wire_mapped_banks(main)?;
         }
         let c = self.config.clone();
         let p = format!("layers.{i}.mlp");

@@ -2308,10 +2308,10 @@ mod mapped_tests {
         );
     }
 
-    /// Mapped mode on the fixture pack: identity routing, capacity == experts,
-    /// never a miss or an upload, bank bytes and kernel reads identical to
     /// The bank touch runs for the first pass and after a gap longer than the
-    /// driver's unwire delay, never inside a pass sequence and never in slot mode.
+    /// driver's unwire delay, never inside a pass sequence, never for a pass
+    /// that reads no mapped bank (which also leaves the stamp alone), and
+    /// never in slot mode.
     #[test]
     fn mapped_banks_are_rewired_after_a_gap_and_not_within_a_pass() {
         use std::time::{Duration, Instant};
@@ -2322,7 +2322,7 @@ mod mapped_tests {
         let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
         let t0 = Instant::now();
         assert!(
-            !store.wire_mapped_banks_at(t0).unwrap(),
+            !store.wire_mapped_banks_at(t0, true).unwrap(),
             "slot mode never touches"
         );
         store
@@ -2339,31 +2339,53 @@ mod mapped_tests {
             .unwrap();
         assert!(store.plan.mapped);
         assert!(
-            store.wire_mapped_banks_at(t0).unwrap(),
+            store.wire_mapped_banks_at(t0, true).unwrap(),
             "first pass touches"
         );
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(100))
+                .wire_mapped_banks_at(t0 + Duration::from_millis(100), true)
                 .unwrap()
         );
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(800))
+                .wire_mapped_banks_at(t0 + Duration::from_millis(800), true)
                 .unwrap()
         );
         assert!(
             store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1800))
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1800), true)
                 .unwrap()
         );
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1850))
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1850), true)
                 .unwrap()
+        );
+        let stamp = store.mapped_pass_start;
+        assert!(stamp.is_some());
+        for ms in [2600, 3400] {
+            assert!(
+                !store
+                    .wire_mapped_banks_at(t0 + Duration::from_millis(ms), false)
+                    .unwrap(),
+                "a pass that reads no mapped bank never touches"
+            );
+            assert_eq!(
+                store.mapped_pass_start, stamp,
+                "a pass that reads no mapped bank must not refresh the stamp"
+            );
+        }
+        assert!(
+            store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(4200), true)
+                .unwrap(),
+            "the main pass after a run of drafts sees the gap since the last main pass"
         );
     }
 
+    /// Mapped mode on the fixture pack: identity routing, capacity == experts,
+    /// never a miss or an upload, bank bytes and kernel reads identical to
     /// the chunk-built banks, leases inert, out-of-range ids refused.
     #[test]
     fn mapped_residency_addresses_every_expert_in_place_without_misses() {

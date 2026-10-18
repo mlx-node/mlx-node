@@ -67,14 +67,15 @@ the SSD safety limit subtracts the mapped bytes MLX counts in `active_memory`. G
 memory at load. The driver wires whole banks, not the experts a token
 routes to, and unwires a bank about a second after its last use; a pass that
 starts later than that after the previous one would otherwise re-wire the
-layers one by one and fall into a 0.5 tokens/s cycle, so every forward pass
-whose predecessor started more than 0.9 s earlier first reads one element of
-every mapped bank in a single eval. Every prefill window and every decode
-step needs the entire routed set resident at once: when other processes'
-anonymous memory leaves
-less than that (a 20 GiB working set beside the 78 GiB pack on 128 GiB), the
-kernel re-faults the pack layer by layer and a 6k turn reads about 1 TB from
-SSD at 0.4 tokens/s instead of 50. The 75% gate does not see that memory;
+layers one by one and fall into a 0.5 tokens/s cycle, so every main-network
+forward pass whose predecessor started more than 0.9 s earlier first reads
+one element of every mapped bank in a single eval (the MTP head's passes read
+no mapped bank and neither touch nor count as a predecessor). Every prefill
+window and every decode step needs the entire routed set resident at once:
+when other processes' anonymous memory leaves less than that (a 20 GiB
+working set beside the 78 GiB pack on 128 GiB), the kernel re-faults the pack
+layer by layer and a 6k turn reads about 1 TB from SSD at 0.4 tokens/s
+instead of 50. The 75% gate does not see that memory;
 `MLX_QWEN4_MAPPED_PACK=0` keeps the slot path for A/B and for such hosts;
 `MLX_QWEN4_WEIGHT_CACHE_GIB`, `stream` and `full` also select it.
 
