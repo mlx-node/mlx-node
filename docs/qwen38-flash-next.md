@@ -120,7 +120,9 @@ one chunk file per expert; a tensor the pack lacks (the build stops when the
 disk falls under the 16 GiB reserve, or when `MLX_QWEN4_PACKED_CACHE_MAX_GB`
 leaves no room after evicting idle siblings) keeps the chunk reader. The
 mapped dir's `.mapped` and staging bytes count toward that cap like `.pack`
-bytes, and an orphaned or least-recently-used mapped dir is removed by the
+bytes — a file is admitted and its staging file sized to its final length
+under one root-wide lock, so concurrent builders never admit against the same
+room — and an orphaned or least-recently-used mapped dir is removed by the
 same sweep — except one whose `lock` file a process holds shared, which every
 open or building pack does.
 
