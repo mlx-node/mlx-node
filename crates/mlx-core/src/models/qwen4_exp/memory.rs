@@ -535,11 +535,19 @@ pub(super) fn prefill_scratch(c: &super::config::Config, tokens: usize) -> u64 {
     let per_token = 4
         * (8 * hc * h
             + ple.max(8 * qkv + experts + 6 * (c.num_attention_heads * c.head_dim) as u64));
-    per_token.saturating_mul(tokens as u64).saturating_add(
-        4 * c.num_attention_heads as u64
-            * tokens as u64
-            * c.indexer_budget.min(super::MAX_PREFILL_CHUNK * 2) as u64,
-    )
+    let t = tokens as u64;
+    let window = 4
+        * c.num_attention_heads as u64
+        * t
+        * c.indexer_budget.min(super::MAX_PREFILL_CHUNK * 2) as u64;
+    // Batched QSA past the budget: F32 per-head and summed block scores for
+    // every row against every block, plus the contiguous BF16 K/V prefix.
+    let context = c.effective_context_limit() as u64;
+    let blocks = context / c.indexer_compress_ratio.max(1) as u64;
+    let qsa = (t * c.indexer_n_heads as u64 * blocks * 4 * 2)
+        .saturating_add(t * blocks * 4 * 6)
+        .saturating_add(2 * c.num_key_value_heads as u64 * context * c.head_dim as u64 * 2);
+    per_token.saturating_mul(t).saturating_add(window.max(qsa))
 }
 
 pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> Result<usize> {

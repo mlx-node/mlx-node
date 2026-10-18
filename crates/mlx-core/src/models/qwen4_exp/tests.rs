@@ -4942,3 +4942,509 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
         }
     }
 }
+
+/// The batched QSA window (selection + indexed kernel) against the per-token
+/// sparse path it replaces, with `MLX_QWEN4_BATCHED_QSA` toggled between the
+/// two decoders' forwards. Budgets 8/16/32 put the sparse cut-off inside,
+/// before and after mixed windows; the only attention layer's index blocks
+/// come from identical inputs on both paths, so they must match bit for bit.
+#[test]
+fn batched_qsa_matches_per_token_flat_and_paged() {
+    const CHILD: &str = "MLX_QWEN4_BATCHED_QSA_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "models::qwen4_exp::tests::batched_qsa_matches_per_token_flat_and_paged",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env_remove("MLX_QWEN4_BATCHED_QSA")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let max_error = |a: &MxArray, b: &MxArray| {
+        let (a, b) = (a.to_float32().unwrap(), b.to_float32().unwrap());
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+    };
+    // Each forward reads the flag once; fully evaluated before it changes.
+    let batched_qsa = |on: bool| unsafe {
+        std::env::set_var("MLX_QWEN4_BATCHED_QSA", if on { "1" } else { "0" })
+    };
+    let path = fixture().join("bf16/paged");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    // The fixture's 128-position limit leaves room for three decode steps.
+    let tokens: Vec<u32> = (0..120)
+        .map(|i| ((i * 7 + i / 5) % 19 + 3) as u32)
+        .collect();
+    let chunks = [7, 9, 13, 3, 1, 5, 17, 2, 31, 11, 21];
+    assert_eq!(chunks.iter().sum::<usize>(), tokens.len());
+    for budget in [8, 16, 32] {
+        for paged in [false, true] {
+            let mut config = config::Config::parse(&raw).unwrap();
+            config.indexer_budget = budget;
+            let layers = config.num_hidden_layers;
+            let make = || {
+                let mut d = decoder::Decoder::new(
+                    config.clone(),
+                    weights::Store::open_fixture(&path, None).unwrap(),
+                )
+                .unwrap();
+                if paged {
+                    d.paged = Some(paged::create(&config).unwrap());
+                    d.paged.as_mut().unwrap().begin_request(1).unwrap();
+                }
+                d
+            };
+            let (mut per_token, mut batched) = (make(), make());
+            let (mut offset, mut sparse_windows) = (0, 0);
+            for count in chunks {
+                let chunk = &tokens[offset..offset + count];
+                offset += count;
+                if count > 1 && offset > budget {
+                    sparse_windows += 1;
+                }
+                let label = format!("budget={budget} paged={paged} end={offset}");
+                batched_qsa(false);
+                let want = per_token.prefill_chunk(chunk, None, true).unwrap();
+                want.eval();
+                batched_qsa(true);
+                let got = batched.prefill_chunk(chunk, None, true).unwrap();
+                got.eval();
+                let error = max_error(&want, &got);
+                assert!(error < 0.04, "{label}: logits error {error}");
+                assert_eq!(per_token.history, batched.history, "{label}");
+                assert_eq!(
+                    per_token.last_chunk_hidden.len(),
+                    batched.last_chunk_hidden.len(),
+                    "{label}"
+                );
+                for (row, (a, b)) in per_token
+                    .last_chunk_hidden
+                    .iter()
+                    .zip(&batched.last_chunk_hidden)
+                    .enumerate()
+                {
+                    let error = max_error(a, b);
+                    assert!(error < 0.04, "{label}: hidden row {row} error {error}");
+                }
+                if paged {
+                    assert_eq!(
+                        batched.paged.as_ref().unwrap().request_tokens(),
+                        batched.history,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        per_token.paged.as_ref().unwrap().request_tokens(),
+                        batched.history,
+                        "{label}"
+                    );
+                }
+                for layer in 0..layers {
+                    match (per_token.index_keys(layer), batched.index_keys(layer)) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) => {
+                            assert_eq!(
+                                a.shape().unwrap().as_ref(),
+                                b.shape().unwrap().as_ref(),
+                                "{label}"
+                            );
+                            assert_eq!(
+                                &*a.to_float32().unwrap(),
+                                &*b.to_float32().unwrap(),
+                                "{label}: layer {layer} index blocks"
+                            );
+                        }
+                        _ => panic!("{label}: layer {layer} index blocks differ in presence"),
+                    }
+                }
+            }
+            assert!(sparse_windows > 0);
+            for token in [11, 4, 9] {
+                batched_qsa(false);
+                let want = per_token.step(token).unwrap();
+                want.eval();
+                batched_qsa(true);
+                let got = batched.step(token).unwrap();
+                got.eval();
+                let error = max_error(&want, &got);
+                assert!(
+                    error < 0.04,
+                    "budget={budget} paged={paged} decode {token}: error {error}"
+                );
+            }
+        }
+    }
+}
+
+/// Exactly representable scores (multiples of 1/8 against bf16 keys) with
+/// repeated and all-zero blocks, so the only freedom left is which tied block
+/// fills the cut-off. Covers rows before the budget (all complete blocks plus
+/// -1), padding when the window has fewer blocks than top-k, and sparse rows.
+#[test]
+fn qsa_select_matches_reference_transcription() {
+    use crate::array::DType;
+    let (heads, dim, ratio) = (2usize, 16usize, 4usize);
+    for (base, t, topk) in [
+        (0usize, 7usize, 2usize),
+        (20, 9, 8),
+        (5, 30, 2),
+        (40, 25, 8),
+    ] {
+        let blocks = (base + t) / ratio;
+        let key_data: Vec<f32> = (0..blocks * dim)
+            .map(|i| {
+                let (b, d) = (i / dim, i % dim);
+                match b % 5 {
+                    // All-zero blocks tie at exactly zero after the ReLU.
+                    0 => 0.0,
+                    // Repeated blocks tie at the same positive score.
+                    1 | 3 => ((d * 3 + 1) % 7) as f32 / 8.0 - 0.25,
+                    _ => (((b * 11 + d * 5) % 13) as f32 - 6.0) / 8.0,
+                }
+            })
+            .collect();
+        let query_data: Vec<f32> = (0..heads * t * dim)
+            .map(|i| (((i * 7 + i / 5) % 9) as f32 - 4.0) / 8.0)
+            .collect();
+        let index_keys = MxArray::from_float32(&key_data, &[blocks as i64, dim as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let query =
+            MxArray::from_float32(&query_data, &[1, heads as i64, t as i64, dim as i64]).unwrap();
+        let (selected, query_ends) =
+            math::qsa_select(&query, &index_keys, base, ratio, topk).unwrap();
+        assert_eq!(
+            selected.shape().unwrap().as_ref(),
+            &[1, t as i64, topk as i64]
+        );
+        let selected = selected.to_int32().unwrap().to_vec();
+        let ends = query_ends.to_int32().unwrap().to_vec();
+        for j in 0..t {
+            let label = format!("base={base} t={t} topk={topk} row={j}");
+            assert_eq!(ends[j], (base + j + 1) as i32, "{label}");
+            let complete = (base + j + 1) / ratio;
+            // language.py: summed ReLU head scores, -inf past `complete`,
+            // padded to top-k, the top-k picks, -1 for invalid, sorted.
+            let score = |b: usize| -> f64 {
+                if b >= complete || b >= blocks {
+                    return f64::NEG_INFINITY;
+                }
+                (0..heads)
+                    .map(|h| {
+                        (0..dim)
+                            .map(|d| {
+                                query_data[(h * t + j) * dim + d] as f64
+                                    * key_data[b * dim + d] as f64
+                            })
+                            .sum::<f64>()
+                            .max(0.0)
+                    })
+                    .sum::<f64>()
+                    / (dim as f64).sqrt()
+            };
+            let mut order: Vec<usize> = (0..blocks.max(topk)).collect();
+            order.sort_by(|&a, &b| score(b).partial_cmp(&score(a)).unwrap().then(a.cmp(&b)));
+            let mut want: Vec<i32> = order[..topk]
+                .iter()
+                .map(|&b| if b < complete { b as i32 } else { -1 })
+                .collect();
+            want.sort();
+            let got = &selected[j * topk..(j + 1) * topk];
+            assert!(
+                got.windows(2).all(|w| w[0] <= w[1]),
+                "{label}: unsorted {got:?}"
+            );
+            let invalid = |row: &[i32]| row.iter().filter(|&&b| b < 0).count();
+            assert_eq!(invalid(got), invalid(&want), "{label}: {got:?} vs {want:?}");
+            if complete <= topk {
+                assert_eq!(got, &want[..], "{label}");
+                continue;
+            }
+            let cutoff = want
+                .iter()
+                .map(|&b| score(b as usize))
+                .fold(f64::INFINITY, f64::min);
+            for &b in got.iter().filter(|b| !want.contains(b)) {
+                assert!(b >= 0 && (b as usize) < complete, "{label}: {got:?}");
+                assert_eq!(score(b as usize), cutoff, "{label}: {got:?} vs {want:?}");
+            }
+            for &b in want.iter().filter(|b| !got.contains(b)) {
+                assert_eq!(score(b as usize), cutoff, "{label}: {got:?} vs {want:?}");
+            }
+        }
+    }
+}
+
+/// The indexed kernel against SDPA with a boolean mask built from the same
+/// picks (mlx-vlm's `build_mask`): selected blocks below each row's end, plus
+/// its incomplete tail block. -1 picks contribute nothing.
+#[test]
+fn qsa_kernel_matches_masked_sdpa() {
+    use crate::array::DType;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let values = |shape: &[i64], seed: usize, dtype: DType| {
+        let n = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(
+            &(0..n)
+                .map(|i| (((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0) * 0.8)
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .unwrap()
+        .astype(dtype)
+        .unwrap()
+    };
+    let ratio = 4;
+    for dtype in [DType::BFloat16, DType::Float16] {
+        for (heads, kv_heads, dim, base, t, topk) in [
+            (4i64, 2i64, 32i64, 29usize, 13usize, 8usize),
+            (8, 2, 128, 61, 40, 16),
+            (4, 4, 64, 0, 37, 2),
+        ] {
+            let label = format!("{dtype:?} heads={heads}/{kv_heads} dim={dim} base={base} t={t}");
+            let length = (base + t) as i64;
+            let q = values(&[1, heads, t as i64, dim], 1, dtype);
+            let k = values(&[1, kv_heads, length, dim], 2, dtype);
+            let v = values(&[1, kv_heads, length, dim], 3, dtype);
+            let blocks = (base + t) / ratio;
+            let index_keys = values(&[blocks as i64, 16], 4, DType::BFloat16);
+            let query = values(&[1, 2, t as i64, 16], 5, DType::Float32);
+            let (selected, query_ends) =
+                math::qsa_select(&query, &index_keys, base, ratio, topk).unwrap();
+            let picks = selected.to_int32().unwrap().to_vec();
+            assert!(
+                picks.contains(&-1) && blocks > topk,
+                "{label}: expected causal and sparse rows"
+            );
+            let mut mask = vec![0i32; t * length as usize];
+            for j in 0..t {
+                let end = base + j + 1;
+                let row = &mut mask[j * length as usize..(j + 1) * length as usize];
+                for &b in &picks[j * topk..(j + 1) * topk] {
+                    if b < 0 {
+                        continue;
+                    }
+                    let start = b as usize * ratio;
+                    for cell in &mut row[start.min(end)..(start + ratio).min(end)] {
+                        *cell = 1;
+                    }
+                }
+                for cell in &mut row[end / ratio * ratio..end] {
+                    *cell = 1;
+                }
+            }
+            let mask = MxArray::from_int32(&mask, &[1, 1, t as i64, length])
+                .unwrap()
+                .greater(&MxArray::scalar_int(0).unwrap())
+                .unwrap();
+            let scale = (dim as f64).powf(-0.5);
+            let want =
+                crate::array::scaled_dot_product_attention(&q, &k, &v, scale, Some(&mask)).unwrap();
+            let got =
+                math::qsa_attention(&q, &k, &v, &selected, &query_ends, scale, ratio).unwrap();
+            assert_eq!(
+                got.shape().unwrap().as_ref(),
+                want.shape().unwrap().as_ref(),
+                "{label}"
+            );
+            let (a, b) = (want.to_float32().unwrap(), got.to_float32().unwrap());
+            let error = a
+                .iter()
+                .zip(b.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(error < 0.04, "{label}: error {error}");
+        }
+    }
+}
+
+/// The per-token path partitions a row as long as its own block count; the
+/// batched path partitions a chunk-wide row whose later blocks are -inf, inside
+/// a `[t, blocks]` batch. With exact ties at the top-512 cut-off, all three
+/// must choose the same blocks.
+#[test]
+fn qsa_argpartition_ties_padded_rows() {
+    let topk = 512usize;
+    for n in [600usize, 8192] {
+        // Half exact zeros; the rest a few repeated positive values, so a tie
+        // group straddles the cut-off.
+        let row: Vec<f32> = (0..n)
+            .map(|i| {
+                if (i * 7919) % n < n / 2 {
+                    0.0
+                } else {
+                    ((i % 3) + 1) as f32 * 0.25
+                }
+            })
+            .collect();
+        let pick = |scores: &MxArray, width: usize| -> Vec<Vec<i32>> {
+            let picks = scores
+                .argpartition(-(topk as i32), Some(-1))
+                .unwrap()
+                .slice_axis(2, (width - topk) as i64, width as i64)
+                .unwrap()
+                .astype(crate::array::DType::Int32)
+                .unwrap()
+                .sort(Some(-1))
+                .unwrap()
+                .to_int32()
+                .unwrap()
+                .to_vec();
+            picks.chunks(topk).map(|c| c.to_vec()).collect()
+        };
+        let truncated = pick(&MxArray::from_float32(&row, &[1, 1, n as i64]).unwrap(), n);
+        let width = n + 389;
+        let mut padded = row.clone();
+        padded.resize(width, f32::NEG_INFINITY);
+        let padded_picks = pick(
+            &MxArray::from_float32(&padded, &[1, 1, width as i64]).unwrap(),
+            width,
+        );
+        assert_eq!(padded_picks, truncated, "n={n}: padded row");
+        let rows = 5;
+        let mut batch = Vec::with_capacity(rows * width);
+        for r in 0..rows {
+            if r == 2 {
+                batch.extend_from_slice(&padded);
+            } else {
+                batch.extend((0..width).map(|i| ((i * (r + 3)) % 17) as f32 * 0.5));
+            }
+        }
+        let batch_picks = pick(
+            &MxArray::from_float32(&batch, &[1, rows as i64, width as i64]).unwrap(),
+            width,
+        );
+        assert_eq!(batch_picks[2], truncated[0], "n={n}: batched row");
+        // The tie group really reaches the cut-off.
+        let threshold = truncated[0]
+            .iter()
+            .map(|&b| row[b as usize])
+            .fold(f32::INFINITY, f32::min);
+        let above = row.iter().filter(|&&s| s > threshold).count();
+        let tied = row.iter().filter(|&&s| s == threshold).count();
+        assert!(
+            above < topk && above + tied > topk,
+            "n={n}: no tie at the cut-off"
+        );
+    }
+}
+
+/// The bf16/paged mlx-vlm oracle (one token at a time) reached through
+/// `prefill_chunk` windows that end at every prompt position: one window, and
+/// a 5-token prefix then one window, so ends past the budget run the batched
+/// QSA path, flat and paged. The oracle comes from the safetensors layout; the
+/// GGUF layout is held to its own singleton decoder, which already differs
+/// from the oracle by up to ~0.09 with no window involved.
+#[test]
+fn bf16_paged_oracle_through_prefill_chunk() {
+    let path = fixture().join("bf16/paged");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("oracle.json")).unwrap()).unwrap();
+    let tokens: Vec<u32> = oracle["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    let open = |source: &std::path::Path| {
+        let store = weights::Store::open_fixture(source, None).unwrap();
+        let config = if store.gguf {
+            gguf::config(&store).unwrap()
+        } else {
+            config::Config::parse(&raw).unwrap()
+        };
+        decoder::Decoder::new(config, store).unwrap()
+    };
+    for source in [path.clone(), path.join("model.gguf")] {
+        let expected: Vec<Vec<f32>> = if source.is_dir() {
+            oracle["logits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_f64().unwrap() as f32)
+                        .collect()
+                })
+                .collect()
+        } else {
+            let mut singleton = open(&source);
+            tokens
+                .iter()
+                .map(|&t| singleton.step(t).unwrap().to_float32().unwrap().to_vec())
+                .collect()
+        };
+        assert_eq!(expected.len(), tokens.len());
+        for paged in [false, true] {
+            let mut model = open(&source);
+            let budget = model.config.indexer_budget;
+            assert!(budget < tokens.len());
+            if paged {
+                model.paged = Some(paged::create(&model.config).unwrap());
+            }
+            let mut seq = 0;
+            let mut maximum = 0f32;
+            for end in 1..=tokens.len() {
+                for split in [0, 5] {
+                    if split >= end && split > 0 {
+                        continue;
+                    }
+                    model.reset();
+                    if let Some(adapter) = &mut model.paged {
+                        adapter.release_request().unwrap();
+                        seq += 1;
+                        adapter.begin_request(seq).unwrap();
+                    }
+                    if split > 0 {
+                        model.prefill_chunk(&tokens[..split], None, false).unwrap();
+                    }
+                    let logits = model
+                        .prefill_chunk(&tokens[split..end], None, true)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap();
+                    let want = &expected[end - 1];
+                    assert_eq!(logits.len(), want.len());
+                    let error = logits
+                        .iter()
+                        .zip(want)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    maximum = maximum.max(error);
+                    assert!(
+                        error < 0.04,
+                        "{} paged={paged} split={split} end={end} (budget {budget}): error {error}",
+                        source.display()
+                    );
+                }
+            }
+            eprintln!(
+                "bf16/paged prefill_chunk {} paged={paged}: maximum error {maximum}",
+                source.display()
+            );
+        }
+    }
+}

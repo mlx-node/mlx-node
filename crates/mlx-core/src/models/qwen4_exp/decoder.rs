@@ -157,6 +157,10 @@ impl Decoder {
             cancelled: self.cancelled.clone(),
         }
     }
+    #[cfg(test)]
+    pub(super) fn index_keys(&self, layer: usize) -> Option<&MxArray> {
+        self.caches[layer].index_keys.as_ref()
+    }
     pub fn take_state(&mut self) -> DecoderState {
         let state = DecoderState {
             caches: std::mem::take(&mut self.caches),
