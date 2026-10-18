@@ -60,6 +60,39 @@ pub(crate) struct SchedulerCacheSnapshot {
     pub bytes_per_block: u64,
 }
 
+/// Per-sequence state a family keeps outside the paged pool (recurrent rows,
+/// draft snapshots): what it may hold at once and what it holds now.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScheduledStateCapacity {
+    pub budget: u64,
+    pub held: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduledStateFit {
+    Fits,
+    AfterReclaim,
+    Never,
+}
+
+/// A candidate above the whole budget must error, never defer: no reclaim
+/// can make room for it.
+fn scheduled_state_fit(
+    capacity: Option<ScheduledStateCapacity>,
+    candidate_bytes: u64,
+) -> ScheduledStateFit {
+    let Some(capacity) = capacity else {
+        return ScheduledStateFit::Fits;
+    };
+    if candidate_bytes > capacity.budget {
+        ScheduledStateFit::Never
+    } else if capacity.held.saturating_add(candidate_bytes) > capacity.budget {
+        ScheduledStateFit::AfterReclaim
+    } else {
+        ScheduledStateFit::Fits
+    }
+}
+
 /// Result of unified-memory reservation after reclaiming idle parked rows.
 #[derive(Debug)]
 enum MemoryReserveOutcome {
@@ -241,6 +274,21 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         Ok(())
     }
     fn scheduled_draft_state_bytes(&self, _total_tokens: u32) -> u64 {
+        0
+    }
+    /// A family whose recurrent rows and draft snapshots live outside the
+    /// paged pool budgets them here and charges nothing to the pool through
+    /// `recurrent_state_bytes` / `scheduled_draft_state_bytes`.
+    fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
+        None
+    }
+    /// Off-pool state this turn adds beside what the family already holds.
+    fn scheduled_state_candidate_bytes(
+        &self,
+        _seq_id: SeqId,
+        _total_tokens: u32,
+        _speculative: bool,
+    ) -> u64 {
         0
     }
     /// Return false when this prefix cannot seed complete draft state. The
@@ -703,6 +751,7 @@ struct PreparedTurn {
     reservation_blocks: u32,
     block_size: u32,
     reservation_state_bytes: u64,
+    requested_tokens: u32,
 }
 
 struct PreparedDecodeRow {
@@ -1983,6 +2032,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             newly_assigned,
             reservation_blocks,
             block_size,
+            requested_tokens,
         }))
     }
 
@@ -2085,15 +2135,34 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         seq_id: SeqId,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
+        state_candidate_bytes: u64,
         snapshot: SchedulerCacheSnapshot,
     ) -> Result<MemoryReserveOutcome> {
         self.try_reserve_reclaiming_idle_with(
             seq_id,
             reservation_blocks,
             candidate_state_bytes,
+            state_candidate_bytes,
             snapshot,
             B::release_scheduled_cache,
         )
+    }
+
+    fn scheduled_state_exceeded(&self, candidate_bytes: u64) -> Error {
+        let capacity = self
+            .inner
+            .scheduled_state_capacity()
+            .unwrap_or(ScheduledStateCapacity { budget: 0, held: 0 });
+        let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+        Error::from_reason(format!(
+            "{} working memory: this turn needs {:.0} MiB of recurrent and draft state beside \
+             {:.0} MiB already held, but only {:.0} MiB remain after the page pool and the \
+             prefill window; release idle cache owners or retry without enableMtp",
+            B::SCHEDULER_NAME,
+            mib(candidate_bytes),
+            mib(capacity.held),
+            mib(capacity.budget)
+        ))
     }
 
     /// Unified-memory admission decision against one cache snapshot.
@@ -2125,6 +2194,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         seq_id: SeqId,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
+        state_candidate_bytes: u64,
         mut snapshot: SchedulerCacheSnapshot,
         mut release_cache: F,
     ) -> Result<MemoryReserveOutcome>
@@ -2134,12 +2204,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         loop {
             let decision =
                 self.reserve_memory_decision(&snapshot, reservation_blocks, candidate_state_bytes);
-            if decision.admitted {
+            let state =
+                scheduled_state_fit(self.inner.scheduled_state_capacity(), state_candidate_bytes);
+            if state == ScheduledStateFit::Never {
+                return Err(self.scheduled_state_exceeded(state_candidate_bytes));
+            }
+            if decision.admitted && state == ScheduledStateFit::Fits {
                 return Ok(MemoryReserveOutcome::Admitted);
             }
             if !self.reclaim_one_idle_scheduled_with(seq_id, &mut release_cache)? {
                 if self.scheduler.has_live_turns() {
                     return Ok(MemoryReserveOutcome::Defer);
+                }
+                if state != ScheduledStateFit::Fits {
+                    return Err(self.scheduled_state_exceeded(state_candidate_bytes));
                 }
                 // No live turns: one pool grow may still make the
                 // reservation fit, so grow-and-retry once. The fit math
@@ -2278,10 +2356,19 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     &prepared.admitted.tokens,
                     reuse,
                 ));
+            let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
+                prepared.seq_id,
+                prepared.requested_tokens,
+                matches!(
+                    prepared.admitted.plan.decoder,
+                    engine::plan::DecoderPlan::Speculative(_)
+                ),
+            );
             match self.try_reserve_reclaiming_idle(
                 prepared.seq_id,
                 charge,
                 candidate_state_bytes,
+                state_candidate_bytes,
                 snapshot,
             ) {
                 Ok(MemoryReserveOutcome::Admitted) => {}
@@ -2314,6 +2401,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             reservation_blocks,
             block_size,
             reservation_state_bytes,
+            requested_tokens: _,
         } = *prepared;
         if cancelled.load(Ordering::Relaxed) {
             if newly_assigned {
@@ -2701,10 +2789,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             } else {
                 turn.block_reservation_total
             };
+            // Preemption released the row and the draft owner: the resume
+            // re-admits both, with the block reservation bounding the tokens.
+            let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
+                turn.seq_id,
+                turn.block_reservation_total.saturating_mul(turn.block_size),
+                turn.payload.scheduled_speculation.is_some(),
+            );
             match self.try_reserve_reclaiming_idle(
                 turn.seq_id,
                 charge,
                 turn.recurrent_state_bytes,
+                state_candidate_bytes,
                 snapshot,
             ) {
                 Ok(MemoryReserveOutcome::Admitted) => {}
@@ -3770,7 +3866,7 @@ mod tests {
         );
 
         let outcome = state
-            .try_reserve_reclaiming_idle(2, reservation_blocks, rec, snapshot)
+            .try_reserve_reclaiming_idle(2, reservation_blocks, rec, 0, snapshot)
             .expect("reserve after reclaim");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -3809,12 +3905,35 @@ mod tests {
             bytes_per_block: 4096,
         };
         let outcome = state
-            .try_reserve_reclaiming_idle(2, 10, 1, snapshot)
+            .try_reserve_reclaiming_idle(2, 10, 1, 0, snapshot)
             .expect("no snapshot refresh");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 100 }),
             "idle scheduler must hard-error, not spin in prepared_waiting: {outcome:?}"
         );
+    }
+
+    /// Off-pool state admission: a candidate above the whole budget errors
+    /// instead of deferring behind rows no reclaim can free enough of.
+    /// MUTATION: compare the candidate with `>=` in `scheduled_state_fit`; the
+    /// exact-budget row below reports `Never` and its assertion fails.
+    #[test]
+    fn scheduled_state_fit_orders_fits_reclaim_and_never() {
+        assert_eq!(scheduled_state_fit(None, u64::MAX), ScheduledStateFit::Fits);
+        let capacity = Some(ScheduledStateCapacity {
+            budget: 100,
+            held: 60,
+        });
+        assert_eq!(scheduled_state_fit(capacity, 40), ScheduledStateFit::Fits);
+        assert_eq!(
+            scheduled_state_fit(capacity, 41),
+            ScheduledStateFit::AfterReclaim
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 100),
+            ScheduledStateFit::AfterReclaim
+        );
+        assert_eq!(scheduled_state_fit(capacity, 101), ScheduledStateFit::Never);
     }
 
     #[test]
@@ -3903,7 +4022,7 @@ mod tests {
             bytes_per_block: 4096,
         };
         let error = state
-            .try_reserve_reclaiming_idle_with(2, 10, 1, snapshot, |_inner, victim| {
+            .try_reserve_reclaiming_idle_with(2, 10, 1, 0, snapshot, |_inner, victim| {
                 assert_eq!(victim, 1);
                 Err(Error::from_reason("injected cache release failure"))
             })
@@ -3937,7 +4056,7 @@ mod tests {
             0,
         ));
         let without_credit = state
-            .try_reserve_reclaiming_idle(2, reservation_blocks, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, reservation_blocks, 0, 0, snapshot)
             .expect("no snapshot refresh");
         assert!(
             matches!(
@@ -3949,7 +4068,7 @@ mod tests {
         let charge = reservation_blocks.saturating_sub(already_materialized);
         assert_eq!(charge, 10);
         let with_credit = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("no snapshot refresh");
         assert!(
             matches!(with_credit, MemoryReserveOutcome::Admitted),
@@ -4112,7 +4231,7 @@ mod tests {
             .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("grow + re-reserve");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -4145,7 +4264,7 @@ mod tests {
         let reservation_blocks = snapshot.blocks.free_blocks;
         let candidate_state_bytes = u64::from(snapshot.blocks.free_blocks) * bytes_per_block + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, reservation_blocks, candidate_state_bytes, snapshot)
+            .try_reserve_reclaiming_idle(2, reservation_blocks, candidate_state_bytes, 0, snapshot)
             .expect("grow + re-reserve");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -4182,7 +4301,7 @@ mod tests {
             })));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("declined grow keeps Reject");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
@@ -4218,7 +4337,7 @@ mod tests {
             })));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("partial grow + re-reserve");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -4248,7 +4367,7 @@ mod tests {
             .expect("paged adapter")
             .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
         let outcome = state
-            .try_reserve_reclaiming_idle(2, 17, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, 17, 0, 0, snapshot)
             .expect("above-max Reject");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
@@ -4578,7 +4697,7 @@ mod tests {
         };
         let mut unpin_calls = 0u32;
         let outcome = state
-            .try_reserve_reclaiming_idle_with(2, 10, 0, snapshot, |_inner, victim| {
+            .try_reserve_reclaiming_idle_with(2, 10, 0, 0, snapshot, |_inner, victim| {
                 unpin_calls += 1;
                 assert!(
                     unpin_calls <= 2,

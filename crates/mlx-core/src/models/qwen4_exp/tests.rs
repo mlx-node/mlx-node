@@ -261,7 +261,7 @@ fn ownerless_mtp_turn_errors_instead_of_decoding_autoregressive() {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum OwnerlessTurn {
+enum TurnKind {
     Start,
     Continue,
     ContinueTool,
@@ -269,12 +269,125 @@ enum OwnerlessTurn {
     StreamContinueTool,
 }
 
+/// The fixture's page pool is 16 blocks (128 KiB). A 120-token MTP start needs
+/// 4 blocks of pages but 115 KiB of recurrent row and draft state, which the
+/// pool must not be charged for: on the real model that charge refused every
+/// MTP prompt above ~7.5k tokens ("max pool holds 1365").
+/// MUTATION: charge draft state to the pool again (override
+/// `scheduled_draft_state_bytes` in qwen4's scheduler impl with
+/// `memory::draft_state_bytes`); the start is refused with "max pool holds 16"
+/// and the `unwrap` of the turn fails.
+#[test]
+fn mtp_turn_near_the_context_limit_is_admitted_against_pages_only() {
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, HybridSchedulerState, reservation_fits_empty_pool,
+    };
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let c = state.inner.decoder.config.clone();
+    let adapter = state.inner.decoder.paged.as_ref().unwrap();
+    let (blocks, bytes_per_block) = (adapter.block_capacity(), adapter.bytes_per_block().unwrap());
+    assert_eq!((blocks, bytes_per_block), (16, 8192));
+    let max_new_tokens = 120;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, max_new_tokens);
+    let pages = requested.div_ceil(adapter.block_size());
+    let state_bytes =
+        memory::row_state_bytes(&c) + memory::draft_state_bytes(&c, u64::from(requested));
+    assert!(reservation_fits_empty_pool(
+        pages,
+        blocks,
+        bytes_per_block,
+        0
+    ));
+    assert!(
+        !reservation_fits_empty_pool(pages, blocks, bytes_per_block, state_bytes),
+        "{state_bytes} B of row and draft state beside {pages} pages must overflow the pool, or this test proves nothing"
+    );
+    let capacity = state.inner.scheduled_state_capacity().unwrap();
+    assert!(capacity.held == 0 && state_bytes <= capacity.budget);
+    let (_, cycles) = drive_turn(
+        &mut state,
+        TurnKind::Start,
+        true,
+        max_new_tokens as i32,
+        Some("long"),
+    )
+    .unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    assert_eq!(state.owner_sequences.len(), 1);
+}
+
+/// Held off-pool state counts every parked or active row, each owner's draft
+/// K/V and the verify snapshots of an owner inside an MTP turn; a candidate
+/// that already owns a row or a draft frontier is charged only for what it
+/// adds.
+/// MUTATION: count only `rows` (drop the active row) in
+/// `scheduled_state_capacity`; the first `held == row` assertion fails.
+#[test]
+fn scheduled_state_accounting_counts_rows_and_tracked_drafts() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let mut inner = tiny_inner();
+    let c = inner.decoder.config.clone();
+    let row = memory::row_state_bytes(&c);
+    let kv = memory::draft_kv_bytes_per_token(&c);
+    assert!(row > 0 && kv > 0);
+    let held = |inner: &Inner| inner.scheduled_state_capacity().unwrap().held;
+    assert_eq!(held(&inner), 0);
+    assert_eq!(inner.scheduled_state_candidate_bytes(1, 100, false), row);
+    assert_eq!(
+        inner.scheduled_state_candidate_bytes(1, 100, true),
+        row + memory::draft_state_bytes(&c, 100)
+    );
+    inner.activate_paged_seq(1).unwrap();
+    assert_eq!(held(&inner), row);
+    assert_eq!(inner.scheduled_state_candidate_bytes(1, 100, false), 0);
+    assert_eq!(inner.scheduled_state_candidate_bytes(2, 100, false), row);
+    inner.begin_mtp(1, 0).unwrap();
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8];
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    let frontier = prompt.len() as u64;
+    assert_eq!(held(&inner), row + memory::draft_state_bytes(&c, frontier));
+    assert_eq!(
+        inner.scheduled_state_candidate_bytes(1, 100, true),
+        memory::draft_state_bytes(&c, 100 - frontier)
+    );
+    inner.release_scheduled_speculation(1);
+    assert_eq!(held(&inner), row + frontier * kv);
+    inner.park_active_scheduled_recurrent().unwrap();
+    assert_eq!(held(&inner), row + frontier * kv);
+    inner.activate_paged_seq(2).unwrap();
+    assert_eq!(held(&inner), 2 * row + frontier * kv);
+    inner.release_scheduled_recurrent_for(1);
+    assert_eq!(held(&inner), row);
+}
+
 /// Drives one turn without a `cacheOwnerId` through the scheduler and returns
 /// its text and MTP cycle count.
 fn drive_ownerless_turn(
     state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Inner>,
-    kind: OwnerlessTurn,
+    kind: TurnKind,
     enable_mtp: bool,
+) -> Result<(String, Option<u32>)> {
+    drive_turn(state, kind, enable_mtp, 8, None)
+}
+
+/// Drives one turn through the scheduler and returns its text and MTP cycle
+/// count.
+fn drive_turn(
+    state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Inner>,
+    kind: TurnKind,
+    enable_mtp: bool,
+    max_new_tokens: i32,
+    cache_owner_id: Option<&str>,
 ) -> Result<(String, Option<u32>)> {
     use crate::engine::cmd::ChatCmd;
     use crate::engine::model_command::ModelCommand;
@@ -283,52 +396,53 @@ fn drive_ownerless_turn(
         serde_json::from_value(serde_json::json!({"role": role, "content": "a"})).unwrap()
     };
     let messages = match kind {
-        OwnerlessTurn::Start => vec![message("user")],
-        OwnerlessTurn::Continue | OwnerlessTurn::StreamContinue => {
+        TurnKind::Start => vec![message("user")],
+        TurnKind::Continue | TurnKind::StreamContinue => {
             vec![message("user"), message("assistant"), message("user")]
         }
-        OwnerlessTurn::ContinueTool | OwnerlessTurn::StreamContinueTool => {
+        TurnKind::ContinueTool | TurnKind::StreamContinueTool => {
             vec![message("user"), message("assistant"), message("tool")]
         }
     };
     let config = crate::engine::types::ChatConfig {
-        max_new_tokens: Some(8),
+        max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         enable_mtp: Some(enable_mtp),
         mtp_depth: Some(2),
         mtp_adaptive_depth: Some(false),
         report_performance: Some(true),
+        cache_owner_id: cache_owner_id.map(str::to_owned),
         ..Default::default()
     };
     let cancelled = Arc::new(AtomicBool::new(false));
     let (reply, mut rx) = tokio::sync::oneshot::channel();
     let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(256);
     let command = match kind {
-        OwnerlessTurn::Start => ChatCmd::SessionStart {
+        TurnKind::Start => ChatCmd::SessionStart {
             messages,
             config,
             reply,
             cancelled,
         },
-        OwnerlessTurn::Continue => ChatCmd::SessionContinue {
+        TurnKind::Continue => ChatCmd::SessionContinue {
             messages,
             config,
             reply,
             cancelled,
         },
-        OwnerlessTurn::ContinueTool => ChatCmd::SessionContinueTool {
+        TurnKind::ContinueTool => ChatCmd::SessionContinueTool {
             messages,
             config,
             reply,
             cancelled,
         },
-        OwnerlessTurn::StreamContinue => ChatCmd::StreamSessionContinue {
+        TurnKind::StreamContinue => ChatCmd::StreamSessionContinue {
             messages,
             config,
             stream_tx,
             cancelled,
         },
-        OwnerlessTurn::StreamContinueTool => ChatCmd::StreamSessionContinueTool {
+        TurnKind::StreamContinueTool => ChatCmd::StreamSessionContinueTool {
             messages,
             config,
             stream_tx,
@@ -370,21 +484,21 @@ fn drive_ownerless_turn(
 fn ownerless_mtp_turn_runs_on_the_scheduler_as_the_ownerless_session() {
     use crate::engine::hybrid_scheduler::HybridSchedulerState;
     let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
-    let (text, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, true).unwrap();
+    let (text, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, true).unwrap();
     assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
     assert_eq!(state.owner_sequences.len(), 1);
     let seq = state.owner_sequences[""];
-    let (plain, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, false).unwrap();
+    let (plain, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, false).unwrap();
     assert_eq!(cycles, None);
     assert_eq!(plain, text);
-    let (again, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, true).unwrap();
+    let (again, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, true).unwrap();
     assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
     assert_eq!(again, text);
     for kind in [
-        OwnerlessTurn::Continue,
-        OwnerlessTurn::StreamContinue,
-        OwnerlessTurn::ContinueTool,
-        OwnerlessTurn::StreamContinueTool,
+        TurnKind::Continue,
+        TurnKind::StreamContinue,
+        TurnKind::ContinueTool,
+        TurnKind::StreamContinueTool,
     ] {
         let (_, cycles) = drive_ownerless_turn(&mut state, kind, true)
             .unwrap_or_else(|error| panic!("{kind:?}: {}", error.reason));
@@ -437,14 +551,14 @@ fn forced_serial_refuses_ownerless_mtp_and_names_the_switch() {
         let reason = result.expect_err("ownerless MTP must not decode").reason;
         assert!(reason.contains("MLX_SERVE_FORCE_SERIAL"), "{reason}");
     };
-    refused(drive_ownerless_turn(&mut state, OwnerlessTurn::Start, true));
-    let (_, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, false).unwrap();
+    refused(drive_ownerless_turn(&mut state, TurnKind::Start, true));
+    let (_, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, false).unwrap();
     assert_eq!(cycles, None);
     for kind in [
-        OwnerlessTurn::Continue,
-        OwnerlessTurn::StreamContinue,
-        OwnerlessTurn::ContinueTool,
-        OwnerlessTurn::StreamContinueTool,
+        TurnKind::Continue,
+        TurnKind::StreamContinue,
+        TurnKind::ContinueTool,
+        TurnKind::StreamContinueTool,
     ] {
         refused(drive_ownerless_turn(&mut state, kind, true));
     }
