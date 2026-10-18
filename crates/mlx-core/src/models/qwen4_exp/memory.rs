@@ -1363,6 +1363,8 @@ fn runtime_slices_cannot_exceed_bootstrap_admission() {
 /// pool and the 1024-token prefill window, two do not, four AR rows do.
 /// MUTATION: stop subtracting `prefill_scratch` in `scheduled_state_budget`;
 /// two 32k MTP owners then fit and the `2 * mtp_32k > budget` assertion fails.
+/// MUTATION: drop the four verify snapshots from `draft_state_bytes`; the 16k
+/// pair then fits and the `2 * row + 2 * draft_16k > budget` assertion fails.
 #[test]
 fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
     let c = super::config::Config::parse(&serde_json::json!({
@@ -1429,4 +1431,18 @@ fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
         2 * mtp_32k
     );
     assert!(4 * row <= budget, "four AR rows must fit");
+    // Two 16k MTP owners queued in one drain pass: the page pool admits both,
+    // and the second owner sees two rows plus its own draft, which fits. Only
+    // the first owner's draft reservation, not materialized before its first
+    // prefill chunk, makes the second defer.
+    let draft_16k = draft_state_bytes(&c, 18_754 + 255);
+    let blocks_16k = (18_754u64 + 255).div_ceil(32);
+    assert_eq!(blocks_16k, 595);
+    assert!(2 * blocks_16k <= blocks);
+    assert!(2 * row + draft_16k <= budget);
+    assert!(
+        2 * row + 2 * draft_16k > budget,
+        "two 16k MTP owners ({} B) must not both pass admission against the {budget} B budget",
+        2 * row + 2 * draft_16k
+    );
 }

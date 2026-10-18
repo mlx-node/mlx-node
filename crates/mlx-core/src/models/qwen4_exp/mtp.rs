@@ -43,19 +43,24 @@ impl State {
     pub fn owner_frontier(&self, seq: u32) -> Option<usize> {
         self.owners.get(&seq).map(|owner| owner.frontier)
     }
-    /// Draft K/V every owner holds, plus the verify snapshots of an owner
-    /// inside an MTP turn.
+    /// Draft K/V an owner holds, plus its verify snapshots inside an MTP turn.
+    fn owner_bytes(c: &super::config::Config, owner: &Owner) -> u64 {
+        if owner.tracking {
+            super::memory::draft_state_bytes(c, owner.frontier as u64)
+        } else {
+            owner.frontier as u64 * super::memory::draft_kv_bytes_per_token(c)
+        }
+    }
     pub fn held_bytes(&self, c: &super::config::Config) -> u64 {
         self.owners
             .values()
-            .map(|owner| {
-                if owner.tracking {
-                    super::memory::draft_state_bytes(c, owner.frontier as u64)
-                } else {
-                    owner.frontier as u64 * super::memory::draft_kv_bytes_per_token(c)
-                }
-            })
+            .map(|owner| Self::owner_bytes(c, owner))
             .sum()
+    }
+    pub fn owner_held_bytes(&self, c: &super::config::Config, seq: u32) -> u64 {
+        self.owners
+            .get(&seq)
+            .map_or(0, |owner| Self::owner_bytes(c, owner))
     }
     pub fn finish(&mut self, seq: u32, frontier: Option<usize>) {
         self.pending.remove(&seq);

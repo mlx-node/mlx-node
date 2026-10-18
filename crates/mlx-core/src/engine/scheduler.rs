@@ -70,7 +70,14 @@ pub(crate) struct TurnState<P> {
     /// Constant-size recurrent/sliding state charged in the same byte budget
     /// as future paged-block growth. Zero means this row has no hybrid state.
     pub recurrent_state_bytes: u64,
+    /// Preemption drops both state charges (`recurrent_state_bytes` and
+    /// `scheduled_state_bytes`) until resume preparation succeeds.
     pub recurrent_state_reservation_active: bool,
+    /// Off-pool state (recurrent row, draft snapshots and K/V) this turn's
+    /// sequence holds once fully materialized. Admission charges the part the
+    /// family does not hold yet, so a queued MTP turn keeps its draft
+    /// reservation until its owner exists.
+    pub scheduled_state_bytes: u64,
     pub preemptions: u32,
     pub payload: P,
     arrival_order: u64,
@@ -189,6 +196,7 @@ impl<P> TurnState<P> {
             block_reservation_active: true,
             recurrent_state_bytes: 0,
             recurrent_state_reservation_active: true,
+            scheduled_state_bytes: 0,
             preemptions: 0,
             payload,
             arrival_order: 0,
@@ -248,6 +256,11 @@ impl<P> TurnState<P> {
         self
     }
 
+    pub fn with_scheduled_state_reservation(mut self, bytes: u64) -> Self {
+        self.scheduled_state_bytes = bytes;
+        self
+    }
+
     fn unallocated_reserved_blocks(&self) -> u32 {
         if !self.block_reservation_active
             || self.block_reservation_total == 0
@@ -262,6 +275,14 @@ impl<P> TurnState<P> {
     fn reserved_recurrent_state_bytes(&self) -> u64 {
         if self.recurrent_state_reservation_active {
             self.recurrent_state_bytes
+        } else {
+            0
+        }
+    }
+
+    fn outstanding_scheduled_state_bytes(&self, held: u64) -> u64 {
+        if self.recurrent_state_reservation_active {
+            self.scheduled_state_bytes.saturating_sub(held)
         } else {
             0
         }
@@ -718,6 +739,17 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .chain(self.running.iter())
             .fold(0u64, |sum, turn| {
                 sum.saturating_add(turn.reserved_recurrent_state_bytes())
+            })
+    }
+
+    /// Off-pool state the waiting and running turns reserved beyond what
+    /// their sequences hold now (`held`).
+    pub fn outstanding_scheduled_state_bytes(&self, held: impl Fn(SeqId) -> u64) -> u64 {
+        self.waiting
+            .iter()
+            .chain(self.running.iter())
+            .fold(0u64, |sum, turn| {
+                sum.saturating_add(turn.outstanding_scheduled_state_bytes(held(turn.seq_id)))
             })
     }
 
@@ -1617,6 +1649,28 @@ mod tests {
             SchedulerAction::Stepped { .. }
         ));
         assert!(scheduler.has_pending_control());
+    }
+
+    /// MUTATION: drop the `recurrent_state_reservation_active` gate in
+    /// `TurnState::outstanding_scheduled_state_bytes`; the preempted row keeps
+    /// reporting 70 and the `0` assertion fails.
+    #[test]
+    fn outstanding_scheduled_state_skips_preempted_rows_and_held_state() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 4).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None).with_scheduled_state_reservation(100))
+            .expect("enqueue 1");
+        scheduler
+            .enqueue_turn(turn(2, 0, &[4], None).with_scheduled_state_reservation(50))
+            .expect("enqueue 2");
+        let held = |seq_id: SeqId| if seq_id == 1 { 30 } else { 80 };
+        assert_eq!(scheduler.outstanding_scheduled_state_bytes(held), 70);
+        let victim = scheduler.take_waiting(1).expect("take victim");
+        scheduler.prepend_preempted(victim);
+        assert_eq!(scheduler.outstanding_scheduled_state_bytes(held), 0);
+        let victim = scheduler.take_preempted().expect("resume victim");
+        scheduler.ready_preempted(victim, false);
+        assert_eq!(scheduler.outstanding_scheduled_state_bytes(held), 70);
     }
 
     #[test]
