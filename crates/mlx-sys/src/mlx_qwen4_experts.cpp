@@ -116,54 +116,57 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
   const int experts = a[3].shape(0) / 640;
   const int gate_bits = a[3].shape(1) * 32 / 2560;
   const int down_bits = a[9].shape(1) * 32 / 640;
-  // Threadgroup z = row * 11 + slot: a row's ten routed assignments, then its
-  // shared expert. Shared hidden rows follow the 10 * ROWS routed rows.
+  // Threadgroup z < 10 * ROWS is the routed assignment row * 10 + slot; the
+  // last z serves the shared expert. A threadgroup holds 2 * ROWS simdgroups,
+  // one per (output half, activation row). Shared hidden rows follow the
+  // 10 * ROWS routed rows.
   static auto gu = mlx::core::fast::metal_kernel(
       "qwen4_routed_shared_gu",
       {"x", "ids", "wg", "sg", "bg", "wu", "su", "bu", "swg", "ssg", "sbg",
        "swu", "ssu", "sbu", "sigmoid_table"},
       {"out"}, R"(
-    const uint row = threadgroup_position_in_grid.z / 11;
-    const uint slot = threadgroup_position_in_grid.z % 11;
-    if (slot < 10) {
-      quantized_expert_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
-        row * 10 + slot,threadgroup_position_in_grid.y,
-        simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+    const uint z = threadgroup_position_in_grid.z;
+    const uint simd = simdgroup_index_in_threadgroup;
+    if (z < 10 * ROWS) {
+      routed_gu_rows<T,BITS,2560,640,E,10,ROWS,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
+        z,threadgroup_position_in_grid.y,simd,thread_index_in_simdgroup);
     } else {
+      const uint row = simd % ROWS;
       q4_shared_gu<T,LANES>(x + row * 2560,swg,ssg,sbg,swu,ssu,sbu,sigmoid_table,
         out + (10 * ROWS + row) * 640,
-        threadgroup_position_in_grid.y,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+        threadgroup_position_in_grid.y * 8 + (simd / ROWS) * 4,thread_index_in_simdgroup);
     }
   )",
       shared_expert_header());
   auto hidden =
       gu({a[0], a[1], a[3], a[4], a[5], a[6], a[7], a[8], a[12], a[13], a[14],
           a[15], a[16], a[17], a[22]},
-         {{11 * rows, 1, 640}}, {mlx::core::float32}, {32, 160, 11 * rows},
-         {32, 2, 1},
+         {{11 * rows, 1, 640}}, {mlx::core::float32},
+         {32, 160 * rows, 10 * rows + 1}, {32, 2 * rows, 1},
          {{"T", mlx::core::bfloat16},
           {"BITS", gate_bits},
           {"E", experts},
           {"LANES", LANES},
           {"ROWS", rows}},
          std::nullopt, false, mlx::core::Device::gpu)[0];
+  // One threadgroup per RPS-column output tile serves every row with
+  // 6 * ROWS simdgroups, one per (role, activation row).
   static auto down = mlx::core::fast::metal_kernel(
       "qwen4_routed_shared_down",
       {"x", "ids", "scores", "w", "scales", "biases", "sw", "ss", "sb", "gate",
        "sigmoid_table"},
       {"out"}, R"(
-    threadgroup P products[10*RPS];
-    threadgroup T shared_products[RPS];
-    const uint row = threadgroup_position_in_grid.z;
-    q4_down_combine_shared<T,P,BITS,2560,640,E,10,RPS,5,STAGE>(
-      x,x + (10 * ROWS + row) * 640,ids,scores,w,scales,biases,sw,ss,sb,gate[row],sigmoid_table,out,products,shared_products,
-      row,threadgroup_position_in_grid.y,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+    threadgroup P products[10*RPS*ROWS];
+    threadgroup T shared_products[RPS*ROWS];
+    q4_down_combine_shared<T,P,BITS,2560,640,E,10,RPS,5,ROWS,STAGE>(
+      x,ids,scores,w,scales,biases,sw,ss,sb,gate,sigmoid_table,out,products,shared_products,
+      threadgroup_position_in_grid.y,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
       shared_expert_header());
   return down({hidden, a[1], a[2], a[9], a[10], a[11], a[18], a[19], a[20],
                a[21], a[22]},
               {{1, rows, 2560}}, {mlx::core::bfloat16},
-              {32, (2560 / RPS) * 6, rows}, {32, 6, 1},
+              {32, (2560 / RPS) * 6 * rows, 1}, {32, 6 * rows, 1},
               {{"T", mlx::core::bfloat16},
                {"P", a[2].dtype()},
                {"RPS", RPS},
