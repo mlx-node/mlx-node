@@ -38,7 +38,6 @@ qwen4_dense_prefill_graph(const std::vector<array> &a) {
                  {"T", mlx::core::bfloat16},
                  {"K", k},
                  {"N", n},
-                 {"R", rows},
                  {"GS", 32},
                  {"BITS", 8}},
                 std::nullopt, false,
@@ -93,9 +92,6 @@ qwen4_indirect_prefill_graph(const std::vector<array> &a) {
       {x, ids, rows, table, w[0], w[1], w[2], w[3], w[4], w[5]}, {{r, 1, m}},
       {x.dtype()}, {32 * (m / 64), 4 * table.shape(0), 1}, {32, 4, 1},
       {{"T", x.dtype()},
-       {"S", x.shape(0)},
-       {"R", r},
-       {"E", experts},
        {"N", m},
        {"K", h},
        {"BITS", gb},
@@ -112,8 +108,6 @@ qwen4_indirect_prefill_graph(const std::vector<array> &a) {
       down({activated, ids, table, w[6], w[7], w[8]}, {{r, 1, h}}, {x.dtype()},
            {32 * (h / 128), 4 * table.shape(0), 1}, {32, 4, 1},
            {{"T", x.dtype()},
-            {"R", r},
-            {"E", experts},
             {"N", h},
             {"K", m},
             {"BITS", db},
@@ -255,6 +249,7 @@ mlx_array *mlx_qwen4_sorted_combine(mlx_array *values, mlx_array *scores,
     auto product_type = mlx::core::promote_types(v.dtype(), s.dtype());
     static auto kernel = mlx::core::fast::metal_kernel(
         "qwen4_sorted_combine", {"values", "scores", "inverse"}, {"out"}, R"(
+      const int ROWS=values_shape[0], TOKENS=ROWS/TOP;
       uint i=thread_position_in_grid.x;
       if (i>=TOKENS*H) return;
       uint token=i/H, col=i%H;
@@ -273,15 +268,10 @@ mlx_array *mlx_qwen4_sorted_combine(mlx_array *values, mlx_array *scores,
       for (int lane=1; lane<LANES; ++lane) total=P(totals[lane]+total);
       out[i]=total;
     )");
-    auto result = kernel({v, s, order}, {{1, tokens, h}}, {product_type},
-                         {tokens * h, 1, 1}, {256, 1, 1},
-                         {{"P", product_type},
-                          {"TOKENS", tokens},
-                          {"H", h},
-                          {"ROWS", rows},
-                          {"TOP", top}},
-                         std::nullopt, false,
-                         mlx::core::default_stream(mlx::core::Device::gpu));
+    auto result = kernel(
+        {v, s, order}, {{1, tokens, h}}, {product_type}, {tokens * h, 1, 1},
+        {256, 1, 1}, {{"P", product_type}, {"H", h}, {"TOP", top}},
+        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
     return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 sorted combine: " << e.what() << std::endl;
@@ -308,6 +298,7 @@ static mlx_array *expert_tiles_impl(mlx_array *ids, int experts,
     static auto kernel = mlx::core::fast::metal_kernel("qwen4_expert_tiles",
                                                        {"ids"}, {"tiles"}, R"(
       threadgroup uint starts[E], ends[E], prefix[E], scratch[E];
+      const int R = ids_shape[0], NT = (R + BM - 1) / BM + E;
       uint lane = thread_index_in_threadgroup;
       for (uint e = lane; e < E; e += 256) {
         uint lo = 0, hi = R;
@@ -333,10 +324,10 @@ static mlx_array *expert_tiles_impl(mlx_array *ids, int experts,
         tiles[2*tile] = 0; tiles[2*tile+1] = 0;
       }
     )");
-    auto result = kernel(
-        {selected}, {{count, 2}}, {mlx::core::uint32}, {256, 1, 1}, {256, 1, 1},
-        {{"R", rows}, {"E", experts}, {"NT", count}, {"BM", tile_rows}},
-        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+    auto result =
+        kernel({selected}, {{count, 2}}, {mlx::core::uint32}, {256, 1, 1},
+               {256, 1, 1}, {{"E", experts}, {"BM", tile_rows}}, std::nullopt,
+               false, mlx::core::default_stream(mlx::core::Device::gpu));
     return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 expert tiles: " << e.what() << std::endl;
@@ -417,7 +408,6 @@ mlx_array *mlx_qwen4_expert_prefill(mlx_array *x, mlx_array *ids,
          {"K", k},
          {"N", n},
          {"E", experts},
-         {"R", rows},
          {"GS", group},
          {"BITS", bits},
          {"AFFINE", affine},

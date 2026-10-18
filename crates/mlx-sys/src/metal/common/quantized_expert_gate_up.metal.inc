@@ -3,6 +3,9 @@ R"metal(
 // Preserve the K-quant decoder and ascending K accumulation. Original token
 // rows feed both projections; only the BF16-rounded SwiGLU result is stored.
 constexpr int BM=32, BN=64, BK=64, PAD=72;
+// Group and window sizes are run-time values; as template constants every
+// group size compiled its own Metal library.
+const int R=ids_shape[0], S=x_shape[0], E=tiles_shape[0]-(R+31)/32;
 uint tile=threadgroup_position_in_grid.y;
 uint begin=tiles[2*tile], end=tiles[2*tile+1];
 if (begin>=end || end>R) return;

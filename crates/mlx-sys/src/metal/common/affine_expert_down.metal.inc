@@ -3,6 +3,7 @@ R"metal(
 // Mixed affine5/8 storage: decode FP16 companions directly into FP32 tiles.
 // Retain TF32 operands, FP32 accumulation and the final BF16 store.
 constexpr int BM=32, BN=128, BK=32, PAD=32+16/sizeof(C);
+const int R=ids_shape[0], E=tiles_shape[0]-(R+31)/32;
 uint tile=threadgroup_position_in_grid.y;
 uint begin=tiles[2*tile], end=tiles[2*tile+1];
 if(begin>=end || end>R) return;

@@ -1156,6 +1156,7 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
         mlx::core::fast::metal_kernel("qwen4_route_scatter", {"ids", "counts"},
                                       {"order", "inverse", "sorted_ids"}, R"(
       threadgroup uint tile[256], prefix[E], scratch[E], earlier[E];
+      const int R = ids_shape[0], NB = (R + 255) / 256;
       uint lane = thread_position_in_threadgroup.x, block = threadgroup_position_in_grid.x;
       uint row = block * 256 + lane;
       tile[lane] = row < R ? ids[row] : E;
@@ -1185,7 +1186,6 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
         count({input}, {{blocks * experts}}, {mlx::core::uint32},
               {blocks * 256, 1, 1}, {256, 1, 1},
               {{"E", experts},
-               {"R", rows},
                {"BALLOT", experts > 256 && experts <= 512 &&
                               (!qwen4_env("MLX_QWEN4_BALLOT_ROUTE_SORT") ||
                                std::string(qwen4_env(
@@ -1194,9 +1194,8 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
     auto result =
         scatter({input, counts[0]}, {{rows}, {rows}, {rows}},
                 {mlx::core::uint32, mlx::core::uint32, mlx::core::uint32},
-                {blocks * 256, 1, 1}, {256, 1, 1},
-                {{"E", experts}, {"R", rows}, {"NB", blocks}}, std::nullopt,
-                false, stream);
+                {blocks * 256, 1, 1}, {256, 1, 1}, {{"E", experts}},
+                std::nullopt, false, stream);
     *order = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
     *inverse = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
     *sorted_ids =

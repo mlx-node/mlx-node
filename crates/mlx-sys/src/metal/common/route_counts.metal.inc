@@ -31,6 +31,7 @@ this harness downloads and benchmarks are third-party works — see
 THIRD_PARTY_NOTICES.md for their licenses and attribution.
 */
 R"metal(
+const int R = ids_shape[0];
 const uint tid = thread_position_in_threadgroup.x;
 const uint block = threadgroup_position_in_grid.x;
 const uint row = block * 256 + tid;

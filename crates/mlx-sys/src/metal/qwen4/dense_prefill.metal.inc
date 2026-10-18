@@ -7,6 +7,9 @@ R"metal(
 // Widen inside the kernel; retain the existing NAX FP32 accumulation.
 // Dispatch excludes shapes using split-K or vector arithmetic.
 constexpr int BM=M_TILE, TM=BM/2, BN=64, BK=64, PAD=64+16/sizeof(C);
+// Window rows are a run-time value, so one library serves every window size.
+int R=1;
+for (int a=0; a+1<x_ndim; ++a) R*=x_shape[a];
 uint tile=threadgroup_position_in_grid.y;
 uint begin=tile*BM, end=min(begin+BM,uint(R));
 if (begin>=end || end>R) return;

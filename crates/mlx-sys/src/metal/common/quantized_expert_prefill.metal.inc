@@ -2,6 +2,7 @@ R"metal(
 // The vendored K-quant block loader and NAX arithmetic remain unchanged.
 // Only row scheduling changes: every 64-row span belongs to one expert.
 constexpr int BM=64, BN=64, BK=64, PAD=64+16/sizeof(C);
+const int R=ids_shape[0];
 uint tile=threadgroup_position_in_grid.y;
 uint begin=tiles[2*tile], end=tiles[2*tile+1];
 if (begin>=end || end>R) return;
