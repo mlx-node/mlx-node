@@ -516,6 +516,9 @@ pub struct Store {
     bank_bytes: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
+    mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
+    /// Start of the last forward pass in mapped mode (bank re-wire gate).
+    mapped_pass_start: Option<std::time::Instant>,
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
@@ -551,6 +554,11 @@ impl Store {
         // reserve. Payload admission and the growth check in read() remain live.
         #[cfg(test)]
         if self.fixture {
+            return Ok(());
+        }
+        // Mapped experts are clean page cache the OS reclaims itself; a turn
+        // grows no anonymous weight memory, so there is no reserve to defend.
+        if self.plan.mapped {
             return Ok(());
         }
         check()
@@ -610,11 +618,15 @@ impl Store {
                 resident_expert_layers: 0,
                 partial_expert_slots: 0,
                 mapped_pack_files: 0,
+                mapped: false,
+                mapped_bytes: 0,
             },
             banks: HashMap::new(),
             bank_bytes: 0,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
+            mapped_experts: HashMap::new(),
+            mapped_pass_start: None,
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
@@ -1150,12 +1162,15 @@ impl Store {
         // briefly under the same safety limit before refusing.
         super::memory::check_active_memory_budget(
             cache_limit,
-            crate::array::memory::get_active_memory,
+            || {
+                crate::array::memory::get_active_memory()
+                    - crate::array::mapped_array_bytes() as f64
+            },
             crate::array::memory::clear_cache,
             std::thread::sleep,
         )?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
-        if cfg!(target_os = "macos") && self.growth_bytes >= 256 << 20 {
+        if cfg!(target_os = "macos") && !self.plan.mapped && self.growth_bytes >= 256 << 20 {
             super::memory::check_growth_headroom()?;
             self.growth_bytes = 0;
         }
@@ -2200,5 +2215,267 @@ mod mapped_tests {
             super::routed_expert_tensor("nextn.0.ffn_gate_exps.weight"),
             None
         );
+    }
+
+    /// Mapped mode on the fixture pack: identity routing, capacity == experts,
+    /// never a miss or an upload, bank bytes and kernel reads identical to
+    /// The bank touch runs for the first pass and after a gap longer than the
+    /// driver's unwire delay, never inside a pass sequence and never in slot mode.
+    #[test]
+    fn mapped_banks_are_rewired_after_a_gap_and_not_within_a_pass() {
+        use std::time::{Duration, Instant};
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let t0 = Instant::now();
+        assert!(
+            !store.wire_mapped_banks_at(t0).unwrap(),
+            "slot mode never touches"
+        );
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store.plan.policy = "auto".into();
+        store
+            .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        assert!(
+            store.wire_mapped_banks_at(t0).unwrap(),
+            "first pass touches"
+        );
+        assert!(
+            !store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(100))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(800))
+                .unwrap()
+        );
+        assert!(
+            store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1800))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1850))
+                .unwrap()
+        );
+    }
+
+    /// the chunk-built banks, leases inert, out-of-range ids refused.
+    #[test]
+    fn mapped_residency_addresses_every_expert_in_place_without_misses() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let dir = temp.0.join("mapped");
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        assert_eq!(store.plan.mapped_pack_files, 3);
+        // Oracle banks: every expert through the ordinary reader, in id order.
+        let oracle: Vec<Arc<Weight>> = PARTS
+            .iter()
+            .map(|(name, rows, ..)| {
+                let chunks: Vec<_> = (0..EXPERTS)
+                    .map(|e| store.read(name, e * *rows, *rows).unwrap())
+                    .collect();
+                Arc::new(Weight::concatenate_rows(&chunks).unwrap())
+            })
+            .collect();
+        store.evict_to(0).unwrap();
+        let expected_bytes: u64 = PARTS
+            .iter()
+            .map(|(name, ..)| {
+                let h = &store.mapped.as_ref().unwrap().file(name).unwrap().header;
+                h.sections.iter().map(|s| s.length).sum::<u64>()
+            })
+            .sum();
+        let before = store.cache_bytes;
+        store.plan.policy = "auto".into();
+        store
+            .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, dense, aux| {
+                // The fixture holds routed experts only.
+                assert_eq!((dense, aux), (0, 0));
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        assert_eq!(store.plan.mapped_bytes, expected_bytes);
+        assert_eq!(store.plan.partial_expert_slots, EXPERTS);
+        assert_eq!(store.cache_limit, 1 << 30);
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
+        assert!(store.device_slots_ready(1) && store.prefill_device_slots_ready(1));
+        assert!(!store.device_slots_ready(2));
+        assert_eq!(store.cache_bytes, before, "mapped banks are not anonymous");
+        assert_eq!(store.slot_bytes, 0);
+
+        let ids = [4u32, 0, 2, 2, 1, 3];
+        let (banks, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_eq!(local, ids, "slot id must be the expert id");
+        assert_eq!(capacity, EXPERTS);
+        let device = MxArray::from_uint32(&ids, &[2, 3]).unwrap();
+        let (_, device_local) = store.device_expert_slots(0, &device).unwrap().unwrap();
+        assert_eq!(&*device_local.to_uint32().unwrap(), &ids);
+        let (_, safe, count) = store.prefill_device_expert_slots(0, &device).unwrap();
+        assert_eq!(&*safe.to_uint32().unwrap(), &ids);
+        assert_eq!(count, EXPERTS);
+        for round in 0..3 {
+            assert!(
+                store.commit_device_routes(&[0, 0, 0], &ids, 2).unwrap(),
+                "round {round}"
+            );
+        }
+        assert_eq!(store.slot_misses, 0);
+        assert_eq!(store.slot_upload_bytes, 0);
+        // 5 unique ids in the window, then 2 + 1 + 2 unique per committed tape.
+        assert_eq!(store.slot_hits, 5 + 3 * 5);
+        assert!(store.slots.is_empty(), "the slot machinery stays unused");
+
+        // The mapped banks are the pack's bytes: the same arrays the chunk
+        // reader builds, byte for byte, with the same quantization geometry.
+        for (part, (name, rows, ..)) in PARTS.iter().enumerate() {
+            let bank = &banks[part];
+            assert!(!bank.values.storage_ptr().is_null(), "{name} is not mapped");
+            assert_eq!(
+                encoded(bank),
+                encoded(&oracle[part]),
+                "{name}: mapped bank differs from the chunk-built bank"
+            );
+            for e in [0usize, 2, 4] {
+                assert_eq!(
+                    encoded(&bank.slice_rows(e * rows, *rows).unwrap()),
+                    encoded(&store.read(name, e * rows, *rows).unwrap()),
+                    "{name} expert {e}"
+                );
+            }
+        }
+        // A kernel reading the mapped buffers equals the same kernel on the
+        // anonymous copy of the same bytes.
+        let x = MxArray::from_float32(
+            &(0..6 * 256)
+                .map(|n| ((n % 97) as f32 - 48.) / 64.)
+                .collect::<Vec<_>>(),
+            &[6, 1, 256],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let selected = MxArray::from_uint32(&ids, &[6]).unwrap();
+        let mapped_out = banks[0].gather_rows(&x, &selected, EXPERTS, false).unwrap();
+        let anonymous_out = oracle[0]
+            .gather_rows(&x, &selected, EXPERTS, false)
+            .unwrap();
+        // Bit patterns: the pseudo-random fixture codes decode to NaNs too.
+        let bits = |a: &MxArray| {
+            a.to_float32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<u32>>()
+        };
+        assert_eq!(bits(&mapped_out), bits(&anonymous_out));
+        // Leases are inert: nothing is retained, completion still evaluates.
+        store.finish_expert_slots(0, &mapped_out).unwrap();
+        store.defer_expert_reduction(0, &mapped_out).unwrap();
+        assert_eq!(store.deferred_reduction_layer, None);
+        store.complete_device_readers().unwrap();
+        store.complete_expert_window(0, &anonymous_out).unwrap();
+        assert!(
+            store
+                .expert_slots(0, EXPERTS, 2, &[EXPERTS as u32])
+                .is_err()
+        );
+        assert!(
+            store
+                .commit_device_routes(&[0], &[EXPERTS as u32, 0], 2)
+                .is_err()
+        );
+        assert!(store.device_expert_slots(1, &device).unwrap().is_none());
+    }
+
+    /// A pack whose header page was damaged is refused at open and rebuilt
+    /// before anything is mapped; a pack whose expert count disagrees with
+    /// the checkpoint keeps the slot path.
+    #[test]
+    fn mapped_residency_refuses_a_damaged_or_mismatched_pack() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let dir = temp.0.join("mapped");
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        let name = PARTS[1].0;
+        let header = store
+            .mapped
+            .as_ref()
+            .unwrap()
+            .file(name)
+            .unwrap()
+            .header
+            .clone();
+        store.mapped = None;
+        // Flip one hex digit of a section checksum inside the header JSON:
+        // still valid JSON, still a 64-char digest, only the page checksum
+        // can tell.
+        let path = dir.join(format!("{name}.mapped"));
+        let mut bytes = fs::read(&path).unwrap();
+        let sha = header.sections[0].sha256.as_bytes();
+        let at = bytes[..super::super::mapped_pack::PAGE as usize]
+            .windows(sha.len())
+            .position(|w| w == sha)
+            .unwrap();
+        bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+        fs::write(&path, &bytes).unwrap();
+        let opened = fs::metadata(&path).unwrap().len();
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        let rebuilt = store.mapped.as_ref().unwrap().file(name).unwrap();
+        assert_eq!(
+            rebuilt.header, header,
+            "{name} must be rebuilt from the sources"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), opened);
+        assert_ne!(
+            fs::read(&path).unwrap()[at],
+            bytes[at],
+            "the damaged page must not survive"
+        );
+        store.plan.policy = "auto".into();
+        store
+            .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+
+        let mut other = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        other.prepare_mapped_pack_at(&dir).unwrap();
+        other.plan.policy = "auto".into();
+        other
+            .select_mapped_residency_with(EXPERTS + 1, Some(1 << 40), &mut |_, _, _| {
+                panic!("an incomplete pack must not be admitted")
+            })
+            .unwrap();
+        assert!(!other.plan.mapped);
+        assert_eq!(other.plan.mapped_bytes, 0);
+        assert!(other.mapped_experts.is_empty());
     }
 }

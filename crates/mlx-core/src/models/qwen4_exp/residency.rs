@@ -262,6 +262,27 @@ impl Store {
         self.banks.get(name).cloned()
     }
 
+    /// Fixed projections with their dense compute copies: the hot set minus
+    /// routed experts, what the mapped budget must hold as banks.
+    pub(super) fn fixed_projection_bytes(&self) -> Result<u64> {
+        self.tensors
+            .iter()
+            .filter(|(name, tensor)| is_fixed_projection(name, tensor))
+            .try_fold(0u64, |n, (name, t)| {
+                n.checked_add(t.bank_bytes(name)?)
+                    .ok_or_else(|| err("Fixed projection inventory overflow"))
+            })
+    }
+
+    pub(super) fn auxiliary_bytes(&self) -> Result<u64> {
+        self.tensors
+            .iter()
+            .filter(|(name, _)| is_auxiliary(name))
+            .try_fold(0u64, |n, (_, t)| {
+                t.runtime_bytes().map(|bytes| n.saturating_add(bytes))
+            })
+    }
+
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
         self.prepare_hot_with_policy(
             &mut super::super::memory::admit,
@@ -389,13 +410,20 @@ impl Store {
         // Fixed projections get at most a quarter, leaving most RAM for experts.
         let mut names = Vec::new();
         let mut bytes = 0u64;
+        // The mapped budget holds no experts: banks may take all but the
+        // LRU room memory::mapped_desired reserved.
+        let cap = if self.plan.mapped {
+            self.cache_limit.saturating_sub(2 << 30)
+        } else {
+            self.cache_limit / 4
+        };
         for (name, tensor) in &self.tensors {
             if !is_fixed_projection(name, tensor) {
                 continue;
             }
             let size = tensor.bank_bytes(name)?;
             // An unusual dense/BF16 checkpoint keeps its bounded chunk path.
-            if size > 1 << 30 || size > (self.cache_limit / 4).saturating_sub(bytes) {
+            if size > 1 << 30 || size > cap.saturating_sub(bytes) {
                 return Ok(Vec::new());
             }
             bytes += size;

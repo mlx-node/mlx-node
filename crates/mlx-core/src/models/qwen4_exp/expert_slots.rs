@@ -3,6 +3,83 @@
 //! supplies bounded misses and releases imported chunks after the slot copy.
 use super::*;
 use crate::models::qwen4_exp::runtime_flags;
+use std::time::{Duration, Instant};
+
+/// The driver unwires a bound file-backed bank ~1.15 s after its last use and
+/// re-wires resident pages at 12-17 ms/GiB, one command buffer at a time. A
+/// forward pass that starts later than that after the previous one (the first
+/// decode step after prefill, any slow step) wires 78 GiB layer by layer, and
+/// layer 0 is idle long enough to unwire again before the pass ends: measured
+/// 0.4-0.6 tokens/s until something breaks the cycle. One eval reading one
+/// element of every mapped bank gives them all the same last use first.
+const MAPPED_WIRE_GAP: Duration = Duration::from_millis(900);
+
+/// One layer's routed experts addressed in place: the pack's sections as
+/// no-copy banks, slot id == expert id, so nothing is ever copied, missed
+/// or overwritten and no reader lease is needed.
+pub(super) struct MappedExperts {
+    banks: [Arc<Weight>; 3],
+    experts: usize,
+}
+
+impl MappedExperts {
+    fn open(
+        files: [&super::super::mapped_pack::LayerFile; 3],
+        experts: usize,
+    ) -> Result<(Self, u64)> {
+        let mut bytes = 0u64;
+        let mut banks = Vec::with_capacity(3);
+        for file in files {
+            let h = &file.header;
+            if h.experts as usize != experts {
+                return Err(err(format!(
+                    "Mapped pack {} holds {} experts, the checkpoint {experts}",
+                    h.name, h.experts
+                )));
+            }
+            bytes += h.sections.iter().map(|s| s.length).sum::<u64>();
+            let mut arrays = file.map_sections()?;
+            let biases = if arrays.len() == 3 {
+                arrays.pop()
+            } else {
+                None
+            };
+            let scales = arrays.pop();
+            let values = arrays
+                .pop()
+                .ok_or_else(|| err(format!("Mapped pack {} has no values section", h.name)))?;
+            banks.push(Arc::new(Weight {
+                values,
+                dense_bf16: None,
+                scales,
+                biases,
+                group: h.group,
+                bits: h.bits,
+                mode: h.mode.clone(),
+            }));
+        }
+        let [gate, up, down] = <[Arc<Weight>; 3]>::try_from(banks)
+            .map_err(|_| err("Mapped layer needs gate, up and down banks"))?;
+        Ok((
+            Self {
+                banks: [gate, up, down],
+                experts,
+            },
+            bytes,
+        ))
+    }
+}
+
+/// The fused expert kernels' bank contract (K-quant gate/up, affine down).
+fn fused_bank_modes(banks: &[Arc<Weight>; 3]) -> bool {
+    matches!(banks[0].mode.as_str(), "q4k" | "q5k")
+        && banks[1].mode == banks[0].mode
+        && banks[2].mode == "affine"
+        && matches!(banks[2].bits, 5 | 8)
+        && banks
+            .iter()
+            .all(|w| w.group == 32 && w.scales.is_some() && w.biases.is_some())
+}
 
 pub(super) struct ExpertSlots {
     banks: [Arc<Weight>; 3],
@@ -54,11 +131,172 @@ impl Store {
         Ok(auxiliary.min(self.cache_limit / 8).max(MAX_READ_BYTES * 6))
     }
 
+    /// Map every routed expert of every layer from the pack when `auto`
+    /// residency selects it (memory::mapped_residency_selected), replacing
+    /// the slot budget by one for dense banks and auxiliary rows only. Any
+    /// failure leaves the slot path in charge.
+    pub(in super::super) fn select_mapped_residency(&mut self) -> Result<()> {
+        let Some(experts) = self
+            .metadata
+            .get("qwen4exp.expert_count")
+            .and_then(GgufMetaValue::as_u64)
+        else {
+            return Ok(());
+        };
+        let physical = self.plan.physical_bytes;
+        self.select_mapped_residency_with(
+            experts as usize,
+            physical,
+            &mut super::super::memory::mapped_plan,
+        )
+    }
+
+    pub(super) fn select_mapped_residency_with(
+        &mut self,
+        experts: usize,
+        physical: Option<u64>,
+        plan: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64) -> Result<()>,
+    ) -> Result<()> {
+        if !self.gguf
+            || experts == 0
+            || !crate::engine::persistence::compiled_forward_backend_available()
+            || !self.slots.is_empty()
+            || !self.banks.is_empty()
+        {
+            return Ok(());
+        }
+        let Some(pack) = &self.mapped else {
+            return Ok(());
+        };
+        let layers: std::collections::BTreeSet<usize> = self
+            .tensors
+            .keys()
+            .filter(|name| !super::residency::is_auxiliary(name))
+            .filter_map(|name| super::routed_expert_tensor(name).map(|(layer, _)| layer))
+            .collect();
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let names = |layer: usize| {
+            ["gate", "up", "down"].map(|part| format!("blk.{layer}.ffn_{part}_exps.weight"))
+        };
+        let complete = layers.iter().all(|&layer| {
+            names(layer).iter().all(|name| {
+                pack.file(name)
+                    .is_some_and(|file| file.header.experts as usize == experts)
+            })
+        });
+        if !super::super::memory::mapped_residency_selected(
+            &self.plan.policy,
+            super::super::memory::explicit_weight_budget(),
+            self.plan.hot_bytes,
+            physical,
+            complete,
+            super::super::memory::mapped_pack_disabled(),
+        ) {
+            return Ok(());
+        }
+        let mut mapped = HashMap::with_capacity(layers.len());
+        let mut bytes = 0u64;
+        for &layer in &layers {
+            let [gate, up, down] = names(layer);
+            let files = [&gate, &up, &down].map(|name| pack.file(name));
+            let [Some(gate), Some(up), Some(down)] = files else {
+                return Ok(());
+            };
+            match MappedExperts::open([gate, up, down], experts) {
+                Ok((layer_banks, layer_bytes)) => {
+                    bytes += layer_bytes;
+                    mapped.insert(layer, layer_banks);
+                }
+                Err(e) => {
+                    tracing::warn!("qwen4 mapped residency unavailable, using slots: {e}");
+                    return Ok(());
+                }
+            }
+        }
+        let dense = self.fixed_projection_bytes()?;
+        let auxiliary = self.auxiliary_bytes()?;
+        if let Err(e) = plan(&mut self.plan, dense, auxiliary) {
+            tracing::warn!("qwen4 mapped residency not admitted, using slots: {e}");
+            return Ok(());
+        }
+        self.cache_limit = self.plan.budget;
+        self.slot_capacity = Some(experts);
+        self.plan.mapped_bytes = bytes;
+        self.plan.partial_expert_slots = experts;
+        self.mapped_experts = mapped;
+        tracing::info!(
+            "qwen4 mapped residency: {} layers x {experts} experts, {:.1} GiB mapped, {:.1} GiB budget for dense banks and rows",
+            layers.len(),
+            bytes as f64 / (1u64 << 30) as f64,
+            self.cache_limit as f64 / (1u64 << 30) as f64
+        );
+        Ok(())
+    }
+
+    /// Called at the start of every forward pass (layer 0's MoE).
+    pub(in super::super) fn wire_mapped_banks(&mut self) -> Result<()> {
+        self.wire_mapped_banks_at(Instant::now()).map(|_| ())
+    }
+
+    /// Returns whether the banks were touched.
+    pub(super) fn wire_mapped_banks_at(&mut self, now: Instant) -> Result<bool> {
+        if !self.plan.mapped {
+            return Ok(false);
+        }
+        let stale = self
+            .mapped_pass_start
+            .is_none_or(|start| now.saturating_duration_since(start) > MAPPED_WIRE_GAP);
+        self.mapped_pass_start = Some(now);
+        if !stale {
+            return Ok(false);
+        }
+        let mut groups: Vec<(DType, Vec<MxArray>)> = Vec::new();
+        for mapped in self.mapped_experts.values() {
+            for bank in &mapped.banks {
+                for array in [
+                    Some(&bank.values),
+                    bank.scales.as_ref(),
+                    bank.biases.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let corner = array.slice(&[0, 0], &[1, 1])?;
+                    let dtype = corner.dtype()?;
+                    match groups.iter_mut().find(|(d, _)| *d == dtype) {
+                        Some((_, list)) => list.push(corner),
+                        None => groups.push((dtype, vec![corner])),
+                    }
+                }
+            }
+        }
+        let touched = groups
+            .iter()
+            .map(|(_, list)| MxArray::concatenate_many(list.iter().collect(), Some(0)))
+            .collect::<Result<Vec<_>>>()?;
+        let started = Instant::now();
+        MxArray::eval_arrays_with_context(
+            &touched.iter().collect::<Vec<_>>(),
+            "qwen4::mapped::wire",
+        )?;
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(50) {
+            tracing::debug!("qwen4 mapped banks wired in {elapsed:.1?}");
+        }
+        self.mapped_pass_start = Some(now + elapsed);
+        Ok(true)
+    }
+
     pub(in super::super) fn expert_slot_capacity(
         &mut self,
         experts: usize,
         top: usize,
     ) -> Result<usize> {
+        if self.plan.mapped {
+            return Ok(experts);
+        }
         if !self.gguf
             || runtime_flags::is_zero(c"MLX_QWEN4_EXPERT_SLOTS")
             || !crate::engine::persistence::compiled_forward_backend_available()
@@ -141,6 +379,14 @@ impl Store {
         }
         if ids.iter().any(|&e| e as usize >= experts) {
             return Err(err("Qwen4 expert id exceeds slot mapping"));
+        }
+        if self.plan.mapped {
+            let mapped = self
+                .mapped_experts
+                .get(&layer)
+                .ok_or_else(|| err("Qwen4 mapped layer has no expert banks"))?;
+            self.slot_hits += wanted.len() as u64;
+            return Ok(Some((mapped.banks.clone(), ids.to_vec(), mapped.experts)));
         }
         let mut slots = if let Some(slots) = self.slots.remove(&layer) {
             slots
@@ -305,6 +551,9 @@ impl Store {
     }
 
     pub(in super::super) fn device_slots_ready(&self, layers: usize) -> bool {
+        if self.plan.mapped {
+            return (0..layers).all(|layer| self.mapped_experts.contains_key(&layer));
+        }
         (0..layers).all(|layer| self.slots.contains_key(&layer))
     }
 
@@ -316,6 +565,13 @@ impl Store {
     /// fits the unchanged banks. This is only an eligibility hint, never a
     /// prediction: every newly computed route is still validated at commit.
     pub(in super::super) fn prefill_device_slots_ready(&self, layers: usize) -> bool {
+        if self.plan.mapped {
+            return (0..layers).all(|layer| {
+                self.mapped_experts
+                    .get(&layer)
+                    .is_some_and(|mapped| fused_bank_modes(&mapped.banks))
+            });
+        }
         (0..layers).all(|layer| {
             self.slots.get(&layer).is_some_and(|slots| {
                 slots.occupants.first().is_some_and(Option::is_some)
@@ -345,6 +601,14 @@ impl Store {
         layer: usize,
         ids: &MxArray,
     ) -> Result<([Arc<Weight>; 3], MxArray, usize)> {
+        if self.plan.mapped {
+            let mapped = self
+                .mapped_experts
+                .get(&layer)
+                .ok_or_else(|| err("Qwen4 tentative prefill has no mapped bank"))?;
+            let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
+            return Ok((mapped.banks.clone(), local, mapped.experts));
+        }
         let count = self
             .slots
             .get(&layer)
@@ -370,6 +634,13 @@ impl Store {
         layer: usize,
         ids: &MxArray,
     ) -> Result<Option<([Arc<Weight>; 3], MxArray)>> {
+        if self.plan.mapped {
+            let Some(mapped) = self.mapped_experts.get(&layer) else {
+                return Ok(None);
+            };
+            let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
+            return Ok(Some((mapped.banks.clone(), local)));
+        }
         let Some(slots) = self.slots.get_mut(&layer) else {
             return Ok(None);
         };
@@ -399,6 +670,20 @@ impl Store {
     ) -> Result<bool> {
         if ids.len() != layers.len() * top || top == 0 {
             return Err(err("Qwen4 device route tape has an invalid shape"));
+        }
+        if self.plan.mapped {
+            for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
+                let Some(mapped) = self.mapped_experts.get(&layer) else {
+                    return Ok(false);
+                };
+                if selected.iter().any(|&e| e as usize >= mapped.experts) {
+                    return Err(err(
+                        "Qwen4 device route names an expert outside the mapped pack",
+                    ));
+                }
+                self.slot_hits += selected.iter().collect::<HashSet<_>>().len() as u64;
+            }
+            return Ok(true);
         }
         for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
             let Some(slots) = self.slots.get(&layer) else {
@@ -444,6 +729,9 @@ impl Store {
     /// before releasing their leases. This prevents periodic per-layer waits
     /// on the eighth hit-only token and retains the ordinary miss protection.
     pub(in super::super) fn complete_device_readers(&mut self) -> Result<()> {
+        if self.plan.mapped {
+            return Ok(());
+        }
         let readers: Vec<_> = self.slots.values().flat_map(|s| s.readers.iter()).collect();
         MxArray::eval_arrays_with_context(&readers, "qwen4::slots::device_readers")?;
         for slots in self.slots.values_mut() {
@@ -458,6 +746,9 @@ impl Store {
         layer: usize,
         output: &MxArray,
     ) -> Result<()> {
+        if self.plan.mapped {
+            return Ok(());
+        }
         if let Some(slots) = self.slots.get_mut(&layer) {
             slots.readers.push(output.clone());
             // Hit-only sequences also have a bounded pending graph. Retain all
@@ -478,6 +769,9 @@ impl Store {
         layer: usize,
         reduced: &MxArray,
     ) -> Result<()> {
+        if self.plan.mapped {
+            return MxArray::eval_arrays_with_context(&[reduced], "qwen4::mapped::complete_window");
+        }
         if let Some(slots) = self.slots.get_mut(&layer) {
             // Complete every outstanding reader, including independent earlier
             // calls. Replacing the leases with only the newest output would
@@ -501,6 +795,10 @@ impl Store {
         layer: usize,
         reduced: &MxArray,
     ) -> Result<()> {
+        if self.plan.mapped {
+            MxArray::async_eval_arrays(&[reduced]);
+            return Ok(());
+        }
         if let Some(previous) = self.deferred_reduction_layer.take()
             && let Some(slots) = self.slots.get_mut(&previous)
         {

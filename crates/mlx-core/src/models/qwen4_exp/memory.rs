@@ -19,7 +19,18 @@ pub(super) struct Plan {
     pub partial_expert_slots: usize,
     /// Routed expert tensors served from the mapped pack (0 = chunk reader).
     pub mapped_pack_files: usize,
+    /// Every routed expert is addressed in place through the mapped pack:
+    /// no slot banks, no mid-turn staging, no wired-limit context.
+    pub mapped: bool,
+    /// Bytes of pack sections backing live arrays; MLX counts them in
+    /// `active_memory`, so budgets subtract them.
+    pub mapped_bytes: u64,
 }
+
+/// Bytes of auxiliary (MTP/vision) inventory the mapped budget keeps room for.
+const MAPPED_AUXILIARY_CAP: u64 = 8 << 30;
+/// LRU rows, paired banks and import staging under the mapped budget.
+const MAPPED_LRU_BYTES: u64 = 2 << 30;
 
 pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
     let policy = match std::env::var_os("MLX_QWEN4_RESIDENCY") {
@@ -91,7 +102,74 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
         resident_expert_layers: 0,
         partial_expert_slots: 0,
         mapped_pack_files: 0,
+        mapped: false,
+        mapped_bytes: 0,
     })
+}
+
+/// `auto` maps the pack when every routed tensor is in it and the hot set
+/// leaves a quarter of RAM; an explicit weight budget, `stream`, `full` and
+/// `MLX_QWEN4_MAPPED_PACK=0` keep the slot path.
+pub(super) fn mapped_residency_selected(
+    policy: &str,
+    explicit_budget: bool,
+    hot_bytes: u64,
+    physical: Option<u64>,
+    pack_complete: bool,
+    disabled: bool,
+) -> bool {
+    policy == "auto"
+        && !explicit_budget
+        && !disabled
+        && pack_complete
+        && physical.is_some_and(|physical| hot_bytes <= physical.saturating_mul(3) / 4)
+}
+
+pub(super) fn mapped_pack_disabled() -> bool {
+    std::env::var_os("MLX_QWEN4_MAPPED_PACK").is_some_and(|v| v == "0")
+}
+
+pub(super) fn explicit_weight_budget() -> bool {
+    std::env::var_os("MLX_QWEN4_WEIGHT_CACHE_GIB").is_some()
+}
+
+/// Whole GiB the mapped budget asks for: dense banks, bounded auxiliary
+/// inventory and LRU room. Routed experts are not in it.
+pub(super) fn mapped_desired(dense_bytes: u64, auxiliary_bytes: u64) -> u64 {
+    dense_bytes
+        .saturating_add(auxiliary_bytes.min(MAPPED_AUXILIARY_CAP))
+        .saturating_add(MAPPED_LRU_BYTES)
+        .saturating_add((1 << 30) - 1)
+        >> 30
+        << 30
+}
+
+/// Replace the slot budget by one that admits only what stays anonymous in
+/// mapped mode. The routed experts are clean page cache the OS may evict.
+pub(super) fn mapped_plan(plan: &mut Plan, dense_bytes: u64, auxiliary_bytes: u64) -> Result<()> {
+    let desired = mapped_desired(dense_bytes, auxiliary_bytes);
+    // A bootstrap snapshot exists only on the live macOS host; fixtures and
+    // other platforms take the desired budget without admission.
+    let budget = match plan.physical_bytes {
+        Some(physical) => {
+            let available = available_memory()?;
+            plan.available_bytes = Some(available);
+            automatic_budget(desired, available, physical)
+        }
+        None => desired,
+    };
+    if budget == 0 {
+        return Err(Error::from_reason(
+            "Qwen4 mapped residency has no whole GiB for dense banks after system/working reserves",
+        ));
+    }
+    if plan.physical_bytes.is_some() {
+        admit(budget)?;
+    }
+    plan.budget = budget;
+    plan.resident = false;
+    plan.mapped = true;
+    Ok(())
 }
 
 fn automatic_budget(desired: u64, available: u64, physical: u64) -> u64 {
@@ -397,6 +475,87 @@ mod tests {
     }
 
     #[test]
+    fn mapped_residency_needs_auto_a_complete_pack_and_a_quarter_of_ram_free() {
+        let physical = Some(128u64 << 30);
+        let hot = 78u64 << 30;
+        assert!(mapped_residency_selected(
+            "auto", false, hot, physical, true, false
+        ));
+        // MLX_QWEN4_WEIGHT_CACHE_GIB pins an anonymous budget: slots.
+        assert!(!mapped_residency_selected(
+            "auto", true, hot, physical, true, false
+        ));
+        assert!(!mapped_residency_selected(
+            "stream", false, hot, physical, true, false
+        ));
+        assert!(!mapped_residency_selected(
+            "full", false, hot, physical, true, false
+        ));
+        // MLX_QWEN4_MAPPED_PACK=0 is the slot A/B arm.
+        assert!(!mapped_residency_selected(
+            "auto", false, hot, physical, true, true
+        ));
+        assert!(!mapped_residency_selected(
+            "auto", false, hot, physical, false, false
+        ));
+        assert!(!mapped_residency_selected(
+            "auto", false, hot, None, true, false
+        ));
+        assert!(mapped_residency_selected(
+            "auto",
+            false,
+            96 << 30,
+            physical,
+            true,
+            false
+        ));
+        assert!(!mapped_residency_selected(
+            "auto",
+            false,
+            (96 << 30) + 1,
+            physical,
+            true,
+            false
+        ));
+        assert!(!mapped_residency_selected(
+            "auto",
+            false,
+            hot,
+            Some(96 << 30),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn mapped_budget_holds_dense_banks_bounded_auxiliary_and_lru_room() {
+        let gib = |n: f64| (n * (1u64 << 30) as f64) as u64;
+        assert_eq!(mapped_desired(gib(3.8), 0), 6 << 30);
+        assert_eq!(mapped_desired(gib(3.8), gib(4.7)), 11 << 30);
+        assert_eq!(mapped_desired(gib(3.8), 20 << 30), 14 << 30);
+        assert_eq!(mapped_desired(0, 0), 2 << 30);
+        let mut plan = Plan {
+            budget: 73 << 30,
+            hot_bytes: 83_631_869_440,
+            resident: true,
+            policy: "auto".into(),
+            available_bytes: None,
+            physical_bytes: None,
+            resident_bank_bytes: 0,
+            resident_expert_layers: 0,
+            partial_expert_slots: 442,
+            mapped_pack_files: 144,
+            mapped: false,
+            mapped_bytes: 0,
+        };
+        // No live snapshot (fixtures, other platforms): the desired budget is
+        // taken as is and nothing is admitted against the host.
+        mapped_plan(&mut plan, gib(3.8), 0).unwrap();
+        assert!(plan.mapped && !plan.resident);
+        assert_eq!(plan.budget, 6 << 30);
+    }
+
+    #[test]
     fn load_reconciliation_preserves_working_room_and_explicit_full_policy() {
         let original = Plan {
             budget: 79 << 30,
@@ -409,6 +568,8 @@ mod tests {
             resident_expert_layers: 0,
             partial_expert_slots: 0,
             mapped_pack_files: 0,
+            mapped: false,
+            mapped_bytes: 0,
         };
         let mut plan = original.clone();
         refresh_from_snapshot(&mut plan, 94 << 30, 128 << 30).unwrap();
@@ -559,7 +720,12 @@ pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> Result<u
         (Some(a), Some(p)) => a.saturating_sub(plan.budget + system_reserve(p) + (2 << 30)),
         _ => plan.budget / 16,
     };
-    let allowance = (plan.budget / 16).min(2 << 30).min(live);
+    // The mapped budget holds no experts, so it does not scale the scratch.
+    let allowance = if plan.mapped {
+        (2 << 30).min(live)
+    } else {
+        (plan.budget / 16).min(2 << 30).min(live)
+    };
     let mut window = super::MAX_PREFILL_CHUNK;
     while window > 1 && prefill_scratch(c, window) > allowance {
         window /= 2;

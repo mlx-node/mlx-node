@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use super::packed_cache::{self, ArrayInfo, Header, VerifiedChunk};
+use crate::array::{DType, Mmap, MxArray};
 
 /// Apple page size: every section offset and length is a multiple, so a
 /// section maps as one no-copy buffer.
@@ -323,6 +324,32 @@ impl LayerFile {
             out.push(buf);
         }
         Ok(out)
+    }
+
+    /// The sections as no-copy arrays over one shared mapping of the file
+    /// past its header page: bank shape `[experts * rows, columns]`, slot
+    /// id == expert id. The pages are clean page cache until a command
+    /// buffer binds them.
+    pub(super) fn map_sections(&self) -> Result<Vec<MxArray>> {
+        let h = &self.header;
+        let len = usize::try_from(h.file_bytes - PAGE).map_err(err)?;
+        let map = Mmap::map(self.file.try_clone().map_err(err)?, PAGE, len)?;
+        h.sections
+            .iter()
+            .map(|s| {
+                let dtype = match s.dtype.as_str() {
+                    "U32" => DType::Uint32,
+                    "F32" => DType::Float32,
+                    "F16" => DType::Float16,
+                    "BF16" => DType::BFloat16,
+                    "U8" => DType::Uint8,
+                    "I8" => DType::Int8,
+                    other => return Err(err(format!("Unsupported mapped section dtype {other}"))),
+                };
+                let offset = usize::try_from(s.offset - PAGE).map_err(err)?;
+                MxArray::from_mapped(&map, offset, &[s.shape[0] as i64, s.shape[1] as i64], dtype)
+            })
+            .collect()
     }
 
     /// One expert in the chunk encoding the slot path already imports.
@@ -776,7 +803,6 @@ impl MappedPack {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     pub(super) fn file(&self, name: &str) -> Option<&LayerFile> {
         self.files.get(name)
     }

@@ -242,6 +242,15 @@ impl ChatBackend for Inner {
     fn eval_caches(&self) -> Result<()> {
         Ok(())
     }
+    /// Mapped experts are file-backed: a wired limit does not pin them and
+    /// only delays their unwiring after the turn (3.2 s vs 1.2 s measured).
+    fn wired_limit_bytes(&self) -> Option<usize> {
+        if self.decoder.weights.plan.mapped {
+            None
+        } else {
+            Some(usize::MAX)
+        }
+    }
     fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
         self.decoder.cancelled = flag;
     }
@@ -302,6 +311,12 @@ pub struct Qwen4ExpResidencyInfo {
     /// Routed expert tensors the slot path reads by range from the mapped
     /// pack; 0 means every expert read goes through the per-expert chunks.
     pub mapped_pack_files: u32,
+    /// Every routed expert is addressed in place through the mapped pack;
+    /// the weight budget then covers dense banks and rows only.
+    pub mapped: bool,
+    /// Pack bytes backing live arrays in mapped mode (clean page cache the
+    /// Metal driver wires while a command buffer binds them).
+    pub mapped_bytes: f64,
 }
 
 #[napi(object)]
@@ -379,8 +394,9 @@ impl Qwen4ExpModel {
                 let pool_guard = Some(crate::cache_limit::coordinator().register_pool(pool_bytes));
                 let mut cache_limit_guard =
                     crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
-                decoder.weights.prepare_hot()?;
                 decoder.weights.prepare_mapped_pack()?;
+                decoder.weights.select_mapped_residency()?;
+                decoder.weights.prepare_hot()?;
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.
                 drop(cache_limit_guard);
@@ -498,6 +514,8 @@ impl Qwen4ExpModel {
             resident_expert_layers: self.residency.resident_expert_layers as u32,
             partial_expert_slots: self.residency.partial_expert_slots as u32,
             mapped_pack_files: self.residency.mapped_pack_files as u32,
+            mapped: self.residency.mapped,
+            mapped_bytes: self.residency.mapped_bytes as f64,
         }
     }
     #[napi]
