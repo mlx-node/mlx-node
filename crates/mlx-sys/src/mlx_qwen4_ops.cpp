@@ -569,8 +569,9 @@ bool mlx_qwen4_qsa_attention(mlx_array *queries, mlx_array *keys,
                              mlx_array *query_ends, float scale,
                              int block_size, mlx_array **out) {
   try {
+    // One SIMD group per incomplete-block token, 32 per threadgroup.
     if (!queries || !keys || !values || !selected || !query_ends || !out ||
-        block_size <= 0 || !std::isfinite(scale))
+        block_size <= 0 || block_size > 33 || !std::isfinite(scale))
       return false;
     auto q = *reinterpret_cast<array *>(queries),
          k = *reinterpret_cast<array *>(keys),

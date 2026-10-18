@@ -5092,6 +5092,102 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
     }
 }
 
+/// Ratio 34 leaves 33 tokens in the incomplete block of rows ending at 33, 67
+/// and 101, one more than the kernel's 32 SIMD groups attend. Sparse windows
+/// must take the per-token path (bit for bit), and the kernel must refuse it.
+#[test]
+fn batched_qsa_falls_back_past_kernel_tail_width() {
+    use crate::array::DType;
+    const CHILD: &str = "MLX_QWEN4_QSA_TAIL_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "models::qwen4_exp::tests::batched_qsa_falls_back_past_kernel_tail_width",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env_remove("MLX_QWEN4_BATCHED_QSA")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let batched_qsa = |on: bool| unsafe {
+        std::env::set_var("MLX_QWEN4_BATCHED_QSA", if on { "1" } else { "0" })
+    };
+    let path = fixture().join("bf16/paged");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let mut config = config::Config::parse(&raw).unwrap();
+    config.indexer_compress_ratio = 34;
+    config.indexer_budget = 34;
+    let make = || {
+        decoder::Decoder::new(
+            config.clone(),
+            weights::Store::open_fixture(&path, None).unwrap(),
+        )
+        .unwrap()
+    };
+    let (mut per_token, mut batched) = (make(), make());
+    let tokens: Vec<u32> = (0..110)
+        .map(|i| ((i * 7 + i / 5) % 19 + 3) as u32)
+        .collect();
+    let mut offset = 0;
+    for count in [30, 30, 30, 20] {
+        let chunk = &tokens[offset..offset + count];
+        offset += count;
+        batched_qsa(false);
+        let want = per_token.prefill_chunk(chunk, None, true).unwrap();
+        want.eval();
+        batched_qsa(true);
+        let got = batched.prefill_chunk(chunk, None, true).unwrap();
+        got.eval();
+        let (want, got) = (want.to_float32().unwrap(), got.to_float32().unwrap());
+        let error = want
+            .iter()
+            .zip(got.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert_eq!(&*want, &*got, "end={offset}: logits error {error}");
+    }
+
+    let values = |shape: &[i64], seed: usize| {
+        let n = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(
+            &(0..n)
+                .map(|i| ((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0)
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+    };
+    let (q, k, v) = (
+        values(&[1, 2, 1, 32], 1),
+        values(&[1, 2, 67, 32], 2),
+        values(&[1, 2, 67, 32], 3),
+    );
+    let selected = MxArray::from_int32(&[0], &[1, 1, 1]).unwrap();
+    let ends = MxArray::from_int32(&[67], &[1, 1]).unwrap();
+    for (block, ok) in [(33, true), (34, false)] {
+        assert_eq!(
+            math::qsa_attention(&q, &k, &v, &selected, &ends, 0.2, block).is_ok(),
+            ok,
+            "block_size={block}"
+        );
+    }
+}
+
 /// Exactly representable scores (multiples of 1/8 against bf16 keys) with
 /// repeated and all-zero blocks, so the only freedom left is which tied block
 /// fills the cut-off. Covers rows before the budget (all complete blocks plus
