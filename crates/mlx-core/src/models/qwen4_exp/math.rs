@@ -962,7 +962,7 @@ mod input_validation_tests {
         );
 
         let mut history = Some(MxArray::from_float32(&[2., 3.], &[2, 1]).unwrap());
-        let convolution_error = conv(&scalar, &scalar, &mut history, 3, 1)
+        let convolution_error = conv_with_completion(&scalar, &scalar, &mut history, 3, 1, false)
             .err()
             .expect("scalar convolution input must be rejected");
         assert_eq!(
@@ -1394,19 +1394,10 @@ mod rotary_window_tests {
     }
 }
 
-/// Stateful depthwise causal convolution. Complete the owned finite history
-/// before returning the lazy activation to its caller.
-pub fn conv(
-    x: &MxArray,
-    weight: &MxArray,
-    state: &mut Option<MxArray>,
-    kernel: usize,
-    dilation: usize,
-) -> Result<MxArray> {
-    conv_with_completion(x, weight, state, kernel, dilation, false)
-}
-
-fn conv_with_completion(
+/// Stateful depthwise causal convolution. Unless `defer_state`, complete the
+/// owned finite history before returning the lazy activation to its caller;
+/// a deferred history must be completed before its frontier is published.
+pub(super) fn conv_with_completion(
     x: &MxArray,
     weight: &MxArray,
     state: &mut Option<MxArray>,

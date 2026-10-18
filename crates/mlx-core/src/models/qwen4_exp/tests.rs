@@ -1081,12 +1081,13 @@ fn batched_causal_convolution_matches_stepwise_history() {
             .unwrap();
             let actual = math::conv_sequence(&input, &weight, &mut a, 4).unwrap();
             for t in 0..tokens {
-                let want = math::conv(
+                let want = math::conv_with_completion(
                     &input.slice_axis(1, t, t + 1).unwrap(),
                     &weight,
                     &mut b,
                     4,
                     1,
+                    false,
                 )
                 .unwrap()
                 .to_float32()
@@ -1135,12 +1136,13 @@ fn dilated_ple_window_preserves_history_across_short_and_long_chunks() {
             .unwrap();
             let actual = math::conv_window(&x, &weight, &mut batched, 4, 3).unwrap();
             for t in 0..tokens {
-                let want = math::conv(
+                let want = math::conv_with_completion(
                     &x.slice_axis(1, t, t + 1).unwrap(),
                     &weight,
                     &mut scalar,
                     4,
                     3,
+                    false,
                 )
                 .unwrap()
                 .to_float32()
@@ -1888,6 +1890,24 @@ fn mtp_transaction_restores_every_accepted_frontier_and_continues_exactly() {
                 speculative: true,
             }])
             .unwrap();
+        // Inspect readiness before any output is read: reading the logits
+        // would complete every ancestor and hide a missing final completion.
+        let ready = |a: &MxArray| unsafe { mlx_sys::mlx_array_is_available(a.as_raw_ptr()) };
+        let c = inner.decoder.config.clone();
+        let adapter = inner.decoder.paged.as_ref().unwrap();
+        let attention_layers = (0..c.num_hidden_layers).filter(|&l| !c.linear(l)).count();
+        assert!(attention_layers > 0);
+        for layer in 0..attention_layers as u32 {
+            assert!(
+                ready(&adapter.key_pool_array(layer).unwrap())
+                    && ready(&adapter.value_pool_array(layer).unwrap()),
+                "keep {keep}: verification returned with a lazy page write in layer {layer}"
+            );
+        }
+        assert!(
+            inner.decoder.snapshot().arrays().all(ready),
+            "keep {keep}: verification returned with a lazy frontier"
+        );
         assert_eq!(&*actual.shape().unwrap(), [4, 1, 64]);
         let actual = actual
             .transpose(Some(&[1, 0, 2]))
@@ -1904,6 +1924,10 @@ fn mtp_transaction_restores_every_accepted_frontier_and_continues_exactly() {
             .unwrap()
             .remove(0)
             .unwrap();
+        assert!(
+            inner.decoder.snapshot().arrays().all(ready),
+            "keep {keep}: the restored frontier is lazy"
+        );
         assert_eq!(
             inner.decoder.history,
             [&prompt[..], &verify[..keep]].concat()
@@ -3143,7 +3167,9 @@ impl CompleteGdnInputs {
             .unwrap();
         }
         let mut history = Some(history.clone());
-        let qkv = math::conv(&self.qkv, &self.conv, &mut history, self.kernel, 1).unwrap();
+        let qkv =
+            math::conv_with_completion(&self.qkv, &self.conv, &mut history, self.kernel, 1, false)
+                .unwrap();
         let q = math::l2(
             &qkv.slice_axis(2, 0, 2048)
                 .unwrap()
