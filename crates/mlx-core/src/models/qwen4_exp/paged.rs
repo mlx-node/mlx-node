@@ -423,6 +423,11 @@ impl HybridSchedulerBackend for Inner {
         };
         row + draft
     }
+    fn scheduled_state_held_bytes(&self, seq: SeqId) -> u64 {
+        let c = &self.decoder.config;
+        u64::from(self.has_scheduled_recurrent(seq)) * super::memory::row_state_bytes(c)
+            + self.mtp.owner_held_bytes(c, seq)
+    }
     fn has_scheduled_recurrent(&self, seq: SeqId) -> bool {
         self.active_seq == Some(seq) || self.rows.contains_key(&seq)
     }

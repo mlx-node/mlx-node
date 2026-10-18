@@ -370,6 +370,72 @@ fn scheduled_state_accounting_counts_rows_and_tracked_drafts() {
     assert_eq!(held(&inner), row);
 }
 
+/// Two MTP owners queued in one drive pass, before any scheduler step. The
+/// first owner's draft state does not exist until its first prefill chunk, so
+/// only the reservation kept on its waiting turn can make the second owner
+/// defer. The budget is shrunk through the prefill window to the shape of two
+/// 16k Flash Next owners (`memory::flash_next_scheduled_state_budget_holds_one_long_mtp_owner`):
+/// two rows and one draft fit, two drafts do not.
+/// MUTATION: drop `outstanding_bytes` from the sum in `scheduled_state_fit`;
+/// both owners are admitted in the first pass and `live_turns() == 1` fails.
+#[test]
+fn queued_mtp_owner_keeps_its_draft_reservation_until_its_owner_exists() {
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, HybridSchedulerState};
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let c = state.inner.decoder.config.clone();
+    let adapter = state.inner.decoder.paged.as_ref().unwrap();
+    let pool = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    let max_new_tokens = 120;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, max_new_tokens);
+    let row = memory::row_state_bytes(&c);
+    let draft = memory::draft_state_bytes(&c, u64::from(requested));
+    let target = 4 * row + draft;
+    let budget_at =
+        |chunk: usize| memory::scheduled_state_budget(pool, memory::prefill_scratch(&c, chunk));
+    let (mut lo, mut hi) = (1usize, 1usize << 31);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if budget_at(mid) <= target {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    state.inner.decoder.prefill_chunk_size = lo;
+    let capacity = state.inner.scheduled_state_capacity().unwrap();
+    assert_eq!(capacity.held, 0);
+    let budget = capacity.budget;
+    assert!(
+        2 * row + draft <= budget && budget < 2 * row + 2 * draft,
+        "budget {budget} B must admit two rows and one draft ({} B) but not two drafts ({} B)",
+        2 * row + draft,
+        2 * row + 2 * draft
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (first, mut first_reply) =
+        turn_command(TurnKind::Start, true, max_new_tokens as i32, Some("first"));
+    let (second, mut second_reply) =
+        turn_command(TurnKind::Start, true, max_new_tokens as i32, Some("second"));
+    assert!(sender.send(first).is_ok() && sender.send(second).is_ok());
+    assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+    assert_eq!(
+        state.live_turns(),
+        1,
+        "the second owner must wait for the first owner's draft reservation"
+    );
+    assert!(state.has_prepared_waiting());
+    assert!(second_reply.poll().is_none());
+    let (first_text, first_cycles) =
+        finish_turn(&mut state, &mut receiver, &mut first_reply).unwrap();
+    assert!(first_cycles.is_some_and(|n| n > 0), "{first_cycles:?}");
+    let (second_text, second_cycles) =
+        finish_turn(&mut state, &mut receiver, &mut second_reply).unwrap();
+    assert!(second_cycles.is_some_and(|n| n > 0), "{second_cycles:?}");
+    assert_eq!(second_text, first_text);
+    assert_eq!(state.owner_sequences.len(), 2);
+}
+
 /// Drives one turn without a `cacheOwnerId` through the scheduler and returns
 /// its text and MTP cycle count.
 fn drive_ownerless_turn(
@@ -389,9 +455,78 @@ fn drive_turn(
     max_new_tokens: i32,
     cache_owner_id: Option<&str>,
 ) -> Result<(String, Option<u32>)> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (command, mut reply) = turn_command(kind, enable_mtp, max_new_tokens, cache_owner_id);
+    assert!(sender.send(command).is_ok());
+    finish_turn(state, &mut receiver, &mut reply)
+}
+
+type CommandReceiver = tokio::sync::mpsc::UnboundedReceiver<
+    crate::engine::model_command::ModelCommand<std::convert::Infallible>,
+>;
+
+/// Drives the scheduler until `reply` resolves.
+fn finish_turn(
+    state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Inner>,
+    receiver: &mut CommandReceiver,
+    reply: &mut TurnReply,
+) -> Result<(String, Option<u32>)> {
+    use crate::model_thread::LoopControl;
+    for _ in 0..1024 {
+        if let Some(result) = reply.poll() {
+            return result;
+        }
+        assert!(matches!(state.drive(receiver), LoopControl::Continue));
+    }
+    panic!("the {:?} turn did not finish", reply.kind);
+}
+
+struct TurnReply {
+    kind: TurnKind,
+    rx: tokio::sync::oneshot::Receiver<Result<crate::engine::types::ChatResult>>,
+    stream_rx: tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
+    streamed: String,
+}
+
+impl TurnReply {
+    /// The turn's text and MTP cycle count once it has replied.
+    fn poll(&mut self) -> Option<Result<(String, Option<u32>)>> {
+        while let Ok(chunk) = self.stream_rx.try_recv() {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => return Some(Err(error)),
+            };
+            self.streamed.push_str(&chunk.text);
+            if chunk.done {
+                return Some(Ok((
+                    std::mem::take(&mut self.streamed),
+                    chunk.performance.and_then(|p| p.mtp_cycles),
+                )));
+            }
+        }
+        match self.rx.try_recv() {
+            Ok(Ok(result)) => Some(Ok((
+                result.text,
+                result.performance.and_then(|p| p.mtp_cycles),
+            ))),
+            Ok(Err(error)) => Some(Err(error)),
+            Err(_) => None,
+        }
+    }
+}
+
+/// One chat command for the scheduler and the handle its reply arrives on.
+fn turn_command(
+    kind: TurnKind,
+    enable_mtp: bool,
+    max_new_tokens: i32,
+    cache_owner_id: Option<&str>,
+) -> (
+    crate::engine::model_command::ModelCommand<std::convert::Infallible>,
+    TurnReply,
+) {
     use crate::engine::cmd::ChatCmd;
     use crate::engine::model_command::ModelCommand;
-    use crate::model_thread::LoopControl;
     let message = |role: &str| -> crate::tokenizer::ChatMessage {
         serde_json::from_value(serde_json::json!({"role": role, "content": "a"})).unwrap()
     };
@@ -415,8 +550,8 @@ fn drive_turn(
         ..Default::default()
     };
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (reply, mut rx) = tokio::sync::oneshot::channel();
-    let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(256);
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let (stream_tx, stream_rx) = crate::model_thread::stream_channel(256);
     let command = match kind {
         TurnKind::Start => ChatCmd::SessionStart {
             messages,
@@ -449,24 +584,15 @@ fn drive_turn(
             cancelled,
         },
     };
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
-    let mut streamed = String::new();
-    for _ in 0..1024 {
-        while let Ok(chunk) = stream_rx.try_recv() {
-            let chunk = chunk?;
-            streamed.push_str(&chunk.text);
-            if chunk.done {
-                return Ok((streamed, chunk.performance.and_then(|p| p.mtp_cycles)));
-            }
-        }
-        if let Ok(result) = rx.try_recv() {
-            let result = result?;
-            return Ok((result.text, result.performance.and_then(|p| p.mtp_cycles)));
-        }
-        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
-    }
-    panic!("the {kind:?} turn did not finish");
+    (
+        ModelCommand::from_chat(command),
+        TurnReply {
+            kind,
+            rx,
+            stream_rx,
+            streamed: String::new(),
+        },
+    )
 }
 
 /// An ownerless `enableMtp` start or continuation (sync, streaming, tool)

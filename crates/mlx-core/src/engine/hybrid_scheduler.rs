@@ -75,10 +75,12 @@ enum ScheduledStateFit {
     Never,
 }
 
-/// A candidate above the whole budget must error, never defer: no reclaim
-/// can make room for it.
+/// `outstanding_bytes` is what queued and running turns reserved but their
+/// sequences do not hold yet; it counts like held state. A candidate above
+/// the whole budget must error, never defer: no reclaim can make room for it.
 fn scheduled_state_fit(
     capacity: Option<ScheduledStateCapacity>,
+    outstanding_bytes: u64,
     candidate_bytes: u64,
 ) -> ScheduledStateFit {
     let Some(capacity) = capacity else {
@@ -86,7 +88,12 @@ fn scheduled_state_fit(
     };
     if candidate_bytes > capacity.budget {
         ScheduledStateFit::Never
-    } else if capacity.held.saturating_add(candidate_bytes) > capacity.budget {
+    } else if capacity
+        .held
+        .saturating_add(outstanding_bytes)
+        .saturating_add(candidate_bytes)
+        > capacity.budget
+    {
         ScheduledStateFit::AfterReclaim
     } else {
         ScheduledStateFit::Fits
@@ -289,6 +296,11 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         _total_tokens: u32,
         _speculative: bool,
     ) -> u64 {
+        0
+    }
+    /// Off-pool state `seq_id` holds now; a live turn's reservation is charged
+    /// only beyond this.
+    fn scheduled_state_held_bytes(&self, _seq_id: SeqId) -> u64 {
         0
     }
     /// Return false when this prefix cannot seed complete draft state. The
@@ -928,6 +940,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     turn.payload.scheduled_speculation = None;
                     turn.decode_draft_allowance = 0;
                     turn.recurrent_state_bytes = self.inner.recurrent_state_bytes();
+                    turn.scheduled_state_bytes = 0;
                 }
                 Err(error) => return Ok(Self::fail(turn, row, error)),
             }
@@ -2106,6 +2119,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.reclaim_one_idle_scheduled_with(seq_id, B::release_scheduled_cache)
     }
 
+    #[cfg(test)]
+    pub(crate) fn live_turns(&self) -> usize {
+        self.scheduler.waiting_len() + self.scheduler.running_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_prepared_waiting(&self) -> bool {
+        self.prepared_waiting.is_some()
+    }
+
     fn reclaim_one_idle_scheduled_with<F>(
         &mut self,
         seq_id: SeqId,
@@ -2204,8 +2227,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         loop {
             let decision =
                 self.reserve_memory_decision(&snapshot, reservation_blocks, candidate_state_bytes);
-            let state =
-                scheduled_state_fit(self.inner.scheduled_state_capacity(), state_candidate_bytes);
+            let outstanding_bytes = {
+                let inner = &self.inner;
+                self.scheduler
+                    .outstanding_scheduled_state_bytes(|seq| inner.scheduled_state_held_bytes(seq))
+            };
+            let state = scheduled_state_fit(
+                self.inner.scheduled_state_capacity(),
+                outstanding_bytes,
+                state_candidate_bytes,
+            );
             if state == ScheduledStateFit::Never {
                 return Err(self.scheduled_state_exceeded(state_candidate_bytes));
             }
@@ -2346,6 +2377,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if !self.ensure_recurrent_slot(prepared.seq_id) {
             return Err(prepared);
         }
+        let mut scheduled_state_bytes = 0u64;
         if let Some(snapshot) = cache_snapshot {
             let reuse = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
             let charge = prepared
@@ -2364,6 +2396,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     engine::plan::DecoderPlan::Speculative(_)
                 ),
             );
+            scheduled_state_bytes = state_candidate_bytes
+                .saturating_add(self.inner.scheduled_state_held_bytes(prepared.seq_id));
             match self.try_reserve_reclaiming_idle(
                 prepared.seq_id,
                 charge,
@@ -2589,7 +2623,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
         .with_block_reservation(reservation_blocks, materialized_blocks, block_size)
-        .with_recurrent_state_reservation(reservation_state_bytes);
+        .with_recurrent_state_reservation(reservation_state_bytes)
+        .with_scheduled_state_reservation(scheduled_state_bytes);
         turn.decode_draft_allowance = draft_allowance;
         if let Some(restore) = restore {
             self.pending_restores.insert(seq_id, restore);
@@ -2803,7 +2838,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 state_candidate_bytes,
                 snapshot,
             ) {
-                Ok(MemoryReserveOutcome::Admitted) => {}
+                Ok(MemoryReserveOutcome::Admitted) => {
+                    turn.scheduled_state_bytes = state_candidate_bytes
+                        .saturating_add(self.inner.scheduled_state_held_bytes(turn.seq_id));
+                }
                 Ok(MemoryReserveOutcome::Defer) => {
                     self.scheduler.prepend_preempted(turn);
                     return;
@@ -3914,26 +3952,50 @@ mod tests {
     }
 
     /// Off-pool state admission: a candidate above the whole budget errors
-    /// instead of deferring behind rows no reclaim can free enough of.
+    /// instead of deferring behind rows no reclaim can free enough of, and a
+    /// queued turn's unmaterialized reservation counts like held state.
     /// MUTATION: compare the candidate with `>=` in `scheduled_state_fit`; the
     /// exact-budget row below reports `Never` and its assertion fails.
+    /// MUTATION: drop `outstanding_bytes` from the sum; `(20, 21)` reports
+    /// `Fits` and its assertion fails.
     #[test]
     fn scheduled_state_fit_orders_fits_reclaim_and_never() {
-        assert_eq!(scheduled_state_fit(None, u64::MAX), ScheduledStateFit::Fits);
+        assert_eq!(
+            scheduled_state_fit(None, u64::MAX, u64::MAX),
+            ScheduledStateFit::Fits
+        );
         let capacity = Some(ScheduledStateCapacity {
             budget: 100,
             held: 60,
         });
-        assert_eq!(scheduled_state_fit(capacity, 40), ScheduledStateFit::Fits);
         assert_eq!(
-            scheduled_state_fit(capacity, 41),
+            scheduled_state_fit(capacity, 0, 40),
+            ScheduledStateFit::Fits
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 0, 41),
             ScheduledStateFit::AfterReclaim
         );
         assert_eq!(
-            scheduled_state_fit(capacity, 100),
+            scheduled_state_fit(capacity, 0, 100),
             ScheduledStateFit::AfterReclaim
         );
-        assert_eq!(scheduled_state_fit(capacity, 101), ScheduledStateFit::Never);
+        assert_eq!(
+            scheduled_state_fit(capacity, 0, 101),
+            ScheduledStateFit::Never
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 20, 20),
+            ScheduledStateFit::Fits
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 20, 21),
+            ScheduledStateFit::AfterReclaim
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 20, 100),
+            ScheduledStateFit::AfterReclaim
+        );
     }
 
     #[test]
