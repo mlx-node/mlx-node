@@ -436,6 +436,69 @@ fn queued_mtp_owner_keeps_its_draft_reservation_until_its_owner_exists() {
     assert_eq!(state.owner_sequences.len(), 2);
 }
 
+/// A preempted MTP turn drops its row and draft owner and re-admits both on
+/// resume. The resume sizes the draft state from the turn's token bound, not
+/// from its block reservation: with `MLX_SCHED_RESERVE_FULL_ISL=0` the block
+/// reservation covers the prompt plus one growth block, and a turn re-admitted
+/// at that size would grow its draft frontier beside owners the full bound
+/// defers. The turn is admitted with the full-ISL reservation and shrunk to
+/// the partial shape before the preemption.
+/// MUTATION: size the resume candidate from
+/// `block_reservation_total * block_size` again in `try_resume_preempted`;
+/// the resumed turn carries `row + draft(64 tokens)` and the
+/// `scheduled_state_bytes` assertion after the resume fails.
+#[test]
+fn resumed_mtp_turn_keeps_the_draft_reservation_of_its_token_bound() {
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, HybridSchedulerState};
+    use crate::engine::scheduler::TurnStatus;
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let c = state.inner.decoder.config.clone();
+    let max_new_tokens = 120;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (command, mut reply) = turn_command(TurnKind::Start, true, max_new_tokens, Some("owner"));
+    assert!(sender.send(command).is_ok());
+    assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+    let seq = state.owner_sequences["owner"];
+    let turn = state.turn_mut(seq).unwrap();
+    assert_eq!(turn.status, TurnStatus::Running);
+    let prompt_tokens = turn.payload.prompt_tokens.len() as u32;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(
+        prompt_tokens,
+        max_new_tokens as u32,
+    );
+    let reserved =
+        memory::row_state_bytes(&c) + memory::draft_state_bytes(&c, u64::from(requested));
+    assert_eq!(turn.scheduled_state_bytes, reserved);
+    turn.block_reservation_total = prompt_tokens.div_ceil(turn.block_size) + 1;
+    let partial = turn.block_reservation_total * turn.block_size;
+    assert!(
+        partial < requested,
+        "a {partial}-token block reservation must undercut the {requested}-token bound, or this test proves nothing"
+    );
+    assert!(state.preempt_running(seq));
+    assert!(
+        state.turn_mut(seq).unwrap().scheduled_state_bytes == reserved
+            && state.inner.scheduled_state_capacity().unwrap().held == 0,
+        "preemption releases the row and the draft owner"
+    );
+    state.resume_preempted();
+    let turn = state.turn_mut(seq).unwrap();
+    assert_eq!((turn.status, turn.preemptions), (TurnStatus::Waiting, 1));
+    assert_eq!(turn.scheduled_state_bytes, reserved);
+    let (text, cycles) = finish_turn(&mut state, &mut receiver, &mut reply).unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    let (control, _) = drive_turn(
+        &mut state,
+        TurnKind::Start,
+        true,
+        max_new_tokens,
+        Some("control"),
+    )
+    .unwrap();
+    assert_eq!(text, control);
+}
+
 /// Drives one turn without a `cacheOwnerId` through the scheduler and returns
 /// its text and MTP cycle count.
 fn drive_ownerless_turn(
