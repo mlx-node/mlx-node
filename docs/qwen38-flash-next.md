@@ -261,7 +261,9 @@ reaches the exclusive lane (`MLX_SERVE_FORCE_SERIAL`) is refused before prefill
 instead of decoding plain AR. Proposals use private draft state; verification
 runs every draft row through each layer together, reading the layer's weights
 once, with one routing readback per layer, and commits only accepted target
-frontiers.
+frontiers. The head's routed experts become resident Q8 (affine, group 32) banks
+on the first MTP owner, about 2.6 GiB for the released checkpoint outside the
+weight LRU, and each draft step gathers them on the device.
 Head availability alone does not establish a latency benefit. Stochastic MTP
 keeps distribution-correct verification and disables the greedy adaptive policy.
 
