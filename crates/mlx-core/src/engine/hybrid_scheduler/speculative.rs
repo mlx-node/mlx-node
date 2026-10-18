@@ -645,6 +645,10 @@ mod tests {
             _ => unreachable!(),
         };
         let (reply, _) = tokio::sync::oneshot::channel();
+        let requested_tokens = engine::scheduler::scheduled_materialized_tokens(
+            prompt.len() as u32,
+            params.max_new_tokens.max(0) as u32,
+        );
         let payload = ScheduledTurn {
             owner_id: format!("owner-{seq}"),
             scheduled_speculation: speculative
@@ -680,6 +684,7 @@ mod tests {
             failure: None,
             allocation_failed: false,
             preemption_replay: None,
+            requested_tokens,
         };
         let mut turn = TurnState::new(seq, prompt, 0, Vec::new(), Some(cancel), payload).unwrap();
         turn.decode_draft_allowance = if speculative { 3 } else { 0 };

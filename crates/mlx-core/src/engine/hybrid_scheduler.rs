@@ -751,6 +751,10 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) failure: Option<Error>,
     pub(crate) allocation_failed: bool,
     pub(crate) preemption_replay: Option<PreemptionReplay>,
+    /// Token bound the off-pool state reservation was sized for. The block
+    /// reservation may cover fewer tokens (`MLX_SCHED_RESERVE_FULL_ISL=0`),
+    /// so a resume must not derive the bound from it.
+    pub(crate) requested_tokens: u32,
 }
 
 struct PreparedTurn {
@@ -2129,6 +2133,28 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.prepared_waiting.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn turn_mut(
+        &mut self,
+        seq_id: SeqId,
+    ) -> Option<&mut TurnState<ScheduledTurn<B::PrefixState>>> {
+        self.scheduler.turn_mut(seq_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preempt_running(&mut self, seq_id: SeqId) -> bool {
+        let Some(turn) = self.scheduler.preempt_running(seq_id) else {
+            return false;
+        };
+        self.handle_preempted(turn);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_preempted(&mut self) {
+        self.try_resume_preempted();
+    }
+
     fn reclaim_one_idle_scheduled_with<F>(
         &mut self,
         seq_id: SeqId,
@@ -2435,7 +2461,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             reservation_blocks,
             block_size,
             reservation_state_bytes,
-            requested_tokens: _,
+            requested_tokens,
         } = *prepared;
         if cancelled.load(Ordering::Relaxed) {
             if newly_assigned {
@@ -2584,6 +2610,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             failure: None,
             allocation_failed: false,
             preemption_replay: None,
+            requested_tokens,
         };
         let prompt_len = admitted.tokens.len() as u32;
         let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
@@ -2824,11 +2851,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             } else {
                 turn.block_reservation_total
             };
-            // Preemption released the row and the draft owner: the resume
-            // re-admits both, with the block reservation bounding the tokens.
             let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
                 turn.seq_id,
-                turn.block_reservation_total.saturating_mul(turn.block_size),
+                turn.payload.requested_tokens,
                 turn.payload.scheduled_speculation.is_some(),
             );
             match self.try_reserve_reclaiming_idle(

@@ -913,6 +913,30 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         cancelled
     }
 
+    fn preempt_running_at(&mut self, index: usize) -> TurnState<P> {
+        let mut victim = self.running.remove(index);
+        victim.status = TurnStatus::Preempted;
+        victim.block_reservation_active = false;
+        victim.recurrent_state_reservation_active = false;
+        victim.preemptions = victim.preemptions.saturating_add(1);
+        self.stats.preemptions = self.stats.preemptions.saturating_add(1);
+        victim
+    }
+
+    #[cfg(test)]
+    pub fn preempt_running(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
+        let index = self.running.iter().position(|turn| turn.seq_id == seq_id)?;
+        Some(self.preempt_running_at(index))
+    }
+
+    #[cfg(test)]
+    pub fn turn_mut(&mut self, seq_id: SeqId) -> Option<&mut TurnState<P>> {
+        self.waiting
+            .iter_mut()
+            .chain(self.running.iter_mut())
+            .find(|turn| turn.seq_id == seq_id)
+    }
+
     /// Remove the oldest preempted row for model-specific cache re-preparation.
     /// Preempted rows are deliberately invisible to `admit_waiting`; the model
     /// must first establish a fresh adapter request (or an SSD restore ticket).
@@ -1198,13 +1222,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .iter()
                 .rposition(|turn| turn.status == TurnStatus::Running)
         {
-            let mut victim = self.running.remove(index);
-            victim.status = TurnStatus::Preempted;
-            victim.block_reservation_active = false;
-            victim.recurrent_state_reservation_active = false;
-            victim.preemptions = victim.preemptions.saturating_add(1);
-            self.stats.preemptions = self.stats.preemptions.saturating_add(1);
-            preempted = Some(victim);
+            preempted = Some(self.preempt_running_at(index));
         }
 
         let mut completed = Vec::new();

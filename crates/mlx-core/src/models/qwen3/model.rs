@@ -5333,6 +5333,10 @@ mod tests {
             failure: None,
             allocation_failed: false,
             preemption_replay: None,
+            requested_tokens: engine::scheduler::scheduled_materialized_tokens(
+                prompt.len() as u32,
+                5,
+            ),
         };
         // Splitting the prefill also verifies that non-final slices leave the
         // pending zero-budget close intact until a token can actually be emitted.
