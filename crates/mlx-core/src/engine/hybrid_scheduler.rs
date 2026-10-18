@@ -163,6 +163,13 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn reset_owner_on_session_start(&self) -> bool {
         false
     }
+    /// The exclusive lane keeps the ownerless session in the scheduler's owner
+    /// tables under the empty owner id, so the scheduled lane can serve that
+    /// same session. Without this, an ownerless turn must stay exclusive: its
+    /// session lives outside the tables the scheduled lane reads.
+    fn ownerless_session_in_owner_tables(&self) -> bool {
+        false
+    }
     fn release_scheduled_cache(&mut self, seq_id: SeqId) -> Result<()> {
         let Some(adapter) = self.paged_adapter_mut() else {
             return Ok(());
@@ -1513,6 +1520,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         Self::chat_config(command)
             .and_then(|config| config.cache_owner_id.as_deref())
             .is_some_and(|owner| !owner.is_empty())
+    }
+
+    /// An ownerless speculative request takes the scheduled lane as the empty
+    /// owner when the family keeps its ownerless session in the owner tables.
+    /// The legacy-owner drain still admits it only into an idle scheduler, so
+    /// the empty owner never has two turns in flight.
+    fn ownerless_speculation_is_scheduled(&self, command: &ChatCmd) -> bool {
+        self.inner.ownerless_session_in_owner_tables()
+            && self.inner.supports_scheduled_speculation()
+            && Self::chat_config(command).is_some_and(|config| config.enable_mtp == Some(true))
     }
 
     fn chat_requires_legacy_owner_drain(command: &ChatCmd) -> bool {
@@ -3013,7 +3030,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     let is_reset = matches!(chat, ChatCmd::ResetCaches { .. });
                     let mut exclusive = false;
                     if !self.inner.scheduler_cache_available()
-                        || !Self::chat_has_explicit_owner(&chat)
+                        || !(Self::chat_has_explicit_owner(&chat)
+                            || self.ownerless_speculation_is_scheduled(&chat))
                         || self.chat_requires_barrier(&chat)
                     {
                         self.scheduler

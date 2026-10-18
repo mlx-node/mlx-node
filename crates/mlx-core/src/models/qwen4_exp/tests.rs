@@ -153,6 +153,177 @@ fn failed_exclusive_turns_release_empty_owners_and_preserve_live_history() {
     assert_eq!(sequences.len(), 1);
 }
 
+/// An ownerless MTP request that still reaches the exclusive lane
+/// (MLX_SERVE_FORCE_SERIAL), where native MTP cannot run, must fail before
+/// prefill instead of decoding AR under `enableMtp: true`.
+///
+/// MUTATION: restore the silent decline (drop the ownerless check in
+/// `run_paged_turn`); the MTP turns then complete as AR and the
+/// `expect_err` below fails.
+#[test]
+fn ownerless_mtp_turn_errors_instead_of_decoding_autoregressive() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, SchedulerOwnerContext};
+    let mut inner = tiny_inner();
+    let mut sequences = std::collections::HashMap::new();
+    let mut states = std::collections::HashMap::new();
+    let mut next = 1;
+    let mut turn = |inner: &mut Inner, enable_mtp: bool, streaming: bool| {
+        let message: crate::tokenizer::ChatMessage =
+            serde_json::from_value(serde_json::json!({"role":"user","content":"a"})).unwrap();
+        let config = crate::engine::types::ChatConfig {
+            max_new_tokens: Some(2),
+            temperature: Some(0.0),
+            enable_mtp: Some(enable_mtp),
+            ..Default::default()
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(16);
+        let cmd = if streaming {
+            ChatCmd::StreamSessionStart {
+                messages: vec![message],
+                config,
+                cancelled,
+                stream_tx,
+            }
+        } else {
+            ChatCmd::SessionStart {
+                messages: vec![message],
+                config,
+                cancelled,
+                reply,
+            }
+        };
+        inner.execute_chat_barrier(
+            cmd,
+            SchedulerOwnerContext {
+                owner_sequences: &mut sequences,
+                owner_states: &mut states,
+                next_seq_id: &mut next,
+            },
+        );
+        let outcome = if streaming {
+            let mut last = None;
+            while let Ok(chunk) = stream_rx.try_recv() {
+                let failed = chunk.is_err();
+                last = Some(chunk.map(|_| ()));
+                if failed {
+                    break;
+                }
+            }
+            last.unwrap()
+        } else {
+            rx.try_recv().unwrap().map(|_| ())
+        };
+        (outcome, sequences.clone(), states.clone())
+    };
+    for streaming in [false, true] {
+        let (outcome, owners, _) = turn(&mut inner, true, streaming);
+        let reason = outcome.expect_err("ownerless MTP must not decode").reason;
+        assert!(
+            reason.starts_with("qwen4_exp runs enableMtp only on its shared scheduler"),
+            "{reason}"
+        );
+        assert!(owners.is_empty(), "a refused turn leaves no owner");
+        assert!(
+            inner
+                .decoder
+                .paged
+                .as_ref()
+                .unwrap()
+                .live_seq_ids()
+                .is_empty()
+        );
+    }
+    // The same ownerless request without MTP completes, so the refusal above
+    // is the MTP gate, not a fixture that cannot run a turn.
+    let (outcome, _, live) = turn(&mut inner, false, false);
+    outcome.unwrap();
+    let history = live[""].clone();
+    assert!(!history.is_empty());
+    // A refusal happens before prefill and keeps the live legacy session.
+    for streaming in [false, true] {
+        let (outcome, _, after) = turn(&mut inner, true, streaming);
+        assert!(outcome.is_err());
+        assert_eq!(after[""], history);
+    }
+}
+
+/// An ownerless `enableMtp` request runs native MTP on the scheduler as the
+/// empty owner, the session ownerless exclusive turns already keep: an
+/// ownerless AR turn in between reuses that owner, and repeated requests never
+/// add an owner or a parked row.
+///
+/// MUTATION: drop `ownerless_speculation_is_scheduled` from the lane choice in
+/// `HybridSchedulerState::drive`; the MTP start then takes the exclusive lane,
+/// is refused, and the first `unwrap` below fails.
+#[test]
+fn ownerless_mtp_turn_runs_on_the_scheduler_as_the_ownerless_session() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    use crate::engine::model_command::ModelCommand;
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = |state: &mut HybridSchedulerState<Inner>, enable_mtp: bool| {
+        let message: crate::tokenizer::ChatMessage =
+            serde_json::from_value(serde_json::json!({"role":"user","content":"a"})).unwrap();
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        let command = ChatCmd::SessionStart {
+            messages: vec![message],
+            config: crate::engine::types::ChatConfig {
+                max_new_tokens: Some(8),
+                temperature: Some(0.0),
+                enable_mtp: Some(enable_mtp),
+                mtp_depth: Some(2),
+                mtp_adaptive_depth: Some(false),
+                report_performance: Some(true),
+                ..Default::default()
+            },
+            cancelled: Arc::new(AtomicBool::new(false)),
+            reply,
+        };
+        assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
+        for _ in 0..1024 {
+            if let Ok(result) = rx.try_recv() {
+                return result;
+            }
+            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        }
+        panic!("the turn did not finish");
+    };
+    let cycles = |result: &crate::engine::types::ChatResult| {
+        result.performance.as_ref().and_then(|p| p.mtp_cycles)
+    };
+    let first = turn(&mut state, true).unwrap();
+    assert!(
+        cycles(&first).is_some_and(|n| n > 0),
+        "{:?}",
+        cycles(&first)
+    );
+    assert_eq!(state.owner_sequences.len(), 1);
+    let seq = state.owner_sequences[""];
+    let plain = turn(&mut state, false).unwrap();
+    assert_eq!(cycles(&plain), None);
+    assert_eq!(plain.text, first.text);
+    let again = turn(&mut state, true).unwrap();
+    assert!(
+        cycles(&again).is_some_and(|n| n > 0),
+        "{:?}",
+        cycles(&again)
+    );
+    assert_eq!(again.text, first.text);
+    assert_eq!(
+        state.owner_sequences,
+        std::collections::HashMap::from([(String::new(), seq)])
+    );
+    assert_eq!(
+        state.inner.rows.len() + usize::from(state.inner.active_seq.is_some()),
+        1
+    );
+}
+
 #[test]
 fn media_prompt_planning_matches_bounded_processor_grids() {
     use crate::vision::qwen::prompt::{
