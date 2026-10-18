@@ -556,11 +556,6 @@ impl Store {
         if self.fixture {
             return Ok(());
         }
-        // Mapped experts are clean page cache the OS reclaims itself; a turn
-        // grows no anonymous weight memory, so there is no reserve to defend.
-        if self.plan.mapped {
-            return Ok(());
-        }
         check()
     }
 
@@ -1142,6 +1137,25 @@ impl Store {
         lookup: bool,
         prepared: Option<Option<super::packed_cache::VerifiedChunk>>,
     ) -> Result<Arc<Weight>> {
+        self.read_impl_with(
+            name,
+            start,
+            rows,
+            lookup,
+            prepared,
+            super::memory::check_growth_headroom,
+        )
+    }
+
+    fn read_impl_with(
+        &mut self,
+        name: &str,
+        start: usize,
+        rows: usize,
+        lookup: bool,
+        prepared: Option<Option<super::packed_cache::VerifiedChunk>>,
+        growth_check: impl FnOnce() -> Result<()>,
+    ) -> Result<Arc<Weight>> {
         if let Some(bank) = self.banks.get(name) {
             let d = self.descriptor(name)?;
             d.range(start, rows)?;
@@ -1170,8 +1184,11 @@ impl Store {
             std::thread::sleep,
         )?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
-        if cfg!(target_os = "macos") && !self.plan.mapped && self.growth_bytes >= 256 << 20 {
-            super::memory::check_growth_headroom()?;
+        // Mapped experts never pass through here, so growth_bytes holds only
+        // anonymous bytes: token/PLE rows, MTP/vision weights and fallback
+        // projection chunks still consume the system reserve in mapped mode.
+        if cfg!(target_os = "macos") && self.growth_bytes >= 256 << 20 {
+            growth_check()?;
             self.growth_bytes = 0;
         }
         self.evict_to(cache_limit.saturating_sub(MAX_READ_BYTES * 3))?;
@@ -1700,6 +1717,80 @@ mod cache_tests {
         assert_eq!(checked.get(), 0, "tiny fixture queried production reserves");
         assert!(production.check_forward_headroom_with(unavailable).is_err());
         assert_eq!(checked.get(), 1, "production skipped its headroom check");
+    }
+
+    #[test]
+    fn mapped_store_keeps_the_forward_headroom_guard() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
+        let mut production = Store::open_metadata(&path, None).unwrap();
+        production.plan.mapped = true;
+        let checked = std::cell::Cell::new(0);
+        let unavailable = || {
+            checked.set(checked.get() + 1);
+            Err(err("simulated exhausted system headroom"))
+        };
+        assert!(production.check_forward_headroom_with(unavailable).is_err());
+        assert_eq!(
+            checked.get(),
+            1,
+            "mapped store skipped the forward headroom check"
+        );
+    }
+
+    /// Only the routed experts are file-backed in mapped mode; every other
+    /// read is anonymous growth and keeps the 256 MiB system-headroom recheck.
+    #[test]
+    fn mapped_store_rechecks_growth_headroom_for_anonymous_rows() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
+        let mut store = Store::open_metadata(&path, None).unwrap();
+        store.plan.mapped = true;
+        let checked = std::cell::Cell::new(0);
+        let unavailable = || {
+            checked.set(checked.get() + 1);
+            Err(err("simulated exhausted system headroom"))
+        };
+        let row = store
+            .read_impl_with("embed_tokens.weight", 0, 1, false, None, unavailable)
+            .unwrap();
+        assert_eq!(
+            checked.get(),
+            0,
+            "a read under 256 MiB of growth queried headroom"
+        );
+        assert_eq!(
+            store.growth_bytes,
+            row.bytes().unwrap(),
+            "mapped mode must charge anonymous rows as growth"
+        );
+        store.growth_bytes = 256 << 20;
+        let error =
+            match store.read_impl_with("embed_tokens.weight", 1, 1, false, None, unavailable) {
+                Ok(_) => panic!("mapped store ignored exhausted growth headroom"),
+                Err(error) => error,
+            };
+        assert!(error.reason.contains("simulated"), "{}", error.reason);
+        assert_eq!(checked.get(), 1);
+        assert_eq!(
+            store.growth_bytes,
+            256 << 20,
+            "a refused read must leave the growth pending"
+        );
+        assert!(
+            !store
+                .cache
+                .contains_key(&("embed_tokens.weight".to_string(), 1, 1))
+        );
+        store
+            .read_impl_with("embed_tokens.weight", 1, 1, false, None, || Ok(()))
+            .unwrap();
+        assert_eq!(
+            store.growth_bytes,
+            row.bytes().unwrap(),
+            "a passing check restarts the growth count"
+        );
     }
 
     #[test]
