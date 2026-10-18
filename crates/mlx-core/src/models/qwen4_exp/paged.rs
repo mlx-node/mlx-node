@@ -298,7 +298,7 @@ impl HybridSchedulerBackend for Inner {
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
     const SCHEDULER_NAME: &'static str = "qwen4_exp";
     fn scheduler_wired_bytes(&self) -> Option<usize> {
-        if runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_WIRED") {
+        if self.decoder.weights.plan.mapped || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_WIRED") {
             return None;
         }
         let pages = self.decoder.paged.as_ref().map_or(Some(0), |p| {

@@ -5470,6 +5470,16 @@ export interface Qwen4ExpResidencyInfo {
    * pack; 0 means every expert read goes through the per-expert chunks.
    */
   mappedPackFiles: number;
+  /**
+   * Every routed expert is addressed in place through the mapped pack;
+   * the weight budget then covers dense banks and rows only.
+   */
+  mapped: boolean;
+  /**
+   * Pack bytes backing live arrays in mapped mode (clean page cache the
+   * Metal driver wires while a command buffer binds them).
+   */
+  mappedBytes: number;
 }
 
 /** Result of text recognition. */

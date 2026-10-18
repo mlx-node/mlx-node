@@ -50,11 +50,38 @@ and caps weights at 75% of physical RAM. Anonymous inactive and compressed
 memory do not count as available. The budget is reconciled after tokenizer and
 page-pool creation; growth rechecks headroom and memory pressure.
 
-If the hot text network fits, it is prepared once in resident quantized banks.
-Otherwise, fixed projections are retained within a quarter of the budget and
-routed experts use stable slots sized from the remaining budget and tensor
-geometry. Sparse token/PLE rows stay on SSD. Only selected cold experts are
-read. Every source read and its F32-equivalent size are capped at 64 MiB;
+With a complete mapped expert pack (below) and a hot set within 75% of
+physical RAM, `auto` maps every routed expert in place: the pack's sections
+back the expert banks as no-copy Metal buffers, slot id is expert id, and no
+expert is ever copied, missed or staged during a turn. The weight budget then
+covers only what stays anonymous — fixed projection banks, up to 8 GiB of
+auxiliary (MTP/vision) inventory and 2 GiB of row/staging room — and the
+routed experts are clean page cache: the Metal driver wires the banks a
+command buffer binds and releases them about a second after the turn, so the
+process holds no expert memory between turns and the OS may evict the pages.
+Turns run without a wired-limit context (it does not pin file-backed buffers
+and only delays their release), the mid-turn headroom and staging checks are
+gone with the staging, and the SSD safety limit subtracts the mapped bytes
+MLX counts in `active_memory`. Greedy output no longer depends on the free
+memory at load. The driver wires whole banks, not the experts a token
+routes to, and unwires a bank about a second after its last use; a pass that
+starts later than that after the previous one would otherwise re-wire the
+layers one by one and fall into a 0.5 tokens/s cycle, so every forward pass
+whose predecessor started more than 0.9 s earlier first reads one element of
+every mapped bank in a single eval. Every prefill window and every decode
+step needs the entire routed set resident at once: when other processes'
+anonymous memory leaves
+less than that (a 20 GiB working set beside the 78 GiB pack on 128 GiB), the
+kernel re-faults the pack layer by layer and a 6k turn reads about 1 TB from
+SSD at 0.4 tokens/s instead of 50. The 75% gate does not see that memory;
+`MLX_QWEN4_MAPPED_PACK=0` keeps the slot path for A/B and for such hosts;
+`MLX_QWEN4_WEIGHT_CACHE_GIB`, `stream` and `full` also select it.
+
+Otherwise, if the hot text network fits, it is prepared once in resident
+quantized banks; else fixed projections are retained within a quarter of the
+budget and routed experts use stable slots sized from the remaining budget and
+tensor geometry. Sparse token/PLE rows stay on SSD. Only selected cold experts
+are read. Every source read and its F32-equivalent size are capped at 64 MiB;
 bank preparation accounts for both imported chunks and their destination.
 
 The optional prepared SSD cache stores losslessly imported matrix chunks, so
@@ -96,7 +123,8 @@ limit reclaims the allocator freelist and re-polls before erroring.
 | `MLX_QWEN4_RESIDENCY=auto`   | Admit full or partial hot residency from current headroom.              |
 | `MLX_QWEN4_RESIDENCY=full`   | Require the full hot set; fail if it cannot fit safely.                 |
 | `MLX_QWEN4_RESIDENCY=stream` | Bound the on-demand cache to at most 8 GiB unless overridden.           |
-| `MLX_QWEN4_WEIGHT_CACHE_GIB` | Optional integer ceiling, at least 2 GiB; live admission still applies. |
+| `MLX_QWEN4_WEIGHT_CACHE_GIB` | Optional integer ceiling, at least 2 GiB; live admission still applies. Pins an anonymous budget, so the slot path is used even when the mapped pack exists. |
+| `MLX_QWEN4_MAPPED_PACK=0`    | Keep the slot path although the mapped pack is complete (A/B arm).      |
 | `MLX_QWEN4_PREFILL_CHUNK`    | Power of two from 1–1024, constrained by the working-memory allowance.  |
 | `MLX_QWEN4_BATCHED_QSA=0`    | Run prompt windows past the indexer budget one token at a time instead of the batched sparse-attention kernel. |
 | `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |
@@ -114,9 +142,10 @@ reading each file back before its atomic rename; later loads check the header
 and file size. Each tensor is built under its own `.<tensor>.lock` file, which
 is never renamed or unlinked, so two loaders of one checkpoint never rebuild
 or truncate each other's published file; a tensor another process is building
-is left out of this load's pack. The slot path reads whole experts from it by
-range through the page cache instead of opening, locking, stamping and hashing
-one chunk file per expert; a tensor the pack lacks (the build stops when the
+is left out of this load's pack. Mapped residency maps its sections
+directly; the slot path reads whole experts from it by range through the page
+cache instead of opening, locking, stamping and hashing one chunk file per
+expert; a tensor the pack lacks (the build stops when the
 disk falls under the 16 GiB reserve, or when `MLX_QWEN4_PACKED_CACHE_MAX_GB`
 leaves no room after evicting idle siblings) keeps the chunk reader. The
 mapped dir's `.mapped` and staging bytes count toward that cap like `.pack`
@@ -127,8 +156,9 @@ same sweep — except one whose `lock` file a process holds shared, which every
 open or building pack does.
 
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
-expert-slot capacity, the number of tensors served from the mapped pack
-(`mappedPackFiles`), and prefill window. These are runtime budgets; they do
+expert-slot capacity (the expert count in mapped mode), the number of tensors
+served from the mapped pack (`mappedPackFiles`), whether experts are mapped in
+place (`mapped`, with `mappedBytes`), and prefill window. These are runtime budgets; they do
 not include every allocation made by macOS or other applications. The runtime
 currently requires macOS Metal for paged inference. NAX kernels are selected
 only for supported hardware and shapes; other shapes retain the native fallback.
