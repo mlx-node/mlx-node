@@ -5465,6 +5465,11 @@ export interface Qwen4ExpResidencyInfo {
   residentExpertLayers: number;
   /** Shared slot capacity for the remaining partial layers at bootstrap. */
   partialExpertSlots: number;
+  /**
+   * Routed expert tensors the slot path reads by range from the mapped
+   * pack; 0 means every expert read goes through the per-expert chunks.
+   */
+  mappedPackFiles: number;
 }
 
 /** Result of text recognition. */

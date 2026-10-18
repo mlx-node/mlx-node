@@ -529,6 +529,7 @@ pub struct Store {
     packed: Option<super::packed_cache::PackedCache>,
     pub packed_hits: u64,
     pub packed_bytes_read: u64,
+    mapped: Option<super::mapped_pack::MappedPack>,
     pub lookup_batches: u64,
     pub lookup_misses: u64,
 }
@@ -608,6 +609,7 @@ impl Store {
                 resident_bank_bytes: 0,
                 resident_expert_layers: 0,
                 partial_expert_slots: 0,
+                mapped_pack_files: 0,
             },
             banks: HashMap::new(),
             bank_bytes: 0,
@@ -626,6 +628,7 @@ impl Store {
             packed: None,
             packed_hits: 0,
             packed_bytes_read: 0,
+            mapped: None,
             lookup_batches: 0,
             lookup_misses: 0,
         };
@@ -932,7 +935,9 @@ impl Store {
 
     /// Preload only the already selected expert group. At most 64 MiB of
     /// verified CPU payloads coexist; MLX imports and all Store/slot mutations
-    /// stay on the inference thread in original request order.
+    /// stay on the inference thread in original request order. Whole-expert
+    /// batches of packed tensors come from the mapped pack by range; anything
+    /// else from the per-expert chunk cache.
     fn read_expert_batch(
         &mut self,
         requests: &[(String, usize, usize)],
@@ -973,11 +978,22 @@ impl Store {
         self.evict_to(self.cache_limit.saturating_sub(staging_bytes))?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
         super::memory::admit(staging_bytes)?;
-        let cache = self
-            .packed
+        let subset: Vec<_> = indices.iter().map(|&i| requests[i].clone()).collect();
+        let mapped = self
+            .mapped
             .as_ref()
-            .ok_or_else(|| err("Qwen4 packed cache disappeared before the prepared batch read"))?;
-        let verified = cache.read_batch(&jobs)?;
+            .map(|pack| pack.read_batch(&subset))
+            .transpose()?
+            .flatten();
+        let verified = match mapped {
+            Some(chunks) => chunks.into_iter().map(Some).collect(),
+            None => {
+                let cache = self.packed.as_ref().ok_or_else(|| {
+                    err("Qwen4 packed cache disappeared before the prepared batch read")
+                })?;
+                cache.read_batch(&jobs)?
+            }
+        };
         let mut prepared: Vec<_> = (0..requests.len()).map(|_| None).collect();
         for (i, chunk) in indices.into_iter().zip(verified) {
             prepared[i] = Some(chunk);
@@ -987,6 +1003,84 @@ impl Store {
             .zip(prepared)
             .map(|((name, start, rows), chunk)| self.read_impl(name, *start, *rows, false, chunk))
             .collect()
+    }
+
+    /// Open the mapped expert pack beside the chunk cache, building whatever
+    /// is missing from verified chunks or the checkpoint. A failure leaves
+    /// the chunk reader in charge; it never fails the load.
+    pub(in super::super) fn prepare_mapped_pack(&mut self) -> Result<()> {
+        let dir = match &self.packed {
+            Some(packed) if self.gguf => match packed.cache_root().zip(packed.identity()) {
+                Some((root, identity)) => {
+                    root.join(format!("{}{identity}", super::mapped_pack::DIR_PREFIX))
+                }
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        self.prepare_mapped_pack_at(&dir)
+    }
+
+    fn prepare_mapped_pack_at(&mut self, dir: &Path) -> Result<()> {
+        let Some(packed) = &self.packed else {
+            return Ok(());
+        };
+        let Some(identity) = packed.identity() else {
+            return Ok(());
+        };
+        let mut routed: Vec<(usize, usize, String, Tensor)> = Vec::new();
+        for (name, tensor) in &self.tensors {
+            let Some((layer, part)) = routed_expert_tensor(name) else {
+                continue;
+            };
+            if tensor.shape.len() != 3
+                || tensor.shape[0] == 0
+                || tensor.packed_key(name, 0, tensor.shape[1])?.is_none()
+            {
+                continue;
+            }
+            routed.push((layer, part, name.clone(), tensor.clone()));
+        }
+        if routed.is_empty() {
+            return Ok(());
+        }
+        routed.sort_by_key(|r| (r.0, r.1));
+        let sources: Vec<RoutedExpertSource<'_>> = routed
+            .into_iter()
+            .map(|(_, _, name, tensor)| RoutedExpertSource {
+                name,
+                tensor,
+                packed,
+            })
+            .collect();
+        let dyn_sources: Vec<&dyn super::mapped_pack::ExpertSource> = sources
+            .iter()
+            .map(|s| s as &dyn super::mapped_pack::ExpertSource)
+            .collect();
+        let started = std::time::Instant::now();
+        match super::mapped_pack::MappedPack::open_or_build(
+            dir,
+            identity,
+            packed.manifest(),
+            &dyn_sources,
+        ) {
+            Ok((pack, report)) => {
+                tracing::info!(
+                    "qwen4 mapped pack: {} opened, {} built, {} unavailable in {:.1} s at {}",
+                    report.opened,
+                    report.built,
+                    report.skipped,
+                    started.elapsed().as_secs_f64(),
+                    pack.dir().display()
+                );
+                self.plan.mapped_pack_files = pack.len();
+                self.mapped = Some(pack);
+            }
+            Err(e) => {
+                tracing::warn!("qwen4 mapped pack unavailable, using expert chunks: {e}");
+            }
+        }
+        Ok(())
     }
 
     /// Gather a bounded lookup window, sharing duplicate rows and submitting
@@ -1051,7 +1145,7 @@ impl Store {
             return Ok(w);
         }
         let d = self.descriptor(name)?.clone();
-        let (offset, bytes) = d.range(start, rows)?;
+        let (_, bytes) = d.range(start, rows)?;
         let cache_limit = self.cache_limit;
         // Refuse before allocation, also accounting for other models in this
         // process. A freelist spike is transient, so reclaim it and re-poll
@@ -1080,121 +1174,12 @@ impl Store {
                 .and_then(|key| self.packed.as_ref()?.read(key).ok().flatten()),
         };
         let prepared_hit = prepared.is_some();
-        let shape = [rows as i64, d.width()? as i64];
         let weight = if let Some((weight, bytes)) = prepared {
             self.packed_hits += 1;
             self.packed_bytes_read += bytes;
             weight
         } else {
-            match &d.encoding {
-                Encoding::Safe(dtype) => {
-                    let mut f = File::open(&d.path).map_err(err)?;
-                    f.seek(SeekFrom::Start(offset)).map_err(err)?;
-                    let mut buf = vec![0; bytes as usize];
-                    f.read_exact(&mut buf).map_err(err)?;
-                    let values = match dtype.as_str() {
-                        "BF16" | "F16" => {
-                            let v: Vec<u16> = buf
-                                .as_chunks::<2>()
-                                .0
-                                .iter()
-                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                                .collect();
-                            if dtype == "BF16" {
-                                MxArray::from_bfloat16(&v, &shape)?
-                            } else {
-                                MxArray::from_float16(&v, &shape)?
-                            }
-                        }
-                        "F32" => MxArray::from_float32(
-                            &buf.as_chunks::<4>()
-                                .0
-                                .iter()
-                                .map(|b| f32::from_le_bytes(*b))
-                                .collect::<Vec<_>>(),
-                            &shape,
-                        )?,
-                        "I64" => MxArray::from_int64(
-                            &buf.as_chunks::<8>()
-                                .0
-                                .iter()
-                                .map(|b| i64::from_le_bytes(*b))
-                                .collect::<Vec<_>>(),
-                            &shape,
-                        )?,
-                        _ => unreachable!(),
-                    };
-                    Weight {
-                        dense_bf16: None,
-                        values,
-                        scales: None,
-                        biases: None,
-                        group: 0,
-                        bits: 0,
-                        mode: String::new(),
-                    }
-                }
-                Encoding::Gguf(ty) => {
-                    let tensor = GgufTensorInfo {
-                        name: "weight".into(),
-                        n_dims: 2,
-                        dims: vec![d.width()? as u64, rows as u64],
-                        tensor_type: *ty,
-                        offset: 0,
-                    };
-                    let g = GgufFile {
-                        version: 3,
-                        tensor_count: 1,
-                        metadata: HashMap::new(),
-                        tensors: vec![tensor],
-                        alignment: 32,
-                        data_offset: offset,
-                    };
-                    let mut a = load_gguf_tensors(
-                        &d.path,
-                        &g,
-                        GgufLoadOptions {
-                            verbose: false,
-                            import_k_quants: true,
-                        },
-                    )?;
-                    let values = a
-                        .remove("weight")
-                        .ok_or_else(|| err("GGUF row reader produced no weight"))?;
-                    let scales = a.remove("weight.scales");
-                    let mut biases = a.remove("weight.biases");
-                    if let Some(zero) = symmetric_zero_point(*ty) {
-                        biases = Some(
-                            scales
-                                .as_ref()
-                                .ok_or_else(|| err("Missing affine scales"))?
-                                .mul_scalar(-(zero as f64))?,
-                        );
-                    }
-                    let (group, bits, mode) = if let Some(k) = ty.k_quant_format() {
-                        (k.group_size() as i32, k.bits() as i32, k.mlx_mode())
-                    } else {
-                        (
-                            32,
-                            match ty {
-                                GgufTensorType::Q5_1 => 5,
-                                GgufTensorType::Q8_0 => 8,
-                                _ => 4,
-                            },
-                            "affine",
-                        )
-                    };
-                    Weight {
-                        dense_bf16: None,
-                        values,
-                        scales,
-                        biases,
-                        group,
-                        bits,
-                        mode: mode.into(),
-                    }
-                }
-            }
+            d.import_rows(start, rows)?
         };
         let arrays: Vec<_> = [
             Some(&weight.values),
@@ -1215,6 +1200,20 @@ impl Store {
                 let _ = cache.write(key, &weight);
             }
         }
+        self.retain_read(name, key, weight, lookup, rows)
+    }
+
+    /// Cache, protect and account a freshly imported chunk.
+    fn retain_read(
+        &mut self,
+        name: &str,
+        key: (String, usize, usize),
+        weight: Weight,
+        lookup: bool,
+        rows: usize,
+    ) -> Result<Arc<Weight>> {
+        let cache_limit = self.cache_limit;
+        let d = self.descriptor(name)?.clone();
         // Embedding lookup already produces BF16 values. Retain that result
         // for a reused row instead of launching a dequantization on every
         // token/PLE access. Charge its actual bytes to the same bounded LRU;
@@ -1277,6 +1276,128 @@ impl Store {
         self.cache.insert(key, Arc::clone(&weight));
         Ok(weight)
     }
+}
+
+impl Tensor {
+    /// Import `rows` rows from `start` straight from the checkpoint: raw
+    /// safetensors bytes, or GGUF blocks through the K-quant repack. No cache
+    /// or accounting is touched; the arrays are lazy.
+    pub(super) fn import_rows(&self, start: usize, rows: usize) -> Result<Weight> {
+        let (offset, bytes) = self.range(start, rows)?;
+        let shape = [rows as i64, self.width()? as i64];
+        Ok(match &self.encoding {
+            Encoding::Safe(dtype) => {
+                let mut f = File::open(&self.path).map_err(err)?;
+                f.seek(SeekFrom::Start(offset)).map_err(err)?;
+                let mut buf = vec![0; bytes as usize];
+                f.read_exact(&mut buf).map_err(err)?;
+                let values = match dtype.as_str() {
+                    "BF16" | "F16" => {
+                        let v: Vec<u16> = buf
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                            .collect();
+                        if dtype == "BF16" {
+                            MxArray::from_bfloat16(&v, &shape)?
+                        } else {
+                            MxArray::from_float16(&v, &shape)?
+                        }
+                    }
+                    "F32" => MxArray::from_float32(
+                        &buf.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_le_bytes(*b))
+                            .collect::<Vec<_>>(),
+                        &shape,
+                    )?,
+                    "I64" => MxArray::from_int64(
+                        &buf.as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|b| i64::from_le_bytes(*b))
+                            .collect::<Vec<_>>(),
+                        &shape,
+                    )?,
+                    _ => unreachable!(),
+                };
+                Weight {
+                    dense_bf16: None,
+                    values,
+                    scales: None,
+                    biases: None,
+                    group: 0,
+                    bits: 0,
+                    mode: String::new(),
+                }
+            }
+            Encoding::Gguf(ty) => {
+                let tensor = GgufTensorInfo {
+                    name: "weight".into(),
+                    n_dims: 2,
+                    dims: vec![self.width()? as u64, rows as u64],
+                    tensor_type: *ty,
+                    offset: 0,
+                };
+                let g = GgufFile {
+                    version: 3,
+                    tensor_count: 1,
+                    metadata: HashMap::new(),
+                    tensors: vec![tensor],
+                    alignment: 32,
+                    data_offset: offset,
+                };
+                let mut a = load_gguf_tensors(
+                    &self.path,
+                    &g,
+                    GgufLoadOptions {
+                        verbose: false,
+                        import_k_quants: true,
+                    },
+                )?;
+                let values = a
+                    .remove("weight")
+                    .ok_or_else(|| err("GGUF row reader produced no weight"))?;
+                let scales = a.remove("weight.scales");
+                let mut biases = a.remove("weight.biases");
+                if let Some(zero) = symmetric_zero_point(*ty) {
+                    biases = Some(
+                        scales
+                            .as_ref()
+                            .ok_or_else(|| err("Missing affine scales"))?
+                            .mul_scalar(-(zero as f64))?,
+                    );
+                }
+                let (group, bits, mode) = if let Some(k) = ty.k_quant_format() {
+                    (k.group_size() as i32, k.bits() as i32, k.mlx_mode())
+                } else {
+                    (
+                        32,
+                        match ty {
+                            GgufTensorType::Q5_1 => 5,
+                            GgufTensorType::Q8_0 => 8,
+                            _ => 4,
+                        },
+                        "affine",
+                    )
+                };
+                Weight {
+                    dense_bf16: None,
+                    values,
+                    scales,
+                    biases,
+                    group,
+                    bits,
+                    mode: mode.into(),
+                }
+            }
+        })
+    }
+}
+
+impl Store {
     pub fn dense(&mut self, name: &str) -> Result<MxArray> {
         let d = self.descriptor(name)?;
         let shape = d.shape.iter().map(|&i| i as i64).collect::<Vec<_>>();
@@ -1378,6 +1499,60 @@ impl Store {
             .iter()
             .map(|x| u64::from_le_bytes(*x))
             .collect())
+    }
+}
+
+/// `blk.{layer}.ffn_{gate|up|down}_exps.weight` -> `(layer, part)`.
+fn routed_expert_tensor(name: &str) -> Option<(usize, usize)> {
+    let (layer, rest) = name.strip_prefix("blk.")?.split_once('.')?;
+    let layer = layer.parse::<usize>().ok()?;
+    let part = [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ]
+    .iter()
+    .position(|p| *p == rest)?;
+    Some((layer, part))
+}
+
+/// One routed expert tensor as the mapped-pack builder sees it: verified
+/// chunks first, the checkpoint importer for whatever the cache lacks.
+struct RoutedExpertSource<'a> {
+    name: String,
+    tensor: Tensor,
+    packed: &'a super::packed_cache::PackedCache,
+}
+
+impl super::mapped_pack::ExpertSource for RoutedExpertSource<'_> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn experts(&self) -> usize {
+        self.tensor.shape[0]
+    }
+    fn rows_per_expert(&self) -> usize {
+        self.tensor.shape[1]
+    }
+    fn width(&self) -> usize {
+        self.tensor.shape[2]
+    }
+    fn cached(&self, expert: usize) -> Result<Option<super::mapped_pack::ExpertRecord>> {
+        let rows = self.rows_per_expert();
+        let Some(key) = self.tensor.packed_key(&self.name, expert * rows, rows)? else {
+            return Ok(None);
+        };
+        let limit = (self.tensor.runtime_bytes()? / self.tensor.rows()? as u64) * rows as u64;
+        Ok(self
+            .packed
+            .read_verified(&key, limit)?
+            .map(super::mapped_pack::ExpertRecord::from_chunk))
+    }
+    fn import(&self, expert: usize) -> Result<super::mapped_pack::ExpertRecord> {
+        let rows = self.rows_per_expert();
+        super::mapped_pack::ExpertRecord::from_weight(
+            &self.tensor.import_rows(expert * rows, rows)?,
+        )
     }
 }
 
@@ -1839,5 +2014,193 @@ mod cache_tests {
         assert!(!store.cache.contains_key(&key(0)));
         store.evict_to(0).unwrap();
         assert!(store.cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::*;
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("qwen4-mapped-store-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const EXPERTS: usize = 5;
+    const PARTS: [(&str, usize, usize, u32, usize); 3] = [
+        // (name, rows per expert, width, GGUF type, block bytes per row)
+        ("blk.0.ffn_gate_exps.weight", 32, 256, 12, 144),
+        ("blk.0.ffn_up_exps.weight", 32, 256, 12, 144),
+        ("blk.0.ffn_down_exps.weight", 128, 64, 7, 48),
+    ];
+
+    /// Three routed expert tensors of one layer: Q4_K gate/up and Q5_1 down,
+    /// filled with deterministic pseudo-random block bytes.
+    fn write_fixture(path: &Path) {
+        let string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend((value.len() as u64).to_le_bytes());
+            bytes.extend(value.bytes());
+        };
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend((PARTS.len() as u64).to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        string(&mut b, "general.architecture");
+        b.extend(8u32.to_le_bytes());
+        string(&mut b, "qwen4exp");
+        let mut offset = 0u64;
+        for (name, rows, width, ty, row_bytes) in PARTS {
+            string(&mut b, name);
+            b.extend(3u32.to_le_bytes());
+            for d in [width as u64, rows as u64, EXPERTS as u64] {
+                b.extend(d.to_le_bytes());
+            }
+            b.extend(ty.to_le_bytes());
+            b.extend(offset.to_le_bytes());
+            offset += (EXPERTS * rows * row_bytes) as u64;
+        }
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        let mut state = 0x2545_f491u32;
+        for _ in 0..offset {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b.push((state >> 24) as u8);
+        }
+        fs::write(path, b).unwrap();
+    }
+
+    fn encoded(weight: &Weight) -> (Vec<u8>, i32, i32, String) {
+        let (arrays, data) = super::super::packed_cache::encode_weight(weight).unwrap();
+        let mut tagged = serde_json::to_vec(&arrays).unwrap();
+        tagged.extend(data);
+        (tagged, weight.group, weight.bits, weight.mode.clone())
+    }
+
+    #[test]
+    fn mapped_pack_matches_the_checkpoint_and_the_chunks_and_feeds_the_slot_batch() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let packed_dir = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".mlx-qwen4-packed-v2-"))
+            })
+            .unwrap();
+        let packs = || {
+            fs::read_dir(&packed_dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+                .count()
+        };
+        assert_eq!(packs(), 0);
+        // No chunk exists yet: every record comes from the GGUF importer.
+        let from_gguf = temp.0.join("from-gguf");
+        store.prepare_mapped_pack_at(&from_gguf).unwrap();
+        assert_eq!(store.plan.mapped_pack_files, 3);
+        assert_eq!(packs(), 0, "the builder never writes chunks");
+        let mapped = store.mapped.take().unwrap();
+        // Oracle: the ordinary reader, expert by expert, encoded as a chunk.
+        for (name, rows, _, _, _) in PARTS {
+            let file = mapped.file(name).unwrap();
+            let h = &file.header;
+            assert_eq!(h.experts as usize, EXPERTS);
+            assert_eq!(h.rows_per_expert as usize, rows);
+            let mut expected: Vec<Vec<u8>> = vec![Vec::new(); h.sections.len()];
+            for expert in 0..EXPERTS {
+                let w = store.read(name, expert * rows, rows).unwrap();
+                let (arrays, data) = super::super::packed_cache::encode_weight(&w).unwrap();
+                assert_eq!(arrays.len(), h.sections.len());
+                let mut cursor = 0;
+                for (part, a) in arrays.iter().enumerate() {
+                    expected[part].extend_from_slice(&data[cursor..cursor + a.bytes]);
+                    cursor += a.bytes;
+                }
+                assert_eq!(
+                    (w.group, w.bits, w.mode.as_str()),
+                    (h.group, h.bits, h.mode.as_str())
+                );
+            }
+            let whole = file.read_range(0, EXPERTS).unwrap();
+            for (s, section) in h.sections.iter().enumerate() {
+                assert_eq!(section.offset % super::super::mapped_pack::PAGE, 0);
+                assert_eq!(section.length % super::super::mapped_pack::PAGE, 0);
+                assert_eq!(whole[s], expected[s], "{name} section {s}");
+            }
+        }
+        assert_eq!(packs(), 15, "the oracle reads published every expert chunk");
+        // Second build from the chunk fast path: byte-identical files.
+        let from_chunks = temp.0.join("from-chunks");
+        store.prepare_mapped_pack_at(&from_chunks).unwrap();
+        for (name, ..) in PARTS {
+            let file_name = format!("{name}.mapped");
+            assert_eq!(
+                fs::read(from_gguf.join(&file_name)).unwrap(),
+                fs::read(from_chunks.join(&file_name)).unwrap(),
+                "{name}: chunk-built file differs from the checkpoint-built file"
+            );
+        }
+        // The slot batch through the range reader equals the chunk reader.
+        let requests: Vec<_> = [4usize, 0, 2]
+            .into_iter()
+            .flat_map(|expert| PARTS.map(|(name, rows, ..)| (name.to_owned(), expert * rows, rows)))
+            .collect();
+        store.evict_to(0).unwrap();
+        assert_eq!(store.cache.len(), 0);
+        let reads = store.mapped.as_ref().unwrap().reads();
+        let packed_hits = store.packed_hits;
+        let via_pack: Vec<_> = store
+            .read_expert_batch(&requests)
+            .unwrap()
+            .iter()
+            .map(|w| encoded(w))
+            .collect();
+        let pack = store.mapped.take().unwrap();
+        assert_eq!(pack.reads(), reads + 9);
+        assert_eq!(
+            store.packed_hits,
+            packed_hits + 9,
+            "range reads are prepared hits"
+        );
+        store.evict_to(0).unwrap();
+        let via_chunks: Vec<_> = store
+            .read_expert_batch(&requests)
+            .unwrap()
+            .iter()
+            .map(|w| encoded(w))
+            .collect();
+        assert_eq!(store.packed_hits, packed_hits + 18);
+        assert_eq!(via_pack, via_chunks);
+        store.mapped = Some(pack);
+        assert_eq!(
+            super::routed_expert_tensor("blk.47.ffn_down_exps.weight"),
+            Some((47, 2))
+        );
+        assert_eq!(
+            super::routed_expert_tensor("blk.3.ffn_down_shexp.weight"),
+            None
+        );
+        assert_eq!(
+            super::routed_expert_tensor("nextn.0.ffn_gate_exps.weight"),
+            None
+        );
     }
 }
