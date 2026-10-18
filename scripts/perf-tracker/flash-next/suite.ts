@@ -79,7 +79,7 @@ export const DEFAULT_MTP_SOURCE_DIR = join(MODELS_DIR, 'qwen3.8-flash-next');
 export const DEFAULT_MTP_AUX_DIR = join(MODELS_DIR, 'qwen3.8-flash-next-mtp-aux');
 
 // The splits carry no other draft, so any mlx-node cycle is native MTP.
-export const SPECULATION: SpeculationRule = { llamaType: 'draft-mtp', mlxMinMeanDepth: 0 };
+export const SPECULATION: SpeculationRule = { llamaType: 'draft-mtp', mlxDraftsPerCycle: 2 };
 
 // Files mlx-node extracts from the GGUF metadata at load; they decide its prompt IDs.
 export const ASSET_FILES = ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', 'config.json'];
@@ -135,7 +135,11 @@ export const PROTOCOL = {
   llamaPrewarmArgs: ['-lv', '4'],
   mlxEnv: {} as Record<string, string>,
   mlxLoadOptions: { autoLoadDraft: false },
-  mlxRequest: { enableMtp: true, mtpDepth: 2, mtpAdaptiveDepth: false } satisfies MlxSpeculationRequest,
+  mlxRequest: {
+    enableMtp: true,
+    mtpDepth: SPECULATION.mlxDraftsPerCycle,
+    mtpAdaptiveDepth: false,
+  } satisfies MlxSpeculationRequest,
   weightBudget:
     'mlx-node default policy: automatic budget, routed experts stream from the internal SSD; recorded per load',
   kvCache: { 'mlx-node': 'BF16 block-paged', 'llama.cpp': 'F16 for target and MTP head' },

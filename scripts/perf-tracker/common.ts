@@ -149,8 +149,9 @@ export function assertPin(path: string, size: number, sha256: string | undefined
 export interface SpeculationRule {
   // The type llama.cpp lists in generation_settings["speculative.types"].
   llamaType: string;
-  // mlx-node's mean drafted tokens per cycle must exceed this.
-  mlxMinMeanDepth: number;
+  // Tokens d every mlx-node cycle drafts. Only the length tail drafts fewer: a cycle there drafts
+  // remaining − 1, a distinct value below d each time, so the run falls short by at most d(d − 1)/2.
+  mlxDraftsPerCycle: number;
 }
 
 export interface MlxSpeculationRequest {
@@ -175,23 +176,51 @@ export interface Acceptance {
   committedPerCycle: number | null;
 }
 
+const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+
 // Both runtimes fall back to plain decoding when a draft is missing or fails to start.
-// mlx-node reports per-cycle means, so its counts are mean × cycles.
+// mlx-node reports per-cycle means of integer totals, so its counts are mean × cycles.
 export function mlxAcceptance(
   performance: MlxSpeculationPerformance,
   rule: SpeculationRule,
   label: string,
 ): Acceptance {
-  const { mtpCycles: cycles = 0, mtpMeanDepth: depth = 0, mtpMeanAcceptedTokens: accepted = 0 } = performance;
-  if (!(cycles > 0 && depth > rule.mlxMinMeanDepth)) {
-    throw new Error(`${label}: mlx-node did not speculate (${cycles} cycles, mean depth ${depth})`);
+  const {
+    mtpCycles: cycles,
+    mtpMeanDepth: depth,
+    mtpMeanAcceptedTokens: mean,
+    mtpMeanAcceptedTokensTotal,
+  } = performance;
+  if (!isCount(cycles) || cycles === 0) {
+    throw new Error(`${label}: mlx-node did not speculate (mtpCycles ${cycles})`);
   }
-  return {
-    cycles,
-    drafted: Math.round(depth * cycles),
-    accepted: Math.round(accepted * cycles),
-    committedPerCycle: performance.mtpMeanAcceptedTokensTotal ?? null,
+  const total = (name: string, value: number | undefined) => {
+    const product = (typeof value === 'number' ? value : Number.NaN) * cycles;
+    const count = Math.round(product);
+    if (!isCount(count) || Math.abs(product - count) > 1e-6) {
+      throw new Error(`${label}: mlx-node ${name} ${value} over ${cycles} cycles is no token count`);
+    }
+    return count;
   };
+  const drafted = total('mtpMeanDepth', depth);
+  const accepted = total('mtpMeanAcceptedTokens', mean);
+  const most = rule.mlxDraftsPerCycle * cycles;
+  const least = most - (rule.mlxDraftsPerCycle * (rule.mlxDraftsPerCycle - 1)) / 2;
+  if (drafted > most || drafted < least) {
+    throw new Error(
+      `${label}: mlx-node drafted ${drafted} tokens in ${cycles} cycles; ${rule.mlxDraftsPerCycle} per cycle drafts ${least}–${most}`,
+    );
+  }
+  if (accepted > drafted) {
+    throw new Error(`${label}: mlx-node accepted ${accepted} of ${drafted} drafted tokens`);
+  }
+  // Native adds 1.0 to the same f64 ratio, so the two agree exactly.
+  if (mtpMeanAcceptedTokensTotal !== (mean as number) + 1) {
+    throw new Error(
+      `${label}: mlx-node mtpMeanAcceptedTokensTotal ${mtpMeanAcceptedTokensTotal} is not mtpMeanAcceptedTokens ${mean} + 1`,
+    );
+  }
+  return { cycles, drafted, accepted, committedPerCycle: mtpMeanAcceptedTokensTotal };
 }
 
 export function llamaAcceptance(
@@ -200,13 +229,16 @@ export function llamaAcceptance(
   rule: SpeculationRule,
   label: string,
 ): Acceptance {
-  const drafted = timings.draft_n ?? 0;
-  if (!speculativeTypes.split(',').includes(rule.llamaType) || !(drafted > 0)) {
+  const { draft_n: drafted, draft_n_accepted: accepted } = timings;
+  if (!speculativeTypes.split(',').includes(rule.llamaType) || !isCount(drafted) || drafted === 0) {
     throw new Error(
       `${label}: llama.cpp did not speculate (speculative.types "${speculativeTypes}", draft_n ${drafted})`,
     );
   }
-  return { cycles: null, drafted, accepted: timings.draft_n_accepted ?? 0, committedPerCycle: null };
+  if (!isCount(accepted) || accepted > drafted) {
+    throw new Error(`${label}: llama.cpp draft_n_accepted ${accepted} of draft_n ${drafted}`);
+  }
+  return { cycles: null, drafted, accepted, committedPerCycle: null };
 }
 
 type Range = { median: number; min: number; max: number };

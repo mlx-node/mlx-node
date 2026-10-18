@@ -35,8 +35,8 @@ export const DRAFT_DIRS: Readonly<Record<Runtime, string>> = {
   'mlx-node': join(MODELS_DIR, 'qwen3.8-27b-dflash2'),
   'llama.cpp': join(MODELS_DIR, 'qwen3.8-27b-dflash2-gguf'),
 };
-// The target GGUF also carries an inline MTP head, which drafts one token per cycle.
-export const SPECULATION: SpeculationRule = { llamaType: 'draft-dflash', mlxMinMeanDepth: 1 };
+// DFlash2 drafts block_size − 1 = 7 tokens per cycle. The target GGUF also carries an inline MTP head, which drafts one.
+export const SPECULATION: SpeculationRule = { llamaType: 'draft-dflash', mlxDraftsPerCycle: 7 };
 export const PORT = 18789;
 export const LOAD_COOLDOWN_SECONDS = 10;
 export const SIDECARS = ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];

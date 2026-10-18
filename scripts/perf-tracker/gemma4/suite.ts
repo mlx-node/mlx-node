@@ -35,7 +35,7 @@ export const DRAFT_DIRS: Readonly<Record<Runtime, string>> = {
   llama: join(MODELS_DIR, 'gemma-4-12b-it-mtp-gguf'),
 };
 // mlx-node DSpark against llama.cpp assistant MTP: llama.cpp cannot run the DSpark draft.
-export const SPECULATION: SpeculationRule = { llamaType: 'draft-mtp', mlxMinMeanDepth: 1 };
+export const SPECULATION: SpeculationRule = { llamaType: 'draft-mtp', mlxDraftsPerCycle: 7 };
 
 export interface Protocol {
   repetitions: number;
@@ -76,6 +76,7 @@ export async function readManifest(): Promise<Manifest> {
     !manifest.cases.some((item) => item.name === protocol.warmupCase) ||
     !Number.isInteger(protocol.outputTokens) ||
     !Number.isInteger(protocol.warmupTokens) ||
+    protocol.mlxRequest.mtpDepth !== SPECULATION.mlxDraftsPerCycle ||
     manifest.draft['llama.cpp'].files.length !== 1
   ) {
     throw new Error(`${manifestPath}: protocol does not match this runner`);
