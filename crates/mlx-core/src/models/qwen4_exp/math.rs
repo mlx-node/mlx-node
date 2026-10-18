@@ -2048,3 +2048,222 @@ mod prefill_epilogue_tests {
         }
     }
 }
+
+/// Row-batched twins of the single-row decode kernels. Up to four activation
+/// rows share one weight stream, and row `j` of every output carries the bits
+/// of the single-row kernel applied to row `j` alone. The MTP verify pass is
+/// the intended caller; the decode path does not use these yet.
+#[allow(dead_code)]
+pub(super) mod rows {
+    use super::super::weights::Weight;
+    use crate::array::{DType, MxArray};
+    use napi::{Error, Result};
+    use std::sync::Arc;
+
+    pub(crate) const MAX_ROWS: i64 = 4;
+
+    fn backend() -> bool {
+        crate::engine::persistence::compiled_forward_backend_available()
+    }
+
+    fn affine_q8(w: &Weight) -> Option<(&MxArray, &MxArray)> {
+        if w.mode != "affine" || w.bits != 8 || w.group != 32 {
+            return None;
+        }
+        match (&w.scales, &w.biases) {
+            (Some(scales), Some(biases)) => Some((scales, biases)),
+            _ => None,
+        }
+    }
+
+    fn row_count(x: &MxArray, width: Option<i64>) -> Result<Option<i64>> {
+        let shape = x.shape()?;
+        Ok(match &*shape {
+            [1, rows, k]
+                if (1..=MAX_ROWS).contains(rows) && width.is_none_or(|width| width == *k) =>
+            {
+                Some(*rows)
+            }
+            _ => None,
+        })
+    }
+
+    /// `x` is `[1, R, K]`; the result is `[1, R, N]` for an admitted Q8 bank.
+    pub(crate) fn dense_decode(w: &Weight, x: &MxArray) -> Result<Option<MxArray>> {
+        let Some((scales, biases)) = affine_q8(w) else {
+            return Ok(None);
+        };
+        if row_count(x, None)?.is_none() || !backend() {
+            return Ok(None);
+        }
+        let raw = unsafe {
+            mlx_sys::mlx_qwen4_dense_decode_rows(
+                x.as_raw_ptr(),
+                w.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+            )
+        };
+        if raw.is_null() {
+            Ok(None)
+        } else {
+            MxArray::from_handle(raw, "Qwen4 row-batched dense decode").map(Some)
+        }
+    }
+
+    /// `x` is `[1, R, 10240]`; the result is the `[1, R, 320]` mixer activation.
+    pub(crate) fn mixer_act(w: &Weight, x: &MxArray) -> Result<Option<MxArray>> {
+        let Some((scales, biases)) = affine_q8(w) else {
+            return Ok(None);
+        };
+        if row_count(x, Some(10240))?.is_none() || !backend() {
+            return Ok(None);
+        }
+        let raw = unsafe {
+            mlx_sys::mlx_qwen4_decode_mixer_act_rows(
+                x.as_raw_ptr(),
+                w.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+            )
+        };
+        if raw.is_null() {
+            Ok(None)
+        } else {
+            MxArray::from_handle(raw, "Qwen4 row-batched mixer activation").map(Some)
+        }
+    }
+
+    /// `x` is `[1, R, 320]`, `normed` is `[1, R, 10240]`; the result is `[1, R, 2560]`.
+    pub(crate) fn hyper_up(w: &Weight, x: &MxArray, normed: &MxArray) -> Result<Option<MxArray>> {
+        let Some((scales, biases)) = affine_q8(w) else {
+            return Ok(None);
+        };
+        if row_count(x, Some(320))?.is_none() || !backend() {
+            return Ok(None);
+        }
+        let raw = unsafe {
+            mlx_sys::mlx_qwen4_hyper_up_rows(
+                x.as_raw_ptr(),
+                w.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                normed.as_raw_ptr(),
+            )
+        };
+        if raw.is_null() {
+            Ok(None)
+        } else {
+            MxArray::from_handle(raw, "Qwen4 row-batched hyper up").map(Some)
+        }
+    }
+
+    /// Adds the `[1, R, 4]` injection gate to `hyper_up`; returns (mixed, gate).
+    pub(crate) fn hyper_up_inject(
+        w: &Weight,
+        x: &MxArray,
+        normed: &MxArray,
+        injection: &MxArray,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        let Some((scales, biases)) = affine_q8(w) else {
+            return Ok(None);
+        };
+        if row_count(x, Some(320))?.is_none() || !backend() {
+            return Ok(None);
+        }
+        let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
+        if !unsafe {
+            mlx_sys::mlx_qwen4_hyper_up_inject_rows(
+                x.as_raw_ptr(),
+                w.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                normed.as_raw_ptr(),
+                injection.as_raw_ptr(),
+                &mut mixed,
+                &mut gate,
+            )
+        } {
+            return Ok(None);
+        }
+        Ok(Some((
+            MxArray::from_handle(mixed, "Qwen4 row-batched mixer with injection")?,
+            MxArray::from_handle(gate, "Qwen4 row-batched mixer injection gate")?,
+        )))
+    }
+
+    /// `x` is `[1, R, 2560]`, `ids` holds `10 R` routes, `scores` `10 R`
+    /// weights and `shared_gate` is `[1, R, 1]`; the result is `[1, R, 2560]`.
+    pub(crate) fn routed_shared_experts(
+        x: &MxArray,
+        ids: &MxArray,
+        scores: &MxArray,
+        banks: &[Arc<Weight>; 3],
+        shared: &[Arc<Weight>; 3],
+        shared_gate: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        if !backend()
+            || row_count(x, Some(2560))?.is_none()
+            || !matches!(banks[0].mode.as_str(), "q4k" | "q5k")
+            || banks[0].mode != banks[1].mode
+            || banks[0].bits != banks[1].bits
+            || banks[2].mode != "affine"
+            || !matches!(banks[2].bits, 5 | 8)
+            || shared.iter().any(|w| w.mode != "affine" || w.bits != 8)
+            || banks
+                .iter()
+                .chain(shared)
+                .any(|w| w.group != 32 || w.scales.is_none() || w.biases.is_none())
+        {
+            return Ok(None);
+        }
+        let ids = ids.reshape(&[-1])?;
+        let mut inputs = vec![x.as_raw_ptr(), ids.as_raw_ptr(), scores.as_raw_ptr()];
+        for bank in banks.iter().chain(shared) {
+            let (Some(scales), Some(biases)) = (&bank.scales, &bank.biases) else {
+                return Ok(None);
+            };
+            inputs.extend([
+                bank.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+            ]);
+        }
+        inputs.push(shared_gate.as_raw_ptr());
+        let raw =
+            unsafe { mlx_sys::mlx_qwen4_routed_shared_experts_rows(inputs.as_ptr(), inputs.len()) };
+        if raw.is_null() {
+            Ok(None)
+        } else {
+            MxArray::from_handle(raw, "Qwen4 row-batched routed/shared experts").map(Some)
+        }
+    }
+
+    /// `logits` is `[1, R, 512]`; returns (`[1, R, 10]` ids, `[1, R, 10]` scores)
+    /// with the single-row kernel's probability rounding, ties and normalization.
+    pub(crate) fn singleton_routes(
+        logits: &MxArray,
+        top: usize,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        if top != 10
+            || row_count(logits, Some(512))?.is_none()
+            || !matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
+            || !backend()
+        {
+            return Ok(None);
+        }
+        let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let ok = unsafe {
+            mlx_sys::mlx_qwen4_prefill_routes(logits.as_raw_ptr(), &mut ids, &mut scores)
+        };
+        if !ok {
+            return Err(Error::from_reason(
+                "Qwen4 row-batched routing kernel failed",
+            ));
+        }
+        Ok(Some((
+            MxArray::from_handle(ids, "row-batched route IDs")?,
+            MxArray::from_handle(scores, "row-batched route scores")?,
+        )))
+    }
+}
