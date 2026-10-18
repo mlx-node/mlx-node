@@ -183,29 +183,23 @@ impl Decoder {
                 true,
             )?;
             let rotated = if self.use_batch_rotary() {
-                Some(
-                    self.rope_window_positions(
-                        &norms.reshape(&[1, 1, blocks as i64, id])?,
-                        (0..blocks).map(|b| base - tail + b * ratio),
-                    )?
-                    .reshape(&[blocks as i64, id])?,
-                )
+                self.rope_window_positions(
+                    &norms.reshape(&[1, 1, blocks as i64, id])?,
+                    (0..blocks).map(|b| base - tail + b * ratio),
+                )?
+                .reshape(&[blocks as i64, id])?
             } else {
-                None
+                let keys = (0..blocks)
+                    .map(|b| {
+                        self.rope(
+                            &norms.slice_axis(0, b as i64, b as i64 + 1)?,
+                            base - tail + b * ratio,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                MxArray::concatenate_many(keys.iter().collect(), Some(0))?
             };
-            for b in 0..blocks {
-                if let Some(keys) = &rotated {
-                    cache
-                        .index_blocks
-                        .push(keys.slice_axis(0, b as i64, b as i64 + 1)?);
-                    continue;
-                }
-                let key = self.rope(
-                    &norms.slice_axis(0, b as i64, b as i64 + 1)?,
-                    base - tail + b * ratio,
-                )?;
-                cache.index_blocks.push(key);
-            }
+            cache.append_index_keys(rotated)?;
         }
         cache.index_tail = (used..tail + t)
             .map(|r| raw.slice_axis(0, r as i64, r as i64 + 1))

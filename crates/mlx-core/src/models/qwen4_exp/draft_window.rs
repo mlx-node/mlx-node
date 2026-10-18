@@ -74,7 +74,6 @@ impl Decoder {
                 )?
                 .linear(&input)?;
             let tail = cache.index_tail.len();
-            let old_blocks = cache.index_blocks.len();
             let mut raw = cache.index_tail.clone();
             raw.push(ik.reshape(&[n, c.indexer_head_dim as i64])?);
             let raw = MxArray::concatenate_many(raw.iter().collect(), Some(0))?;
@@ -94,12 +93,18 @@ impl Decoder {
                     c.indexer_head_dim,
                     true,
                 )?;
-                for block in 0..used / ratio {
-                    cache.index_blocks.push(self.rope(
-                        &means.slice_axis(0, block as i64, block as i64 + 1)?,
-                        position - tail + block * ratio,
-                    )?);
-                }
+                let keys = (0..used / ratio)
+                    .map(|block| {
+                        self.rope(
+                            &means.slice_axis(0, block as i64, block as i64 + 1)?,
+                            position - tail + block * ratio,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                cache.append_index_keys(MxArray::concatenate_many(
+                    keys.iter().collect(),
+                    Some(0),
+                )?)?;
             }
             cache.index_tail = (used..tail + tokens.len())
                 .map(|r| raw.slice_axis(0, r as i64, r as i64 + 1))
@@ -117,7 +122,7 @@ impl Decoder {
                 .iter()
                 .chain(cache.values.iter())
                 .chain(cache.index_tail.iter())
-                .chain(cache.index_blocks[old_blocks..].iter())
+                .chain(cache.index_keys.iter())
                 .collect();
             MxArray::eval_arrays_with_context(&arrays, "qwen4::mtp::history_cache")
         })();
