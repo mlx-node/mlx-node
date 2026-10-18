@@ -5915,6 +5915,18 @@ fn row(a: &MxArray, j: i64) -> MxArray {
     a.slice_axis(1, j, j + 1).unwrap()
 }
 
+/// A copied one-element row. MLX binds an input under eight elements in the
+/// constant address space, whose buffer offset must be 4-byte aligned; a BF16
+/// row view at an odd element offset would read the element before it.
+fn gate_row(a: &MxArray, j: i64) -> MxArray {
+    use crate::array::DType;
+    row(a, j)
+        .astype(DType::Float32)
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+}
+
 fn stack_rows(parts: &[MxArray]) -> MxArray {
     MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap()
 }
@@ -6131,7 +6143,7 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
                             &row(&scores, j),
                             &banks,
                             &shared,
-                            &row(&shared_gate, j),
+                            &gate_row(&shared_gate, j),
                         )
                         .unwrap()
                         .expect("single-row routed/shared fast path")
@@ -6153,6 +6165,74 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
                     &stack_rows(&singles),
                     &format!(
                         "routed/shared experts gate={gate_bits} down={down_bits} scores={score_type:?} rows={rows}"
+                    ),
+                );
+            }
+        }
+    }
+    // Cross-row expert reuse in the R-row routed/shared kernels: an expert's
+    // weights stream once per threadgroup set and every assignment on it is
+    // written. The same routes in every row, one row's routes rotated per row
+    // and routes distinct across rows must each carry the single-row bits.
+    let experts = 64usize;
+    let (banks, shared) = expert_banks(experts, 4, 5, &mut next);
+    let base: Vec<u32> = (0..10).map(|s| (s * 7 + 3) as u32).collect();
+    for rows in 1..=4 {
+        let x = bf16_rows(rows, 2560, 1. / 256., 2., &mut next);
+        let shared_gate = bf16_rows(rows, 1, 1. / 64., 8., &mut next);
+        let count = rows as usize * 10;
+        let patterns: [(&str, Vec<u32>); 3] = [
+            ("same", (0..count).map(|i| base[i % 10]).collect()),
+            (
+                "rotated",
+                (0..count)
+                    .map(|i| base[(i % 10 + i / 10 * 3) % 10])
+                    .collect(),
+            ),
+            (
+                "distinct",
+                (0..count).map(|i| (i * 5 % experts) as u32).collect(),
+            ),
+        ];
+        for (pattern, routes) in patterns {
+            let ids = MxArray::from_uint32(&routes, &[rows * 10]).unwrap();
+            for score_type in [DType::Float32, DType::BFloat16] {
+                let scores: Vec<f32> = (0..count)
+                    .map(|_| (next() % 19 + 1) as f32 / 100.)
+                    .collect();
+                let scores = MxArray::from_float32(&scores, &[1, rows, 10])
+                    .unwrap()
+                    .astype(score_type)
+                    .unwrap();
+                let singles: Vec<MxArray> = (0..rows)
+                    .map(|j| {
+                        math::routed_shared_experts(
+                            &row(&x, j),
+                            &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
+                            &row(&scores, j),
+                            &banks,
+                            &shared,
+                            &gate_row(&shared_gate, j),
+                        )
+                        .unwrap()
+                        .expect("single-row routed/shared fast path")
+                    })
+                    .collect();
+                let batched = math::rows::routed_shared_experts(
+                    &x,
+                    &ids,
+                    &scores,
+                    &banks,
+                    &shared,
+                    &shared_gate,
+                )
+                .unwrap()
+                .expect("row-batched routed/shared experts admit [1, R, 2560]");
+                assert_same_bits(
+                    &batched,
+                    &stack_rows(&singles),
+                    &format!(
+                        "routed/shared experts {pattern} routes scores={score_type:?} rows={rows}"
                     ),
                 );
             }
@@ -6383,8 +6463,11 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         let experts = 64usize;
         let (banks, shared) = expert_banks(experts, 4, 5, &mut next);
         let x = bf16_rows(4, 2560, 1. / 256., 2., &mut next);
-        let distinct: Vec<u32> = (0..40).map(|_| next() % experts as u32).collect();
+        // Distinct: 40 different experts. Same: every row routes like row 0.
+        // Overlap4: row j routes to experts 6j..6j+9, so consecutive rows share four.
+        let distinct: Vec<u32> = (0..40).map(|i| (i * 5 % experts) as u32).collect();
         let same: Vec<u32> = (0..40).map(|i| distinct[i % 10]).collect();
+        let overlap: Vec<u32> = (0..40).map(|i| (i / 10 * 6 + i % 10) as u32).collect();
         let scores = MxArray::from_float32(
             &(0..40)
                 .map(|_| (next() % 19 + 1) as f32 / 100.)
@@ -6393,9 +6476,35 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         )
         .unwrap();
         let shared_gate = bf16_rows(4, 1, 1. / 64., 8., &mut next);
+        // Bytes against ALU: the plain routed kernel with ten distinct experts per
+        // row reads ten tiles, with one expert in every slot it reads one tile and
+        // does the same arithmetic.
+        for (label, routes) in [
+            ("routed_e64_distinct_experts", distinct.clone()),
+            ("routed_e64_one_expert", vec![distinct[0]; 40]),
+        ] {
+            let ids = MxArray::from_uint32(&routes, &[40]).unwrap();
+            let (banks, x, scores) = (banks.clone(), x.clone(), scores.clone());
+            measure(
+                label,
+                Box::new(move |rows| {
+                    vec![
+                        math::routed_experts(
+                            &x.slice_axis(1, 0, rows).unwrap(),
+                            &ids.slice_axis(0, 0, rows * 10).unwrap(),
+                            &scores.slice_axis(1, 0, rows).unwrap(),
+                            &banks,
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    ]
+                }),
+            );
+        }
         for (label, routes) in [
             ("routed_shared_e64_distinct_routes", distinct),
             ("routed_shared_e64_same_routes", same),
+            ("routed_shared_e64_overlap4_routes", overlap),
         ] {
             let ids = MxArray::from_uint32(&routes, &[40]).unwrap();
             let (banks, shared, x, scores, shared_gate) = (
