@@ -8,11 +8,14 @@ import {
   ROOT,
   loadFixture,
   readJson,
+  type DraftPins,
   type FixtureCase,
   type FixtureManifest,
+  type MlxSpeculationRequest,
+  type SpeculationRule,
 } from '../common.js';
 
-export const FIXTURE = 'gemma4-oxc-review-v1';
+export const FIXTURE = 'gemma4-oxc-review-v2';
 export const MODEL_DIR = join(MODELS_DIR, 'gemma-4-12b-it-qat-q4_0-gguf');
 export const MODEL_FILE = join(MODEL_DIR, 'gemma-4-12b-it-qat-q4_0.gguf');
 // No pin exists for the media companion; provenance records its hash.
@@ -23,7 +26,16 @@ export const PILOT_SETTLE_MS = 60_000;
 
 export const RUNTIMES = ['mlx', 'llama'] as const;
 export type Runtime = (typeof RUNTIMES)[number];
-export const LABEL: Record<Runtime, string> = { mlx: 'mlx-node', llama: 'llama.cpp' };
+export const LABEL = { mlx: 'mlx-node', llama: 'llama.cpp' } as const satisfies Record<Runtime, string>;
+
+// The fixture pins the draft files; these are their local folders. The target folder keeps
+// its own download marker, so the llama.cpp draft has a folder of its own.
+export const DRAFT_DIRS: Readonly<Record<Runtime, string>> = {
+  mlx: join(MODELS_DIR, 'dspark_gemma4_12b_block7'),
+  llama: join(MODELS_DIR, 'gemma-4-12b-it-mtp-gguf'),
+};
+// mlx-node DSpark against llama.cpp assistant MTP: llama.cpp cannot run the DSpark draft.
+export const SPECULATION: SpeculationRule = { llamaType: 'draft-mtp', mlxMinMeanDepth: 1 };
 
 export interface Protocol {
   repetitions: number;
@@ -33,17 +45,24 @@ export interface Protocol {
   cooldownSeconds: number;
   llamaServerArgs: string[];
   mlxEnv: Record<string, string>;
+  mlxRequest: MlxSpeculationRequest;
 }
 
 export interface Manifest extends FixtureManifest {
   source: Record<string, string>;
   model: { file: string; sha256: string; tokenizerSha256: string; configSha256: string };
+  draft: DraftPins;
   cases: (FixtureManifest['cases'][number] & { historicalMessages: number; toolResults: number })[];
   protocol: Protocol;
 }
 
-export const llamaServerArgs = (protocol: Protocol): string[] => [
-  ...protocol.llamaServerArgs,
+export const draftPaths = (manifest: Manifest, runtime: Runtime): string[] =>
+  manifest.draft[LABEL[runtime]].files.map(({ file }) => join(DRAFT_DIRS[runtime], file));
+
+export const llamaServerArgs = (manifest: Manifest): string[] => [
+  ...manifest.protocol.llamaServerArgs,
+  '-md',
+  ...draftPaths(manifest, 'llama'),
   ...LLAMA_SINGLE_REQUEST_ARGS,
 ];
 
@@ -56,7 +75,8 @@ export async function readManifest(): Promise<Manifest> {
     protocol.repetitions !== REPETITIONS.length ||
     !manifest.cases.some((item) => item.name === protocol.warmupCase) ||
     !Number.isInteger(protocol.outputTokens) ||
-    !Number.isInteger(protocol.warmupTokens)
+    !Number.isInteger(protocol.warmupTokens) ||
+    manifest.draft['llama.cpp'].files.length !== 1
   ) {
     throw new Error(`${manifestPath}: protocol does not match this runner`);
   }

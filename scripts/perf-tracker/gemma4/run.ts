@@ -12,6 +12,7 @@ import {
   ROOT,
   addonIdentity,
   assertCleanEnv,
+  assertPin,
   assertLatestMain,
   fetchLatestLlama,
   assertCleanTree,
@@ -33,6 +34,9 @@ import {
   PILOT_RUN,
   PILOT_SETTLE_MS,
   REPETITIONS,
+  RUNTIMES,
+  draftPaths,
+  LABEL,
   llamaServerArgs,
   manifestPath,
   readFixture,
@@ -46,7 +50,9 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(HERE, 'worker.ts');
 const RENDER = join(HERE, 'render.ts');
-const SCRIPTS = ['run.ts', 'worker.ts', 'render.ts', 'report.ts', 'suite.ts', 'baseline.csv', '../common.ts'];
+const SCRIPTS = ['run.ts', 'worker.ts', 'render.ts', 'report.ts', 'suite.ts', '../common.ts'];
+// The previous entry of this fixture version, once one is posted.
+const BASELINE = 'baseline.csv';
 const STEPS = ['preflight', 'prewarm', 'matrix', 'report', 'all'];
 
 const exists = (path: string) =>
@@ -57,15 +63,26 @@ const exists = (path: string) =>
 
 async function modelFiles(manifest: Manifest) {
   if (manifest.model.file !== basename(MODEL_FILE)) throw new Error(`${manifestPath}: unexpected model file`);
-  const pinned = async (path: string, expected: string) => {
-    const sha256 = await sha256File(path);
-    if (sha256 !== expected) throw new Error(`${path}: SHA-256 ${sha256}, expected ${expected}`);
-    return { path, bytes: (await stat(path)).size, sha256 };
+  const pinned = async (path: string, expected: string, bytes?: number) => {
+    const record = { path, bytes: (await stat(path)).size, sha256: await sha256File(path) };
+    assertPin(path, record.bytes, record.sha256, {
+      file: basename(path),
+      bytes: bytes ?? record.bytes,
+      sha256: expected,
+    });
+    return record;
   };
   // Unpinned, but they change the mlx-node prompt IDs; render.ts checks them.
   const recorded = async (path: string) =>
     (await exists(path)) ? { path, bytes: (await stat(path)).size, sha256: await sha256File(path) } : null;
   const marker = join(MODEL_DIR, '.mlx-download-complete.json');
+  const drafts: Record<string, { path: string; bytes: number; sha256: string }[]> = {};
+  for (const runtime of RUNTIMES) {
+    const files = manifest.draft[LABEL[runtime]].files;
+    drafts[LABEL[runtime]] = await Promise.all(
+      draftPaths(manifest, runtime).map((path, index) => pinned(path, files[index].sha256, files[index].bytes)),
+    );
+  }
   return {
     gguf: await pinned(MODEL_FILE, manifest.model.sha256),
     tokenizer: await pinned(join(MODEL_DIR, 'tokenizer.json'), manifest.model.tokenizerSha256),
@@ -74,6 +91,7 @@ async function modelFiles(manifest: Manifest) {
     chatTemplate: await recorded(join(MODEL_DIR, 'chat_template.jinja')),
     mmproj: { path: MMPROJ_FILE, bytes: (await stat(MMPROJ_FILE)).size, sha256: await sha256File(MMPROJ_FILE) },
     download: (await exists(marker)) ? await readJson<unknown>(marker) : null,
+    drafts,
   };
 }
 
@@ -91,6 +109,7 @@ function checkout(allowDirty: boolean) {
 async function identity(manifest: Manifest, allowDirty: boolean) {
   const scripts: Record<string, string> = {};
   for (const file of SCRIPTS) scripts[file] = await sha256File(join(HERE, file));
+  if (await exists(join(HERE, BASELINE))) scripts[BASELINE] = await sha256File(join(HERE, BASELINE));
   return {
     checkout: checkout(allowDirty),
     addon: await addonIdentity(),
@@ -147,7 +166,7 @@ async function preflight(out: string, allowDirty: boolean) {
       cases: cases.map(({ name, promptTokens, sha256 }) => ({ name, promptTokens, tokenIdsSha256: sha256 })),
       render,
     },
-    protocol: { ...manifest.protocol, llamaServerArgs: llamaServerArgs(manifest.protocol) },
+    protocol: { ...manifest.protocol, llamaServerArgs: llamaServerArgs(manifest) },
     childEnv: { prewarm: {}, matrix: manifest.protocol.mlxEnv },
     before: hostSnapshot(),
   };

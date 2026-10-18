@@ -1,24 +1,45 @@
 /// <reference types="node" />
 
+import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ACCEPTANCE_CSV_COLUMNS,
+  ROOT,
+  acceptanceCsv,
+  acceptanceStats,
+  acceptanceTable,
   compareTable,
+  llamaAcceptance,
+  mlxAcceptance,
   parseCsv,
   range,
   readJson,
   renderChart,
-  singleRequestNote,
   toCsv,
   writeJson,
+  type Acceptance,
+  type AcceptanceStats,
   type CompareRow,
+  type MlxSpeculationPerformance,
 } from '../common.js';
-import { LABEL, REPETITIONS, RUNTIMES, readManifest, sampleId, samplePath, type Runtime } from './suite.js';
+import {
+  FIXTURE,
+  LABEL,
+  REPETITIONS,
+  RUNTIMES,
+  SPECULATION,
+  readManifest,
+  sampleId,
+  samplePath,
+  type Runtime,
+} from './suite.js';
 
+// The previous entry of this fixture version, once one is posted.
 const BASELINE = join(dirname(fileURLToPath(import.meta.url)), 'baseline.csv');
-const BASELINE_DATE = '2026-09-10';
+const METHODS = 'mlx-node DSpark (block 7) vs llama.cpp assistant MTP (depth 3)';
 const METRICS = ['prefillMs', 'prefillTps', 'decodeTps', 'wallMs', 'generatedTokens'] as const;
 const CSV_COLUMNS = [
   'runtime',
@@ -30,6 +51,7 @@ const CSV_COLUMNS = [
   'decode_tokens_per_second',
   'ttft_ms',
   'wall_ms',
+  ...ACCEPTANCE_CSV_COLUMNS,
 ];
 
 type Metric = (typeof METRICS)[number];
@@ -46,12 +68,23 @@ interface Sample extends Record<Metric, number> {
   textSha256: string;
   addonSha256?: string;
   args?: unknown;
-  result?: { finishReason?: string; stop_type?: string };
+  result?: {
+    finishReason?: string;
+    stop_type?: string;
+    performance?: MlxSpeculationPerformance;
+    timings?: { draft_n?: number; draft_n_accepted?: number };
+    generation_settings?: Record<string, unknown>;
+  };
   finishReason?: string;
   timingOverheadMs?: number;
+  acceptance: Acceptance;
 }
 
-type RuntimeRow = Record<Metric, Stats> & { distinctOutputHashes: number; finishReasons: string[] };
+type RuntimeRow = Record<Metric, Stats> & {
+  distinctOutputHashes: number;
+  finishReasons: string[];
+  acceptance: AcceptanceStats;
+};
 
 interface Row extends Record<Runtime, RuntimeRow> {
   name: string;
@@ -67,7 +100,6 @@ interface Provenance {
   completedAt?: string;
   host: { os: string; chip: string; gpuCores: number; memoryBytes: number };
   addon: Record<string, string>;
-  protocol: { llamaServerArgs: string[] };
 }
 
 export async function report(out: string): Promise<void> {
@@ -100,6 +132,15 @@ export async function report(out: string): Promise<void> {
           runtime,
           finishReason: result?.finishReason ?? result?.stop_type,
           timingOverheadMs: sample.wallMs - sample.accountedMs,
+          acceptance:
+            runtime === 'mlx'
+              ? mlxAcceptance(result?.performance ?? {}, SPECULATION, path)
+              : llamaAcceptance(
+                  result?.timings ?? {},
+                  String(result?.generation_settings?.['speculative.types']),
+                  SPECULATION,
+                  path,
+                ),
         });
       }
     }
@@ -115,6 +156,7 @@ export async function report(out: string): Promise<void> {
         ...(stats as Record<Metric, Stats>),
         distinctOutputHashes: new Set(group.map((s) => s.textSha256)).size,
         finishReasons: [...new Set(group.map((s) => String(s.finishReason)))].sort(),
+        acceptance: acceptanceStats(group.map((s) => s.acceptance)),
       };
     };
     const mlx = side('mlx');
@@ -160,6 +202,7 @@ export async function report(out: string): Promise<void> {
           decode_tokens_per_second: s.decodeTps,
           ttft_ms: s.prefillMs,
           wall_ms: s.wallMs,
+          ...acceptanceCsv(s.acceptance),
         };
       }),
     ),
@@ -172,7 +215,11 @@ export async function report(out: string): Promise<void> {
       Object.fromEntries(
         RUNTIMES.map((runtime) => [
           LABEL[runtime],
-          { prefillTokensPerSecond: row[runtime].prefillTps, decodeTokensPerSecond: row[runtime].decodeTps },
+          {
+            prefillTokensPerSecond: row[runtime].prefillTps,
+            decodeTokensPerSecond: row[runtime].decodeTps,
+            acceptance: row[runtime].acceptance,
+          },
         ]),
       ),
     ),
@@ -192,11 +239,11 @@ export async function report(out: string): Promise<void> {
       subtitle: `${host.chip} · ${host.gpuCores} GPU cores · ${Math.round(host.memoryBytes / 2 ** 30)} GB · ${host.os} · ${environment.createdAt.slice(0, 10)}`,
       groups,
       panels: [panel('Prefill', 'prefillTps'), panel('Decode', 'decodeTps')],
-      note: `Bars: median of ${REPETITIONS.length} fresh processes; whiskers: min–max. Same token IDs, ${protocol.outputTokens} output tokens, BF16 KV, 0 cached tokens. Higher is faster.`,
+      note: `Bars: median of ${REPETITIONS.length} fresh processes; whiskers: min–max. Same token IDs, ${protocol.outputTokens} output tokens, BF16 KV, 0 cached tokens; ${METHODS}. Higher is faster.`,
     }),
   );
 
-  const baseline = parseCsv(await readFile(BASELINE, 'utf8'));
+  const baseline = existsSync(BASELINE) ? parseCsv(await readFile(BASELINE, 'utf8')) : [];
   const before = (runtime: Runtime, promptTokens: number, column: string) =>
     range(
       baseline
@@ -211,17 +258,36 @@ export async function report(out: string): Promise<void> {
         after: row[runtime][metric].median / scale,
       })),
     );
+  const history = baseline.length
+    ? [
+        `Before = medians of the previous entry in \`${relative(ROOT, BASELINE)}\`; after = medians of this run. Prompt tokens · runtime.`,
+        '',
+        compareTable('Prefill, tokens/second', compare('prefill_tokens_per_second', 'prefillTps')),
+        compareTable('Decode, tokens/second', compare('decode_tokens_per_second', 'decodeTps')),
+        compareTable('Request wall time, seconds', compare('wall_ms', 'wallMs', 1000)),
+      ]
+    : [
+        `First entry of the \`${FIXTURE}\` protocol: speculative decoding is on in both runtimes, and it changes prefill as well as decode (mlx-node keeps target hidden states for the DSpark draft while it prefills; llama.cpp's assistant MTP shares the target K/V and adds no prefill pass). Entries before 2026-10-18 decoded without speculation, so there is no before value.`,
+        '',
+      ];
   await writeFile(
     join(out, 'compare.md'),
     [
-      `## Gemma 4 12B IT QAT Q4_0: this run vs ${BASELINE_DATE}`,
+      `## Gemma 4 12B IT QAT Q4_0: ${environment.createdAt.slice(0, 10)}`,
       '',
-      `Before = medians of the ${BASELINE_DATE} samples in \`scripts/perf-tracker/gemma4/baseline.csv\`; after = medians of this run. Prompt tokens · runtime.`,
-      ...singleRequestNote(environment.protocol.llamaServerArgs, protocol.llamaServerArgs),
+      ...history,
+      `### Speculation (${METHODS})`,
       '',
-      compareTable('Prefill, tokens/second', compare('prefill_tokens_per_second', 'prefillTps')),
-      compareTable('Decode, tokens/second', compare('decode_tokens_per_second', 'decodeTps')),
-      compareTable('Request wall time, seconds', compare('wall_ms', 'wallMs', 1000)),
+      "The methods differ: llama.cpp cannot load the DSpark draft (its converter refuses the draft's logit softcap, and its DFlash graph adds the Markov bias to logits it never softcaps, where DSpark adds it after the softcap), and mlx-node does not run the assistant MTP head. The DSpark draft was trained against the non-QAT Gemma 4 12B, not this QAT Q4_0 target. llama.cpp does not report its verify steps.",
+      '',
+      acceptanceTable(
+        rows.flatMap((row) =>
+          RUNTIMES.map((runtime) => ({
+            label: `${row.promptTokens.toLocaleString('en-US')} · ${LABEL[runtime]}`,
+            stats: row[runtime].acceptance,
+          })),
+        ),
+      ),
     ].join('\n'),
   );
 

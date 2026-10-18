@@ -11,6 +11,7 @@ import {
   ROOT,
   addonIdentity,
   assertCleanEnv,
+  assertPin,
   assertHostReady,
   assertLatestMain,
   fetchLatestLlama,
@@ -37,18 +38,23 @@ import {
   LOAD_COOLDOWN_SECONDS,
   MODEL_PATH,
   SIDECARS,
+  SPECULATION,
   admissionPolicy,
   checkAdmittedIds,
   discardPartialCells,
+  draftPaths,
   llamaServerArgs,
   PORT,
   Progress,
   RUNTIMES,
   paths,
   readManifest,
+  sampleAcceptance,
   verifyTokenizer,
   writeJsonAtomic,
+  type FileIdentity,
   type Identity,
+  type Manifest,
   type Provenance,
   type Runtime,
   type Sample,
@@ -71,31 +77,53 @@ async function scriptHashes(): Promise<Record<string, string>> {
   return hashes;
 }
 
-// The 17.5 GB GGUF hash takes about a minute, so blocks compare its size, mtime and inode.
-async function identity(allowDirty: boolean, hashModel: boolean): Promise<Identity> {
-  const { size, mtimeMs, ino } = await stat(MODEL_PATH);
-  if (hashModel) console.log(`Hashing ${MODEL_PATH}`);
+async function fileIdentity(path: string, hash: boolean): Promise<FileIdentity> {
+  const { size, mtimeMs, ino } = await stat(path);
+  if (hash) console.log(`Hashing ${path}`);
+  return {
+    path,
+    realpath: await realpath(path),
+    size,
+    mtimeMs,
+    ino,
+    ...(hash ? { sha256: await sha256File(path) } : {}),
+  };
+}
+
+// The 17.5 GB GGUF hash takes about a minute, so blocks compare size, mtime and inode of the model files.
+async function identity(manifest: Manifest, allowDirty: boolean, hashModel: boolean): Promise<Identity> {
+  const drafts = async (runtime: Runtime) =>
+    Promise.all(draftPaths(manifest, runtime).map((path) => fileIdentity(path, hashModel)));
   return {
     tree: await treeIdentity(allowDirty),
     addon: await addonIdentity(),
     llama: await llamaIdentity(),
-    model: {
-      path: MODEL_PATH,
-      realpath: await realpath(MODEL_PATH),
-      size,
-      mtimeMs,
-      ino,
-      ...(hashModel ? { sha256: await sha256File(MODEL_PATH) } : {}),
-    },
+    model: await fileIdentity(MODEL_PATH, hashModel),
+    drafts: { 'mlx-node': await drafts('mlx-node'), 'llama.cpp': await drafts('llama.cpp') },
     sidecars: await fileHashes(dirname(MODEL_PATH), SIDECARS),
     scripts: await scriptHashes(),
   };
 }
 
-async function verifyIdentity(recorded: Identity, allowDirty: boolean, hashModel: boolean, when: string) {
-  const current = await identity(allowDirty, hashModel);
-  const { sha256: _sha256, ...model } = recorded.model;
-  const expected = hashModel ? recorded : { ...recorded, model };
+async function verifyIdentity(
+  manifest: Manifest,
+  recorded: Identity,
+  allowDirty: boolean,
+  hashModel: boolean,
+  when: string,
+) {
+  const current = await identity(manifest, allowDirty, hashModel);
+  const unhashed = ({ sha256: _sha256, ...file }: FileIdentity) => file;
+  const expected = hashModel
+    ? recorded
+    : {
+        ...recorded,
+        model: unhashed(recorded.model),
+        drafts: {
+          'mlx-node': recorded.drafts['mlx-node'].map(unhashed),
+          'llama.cpp': recorded.drafts['llama.cpp'].map(unhashed),
+        },
+      };
   const changed = IDENTITY_KEYS.filter((key) => !isDeepStrictEqual(current[key], expected[key]));
   if (changed.length) throw new Error(`${when}: ${changed.join(', ')} changed since preflight`);
 }
@@ -109,11 +137,13 @@ async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean)
   const manifest = await readManifest();
   assertHostReady(PORT);
   const fixture = await loadFixture(FIXTURE);
-  const recorded = await identity(allowDirty, true);
-  if (recorded.model.size !== manifest.model.bytes || recorded.model.sha256 !== manifest.model.sha256) {
-    throw new Error(
-      `${MODEL_PATH}: ${recorded.model.size} bytes, SHA-256 ${recorded.model.sha256}; not the pinned GGUF`,
-    );
+  const recorded = await identity(manifest, allowDirty, true);
+  assertPin(MODEL_PATH, recorded.model.size, recorded.model.sha256, manifest.model);
+  for (const runtime of RUNTIMES) {
+    for (const [index, pin] of manifest.draft[runtime].files.entries()) {
+      const { path, size, sha256 } = recorded.drafts[runtime][index];
+      assertPin(path, size, sha256, pin);
+    }
   }
   const tokenizer = await verifyTokenizer(join(dirname(MODEL_PATH), 'tokenizer.json'));
   await writeJson(files.provenance, {
@@ -129,7 +159,7 @@ async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean)
     tokenizer,
     protocol: {
       ...manifest.protocol,
-      llamaServerArgs: llamaServerArgs(manifest.protocol),
+      llamaServerArgs: llamaServerArgs(manifest),
       port: PORT,
       loadCooldownSeconds: LOAD_COOLDOWN_SECONDS,
       admission: admissionPolicy(desktopLoad),
@@ -146,7 +176,6 @@ async function prewarm(out: string): Promise<void> {
   const worker = await MlxWorker.start('prewarm', out, protocol.mlxEnv);
   await worker.close();
   const { loaded } = worker;
-  if (loaded.paged !== true) throw new Error('Block-paged cache inactive; not the recorded protocol');
   const tokenizer = await verifyTokenizer(join(loaded.assets as string, 'tokenizer.json'));
   await writeJson(join(out, 'prewarm.json'), { loaded, tokenizer });
 }
@@ -180,7 +209,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
   if (!existsSync(files.provenance)) throw new Error(`${files.provenance} is missing; run preflight first`);
   const provenance = await readJson<Provenance>(files.provenance);
   assertHostReady(PORT);
-  await verifyIdentity(provenance, allowDirty, true, 'matrix start');
+  await verifyIdentity(manifest, provenance, allowDirty, true, 'matrix start');
   const { cases } = await loadFixture(FIXTURE);
 
   const repetitions = Array.from({ length: protocol.repetitions }, (_, index) => index + 1);
@@ -224,20 +253,16 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
         if (repetitions.every((run) => completed.has(key(runtime, item.name, run)))) continue;
         const kind = KIND[runtime];
         const block = `block-${item.name}-${stamp}`;
-        await verifyIdentity(provenance, allowDirty, false, `${kind}-${block}`);
+        await verifyIdentity(manifest, provenance, allowDirty, false, `${kind}-${block}`);
         progress.emit({ event: 'identity_verified', label: `${kind}-${block}`, gguf: 'size, mtime, inode' });
         await admit(policy, progress, `${kind}-${block}-load`, LOAD_COOLDOWN_SECONDS);
         let runner: Runner;
         if (runtime === 'mlx-node') {
           const worker = await MlxWorker.start(block, out, protocol.mlxEnv);
           progress.emit({ event: 'loaded', runtime, run: block, metadata: worker.loaded });
-          if (worker.loaded.paged !== true) {
-            await worker.close();
-            throw new Error('Block-paged cache inactive; not the recorded protocol');
-          }
           runner = worker;
         } else {
-          const server = await LlamaServer.start(block, out, llamaServerArgs(protocol));
+          const server = await LlamaServer.start(block, out, llamaServerArgs(manifest));
           progress.emit({ event: 'loaded', runtime, run: block, loadMs: server.loadMs, args: server.args });
           runner = server;
         }
@@ -272,6 +297,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
                 `${runtime} ${item.name}: ${result.numTokens} tokens, ${result.cachedTokens} cached, ${result.promptTokens} prompt`,
               );
             }
+            sampleAcceptance(result, SPECULATION);
             const {
               text: _t,
               thinking: _k,
@@ -294,7 +320,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
     }
     if (completed.size !== expected.size) throw new Error('Incomplete measurement matrix');
     provenance.postRun = hostSnapshot();
-    await verifyIdentity(provenance, allowDirty, true, 'post-run');
+    await verifyIdentity(manifest, provenance, allowDirty, true, 'post-run');
     progress.emit({ event: 'identity_verified', label: 'post-run', gguf: 'sha256' });
     progress.emit({ event: 'complete', samples: samples.length });
   } finally {

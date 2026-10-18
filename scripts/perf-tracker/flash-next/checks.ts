@@ -8,11 +8,12 @@ import { isDeepStrictEqual } from 'node:util';
 import { fileHashes, sh, sha256File, sleep, type FixtureCase } from '../common.js';
 import { processTable } from '../qwen38/admission.js';
 import type { Result } from '../qwen38/runtimes.js';
-import { ASSET_FILES, PROTOCOL, type Loaded, type SplitIdentity, type Volume } from './suite.js';
+import { sampleAcceptance } from '../qwen38/suite.js';
+import { ASSET_FILES, PROTOCOL, SPECULATION, type Loaded, type SplitIdentity, type Volume } from './suite.js';
 
 export async function split(path: string, hash: boolean): Promise<SplitIdentity> {
   const info = await lstat(path);
-  if (!info.isFile()) throw new Error(`${path}: not a regular file; copy the GGUF splits, not links`);
+  if (!info.isFile()) throw new Error(`${path}: not a regular file; copy the model files, not links`);
   const { size, mtimeMs, ctimeMs, ino, dev } = info;
   return { path, size, mtimeMs, ctimeMs, ino, dev, ...(hash ? { sha256: await sha256File(path) } : {}) };
 }
@@ -36,12 +37,12 @@ export function volume(path: string): Volume {
 }
 
 // The user's decision: both runtimes stream this model from the internal SSD, never a USB disk.
-export function assertInternalSsd(splitPaths: readonly string[]): Volume[] {
-  const volumes = splitPaths.map(volume);
+export function assertInternalSsd(paths: readonly string[]): Volume[] {
+  const volumes = paths.map(volume);
   const outside = volumes.filter((item) => !item.internal || !item.solidState);
   if (outside.length) {
     const where = outside.map((item) => `${item.path} is on ${item.volumeName} (${item.bus})`).join('; ');
-    throw new Error(`Copy the GGUF splits to the internal SSD first: ${where}`);
+    throw new Error(`Copy the model files to the internal SSD first: ${where}`);
   }
   return volumes;
 }
@@ -82,10 +83,12 @@ export function checkResult(result: Result, item: FixtureCase): void {
       `${result.runtime} ${item.name}: ${result.numTokens} tokens, ${result.cachedTokens} cached, ${result.promptTokens} prompt`,
     );
   }
+  sampleAcceptance(result, SPECULATION);
 }
 
 // The context cap and the extracted tokenizer assets are fixed per load, so check them per load.
 export async function checkLoaded(loaded: Loaded, cases: readonly FixtureCase[], expected?: Record<string, string>) {
+  if (loaded.hasMtp !== true) throw new Error('mlx-node loaded no MTP weights; not the recorded protocol');
   const needed = Math.max(...cases.map((item) => item.tokenIds.length)) + PROTOCOL.outputTokens;
   if (loaded.context.effectiveWindowTokens < needed) {
     throw new Error(

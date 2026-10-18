@@ -6,12 +6,11 @@ import { pathToFileURL } from 'node:url';
 
 import { ROOT, assertCleanEnv, assertLoadedAddon, loadFixture } from '../common.js';
 import { serveSamples, sessionTokenizer, type SessionModel, type Tokenizer } from './session.js';
-import { FIXTURE, MODEL_PATH, readManifest } from './suite.js';
+import { DRAFT_DIRS, FIXTURE, MODEL_PATH, readManifest, type Protocol } from './suite.js';
 
 interface Model extends SessionModel {
   modelAssetsPath(): string;
   contextLimits(): unknown;
-  hasBlockPagedCache(): boolean;
   hasMtpWeights(): boolean;
 }
 
@@ -24,7 +23,7 @@ for (const [name, value] of Object.entries(protocol.mlxEnv)) {
 }
 const { cases } = await loadFixture(FIXTURE);
 const { loadModel } = (await import(pathToFileURL(join(ROOT, 'packages/lm/src/models/model-loader.ts')).href)) as {
-  loadModel: (path: string, options: { autoLoadDraft: boolean }) => Promise<Model>;
+  loadModel: (path: string, options: { draftModelPath: string } & Protocol['mlxLoadOptions']) => Promise<Model>;
 };
 const { memoryStats, Qwen3Tokenizer } = (await import(pathToFileURL(join(ROOT, 'packages/core/index.cjs')).href)) as {
   memoryStats: () => unknown;
@@ -33,9 +32,9 @@ const { memoryStats, Qwen3Tokenizer } = (await import(pathToFileURL(join(ROOT, '
 assertLoadedAddon();
 
 const loadStart = performance.now();
-// loadModel attaches a qwen3.8-27b-dflash2 directory found beside the GGUF;
-// the recorded protocol loads no draft.
-const model = await loadModel(MODEL_PATH, { autoLoadDraft: false });
+// An explicit draftModelPath fails the load unless the DFlash2 draft validates against the target.
+const model = await loadModel(MODEL_PATH, { draftModelPath: DRAFT_DIRS['mlx-node'], ...protocol.mlxLoadOptions });
+if (!model.hasMtpWeights()) throw new Error('No speculative draft loaded; not the recorded protocol');
 const assets = model.modelAssetsPath();
 console.log(
   JSON.stringify({
@@ -44,13 +43,12 @@ console.log(
     pid: process.pid,
     assets,
     context: model.contextLimits(),
-    paged: model.hasBlockPagedCache(),
+    draft: DRAFT_DIRS['mlx-node'],
+    kvFormat: protocol.mlxLoadOptions.kvFormat,
     hasMtp: model.hasMtpWeights(),
   }),
 );
-// The recorded protocol is the block-paged BF16 K/V cache; the flat fallback defaults to int8 K/V.
-if (!model.hasBlockPagedCache()) throw new Error('Block-paged cache inactive; not the recorded protocol');
 
 const tokenizer = await sessionTokenizer(assets, out, (path) => Qwen3Tokenizer.fromPretrained(path));
-await serveSamples(model, tokenizer, cases, out, memoryStats);
+await serveSamples(model, tokenizer, cases, out, memoryStats, protocol.mlxRequest);
 process.exit(0);

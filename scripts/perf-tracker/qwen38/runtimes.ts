@@ -9,13 +9,12 @@ import { createInterface } from 'node:readline';
 
 import { ROOT, llamaServerPath, sleep, writeJson, type FixtureCase } from '../common.js';
 import { descendants, processTable } from './admission.js';
-import { HERE, MODEL_PATH, PORT, type Performance, type Runtime } from './suite.js';
+import { HERE, MODEL_PATH, PORT, type Speculated } from './suite.js';
 
 const RESPONSE_TIMEOUT_MS = 1_200_000;
 
-export interface Result {
+export interface Result extends Speculated {
   event: 'result';
-  runtime: Runtime;
   name: string;
   run: number | string;
   pid: number;
@@ -24,7 +23,6 @@ export interface Result {
   numTokens: number;
   promptTokens: number;
   cachedTokens: number;
-  performance: Performance;
   [field: string]: unknown;
 }
 
@@ -312,6 +310,7 @@ export class LlamaServer implements Runner {
     });
     if (!final) throw new Error('No llama final');
     const timings = final.timings as Record<string, number>;
+    const settings = final.generation_settings as Record<string, unknown>;
     const cached = timings.cache_n ?? 0;
     const result: Result = {
       event: 'result',
@@ -334,6 +333,7 @@ export class LlamaServer implements Runner {
         decodeTokensPerSecond: timings.predicted_per_second,
       },
       timings,
+      speculativeTypes: String(settings['speculative.types']),
       final,
       tokens,
       text: text.join(''),

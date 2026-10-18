@@ -126,15 +126,129 @@ export function llamaServerPath(): string {
 // only help a later request reuse the prompt, yet the checkpoints copy state twice in each timed prefill.
 export const LLAMA_SINGLE_REQUEST_ARGS = ['-ctxcp', '0', '-cram', '0'] as const;
 
-const hasSingleRequestArgs = (args: readonly string[]) =>
-  args.some((_, start) => LLAMA_SINGLE_REQUEST_ARGS.every((arg, offset) => args[start + offset] === arg));
+export interface PinnedFile {
+  file: string;
+  bytes: number;
+  sha256: string;
+}
 
-export function singleRequestNote(runArgs: readonly string[], baselineArgs: readonly string[]): string[] {
-  if (!hasSingleRequestArgs(runArgs) || hasSingleRequestArgs(baselineArgs)) return [];
-  return [
-    '',
-    `llama.cpp ran with \`${LLAMA_SINGLE_REQUEST_ARGS.join(' ')}\` (no context checkpoints, no RAM prompt cache); the baseline ran with llama.cpp defaults, which add two state copies to each prefill.`,
+export interface DraftPin {
+  repo: string;
+  revision: string;
+  files: PinnedFile[];
+}
+
+export type DraftPins = Record<'mlx-node' | 'llama.cpp', DraftPin>;
+
+export function assertPin(path: string, size: number, sha256: string | undefined, pin: PinnedFile): void {
+  if (size !== pin.bytes || sha256 !== pin.sha256) {
+    throw new Error(`${path}: ${size} bytes, SHA-256 ${sha256}; pinned ${pin.bytes} bytes, SHA-256 ${pin.sha256}`);
+  }
+}
+
+export interface SpeculationRule {
+  // The type llama.cpp lists in generation_settings["speculative.types"].
+  llamaType: string;
+  // mlx-node's mean drafted tokens per cycle must exceed this.
+  mlxMinMeanDepth: number;
+}
+
+export interface MlxSpeculationRequest {
+  enableMtp: true;
+  mtpDepth?: number;
+  mtpAdaptiveDepth: false;
+}
+
+export interface MlxSpeculationPerformance {
+  mtpCycles?: number;
+  mtpMeanDepth?: number;
+  mtpMeanAcceptedTokens?: number;
+  mtpMeanAcceptedTokensTotal?: number;
+}
+
+export interface Acceptance {
+  // llama.cpp's /completion does not report its verify steps.
+  cycles: number | null;
+  drafted: number;
+  accepted: number;
+  // Tokens committed per verify step, the verified token included.
+  committedPerCycle: number | null;
+}
+
+// Both runtimes fall back to plain decoding when a draft is missing or fails to start.
+// mlx-node reports per-cycle means, so its counts are mean × cycles.
+export function mlxAcceptance(
+  performance: MlxSpeculationPerformance,
+  rule: SpeculationRule,
+  label: string,
+): Acceptance {
+  const { mtpCycles: cycles = 0, mtpMeanDepth: depth = 0, mtpMeanAcceptedTokens: accepted = 0 } = performance;
+  if (!(cycles > 0 && depth > rule.mlxMinMeanDepth)) {
+    throw new Error(`${label}: mlx-node did not speculate (${cycles} cycles, mean depth ${depth})`);
+  }
+  return {
+    cycles,
+    drafted: Math.round(depth * cycles),
+    accepted: Math.round(accepted * cycles),
+    committedPerCycle: performance.mtpMeanAcceptedTokensTotal ?? null,
+  };
+}
+
+export function llamaAcceptance(
+  timings: { draft_n?: number; draft_n_accepted?: number },
+  speculativeTypes: string,
+  rule: SpeculationRule,
+  label: string,
+): Acceptance {
+  const drafted = timings.draft_n ?? 0;
+  if (!speculativeTypes.split(',').includes(rule.llamaType) || !(drafted > 0)) {
+    throw new Error(
+      `${label}: llama.cpp did not speculate (speculative.types "${speculativeTypes}", draft_n ${drafted})`,
+    );
+  }
+  return { cycles: null, drafted, accepted: timings.draft_n_accepted ?? 0, committedPerCycle: null };
+}
+
+type Range = { median: number; min: number; max: number };
+
+export interface AcceptanceStats {
+  drafted: Range;
+  accepted: Range;
+  acceptanceRate: Range;
+  cycles: Range | null;
+  committedPerCycle: Range | null;
+}
+
+export function acceptanceStats(items: readonly Acceptance[]): AcceptanceStats {
+  const known = (values: (number | null)[]) =>
+    values.every((value): value is number => value !== null) ? range(values) : null;
+  return {
+    drafted: range(items.map(({ drafted }) => drafted)),
+    accepted: range(items.map(({ accepted }) => accepted)),
+    acceptanceRate: range(items.map(({ drafted, accepted }) => accepted / drafted)),
+    cycles: known(items.map(({ cycles }) => cycles)),
+    committedPerCycle: known(items.map(({ committedPerCycle }) => committedPerCycle)),
+  };
+}
+
+export const ACCEPTANCE_CSV_COLUMNS = ['draft_cycles', 'drafted_tokens', 'accepted_drafts'] as const;
+
+export const acceptanceCsv = ({ cycles, drafted, accepted }: Acceptance) => ({
+  draft_cycles: cycles,
+  drafted_tokens: drafted,
+  accepted_drafts: accepted,
+});
+
+export function acceptanceTable(rows: readonly { label: string; stats: AcceptanceStats }[]): string {
+  const lines = [
+    '| Cell | Drafted | Accepted | Acceptance | Tokens per verify step |',
+    '|---|---:|---:|---:|---:|',
+    ...rows.map(
+      ({ label, stats }) =>
+        `| ${label} | ${stats.drafted.median.toFixed(0)} | ${stats.accepted.median.toFixed(0)} | ${(stats.acceptanceRate.median * 100).toFixed(1)}% | ${stats.committedPerCycle?.median.toFixed(2) ?? 'not reported'} |`,
+    ),
   ];
+  return `${lines.join('\n')}\n`;
 }
 
 export interface LlamaIdentity {
@@ -326,7 +440,7 @@ export interface FixtureManifest {
 }
 
 export async function loadFixture(
-  name: 'gemma4-oxc-review-v1' | 'qwen38-oxc-review-v1',
+  name: 'gemma4-oxc-review-v2' | 'qwen38-oxc-review-v2',
 ): Promise<{ manifest: FixtureManifest; path: string; cases: FixtureCase[] }> {
   const manifest = await readJson<FixtureManifest>(join(ROOT, 'scripts/fixtures', `${name}.json`));
   const path = join(ROOT, manifest.payload.path);

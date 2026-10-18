@@ -3,7 +3,14 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { LLAMA_SINGLE_REQUEST_ARGS, MODELS_DIR, type LlamaIdentity, type TreeIdentity } from '../common.js';
+import {
+  LLAMA_SINGLE_REQUEST_ARGS,
+  MODELS_DIR,
+  type LlamaIdentity,
+  type MlxSpeculationRequest,
+  type SpeculationRule,
+  type TreeIdentity,
+} from '../common.js';
 import type { IdCheck, Policy } from '../qwen38/suite.js';
 
 export const HERE = dirname(fileURLToPath(import.meta.url));
@@ -39,6 +46,40 @@ export const SPLITS = [
     sha256: '753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a',
   },
 ] as const;
+
+// llama.cpp's self-contained Q8_0 MTP head (own token embedding and output) from the splits' repo.
+// The UD-Q4_K_XL splits carry no MTP tensors, and mainline llama.cpp cannot load the shared-* heads.
+export const MTP_HEAD = {
+  repo: SOURCE.repo,
+  revision: SOURCE.revision,
+  path: 'MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf',
+  file: 'mtp-Qwen3.8-Flash-Next-Q8_0.gguf',
+  bytes: 4_137_429_120,
+  sha256: '58a47d6a216307e9b97172d5bfdc3436a8994b632f5e436b9bb6edf8951da8d1',
+} as const;
+export const DEFAULT_MTP_HEAD = join(MODELS_DIR, 'qwen3.8-flash-next-gguf/MTP-Q8_0', MTP_HEAD.file);
+
+// mlx-node reads qwen4_exp MTP weights only from `mtp.*` safetensors of the original checkpoint
+// (auxiliaryModelPath). mtp-aux.ts copies those tensors byte for byte into this folder; config.json
+// drops vision_config, since the folder holds no vision tensors.
+export const MTP_AUX = {
+  repo: 'Qwen/Qwen3.8-Flash-Next',
+  revision: 'de4b8e4d43b917e7706784d8bb445c9af86a3540',
+  tensors: 31,
+  files: [
+    { file: 'config.json', bytes: 3_604, sha256: 'd77ccad877a68d7e102915b0766c18eb16bc0a235727b161005b58cb6778a3b9' },
+    {
+      file: 'model.safetensors',
+      bytes: 5_214_305_528,
+      sha256: '00474214c9c150a5b89447a33791d4498dac9b98843d903618b899068576ab6b',
+    },
+  ],
+} as const;
+export const DEFAULT_MTP_SOURCE_DIR = join(MODELS_DIR, 'qwen3.8-flash-next');
+export const DEFAULT_MTP_AUX_DIR = join(MODELS_DIR, 'qwen3.8-flash-next-mtp-aux');
+
+// The splits carry no other draft, so any mlx-node cycle is native MTP.
+export const SPECULATION: SpeculationRule = { llamaType: 'draft-mtp', mlxMinMeanDepth: 0 };
 
 // Files mlx-node extracts from the GGUF metadata at load; they decide its prompt IDs.
 export const ASSET_FILES = ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', 'config.json'];
@@ -79,20 +120,32 @@ export const PROTOCOL = {
     '-lm',
     'mmap',
     '--spec-type',
-    'none',
+    'draft-mtp',
+    '--spec-draft-n-max',
+    '2',
+    '--spec-draft-n-min',
+    '0',
+    '-ngld',
+    'all',
     ...LLAMA_SINGLE_REQUEST_ARGS,
     '--no-warmup',
     '--perf',
   ],
   // Untimed prewarm only: info-level libllama logs carry the buffer sizes and backend notes.
   llamaPrewarmArgs: ['-lv', '4'],
-  // llama.cpp keeps every weight resident; the automatic budget keeps a reserve and streams experts from SSD.
-  mlxEnv: { MLX_QWEN4_RESIDENCY: 'full' } as Record<string, string>,
+  mlxEnv: {} as Record<string, string>,
   mlxLoadOptions: { autoLoadDraft: false },
+  mlxRequest: { enableMtp: true, mtpDepth: 2, mtpAdaptiveDepth: false } satisfies MlxSpeculationRequest,
   weightBudget:
-    'mlx-node full hot-path residency (MLX_QWEN4_RESIDENCY=full); the load fails instead of streaming experts',
-  kvCache: { 'mlx-node': 'BF16 block-paged', 'llama.cpp': 'F16' },
-  sampling: 'Greedy, high thinking, retain historical reasoning; no MTP or other speculation.',
+    'mlx-node default policy: automatic budget, routed experts stream from the internal SSD; recorded per load',
+  kvCache: { 'mlx-node': 'BF16 block-paged', 'llama.cpp': 'F16 for target and MTP head' },
+  sampling:
+    'Greedy, high thinking, retain historical reasoning. Native MTP in both runtimes: 2 drafted tokens per verify step (the depth unsloth recommends), greedy verification.',
+  mtp: {
+    'mlx-node':
+      'BF16 mtp.* block from the original checkpoint (auxiliaryModelPath); token embedding and output from the target GGUF',
+    'llama.cpp': 'Self-contained Q8_0 MTP head (-md), its own Q8_0 token embedding and output',
+  },
 };
 
 export interface SplitIdentity {
@@ -112,10 +165,11 @@ export interface Identity {
   addon: Record<string, string>;
   llama: LlamaIdentity;
   model: { dir: string; splits: SplitIdentity[] };
+  mtp: { head: SplitIdentity; auxDir: string; aux: SplitIdentity[] };
   scripts: Record<string, string>;
 }
 
-export const IDENTITY_KEYS = ['tree', 'addon', 'llama', 'model', 'scripts'] as const;
+export const IDENTITY_KEYS = ['tree', 'addon', 'llama', 'model', 'mtp', 'scripts'] as const;
 
 export interface Volume {
   path: string;
@@ -148,6 +202,7 @@ export interface Loaded {
   assets: string;
   context: { effectiveWindowTokens: number };
   residency: Residency;
+  hasMtp: boolean;
   [field: string]: unknown;
 }
 

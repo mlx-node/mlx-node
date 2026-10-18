@@ -26,7 +26,7 @@ for (const [name, value] of Object.entries(PROTOCOL.mlxEnv)) {
 const provenance = await readJson<Provenance>(join(out, 'provenance.json'));
 const { cases } = await loadFixture(FIXTURE);
 const { loadModel } = (await import(pathToFileURL(join(ROOT, 'packages/lm/src/models/model-loader.ts')).href)) as {
-  loadModel: (path: string, options: { autoLoadDraft: boolean }) => Promise<Model>;
+  loadModel: (path: string, options: { autoLoadDraft: boolean; auxiliaryModelPath: string }) => Promise<Model>;
 };
 const { memoryStats, Qwen3Tokenizer } = (await import(pathToFileURL(join(ROOT, 'packages/core/index.cjs')).href)) as {
   memoryStats: () => unknown;
@@ -34,17 +34,20 @@ const { memoryStats, Qwen3Tokenizer } = (await import(pathToFileURL(join(ROOT, '
 };
 assertLoadedAddon();
 
-// Full residency is admitted only if free memory covers the hot weights and mlx-node's reserve now.
+// The automatic weight budget is sized from free memory at this moment.
 const beforeLoad = {
   at: new Date().toISOString(),
   pressureLevel: Number(sh('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'])),
   vmStat: sh('vm_stat', []),
 };
 const loadStart = performance.now();
-const model = await loadModel(provenance.model.splits[0].path, PROTOCOL.mlxLoadOptions);
+const model = await loadModel(provenance.model.splits[0].path, {
+  ...PROTOCOL.mlxLoadOptions,
+  auxiliaryModelPath: provenance.mtp.auxDir,
+});
 const loadMs = performance.now() - loadStart;
 if (typeof model.residencyInfo !== 'function') throw new Error('The GGUF did not load as a qwen4_exp model');
-if (!model.residencyInfo().fullHotResidency) throw new Error('mlx-node did not admit full hot-path residency');
+if (!model.hasMtpWeights()) throw new Error('mlx-node loaded no MTP weights; not the recorded protocol');
 const assets = model.modelAssetsPath();
 console.log(
   JSON.stringify({
@@ -62,5 +65,5 @@ console.log(
 );
 
 const tokenizer = await sessionTokenizer(assets, out, (path) => Qwen3Tokenizer.fromPretrained(path));
-await serveSamples(model, tokenizer, cases, out, memoryStats);
+await serveSamples(model, tokenizer, cases, out, memoryStats, PROTOCOL.mlxRequest);
 process.exit(0);

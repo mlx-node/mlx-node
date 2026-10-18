@@ -4,7 +4,7 @@ import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
-import { writeJson, type FixtureCase } from '../common.js';
+import { writeJson, type FixtureCase, type MlxSpeculationRequest } from '../common.js';
 
 export interface StreamEvent {
   done: boolean;
@@ -56,6 +56,7 @@ export async function serveSamples(
   cases: readonly FixtureCase[],
   out: string,
   memoryStats: () => unknown,
+  speculation: MlxSpeculationRequest,
 ): Promise<void> {
   for await (const line of createInterface({ input: process.stdin })) {
     const request = JSON.parse(line) as { action?: string; name: string; run: number | string; maxNewTokens: number };
@@ -79,7 +80,7 @@ export async function serveSamples(
       frequencyPenalty: 0,
       reasoningEffort: 'high',
       includeReasoning: true,
-      enableMtp: false,
+      ...speculation,
       reuseCache: true,
       reportPerformance: true,
       cacheSalt: `benchmark-${process.pid}-${request.run}-${request.name}`,

@@ -10,19 +10,33 @@ import {
   MODELS_DIR,
   ROOT,
   fileHashes,
+  llamaAcceptance,
+  mlxAcceptance,
   readJson,
   sh,
   sha256,
   writeJson,
+  type Acceptance,
+  type DraftPins,
   type FixtureCase,
   type FixtureManifest,
   type LlamaIdentity,
+  type MlxSpeculationPerformance,
+  type MlxSpeculationRequest,
+  type SpeculationRule,
   type TreeIdentity,
 } from '../common.js';
 
 export const HERE = dirname(fileURLToPath(import.meta.url));
-export const FIXTURE = 'qwen38-oxc-review-v1';
+export const FIXTURE = 'qwen38-oxc-review-v2';
 export const MODEL_PATH = join(MODELS_DIR, 'qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf');
+// The fixture pins the draft files; these are their local folders.
+export const DRAFT_DIRS: Readonly<Record<Runtime, string>> = {
+  'mlx-node': join(MODELS_DIR, 'qwen3.8-27b-dflash2'),
+  'llama.cpp': join(MODELS_DIR, 'qwen3.8-27b-dflash2-gguf'),
+};
+// The target GGUF also carries an inline MTP head, which drafts one token per cycle.
+export const SPECULATION: SpeculationRule = { llamaType: 'draft-dflash', mlxMinMeanDepth: 1 };
 export const PORT = 18789;
 export const LOAD_COOLDOWN_SECONDS = 10;
 export const SIDECARS = ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
@@ -53,18 +67,25 @@ export interface Protocol {
   cooldownSeconds: number;
   llamaServerArgs: string[];
   mlxEnv: Record<string, string>;
+  mlxLoadOptions: { kvFormat: 'bf16' };
+  mlxRequest: MlxSpeculationRequest;
   admissionPolicyByPromptTokens: Record<string, string>;
 }
 
 export interface Manifest extends FixtureManifest {
   model: { file: string; bytes: number; sha256: string };
+  draft: DraftPins;
   cases: (FixtureManifest['cases'][number] & { sourceLine: number })[];
   protocol: Protocol;
-  measuredRevisions: Record<Runtime, string>;
 }
 
-export const llamaServerArgs = (protocol: Protocol): string[] => [
-  ...protocol.llamaServerArgs,
+export const draftPaths = (manifest: Manifest, runtime: Runtime): string[] =>
+  manifest.draft[runtime].files.map(({ file }) => join(DRAFT_DIRS[runtime], file));
+
+export const llamaServerArgs = (manifest: Manifest): string[] => [
+  ...manifest.protocol.llamaServerArgs,
+  '-md',
+  ...draftPaths(manifest, 'llama.cpp'),
   ...LLAMA_SINGLE_REQUEST_ARGS,
 ];
 
@@ -81,17 +102,34 @@ export async function readManifest(): Promise<Manifest> {
   ) {
     throw new Error(`${FIXTURE}: the pinned admission policy no longer matches this runner`);
   }
+  if (manifest.draft['llama.cpp'].files.length !== 1) throw new Error(`${FIXTURE}: llama.cpp takes one draft GGUF`);
   return manifest;
 }
 
-export interface Performance {
+export interface Performance extends MlxSpeculationPerformance {
   ttftMs: number;
   prefillTokensPerSecond: number;
   decodeTokensPerSecond: number;
-  mtpCycles?: number;
 }
 
-export interface Sample {
+export interface Speculated {
+  runtime: Runtime;
+  name: string;
+  run: number | string;
+  performance: Performance;
+  timings?: { draft_n?: number; draft_n_accepted?: number };
+  speculativeTypes?: string;
+}
+
+// Throws for a sample that ran without speculation.
+export function sampleAcceptance(sample: Speculated, rule: SpeculationRule): Acceptance {
+  const label = `${sample.runtime} ${sample.name} run ${sample.run}`;
+  return sample.runtime === 'mlx-node'
+    ? mlxAcceptance(sample.performance, rule, label)
+    : llamaAcceptance(sample.timings ?? {}, sample.speculativeTypes ?? '', rule, label);
+}
+
+export interface Sample extends Speculated {
   event: 'result';
   runtime: Runtime;
   name: string;
@@ -102,22 +140,31 @@ export interface Sample {
   numTokens: number;
   promptTokens: number;
   cachedTokens: number;
-  performance: Performance;
   block?: string;
   [field: string]: unknown;
 }
 
-// Everything a fresh runtime process reads; `model.sha256` is absent from the per-block check.
+export interface FileIdentity {
+  path: string;
+  realpath: string;
+  size: number;
+  mtimeMs: number;
+  ino: number;
+  sha256?: string;
+}
+
+// Everything a fresh runtime process reads; file hashes are absent from the per-block check.
 export interface Identity {
   tree: TreeIdentity;
   addon: Record<string, string>;
   llama: LlamaIdentity;
-  model: { path: string; realpath: string; size: number; mtimeMs: number; ino: number; sha256?: string };
+  model: FileIdentity;
+  drafts: Record<Runtime, FileIdentity[]>;
   sidecars: Record<string, string>;
   scripts: Record<string, string>;
 }
 
-export const IDENTITY_KEYS = ['tree', 'addon', 'llama', 'model', 'sidecars', 'scripts'] as const;
+export const IDENTITY_KEYS = ['tree', 'addon', 'llama', 'model', 'drafts', 'sidecars', 'scripts'] as const;
 
 export interface Provenance extends Identity {
   host: { os: string; chip: string; gpuCores: number; memoryBytes: number };

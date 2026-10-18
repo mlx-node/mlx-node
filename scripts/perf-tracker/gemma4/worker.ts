@@ -3,7 +3,6 @@
 
 import { spawn } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
-import { readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -15,16 +14,20 @@ import {
   ROOT,
   assertCleanEnv,
   assertLoadedAddon,
+  llamaAcceptance,
   llamaServerPath,
+  mlxAcceptance,
   sha256,
   sha256File,
   sleep,
   writeJson,
 } from '../common.js';
 import {
+  DRAFT_DIRS,
   MODEL_FILE,
   PILOT_RUN,
   RUNTIMES,
+  SPECULATION,
   llamaServerArgs,
   readFixture,
   sampleId,
@@ -64,19 +67,15 @@ const id = sampleId(runtime, data.name, run);
 const save = (sample: unknown) => writeJson(samplePath(out, id), sample);
 
 async function mlx() {
-  const planLog = join(out!, 'raw', `${id}.plans.jsonl`);
-  // The addon appends; a retried sample must not inherit a failed attempt's plans.
-  await rm(planLog, { force: true });
-  process.env.MLX_NODE_LOG = 'mlx_core::decode_tuning=info';
-  process.env.MLX_NODE_LOG_FILE = planLog;
   const n = data!.promptTokens;
   const { Gemma4Model, getMemorySnapshot, resetPeakMemory } = (await import(
     pathToFileURL(join(ROOT, 'packages/core/index.cjs')).href
   )) as Core;
   assertLoadedAddon();
   const started = performance.now();
-  const model = await Gemma4Model.load(MODEL_FILE);
+  const model = await Gemma4Model.load(MODEL_FILE, { draftModelPath: DRAFT_DIRS.mlx });
   const loadMs = performance.now() - started;
+  if (!model.hasMtpWeights()) throw new Error('No DSpark draft loaded; not the recorded protocol');
   const memoryAfterLoad = getMemorySnapshot();
   const config: ChatConfig = {
     temperature: 0,
@@ -88,7 +87,7 @@ async function mlx() {
     frequencyPenalty: 0,
     reasoningEffort: 'high',
     tools: data!.tools as ChatConfig['tools'],
-    enableMtp: false,
+    ...protocol.mlxRequest,
     reuseCache: true,
     reportPerformance: true,
   };
@@ -107,6 +106,7 @@ async function mlx() {
   if (result.promptTokens !== n || result.cachedTokens !== 0 || result.numTokens !== protocol.outputTokens) {
     throw new Error(`Workload mismatch: ${JSON.stringify(result)}`);
   }
+  const acceptance = mlxAcceptance(p, SPECULATION, id);
   const decodeMs = ((result.numTokens - 1) / p.decodeTokensPerSecond) * 1000;
   const sample = {
     runtime,
@@ -119,7 +119,6 @@ async function mlx() {
     memoryAfterLoad,
     memoryBeforeRequest,
     memoryAfterRequest,
-    decodePlans: await decodePlans(planLog),
     wallMs,
     prefillMs: p.ttftMs,
     prefillTps: p.prefillTokensPerSecond,
@@ -135,42 +134,8 @@ async function mlx() {
     result,
   };
   await save(sample);
-  console.log(JSON.stringify({ ...sample, result: undefined }));
+  console.log(JSON.stringify({ ...sample, result: undefined, acceptance }));
   await model.resetCaches();
-}
-
-interface PlanEvent {
-  event: string;
-  context_bucket: number;
-  stage: string;
-  early_layers: number;
-  grouped_stripes?: number;
-  samples: string;
-  candidate_early_layers: string;
-  candidate_stripes?: string;
-}
-
-// Every fresh process calibrates at least one context bucket; an empty list
-// means the event or its log target changed, not that no plan was chosen.
-async function decodePlans(planLog: string) {
-  const plans = (await readFile(planLog, 'utf8'))
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as PlanEvent)
-    .filter((event) => event.event === 'decode_tuned')
-    .map((event) => ({
-      contextBucket: event.context_bucket,
-      stage: event.stage,
-      earlyLayers: event.early_layers,
-      groupedStripes: event.grouped_stripes ?? null,
-      samples: JSON.parse(event.samples) as number[][],
-      candidateEarlyLayers: JSON.parse(event.candidate_early_layers) as number[],
-      candidateStripes:
-        event.candidate_stripes === undefined ? null : (JSON.parse(event.candidate_stripes) as number[]),
-    }));
-  if (!plans.length) throw new Error(`${planLog}: no decode_tuned event`);
-  return plans;
 }
 
 async function freePort(): Promise<number> {
@@ -188,7 +153,7 @@ async function llama() {
   const args = [
     '-m',
     MODEL_FILE,
-    ...llamaServerArgs(protocol),
+    ...llamaServerArgs(manifest),
     '--host',
     '127.0.0.1',
     '--port',
@@ -250,6 +215,7 @@ async function llama() {
     if (t.prompt_n !== n || t.predicted_n !== protocol.outputTokens || t.cache_n !== 0 || result.truncated) {
       throw new Error(`Workload mismatch: ${JSON.stringify(result)}`);
     }
+    const acceptance = llamaAcceptance(t, String(result.generation_settings['speculative.types']), SPECULATION, id);
     const sample = {
       runtime,
       name: data!.name,
@@ -272,7 +238,7 @@ async function llama() {
       result,
     };
     await save(sample);
-    console.log(JSON.stringify({ ...sample, args: undefined, result: undefined }));
+    console.log(JSON.stringify({ ...sample, args: undefined, result: undefined, acceptance }));
   } finally {
     server.kill('SIGTERM');
     await Promise.race([exit, sleep(5000)]);

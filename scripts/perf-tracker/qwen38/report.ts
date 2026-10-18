@@ -1,32 +1,44 @@
 /// <reference types="node" />
 
+import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 import {
+  ACCEPTANCE_CSV_COLUMNS,
+  ROOT,
+  acceptanceCsv,
+  acceptanceStats,
+  acceptanceTable,
   compareTable,
   median,
   parseCsv,
   range,
   readJson,
   renderChart,
-  singleRequestNote,
   toCsv,
   writeJson,
+  type AcceptanceStats,
   type ChartSeries,
   type CompareRow,
+  type SpeculationRule,
 } from '../common.js';
 import {
+  FIXTURE,
   HERE,
   KIND,
   RUNTIMES,
+  SPECULATION,
   paths,
   readManifest,
+  sampleAcceptance,
   type Manifest,
   type Provenance,
   type Runtime,
   type Sample,
 } from './suite.js';
+
+const BASELINE = join(HERE, 'baseline.csv');
 
 export const CSV_COLUMNS = [
   'runtime',
@@ -38,6 +50,7 @@ export const CSV_COLUMNS = [
   'decode_tokens_per_second',
   'ttft_ms',
   'wall_ms',
+  ...ACCEPTANCE_CSV_COLUMNS,
 ] as const;
 
 const METRICS = ['prefillTokensPerSecond', 'decodeTokensPerSecond', 'ttftMs'] as const;
@@ -48,6 +61,7 @@ interface Cell {
   prefillTokensPerSecond: Stat;
   decodeTokensPerSecond: Stat;
   ttftMs: Stat;
+  acceptance: AcceptanceStats;
 }
 
 interface Stat {
@@ -76,8 +90,17 @@ export interface Summary {
   summary: SummaryRow[];
 }
 
-// Refuses an incomplete or off-protocol run.
-export async function summarize(out: string, allowDirty: boolean, outputLength?: number): Promise<Summary> {
+export interface SummarizeOptions {
+  outputTokens?: number;
+  speculation: SpeculationRule;
+}
+
+// Refuses an incomplete or off-protocol run, or a sample that ran without speculation.
+export async function summarize(
+  out: string,
+  allowDirty: boolean,
+  { outputTokens: outputLength, speculation }: SummarizeOptions,
+): Promise<Summary> {
   const manifest = await readManifest();
   const { repetitions } = manifest.protocol;
   const outputTokens = outputLength ?? manifest.protocol.outputTokens;
@@ -113,14 +136,10 @@ export async function summarize(out: string, allowDirty: boolean, outputLength?:
   for (const sample of samples) {
     const item = manifest.cases.find((candidate) => candidate.name === sample.name)!;
     const label = `${KIND[sample.runtime]}-${sample.run}-${sample.name}`;
-    if (
-      sample.numTokens !== outputTokens ||
-      sample.cachedTokens !== 0 ||
-      sample.promptTokens !== item.promptTokens ||
-      sample.performance.mtpCycles
-    ) {
-      throw new Error(`${label}: token accounting or speculation differs from the protocol`);
+    if (sample.numTokens !== outputTokens || sample.cachedTokens !== 0 || sample.promptTokens !== item.promptTokens) {
+      throw new Error(`${label}: token accounting differs from the protocol`);
     }
+    sampleAcceptance(sample, speculation);
     if (provenance.protocol.admission[item.promptTokens] === 'no-other-local-llm') {
       if (!events.some((event) => event.event === 'llm_isolation_confirmed' && event.label === label)) {
         throw new Error(`${label}: no recorded no-other-local-LLM admission`);
@@ -147,6 +166,7 @@ export async function summarize(out: string, allowDirty: boolean, outputLength?:
         prefillTokensPerSecond: stat('prefillTokensPerSecond'),
         decodeTokensPerSecond: stat('decodeTokensPerSecond'),
         ttftMs: stat('ttftMs'),
+        acceptance: acceptanceStats(runs.map((sample) => sampleAcceptance(sample, speculation))),
       };
     };
     const mlx = cell('mlx-node');
@@ -164,10 +184,11 @@ export async function summarize(out: string, allowDirty: boolean, outputLength?:
   return { manifest, provenance, samples, summary };
 }
 
-export function samplesCsv(samples: readonly Sample[]): string {
+export function samplesCsv(samples: readonly Sample[], speculation: SpeculationRule): string {
   return toCsv(
     CSV_COLUMNS,
     samples.map((sample) => ({
+      ...acceptanceCsv(sampleAcceptance(sample, speculation)),
       runtime: sample.runtime,
       prompt_tokens: sample.promptTokens,
       repetition: sample.run,
@@ -194,12 +215,50 @@ export function printSummary(rows: readonly SummaryRow[]): void {
   }
 }
 
+export const speculationTable = (rows: readonly SummaryRow[]): string =>
+  acceptanceTable(
+    rows.flatMap((row) =>
+      RUNTIMES.map((runtime) => ({
+        label: `${runtime} · ${tokens(row.promptTokens)}`,
+        stats: row[runtime].acceptance,
+      })),
+    ),
+  );
+
+// The baseline is the previous entry of the same fixture version.
+export async function baselineHistory(
+  baseline: string,
+  rows: readonly SummaryRow[],
+  firstEntry: string,
+): Promise<string[]> {
+  if (!existsSync(baseline)) return [firstEntry, ''];
+  const lines = parseCsv(await readFile(baseline, 'utf8'));
+  const compare = (metric: 'prefill' | 'decode'): CompareRow[] =>
+    rows.flatMap((row) =>
+      RUNTIMES.map((runtime) => ({
+        label: `${runtime} · ${tokens(row.promptTokens)}`,
+        before: median(
+          lines
+            .filter((line) => line.runtime === runtime && Number(line.prompt_tokens) === row.promptTokens)
+            .map((line) => Number(line[`${metric}_tokens_per_second`])),
+        ),
+        after: row[runtime][`${metric}TokensPerSecond`].median,
+      })),
+    );
+  return [
+    `Before = medians of the previous entry in \`${relative(ROOT, baseline)}\`; after = this run.`,
+    '',
+    compareTable('Prefill', compare('prefill')),
+    compareTable('Decode', compare('decode')),
+  ];
+}
+
 // Refuses an incomplete or off-protocol run, then writes samples.csv,
 // summary.json, chart.svg and compare.md.
 export async function report(out: string, allowDirty: boolean): Promise<SummaryRow[]> {
-  const { manifest, provenance, samples, summary } = await summarize(out, allowDirty);
+  const { manifest, provenance, samples, summary } = await summarize(out, allowDirty, { speculation: SPECULATION });
   const { outputTokens, repetitions } = manifest.protocol;
-  await writeFile(join(out, 'samples.csv'), samplesCsv(samples));
+  await writeFile(join(out, 'samples.csv'), samplesCsv(samples, SPECULATION));
   await writeJson(join(out, 'summary.json'), summary);
 
   const measuredAt = provenance.matrix?.startedAt.slice(0, 10) ?? 'unknown date';
@@ -220,40 +279,34 @@ export async function report(out: string, allowDirty: boolean): Promise<SummaryR
         { title: 'Prefill', unit: 'tok/s', series: series('prefillTokensPerSecond') },
         { title: 'Decode', unit: 'tok/s', series: series('decodeTokensPerSecond') },
       ],
-      note: `Median of ${repetitions} runs, ${outputTokens} output tokens; whiskers are min–max. *Background graphics allowed, no other local LLM${provenance.protocol.desktopLoad ? '' : '; other rows start at GPU idle'}.`,
+      note: `Median of ${repetitions} runs, ${outputTokens} output tokens; whiskers are min–max; DFlash2 on, 7 drafts per step. *Background graphics allowed, no other local LLM${provenance.protocol.desktopLoad ? '' : '; other rows start at GPU idle'}.`,
     }),
   );
 
-  const baseline = parseCsv(await readFile(join(HERE, 'baseline.csv'), 'utf8'));
-  const compare = (metric: 'prefill' | 'decode'): CompareRow[] =>
-    summary.flatMap((row) =>
-      RUNTIMES.map((runtime) => ({
-        label: `${runtime} · ${tokens(row.promptTokens)}`,
-        before: median(
-          baseline
-            .filter((line) => line.runtime === runtime && Number(line.prompt_tokens) === row.promptTokens)
-            .map((line) => Number(line[`${metric}_tokens_per_second`])),
-        ),
-        after: row[runtime][`${metric}TokensPerSecond`].median,
-      })),
-    );
+  const history = await baselineHistory(
+    BASELINE,
+    summary,
+    `First entry of the \`${FIXTURE}\` protocol: speculative decoding is on in both runtimes, and it changes prefill as well as decode (mlx-node's DFlash2 turn runs on its flat cache, and both runtimes build the draft context inside prefill). Entries before 2026-10-18 ran without speculation, so there is no before value.`,
+  );
   await writeFile(
     join(out, 'compare.md'),
     [
-      `## Qwen3.8 27B UD-Q4_K_XL: ${measuredAt} vs 2026-09-09`,
+      `## Qwen3.8 27B UD-Q4_K_XL: ${measuredAt}`,
       '',
-      `Before: issue #142 initial benchmark (mlx-node ${manifest.measuredRevisions['mlx-node'].slice(0, 12)}, llama.cpp ${manifest.measuredRevisions['llama.cpp'].slice(0, 12)}; Apple M5 Max, 40 GPU cores, 128 GiB).`,
-      `After: mlx-node ${commit}, llama.cpp ${provenance.llama.commit.slice(0, 12)}; ${host}. Medians of ${repetitions} runs, tokens/second.`,
+      `This run: mlx-node ${commit}, llama.cpp ${provenance.llama.commit.slice(0, 12)}; ${host}. Medians of ${repetitions} runs, tokens/second.`,
       ...(provenance.protocol.desktopLoad
         ? [
             '',
-            'Admission: --desktop-load. Every row ran with desktop graphics and no other local LLM; the 6,219 and 18,754 rows did not wait for GPU idle as the baseline did.',
+            'Admission: --desktop-load. Every row ran with desktop graphics and no other local LLM; the 6,219 and 18,754 rows did not wait for GPU idle.',
           ]
         : []),
-      ...singleRequestNote(provenance.protocol.llamaServerArgs, manifest.protocol.llamaServerArgs),
       '',
-      compareTable('Prefill', compare('prefill')),
-      compareTable('Decode', compare('decode')),
+      ...history,
+      '### Speculation (DFlash2, 7 drafts per step)',
+      '',
+      'Medians per cell. mlx-node reports per-step means, so its counts are mean × steps; llama.cpp reports no step count.',
+      '',
+      speculationTable(summary),
     ].join('\n'),
   );
   return summary;

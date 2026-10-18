@@ -12,6 +12,7 @@ import {
   addonIdentity,
   assertCleanEnv,
   assertHostReady,
+  assertPin,
   assertLatestMain,
   fetchLatestLlama,
   hostInfo,
@@ -50,8 +51,12 @@ import { assertInternalSsd, assertNoRuntimeAlive, checkLoaded, checkResult, spli
 import { report } from './report.js';
 import {
   DEFAULT_MODEL_DIR,
+  DEFAULT_MTP_AUX_DIR,
+  DEFAULT_MTP_HEAD,
   HERE,
   IDENTITY_KEYS,
+  MTP_AUX,
+  MTP_HEAD,
   PREWARM_TIMEOUT_MS,
   PROTOCOL,
   SAMPLE_TIMEOUT_MS,
@@ -82,24 +87,57 @@ async function scriptHashes(): Promise<Record<string, string>> {
   return hashes;
 }
 
+interface ModelPaths {
+  dir: string;
+  mtpHead: string;
+  mtpAuxDir: string;
+}
+
 // The 111 GB of splits take minutes to hash, so blocks compare size, times, inode and device.
-async function identity(allowDirty: boolean, dir: string, hashModel: boolean): Promise<Identity> {
-  if (hashModel) console.log(`Hashing ${dir}`);
+async function identity(
+  allowDirty: boolean,
+  { dir, mtpHead, mtpAuxDir }: ModelPaths,
+  hashModel: boolean,
+): Promise<Identity> {
+  if (hashModel) console.log(`Hashing ${dir}, ${mtpHead} and ${mtpAuxDir}`);
   const splits: SplitIdentity[] = [];
   for (const { file } of SPLITS) splits.push(await split(join(dir, file), hashModel));
+  const aux: SplitIdentity[] = [];
+  for (const { file } of MTP_AUX.files) aux.push(await split(join(mtpAuxDir, file), hashModel));
   return {
     tree: await treeIdentity(allowDirty),
     addon: await addonIdentity(),
     llama: await llamaIdentity(),
     model: { dir, splits },
+    mtp: { head: await split(mtpHead, hashModel), auxDir: mtpAuxDir, aux },
     scripts: await scriptHashes(),
   };
 }
 
+const modelPaths = ({ model, mtp }: Identity): ModelPaths => ({
+  dir: model.dir,
+  mtpHead: mtp.head.path,
+  mtpAuxDir: mtp.auxDir,
+});
+
+const modelFiles = ({ dir, mtpHead, mtpAuxDir }: ModelPaths): string[] => [
+  ...SPLITS.map(({ file }) => join(dir, file)),
+  mtpHead,
+  ...MTP_AUX.files.map(({ file }) => join(mtpAuxDir, file)),
+];
+
+const llamaArgs = (provenance: Provenance): string[] => ['-md', provenance.mtp.head.path, ...PROTOCOL.llamaServerArgs];
+
 async function verifyIdentity(recorded: Identity, allowDirty: boolean, hashModel: boolean, when: string) {
-  const current = await identity(allowDirty, recorded.model.dir, hashModel);
-  const splits = recorded.model.splits.map(({ sha256: _sha256, ...rest }) => rest);
-  const expected = hashModel ? recorded : { ...recorded, model: { ...recorded.model, splits } };
+  const current = await identity(allowDirty, modelPaths(recorded), hashModel);
+  const unhashed = ({ sha256: _sha256, ...rest }: SplitIdentity) => rest;
+  const expected = hashModel
+    ? recorded
+    : {
+        ...recorded,
+        model: { ...recorded.model, splits: recorded.model.splits.map(unhashed) },
+        mtp: { ...recorded.mtp, head: unhashed(recorded.mtp.head), aux: recorded.mtp.aux.map(unhashed) },
+      };
   const changed = IDENTITY_KEYS.filter((key) => !isDeepStrictEqual(current[key], expected[key]));
   if (changed.length) throw new Error(`${when}: ${changed.join(', ')} changed since preflight`);
 }
@@ -114,7 +152,7 @@ function stayAwake() {
   return spawn('caffeinate', ['-i', '-w', String(process.pid)], { stdio: 'ignore' });
 }
 
-async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean, modelDir: string): Promise<void> {
+async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean, given: ModelPaths): Promise<void> {
   assertCleanEnv();
   const latestMain = assertLatestMain();
   await fetchLatestLlama();
@@ -123,15 +161,22 @@ async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean,
   const manifest = await readManifest();
   assertHostReady(PORT);
   const fixture = await loadFixture(FIXTURE);
-  const dir = await realpath(modelDir);
-  for (const { file } of SPLITS) await split(join(dir, file), false);
-  const volumes = assertInternalSsd(SPLITS.map(({ file }) => join(dir, file)));
-  const recorded = await identity(allowDirty, dir, true);
-  for (const [index, pinned] of SPLITS.entries()) {
+  const located = {
+    dir: await realpath(given.dir),
+    mtpHead: await realpath(given.mtpHead),
+    mtpAuxDir: await realpath(given.mtpAuxDir),
+  };
+  for (const path of modelFiles(located)) await split(path, false);
+  const volumes = assertInternalSsd(modelFiles(located));
+  const recorded = await identity(allowDirty, located, true);
+  for (const [index, pin] of SPLITS.entries()) {
     const { path, size, sha256 } = recorded.model.splits[index];
-    if (size !== pinned.bytes || sha256 !== pinned.sha256) {
-      throw new Error(`${path}: ${size} bytes, SHA-256 ${sha256}; not the pinned ${SOURCE.repo} split`);
-    }
+    assertPin(path, size, sha256, pin);
+  }
+  assertPin(recorded.mtp.head.path, recorded.mtp.head.size, recorded.mtp.head.sha256, MTP_HEAD);
+  for (const [index, pin] of MTP_AUX.files.entries()) {
+    const { path, size, sha256 } = recorded.mtp.aux[index];
+    assertPin(path, size, sha256, pin);
   }
   const { repetitions, warmupTokens, cooldownSeconds } = manifest.protocol;
   await writeJson(files.provenance, {
@@ -140,7 +185,7 @@ async function preflight(out: string, allowDirty: boolean, desktopLoad: boolean,
     latestMain,
     host: hostInfo(),
     ...recorded,
-    source: { ...SOURCE, splits: SPLITS },
+    source: { ...SOURCE, splits: SPLITS, mtpHead: MTP_HEAD, mtpAux: MTP_AUX },
     volumes,
     fixture: {
       id: manifest.id,
@@ -169,7 +214,7 @@ async function prewarm(out: string, allowDirty: boolean): Promise<void> {
   const files = paths(out);
   const provenance = await readProvenance(out);
   assertHostReady(PORT);
-  assertInternalSsd(provenance.model.splits.map(({ path }) => path));
+  assertInternalSsd(modelFiles(modelPaths(provenance)));
   await verifyIdentity(provenance, allowDirty, false, 'prewarm');
   const { cases } = await loadFixture(FIXTURE);
   await mkdir(files.raw, { recursive: true });
@@ -199,7 +244,7 @@ async function prewarm(out: string, allowDirty: boolean): Promise<void> {
     const tokenizer = await verifyTokenizer(join(loaded.assets, 'tokenizer.json'));
 
     await assertNoRuntimeAlive('prewarm llama.cpp');
-    const args = [...PROTOCOL.llamaServerArgs, ...PROTOCOL.llamaPrewarmArgs];
+    const args = [...llamaArgs(provenance), ...PROTOCOL.llamaPrewarmArgs];
     const model = provenance.model.splits[0].path;
     const server = await LlamaServer.start('prewarm', out, args, { model, timeoutMs: PREWARM_TIMEOUT_MS });
     const llama: Result[] = [];
@@ -217,7 +262,9 @@ async function prewarm(out: string, allowDirty: boolean): Promise<void> {
     const llamaLog = (await readFile(join(files.raw, 'llama-prewarm.log'), 'utf8'))
       .split('\n')
       .filter((line) =>
-        /buffer size|n_ctx|kv_unified|n_slots|has_bfloat|fallback|not supported|checkpoint| W |CPU/.test(line),
+        /buffer size|n_ctx|kv_unified|n_slots|has_bfloat|fallback|not supported|checkpoint| W |CPU|draft|spec|MTP/.test(
+          line,
+        ),
       );
 
     const at = new Date().toISOString();
@@ -250,7 +297,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
     throw new Error(`${out}: no verified prewarm; run the prewarm step first`);
   }
   assertHostReady(PORT);
-  assertInternalSsd(provenance.model.splits.map(({ path }) => path));
+  assertInternalSsd(modelFiles(modelPaths(provenance)));
   await verifyIdentity(provenance, allowDirty, true, 'matrix start');
   const { cases } = await loadFixture(FIXTURE);
 
@@ -320,7 +367,7 @@ async function matrix(out: string, allowDirty: boolean): Promise<void> {
           runner = worker;
         } else {
           const model = provenance.model.splits[0].path;
-          const server = await LlamaServer.start(block, out, PROTOCOL.llamaServerArgs, { model });
+          const server = await LlamaServer.start(block, out, llamaArgs(provenance), { model });
           progress.emit({ event: 'loaded', runtime, run: block, loadMs: server.loadMs, args: server.args });
           runner = server;
         }
@@ -391,6 +438,8 @@ async function main(): Promise<void> {
     options: {
       out: { type: 'string' },
       'model-dir': { type: 'string' },
+      'mtp-head': { type: 'string' },
+      'mtp-aux-dir': { type: 'string' },
       'allow-dirty': { type: 'boolean', default: false },
       'desktop-load': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
@@ -399,12 +448,14 @@ async function main(): Promise<void> {
   const step = positionals[0] as Step;
   if (values.help || positionals.length !== 1 || !STEPS.includes(step)) {
     console.log(
-      `Usage: oxnode scripts/perf-tracker/flash-next/run.ts <${STEPS.join('|')}> [--out <dir>] [--model-dir <dir>]\n` +
+      `Usage: oxnode scripts/perf-tracker/flash-next/run.ts <${STEPS.join('|')}> [--out <dir>] [--model-dir <dir>] [--mtp-head <file>] [--mtp-aux-dir <dir>]\n` +
         'Preflight requires HEAD to contain origin/main and installs the newest llama.cpp macOS arm64 release.\n' +
         'Without --out a new run directory is created; with --out the step continues or reports that run.\n' +
         'all = preflight, prewarm, matrix, report. prewarm also proves the native session admits the pinned IDs.\n' +
         `--model-dir (preflight/all): the folder of the four splits on the internal SSD; default ${DEFAULT_MODEL_DIR}.\n` +
-        '  Later steps read it from provenance.json.\n' +
+        `--mtp-head (preflight/all): llama.cpp's MTP head GGUF on the internal SSD; default ${DEFAULT_MTP_HEAD}.\n` +
+        `--mtp-aux-dir (preflight/all): mlx-node's MTP folder from mtp-aux.ts on the internal SSD; default ${DEFAULT_MTP_AUX_DIR}.\n` +
+        '  Later steps read these paths from provenance.json.\n' +
         '--allow-dirty measures or reports an uncommitted checkout instead of refusing it (development only).\n' +
         '--desktop-load (preflight/all): admit every row with no other local LLM instead of waiting for GPU idle;\n' +
         '  the run records it and its 6k/16k rows are not comparable with GPU-idle entries.',
@@ -412,15 +463,22 @@ async function main(): Promise<void> {
     if (!values.help) process.exitCode = 1;
     return;
   }
-  if (values['model-dir'] !== undefined && step !== 'preflight' && step !== 'all') {
-    throw new Error('--model-dir applies to preflight and all; later steps read the model folder from provenance.json');
+  const located = [values['model-dir'], values['mtp-head'], values['mtp-aux-dir']].some((value) => value !== undefined);
+  if (located && step !== 'preflight' && step !== 'all') {
+    throw new Error(
+      '--model-dir, --mtp-head and --mtp-aux-dir apply to preflight and all; later steps read the paths from provenance.json',
+    );
   }
   if (step === 'report' && !values.out && !process.env.OUT_DIR) throw new Error('report needs --out <run dir>');
   const out = await outDir('flash-next', values.out);
   const allowDirty = values['allow-dirty'];
   console.log(`flash-next ${step}: ${out}`);
   if (step === 'preflight' || step === 'all') {
-    await preflight(out, allowDirty, values['desktop-load'], values['model-dir'] ?? DEFAULT_MODEL_DIR);
+    await preflight(out, allowDirty, values['desktop-load'], {
+      dir: values['model-dir'] ?? DEFAULT_MODEL_DIR,
+      mtpHead: values['mtp-head'] ?? DEFAULT_MTP_HEAD,
+      mtpAuxDir: values['mtp-aux-dir'] ?? DEFAULT_MTP_AUX_DIR,
+    });
   }
   if (step === 'prewarm' || step === 'all') await prewarm(out, allowDirty);
   if (step === 'matrix' || step === 'all') await matrix(out, allowDirty);

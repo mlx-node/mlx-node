@@ -1,22 +1,12 @@
 /// <reference types="node" />
 
-import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import {
-  compareTable,
-  median,
-  parseCsv,
-  readJson,
-  renderChart,
-  writeJson,
-  type ChartSeries,
-  type CompareRow,
-} from '../common.js';
-import { samplesCsv, summarize, type SummaryRow } from '../qwen38/report.js';
+import { readJson, renderChart, writeJson, type ChartSeries } from '../common.js';
+import { baselineHistory, samplesCsv, speculationTable, summarize, type SummaryRow } from '../qwen38/report.js';
 import { RUNTIMES, paths } from '../qwen38/suite.js';
-import { HERE, PROTOCOL, type Loaded, type Provenance, type Residency } from './suite.js';
+import { HERE, PROTOCOL, SPECULATION, type Loaded, type Provenance, type Residency } from './suite.js';
 
 const BASELINE = join(HERE, 'baseline.csv');
 const GIB = 2 ** 30;
@@ -58,7 +48,10 @@ function range(values: readonly number[], digits: number): string {
 // Refuses what summarize() refuses or a run without the native prompt-ID proof, then
 // writes samples.csv, summary.json, chart.svg and compare.md.
 export async function report(out: string, allowDirty: boolean): Promise<FlashSummaryRow[]> {
-  const { manifest, samples, summary } = await summarize(out, allowDirty, PROTOCOL.outputTokens);
+  const { manifest, samples, summary } = await summarize(out, allowDirty, {
+    outputTokens: PROTOCOL.outputTokens,
+    speculation: SPECULATION,
+  });
   const { repetitions } = manifest.protocol;
   const files = paths(out);
   const provenance = await readJson<Provenance>(files.provenance);
@@ -107,7 +100,7 @@ export async function report(out: string, allowDirty: boolean): Promise<FlashSum
     });
   }
 
-  await writeFile(join(out, 'samples.csv'), samplesCsv(samples));
+  await writeFile(join(out, 'samples.csv'), samplesCsv(samples, SPECULATION));
   await writeJson(join(out, 'summary.json'), rows);
 
   const measuredAt = provenance.matrix?.startedAt.slice(0, 10) ?? 'unknown date';
@@ -130,7 +123,7 @@ export async function report(out: string, allowDirty: boolean): Promise<FlashSum
         { title: 'Prefill', unit: 'tok/s', series: series('prefillTokensPerSecond') },
         { title: 'Decode', unit: 'tok/s', series: series('decodeTokensPerSecond') },
       ],
-      note: `Median of ${repetitions} runs, ${PROTOCOL.outputTokens} output tokens; whiskers min–max; mlx-node full residency, budget ${budget}. *No other local LLM${provenance.protocol.desktopLoad ? '' : '; other rows start at GPU idle'}.`,
+      note: `Median of ${repetitions} runs, ${PROTOCOL.outputTokens} output tokens; whiskers min–max; MTP on, depth 2; mlx-node SSD streaming (auto budget ${budget}). *No other local LLM${provenance.protocol.desktopLoad ? '' : '; other rows start at GPU idle'}.`,
     }),
   );
 
@@ -142,33 +135,11 @@ export async function report(out: string, allowDirty: boolean): Promise<FlashSum
       return `| ${tokens(row.promptTokens)} | ${mlx.prefillTokensPerSecond.median.toFixed(1)} | ${llama.prefillTokensPerSecond.median.toFixed(1)} | ${row.prefillRatio.toFixed(3)}× | ${mlx.decodeTokensPerSecond.median.toFixed(2)} | ${llama.decodeTokensPerSecond.median.toFixed(2)} | ${row.decodeRatio.toFixed(3)}× |`;
     }),
   ];
-  let history: string[];
-  if (existsSync(BASELINE)) {
-    const baseline = parseCsv(await readFile(BASELINE, 'utf8'));
-    const compare = (metric: 'prefill' | 'decode'): CompareRow[] =>
-      rows.flatMap((row) =>
-        RUNTIMES.map((runtime) => ({
-          label: `${runtime} · ${tokens(row.promptTokens)}`,
-          before: median(
-            baseline
-              .filter((line) => line.runtime === runtime && Number(line.prompt_tokens) === row.promptTokens)
-              .map((line) => Number(line[`${metric}_tokens_per_second`])),
-          ),
-          after: row[runtime][`${metric}TokensPerSecond`].median,
-        })),
-      );
-    history = [
-      'Before = medians of the previous entry in `scripts/perf-tracker/flash-next/baseline.csv`; after = this run.',
-      '',
-      compareTable('Prefill', compare('prefill')),
-      compareTable('Decode', compare('decode')),
-    ];
-  } else {
-    history = [
-      'First entry for this model: `scripts/perf-tracker/flash-next/baseline.csv` does not exist yet, so there is no earlier entry to compare with.',
-      '',
-    ];
-  }
+  const history = await baselineHistory(
+    BASELINE,
+    rows,
+    'First entry for this model, so there is no before value. MTP is on in both runtimes and changes prefill as well as decode: both runtimes run the MTP head over the prompt inside prefill.',
+  );
   await writeFile(
     join(out, 'compare.md'),
     [
@@ -185,9 +156,14 @@ export async function report(out: string, allowDirty: boolean): Promise<FlashSum
       ...ratios,
       '',
       ...history,
-      '### mlx-node weight budget per load',
+      '### Speculation (native MTP, depth 2)',
       '',
-      'Full hot-path residency (`MLX_QWEN4_RESIDENCY=full`): every hot weight stays resident, as in llama.cpp. The budget is what mlx-node admitted for each load.',
+      "Medians per cell. mlx-node runs the BF16 `mtp.*` block from the original checkpoint with the target GGUF's embedding and output; llama.cpp runs unsloth's self-contained Q8_0 MTP head. mlx-node reports per-step means, so its counts are mean × steps; llama.cpp reports no step count.",
+      '',
+      speculationTable(rows),
+      '### mlx-node weight budget per load (information)',
+      '',
+      "mlx-node's default policy: an automatic budget sized from free memory at each load, with routed experts streamed from the internal SSD.",
       '',
       '| Prompt tokens | Process | Budget GiB | Hot weights GiB | Full hot residency | Prefill window | Free at load GiB |',
       '|---:|---:|---:|---:|:---:|---:|---:|',
