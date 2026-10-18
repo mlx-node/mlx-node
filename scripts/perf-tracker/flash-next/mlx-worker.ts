@@ -65,5 +65,5 @@ console.log(
 );
 
 const tokenizer = await sessionTokenizer(assets, out, (path) => Qwen3Tokenizer.fromPretrained(path));
-await serveSamples(model, tokenizer, cases, out, memoryStats, PROTOCOL.mlxRequest);
+await serveSamples(model, tokenizer, cases, out, memoryStats, PROTOCOL.mlxRequest, PROTOCOL.mlxCacheOwnerPrefix);
 process.exit(0);

@@ -50,6 +50,7 @@ export async function sessionTokenizer(
 }
 
 // One stdin line per request until {"action":"exit"}; one stdout result line each.
+// With `cacheOwnerPrefix` every request is its own native session, as one ChatSession per request is.
 export async function serveSamples(
   model: SessionModel,
   tokenizer: Tokenizer,
@@ -57,7 +58,9 @@ export async function serveSamples(
   out: string,
   memoryStats: () => unknown,
   speculation: MlxSpeculationRequest,
+  cacheOwnerPrefix?: string,
 ): Promise<void> {
+  let requests = 0;
   for await (const line of createInterface({ input: process.stdin })) {
     const request = JSON.parse(line) as { action?: string; name: string; run: number | string; maxNewTokens: number };
     if (request.action === 'exit') break;
@@ -84,6 +87,9 @@ export async function serveSamples(
       reuseCache: true,
       reportPerformance: true,
       cacheSalt: `benchmark-${process.pid}-${request.run}-${request.name}`,
+      ...(cacheOwnerPrefix === undefined
+        ? {}
+        : { cacheOwnerId: `${cacheOwnerPrefix}-${process.pid}-${requests++}-${request.run}-${request.name}` }),
     })) {
       firstEventMs ??= performance.now() - started;
       if (event.done) result = event;

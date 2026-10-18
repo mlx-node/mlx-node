@@ -140,6 +140,8 @@ export const PROTOCOL = {
     mtpDepth: SPECULATION.mlxDraftsPerCycle,
     mtpAdaptiveDepth: false,
   } satisfies MlxSpeculationRequest,
+  // qwen4_exp runs MTP only on its scheduler; builds that send an ownerless request to the exclusive lane decode AR.
+  mlxCacheOwnerPrefix: 'flash-next',
   weightBudget:
     'mlx-node default policy: automatic budget, routed experts stream from the internal SSD; recorded per load',
   kvCache: { 'mlx-node': 'BF16 block-paged', 'llama.cpp': 'F16 for target and MTP head' },
