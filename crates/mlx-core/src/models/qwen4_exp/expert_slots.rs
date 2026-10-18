@@ -19,6 +19,7 @@ const MAPPED_WIRE_GAP: Duration = Duration::from_millis(900);
 /// or overwritten and no reader lease is needed.
 pub(super) struct MappedExperts {
     banks: [Arc<Weight>; 3],
+    maps: [Arc<crate::array::Mmap>; 3],
     experts: usize,
 }
 
@@ -28,7 +29,7 @@ impl MappedExperts {
         experts: usize,
     ) -> Result<(Self, u64)> {
         let mut bytes = 0u64;
-        let mut banks = Vec::with_capacity(3);
+        let mut parts = Vec::with_capacity(3);
         for file in files {
             let h = &file.header;
             if h.experts as usize != experts {
@@ -38,7 +39,7 @@ impl MappedExperts {
                 )));
             }
             bytes += h.sections.iter().map(|s| s.length).sum::<u64>();
-            let mut arrays = file.map_sections()?;
+            let (map, mut arrays) = file.map_sections()?;
             let biases = if arrays.len() == 3 {
                 arrays.pop()
             } else {
@@ -48,21 +49,25 @@ impl MappedExperts {
             let values = arrays
                 .pop()
                 .ok_or_else(|| err(format!("Mapped pack {} has no values section", h.name)))?;
-            banks.push(Arc::new(Weight {
-                values,
-                dense_bf16: None,
-                scales,
-                biases,
-                group: h.group,
-                bits: h.bits,
-                mode: h.mode.clone(),
-            }));
+            parts.push((
+                Arc::new(Weight {
+                    values,
+                    dense_bf16: None,
+                    scales,
+                    biases,
+                    group: h.group,
+                    bits: h.bits,
+                    mode: h.mode.clone(),
+                }),
+                map,
+            ));
         }
-        let [gate, up, down] = <[Arc<Weight>; 3]>::try_from(banks)
+        let [(gate, gate_map), (up, up_map), (down, down_map)] = <[_; 3]>::try_from(parts)
             .map_err(|_| err("Mapped layer needs gate, up and down banks"))?;
         Ok((
             Self {
                 banks: [gate, up, down],
+                maps: [gate_map, up_map, down_map],
                 experts,
             },
             bytes,
@@ -221,6 +226,18 @@ impl Store {
             tracing::warn!("qwen4 mapped residency not admitted, using slots: {e}");
             return Ok(());
         }
+        let files = (0..=layers.last().copied().unwrap_or(0))
+            .map(|layer| mapped.get(&layer).map(|experts| experts.maps.clone()))
+            .collect();
+        match super::super::prefetch::Pool::new(files, super::super::prefetch::Advise) {
+            Ok(pool) => {
+                if super::super::prefetch::at_load() {
+                    pool.request_all();
+                }
+                self.prefetch = Some(pool);
+            }
+            Err(e) => tracing::warn!("qwen4 mapped pack read-ahead unavailable: {e}"),
+        }
         self.cache_limit = self.plan.budget;
         self.slot_capacity = Some(experts);
         self.plan.mapped_bytes = bytes;
@@ -240,11 +257,24 @@ impl Store {
     /// experts); such a pass must leave the stamp alone, or a run of drafts
     /// hides the gap the next main pass has to re-wire for.
     pub(in super::super) fn wire_mapped_banks(&mut self, main: bool) -> Result<()> {
-        self.wire_mapped_banks_at(Instant::now(), main).map(|_| ())
+        self.wire_mapped_banks_at(
+            Instant::now(),
+            main,
+            super::super::prefetch::depth_from_env(),
+        )
+        .map(|_| ())
     }
 
-    /// Returns whether the banks were touched.
-    pub(super) fn wire_mapped_banks_at(&mut self, now: Instant, main: bool) -> Result<bool> {
+    /// Returns whether the banks were touched. A stale pass over a pack that
+    /// is not fully resident reads `depth` layers ahead instead: the touch
+    /// binds every bank at once, so the driver would fault the whole pack in
+    /// on the model thread at its own rate before layer 0 runs.
+    pub(super) fn wire_mapped_banks_at(
+        &mut self,
+        now: Instant,
+        main: bool,
+        depth: usize,
+    ) -> Result<bool> {
         if !self.plan.mapped || !main {
             return Ok(false);
         }
@@ -253,6 +283,17 @@ impl Store {
             .is_none_or(|start| now.saturating_duration_since(start) > MAPPED_WIRE_GAP);
         self.mapped_pass_start = Some(now);
         if !stale {
+            return Ok(false);
+        }
+        self.prefetch_pass = false;
+        if depth > 0
+            && let Some(pool) = &self.prefetch
+            && !pool.sampled_resident()
+        {
+            tracing::info!("qwen4 mapped pack not resident: reading {depth} layers ahead");
+            self.prefetch_depth = depth;
+            pool.layer_started(0, depth);
+            self.prefetch_pass = depth < self.last_mapped_layer();
             return Ok(false);
         }
         let mut groups: Vec<(DType, Vec<MxArray>)> = Vec::new();
@@ -290,6 +331,27 @@ impl Store {
         }
         self.mapped_pass_start = Some(now + elapsed);
         Ok(true)
+    }
+
+    /// Layer `layer` of a pass starts: in a read-ahead pass, request the
+    /// layer `depth` ahead of it. The pass ends with the request for the last
+    /// layer, not at the next layer-0 call: a pass over several rows reaches
+    /// layer 0 once per row.
+    pub(in super::super) fn prefetch_mapped_layer(&mut self, layer: usize, main: bool) {
+        if main
+            && self.prefetch_pass
+            && layer > 0
+            && let Some(pool) = &self.prefetch
+        {
+            pool.layer_started(layer, self.prefetch_depth);
+            if layer + self.prefetch_depth >= self.last_mapped_layer() {
+                self.prefetch_pass = false;
+            }
+        }
+    }
+
+    fn last_mapped_layer(&self) -> usize {
+        self.mapped_experts.keys().max().copied().unwrap_or(0)
     }
 
     pub(in super::super) fn expert_slot_capacity(

@@ -10,8 +10,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use napi::{Error, Result};
@@ -329,12 +329,13 @@ impl LayerFile {
     /// The sections as no-copy arrays over one shared mapping of the file
     /// past its header page: bank shape `[experts * rows, columns]`, slot
     /// id == expert id. The pages are clean page cache until a command
-    /// buffer binds them.
-    pub(super) fn map_sections(&self) -> Result<Vec<MxArray>> {
+    /// buffer binds them; the mapping comes along for read-ahead.
+    pub(super) fn map_sections(&self) -> Result<(Arc<Mmap>, Vec<MxArray>)> {
         let h = &self.header;
         let len = usize::try_from(h.file_bytes - PAGE).map_err(err)?;
         let map = Mmap::map(self.file.try_clone().map_err(err)?, PAGE, len)?;
-        h.sections
+        let arrays = h
+            .sections
             .iter()
             .map(|s| {
                 let dtype = match s.dtype.as_str() {
@@ -349,7 +350,8 @@ impl LayerFile {
                 let offset = usize::try_from(s.offset - PAGE).map_err(err)?;
                 MxArray::from_mapped(&map, offset, &[s.shape[0] as i64, s.shape[1] as i64], dtype)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((map, arrays))
     }
 
     /// One expert in the chunk encoding the slot path already imports.

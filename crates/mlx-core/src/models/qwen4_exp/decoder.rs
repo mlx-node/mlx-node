@@ -1270,9 +1270,11 @@ impl Decoder {
         }
     }
     fn moe(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
+        let main = self.gguf();
         if i == 0 {
-            let main = self.gguf();
             self.weights.wire_mapped_banks(main)?;
+        } else {
+            self.weights.prefetch_mapped_layer(i, main);
         }
         let c = self.config.clone();
         let p = format!("layers.{i}.mlp");
