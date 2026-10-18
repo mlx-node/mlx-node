@@ -70,7 +70,21 @@ starts later than that after the previous one would otherwise re-wire the
 layers one by one and fall into a 0.5 tokens/s cycle, so every main-network
 forward pass whose predecessor started more than 0.9 s earlier first reads
 one element of every mapped bank in a single eval (the MTP head's passes read
-no mapped bank and neither touch nor count as a predecessor). Every prefill
+no mapped bank and neither touch nor count as a predecessor). When such a
+pass finds the pack not fully resident (eight 256 KiB `mincore` probes per
+file), it reads ahead instead of touching: a worker thread asks the kernel
+(`F_RDADVISE`, which skips resident pages) for the whole files of layers 0
+to 3 as the pass starts and for layer L+3 as layer L starts, so a cold first
+prompt streams the pack at the SSD's rate (10.5 GiB/s measured) rather than
+the driver's fault rate (4.2 GiB/s), and the model thread never reads; the
+touch would bind every bank at once and fault the whole pack in before
+layer 0. The worker reads one byte of every page it requested (advisory
+pages are speculative and were reclaimed before the driver bound them,
+doubling a cold window's reads), so after a cold turn the pack counts in
+the process RSS while its footprint is unchanged. `MLX_QWEN4_PREFETCH_LAYERS`
+sets the depth (default 3; `0` restores the unconditional touch) and
+`MLX_QWEN4_PREFETCH_AT_LOAD=1` requests the whole pack as the model loads.
+Every prefill
 window and every decode step needs the entire routed set resident at once:
 when other processes' anonymous memory leaves less than that (a 20 GiB
 working set beside the 78 GiB pack on 128 GiB), the kernel re-faults the pack
@@ -127,6 +141,8 @@ limit reclaims the allocator freelist and re-polls before erroring.
 | `MLX_QWEN4_RESIDENCY=stream` | Bound the on-demand cache to at most 8 GiB unless overridden.           |
 | `MLX_QWEN4_WEIGHT_CACHE_GIB` | Optional integer ceiling, at least 2 GiB; live admission still applies. Pins an anonymous budget, so the slot path is used even when the mapped pack exists. |
 | `MLX_QWEN4_MAPPED_PACK=0`    | Keep the slot path although the mapped pack is complete (A/B arm).      |
+| `MLX_QWEN4_PREFETCH_LAYERS`  | Layers of the mapped pack read ahead of the one computing when a pass starts over a pack that is not fully resident (default 3; `0` disables read-ahead and a stale pass always touches every bank). |
+| `MLX_QWEN4_PREFETCH_AT_LOAD=1` | Ask the kernel for the whole mapped pack as the model loads (opt-in; moves the first prompt's SSD time into the load). |
 | `MLX_QWEN4_PREFILL_CHUNK`    | Power of two from 1–1024, constrained by the working-memory allowance.  |
 | `MLX_QWEN4_BATCHED_QSA=0`    | Run prompt windows past the indexer budget one token at a time instead of the batched sparse-attention kernel. |
 | `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |

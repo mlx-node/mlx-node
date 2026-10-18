@@ -519,6 +519,11 @@ pub struct Store {
     mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
     /// Start of the last forward pass in mapped mode (bank re-wire gate).
     mapped_pass_start: Option<std::time::Instant>,
+    prefetch: Option<super::prefetch::Pool>,
+    /// The current pass started stale over a pack that was not fully
+    /// resident and reads `prefetch_depth` layers ahead.
+    prefetch_pass: bool,
+    prefetch_depth: usize,
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
@@ -622,6 +627,9 @@ impl Store {
             slots: HashMap::new(),
             mapped_experts: HashMap::new(),
             mapped_pass_start: None,
+            prefetch: None,
+            prefetch_pass: false,
+            prefetch_depth: 0,
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
@@ -2308,10 +2316,12 @@ mod mapped_tests {
         );
     }
 
-    /// The bank touch runs for the first pass and after a gap longer than the
-    /// driver's unwire delay, never inside a pass sequence, never for a pass
-    /// that reads no mapped bank (which also leaves the stamp alone), and
-    /// never in slot mode.
+    /// A stale pass (the first one, or one after a gap longer than the
+    /// driver's unwire delay) touches the banks when the pack is resident
+    /// and reads ahead instead when it is not; a pass inside the gap, a pass
+    /// that reads no mapped bank (which also leaves the stamp alone) and
+    /// slot mode do neither. With read-ahead off (depth 0) a stale pass
+    /// touches even a cold pack.
     #[test]
     fn mapped_banks_are_rewired_after_a_gap_and_not_within_a_pass() {
         use std::time::{Duration, Instant};
@@ -2319,47 +2329,70 @@ mod mapped_tests {
         let gguf = temp.0.join("experts.gguf");
         write_fixture(&gguf);
         let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let map = |dir: &str| {
+            let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+            store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
+            store.plan.policy = "auto".into();
+            store
+                .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, _, _| {
+                    plan.budget = 1 << 30;
+                    plan.mapped = true;
+                    plan.resident = false;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(store.plan.mapped);
+            assert!(
+                !store.prefetch.as_ref().unwrap().sampled_resident(),
+                "a freshly built pack (F_NOCACHE writes) is cold"
+            );
+            store
+        };
         let t0 = Instant::now();
+        let mut slots = Store::open_fixture(&gguf, Some(&root)).unwrap();
         assert!(
-            !store.wire_mapped_banks_at(t0, true).unwrap(),
+            !slots.wire_mapped_banks_at(t0, true, 3).unwrap(),
             "slot mode never touches"
         );
-        store
-            .prepare_mapped_pack_at(&temp.0.join("mapped"))
-            .unwrap();
-        store.plan.policy = "auto".into();
-        store
-            .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, _, _| {
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                plan.resident = false;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
+        assert!(slots.prefetch.is_none());
+
+        let mut store = map("mapped");
         assert!(
-            store.wire_mapped_banks_at(t0, true).unwrap(),
-            "first pass touches"
+            !store.wire_mapped_banks_at(t0, true, 3).unwrap(),
+            "a stale pass over a cold pack reads ahead instead of touching"
         );
+        assert_eq!(store.prefetch_depth, 3);
+        assert!(
+            !store.prefetch_pass,
+            "the one-layer pack was requested whole at the pass start"
+        );
+        let pool = store.prefetch.as_ref().unwrap();
+        pool.wait_idle();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pool.sampled_resident() {
+            assert!(Instant::now() < deadline, "read-ahead did not land in 10 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(100), true)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(100), true, 3)
                 .unwrap()
         );
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(800), true)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(800), true, 3)
                 .unwrap()
         );
         assert!(
             store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1800), true)
-                .unwrap()
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1800), true, 3)
+                .unwrap(),
+            "a stale pass over a resident pack touches"
         );
+        assert!(!store.prefetch_pass);
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1850), true)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1850), true, 3)
                 .unwrap()
         );
         let stamp = store.mapped_pass_start;
@@ -2367,7 +2400,7 @@ mod mapped_tests {
         for ms in [2600, 3400] {
             assert!(
                 !store
-                    .wire_mapped_banks_at(t0 + Duration::from_millis(ms), false)
+                    .wire_mapped_banks_at(t0 + Duration::from_millis(ms), false, 3)
                     .unwrap(),
                 "a pass that reads no mapped bank never touches"
             );
@@ -2378,10 +2411,17 @@ mod mapped_tests {
         }
         assert!(
             store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(4200), true)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(4200), true, 3)
                 .unwrap(),
             "the main pass after a run of drafts sees the gap since the last main pass"
         );
+
+        let mut cold = map("mapped-cold");
+        assert!(
+            cold.wire_mapped_banks_at(t0, true, 0).unwrap(),
+            "read-ahead off: a stale pass touches a cold pack"
+        );
+        assert!(!cold.prefetch_pass);
     }
 
     /// Mapped mode on the fixture pack: identity routing, capacity == experts,

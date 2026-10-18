@@ -12,6 +12,7 @@ mod memory;
 mod mtp;
 mod packed_cache;
 mod paged;
+mod prefetch;
 mod route_plan;
 mod runtime_flags;
 mod weights;
