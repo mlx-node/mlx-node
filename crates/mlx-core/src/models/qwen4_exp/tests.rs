@@ -3534,10 +3534,74 @@ fn bf16_indirect_prefill_staging_preserves_scalar_load_results() {
     assert!(status.success(), "BF16 staging changed an output bit");
 }
 
+fn quantized_expert_bank(
+    e: usize,
+    n: usize,
+    k: usize,
+    bits: usize,
+    affine: bool,
+    seed: u32,
+) -> std::sync::Arc<weights::Weight> {
+    std::sync::Arc::new(weights::Weight {
+        values: MxArray::from_uint32(
+            &(0..e * n * k * bits / 32)
+                .map(|i| (i as u32).wrapping_mul(0x9e3779b9).wrapping_add(seed))
+                .collect::<Vec<_>>(),
+            &[(e * n) as i64, (k * bits / 32) as i64],
+        )
+        .unwrap(),
+        scales: Some(if affine {
+            MxArray::from_float16(
+                &vec![half::f16::from_f32(0.0013).to_bits(); e * n * k / 32],
+                &[(e * n) as i64, (k / 32) as i64],
+            )
+            .unwrap()
+        } else {
+            MxArray::from_uint8(
+                &(0..e * n * k / 16)
+                    .map(|i| ((i + seed as usize) % 63 + 1) as u8)
+                    .collect::<Vec<_>>(),
+                &[(e * n) as i64, (k / 16) as i64],
+            )
+            .unwrap()
+        }),
+        biases: Some(
+            MxArray::from_float16(
+                &(0..e * n * if affine { k / 32 } else { k / 128 })
+                    .map(|i| {
+                        half::f16::from_f32(if affine {
+                            -0.02 + (i % 7) as f32 * 0.001
+                        } else {
+                            0.00013 + (i % 7) as f32 * 0.0001
+                        })
+                        .to_bits()
+                    })
+                    .collect::<Vec<_>>(),
+                &[
+                    (e * n) as i64,
+                    if affine {
+                        (k / 32) as i64
+                    } else {
+                        (k / 128) as i64
+                    },
+                ],
+            )
+            .unwrap(),
+        ),
+        dense_bf16: None,
+        group: 32,
+        bits: bits as i32,
+        mode: if affine {
+            "affine".into()
+        } else {
+            format!("q{bits}k")
+        },
+    })
+}
+
 #[test]
 fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
     use crate::array::DType;
-    use std::sync::Arc;
     let counts = [0usize, 15, 16, 17, 31, 32, 33, 63, 64, 65];
     let e = counts.len();
     // This mode runs only in the isolated child above. The scalar-load path
@@ -3577,61 +3641,7 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
         .reshape(&[rows as i64, 1, h as i64])
         .unwrap();
     let bank = |n: usize, k: usize, bits: usize, affine: bool, seed: u32| {
-        Arc::new(weights::Weight {
-            values: MxArray::from_uint32(
-                &(0..e * n * k * bits / 32)
-                    .map(|i| (i as u32).wrapping_mul(0x9e3779b9).wrapping_add(seed))
-                    .collect::<Vec<_>>(),
-                &[(e * n) as i64, (k * bits / 32) as i64],
-            )
-            .unwrap(),
-            scales: Some(if affine {
-                MxArray::from_float16(
-                    &vec![half::f16::from_f32(0.0013).to_bits(); e * n * k / 32],
-                    &[(e * n) as i64, (k / 32) as i64],
-                )
-                .unwrap()
-            } else {
-                MxArray::from_uint8(
-                    &(0..e * n * k / 16)
-                        .map(|i| ((i + seed as usize) % 63 + 1) as u8)
-                        .collect::<Vec<_>>(),
-                    &[(e * n) as i64, (k / 16) as i64],
-                )
-                .unwrap()
-            }),
-            biases: Some(
-                MxArray::from_float16(
-                    &(0..e * n * if affine { k / 32 } else { k / 128 })
-                        .map(|i| {
-                            half::f16::from_f32(if affine {
-                                -0.02 + (i % 7) as f32 * 0.001
-                            } else {
-                                0.00013 + (i % 7) as f32 * 0.0001
-                            })
-                            .to_bits()
-                        })
-                        .collect::<Vec<_>>(),
-                    &[
-                        (e * n) as i64,
-                        if affine {
-                            (k / 32) as i64
-                        } else {
-                            (k / 128) as i64
-                        },
-                    ],
-                )
-                .unwrap(),
-            ),
-            dense_bf16: None,
-            group: 32,
-            bits: bits as i32,
-            mode: if affine {
-                "affine".into()
-            } else {
-                format!("q{bits}k")
-            },
-        })
+        quantized_expert_bank(e, n, k, bits, affine, seed)
     };
     for gb in [4, 5] {
         for db in [5, 8] {
@@ -3762,6 +3772,151 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
                 .is_none()
             );
         }
+    }
+}
+
+#[test]
+fn expert_prefill_runtime_sizes_match_quantized_matmul() {
+    use crate::array::DType;
+    // Group rows, window tokens and the combine size are read at run time.
+    // Two of each go through the same kernels and must match the MLX
+    // quantized matmul; the tile table is checked on the CPU.
+    let e = 10usize;
+    let (h, m, top) = (256usize, 128usize, 10usize);
+    let probe = MxArray::from_uint32(&[0; 256], &[256]).unwrap();
+    if math::expert_tiles(&probe, 1).unwrap().is_none() {
+        return;
+    }
+    let groups: [(&[usize], usize); 2] = [
+        (&[0, 15, 16, 17, 31, 32, 33, 63, 64, 65], 53),
+        (&[64, 1, 0, 47, 32, 9, 96, 2, 31, 18], 41),
+    ];
+    for (gb, db) in [(4, 5), (5, 8)] {
+        let banks = [
+            quantized_expert_bank(e, m, h, gb, false, 71),
+            quantized_expert_bank(e, m, h, gb, false, 197),
+            quantized_expert_bank(e, h, m, db, true, 13),
+        ];
+        for (counts, tokens) in groups {
+            let host: Vec<u32> = counts
+                .iter()
+                .enumerate()
+                .flat_map(|(id, &n)| std::iter::repeat_n(id as u32, n))
+                .collect();
+            let rows = host.len();
+            let ids = MxArray::from_uint32(&host, &[rows as i64]).unwrap();
+            let tiles = math::expert_tiles(&ids, e).unwrap().unwrap();
+            let mut table = Vec::new();
+            let mut start = 0;
+            for &n in counts {
+                for row in (start..start + n).step_by(64) {
+                    table.extend([row as u32, (row + 64).min(start + n) as u32]);
+                }
+                start += n;
+            }
+            table.resize(2 * (rows.div_ceil(64) + e), 0);
+            assert_eq!(&*tiles.to_uint32().unwrap(), &table, "tiles rows={rows}");
+            let source = MxArray::from_float32(
+                &(0..tokens * h)
+                    .map(|i| ((i * 13 % 251) as f32 - 125.) / 128. + tokens as f32 / 512.)
+                    .collect::<Vec<_>>(),
+                &[tokens as i64, h as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let token_rows = MxArray::from_uint32(
+                &(0..rows)
+                    .map(|i| ((i * 37 + 11) % tokens) as u32)
+                    .collect::<Vec<_>>(),
+                &[rows as i64],
+            )
+            .unwrap();
+            let expanded = source
+                .take(&token_rows, 0)
+                .unwrap()
+                .reshape(&[rows as i64, 1, h as i64])
+                .unwrap();
+            // Kernels run before the oracle, and each result stays alive: a
+            // reused buffer holding the right bytes would hide skipped rows.
+            let indirect = math::prefill_indirect(&source, &ids, &token_rows, &banks, e)
+                .unwrap()
+                .expect("supported NAX format");
+            let actual = indirect.to_float32().unwrap();
+            let tiled = |bank: &weights::Weight, x: &MxArray| {
+                bank.tiled_expert_rows(x, &ids, &tiles, e).unwrap().unwrap()
+            };
+            let tiled_hidden =
+                math::swiglu(&tiled(&banks[0], &expanded), &tiled(&banks[1], &expanded)).unwrap();
+            let tiled_out = tiled(&banks[2], &tiled_hidden);
+            let tiled = tiled_out.to_float32().unwrap();
+            let project =
+                |bank: &weights::Weight, x: &MxArray| bank.expert_rows(x, &ids, e, true).unwrap();
+            let hidden = math::swiglu(
+                &project(&banks[0], &expanded),
+                &project(&banks[1], &expanded),
+            )
+            .unwrap();
+            let expected = project(&banks[2], &hidden).to_float32().unwrap();
+            assert_eq!(
+                &*actual, &*expected,
+                "rows={rows} tokens={tokens} gate={gb} down={db}"
+            );
+            assert_eq!(&*tiled, &*expected, "tiled rows={rows} gate={gb} down={db}");
+            drop((indirect, tiled_out));
+        }
+    }
+    for tokens in [17usize, 75] {
+        let rows = tokens * top;
+        let values = MxArray::from_float32(
+            &(0..rows * h)
+                .map(|i| ((i * 997 % 253) as f32 - 126.) * if i % 7 == 0 { 16.0 } else { 0.0013 })
+                .collect::<Vec<_>>(),
+            &[rows as i64, h as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let scores = MxArray::from_float32(
+            &(0..rows)
+                .map(|i| (i % 11 + 1) as f32 * 0.0113)
+                .collect::<Vec<_>>(),
+            &[1, tokens as i64, top as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let inverse = MxArray::from_uint32(
+            &(0..rows)
+                .map(|i| ((i * 37) % rows) as u32)
+                .collect::<Vec<_>>(),
+            &[rows as i64],
+        )
+        .unwrap();
+        let raw = unsafe {
+            mlx_sys::mlx_qwen4_sorted_combine(
+                values.as_raw_ptr(),
+                scores.as_raw_ptr(),
+                inverse.as_raw_ptr(),
+                top as i32,
+            )
+        };
+        let actual = MxArray::from_handle(raw, "runtime combine test")
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let expected = values
+            .take(&inverse, 0)
+            .unwrap()
+            .reshape(&[1, tokens as i64, top as i64, h as i64])
+            .unwrap()
+            .mul(&scores.expand_dims(-1).unwrap())
+            .unwrap()
+            .sum(Some(&[2]), Some(false))
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        assert_eq!(&*actual, &*expected, "combine tokens={tokens}");
     }
 }
 
