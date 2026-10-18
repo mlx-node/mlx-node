@@ -17,20 +17,7 @@ impl Decoder {
     }
 
     fn pending_state_arrays(&self) -> Vec<&MxArray> {
-        self.caches
-            .iter()
-            .flat_map(|cache| {
-                cache
-                    .conv
-                    .iter()
-                    .chain(cache.recurrent.iter())
-                    .chain(cache.ple_conv.iter())
-                    .chain(cache.keys.iter())
-                    .chain(cache.values.iter())
-                    .chain(cache.index_keys.iter())
-                    .chain(cache.index_tail.iter())
-            })
-            .collect()
+        self.caches.iter().flat_map(LayerCache::arrays).collect()
     }
 
     pub(super) fn async_device_prefill(&self) -> bool {
