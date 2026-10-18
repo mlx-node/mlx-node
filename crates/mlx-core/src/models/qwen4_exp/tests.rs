@@ -3421,6 +3421,69 @@ fn paged_writes_accept_offset_projection_views() {
 }
 
 #[test]
+fn gather_window_runtime_shapes_match_selected() {
+    use crate::array::DType;
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let mut pages = paged::create(&c).unwrap();
+    pages.begin_request(1).unwrap();
+    let (h, d) = (c.num_key_value_heads, c.head_dim);
+    let rows = |shape: &[i64], seed: usize| {
+        let n = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(
+            &(0..n)
+                .map(|i| ((i * 7 + seed) % 127) as f32 / 16. - 4.)
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+    };
+    for (written, fresh) in [(33usize, 5usize), (37, 9)] {
+        let start = pages.request_tokens().len();
+        pages.record_tokens(&vec![3; written]).unwrap();
+        let shape = [written as i64, h as i64, d as i64];
+        let k = rows(&shape, start);
+        let v = rows(&shape, start + 61);
+        paged::write_rows(&mut pages, 0, &k, &v, start as u32).unwrap();
+        pages.eval_pending_pool_writes().unwrap();
+        let base = start + written;
+        let fresh_shape = [1, h as i64, fresh as i64, d as i64];
+        let fk = rows(&fresh_shape, base + 13);
+        let fv = rows(&fresh_shape, base + 29);
+        let mut prior = (0..base as i32).step_by(5).collect::<Vec<_>>();
+        prior.push(base as i32 - 1);
+        let offsets = [fresh as i32 - 1, 0, 2];
+        let mut ids = prior.clone();
+        ids.extend(offsets.iter().map(|&o| base as i32 + o));
+        ids.extend([-1, (base + fresh) as i32]);
+        let tokens = MxArray::from_int32(&ids, &[ids.len() as i64]).unwrap();
+        let (k, v) = paged::gather_window(&pages, 0, &tokens, &fk, &fv, base).unwrap();
+        assert_eq!(
+            k.shape().unwrap().as_ref(),
+            &[1, h as i64, ids.len() as i64, d as i64]
+        );
+        let (pk, pv) = paged::gather_selected(&pages, 0, &prior, h, d).unwrap();
+        let picks = MxArray::from_int32(&offsets, &[offsets.len() as i64]).unwrap();
+        let zeros = MxArray::zeros(&[1, h as i64, 2, d as i64], Some(DType::BFloat16)).unwrap();
+        for (out, selected, source) in [(&k, &pk, &fk), (&v, &pv, &fv)] {
+            let expected = MxArray::concatenate_many(
+                vec![selected, &source.take(&picks, 2).unwrap(), &zeros],
+                Some(2),
+            )
+            .unwrap();
+            assert_eq!(
+                &*out.to_float32().unwrap(),
+                &*expected.to_float32().unwrap(),
+                "base={base} fresh={fresh}"
+            );
+        }
+    }
+}
+
+#[test]
 fn convolution_history_releases_wide_prefill_storage() {
     // Run serialized with the GPU suite. Check live allocation ownership,
     // not allocator cache size; a view would retain > 2 MiB here.

@@ -517,20 +517,26 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
         k.dtype() != v.dtype() || k.size() != v.size() || fk.shape(0) != 1 ||
         fk.shape(3) % 8)
       return false;
-    int heads = fk.shape(1), dim = fk.shape(3), fresh = fk.shape(2),
-        count = ids.size();
+    int heads = fk.shape(1), dim = fk.shape(3), count = ids.size();
+    // Sizes that change per row or decode step are runtime arguments: each
+    // distinct template tuple compiles a Metal library that is never evicted.
     static auto kernel = mlx::core::fast::metal_kernel(
-        "qwen4_gather_window", {"keys", "values", "blocks", "ids", "fk", "fv"},
-        {"ko", "vo"}, R"(
+        "qwen4_gather_window",
+        {"keys", "values", "blocks", "ids", "fk", "fv", "base"}, {"ko", "vo"},
+        R"(
+      const int N = ids_shape[0], FRESH = fk_shape[2];
       uint i = thread_position_in_grid.x;
       if (i >= H * N * D) return;
       uint d = i % D, t = (i / D) % N, h = i / (D * N);
       int token = ids[t];
-      if (token < 0 || token >= BASE + FRESH) { ko[i] = 0; vo[i] = 0; return; }
-      if (token >= BASE) {
-        size_t src = (size_t(h) * FRESH + uint(token - BASE)) * D + d;
+      if (token < 0 || token >= base + FRESH) { ko[i] = 0; vo[i] = 0; return; }
+      if (token >= base) {
+        size_t src = (size_t(h) * FRESH + uint(token - base)) * D + d;
         ko[i] = fk[src]; vo[i] = fv[src];
       } else {
+        size_t elements = 1;
+        for (int a = 0; a < keys_ndim; ++a) elements *= size_t(keys_shape[a]);
+        const int POOL = int(elements / (H * D * BS));
         int block = blocks[token / BS];
         if (block < 0 || block >= POOL) { ko[i] = 0; vo[i] = 0; return; }
         uint offset = token % BS;
@@ -540,17 +546,11 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
       }
     )");
     auto result = kernel(
-        {k, v, blocks, ids, fk, fv},
+        {k, v, blocks, ids, fk, fv, array(base, mlx::core::int32)},
         {{1, heads, count, dim}, {1, heads, count, dim}},
         {fk.dtype(), fk.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
-        {{"H", heads},
-         {"D", dim},
-         {"N", count},
-         {"BASE", base},
-         {"FRESH", fresh},
-         {"BS", block_size},
-         {"POOL", int(k.size() / (heads * dim * block_size))}},
-        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+        {{"H", heads}, {"D", dim}, {"BS", block_size}}, std::nullopt, false,
+        mlx::core::default_stream(mlx::core::Device::gpu));
     *out_k = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
     *out_v = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
     return true;
