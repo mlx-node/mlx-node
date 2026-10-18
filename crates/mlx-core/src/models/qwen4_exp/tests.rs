@@ -4696,7 +4696,7 @@ fn reference_prefill_router_preserves_probability_order_and_scores() {
             }
         }
     }
-    let x = MxArray::zeros(&[1, 8, 512], Some(DType::BFloat16)).unwrap();
+    let x = MxArray::zeros(&[1, 1025, 512], Some(DType::BFloat16)).unwrap();
     let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
     assert!(!unsafe { mlx_sys::mlx_qwen4_prefill_routes(x.as_raw_ptr(), &mut ids, &mut scores) });
     assert!(ids.is_null() && scores.is_null());
@@ -5697,5 +5697,695 @@ fn bf16_paged_oracle_through_prefill_chunk() {
                 source.display()
             );
         }
+    }
+}
+
+/// Deterministic Q8 affine bank for the row-batched kernel gates.
+fn q8_bank(n: usize, k: usize, next: &mut impl FnMut() -> u32) -> weights::Weight {
+    use crate::array::DType;
+    let codes: Vec<u32> = (0..n * k / 4).map(|_| next()).collect();
+    let scales: Vec<f32> = (0..n * k / 32)
+        .map(|_| ((next() % 97) as f32 + 1.) / 16384.)
+        .collect();
+    let biases: Vec<f32> = scales
+        .iter()
+        .map(|s| -s * (64 + next() % 129) as f32)
+        .collect();
+    weights::Weight {
+        values: MxArray::from_uint32(&codes, &[n as i64, k as i64 / 4]).unwrap(),
+        dense_bf16: None,
+        scales: Some(
+            MxArray::from_float32(&scales, &[n as i64, k as i64 / 32])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap(),
+        ),
+        biases: Some(
+            MxArray::from_float32(&biases, &[n as i64, k as i64 / 32])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap(),
+        ),
+        group: 32,
+        bits: 8,
+        mode: "affine".into(),
+    }
+}
+
+/// Mixed-format routed banks (gate/up K-quant, down affine) plus Q8 shared banks.
+fn expert_banks(
+    experts: usize,
+    gate_bits: usize,
+    down_bits: usize,
+    next: &mut impl FnMut() -> u32,
+) -> (
+    [std::sync::Arc<weights::Weight>; 3],
+    [std::sync::Arc<weights::Weight>; 3],
+) {
+    use std::sync::Arc;
+    let (h, m) = (2560usize, 640usize);
+    let mut bank = |e: usize, n: usize, k: usize, bits: usize, affine: bool| {
+        let values: Vec<u32> = (0..e * n * k * bits / 32).map(|_| next()).collect();
+        let scales = if affine {
+            let values: Vec<u16> = (0..e * n * k / 32)
+                .map(|_| half::f16::from_f32((next() % 97 + 1) as f32 / 16384.).to_bits())
+                .collect();
+            MxArray::from_float16(&values, &[(e * n) as i64, (k / 32) as i64]).unwrap()
+        } else {
+            let values: Vec<u8> = (0..e * n * k / 16).map(|_| (next() % 64) as u8).collect();
+            MxArray::from_uint8(&values, &[(e * n) as i64, (k / 16) as i64]).unwrap()
+        };
+        let side = if affine { k / 32 } else { k / 128 };
+        let biases: Vec<u16> = (0..e * n * side)
+            .map(|_| {
+                half::f16::from_f32(
+                    (next() % 97 + 1) as f32 / 16384. * if affine { -1. } else { 1. },
+                )
+                .to_bits()
+            })
+            .collect();
+        Arc::new(weights::Weight {
+            dense_bf16: None,
+            values: MxArray::from_uint32(&values, &[(e * n) as i64, (k * bits / 32) as i64])
+                .unwrap(),
+            scales: Some(scales),
+            biases: Some(MxArray::from_float16(&biases, &[(e * n) as i64, side as i64]).unwrap()),
+            group: 32,
+            bits: bits as i32,
+            mode: if affine {
+                "affine"
+            } else if bits == 4 {
+                "q4k"
+            } else {
+                "q5k"
+            }
+            .into(),
+        })
+    };
+    (
+        [
+            bank(experts, m, h, gate_bits, false),
+            bank(experts, m, h, gate_bits, false),
+            bank(experts, h, m, down_bits, true),
+        ],
+        [
+            bank(1, m, h, 8, true),
+            bank(1, m, h, 8, true),
+            bank(1, h, m, 8, true),
+        ],
+    )
+}
+
+fn bf16_rows(
+    rows: i64,
+    width: i64,
+    scale: f32,
+    shift: f32,
+    next: &mut impl FnMut() -> u32,
+) -> MxArray {
+    use crate::array::DType;
+    let values: Vec<f32> = (0..rows * width)
+        .map(|_| (next() % 1024) as f32 * scale - shift)
+        .collect();
+    MxArray::from_float32(&values, &[1, rows, width])
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+}
+
+fn f32_bits(a: &MxArray) -> Vec<u32> {
+    a.to_float32()
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// Bit equality with a readable failure: the first differing index and both bit patterns.
+fn assert_same_bits(actual: &MxArray, expected: &MxArray, what: &str) {
+    let (a, e) = (f32_bits(actual), f32_bits(expected));
+    assert_eq!(a.len(), e.len(), "{what}: length");
+    let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != e[i]).collect();
+    assert!(
+        diffs.is_empty(),
+        "{what}: {} of {} values differ, first at {} ({:#010x} vs {:#010x})",
+        diffs.len(),
+        a.len(),
+        diffs[0],
+        a[diffs[0]],
+        e[diffs[0]]
+    );
+}
+
+fn row(a: &MxArray, j: i64) -> MxArray {
+    a.slice_axis(1, j, j + 1).unwrap()
+}
+
+fn stack_rows(parts: &[MxArray]) -> MxArray {
+    MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap()
+}
+
+#[test]
+fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
+    use crate::array::DType;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let mut seed = 0x9e37_79b9u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    // Dense Q8 projections: the fast walk (K % 512 == 0, N % 8 == 0), partial
+    // tails, a four-row output and the two mixer geometries.
+    for (n, k) in [
+        (64usize, 2560usize),
+        (4, 2560),
+        (320, 2560),
+        (64, 288),
+        (20, 640),
+    ] {
+        let w = q8_bank(n, k, &mut next);
+        let (s, b) = (w.scales.as_ref().unwrap(), w.biases.as_ref().unwrap());
+        for rows in 1..=4 {
+            let x = bf16_rows(rows, k as i64, 1. / 256., 2., &mut next);
+            let singles: Vec<MxArray> = (0..rows)
+                .map(|j| {
+                    MxArray::from_handle(
+                        unsafe {
+                            mlx_sys::mlx_qwen4_dense_decode(
+                                row(&x, j).as_raw_ptr(),
+                                w.values.as_raw_ptr(),
+                                s.as_raw_ptr(),
+                                b.as_raw_ptr(),
+                            )
+                        },
+                        "single-row dense decode",
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let batched = math::rows::dense_decode(&w, &x)
+                .unwrap()
+                .expect("row-batched dense decode admits [1, R, K]");
+            assert_eq!(*batched.shape().unwrap(), [1, rows, n as i64]);
+            assert_same_bits(
+                &batched,
+                &stack_rows(&singles),
+                &format!("dense decode N={n} K={k} rows={rows}"),
+            );
+        }
+        let five = bf16_rows(5, k as i64, 1. / 256., 2., &mut next);
+        assert!(math::rows::dense_decode(&w, &five).unwrap().is_none());
+    }
+    // Mixer activation (10240 -> 320 with SiLU), hyper up (320 -> 10240 with
+    // the four-stream sigmoid mean) and hyper up with the injection gate.
+    let down = q8_bank(320, 10240, &mut next);
+    let up = q8_bank(10240, 320, &mut next);
+    let (ds, db) = (down.scales.as_ref().unwrap(), down.biases.as_ref().unwrap());
+    let (us, ub) = (up.scales.as_ref().unwrap(), up.biases.as_ref().unwrap());
+    for rows in 1..=4 {
+        let mixer_in = bf16_rows(rows, 10240, 1. / 256., 2., &mut next);
+        let singles: Vec<MxArray> = (0..rows)
+            .map(|j| {
+                MxArray::from_handle(
+                    unsafe {
+                        mlx_sys::mlx_qwen4_decode_mixer_act(
+                            row(&mixer_in, j).as_raw_ptr(),
+                            down.values.as_raw_ptr(),
+                            ds.as_raw_ptr(),
+                            db.as_raw_ptr(),
+                        )
+                    },
+                    "single-row mixer activation",
+                )
+                .unwrap()
+            })
+            .collect();
+        let batched = math::rows::mixer_act(&down, &mixer_in)
+            .unwrap()
+            .expect("row-batched mixer activation admits [1, R, 10240]");
+        assert_same_bits(
+            &batched,
+            &stack_rows(&singles),
+            &format!("mixer activation rows={rows}"),
+        );
+
+        let x = bf16_rows(rows, 320, 1. / 64., 8., &mut next);
+        let normed = bf16_rows(rows, 10240, 1. / 128., 4., &mut next);
+        let injection = bf16_rows(rows, 4, 1. / 16., 32., &mut next);
+        let singles: Vec<MxArray> = (0..rows)
+            .map(|j| {
+                MxArray::from_handle(
+                    unsafe {
+                        mlx_sys::mlx_qwen4_hyper_up(
+                            row(&x, j).as_raw_ptr(),
+                            up.values.as_raw_ptr(),
+                            us.as_raw_ptr(),
+                            ub.as_raw_ptr(),
+                            row(&normed, j).as_raw_ptr(),
+                        )
+                    },
+                    "single-row hyper up",
+                )
+                .unwrap()
+            })
+            .collect();
+        let batched = math::rows::hyper_up(&up, &x, &normed)
+            .unwrap()
+            .expect("row-batched hyper up admits [1, R, 320]");
+        assert_same_bits(
+            &batched,
+            &stack_rows(&singles),
+            &format!("hyper up rows={rows}"),
+        );
+
+        let (mut mixed_singles, mut gate_singles) = (Vec::new(), Vec::new());
+        for j in 0..rows {
+            let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert!(unsafe {
+                mlx_sys::mlx_qwen4_hyper_up_inject(
+                    row(&x, j).as_raw_ptr(),
+                    up.values.as_raw_ptr(),
+                    us.as_raw_ptr(),
+                    ub.as_raw_ptr(),
+                    row(&normed, j).as_raw_ptr(),
+                    row(&injection, j).as_raw_ptr(),
+                    &mut mixed,
+                    &mut gate,
+                )
+            });
+            mixed_singles.push(MxArray::from_handle(mixed, "single-row mixer inject").unwrap());
+            gate_singles.push(MxArray::from_handle(gate, "single-row inject gate").unwrap());
+        }
+        let (mixed, gate) = math::rows::hyper_up_inject(&up, &x, &normed, &injection)
+            .unwrap()
+            .expect("row-batched hyper up inject admits [1, R, 320]");
+        assert_same_bits(
+            &mixed,
+            &stack_rows(&mixed_singles),
+            &format!("hyper up inject mixed rows={rows}"),
+        );
+        assert_same_bits(
+            &gate,
+            &stack_rows(&gate_singles),
+            &format!("hyper up inject gate rows={rows}"),
+        );
+    }
+    // Routed experts (already row-indexed) and routed + shared experts over
+    // the four admitted bank formats, both score dtypes and a missing slot.
+    let experts = 3usize;
+    for (gate_bits, down_bits) in [(4usize, 5usize), (4, 8), (5, 5), (5, 8)] {
+        let (banks, shared) = expert_banks(experts, gate_bits, down_bits, &mut next);
+        for rows in 1..=4 {
+            let x = bf16_rows(rows, 2560, 1. / 256., 2., &mut next);
+            let mut selected: Vec<u32> = (0..rows * 10).map(|_| next() % experts as u32).collect();
+            if rows > 1 {
+                selected[19] = experts as u32;
+            }
+            let ids = MxArray::from_uint32(&selected, &[rows * 10]).unwrap();
+            let gates: Vec<f32> = (0..rows)
+                .map(|j| {
+                    if j == 0 {
+                        -6.84375
+                    } else {
+                        (next() % 256) as f32 / 16. - 8.
+                    }
+                })
+                .collect();
+            let shared_gate = MxArray::from_float32(&gates, &[1, rows, 1])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            for score_type in [DType::Float32, DType::BFloat16] {
+                let scores: Vec<f32> = (0..rows * 10)
+                    .map(|_| (next() % 19 + 1) as f32 / 100.)
+                    .collect();
+                let scores = MxArray::from_float32(&scores, &[1, rows, 10])
+                    .unwrap()
+                    .astype(score_type)
+                    .unwrap();
+                let singles: Vec<MxArray> = (0..rows)
+                    .map(|j| {
+                        math::routed_experts(
+                            &row(&x, j),
+                            &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
+                            &row(&scores, j),
+                            &banks,
+                        )
+                        .unwrap()
+                        .unwrap()
+                    })
+                    .collect();
+                let batched = math::routed_experts(&x, &ids, &scores, &banks)
+                    .unwrap()
+                    .unwrap();
+                assert_same_bits(
+                    &batched,
+                    &stack_rows(&singles),
+                    &format!(
+                        "routed experts gate={gate_bits} down={down_bits} scores={score_type:?} rows={rows}"
+                    ),
+                );
+                let singles: Vec<MxArray> = (0..rows)
+                    .map(|j| {
+                        math::routed_shared_experts(
+                            &row(&x, j),
+                            &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
+                            &row(&scores, j),
+                            &banks,
+                            &shared,
+                            &row(&shared_gate, j),
+                        )
+                        .unwrap()
+                        .expect("single-row routed/shared fast path")
+                    })
+                    .collect();
+                let batched = math::rows::routed_shared_experts(
+                    &x,
+                    &ids,
+                    &scores,
+                    &banks,
+                    &shared,
+                    &shared_gate,
+                )
+                .unwrap()
+                .expect("row-batched routed/shared experts admit [1, R, 2560]");
+                assert_eq!(batched.dtype().unwrap(), DType::BFloat16);
+                assert_same_bits(
+                    &batched,
+                    &stack_rows(&singles),
+                    &format!(
+                        "routed/shared experts gate={gate_bits} down={down_bits} scores={score_type:?} rows={rows}"
+                    ),
+                );
+            }
+        }
+    }
+    // Routing: probability rounding, ties, NaN and infinite rows side by side.
+    for dtype in [DType::BFloat16, DType::Float32] {
+        for rows in 1..=4 {
+            let values: Vec<f32> = (0..rows as usize * 512)
+                .map(|i| {
+                    let (case, e) = (i / 512 + rows as usize, i % 512);
+                    match case {
+                        1 => (e % 4) as f32,
+                        2 => f32::NEG_INFINITY,
+                        3 if e == 7 => f32::NAN,
+                        4 if e == 511 => f32::INFINITY,
+                        _ => ((e * 131 + case * 53) as f32 * 0.017).sin() * case as f32 * 0.3,
+                    }
+                })
+                .collect();
+            let logits = MxArray::from_float32(&values, &[1, rows, 512])
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+            let (mut id_singles, mut score_singles) = (Vec::new(), Vec::new());
+            for j in 0..rows {
+                let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
+                assert!(unsafe {
+                    mlx_sys::mlx_qwen4_singleton_routes(
+                        row(&logits, j).as_raw_ptr(),
+                        &mut ids,
+                        &mut scores,
+                    )
+                });
+                id_singles.push(MxArray::from_handle(ids, "single-row route IDs").unwrap());
+                score_singles
+                    .push(MxArray::from_handle(scores, "single-row route scores").unwrap());
+            }
+            let (ids, scores) = math::rows::singleton_routes(&logits, 10)
+                .unwrap()
+                .expect("row-batched routing admits [1, R, 512]");
+            assert_eq!(
+                &*ids.to_uint32().unwrap(),
+                &*stack_rows(&id_singles).to_uint32().unwrap(),
+                "route IDs {dtype:?} rows={rows}"
+            );
+            assert_same_bits(
+                &scores,
+                &stack_rows(&score_singles),
+                &format!("route scores {dtype:?} rows={rows}"),
+            );
+        }
+    }
+    // Injection + hyper norm (already row-indexed): stream and normed rows.
+    let weight = MxArray::from_float32(
+        &(0..10240)
+            .map(|i| 1.01 + ((i * 7) % 97) as f32 / 400.)
+            .collect::<Vec<_>>(),
+        &[10240],
+    )
+    .unwrap();
+    for rows in 1..=4 {
+        let x = bf16_rows(rows, 10240, 1. / 64., 8., &mut next);
+        let y = bf16_rows(rows, 2560, 1. / 128., 4., &mut next);
+        let gate = bf16_rows(rows, 4, 1. / 256., 2., &mut next);
+        let (mut stream_singles, mut normed_singles) = (Vec::new(), Vec::new());
+        for j in 0..rows {
+            let (mut s, mut n) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert!(unsafe {
+                mlx_sys::mlx_qwen4_inject_norm(
+                    row(&x, j).as_raw_ptr(),
+                    row(&y, j).as_raw_ptr(),
+                    row(&gate, j).as_raw_ptr(),
+                    weight.as_raw_ptr(),
+                    1e-6,
+                    &mut s,
+                    &mut n,
+                )
+            });
+            stream_singles.push(MxArray::from_handle(s, "single-row stream").unwrap());
+            normed_singles.push(MxArray::from_handle(n, "single-row normed").unwrap());
+        }
+        let (mut s, mut n) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert!(unsafe {
+            mlx_sys::mlx_qwen4_inject_norm(
+                x.as_raw_ptr(),
+                y.as_raw_ptr(),
+                gate.as_raw_ptr(),
+                weight.as_raw_ptr(),
+                1e-6,
+                &mut s,
+                &mut n,
+            )
+        });
+        let s = MxArray::from_handle(s, "row-batched stream").unwrap();
+        let n = MxArray::from_handle(n, "row-batched normed").unwrap();
+        assert_same_bits(
+            &s,
+            &stack_rows(&stream_singles),
+            &format!("inject stream rows={rows}"),
+        );
+        assert_same_bits(
+            &n,
+            &stack_rows(&normed_singles),
+            &format!("inject norm rows={rows}"),
+        );
+    }
+}
+
+#[test]
+#[ignore = "GPU timing: run alone under the gpu lock with --ignored --nocapture"]
+fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
+    use std::time::Instant;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let mut seed = 0x2545_f491u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    const BATCH: usize = 24;
+    // Wall time includes the CPU encode of the batch; with MLX_METAL_COMMAND_TRACE=1
+    // the `[metal-command]` lines between two markers carry the GPU time alone.
+    let settle = || std::thread::sleep(std::time::Duration::from_millis(5));
+    let measure = |name: &str, mut run: Box<dyn FnMut(i64) -> Vec<MxArray>>| {
+        for rows in [1, 3] {
+            eprintln!("ROWBENCH-MARK warm");
+            MxArray::eval_arrays_with_context(&run(rows).iter().collect::<Vec<_>>(), "warm")
+                .unwrap();
+            settle();
+            eprintln!("ROWBENCH-MARK end");
+        }
+        let mut per_call = [Vec::new(), Vec::new()];
+        for sample in 0..9 {
+            for (slot, rows) in [1i64, 3].into_iter().enumerate() {
+                let mut outputs = Vec::with_capacity(BATCH);
+                for _ in 0..BATCH {
+                    outputs.extend(run(rows));
+                }
+                settle();
+                eprintln!("ROWBENCH-MARK {name} rows={rows} sample={sample} batch={BATCH}");
+                let start = Instant::now();
+                MxArray::eval_arrays_with_context(&outputs.iter().collect::<Vec<_>>(), "timed")
+                    .unwrap();
+                per_call[slot].push(start.elapsed().as_secs_f64() * 1e6 / BATCH as f64);
+                settle();
+                eprintln!("ROWBENCH-MARK end");
+            }
+        }
+        for v in &mut per_call {
+            v.sort_by(|a, b| a.total_cmp(b));
+        }
+        let (one, three) = (per_call[0][4], per_call[1][4]);
+        println!(
+            "ROWBENCH {name}: one_row_us={one:.1} three_rows_us={three:.1} ratio={:.3}",
+            three / one
+        );
+    };
+    for (label, n, k) in [
+        ("dense_qgate_12288x2560", 12288usize, 2560usize),
+        ("dense_o_2560x6144", 2560, 6144),
+        ("dense_kv_2048x2560", 2048, 2560),
+    ] {
+        let w = q8_bank(n, k, &mut next);
+        let x = bf16_rows(4, k as i64, 1. / 256., 2., &mut next);
+        measure(
+            label,
+            Box::new(move |rows| {
+                vec![
+                    math::rows::dense_decode(&w, &x.slice_axis(1, 0, rows).unwrap())
+                        .unwrap()
+                        .unwrap(),
+                ]
+            }),
+        );
+    }
+    {
+        let down = q8_bank(320, 10240, &mut next);
+        let x = bf16_rows(4, 10240, 1. / 256., 2., &mut next);
+        measure(
+            "mixer_act_320x10240",
+            Box::new(move |rows| {
+                vec![
+                    math::rows::mixer_act(&down, &x.slice_axis(1, 0, rows).unwrap())
+                        .unwrap()
+                        .unwrap(),
+                ]
+            }),
+        );
+        let up = q8_bank(10240, 320, &mut next);
+        let x = bf16_rows(4, 320, 1. / 64., 8., &mut next);
+        let normed = bf16_rows(4, 10240, 1. / 128., 4., &mut next);
+        let injection = bf16_rows(4, 4, 1. / 16., 32., &mut next);
+        let (up2, x2, normed2) = (up.clone(), x.clone(), normed.clone());
+        measure(
+            "hyper_up_10240x320",
+            Box::new(move |rows| {
+                vec![
+                    math::rows::hyper_up(
+                        &up2,
+                        &x2.slice_axis(1, 0, rows).unwrap(),
+                        &normed2.slice_axis(1, 0, rows).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap(),
+                ]
+            }),
+        );
+        measure(
+            "hyper_up_inject_10240x320",
+            Box::new(move |rows| {
+                let (mixed, gate) = math::rows::hyper_up_inject(
+                    &up,
+                    &x.slice_axis(1, 0, rows).unwrap(),
+                    &normed.slice_axis(1, 0, rows).unwrap(),
+                    &injection.slice_axis(1, 0, rows).unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+                vec![mixed, gate]
+            }),
+        );
+    }
+    {
+        let experts = 64usize;
+        let (banks, shared) = expert_banks(experts, 4, 5, &mut next);
+        let x = bf16_rows(4, 2560, 1. / 256., 2., &mut next);
+        let distinct: Vec<u32> = (0..40).map(|_| next() % experts as u32).collect();
+        let same: Vec<u32> = (0..40).map(|i| distinct[i % 10]).collect();
+        let scores = MxArray::from_float32(
+            &(0..40)
+                .map(|_| (next() % 19 + 1) as f32 / 100.)
+                .collect::<Vec<_>>(),
+            &[1, 4, 10],
+        )
+        .unwrap();
+        let shared_gate = bf16_rows(4, 1, 1. / 64., 8., &mut next);
+        for (label, routes) in [
+            ("routed_shared_e64_distinct_routes", distinct),
+            ("routed_shared_e64_same_routes", same),
+        ] {
+            let ids = MxArray::from_uint32(&routes, &[40]).unwrap();
+            let (banks, shared, x, scores, shared_gate) = (
+                banks.clone(),
+                shared.clone(),
+                x.clone(),
+                scores.clone(),
+                shared_gate.clone(),
+            );
+            measure(
+                label,
+                Box::new(move |rows| {
+                    vec![
+                        math::rows::routed_shared_experts(
+                            &x.slice_axis(1, 0, rows).unwrap(),
+                            &ids.slice_axis(0, 0, rows * 10).unwrap(),
+                            &scores.slice_axis(1, 0, rows).unwrap(),
+                            &banks,
+                            &shared,
+                            &shared_gate.slice_axis(1, 0, rows).unwrap(),
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    ]
+                }),
+            );
+        }
+    }
+    {
+        let logits = bf16_rows(4, 512, 1. / 128., 4., &mut next);
+        measure(
+            "singleton_routes",
+            Box::new(move |rows| {
+                let (ids, scores) =
+                    math::rows::singleton_routes(&logits.slice_axis(1, 0, rows).unwrap(), 10)
+                        .unwrap()
+                        .unwrap();
+                vec![ids, scores]
+            }),
+        );
+        let weight = MxArray::from_float32(&vec![1.01; 10240], &[10240]).unwrap();
+        let x = bf16_rows(4, 10240, 1. / 64., 8., &mut next);
+        let y = bf16_rows(4, 2560, 1. / 128., 4., &mut next);
+        let gate = bf16_rows(4, 4, 1. / 256., 2., &mut next);
+        measure(
+            "inject_norm",
+            Box::new(move |rows| {
+                let (mut s, mut n) = (std::ptr::null_mut(), std::ptr::null_mut());
+                assert!(unsafe {
+                    mlx_sys::mlx_qwen4_inject_norm(
+                        x.slice_axis(1, 0, rows).unwrap().as_raw_ptr(),
+                        y.slice_axis(1, 0, rows).unwrap().as_raw_ptr(),
+                        gate.slice_axis(1, 0, rows).unwrap().as_raw_ptr(),
+                        weight.as_raw_ptr(),
+                        1e-6,
+                        &mut s,
+                        &mut n,
+                    )
+                });
+                vec![
+                    MxArray::from_handle(s, "stream").unwrap(),
+                    MxArray::from_handle(n, "normed").unwrap(),
+                ]
+            }),
+        );
     }
 }

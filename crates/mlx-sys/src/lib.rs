@@ -2789,6 +2789,42 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
+    /// Row-batched twins of the single-row decode kernels: `x` is `[1, R, K]`
+    /// with `R` in `1..=4`, every row's weight read is shared, and row `j`
+    /// carries the bits of the single-row entry on row `j` alone.
+    pub fn mlx_qwen4_dense_decode_rows(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_decode_mixer_act_rows(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_hyper_up_rows(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        normed: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_hyper_up_inject_rows(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        normed: *mut mlx_array,
+        injection: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_gate: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_routed_shared_experts_rows(
+        inputs: *const *mut mlx_array,
+        count: usize,
+    ) -> *mut mlx_array;
     pub fn mlx_qwen4_prefill_mixer_act(
         input: *mut mlx_array,
         weight: *mut mlx_array,

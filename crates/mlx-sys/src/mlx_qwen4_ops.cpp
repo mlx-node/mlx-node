@@ -195,8 +195,9 @@ bool mlx_qwen4_routes_shared_gate(mlx_array *logits, mlx_array *input,
 #endif
   return false;
 }
-// TrackFastMoE.route: one independent threadgroup per prompt row.
-// Preserve this checkpoint's probability-first selection and normalization.
+// TrackFastMoE.route: one independent threadgroup per row, from a single
+// verify row up to a prefill window. Preserve this checkpoint's
+// probability-first selection and normalization.
 bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
                               mlx_array **scores) {
 #ifdef MLX_NODE_METAL_ENABLED
@@ -204,7 +205,7 @@ bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
     if (!logits || !ids || !scores)
       return false;
     const auto &x = *reinterpret_cast<array *>(logits);
-    if ((x.ndim() != 3 || x.shape(0) != 1 || x.shape(1) < 9 ||
+    if ((x.ndim() != 3 || x.shape(0) != 1 || x.shape(1) < 1 ||
          x.shape(1) > 1024 || x.shape(2) != 512) ||
         (x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32))
       return false;
