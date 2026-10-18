@@ -222,9 +222,11 @@ impl PagedBackend for Inner {
         &mut self,
         _: &crate::engine::params::ChatParams,
     ) -> Result<bool> {
-        // The scheduled lane owns proposal/verification transactions. An
-        // exclusive legacy/media barrier serves target AR without opening a
-        // second, competing speculative cache owner.
+        // The scheduled lane owns proposal/verification transactions. An owned
+        // turn routed here (cold continue of an unknown owner,
+        // MLX_SERVE_FORCE_SERIAL) serves target AR without opening a second,
+        // competing speculative cache owner. An ownerless one never gets here:
+        // `run_paged_turn` refuses it before prefill.
         Ok(false)
     }
     fn finalize_paged_turn(&mut self, reuse: bool, _: u64) {
@@ -322,6 +324,9 @@ impl HybridSchedulerBackend for Inner {
     }
     fn supports_scheduled_speculation(&self) -> bool {
         self.has_mtp
+    }
+    fn ownerless_session_in_owner_tables(&self) -> bool {
+        true
     }
     fn supports_adaptive_scheduled_speculation(&self) -> bool {
         self.has_mtp

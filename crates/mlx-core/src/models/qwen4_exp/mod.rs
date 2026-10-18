@@ -118,6 +118,17 @@ impl ChatBackend for Inner {
         &mut self,
         args: &mut crate::engine::backend::WholeTurnArgs<'_>,
     ) -> Result<crate::engine::backend::TurnOutput> {
+        // Native MTP runs only on the scheduled lane; an ownerless MTP request
+        // that lands here would otherwise decode AR under `enableMtp: true`.
+        if matches!(
+            args.plan.decoder,
+            crate::engine::plan::DecoderPlan::Speculative(_)
+        ) && args.params.cache_owner_id.is_empty()
+        {
+            return Err(Error::from_reason(
+                "qwen4_exp runs enableMtp only on its shared scheduler, which MLX_SERVE_FORCE_SERIAL turns off; set enableMtp: false or unset MLX_SERVE_FORCE_SERIAL",
+            ));
+        }
         crate::engine::paged_turn::run_paged_turn(self, args)
     }
     fn run_multimodal_turn(
