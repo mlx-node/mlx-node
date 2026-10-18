@@ -35,27 +35,27 @@ fn err(e: impl std::fmt::Display) -> Error {
     Error::from_reason(e.to_string())
 }
 
-#[derive(Serialize, Deserialize)]
-struct ArrayInfo {
-    dtype: String,
-    shape: Vec<i64>,
-    bytes: usize,
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(super) struct ArrayInfo {
+    pub(super) dtype: String,
+    pub(super) shape: Vec<i64>,
+    pub(super) bytes: usize,
 }
 #[derive(Serialize, Deserialize)]
-struct Header {
-    key: String,
-    group: i32,
-    bits: i32,
-    mode: String,
+pub(super) struct Header {
+    pub(super) key: String,
+    pub(super) group: i32,
+    pub(super) bits: i32,
+    pub(super) mode: String,
     // values, scales, optional biases
-    arrays: Vec<ArrayInfo>,
+    pub(super) arrays: Vec<ArrayInfo>,
 }
 
 /// Fully verified owned bytes; no file mapping or path-based trust survives a read.
 pub(super) struct VerifiedChunk {
-    header: Header,
-    data: Vec<u8>,
-    file_len: u64,
+    pub(super) header: Header,
+    pub(super) data: Vec<u8>,
+    pub(super) file_len: u64,
 }
 
 pub(super) struct PackedCache {
@@ -234,7 +234,7 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
 /// follows links, so a `.mlx-qwen4-packed-v2-*` symlink would admit its
 /// external target into sizing (`read_dir` walks it) and eviction. The
 /// producers only ever emit real dirs, so links are foreign.
-fn is_real_dir(path: &Path) -> bool {
+pub(super) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
@@ -242,7 +242,7 @@ fn is_real_dir(path: &Path) -> bool {
 /// the link, never its target. Any other occupant or lookup failure is left
 /// for the caller's `create_dir_all` to surface. Prevents a planted link
 /// from redirecting dir creation and writes outside the cache root.
-fn unlink_if_symlink(path: &Path) {
+pub(super) fn unlink_if_symlink(path: &Path) {
     if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
         let _ = fs::remove_file(path);
     }
@@ -277,7 +277,7 @@ fn dir_c_name(name: &OsStr) -> io::Result<std::ffi::CString> {
 /// the descriptor-relative root for all writes under it. `None` on any
 /// failure (symlink, missing, non-dir): callers treat that exactly like
 /// the old not-a-real-dir check.
-fn open_dir_nofollow(path: &Path) -> Option<File> {
+pub(super) fn open_dir_nofollow(path: &Path) -> Option<File> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `c_path` outlives the call; the fd is wrapped in `File`,
     // which owns it.
@@ -294,7 +294,7 @@ fn open_dir_nofollow(path: &Path) -> Option<File> {
     Some(unsafe { File::from_raw_fd(fd) })
 }
 
-fn dir_open_at(
+pub(super) fn dir_open_at(
     dirfd: &File,
     name: &OsStr,
     flags: libc::c_int,
@@ -313,7 +313,7 @@ fn dir_open_at(
 
 /// Create-or-truncate `name` inside `dirfd` and write `contents`.
 /// O_NOFOLLOW keeps a planted link at `name` from redirecting the write.
-fn dir_write_file(dirfd: &File, name: &str, contents: &[u8]) -> io::Result<()> {
+pub(super) fn dir_write_file(dirfd: &File, name: &str, contents: &[u8]) -> io::Result<()> {
     let mut file = dir_open_at(
         dirfd,
         OsStr::new(name),
@@ -349,7 +349,7 @@ fn dir_create_new_file(dirfd: &File, name: &str) -> io::Result<File> {
 
 /// Atomic `rename` inside the pinned dir — both endpoints relative to
 /// `dirfd`, so a swapped `self.root` path cannot redirect either side.
-fn dir_renameat(dirfd: &File, from: &str, to: &str) -> io::Result<()> {
+pub(super) fn dir_renameat(dirfd: &File, from: &str, to: &str) -> io::Result<()> {
     let c_from = dir_c_name(OsStr::new(from))?;
     let c_to = dir_c_name(OsStr::new(to))?;
     // SAFETY: `dirfd` is an open directory descriptor; both names are live
@@ -370,7 +370,7 @@ fn dir_renameat(dirfd: &File, from: &str, to: &str) -> io::Result<()> {
 
 /// Unlink `name` inside the pinned dir. Errors are surfaced so callers can
 /// tell a real removal from a miss.
-fn dir_unlinkat(dirfd: &File, name: &OsStr) -> io::Result<()> {
+pub(super) fn dir_unlinkat(dirfd: &File, name: &OsStr) -> io::Result<()> {
     let c_name = dir_c_name(name)?;
     // SAFETY: `dirfd` is an open directory descriptor and `c_name` is a
     // live NUL-terminated name; flag 0 removes files only, never dirs.
@@ -383,7 +383,7 @@ fn dir_unlinkat(dirfd: &File, name: &OsStr) -> io::Result<()> {
 
 /// `lstat` relative to the pinned dir: a symlink at `name` reports its own
 /// metadata, never the target's — same contract as `fs::symlink_metadata`.
-fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
+pub(super) fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
     let c_name = dir_c_name(name).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `dirfd` is an open directory descriptor, `c_name` is a live
@@ -407,7 +407,7 @@ fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
 /// source fingerprint). Anything else under the prefix — `.mlx-qwen4-packed-
 /// v2-backup`, a typo, a manual copy — is foreign: never sized, never swept,
 /// never evicted.
-fn dir_name_identity(dir: &Path) -> Option<&str> {
+pub(super) fn dir_name_identity(dir: &Path) -> Option<&str> {
     let suffix = dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)?;
     if suffix.len() == 64
         && suffix
@@ -789,7 +789,7 @@ fn remove_packed_dir(dir: &Path, reason: &str) -> u64 {
 }
 
 /// Best-effort mtime stamp; keeps the dir young for idle-expiry and LRU.
-fn stamp_mtime(path: &Path) {
+pub(super) fn stamp_mtime(path: &Path) {
     let Ok(file) = OpenOptions::new().write(true).open(path) else {
         return;
     };
@@ -1184,6 +1184,21 @@ impl PackedCache {
         self.root.join(format!("{key}.pack"))
     }
 
+    /// The source fingerprint this identity dir was named for; the mapped
+    /// pack reuses it so both formats of one checkpoint share the suffix.
+    pub(super) fn identity(&self) -> Option<&str> {
+        dir_name_identity(&self.root)
+    }
+
+    /// The cache root every identity dir of either format lives under.
+    pub(super) fn cache_root(&self) -> Option<&Path> {
+        self.root.parent()
+    }
+
+    pub(super) fn manifest(&self) -> Option<&[u8]> {
+        self.manifest.as_deref()
+    }
+
     pub fn read(&self, key: &str) -> Result<Option<(Weight, u64)>> {
         self.read_verified(key, MAX_READ_BYTES)?
             .map(VerifiedChunk::into_weight)
@@ -1247,7 +1262,11 @@ impl PackedCache {
         })
     }
 
-    fn read_verified(&self, key: &str, payload_limit: u64) -> Result<Option<VerifiedChunk>> {
+    pub(super) fn read_verified(
+        &self,
+        key: &str,
+        payload_limit: u64,
+    ) -> Result<Option<VerifiedChunk>> {
         // Deletion exclusion for the whole read: an mtime stamp alone is an
         // unlocked witness — an evictor can pass its under-lock staleness
         // recheck before the stamp lands and still remove_dir_all. The guard
@@ -1392,30 +1411,14 @@ impl PackedCache {
             let _ = dir_write_file(&dirfd, ".manifest", manifest);
         }
         // Serialize outside the lock so the ledger can reserve exact bytes.
-        let mut header = Header {
+        let (arrays, data) = encode_weight(weight)?;
+        let header = Header {
             key: key.into(),
             group: weight.group,
             bits: weight.bits,
             mode: weight.mode.clone(),
-            arrays: Vec::new(),
+            arrays,
         };
-        let mut data = Vec::with_capacity(weight.bytes()? as usize);
-        for a in [
-            Some(&weight.values),
-            weight.scales.as_ref(),
-            weight.biases.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let (dtype, bytes) = encode_array(a)?;
-            header.arrays.push(ArrayInfo {
-                dtype: dtype.into(),
-                shape: a.shape()?.to_vec(),
-                bytes: bytes.len(),
-            });
-            data.extend_from_slice(&bytes);
-        }
         let header = serde_json::to_vec(&header).map_err(err)?;
         if header.len() > MAX_HEADER || data.len() as u64 > MAX_READ_BYTES {
             return Err(err("Packed chunk exceeds staging budget"));
@@ -1645,7 +1648,7 @@ impl VerifiedChunk {
 /// Free-space check on the writer's pinned dir fd: the reservation guards
 /// the volume the fd's inode actually lives on, not whatever `self.root`
 /// might resolve to after a swap.
-fn has_disk_space(dirfd: &File, needed: u64) -> bool {
+pub(super) fn has_disk_space(dirfd: &File, needed: u64) -> bool {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `dirfd` is an open descriptor and `stat` is valid memory to fill.
     if unsafe { libc::fstatvfs(dirfd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -1654,6 +1657,31 @@ fn has_disk_space(dirfd: &File, needed: u64) -> bool {
     // SAFETY: fstatvfs returned success, so `stat` is fully initialized.
     let stat = unsafe { stat.assume_init() };
     (stat.f_bavail as u64).saturating_mul(stat.f_frsize) >= FREE_RESERVE + needed
+}
+
+/// The three arrays of a quantized chunk as their on-disk `ArrayInfo` list
+/// and one concatenated little-endian payload — the `.pack` body and the
+/// per-expert record of the mapped pack share this encoding.
+pub(super) fn encode_weight(weight: &Weight) -> Result<(Vec<ArrayInfo>, Vec<u8>)> {
+    let mut arrays = Vec::with_capacity(3);
+    let mut data = Vec::with_capacity(weight.bytes()? as usize);
+    for a in [
+        Some(&weight.values),
+        weight.scales.as_ref(),
+        weight.biases.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let (dtype, bytes) = encode_array(a)?;
+        arrays.push(ArrayInfo {
+            dtype: dtype.into(),
+            shape: a.shape()?.to_vec(),
+            bytes: bytes.len(),
+        });
+        data.extend_from_slice(&bytes);
+    }
+    Ok((arrays, data))
 }
 
 fn encode_array(a: &MxArray) -> Result<(&'static str, Vec<u8>)> {

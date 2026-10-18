@@ -5,6 +5,7 @@ mod auxiliary;
 mod config;
 mod decoder;
 mod gguf;
+mod mapped_pack;
 mod math;
 mod media;
 mod memory;
@@ -298,6 +299,9 @@ pub struct Qwen4ExpResidencyInfo {
     pub resident_expert_layers: u32,
     /// Shared slot capacity for the remaining partial layers at bootstrap.
     pub partial_expert_slots: u32,
+    /// Routed expert tensors the slot path reads by range from the mapped
+    /// pack; 0 means every expert read goes through the per-expert chunks.
+    pub mapped_pack_files: u32,
 }
 
 #[napi(object)]
@@ -376,6 +380,7 @@ impl Qwen4ExpModel {
                 let mut cache_limit_guard =
                     crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
                 decoder.weights.prepare_hot()?;
+                decoder.weights.prepare_mapped_pack()?;
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.
                 drop(cache_limit_guard);
@@ -492,6 +497,7 @@ impl Qwen4ExpModel {
             resident_bank_bytes: self.residency.resident_bank_bytes as f64,
             resident_expert_layers: self.residency.resident_expert_layers as u32,
             partial_expert_slots: self.residency.partial_expert_slots as u32,
+            mapped_pack_files: self.residency.mapped_pack_files as u32,
         }
     }
     #[napi]

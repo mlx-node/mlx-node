@@ -102,8 +102,20 @@ limit reclaims the allocator freelist and re-polls before erroring.
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |
 | `MLX_QWEN4_IGNORE_MEMORY_PRESSURE` | `=1` skips the macOS bootstrap memory-pressure gate — diagnostic only; the free/file-backed headroom checks still apply. |
 
+The routed expert tensors of a GGUF checkpoint are also kept as a mapped expert
+pack beside the chunk cache: `.mlx-qwen4-mapped-v3-<identity>/`, one file per
+`(layer, tensor)` whose three quantized arrays are 16 KiB-aligned sections with
+the experts in id order (~74 GiB for Flash Next). The first load builds it from
+the verified chunks (else from the checkpoint), hashing every section and
+reading each file back before its atomic rename; later loads check the header
+and file size. The slot path reads whole experts from it by range through the
+page cache instead of opening, locking, stamping and hashing one chunk file per
+expert; a tensor the pack lacks (the build stops when the disk falls under the
+16 GiB reserve) keeps the chunk reader.
+
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
-expert-slot capacity, and prefill window. These are runtime budgets; they do
+expert-slot capacity, the number of tensors served from the mapped pack
+(`mappedPackFiles`), and prefill window. These are runtime budgets; they do
 not include every allocation made by macOS or other applications. The runtime
 currently requires macOS Metal for paged inference. NAX kernels are selected
 only for supported hardware and shapes; other shapes retain the native fallback.

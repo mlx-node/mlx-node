@@ -17,6 +17,8 @@ pub(super) struct Plan {
     pub resident_bank_bytes: u64,
     pub resident_expert_layers: usize,
     pub partial_expert_slots: usize,
+    /// Routed expert tensors served from the mapped pack (0 = chunk reader).
+    pub mapped_pack_files: usize,
 }
 
 pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
@@ -88,6 +90,7 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
         resident_bank_bytes: 0,
         resident_expert_layers: 0,
         partial_expert_slots: 0,
+        mapped_pack_files: 0,
     })
 }
 
@@ -405,6 +408,7 @@ mod tests {
             resident_bank_bytes: 0,
             resident_expert_layers: 0,
             partial_expert_slots: 0,
+            mapped_pack_files: 0,
         };
         let mut plan = original.clone();
         refresh_from_snapshot(&mut plan, 94 << 30, 128 << 30).unwrap();
