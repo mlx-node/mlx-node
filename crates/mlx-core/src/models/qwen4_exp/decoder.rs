@@ -71,6 +71,16 @@ impl LayerCache {
         };
         Ok(self.index_keys.insert(keys))
     }
+    pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
+        self.conv
+            .iter()
+            .chain(self.recurrent.iter())
+            .chain(self.ple_conv.iter())
+            .chain(self.keys.iter())
+            .chain(self.values.iter())
+            .chain(self.index_keys.iter())
+            .chain(self.index_tail.iter())
+    }
 }
 #[derive(Clone, Default)]
 pub struct DecoderState {
@@ -81,6 +91,14 @@ pub struct DecoderState {
     media_digests: Vec<crate::engine::cache::ImageCacheDigest>,
     last_chunk_hidden: Vec<MxArray>,
     cancelled: Option<Arc<AtomicBool>>,
+}
+impl DecoderState {
+    pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
+        self.caches
+            .iter()
+            .flat_map(LayerCache::arrays)
+            .chain(self.last_chunk_hidden.iter())
+    }
 }
 pub struct Decoder {
     pub batch_prefill: bool,
@@ -869,7 +887,6 @@ impl Decoder {
     }
     fn submit(&self, arrays: &[&MxArray], context: &str) -> Result<()> {
         if !runtime_flags::is_zero(c"MLX_QWEN4_ASYNC_SUBMISSION")
-            && self.verification.is_none()
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             MxArray::async_eval_arrays(arrays);
@@ -976,7 +993,6 @@ impl Decoder {
             &format!("{g}.ssm_conv1d.weight"),
         )?;
         if self.gguf()
-            && self.verification.is_none()
             && (kh, nh, kd, vd) == (16, 48, 128, 128)
             && (2..=8).contains(&c.linear_conv_kernel_dim)
             && c.rms_norm_eps.is_finite()
@@ -1024,7 +1040,14 @@ impl Decoder {
                 &format!("{g}.ssm_out.weight"),
             );
         }
-        let qkv = math::conv(&qkv, &conv, &mut cache.conv, c.linear_conv_kernel_dim, 1)?;
+        let qkv = math::conv_with_completion(
+            &qkv,
+            &conv,
+            &mut cache.conv,
+            c.linear_conv_kernel_dim,
+            1,
+            self.verification.is_some(),
+        )?;
         let q = math::l2(&qkv.slice_axis(2, 0, keydim)?.reshape(&[1, kh, kd])?)?
             .mul_scalar((kd as f64).powf(-0.5))?;
         let k = math::l2(
@@ -1822,18 +1845,38 @@ impl Decoder {
         let states = self.verification.take().ok_or_else(|| {
             Error::from_reason("Qwen4 verification lost its accepted-frontier snapshots")
         })?;
-        let mut logits = Vec::with_capacity(tokens.len());
-        for h in self.last_chunk_hidden.clone() {
-            let (mixed, _) = self.hyper(&h, "hyper_connection_mixer", "output_hc", false)?;
-            logits.push(
-                self.linear(&mixed, "lm_head.weight", "output.weight")?
-                    .reshape(&[1, -1])?,
-            );
+        let result = (|| {
+            let mut logits = Vec::with_capacity(tokens.len());
+            for h in self.last_chunk_hidden.clone() {
+                let (mixed, _) = self.hyper(&h, "hyper_connection_mixer", "output_hc", false)?;
+                logits.push(
+                    self.linear(&mixed, "lm_head.weight", "output.weight")?
+                        .reshape(&[1, -1])?,
+                );
+            }
+            let logits = MxArray::concatenate_many(logits.iter().collect(), Some(0))?;
+            // Commit rolls the page cursor back and restores one of these
+            // states: every pool write and frontier array must be complete.
+            let completed: Vec<_> = std::iter::once(&logits)
+                .chain(states.iter().flat_map(DecoderState::arrays))
+                .chain(self.caches.iter().flat_map(LayerCache::arrays))
+                .collect();
+            MxArray::async_eval_arrays(&completed);
+            if let Some(adapter) = &mut self.paged {
+                adapter
+                    .eval_pending_pool_writes()
+                    .map_err(Error::from_reason)?;
+            }
+            MxArray::eval_arrays_with_context(&completed, "qwen4::decoder::verify")?;
+            Ok(logits)
+        })();
+        match result {
+            Ok(logits) => Ok((logits, states)),
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
         }
-        Ok((
-            MxArray::concatenate_many(logits.iter().collect(), Some(0))?,
-            states,
-        ))
     }
 
     fn prefill_chunk_inner(
@@ -1970,6 +2013,8 @@ impl Decoder {
                     if defer_final && i + 1 == self.config.num_hidden_layers {
                         // TrackFastModel returns a lazy final mixer/head. The
                         // checked route commit joins it with all state/readers.
+                    } else if self.verification.is_some() {
+                        self.submit(&[&next], "qwen4::decoder::next")?;
                     } else if tokens.len() == 1
                         && (i + 1) % submit_span != 0
                         && i + 1 < self.config.num_hidden_layers
@@ -2031,10 +2076,10 @@ impl Decoder {
                         self.config.head_dim as i64,
                     ])?;
                 super::paged::write_rows(adapter, layer, &k, &v, base as u32)?;
-                if ((tokens.len() > 1 && !async_window)
-                    || (i + 1) % submit_span == 0
-                    || i + 1 == self.config.num_hidden_layers
-                    || self.verification.is_some())
+                if self.verification.is_none()
+                    && ((tokens.len() > 1 && !async_window)
+                        || (i + 1) % submit_span == 0
+                        || i + 1 == self.config.num_hidden_layers)
                     && !(defer_final && i + 1 == self.config.num_hidden_layers)
                 {
                     adapter
@@ -2044,6 +2089,7 @@ impl Decoder {
             }
             self.caches[i] = cache;
             if tokens.len() == 1
+                && self.verification.is_none()
                 && ((i + 1) % submit_span == 0 || i + 1 == self.config.num_hidden_layers)
                 && !(defer_final && i + 1 == self.config.num_hidden_layers)
                 && let Some(adapter) = &mut self.paged
@@ -2078,7 +2124,7 @@ impl Decoder {
         } else {
             mixed
         };
-        if !defer_final {
+        if !defer_final && self.verification.is_none() {
             MxArray::eval_arrays_with_context(&[&logits], "qwen4::decoder::logits")?;
         }
 
