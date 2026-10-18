@@ -977,11 +977,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             return Ok(Self::fail(turn, row, error));
         }
         sampled.eval();
-        if turn.payload.params.report_performance {
-            turn.payload.first_token_instant = Some(Instant::now());
-        }
         crate::array::synchronize_and_clear_cache();
         if turn.payload.params.max_new_tokens == 0 {
+            if turn.payload.params.report_performance {
+                turn.payload.first_token_instant = Some(Instant::now());
+            }
             turn.payload.profiler.snapshot_memory_after();
             turn.payload.profiler.report();
             return Ok(RowStepResult {
@@ -1038,6 +1038,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             } else if let Some(reason) = row.repetition {
                 turn.payload.finish_reason = reason.to_string();
             }
+        }
+        // The prefill-sampled token is emitted only here, one decode forward
+        // later; stamping TTFT at the sample hides that forward (seconds on a
+        // cold request) inside decode time.
+        if turn.payload.params.report_performance && turn.payload.first_token_instant.is_none() {
+            turn.payload.first_token_instant = Some(Instant::now());
         }
     }
 
