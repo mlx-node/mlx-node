@@ -149,7 +149,9 @@ pub(super) unsafe extern "C" fn release_mapped(ctx: *mut c_void) {
 }
 
 impl MxArray {
-    /// Storage pointer of an array that already holds data; null otherwise.
+    /// Storage pointer of the array; null unless the array is available (a
+    /// mapped array, or an evaluated array that was already waited on). An
+    /// async-evaluated array stays null until [`MxArray::eval`] waits on it.
     pub fn storage_ptr(&self) -> *const c_void {
         // SAFETY: the handle is a live array.
         unsafe { sys::mlx_array_data_ptr(self.handle.0) }
@@ -287,6 +289,32 @@ mod tests {
         drop((whole, gpu, tail, tail_sum));
         wait_for_leases(&map);
         assert_eq!(mapped_array_bytes(), before);
+    }
+
+    #[test]
+    fn storage_ptr_never_consumes_a_pending_event() {
+        let words = pattern(1024);
+        let total = [cpu_sum(&words)];
+        let x = MxArray::from_uint32(&words, &[words.len() as i64]).unwrap();
+
+        let lazy = x.sum(None, None).unwrap();
+        assert!(lazy.storage_ptr().is_null(), "unscheduled array");
+
+        let synced = x.sum(None, None).unwrap();
+        synced.eval();
+        assert!(!synced.storage_ptr().is_null(), "sync eval waited on it");
+
+        let pending = x.sum(None, None).unwrap();
+        MxArray::async_eval_arrays(&[&pending]);
+        crate::array::memory::synchronize();
+        assert!(
+            pending.storage_ptr().is_null(),
+            "async-evaluated array whose signaled event nobody waited on"
+        );
+        pending.eval();
+        assert!(!pending.storage_ptr().is_null(), "eval waited on it");
+        assert_eq!(pending.to_uint32().unwrap().as_ref(), &total);
+        assert_eq!(synced.to_uint32().unwrap().as_ref(), &total);
     }
 
     #[test]

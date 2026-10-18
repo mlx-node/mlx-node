@@ -2920,5 +2920,7 @@ unsafe extern "C" {
         release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
         ctx: *mut std::ffi::c_void,
     ) -> *mut mlx_array;
+    // Null unless the array is available (a mapped array, or an evaluated
+    // array that was already waited on); never waits and never throws.
     pub fn mlx_array_data_ptr(handle: *mut mlx_array) -> *const std::ffi::c_void;
 }
