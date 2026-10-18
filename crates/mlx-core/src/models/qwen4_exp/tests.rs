@@ -153,17 +153,22 @@ fn failed_exclusive_turns_release_empty_owners_and_preserve_live_history() {
     assert_eq!(sequences.len(), 1);
 }
 
-/// An ownerless MTP request that still reaches the exclusive lane
-/// (MLX_SERVE_FORCE_SERIAL), where native MTP cannot run, must fail before
-/// prefill instead of decoding AR under `enableMtp: true`.
+/// An ownerless MTP request that still reaches the exclusive lane, where
+/// native MTP cannot run, must fail before prefill instead of decoding AR
+/// under `enableMtp: true`, and must name MLX_SERVE_FORCE_SERIAL only when
+/// that switch is what routed it there.
 ///
 /// MUTATION: restore the silent decline (drop the ownerless check in
 /// `run_paged_turn`); the MTP turns then complete as AR and the
 /// `expect_err` below fails.
+/// MUTATION: name MLX_SERVE_FORCE_SERIAL unconditionally in that refusal;
+/// the `force_serial()` comparison below fails.
 #[test]
 fn ownerless_mtp_turn_errors_instead_of_decoding_autoregressive() {
     use crate::engine::cmd::ChatCmd;
-    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, SchedulerOwnerContext};
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, HybridSchedulerState, SchedulerOwnerContext,
+    };
     let mut inner = tiny_inner();
     let mut sequences = std::collections::HashMap::new();
     let mut states = std::collections::HashMap::new();
@@ -225,6 +230,11 @@ fn ownerless_mtp_turn_errors_instead_of_decoding_autoregressive() {
             reason.starts_with("qwen4_exp runs enableMtp only on its shared scheduler"),
             "{reason}"
         );
+        assert_eq!(
+            reason.contains("MLX_SERVE_FORCE_SERIAL"),
+            HybridSchedulerState::<Inner>::force_serial(),
+            "{reason}"
+        );
         assert!(owners.is_empty(), "a refused turn leaves no owner");
         assert!(
             inner
@@ -250,78 +260,194 @@ fn ownerless_mtp_turn_errors_instead_of_decoding_autoregressive() {
     }
 }
 
-/// An ownerless `enableMtp` request runs native MTP on the scheduler as the
-/// empty owner, the session ownerless exclusive turns already keep: an
-/// ownerless AR turn in between reuses that owner, and repeated requests never
-/// add an owner or a parked row.
+#[derive(Clone, Copy, Debug)]
+enum OwnerlessTurn {
+    Start,
+    Continue,
+    ContinueTool,
+    StreamContinue,
+    StreamContinueTool,
+}
+
+/// Drives one turn without a `cacheOwnerId` through the scheduler and returns
+/// its text and MTP cycle count.
+fn drive_ownerless_turn(
+    state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Inner>,
+    kind: OwnerlessTurn,
+    enable_mtp: bool,
+) -> Result<(String, Option<u32>)> {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::model_command::ModelCommand;
+    use crate::model_thread::LoopControl;
+    let message = |role: &str| -> crate::tokenizer::ChatMessage {
+        serde_json::from_value(serde_json::json!({"role": role, "content": "a"})).unwrap()
+    };
+    let messages = match kind {
+        OwnerlessTurn::Start => vec![message("user")],
+        OwnerlessTurn::Continue | OwnerlessTurn::StreamContinue => {
+            vec![message("user"), message("assistant"), message("user")]
+        }
+        OwnerlessTurn::ContinueTool | OwnerlessTurn::StreamContinueTool => {
+            vec![message("user"), message("assistant"), message("tool")]
+        }
+    };
+    let config = crate::engine::types::ChatConfig {
+        max_new_tokens: Some(8),
+        temperature: Some(0.0),
+        enable_mtp: Some(enable_mtp),
+        mtp_depth: Some(2),
+        mtp_adaptive_depth: Some(false),
+        report_performance: Some(true),
+        ..Default::default()
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (reply, mut rx) = tokio::sync::oneshot::channel();
+    let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(256);
+    let command = match kind {
+        OwnerlessTurn::Start => ChatCmd::SessionStart {
+            messages,
+            config,
+            reply,
+            cancelled,
+        },
+        OwnerlessTurn::Continue => ChatCmd::SessionContinue {
+            messages,
+            config,
+            reply,
+            cancelled,
+        },
+        OwnerlessTurn::ContinueTool => ChatCmd::SessionContinueTool {
+            messages,
+            config,
+            reply,
+            cancelled,
+        },
+        OwnerlessTurn::StreamContinue => ChatCmd::StreamSessionContinue {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        },
+        OwnerlessTurn::StreamContinueTool => ChatCmd::StreamSessionContinueTool {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        },
+    };
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
+    let mut streamed = String::new();
+    for _ in 0..1024 {
+        while let Ok(chunk) = stream_rx.try_recv() {
+            let chunk = chunk?;
+            streamed.push_str(&chunk.text);
+            if chunk.done {
+                return Ok((streamed, chunk.performance.and_then(|p| p.mtp_cycles)));
+            }
+        }
+        if let Ok(result) = rx.try_recv() {
+            let result = result?;
+            return Ok((result.text, result.performance.and_then(|p| p.mtp_cycles)));
+        }
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+    }
+    panic!("the {kind:?} turn did not finish");
+}
+
+/// An ownerless `enableMtp` start or continuation (sync, streaming, tool)
+/// runs native MTP on the scheduler as the empty owner, the session ownerless
+/// exclusive turns already keep: an ownerless AR turn in between reuses that
+/// owner, and repeated requests never add an owner or a parked row.
 ///
 /// MUTATION: drop `ownerless_speculation_is_scheduled` from the lane choice in
 /// `HybridSchedulerState::drive`; the MTP start then takes the exclusive lane,
 /// is refused, and the first `unwrap` below fails.
+/// MUTATION: drop the empty-owner fallback from `owner_known` in
+/// `chat_requires_barrier`; the first MTP continuation then takes the
+/// exclusive lane, is refused, and its `unwrap` fails.
 #[test]
 fn ownerless_mtp_turn_runs_on_the_scheduler_as_the_ownerless_session() {
-    use crate::engine::cmd::ChatCmd;
     use crate::engine::hybrid_scheduler::HybridSchedulerState;
-    use crate::engine::model_command::ModelCommand;
-    use crate::model_thread::LoopControl;
     let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let mut turn = |state: &mut HybridSchedulerState<Inner>, enable_mtp: bool| {
-        let message: crate::tokenizer::ChatMessage =
-            serde_json::from_value(serde_json::json!({"role":"user","content":"a"})).unwrap();
-        let (reply, mut rx) = tokio::sync::oneshot::channel();
-        let command = ChatCmd::SessionStart {
-            messages: vec![message],
-            config: crate::engine::types::ChatConfig {
-                max_new_tokens: Some(8),
-                temperature: Some(0.0),
-                enable_mtp: Some(enable_mtp),
-                mtp_depth: Some(2),
-                mtp_adaptive_depth: Some(false),
-                report_performance: Some(true),
-                ..Default::default()
-            },
-            cancelled: Arc::new(AtomicBool::new(false)),
-            reply,
-        };
-        assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
-        for _ in 0..1024 {
-            if let Ok(result) = rx.try_recv() {
-                return result;
-            }
-            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
-        }
-        panic!("the turn did not finish");
-    };
-    let cycles = |result: &crate::engine::types::ChatResult| {
-        result.performance.as_ref().and_then(|p| p.mtp_cycles)
-    };
-    let first = turn(&mut state, true).unwrap();
-    assert!(
-        cycles(&first).is_some_and(|n| n > 0),
-        "{:?}",
-        cycles(&first)
-    );
+    let (text, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, true).unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
     assert_eq!(state.owner_sequences.len(), 1);
     let seq = state.owner_sequences[""];
-    let plain = turn(&mut state, false).unwrap();
-    assert_eq!(cycles(&plain), None);
-    assert_eq!(plain.text, first.text);
-    let again = turn(&mut state, true).unwrap();
-    assert!(
-        cycles(&again).is_some_and(|n| n > 0),
-        "{:?}",
-        cycles(&again)
-    );
-    assert_eq!(again.text, first.text);
-    assert_eq!(
-        state.owner_sequences,
-        std::collections::HashMap::from([(String::new(), seq)])
-    );
-    assert_eq!(
-        state.inner.rows.len() + usize::from(state.inner.active_seq.is_some()),
-        1
-    );
+    let (plain, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, false).unwrap();
+    assert_eq!(cycles, None);
+    assert_eq!(plain, text);
+    let (again, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, true).unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    assert_eq!(again, text);
+    for kind in [
+        OwnerlessTurn::Continue,
+        OwnerlessTurn::StreamContinue,
+        OwnerlessTurn::ContinueTool,
+        OwnerlessTurn::StreamContinueTool,
+    ] {
+        let (_, cycles) = drive_ownerless_turn(&mut state, kind, true)
+            .unwrap_or_else(|error| panic!("{kind:?}: {}", error.reason));
+        assert!(cycles.is_some_and(|n| n > 0), "{kind:?}: {cycles:?}");
+        assert_eq!(
+            state.owner_sequences,
+            std::collections::HashMap::from([(String::new(), seq)]),
+            "{kind:?}"
+        );
+        assert_eq!(
+            state.inner.rows.len() + usize::from(state.inner.active_seq.is_some()),
+            1,
+            "{kind:?}"
+        );
+    }
+}
+
+/// Under MLX_SERVE_FORCE_SERIAL every turn takes the exclusive lane, so an
+/// ownerless `enableMtp` start or continuation is refused before prefill and
+/// the refusal names the switch; an ownerless AR turn still runs.
+///
+/// MUTATION: never name MLX_SERVE_FORCE_SERIAL in the `run_paged_turn`
+/// refusal; the child's `contains` assertions fail.
+#[test]
+fn forced_serial_refuses_ownerless_mtp_and_names_the_switch() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    const CHILD: &str = "MLX_QWEN4_FORCED_SERIAL_MTP_CHILD";
+    const NAME: &str =
+        "models::qwen4_exp::tests::forced_serial_refuses_ownerless_mtp_and_names_the_switch";
+    if std::env::var_os(CHILD).is_none() {
+        // The switch is read from the process environment on every command;
+        // a child process keeps it away from concurrent scheduler tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME])
+            .env(CHILD, "1")
+            .env("MLX_SERVE_FORCE_SERIAL", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    assert!(HybridSchedulerState::<Inner>::force_serial());
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let refused = |result: Result<(String, Option<u32>)>| {
+        let reason = result.expect_err("ownerless MTP must not decode").reason;
+        assert!(reason.contains("MLX_SERVE_FORCE_SERIAL"), "{reason}");
+    };
+    refused(drive_ownerless_turn(&mut state, OwnerlessTurn::Start, true));
+    let (_, cycles) = drive_ownerless_turn(&mut state, OwnerlessTurn::Start, false).unwrap();
+    assert_eq!(cycles, None);
+    for kind in [
+        OwnerlessTurn::Continue,
+        OwnerlessTurn::StreamContinue,
+        OwnerlessTurn::ContinueTool,
+        OwnerlessTurn::StreamContinueTool,
+    ] {
+        refused(drive_ownerless_turn(&mut state, kind, true));
+    }
 }
 
 #[test]
