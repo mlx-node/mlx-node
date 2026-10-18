@@ -58,13 +58,22 @@ mlx_array* mlx_array_from_mapped(void* ptr,
   }
 }
 
-// Storage pointer of an array that already holds data (a mapped array, or any
-// evaluated array); null for an unevaluated array.
+// Storage pointer of an array whose data is settled: a mapped array, or an
+// evaluated array that was already waited on. Null otherwise, including an
+// async-evaluated array nobody waited on. Never touch the event here
+// (is_available() does): a poisoned event throws, and catching that clears
+// the error, so the next wait would not report the failed GPU work.
 const void* mlx_array_data_ptr(mlx_array* handle) {
-  if (handle == nullptr) return nullptr;
-  auto* arr = reinterpret_cast<array*>(handle);
-  if (!arr->is_available() || arr->buffer().ptr() == nullptr) return nullptr;
-  return arr->data<void>();
+  try {
+    if (handle == nullptr) return nullptr;
+    auto* arr = reinterpret_cast<array*>(handle);
+    const bool settled = arr->status() == array::Status::available ||
+        (arr->status() == array::Status::evaluated && !arr->event().valid());
+    if (!settled || arr->buffer().ptr() == nullptr) return nullptr;
+    return arr->data<void>();
+  } catch (...) {
+    return nullptr;
+  }
 }
 
 }  // extern "C"
