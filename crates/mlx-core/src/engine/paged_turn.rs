@@ -310,7 +310,10 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     };
     y.eval();
 
-    if report_perf {
+    // The decode loop stamps TTFT when it emits this token, after the first
+    // decode forward; stamping at the sample hides that forward (seconds on a
+    // cold request) inside decode time. A zero budget never emits.
+    if report_perf && max_new_tokens <= 0 {
         first_token_instant = Some(Instant::now());
     }
 
@@ -494,6 +497,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     use napi::bindgen_prelude::*;
 
@@ -587,10 +591,13 @@ mod tests {
         /// check — the "cancel arrives during the forward" race.
         cancel: Option<Arc<AtomicBool>>,
         flip_on_forward: Option<usize>,
+        /// Wall time every `forward` takes (a cold first decode forward).
+        forward_delay: Duration,
     }
 
     impl DecodeStep for MockPagedDecode {
         fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            std::thread::sleep(self.forward_delay);
             let n = self.forward_count.fetch_add(1, Ordering::Relaxed) + 1;
             if self.fail_forward_on == Some(n) {
                 return Err(Error::from_reason(format!(
@@ -707,6 +714,8 @@ mod tests {
         spec_admit: Option<bool>,
         /// Tokens the scripted speculative core emits in one go.
         spec_tokens: Vec<u32>,
+        /// Forwarded to the stepper's `forward_delay`.
+        forward_delay: Duration,
     }
 
     impl ChatBackend for MockBackend {
@@ -749,9 +758,8 @@ mod tests {
             unreachable!("the generic FLAT begin_decode must not run on the paged path")
         }
 
-        // Profiling is OFF in the test config, so finalize's perf path is
-        // never exercised; provide a minimal finalize that returns a
-        // skeletal result.
+        // A minimal finalize that returns a skeletal result; `performance`
+        // passes through for the TTFT test.
         fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
             self.ledger.push("finalize_turn");
             // `raw_text` is the verbatim decode of the committed tokens —
@@ -853,6 +861,7 @@ mod tests {
                 fail_forward_on: self.fail_forward_on,
                 cancel: self.cancel.clone(),
                 flip_on_forward: self.flip_on_forward,
+                forward_delay: self.forward_delay,
             })
         }
 
@@ -1033,6 +1042,7 @@ mod tests {
             flip_on_forward: None,
             spec_admit: None,
             spec_tokens: Vec::new(),
+            forward_delay: Duration::ZERO,
         };
 
         // T=0 greedy params, profiling OFF, no cutoffs, budget MAX_NEW.
@@ -1141,6 +1151,130 @@ mod tests {
         }
     }
 
+    /// Records when the first per-token chunk reached the sink.
+    struct TimedSink {
+        first_token_at: std::sync::Mutex<Option<Instant>>,
+        chunks: std::sync::Mutex<Vec<ChatStreamChunk>>,
+    }
+    impl ChunkSink for TimedSink {
+        fn send(&self, chunk: Result<ChatStreamChunk>) {
+            let now = Instant::now();
+            if let (Ok(c), Ok(mut v)) = (chunk, self.chunks.lock()) {
+                if !c.done
+                    && let Ok(mut first) = self.first_token_at.lock()
+                {
+                    first.get_or_insert(now);
+                }
+                v.push(c);
+            }
+        }
+    }
+
+    /// The prefill-sampled token is streamed only after the first decode
+    /// forward. Every forward here sleeps `DELAY`, so a TTFT stamped at the
+    /// sample opens the reported decode window ~`DELAY` before the first chunk
+    /// reaches the sink.
+    #[test]
+    fn reported_ttft_is_not_earlier_than_the_first_streamed_token() {
+        const MAX_NEW: i32 = 3;
+        const DELAY: Duration = Duration::from_millis(80);
+
+        let tokenizer = tiny_qwen3_tokenizer();
+        let mut backend = MockBackend {
+            ledger: Arc::new(Ledger::default()),
+            forward_count: Arc::new(AtomicUsize::new(0)),
+            tokenizer: tokenizer.clone(),
+            vocab: 4,
+            target: 0,
+            decode_target: 1,
+            fail_prime: false,
+            fail_prefill: false,
+            fail_forward_on: None,
+            fail_save: false,
+            adapter_cursor: Arc::new(AtomicUsize::new(0)),
+            prime_cache_salt: Arc::new(AtomicU64::new(0)),
+            finalize_cache_salt: Arc::new(AtomicU64::new(0)),
+            saved: Arc::new(std::sync::Mutex::new(None)),
+            cancel: None,
+            flip_on_forward: None,
+            spec_admit: None,
+            spec_tokens: Vec::new(),
+            forward_delay: DELAY,
+        };
+        let config = ChatConfig {
+            cache_salt: None,
+            cache_owner_id: None,
+            cache_root_owner_id: None,
+            temperature: Some(0.0),
+            max_new_tokens: Some(MAX_NEW),
+            max_consecutive_tokens: Some(0),
+            max_ngram_repeats: Some(0),
+            report_performance: Some(true),
+            ..Default::default()
+        };
+        let p = crate::engine::params::extract_chat_params(&config);
+        let sink = TimedSink {
+            first_token_at: std::sync::Mutex::new(None),
+            chunks: std::sync::Mutex::new(Vec::new()),
+        };
+        // Per-token chunks stream only with a cancel flag, as in production.
+        let cancelled = AtomicBool::new(false);
+        let tokens = vec![0u32, 1, 2];
+        let mut args = WholeTurnArgs {
+            tokens: &tokens,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &p,
+            thinking: ThinkingSetup {
+                enabled: false,
+                budget: None,
+            },
+            plan: paged_test_plan(),
+            sink: Some(&sink),
+            cancelled: Some(&cancelled),
+            media: no_media(),
+        };
+
+        let out = run_paged_turn(&mut backend, &mut args)
+            .unwrap_or_else(|e| panic!("run_paged_turn failed: {}", e.reason));
+        let returned = Instant::now();
+        assert!(matches!(out, TurnOutput::Streamed), "streaming turn");
+
+        let first = sink
+            .first_token_at
+            .into_inner()
+            .unwrap_or_else(|e| panic!("sink poisoned: {e}"))
+            .unwrap_or_else(|| panic!("no per-token chunk was streamed"));
+        let chunks = sink
+            .chunks
+            .into_inner()
+            .unwrap_or_else(|e| panic!("sink poisoned: {e}"));
+        let done = chunks
+            .last()
+            .filter(|c| c.done)
+            .unwrap_or_else(|| panic!("last chunk must be the done chunk: {chunks:?}"));
+        assert_eq!(done.num_tokens, Some(MAX_NEW as u32));
+        assert!(
+            chunks.iter().filter(|c| !c.done).count() >= MAX_NEW as usize,
+            "one streamed chunk per committed token: {chunks:?}"
+        );
+        let perf = done
+            .performance
+            .as_ref()
+            .unwrap_or_else(|| panic!("reportPerformance turn must carry metrics"));
+        // decode tok/s = (n - 1) / (generation_end - first_token_instant).
+        let decode_window_ms = f64::from(MAX_NEW - 1) * 1000.0 / perf.decode_tokens_per_second;
+        let first_chunk_to_return_ms = returned.duration_since(first).as_secs_f64() * 1000.0;
+        let slack_ms = DELAY.as_secs_f64() * 1000.0 / 2.0;
+        assert!(
+            decode_window_ms <= first_chunk_to_return_ms + slack_ms,
+            "TTFT stamped {:.1} ms before the first streamed chunk (decode window \
+             {decode_window_ms:.1} ms, first chunk -> return {first_chunk_to_return_ms:.1} ms)",
+            decode_window_ms - first_chunk_to_return_ms,
+        );
+    }
+
     /// END-TO-END streaming cancel-during-forward parity over the whole
     /// `run_paged_turn` (prime → prefill → decode loop → residual flush →
     /// done chunk) — the test that catches the streaming-cancel bug in
@@ -1199,6 +1333,7 @@ mod tests {
             flip_on_forward: Some(2),
             spec_admit: None,
             spec_tokens: Vec::new(),
+            forward_delay: Duration::ZERO,
         };
 
         let config = ChatConfig {
@@ -1340,6 +1475,7 @@ mod tests {
             flip_on_forward: None,
             spec_admit: None,
             spec_tokens: Vec::new(),
+            forward_delay: Duration::ZERO,
         };
 
         let config = ChatConfig {
@@ -1605,6 +1741,7 @@ mod tests {
             flip_on_forward: None,
             spec_admit: None,
             spec_tokens: Vec::new(),
+            forward_delay: Duration::ZERO,
         };
 
         let config = ChatConfig {
@@ -1769,6 +1906,7 @@ mod tests {
             flip_on_forward: None,
             spec_admit: None,
             spec_tokens: Vec::new(),
+            forward_delay: Duration::ZERO,
         };
         let config = ChatConfig {
             temperature: Some(0.0),
@@ -1924,6 +2062,7 @@ mod tests {
             flip_on_forward: None,
             spec_admit,
             spec_tokens,
+            forward_delay: Duration::ZERO,
         };
 
         let config = ChatConfig {
