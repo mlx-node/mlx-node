@@ -1331,6 +1331,14 @@ impl Decoder {
             let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
             (selected, scores)
         };
+        if !self.scope.is_empty()
+            && let Some(sum) = self.mtp_resident_experts(x, &selected, &scores)?
+        {
+            let (shared, gate) = self.shared_expert_parts(x, i, shared_gate)?;
+            return sum
+                .astype(x.dtype()?)?
+                .add(&math::sigmoid_mul(&gate, &shared)?);
+        }
         if let Some(out) =
             self.tentative_shared_experts(x, &selected, &scores, shared_gate.as_ref(), i)?
         {

@@ -86,6 +86,51 @@ impl Tensor {
         }
         Ok((self.offset + self.row_bytes()? * start as u64, bytes))
     }
+    /// Decode a row range of a safetensors tensor into an array without the LRU.
+    pub(super) fn import_safe_rows(&self, start: usize, rows: usize) -> Result<MxArray> {
+        let Encoding::Safe(dtype) = &self.encoding else {
+            return Err(err("Safetensors row import on a GGUF tensor"));
+        };
+        let (offset, bytes) = self.range(start, rows)?;
+        let shape = [rows as i64, self.width()? as i64];
+        let mut f = File::open(&self.path).map_err(err)?;
+        f.seek(SeekFrom::Start(offset)).map_err(err)?;
+        let mut buf = vec![0; bytes as usize];
+        f.read_exact(&mut buf).map_err(err)?;
+        let values = match dtype.as_str() {
+            "BF16" | "F16" => {
+                let v: Vec<u16> = buf
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                if dtype == "BF16" {
+                    MxArray::from_bfloat16(&v, &shape)?
+                } else {
+                    MxArray::from_float16(&v, &shape)?
+                }
+            }
+            "F32" => MxArray::from_float32(
+                &buf.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect::<Vec<_>>(),
+                &shape,
+            )?,
+            "I64" => MxArray::from_int64(
+                &buf.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| i64::from_le_bytes(*b))
+                    .collect::<Vec<_>>(),
+                &shape,
+            )?,
+            _ => unreachable!(),
+        };
+        Ok(values)
+    }
     fn packed_key(&self, name: &str, start: usize, rows: usize) -> Result<Option<String>> {
         let (offset, bytes) = self.range(start, rows)?;
         Ok(match self.encoding {
@@ -890,6 +935,10 @@ impl Store {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn lru_holds(&self, name: &str) -> bool {
+        self.cache.keys().any(|(n, _, _)| n == name)
+    }
     pub fn descriptor(&self, name: &str) -> Result<&Tensor> {
         self.tensors
             .get(name)
@@ -1080,60 +1129,21 @@ impl Store {
                 .and_then(|key| self.packed.as_ref()?.read(key).ok().flatten()),
         };
         let prepared_hit = prepared.is_some();
-        let shape = [rows as i64, d.width()? as i64];
         let weight = if let Some((weight, bytes)) = prepared {
             self.packed_hits += 1;
             self.packed_bytes_read += bytes;
             weight
         } else {
             match &d.encoding {
-                Encoding::Safe(dtype) => {
-                    let mut f = File::open(&d.path).map_err(err)?;
-                    f.seek(SeekFrom::Start(offset)).map_err(err)?;
-                    let mut buf = vec![0; bytes as usize];
-                    f.read_exact(&mut buf).map_err(err)?;
-                    let values = match dtype.as_str() {
-                        "BF16" | "F16" => {
-                            let v: Vec<u16> = buf
-                                .as_chunks::<2>()
-                                .0
-                                .iter()
-                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                                .collect();
-                            if dtype == "BF16" {
-                                MxArray::from_bfloat16(&v, &shape)?
-                            } else {
-                                MxArray::from_float16(&v, &shape)?
-                            }
-                        }
-                        "F32" => MxArray::from_float32(
-                            &buf.as_chunks::<4>()
-                                .0
-                                .iter()
-                                .map(|b| f32::from_le_bytes(*b))
-                                .collect::<Vec<_>>(),
-                            &shape,
-                        )?,
-                        "I64" => MxArray::from_int64(
-                            &buf.as_chunks::<8>()
-                                .0
-                                .iter()
-                                .map(|b| i64::from_le_bytes(*b))
-                                .collect::<Vec<_>>(),
-                            &shape,
-                        )?,
-                        _ => unreachable!(),
-                    };
-                    Weight {
-                        dense_bf16: None,
-                        values,
-                        scales: None,
-                        biases: None,
-                        group: 0,
-                        bits: 0,
-                        mode: String::new(),
-                    }
-                }
+                Encoding::Safe(_) => Weight {
+                    dense_bf16: None,
+                    values: d.import_safe_rows(start, rows)?,
+                    scales: None,
+                    biases: None,
+                    group: 0,
+                    bits: 0,
+                    mode: String::new(),
+                },
                 Encoding::Gguf(ty) => {
                     let tensor = GgufTensorInfo {
                         name: "weight".into(),

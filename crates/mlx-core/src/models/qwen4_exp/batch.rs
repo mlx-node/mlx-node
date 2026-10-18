@@ -393,6 +393,60 @@ impl Decoder {
         Ok(Some(reduced))
     }
 
+    /// The MTP head's experts live in two resident banks (gate|up fused, down)
+    /// built on the first MTP owner; route them on the device like the target's.
+    pub(super) fn mtp_resident_experts(
+        &self,
+        x: &MxArray,
+        selected: &MxArray,
+        scores: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        let prefix = format!("{}layers.0.mlp.experts", self.scope);
+        let (Some(gate_up), Some(down)) = (
+            self.weights
+                .resident_bank(&format!("{prefix}.gate_up_proj")),
+            self.weights.resident_bank(&format!("{prefix}.down_proj")),
+        ) else {
+            return Ok(None);
+        };
+        let c = &self.config;
+        let tokens = x.shape_at(1)?;
+        let (h, m, top) = (
+            c.hidden_size as i64,
+            c.moe_intermediate_size as i64,
+            c.num_experts_per_tok as i64,
+        );
+        let rows = tokens * top;
+        let token_rows = MxArray::arange(0.0, tokens as f64, None, Some(DType::Int32))?
+            .reshape(&[tokens, 1])?
+            .broadcast_to(&[tokens, top])?
+            .reshape(&[-1])?;
+        let input = x
+            .reshape(&[tokens, h])?
+            .take(&token_rows, 0)?
+            .reshape(&[rows, 1, h])?;
+        let ids = selected.reshape(&[-1])?;
+        let both = gate_up.expert_rows(&input, &ids, c.num_experts, false)?;
+        let hidden = math::swiglu(&both.slice_axis(2, 0, m)?, &both.slice_axis(2, m, 2 * m)?)?;
+        let out = down
+            .expert_rows(&hidden, &ids, c.num_experts, false)?
+            .reshape(&[rows, h])?;
+        math::combine_expert_rows(&out, scores, None, top as usize).map(Some)
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn mtp_resident_experts_for_test(
+        &mut self,
+        x: &MxArray,
+        selected: &MxArray,
+        scores: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        self.scope = "mtp.".into();
+        let out = self.mtp_resident_experts(x, selected, scores);
+        self.scope.clear();
+        out
+    }
+
     pub(super) fn selected_experts(
         &mut self,
         x: &MxArray,

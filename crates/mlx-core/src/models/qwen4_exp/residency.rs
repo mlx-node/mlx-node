@@ -462,31 +462,162 @@ impl Store {
             .flatten()
             .collect();
             MxArray::eval_arrays_with_context(&arrays, "Qwen4 prepare resident bank")?;
-            let keys: Vec<_> = self
-                .cache
-                .keys()
-                .filter(|(n, _, _)| n == &name)
-                .cloned()
-                .collect();
-            for key in keys {
-                if let Some(w) = self.cache.remove(&key) {
-                    self.cache_bytes -= w.bytes()?;
-                    if self.protected.remove(&key) {
-                        self.protected_bytes -= w.bytes()?;
-                    }
-                }
-                self.recency.remove(&key);
-            }
-            let bytes = bank.bytes()?;
-            self.bank_bytes += bytes;
-            self.cache_bytes += bytes;
-            self.plan.resident_bank_bytes = self.bank_bytes;
-            self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
-            self.banks.insert(name, Arc::new(bank));
+            self.install_bank(name, bank)?;
             drop(chunks);
             super::super::memory::maintain_freelist(self.plan.physical_bytes);
         }
         Ok(true)
+    }
+
+    /// Replace the LRU rows of `name` with one resident bank, outside the LRU
+    /// but inside the cache budget.
+    fn install_bank(&mut self, name: String, bank: Weight) -> Result<()> {
+        let keys: Vec<_> = self
+            .cache
+            .keys()
+            .filter(|(n, _, _)| n == &name)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(w) = self.cache.remove(&key) {
+                self.cache_bytes -= w.bytes()?;
+                if self.protected.remove(&key) {
+                    self.protected_bytes -= w.bytes()?;
+                }
+            }
+            self.recency.remove(&key);
+        }
+        let bytes = bank.bytes()?;
+        self.bank_bytes += bytes;
+        self.cache_bytes += bytes;
+        self.plan.resident_bank_bytes = self.bank_bytes;
+        self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
+        self.banks.insert(name, Arc::new(bank));
+        Ok(())
+    }
+}
+
+const MTP_EXPERT_BANKS: [&str; 2] = [
+    "mtp.layers.0.mlp.experts.gate_up_proj",
+    "mtp.layers.0.mlp.experts.down_proj",
+];
+
+impl Weight {
+    fn quantize_q8(values: &MxArray) -> Result<Self> {
+        // f16 scales: the affine expert GEMV accepts only the GGUF import dtype.
+        let source = values.astype(DType::Float16)?;
+        let (mut codes, mut scales, mut biases) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                source.as_raw_ptr(),
+                32,
+                8,
+                c"affine".as_ptr(),
+                &mut codes,
+                &mut scales,
+                &mut biases,
+            )
+        };
+        if !ok {
+            return Err(err("Qwen4 MTP expert bank quantization failed"));
+        }
+        Ok(Self {
+            values: MxArray::from_handle(codes, "Qwen4 MTP bank codes")?,
+            dense_bf16: None,
+            scales: Some(MxArray::from_handle(scales, "Qwen4 MTP bank scales")?),
+            biases: Some(MxArray::from_handle(biases, "Qwen4 MTP bank biases")?),
+            group: 32,
+            bits: 8,
+            mode: "affine".into(),
+        })
+    }
+}
+
+impl Store {
+    pub(in super::super) fn mtp_bank_bytes(&self) -> Result<u64> {
+        MTP_EXPERT_BANKS
+            .iter()
+            .filter_map(|name| self.banks.get(*name))
+            .try_fold(0u64, |n, w| Ok(n + w.bytes()?))
+    }
+
+    /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
+    /// so a draft step gathers them on the device. Runs once, on the first MTP
+    /// owner; the whole aux tensor streams through 64 MiB row chunks.
+    pub(in super::super) fn prepare_mtp_expert_banks(&mut self) -> Result<u64> {
+        if MTP_EXPERT_BANKS
+            .iter()
+            .any(|name| !self.tensors.contains_key(*name))
+        {
+            return Ok(0);
+        }
+        for name in MTP_EXPERT_BANKS {
+            if self.banks.contains_key(name) {
+                continue;
+            }
+            let d = self.descriptor(name)?.clone();
+            let (rows, width) = (d.rows()?, d.width()?);
+            // MLX affine quantization needs K % 32 == 0; a narrower expert
+            // (fixtures) stays a dense gather bank.
+            let quantized = width % 32 == 0;
+            let bytes = (rows as u64)
+                .saturating_mul(width as u64)
+                .saturating_mul(if quantized { 9 } else { 16 })
+                / 8;
+            self.evict_to(
+                self.cache_limit
+                    .saturating_sub(bytes.saturating_mul(2) + MAX_READ_BYTES * 3),
+            )?;
+            super::super::memory::admit(
+                bytes.saturating_mul(2) + super::super::memory::WORKING_BYTES,
+            )?;
+            let chunk = (MAX_READ_BYTES as usize / (width * 4)).clamp(1, rows);
+            let mut chunks = Vec::with_capacity(rows.div_ceil(chunk));
+            for start in (0..rows).step_by(chunk) {
+                let values = d.import_safe_rows(start, (rows - start).min(chunk))?;
+                let weight = if quantized {
+                    Weight::quantize_q8(&values)?
+                } else {
+                    Weight {
+                        values,
+                        dense_bf16: None,
+                        scales: None,
+                        biases: None,
+                        group: 0,
+                        bits: 0,
+                        mode: String::new(),
+                    }
+                };
+                let arrays: Vec<_> = [
+                    Some(&weight.values),
+                    weight.scales.as_ref(),
+                    weight.biases.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                MxArray::eval_arrays_with_context(&arrays, "Qwen4 MTP expert bank chunk")?;
+                chunks.push(Arc::new(weight));
+            }
+            let bank = Weight::concatenate_rows(&chunks)?;
+            let arrays: Vec<_> = [
+                Some(&bank.values),
+                bank.scales.as_ref(),
+                bank.biases.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            MxArray::eval_arrays_with_context(&arrays, "Qwen4 MTP expert bank")?;
+            drop(chunks);
+            self.install_bank(name.into(), bank)?;
+            super::super::memory::maintain_freelist(self.plan.physical_bytes);
+        }
+        self.mtp_bank_bytes()
     }
 }
 

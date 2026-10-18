@@ -1956,6 +1956,175 @@ fn paged_qsa_matches_flat_across_page_boundaries_sparse_selection_and_owner_swit
 }
 
 #[test]
+fn mtp_draft_gathers_the_resident_q8_expert_bank() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let store = weights::Store::open_fixture(&path, None).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    let bytes = decoder.weights.prepare_mtp_expert_banks().unwrap();
+    assert!(bytes > 0);
+    assert_eq!(decoder.weights.prepare_mtp_expert_banks().unwrap(), bytes);
+    assert_eq!(decoder.weights.mtp_bank_bytes().unwrap(), bytes);
+    let gate_up = decoder
+        .weights
+        .resident_bank("mtp.layers.0.mlp.experts.gate_up_proj")
+        .unwrap();
+    assert!(gate_up.scales.is_some());
+    assert_eq!(
+        (gate_up.bits, gate_up.group, gate_up.mode.as_str()),
+        (8, 32, "affine")
+    );
+    assert_eq!(
+        gate_up.scales.as_ref().unwrap().dtype().unwrap(),
+        crate::array::DType::Float16
+    );
+    assert!(
+        decoder
+            .weights
+            .resident_bank("mtp.layers.0.mlp.experts.down_proj")
+            .is_some()
+    );
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let mut cache = decoder::LayerCache::default();
+    let mut worst = 0f32;
+    for row in oracle["rows"].as_array().unwrap() {
+        let hidden: Vec<f32> = row["input_hidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let hidden = MxArray::from_float32(&hidden, &[1, 1, (c.hc_count * c.hidden_size) as i64])
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let (_, logits) = decoder
+            .draft_step(
+                &hidden,
+                row["token"].as_u64().unwrap() as u32,
+                row["position"].as_u64().unwrap() as usize,
+                &mut cache,
+                true,
+            )
+            .unwrap();
+        let expected: Vec<f32> = row["logits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let actual = logits.unwrap().to_float32().unwrap();
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        assert_eq!(
+            argmax(&actual),
+            argmax(&expected),
+            "position {}",
+            row["position"]
+        );
+        let diff = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        worst = worst.max(diff);
+    }
+    assert!(worst < 0.04, "Q8 draft logits drift {worst}");
+    for name in [
+        "mtp.layers.0.mlp.experts.gate_up_proj",
+        "mtp.layers.0.mlp.experts.down_proj",
+    ] {
+        assert!(
+            !decoder.weights.lru_holds(name),
+            "{name} was read through the LRU"
+        );
+    }
+}
+
+#[test]
+fn mtp_resident_bank_matches_the_dense_expert_sum() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let store = weights::Store::open_fixture(&path, None).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    let (h, m) = (c.hidden_size, c.moe_intermediate_size);
+    let x = MxArray::from_float32(
+        &(0..h).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>(),
+        &[1, 1, h as i64],
+    )
+    .unwrap()
+    .astype(crate::array::DType::BFloat16)
+    .unwrap();
+    let ids = [1u32, 3];
+    let selected = MxArray::from_uint32(&ids, &[1, 1, 2]).unwrap();
+    let scores = MxArray::from_float32(&[0.6, 0.4], &[1, 1, 2])
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+    // The dense reference is the pre-bank draft path: row reads + linear.
+    let mut reference: Option<MxArray> = None;
+    for (j, &e) in ids.iter().enumerate() {
+        let e = e as usize;
+        let both = decoder
+            .weights
+            .read("mtp.layers.0.mlp.experts.gate_up_proj", e * 2 * m, 2 * m)
+            .unwrap()
+            .linear(&x)
+            .unwrap();
+        let hidden = math::swiglu(
+            &both.slice_axis(2, 0, m as i64).unwrap(),
+            &both.slice_axis(2, m as i64, 2 * m as i64).unwrap(),
+        )
+        .unwrap();
+        let out = decoder
+            .weights
+            .read("mtp.layers.0.mlp.experts.down_proj", e * h, h)
+            .unwrap()
+            .linear(&hidden)
+            .unwrap()
+            .mul(&scores.slice_axis(2, j as i64, j as i64 + 1).unwrap())
+            .unwrap();
+        reference = Some(match reference {
+            None => out,
+            Some(acc) => acc.add(&out).unwrap(),
+        });
+    }
+    let reference = reference.unwrap().to_float32().unwrap();
+    assert!(
+        decoder
+            .mtp_resident_experts_for_test(&x, &selected, &scores)
+            .unwrap()
+            .is_none()
+    );
+    decoder.weights.prepare_mtp_expert_banks().unwrap();
+    let actual = decoder
+        .mtp_resident_experts_for_test(&x, &selected, &scores)
+        .unwrap()
+        .unwrap();
+    assert_eq!(*actual.shape().unwrap(), [1, 1, h as i64]);
+    let actual = actual.to_float32().unwrap();
+    let scale = reference.iter().fold(0f32, |a, b| a.max(b.abs()));
+    let diff = actual
+        .iter()
+        .zip(reference.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    eprintln!("mtp bank expert sum: max |diff| {diff} of scale {scale}");
+    assert!(
+        scale > 0.0 && diff <= 0.02 * scale,
+        "diff {diff} scale {scale}"
+    );
+}
+
+#[test]
 fn mtp_head_matches_reference_hc_norm_and_shifted_history() {
     let path = fixture().join("bf16/paged");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();

@@ -81,6 +81,7 @@ impl State {
 impl Inner {
     pub fn begin_mtp(&mut self, seq: u32, position: u32) -> Result<bool> {
         if position == 0 {
+            self.decoder.weights.prepare_mtp_expert_banks()?;
             self.mtp.owners.insert(
                 seq,
                 Owner {

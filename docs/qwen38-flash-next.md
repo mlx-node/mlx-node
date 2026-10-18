@@ -134,7 +134,10 @@ only on the shared scheduler. An ownerless `enableMtp` start or continuation run
 there as the ownerless session that ownerless AR turns continue; one that still
 reaches the exclusive lane (`MLX_SERVE_FORCE_SERIAL`) is refused before prefill
 instead of decoding plain AR. Proposals use private draft state; verification
-commits only accepted target frontiers.
+commits only accepted target frontiers. The head's routed experts become
+resident Q8 (affine, group 32) banks on the first MTP owner, about 2.6 GiB for
+the released checkpoint outside the weight LRU, and each draft step gathers
+them on the device.
 Head availability alone does not establish a latency benefit. Stochastic MTP
 keeps distribution-correct verification and disables the greedy adaptive policy.
 
