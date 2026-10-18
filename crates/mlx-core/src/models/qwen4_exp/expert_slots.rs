@@ -235,14 +235,17 @@ impl Store {
         Ok(())
     }
 
-    /// Called at the start of every forward pass (layer 0's MoE).
-    pub(in super::super) fn wire_mapped_banks(&mut self) -> Result<()> {
-        self.wire_mapped_banks_at(Instant::now()).map(|_| ())
+    /// Called at the start of every forward pass (layer 0's MoE). `main` is
+    /// false for a pass that reads no mapped bank (the MTP head runs its own
+    /// experts); such a pass must leave the stamp alone, or a run of drafts
+    /// hides the gap the next main pass has to re-wire for.
+    pub(in super::super) fn wire_mapped_banks(&mut self, main: bool) -> Result<()> {
+        self.wire_mapped_banks_at(Instant::now(), main).map(|_| ())
     }
 
     /// Returns whether the banks were touched.
-    pub(super) fn wire_mapped_banks_at(&mut self, now: Instant) -> Result<bool> {
-        if !self.plan.mapped {
+    pub(super) fn wire_mapped_banks_at(&mut self, now: Instant, main: bool) -> Result<bool> {
+        if !self.plan.mapped || !main {
             return Ok(false);
         }
         let stale = self
