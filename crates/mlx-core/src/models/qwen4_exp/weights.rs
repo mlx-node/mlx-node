@@ -1010,10 +1010,8 @@ impl Store {
     /// the chunk reader in charge; it never fails the load.
     pub(in super::super) fn prepare_mapped_pack(&mut self) -> Result<()> {
         let dir = match &self.packed {
-            Some(packed) if self.gguf => match packed.cache_root().zip(packed.identity()) {
-                Some((root, identity)) => {
-                    root.join(format!("{}{identity}", super::mapped_pack::DIR_PREFIX))
-                }
+            Some(packed) if self.gguf => match packed.mapped_dir() {
+                Some(dir) => dir,
                 None => return Ok(()),
             },
             _ => return Ok(()),

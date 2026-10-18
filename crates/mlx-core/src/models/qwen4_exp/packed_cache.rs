@@ -27,6 +27,12 @@ const FREE_RESERVE: u64 = 16 << 30;
 /// verified reads keep a live dir young.
 const PACKED_SWEEP_MIN_AGE: Duration = Duration::from_secs(3600);
 const DIR_PREFIX: &str = ".mlx-qwen4-packed-v2-";
+/// The mapped expert pack of the same identity lives beside the chunk dir
+/// under this prefix; both are one checkpoint's cache to the sweep and cap.
+pub(super) const MAPPED_DIR_PREFIX: &str = ".mlx-qwen4-mapped-v3-";
+/// A mapped dir's stable lock file: SH while a model reads or builds the
+/// pack, EX by an evictor. Never renamed or unlinked (flock needs the inode).
+const MAPPED_LOCK: &str = "lock";
 /// Optional total cap across all identity dirs; unset/<=0 keeps the per-dir
 /// DISK_BUDGET behaviour.
 const TOTAL_CAP_ENV: &str = "MLX_QWEN4_PACKED_CACHE_MAX_GB";
@@ -403,20 +409,50 @@ pub(super) fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
     Some(unsafe { stat.assume_init() })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DirKind {
+    Chunks,
+    Mapped,
+}
+
 /// Producer identities are exactly 64 lowercase hex chars (the blake-style
-/// source fingerprint). Anything else under the prefix — `.mlx-qwen4-packed-
-/// v2-backup`, a typo, a manual copy — is foreign: never sized, never swept,
-/// never evicted.
-pub(super) fn dir_name_identity(dir: &Path) -> Option<&str> {
-    let suffix = dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)?;
-    if suffix.len() == 64
+/// source fingerprint) under the chunk prefix or the mapped prefix. Anything
+/// else under either prefix — `.mlx-qwen4-packed-v2-backup`, a typo, a manual
+/// copy — is foreign: never sized, never swept, never evicted.
+fn identity_dir_kind(dir: &Path) -> Option<(DirKind, &str)> {
+    let name = dir.file_name()?.to_str()?;
+    let (kind, suffix) = match name.strip_prefix(DIR_PREFIX) {
+        Some(suffix) => (DirKind::Chunks, suffix),
+        None => (DirKind::Mapped, name.strip_prefix(MAPPED_DIR_PREFIX)?),
+    };
+    (suffix.len() == 64
         && suffix
             .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Some(suffix);
-    }
-    None
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    .then_some((kind, suffix))
+}
+
+pub(super) fn dir_name_identity(dir: &Path) -> Option<&str> {
+    identity_dir_kind(dir).map(|(_, identity)| identity)
+}
+
+fn is_mapped_dir(dir: &Path) -> bool {
+    identity_dir_kind(dir).is_some_and(|(kind, _)| kind == DirKind::Mapped)
+}
+
+/// The other format's dir of the same identity. A load uses both, so the
+/// sweep and the cap treat the current dir's twin as current too.
+fn twin_dir(dir: &Path) -> Option<PathBuf> {
+    let (kind, identity) = identity_dir_kind(dir)?;
+    let prefix = match kind {
+        DirKind::Chunks => MAPPED_DIR_PREFIX,
+        DirKind::Mapped => DIR_PREFIX,
+    };
+    Some(dir.parent()?.join(format!("{prefix}{identity}")))
+}
+
+fn is_current(dir: &Path, current: &Path) -> bool {
+    dir == current || twin_dir(current).is_some_and(|twin| twin == dir)
 }
 
 /// Producer chunk files are `{chunk_key}.pack` where chunk_key is a SHA-256
@@ -549,6 +585,33 @@ fn pack_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// A mapped dir's spend: its `<tensor>.mapped` files and the `.<tensor>.tmp`
+/// a builder is filling or a crash left (the next load rebuilds it in
+/// place, so it stays spend until then). Lock files and the manifest are
+/// not counted, like the chunk dir's ledger.
+fn is_mapped_entry(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.ends_with(".mapped") || (name.starts_with('.') && name.ends_with(".tmp"))
+    })
+}
+
+fn mapped_bytes(dir: &Path) -> u64 {
+    if !is_real_dir(dir) {
+        return 0;
+    }
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| is_mapped_entry(&e.file_name()))
+                .filter_map(|e| fs::symlink_metadata(e.path()).ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// Bytes the sweep deliberately retains in `{uuid}.tmp` crash leftovers:
 /// regular files younger than `PACKED_SWEEP_MIN_AGE` — the same freshness
 /// gate the sweep applies before unlinking one. Aged tmps and non-regular
@@ -602,8 +665,10 @@ fn sibling_pack_estimate(dir: &Path) -> u64 {
 }
 
 /// Root-wide spend: `current_used` for `current` plus `sibling_bytes` over
-/// every other identity dir under `parent`. Both inputs are expected to
-/// include retained `.tmp` leftovers — `sibling_pack_estimate`/
+/// every other chunk dir under `parent` and `mapped_bytes` over every other
+/// mapped dir (the current dir's twin included: its bytes are real spend,
+/// only eviction treats it as current). Both inputs are expected to include
+/// retained `.tmp` leftovers — `sibling_pack_estimate`/
 /// `reconciled_sibling_pack_spend` already add them, and the writer passes
 /// `used + retained_tmp_bytes` as `current_used`. Read errors count as 0 —
 /// this is an advisory estimate, never a load failure.
@@ -619,42 +684,56 @@ fn root_pack_spend(
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| p != current && is_real_dir(p) && dir_name_identity(p).is_some())
-                .map(|p| sibling_bytes(&p))
+                .map(|p| {
+                    if is_mapped_dir(&p) {
+                        mapped_bytes(&p)
+                    } else {
+                        sibling_bytes(&p)
+                    }
+                })
                 .sum()
         })
         .unwrap_or(0);
     current_used.saturating_add(siblings)
 }
 
-/// Try the writer flock non-blockingly. Some(_) keeps the fd as a guard; the
-/// inner None means no ledger exists (nothing can be holding a lock). None
-/// means a live writer or an error: keep the dir.
-fn try_budget_lock(dir: &Path) -> Option<Option<File>> {
-    let path = dir.join("budget");
-    // macOS flock requires a writable fd for LOCK_EX; a read-only ledger falls
+/// Try an exclusive flock on `path` non-blockingly. Some(_) keeps the fd as
+/// a guard; the inner None means the file does not exist (nothing can be
+/// holding a lock). None means a live holder or an error: keep the dir.
+fn try_exclusive_lock(path: &Path) -> Option<Option<File>> {
+    // macOS flock requires a writable fd for LOCK_EX; a read-only file falls
     // back to read-only and relies on the kernel accepting or refusing it.
     let file = match OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
-        .or_else(|_| File::open(&path))
+        .open(path)
+        .or_else(|_| File::open(path))
     {
         Ok(f) => f,
-        // No ledger means no writer ever locked it; treat as free.
         Err(e) if e.kind() == ErrorKind::NotFound => return Some(None),
         Err(_) => return None,
     };
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return None;
     }
-    // The ledger could have been unlinked between open and flock; only act on
-    // the dir whose ledger we actually hold.
+    // The file could have been unlinked between open and flock; only act on
+    // the dir whose lock inode we actually hold.
     let held = file.metadata().ok();
-    let live = fs::metadata(&path).ok();
+    let live = fs::metadata(path).ok();
     match (held, live) {
         (Some(a), Some(b)) if a.dev() == b.dev() && a.ino() == b.ino() => Some(Some(file)),
         _ => None,
     }
+}
+
+/// The chunk dir's writer lock: its `budget` ledger.
+fn try_budget_lock(dir: &Path) -> Option<Option<File>> {
+    try_exclusive_lock(&dir.join("budget"))
+}
+
+/// The mapped dir's lock file; every open `MappedPack` holds it SH.
+fn try_mapped_lock(dir: &Path) -> Option<Option<File>> {
+    try_exclusive_lock(&dir.join(MAPPED_LOCK))
 }
 
 /// `try_budget_lock` relative to a pinned dir fd: the ledger is opened
@@ -735,32 +814,47 @@ fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) 
         );
         return 0;
     };
-    let Some(_guard) = try_budget_lock(dir) else {
-        debug!(
-            "packed cache: keeping {} (writer holds budget lock)",
-            dir.display()
-        );
-        return 0;
+    let _guard = if is_mapped_dir(dir) {
+        // A mapped dir has no creation window: `hold_mapped_dir` takes the
+        // SH lock before the manifest is written, so a lock-free manifested
+        // dir is one nobody is reading or building.
+        let Some(guard) = try_mapped_lock(dir) else {
+            debug!(
+                "packed cache: keeping {} (mapped pack is open or being built)",
+                dir.display()
+            );
+            return 0;
+        };
+        guard
+    } else {
+        let Some(guard) = try_budget_lock(dir) else {
+            debug!(
+                "packed cache: keeping {} (writer holds budget lock)",
+                dir.display()
+            );
+            return 0;
+        };
+        // A dir without a budget ledger whose manifest still recomputes to
+        // its dir-name identity sits in `new_at`'s creation window: the
+        // manifest is written eagerly but `budget` only appears at the first
+        // `write`. Deleting it would vanish a live load's cache root
+        // mid-write. A stale or mismatched manifest means abandonment, not
+        // creation — fall through to the caller's verdict.
+        if guard.is_none()
+            && is_real_dir(dir)
+            && dir.join(".manifest").is_file()
+            && identity_from_manifest(dir)
+                .ok()
+                .is_some_and(|identity| dir_name_identity(dir) == Some(identity.as_str()))
+        {
+            debug!(
+                "packed cache: keeping {} (verified manifest without ledger is mid-creation)",
+                dir.display()
+            );
+            return 0;
+        }
+        guard
     };
-    // A dir without a budget ledger whose manifest still recomputes to its
-    // dir-name identity sits in `new_at`'s creation window: the manifest is
-    // written eagerly but `budget` only appears at the first `write`.
-    // Deleting it would vanish a live load's cache root mid-write. A stale
-    // or mismatched manifest means abandonment, not creation — fall through
-    // to the caller's verdict.
-    if _guard.is_none()
-        && is_real_dir(dir)
-        && dir.join(".manifest").is_file()
-        && identity_from_manifest(dir)
-            .ok()
-            .is_some_and(|identity| dir_name_identity(dir) == Some(identity.as_str()))
-    {
-        debug!(
-            "packed cache: keeping {} (verified manifest without ledger is mid-creation)",
-            dir.display()
-        );
-        return 0;
-    }
     // Recheck under the held lock: the dir may have been rebuilt while we
     // waited, in which case our lock no longer proves staleness.
     if !still_stale(dir) {
@@ -796,7 +890,7 @@ pub(super) fn stamp_mtime(path: &Path) {
     let _ = file.set_modified(SystemTime::now());
 }
 
-fn packed_total_cap() -> Option<u64> {
+pub(super) fn packed_total_cap() -> Option<u64> {
     let raw = std::env::var(TOTAL_CAP_ENV).ok()?;
     raw.trim()
         .parse::<f64>()
@@ -828,9 +922,61 @@ fn packed_root_cap_lock(parent: &Path) -> Option<File> {
     Some(file)
 }
 
+/// The mapped builder's root cap lock: a chunk writer's estimate→reserve
+/// section lasts milliseconds, so wait up to a second for it instead of
+/// losing a 0.5-1 GiB file build to a busy lock.
+fn packed_root_cap_lock_wait(parent: &Path) -> Option<File> {
+    for _ in 0..50 {
+        if let Some(guard) = packed_root_cap_lock(parent) {
+            return Some(guard);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// Admission for one mapped-pack file of `file_bytes` in the mapped `dir`:
+/// the free-space reserve, and under a configured total cap the root-wide
+/// spend after evicting idle siblings, under the root cap lock so a chunk
+/// writer cannot admit against the same room. `Err` carries the reason.
+pub(super) fn admit_mapped_file(
+    dir: &Path,
+    dirfd: &File,
+    file_bytes: u64,
+    cap: Option<u64>,
+) -> Result<()> {
+    let gib = file_bytes as f64 / (1u64 << 30) as f64;
+    if !has_disk_space(dirfd, file_bytes) {
+        return Err(err(format!(
+            "Not enough disk space for {gib:.2} GiB plus the 16 GiB reserve"
+        )));
+    }
+    let Some((cap, parent)) = cap.zip(dir.parent()) else {
+        return Ok(());
+    };
+    let _root_guard = packed_root_cap_lock_wait(parent)
+        .ok_or_else(|| err(format!("{TOTAL_CAP_ENV} admission lock stayed busy")))?;
+    let own = mapped_bytes(dir);
+    let fits = |spend: u64| spend.saturating_add(file_bytes) <= cap;
+    if !fits(root_pack_spend(parent, dir, own, sibling_pack_estimate)) {
+        enforce_packed_total_cap(parent, dir, cap.saturating_sub(file_bytes));
+        if !fits(root_pack_spend(
+            parent,
+            dir,
+            own,
+            reconciled_sibling_pack_spend,
+        )) {
+            return Err(err(format!(
+                "{TOTAL_CAP_ENV} leaves no room for a {gib:.2} GiB mapped file"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Enforce the optional total cap: evict least-recently-used sibling dirs
-/// first, then shed the oldest `.pack` files inside the current dir under its
-/// own ledger lock.
+/// of either format first (never `current` or its twin), then shed the
+/// oldest `.pack` files inside a current chunk dir under its own ledger lock.
 fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
     let mut dirs: Vec<(PathBuf, Option<SystemTime>)> = fs::read_dir(parent)
         .map(|entries| {
@@ -857,7 +1003,7 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
     // manifest-less dirs are never cap-evicted.
     let cutoff = SystemTime::now() - PACKED_SWEEP_MIN_AGE;
     let mut reclaimed = 0u64;
-    for (dir, snapshot) in dirs.iter().filter(|(p, _)| p != current) {
+    for (dir, snapshot) in dirs.iter().filter(|(p, _)| !is_current(p, current)) {
         if total <= cap {
             break;
         }
@@ -874,7 +1020,7 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
         total = total.saturating_sub(removed);
         reclaimed += removed;
     }
-    if total > cap {
+    if total > cap && !is_mapped_dir(current) {
         // Shed oldest .pack files in the current dir under its own budget
         // lock. Both the lock and the unlinks anchor to a pinned dir fd: a
         // `current` path swapped for a symlink since its check cannot make
@@ -932,8 +1078,8 @@ fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
     }
 }
 
-/// Sweep sibling `.mlx-qwen4-packed-v2-*` dirs for orphans and enforce the
-/// optional total cap. Never fatal.
+/// Sweep sibling `.mlx-qwen4-packed-v2-*` and `.mlx-qwen4-mapped-v3-*` dirs
+/// for orphans and enforce the optional total cap. Never fatal.
 fn sweep_packed_cache(parent: &Path, current: &Path) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Ok(entries) = fs::read_dir(parent) else {
@@ -941,7 +1087,8 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
-            if dir == current || !is_real_dir(&dir) || dir_name_identity(&dir).is_none() {
+            if is_current(&dir, current) || !is_real_dir(&dir) || dir_name_identity(&dir).is_none()
+            {
                 continue;
             }
             if let Some(reason) = packed_orphan_reason(&dir) {
@@ -1026,7 +1173,7 @@ fn packed_deletion_guard(
 /// in flight makes both sides fail — the dir cannot be removed out from
 /// under an open. A read that loses the race proceeds unguarded and simply
 /// observes the removal (miss or fd-survives), never corrupt data.
-struct ReadGuard {
+pub(super) struct ReadGuard {
     dir: Option<PathBuf>,
     _flock: Option<File>,
 }
@@ -1040,6 +1187,61 @@ impl ReadGuard {
     fn live(&self) -> bool {
         self.dir.is_some() && self._flock.is_some()
     }
+
+    /// Register `dir` in the reader registry and keep `flock` for the
+    /// guard's lifetime. Readers BLOCK on the registry mutex — its critical
+    /// sections are tiny (a count bump, or a whole remove_dir_all a deleter
+    /// holds it through). A blocking lock still cannot straddle a delete:
+    /// either we register before the deleter's try_lock (it sees the count
+    /// and skips) or after it finishes (the dir is gone and the open
+    /// misses). try_lock would be wrong here — a parallel reader's brief
+    /// bump would fail the lock and spuriously degrade a healthy read to a
+    /// miss.
+    fn registered(dir: &Path, flock: Option<File>) -> Self {
+        let mut registry = packed_readers()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *registry.entry(dir.to_path_buf()).or_insert(0) += 1;
+        drop(registry);
+        Self {
+            dir: Some(dir.to_path_buf()),
+            _flock: flock,
+        }
+    }
+}
+
+/// Hold a mapped dir for a `MappedPack`'s lifetime: the in-process registry
+/// entry plus an SH flock on its lock file, both of which `locked_remove`
+/// must win before removing the dir. Taken before anything is written into
+/// the dir, so the dir is never evictable while a load builds or reads it.
+/// `Err` means an evictor holds the lock or removed the dir meanwhile; the
+/// load then keeps the chunk reader.
+pub(super) fn hold_mapped_dir(dir: &Path, dirfd: &File) -> io::Result<ReadGuard> {
+    let lock = dir_open_at(
+        dirfd,
+        OsStr::new(MAPPED_LOCK),
+        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o644,
+    )?;
+    // SAFETY: `lock` owns an open descriptor for the flock's lifetime.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "mapped pack dir is being evicted",
+        ));
+    }
+    // An evictor that won the EX lock before our open removes the whole dir:
+    // the name we hold is then gone from the (unlinked) directory.
+    let held = lock.metadata()?;
+    let live = dir_stat(dirfd, OsStr::new(MAPPED_LOCK))
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "mapped pack dir was removed"))?;
+    if held.dev() != live.st_dev as u64 || held.ino() != live.st_ino {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "mapped pack dir was replaced",
+        ));
+    }
+    Ok(ReadGuard::registered(dir, Some(lock)))
 }
 
 impl Drop for ReadGuard {
@@ -1058,19 +1260,6 @@ impl Drop for ReadGuard {
 }
 
 fn read_guard(root: &Path) -> ReadGuard {
-    // Readers BLOCK on the registry mutex — its critical sections are tiny
-    // (a count bump, or a whole remove_dir_all a deleter holds it through).
-    // A blocking lock still cannot straddle a delete: either we register
-    // before the deleter's try_lock (it sees the count and skips) or after
-    // it finishes (the dir is gone and the open misses). try_lock would be
-    // wrong here — a parallel reader's brief bump would fail the lock and
-    // spuriously degrade a healthy read to a miss.
-    let mut registry = packed_readers()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    *registry.entry(root.to_path_buf()).or_insert(0) += 1;
-    drop(registry);
-    let dir = Some(root.to_path_buf());
     let flock = File::open(root.join("budget")).ok().and_then(|file| {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
             return None;
@@ -1084,7 +1273,7 @@ fn read_guard(root: &Path) -> ReadGuard {
             _ => None,
         }
     });
-    ReadGuard { dir, _flock: flock }
+    ReadGuard::registered(root, flock)
 }
 
 /// Remove the oldest `.pack` files in `dir` (by mtime — the recency witness
@@ -1190,9 +1379,9 @@ impl PackedCache {
         dir_name_identity(&self.root)
     }
 
-    /// The cache root every identity dir of either format lives under.
-    pub(super) fn cache_root(&self) -> Option<&Path> {
-        self.root.parent()
+    /// This checkpoint's mapped pack dir beside the chunk dir.
+    pub(super) fn mapped_dir(&self) -> Option<PathBuf> {
+        twin_dir(&self.root)
     }
 
     pub(super) fn manifest(&self) -> Option<&[u8]> {
@@ -2359,10 +2548,173 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let operation = if std::env::var_os("MLX_NODE_PACKED_LOCK_TEST_SHARED").is_some() {
+            libc::LOCK_SH
+        } else {
+            libc::LOCK_EX
+        };
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), operation) }, 0);
         fs::write(acquired, b"acquired").unwrap();
         // The parent kills this process once the sweep assertion completes.
         std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// A mapped dir fixture: `<letter>*64` identity, one `x.mapped` of
+    /// `bytes`, a manifest whose source is gone, every witness aged past the
+    /// sweep grace when `aged`.
+    fn mapped_fixture(parent: &Path, letter: char, bytes: usize, aged: bool) -> PathBuf {
+        let dir = parent.join(format!(
+            "{MAPPED_DIR_PREFIX}{}",
+            letter.to_string().repeat(64)
+        ));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("x.mapped"), vec![0_u8; bytes]).unwrap();
+        fs::write(dir.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        fs::write(dir.join(MAPPED_LOCK), b"").unwrap();
+        if aged {
+            for entry in ["x.mapped", ".manifest", MAPPED_LOCK] {
+                age(&dir.join(entry), 7200);
+            }
+            age_dir(&dir, 7200);
+        }
+        dir
+    }
+
+    #[test]
+    fn stale_mapped_dir_is_swept_and_the_current_identity_twin_is_kept() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        // The current identity's mapped dir, with the same orphan-looking
+        // manifest and age as the stale sibling: only `is_current` keeps it.
+        let twin = cache.mapped_dir().unwrap();
+        assert_eq!(twin_dir(&twin).as_deref(), Some(cache.root.as_path()));
+        fs::create_dir(&twin).unwrap();
+        fs::write(twin.join("x.mapped"), vec![0_u8; 100]).unwrap();
+        fs::write(twin.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        age(&twin.join("x.mapped"), 7200);
+        age(&twin.join(".manifest"), 7200);
+        age_dir(&twin, 7200);
+        let stale = mapped_fixture(&parent, 'a', 100, true);
+        assert_eq!(
+            packed_orphan_reason(&stale),
+            Some("unreadable manifest or missing source")
+        );
+        // A mapped dir whose name is not a 64-hex identity is foreign.
+        let foreign = parent.join(format!("{MAPPED_DIR_PREFIX}backup"));
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        age(&foreign.join(".manifest"), 7200);
+        age_dir(&foreign, 7200);
+        let _cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        assert!(
+            !stale.exists(),
+            "an aged mapped dir with a dead source is an orphan"
+        );
+        assert!(
+            twin.exists(),
+            "the current identity's mapped dir is current"
+        );
+        assert!(foreign.exists());
+        assert!(cache.root.exists());
+    }
+
+    #[test]
+    fn total_cap_counts_mapped_bytes_and_evicts_idle_mapped_dirs_but_never_the_current_twin() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        let twin = cache.mapped_dir().unwrap();
+        fs::create_dir(&twin).unwrap();
+        fs::write(twin.join("x.mapped"), vec![0_u8; 100]).unwrap();
+        fs::write(twin.join(".blk.1.tmp"), vec![0_u8; 50]).unwrap();
+        fs::write(twin.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        fs::write(twin.join(MAPPED_LOCK), b"").unwrap();
+        for entry in ["x.mapped", ".blk.1.tmp", ".manifest", MAPPED_LOCK] {
+            age(&twin.join(entry), 7200);
+        }
+        age_dir(&twin, 7200);
+        let idle = mapped_fixture(&parent, 'a', 100, true);
+        let fresh = mapped_fixture(&parent, 'b', 100, false);
+        // Mapped files and staging files are spend; manifests and locks not.
+        assert_eq!(mapped_bytes(&twin), 150);
+        assert_eq!(
+            root_pack_spend(&parent, &cache.root, 0, sibling_pack_estimate),
+            350
+        );
+        assert_eq!(
+            root_pack_spend(&parent, &twin, mapped_bytes(&twin), sibling_pack_estimate),
+            350,
+            "seen from the mapped dir the chunk twin is an empty sibling"
+        );
+        // Over the cap: the idle sibling is the only eviction — the fresh
+        // one is inside the grace and the aged twin is current.
+        enforce_packed_total_cap(&parent, &cache.root, 10);
+        assert!(!idle.exists());
+        assert!(fresh.exists());
+        assert!(twin.exists());
+        assert!(
+            twin.join("x.mapped").is_file(),
+            "a mapped dir is never shed file by file"
+        );
+    }
+
+    #[test]
+    fn held_mapped_dir_lock_blocks_sweep_and_cap_eviction() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let current = parent.join(format!("{DIR_PREFIX}{}", "c".repeat(64)));
+        fs::create_dir(&current).unwrap();
+        // Another process reads the pack: its SH lock keeps the orphan.
+        let stale = mapped_fixture(&parent, 'a', 100, true);
+        let acquired = temp.0.join("child.acquired");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("models::qwen4_exp::packed_cache::tests::packed_budget_lock_child")
+            .arg("--ignored")
+            .env("MLX_NODE_PACKED_LOCK_TEST_PATH", stale.join(MAPPED_LOCK))
+            .env("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED", &acquired)
+            .env("MLX_NODE_PACKED_LOCK_TEST_SHARED", "1")
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if acquired.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(acquired.is_file(), "child never acquired the mapped lock");
+        sweep_packed_cache(&parent, &current);
+        assert!(stale.exists(), "an open pack is not swept");
+        enforce_packed_total_cap(&parent, &current, 0);
+        assert!(stale.exists(), "an open pack is not cap-evicted");
+        child.kill().unwrap();
+        let _ = child.wait();
+        sweep_packed_cache(&parent, &current);
+        assert!(!stale.exists());
+        // The same process holding the dir through `hold_mapped_dir` (a
+        // loaded MappedPack) is excluded too, by the registry and the lock.
+        let held = mapped_fixture(&parent, 'b', 100, true);
+        let dirfd = open_dir_nofollow(&held).unwrap();
+        let guard = hold_mapped_dir(&held, &dirfd).unwrap();
+        assert!(guard.live());
+        assert_eq!(locked_remove(&held, "test", |_| true), 0);
+        assert!(held.exists());
+        drop(guard);
+        assert!(locked_remove(&held, "test", |_| true) > 0);
+        assert!(!held.exists());
+        // Holding a dir an evictor removed meanwhile is refused.
+        let gone = mapped_fixture(&parent, 'd', 100, true);
+        let dirfd = open_dir_nofollow(&gone).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        assert!(hold_mapped_dir(&gone, &dirfd).is_err());
     }
 
     #[test]

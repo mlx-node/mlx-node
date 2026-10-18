@@ -21,7 +21,6 @@ use tracing::{info, warn};
 
 use super::packed_cache::{self, ArrayInfo, Header, VerifiedChunk};
 
-pub(super) const DIR_PREFIX: &str = ".mlx-qwen4-mapped-v3-";
 /// Apple page size: every section offset and length is a multiple, so a
 /// section maps as one no-copy buffer.
 pub(super) const PAGE: u64 = 16 << 10;
@@ -242,6 +241,13 @@ fn tmp_name(name: &str) -> String {
     format!(".{name}.tmp")
 }
 
+/// The tensor's build lock. Never renamed or unlinked: a lock on the
+/// staging inode would travel with the rename and leave the name free for
+/// a second builder to rebuild, or truncate, the published file.
+fn lock_name(name: &str) -> String {
+    format!(".{name}.lock")
+}
+
 /// Builder writes only: 74 GiB written through the page cache would evict
 /// the pages the running model reads. Reads must keep the page cache, the
 /// tier that serves warm re-reads; F_NOCACHE reads lost every warm row.
@@ -425,48 +431,84 @@ fn fetch_group(
     Ok(out)
 }
 
-/// Build one tensor's file in the pinned dir: a flock-held `.tmp`, the
-/// sections written in expert order with running checksums, the header page,
-/// fsync, a read-back verification, then the atomic rename. `None` when
-/// another builder holds this tensor's staging file.
-fn build_file(
-    dirfd: &File,
-    identity: &str,
-    source: &dyn ExpertSource,
-) -> Result<Option<MappedHeader>> {
+/// The pinned dir a pack is opened or built in.
+struct Site<'a> {
+    dir: &'a Path,
+    dirfd: &'a File,
+    identity: &'a str,
+    /// Re-hash every section of every file opened.
+    verify: bool,
+    /// The configured root-wide cache cap, if any.
+    cap: Option<u64>,
+}
+
+impl Site<'_> {
+    fn open(&self, name: &str) -> Result<Option<LayerFile>> {
+        LayerFile::open(self.dirfd, name, self.identity, self.verify)
+    }
+}
+
+enum Outcome {
+    /// Valid under the build lock: another builder published it meanwhile.
+    Opened(LayerFile),
+    Built(LayerFile),
+    /// Another builder holds this tensor's lock.
+    Busy,
+}
+
+/// Build one tensor's file in the pinned dir under its lock file: the
+/// final rechecked (another builder may have published it), an invalid
+/// final unlinked, the `.tmp` created afresh, the sections written in expert
+/// order with running checksums, the header page, fsync, a read-back
+/// verification, the atomic rename and the directory fsync, all before the
+/// lock is released.
+fn build_file(site: &Site<'_>, source: &dyn ExpertSource) -> Result<Outcome> {
     let name = source.name();
-    let tmp = tmp_name(name);
-    let staging = packed_cache::dir_open_at(
-        dirfd,
-        OsStr::new(&tmp),
+    let lock = packed_cache::dir_open_at(
+        site.dirfd,
+        OsStr::new(&lock_name(name)),
         libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o644,
     )
     .map_err(err)?;
-    // SAFETY: `staging` owns an open descriptor for the flock's lifetime.
-    if unsafe { libc::flock(staging.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Ok(None);
+    // SAFETY: `lock` owns an open descriptor for the flock's lifetime.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(Outcome::Busy);
     }
-    let result = write_file(dirfd, &staging, identity, source);
-    if result.is_err() {
-        let _ = packed_cache::dir_unlinkat(dirfd, OsStr::new(&tmp));
+    match site.open(name) {
+        Ok(Some(file)) => return Ok(Outcome::Opened(file)),
+        Ok(None) => {}
+        Err(e) => {
+            warn!("qwen4 mapped pack: rebuilding {name}: {e}");
+            let _ = packed_cache::dir_unlinkat(site.dirfd, OsStr::new(&file_name(name)));
+        }
     }
-    result.map(Some)
+    let tmp = tmp_name(name);
+    let staging = packed_cache::dir_open_at(
+        site.dirfd,
+        OsStr::new(&tmp),
+        libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o644,
+    )
+    .map_err(err)?;
+    if let Err(e) = write_file(site, &staging, source) {
+        let _ = packed_cache::dir_unlinkat(site.dirfd, OsStr::new(&tmp));
+        return Err(e);
+    }
+    let _ = site.dirfd.sync_all();
+    match LayerFile::open(site.dirfd, name, site.identity, false)? {
+        Some(file) => Ok(Outcome::Built(file)),
+        None => Err(err(format!("{name} vanished after its build"))),
+    }
 }
 
-fn write_file(
-    dirfd: &File,
-    staging: &File,
-    identity: &str,
-    source: &dyn ExpertSource,
-) -> Result<MappedHeader> {
+fn write_file(site: &Site<'_>, staging: &File, source: &dyn ExpertSource) -> Result<MappedHeader> {
     let name = source.name();
     let experts = source.experts();
     let rows = source.rows_per_expert();
     if experts == 0 || rows == 0 {
         return Err(err(format!("{name} has no experts to pack")));
     }
-    staging.set_len(0).map_err(err)?;
     set_nocache(staging);
     let first = fetch_group(source, 0, BUILD_GROUP.min(experts), None)?;
     let prototype = first[0].clone();
@@ -503,12 +545,8 @@ fn write_file(
         cursor += round_up(payload);
     }
     let file_bytes = cursor;
-    if !packed_cache::has_disk_space(dirfd, file_bytes) {
-        return Err(err(format!(
-            "Not enough disk space for {name} ({:.2} GiB plus the 16 GiB reserve)",
-            file_bytes as f64 / (1u64 << 30) as f64
-        )));
-    }
+    packed_cache::admit_mapped_file(site.dir, site.dirfd, file_bytes, site.cap)
+        .map_err(|e| err(format!("{name}: {}", e.reason)))?;
     staging.set_len(file_bytes).map_err(err)?;
     let mut hashers: Vec<Sha256> = sections.iter().map(|_| Sha256::new()).collect();
     let mut pending = Some(first);
@@ -535,7 +573,7 @@ fn write_file(
         section.sha256 = hex(&hasher.finalize());
     }
     let header = MappedHeader {
-        identity: identity.into(),
+        identity: site.identity.into(),
         name: name.into(),
         experts: experts as u64,
         rows_per_expert: rows as u64,
@@ -558,7 +596,7 @@ fn write_file(
         return Err(err(format!("{name} header read-back differs")));
     }
     verify_sections(staging, &header)?;
-    packed_cache::dir_renameat(dirfd, &tmp_name(name), &file_name(name)).map_err(err)?;
+    packed_cache::dir_renameat(site.dirfd, &tmp_name(name), &file_name(name)).map_err(err)?;
     Ok(header)
 }
 
@@ -574,22 +612,31 @@ pub(super) struct MappedPack {
     stamp: Mutex<Instant>,
     reads: AtomicU64,
     bytes: AtomicU64,
+    /// Keeps the dir out of the cache sweep's eviction while this pack lives.
+    _hold: packed_cache::ReadGuard,
 }
 
 impl MappedPack {
     /// Open every valid tensor file under `dir`, rebuild invalid ones and
     /// build missing ones from `sources`. Building stops at the first
-    /// failure (disk, source) and the files that exist stay usable; a tensor
-    /// another process is building right now is left out of this pack.
-    /// Sections are hashed when built and read back; an open checks the
-    /// header and the file size only.
+    /// failure (disk, cap, source) and the files that exist stay usable; a
+    /// tensor another process is building right now is left out of this
+    /// pack. Sections are hashed when built and read back; an open checks
+    /// the header and the file size only.
     pub(super) fn open_or_build(
         dir: &Path,
         identity: &str,
         manifest: Option<&[u8]>,
         sources: &[&dyn ExpertSource],
     ) -> Result<(Self, BuildReport)> {
-        Self::open_or_build_with(dir, identity, manifest, sources, false)
+        Self::open_or_build_with(
+            dir,
+            identity,
+            manifest,
+            sources,
+            false,
+            packed_cache::packed_total_cap(),
+        )
     }
 
     /// `verify` re-hashes every section of every file it opens.
@@ -600,7 +647,19 @@ impl MappedPack {
         manifest: Option<&[u8]>,
         sources: &[&dyn ExpertSource],
     ) -> Result<(Self, BuildReport)> {
-        Self::open_or_build_with(dir, identity, manifest, sources, true)
+        Self::open_or_build_with(dir, identity, manifest, sources, true, None)
+    }
+
+    /// Builds under an injected root-wide cap instead of the environment's.
+    #[cfg(test)]
+    pub(super) fn open_or_build_capped(
+        dir: &Path,
+        identity: &str,
+        manifest: Option<&[u8]>,
+        sources: &[&dyn ExpertSource],
+        cap: u64,
+    ) -> Result<(Self, BuildReport)> {
+        Self::open_or_build_with(dir, identity, manifest, sources, false, Some(cap))
     }
 
     fn open_or_build_with(
@@ -609,17 +668,26 @@ impl MappedPack {
         manifest: Option<&[u8]>,
         sources: &[&dyn ExpertSource],
         verify: bool,
+        cap: Option<u64>,
     ) -> Result<(Self, BuildReport)> {
         packed_cache::unlink_if_symlink(dir);
         std::fs::create_dir_all(dir).map_err(err)?;
         let dirfd = packed_cache::open_dir_nofollow(dir)
             .ok_or_else(|| err(format!("{} is not a real directory", dir.display())))?;
+        let hold = packed_cache::hold_mapped_dir(dir, &dirfd).map_err(err)?;
         if let Some(manifest) = manifest
             && packed_cache::dir_stat(&dirfd, OsStr::new(".manifest"))
                 .is_none_or(|stat| (stat.st_mode & libc::S_IFMT) != libc::S_IFREG)
         {
             packed_cache::dir_write_file(&dirfd, ".manifest", manifest).map_err(err)?;
         }
+        let site = Site {
+            dir,
+            dirfd: &dirfd,
+            identity,
+            verify,
+            cap,
+        };
         let mut report = BuildReport {
             opened: 0,
             built: 0,
@@ -630,48 +698,42 @@ impl MappedPack {
         let mut layer: Option<(String, u64, Duration)> = None;
         for source in sources {
             let name = source.name();
-            match LayerFile::open(&dirfd, name, identity, verify) {
-                Ok(Some(file)) => {
-                    report.opened += 1;
-                    files.insert(name.to_owned(), file);
-                    continue;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!("qwen4 mapped pack: rebuilding {name}: {e}");
-                    let _ = packed_cache::dir_unlinkat(&dirfd, OsStr::new(&file_name(name)));
-                }
+            // An unlocked peek: a valid file needs no lock. Anything else is
+            // decided again under the tensor's lock inside `build_file`.
+            if let Ok(Some(file)) = site.open(name) {
+                report.opened += 1;
+                files.insert(name.to_owned(), file);
+                continue;
             }
             if !building {
                 report.skipped += 1;
                 continue;
             }
             let started = Instant::now();
-            match build_file(&dirfd, identity, *source) {
-                Ok(Some(header)) => {
+            match build_file(&site, *source) {
+                Ok(Outcome::Opened(file)) => {
+                    report.opened += 1;
+                    files.insert(name.to_owned(), file);
+                }
+                Ok(Outcome::Built(file)) => {
                     let elapsed = started.elapsed();
                     let prefix = name.split(".ffn_").next().unwrap_or(name).to_owned();
                     match &mut layer {
                         Some((current, bytes, time)) if *current == prefix => {
-                            *bytes += header.file_bytes;
+                            *bytes += file.header.file_bytes;
                             *time += elapsed;
                         }
                         _ => {
                             if let Some((current, bytes, time)) = layer.take() {
                                 log_layer(&current, bytes, time);
                             }
-                            layer = Some((prefix, header.file_bytes, elapsed));
+                            layer = Some((prefix, file.header.file_bytes, elapsed));
                         }
                     }
-                    match LayerFile::open(&dirfd, name, identity, false)? {
-                        Some(file) => {
-                            report.built += 1;
-                            files.insert(name.to_owned(), file);
-                        }
-                        None => return Err(err(format!("{name} vanished after its build"))),
-                    }
+                    report.built += 1;
+                    files.insert(name.to_owned(), file);
                 }
-                Ok(None) => {
+                Ok(Outcome::Busy) => {
                     warn!("qwen4 mapped pack: {name} is being built by another process");
                     report.skipped += 1;
                 }
@@ -692,6 +754,7 @@ impl MappedPack {
                 stamp: Mutex::new(Instant::now()),
                 reads: AtomicU64::new(0),
                 bytes: AtomicU64::new(0),
+                _hold: hold,
             },
             report,
         ))
@@ -827,8 +890,32 @@ fn log_layer(layer: &str, bytes: u64, time: Duration) {
 mod tests {
     use super::*;
     use crate::array::MxArray;
+    use crate::models::qwen4_exp::packed_cache::MAPPED_DIR_PREFIX as DIR_PREFIX;
     use crate::models::qwen4_exp::weights::Weight;
     use std::fs;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// A second process holding `path` exclusively until killed.
+    fn lock_holder(temp: &Path, path: &Path) -> std::process::Child {
+        let acquired = temp.join(format!("{}.acquired", uuid::Uuid::new_v4()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("models::qwen4_exp::packed_cache::tests::packed_budget_lock_child")
+            .arg("--ignored")
+            .env("MLX_NODE_PACKED_LOCK_TEST_PATH", path)
+            .env("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED", &acquired)
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if acquired.is_file() {
+                return child;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child never acquired {}", path.display());
+    }
 
     struct Temp(PathBuf);
     impl Temp {
@@ -1199,29 +1286,157 @@ mod tests {
                 "{name} must be byte-identical after the resumed build"
             );
         }
-        // A staging file another builder holds locked is left alone.
-        let held = packed_cache::dir_open_at(
-            &packed_cache::open_dir_nofollow(&partial).unwrap(),
-            OsStr::new(&tmp_name(&gate)),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
-            0o644,
-        )
-        .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        // Built tensors leave their lock files behind for the next builder;
+        // the copied, merely opened one took no lock. A tensor whose lock
+        // file another process holds is left alone.
+        assert!(partial.join(lock_name(&up)).is_file());
+        assert!(!partial.join(lock_name(&gate)).exists());
+        drop(pack);
+        fs::write(partial.join(lock_name(&gate)), b"").unwrap();
+        let mut holder = lock_holder(&temp.0, &partial.join(lock_name(&gate)));
         fs::remove_file(partial.join(file_name(&gate))).unwrap();
         let (pack, report) =
             MappedPack::open_or_build(&partial, IDENTITY, None, &dyn_sources(&banks)).unwrap();
         assert_eq!((report.opened, report.built, report.skipped), (2, 0, 1));
         assert!(pack.file(&gate).is_none());
+        assert!(!partial.join(tmp_name(&gate)).exists());
         assert!(
             pack.read_batch(&[(gate.clone(), 0, 4), (up.clone(), 0, 4)])
                 .unwrap()
                 .is_none()
         );
-        drop(held);
+        holder.kill().unwrap();
+        let _ = holder.wait();
+        drop(pack);
+        let (_, report) =
+            MappedPack::open_or_build(&partial, IDENTITY, None, &dyn_sources(&banks)).unwrap();
+        assert_eq!((report.opened, report.built, report.skipped), (2, 1, 0));
+    }
+
+    /// The published final is rechecked under the tensor lock: a builder
+    /// that saw it missing before another builder's rename opens it instead
+    /// of rebuilding it, and never touches the `.tmp` an old builder still
+    /// holds open (truncating it would zero the published file).
+    #[test]
+    fn build_file_opens_a_final_published_before_its_lock_and_leaves_the_staging_file_alone() {
+        let temp = Temp::new();
+        let dir = temp.0.join(format!("{DIR_PREFIX}{IDENTITY}"));
+        let banks = sources(37);
+        let (pack, _) =
+            MappedPack::open_or_build(&dir, IDENTITY, None, &dyn_sources(&banks)).unwrap();
+        drop(pack);
+        let up = &banks[1];
+        let final_path = dir.join(file_name(&up.name));
+        let published = fs::read(&final_path).unwrap();
+        let tmp_path = dir.join(tmp_name(&up.name));
+        fs::write(&tmp_path, b"an old builder's half-written staging file").unwrap();
+        let held_tmp = File::options()
+            .read(true)
+            .write(true)
+            .open(&tmp_path)
+            .unwrap();
+        let fetched = up.cached_calls.load(Relaxed);
+        let dirfd = packed_cache::open_dir_nofollow(&dir).unwrap();
+        let site = Site {
+            dir: &dir,
+            dirfd: &dirfd,
+            identity: IDENTITY,
+            verify: false,
+            cap: None,
+        };
+        let outcome = build_file(&site, up).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Opened(_)),
+            "a valid final is opened, not rebuilt"
+        );
+        assert_eq!(
+            up.cached_calls.load(Relaxed),
+            fetched,
+            "no expert was fetched"
+        );
+        assert_eq!(fs::read(&final_path).unwrap(), published);
+        assert_eq!(
+            fs::read(&tmp_path).unwrap(),
+            b"an old builder's half-written staging file",
+            "the staging file another fd holds is neither truncated nor renamed"
+        );
+        assert_eq!(held_tmp.metadata().unwrap().len(), 42);
+        drop(held_tmp);
+        // With the final gone the same call rebuilds through a fresh staging
+        // file and publishes byte-identical bytes.
+        fs::remove_file(&final_path).unwrap();
+        let outcome = build_file(&site, up).unwrap();
+        assert!(matches!(outcome, Outcome::Built(_)));
+        assert_eq!(fs::read(&final_path).unwrap(), published);
+        assert!(!tmp_path.exists());
+    }
+
+    /// Under a root-wide cap a file is admitted only once idle mapped
+    /// siblings have been evicted to make room; a fresh sibling cannot be
+    /// evicted, so the build stops at the file that does not fit.
+    #[test]
+    fn builder_admits_files_under_the_root_cap_by_evicting_idle_mapped_siblings() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let banks = sources(37);
+        let sibling = |letter: &str, aged: bool| {
+            let dir = parent.join(format!("{DIR_PREFIX}{}", letter.repeat(64)));
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("x.mapped"), vec![0u8; 100 << 10]).unwrap();
+            fs::write(dir.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+            if aged {
+                let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+                for entry in [dir.join("x.mapped"), dir.join(".manifest")] {
+                    File::options()
+                        .write(true)
+                        .open(entry)
+                        .unwrap()
+                        .set_modified(old)
+                        .unwrap();
+                }
+                File::open(&dir).unwrap().set_modified(old).unwrap();
+            }
+            dir
+        };
+        // Every fixture file is 80 KiB: three fit a 300 KiB cap only once the
+        // idle 100 KiB sibling is evicted for the third.
+        let idle = sibling("a", true);
+        let dir = parent.join(format!("{DIR_PREFIX}{IDENTITY}"));
+        let (pack, report) = MappedPack::open_or_build_capped(
+            &dir,
+            IDENTITY,
+            Some(b"path_hex=00\n"),
+            &dyn_sources(&banks),
+            300 << 10,
+        )
+        .unwrap();
+        assert_eq!((report.opened, report.built, report.skipped), (0, 3, 0));
+        assert!(
+            !idle.exists(),
+            "the idle sibling made room for the third file"
+        );
+        for source in &banks {
+            assert_eq!(pack.file(&source.name).unwrap().header.file_bytes, 80 << 10);
+        }
+        drop(pack);
+        fs::remove_dir_all(&dir).unwrap();
+        // A fresh sibling is not evictable: the second file would overspend a
+        // 200 KiB cap, so the build stops there and the first file stays.
+        let fresh = sibling("b", false);
+        let (pack, report) = MappedPack::open_or_build_capped(
+            &dir,
+            IDENTITY,
+            Some(b"path_hex=00\n"),
+            &dyn_sources(&banks),
+            200 << 10,
+        )
+        .unwrap();
+        assert_eq!((report.opened, report.built, report.skipped), (0, 1, 2));
+        assert_eq!(pack.len(), 1);
+        assert!(fresh.exists());
+        assert!(dir.join(file_name(&banks[0].name)).is_file());
+        assert!(!dir.join(tmp_name(&banks[1].name)).exists());
     }
 
     #[test]
