@@ -60,9 +60,10 @@ routed experts are clean page cache: the Metal driver wires the banks a
 command buffer binds and releases them about a second after the turn, so the
 process holds no expert memory between turns and the OS may evict the pages.
 Turns run without a wired-limit context (it does not pin file-backed buffers
-and only delays their release), the mid-turn headroom and staging checks are
-gone with the staging, and the SSD safety limit subtracts the mapped bytes
-MLX counts in `active_memory`. Greedy output no longer depends on the free
+and only delays their release), the mid-turn staging admission is gone with
+the staging, the forward and growth headroom checks still guard what stays
+anonymous (rows, auxiliary weights, fallback projection chunks, scratch), and
+the SSD safety limit subtracts the mapped bytes MLX counts in `active_memory`. Greedy output no longer depends on the free
 memory at load. The driver wires whole banks, not the experts a token
 routes to, and unwires a bank about a second after its last use; a pass that
 starts later than that after the previous one would otherwise re-wire the
