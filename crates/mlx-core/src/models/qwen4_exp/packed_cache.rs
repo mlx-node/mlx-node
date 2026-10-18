@@ -938,10 +938,16 @@ fn packed_root_cap_lock_wait(parent: &Path) -> Option<File> {
 /// Admission for one mapped-pack file of `file_bytes` in the mapped `dir`:
 /// the free-space reserve, and under a configured total cap the root-wide
 /// spend after evicting idle siblings, under the root cap lock so a chunk
-/// writer cannot admit against the same room. `Err` carries the reason.
+/// writer cannot admit against the same room. On success the 0-length
+/// `staging` file is enlarged to `file_bytes` before the lock is released:
+/// `mapped_bytes` counts `.tmp` lengths, so an admitted builder that has
+/// not yet sized its file is invisible to the next admission and two
+/// builders on different tensors would jointly overspend the cap. `Err`
+/// carries the reason.
 pub(super) fn admit_mapped_file(
     dir: &Path,
     dirfd: &File,
+    staging: &File,
     file_bytes: u64,
     cap: Option<u64>,
 ) -> Result<()> {
@@ -952,7 +958,7 @@ pub(super) fn admit_mapped_file(
         )));
     }
     let Some((cap, parent)) = cap.zip(dir.parent()) else {
-        return Ok(());
+        return staging.set_len(file_bytes).map_err(err);
     };
     let _root_guard = packed_root_cap_lock_wait(parent)
         .ok_or_else(|| err(format!("{TOTAL_CAP_ENV} admission lock stayed busy")))?;
@@ -971,7 +977,7 @@ pub(super) fn admit_mapped_file(
             )));
         }
     }
-    Ok(())
+    staging.set_len(file_bytes).map_err(err)
 }
 
 /// Enforce the optional total cap: evict least-recently-used sibling dirs
@@ -2663,6 +2669,38 @@ mod tests {
             twin.join("x.mapped").is_file(),
             "a mapped dir is never shed file by file"
         );
+    }
+
+    /// Admission under the cap leaves the staging file at its final length,
+    /// so the next admission — another tensor of the same load, or a sibling
+    /// checkpoint's builder — sees the room as taken.
+    #[test]
+    fn mapped_admission_reserves_the_staging_length_for_the_next_admission() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let a = mapped_fixture(&parent, 'a', 100, false);
+        let b = mapped_fixture(&parent, 'b', 100, false);
+        let file_bytes = 64 << 10;
+        // Room for exactly one more file on top of both dirs' `.mapped` bytes.
+        let cap = Some(200 + file_bytes);
+        let staging_a = File::create(a.join(".blk.0.ffn_gate_exps.weight.tmp")).unwrap();
+        let dirfd_a = open_dir_nofollow(&a).unwrap();
+        admit_mapped_file(&a, &dirfd_a, &staging_a, file_bytes, cap).unwrap();
+        let staging_b = File::create(b.join(".blk.0.ffn_gate_exps.weight.tmp")).unwrap();
+        let dirfd_b = open_dir_nofollow(&b).unwrap();
+        assert!(
+            admit_mapped_file(&b, &dirfd_b, &staging_b, file_bytes, cap).is_err(),
+            "the second builder must see the first one's reservation"
+        );
+        assert_eq!(staging_a.metadata().unwrap().len(), file_bytes);
+        assert_eq!(mapped_bytes(&a), 100 + file_bytes);
+        assert_eq!(
+            staging_b.metadata().unwrap().len(),
+            0,
+            "a refused file reserves nothing"
+        );
+        assert!(a.exists(), "a fresh sibling is never evicted to make room");
     }
 
     #[test]

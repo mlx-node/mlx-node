@@ -545,9 +545,8 @@ fn write_file(site: &Site<'_>, staging: &File, source: &dyn ExpertSource) -> Res
         cursor += round_up(payload);
     }
     let file_bytes = cursor;
-    packed_cache::admit_mapped_file(site.dir, site.dirfd, file_bytes, site.cap)
+    packed_cache::admit_mapped_file(site.dir, site.dirfd, staging, file_bytes, site.cap)
         .map_err(|e| err(format!("{name}: {}", e.reason)))?;
-    staging.set_len(file_bytes).map_err(err)?;
     let mut hashers: Vec<Sha256> = sections.iter().map(|_| Sha256::new()).collect();
     let mut pending = Some(first);
     let mut start = 0usize;
