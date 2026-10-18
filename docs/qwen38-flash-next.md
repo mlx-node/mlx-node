@@ -211,8 +211,11 @@ MLP projections across ready rows. Warm continuation reuses that
 owner's full state; standalone KV-only prefix restores are disabled because
 recurrent, PLE, and indexer state are also required.
 
-Native MTP is **opt-in** (`enableMtp: true`) with depth capped at three. Proposals
-use private draft state; verification commits only accepted target frontiers.
+Native MTP is **opt-in** (`enableMtp: true`) with depth capped at three. It runs
+only on the shared scheduler. An ownerless `enableMtp` request runs there as the
+ownerless session that ownerless AR turns continue; with `MLX_SERVE_FORCE_SERIAL`
+it is refused before prefill instead of decoding plain AR. Proposals use private
+draft state; verification commits only accepted target frontiers.
 Head availability alone does not establish a latency benefit. Stochastic MTP
 keeps distribution-correct verification and disables the greedy adaptive policy.
 
