@@ -1143,4 +1143,135 @@ mod tests {
             );
         }
     }
+
+    struct EmitClock {
+        inner: Box<dyn StreamEmitter>,
+        first_emit_done: Arc<std::sync::Mutex<Option<Instant>>>,
+    }
+
+    impl StreamEmitter for EmitClock {
+        fn on_token_id(
+            &mut self,
+            token_id: u32,
+            token_text: &str,
+            is_reasoning: bool,
+            include_reasoning: bool,
+            sink: &dyn ChunkSink,
+        ) {
+            self.inner
+                .on_token_id(token_id, token_text, is_reasoning, include_reasoning, sink);
+            self.first_emit_done
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Instant::now);
+        }
+
+        fn on_token_text(
+            &mut self,
+            token_text: &str,
+            is_reasoning: bool,
+            include_reasoning: bool,
+            sink: &dyn ChunkSink,
+        ) {
+            self.inner
+                .on_token_text(token_text, is_reasoning, include_reasoning, sink);
+        }
+
+        fn on_residual(
+            &mut self,
+            residual: &str,
+            is_reasoning: bool,
+            include_reasoning: bool,
+            sink: &dyn ChunkSink,
+        ) {
+            self.inner
+                .on_residual(residual, is_reasoning, include_reasoning, sink);
+        }
+
+        fn finish(&mut self, result: &ChatResult, sink: &dyn ChunkSink) {
+            self.inner.finish(result, sink);
+        }
+    }
+
+    /// The reported TTFT must cover the first token's delivery to the
+    /// stream, not only its sample: the prefill-sampled token is emitted one
+    /// decode forward later, on both the AR and the speculative seed paths.
+    ///
+    /// MUTATION: stamp `first_token_instant` right after `sampled.eval()` in
+    /// `execute_prefill` (the pre-fix site) and drop the stamp in
+    /// `finish_decode_row` — both arms fail: the stamp precedes the emit.
+    #[test]
+    fn reported_ttft_is_not_earlier_than_the_first_streamed_token() {
+        for speculate in [false, true] {
+            let mut inner = seeded_tiny_paged_inner_with_draft(1729).unwrap();
+            let mut turn = request(
+                &mut inner,
+                41,
+                vec![0, 1, 2, 3, 4, 5, 6],
+                speculate,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(64);
+            let first_emit_done = Arc::new(std::sync::Mutex::new(None));
+            turn.payload.response = ScheduledReply::Stream(stream_tx);
+            turn.payload.emitter = Some(Box::new(EmitClock {
+                inner: Box::new(engine::backend::DefaultStreamEmitter),
+                first_emit_done: Arc::clone(&first_emit_done),
+            }));
+            turn.payload.params.include_reasoning = true;
+            assert!(turn.payload.params.report_performance);
+            let generation_start = Instant::now();
+            turn.payload.generation_start = Some(generation_start);
+            let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
+            scheduler.enqueue_turn(turn).unwrap();
+            let mut finished = None;
+            for _ in 0..100 {
+                if let SchedulerAction::Stepped { mut completed, .. } = scheduler
+                    .drive_once(&mut HybridStepExecutor::new(&mut inner))
+                    .unwrap()
+                    && let Some(turn) = completed.pop()
+                {
+                    finished = Some(turn);
+                    break;
+                }
+            }
+            let turn = finished.expect("the turn completes");
+            assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
+            assert!(
+                turn.payload.generated_tokens.len() > 1,
+                "speculate={speculate}: the turn must decode past its first token"
+            );
+            assert!(
+                stream_rx.try_recv().is_ok_and(|chunk| chunk.is_ok()),
+                "speculate={speculate}: the first token reached the stream"
+            );
+            let emitted = first_emit_done
+                .lock()
+                .unwrap()
+                .expect("the first token was emitted");
+            let stamped = turn
+                .payload
+                .first_token_instant
+                .expect("report_performance stamps the first token");
+            assert!(
+                stamped >= emitted,
+                "speculate={speculate}: TTFT stamped {:?} before the first emit",
+                emitted.duration_since(stamped)
+            );
+            let metrics = engine::finalize::compute_performance_metrics(
+                turn.payload.generation_start,
+                turn.payload.first_token_instant,
+                turn.payload.prompt_tokens.len(),
+                turn.payload.generated_tokens.len(),
+            )
+            .unwrap();
+            let emitted_ms = emitted.duration_since(generation_start).as_secs_f64() * 1000.0;
+            assert!(
+                metrics.ttft_ms >= emitted_ms,
+                "speculate={speculate}: reported ttft {} ms < first emit {} ms",
+                metrics.ttft_ms,
+                emitted_ms
+            );
+        }
+    }
 }
