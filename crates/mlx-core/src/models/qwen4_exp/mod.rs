@@ -129,7 +129,11 @@ impl ChatBackend for Inner {
         ) && args.params.cache_owner_id.is_empty()
         {
             return Err(Error::from_reason(
-                "qwen4_exp runs enableMtp only on its shared scheduler, which MLX_SERVE_FORCE_SERIAL turns off; set enableMtp: false or unset MLX_SERVE_FORCE_SERIAL",
+                if crate::engine::hybrid_scheduler::HybridSchedulerState::<Self>::force_serial() {
+                    "qwen4_exp runs enableMtp only on its shared scheduler, which MLX_SERVE_FORCE_SERIAL turns off; set enableMtp: false or unset MLX_SERVE_FORCE_SERIAL"
+                } else {
+                    "qwen4_exp runs enableMtp only on its shared scheduler, and this ownerless request was routed to the exclusive lane; set enableMtp: false"
+                },
             ));
         }
         crate::engine::paged_turn::run_paged_turn(self, args)

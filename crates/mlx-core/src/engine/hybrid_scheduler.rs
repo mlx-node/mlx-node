@@ -1619,6 +1619,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         });
         let owner_known = Self::chat_config(command)
             .and_then(|config| config.cache_owner_id.as_deref())
+            .or_else(|| self.inner.ownerless_session_in_owner_tables().then_some(""))
             .is_some_and(|owner| self.owner_sequences.contains_key(owner));
         has_media || (is_continue && !owner_known)
     }
