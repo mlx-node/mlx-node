@@ -2905,3 +2905,20 @@ unsafe extern "C" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 }
+
+unsafe extern "C" {
+    // Array over caller-owned storage (`mlx_mapped.cpp`). Null when the Metal
+    // driver refuses a no-copy buffer over `ptr`; never an array over copied
+    // bytes. `release_fn(ctx)` runs once when the last array sharing the
+    // storage is dropped, and does not run on a null return.
+    pub fn mlx_array_from_mapped(
+        ptr: *mut std::ffi::c_void,
+        bytes: usize,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+        release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        ctx: *mut std::ffi::c_void,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_data_ptr(handle: *mut mlx_array) -> *const std::ffi::c_void;
+}
