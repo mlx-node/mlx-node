@@ -5125,32 +5125,13 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
 }
 
 /// The batched QSA window (selection + indexed kernel) against the per-token
-/// sparse path it replaces, with `MLX_QWEN4_BATCHED_QSA` toggled between the
-/// two decoders' forwards. Budgets 8/16/32 put the sparse cut-off inside,
-/// before and after mixed windows; the only attention layer's index blocks
-/// come from identical inputs on both paths, so they must match bit for bit.
+/// sparse path: one decoder takes the tokens as multi-token chunks, the other
+/// one token at a time (a width-1 `prefill_chunk` runs the per-token path).
+/// Budgets 8/16/32 put the sparse cut-off inside, before and after mixed
+/// windows; the only attention layer's index blocks come from identical inputs
+/// on both paths, so they must match bit for bit.
 #[test]
 fn batched_qsa_matches_per_token_flat_and_paged() {
-    const CHILD: &str = "MLX_QWEN4_BATCHED_QSA_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "models::qwen4_exp::tests::batched_qsa_matches_per_token_flat_and_paged",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .env_remove("MLX_QWEN4_BATCHED_QSA")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
     }
@@ -5161,10 +5142,6 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
             .zip(b.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max)
-    };
-    // Each forward reads the flag once; fully evaluated before it changes.
-    let batched_qsa = |on: bool| unsafe {
-        std::env::set_var("MLX_QWEN4_BATCHED_QSA", if on { "1" } else { "0" })
     };
     let path = fixture().join("bf16/paged");
     let raw: serde_json::Value =
@@ -5201,29 +5178,24 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
                     sparse_windows += 1;
                 }
                 let label = format!("budget={budget} paged={paged} end={offset}");
-                batched_qsa(false);
-                let want = per_token.prefill_chunk(chunk, None, true).unwrap();
-                want.eval();
-                batched_qsa(true);
+                let mut want = None;
+                for &token in chunk {
+                    let logits = per_token.prefill_chunk(&[token], None, true).unwrap();
+                    logits.eval();
+                    want = Some(logits);
+                }
+                let want = want.unwrap();
                 let got = batched.prefill_chunk(chunk, None, true).unwrap();
                 got.eval();
                 let error = max_error(&want, &got);
                 assert!(error < 0.04, "{label}: logits error {error}");
                 assert_eq!(per_token.history, batched.history, "{label}");
-                assert_eq!(
-                    per_token.last_chunk_hidden.len(),
-                    batched.last_chunk_hidden.len(),
-                    "{label}"
+                assert_eq!(batched.last_chunk_hidden.len(), count, "{label}");
+                let error = max_error(
+                    per_token.last_chunk_hidden.last().unwrap(),
+                    batched.last_chunk_hidden.last().unwrap(),
                 );
-                for (row, (a, b)) in per_token
-                    .last_chunk_hidden
-                    .iter()
-                    .zip(&batched.last_chunk_hidden)
-                    .enumerate()
-                {
-                    let error = max_error(a, b);
-                    assert!(error < 0.04, "{label}: hidden row {row} error {error}");
-                }
+                assert!(error < 0.04, "{label}: last hidden row error {error}");
                 if paged {
                     assert_eq!(
                         batched.paged.as_ref().unwrap().request_tokens(),
@@ -5257,10 +5229,8 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
             }
             assert!(sparse_windows > 0);
             for token in [11, 4, 9] {
-                batched_qsa(false);
                 let want = per_token.step(token).unwrap();
                 want.eval();
-                batched_qsa(true);
                 let got = batched.step(token).unwrap();
                 got.eval();
                 let error = max_error(&want, &got);
@@ -5270,102 +5240,6 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
                 );
             }
         }
-    }
-}
-
-/// Ratio 34 leaves 33 tokens in the incomplete block of rows ending at 33, 67
-/// and 101, one more than the kernel's 32 SIMD groups attend. Sparse windows
-/// must take the per-token path (bit for bit), and the kernel must refuse it.
-#[test]
-fn batched_qsa_falls_back_past_kernel_tail_width() {
-    use crate::array::DType;
-    const CHILD: &str = "MLX_QWEN4_QSA_TAIL_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "models::qwen4_exp::tests::batched_qsa_falls_back_past_kernel_tail_width",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .env_remove("MLX_QWEN4_BATCHED_QSA")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let batched_qsa = |on: bool| unsafe {
-        std::env::set_var("MLX_QWEN4_BATCHED_QSA", if on { "1" } else { "0" })
-    };
-    let path = fixture().join("bf16/paged");
-    let raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
-    let mut config = config::Config::parse(&raw).unwrap();
-    config.indexer_compress_ratio = 34;
-    config.indexer_budget = 34;
-    let make = || {
-        decoder::Decoder::new(
-            config.clone(),
-            weights::Store::open_fixture(&path, None).unwrap(),
-        )
-        .unwrap()
-    };
-    let (mut per_token, mut batched) = (make(), make());
-    let tokens: Vec<u32> = (0..110)
-        .map(|i| ((i * 7 + i / 5) % 19 + 3) as u32)
-        .collect();
-    let mut offset = 0;
-    for count in [30, 30, 30, 20] {
-        let chunk = &tokens[offset..offset + count];
-        offset += count;
-        batched_qsa(false);
-        let want = per_token.prefill_chunk(chunk, None, true).unwrap();
-        want.eval();
-        batched_qsa(true);
-        let got = batched.prefill_chunk(chunk, None, true).unwrap();
-        got.eval();
-        let (want, got) = (want.to_float32().unwrap(), got.to_float32().unwrap());
-        let error = want
-            .iter()
-            .zip(got.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        assert_eq!(&*want, &*got, "end={offset}: logits error {error}");
-    }
-
-    let values = |shape: &[i64], seed: usize| {
-        let n = shape.iter().product::<i64>() as usize;
-        MxArray::from_float32(
-            &(0..n)
-                .map(|i| ((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0)
-                .collect::<Vec<_>>(),
-            shape,
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap()
-    };
-    let (q, k, v) = (
-        values(&[1, 2, 1, 32], 1),
-        values(&[1, 2, 67, 32], 2),
-        values(&[1, 2, 67, 32], 3),
-    );
-    let selected = MxArray::from_int32(&[0], &[1, 1, 1]).unwrap();
-    let ends = MxArray::from_int32(&[67], &[1, 1]).unwrap();
-    for (block, ok) in [(33, true), (34, false)] {
-        assert_eq!(
-            math::qsa_attention(&q, &k, &v, &selected, &ends, 0.2, block).is_ok(),
-            ok,
-            "block_size={block}"
-        );
     }
 }
 
@@ -5469,9 +5343,43 @@ fn qsa_select_matches_reference_transcription() {
     }
 }
 
-/// The indexed kernel against SDPA with a boolean mask built from the same
+/// |a - b| in units of the BF16 spacing at the larger magnitude of the two
+/// (0 when both are 0), so near-zero sign flips do not count as thousands.
+pub(super) fn bf16_ulp_distance(a: f32, b: f32) -> u32 {
+    let magnitude = a.abs().max(b.abs());
+    if magnitude == 0.0 || !magnitude.is_finite() {
+        return if a == b { 0 } else { u32::MAX };
+    }
+    let exponent = magnitude.log2().floor() as i32;
+    let ulp = 2f32.powi(exponent - 7);
+    ((a - b).abs() / ulp).round() as u32
+}
+
+/// `[0 ULP, 1, 2, 3-4, 5+]` counts and the largest distance over two arrays.
+pub(super) fn bf16_ulp_histogram(a: &[f32], b: &[f32]) -> ([usize; 5], u32) {
+    assert_eq!(a.len(), b.len());
+    let mut hist = [0usize; 5];
+    let mut max = 0;
+    for (&x, &y) in a.iter().zip(b) {
+        let d = bf16_ulp_distance(x, y);
+        max = max.max(d);
+        hist[match d {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3..=4 => 3,
+            _ => 4,
+        }] += 1;
+    }
+    (hist, max)
+}
+
+/// The tiled kernel against SDPA with a boolean mask built from the same
 /// picks (mlx-vlm's `build_mask`): selected blocks below each row's end, plus
-/// its incomplete tail block. -1 picks contribute nothing.
+/// its incomplete tail block. -1 picks contribute nothing. Includes the
+/// released checkpoint's geometry (24/2 heads, D 256, ratio 4, top-k 512) and
+/// a ratio-33 case whose tail block fills all 32 SIMD groups; ratio 34 is
+/// refused (the window falls back to the per-token path).
 #[test]
 fn qsa_kernel_matches_masked_sdpa() {
     use crate::array::DType;
@@ -5490,14 +5398,17 @@ fn qsa_kernel_matches_masked_sdpa() {
         .astype(dtype)
         .unwrap()
     };
-    let ratio = 4;
     for dtype in [DType::BFloat16, DType::Float16] {
-        for (heads, kv_heads, dim, base, t, topk) in [
-            (4i64, 2i64, 32i64, 29usize, 13usize, 8usize),
-            (8, 2, 128, 61, 40, 16),
-            (4, 4, 64, 0, 37, 2),
+        for (heads, kv_heads, dim, base, t, topk, ratio) in [
+            (4i64, 2i64, 32i64, 29usize, 13usize, 8usize, 4usize),
+            (8, 2, 128, 61, 40, 16, 4),
+            (4, 4, 64, 0, 37, 2, 4),
+            (4, 2, 32, 20, 60, 1, 33),
+            (24, 2, 256, 4096, 48, 512, 4),
         ] {
-            let label = format!("{dtype:?} heads={heads}/{kv_heads} dim={dim} base={base} t={t}");
+            let label = format!(
+                "{dtype:?} heads={heads}/{kv_heads} dim={dim} base={base} t={t} ratio={ratio}"
+            );
             let length = (base + t) as i64;
             let q = values(&[1, heads, t as i64, dim], 1, dtype);
             let k = values(&[1, kv_heads, length, dim], 2, dtype);
@@ -5508,9 +5419,11 @@ fn qsa_kernel_matches_masked_sdpa() {
             let (selected, query_ends) =
                 math::qsa_select(&query, &index_keys, base, ratio, topk).unwrap();
             let picks = selected.to_int32().unwrap().to_vec();
-            assert!(
-                picks.contains(&-1) && blocks > topk,
-                "{label}: expected causal and sparse rows"
+            assert!(blocks > topk, "{label}: expected sparse rows");
+            assert_eq!(
+                picks.contains(&-1),
+                base < ratio * topk,
+                "{label}: causal rows exist exactly below the budget"
             );
             let mut mask = vec![0i32; t * length as usize];
             for j in 0..t {
@@ -5549,8 +5462,22 @@ fn qsa_kernel_matches_masked_sdpa() {
                 .zip(b.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
+            let (hist, max_ulp) = bf16_ulp_histogram(&a, &b);
+            eprintln!("{label}: max abs {error:.5} ULP hist {hist:?} max {max_ulp}");
             assert!(error < 0.04, "{label}: error {error}");
         }
+    }
+    let q = values(&[1, 2, 1, 32], 1, DType::BFloat16);
+    let k = values(&[1, 2, 67, 32], 2, DType::BFloat16);
+    let v = values(&[1, 2, 67, 32], 3, DType::BFloat16);
+    let selected = MxArray::from_int32(&[0], &[1, 1, 1]).unwrap();
+    let ends = MxArray::from_int32(&[67], &[1, 1]).unwrap();
+    for (block, ok) in [(33, true), (34, false)] {
+        assert_eq!(
+            math::qsa_attention(&q, &k, &v, &selected, &ends, 0.2, block).is_ok(),
+            ok,
+            "block_size={block}"
+        );
     }
 }
 
