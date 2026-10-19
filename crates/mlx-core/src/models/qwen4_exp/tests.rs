@@ -6269,9 +6269,10 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
 }
 
 #[test]
-#[ignore = "GPU timing: run alone under the gpu lock with --ignored --nocapture"]
+#[ignore = "GPU timing: run alone under both locks with MLX_METAL_COMMAND_TRACE=1; S2/bench-gpu.sh parses the trace"]
 fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
-    use std::time::Instant;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
     }
@@ -6282,42 +6283,108 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         seed ^= seed << 5;
         seed
     };
+    // Consecutive calls never share a weight bank and a bank comes back only after
+    // >= 400 MB of other weights, so every byte streams from DRAM as in decode: 24
+    // calls on one bank, or ten experts that overlap the previous call's, run from
+    // the system cache at 0.9-1.5 TB/s once the GPU is at speed.
     const BATCH: usize = 24;
-    // Wall time includes the CPU encode of the batch; with MLX_METAL_COMMAND_TRACE=1
-    // the `[metal-command]` lines between two markers carry the GPU time alone.
-    let settle = || std::thread::sleep(std::time::Duration::from_millis(5));
-    let measure = |name: &str, mut run: Box<dyn FnMut(i64) -> Vec<MxArray>>| {
+    const SAMPLES: usize = 9;
+    const PRIMER_CALLS: usize = 48;
+    const REUSE_BYTES: usize = 400 << 20;
+    let banks_for = |weights: usize| REUSE_BYTES.div_ceil(weights * 9 / 8).max(BATCH);
+    // The GPU clock settles low under a sparse duty cycle and that moves the ratio
+    // itself (dense qgate: 1.52 at speed, 1.86 with a 5 ms sleep before each batch).
+    // A primer of qgate projections runs unmarked right before every timed batch and
+    // nothing sleeps. The trace record is printed from the command buffer's completion
+    // handler in several write(2) calls, so a marker written while a record is in
+    // flight corrupts both lines: the markers carry CLOCK_MONOTONIC_RAW stamps (the
+    // clock behind the trace's submitCpu) taken around the timed eval and are written
+    // one iteration later, after the next batch's graph build, in a single write.
+    let host_now = || {
+        let mut t = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut t) },
+            0
+        );
+        t.tv_sec as f64 + t.tv_nsec as f64 * 1e-9
+    };
+    let mark = |lines: String| {
+        std::io::stderr()
+            .lock()
+            .write_all(lines.as_bytes())
+            .unwrap()
+    };
+    let eval = |outputs: &[MxArray], context: &str| {
+        MxArray::eval_arrays_with_context(&outputs.iter().collect::<Vec<_>>(), context).unwrap();
+    };
+    let primer_w = q8_bank(12288, 2560, &mut next);
+    let primer_x = bf16_rows(1, 2560, 1. / 256., 2., &mut next);
+    let primer = || {
+        let outputs: Vec<MxArray> = (0..PRIMER_CALLS)
+            .map(|_| {
+                math::rows::dense_decode(&primer_w, &primer_x)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        eval(&outputs, "primer");
+    };
+    let warm_until = Instant::now() + Duration::from_millis(750);
+    while Instant::now() < warm_until {
+        primer();
+    }
+    // `run(rows, call)` picks its bank from the running call counter; the pipeline
+    // warm covers `warm_calls` so no bank is first touched inside a timed batch.
+    let measure = |name: &str,
+                   warm_calls: usize,
+                   mut run: Box<dyn FnMut(i64, usize) -> Vec<MxArray>>| {
+        let mut calls = 0usize;
+        let mut batch = |rows: i64| {
+            let mut outputs = Vec::with_capacity(BATCH);
+            for _ in 0..BATCH {
+                outputs.extend(run(rows, calls));
+                calls += 1;
+            }
+            outputs
+        };
         for rows in [1, 3] {
-            eprintln!("ROWBENCH-MARK warm");
-            MxArray::eval_arrays_with_context(&run(rows).iter().collect::<Vec<_>>(), "warm")
-                .unwrap();
-            settle();
-            eprintln!("ROWBENCH-MARK end");
-        }
-        let mut per_call = [Vec::new(), Vec::new()];
-        for sample in 0..9 {
-            for (slot, rows) in [1i64, 3].into_iter().enumerate() {
-                let mut outputs = Vec::with_capacity(BATCH);
-                for _ in 0..BATCH {
-                    outputs.extend(run(rows));
-                }
-                settle();
-                eprintln!("ROWBENCH-MARK {name} rows={rows} sample={sample} batch={BATCH}");
-                let start = Instant::now();
-                MxArray::eval_arrays_with_context(&outputs.iter().collect::<Vec<_>>(), "timed")
-                    .unwrap();
-                per_call[slot].push(start.elapsed().as_secs_f64() * 1e6 / BATCH as f64);
-                settle();
-                eprintln!("ROWBENCH-MARK end");
+            for _ in 0..warm_calls.div_ceil(BATCH) {
+                eval(&batch(rows), "pipeline warm");
             }
         }
-        for v in &mut per_call {
+        let mut wall = [Vec::new(), Vec::new()];
+        let mut pending = None;
+        for sample in 0..SAMPLES {
+            for (slot, rows) in [1i64, 3].into_iter().enumerate() {
+                let timed = batch(rows);
+                if let Some(lines) = pending.take() {
+                    mark(lines);
+                }
+                primer();
+                let t0 = host_now();
+                let start = Instant::now();
+                eval(&timed, "timed");
+                wall[slot].push(start.elapsed().as_secs_f64() * 1e6 / BATCH as f64);
+                let t1 = host_now();
+                pending = Some(format!(
+                    "ROWBENCH-MARK {name} rows={rows} sample={sample} batch={BATCH} t={t0:.9}\nROWBENCH-MARK end t={t1:.9}\n"
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        if let Some(lines) = pending.take() {
+            mark(lines);
+        }
+        for v in &mut wall {
             v.sort_by(|a, b| a.total_cmp(b));
         }
-        let (one, three) = (per_call[0][4], per_call[1][4]);
         println!(
-            "ROWBENCH {name}: one_row_us={one:.1} three_rows_us={three:.1} ratio={:.3}",
-            three / one
+            "ROWBENCH-WALL {name}: one_row_us={:.1} three_rows_us={:.1} host time with the encode; the GPU ratio comes from the trace",
+            wall[0][SAMPLES / 2],
+            wall[1][SAMPLES / 2]
         );
     };
     for (label, n, k) in [
@@ -6325,43 +6392,58 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         ("dense_o_2560x6144", 2560, 6144),
         ("dense_kv_2048x2560", 2048, 2560),
     ] {
-        let w = q8_bank(n, k, &mut next);
+        let nbanks = banks_for(n * k);
+        let banks: Vec<_> = (0..nbanks).map(|_| q8_bank(n, k, &mut next)).collect();
         let x = bf16_rows(4, k as i64, 1. / 256., 2., &mut next);
         measure(
             label,
-            Box::new(move |rows| {
+            nbanks,
+            Box::new(move |rows, call| {
                 vec![
-                    math::rows::dense_decode(&w, &x.slice_axis(1, 0, rows).unwrap())
-                        .unwrap()
-                        .unwrap(),
+                    math::rows::dense_decode(
+                        &banks[call % nbanks],
+                        &x.slice_axis(1, 0, rows).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap(),
                 ]
             }),
         );
     }
     {
-        let down = q8_bank(320, 10240, &mut next);
+        let nbanks = banks_for(320 * 10240);
+        let downs: Vec<_> = (0..nbanks)
+            .map(|_| q8_bank(320, 10240, &mut next))
+            .collect();
         let x = bf16_rows(4, 10240, 1. / 256., 2., &mut next);
         measure(
             "mixer_act_320x10240",
-            Box::new(move |rows| {
+            nbanks,
+            Box::new(move |rows, call| {
                 vec![
-                    math::rows::mixer_act(&down, &x.slice_axis(1, 0, rows).unwrap())
-                        .unwrap()
-                        .unwrap(),
+                    math::rows::mixer_act(
+                        &downs[call % nbanks],
+                        &x.slice_axis(1, 0, rows).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap(),
                 ]
             }),
         );
-        let up = q8_bank(10240, 320, &mut next);
+        let ups: Vec<_> = (0..nbanks)
+            .map(|_| q8_bank(10240, 320, &mut next))
+            .collect();
         let x = bf16_rows(4, 320, 1. / 64., 8., &mut next);
         let normed = bf16_rows(4, 10240, 1. / 128., 4., &mut next);
         let injection = bf16_rows(4, 4, 1. / 16., 32., &mut next);
-        let (up2, x2, normed2) = (up.clone(), x.clone(), normed.clone());
+        let (ups2, x2, normed2) = (ups.clone(), x.clone(), normed.clone());
         measure(
             "hyper_up_10240x320",
-            Box::new(move |rows| {
+            nbanks,
+            Box::new(move |rows, call| {
                 vec![
                     math::rows::hyper_up(
-                        &up2,
+                        &ups2[call % nbanks],
                         &x2.slice_axis(1, 0, rows).unwrap(),
                         &normed2.slice_axis(1, 0, rows).unwrap(),
                     )
@@ -6372,9 +6454,10 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         );
         measure(
             "hyper_up_inject_10240x320",
-            Box::new(move |rows| {
+            nbanks,
+            Box::new(move |rows, call| {
                 let (mixed, gate) = math::rows::hyper_up_inject(
-                    &up,
+                    &ups[call % nbanks],
                     &x.slice_axis(1, 0, rows).unwrap(),
                     &normed.slice_axis(1, 0, rows).unwrap(),
                     &injection.slice_axis(1, 0, rows).unwrap(),
@@ -6386,14 +6469,27 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         );
     }
     {
-        let experts = 64usize;
+        let experts = 128usize;
         let (banks, shared) = expert_banks(experts, 4, 5, &mut next);
         let x = bf16_rows(4, 2560, 1. / 256., 2., &mut next);
         // Distinct: 40 different experts. Same: every row routes like row 0.
         // Overlap4: row j routes to experts 6j..6j+9, so consecutive rows share four.
-        let distinct: Vec<u32> = (0..40).map(|i| (i * 5 % experts) as u32).collect();
-        let same: Vec<u32> = (0..40).map(|i| distinct[i % 10]).collect();
-        let overlap: Vec<u32> = (0..40).map(|i| (i / 10 * 6 + i % 10) as u32).collect();
+        // Call c adds 40c mod 128 (period 16): consecutive calls share no expert and
+        // a row's experts come back after 13 one-row or 7 three-row calls.
+        let distinct: Vec<u32> = (0..40).collect();
+        let same: Vec<u32> = (0..40).map(|i| i % 10).collect();
+        let overlap: Vec<u32> = (0..40).map(|i| i / 10 * 6 + i % 10).collect();
+        let rotate = |routes: &[u32]| -> Vec<MxArray> {
+            (0..16)
+                .map(|call| {
+                    let ids: Vec<u32> = routes
+                        .iter()
+                        .map(|r| (r + 40 * call) % experts as u32)
+                        .collect();
+                    MxArray::from_uint32(&ids, &[40]).unwrap()
+                })
+                .collect()
+        };
         let scores = MxArray::from_float32(
             &(0..40)
                 .map(|_| (next() % 19 + 1) as f32 / 100.)
@@ -6404,20 +6500,22 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         let shared_gate = bf16_rows(4, 1, 1. / 64., 8., &mut next);
         // Bytes against ALU: the plain routed kernel with ten distinct experts per
         // row reads ten tiles, with one expert in every slot it reads one tile and
-        // does the same arithmetic.
+        // does the same arithmetic (that tile returns after 16 calls, 58 MB, which
+        // can only make the one-expert case cheaper).
         for (label, routes) in [
-            ("routed_e64_distinct_experts", distinct.clone()),
-            ("routed_e64_one_expert", vec![distinct[0]; 40]),
+            ("routed_e128_distinct_experts", distinct.clone()),
+            ("routed_e128_one_expert", vec![0; 40]),
         ] {
-            let ids = MxArray::from_uint32(&routes, &[40]).unwrap();
+            let ids = rotate(&routes);
             let (banks, x, scores) = (banks.clone(), x.clone(), scores.clone());
             measure(
                 label,
-                Box::new(move |rows| {
+                16 * BATCH,
+                Box::new(move |rows, call| {
                     vec![
                         math::routed_experts(
                             &x.slice_axis(1, 0, rows).unwrap(),
-                            &ids.slice_axis(0, 0, rows * 10).unwrap(),
+                            &ids[call % 16].slice_axis(0, 0, rows * 10).unwrap(),
                             &scores.slice_axis(1, 0, rows).unwrap(),
                             &banks,
                         )
@@ -6428,11 +6526,11 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
             );
         }
         for (label, routes) in [
-            ("routed_shared_e64_distinct_routes", distinct),
-            ("routed_shared_e64_same_routes", same),
-            ("routed_shared_e64_overlap4_routes", overlap),
+            ("routed_shared_e128_distinct_routes", distinct),
+            ("routed_shared_e128_same_routes", same),
+            ("routed_shared_e128_overlap4_routes", overlap),
         ] {
-            let ids = MxArray::from_uint32(&routes, &[40]).unwrap();
+            let ids = rotate(&routes);
             let (banks, shared, x, scores, shared_gate) = (
                 banks.clone(),
                 shared.clone(),
@@ -6442,11 +6540,12 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
             );
             measure(
                 label,
-                Box::new(move |rows| {
+                16 * BATCH,
+                Box::new(move |rows, call| {
                     vec![
                         math::rows::routed_shared_experts(
                             &x.slice_axis(1, 0, rows).unwrap(),
-                            &ids.slice_axis(0, 0, rows * 10).unwrap(),
+                            &ids[call % 16].slice_axis(0, 0, rows * 10).unwrap(),
                             &scores.slice_axis(1, 0, rows).unwrap(),
                             &banks,
                             &shared,
@@ -6463,7 +6562,8 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         let logits = bf16_rows(4, 512, 1. / 128., 4., &mut next);
         measure(
             "singleton_routes",
-            Box::new(move |rows| {
+            BATCH,
+            Box::new(move |rows, _| {
                 let (ids, scores) =
                     math::rows::singleton_routes(&logits.slice_axis(1, 0, rows).unwrap(), 10)
                         .unwrap()
@@ -6477,7 +6577,8 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
         let gate = bf16_rows(4, 4, 1. / 256., 2., &mut next);
         measure(
             "inject_norm",
-            Box::new(move |rows| {
+            BATCH,
+            Box::new(move |rows, _| {
                 let (mut s, mut n) = (std::ptr::null_mut(), std::ptr::null_mut());
                 assert!(unsafe {
                     mlx_sys::mlx_qwen4_inject_norm(
