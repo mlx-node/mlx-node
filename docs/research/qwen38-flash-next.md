@@ -484,23 +484,9 @@ The supplied GGUF codes, system reserves and admission rules are unchanged.
 
 ```sh
 export MLX_METAL_HASH_KERNEL_CACHE=1
-export MLX_QWEN4_ATTENTION_NORM_ROTARY=1
 export MLX_QWEN4_EXPERT_LANE_STAGING=1
-export MLX_QWEN4_FUSED_ROTARY=1
-export MLX_QWEN4_GDN_GATE_INPUTS=1
-export MLX_QWEN4_GDN_GATE_PAIR=1
 export MLX_QWEN4_GDN_VECTOR_ROWS=1
-export MLX_QWEN4_INJECT_NEXT_NORM=1
-export MLX_QWEN4_MIXER_DOWN_INJECT=0
-export MLX_QWEN4_MIXER_INJECT=1
-export MLX_QWEN4_MIXER_LANE_PRODUCTS=1
-export MLX_QWEN4_PREFILL_PLE_GEMM=1
-export MLX_QWEN4_PREFILL_REFERENCE_BF16=1
-export MLX_QWEN4_PREFILL_SHARED_COMBINE=1
 export MLX_QWEN4_REFERENCE_DOWN_SCHEDULE=1
-export MLX_QWEN4_ROTARY_TABLES=1
-export MLX_QWEN4_ROUTER_ROW_SCHEDULE=1
-export MLX_QWEN4_ROUTE_REGISTER_RESULTS=1
 export MLX_QWEN4_WEIGHT_CACHE_GIB=63
 ```
 
@@ -625,12 +611,16 @@ Default prefill controls include `MLX_QWEN4_PREFILL_MIXER_BM32`,
 `MLX_QWEN4_PREFILL_DEVICE_ROUTES`, `MLX_QWEN4_PREFILL_NORM`,
 `MLX_QWEN4_PREFILL_ASYNC_WINDOW`, and `MLX_QWEN4_PREFILL_SHARED_Q8`.
 
-`MLX_QWEN4_PREFILL_REFERENCE_BF16=1` and `MLX_QWEN4_PREFILL_PLE_GEMM=1`
-are **arithmetic experiments, off by default**. Historical results exceeding
-90% prefill used both. Rotary reuse/fusion, next-layer injection/norm, mixer
-injection, shared combine, reference down scheduling, attention
-normalization/rotary and direct/paired GDN gates remain optional. Their
-existence is not evidence of a repeatable speedup. The PLE history copy is
+The opt-in exact fusions measured on 2026-10-20 (teacher-forced logits on the
+6k and 16k prompts in one process, mapped residency, 256 positions) were
+bit-identical but moved steady decode by less than the run's own 5.8% drift,
+and `MLX_QWEN4_PREFILL_REFERENCE_BF16` / `MLX_QWEN4_PREFILL_PLE_GEMM` changed
+the argmax at 2-4 of 256 positions; all of them were removed with their
+kernels: attention norm+rotary, rotary tables, fused rotary window, paired and
+BF16 GDN gates, mixer down/injection and split-K, mixer injection and its
+two-column and lane-product variants, combined routes + shared gate, direct
+attention gate, router row schedule, prefill shared combine, BF16 prefill GDN
+values, deferred prefill MLP, synchronous projections. The PLE history copy is
 always lazy (the former `MLX_QWEN4_DECODE_ASYNC_PLE` is the only behaviour).
 
 ### Bounded residency on macOS 27

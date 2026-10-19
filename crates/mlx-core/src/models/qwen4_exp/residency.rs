@@ -567,17 +567,10 @@ impl Store {
         };
         // The reference groups QKV/Z/B/A projections. Here A/B are F32
         // source matrices with cached BF16 compute weights, unlike Q8 QKV/Z.
-        let gate_pair =
-            first.ends_with(".ssm_alpha.weight") && second.ends_with(".ssm_beta.weight");
-        let dense_gates = gate_pair
-            && rows == 1
-            && x.dtype()? == DType::BFloat16
-            && shape.last() == Some(&2560)
-            && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR");
         // A wider N changes MLX's matrix-multiply schedule for short windows.
         // This must precede the paired-bank cache lookup: a bank prepared by
         // singleton decoding must not opt a later verification window in.
-        if gate_pair && !dense_gates {
+        if first.ends_with(".ssm_alpha.weight") && second.ends_with(".ssm_beta.weight") {
             return Ok((self.linear(first, x)?, self.linear(second, x)?));
         }
         if (rows <= 8 || wide_shared) && !runtime_flags::is_zero(c"MLX_QWEN4_PAIRED_PROJECTIONS") {
@@ -590,17 +583,6 @@ impl Store {
             {
                 let storage_compatible = match (&a.scales, &b.scales) {
                     (Some(a), Some(b)) => a.dtype()? == b.dtype()?,
-                    (None, None) => {
-                        dense_gates
-                            && a.values.dtype()? == DType::Float32
-                            && b.values.dtype()? == DType::Float32
-                            && *a.values.shape()? == [48, 2560]
-                            && *b.values.shape()? == [48, 2560]
-                            && a.dense_bf16.is_some()
-                            && b.dense_bf16.is_some()
-                            && a.biases.is_none()
-                            && b.biases.is_none()
-                    }
                     _ => false,
                 };
                 let compatible = storage_compatible

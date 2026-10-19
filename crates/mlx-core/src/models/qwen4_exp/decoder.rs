@@ -276,33 +276,18 @@ impl Decoder {
             .collect();
     }
     fn rope(&self, x: &MxArray, pos: usize) -> Result<MxArray> {
-        let cached = runtime_flags::is_one(c"MLX_QWEN4_ROTARY_TABLES");
-        if !cached && (!self.scope.is_empty() || self.positions.is_empty()) {
+        if !self.scope.is_empty() || self.positions.is_empty() {
             return math::rope(x, pos, self.config.rope_dims(), self.config.rope_theta());
         }
         let v = &self.config.rope_parameters;
-        let (p, sections, interleaved) = if !self.scope.is_empty() || self.positions.is_empty() {
-            ([pos as i64; 3], [0; 3], true)
-        } else {
-            (
-                self.positions
-                    .get(pos)
-                    .copied()
-                    .unwrap_or([pos as i64 + self.rope_delta; 3]),
-                std::array::from_fn(|i| v["mrope_section"][i].as_u64().unwrap_or(0) as usize),
-                v["mrope_interleaved"].as_bool().unwrap_or(true),
-            )
-        };
-        if cached {
-            return self.rotary_tables.borrow_mut().apply_singleton(
-                x,
-                p,
-                self.config.rope_dims(),
-                self.config.rope_theta(),
-                sections,
-                interleaved,
-            );
-        }
+        let p = self
+            .positions
+            .get(pos)
+            .copied()
+            .unwrap_or([pos as i64 + self.rope_delta; 3]);
+        let sections =
+            std::array::from_fn(|i| v["mrope_section"][i].as_u64().unwrap_or(0) as usize);
+        let interleaved = v["mrope_interleaved"].as_bool().unwrap_or(true);
         math::mrope(
             x,
             p,
@@ -714,34 +699,7 @@ impl Decoder {
                 true,
             )?
         };
-        let paired = if (runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
-            || runtime_flags::is_one(c"MLX_QWEN4_MIXER_SPLIT_K"))
-            && inject
-            && self.gguf()
-            && c.hc_count == 4
-            && c.hidden_size == 2560
-            && x.shape()?[1] == 1
-        {
-            let down_key = self.key(
-                &format!("{hf}.input_mix_weight_down.weight"),
-                &format!("{gg}_down.weight"),
-            );
-            let inject_key = self.key(
-                &format!("{hf}.block_inject_weight.weight"),
-                &format!("{gg}_inject.weight"),
-            );
-            match (
-                self.weights.resident_bank(&down_key),
-                self.weights.resident_bank(&inject_key),
-            ) {
-                (Some(down), Some(injection)) => down.mixer_down_inject(&n, &injection)?,
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let activated = if paired.is_none()
-            && self.gguf()
+        let activated = if self.gguf()
             && c.hc_count == 4
             && c.hidden_size == 2560
             && (x.shape()?[1] >= 1024 || x.shape()?[1] == 1)
@@ -758,10 +716,8 @@ impl Decoder {
         } else {
             None
         };
-        let is_activated = paired.is_some() || activated.is_some();
-        let (down, inject_projection) = if let Some((down, gate)) = paired {
-            (down, Some(gate))
-        } else if let Some(activated) = activated {
+        let is_activated = activated.is_some();
+        let (down, inject_projection) = if let Some(activated) = activated {
             let gate = if inject {
                 Some(self.linear(
                     &n,
@@ -804,15 +760,6 @@ impl Decoder {
             &format!("{hf}.input_mix_weight_up.weight"),
             &format!("{gg}_up.weight"),
         );
-        if self.gguf()
-            && c.hc_count == 4
-            && c.hidden_size == 2560
-            && let Some(injection) = inject_projection.as_ref()
-            && let Some(weight) = self.weights.resident_bank(&key)
-            && let Some((mixed, gate)) = weight.hyper_up_inject(&down, &n, injection)?
-        {
-            return Ok((mixed, Some(gate)));
-        }
         let fused = if self.gguf() && c.hc_count == 4 && c.hidden_size == 2560 {
             self.weights
                 .resident_bank(&key)
@@ -872,35 +819,6 @@ impl Decoder {
             &format!("blk.{layer}.hc_ffn_norm.weight"),
             normalize,
         )
-    }
-
-    fn inject_for_next_attention(
-        &mut self,
-        x: &MxArray,
-        branch: &MxArray,
-        gate: &MxArray,
-        layer: usize,
-        normalize: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
-        let next = layer + 1;
-        // PLE adds to the stream before its attention norm. Never carry a
-        // normalization across that addition or across a forward boundary.
-        if normalize
-            && next < self.config.num_hidden_layers
-            && !self.config.ple_layer_ids.contains(&(next + 1))
-            && runtime_flags::is_one(c"MLX_QWEN4_INJECT_NEXT_NORM")
-        {
-            self.inject_for_hyper(
-                x,
-                branch,
-                gate,
-                &format!("layers.{next}.attn_hyper_connection.hc_norm.weight"),
-                &format!("blk.{next}.hc_attn_norm.weight"),
-                true,
-            )
-        } else {
-            Ok((Self::inject(x, branch, gate)?, None))
-        }
     }
 
     fn inject_for_hyper(
@@ -999,41 +917,20 @@ impl Decoder {
             self.config.linear_num_value_heads as i64,
             self.config.linear_value_head_dim as i64,
         ])?;
-        // TrackFastModel.bindGDN groups compatible projections. The GGUF
-        // gate matrices are dense F32, so pair them separately from Q8 QKV/Z.
-        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR") {
-            self.linear_pair(
+        let a = self
+            .linear(
                 x,
-                (
-                    &format!("{p}.in_proj_a.weight"),
-                    &format!("{g}.ssm_alpha.weight"),
-                ),
-                (
-                    &format!("{p}.in_proj_b.weight"),
-                    &format!("{g}.ssm_beta.weight"),
-                ),
+                &format!("{p}.in_proj_a.weight"),
+                &format!("{g}.ssm_alpha.weight"),
             )?
-        } else {
-            (
-                self.linear(
-                    x,
-                    &format!("{p}.in_proj_a.weight"),
-                    &format!("{g}.ssm_alpha.weight"),
-                )?,
-                self.linear(
-                    x,
-                    &format!("{p}.in_proj_b.weight"),
-                    &format!("{g}.ssm_beta.weight"),
-                )?,
-            )
-        };
-        // TrackFastGDNDecode reads projected BF16 gates directly. Keep local
-        // F32 gate arithmetic inside the consumer, without two cast buffers.
-        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_INPUTS") {
-            (a, b)
-        } else {
-            (a.astype(DType::Float32)?, b.astype(DType::Float32)?)
-        };
+            .astype(DType::Float32)?;
+        let b = self
+            .linear(
+                x,
+                &format!("{p}.in_proj_b.weight"),
+                &format!("{g}.ssm_beta.weight"),
+            )?
+            .astype(DType::Float32)?;
         Ok(GdnProjections { qkv, z, a, b })
     }
 
@@ -1366,39 +1263,22 @@ impl Decoder {
             &format!("{p}.gate.weight"),
             &format!("{g}.ffn_gate_inp.weight"),
         )?;
-        let combined = if self.gguf()
-            && runtime_flags::is_one(c"MLX_QWEN4_ROUTE_SHARED_GATE")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
-            && let Some(weight) = self
-                .weights
-                .resident_bank(&format!("{g}.ffn_gate_inp_shexp.weight"))
-            && let Some(dense) = &weight.dense_bf16
-        {
-            math::routes_shared_gate(&logits, x, dense, c.num_experts_per_tok)?
-        } else {
-            None
-        };
-        let mut shared_gate = None;
-        let (selected, scores) = if let Some((selected, scores, gate)) = combined {
-            shared_gate = Some(gate);
-            (selected, scores)
-        } else if let Some(routes) = math::singleton_routes(&logits, c.num_experts_per_tok)? {
-            routes
-        } else {
-            let probs = Activations::softmax_precise(&logits, Some(-1))?;
-            let ne = c.num_experts as i64;
-            let top = c.num_experts_per_tok as i64;
-            let selected =
-                probs
-                    .argpartition(-(top as i32), Some(-1))?
-                    .slice_axis(2, ne - top, ne)?;
-            let scores = probs.take_along_axis(&selected, -1)?;
-            let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
-            (selected, scores)
-        };
-        if let Some(out) =
-            self.tentative_shared_experts(x, &selected, &scores, shared_gate.as_ref(), i)?
-        {
+        let (selected, scores) =
+            if let Some(routes) = math::singleton_routes(&logits, c.num_experts_per_tok)? {
+                routes
+            } else {
+                let probs = Activations::softmax_precise(&logits, Some(-1))?;
+                let ne = c.num_experts as i64;
+                let top = c.num_experts_per_tok as i64;
+                let selected =
+                    probs
+                        .argpartition(-(top as i32), Some(-1))?
+                        .slice_axis(2, ne - top, ne)?;
+                let scores = probs.take_along_axis(&selected, -1)?;
+                let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
+                (selected, scores)
+            };
+        if let Some(out) = self.tentative_shared_experts(x, &selected, &scores, i)? {
             return Ok(out);
         }
         let device = self.tentative_experts(x, &selected, &scores, i)?;
@@ -1455,16 +1335,11 @@ impl Decoder {
             MxArray::concatenate_many(weighted.iter().collect(), Some(1))?
                 .sum(Some(&[1]), Some(true))?
         };
-        let (shared, gate) = self.shared_expert_parts(x, i, shared_gate)?;
+        let (shared, gate) = self.shared_expert_parts(x, i)?;
         sum.astype(x.dtype()?)?
             .add(&math::sigmoid_mul(&gate, &shared)?)
     }
-    fn shared_expert_parts(
-        &mut self,
-        x: &MxArray,
-        i: usize,
-        precomputed_gate: Option<MxArray>,
-    ) -> Result<(MxArray, MxArray)> {
+    fn shared_expert_parts(&mut self, x: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
         let p = format!("layers.{i}.mlp");
         let g = format!("blk.{i}");
         let (gate, up) = self.linear_pair(
@@ -1485,14 +1360,11 @@ impl Decoder {
             &format!("{g}.ffn_down_shexp.weight"),
         )?;
         drop(activation);
-        let gate = match precomputed_gate {
-            Some(gate) => gate,
-            None => self.linear(
-                x,
-                &format!("{p}.shared_expert_gate.weight"),
-                &format!("{g}.ffn_gate_inp_shexp.weight"),
-            )?,
-        };
+        let gate = self.linear(
+            x,
+            &format!("{p}.shared_expert_gate.weight"),
+            &format!("{g}.ffn_gate_inp_shexp.weight"),
+        )?;
         Ok((shared, gate))
     }
 
@@ -1800,19 +1672,7 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
-        Ok(self.layer_with_norm(x, token, i, cache, None, false)?.0)
-    }
-
-    fn layer_with_norm(
-        &mut self,
-        x: MxArray,
-        token: u32,
-        i: usize,
-        cache: &mut LayerCache,
-        incoming_norm: Option<&MxArray>,
-        normalize_next: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
-        let (x, normed) = self.attention_block_for_mlp(x, token, i, cache, true, incoming_norm)?;
+        let (x, normed) = self.attention_block_for_mlp(x, token, i, cache, true)?;
         let (mixed, gate) = self.hyper_with_norm(
             &x,
             &format!("layers.{i}.mlp_hyper_connection"),
@@ -1823,7 +1683,7 @@ impl Decoder {
         let branch = self.moe(&mixed, i)?;
         let gate =
             gate.ok_or_else(|| Error::from_reason("Qwen4 MLP is missing its injection gate"))?;
-        self.inject_for_next_attention(&x, &branch, &gate, i, normalize_next)
+        Self::inject(&x, &branch, &gate)
     }
 
     fn attention_block(
@@ -1833,9 +1693,7 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
-        Ok(self
-            .attention_block_for_mlp(x, token, i, cache, false, None)?
-            .0)
+        Ok(self.attention_block_for_mlp(x, token, i, cache, false)?.0)
     }
 
     fn attention_block_for_mlp(
@@ -1845,7 +1703,6 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
         normalize: bool,
-        incoming_norm: Option<&MxArray>,
     ) -> Result<(MxArray, Option<MxArray>)> {
         if self.config.ple_layer_ids.contains(&(i + 1)) {
             x = x.add(&self.ple(&x, token, i, cache)?)?;
@@ -1855,7 +1712,7 @@ impl Decoder {
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
-            incoming_norm,
+            None,
         )?;
         let branch = if self.config.linear(i) {
             self.gdn(&mixed, i, cache)?
@@ -2035,7 +1892,6 @@ impl Decoder {
                     .collect(),
             );
         }
-        let mut attention_normed = None;
         for i in 0..self.config.num_hidden_layers {
             self.check_cancelled()?;
             let mut cache = std::mem::take(&mut self.caches[i]);
@@ -2046,14 +1902,8 @@ impl Decoder {
                 let input = window
                     .as_ref()
                     .ok_or_else(|| Error::from_reason("Qwen4 attention lost its prefill window"))?;
-                let (stream, normed) = self.attention_matrix_for_mlp(
-                    input,
-                    tokens,
-                    i,
-                    &mut cache,
-                    true,
-                    attention_normed.as_ref(),
-                )?;
+                let (stream, normed) =
+                    self.attention_matrix_for_mlp(input, tokens, i, &mut cache, true)?;
                 window = Some(stream);
                 mlp_normed = normed;
             } else if batched {
@@ -2061,20 +1911,7 @@ impl Decoder {
             } else {
                 for (j, &token) in tokens.iter().enumerate() {
                     self.check_cancelled()?;
-                    let next = if tokens.len() == 1 && self.verification.is_none() {
-                        let (stream, normed) = self.layer_with_norm(
-                            hidden[j].clone(),
-                            token,
-                            i,
-                            &mut cache,
-                            attention_normed.as_ref(),
-                            true,
-                        )?;
-                        attention_normed = normed;
-                        stream
-                    } else {
-                        self.layer(hidden[j].clone(), token, i, &mut cache)?
-                    };
+                    let next = self.layer(hidden[j].clone(), token, i, &mut cache)?;
                     if defer_final && i + 1 == self.config.num_hidden_layers {
                         // TrackFastModel returns a lazy final mixer/head. The
                         // checked route commit joins it with all state/readers.
@@ -2107,10 +1944,7 @@ impl Decoder {
                 let input = window
                     .as_ref()
                     .ok_or_else(|| Error::from_reason("Qwen4 MLP lost its prefill window"))?;
-                let (stream, normed) =
-                    self.mlp_matrix_for_attention(input, i, mlp_normed.as_ref(), true)?;
-                window = Some(stream);
-                attention_normed = normed;
+                window = Some(self.mlp_matrix_for_attention(input, i, mlp_normed.as_ref())?);
             } else if batched {
                 hidden = self.mlp_batch(&hidden, i)?;
             }
@@ -2211,11 +2045,10 @@ impl Decoder {
         self.prefetch_ple_rows(&[token])?;
         let row = self.embed_token(token)?;
         let mut x = MxArray::tile(&row, &[1, 1, self.config.hc_count as i32])?;
-        let mut normed = None;
         for i in 0..self.config.num_hidden_layers {
             self.check_cancelled()?;
             let mut cache = std::mem::take(&mut self.caches[i]);
-            (x, normed) = self.layer_with_norm(x, token, i, &mut cache, normed.as_ref(), true)?;
+            x = self.layer(x, token, i, &mut cache)?;
             if defer_final && i + 1 == self.config.num_hidden_layers {
                 // The validated route commit completes the final head too.
             } else if (i + 1) % submit_span != 0 && i + 1 < self.config.num_hidden_layers {

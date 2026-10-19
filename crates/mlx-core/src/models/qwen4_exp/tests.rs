@@ -809,7 +809,7 @@ fn full_bank_preparation_reuses_streamed_expert_chunks_after_restart() {
 ///   `attention_window`, the rest the sparse singleton path.
 /// - width 7: the first chunk is a dense window (BF16) that splits an index
 ///   block (7 = 4 + 3); every later chunk is past the budget; a 36-token
-///   prompt ends on a 1-token chunk, the singleton `layer_with_norm` path
+///   prompt ends on a 1-token chunk, the singleton `layer` path
 ///   inside `prefill_chunk`.
 /// - width 32: crosses the budget inside one chunk, leaves a 4-token tail;
 ///   `batched_prefill_*` prepares the fixture under `policy = "auto"` here,
@@ -3028,56 +3028,6 @@ fn sorted_expert_combine_keeps_product_rounding_and_reduction_order() {
                 &*actual, &*reference,
                 "{hidden} {value_type:?} {score_type:?}"
             );
-            if hidden == 2560 && value_type == DType::BFloat16 {
-                for phase in [0.0, 0.71] {
-                    let shared = MxArray::from_float32(
-                        &(0..tokens * hidden)
-                            .map(|i| (i as f32 * 0.039 + phase).sin() * 2.3)
-                            .collect::<Vec<_>>(),
-                        &[1, tokens as i64, hidden as i64],
-                    )
-                    .unwrap()
-                    .astype(DType::BFloat16)
-                    .unwrap();
-                    let gate = MxArray::from_float32(
-                        &(0..tokens)
-                            .map(|i| (i as f32 * 0.37 + phase).cos() * 9.0)
-                            .collect::<Vec<_>>(),
-                        &[1, tokens as i64, 1],
-                    )
-                    .unwrap()
-                    .astype(DType::BFloat16)
-                    .unwrap();
-                    let reduced =
-                        MxArray::from_float32(&reference, &[1, tokens as i64, hidden as i64])
-                            .unwrap()
-                            .astype(DType::BFloat16)
-                            .unwrap();
-                    let expected = reduced
-                        .add(&math::sigmoid_mul(&gate, &shared).unwrap())
-                        .unwrap()
-                        .to_float32()
-                        .unwrap();
-                    let raw = unsafe {
-                        mlx_sys::mlx_qwen4_sorted_shared_combine(
-                            values.as_raw_ptr(),
-                            scores.as_raw_ptr(),
-                            inverse.as_raw_ptr(),
-                            shared.as_raw_ptr(),
-                            gate.as_raw_ptr(),
-                            top as i32,
-                        )
-                    };
-                    let combined = MxArray::from_handle(raw, "sorted shared combine test")
-                        .unwrap()
-                        .to_float32()
-                        .unwrap();
-                    assert_eq!(
-                        &*combined, &*expected,
-                        "shared {score_type:?} phase={phase}"
-                    );
-                }
-            }
         }
     }
 }
@@ -3312,26 +3262,6 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
                         normed.as_raw_ptr(),
                     )
                 };
-                if super::runtime_flags::is_one(c"MLX_QWEN4_MIXER_UP_COLUMNS") {
-                    let injection = MxArray::zeros(&[1, 1, 4], Some(DType::BFloat16)).unwrap();
-                    let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
-                    assert!(unsafe {
-                        mlx_sys::mlx_qwen4_hyper_up_inject(
-                            x.as_raw_ptr(),
-                            w.as_raw_ptr(),
-                            s.as_raw_ptr(),
-                            b.as_raw_ptr(),
-                            normed.as_raw_ptr(),
-                            injection.as_raw_ptr(),
-                            &mut mixed,
-                            &mut gate,
-                        )
-                    });
-                    let mixed = MxArray::from_handle(mixed, "two-column mixer").unwrap();
-                    let gate = MxArray::from_handle(gate, "two-column injection").unwrap();
-                    assert_eq!(&*mixed.to_float32().unwrap(), &*want.to_float32().unwrap());
-                    assert_eq!(&*gate.to_float32().unwrap(), &[1.; 4]);
-                }
                 let got = MxArray::from_handle(raw, "hyper up specialization must run").unwrap();
                 assert_eq!(
                     &*got.to_float32().unwrap(),
@@ -3352,56 +3282,6 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
                 .is_null()
             );
         }
-    }
-}
-
-#[test]
-fn parallel_mixer_products_preserve_projection_and_halfway_rounding() {
-    // Reuse the independent GEMV/normalization references with the lane port
-    // enabled in isolated processes, including fused injection output.
-    for test in [
-        "compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding",
-        "hyper_up_preserves_native_sigmoid_halfway_rounding",
-    ] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                &format!("models::qwen4_exp::tests::{test}"),
-                "--test-threads=1",
-            ])
-            .env("MLX_QWEN4_MIXER_LANE_PRODUCTS", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{test}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[test]
-fn two_column_mixer_preserves_projections_and_halfway_rounding() {
-    for test in [
-        "compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding",
-        "hyper_up_preserves_native_sigmoid_halfway_rounding",
-    ] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                &format!("models::qwen4_exp::tests::{test}"),
-                "--test-threads=1",
-            ])
-            .env("MLX_QWEN4_MIXER_UP_COLUMNS", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{test}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 }
 
@@ -3493,7 +3373,7 @@ fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
         let mut mixed = std::ptr::null_mut();
         let mut fused_gate = std::ptr::null_mut();
         assert!(unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject(
+            mlx_sys::mlx_qwen4_hyper_up_inject_rows(
                 x.as_raw_ptr(),
                 w.as_raw_ptr(),
                 s.as_raw_ptr(),
@@ -3519,7 +3399,7 @@ fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
         let mut mixed = std::ptr::null_mut();
         let mut fused_gate = std::ptr::null_mut();
         assert!(!unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject(
+            mlx_sys::mlx_qwen4_hyper_up_inject_rows(
                 x.as_raw_ptr(),
                 w.as_raw_ptr(),
                 s.as_raw_ptr(),
@@ -4092,24 +3972,6 @@ fn convolution_history_releases_wide_prefill_storage() {
     );
 }
 
-#[test]
-fn bf16_indirect_prefill_staging_preserves_scalar_load_results() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "models::qwen4_exp::tests::indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding",
-            "--test-threads=1",
-        ])
-        .env("QWEN4_TEST_BF16_STAGING", "1")
-        .env("MLX_QWEN4_PREFILL_REFERENCE_BF16", "1")
-        .status()
-        .unwrap();
-    assert!(status.success(), "BF16 staging changed an output bit");
-}
-
 fn quantized_expert_bank(
     e: usize,
     n: usize,
@@ -4183,7 +4045,6 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
     // This mode runs only in the isolated child above. The scalar-load path
     // is the oracle for an address-only BF16 prefetch change, not for the
     // separate BF16-vs-F32 arithmetic experiment.
-    let check_bf16_staging = std::env::var_os("QWEN4_TEST_BF16_STAGING").is_some();
     let (h, m, tokens) = (256usize, 128usize, 53usize);
     let ids: Vec<u32> = counts
         .iter()
@@ -4226,36 +4087,6 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
                 bank(m, h, gb, false, 197),
                 bank(h, m, db, true, 13),
             ];
-            if check_bf16_staging {
-                for phase in [0., 0.125] {
-                    let input = source
-                        .add_scalar(phase)
-                        .unwrap()
-                        .astype(DType::BFloat16)
-                        .unwrap();
-                    // The child's main thread alone changes the switch, and
-                    // each graph is fully evaluated before the next change.
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_DOWN_STAGING", "0") };
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_HOIST_ZERO", "0") };
-                    let expected = math::prefill_indirect(&input, &ids, &token_rows, &banks, e)
-                        .unwrap()
-                        .expect("supported scalar BF16 path")
-                        .to_float32()
-                        .unwrap();
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_DOWN_STAGING", "1") };
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_HOIST_ZERO", "1") };
-                    let actual = math::prefill_indirect(&input, &ids, &token_rows, &banks, e)
-                        .unwrap()
-                        .expect("supported staged BF16 path")
-                        .to_float32()
-                        .unwrap();
-                    assert_eq!(
-                        &*actual, &*expected,
-                        "BF16 stage gate={gb} down={db} phase={phase}"
-                    );
-                }
-                continue;
-            }
             let gate = banks[0]
                 .tiled_expert_rows(&expanded, &ids, &tiles, e)
                 .unwrap()
@@ -4640,90 +4471,6 @@ fn compact_dense_prefill_preserves_affine_rounding_views_and_fallbacks() {
 }
 
 #[test]
-fn route_register_results_preserve_probability_ties_and_scores() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["router_preserves_probability", "--test-threads=1"])
-        .env("MLX_QWEN4_ROUTE_REGISTER_RESULTS", "1")
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "register routing changed IDs or score bits"
-    );
-}
-
-#[test]
-fn singleton_router_row_schedule_preserves_native_gemv() {
-    use crate::array::DType;
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    for phase in 0..4 {
-        let x = MxArray::from_float32(
-            &(0..5120)
-                .map(|i| ((i * 131 + phase * 53) as f32 * 0.017).sin())
-                .collect::<Vec<_>>(),
-            &[1, 1, 5120],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        // Offset and strided inputs exercise the custom primitive's copies.
-        let x = if phase % 2 == 0 {
-            x.slice_axis(2, 2560, 5120).unwrap()
-        } else {
-            x.reshape(&[2560, 2])
-                .unwrap()
-                .slice_axis(1, 1, 2)
-                .unwrap()
-                .reshape(&[1, 1, 2560])
-                .unwrap()
-        };
-        let w = MxArray::from_float32(
-            &(0..513 * 2560)
-                .map(|i| ((i * 37 + phase * 101) as f32 * 0.0031).cos() * 0.125)
-                .collect::<Vec<_>>(),
-            &[513, 2560],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap()
-        .slice_axis(0, 1, 513)
-        .unwrap();
-        let expected = x
-            .matmul(&w.transpose(None).unwrap())
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        let raw = unsafe { mlx_sys::mlx_qwen4_router_decode(x.as_raw_ptr(), w.as_raw_ptr()) };
-        assert!(!raw.is_null(), "supported router shape");
-        let actual = MxArray::from_handle(raw, "router regression")
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        for (i, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "router phase={phase} row={i}"
-            );
-        }
-        assert!(
-            unsafe {
-                mlx_sys::mlx_qwen4_router_decode(
-                    x.astype(DType::Float32).unwrap().as_raw_ptr(),
-                    w.as_raw_ptr(),
-                )
-            }
-            .is_null()
-        );
-    }
-}
-
-#[test]
 fn singleton_router_preserves_probability_rounding_ties_and_normalization() {
     use crate::array::{DType, MxArray};
     use crate::nn::Activations;
@@ -4787,136 +4534,6 @@ fn singleton_router_preserves_probability_rounding_ties_and_normalization() {
 }
 
 #[test]
-fn combined_routes_preserve_probability_ties_dense_gate_and_changing_views() {
-    use crate::array::DType;
-    use crate::nn::Activations;
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    const CHILD: &str = "MLX_QWEN4_COMBINED_ROUTE_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        for cached in ["0", "1"] {
-            for registers in ["0", "1"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "models::qwen4_exp::tests::combined_routes_preserve_probability_ties_dense_gate_and_changing_views", "--test-threads=1"])
-                    .env(CHILD, "1")
-                    .env("MLX_QWEN4_CACHED_KERNEL_GRAPHS", cached)
-                    .env("MLX_QWEN4_ROUTE_REGISTER_RESULTS", registers)
-                    .output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "cached={cached}, registers={registers}: {}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-        return;
-    }
-    for case in 0..64 {
-        // Select alternating columns: real strided views with changing input
-        // and weight storage catch accidental graph constant captures.
-        let view = |values: &[f32], width: i64| {
-            MxArray::from_float32(values, &[width, 2])
-                .unwrap()
-                .astype(DType::BFloat16)
-                .unwrap()
-                .slice_axis(1, case % 2, case % 2 + 1)
-                .unwrap()
-                .transpose(None)
-                .unwrap()
-        };
-        let l: Vec<f32> = (0..1024)
-            .map(|i| match case {
-                0 => 0.,
-                1 => (i % 4) as f32,
-                2 => f32::NEG_INFINITY,
-                3 => f32::INFINITY,
-                4 if i == 14 => f32::NAN,
-                5 if i == 1023 => f32::INFINITY,
-                _ => ((i * 131 + case * 53) as f32 * 0.017).sin() * case as f32 * 0.3,
-            })
-            .collect();
-        let l = view(&l, 512).reshape(&[1, 1, 512]).unwrap();
-        let values: Vec<f32> = (0..5120)
-            .map(|i| ((i * 19 + case * 37) % 257) as f32 / 128. - 1.)
-            .collect();
-        let weights: Vec<f32> = (0..5120)
-            .map(|i| ((i * 31 + case * 13) % 511) as f32 / 256. - 1.)
-            .collect();
-        let x = view(&values, 2560).reshape(&[1, 1, 2560]).unwrap();
-        let w = view(&weights, 2560);
-        let probs = Activations::softmax_precise(&l, Some(-1)).unwrap();
-        let want_ids = probs
-            .argpartition(-10, Some(-1))
-            .unwrap()
-            .slice_axis(2, 502, 512)
-            .unwrap();
-        let want_scores = probs.take_along_axis(&want_ids, -1).unwrap();
-        let want_scores = want_scores
-            .div(&want_scores.sum(Some(&[-1]), Some(true)).unwrap())
-            .unwrap();
-        let want_gate = x.matmul(&w.transpose(None).unwrap()).unwrap();
-        let (mut ids, mut scores, mut gate) = (
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        assert!(unsafe {
-            mlx_sys::mlx_qwen4_routes_shared_gate(
-                l.as_raw_ptr(),
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                &mut ids,
-                &mut scores,
-                &mut gate,
-            )
-        });
-        let ids = MxArray::from_handle(ids, "combined IDs").unwrap();
-        let scores = MxArray::from_handle(scores, "combined scores").unwrap();
-        let gate = MxArray::from_handle(gate, "combined gate").unwrap();
-        assert_eq!(
-            &*ids.to_uint32().unwrap(),
-            &*want_ids.to_uint32().unwrap(),
-            "IDs case={case}"
-        );
-        for (a, b) in scores
-            .to_float32()
-            .unwrap()
-            .iter()
-            .zip(want_scores.to_float32().unwrap().iter())
-        {
-            assert!(
-                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
-                "scores case={case}: {a} vs {b}"
-            );
-        }
-        assert_eq!(
-            &*gate.to_float32().unwrap(),
-            &*want_gate.to_float32().unwrap(),
-            "gate case={case}"
-        );
-        let unsupported = l.astype(DType::Float32).unwrap();
-        let (mut ids, mut scores, mut gate) = (
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        assert!(!unsafe {
-            mlx_sys::mlx_qwen4_routes_shared_gate(
-                unsupported.as_raw_ptr(),
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                &mut ids,
-                &mut scores,
-                &mut gate,
-            )
-        });
-        assert!(ids.is_null() && scores.is_null() && gate.is_null());
-    }
-}
-
-#[test]
 fn reference_prefill_hc_mix_preserves_bf16_boundaries_and_views() {
     use crate::array::DType;
     if !crate::engine::persistence::compiled_forward_backend_available() {
@@ -4956,155 +4573,6 @@ fn reference_prefill_hc_mix_preserves_bf16_boundaries_and_views() {
         unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(short.as_raw_ptr(), short.as_raw_ptr()) }
             .is_null()
     );
-}
-
-#[test]
-fn mixer_split_k_preserves_independent_projections() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "mixer_down_injection_matches_independent_projections",
-            "--test-threads=1",
-        ])
-        .env("MLX_QWEN4_MIXER_SPLIT_K", "1")
-        .env("MLX_QWEN4_MIXER_DOWN_INJECT", "0")
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "ordered split-K mixer changed projection bits"
-    );
-}
-
-#[test]
-fn mixer_down_injection_matches_independent_projections() {
-    use crate::array::DType;
-    use crate::models::quantized_linear::QuantizedLinear;
-    use crate::nn::Activations;
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    for phase in [3usize, 17] {
-        let k = 10240;
-        // Offset views and changing weight values catch cached-graph captures.
-        let make = |n: usize| {
-            let w = MxArray::from_uint32(
-                &(0..(n + 1) * k / 4)
-                    .map(|i| {
-                        (i as u32)
-                            .wrapping_mul(0x9e3779b9)
-                            .wrapping_add(phase as u32)
-                    })
-                    .collect::<Vec<_>>(),
-                &[(n + 1) as i64, (k / 4) as i64],
-            )
-            .unwrap()
-            .slice_axis(0, 1, (n + 1) as i64)
-            .unwrap();
-            let s = MxArray::from_float32(
-                &(0..(n + 1) * k / 32)
-                    .map(|i| ((i * 13 + phase) % 61 + 1) as f32 / 65536.)
-                    .collect::<Vec<_>>(),
-                &[(n + 1) as i64, (k / 32) as i64],
-            )
-            .unwrap()
-            .astype(DType::Float16)
-            .unwrap()
-            .slice_axis(0, 1, (n + 1) as i64)
-            .unwrap();
-            let b = s.mul_scalar(-128.).unwrap().astype(DType::Float16).unwrap();
-            (w, s, b)
-        };
-        let (wd, sd, bd) = make(320);
-        let (wi, si, bi) = make(4);
-        let x = MxArray::from_float32(
-            &(0..2 * k)
-                .map(|i| ((i * 17 + phase) % 251) as f32 / 128. - 1.)
-                .collect::<Vec<_>>(),
-            &[2, k as i64],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap()
-        .slice_axis(0, 1, 2)
-        .unwrap()
-        .reshape(&[1, 1, k as i64])
-        .unwrap();
-        let project = |w: &MxArray, s: &MxArray, b: &MxArray| {
-            QuantizedLinear::new(
-                w.clone(),
-                s.clone(),
-                Some(b.clone()),
-                None,
-                32,
-                8,
-                "affine".into(),
-            )
-            .forward(&x)
-            .unwrap()
-        };
-        let expected_act =
-            Activations::silu(&project(&wd, &sd, &bd).div_scalar(4.).unwrap()).unwrap();
-        let expected_gate = project(&wi, &si, &bi);
-        if std::env::var("MLX_QWEN4_MIXER_SPLIT_K").as_deref() == Ok("1") {
-            let weight = |w: &MxArray, s: &MxArray, b: &MxArray| weights::Weight {
-                values: w.clone(),
-                dense_bf16: None,
-                scales: Some(s.clone()),
-                biases: Some(b.clone()),
-                group: 32,
-                bits: 8,
-                mode: "affine".into(),
-            };
-            let (actual, gate) = weight(&wd, &sd, &bd)
-                .mixer_down_inject(&x, &weight(&wi, &si, &bi))
-                .unwrap()
-                .expect("split-K independently enables its eligible mixer path");
-            assert_eq!(
-                &*actual.to_float32().unwrap(),
-                &*expected_act.to_float32().unwrap()
-            );
-            assert_eq!(
-                &*gate.to_float32().unwrap(),
-                &*expected_gate.to_float32().unwrap()
-            );
-        }
-        let call = |input: &MxArray, out: &mut _, gate: &mut _| unsafe {
-            mlx_sys::mlx_qwen4_mixer_down_inject(
-                input.as_raw_ptr(),
-                wd.as_raw_ptr(),
-                sd.as_raw_ptr(),
-                bd.as_raw_ptr(),
-                wi.as_raw_ptr(),
-                si.as_raw_ptr(),
-                bi.as_raw_ptr(),
-                out,
-                gate,
-            )
-        };
-        let (mut out, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert!(call(&x, &mut out, &mut gate));
-        let out = MxArray::from_handle(out, "fused down activation").unwrap();
-        let gate = MxArray::from_handle(gate, "fused injection projection").unwrap();
-        assert_eq!(
-            &*out.to_float32().unwrap(),
-            &*expected_act.to_float32().unwrap()
-        );
-        assert_eq!(
-            &*gate.to_float32().unwrap(),
-            &*expected_gate.to_float32().unwrap()
-        );
-        for unsupported in [
-            x.astype(DType::Float32).unwrap(),
-            x.broadcast_to(&[1, 2, k as i64]).unwrap(),
-        ] {
-            let (mut out, mut gate) = (x.as_raw_ptr(), x.as_raw_ptr());
-            assert!(!call(&unsupported, &mut out, &mut gate));
-            assert!(out.is_null() && gate.is_null());
-        }
-    }
 }
 
 #[test]
@@ -6629,7 +6097,7 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
         for j in 0..rows {
             let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
             assert!(unsafe {
-                mlx_sys::mlx_qwen4_hyper_up_inject(
+                mlx_sys::mlx_qwen4_hyper_up_inject_rows(
                     row(&x, j).as_raw_ptr(),
                     up.values.as_raw_ptr(),
                     us.as_raw_ptr(),
@@ -7249,4 +6717,362 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
             }),
         );
     }
+}
+
+/// Real-model teacher-forced exactness and decode-time A/B of environment
+/// arms in ONE process. The clean environment is the reference: it decodes
+/// `D3_STEPS` greedy tokens; every arm sets its variables, replays those
+/// tokens and reports argmax mismatches per position, the ULP distance of
+/// the first 32 logits rows and its steady decode step time (steps 32..).
+/// A reference rerun after every eight arms shows the process's own spread.
+/// Needs `QWEN4_EXP_REAL_MODEL` / `QWEN4_EXP_REAL_INPUTS` (the benchmark
+/// `inputs.json`), `--test-threads=1` and a clean `MLX_*` environment.
+/// `D3_ARMS` = `NAME=VAL[+NAME=VAL];...`, `D3_CASES` (default `6k,16k`),
+/// `D3_OUT` (results JSON), `D3_EXPECTED` (an earlier `D3_OUT`: the
+/// reference argmax of every case must match it or the test fails).
+#[test]
+#[ignore]
+fn real_model_teacher_forced_env_arms() {
+    use std::time::Instant;
+    let (Ok(model), Ok(inputs)) = (
+        std::env::var("QWEN4_EXP_REAL_MODEL"),
+        std::env::var("QWEN4_EXP_REAL_INPUTS"),
+    ) else {
+        eprintln!(
+            "real_model_teacher_forced_env_arms: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_INPUTS not set"
+        );
+        return;
+    };
+    let steps: usize = std::env::var("D3_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    assert!(steps >= 33, "D3_STEPS must leave a steady window (>= 33)");
+    // `MLX_METAL_COMMAND_TRACE` runs count `[metal-command]` dispatches
+    // between these markers.
+    let step_marks = std::env::var("D3_STEP_MARKS").as_deref() == Ok("1");
+    let cases: Vec<String> = std::env::var("D3_CASES")
+        .unwrap_or_else(|_| "6k,16k".into())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let arms: Vec<(String, Vec<(String, String)>)> = std::env::var("D3_ARMS")
+        .unwrap_or_default()
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+        .map(|arm| {
+            let env: Vec<(String, String)> = arm
+                .split('+')
+                .map(|kv| {
+                    let (k, v) = kv.split_once('=').expect("D3_ARMS entries are NAME=VAL");
+                    (k.trim().to_owned(), v.trim().to_owned())
+                })
+                .collect();
+            (arm.trim().to_owned(), env)
+        })
+        .collect();
+    let expected: Option<serde_json::Value> = std::env::var("D3_EXPECTED")
+        .ok()
+        .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap());
+    let inputs: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+    let prompt_for = |name: &str| -> Vec<u32> {
+        inputs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap_or_else(|| panic!("case {name} in inputs"))["tokenIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_u64().unwrap() as u32)
+            .collect()
+    };
+
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config, store).unwrap();
+    decoder.register_cache_limit();
+    decoder.weights.prepare_mapped_pack().unwrap();
+    decoder.weights.select_mapped_residency(0).unwrap();
+    decoder.weights.prepare_hot().unwrap();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
+    eprintln!(
+        "D3 residency: mapped={} slots={} budget={:.1} GiB window={}",
+        decoder.weights.plan.mapped,
+        decoder.weights.plan.partial_expert_slots,
+        decoder.weights.plan.budget as f64 / (1u64 << 30) as f64,
+        decoder.prefill_chunk_size
+    );
+
+    struct Arm {
+        argmax: Vec<u32>,
+        top: Vec<f32>,
+        rows: Vec<Vec<f32>>,
+        tokens: Vec<u32>,
+        prefill_ms: f64,
+        step_ms: Vec<f64>,
+        mapped: bool,
+        slots: usize,
+        bf16: bool,
+    }
+    let run_arm = |decoder: &mut decoder::Decoder,
+                   prompt: &[u32],
+                   forced: Option<&[u32]>|
+     -> std::result::Result<Arm, String> {
+        decoder.reset();
+        if decoder.weights.begin_turn().unwrap().is_some() {
+            eprintln!("D3 WARNING: a slot fallback was applied before this arm");
+        }
+        let mapped = decoder.weights.plan.mapped;
+        let slots = decoder.weights.plan.partial_expert_slots;
+        let started = Instant::now();
+        let mut logits = None;
+        let mut start = 0;
+        while start < prompt.len() {
+            let end = (start + decoder.prefill_slice_size()).min(prompt.len());
+            logits = Some(
+                decoder
+                    .prefill_chunk(&prompt[start..end], None, end == prompt.len())
+                    .map_err(|e| format!("prefill: {e}"))?,
+            );
+            start = end;
+        }
+        let mut logits = logits.ok_or("empty prompt")?;
+        let bf16 = logits.dtype().unwrap() == crate::array::DType::BFloat16;
+        let prefill_ms = started.elapsed().as_secs_f64() * 1e3;
+        let mut arm = Arm {
+            argmax: Vec::with_capacity(steps),
+            top: Vec::with_capacity(steps),
+            rows: Vec::with_capacity(32),
+            tokens: Vec::with_capacity(steps),
+            prefill_ms,
+            step_ms: Vec::with_capacity(steps),
+            mapped,
+            slots,
+            bf16,
+        };
+        let mut stepped: Option<Instant> = None;
+        for i in 0..steps {
+            let last = logits.shape().unwrap().len() as i32 - 1;
+            let id = logits
+                .argmax(last, Some(false))
+                .unwrap()
+                .item_at_uint32(0)
+                .unwrap();
+            if let Some(t) = stepped {
+                arm.step_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let top = logits
+                .max(None, Some(false))
+                .unwrap()
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .item_at_float32(0)
+                .unwrap();
+            arm.argmax.push(id);
+            arm.top.push(top);
+            if step_marks {
+                eprintln!("D3-STEP {i}");
+            }
+            if i < 32 {
+                arm.rows.push(logits.to_float32().unwrap().to_vec());
+            }
+            let next = forced.map_or(id, |f| f[i]);
+            arm.tokens.push(next);
+            if i + 1 < steps {
+                let t = Instant::now();
+                logits = decoder.step(next).map_err(|e| format!("step {i}: {e}"))?;
+                stepped = Some(t);
+            }
+        }
+        Ok(arm)
+    };
+    let ulp_key = |value: f32, bf16: bool| -> i64 {
+        let bits = value.to_bits();
+        if bf16 {
+            let b = (bits >> 16) as i64;
+            if b & 0x8000 != 0 { -(b & 0x7fff) } else { b }
+        } else {
+            let b = bits as i64;
+            if b & 0x8000_0000 != 0 {
+                -(b & 0x7fff_ffff)
+            } else {
+                b
+            }
+        }
+    };
+    let steady = |arm: &Arm| -> (f64, f64) {
+        let window = &arm.step_ms[31..];
+        let mut sorted = window.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        (
+            sorted[sorted.len() / 2],
+            window.iter().sum::<f64>() / window.len() as f64,
+        )
+    };
+    let compare = |case: &str, name: &str, reference: &Arm, arm: &Arm| -> serde_json::Value {
+        let mut details = Vec::new();
+        for (p, (a, b)) in reference.argmax.iter().zip(&arm.argmax).enumerate() {
+            if a != b {
+                details.push(serde_json::json!({
+                    "position": p,
+                    "reference": [a, reference.top[p]],
+                    "arm": [b, arm.top[p]],
+                }));
+            }
+        }
+        let mut identical = 0usize;
+        let mut max_ulp = 0i64;
+        for (r, a) in reference.rows.iter().zip(&arm.rows) {
+            let worst = r
+                .iter()
+                .zip(a)
+                .map(|(x, y)| (ulp_key(*x, reference.bf16) - ulp_key(*y, reference.bf16)).abs())
+                .max()
+                .unwrap_or(0);
+            if worst == 0 {
+                identical += 1;
+            }
+            max_ulp = max_ulp.max(worst);
+        }
+        let (median, mean) = steady(arm);
+        eprintln!(
+            "D3 {case} {name}: argmax_mismatches={} rows32_identical={identical}/{} max_ulp={max_ulp} prefill_ms={:.0} steady_median_ms={median:.2} steady_mean_ms={mean:.2} mapped={} slots={}",
+            details.len(),
+            reference.rows.len(),
+            arm.prefill_ms,
+            arm.mapped,
+            arm.slots
+        );
+        for d in details.iter().take(8) {
+            eprintln!("D3 {case} {name} MISMATCH {d}");
+        }
+        serde_json::json!({
+            "name": name,
+            "argmax_mismatches": details.len(),
+            "mismatches": details,
+            "rows32_identical": identical,
+            "rows32_max_ulp": max_ulp,
+            "prefill_ms": arm.prefill_ms,
+            "steady_median_ms": median,
+            "steady_mean_ms": mean,
+            "mapped": arm.mapped,
+            "slots": arm.slots,
+        })
+    };
+
+    let mut failed = false;
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "residency".into(),
+        serde_json::json!({
+            "mapped": decoder.weights.plan.mapped,
+            "slots": decoder.weights.plan.partial_expert_slots,
+        }),
+    );
+    let mut case_results = serde_json::Map::new();
+    for case in &cases {
+        let prompt = prompt_for(case);
+        let reference = run_arm(&mut decoder, &prompt, None).expect("the reference arm");
+        let (median, mean) = steady(&reference);
+        eprintln!(
+            "D3 {case} reference: prompt={} prefill_ms={:.0} steady_median_ms={median:.2} steady_mean_ms={mean:.2} mapped={} slots={} tokens={:?}",
+            prompt.len(),
+            reference.prefill_ms,
+            reference.mapped,
+            reference.slots,
+            &reference.tokens[..16.min(reference.tokens.len())]
+        );
+        if let Some(expected) = &expected {
+            let want: Vec<u32> = expected["cases"][case]["reference"]["argmax"]
+                .as_array()
+                .unwrap_or_else(|| panic!("D3_EXPECTED has no reference argmax for {case}"))
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let mismatches: Vec<usize> = want
+                .iter()
+                .zip(&reference.argmax)
+                .enumerate()
+                .filter(|(_, (w, g))| w != g)
+                .map(|(p, _)| p)
+                .collect();
+            if want.len() != reference.argmax.len() || !mismatches.is_empty() {
+                failed = true;
+                eprintln!(
+                    "D3 {case} EXPECTED MISMATCH: {} positions differ from D3_EXPECTED (first: {:?}), lengths {} vs {}",
+                    mismatches.len(),
+                    mismatches.first(),
+                    want.len(),
+                    reference.argmax.len()
+                );
+            } else {
+                eprintln!(
+                    "D3 {case} EXPECTED OK: {} positions match D3_EXPECTED",
+                    want.len()
+                );
+            }
+        }
+        let mut arm_results = Vec::new();
+        for (k, (name, env)) in arms.iter().enumerate() {
+            if k > 0 && k % 8 == 0 {
+                let rerun = run_arm(&mut decoder, &prompt, Some(&reference.tokens))
+                    .expect("a reference rerun");
+                arm_results.push(compare(
+                    case,
+                    &format!("reference-rerun-{}", k / 8),
+                    &reference,
+                    &rerun,
+                ));
+            }
+            for (key, value) in env {
+                unsafe { std::env::set_var(key, value) };
+            }
+            let arm = run_arm(&mut decoder, &prompt, Some(&reference.tokens));
+            for (key, _) in env {
+                unsafe { std::env::remove_var(key) };
+            }
+            match arm {
+                Ok(arm) => arm_results.push(compare(case, name, &reference, &arm)),
+                Err(error) => {
+                    eprintln!("D3 {case} {name}: ERROR {error}");
+                    arm_results.push(serde_json::json!({"name": name, "error": error}));
+                }
+            }
+        }
+        let rerun = run_arm(&mut decoder, &prompt, Some(&reference.tokens))
+            .expect("the final reference rerun");
+        arm_results.push(compare(case, "reference-rerun-final", &reference, &rerun));
+        case_results.insert(
+            case.clone(),
+            serde_json::json!({
+                "reference": {
+                    "argmax": reference.argmax,
+                    "tokens": reference.tokens,
+                    "prefill_ms": reference.prefill_ms,
+                    "steady_median_ms": median,
+                    "steady_mean_ms": mean,
+                    "mapped": reference.mapped,
+                    "slots": reference.slots,
+                },
+                "arms": arm_results,
+            }),
+        );
+        out.insert(
+            "cases".into(),
+            serde_json::Value::Object(case_results.clone()),
+        );
+        if let Ok(path) = std::env::var("D3_OUT") {
+            std::fs::write(&path, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+            eprintln!("D3 wrote {path}");
+        }
+    }
+    assert!(
+        !failed,
+        "the reference argmax differs from D3_EXPECTED (see D3 EXPECTED MISMATCH lines)"
+    );
 }

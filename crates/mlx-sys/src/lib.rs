@@ -2539,14 +2539,6 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn mlx_qwen4_routes_shared_gate(
-        logits: *mut mlx_array,
-        input: *mut mlx_array,
-        weight: *mut mlx_array,
-        ids: *mut *mut mlx_array,
-        scores: *mut *mut mlx_array,
-        gate: *mut *mut mlx_array,
-    ) -> bool;
     pub fn mlx_qwen4_singleton_routes(
         logits: *mut mlx_array,
         ids: *mut *mut mlx_array,
@@ -2661,22 +2653,6 @@ unsafe extern "C" {
     ) -> *mut mlx_array;
     pub fn mlx_qwen4_prefill_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64)
     -> *mut mlx_array;
-    pub fn mlx_qwen4_rotary_window(
-        x: *mut mlx_array,
-        cosine: *mut mlx_array,
-        sine: *mut mlx_array,
-    ) -> *mut mlx_array;
-    pub fn mlx_qwen4_attention_gate(
-        attention: *mut mlx_array,
-        projection: *mut mlx_array,
-    ) -> *mut mlx_array;
-    pub fn mlx_qwen4_attention_norm_rotary(
-        x: *mut mlx_array,
-        weight: *mut mlx_array,
-        cosine: *mut mlx_array,
-        sine: *mut mlx_array,
-        eps: f64,
-    ) -> *mut mlx_array;
     pub fn mlx_qwen4_decode_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64) -> *mut mlx_array;
     pub fn mlx_qwen4_inject_norm(
         x: *mut mlx_array,
@@ -2686,17 +2662,6 @@ unsafe extern "C" {
         eps: f64,
         stream: *mut *mut mlx_array,
         normed: *mut *mut mlx_array,
-    ) -> bool;
-    pub fn mlx_qwen4_mixer_down_inject(
-        input: *mut mlx_array,
-        down: *mut mlx_array,
-        down_scales: *mut mlx_array,
-        down_biases: *mut mlx_array,
-        inject: *mut mlx_array,
-        inject_scales: *mut mlx_array,
-        inject_biases: *mut mlx_array,
-        out: *mut *mut mlx_array,
-        out_inject: *mut *mut mlx_array,
     ) -> bool;
     pub fn mlx_qwen4_decode_mixer_act(
         x: *mut mlx_array,
@@ -2780,9 +2745,6 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
-    pub fn mlx_qwen4_router_decode(input: *mut mlx_array, weight: *mut mlx_array)
-    -> *mut mlx_array;
-
     pub fn mlx_qwen4_dense_decode(
         x: *mut mlx_array,
         weight: *mut mlx_array,
@@ -2839,25 +2801,6 @@ unsafe extern "C" {
         biases: *mut mlx_array,
         normed: *mut mlx_array,
     ) -> *mut mlx_array;
-    pub fn mlx_qwen4_hyper_up_inject(
-        x: *mut mlx_array,
-        weight: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        normed: *mut mlx_array,
-        injection: *mut mlx_array,
-        out: *mut *mut mlx_array,
-        out_gate: *mut *mut mlx_array,
-    ) -> bool;
-    pub fn mlx_qwen4_sorted_shared_combine(
-        values: *mut mlx_array,
-        scores: *mut mlx_array,
-        inverse: *mut mlx_array,
-        shared: *mut mlx_array,
-        gate: *mut mlx_array,
-        top: i32,
-    ) -> *mut mlx_array;
-
     pub fn mlx_qwen4_expert_prefill(
         x: *mut mlx_array,
         ids: *mut mlx_array,

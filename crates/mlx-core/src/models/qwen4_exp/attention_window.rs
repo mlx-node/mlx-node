@@ -80,28 +80,6 @@ impl Decoder {
         count: usize,
         window: bool,
     ) -> Result<MxArray> {
-        if self.gguf()
-            && self.config.head_dim == 256
-            && x.dtype()? == DType::BFloat16
-            && runtime_flags::is_one(c"MLX_QWEN4_ATTENTION_NORM_ROTARY")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
-            let weight = self.dense(hf, gg)?;
-            let (positions, sections, interleaved) =
-                self.rotary_window_parameters(start..start + count);
-            if let Some(out) = self.rotary_tables.borrow_mut().apply_normalized(
-                x,
-                &weight,
-                positions,
-                self.config.rope_dims(),
-                self.config.rope_theta(),
-                sections,
-                interleaved,
-                self.config.rms_norm_eps,
-            )? {
-                return Ok(out);
-            }
-        }
         let normalized = self.norm(x, hf, gg, self.config.head_dim, true)?;
         if window {
             self.rope_window(&normalized, start, count)

@@ -32,7 +32,6 @@ impl Decoder {
         selected: &MxArray,
         scores: &MxArray,
         layer: usize,
-        shared: Option<(&MxArray, &MxArray)>,
     ) -> Result<MxArray> {
         let tokens = x.shape_at(1)?;
         let top = self.config.num_experts_per_tok;
@@ -53,11 +52,7 @@ impl Decoder {
         )?
         .ok_or_else(|| Error::from_reason("Qwen4 tentative prefill requires indirect experts"))?;
         let output = output.reshape(&[tokens * top as i64, self.config.hidden_size as i64])?;
-        let reduced = if let Some((shared, gate)) = shared {
-            math::combine_shared_expert_rows(&output, scores, &inverse, shared, gate, top)?
-        } else {
-            math::combine_expert_rows(&output, scores, Some(&inverse), top)?
-        };
+        let reduced = math::combine_expert_rows(&output, scores, Some(&inverse), top)?;
         self.weights.finish_expert_slots(layer, &reduced)?;
         self.device_routes
             .as_mut()
@@ -199,7 +194,6 @@ impl Decoder {
         x: &MxArray,
         selected: &MxArray,
         scores: &MxArray,
-        shared_gate: Option<&MxArray>,
         layer: usize,
     ) -> Result<Option<MxArray>> {
         if self.device_routes.is_none()
@@ -219,14 +213,11 @@ impl Decoder {
         let Some((banks, local)) = self.weights.device_expert_slots(layer, selected)? else {
             return Ok(None);
         };
-        let shared_gate = match shared_gate {
-            Some(gate) => gate.clone(),
-            None => self.linear(
-                x,
-                &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
-                &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
-            )?,
-        };
+        let shared_gate = self.linear(
+            x,
+            &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
+            &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+        )?;
         let Some(out) =
             math::routed_shared_experts(x, &local, scores, &banks, &shared, &shared_gate)?
         else {

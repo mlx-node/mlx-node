@@ -345,7 +345,7 @@ bool hyper_up_admits(const array &x, const array &w, const array &s,
          b.shape() == s.shape() && b.dtype() == s.dtype();
 }
 
-std::vector<array> hyper_up_graph(const std::vector<array> &in, bool parallel) {
+std::vector<array> hyper_up_graph(const std::vector<array> &in) {
   const auto &x = in[0], &w = in[1], &s = in[2], &b = in[3], &n = in[4];
   const int rows = x.shape(1);
   static auto kernel = mlx::core::fast::metal_kernel(
@@ -361,20 +361,18 @@ std::vector<array> hyper_up_graph(const std::vector<array> &in, bool parallel) {
                  {"FAST", false},
                  {"RPS", 4},
                  {"ACT", false},
-                 {"MIX", parallel ? 2 : 1},
+                 {"MIX", 1},
                  {"ROWS", rows}},
                 std::nullopt, false, mlx::core::Device::gpu);
 }
 
 const std::function<std::vector<array>(const std::vector<array> &)> &
 hyper_up_compiled() {
-  static auto compiled = mlx::core::compile(
-      [](const std::vector<array> &a) { return hyper_up_graph(a, false); });
+  static auto compiled = mlx::core::compile(hyper_up_graph);
   return compiled;
 }
 
-std::vector<array> hyper_up_inject_graph(const std::vector<array> &a,
-                                         int mode) {
+std::vector<array> hyper_up_inject_graph(const std::vector<array> &a) {
   const int rows = a[0].shape(1);
   static const std::string epilogue = R"(
     if (threadgroup_position_in_grid.y == 0 &&
@@ -387,21 +385,12 @@ std::vector<array> hyper_up_inject_graph(const std::vector<array> &a,
   static const std::string source = std::string(
 #include "metal/qwen4/dense_decode.metal.inc"
       ) + epilogue;
-  static const std::string columns_source = std::string(
-#include "metal/qwen4/mixer_up_columns.metal.inc"
-      ) + epilogue;
-  static auto columns_kernel = mlx::core::fast::metal_kernel(
-      "qwen4_mixer_up_columns",
-      {"x", "w", "scales", "biases", "normed", "sigmoid_table",
-       "inject_projection", "inject_table"},
-      {"out", "inject_out"}, columns_source, qmv_header());
   static auto kernel = mlx::core::fast::metal_kernel(
       "qwen4_hyper_up_inject",
       {"x", "w", "scales", "biases", "normed", "sigmoid_table",
        "inject_projection", "inject_table"},
       {"out", "inject_out"}, source, qmv_header());
-  auto &selected = mode == 2 ? columns_kernel : kernel;
-  return selected(a, {{1, rows, 2560}, {1, rows, 4}},
+  return kernel(a, {{1, rows, 2560}, {1, rows, 4}},
                   {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 2560, 1},
                   {32, 2, 1},
                   {{"T", mlx::core::bfloat16},
@@ -410,15 +399,14 @@ std::vector<array> hyper_up_inject_graph(const std::vector<array> &a,
                    {"FAST", false},
                    {"RPS", 4},
                    {"ACT", false},
-                   {"MIX", mode == 1 ? 2 : 1},
+                   {"MIX", 1},
                    {"ROWS", rows}},
                   std::nullopt, false, mlx::core::Device::gpu);
 }
 
 const std::function<std::vector<array>(const std::vector<array> &)> &
 hyper_up_inject_compiled() {
-  static auto compiled = mlx::core::compile(
-      [](const std::vector<array> &a) { return hyper_up_inject_graph(a, 0); });
+  static auto compiled = mlx::core::compile(hyper_up_inject_graph);
   return compiled;
 }
 
@@ -578,74 +566,6 @@ extern "C" mlx_array *mlx_qwen4_decode_mixer_act_rows(mlx_array *input,
 #endif
   return nullptr;
 }
-// Fuse the two projections without concatenating or retaining another bank.
-extern "C" bool mlx_qwen4_mixer_down_inject(
-    mlx_array *input, mlx_array *down, mlx_array *down_scales,
-    mlx_array *down_biases, mlx_array *inject, mlx_array *inject_scales,
-    mlx_array *inject_biases, mlx_array **out, mlx_array **out_inject) {
-  if (!out || !out_inject)
-    return false;
-  *out = nullptr;
-  *out_inject = nullptr;
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!input || !down || !down_scales || !down_biases || !inject ||
-        !inject_scales || !inject_biases)
-      return false;
-    const auto &x = *reinterpret_cast<array *>(input);
-    const auto &wd = *reinterpret_cast<array *>(down);
-    const auto &sd = *reinterpret_cast<array *>(down_scales);
-    const auto &bd = *reinterpret_cast<array *>(down_biases);
-    const auto &wi = *reinterpret_cast<array *>(inject);
-    const auto &si = *reinterpret_cast<array *>(inject_scales);
-    const auto &bi = *reinterpret_cast<array *>(inject_biases);
-    auto valid = [](const array &w, const array &s, const array &b, int n) {
-      return w.shape() == Shape{n, 2560} && w.dtype() == mlx::core::uint32 &&
-             s.shape() == Shape{n, 320} && s.dtype() == mlx::core::float16 &&
-             b.shape() == s.shape() && b.dtype() == s.dtype();
-    };
-    if (x.shape() != Shape{1, 1, 10240} || x.dtype() != mlx::core::bfloat16 ||
-        !valid(wd, sd, bd, 320) || !valid(wi, si, bi, 4))
-      return false;
-    static auto compiled = mlx::core::compile([](const std::vector<array> &a) {
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_mixer_down_inject",
-          {"x", "wd", "sd", "bd", "wi", "si", "bi", "silu_table"},
-          {"act", "injection"},
-#include "metal/qwen4/mixer_down_inject.metal.inc"
-          , qmv_header());
-      return kernel(a, {{1, 1, 320}, {1, 1, 4}},
-                    {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 324, 1},
-                    {32, 2, 1}, {{"T", mlx::core::bfloat16}}, std::nullopt,
-                    false, mlx::core::Device::gpu);
-    });
-    static auto split_compiled = mlx::core::compile([](const std::vector<array> &a) {
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_mixer_split_k",
-          {"x", "wd", "sd", "bd", "wi", "si", "bi", "silu_table"},
-          {"act", "injection"},
-#include "metal/qwen4/mixer_split_k.metal.inc"
-          , qmv_header());
-      return kernel(a, {{1, 1, 320}, {1, 1, 4}},
-                    {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 656, 1},
-                    {32, 4, 1}, {{"T", mlx::core::bfloat16}}, std::nullopt,
-                    false, mlx::core::Device::gpu);
-    });
-    const auto split = qwen4_env("MLX_QWEN4_MIXER_SPLIT_K");
-    auto result = (split && std::string(split) == "1" ? split_compiled : compiled)(
-        {x, wd, sd, bd, wi, si, bi, native_bf16_silu_table()});
-    auto activation = std::make_unique<array>(std::move(result[0]));
-    auto injection = std::make_unique<array>(std::move(result[1]));
-    *out = reinterpret_cast<mlx_array *>(activation.release());
-    *out_inject = reinterpret_cast<mlx_array *>(injection.release());
-    return true;
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 mixer down/injection: " << e.what() << std::endl;
-  }
-#endif
-  return false;
-}
-
 extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
                                          mlx_array *scales, mlx_array *biases,
                                          mlx_array *normed) {
@@ -660,16 +580,11 @@ extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
     const auto &n = *reinterpret_cast<array *>(normed);
     if (!hyper_up_admits(x, w, s, b, n, 1))
       return nullptr;
-    static auto parallel_compiled = mlx::core::compile(
-        [](const std::vector<array> &a) { return hyper_up_graph(a, true); });
-    const auto lanes = qwen4_env("MLX_QWEN4_MIXER_LANE_PRODUCTS");
-    const bool parallel = lanes && std::string(lanes) == "1";
     auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
     const bool cached = (!setting || std::string(setting) != "0");
     const auto &table = native_bf16_sigmoid_table();
-    auto result = cached ? (parallel ? parallel_compiled
-                                     : hyper_up_compiled())({x, w, s, b, n, table})
-                         : hyper_up_graph({x, w, s, b, n, table}, parallel);
+    auto result = cached ? hyper_up_compiled()({x, w, s, b, n, table})
+                         : hyper_up_graph({x, w, s, b, n, table});
     return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 hyper up: " << e.what() << std::endl;
@@ -704,48 +619,6 @@ extern "C" mlx_array *mlx_qwen4_hyper_up_rows(mlx_array *input,
   return nullptr;
 }
 
-// TrackFastMixer.upMix emits the injection gate in the same dispatch. Keep
-// the local Q8 projection and both sigmoid arithmetic paths unchanged.
-extern "C" bool mlx_qwen4_hyper_up_inject(
-    mlx_array *input, mlx_array *weight, mlx_array *scales, mlx_array *biases,
-    mlx_array *normed, mlx_array *injection, mlx_array **out,
-    mlx_array **out_gate) {
-  if (!out || !out_gate) return false;
-  *out = nullptr;
-  *out_gate = nullptr;
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!input || !weight || !scales || !biases || !normed || !injection)
-      return false;
-    const auto &x = *reinterpret_cast<array *>(input);
-    const auto &w = *reinterpret_cast<array *>(weight);
-    const auto &s = *reinterpret_cast<array *>(scales);
-    const auto &b = *reinterpret_cast<array *>(biases);
-    const auto &n = *reinterpret_cast<array *>(normed);
-    const auto &g = *reinterpret_cast<array *>(injection);
-    if (!hyper_up_admits(x, w, s, b, n, 1) || g.shape() != Shape{1, 1, 4} ||
-        g.dtype() != x.dtype())
-      return false;
-    static auto parallel_compiled = mlx::core::compile(
-        [](const std::vector<array> &a) { return hyper_up_inject_graph(a, 1); });
-    static auto columns_compiled = mlx::core::compile(
-        [](const std::vector<array> &a) { return hyper_up_inject_graph(a, 2); });
-    const auto columns = qwen4_env("MLX_QWEN4_MIXER_UP_COLUMNS");
-    const bool two_columns = columns && std::string(columns) == "1";
-    const auto lanes = qwen4_env("MLX_QWEN4_MIXER_LANE_PRODUCTS");
-    const bool parallel = lanes && std::string(lanes) == "1";
-    return hyper_up_inject_run(
-        x, w, s, b, n, g,
-        two_columns ? columns_compiled
-                    : (parallel ? parallel_compiled : hyper_up_inject_compiled()),
-        out, out_gate);
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 mixer injection: " << e.what() << std::endl;
-  }
-#endif
-  return false;
-}
-
 extern "C" bool mlx_qwen4_hyper_up_inject_rows(
     mlx_array *input, mlx_array *weight, mlx_array *scales, mlx_array *biases,
     mlx_array *normed, mlx_array *injection, mlx_array **out,
@@ -775,54 +648,6 @@ extern "C" bool mlx_qwen4_hyper_up_inject_rows(
 #endif
   return false;
 }
-extern "C" mlx_array *mlx_qwen4_sorted_shared_combine(
-    mlx_array *values, mlx_array *scores, mlx_array *inverse,
-    mlx_array *shared, mlx_array *gate, int top) {
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!values || !scores || !inverse || !shared || !gate || top != 10)
-      return nullptr;
-    const auto &v = *reinterpret_cast<array *>(values);
-    const auto &s = *reinterpret_cast<array *>(scores);
-    const auto &order = *reinterpret_cast<array *>(inverse);
-    const auto &sh = *reinterpret_cast<array *>(shared);
-    const auto &g = *reinterpret_cast<array *>(gate);
-    if (v.ndim() != 2 || v.shape(1) != 2560 || v.shape(0) % top ||
-        v.dtype() != mlx::core::bfloat16 ||
-        s.size() != v.shape(0) || order.size() != v.shape(0) ||
-        (s.dtype() != mlx::core::bfloat16 && s.dtype() != mlx::core::float32) ||
-        (order.dtype() != mlx::core::uint32 && order.dtype() != mlx::core::int32))
-      return nullptr;
-    const int tokens = v.shape(0) / top;
-    if (tokens <= 8 || tokens > 1024 || sh.shape() != Shape{1, tokens, 2560} ||
-        g.shape() != Shape{1, tokens, 1} || sh.dtype() != v.dtype() ||
-        g.dtype() != v.dtype())
-      return nullptr;
-    static auto graph = [](const std::vector<array> &a) {
-      const int tokens = a[0].shape(0) / 10;
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_sorted_shared_combine",
-          {"values", "scores", "inverse", "shared", "gate", "sigmoid_table"},
-          {"out"},
-#include "metal/common/sorted_expert_shared_combine.metal.inc"
-          );
-      return kernel(a, {{1, tokens, 2560}}, {mlx::core::bfloat16},
-                    {tokens * 2560, 1, 1}, {256, 1, 1},
-                    {{"T", mlx::core::bfloat16}, {"P", a[1].dtype()},
-                     {"TOKENS", tokens}, {"H", 2560},
-                     {"ROWS", tokens * 10}, {"TOP", 10}},
-                    std::nullopt, false, mlx::core::Device::gpu);
-    };
-    static auto compiled = mlx::core::compile(graph);
-    auto result = compiled({v, s, order, sh, g, native_bf16_sigmoid_table()});
-    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 sorted shared combine: " << e.what() << std::endl;
-  }
-#endif
-  return nullptr;
-}
-
 extern "C" mlx_array *mlx_qwen4_routed_experts(mlx_array *x, mlx_array *ids,
                                                mlx_array *scores, mlx_array *wg,
                                                mlx_array *sg, mlx_array *bg,
@@ -892,41 +717,6 @@ extern "C" mlx_array *mlx_qwen4_routed_experts(mlx_array *x, mlx_array *ids,
     return reinterpret_cast<mlx_array *>(new array(std::move(out)));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 routed experts: " << e.what() << std::endl;
-  }
-#endif
-  return nullptr;
-}
-
-// Read SDPA's head-major result and the interleaved Q/gate projection without
-// materializing the two token-major reshape buffers before the pointwise op.
-extern "C" mlx_array *mlx_qwen4_attention_gate(mlx_array *attention,
-                                              mlx_array *projection) {
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!attention || !projection) return nullptr;
-    const auto &att = *reinterpret_cast<array *>(attention);
-    const auto &qg = *reinterpret_cast<array *>(projection);
-    if (att.ndim() != 4 || att.shape(0) != 1 || att.shape(1) < 1 ||
-        att.shape(1) > 128 || att.shape(2) < 1 || att.shape(2) > 1024 ||
-        att.shape(3) != 256 || att.dtype() != mlx::core::bfloat16 ||
-        qg.shape() != Shape{1, att.shape(2), att.shape(1), 512} ||
-        qg.dtype() != att.dtype()) return nullptr;
-    static auto graph = [](const std::vector<array> &a) {
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_attention_gate", {"att", "qg", "sigmoid_table"}, {"out"},
-#include "metal/common/attention_gate_bf16.metal.inc"
-          , "", false);
-      const int heads = a[0].shape(1), tokens = a[0].shape(2);
-      return kernel(a, {{1, tokens, heads * 256}}, {a[0].dtype()},
-                    {heads * 256, tokens, 1}, {256, 1, 1},
-                    {{"T", a[0].dtype()}, {"H", heads}, {"D", 256}},
-                    std::nullopt, false, mlx::core::Device::gpu);
-    };
-    static auto compiled = mlx::core::compile(graph);
-    auto result = compiled({att, qg, native_bf16_sigmoid_table()});
-    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 attention output gate: " << e.what() << std::endl;
   }
 #endif
   return nullptr;

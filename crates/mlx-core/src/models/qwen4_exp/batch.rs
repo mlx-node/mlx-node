@@ -476,9 +476,7 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
-        Ok(self
-            .attention_matrix_for_mlp(x, tokens, i, cache, false, None)?
-            .0)
+        Ok(self.attention_matrix_for_mlp(x, tokens, i, cache, false)?.0)
     }
 
     pub(super) fn attention_matrix_for_mlp(
@@ -488,7 +486,6 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
         normalize: bool,
-        incoming_norm: Option<&MxArray>,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let base = self.history.len();
         let x = if self.config.ple_layer_ids.contains(&(i + 1)) {
@@ -502,7 +499,7 @@ impl Decoder {
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
-            incoming_norm,
+            None,
         )?;
 
         let branch = if self.config.linear(i) {
@@ -593,21 +590,10 @@ impl Decoder {
                 &qkv.slice_axis(2, kh * kd, 2 * kh * kd)?
                     .reshape(&[1, t, kh, kd])?,
             )?;
-            let compact = x.dtype()? == DType::BFloat16
-                && kd >= 32
-                && kd % 32 == 0
-                && crate::engine::persistence::compiled_forward_backend_available()
-                && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
-                && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_GDN_BF16");
-            let storage = if compact {
-                DType::BFloat16
-            } else {
-                DType::Float32
-            };
             let v = qkv
                 .slice_axis(2, 2 * kh * kd, 2 * kh * kd + nh * vd)?
                 .reshape(&[1, t, nh, vd])?
-                .astype(storage)?;
+                .astype(DType::Float32)?;
             let (q, k) = if self.gguf() {
                 (q, k)
             } else {
@@ -617,7 +603,13 @@ impl Decoder {
                 )
             };
             let (decay, beta) = math::gdn_gates(&a, &b, &scale, &dt)?;
-            [q.astype(storage)?, k.astype(storage)?, v, decay, beta]
+            [
+                q.astype(DType::Float32)?,
+                k.astype(DType::Float32)?,
+                v,
+                decay,
+                beta,
+            ]
         };
 
         let state = match &cache.recurrent {
@@ -675,7 +667,7 @@ impl Decoder {
     }
 
     pub(super) fn mlp_matrix(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
-        Ok(self.mlp_matrix_for_attention(x, i, None, false)?.0)
+        self.mlp_matrix_for_attention(x, i, None)
     }
 
     pub(super) fn mlp_matrix_for_attention(
@@ -683,8 +675,7 @@ impl Decoder {
         x: &MxArray,
         i: usize,
         normed: Option<&MxArray>,
-        normalize_next: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
+    ) -> Result<MxArray> {
         let (mixed, gate) = self.hyper_with_norm(
             x,
             &format!("layers.{i}.mlp_hyper_connection"),
@@ -697,9 +688,8 @@ impl Decoder {
 
         let gate = gate
             .ok_or_else(|| Error::from_reason("Qwen4 batched MLP is missing its injection gate"))?;
-        let (out, next_norm) =
-            self.inject_for_next_attention(x, &branch, &gate, i, normalize_next)?;
-        if self.async_prefill || runtime_flags::is_one(c"MLX_QWEN4_PREFILL_DEFER_MLP") {
+        let out = Self::inject(x, &branch, &gate)?;
+        if self.async_prefill {
             // The next router readback (or final window output) fences this
             // graph. Slot-bank readers remain retained until their own fence.
             // Reference schedule: first two layers, then groups of three.
@@ -710,7 +700,7 @@ impl Decoder {
             MxArray::eval_arrays_with_context(&[&out], "qwen4::batch::mlp")?;
         }
 
-        Ok((out, next_norm))
+        Ok(out)
     }
 
     pub(super) fn moe_batch(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
@@ -745,17 +735,8 @@ impl Decoder {
         };
         let scores = scores.reshape(&[1, (tokens * top) as i64, 1])?;
 
-        if self.device_routes.is_some()
-            && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_SHARED_COMBINE")
-        {
-            let (shared, gate) = self.shared_expert_parts(x, i, None)?;
-            let out =
-                self.tentative_prefill_experts(x, &selected, &scores, i, Some((&shared, &gate)))?;
-
-            return Ok(out);
-        }
         let resident = if self.device_routes.is_some() {
-            Some(self.tentative_prefill_experts(x, &selected, &scores, i, None)?)
+            Some(self.tentative_prefill_experts(x, &selected, &scores, i)?)
         } else {
             self.resident_experts(x, &selected, &scores, i)?
         };
@@ -832,7 +813,7 @@ impl Decoder {
             }
         };
 
-        let (shared, gate) = self.shared_expert_parts(x, i, None)?;
+        let (shared, gate) = self.shared_expert_parts(x, i)?;
         let output = sum
             .astype(x.dtype()?)?
             .add(&math::sigmoid_mul(&gate, &shared)?)?;

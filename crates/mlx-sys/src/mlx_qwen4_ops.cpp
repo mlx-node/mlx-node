@@ -64,36 +64,6 @@ bool mlx_qwen4_flag_equals(const char *name, const char *value) noexcept {
   return setting && value && std::strcmp(setting, value) == 0;
 }
 
-mlx_array *mlx_qwen4_router_decode(mlx_array *input, mlx_array *weight) {
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!input || !weight)
-      return nullptr;
-    const auto &x = *reinterpret_cast<array *>(input);
-    const auto &w = *reinterpret_cast<array *>(weight);
-    if (x.shape() != mlx::core::Shape{1, 1, 2560} ||
-        w.shape() != mlx::core::Shape{512, 2560} ||
-        x.dtype() != mlx::core::bfloat16 || w.dtype() != x.dtype())
-      return nullptr;
-    static auto graph = [](const std::vector<array> &a) {
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_router_decode", {"x", "w"}, {"out"},
-#include "metal/qwen4/router_decode.metal.inc"
-      );
-      return kernel(a, {{1, 1, 512}}, {mlx::core::bfloat16}, {32 * 128, 1, 4},
-                    {32, 1, 4}, {{"T", mlx::core::bfloat16}}, std::nullopt,
-                    false, mlx::core::Device::gpu);
-    };
-    static auto compiled = mlx::core::compile(graph);
-    auto result = compiled({x, w});
-    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 router decode: " << e.what() << std::endl;
-  }
-#endif
-  return nullptr;
-}
-
 // Singleton only: wider reductions use a different operation schedule.
 bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
                                 mlx_array **scores) {
@@ -105,8 +75,7 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
     if (x.shape() != mlx::core::Shape{1, 1, 512} ||
         (x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32))
       return false;
-    static auto make_graph = [](bool registers) {
-      return [registers](const std::vector<array> &in) {
+    static auto graph = [](const std::vector<array> &in) {
         const auto &x = in[0];
         static auto kernel = mlx::core::fast::metal_kernel(
             "qwen4_singleton_routes", {"logits"}, {"ids", "scores"},
@@ -114,21 +83,13 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
         );
         return kernel({x}, {{1, 1, 10}, {1, 1, 10}},
                       {mlx::core::uint32, x.dtype()}, {128, 1, 1}, {128, 1, 1},
-                      {{"T", x.dtype()}, {"REG", registers}}, std::nullopt, false,
+                      {{"T", x.dtype()}}, std::nullopt, false,
                       mlx::core::default_stream(mlx::core::Device::gpu));
-      };
     };
-    static auto graph = make_graph(false);
-    static auto register_graph = make_graph(true);
     static auto compiled = mlx::core::compile(graph);
-    static auto register_compiled = mlx::core::compile(register_graph);
     auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
     const bool cached = (!setting || std::string(setting) != "0");
-    const auto reg = qwen4_env("MLX_QWEN4_ROUTE_REGISTER_RESULTS");
-    const bool registers = reg && std::string(reg) == "1";
-    auto result = registers
-                      ? (cached ? register_compiled({x}) : register_graph({x}))
-                      : (cached ? compiled({x}) : graph({x}));
+    auto result = cached ? compiled({x}) : graph({x});
     auto i = std::make_unique<array>(std::move(result[0]));
     auto p = std::make_unique<array>(std::move(result[1]));
     *ids = reinterpret_cast<mlx_array *>(i.release());
@@ -141,59 +102,6 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
 #else
   return false;
 #endif
-}
-// Keep the shared-gate projection alongside route selection, as in
-// TrackFastMoE. Every changing tensor remains a compiled-graph argument.
-bool mlx_qwen4_routes_shared_gate(mlx_array *logits, mlx_array *input,
-                                 mlx_array *weight, mlx_array **ids,
-                                 mlx_array **scores, mlx_array **gate) {
-  if (!ids || !scores || !gate) return false;
-  *ids = nullptr;
-  *scores = nullptr;
-  *gate = nullptr;
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!logits || !input || !weight) return false;
-    const auto &l = *reinterpret_cast<array *>(logits);
-    const auto &x = *reinterpret_cast<array *>(input);
-    const auto &w = *reinterpret_cast<array *>(weight);
-    if (l.shape() != mlx::core::Shape{1, 1, 512} ||
-        x.shape() != mlx::core::Shape{1, 1, 2560} ||
-        w.shape() != mlx::core::Shape{1, 2560} ||
-        l.dtype() != mlx::core::bfloat16 || x.dtype() != l.dtype() ||
-        w.dtype() != x.dtype()) return false;
-    static auto graph = [](const std::vector<array> &a, bool registers) {
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_routes_shared_gate", {"logits", "x", "wg"},
-          {"ids", "scores", "gate"},
-#include "metal/qwen4/routes_shared_gate.metal.inc"
-      );
-      return kernel(a, {{1, 1, 10}, {1, 1, 10}, {1, 1, 1}},
-                    {mlx::core::uint32, mlx::core::bfloat16, mlx::core::bfloat16},
-                    {384, 1, 1}, {384, 1, 1},
-                    {{"T", mlx::core::bfloat16}, {"REG", registers}},
-                    std::nullopt, false, mlx::core::Device::gpu);
-    };
-    static auto compiled = mlx::core::compile(
-        [](const std::vector<array> &a) { return graph(a, false); });
-    static auto register_compiled = mlx::core::compile(
-        [](const std::vector<array> &a) { return graph(a, true); });
-    const bool registers = mlx_qwen4_flag_equals("MLX_QWEN4_ROUTE_REGISTER_RESULTS", "1");
-    const bool cached = !mlx_qwen4_flag_equals("MLX_QWEN4_CACHED_KERNEL_GRAPHS", "0");
-    auto result = cached ? (registers ? register_compiled : compiled)({l, x, w})
-                         : graph({l, x, w}, registers);
-    auto i = std::make_unique<array>(std::move(result[0]));
-    auto s = std::make_unique<array>(std::move(result[1]));
-    auto g = std::make_unique<array>(std::move(result[2]));
-    *ids = reinterpret_cast<mlx_array *>(i.release());
-    *scores = reinterpret_cast<mlx_array *>(s.release());
-    *gate = reinterpret_cast<mlx_array *>(g.release());
-    return true;
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 routes/shared gate: " << e.what() << std::endl;
-  }
-#endif
-  return false;
 }
 // TrackFastMoE.route: one independent threadgroup per row, from a single
 // verify row up to a prefill window. Preserve this checkpoint's
@@ -209,8 +117,7 @@ bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
          x.shape(1) > 1024 || x.shape(2) != 512) ||
         (x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32))
       return false;
-    static auto make_graph = [](bool registers) {
-      return [registers](const std::vector<array> &in) {
+    static auto graph = [](const std::vector<array> &in) {
         const auto &x = in[0];
         static auto kernel = mlx::core::fast::metal_kernel(
             "qwen4_prefill_routes", {"logits"}, {"ids", "scores"},
@@ -219,21 +126,13 @@ bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
         int rows = x.shape(1);
         return kernel({x}, {{1, rows, 10}, {1, rows, 10}},
                       {mlx::core::uint32, x.dtype()}, {128, rows, 1}, {128, 1, 1},
-                      {{"T", x.dtype()}, {"REG", registers}}, std::nullopt, false,
+                      {{"T", x.dtype()}}, std::nullopt, false,
                       mlx::core::default_stream(mlx::core::Device::gpu));
-      };
     };
-    static auto graph = make_graph(false);
-    static auto register_graph = make_graph(true);
     static auto compiled = mlx::core::compile(graph);
-    static auto register_compiled = mlx::core::compile(register_graph);
     auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
     const bool cached = (!setting || std::string(setting) != "0");
-    const auto reg = qwen4_env("MLX_QWEN4_ROUTE_REGISTER_RESULTS");
-    const bool registers = reg && std::string(reg) == "1";
-    auto result = registers
-                      ? (cached ? register_compiled({x}) : register_graph({x}))
-                      : (cached ? compiled({x}) : graph({x}));
+    auto result = cached ? compiled({x}) : graph({x});
     auto i = std::make_unique<array>(std::move(result[0]));
     auto p = std::make_unique<array>(std::move(result[1]));
     *ids = reinterpret_cast<mlx_array *>(i.release());
@@ -754,93 +653,6 @@ bool mlx_qwen4_qsa_attention(mlx_array *queries, mlx_array *keys,
     std::cerr << "Qwen4 sparse attention: " << e.what() << std::endl;
     return false;
   }
-}
-
-// Reference partial rotary epilogue with local BF16 operation boundaries.
-mlx_array *mlx_qwen4_rotary_window(mlx_array *input, mlx_array *cosine,
-                                    mlx_array *sine) {
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!input || !cosine || !sine)
-      return nullptr;
-    const auto &x = *reinterpret_cast<array *>(input);
-    const auto &c = *reinterpret_cast<array *>(cosine);
-    const auto &s = *reinterpret_cast<array *>(sine);
-    if (x.ndim() != 4 || x.shape(0) != 1 || x.shape(1) < 1 ||
-        x.shape(2) < 1 || x.shape(2) > 1024 || x.shape(3) < 1 ||
-        x.size() > std::numeric_limits<int>::max() ||
-        x.dtype() != mlx::core::bfloat16 || c.dtype() != x.dtype() ||
-        s.dtype() != x.dtype() || c.ndim() != 4 ||
-        c.shape(0) != 1 || c.shape(1) != 1 || c.shape(2) != x.shape(2) ||
-        c.shape(3) < 1 || c.shape(3) > x.shape(3) / 2 || s.shape() != c.shape())
-      return nullptr;
-    static auto graph = [](const std::vector<array> &a) {
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_rotary_window", {"x", "cosb", "sinb"}, {"out"},
-#include "metal/common/rope_split_half.metal.inc"
-      );
-      const auto &x = a[0];
-      return kernel(a, {x.shape()}, {x.dtype()}, {int(x.size()), 1, 1},
-                    {256, 1, 1}, {{"T", x.dtype()}, {"S", x.shape(2)},
-                                 {"D", x.shape(3)}, {"ROT", 2 * a[1].shape(3)},
-                                 {"COUNT", int(x.size())}},
-                    std::nullopt, false,
-                    mlx::core::default_stream(mlx::core::Device::gpu));
-    };
-    static auto compiled = mlx::core::compile(graph);
-    auto result = compiled({x, c, s});
-    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 rotary window: " << e.what() << std::endl;
-  }
-#endif
-  return nullptr;
-}
-
-// Reference attention prep, with the GGUF's F32 scales and reduction order.
-mlx_array *mlx_qwen4_attention_norm_rotary(mlx_array *input, mlx_array *weight,
-                                          mlx_array *cosine, mlx_array *sine,
-                                          double eps) {
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!input || !weight || !cosine || !sine || !std::isfinite(eps) || eps <= 0)
-      return nullptr;
-    const auto &x = *reinterpret_cast<array *>(input);
-    const auto &w = *reinterpret_cast<array *>(weight);
-    const auto &c = *reinterpret_cast<array *>(cosine);
-    const auto &s = *reinterpret_cast<array *>(sine);
-    if (x.ndim() != 4 || x.shape(0) != 1 || x.shape(1) < 1 ||
-        x.shape(2) < 1 || x.shape(2) > 1024 || x.shape(3) != 256 ||
-        x.size() > std::numeric_limits<int>::max() ||
-        x.dtype() != mlx::core::bfloat16 || w.size() != 256 ||
-        w.dtype() != mlx::core::float32 || c.dtype() != x.dtype() ||
-        s.dtype() != x.dtype() || c.ndim() != 4 ||
-        c.shape(0) != 1 || c.shape(1) != 1 || c.shape(2) != x.shape(2) ||
-        c.shape(3) < 1 || c.shape(3) > 128 || s.shape() != c.shape())
-      return nullptr;
-    static auto graph = [](const std::vector<array> &a) {
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_attention_norm_rotary", {"x", "w", "cosb", "sinb", "eps"},
-          {"out"},
-#include "metal/common/rms_norm_rope_256.metal.inc"
-          , "", false);
-      const auto &x = a[0];
-      return kernel(a, {x.shape()}, {x.dtype()},
-                    {32, int(x.size() / 256), 1}, {32, 1, 1},
-                    {{"T", x.dtype()}, {"S", x.shape(2)}, {"D", 256},
-                     {"ROT", 2 * a[2].shape(3)}},
-                    std::nullopt, false,
-                    mlx::core::default_stream(mlx::core::Device::gpu));
-    };
-    static auto compiled = mlx::core::compile(graph);
-    auto result = compiled({x, reshape(w, {256}), c, s, array(float(eps))});
-    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 attention normalization and rotary: " << e.what()
-              << std::endl;
-  }
-#endif
-  return nullptr;
 }
 
 // Reference wide normalization schedule, retaining this GGUF's arithmetic.

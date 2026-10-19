@@ -14,7 +14,7 @@
 using mlx::core::metal::native_bf16_silu_table;
 using mlx::core::quantized_preamble::nax_header;
 
-template <int BM, bool ACT = false, bool PREFETCH = false, bool COMPACT = false>
+template <int BM, bool ACT = false, bool PREFETCH = false>
 static std::vector<array>
 qwen4_dense_prefill_graph(const std::vector<array> &a) {
   const auto &x = a[0];
@@ -34,7 +34,7 @@ qwen4_dense_prefill_graph(const std::vector<array> &a) {
                 {{"WEIGHT_PREFETCH", PREFETCH},
                  {"ACT", ACT},
                  {"M_TILE", BM},
-                 {"C", COMPACT ? mlx::core::bfloat16 : mlx::core::float32},
+                 {"C", mlx::core::float32},
                  {"T", mlx::core::bfloat16},
                  {"K", k},
                  {"N", n},
@@ -44,34 +44,21 @@ qwen4_dense_prefill_graph(const std::vector<array> &a) {
                 mlx::core::default_stream(mlx::core::Device::gpu));
 }
 
-template <int BM, bool ACT, bool COMPACT>
-static std::vector<array>
-qwen4_dense_prefill_variant(const std::vector<array> &a, bool cached) {
-  const auto setting = qwen4_env("MLX_QWEN4_PREFILL_Q8_PREFETCH");
-  if (!setting || std::string(setting) != "0") {
-    static auto compiled =
-        mlx::core::compile(qwen4_dense_prefill_graph<BM, ACT, true, COMPACT>);
-    return cached ? compiled(a)
-                  : qwen4_dense_prefill_graph<BM, ACT, true, COMPACT>(a);
-  }
-  static auto compiled =
-      mlx::core::compile(qwen4_dense_prefill_graph<BM, ACT, false, COMPACT>);
-  return cached ? compiled(a)
-                : qwen4_dense_prefill_graph<BM, ACT, false, COMPACT>(a);
-}
-
-// Experimental reference BF16 cooperative operands. The default retains
-// this GGUF checkpoint's FP32/TF32 arithmetic; callers must compare logits.
 template <int BM, bool ACT = false>
 static std::vector<array>
 qwen4_dense_prefill_dispatch(const std::vector<array> &a, bool cached) {
-  const auto compact = qwen4_env("MLX_QWEN4_PREFILL_REFERENCE_BF16");
-  return compact && std::string(compact) == "1"
-             ? qwen4_dense_prefill_variant<BM, ACT, true>(a, cached)
-             : qwen4_dense_prefill_variant<BM, ACT, false>(a, cached);
+  const auto setting = qwen4_env("MLX_QWEN4_PREFILL_Q8_PREFETCH");
+  if (!setting || std::string(setting) != "0") {
+    static auto compiled =
+        mlx::core::compile(qwen4_dense_prefill_graph<BM, ACT, true>);
+    return cached ? compiled(a) : qwen4_dense_prefill_graph<BM, ACT, true>(a);
+  }
+  static auto compiled =
+      mlx::core::compile(qwen4_dense_prefill_graph<BM, ACT, false>);
+  return cached ? compiled(a) : qwen4_dense_prefill_graph<BM, ACT, false>(a);
 }
 
-template <bool HOIST, bool STAGE, bool PACKED, bool COMPACT>
+template <bool HOIST, bool STAGE, bool PACKED>
 static std::vector<array>
 qwen4_indirect_prefill_graph(const std::vector<array> &a) {
   const auto &x = a[0];
@@ -114,36 +101,26 @@ qwen4_indirect_prefill_graph(const std::vector<array> &a) {
             {"HOIST_ZERO", int(HOIST)},
             {"STAGE", int(STAGE)},
             {"PREFETCH", PACKED},
-            {"C", COMPACT ? mlx::core::bfloat16 : mlx::core::float32}},
+            {"C", mlx::core::float32}},
            std::nullopt, false,
            mlx::core::default_stream(mlx::core::Device::gpu))[0];
   return {out};
 }
 
-template <bool HOIST, bool STAGE, bool COMPACT>
-static std::vector<array>
-qwen4_indirect_prefill_variant(const std::vector<array> &a, bool cached) {
-  const auto packed = qwen4_env("MLX_QWEN4_PREFILL_PACKED_EXPERTS");
-  if (!packed || std::string(packed) != "0") {
-    static auto compiled = mlx::core::compile(
-        qwen4_indirect_prefill_graph<HOIST, STAGE, true, COMPACT>);
-    return cached
-               ? compiled(a)
-               : qwen4_indirect_prefill_graph<HOIST, STAGE, true, COMPACT>(a);
-  }
-  static auto compiled = mlx::core::compile(
-      qwen4_indirect_prefill_graph<HOIST, STAGE, false, COMPACT>);
-  return cached ? compiled(a)
-                : qwen4_indirect_prefill_graph<HOIST, STAGE, false, COMPACT>(a);
-}
-
 template <bool HOIST, bool STAGE>
 static std::vector<array> qwen4_indirect_prefill(const std::vector<array> &a,
                                                  bool cached) {
-  const auto compact = qwen4_env("MLX_QWEN4_PREFILL_REFERENCE_BF16");
-  return compact && std::string(compact) == "1"
-             ? qwen4_indirect_prefill_variant<HOIST, STAGE, true>(a, cached)
-             : qwen4_indirect_prefill_variant<HOIST, STAGE, false>(a, cached);
+  const auto packed = qwen4_env("MLX_QWEN4_PREFILL_PACKED_EXPERTS");
+  if (!packed || std::string(packed) != "0") {
+    static auto compiled =
+        mlx::core::compile(qwen4_indirect_prefill_graph<HOIST, STAGE, true>);
+    return cached ? compiled(a)
+                  : qwen4_indirect_prefill_graph<HOIST, STAGE, true>(a);
+  }
+  static auto compiled =
+      mlx::core::compile(qwen4_indirect_prefill_graph<HOIST, STAGE, false>);
+  return cached ? compiled(a)
+                : qwen4_indirect_prefill_graph<HOIST, STAGE, false>(a);
 }
 
 #endif

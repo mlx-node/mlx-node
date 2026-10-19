@@ -177,52 +177,6 @@ pub struct Weight {
     pub(super) mode: String,
 }
 impl Weight {
-    pub(super) fn mixer_down_inject(
-        &self,
-        x: &MxArray,
-        injection: &Self,
-    ) -> Result<Option<(MxArray, MxArray)>> {
-        if !(runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
-            || runtime_flags::is_one(c"MLX_QWEN4_MIXER_SPLIT_K"))
-            || runtime_flags::is_zero(c"MLX_QWEN4_DECODE_MIXER_ACT")
-            || !crate::engine::persistence::compiled_forward_backend_available()
-            || [self, injection]
-                .iter()
-                .any(|w| w.mode != "affine" || w.bits != 8 || w.group != 32)
-        {
-            return Ok(None);
-        }
-        let (Some(sd), Some(bd), Some(si), Some(bi)) = (
-            &self.scales,
-            &self.biases,
-            &injection.scales,
-            &injection.biases,
-        ) else {
-            return Ok(None);
-        };
-        let mut out = std::ptr::null_mut();
-        let mut gate = std::ptr::null_mut();
-        if !unsafe {
-            mlx_sys::mlx_qwen4_mixer_down_inject(
-                x.as_raw_ptr(),
-                self.values.as_raw_ptr(),
-                sd.as_raw_ptr(),
-                bd.as_raw_ptr(),
-                injection.values.as_raw_ptr(),
-                si.as_raw_ptr(),
-                bi.as_raw_ptr(),
-                &mut out,
-                &mut gate,
-            )
-        } {
-            return Ok(None);
-        }
-        Ok(Some((
-            MxArray::from_handle(out, "Qwen4 mixer activation with injection")?,
-            MxArray::from_handle(gate, "Qwen4 mixer injection projection")?,
-        )))
-    }
-
     pub(super) fn mixer_act(&self, x: &MxArray) -> Result<Option<MxArray>> {
         let decode = x.shape_at(1)? == 1;
         let setting = if decode {
@@ -259,46 +213,6 @@ impl Weight {
         } else {
             MxArray::from_handle(raw, "Qwen4 reference mixer activation").map(Some)
         }
-    }
-
-    pub(super) fn hyper_up_inject(
-        &self,
-        x: &MxArray,
-        normed: &MxArray,
-        injection: &MxArray,
-    ) -> Result<Option<(MxArray, MxArray)>> {
-        if self.mode != "affine"
-            || self.bits != 8
-            || self.group != 32
-            || !runtime_flags::is_one(c"MLX_QWEN4_MIXER_INJECT")
-            || runtime_flags::is_zero(c"MLX_QWEN4_HYPER_UP")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
-            return Ok(None);
-        }
-        let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
-            return Ok(None);
-        };
-        let mut mixed = std::ptr::null_mut();
-        let mut gate = std::ptr::null_mut();
-        if !unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject(
-                x.as_raw_ptr(),
-                self.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-                normed.as_raw_ptr(),
-                injection.as_raw_ptr(),
-                &mut mixed,
-                &mut gate,
-            )
-        } {
-            return Ok(None);
-        }
-        Ok(Some((
-            MxArray::from_handle(mixed, "Qwen4 mixer with injection")?,
-            MxArray::from_handle(gate, "Qwen4 mixer injection gate")?,
-        )))
     }
 
     pub(super) fn hyper_up(&self, x: &MxArray, normed: &MxArray) -> Result<Option<MxArray>> {
@@ -403,11 +317,7 @@ impl Weight {
                 )
             };
             if !compact.is_null() {
-                let y = MxArray::from_handle(compact, "Qwen4 compact dense decode")?;
-                if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
-                    MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
-                }
-                return Ok(y);
+                return MxArray::from_handle(compact, "Qwen4 compact dense decode");
             }
         }
         let compact = if self.mode == "affine"
@@ -451,18 +361,6 @@ impl Weight {
             } else {
                 &self.values
             };
-            if runtime_flags::is_one(c"MLX_QWEN4_ROUTER_ROW_SCHEDULE") {
-                let compact = unsafe {
-                    mlx_sys::mlx_qwen4_router_decode(x.as_raw_ptr(), values.as_raw_ptr())
-                };
-                if !compact.is_null() {
-                    let y = MxArray::from_handle(compact, "Qwen4 router row schedule")?;
-                    if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
-                        MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
-                    }
-                    return Ok(y);
-                }
-            }
             let weight = values.transpose(None)?.astype(x.dtype()?)?;
             let shape = x.shape()?;
             let (&width, outer_shape) = shape
@@ -485,13 +383,6 @@ impl Weight {
                 x.matmul(&weight)?
             }
         };
-        // MLX owns the input buffers until this output is evaluated, including
-        // when an LRU entry is evicted. The decoder fences each expert output,
-        // recurrent update and layer; these bounded groups can submit their
-        // dependent projections together instead of blocking after each one.
-        if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
-            MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
-        }
         Ok(y)
     }
     pub fn dense(&self) -> Result<MxArray> {
@@ -1742,17 +1633,7 @@ impl Store {
     /// wide window. Keep its M/N/K matrix dispatch, with our existing GGUF
     /// loader, rather than broadcasting one GEMV for every prompt token.
     pub fn linear_ple_window(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
-        if self.gguf
-            && x.dtype()? == DType::BFloat16
-            && x.shape()?.len() == 3
-            && x.shape()?[0] == 1
-            && x.shape()?[1] > 8
-            && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_PLE_GEMM")
-        {
-            self.linear(name, x)
-        } else {
-            self.linear_vector_window(name, x)
-        }
+        self.linear_vector_window(name, x)
     }
 
     pub fn linear_vector_window(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
