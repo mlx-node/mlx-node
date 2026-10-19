@@ -161,7 +161,7 @@ impl Store {
         &mut self,
         experts: usize,
         pool_bytes: u64,
-        plan: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64, u64, u64) -> Result<()>,
+        plan: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64, u64) -> Result<()>,
     ) -> Result<()> {
         if !self.gguf
             || experts == 0
@@ -207,9 +207,8 @@ impl Store {
             .flat_map(|file| file.header.sections.iter().map(|s| s.length))
             .sum();
         let dense = self.fixed_projection_bytes()?;
-        let auxiliary = self.auxiliary_bytes()?;
         let mut candidate = self.plan.clone();
-        if let Err(e) = plan(&mut candidate, dense, auxiliary, pool_bytes, pack_bytes) {
+        if let Err(e) = plan(&mut candidate, dense, pool_bytes, pack_bytes) {
             self.plan.mapped_bank_budget = candidate.mapped_bank_budget;
             self.plan.live_non_reclaimable = candidate.live_non_reclaimable;
             tracing::warn!("qwen4 residency: slot path, {e}");
@@ -273,9 +272,9 @@ impl Store {
         self.live.store(&self.plan);
     }
 
-    /// The first turn of a measurement window opens: a tripped mapped
-    /// process moves to the slot path first, then the window's SSD count
-    /// and slow streak begin. Returns the fallback applied.
+    /// The first turn of a measurement window opens: a trip whose switch
+    /// failed at its pass moves the process to the slot path first, then the
+    /// window's SSD count and slow streak begin. Returns the fallback applied.
     pub(in super::super) fn begin_turn(&mut self) -> Result<Option<Fallback>> {
         let applied = self.apply_fallback()?;
         self.tripwire
@@ -284,7 +283,7 @@ impl Store {
     }
 
     /// A turn opens beside turns already open: residency is one per store,
-    /// so a trip moves every open turn to slots here; the window they
+    /// so an armed trip moves every open turn to slots here; the window they
     /// share keeps its baseline. Returns the fallback applied.
     pub(in super::super) fn apply_fallback(&mut self) -> Result<Option<Fallback>> {
         match self.tripwire.take() {
@@ -296,19 +295,45 @@ impl Store {
         }
     }
 
-    /// One main-network pass over `rows` rows took `elapsed`.
-    pub(in super::super) fn observe_pass(&mut self, rows: usize, elapsed: Duration) {
+    /// One main-network pass over `rows` rows took `elapsed`. A pass that
+    /// trips the wire is the last mapped one: the store leaves the mapped
+    /// path here, between two passes of the same request, and the request
+    /// goes on over slot banks with its state intact (the pass's arrays hold
+    /// their own leases on the mapping). Returns the fallback applied; a
+    /// switch that fails leaves the trip armed for the next turn to open.
+    pub(in super::super) fn observe_pass(
+        &mut self,
+        rows: usize,
+        elapsed: Duration,
+    ) -> Result<Option<Fallback>> {
+        self.observe_pass_at(rows, elapsed, super::super::memory::process_disk_reads())
+    }
+
+    pub(in super::super) fn observe_pass_at(
+        &mut self,
+        rows: usize,
+        elapsed: Duration,
+        reads: u64,
+    ) -> Result<Option<Fallback>> {
         if !self.plan.mapped {
-            return;
+            return Ok(None);
         }
-        let reads = super::super::memory::process_disk_reads();
-        if let Some(why) = self
+        let Some(why) = self
             .tripwire
             .observe(rows, elapsed, reads, self.plan.mapped_bytes)
-        {
-            tracing::warn!(
-                "qwen4 residency: mapped turn thrashes ({why}); the next turn to open runs on slots"
-            );
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        tracing::warn!(
+            "qwen4 residency: mapped turn thrashes ({why}); the request goes on over slots"
+        );
+        match self.apply_fallback() {
+            Ok(applied) => Ok(applied),
+            Err(error) => {
+                self.tripwire.rearm(why);
+                Err(error)
+            }
         }
     }
 

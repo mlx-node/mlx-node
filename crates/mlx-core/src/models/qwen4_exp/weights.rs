@@ -601,6 +601,10 @@ pub struct Store {
     rows: Option<Fetcher>,
     #[cfg(test)]
     pub(in super::super) row_readers: bool,
+    /// Measurement hook: `false` leaves every imported row in its own
+    /// buffer (the pre-fold shape) so a test can time the fold alone.
+    #[cfg(test)]
+    pub(in super::super) fold_rows: bool,
     pub lookup: Arc<LookupStats>,
     pub live: Arc<Live>,
     tripwire: Tripwire,
@@ -718,6 +722,8 @@ impl Store {
             rows: None,
             #[cfg(test)]
             row_readers: true,
+            #[cfg(test)]
+            fold_rows: true,
             lookup: Arc::default(),
             live: Arc::default(),
             tripwire: Tripwire::default(),
@@ -1262,9 +1268,17 @@ impl Store {
         // them, which one buffer per row reached on the third fresh
         // 10k-token prompt. Rows the LRU already held keep their buffer, so
         // no buffer carries a slot nothing points to, and a window's buffer
-        // is charged whole until its last row view is evicted.
+        // is charged whole until its last row view is evicted. The window
+        // then takes that buffer as ONE concatenation input beside the held
+        // rows: one input per imported row again would add a copy dispatch
+        // per import to every layer of every decode token (measured 11 us
+        // per 2-hit/6-miss lookup, 0.5 ms per token over 48 layers).
         imported.retain(|&(id, _)| self.cache.contains_key(&(name.to_string(), id, 1)));
-        if imported.len() > 1 {
+        #[cfg(test)]
+        let fold = self.fold_rows;
+        #[cfg(not(test))]
+        let fold = true;
+        if fold && imported.len() > 1 {
             let fresh = MxArray::concatenate_many(
                 imported.iter().map(|&(_, slot)| &rows[slot]).collect(),
                 Some(0),
@@ -1273,6 +1287,7 @@ impl Store {
             let id = self.next_window_bank;
             self.next_window_bank += 1;
             let mut rehomed = 0;
+            let mut position = vec![0i32; rows.len()];
             for (i, &(row, slot)) in imported.iter().enumerate() {
                 let key = (name.to_string(), row, 1);
                 let view = fresh.slice_axis(0, i as i64, i as i64 + 1)?;
@@ -1282,7 +1297,7 @@ impl Store {
                     .ok_or_else(|| err("Qwen4 decoded row left the LRU inside its window"))?;
                 rehomed += entry.bytes()?;
                 *entry = Arc::new(Weight {
-                    values: view.clone(),
+                    values: view,
                     dense_bf16: None,
                     scales: None,
                     biases: None,
@@ -1291,7 +1306,7 @@ impl Store {
                     mode: String::new(),
                 });
                 self.row_bank.insert(key, id);
-                rows[slot] = view;
+                position[slot] = i as i32;
             }
             self.window_banks.insert(
                 id,
@@ -1302,9 +1317,20 @@ impl Store {
             );
             self.cache_bytes = self.cache_bytes - rehomed + bytes;
             self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
-            if imported.len() == rows.len() {
-                return fresh.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0);
+            let mut parts = vec![&fresh];
+            for (slot, row) in rows.iter().enumerate() {
+                if !imported.iter().any(|&(_, s)| s == slot) {
+                    position[slot] = (imported.len() + parts.len() - 1) as i32;
+                    parts.push(row);
+                }
             }
+            let order: Vec<i32> = order.iter().map(|&slot| position[slot as usize]).collect();
+            let window = if parts.len() == 1 {
+                fresh
+            } else {
+                MxArray::concatenate_many(parts, Some(0))?
+            };
+            return window.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0);
         }
         let window = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
         window.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
@@ -2248,6 +2274,10 @@ mod cache_tests {
 
     /// A GGUF of one Q5_1 `token_embd.weight` [8, 32]: 24 bytes per row.
     fn rows_gguf(dir: &Path) -> (PathBuf, Vec<u8>) {
+        rows_gguf_n(dir, 8)
+    }
+
+    fn rows_gguf_n(dir: &Path, rows: u32) -> (PathBuf, Vec<u8>) {
         let path = dir.join("rows.gguf");
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
@@ -2263,13 +2293,13 @@ mod cache_tests {
         string(&mut b, "token_embd.weight");
         b.extend(2u32.to_le_bytes());
         b.extend(32u64.to_le_bytes());
-        b.extend(8u64.to_le_bytes());
+        b.extend(u64::from(rows).to_le_bytes());
         b.extend(7u32.to_le_bytes());
         b.extend(0u64.to_le_bytes());
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
-        for row in 0..8u32 {
+        for row in 0..rows {
             b.extend(half::f16::from_f32(0.015625).to_bits().to_le_bytes());
             b.extend(half::f16::from_f32(-0.25).to_bits().to_le_bytes());
             b.extend((row * 7919).to_le_bytes());
@@ -2277,6 +2307,182 @@ mod cache_tests {
         }
         fs::write(&path, &b).unwrap();
         (path, b)
+    }
+
+    /// What one decode step pays per layer for the window fold: a PLE lookup
+    /// of eight rows where the two unigram heads hit the LRU and six n-gram
+    /// heads miss (the steady-decode shape), timed through the eval of its
+    /// window, with the fold against the pre-fold shape (one buffer per
+    /// row). Prints both medians and the delta scaled to the 48 layers of a
+    /// token. The values are bit-identical across both shapes.
+    #[test]
+    fn decode_row_lookup_fold_cost_per_layer() {
+        let cleanup = Cleanup::new();
+        let dir = cleanup.0.clone();
+        let (path, _) = rows_gguf_n(&dir, 4096);
+        let name = "token_embd.weight";
+        let rounds = 400usize;
+        let mut medians = Vec::new();
+        let mut sums = Vec::new();
+        for fold in [true, false, true, false] {
+            let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
+            store.fold_rows = fold;
+            let warm = store.lookup_rows(name, &[0, 1]).unwrap();
+            MxArray::eval_arrays(&[&warm]).unwrap();
+            let mut costs = Vec::with_capacity(rounds);
+            let mut sum = 0.0f64;
+            for round in 0..rounds {
+                let m = 2 + round * 6;
+                let ids = [0, 1, m, m + 1, m + 2, m + 3, m + 4, m + 5];
+                let started = std::time::Instant::now();
+                let window = store.lookup_rows(name, &ids).unwrap();
+                MxArray::eval_arrays(&[&window]).unwrap();
+                costs.push(started.elapsed());
+                sum += window
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .sum::<f64>();
+            }
+            costs.sort_unstable();
+            medians.push((fold, costs[costs.len() / 2], costs[costs.len() * 9 / 10]));
+            sums.push(sum);
+            assert_eq!(store.lookup.misses(), 2 + 6 * rounds as u64);
+        }
+        assert!(sums.windows(2).all(|w| w[0] == w[1]), "{sums:?}");
+        for (fold, median, p90) in &medians {
+            eprintln!(
+                "row lookup (2 hits + 6 misses) fold={fold}: median {median:.1?}, p90 {p90:.1?}"
+            );
+        }
+        let fold = medians.iter().filter(|m| m.0).map(|m| m.1).min().unwrap();
+        let plain = medians.iter().filter(|m| !m.0).map(|m| m.1).min().unwrap();
+        let delta = fold.saturating_sub(plain);
+        eprintln!(
+            "fold delta per lookup {delta:.1?}; x48 layers = {:.1?} per decode token",
+            delta * 48
+        );
+    }
+
+    /// The same measurement on the real model, one process: a 6k turn's 256
+    /// decode steps with the window fold and without it (`fold_rows`), the
+    /// prompt being the pinned R0 "6k" case. Opt-in, needs the checkpoint:
+    /// `QWEN4_EXP_REAL_MODEL=<gguf> QWEN4_EXP_REAL_INPUTS=<inputs.json>
+    /// cargo test -p mlx-core --lib real_6k_turn_fold_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_6k_turn_fold_cost() {
+        let (Ok(model), Ok(inputs)) = (
+            std::env::var("QWEN4_EXP_REAL_MODEL"),
+            std::env::var("QWEN4_EXP_REAL_INPUTS"),
+        ) else {
+            eprintln!(
+                "real_6k_turn_fold_cost: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_INPUTS not set"
+            );
+            return;
+        };
+        let cases: serde_json::Value = serde_json::from_slice(&fs::read(inputs).unwrap()).unwrap();
+        let tokens: Vec<u32> = cases
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "6k")
+            .expect("a 6k case")["tokenIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_u64().unwrap() as u32)
+            .collect();
+        let store = Store::open(Path::new(&model)).unwrap();
+        let config = super::super::gguf::config(&store).unwrap();
+        let mut decoder = super::super::decoder::Decoder::new(config, store).unwrap();
+        decoder.register_cache_limit();
+        decoder.weights.prepare_mapped_pack().unwrap();
+        decoder.weights.select_mapped_residency(0).unwrap();
+        decoder.weights.prepare_hot().unwrap();
+        decoder.weights.publish_live();
+        decoder.residency_changed();
+        eprintln!(
+            "residency: mapped={} slots={} budget={:.1} GiB window={}",
+            decoder.weights.plan.mapped,
+            decoder.weights.plan.partial_expert_slots,
+            decoder.weights.plan.budget as f64 / (1u64 << 30) as f64,
+            decoder.prefill_chunk_size
+        );
+        let argmax = |logits: &MxArray| -> u32 {
+            let last = logits.shape().unwrap().len() as i32 - 1;
+            logits
+                .argmax(last, Some(false))
+                .unwrap()
+                .item_at_uint32(0)
+                .unwrap()
+        };
+        let steps = 256usize;
+        let mut texts = Vec::new();
+        for fold in [true, false, true, false] {
+            decoder.weights.fold_rows = fold;
+            decoder.reset();
+            // Every arm imports the same rows: the LRU would otherwise hold
+            // the first arm's rows and the later arms would fold nothing.
+            let rows = decoder
+                .weights
+                .window_banks
+                .values()
+                .map(|bank| bank.bytes)
+                .sum::<u64>()
+                + decoder
+                    .weights
+                    .cache
+                    .iter()
+                    .filter(|(key, _)| !decoder.weights.row_bank.contains_key(*key))
+                    .map(|(_, weight)| weight.bytes().unwrap())
+                    .sum::<u64>();
+            let target = decoder.weights.cache_bytes - rows;
+            decoder.weights.evict_to(target).unwrap();
+            assert!(decoder.weights.cache.is_empty(), "the LRU holds rows only");
+            decoder.weights.begin_turn().unwrap();
+            let slice = decoder.prefill_slice_size();
+            let started = std::time::Instant::now();
+            let mut logits = None;
+            for (i, chunk) in tokens.chunks(slice).enumerate() {
+                logits = Some(
+                    decoder
+                        .prefill_chunk(chunk, None, (i + 1) * slice >= tokens.len())
+                        .unwrap(),
+                );
+            }
+            let mut token = argmax(&logits.unwrap());
+            let prefill = started.elapsed();
+            let mut generated = vec![token];
+            let mut times = Vec::with_capacity(steps);
+            for _ in 0..steps {
+                let started = std::time::Instant::now();
+                let logits = decoder.step(token).unwrap();
+                token = argmax(&logits);
+                times.push(started.elapsed());
+                generated.push(token);
+            }
+            let steady = &times[32..];
+            let mean = steady.iter().sum::<std::time::Duration>() / steady.len() as u32;
+            let mut sorted = steady.to_vec();
+            sorted.sort_unstable();
+            eprintln!(
+                "fold={fold}: prefill {prefill:.1?} ({:.0} tok/s), decode steps 32..{steps}: mean {mean:.2?} median {:.2?} -> {:.2} tok/s, lookups {} misses {}",
+                tokens.len() as f64 / prefill.as_secs_f64(),
+                sorted[sorted.len() / 2],
+                1.0 / mean.as_secs_f64(),
+                decoder.weights.lookup.lookups(),
+                decoder.weights.lookup.misses(),
+            );
+            texts.push(generated);
+        }
+        assert!(
+            texts.windows(2).all(|w| w[0] == w[1]),
+            "the fold must not change the greedy text"
+        );
     }
 
     #[test]
@@ -2674,6 +2880,8 @@ mod cache_tests {
 #[cfg(test)]
 mod mapped_tests {
     use super::*;
+    use crate::models::qwen4_exp::memory;
+    use std::time::Duration;
 
     struct Temp(PathBuf);
     impl Temp {
@@ -2896,7 +3104,7 @@ mod mapped_tests {
             store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
             store.plan.policy = "auto".into();
             store
-                .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+                .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                     plan.budget = 1 << 30;
                     plan.mapped = true;
                     plan.resident = false;
@@ -3020,10 +3228,10 @@ mod mapped_tests {
         let before = store.cache_bytes;
         store.plan.policy = "auto".into();
         store
-            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, dense, aux, pool, pack| {
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, dense, pool, pack| {
                 // The fixture holds routed experts only; the gate sees
                 // the pool it was given and the pack's section bytes.
-                assert_eq!((dense, aux, pool), (0, 0, 1 << 30));
+                assert_eq!((dense, pool), (0, 1 << 30));
                 assert_eq!(pack, expected_bytes);
                 plan.budget = 1 << 30;
                 plan.mapped = true;
@@ -3174,7 +3382,7 @@ mod mapped_tests {
         );
         store.plan.policy = "auto".into();
         store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
                 plan.resident = false;
@@ -3187,7 +3395,7 @@ mod mapped_tests {
         other.prepare_mapped_pack_at(&dir).unwrap();
         other.plan.policy = "auto".into();
         other
-            .select_mapped_residency_with(EXPERTS + 1, 0, &mut |_, _, _, _, _| {
+            .select_mapped_residency_with(EXPERTS + 1, 0, &mut |_, _, _, _| {
                 panic!("an incomplete pack must not be admitted")
             })
             .unwrap();
@@ -3213,7 +3421,7 @@ mod mapped_tests {
         let limit_before = store.cache_limit;
         let mut seen_pack = 0;
         store
-            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, _, _, _, pack| {
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, _, _, pack| {
                 seen_pack = pack;
                 plan.mapped_bank_budget = pack - 1;
                 plan.live_non_reclaimable = 40 << 30;
@@ -3242,10 +3450,132 @@ mod mapped_tests {
         assert!(store.slots.is_empty(), "slots are built by the first turn");
     }
 
-    /// A mapped store whose turn tripped the wire finishes that turn mapped
-    /// and starts the next one on slots: banks unmapped, the slot budget
-    /// taken from the live host, slots built on demand, the reason
-    /// published.
+    /// A pass that trips the wire is the request's last mapped one: the
+    /// store leaves the mapped path between that pass and the next (banks
+    /// unmapped, read-ahead released, the slot budget taken from the live
+    /// host, slots built on demand, the reason published) and the same
+    /// request's next pass maps its expert ids through slots.
+    ///
+    /// MUTATION (M-M6-switch): `observe_pass_at` logs the trip and returns
+    /// `Ok(None)` without `apply_fallback`; the request finishes mapped.
+    #[test]
+    fn a_trip_observed_mid_turn_leaves_the_mapped_path_at_that_pass() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store.plan.policy = "auto".into();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        let mapped = store.plan.mapped_bytes;
+        assert!(store.begin_turn().unwrap().is_none());
+        let base = store.tripwire_mut().turn_start_reads();
+        let ids = [4u32, 0, 2];
+        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mapped_bank = Arc::as_ptr(&banks[0]);
+        // Passes 1..k read the pack once between them: mapped throughout.
+        for pass in 1..=4u64 {
+            assert!(
+                store
+                    .observe_pass_at(1, Duration::from_millis(25), base + pass * mapped / 4)
+                    .unwrap()
+                    .is_none(),
+                "pass {pass}"
+            );
+            assert!(store.plan.mapped);
+            let (same, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+            assert_eq!(Arc::as_ptr(&same[0]), mapped_bank);
+        }
+        // Pass k+1 crosses twice the pack: the store leaves mapped mode now.
+        let why = store
+            .observe_pass_at(1, Duration::from_millis(25), base + 2 * mapped + 1)
+            .unwrap()
+            .expect("the tripping pass applies the switch");
+        assert_eq!(
+            why,
+            Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped
+            }
+        );
+        assert!(!store.plan.mapped);
+        assert_eq!(store.plan.mapped_bytes, 0);
+        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert!(store.cache_limit >= store.cache_bytes + MAX_READ_BYTES * 3);
+        assert!(!store.live.mapped.load(Ordering::Acquire));
+        assert_eq!(store.live.fallback(), Some(why));
+        assert_eq!(
+            store.tripwire_mut().turn_start_reads(),
+            base,
+            "the window in progress keeps its baseline"
+        );
+        let (slots, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
+        assert_eq!(capacity, EXPERTS);
+        assert_eq!(local.len(), ids.len());
+        assert!(store.slot_bytes > 0 && store.slots.contains_key(&0));
+        // Later passes of the same request and the next turn change nothing.
+        assert!(
+            store
+                .observe_pass_at(1, Duration::from_millis(25), base + 3 * mapped)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.begin_turn().unwrap().is_none(), "applied once");
+        assert!(!store.plan.mapped);
+    }
+
+    /// The per-pass bookkeeping of a mapped turn (two `Instant::now`, the
+    /// process disk-read counter, the tripwire's median and reference scan)
+    /// costs microseconds, not the 0.3 ms per token that would show in a
+    /// 20 ms decode step. Prints the median and p99 per pass.
+    #[test]
+    fn per_pass_bookkeeping_costs_microseconds() {
+        let mapped = 73u64 << 30;
+        let mut wire = Tripwire::default();
+        wire.begin_turn(memory::process_disk_reads());
+        for window in [12_000u64, 900, 850, 800, 820, 810] {
+            wire.observe(1024, Duration::from_millis(window), 0, mapped);
+        }
+        for _ in 0..64 {
+            wire.observe(1, Duration::from_millis(25), 0, mapped);
+        }
+        let mut costs: Vec<Duration> = (0..4096)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let reads = memory::process_disk_reads();
+                let elapsed = started.elapsed();
+                assert!(wire.observe(1, elapsed, reads, mapped).is_none());
+                wire.observe(4, Duration::from_millis(30), reads, mapped);
+                started.elapsed()
+            })
+            .collect();
+        costs.sort_unstable();
+        let median = costs[costs.len() / 2];
+        let p99 = costs[costs.len() * 99 / 100];
+        eprintln!(
+            "per-pass bookkeeping: median {median:.1?}, p99 {p99:.1?}, max {:.1?}",
+            costs[costs.len() - 1]
+        );
+        assert!(median < Duration::from_micros(300), "median {median:?}");
+    }
+
+    /// A trip taken through the wire directly (its switch did not run at
+    /// the pass) stays armed: the next turn to open applies it, banks
+    /// unmapped, the slot budget taken from the live host, slots built on
+    /// demand, the reason published.
     #[test]
     fn a_tripped_mapped_store_runs_its_next_turn_on_slots() {
         let temp = Temp::new();
@@ -3258,7 +3588,7 @@ mod mapped_tests {
             .unwrap();
         store.plan.policy = "auto".into();
         store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
                 plan.resident = false;
@@ -3334,7 +3664,7 @@ mod mapped_tests {
             .unwrap();
         store.plan.policy = "auto".into();
         store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
                 plan.resident = false;
@@ -3393,7 +3723,7 @@ mod mapped_tests {
             .unwrap();
         store.plan.policy = "auto".into();
         store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
                 plan.resident = false;

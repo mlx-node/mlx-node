@@ -1,5 +1,6 @@
 //! Residency facts shared with `residencyInfo()` and the mid-turn tripwire
-//! that sends a thrashing mapped process to the slot path at its next turn.
+//! that sends a thrashing mapped process to the slot path at the pass that
+//! showed the symptom.
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,9 +17,19 @@ const SSD_FACTOR: u64 = 2;
 const SLOW_FACTOR: u32 = 10;
 const SLOW_STREAK: u32 = 8;
 /// Passes per row count the median is taken over; at least this many
-/// before any pass is judged.
+/// before any pass is judged against its own median.
 const SAMPLES: usize = 64;
 const MIN_SAMPLES: usize = 8;
+/// A row count with fewer samples is judged against the fastest pass over
+/// more rows seen so far, when that pass had at least this many rows: a
+/// prefill window costs about 0.8 ms per row where a decode step costs 25-40
+/// ms per row, so a smaller window would call healthy decode steps slow,
+/// while a 256-row window (>= 200 ms) leaves a healthy step 5-8x headroom
+/// and a thrashing one (2.4-10 s) none.
+const SEED_MIN_ROWS: usize = 256;
+/// `Live::fallback_token_index` while no request has left the mapped path
+/// mid-turn.
+pub const NO_TOKEN_INDEX: u64 = u64::MAX;
 
 /// Why a process is on the slot path although the pack exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,7 +40,8 @@ pub enum Fallback {
     /// One turn read `read` bytes from SSD against `mapped` mapped bytes.
     SsdReads { read: u64, mapped: u64 },
     /// `steps` consecutive passes of `rows` rows took `step` against a
-    /// `median` of their kind.
+    /// `median` of their kind (the fastest larger pass while the row count
+    /// has fewer than `MIN_SAMPLES` samples).
     SlowSteps {
         rows: usize,
         step: Duration,
@@ -83,8 +95,7 @@ impl Fallback {
 }
 
 /// What `residencyInfo()` reads from the JS thread while the model thread
-/// may change the residency between turns.
-#[derive(Default)]
+/// may change the residency between passes.
 pub struct Live {
     pub mapped: AtomicBool,
     pub mapped_bytes: AtomicU64,
@@ -96,6 +107,26 @@ pub struct Live {
     /// process moves to slots).
     pub prefill_chunk_tokens: AtomicU64,
     pub fallback: Mutex<Option<Fallback>>,
+    /// Tokens the active request held when it left the mapped path
+    /// mid-turn; `NO_TOKEN_INDEX` for the load gate and a fallback applied
+    /// between turns.
+    pub fallback_token_index: AtomicU64,
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Self {
+            mapped: AtomicBool::new(false),
+            mapped_bytes: AtomicU64::new(0),
+            weight_budget: AtomicU64::new(0),
+            partial_expert_slots: AtomicU64::new(0),
+            mapped_bank_budget: AtomicU64::new(0),
+            live_non_reclaimable: AtomicU64::new(0),
+            prefill_chunk_tokens: AtomicU64::new(0),
+            fallback: Mutex::new(None),
+            fallback_token_index: AtomicU64::new(NO_TOKEN_INDEX),
+        }
+    }
 }
 
 impl Live {
@@ -123,9 +154,9 @@ impl Live {
 }
 
 /// Thrash symptoms of a mapped turn whose pack no longer fits beside the
-/// host's live memory. The turn that shows them finishes as it is; the next
-/// turn to open moves the store, and every turn still open with it, to
-/// slots.
+/// host's live memory. The store leaves the mapped path at the pass that
+/// shows them, every open turn with it; a trip whose switch failed stays
+/// armed for the next turn to open.
 #[derive(Default)]
 pub(super) struct Tripwire {
     /// `process_disk_reads()` when the current turn started.
@@ -143,6 +174,32 @@ impl Tripwire {
     pub fn begin_turn(&mut self, reads_now: u64) {
         self.turn_start_reads = reads_now;
         self.slow_streak = 0;
+    }
+
+    /// A trip taken but not applied (the switch to slots failed) waits for
+    /// the next turn to open.
+    pub fn rearm(&mut self, why: Fallback) {
+        self.tripped = Some(why);
+    }
+
+    /// The reference a pass of `rows` rows is judged against: the running
+    /// median of its own kind once it has `MIN_SAMPLES`, else the fastest
+    /// pass over more rows (`SEED_MIN_ROWS` or more) seen so far, so the
+    /// slow-step rule can fire inside the first turn, whose decode steps
+    /// have no history of their own.
+    fn reference(&self, rows: usize) -> Option<(Duration, bool)> {
+        let samples = self.passes.get(&rows).map_or(0, VecDeque::len);
+        if samples >= MIN_SAMPLES {
+            let mut sorted: Vec<Duration> = self.passes[&rows].iter().copied().collect();
+            sorted.sort_unstable();
+            return Some((sorted[sorted.len() / 2], true));
+        }
+        self.passes
+            .iter()
+            .filter(|&(&count, _)| count > rows && count >= SEED_MIN_ROWS)
+            .filter_map(|(_, samples)| samples.iter().min().copied())
+            .min()
+            .map(|seed| (seed, false))
     }
 
     #[cfg(test)]
@@ -185,12 +242,13 @@ impl Tripwire {
             });
             return self.tripped.as_ref();
         }
-        let samples = self.passes.entry(rows).or_default();
-        if samples.len() >= MIN_SAMPLES {
-            let mut sorted: Vec<Duration> = samples.iter().copied().collect();
-            sorted.sort_unstable();
-            let median = sorted[sorted.len() / 2];
-            if elapsed > median.saturating_mul(SLOW_FACTOR) {
+        if let Some((median, own)) = self.reference(rows) {
+            let limit = if own {
+                median.saturating_mul(SLOW_FACTOR)
+            } else {
+                median
+            };
+            if elapsed > limit {
                 self.slow_streak += 1;
                 if self.slow_streak >= SLOW_STREAK {
                     self.tripped = Some(Fallback::SlowSteps {
@@ -205,6 +263,7 @@ impl Tripwire {
             }
             self.slow_streak = 0;
         }
+        let samples = self.passes.entry(rows).or_default();
         if samples.len() == SAMPLES {
             samples.pop_front();
         }
@@ -308,11 +367,86 @@ mod tests {
         for _ in 0..SLOW_STREAK + 2 {
             assert!(wire.observe(1024, 800 * MS, 0, 1 << 30).is_none());
         }
-        // Verification passes of 4 rows have fewer than MIN_SAMPLES samples.
+        // Verification passes of 4 rows at 50 ms: healthy against their own
+        // (absent) history and against the 1024-row windows.
         for _ in 0..MIN_SAMPLES - 1 {
-            assert!(wire.observe(4, 5_000 * MS, 0, 1 << 30).is_none());
+            assert!(wire.observe(4, 50 * MS, 0, 1 << 30).is_none());
         }
         assert!(wire.tripped().is_none());
+    }
+
+    /// The first turn of a process: a cold 6k prompt (six 1024-row windows,
+    /// the first reading the pack) and then decode steps with no history of
+    /// their own. A thrash that starts here (2.4 s steps) trips against the
+    /// fastest window; the re-wire step and healthy steps do not.
+    ///
+    /// MUTATION (M-M6-seed): `reference` returns `None` for a row count with
+    /// fewer than `MIN_SAMPLES` samples; the thrash runs on.
+    #[test]
+    fn a_first_turn_thrash_trips_against_the_prompts_fastest_window() {
+        let mapped = 73u64 << 30;
+        let mut wire = Tripwire::default();
+        wire.begin_turn(0);
+        for window in [12_000, 900, 850, 800, 820, 810] {
+            assert!(wire.observe(1024, window * MS, mapped, mapped).is_none());
+        }
+        // The first decode step re-wires the banks: one slow pass.
+        assert!(wire.observe(1, 1_400 * MS, mapped, mapped).is_none());
+        for _ in 0..3 {
+            assert!(wire.observe(1, 25 * MS, mapped, mapped).is_none());
+        }
+        assert_eq!(wire.slow_streak(), 0);
+        for _ in 0..SLOW_STREAK - 1 {
+            assert!(wire.observe(1, 2_400 * MS, mapped, mapped).is_none());
+        }
+        assert_eq!(
+            wire.observe(1, 2_400 * MS, mapped, mapped).cloned(),
+            Some(Fallback::SlowSteps {
+                rows: 1,
+                step: 2_400 * MS,
+                median: 800 * MS,
+                steps: SLOW_STREAK,
+            })
+        );
+        // Healthy decode after the same prompt never trips, and once the
+        // steps have their own history they are judged against it.
+        let mut healthy = Tripwire::default();
+        healthy.begin_turn(0);
+        for window in [12_000, 900, 850, 800, 820, 810] {
+            assert!(healthy.observe(1024, window * MS, mapped, mapped).is_none());
+        }
+        assert!(healthy.observe(1, 1_400 * MS, mapped, mapped).is_none());
+        for _ in 0..64 {
+            assert!(healthy.observe(1, 30 * MS, mapped, mapped).is_none());
+        }
+        assert_eq!(healthy.reference(1), Some((30 * MS, true)));
+        assert!(healthy.tripped().is_none());
+    }
+
+    /// A prompt shorter than `SEED_MIN_ROWS` seeds nothing: its per-row cost
+    /// is a prefill cost, not a decode cost, so decode steps have no
+    /// reference until they have their own history.
+    #[test]
+    fn a_short_prompt_seeds_no_decode_reference() {
+        let mut wire = Tripwire::default();
+        wire.begin_turn(0);
+        assert!(wire.observe(40, 60 * MS, 0, 1 << 30).is_none());
+        assert_eq!(wire.reference(1), None);
+        for _ in 0..2 * SLOW_STREAK {
+            assert!(wire.observe(1, 100 * MS, 0, 1 << 30).is_none());
+        }
+        assert!(wire.tripped().is_none());
+        // A 512-row fallback window is judged against a 1024-row one.
+        assert!(wire.observe(1024, 800 * MS, 0, 1 << 30).is_none());
+        assert_eq!(wire.reference(512), Some((800 * MS, false)));
+        assert_eq!(wire.reference(1024), None, "no larger pass exists");
+        // A failed switch re-arms the trip for the next turn.
+        let why = Fallback::SsdReads {
+            read: 3 << 30,
+            mapped: 1 << 30,
+        };
+        wire.rearm(why.clone());
+        assert_eq!(wire.take(), Some(why));
     }
 
     #[test]

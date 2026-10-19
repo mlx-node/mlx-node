@@ -672,9 +672,7 @@ impl Inner {
                 self.release_scheduled_recurrent_for(seq);
             }
         } else {
-            self.decoder
-                .weights
-                .observe_pass(rows.len(), started.elapsed());
+            self.decoder.observe_pass(rows.len(), started.elapsed());
         }
         result
     }

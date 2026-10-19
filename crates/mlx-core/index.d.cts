@@ -5495,11 +5495,17 @@ export interface Qwen4ExpResidencyInfo {
   /**
    * Why the slot path serves the experts although the pack exists: the
    * load gate, or a mapped turn that read over twice the pack from SSD or
-   * ran eight consecutive passes over ten times their median.
+   * ran eight consecutive passes over ten times their median (over the
+   * fastest larger pass while they have no median of their own).
    */
   fallbackReason?: string;
   fallbackReadBytes?: number;
   fallbackSlowSteps?: number;
+  /**
+   * Tokens the request held when it left the mapped path between two of
+   * its passes; absent for the load gate.
+   */
+  fallbackTokenIndex?: number;
   /**
    * Token/PLE rows asked of the decoded-row LRU since load, and the ones
    * it had to import.

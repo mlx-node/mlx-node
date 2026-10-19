@@ -55,12 +55,12 @@ in place when the live host holds the whole pack beside what stays anonymous:
 the pack's sections back the expert banks as no-copy Metal buffers, slot id
 is expert id, and no expert is ever copied, missed or staged during a turn.
 The weight budget then covers only what stays anonymous — fixed projection
-banks, up to 8 GiB of auxiliary (MTP/vision) inventory and 2 GiB of
-row/staging room — and the routed experts are clean page cache: the Metal
+banks and 2 GiB of row/staging room, through which auxiliary (MTP/vision)
+rows stream like token rows — and the routed experts are clean page cache: the Metal
 driver wires the banks a command buffer binds and releases them about a
 second after the turn, so the process holds no expert memory between turns
 and the OS may evict the pages. The decision is a byte budget for mapped
-banks: physical RAM minus a 6 GiB margin, minus the host's live
+banks: physical RAM minus a 4 GiB margin, minus the host's live
 non-reclaimable memory (wired, compressor, other processes' anonymous pages;
 `vm_stat`, not "free"), minus that anonymous budget and the paged KV pool.
 The pack maps when the budget covers every bank, else the slot path serves
@@ -71,15 +71,22 @@ wires every bank, so a mapped turn cannot keep the slot path's free/file
 reserve; it stops growing anonymous memory only below 2 GiB of free plus file
 cache. A mapped turn that reads more than twice the pack from SSD, or runs
 eight consecutive passes over ten times the running median of their kind
-(the streak and the SSD count start over when a turn opens on an idle model,
-whose first pass is the bank re-wire; turns admitted while others run join
-the window in progress), finishes as it is and the next turn to open runs on
-the slot path, every turn still open with it (residency is one per model):
-banks and read-ahead released first, then the slot budget read from the live
+(a row count with no median yet — the decode steps of a process's first turn
+— is judged against the fastest pass of 256 rows or more seen so far; the
+streak and the SSD count start over when a turn opens on an idle model, whose
+first pass is the bank re-wire; turns admitted while others run join the
+window in progress), leaves the mapped path between that pass and its next
+one: the same request goes on over slot banks with its KV and recurrent
+state intact, every turn open with it (residency is one per model). Banks
+and read-ahead are released first, then the slot budget is read from the live
 host once wired memory has fallen and held for a second of fresh samples
 (`host_statistics64` repeats its last answer between its few fresh reads per
-second; such copies are skipped), at most 3 s; the prefill window is derived
-from the slot allowance again; the reason, the bytes or the step count are
+second; such copies are skipped), at most 3 s, and capped by the room the host
+has left for anonymous memory (physical RAM minus the margin and its live
+non-reclaimable memory: the pages a wired pack pushed into the compressor
+pool are not free, whatever free plus file cache says); the prefill window is derived
+from the slot allowance again; the reason, the bytes or the step count and
+the request's token position at the switch (`fallbackTokenIndex`) are
 reported. Turns run without a wired-limit context (it does not pin
 file-backed buffers and only delays their release), the mid-turn staging
 admission is gone with the staging, the SSD safety limit subtracts the mapped

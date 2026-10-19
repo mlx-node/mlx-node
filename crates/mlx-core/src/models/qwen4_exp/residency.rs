@@ -274,15 +274,6 @@ impl Store {
             })
     }
 
-    pub(super) fn auxiliary_bytes(&self) -> Result<u64> {
-        self.tensors
-            .iter()
-            .filter(|(name, _)| is_auxiliary(name))
-            .try_fold(0u64, |n, (_, t)| {
-                t.runtime_bytes().map(|bytes| n.saturating_add(bytes))
-            })
-    }
-
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
         self.prepare_hot_with_policy(
             &mut super::super::memory::admit,

@@ -125,8 +125,55 @@ pub struct Decoder {
     device_routes: Option<Vec<(usize, MxArray)>>,
     device_route_cooldown: usize,
     pub last_chunk_hidden: Vec<MxArray>,
+    /// The weight budget this store registers with the process-wide cache
+    /// limit; re-registered whenever the residency changes, between turns or
+    /// between two passes of one request.
+    cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
 }
 impl Decoder {
+    /// Register the budget in force with the process-wide cache limit.
+    pub fn register_cache_limit(&mut self) {
+        self.cache_limit_guard = None;
+        self.cache_limit_guard =
+            Some(crate::cache_limit::coordinator().register(self.weights.cache_budget()));
+    }
+
+    /// The prefill window follows the plan in force (mapped or fallback).
+    pub fn refresh_prefill_window(&mut self) {
+        self.prefill_chunk_size = super::memory::prefill_window(&self.config, &self.weights.plan);
+        self.weights
+            .live
+            .prefill_chunk_tokens
+            .store(self.prefill_chunk_size as u64, Ordering::Release);
+    }
+
+    /// The store changed its residency: the budget it registers and the
+    /// prefill window it admits follow.
+    pub fn residency_changed(&mut self) {
+        self.register_cache_limit();
+        self.refresh_prefill_window();
+    }
+
+    /// One main-network pass over `rows` rows took `elapsed`. A pass that
+    /// trips the wire moves the store to slots before the next one; the
+    /// request goes on with its state intact, and `residencyInfo()` records
+    /// the position it left the mapped path at.
+    pub(super) fn observe_pass(&mut self, rows: usize, elapsed: std::time::Duration) {
+        match self.weights.observe_pass(rows, elapsed) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                self.weights
+                    .live
+                    .fallback_token_index
+                    .store(self.history.len() as u64, Ordering::Release);
+                self.residency_changed();
+            }
+            Err(error) => {
+                tracing::warn!("qwen4 residency: slot fallback not applied: {error}")
+            }
+        }
+    }
+
     pub fn prefill_slice_size(&self) -> usize {
         let requested = std::env::var("MLX_QWEN4_PREFILL_SLICE").ok();
         super::memory::prefill_slice(self.prefill_chunk_size, requested.as_deref())
@@ -160,6 +207,7 @@ impl Decoder {
             device_routes: None,
             device_route_cooldown: 0,
             last_chunk_hidden: Vec::new(),
+            cache_limit_guard: None,
         };
         d.preflight()?;
         Ok(d)
@@ -1729,7 +1777,7 @@ impl Decoder {
         if result.is_err() {
             self.reset();
         } else {
-            self.weights.observe_pass(1, started.elapsed());
+            self.observe_pass(1, started.elapsed());
         }
         result
     }
@@ -1837,7 +1885,7 @@ impl Decoder {
         if result.is_err() {
             self.reset();
         } else {
-            self.weights.observe_pass(tokens.len(), started.elapsed());
+            self.observe_pass(tokens.len(), started.elapsed());
         }
         result
     }

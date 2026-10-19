@@ -50,7 +50,6 @@ struct Inner {
     vision: media::Vision,
     media_prefill: Option<media::Prepared>,
     _pool_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
-    cache_limit_guard: crate::cache_limit::CacheLimitGuard,
     /// Scheduled turns admitted and not yet finished; the first to open
     /// after the set emptied starts a tripwire window, every open adds its
     /// turn to the one in progress.
@@ -61,10 +60,10 @@ struct Inner {
 }
 
 impl Inner {
-    /// A turn opens. A tripped mapped process moves to the slot path here,
-    /// before any pass of the turn; the first turn of a window also starts
-    /// the window's SSD count and slow streak. The prefill window follows
-    /// the plan in force.
+    /// A turn opens. A trip whose mid-turn switch failed moves the process to
+    /// the slot path here, before any pass of the turn; the first turn of a
+    /// window also starts the window's SSD count and slow streak. The prefill
+    /// window follows the plan in force.
     fn open_turn(&mut self, first: bool) {
         let applied = if first {
             self.decoder.weights.begin_turn()
@@ -72,19 +71,13 @@ impl Inner {
             self.decoder.weights.apply_fallback()
         };
         match applied {
-            Ok(Some(_)) => {
-                self.cache_limit_guard =
-                    crate::cache_limit::coordinator().register(self.decoder.weights.cache_budget());
+            Ok(Some(_)) => self.decoder.residency_changed(),
+            Ok(None) => self.decoder.refresh_prefill_window(),
+            Err(error) => {
+                tracing::warn!("qwen4 residency: slot fallback not applied: {error}");
+                self.decoder.refresh_prefill_window();
             }
-            Ok(None) => {}
-            Err(error) => tracing::warn!("qwen4 residency: slot fallback not applied: {error}"),
         }
-        self.decoder.prefill_chunk_size =
-            memory::prefill_window(&self.decoder.config, &self.decoder.weights.plan);
-        self.decoder.weights.live.prefill_chunk_tokens.store(
-            self.decoder.prefill_chunk_size as u64,
-            std::sync::atomic::Ordering::Release,
-        );
     }
 }
 struct Step<'a>(&'a mut Inner);
@@ -390,10 +383,14 @@ pub struct Qwen4ExpResidencyInfo {
     pub live_non_reclaimable_bytes: f64,
     /// Why the slot path serves the experts although the pack exists: the
     /// load gate, or a mapped turn that read over twice the pack from SSD or
-    /// ran eight consecutive passes over ten times their median.
+    /// ran eight consecutive passes over ten times their median (over the
+    /// fastest larger pass while they have no median of their own).
     pub fallback_reason: Option<String>,
     pub fallback_read_bytes: Option<f64>,
     pub fallback_slow_steps: Option<u32>,
+    /// Tokens the request held when it left the mapped path between two of
+    /// its passes; absent for the load gate.
+    pub fallback_token_index: Option<u32>,
     /// Token/PLE rows asked of the decoded-row LRU since load, and the ones
     /// it had to import.
     pub decoded_row_lookups: f64,
@@ -484,22 +481,14 @@ impl Qwen4ExpModel {
                     * u64::from(paged_capacity);
                 decoder.paged = Some(adapter);
                 let pool_guard = Some(crate::cache_limit::coordinator().register_pool(pool_bytes));
-                let mut cache_limit_guard =
-                    crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
+                decoder.register_cache_limit();
                 decoder.weights.prepare_mapped_pack()?;
                 decoder.weights.select_mapped_residency(pool_bytes)?;
                 decoder.weights.prepare_hot()?;
                 decoder.weights.publish_live();
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.
-                drop(cache_limit_guard);
-                cache_limit_guard =
-                    crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
-                decoder.prefill_chunk_size = memory::prefill_window(&config, &decoder.weights.plan);
-                decoder.weights.live.prefill_chunk_tokens.store(
-                    decoder.prefill_chunk_size as u64,
-                    std::sync::atomic::Ordering::Release,
-                );
+                decoder.residency_changed();
                 let residency = decoder.weights.plan.clone();
                 let live = Arc::clone(&decoder.weights.live);
                 let lookup = Arc::clone(&decoder.weights.lookup);
@@ -516,7 +505,6 @@ impl Qwen4ExpModel {
                     vision,
                     media_prefill: None,
                     _pool_guard: pool_guard,
-                    cache_limit_guard,
                     open_turns: std::collections::HashSet::new(),
                     exclusive_turn: false,
                 };
@@ -630,6 +618,9 @@ impl Qwen4ExpModel {
                 .and_then(tripwire::Fallback::read_bytes)
                 .map(|n| n as f64),
             fallback_slow_steps: fallback.as_ref().and_then(tripwire::Fallback::slow_steps),
+            fallback_token_index: Some(live.fallback_token_index.load(Ordering::Acquire))
+                .filter(|&index| index != tripwire::NO_TOKEN_INDEX)
+                .map(|index| u32::try_from(index).unwrap_or(u32::MAX)),
             decoded_row_lookups: lookups as f64,
             decoded_row_misses: misses as f64,
             decoded_row_hit_rate: if lookups == 0 {
