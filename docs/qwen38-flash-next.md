@@ -137,7 +137,9 @@ instead of decoding plain AR. Proposals use private draft state; verification
 commits only accepted target frontiers. The head's routed experts become
 resident Q8 (affine, group 32) banks on the first MTP owner, about 2.6 GiB for
 the released checkpoint outside the weight LRU, and each draft step gathers
-them on the device.
+them on the device. Both banks are installed together, only when the weight
+cache can stage them; otherwise drafts keep streaming expert rows, and
+`residencyInfo().residentBankBytes` reports the banks once they exist.
 Head availability alone does not establish a latency benefit. Stochastic MTP
 keeps distribution-correct verification and disables the greedy adaptive policy.
 

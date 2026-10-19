@@ -559,6 +559,7 @@ pub struct Store {
     pub(super) plan: super::memory::Plan,
     banks: HashMap<String, Arc<Weight>>,
     bank_bytes: u64,
+    mtp_banks_declined: bool,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
     wide_routes: HashMap<usize, Vec<u32>>,
@@ -650,12 +651,13 @@ impl Store {
                 policy: "stream".into(),
                 available_bytes: None,
                 physical_bytes: None,
-                resident_bank_bytes: 0,
+                resident_bank_bytes: Default::default(),
                 resident_expert_layers: 0,
                 partial_expert_slots: 0,
             },
             banks: HashMap::new(),
             bank_bytes: 0,
+            mtp_banks_declined: false,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
             wide_routes: HashMap::new(),
@@ -938,6 +940,15 @@ impl Store {
     #[cfg(test)]
     pub(super) fn lru_holds(&self, name: &str) -> bool {
         self.cache.keys().any(|(n, _, _)| n == name)
+    }
+    #[cfg(test)]
+    pub(super) fn cached_bytes(&self) -> u64 {
+        self.cache_bytes
+    }
+    #[cfg(test)]
+    pub(super) fn set_cache_limit(&mut self, bytes: u64) {
+        self.cache_limit = bytes;
+        self.plan.budget = bytes;
     }
     pub fn descriptor(&self, name: &str) -> Result<&Tensor> {
         self.tensors

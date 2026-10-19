@@ -5425,7 +5425,10 @@ export interface Qwen4ExpLoadOptions {
   auxiliaryModelPath?: string;
 }
 
-/** Load-time residency decision; full residency is admitted before payload reads. */
+/**
+ * Load-time residency decision (full residency is admitted before payload
+ * reads) plus the live pinned-bank total.
+ */
 export interface Qwen4ExpResidencyInfo {
   policy: string;
   weightBudgetBytes: number;
@@ -5435,7 +5438,10 @@ export interface Qwen4ExpResidencyInfo {
   /** Free plus reclaimable file-backed memory observed at bootstrap. */
   availableMemoryBytes?: number;
   physicalMemoryBytes?: number;
-  /** Assembled matrices actually pinned, including partial projection banks. */
+  /**
+   * Assembled matrices actually pinned right now: partial projection banks
+   * and the MTP expert banks built on the first MTP owner.
+   */
   residentBankBytes: number;
   /** Complete routed layers whose expert IDs stay on the GPU. */
   residentExpertLayers: number;

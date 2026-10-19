@@ -2504,6 +2504,76 @@ fn scheduled_decode_preserves_sampling_shape_and_owner_logits() {
 }
 
 #[test]
+fn mtp_owner_starts_without_banks_when_the_cache_cannot_stage_them() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use rand::SeedableRng;
+    let mut inner = tiny_inner();
+    // 3 x MAX_READ_BYTES: the first bank's eviction target saturates to zero
+    // and passes, the second bank's cannot once the first is pinned.
+    inner
+        .decoder
+        .weights
+        .set_cache_limit(weights::MAX_READ_BYTES * 3);
+    let before = inner.decoder.weights.cached_bytes();
+    inner.activate_paged_seq(1).unwrap();
+    assert!(inner.begin_mtp(1, 0).unwrap());
+    assert_eq!(inner.decoder.weights.mtp_bank_bytes().unwrap(), 0);
+    assert_eq!(inner.decoder.weights.cached_bytes(), before);
+    // Ordinary reads need the fixture's staging room; the decline is sticky.
+    inner.decoder.weights.set_cache_limit(1 << 30);
+    let params = inner.resolve_params(&crate::engine::types::ChatConfig {
+        temperature: Some(0.0),
+        enable_mtp: Some(true),
+        mtp_depth: Some(2),
+        ..Default::default()
+    });
+    let prompt = [3, 9, 5, 7];
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    let logits = inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    let anchor = logits.argmax(-1, None).unwrap().item_at_int32(0).unwrap() as u32;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(19);
+    let proposal = inner
+        .propose_mtp(1, anchor, 2, &params, &mut rng, true)
+        .unwrap();
+    assert_eq!(proposal.draft_ids.len(), 2);
+    assert!(
+        inner
+            .decoder
+            .weights
+            .lru_holds("mtp.layers.0.mlp.experts.gate_up_proj"),
+        "drafts must have streamed expert rows through the LRU"
+    );
+    assert_eq!(inner.decoder.weights.mtp_bank_bytes().unwrap(), 0);
+}
+
+#[test]
+fn residency_info_sees_the_mtp_banks_built_on_the_first_owner() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::sync::atomic::Ordering;
+    let mut inner = tiny_inner();
+    // The model handle keeps a clone of the plan taken at load.
+    let handle = inner.decoder.weights.plan.clone();
+    let at_load = handle.resident_bank_bytes.load(Ordering::Relaxed);
+    inner.activate_paged_seq(1).unwrap();
+    assert!(inner.begin_mtp(1, 0).unwrap());
+    let banks = inner.decoder.weights.mtp_bank_bytes().unwrap();
+    assert!(banks > 0);
+    assert_eq!(
+        handle.resident_bank_bytes.load(Ordering::Relaxed),
+        at_load + banks
+    );
+}
+
+#[test]
 fn mtp_confidence_and_adaptive_policy_preserve_the_target_frontier() {
     use crate::engine::backend::PagedBackend;
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
