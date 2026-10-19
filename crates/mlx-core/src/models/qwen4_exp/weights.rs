@@ -1236,7 +1236,9 @@ impl Store {
     }
 
     /// Import `rows` rows of `d`: bytes a reader thread fetched for a single
-    /// row, else a `pread` through the shared descriptor.
+    /// row, else a `pread` through the shared descriptor. A reader's error is
+    /// dropped, never returned: it may be older than this lookup, and only the
+    /// read done now says whether the row is readable.
     fn import_rows(&mut self, d: &Tensor, name: &str, start: usize, rows: usize) -> Result<Weight> {
         let fetched = if rows == 1 {
             self.rows
@@ -1246,15 +1248,18 @@ impl Store {
             None
         };
         let bytes = match fetched {
-            Some((bytes, late)) => {
+            Some((Ok(bytes), late)) => {
                 LookupStats::count(if late {
                     &self.lookup.late
                 } else {
                     &self.lookup.prefetched
                 });
-                bytes.map_err(err)?
+                bytes
             }
-            None => {
+            fetched => {
+                if fetched.is_some() {
+                    LookupStats::count(&self.lookup.late);
+                }
                 let file = self.file(&d.path)?;
                 d.read_rows(&file, start, rows)?
             }
@@ -2108,17 +2113,22 @@ mod cache_tests {
             assert_eq!(&*actual, &*expected, "dtype {dtype:?}");
         }
     }
-    #[test]
-    fn batched_lookup_reuses_decoded_rows_and_survives_eviction() {
-        let dir = std::env::temp_dir().join(format!("qwen4-lookup-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
+    struct Cleanup(PathBuf);
+    impl Cleanup {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("qwen4-lookup-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
         }
-        let _cleanup = Cleanup(dir.clone());
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A GGUF of one Q5_1 `token_embd.weight` [8, 32]: 24 bytes per row.
+    fn rows_gguf(dir: &Path) -> (PathBuf, Vec<u8>) {
         let path = dir.join("rows.gguf");
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
@@ -2146,7 +2156,15 @@ mod cache_tests {
             b.extend((row * 7919).to_le_bytes());
             b.extend([row as u8; 16]);
         }
-        fs::write(&path, b).unwrap();
+        fs::write(&path, &b).unwrap();
+        (path, b)
+    }
+
+    #[test]
+    fn batched_lookup_reuses_decoded_rows_and_survives_eviction() {
+        let cleanup = Cleanup::new();
+        let dir = cleanup.0.clone();
+        let (path, _) = rows_gguf(&dir);
         let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
         let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
         let ids = [3usize, 1, 3, 7];
@@ -2206,6 +2224,47 @@ mod cache_tests {
                 &expected
             );
         }
+    }
+
+    /// A reader's failed read is consumed with its request and never
+    /// returned: the import reads the row itself, so the file as it is now
+    /// decides, and nothing for the key stays behind.
+    #[test]
+    fn a_row_readers_error_is_dropped_and_the_import_reads_the_row_itself() {
+        let cleanup = Cleanup::new();
+        let dir = cleanup.0.clone();
+        let (path, bytes) = rows_gguf(&dir);
+        let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let name = "token_embd.weight";
+        let keys = [(name.to_string(), 7usize)];
+        let (offset, _) = store.descriptor(name).unwrap().range(7, 1).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(offset + 10)
+            .unwrap();
+        store.prefetch_rows(&keys).unwrap();
+        store.rows.as_ref().unwrap().wait_idle();
+        fs::write(&path, &bytes).unwrap();
+        store.prefetch_rows(&keys).unwrap();
+        let row = store.lookup_rows(name, &[7]).unwrap();
+        let expected = oracle.read(name, 7, 1).unwrap().dense().unwrap();
+        assert_eq!(
+            &*row.astype(DType::Float32).unwrap().to_float32().unwrap(),
+            &*expected
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+        );
+        assert_eq!((store.lookup.prefetched(), store.lookup.late()), (0, 1));
+        store.rows.as_ref().unwrap().wait_idle();
+        assert!(
+            store.rows.as_ref().unwrap().take(&keys[0]).is_none(),
+            "nothing for the key may stay behind"
+        );
     }
 
     /// PLE rows of the GGUF fixture through the reader threads against the

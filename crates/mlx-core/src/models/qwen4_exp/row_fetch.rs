@@ -27,6 +27,10 @@ const PENDING_LIMIT: usize = 1 << 16;
 
 struct State {
     queue: VecDeque<Job>,
+    /// Keys of `queue`. A key is pending at most once across queue, running
+    /// and done: a second job for it would complete after the one take and
+    /// be handed to a later request for the key.
+    queued: HashSet<Key>,
     running: HashSet<Key>,
     done: HashMap<Key, std::io::Result<Vec<u8>>>,
 }
@@ -63,6 +67,7 @@ impl Fetcher {
             shared: Arc::new((
                 Mutex::new(State {
                     queue: VecDeque::new(),
+                    queued: HashSet::new(),
                     running: HashSet::new(),
                     done: HashMap::new(),
                 }),
@@ -83,15 +88,25 @@ impl Fetcher {
         Ok(fetcher)
     }
 
-    /// Queue `jobs` behind whatever is still pending, in order.
+    /// Queue `jobs` behind whatever is still pending, in order; a key that is
+    /// already queued, running or ready is not queued again.
     pub(super) fn request(&self, jobs: Vec<Job>) {
         let (lock, ready) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
         if state.queue.len() + state.done.len() > PENDING_LIMIT {
             state.queue.clear();
+            state.queued.clear();
             state.done.clear();
         }
-        state.queue.extend(jobs);
+        for job in jobs {
+            if state.running.contains(&job.key)
+                || state.done.contains_key(&job.key)
+                || !state.queued.insert(job.key.clone())
+            {
+                continue;
+            }
+            state.queue.push_back(job);
+        }
         ready.notify_all();
     }
 
@@ -103,8 +118,11 @@ impl Fetcher {
         if let Some(bytes) = state.done.remove(key) {
             return Some((bytes, false));
         }
-        if let Some(position) = state.queue.iter().position(|job| job.key == *key) {
+        if state.queued.contains(key)
+            && let Some(position) = state.queue.iter().position(|job| job.key == *key)
+        {
             let job = state.queue.remove(position)?;
+            state.queued.remove(key);
             drop(state);
             return Some((read(&job), true));
         }
@@ -115,6 +133,16 @@ impl Fetcher {
             if let Some(bytes) = state.done.remove(key) {
                 return Some((bytes, true));
             }
+            state = ready.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Block until no job is queued or running (needs at least one worker).
+    #[cfg(test)]
+    pub(super) fn wait_idle(&self) {
+        let (lock, ready) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while !state.queue.is_empty() || !state.running.is_empty() {
             state = ready.wait(state).unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -140,6 +168,7 @@ fn run(shared: &(Mutex<State>, Condvar), stop: &AtomicBool) {
                     return;
                 }
                 if let Some(job) = state.queue.pop_front() {
+                    state.queued.remove(&job.key);
                     state.running.insert(job.key.clone());
                     break job;
                 }
@@ -224,6 +253,39 @@ mod tests {
             len: 90,
         }]);
         assert!(alone.take(&("table".into(), 99)).unwrap().0.is_err());
+    }
+
+    #[test]
+    fn a_key_already_pending_is_requested_once() {
+        let dir = Temp::new();
+        let (file, bytes) = table(&dir);
+        let key: Key = ("table".into(), 9);
+        // Ready in `done`: the second request is skipped, so the one take
+        // drains the key and no second completion appears afterwards.
+        let fetcher = Fetcher::new(2).unwrap();
+        fetcher.request(vec![job(&file, 9)]);
+        fetcher.wait_idle();
+        fetcher.request(vec![job(&file, 9)]);
+        let (got, late) = fetcher.take(&key).unwrap();
+        assert!(!late);
+        assert_eq!(got.unwrap(), &bytes[9 * 90..10 * 90]);
+        fetcher.wait_idle();
+        assert!(
+            fetcher.take(&key).is_none(),
+            "a second job for a ready key must not have run"
+        );
+        // Still queued (no readers): the key repeated inside one batch and in
+        // a later batch is one queued job, read once by the taker.
+        let alone = Fetcher::new(0).unwrap();
+        alone.request(vec![job(&file, 9), job(&file, 9)]);
+        alone.request(vec![job(&file, 9)]);
+        let (got, late) = alone.take(&key).unwrap();
+        assert!(late);
+        assert_eq!(got.unwrap(), &bytes[9 * 90..10 * 90]);
+        assert!(
+            alone.take(&key).is_none(),
+            "a second job for a queued key must not exist"
+        );
     }
 
     #[test]
