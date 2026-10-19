@@ -495,6 +495,10 @@ pub struct Store {
     rows: Option<Fetcher>,
     #[cfg(test)]
     pub(in super::super) row_readers: bool,
+    /// Rows a `linear_rows` window projected one at a time (no row-batched
+    /// kernel admitted the weight); a prefill window must never add to it.
+    #[cfg(test)]
+    pub(in super::super) single_row_projections: u64,
     /// Measurement hook: `false` leaves every imported row in its own
     /// buffer (the pre-fold shape) so a test can time the fold alone.
     #[cfg(test)]
@@ -618,6 +622,8 @@ impl Store {
             rows: None,
             #[cfg(test)]
             row_readers: true,
+            #[cfg(test)]
+            single_row_projections: 0,
             #[cfg(test)]
             fold_rows: true,
             lookup: Arc::default(),
@@ -1727,28 +1733,38 @@ impl Store {
             return Err(err(format!("Projection shape mismatch: {name}")));
         }
         let chunk = (MAX_READ_BYTES as usize / (width * 4)).clamp(1, 4096);
+        #[cfg(test)]
+        let single_rows = std::cell::Cell::new(0u64);
         let project = |w: &Weight| -> Result<MxArray> {
             if let Some(out) = super::math::rows::dense_decode(w, x)? {
                 return Ok(out);
             }
+            #[cfg(test)]
+            single_rows.set(single_rows.get() + count as u64);
             let parts = (0..count)
                 .map(|j| w.linear(&x.slice_axis(1, j, j + 1)?))
                 .collect::<Result<Vec<_>>>()?;
             MxArray::concatenate_many(parts.iter().collect(), Some(1))
         };
-        if let Some(bank) = self.banks.get(name) {
-            return project(bank);
-        }
-        let mut outputs = Vec::new();
-        for start in (0..rows).step_by(chunk) {
-            let weight = self.read(name, start, (rows - start).min(chunk))?;
-            outputs.push(project(&weight)?);
-        }
-        if outputs.len() == 1 {
-            Ok(outputs.remove(0))
+        let output = if let Some(bank) = self.banks.get(name) {
+            project(bank)?
         } else {
-            MxArray::concatenate_many(outputs.iter().collect(), Some(-1))
+            let mut outputs = Vec::new();
+            for start in (0..rows).step_by(chunk) {
+                let weight = self.read(name, start, (rows - start).min(chunk))?;
+                outputs.push(project(&weight)?);
+            }
+            if outputs.len() == 1 {
+                outputs.remove(0)
+            } else {
+                MxArray::concatenate_many(outputs.iter().collect(), Some(-1))?
+            }
+        };
+        #[cfg(test)]
+        {
+            self.single_row_projections += single_rows.get();
         }
+        Ok(output)
     }
 
     /// `linear_pair` for a `[1, R, K]` window: the paired bank prepared by

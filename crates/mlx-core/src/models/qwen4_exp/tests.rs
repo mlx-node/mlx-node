@@ -3121,6 +3121,49 @@ fn mtp_transaction_restores_every_accepted_frontier_and_continues_exactly() {
     }
 }
 
+/// A prefill window runs the shared projections batched: no weight is
+/// projected one row at a time (an 18-row window exceeds the row kernels'
+/// four rows, so each row would otherwise dispatch its own projection). The
+/// verification pass over the same decoder is row-exact, and this fixture's
+/// weights are not Q8 banks, so there every row is projected alone.
+#[test]
+fn prefill_window_projections_stay_batched_outside_verification() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledVerifyRow};
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10, 9, 13, 7, 4, 3, 11, 8, 6, 5];
+    let mut inner = tiny_inner();
+    assert!(inner.decoder.batch_prefill && inner.decoder.window_carry);
+    inner.activate_paged_seq(1).unwrap();
+    inner.begin_mtp(1, 0).unwrap();
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    assert_eq!(
+        inner.decoder.weights.single_row_projections, 0,
+        "the prefill window projected weights one row at a time"
+    );
+    inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 1,
+            first_position: prompt.len() as u32,
+            tokens: vec![4, 11, 7],
+            speculative: true,
+        }])
+        .unwrap();
+    assert!(
+        inner.decoder.weights.single_row_projections >= 3,
+        "verification projects each of its rows alone: {}",
+        inner.decoder.weights.single_row_projections
+    );
+}
+
 #[test]
 fn mtp_verification_keeps_ragged_owners_isolated() {
     use crate::engine::backend::PagedBackend;

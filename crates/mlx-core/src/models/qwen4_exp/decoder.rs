@@ -355,9 +355,16 @@ impl Decoder {
         self.weights
             .linear_pair(x, &self.key(a.0, a.1), &self.key(b.0, b.1))
     }
-    /// Row-exact projections of a `[1, R, K]` window (`R <= 4`); one row is
-    /// the ordinary projection.
+    /// Row-exact projections of a verification window (`[1, R, K]`, `R <= 4`):
+    /// row `j` carries the bits of the single-row projection. Outside a
+    /// verification pass a window is a prefill window, whatever its row
+    /// count, and takes the batched projection: the row kernels admit four
+    /// rows, and every other row would run a single-row projection of its own
+    /// (a 6k prompt dispatched 1.5 M of them).
     fn linear_rows(&mut self, x: &MxArray, hf: &str, gg: &str) -> Result<MxArray> {
+        if self.verification.is_none() {
+            return self.linear(x, hf, gg);
+        }
         self.weights.linear_rows(&self.key(hf, gg), x)
     }
     fn linear_pair_rows(
@@ -366,6 +373,9 @@ impl Decoder {
         a: (&str, &str),
         b: (&str, &str),
     ) -> Result<(MxArray, MxArray)> {
+        if self.verification.is_none() {
+            return self.linear_pair(x, a, b);
+        }
         self.weights
             .linear_pair_rows(x, &self.key(a.0, a.1), &self.key(b.0, b.1))
     }
@@ -2044,11 +2054,10 @@ impl Decoder {
             return Err(Error::from_reason("Qwen4 verification width must be 1-4"));
         }
         self.verification = Some(Vec::new());
-        self.prefill_chunk(tokens, None, false)?;
-        let states = self.verification.take().ok_or_else(|| {
-            Error::from_reason("Qwen4 verification lost its accepted-frontier snapshots")
-        })?;
         let result = (|| {
+            self.prefill_chunk(tokens, None, false)?;
+            // The pass stays open through the head: these rows are row-exact
+            // too, and `linear_rows` is batched outside a verification pass.
             let window =
                 MxArray::concatenate_many(self.last_chunk_hidden.iter().collect(), Some(1))?;
             let (mixed, _) =
@@ -2056,6 +2065,9 @@ impl Decoder {
             let logits = self
                 .linear_rows(&mixed, "lm_head.weight", "output.weight")?
                 .reshape(&[tokens.len() as i64, -1])?;
+            let states = self.verification.take().ok_or_else(|| {
+                Error::from_reason("Qwen4 verification lost its accepted-frontier snapshots")
+            })?;
             // Commit rolls the page cursor back and restores one of these
             // states: every pool write and frontier array must be complete.
             let completed: Vec<_> = std::iter::once(&logits)
@@ -2069,10 +2081,10 @@ impl Decoder {
                     .map_err(Error::from_reason)?;
             }
             MxArray::eval_arrays_with_context(&completed, "qwen4::decoder::verify")?;
-            Ok(logits)
+            Ok((logits, states))
         })();
         match result {
-            Ok(logits) => Ok((logits, states)),
+            Ok(verified) => Ok(verified),
             Err(error) => {
                 self.reset();
                 Err(error)
