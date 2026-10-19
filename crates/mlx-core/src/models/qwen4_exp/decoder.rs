@@ -106,6 +106,10 @@ pub struct Decoder {
     pub async_prefill: bool,
     pub batch_rotary: bool,
     pub prefill_chunk_size: usize,
+    /// A test that sizes admission through the prefill window keeps its
+    /// window across the turn opens that re-derive it from the plan.
+    #[cfg(test)]
+    pub(super) prefill_window_pin: Option<usize>,
     // Like TrackFastModel's retained configuration, share immutable metadata
     // across forward helpers instead of copying its strings/lists per layer.
     pub config: Arc<Config>,
@@ -144,7 +148,10 @@ impl Decoder {
 
     /// The prefill window follows the plan in force (mapped or fallback).
     pub fn refresh_prefill_window(&mut self) {
-        self.prefill_chunk_size = super::memory::prefill_window(&self.config, &self.weights.plan);
+        let window = super::memory::prefill_window(&self.config, &self.weights.plan);
+        #[cfg(test)]
+        let window = self.prefill_window_pin.unwrap_or(window);
+        self.prefill_chunk_size = window;
         self.weights
             .live
             .prefill_chunk_tokens
@@ -193,6 +200,8 @@ impl Decoder {
         let prefill_chunk_size = super::memory::prefill_window(&config, &weights.plan);
         let d = Self {
             prefill_chunk_size,
+            #[cfg(test)]
+            prefill_window_pin: None,
             window_carry: true,
             async_prefill: true,
             batch_rotary: true,

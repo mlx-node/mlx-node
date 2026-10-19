@@ -402,6 +402,9 @@ fn queued_mtp_owner_keeps_its_draft_reservation_until_its_owner_exists() {
             lo = mid + 1;
         }
     }
+    // Every turn open re-derives the window from the plan; the pin keeps
+    // the shrunk budget through both admissions.
+    state.inner.decoder.prefill_window_pin = Some(lo);
     state.inner.decoder.prefill_chunk_size = lo;
     let capacity = state.inner.scheduled_state_capacity().unwrap();
     assert_eq!(capacity.held, 0);
