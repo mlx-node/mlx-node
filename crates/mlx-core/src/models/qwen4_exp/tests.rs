@@ -5504,7 +5504,9 @@ fn qsa_kernel_matches_masked_sdpa() {
 /// bits over every batch, head, query row and dim: GQA factors 1, 3, 5 and 12
 /// (odd factors leave the last head unpaired), batches above 1, -1 picks,
 /// exact and incomplete tail blocks, query ends below the key length, D 256
-/// and D 64, block sizes 4, 8 and 33. The capability pick must match both.
+/// and D 64, block sizes 4, 8 and 33. The capability pick must match both and
+/// must run the paired kernel wherever the kv group has two heads and the
+/// paired pipeline holds the threadgroup.
 #[test]
 fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
     use crate::array::DType;
@@ -5531,7 +5533,7 @@ fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
             .map(|x| x.to_bits())
             .collect::<Vec<_>>()
     };
-    let mut paired_cases = 0;
+    let (mut paired_cases, mut capability_paired) = (0, 0);
     for (heads, kv_heads, dim, length, t, topk, block, batch) in [
         (2i64, 2i64, 64i64, 70usize, 9usize, 3usize, 4usize, 2i64),
         (6, 2, 256, 300, 11, 6, 4, 2),
@@ -5593,7 +5595,7 @@ fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
             let query_ends = MxArray::from_int32(&ends, &[batch, t as i64]).unwrap();
             let scale = (dim as f64).powf(-0.5);
             let run = |kernel: QsaKernel| {
-                math::qsa_attention(&q, &k, &v, &selected, &query_ends, scale, block, kernel)
+                math::qsa_dispatch(&q, &k, &v, &selected, &query_ends, scale, block, kernel)
                     .unwrap()
             };
             let threads = |kernel: QsaKernel| {
@@ -5612,7 +5614,9 @@ fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
                 paired_threads > 0,
                 "{label}: the paired pipeline did not build"
             );
-            let want = bits(&run(QsaKernel::SingleHead));
+            let (single, single_heads) = run(QsaKernel::SingleHead);
+            assert_eq!(single_heads, 1, "{label}: the single-head kernel");
+            let want = bits(&single);
             assert!(
                 want.iter().any(|&b| f32::from_bits(b) != 0.0),
                 "{label}: all-zero output"
@@ -5637,14 +5641,115 @@ fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
                     );
                 }
             };
-            compare("the capability pick", &run(QsaKernel::ByCapability));
+            // A kv group of one head has no second head to pair.
+            let want_heads = if heads / kv_heads >= 2 && paired_threads >= 1024 {
+                2
+            } else {
+                1
+            };
+            let (capability, capability_heads) = run(QsaKernel::ByCapability);
+            assert_eq!(
+                capability_heads, want_heads,
+                "{label}: the capability pick ran the {capability_heads}-head kernel; the paired pipeline holds {paired_threads} threads"
+            );
+            if capability_heads == 2 {
+                capability_paired += 1;
+            }
+            compare("the capability pick", &capability);
             if paired_threads >= 1024 {
-                compare("the paired kernel", &run(QsaKernel::PairedHeads));
+                let (paired, paired_heads) = run(QsaKernel::PairedHeads);
+                assert_eq!(paired_heads, 2, "{label}: the paired kernel");
+                compare("the paired kernel", &paired);
                 paired_cases += 1;
             }
         }
     }
-    eprintln!("paired kernel compared bit for bit on {paired_cases} geometry/dtype cases");
+    eprintln!(
+        "paired kernel compared bit for bit on {paired_cases} geometry/dtype cases; the capability pick ran it on {capability_paired}"
+    );
+    assert!(
+        capability_paired > 0,
+        "the capability pick never ran the paired kernel"
+    );
+}
+
+/// A pipeline probe that throws (a failed Metal compile) is not remembered:
+/// that call falls back to the single-head kernel, the next call probes again
+/// and runs the paired kernel, writing the same bits.
+#[test]
+fn qsa_failed_pipeline_probe_is_retried() {
+    use crate::array::DType;
+    use math::QsaKernel;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    // A geometry no other test builds, so neither pipeline is cached yet.
+    let (heads, kv_heads, dim, length, t, topk, block) = (4i64, 2i64, 64i64, 90i64, 5i64, 7i64, 4);
+    let values = |shape: &[i64], seed: usize| {
+        let n = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(
+            &(0..n)
+                .map(|i| (((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0) * 0.8)
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+    };
+    let q = values(&[1, heads, t, dim], 1);
+    let k = values(&[1, kv_heads, length, dim], 2);
+    let v = values(&[1, kv_heads, length, dim], 3);
+    let picks: Vec<i32> = (0..t * topk).map(|i| (i % topk * 2) as i32).collect();
+    let ends = vec![length as i32 - 1; t as usize];
+    let selected = MxArray::from_int32(&picks, &[1, t, topk]).unwrap();
+    let query_ends = MxArray::from_int32(&ends, &[1, t]).unwrap();
+    let run = || {
+        math::qsa_dispatch(
+            &q,
+            &k,
+            &v,
+            &selected,
+            &query_ends,
+            0.125,
+            block,
+            QsaKernel::ByCapability,
+        )
+        .unwrap()
+    };
+    let bits = |a: &MxArray| {
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(math::qsa_fail_pipeline_probes(1), 0);
+    let (first, first_heads) = run();
+    assert_eq!(
+        math::qsa_fail_pipeline_probes(0),
+        0,
+        "the injected failure was not consumed: the paired pipeline was already cached"
+    );
+    assert_eq!(
+        first_heads, 1,
+        "the call whose paired probe failed ran the {first_heads}-head kernel"
+    );
+    let (second, second_heads) = run();
+    let paired_threads = math::qsa_pipeline_threads(
+        &q,
+        &k,
+        &v,
+        &selected,
+        &query_ends,
+        block,
+        QsaKernel::PairedHeads,
+    );
+    assert_eq!(
+        second_heads, 2,
+        "the call after the failed probe ran the {second_heads}-head kernel (the paired pipeline holds {paired_threads} threads)"
+    );
+    assert_eq!(bits(&first), bits(&second), "single-head vs paired bits");
 }
 
 /// The per-token path partitions a row as long as its own block count; the
