@@ -6438,7 +6438,7 @@ fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
             .map(|x| x.to_bits())
             .collect::<Vec<_>>()
     };
-    let (mut paired_cases, mut capability_paired) = (0, 0);
+    let (mut paired_cases, mut pairable_cases, mut capability_paired) = (0, 0, 0);
     for (heads, kv_heads, dim, length, t, topk, block, batch) in [
         (2i64, 2i64, 64i64, 70usize, 9usize, 3usize, 4usize, 2i64),
         (6, 2, 256, 300, 11, 6, 4, 2),
@@ -6546,12 +6546,13 @@ fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
                     );
                 }
             };
-            // A kv group of one head has no second head to pair.
-            let want_heads = if heads / kv_heads >= 2 && paired_threads >= 1024 {
-                2
-            } else {
-                1
-            };
+            // A kv group of one head has no second head to pair, and a GPU whose
+            // paired pipeline holds fewer than 1024 threads runs single-head.
+            let pairable = heads / kv_heads >= 2 && paired_threads >= 1024;
+            if pairable {
+                pairable_cases += 1;
+            }
+            let want_heads = if pairable { 2 } else { 1 };
             let (capability, capability_heads) = run(QsaKernel::ByCapability);
             assert_eq!(
                 capability_heads, want_heads,
@@ -6570,12 +6571,18 @@ fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
         }
     }
     eprintln!(
-        "paired kernel compared bit for bit on {paired_cases} geometry/dtype cases; the capability pick ran it on {capability_paired}"
+        "paired kernel compared bit for bit on {paired_cases} geometry/dtype cases; the capability pick ran it on {capability_paired} of {pairable_cases} pairable"
     );
-    assert!(
-        capability_paired > 0,
-        "the capability pick never ran the paired kernel"
-    );
+    if pairable_cases == 0 {
+        eprintln!(
+            "note: no paired pipeline holds 1024 threads on this GPU, so the capability pick was checked single-head only"
+        );
+    } else {
+        assert_eq!(
+            capability_paired, pairable_cases,
+            "the capability pick ran the paired kernel on {capability_paired} of {pairable_cases} pairable cases"
+        );
+    }
 }
 
 /// A pipeline probe that throws (a failed Metal compile) is not remembered:
