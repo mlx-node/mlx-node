@@ -81,11 +81,16 @@ state intact, every turn open with it (residency is one per model). Banks
 and read-ahead are released first, then the slot budget is read from the live
 host once wired memory has fallen and held for a second of fresh samples
 (`host_statistics64` repeats its last answer between its few fresh reads per
-second; such copies are skipped), at most 3 s, and capped by the room the host
-has left for anonymous memory (physical RAM minus the margin and its live
-non-reclaimable memory: the pages a wired pack pushed into the compressor
-pool are not free, whatever free plus file cache says); the prefill window is derived
-from the slot allowance again; the reason, the bytes or the step count and
+second; such copies are skipped), at most 3 s, with the bootstrap rule over the
+free plus file cache the host keeps once everything live is touched again
+(free plus file plus purgeable, minus the inflation of the compressor pool and
+the pages swapped out: the hog and the apps a wired pack pushed into the
+compressor and into swap come back on top of the slots, whatever the plain
+count says right after the unwire; 68 GiB of it beside a 40 GiB hog sized 48
+GiB of slots that decoded at 0.11 tokens/s while the kernel cycled banks and
+hog through the compressor); the prefill window is derived from the slot
+allowance again and read before every remaining pass of the request; the
+reason, the bytes or the step count and
 the request's token position at the switch (`fallbackTokenIndex`) are
 reported. Turns run without a wired-limit context (it does not pin
 file-backed buffers and only delays their release), the mid-turn staging

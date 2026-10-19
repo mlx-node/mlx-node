@@ -129,6 +129,10 @@ pub struct Decoder {
     /// limit; re-registered whenever the residency changes, between turns or
     /// between two passes of one request.
     cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// Runs after every observed pass; tests cut the admitted window between
+    /// two passes of one prompt through it.
+    #[cfg(test)]
+    pub(super) after_pass: Option<Box<dyn FnMut(&mut Decoder) + Send>>,
 }
 impl Decoder {
     /// Register the budget in force with the process-wide cache limit.
@@ -172,6 +176,11 @@ impl Decoder {
                 tracing::warn!("qwen4 residency: slot fallback not applied: {error}")
             }
         }
+        #[cfg(test)]
+        if let Some(mut hook) = self.after_pass.take() {
+            hook(self);
+            self.after_pass = Some(hook);
+        }
     }
 
     pub fn prefill_slice_size(&self) -> usize {
@@ -208,6 +217,8 @@ impl Decoder {
             device_route_cooldown: 0,
             last_chunk_hidden: Vec::new(),
             cache_limit_guard: None,
+            #[cfg(test)]
+            after_pass: None,
         };
         d.preflight()?;
         Ok(d)

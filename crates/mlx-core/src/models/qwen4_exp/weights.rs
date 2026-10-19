@@ -2444,15 +2444,17 @@ mod cache_tests {
             decoder.weights.evict_to(target).unwrap();
             assert!(decoder.weights.cache.is_empty(), "the LRU holds rows only");
             decoder.weights.begin_turn().unwrap();
-            let slice = decoder.prefill_slice_size();
             let started = std::time::Instant::now();
             let mut logits = None;
-            for (i, chunk) in tokens.chunks(slice).enumerate() {
+            let mut start = 0;
+            while start < tokens.len() {
+                let end = (start + decoder.prefill_slice_size()).min(tokens.len());
                 logits = Some(
                     decoder
-                        .prefill_chunk(chunk, None, (i + 1) * slice >= tokens.len())
+                        .prefill_chunk(&tokens[start..end], None, end == tokens.len())
                         .unwrap(),
                 );
+                start = end;
             }
             let mut token = argmax(&logits.unwrap());
             let prefill = started.elapsed();
@@ -3744,6 +3746,8 @@ mod mapped_tests {
             purgeable: 0,
             wired: 50 << 30,
             compressor: 10 << 30,
+            uncompressed: 10 << 30,
+            swapped: 0,
             faults: 1,
         };
         let released = |faults: u64| HostMemory {

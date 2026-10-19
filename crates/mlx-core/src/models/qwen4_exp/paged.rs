@@ -188,8 +188,12 @@ impl PagedBackend for Inner {
     fn paged_prefill(&mut self, tokens: &[u32], _: &Prefix, stream: Stream) -> Result<MxArray> {
         let _context = crate::stream::StreamContext::new(stream);
         let mut logits = None;
-        let chunk_size = self.decoder.prefill_slice_size();
-        for (i, chunk) in tokens.chunks(chunk_size).enumerate() {
+        // Read before every pass: a pass that leaves the mapped path shrinks
+        // the window for the passes after it.
+        let mut start = 0;
+        while start < tokens.len() {
+            let end = (start + self.decoder.prefill_slice_size()).min(tokens.len());
+            let chunk = &tokens[start..end];
             let base = self.decoder.history.len();
             let embeddings = if let Some(media) = &self.media_prefill {
                 self.decoder.positions = media.positions.clone();
@@ -206,10 +210,11 @@ impl PagedBackend for Inner {
             logits = Some(self.decoder.prefill_chunk(
                 chunk,
                 embeddings.as_ref(),
-                (i + 1) * chunk_size >= tokens.len(),
+                end == tokens.len(),
             )?);
             let hidden = self.decoder.last_chunk_hidden.clone();
             self.observe_mtp(self.active_seq.unwrap_or(0), chunk, &hidden)?;
+            start = end;
         }
         logits
             .ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))?

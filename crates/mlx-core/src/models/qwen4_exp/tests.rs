@@ -2177,6 +2177,79 @@ fn a_turn_opens_with_the_prefill_window_of_the_plan_in_force() {
     inner.scheduled_turn_closed(1);
 }
 
+/// Rows of every prefill pass over `prompt` when the admitted window is cut
+/// from `wide` to `narrow` after the first pass, as a pass that leaves the
+/// mapped path does through `Decoder::residency_changed`.
+fn prefill_pass_rows(
+    inner: &mut Inner,
+    paged: bool,
+    prompt: &[u32],
+    wide: usize,
+    narrow: usize,
+) -> Vec<usize> {
+    use crate::engine::backend::{ChatBackend, PagedBackend};
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::sync::{Arc, Mutex};
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&rows);
+    let mut done = 0usize;
+    inner.decoder.prefill_chunk_size = wide;
+    inner.decoder.after_pass = Some(Box::new(move |decoder: &mut decoder::Decoder| {
+        seen.lock().unwrap().push(decoder.history.len() - done);
+        done = decoder.history.len();
+        decoder.prefill_chunk_size = narrow;
+    }));
+    let stream = Stream::default(crate::stream::DeviceType::Gpu);
+    let logits = if paged {
+        inner.activate_paged_seq(1).unwrap();
+        let prefix = inner.prime_prefix_state(prompt, false, 32, &[], 0).unwrap();
+        inner.paged_prefill(prompt, &prefix, stream).unwrap()
+    } else {
+        inner.decoder.paged = None;
+        inner.prefill(prompt, stream).unwrap()
+    };
+    inner.decoder.after_pass = None;
+    assert_eq!(
+        &*logits.shape().unwrap(),
+        [1, 64],
+        "the last pass projects the logits"
+    );
+    assert_eq!(inner.decoder.history, prompt);
+    Arc::into_inner(rows)
+        .expect("the hook was dropped")
+        .into_inner()
+        .unwrap()
+}
+
+/// A mapped prefill that trips mid-prompt leaves the rest of the prompt a
+/// smaller window (the slot allowance's), and every pass after the switch
+/// must take it: the whole-prompt loops read the admitted slice before each
+/// pass instead of once before the loop.
+///
+/// MUTATION (M-M6F-flat): `Inner::prefill` takes the slice size once before
+/// its loop; the passes after the cut keep 32 rows.
+#[test]
+fn an_exclusive_prefill_reads_the_admitted_window_before_every_pass() {
+    let prompt: Vec<u32> = (0..96).map(|i| 3 + (i % 10) as u32).collect();
+    let mut inner = tiny_inner();
+    let rows = prefill_pass_rows(&mut inner, false, &prompt, 32, 8);
+    let mut expected = vec![32];
+    expected.extend([8; 8]);
+    assert_eq!(rows, expected);
+}
+
+/// MUTATION (M-M6F-paged): `paged_prefill` takes the slice size once before
+/// its loop; the passes after the cut keep 32 rows.
+#[test]
+fn an_exclusive_paged_prefill_reads_the_admitted_window_before_every_pass() {
+    let prompt: Vec<u32> = (0..96).map(|i| 3 + (i % 10) as u32).collect();
+    let mut inner = tiny_inner();
+    let rows = prefill_pass_rows(&mut inner, true, &prompt, 32, 8);
+    let mut expected = vec![32];
+    expected.extend([8; 8]);
+    assert_eq!(rows, expected);
+}
+
 #[test]
 fn scheduled_decode_preserves_sampling_shape_and_owner_logits() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;

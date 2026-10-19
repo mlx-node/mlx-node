@@ -320,13 +320,17 @@ impl ChatBackend for Inner {
         }
         let _context = StreamContext::new(stream);
         let mut logits = None;
-        let chunk_size = self.decoder.prefill_slice_size();
-        for (i, chunk) in tokens.chunks(chunk_size).enumerate() {
+        // Read before every pass: a pass that leaves the mapped path shrinks
+        // the window for the passes after it.
+        let mut start = 0;
+        while start < tokens.len() {
+            let end = (start + self.decoder.prefill_slice_size()).min(tokens.len());
             logits = Some(self.decoder.prefill_chunk(
-                chunk,
+                &tokens[start..end],
                 None,
-                (i + 1) * chunk_size >= tokens.len(),
+                end == tokens.len(),
             )?);
+            start = end;
         }
         logits
             .ok_or_else(|| Error::from_reason("Empty qwen4_exp prefill"))?

@@ -69,7 +69,16 @@ pub(super) struct HostMemory {
     pub anonymous: u64,
     pub purgeable: u64,
     pub wired: u64,
+    /// Physical pages the compressor pool occupies.
     pub compressor: u64,
+    /// Uncompressed size of the pages in the compressor pool
+    /// (`total_uncompressed_pages_in_compressor`): what they take back when
+    /// touched again (2.3-2.7x the pool for idle apps, 1x for incompressible
+    /// data).
+    pub uncompressed: u64,
+    /// Pages swapped out, uncompressed (`swapped_count`: 9.0 GiB beside
+    /// 4.9 GB of swap file measured).
+    pub swapped: u64,
     /// Page faults since boot. `host_statistics64` answers only a few
     /// fresh reads per second per host and hands every other caller its
     /// previous answer; a sample equal to the last one in every field is
@@ -291,27 +300,30 @@ const UNWIRE_STEP: u64 = 256 << 20;
 /// sample between two steps would make the budget of that plateau permanent.
 const UNWIRE_FLAT_SAMPLES: u32 = 4;
 
-/// Bytes the host can still take as anonymous memory under the gate's
-/// model: physical RAM minus the margin and everything live that is neither
-/// free nor evictable. Free plus file cache overstates that room after a
-/// mapped turn: the pages the wired pack pushed into the compressor pool
-/// stay there until swap moves them (measured beside a 40 GiB hog: 38 GiB
-/// in the compressor, 60 GiB free+file, and the 36 GiB slot budget read
-/// from the latter decoded at 0.1 tokens/s out of swap).
-pub(super) fn anonymous_room(host: &HostMemory) -> u64 {
-    host.physical
-        .saturating_sub(MAPPED_MARGIN)
-        .saturating_sub(host.non_reclaimable())
-        >> 30
-        << 30
+/// Free plus file cache the host will have once everything live has been
+/// touched again: what is free now plus the purgeable pages, minus the
+/// inflation of the compressor pool (uncompressed minus occupied) and the
+/// pages swapped out. Right after a mapped turn unwires its pack the plain
+/// count lies: beside a 40 GiB touching hog it read 60-68 GiB while the hog
+/// and the apps sat compressed and swapped; the 47-48 GiB of slots the
+/// bootstrap rule sized from it had to share RAM with them when they came
+/// back, the kernel cycled the incompressible banks and the hog through
+/// the compressor at 7 GB/s, and the request decoded at 0.10 tokens/s. The
+/// compressor's physical pages are no debt: they are already outside free
+/// plus file cache.
+pub(super) fn available_after_debt(host: &HostMemory) -> u64 {
+    host.available()
+        .saturating_add(host.purgeable)
+        .saturating_sub(host.uncompressed.saturating_sub(host.compressor))
+        .saturating_sub(host.swapped)
 }
 
 /// The slot budget for a process that leaves mapped mode after a tripwire:
-/// the bootstrap rule over the live host, capped by `anonymous_room`,
-/// partial residency only. Called with the banks already released; the
-/// budget has to cover what the store still holds. A host that cannot be
-/// read leaves the held bytes as the budget, so the store is never left
-/// between the two paths.
+/// the bootstrap rule over the live host's `available_after_debt`, partial
+/// residency only. Called with the banks already released; the budget has
+/// to cover what the store still holds. A host that cannot be read leaves
+/// the held bytes as the budget, so the store is never left between the two
+/// paths.
 pub(super) fn slot_fallback_plan_with(
     plan: &mut Plan,
     held_bytes: u64,
@@ -322,9 +334,9 @@ pub(super) fn slot_fallback_plan_with(
     let budget = match plan.physical_bytes {
         Some(_) => match settled_host(host, sleep) {
             Ok(host) => {
-                plan.available_bytes = Some(host.available());
-                automatic_budget(desired, host.available(), host.physical)
-                    .min(anonymous_room(&host))
+                let available = available_after_debt(&host);
+                plan.available_bytes = Some(available);
+                automatic_budget(desired, available, host.physical)
             }
             Err(error) => {
                 tracing::warn!(
@@ -593,6 +605,8 @@ pub(super) fn host_memory() -> Result<HostMemory> {
         purgeable: u64::from(stats.purgeable_count) * page,
         wired: u64::from(stats.wire_count) * page,
         compressor: u64::from(stats.compressor_page_count) * page,
+        uncompressed: stats.total_uncompressed_pages_in_compressor * page,
+        swapped: stats.swapped_count * page,
         faults: stats.faults,
     })
 }
@@ -686,6 +700,30 @@ mod tests {
         (n * (1u64 << 30) as f64) as u64
     }
 
+    /// A fixture a `host_statistics64` read could have produced: free,
+    /// file-backed, anonymous, wired and compressor pages partition physical
+    /// RAM (speculative pages sit in both free and file: 0.5-1.4 GiB
+    /// measured), purgeable pages are anonymous, and the compressor stores
+    /// at least what it occupies.
+    fn coherent(host: HostMemory) -> HostMemory {
+        let sum = host.free + host.file + host.anonymous + host.wired + host.compressor;
+        assert!(
+            sum <= host.physical + (1 << 30),
+            "incoherent fixture: {:.1} GiB of pages on a {:.1} GiB host",
+            sum as f64 / (1u64 << 30) as f64,
+            host.physical as f64 / (1u64 << 30) as f64
+        );
+        assert!(
+            host.purgeable <= host.anonymous,
+            "purgeable pages are anonymous"
+        );
+        assert!(
+            host.uncompressed >= host.compressor,
+            "the pool stores what it occupies"
+        );
+        host
+    }
+
     /// The desktop of 2026-10-19 15:47 (vm_stat): the same free memory with
     /// a 40 GiB anonymous hog beside it must send the pack to slots, and
     /// free memory alone must not admit it.
@@ -693,7 +731,7 @@ mod tests {
     fn mapped_gate_reads_live_memory_not_free() {
         let pack = gib(73.15);
         let need = gib(13.0);
-        let quiet = HostMemory {
+        let quiet = coherent(HostMemory {
             physical: 128 << 30,
             free: gib(77.3),
             file: gib(10.0),
@@ -701,8 +739,10 @@ mod tests {
             purgeable: gib(0.7),
             wired: gib(13.2),
             compressor: gib(7.5),
+            uncompressed: gib(18.0),
+            swapped: gib(3.0),
             faults: 0,
-        };
+        });
         let gate = mapped_gate(&quiet, need, 0);
         assert_eq!(
             gate.non_reclaimable,
@@ -717,35 +757,36 @@ mod tests {
             mapped_gate(&quiet, need, MAPPED_MARGIN).bank_budget < pack,
             "with the margin this desktop is 2 GiB short"
         );
-        // A touching 40 GiB hog: the kernel compressed and swapped idle apps
-        // for it, so free barely moved while anonymous grew.
-        let hog = HostMemory {
-            free: gib(70.0),
+        // A touching 40 GiB hog takes its pages out of free: anonymous grows
+        // by the hog.
+        let hog = coherent(HostMemory {
+            free: gib(37.3),
             anonymous: gib(20.1) + gib(40.0),
-            compressor: gib(9.0),
             ..quiet
-        };
+        });
         assert!(
             mapped_gate(&hog, need, 0).bank_budget < pack,
             "live anonymous memory decides, not free"
         );
         assert!(mapped_gate(&hog, need, 0).bank_budget < gate.bank_budget - gib(39.0));
         // M3's 20 GiB hog (det-hog-1: 1.06 TB of re-reads) is refused too.
-        let hog20 = HostMemory {
+        let hog20 = coherent(HostMemory {
+            free: gib(57.3),
             anonymous: gib(20.1) + gib(20.0),
             ..quiet
-        };
+        });
         assert!(mapped_gate(&hog20, need, 0).bank_budget < pack);
         // Purgeable pages are reclaimable; wired and compressed are not.
-        let purgeable = HostMemory {
+        let purgeable = coherent(HostMemory {
             purgeable: gib(30.0),
             ..hog20
-        };
+        });
         assert!(mapped_gate(&purgeable, need, 0).bank_budget >= pack);
-        let wired = HostMemory {
+        let wired = coherent(HostMemory {
+            free: gib(57.3),
             wired: gib(13.2) + gib(20.0),
             ..quiet
-        };
+        });
         assert!(mapped_gate(&wired, need, 0).bank_budget < pack);
         assert_eq!(mapped_gate(&quiet, u64::MAX, 0).bank_budget, 0);
     }
@@ -791,15 +832,19 @@ mod tests {
         // auxiliary term and the 6 GiB margin drew the line at 35.85).
         let need = mapped_desired(gib(4.9)) + (1 << 30);
         assert_eq!(need, 8 << 30);
-        let desktop = |live: f64| HostMemory {
-            physical: 128 << 30,
-            free: gib(60.0),
-            file: gib(128.0 - 60.0) - gib(live),
-            anonymous: gib(live) - gib(20.0),
-            purgeable: 0,
-            wired: gib(13.0),
-            compressor: gib(7.0),
-            faults: 0,
+        let desktop = |live: f64| {
+            coherent(HostMemory {
+                physical: 128 << 30,
+                free: gib(60.0),
+                file: gib(128.0 - 60.0) - gib(live),
+                anonymous: gib(live) - gib(20.0),
+                purgeable: 0,
+                wired: gib(13.0),
+                compressor: gib(7.0),
+                uncompressed: gib(17.0),
+                swapped: gib(5.0),
+                faults: 0,
+            })
         };
         assert!(mapped_gate(&desktop(42.8), need, MAPPED_MARGIN).bank_budget >= gib(73.15));
         assert!(mapped_gate(&desktop(42.0), need, MAPPED_MARGIN).bank_budget >= gib(73.15));
@@ -833,7 +878,7 @@ mod tests {
     /// after wired has fallen and settled, not from the first one.
     #[test]
     fn slot_fallback_sizes_from_the_host_after_the_banks_unwire() {
-        let still_wired = HostMemory {
+        let still_wired = coherent(HostMemory {
             physical: 128 << 30,
             free: gib(0.13),
             file: gib(43.69),
@@ -841,8 +886,10 @@ mod tests {
             purgeable: 0,
             wired: gib(23.31),
             compressor: gib(10.0),
+            uncompressed: gib(10.0),
+            swapped: 0,
             faults: 1,
-        };
+        });
         let unwiring = HostMemory {
             free: gib(0.2),
             file: gib(47.2),
@@ -935,25 +982,35 @@ mod tests {
         assert_eq!(plan.budget, 12 << 30);
     }
 
-    /// The two hosts a 40 GiB touching hog left behind on 2026-10-19 when a
-    /// mapped turn tripped mid-prefill. Free plus file cache said 60 GiB
-    /// both times; what the host could still take as anonymous memory was
-    /// 23 GiB with a 10 GiB compressor pool and nothing with a 38 GiB one.
+    /// The host a mapped turn left when it tripped ten tokens into its
+    /// decode beside a 40 GiB touching hog (M6F-hog40-during-1, 2026-10-19):
+    /// the unwired pack showed 68 GiB of free plus file cache and the
+    /// bootstrap rule handed out 48 GiB of slots, while 15 GiB of pages
+    /// stood in swap and the pool held the hog's incompressible pages; when
+    /// they came back the kernel cycled banks and hog through the compressor
+    /// at 7 GB/s and the request decoded at 0.11 tokens/s (its successor,
+    /// banks full, 12 tokens/s). Sized from the free plus file cache the host
+    /// keeps once that debt is paid, the same rule gives 33 GiB. The pool's
+    /// physical pages are no debt: a cap on them is inert on a coherent
+    /// snapshot (free plus file plus purgeable minus a margin, above the
+    /// rule's own 20 GiB reserve).
     ///
-    /// MUTATION (M-M6-room): the `anonymous_room` cap is dropped from
-    /// `slot_fallback_plan_with`; the compressed host gets 40 GiB of slots.
+    /// MUTATION (M-M6-room): `slot_fallback_plan_with` sizes from the plain
+    /// `available()` again; the hogged host gets 48 GiB of slots.
     #[test]
-    fn slot_fallback_budget_is_capped_by_the_room_for_anonymous_memory() {
-        let hogged = |compressor: f64| HostMemory {
+    fn slot_fallback_budget_counts_the_compressed_and_swapped_debt() {
+        let hogged = coherent(HostMemory {
             physical: 128 << 30,
-            free: gib(5.0),
-            file: gib(55.0),
-            anonymous: gib(76.0),
+            free: gib(2.0),
+            file: gib(66.0),
+            anonymous: gib(40.0),
             purgeable: 0,
-            wired: gib(15.0),
-            compressor: gib(compressor),
+            wired: gib(14.0),
+            compressor: gib(6.0),
+            uncompressed: gib(7.0),
+            swapped: gib(15.0),
             faults: 1,
-        };
+        });
         let size = |host: HostMemory, held: u64| {
             let mut plan = plan_without_snapshot();
             plan.physical_bytes = Some(128 << 30);
@@ -961,34 +1018,58 @@ mod tests {
             plan.mapped = true;
             slot_fallback_plan_with(&mut plan, held, &mut || Ok(host), &mut |_| {});
             assert!(!plan.mapped);
+            assert_eq!(plan.available_bytes, Some(available_after_debt(&host)));
             plan.budget
         };
         assert_eq!(
-            automatic_budget(gib(84.0), hogged(10.0).available(), 128 << 30),
-            gib(40.0)
+            automatic_budget(gib(84.0), hogged.available(), 128 << 30),
+            gib(48.0)
         );
-        assert_eq!(anonymous_room(&hogged(10.0)), gib(23.0));
-        assert_eq!(size(hogged(10.0), gib(5.0)), gib(23.0));
-        assert_eq!(anonymous_room(&hogged(38.0)), 0);
+        assert_eq!(available_after_debt(&hogged), gib(52.0));
+        assert_eq!(size(hogged, gib(5.0)), gib(32.0));
+        // The whole hog swapped and the apps compressed 2.5:1: nothing comes
+        // back as free memory, the budget is what the store holds plus
+        // staging.
+        let swamped = coherent(HostMemory {
+            anonymous: gib(14.0),
+            compressor: gib(12.0),
+            uncompressed: gib(30.0),
+            swapped: gib(15.0) + gib(40.0),
+            file: gib(86.0),
+            ..hogged
+        });
         assert_eq!(
-            size(hogged(38.0), gib(5.0)),
-            (gib(5.0) + super::super::weights::MAX_READ_BYTES * 3 + ((1 << 30) - 1)) >> 30 << 30,
-            "no room: the budget is what the store holds plus staging"
+            available_after_debt(&swamped),
+            gib(88.0) - gib(18.0) - gib(55.0)
         );
-        // A quiet host keeps the bootstrap rule: the cap is not binding.
-        let quiet = HostMemory {
-            anonymous: gib(36.0),
-            compressor: 0,
-            free: gib(30.0),
-            file: gib(47.0),
-            ..hogged(0.0)
-        };
-        assert_eq!(anonymous_room(&quiet), gib(73.0));
-        assert_eq!(size(quiet, gib(5.0)), gib(57.0));
+        assert_eq!(
+            size(swamped, gib(5.0)),
+            (gib(5.0) + super::super::weights::MAX_READ_BYTES * 3 + ((1 << 30) - 1)) >> 30 << 30
+        );
+        // This desktop at 22:22 the same day (host_statistics64 read): 1.4
+        // GiB of pool inflation and 9.0 GiB of old swap cost the rule 5 GiB
+        // of slots against the plain count.
+        let quiet = coherent(HostMemory {
+            physical: 128 << 30,
+            free: gib(7.90),
+            file: gib(101.25),
+            anonymous: gib(12.40),
+            purgeable: gib(0.43),
+            wired: gib(5.84),
+            compressor: gib(1.08),
+            uncompressed: gib(2.53),
+            swapped: gib(9.04),
+            faults: 1,
+        });
+        assert_eq!(
+            automatic_budget(gib(84.0), quiet.available(), 128 << 30),
+            gib(84.0)
+        );
+        assert_eq!(size(quiet, gib(5.0)), gib(79.0));
     }
 
     fn release(wired: f64, file: f64, faults: u64) -> HostMemory {
-        HostMemory {
+        coherent(HostMemory {
             physical: 128 << 30,
             free: 1 << 30,
             file: gib(file),
@@ -996,8 +1077,10 @@ mod tests {
             purgeable: 0,
             wired: gib(wired),
             compressor: 10 << 30,
+            uncompressed: 10 << 30,
+            swapped: 0,
             faults,
-        }
+        })
     }
 
     /// The driver lets the banks go in steps. One flat sample between two
