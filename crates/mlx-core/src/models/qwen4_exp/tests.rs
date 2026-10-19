@@ -2000,22 +2000,22 @@ fn mtp_draft_gathers_the_resident_q8_expert_bank() {
             .unwrap()
             .astype(crate::array::DType::BFloat16)
             .unwrap();
-        let (_, logits) = decoder
+        let (_, logits, next) = decoder
             .draft_step(
-                &hidden,
-                row["token"].as_u64().unwrap() as u32,
+                &[hidden],
+                &[row["token"].as_u64().unwrap() as u32],
                 row["position"].as_u64().unwrap() as usize,
                 &mut cache,
-                true,
             )
             .unwrap();
+        cache = next;
         let expected: Vec<f32> = row["logits"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_f64().unwrap() as f32)
             .collect();
-        let actual = logits.unwrap().to_float32().unwrap();
+        let actual = logits.to_float32().unwrap();
         let argmax = |v: &[f32]| {
             v.iter()
                 .enumerate()
@@ -2146,16 +2146,16 @@ fn mtp_head_matches_reference_hc_norm_and_shifted_history() {
             .unwrap()
             .astype(crate::array::DType::BFloat16)
             .unwrap();
-        let (h, logits) = decoder
+        let (h, logits, next) = decoder
             .draft_step(
-                &hidden,
-                row["token"].as_u64().unwrap() as u32,
+                &[hidden],
+                &[row["token"].as_u64().unwrap() as u32],
                 row["position"].as_u64().unwrap() as usize,
                 &mut cache,
-                true,
             )
             .unwrap();
-        for (actual, key) in [(h, "hidden"), (logits.unwrap(), "logits")] {
+        cache = next;
+        for (actual, key) in [(h, "hidden"), (logits, "logits")] {
             let diff = actual
                 .to_float32()
                 .unwrap()
@@ -3897,9 +3897,10 @@ fn mtp_cache_only_prefill_matches_full_head_history_and_keeps_target_state() {
         let mut full_cache = decoder::LayerCache::default();
         let mut fast_cache = decoder::LayerCache::default();
         for i in 0..16 {
-            reference
-                .draft_step(&hidden[i], tokens[i], i, &mut full_cache, false)
-                .unwrap();
+            full_cache = reference
+                .draft_step(&hidden[i..=i], &tokens[i..=i], i, &mut full_cache)
+                .unwrap()
+                .2;
         }
         for start in (0..16).step_by(width) {
             let end = (start + width).min(16);
@@ -3912,14 +3913,14 @@ fn mtp_cache_only_prefill_matches_full_head_history_and_keeps_target_state() {
                 )
                 .unwrap();
         }
-        let (_, a) = reference
-            .draft_step(&hidden[16], tokens[16], 16, &mut full_cache, true)
+        let (_, a, _) = reference
+            .draft_step(&hidden[16..17], &tokens[16..17], 16, &mut full_cache)
             .unwrap();
-        let (_, b) = candidate
-            .draft_step(&hidden[16], tokens[16], 16, &mut fast_cache, true)
+        let (_, b, _) = candidate
+            .draft_step(&hidden[16..17], &tokens[16..17], 16, &mut fast_cache)
             .unwrap();
-        let a = a.unwrap().to_float32().unwrap();
-        let b = b.unwrap().to_float32().unwrap();
+        let a = a.to_float32().unwrap();
+        let b = b.to_float32().unwrap();
         let error = a
             .iter()
             .zip(b.iter())
@@ -3928,6 +3929,195 @@ fn mtp_cache_only_prefill_matches_full_head_history_and_keeps_target_state() {
         assert!(error < 0.04, "MTP history width={width}, error={error}");
         assert_eq!(candidate.history, [3, 9, 7]);
     }
+}
+
+#[test]
+fn mtp_first_draft_pass_extends_only_the_trusted_history() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let rows = oracle["rows"].as_array().unwrap();
+    let tokens: Vec<u32> = rows
+        .iter()
+        .map(|r| r["token"].as_u64().unwrap() as u32)
+        .collect();
+    let hidden: Vec<MxArray> = rows
+        .iter()
+        .map(|r| {
+            let values: Vec<f32> = r["input_hidden"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+            MxArray::from_float32(&values, &[1, 1, (c.hc_count * c.hidden_size) as i64])
+                .unwrap()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap()
+        })
+        .collect();
+    let decoder = || {
+        decoder::Decoder::new(
+            c.clone(),
+            weights::Store::open_fixture(&path, None).unwrap(),
+        )
+        .unwrap()
+    };
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
+    };
+    // Rows start..end - 1 are trusted history, row end - 1 runs the head.
+    for (start, end) in [(0, 1), (0, 6), (5, 11), (3, 17)] {
+        let head = end - 1;
+        let mut reference = decoder();
+        let mut candidate = decoder();
+        let mut base = decoder::LayerCache::default();
+        if start > 0 {
+            reference
+                .draft_prefill(&hidden[..start], &tokens[..start], 0, &mut base)
+                .unwrap();
+        }
+        let mut separate = base.clone();
+        if head > start {
+            reference
+                .draft_prefill(
+                    &hidden[start..head],
+                    &tokens[start..head],
+                    start,
+                    &mut separate,
+                )
+                .unwrap();
+        }
+        let (_, expected, _) = reference
+            .draft_step(&hidden[head..end], &tokens[head..end], head, &mut separate)
+            .unwrap();
+        let mut merged = base.clone();
+        let (_, actual, draft) = candidate
+            .draft_step(&hidden[start..end], &tokens[start..end], start, &mut merged)
+            .unwrap();
+        assert_eq!(
+            merged.history_shape(),
+            separate.history_shape(),
+            "rows {start}..{end}: the trusted cache must hold the history rows only"
+        );
+        assert_eq!(merged.history_shape().0, head);
+        assert_eq!(draft.history_shape().0, end, "rows {start}..{end}");
+        let expected = expected.to_float32().unwrap();
+        let actual = actual.to_float32().unwrap();
+        let oracle: Vec<f32> = rows[head]["logits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        for (name, other) in [("separate passes", &expected[..]), ("oracle", &oracle[..])] {
+            let error = actual
+                .iter()
+                .zip(other)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(error < 0.04, "rows {start}..{end} vs {name}: {error}");
+            assert_eq!(
+                argmax(&actual),
+                argmax(other),
+                "rows {start}..{end} vs {name}"
+            );
+        }
+        assert!(candidate.history.is_empty());
+    }
+}
+
+#[test]
+fn mtp_accepted_rows_wait_for_the_next_first_draft_pass() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
+    };
+    use rand::SeedableRng;
+    let mut inner = tiny_inner();
+    let params = inner.resolve_params(&crate::engine::types::ChatConfig {
+        temperature: Some(0.0),
+        enable_mtp: Some(true),
+        ..Default::default()
+    });
+    assert_eq!(
+        params.mtp_depth, 2,
+        "Flash Next drafts two tokens by default"
+    );
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10];
+    assert!(inner.decoder.prefill_chunk_size > prompt.len());
+    inner.activate_paged_seq(1).unwrap();
+    inner.begin_mtp(1, 0).unwrap();
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    let logits = inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    assert_eq!(inner.mtp.draft_rows(1), Some((0, 8)));
+    let anchor = logits.argmax(-1, None).unwrap().item_at_int32(0).unwrap() as u32;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let proposal = inner
+        .propose_mtp(1, anchor, 2, &params, &mut rng, false)
+        .unwrap();
+    assert_eq!(proposal.draft_ids.len(), 2);
+    assert_eq!(
+        inner.mtp.draft_rows(1),
+        Some((8, 0)),
+        "the anchor row stays out of the persistent draft cache"
+    );
+    let mut tokens = vec![anchor];
+    tokens.extend(proposal.draft_ids.iter().map(|&t| t as u32));
+    inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 1,
+            first_position: prompt.len() as u32,
+            tokens: tokens.clone(),
+            speculative: true,
+        }])
+        .unwrap();
+    inner
+        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 1, keep: 2 }])
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(
+        inner.mtp.draft_rows(1),
+        Some((8, 2)),
+        "commit leaves accepted rows for the next proposal"
+    );
+    let next = inner
+        .propose_mtp(1, 13, 2, &params, &mut rng, false)
+        .unwrap();
+    assert_eq!(next.draft_ids.len(), 2);
+    assert_eq!(inner.mtp.draft_rows(1), Some((10, 0)));
+    // Whole windows are written as soon as they fill.
+    let mut windowed = tiny_inner();
+    windowed.decoder.prefill_chunk_size = 4;
+    windowed.activate_paged_seq(1).unwrap();
+    windowed.begin_mtp(1, 0).unwrap();
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10, 6];
+    let prefix = windowed
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    windowed
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    assert_eq!(windowed.mtp.draft_rows(1), Some((8, 1)));
 }
 
 struct CompleteGdnInputs {

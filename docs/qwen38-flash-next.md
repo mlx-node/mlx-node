@@ -129,12 +129,14 @@ MLP projections across ready rows. Warm continuation reuses that
 owner's full state; standalone KV-only prefix restores are disabled because
 recurrent, PLE, and indexer state are also required.
 
-Native MTP is **opt-in** (`enableMtp: true`) with depth capped at three. It runs
+Native MTP is **opt-in** (`enableMtp: true`); it drafts two tokens per cycle
+unless `mtpDepth` says otherwise, capped at three. It runs
 only on the shared scheduler. An ownerless `enableMtp` start or continuation runs
 there as the ownerless session that ownerless AR turns continue; one that still
 reaches the exclusive lane (`MLX_SERVE_FORCE_SERIAL`) is refused before prefill
 instead of decoding plain AR. Proposals use private draft state; verification
-commits only accepted target frontiers. The head's routed experts become
+commits only accepted target frontiers, whose head rows are written by the next
+proposal's first draft pass together with its anchor row. The head's routed experts become
 resident Q8 (affine, group 32) banks on the first MTP owner, about 2.6 GiB for
 the released checkpoint outside the weight LRU, and each draft step gathers
 them on the device. Both banks are installed together, only when the weight
