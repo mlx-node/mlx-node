@@ -1243,7 +1243,6 @@ pub(super) fn singleton_routes(logits: &MxArray, top: usize) -> Result<Option<(M
         || *logits.shape()? != [1, 1, 512]
         || !matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
         || !crate::engine::persistence::compiled_forward_backend_available()
-        || runtime_flags::is_zero(c"MLX_QWEN4_SINGLETON_ROUTER")
     {
         return Ok(None);
     }
@@ -1267,7 +1266,6 @@ pub(super) fn prefill_routes(logits: &MxArray, top: usize) -> Result<Option<(MxA
         || logits.shape_at(2)? != 512
         || !matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
         || !crate::engine::persistence::compiled_forward_backend_available()
-        || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ROUTER")
     {
         return Ok(None);
     }

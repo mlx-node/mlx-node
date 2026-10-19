@@ -305,7 +305,6 @@ impl Weight {
         if self.mode == "affine"
             && self.bits == 8
             && self.group == 32
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_DECODE_STORAGE")
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
         {
             let compact = unsafe {
