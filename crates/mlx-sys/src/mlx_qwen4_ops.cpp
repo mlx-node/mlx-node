@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #ifdef MLX_NODE_METAL_ENABLED
 #include "metal/common/quantized.h"
@@ -525,12 +526,15 @@ array qsa_kernel_output(const array &q, const array &k, const array &v,
       mlx::core::default_stream(mlx::core::Device::gpu))[0];
 }
 
+thread_local int qsa_failing_probes = 0;
+
 #ifdef MLX_NODE_METAL_ENABLED
 // maxTotalThreadsPerThreadgroup of the exact pipeline CustomKernel::eval_gpu
 // runs for `output` (same library key, so the compile is shared), built
 // without evaluating anything; 0 when it cannot be built or its SIMD width
 // is not 32. The key covers dtype, head dim, every template constant and the
-// input address spaces, so one probe serves every later call of a geometry.
+// input address spaces, so one inspected pipeline serves every later call of
+// a geometry.
 int qsa_pipeline_threads(const array &output) {
   static std::mutex mutex;
   static std::unordered_map<std::string, int> cache;
@@ -546,6 +550,10 @@ int qsa_pipeline_threads(const array &output) {
     return found->second;
   int threads = 0;
   try {
+    if (qsa_failing_probes > 0) {
+      --qsa_failing_probes;
+      throw std::runtime_error("injected pipeline probe failure");
+    }
     const auto state = custom->state();
     const auto &name = std::get<0>(state);
     const auto &source = std::get<1>(state);
@@ -559,8 +567,10 @@ int qsa_pipeline_threads(const array &output) {
             device.mtl_device()->maxThreadgroupMemoryLength())
       threads = int(pipeline->maxTotalThreadsPerThreadgroup());
   } catch (const std::exception &e) {
+    // Not cached: a failed compile must not disable the kernel until restart.
     std::cerr << "Qwen4 sparse attention: pipeline " << key << ": "
               << e.what() << std::endl;
+    return 0;
   }
   if (threads < kQsaThreads)
     std::cerr << "Qwen4 sparse attention: pipeline " << key << " holds "
@@ -578,24 +588,24 @@ extern "C" {
 
 // `heads_per_group` 0 runs the paired kernel when its pipeline holds the
 // threadgroup and the single-head kernel otherwise; both write the same bits.
-// 1 or 2 insists on that kernel. False when the arrays do not fit the kernel
-// or no pipeline can run it.
-bool mlx_qwen4_qsa_attention(mlx_array *queries, mlx_array *keys,
-                             mlx_array *values, mlx_array *selected,
-                             mlx_array *query_ends, float scale,
-                             int block_size, int heads_per_group,
-                             mlx_array **out) {
+// 1 or 2 insists on that kernel. Returns how many heads each K/V row read of
+// the dispatched kernel serves (1 or 2), 0 when the arrays do not fit the
+// kernel or no pipeline can run it.
+int mlx_qwen4_qsa_attention(mlx_array *queries, mlx_array *keys,
+                            mlx_array *values, mlx_array *selected,
+                            mlx_array *query_ends, float scale, int block_size,
+                            int heads_per_group, mlx_array **out) {
   try {
     if (!queries || !keys || !values || !selected || !query_ends || !out ||
         !std::isfinite(scale) || heads_per_group < 0 || heads_per_group > 2)
-      return false;
+      return 0;
     auto q = *reinterpret_cast<array *>(queries),
          k = *reinterpret_cast<array *>(keys),
          v = *reinterpret_cast<array *>(values);
     auto sel = *reinterpret_cast<array *>(selected),
          ends = *reinterpret_cast<array *>(query_ends);
     if (!qsa_inputs_valid(q, k, v, sel, ends, block_size))
-      return false;
+      return 0;
     // Two heads share each K/V row read. Three or more spill the per-head
     // fp32 accumulators at 1024 threads per threadgroup and run slower
     // (M5 Max, D 256: 1.72 ms for 2 heads vs 2.0 / 2.75 / 3.4 ms for 1 / 3 / 4).
@@ -607,15 +617,15 @@ bool mlx_qwen4_qsa_attention(mlx_array *queries, mlx_array *keys,
           qsa_kernel_output(q, k, v, sel, ends, scale, block_size, heads);
       if (qsa_pipeline_threads(result) >= kQsaThreads) {
         *out = reinterpret_cast<mlx_array *>(new array(std::move(result)));
-        return true;
+        return heads;
       }
     }
     std::cerr << "Qwen4 sparse attention: no pipeline holds " << kQsaThreads
               << " threads per threadgroup" << std::endl;
-    return false;
+    return 0;
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 sparse attention: " << e.what() << std::endl;
-    return false;
+    return 0;
   }
 }
 
@@ -642,6 +652,14 @@ int mlx_qwen4_qsa_attention_pipeline_threads(
     std::cerr << "Qwen4 sparse attention: " << e.what() << std::endl;
     return 0;
   }
+}
+
+// TEST-ONLY: the calling thread's next `count` pipeline probes that miss the
+// cache throw as a failed Metal compile would. Returns the count armed before.
+int mlx_test_qwen4_qsa_fail_probes(int count) {
+  const int armed = qsa_failing_probes;
+  qsa_failing_probes = std::max(count, 0);
+  return armed;
 }
 
 // Reference wide normalization schedule, retaining this GGUF's arithmetic.

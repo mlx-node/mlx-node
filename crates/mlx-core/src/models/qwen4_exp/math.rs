@@ -1470,8 +1470,27 @@ pub(super) fn qsa_attention(
     block_size: usize,
     kernel: QsaKernel,
 ) -> Result<MxArray> {
+    qsa_dispatch(
+        q, keys, values, selected, query_ends, scale, block_size, kernel,
+    )
+    .map(|(out, _)| out)
+}
+
+/// `qsa_attention` and how many heads of the kv group each K/V row read of the
+/// kernel that ran serves (1 or 2).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn qsa_dispatch(
+    q: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    selected: &MxArray,
+    query_ends: &MxArray,
+    scale: f64,
+    block_size: usize,
+    kernel: QsaKernel,
+) -> Result<(MxArray, i32)> {
     let mut out = std::ptr::null_mut();
-    let ok = unsafe {
+    let heads = unsafe {
         mlx_sys::mlx_qwen4_qsa_attention(
             q.as_raw_ptr(),
             keys.as_raw_ptr(),
@@ -1484,10 +1503,11 @@ pub(super) fn qsa_attention(
             &mut out,
         )
     };
-    if !ok {
+    if heads == 0 {
         return Err(Error::from_reason("Qwen4 sparse attention kernel failed"));
     }
-    MxArray::from_handle(out, "Qwen4 sparse attention")
+    tracing::debug!(heads_per_kv_read = heads, "Qwen4 sparse attention kernel");
+    Ok((MxArray::from_handle(out, "Qwen4 sparse attention")?, heads))
 }
 
 /// `maxTotalThreadsPerThreadgroup` of `kernel`'s pipeline (`SingleHead` or
@@ -1513,6 +1533,13 @@ pub(super) fn qsa_pipeline_threads(
             kernel.heads_per_group(),
         )
     }
+}
+
+/// Makes this thread's next `count` QSA pipeline probes that miss the cache
+/// fail as a Metal compile error would; returns the count armed before.
+#[cfg(test)]
+pub(super) fn qsa_fail_pipeline_probes(count: i32) -> i32 {
+    unsafe { mlx_sys::mlx_test_qwen4_qsa_fail_probes(count) }
 }
 
 pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {

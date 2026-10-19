@@ -2714,7 +2714,7 @@ unsafe extern "C" {
         block_size: i32,
         heads_per_group: i32,
         out: *mut *mut mlx_array,
-    ) -> bool;
+    ) -> i32;
     pub fn mlx_qwen4_qsa_attention_pipeline_threads(
         queries: *mut mlx_array,
         keys: *mut mlx_array,
@@ -2724,6 +2724,10 @@ unsafe extern "C" {
         block_size: i32,
         heads_per_group: i32,
     ) -> i32;
+    /// TEST-ONLY: the calling thread's next `count` QSA pipeline probes that
+    /// miss the cache throw as a failed Metal compile would; returns the count
+    /// armed before the call.
+    pub fn mlx_test_qwen4_qsa_fail_probes(count: i32) -> i32;
 }
 
 unsafe extern "C" {
