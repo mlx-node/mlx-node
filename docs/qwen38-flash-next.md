@@ -78,11 +78,15 @@ to 3 as the pass starts and for layer L+3 as layer L starts, so a cold first
 prompt streams the pack at the SSD's rate (10.5 GiB/s measured) rather than
 the driver's fault rate (4.2 GiB/s), and the model thread never reads; the
 touch would bind every bank at once and fault the whole pack in before
-layer 0. The worker reads one byte of every page it requested (advisory
-pages are speculative and were reclaimed before the driver bound them,
-doubling a cold window's reads), so after a cold turn the pack counts in
-the process RSS while its footprint is unchanged. `MLX_QWEN4_PREFETCH_LAYERS`
-sets the depth (default 3; `0` restores the unconditional touch) and
+layer 0. The worker reads one byte of every page it requested, through a
+view of the file that lives only for that walk: advisory pages are
+speculative and were reclaimed before the driver bound them, doubling a
+cold window's reads, and a walk through the banks' own mapping left the
+whole pack in the process's page tables (75 GiB of RSS between turns). A
+pass over several rows (MTP verification) runs every layer's hook once per
+row; the pool requests each layer once per pass. `MLX_QWEN4_PREFETCH_LAYERS`
+sets the depth (default 3; `0` restores the unconditional touch; a depth past
+the last layer requests the whole pack as the pass starts) and
 `MLX_QWEN4_PREFETCH_AT_LOAD=1` requests the whole pack as the model loads.
 Every prefill
 window and every decode step needs the entire routed set resident at once:

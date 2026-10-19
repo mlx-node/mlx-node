@@ -287,7 +287,7 @@ impl Store {
         }
         self.prefetch_pass = false;
         if depth > 0
-            && let Some(pool) = &self.prefetch
+            && let Some(pool) = self.prefetch.as_mut()
             && !pool.sampled_resident()
         {
             tracing::info!("qwen4 mapped pack not resident: reading {depth} layers ahead");
@@ -341,10 +341,10 @@ impl Store {
         if main
             && self.prefetch_pass
             && layer > 0
-            && let Some(pool) = &self.prefetch
+            && let Some(pool) = self.prefetch.as_mut()
         {
             pool.layer_started(layer, self.prefetch_depth);
-            if layer + self.prefetch_depth >= self.last_mapped_layer() {
+            if layer.saturating_add(self.prefetch_depth) >= self.last_mapped_layer() {
                 self.prefetch_pass = false;
             }
         }

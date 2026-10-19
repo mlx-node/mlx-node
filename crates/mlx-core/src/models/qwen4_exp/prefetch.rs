@@ -37,13 +37,16 @@ pub(super) trait Issue: Send + 'static {
 }
 
 /// F_RDADVISE over the whole mapping, then one read of every page through
-/// it. The advisory is asynchronous, pages in only what is absent and
-/// allocates nothing in this process, but the pages it brings in are
-/// speculative: with the page cache full, the pageout scan reclaims them
-/// before the driver binds the bank, and a cold 6k window read the pack
-/// twice (142 GiB for 73 GiB, 33 s instead of 27). A referenced page is
-/// reclaimed after the inactive ones instead; the reads also pace the
-/// worker behind the kernel's queue.
+/// a view of the file that lives only for that walk. The advisory is
+/// asynchronous, pages in only what is absent and allocates nothing in this
+/// process, but the pages it brings in are speculative: with the page cache
+/// full, the pageout scan reclaims them before the driver binds the bank,
+/// and a cold 6k window read the pack twice (142 GiB for 73 GiB, 33 s
+/// instead of 27). A referenced page is reclaimed after the inactive ones
+/// instead; the reads also pace the worker behind the kernel's queue. The
+/// walk must not go through the mapping the banks address: pages touched
+/// there stay in this process's page tables for the mapping's life (75 GiB
+/// of RSS after a cold turn).
 pub(super) struct Advise;
 
 impl Issue for Advise {
@@ -60,15 +63,37 @@ impl Issue for Advise {
             unsafe { libc::fcntl(map.fd().as_raw_fd(), libc::F_RDADVISE, &advisory) };
             offset += count;
         }
+        // SAFETY: a read-only shared view of the mapped range of an open
+        // file; it is unmapped below and nothing else refers to it.
+        let view = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map.len(),
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                map.fd().as_raw_fd(),
+                map.offset() as libc::off_t,
+            )
+        };
+        if view == libc::MAP_FAILED {
+            tracing::warn!(
+                "qwen4 mapped pack read-ahead: no view for the page walk: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
         let page = page_size();
         let mut touched = 0u8;
         let mut offset = 0usize;
         while offset < map.len() {
-            // SAFETY: `offset` lies inside the live read-only mapping.
-            touched = touched.wrapping_add(unsafe { map.as_ptr().add(offset).read_volatile() });
+            // SAFETY: `offset` lies inside the live read-only view.
+            touched =
+                touched.wrapping_add(unsafe { view.cast::<u8>().add(offset).read_volatile() });
             offset += page;
         }
         std::hint::black_box(touched);
+        // SAFETY: `view` is the mapping created above, of `map.len()` bytes.
+        unsafe { libc::munmap(view, map.len()) };
     }
 }
 
@@ -80,6 +105,11 @@ struct Queue {
 
 pub(super) struct Pool {
     layers: Vec<Option<[Arc<Mmap>; 3]>>,
+    /// Layers `0..requested` of the current pass have been requested. A
+    /// pass over several rows (MTP verification) runs every layer's hook
+    /// once per row; without the cursor each repeat queued the layer again
+    /// and the one worker spent its lead re-walking resident files.
+    requested: usize,
     queue: Arc<(Mutex<Queue>, Condvar)>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -108,24 +138,33 @@ impl Pool {
             })?;
         Ok(Self {
             layers,
+            requested: 0,
             queue,
             stop,
             worker: Some(worker),
         })
     }
 
-    /// Called as layer `layer` of a prefetch pass starts: the first layer
-    /// requests itself and the `depth` layers after it, every later layer
-    /// the one `depth` ahead, so each layer is requested once per pass.
-    pub(super) fn layer_started(&self, layer: usize, depth: usize) {
+    /// Called as layer `layer` of a prefetch pass starts: layer 0 opens the
+    /// pass and requests itself and the `depth` layers after it, every later
+    /// layer the one `depth` ahead; a layer the pass has already requested is
+    /// not requested again, however many rows run its hook. A depth past the
+    /// last layer requests the whole pack.
+    pub(super) fn layer_started(&mut self, layer: usize, depth: usize) {
         if depth == 0 {
             return;
         }
+        let through = layer
+            .saturating_add(depth)
+            .min(self.layers.len().saturating_sub(1));
         if layer == 0 {
-            self.request(0..=depth);
+            self.request(0..=through);
+        } else if through >= self.requested {
+            self.request(through..=through);
         } else {
-            self.request(layer + depth..=layer + depth);
+            return;
         }
+        self.requested = through + 1;
     }
 
     pub(super) fn request_all(&self) {
@@ -344,7 +383,7 @@ mod tests {
         let mut layers = layer_maps(&dir, 9, 1);
         layers[6] = None;
         let issued = Arc::new(Mutex::new(Vec::new()));
-        let pool = Pool::new(layers.clone(), Recorder(issued.clone())).unwrap();
+        let mut pool = Pool::new(layers.clone(), Recorder(issued.clone())).unwrap();
         let take = || std::mem::take(&mut *issued.lock().unwrap());
 
         pool.layer_started(0, 3);
@@ -389,6 +428,98 @@ mod tests {
         assert_eq!(take(), pointers(&layers, &[0, 1, 2, 3, 4, 5, 7, 8]));
     }
 
+    /// One pass over four rows (MTP verification) runs every layer's hook
+    /// four times; each file of the pack is issued once, and the next pass
+    /// starts over.
+    #[test]
+    fn a_pass_issues_each_file_once_however_many_rows_run_its_layers() {
+        let dir = Temp::new();
+        let mut layers = layer_maps(&dir, 9, 1);
+        layers[6] = None;
+        let issued = Arc::new(Mutex::new(Vec::new()));
+        let mut pool = Pool::new(layers.clone(), Recorder(issued.clone())).unwrap();
+        let take = || std::mem::take(&mut *issued.lock().unwrap());
+
+        pool.layer_started(0, 3);
+        for layer in 1..layers.len() {
+            for _ in 0..4 {
+                pool.layer_started(layer, 3);
+            }
+        }
+        pool.wait_idle();
+        assert_eq!(
+            take(),
+            pointers(&layers, &[0, 1, 2, 3, 4, 5, 7, 8]),
+            "every file of the pack once, in layer order"
+        );
+        pool.layer_started(0, 3);
+        pool.wait_idle();
+        assert_eq!(
+            take(),
+            pointers(&layers, &[0, 1, 2, 3]),
+            "the next pass requests its first layers again"
+        );
+    }
+
+    /// A depth past the last layer requests the whole pack once and returns
+    /// at once: the range is clamped before it is walked.
+    #[test]
+    fn a_depth_past_the_last_layer_requests_the_pack_once() {
+        let dir = Temp::new();
+        let layers = layer_maps(&dir, 5, 1);
+        let issued = Arc::new(Mutex::new(Vec::new()));
+        let mut pool = Pool::new(layers.clone(), Recorder(issued.clone())).unwrap();
+        let started = Instant::now();
+        pool.layer_started(0, usize::MAX);
+        pool.layer_started(1, usize::MAX);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        pool.wait_idle();
+        assert_eq!(
+            std::mem::take(&mut *issued.lock().unwrap()),
+            pointers(&layers, &[0, 1, 2, 3, 4])
+        );
+    }
+
+    fn resident_bytes() -> u64 {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let rc = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&mut info as *mut libc::proc_taskinfo).cast::<c_void>(),
+                size,
+            )
+        };
+        assert_eq!(rc, size);
+        info.pti_resident_size
+    }
+
+    /// The page walk makes the file resident without leaving any page of it
+    /// mapped in this process.
+    #[test]
+    fn the_page_walk_leaves_no_page_of_the_file_mapped_in_this_process() {
+        let dir = Temp::new();
+        let pages = (512 << 20) / page_size();
+        let map = Mmap::map(
+            cold_file(&dir.0.join("blk.0.gate"), pages),
+            0,
+            pages * page_size(),
+        )
+        .unwrap();
+        assert_eq!(resident_fraction(&map), 0.0);
+        let before = resident_bytes();
+        Advise.read_ahead(&map);
+        let grown = resident_bytes().saturating_sub(before);
+        wait_resident(&map);
+        assert!(
+            grown < (map.len() / 2) as u64,
+            "the walk mapped {grown} B of the {} B file into this process",
+            map.len()
+        );
+    }
+
     /// Against the page cache itself: the layers a pass requested are
     /// resident before the model reaches them, the ones it did not are not,
     /// and the sampled check tells a partly cold pack from a warm one.
@@ -405,7 +536,7 @@ mod tests {
                 );
             }
         }
-        let pool = Pool::new(layers.clone(), Advise).unwrap();
+        let mut pool = Pool::new(layers.clone(), Advise).unwrap();
         assert!(!pool.sampled_resident());
 
         pool.layer_started(0, 2);
