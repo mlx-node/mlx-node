@@ -2055,9 +2055,7 @@ mod prefill_epilogue_tests {
 
 /// Row-batched twins of the single-row decode kernels. Up to four activation
 /// rows share one weight stream, and row `j` of every output carries the bits
-/// of the single-row kernel applied to row `j` alone. The MTP verify pass is
-/// the intended caller; the decode path does not use these yet.
-#[allow(dead_code)]
+/// of the single-row kernel applied to row `j` alone.
 pub(super) mod rows {
     use super::super::weights::Weight;
     use crate::array::{DType, MxArray};

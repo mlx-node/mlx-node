@@ -126,7 +126,9 @@ owner's full state; standalone KV-only prefix restores are disabled because
 recurrent, PLE, and indexer state are also required.
 
 Native MTP is **opt-in** (`enableMtp: true`) with depth capped at three. Proposals
-use private draft state; verification commits only accepted target frontiers.
+use private draft state; verification runs every draft row through each layer
+together, reading the layer's weights once, with one routing readback per
+layer, and commits only accepted target frontiers.
 Head availability alone does not establish a latency benefit. Stochastic MTP
 keeps distribution-correct verification and disables the greedy adaptive policy.
 

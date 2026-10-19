@@ -1364,6 +1364,72 @@ impl Store {
             MxArray::concatenate_many(outputs.iter().collect(), Some(-1))
         }
     }
+    /// `x` is `[1, R, K]`, `R <= 4`. Row `j` of the result carries the bits of
+    /// `linear` applied to row `j` alone: an admitted Q8 bank streams once
+    /// through the row-batched kernel, every other weight runs its single-row
+    /// projection per row.
+    pub(super) fn linear_rows(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
+        let count = x.shape_at(1)?;
+        if count == 1 {
+            return self.linear(name, x);
+        }
+        let d = self.descriptor(name)?;
+        let rows = d.rows()?;
+        let width = d.width()?;
+        if x.shape()?.last().copied() != Some(width as i64) {
+            return Err(err(format!("Projection shape mismatch: {name}")));
+        }
+        let chunk = (MAX_READ_BYTES as usize / (width * 4)).clamp(1, 4096);
+        let project = |w: &Weight| -> Result<MxArray> {
+            if let Some(out) = super::math::rows::dense_decode(w, x)? {
+                return Ok(out);
+            }
+            let parts = (0..count)
+                .map(|j| w.linear(&x.slice_axis(1, j, j + 1)?))
+                .collect::<Result<Vec<_>>>()?;
+            MxArray::concatenate_many(parts.iter().collect(), Some(1))
+        };
+        if let Some(bank) = self.banks.get(name) {
+            return project(bank);
+        }
+        let mut outputs = Vec::new();
+        for start in (0..rows).step_by(chunk) {
+            let weight = self.read(name, start, (rows - start).min(chunk))?;
+            outputs.push(project(&weight)?);
+        }
+        if outputs.len() == 1 {
+            Ok(outputs.remove(0))
+        } else {
+            MxArray::concatenate_many(outputs.iter().collect(), Some(-1))
+        }
+    }
+
+    /// `linear_pair` for a `[1, R, K]` window: the paired bank prepared by
+    /// single-row decoding streams once, otherwise each projection runs
+    /// through `linear_rows`.
+    pub(super) fn linear_pair_rows(
+        &mut self,
+        x: &MxArray,
+        first: &str,
+        second: &str,
+    ) -> Result<(MxArray, MxArray)> {
+        if x.shape_at(1)? == 1 {
+            return self.linear_pair(x, first, second);
+        }
+        let key = (first.to_owned(), second.to_owned());
+        if let Some(bank) = self.paired_banks.get(&key)
+            && let Some(output) = super::math::rows::dense_decode(bank, x)?
+        {
+            let n = self.descriptor(first)?.rows()? as i64;
+            let axis = output.ndim()? as usize - 1;
+            return Ok((
+                output.slice_axis(axis, 0, n)?,
+                output.slice_axis(axis, n, output.shape()?[axis])?,
+            ));
+        }
+        Ok((self.linear_rows(first, x)?, self.linear_rows(second, x)?))
+    }
+
     pub fn integers(&self, name: &str) -> Result<Vec<u64>> {
         let d = self.descriptor(name)?;
         if !matches!(&d.encoding, Encoding::Safe(t) if t == "I64") || d.bytes > 4096 {
