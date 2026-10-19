@@ -14,6 +14,7 @@ mod packed_cache;
 mod paged;
 mod prefetch;
 mod route_plan;
+mod row_fetch;
 mod runtime_flags;
 mod weights;
 
@@ -318,6 +319,16 @@ pub struct Qwen4ExpResidencyInfo {
     /// Pack bytes backing live arrays in mapped mode (clean page cache the
     /// Metal driver wires while a command buffer binds them).
     pub mapped_bytes: f64,
+    /// Token/PLE rows asked of the decoded-row LRU since load, and the ones
+    /// it had to import.
+    pub decoded_row_lookups: f64,
+    pub decoded_row_misses: f64,
+    /// Share of decoded-row lookups served without an import.
+    pub decoded_row_hit_rate: f64,
+    /// Imported rows whose bytes a reader thread had ready, and those the
+    /// model thread read or waited for after requesting them.
+    pub prefetched_rows: f64,
+    pub late_rows: f64,
 }
 
 #[napi(object)]
@@ -338,6 +349,7 @@ pub struct Qwen4ExpModel {
     has_mtp: bool,
     paged_capacity: u32,
     residency: memory::Plan,
+    lookup: Arc<weights::LookupStats>,
     prefill_chunk_size: usize,
     supports_images: bool,
 }
@@ -407,6 +419,7 @@ impl Qwen4ExpModel {
                     memory::prefill_window(&config, &decoder.weights.plan)?;
                 let prefill_chunk_size = decoder.prefill_chunk_size;
                 let residency = decoder.weights.plan.clone();
+                let lookup = Arc::clone(&decoder.weights.lookup);
                 let assets = assets.to_string_lossy().into_owned();
                 let inner = Inner {
                     decoder,
@@ -430,6 +443,7 @@ impl Qwen4ExpModel {
                         has_mtp,
                         paged_capacity,
                         residency,
+                        lookup,
                         prefill_chunk_size,
                         supports_images,
                     ),
@@ -443,6 +457,7 @@ impl Qwen4ExpModel {
             has_mtp,
             paged_capacity,
             residency,
+            lookup,
             prefill_chunk_size,
             supports_images,
         ) = match ready.await {
@@ -475,6 +490,7 @@ impl Qwen4ExpModel {
             has_mtp,
             paged_capacity,
             residency,
+            lookup,
             prefill_chunk_size,
             supports_images,
         })
@@ -503,6 +519,7 @@ impl Qwen4ExpModel {
     }
     #[napi]
     pub fn residency_info(&self) -> Qwen4ExpResidencyInfo {
+        let (lookups, misses) = (self.lookup.lookups(), self.lookup.misses());
         Qwen4ExpResidencyInfo {
             policy: self.residency.policy.clone(),
             weight_budget_bytes: self.residency.budget as f64,
@@ -517,6 +534,15 @@ impl Qwen4ExpModel {
             mapped_pack_files: self.residency.mapped_pack_files as u32,
             mapped: self.residency.mapped,
             mapped_bytes: self.residency.mapped_bytes as f64,
+            decoded_row_lookups: lookups as f64,
+            decoded_row_misses: misses as f64,
+            decoded_row_hit_rate: if lookups == 0 {
+                0.0
+            } else {
+                1.0 - misses as f64 / lookups as f64
+            },
+            prefetched_rows: self.lookup.prefetched() as f64,
+            late_rows: self.lookup.late() as f64,
         }
     }
     #[napi]

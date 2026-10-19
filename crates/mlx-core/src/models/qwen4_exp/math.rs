@@ -1447,8 +1447,12 @@ fn conv_with_completion(
     Activations::silu(&output)
 }
 
-/// Dilated causal convolution over a prompt window. Keep the same tap order
+/// Dilated causal convolution over a PLE window. Keep the same tap order
 /// and F32 products as the singleton operation, with an owned finite tail.
+/// The tail stays lazy: it is a slice of an input the window's own output
+/// materializes, so the next window or the route commit completes it
+/// without reading any expert bank, and the token start does not drain
+/// the GPU for a 10 KB copy.
 pub(super) fn conv_window(
     x: &MxArray,
     weight: &MxArray,
@@ -1456,23 +1460,10 @@ pub(super) fn conv_window(
     kernel: usize,
     dilation: usize,
 ) -> Result<MxArray> {
-    conv_window_with_completion(x, weight, state, kernel, dilation, false)
-}
-
-// A tentative window owns immutable banks until its final output/state join.
-// Keep the tiny history copy lazy within that window, as TrackFastModel does.
-pub(super) fn conv_window_with_completion(
-    x: &MxArray,
-    weight: &MxArray,
-    state: &mut Option<MxArray>,
-    kernel: usize,
-    dilation: usize,
-    defer_state: bool,
-) -> Result<MxArray> {
     let shape = x.shape()?;
     let (tokens, width) = (shape[1], shape[2]);
     if tokens == 1 {
-        return conv_with_completion(x, weight, state, kernel, dilation, defer_state);
+        return conv_with_completion(x, weight, state, kernel, dilation, true);
     }
     let keep = ((kernel - 1) * dilation) as i64;
     let old = match state {
@@ -1526,11 +1517,7 @@ pub(super) fn conv_window_with_completion(
             .astype(x.dtype()?)?
             .reshape(&shape)?
     };
-    let tail = input.slice_axis(0, tokens, tokens + keep)?.deep_copy()?;
-    if !defer_state {
-        MxArray::eval_arrays_with_context(&[&tail], "qwen4::ple::conv_tail")?;
-    }
-    *state = Some(tail);
+    *state = Some(input.slice_axis(0, tokens, tokens + keep)?.deep_copy()?);
     Activations::silu(&out)
 }
 

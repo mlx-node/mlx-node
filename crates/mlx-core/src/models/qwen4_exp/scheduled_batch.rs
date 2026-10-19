@@ -22,6 +22,7 @@ impl Decoder {
         adapter
             .record_tokens(&[token])
             .map_err(Error::from_reason)?;
+        self.prefetch_ple_rows(&[token])?;
         MxArray::tile(
             &self.embed_token(token)?,
             &[1, 1, self.config.hc_count as i32],

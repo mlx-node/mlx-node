@@ -5,17 +5,20 @@
 use crate::models::qwen4_exp::runtime_flags;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use napi::{Error, Result};
 use serde::Deserialize;
 
+use super::row_fetch::{Fetcher, Job};
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::QuantizedLinear;
 use crate::utils::gguf::{
-    GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensors,
+    GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensor,
     parse_gguf, symmetric_zero_point,
 };
 
@@ -27,6 +30,39 @@ mod residency;
 pub const CACHE_BYTES: u64 = 8 << 30;
 pub(super) const MAX_READ_BYTES: u64 = 64 << 20;
 const MAX_HEADER_BYTES: u64 = 16 << 20;
+/// Reader threads for token/PLE rows: 17 random 90 B-2.7 KB reads per token.
+const ROW_READERS: usize = 4;
+
+/// Decoded-row LRU and reader-thread counters, shared with `residencyInfo()`.
+#[derive(Default)]
+pub struct LookupStats {
+    /// Distinct rows asked of the decoded-row LRU per lookup window.
+    pub lookups: AtomicU64,
+    /// Lookups the LRU had to import.
+    pub misses: AtomicU64,
+    /// Imports whose bytes a reader thread had ready.
+    pub prefetched: AtomicU64,
+    /// Imports the model thread read itself or waited for after requesting.
+    pub late: AtomicU64,
+}
+
+impl LookupStats {
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn lookups(&self) -> u64 {
+        self.lookups.load(Ordering::Relaxed)
+    }
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+    pub fn prefetched(&self) -> u64 {
+        self.prefetched.load(Ordering::Relaxed)
+    }
+    pub fn late(&self) -> u64 {
+        self.late.load(Ordering::Relaxed)
+    }
+}
 
 fn err(message: impl ToString) -> Error {
     Error::from_reason(message.to_string())
@@ -538,8 +574,12 @@ pub struct Store {
     pub packed_hits: u64,
     pub packed_bytes_read: u64,
     mapped: Option<super::mapped_pack::MappedPack>,
-    pub lookup_batches: u64,
-    pub lookup_misses: u64,
+    /// One open descriptor per checkpoint file; row reads `pread` through it.
+    files: HashMap<PathBuf, Arc<File>>,
+    rows: Option<Fetcher>,
+    #[cfg(test)]
+    pub(in super::super) row_readers: bool,
+    pub lookup: Arc<LookupStats>,
 }
 
 #[derive(Deserialize)]
@@ -644,8 +684,11 @@ impl Store {
             packed_hits: 0,
             packed_bytes_read: 0,
             mapped: None,
-            lookup_batches: 0,
-            lookup_misses: 0,
+            files: HashMap::new(),
+            rows: None,
+            #[cfg(test)]
+            row_readers: true,
+            lookup: Arc::default(),
         };
         if s.gguf {
             s.index_gguf(path)?;
@@ -1096,9 +1139,11 @@ impl Store {
         Ok(())
     }
 
-    /// Gather a bounded lookup window, sharing duplicate rows and submitting
-    /// cold imports/dequantizations together. Decoded rows use the existing
-    /// Store-owned LRU and its byte accounting, so no second cache is reserved.
+    /// Gather a bounded lookup window, sharing duplicate rows. Decoded rows
+    /// use the existing Store-owned LRU and its byte accounting, so no second
+    /// cache is reserved. The gather stays lazy: the layer that consumes it
+    /// submits the imports and dequantizations with its own graph instead of
+    /// draining the GPU at the token start.
     pub fn lookup_rows(&mut self, name: &str, ids: &[usize]) -> Result<MxArray> {
         let d = self.descriptor(name)?;
         let total_rows = d.rows()?;
@@ -1113,13 +1158,18 @@ impl Store {
             return Err(err("Lookup window exceeds tensor or staging bounds"));
         }
         let mut unique = HashMap::new();
-        let misses_before = self.lookup_misses;
         let mut rows = Vec::new();
         let mut order = Vec::with_capacity(ids.len());
         for &id in ids {
             let slot = if let Some(&slot) = unique.get(&id) {
                 slot
             } else {
+                LookupStats::count(&self.lookup.lookups);
+                if !self.banks.contains_key(name)
+                    && !self.cache.contains_key(&(name.to_string(), id, 1))
+                {
+                    LookupStats::count(&self.lookup.misses);
+                }
                 let row = self.read_impl(name, id, 1, true, None)?.dense_pending()?;
                 let slot = rows.len() as i32;
                 rows.push(row);
@@ -1128,13 +1178,88 @@ impl Store {
             };
             order.push(slot);
         }
-        let bank = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
-        let out = bank.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)?;
-        if self.lookup_misses != misses_before {
-            MxArray::eval_arrays_with_context(&[&out], "qwen4::lookup_window")?;
+        if let [row] = rows.as_slice()
+            && order.len() == 1
+        {
+            return Ok(row.clone());
         }
-        self.lookup_batches += 1;
-        Ok(out)
+        let bank = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
+        bank.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
+    }
+
+    /// Start reading rows `(tensor, row)` on the reader threads; rows the
+    /// LRU or a bank already holds are skipped. `read_impl` takes the bytes
+    /// when it imports the row.
+    pub fn prefetch_rows(&mut self, keys: &[(String, usize)]) -> Result<()> {
+        #[cfg(test)]
+        if !self.row_readers {
+            return Ok(());
+        }
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+        for (name, row) in keys {
+            if !seen.insert((name.as_str(), *row))
+                || self.banks.contains_key(name)
+                || self.cache.contains_key(&(name.clone(), *row, 1))
+            {
+                continue;
+            }
+            let d = self.descriptor(name)?.clone();
+            let (offset, len) = d.range(*row, 1)?;
+            let file = self.file(&d.path)?;
+            jobs.push(Job {
+                key: (name.clone(), *row),
+                file,
+                offset,
+                len: len as usize,
+            });
+        }
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        if self.rows.is_none() {
+            self.rows = Some(Fetcher::new(ROW_READERS).map_err(err)?);
+        }
+        if let Some(fetcher) = &self.rows {
+            fetcher.request(jobs);
+        }
+        Ok(())
+    }
+
+    fn file(&mut self, path: &Path) -> Result<Arc<File>> {
+        if let Some(file) = self.files.get(path) {
+            return Ok(Arc::clone(file));
+        }
+        let file = Arc::new(File::open(path).map_err(err)?);
+        self.files.insert(path.to_path_buf(), Arc::clone(&file));
+        Ok(file)
+    }
+
+    /// Import `rows` rows of `d`: bytes a reader thread fetched for a single
+    /// row, else a `pread` through the shared descriptor.
+    fn import_rows(&mut self, d: &Tensor, name: &str, start: usize, rows: usize) -> Result<Weight> {
+        let fetched = if rows == 1 {
+            self.rows
+                .as_ref()
+                .and_then(|fetcher| fetcher.take(&(name.to_string(), start)))
+        } else {
+            None
+        };
+        let bytes = match fetched {
+            Some((bytes, late)) => {
+                LookupStats::count(if late {
+                    &self.lookup.late
+                } else {
+                    &self.lookup.prefetched
+                });
+                bytes.map_err(err)?
+            }
+            None => {
+                let file = self.file(&d.path)?;
+                d.read_rows(&file, start, rows)?
+            }
+        };
+        d.import_bytes(&bytes, rows)
     }
 
     fn read_impl(
@@ -1217,7 +1342,7 @@ impl Store {
             self.packed_bytes_read += bytes;
             weight
         } else {
-            d.import_rows(start, rows)?
+            self.import_rows(&d, name, start, rows)?
         };
         let arrays: Vec<_> = [
             Some(&weight.values),
@@ -1262,9 +1387,7 @@ impl Store {
                 || name == "embed_tokens.weight"
                 || name == "per_layer_token_embd.weight"
                 || name.contains("ngram_embedding"))
-            && !runtime_flags::is_zero(c"MLX_QWEN4_CACHE_EMBEDDING_ROWS")
         {
-            self.lookup_misses += 1;
             Weight {
                 dense_bf16: None,
                 values: if lookup {
@@ -1321,14 +1444,27 @@ impl Tensor {
     /// safetensors bytes, or GGUF blocks through the K-quant repack. No cache
     /// or accounting is touched; the arrays are lazy.
     pub(super) fn import_rows(&self, start: usize, rows: usize) -> Result<Weight> {
+        let file = File::open(&self.path).map_err(err)?;
+        self.import_bytes(&self.read_rows(&file, start, rows)?, rows)
+    }
+
+    /// The checkpoint bytes of `rows` rows from `start`, through an open
+    /// descriptor of the tensor's file.
+    pub(super) fn read_rows(&self, file: &File, start: usize, rows: usize) -> Result<Vec<u8>> {
         let (offset, bytes) = self.range(start, rows)?;
+        let mut buf = vec![0; bytes as usize];
+        file.read_exact_at(&mut buf, offset).map_err(err)?;
+        Ok(buf)
+    }
+
+    /// Decode the checkpoint bytes of `rows` consecutive rows into lazy arrays.
+    pub(super) fn import_bytes(&self, buf: &[u8], rows: usize) -> Result<Weight> {
+        if rows == 0 || buf.len() as u64 != self.row_bytes()?.saturating_mul(rows as u64) {
+            return Err(err("SSD row payload does not match its descriptor"));
+        }
         let shape = [rows as i64, self.width()? as i64];
         Ok(match &self.encoding {
             Encoding::Safe(dtype) => {
-                let mut f = File::open(&self.path).map_err(err)?;
-                f.seek(SeekFrom::Start(offset)).map_err(err)?;
-                let mut buf = vec![0; bytes as usize];
-                f.read_exact(&mut buf).map_err(err)?;
                 let values = match dtype.as_str() {
                     "BF16" | "F16" => {
                         let v: Vec<u16> = buf
@@ -1383,18 +1519,21 @@ impl Tensor {
                     version: 3,
                     tensor_count: 1,
                     metadata: HashMap::new(),
-                    tensors: vec![tensor],
+                    tensors: Vec::new(),
                     alignment: 32,
-                    data_offset: offset,
+                    data_offset: 0,
                 };
-                let mut a = load_gguf_tensors(
-                    &self.path,
+                let mut a: HashMap<String, MxArray> = load_gguf_tensor(
+                    &mut Cursor::new(buf),
                     &g,
+                    &tensor,
                     GgufLoadOptions {
                         verbose: false,
                         import_k_quants: true,
                     },
-                )?;
+                )?
+                .into_iter()
+                .collect();
                 let values = a
                     .remove("weight")
                     .ok_or_else(|| err("GGUF row reader produced no weight"))?;
@@ -2029,12 +2168,15 @@ mod cache_tests {
             .unwrap()
             .to_vec();
         let cold = store.lookup_rows("token_embd.weight", &ids).unwrap();
+        assert!(
+            !unsafe { mlx_sys::mlx_array_is_available(cold.as_raw_ptr()) },
+            "a cold lookup window must stay lazy for its consumer's graph"
+        );
         assert_eq!(store.bytes_read, 3 * 24);
-        assert_eq!(store.lookup_misses, 3);
+        assert_eq!((store.lookup.lookups(), store.lookup.misses()), (3, 3));
         assert_eq!(store.cache_bytes, 3 * 32 * 2);
         let warm = store.lookup_rows("token_embd.weight", &ids).unwrap();
-        assert_eq!(store.lookup_batches, 2);
-        assert_eq!(store.lookup_misses, 3);
+        assert_eq!((store.lookup.lookups(), store.lookup.misses()), (6, 3));
         assert_eq!(store.bytes_read, 3 * 24);
         assert!(store.lookup_rows("token_embd.weight", &[0, 8]).is_err());
         assert_eq!(
@@ -2044,12 +2186,75 @@ mod cache_tests {
         );
         store.evict_to(0).unwrap();
         assert_eq!(store.cache_bytes, 0);
-        for output in [cold, warm] {
+        // Reader threads: the same rows, requested ahead and consumed by the
+        // import, decode to the same bits through the in-memory GGUF path.
+        let keys: Vec<_> = ids
+            .iter()
+            .map(|&id| ("token_embd.weight".to_string(), id))
+            .collect();
+        store.prefetch_rows(&keys).unwrap();
+        let fetched = store.lookup_rows("token_embd.weight", &ids).unwrap();
+        assert_eq!((store.lookup.lookups(), store.lookup.misses()), (9, 6));
+        assert_eq!(store.lookup.prefetched() + store.lookup.late(), 3);
+        store.prefetch_rows(&keys).unwrap();
+        let hits = store.lookup_rows("token_embd.weight", &ids).unwrap();
+        assert_eq!(store.lookup.misses(), 6, "LRU hits request nothing");
+        assert_eq!(store.lookup.prefetched() + store.lookup.late(), 3);
+        for output in [cold, warm, fetched, hits] {
             assert_eq!(
                 &*output.astype(DType::Float32).unwrap().to_float32().unwrap(),
                 &expected
             );
         }
+    }
+
+    /// PLE rows of the GGUF fixture through the reader threads against the
+    /// direct importer, bit for bit, with every requested row consumed.
+    #[test]
+    fn prefetched_ple_rows_match_the_direct_importer_and_are_consumed() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/model.gguf");
+        let mut store = Store::open_fixture(&path, None).unwrap();
+        let name = "per_layer_token_embd.weight";
+        let d = store.descriptor(name).unwrap().clone();
+        let total = d.rows().unwrap();
+        let ids: Vec<usize> = (0..16usize)
+            .map(|h| (h * 7919 + 13) % total)
+            .chain([13 % total])
+            .collect();
+        let distinct = ids.iter().collect::<HashSet<_>>().len() as u64;
+        let expected = ids
+            .iter()
+            .map(|&id| d.import_rows(id, 1).unwrap().dense().unwrap())
+            .collect::<Vec<_>>();
+        let expected = MxArray::concatenate_many(expected.iter().collect(), Some(0))
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let keys: Vec<_> = ids.iter().map(|&id| (name.to_string(), id)).collect();
+        store.prefetch_rows(&keys).unwrap();
+        let fetched = store.lookup_rows(name, &ids).unwrap();
+        assert!(!unsafe { mlx_sys::mlx_array_is_available(fetched.as_raw_ptr()) });
+        assert_eq!(
+            &*fetched
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap(),
+            &expected
+        );
+        assert_eq!(
+            (store.lookup.lookups(), store.lookup.misses()),
+            (distinct, distinct)
+        );
+        assert_eq!(
+            store.lookup.prefetched() + store.lookup.late(),
+            distinct,
+            "every imported row must come from the request"
+        );
     }
 
     #[test]
