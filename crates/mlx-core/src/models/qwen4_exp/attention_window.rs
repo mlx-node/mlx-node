@@ -106,8 +106,7 @@ impl Decoder {
             || self.verification.is_some()
             || self.position_override.is_some()
             || (sparse
-                && (runtime_flags::is_zero(c"MLX_QWEN4_BATCHED_QSA")
-                    || !matches!(dtype, DType::BFloat16 | DType::Float16)
+                && (!matches!(dtype, DType::BFloat16 | DType::Float16)
                     || !c.head_dim.is_multiple_of(32)
                     // The kernel attends at most 32 incomplete-block tokens.
                     || c.indexer_compress_ratio > 33

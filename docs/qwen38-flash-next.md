@@ -187,7 +187,6 @@ before erroring.
 | `MLX_QWEN4_MAPPED_PACK=0`    | Keep the slot path although the mapped pack is complete (A/B arm).      |
 | `MLX_QWEN4_PREFETCH_LAYERS`  | Layers of the mapped pack read ahead of the one computing when a pass starts over a pack that is not fully resident (default 3; `0` disables read-ahead and a stale pass always touches every bank). |
 | `MLX_QWEN4_PREFETCH_AT_LOAD=1` | Ask the kernel for the whole mapped pack as the model loads (opt-in; moves the first prompt's SSD time into the load). |
-| `MLX_QWEN4_BATCHED_QSA=0`    | Run prompt windows past the indexer budget one token at a time instead of the batched sparse-attention kernel. |
 | `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
 | `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
