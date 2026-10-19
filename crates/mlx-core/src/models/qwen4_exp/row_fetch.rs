@@ -45,31 +45,42 @@ fn read(job: &Job) -> std::io::Result<Vec<u8>> {
 
 impl Fetcher {
     pub(super) fn new(workers: usize) -> std::io::Result<Self> {
-        let shared = Arc::new((
-            Mutex::new(State {
-                queue: VecDeque::new(),
-                running: HashSet::new(),
-                done: HashMap::new(),
-            }),
-            Condvar::new(),
-        ));
-        let stop = Arc::new(AtomicBool::new(false));
-        let workers = (0..workers)
-            .map(|_| {
-                std::thread::Builder::new()
-                    .name("mlx-qwen4-rows".into())
-                    .spawn({
-                        let shared = shared.clone();
-                        let stop = stop.clone();
-                        move || run(&shared, &stop)
-                    })
-            })
-            .collect::<std::io::Result<Vec<_>>>()?;
-        Ok(Self {
-            shared,
-            stop,
-            workers,
-        })
+        Self::start(workers, |builder, body| builder.spawn(body))
+    }
+
+    /// `Self` exists before the first spawn: a failed spawn drops it and
+    /// `Drop` stops and joins the workers already running. Handles held in a
+    /// bare `Vec` would be detached by the `?`, parked on the condvar with
+    /// `stop` false for the life of the process.
+    fn start(
+        workers: usize,
+        mut spawn: impl FnMut(
+            std::thread::Builder,
+            Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<JoinHandle<()>>,
+    ) -> std::io::Result<Self> {
+        let mut fetcher = Self {
+            shared: Arc::new((
+                Mutex::new(State {
+                    queue: VecDeque::new(),
+                    running: HashSet::new(),
+                    done: HashMap::new(),
+                }),
+                Condvar::new(),
+            )),
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: Vec::with_capacity(workers),
+        };
+        for _ in 0..workers {
+            let shared = fetcher.shared.clone();
+            let stop = fetcher.stop.clone();
+            let handle = spawn(
+                std::thread::Builder::new().name("mlx-qwen4-rows".into()),
+                Box::new(move || run(&shared, &stop)),
+            )?;
+            fetcher.workers.push(handle);
+        }
+        Ok(fetcher)
     }
 
     /// Queue `jobs` behind whatever is still pending, in order.
@@ -148,6 +159,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
 
     struct Temp(PathBuf);
     impl Temp {
@@ -212,5 +224,32 @@ mod tests {
             len: 90,
         }]);
         assert!(alone.take(&("table".into(), 99)).unwrap().0.is_err());
+    }
+
+    #[test]
+    fn a_failed_spawn_stops_and_joins_the_workers_already_started() {
+        let exited = Arc::new(AtomicUsize::new(0));
+        let mut spawned = 0;
+        let result = Fetcher::start(4, |builder, body| {
+            if spawned == 2 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            spawned += 1;
+            let exited = exited.clone();
+            builder.spawn(move || {
+                body();
+                exited.fetch_add(1, Ordering::Release);
+            })
+        });
+        assert_eq!(
+            result.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(spawned, 2);
+        assert_eq!(
+            exited.load(Ordering::Acquire),
+            2,
+            "both started workers must have returned before the error came back"
+        );
     }
 }
