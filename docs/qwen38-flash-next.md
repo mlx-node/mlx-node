@@ -48,23 +48,39 @@ tensor sizes, physical RAM, and live free/file-backed memory. It reserves one
 eighth of RAM for the system (bounded to 2–16 GiB), plus 4 GiB for runtime work,
 and caps weights at 75% of physical RAM. Anonymous inactive and compressed
 memory do not count as available. The budget is reconciled after tokenizer and
-page-pool creation; growth rechecks headroom and memory pressure.
+page-pool creation; growth rechecks headroom.
 
-With a complete mapped expert pack (below) and a hot set within 75% of
-physical RAM, `auto` maps every routed expert in place: the pack's sections
-back the expert banks as no-copy Metal buffers, slot id is expert id, and no
-expert is ever copied, missed or staged during a turn. The weight budget then
-covers only what stays anonymous — fixed projection banks, up to 8 GiB of
-auxiliary (MTP/vision) inventory and 2 GiB of row/staging room — and the
-routed experts are clean page cache: the Metal driver wires the banks a
-command buffer binds and releases them about a second after the turn, so the
-process holds no expert memory between turns and the OS may evict the pages.
-Turns run without a wired-limit context (it does not pin file-backed buffers
-and only delays their release), the mid-turn staging admission is gone with
-the staging, the forward and growth headroom checks still guard what stays
-anonymous (rows, auxiliary weights, fallback projection chunks, scratch), and
-the SSD safety limit subtracts the mapped bytes MLX counts in `active_memory`. Greedy output no longer depends on the free
-memory at load. The driver wires whole banks, not the experts a token
+With a complete mapped expert pack (below), `auto` maps every routed expert
+in place when the live host holds the whole pack beside what stays anonymous:
+the pack's sections back the expert banks as no-copy Metal buffers, slot id
+is expert id, and no expert is ever copied, missed or staged during a turn.
+The weight budget then covers only what stays anonymous — fixed projection
+banks, up to 8 GiB of auxiliary (MTP/vision) inventory and 2 GiB of
+row/staging room — and the routed experts are clean page cache: the Metal
+driver wires the banks a command buffer binds and releases them about a
+second after the turn, so the process holds no expert memory between turns
+and the OS may evict the pages. The decision is a byte budget for mapped
+banks: physical RAM minus a 6 GiB margin, minus the host's live
+non-reclaimable memory (wired, compressor, other processes' anonymous pages;
+`vm_stat`, not "free"), minus that anonymous budget and the paged KV pool.
+The pack maps when the budget covers every bank, else the slot path serves
+the experts with its usual budget; `residencyInfo()` reports the budget
+(`mappedBankBudgetBytes`), the live memory it saw (`liveNonReclaimableBytes`)
+and the reason for a slot choice (`fallbackReason`). During a pass the driver
+wires every bank, so a mapped turn cannot keep the slot path's free/file
+reserve; it stops growing anonymous memory only below 2 GiB of free plus file
+cache. A mapped turn that reads more than twice the pack from SSD, or runs
+eight consecutive passes over ten times the running median of their kind,
+finishes as it is and the next turn runs on the slot path (banks unmapped,
+slot budget from the live host); the reason, the bytes or the step count
+are reported. Turns run without a wired-limit context (it does not pin
+file-backed buffers and only delays their release), the mid-turn staging
+admission is gone with the staging, the SSD safety limit subtracts the mapped
+bytes MLX counts in `active_memory`, and a lookup window's decoded rows share
+one Metal buffer (one per row made a fresh 10k-token prompt cost 165k Metal
+resources and the third one abort at MLX's ~499k resource limit; the LRU
+evicts them by bytes and reports `decodedRowEvictions`). Greedy output no
+longer depends on the free memory at load. The driver wires whole banks, not the experts a token
 routes to, and unwires a bank about a second after its last use; a pass that
 starts later than that after the previous one would otherwise re-wire the
 layers one by one and fall into a 0.5 tokens/s cycle, so every main-network
@@ -93,8 +109,8 @@ window and every decode step needs the entire routed set resident at once:
 when other processes' anonymous memory leaves less than that (a 20 GiB
 working set beside the 78 GiB pack on 128 GiB), the kernel re-faults the pack
 layer by layer and a 6k turn reads about 1 TB from SSD at 0.4 tokens/s
-instead of 50. The 75% gate does not see that memory;
-`MLX_QWEN4_MAPPED_PACK=0` keeps the slot path for A/B and for such hosts;
+instead of 50; the live-memory gate and the tripwire above send such a host
+to the slot path. `MLX_QWEN4_MAPPED_PACK=0` keeps the slot path for A/B;
 `MLX_QWEN4_WEIGHT_CACHE_GIB`, `stream` and `full` also select it.
 
 Otherwise, if the hot text network fits, it is prepared once in resident
@@ -137,11 +153,8 @@ tokenizer sidecars are exempt from orphan removal and their markers are
 re-stamped on use, so they are only collected by the
 `MLX_NATIVE_GGUF_CACHE_MAX_GB` least-recently-used cap.
 
-Bootstrap, admission and the SSD-read safety limit also gate on macOS memory
-pressure rather than failing on the first reading: pressure is polled every
-250 ms for up to about 3 s before the load is refused, and a breached safety
-limit reclaims the allocator freelist and re-polls before erroring.
-`MLX_QWEN4_IGNORE_MEMORY_PRESSURE=1` bypasses the gate entirely.
+A breached SSD-read safety limit reclaims the allocator freelist and re-polls
+before erroring.
 
 | Setting                      | Behavior                                                                |
 | ---------------------------- | ----------------------------------------------------------------------- |
@@ -158,7 +171,6 @@ limit reclaims the allocator freelist and re-polls before erroring.
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
 | `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |
-| `MLX_QWEN4_IGNORE_MEMORY_PRESSURE` | `=1` skips the macOS bootstrap memory-pressure gate — diagnostic only; the free/file-backed headroom checks still apply. |
 
 The routed expert tensors of a GGUF checkpoint are also kept as a mapped expert
 pack beside the chunk cache: `.mlx-qwen4-mapped-v3-<identity>/`, one file per
@@ -185,10 +197,16 @@ open or building pack does.
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
 expert-slot capacity (the expert count in mapped mode), the number of tensors
 served from the mapped pack (`mappedPackFiles`), whether experts are mapped in
-place (`mapped`, with `mappedBytes`), the prefill window, and the live
-decoded-row counters (`decodedRowLookups`, `decodedRowMisses`,
-`decodedRowHitRate`, plus `prefetchedRows` / `lateRows`: imported rows the
-reader threads had ready versus rows the model thread read or waited for).
+place (`mapped`, with `mappedBytes`; `weightBudgetBytes`,
+`partialExpertSlots` and both follow a mid-session fallback), the bank budget
+and live memory of the residency decision (`mappedBankBudgetBytes`,
+`liveNonReclaimableBytes`), why the slot path serves the experts
+(`fallbackReason`, with `fallbackReadBytes` or `fallbackSlowSteps`), the
+prefill window, and the live decoded-row counters (`decodedRowLookups`,
+`decodedRowMisses`, `decodedRowHitRate`, `decodedRowEvictions`,
+`decodedRowEvictedBytes`, plus `prefetchedRows` / `lateRows`: imported rows
+the reader threads had ready versus rows the model thread read or waited
+for).
 The budgets are runtime budgets; they do
 not include every allocation made by macOS or other applications. The runtime
 currently requires macOS Metal for paged inference. NAX kernels are selected

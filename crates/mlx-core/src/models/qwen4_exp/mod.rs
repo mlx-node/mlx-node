@@ -16,6 +16,7 @@ mod prefetch;
 mod route_plan;
 mod row_fetch;
 mod runtime_flags;
+mod tripwire;
 mod weights;
 
 const MAX_PREFILL_CHUNK: usize = 1024;
@@ -49,7 +50,34 @@ struct Inner {
     vision: media::Vision,
     media_prefill: Option<media::Prepared>,
     _pool_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
-    _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// A cancel flag is installed; the next installation after it is
+    /// cleared starts a new turn.
+    turn_open: bool,
+}
+
+impl Inner {
+    /// The first installed cancel flag after a cleared one opens a turn: a
+    /// tripped mapped process moves to the slot path here, before any pass.
+    fn begin_turn(&mut self) {
+        let applied = match self.decoder.weights.begin_turn() {
+            Ok(applied) => applied,
+            Err(error) => {
+                tracing::warn!("qwen4 residency: slot fallback not applied: {error}");
+                return;
+            }
+        };
+        if applied.is_some() {
+            self.cache_limit_guard =
+                crate::cache_limit::coordinator().register(self.decoder.weights.cache_budget());
+            match memory::prefill_window(&self.decoder.config, &self.decoder.weights.plan) {
+                Ok(window) => self.decoder.prefill_chunk_size = window,
+                Err(error) => {
+                    tracing::warn!("qwen4 residency: prefill window kept after fallback: {error}")
+                }
+            }
+        }
+    }
 }
 struct Step<'a>(&'a mut Inner);
 impl DecodeStep for Step<'_> {
@@ -269,6 +297,14 @@ impl ChatBackend for Inner {
         }
     }
     fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        match (flag.is_some(), self.turn_open) {
+            (true, false) => {
+                self.turn_open = true;
+                self.begin_turn();
+            }
+            (false, _) => self.turn_open = false,
+            (true, true) => {}
+        }
         self.decoder.cancelled = flag;
     }
     fn prefill(&mut self, tokens: &[u32], stream: Stream) -> Result<MxArray> {
@@ -334,6 +370,20 @@ pub struct Qwen4ExpResidencyInfo {
     /// Pack bytes backing live arrays in mapped mode (clean page cache the
     /// Metal driver wires while a command buffer binds them).
     pub mapped_bytes: f64,
+    /// Bytes of mapped banks the host could hold beside what stays anonymous
+    /// when the residency was chosen: physical RAM minus a margin, the live
+    /// non-reclaimable memory below and the anonymous need. The pack maps
+    /// when this covers every bank.
+    pub mapped_bank_budget_bytes: f64,
+    /// Wired, compressed and other processes' anonymous memory when the
+    /// residency was chosen.
+    pub live_non_reclaimable_bytes: f64,
+    /// Why the slot path serves the experts although the pack exists: the
+    /// load gate, or a mapped turn that read over twice the pack from SSD or
+    /// ran eight consecutive passes over ten times their median.
+    pub fallback_reason: Option<String>,
+    pub fallback_read_bytes: Option<f64>,
+    pub fallback_slow_steps: Option<u32>,
     /// Token/PLE rows asked of the decoded-row LRU since load, and the ones
     /// it had to import.
     pub decoded_row_lookups: f64,
@@ -344,6 +394,9 @@ pub struct Qwen4ExpResidencyInfo {
     /// model thread read or waited for after requesting them.
     pub prefetched_rows: f64,
     pub late_rows: f64,
+    /// Decoded rows the LRU bound evicted since load, and their bytes.
+    pub decoded_row_evictions: f64,
+    pub decoded_row_evicted_bytes: f64,
 }
 
 #[napi(object)]
@@ -364,6 +417,7 @@ pub struct Qwen4ExpModel {
     has_mtp: bool,
     paged_capacity: u32,
     residency: memory::Plan,
+    live: Arc<tripwire::Live>,
     lookup: Arc<weights::LookupStats>,
     prefill_chunk_size: usize,
     supports_images: bool,
@@ -423,8 +477,9 @@ impl Qwen4ExpModel {
                 let mut cache_limit_guard =
                     crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
                 decoder.weights.prepare_mapped_pack()?;
-                decoder.weights.select_mapped_residency()?;
+                decoder.weights.select_mapped_residency(pool_bytes)?;
                 decoder.weights.prepare_hot()?;
+                decoder.weights.publish_live();
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.
                 drop(cache_limit_guard);
@@ -434,6 +489,7 @@ impl Qwen4ExpModel {
                     memory::prefill_window(&config, &decoder.weights.plan)?;
                 let prefill_chunk_size = decoder.prefill_chunk_size;
                 let residency = decoder.weights.plan.clone();
+                let live = Arc::clone(&decoder.weights.live);
                 let lookup = Arc::clone(&decoder.weights.lookup);
                 let assets = assets.to_string_lossy().into_owned();
                 let inner = Inner {
@@ -448,7 +504,8 @@ impl Qwen4ExpModel {
                     vision,
                     media_prefill: None,
                     _pool_guard: pool_guard,
-                    _cache_limit_guard: cache_limit_guard,
+                    cache_limit_guard,
+                    turn_open: false,
                 };
                 Ok((
                     crate::engine::hybrid_scheduler::HybridSchedulerState::new(inner)?,
@@ -458,6 +515,7 @@ impl Qwen4ExpModel {
                         has_mtp,
                         paged_capacity,
                         residency,
+                        live,
                         lookup,
                         prefill_chunk_size,
                         supports_images,
@@ -472,6 +530,7 @@ impl Qwen4ExpModel {
             has_mtp,
             paged_capacity,
             residency,
+            live,
             lookup,
             prefill_chunk_size,
             supports_images,
@@ -505,6 +564,7 @@ impl Qwen4ExpModel {
             has_mtp,
             paged_capacity,
             residency,
+            live,
             lookup,
             prefill_chunk_size,
             supports_images,
@@ -534,10 +594,13 @@ impl Qwen4ExpModel {
     }
     #[napi]
     pub fn residency_info(&self) -> Qwen4ExpResidencyInfo {
+        use std::sync::atomic::Ordering;
         let (lookups, misses) = (self.lookup.lookups(), self.lookup.misses());
+        let live = &self.live;
+        let fallback = live.fallback();
         Qwen4ExpResidencyInfo {
             policy: self.residency.policy.clone(),
-            weight_budget_bytes: self.residency.budget as f64,
+            weight_budget_bytes: live.weight_budget.load(Ordering::Acquire) as f64,
             hot_weight_bytes: self.residency.hot_bytes as f64,
             full_hot_residency: self.residency.resident,
             prefill_chunk_tokens: self.prefill_chunk_size as u32,
@@ -545,10 +608,18 @@ impl Qwen4ExpModel {
             physical_memory_bytes: self.residency.physical_bytes.map(|n| n as f64),
             resident_bank_bytes: self.residency.resident_bank_bytes as f64,
             resident_expert_layers: self.residency.resident_expert_layers as u32,
-            partial_expert_slots: self.residency.partial_expert_slots as u32,
+            partial_expert_slots: live.partial_expert_slots.load(Ordering::Acquire) as u32,
             mapped_pack_files: self.residency.mapped_pack_files as u32,
-            mapped: self.residency.mapped,
-            mapped_bytes: self.residency.mapped_bytes as f64,
+            mapped: live.mapped.load(Ordering::Acquire),
+            mapped_bytes: live.mapped_bytes.load(Ordering::Acquire) as f64,
+            mapped_bank_budget_bytes: live.mapped_bank_budget.load(Ordering::Acquire) as f64,
+            live_non_reclaimable_bytes: live.live_non_reclaimable.load(Ordering::Acquire) as f64,
+            fallback_reason: fallback.as_ref().map(ToString::to_string),
+            fallback_read_bytes: fallback
+                .as_ref()
+                .and_then(tripwire::Fallback::read_bytes)
+                .map(|n| n as f64),
+            fallback_slow_steps: fallback.as_ref().and_then(tripwire::Fallback::slow_steps),
             decoded_row_lookups: lookups as f64,
             decoded_row_misses: misses as f64,
             decoded_row_hit_rate: if lookups == 0 {
@@ -558,6 +629,8 @@ impl Qwen4ExpModel {
             },
             prefetched_rows: self.lookup.prefetched() as f64,
             late_rows: self.lookup.late() as f64,
+            decoded_row_evictions: self.lookup.evicted_rows() as f64,
+            decoded_row_evicted_bytes: self.lookup.evicted_row_bytes() as f64,
         }
     }
     #[napi]

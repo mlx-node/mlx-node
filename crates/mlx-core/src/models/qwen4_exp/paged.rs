@@ -627,6 +627,7 @@ pub(super) fn gather_window(
 
 impl Inner {
     fn decode_shared_layers(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        let started = std::time::Instant::now();
         let result = (|| {
             let mut hidden = Vec::with_capacity(rows.len());
             for &(seq, token) in rows {
@@ -661,6 +662,10 @@ impl Inner {
                 }
                 self.release_scheduled_recurrent_for(seq);
             }
+        } else {
+            self.decoder
+                .weights
+                .observe_pass(rows.len(), started.elapsed());
         }
         result
     }

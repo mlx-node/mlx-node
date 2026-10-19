@@ -5481,6 +5481,26 @@ export interface Qwen4ExpResidencyInfo {
    */
   mappedBytes: number;
   /**
+   * Bytes of mapped banks the host could hold beside what stays anonymous
+   * when the residency was chosen: physical RAM minus a margin, the live
+   * non-reclaimable memory below and the anonymous need. The pack maps
+   * when this covers every bank.
+   */
+  mappedBankBudgetBytes: number;
+  /**
+   * Wired, compressed and other processes' anonymous memory when the
+   * residency was chosen.
+   */
+  liveNonReclaimableBytes: number;
+  /**
+   * Why the slot path serves the experts although the pack exists: the
+   * load gate, or a mapped turn that read over twice the pack from SSD or
+   * ran eight consecutive passes over ten times their median.
+   */
+  fallbackReason?: string;
+  fallbackReadBytes?: number;
+  fallbackSlowSteps?: number;
+  /**
    * Token/PLE rows asked of the decoded-row LRU since load, and the ones
    * it had to import.
    */
@@ -5494,6 +5514,9 @@ export interface Qwen4ExpResidencyInfo {
    */
   prefetchedRows: number;
   lateRows: number;
+  /** Decoded rows the LRU bound evicted since load, and their bytes. */
+  decodedRowEvictions: number;
+  decodedRowEvictedBytes: number;
 }
 
 /** Result of text recognition. */

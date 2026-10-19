@@ -1807,7 +1807,8 @@ fn tiny_inner() -> Inner {
         vision,
         media_prefill: None,
         _pool_guard: None,
-        _cache_limit_guard: crate::cache_limit::coordinator().register(1 << 20),
+        cache_limit_guard: crate::cache_limit::coordinator().register(1 << 20),
+        turn_open: false,
     }
 }
 

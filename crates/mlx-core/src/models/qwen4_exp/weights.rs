@@ -15,6 +15,7 @@ use napi::{Error, Result};
 use serde::Deserialize;
 
 use super::row_fetch::{Fetcher, Job};
+use super::tripwire::{Fallback, Live, Tripwire};
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::QuantizedLinear;
 use crate::utils::gguf::{
@@ -44,11 +45,20 @@ pub struct LookupStats {
     pub prefetched: AtomicU64,
     /// Imports the model thread read itself or waited for after requesting.
     pub late: AtomicU64,
+    /// Decoded rows the LRU bound evicted, and their bytes.
+    pub evicted_rows: AtomicU64,
+    pub evicted_row_bytes: AtomicU64,
 }
 
 impl LookupStats {
     fn count(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn evicted_rows(&self) -> u64 {
+        self.evicted_rows.load(Ordering::Relaxed)
+    }
+    pub fn evicted_row_bytes(&self) -> u64 {
+        self.evicted_row_bytes.load(Ordering::Relaxed)
     }
     pub fn lookups(&self) -> u64 {
         self.lookups.load(Ordering::Relaxed)
@@ -580,6 +590,8 @@ pub struct Store {
     #[cfg(test)]
     pub(in super::super) row_readers: bool,
     pub lookup: Arc<LookupStats>,
+    pub live: Arc<Live>,
+    tripwire: Tripwire,
 }
 
 #[derive(Deserialize)]
@@ -591,7 +603,8 @@ struct SafeDescriptor {
 
 impl Store {
     pub(super) fn check_forward_headroom(&self) -> Result<()> {
-        self.check_forward_headroom_with(super::memory::check_growth_headroom)
+        let mapped = self.plan.mapped;
+        self.check_forward_headroom_with(|| super::memory::check_growth_headroom(mapped))
     }
 
     fn check_forward_headroom_with(&self, check: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -660,6 +673,8 @@ impl Store {
                 mapped_pack_files: 0,
                 mapped: false,
                 mapped_bytes: 0,
+                mapped_bank_budget: 0,
+                live_non_reclaimable: 0,
             },
             banks: HashMap::new(),
             bank_bytes: 0,
@@ -689,6 +704,8 @@ impl Store {
             #[cfg(test)]
             row_readers: true,
             lookup: Arc::default(),
+            live: Arc::default(),
+            tripwire: Tripwire::default(),
         };
         if s.gguf {
             s.index_gguf(path)?;
@@ -734,7 +751,14 @@ impl Store {
             }
             self.recency.remove(&old);
             if let Some(w) = self.cache.remove(&old) {
-                self.cache_bytes -= w.bytes()?;
+                let bytes = w.bytes()?;
+                self.cache_bytes -= bytes;
+                if old.2 == 1 {
+                    LookupStats::count(&self.lookup.evicted_rows);
+                    self.lookup
+                        .evicted_row_bytes
+                        .fetch_add(bytes, Ordering::Relaxed);
+                }
             }
         }
         Ok(())
@@ -1184,6 +1208,31 @@ impl Store {
             return Ok(row.clone());
         }
         let bank = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
+        // Every row the window touched is re-homed as a view of the window's
+        // bank: one Metal buffer per window instead of one per row. Each
+        // buffer is a Metal resource and MLX aborts at ~499k of them; a fresh
+        // 10k-token prompt makes 165k rows, so the third such prompt in one
+        // process died. A row an older window holds is copied into this bank
+        // by the concatenation anyway, and the old bank is released once its
+        // untouched rows age out.
+        if !self.banks.contains_key(name) {
+            for (&id, &slot) in &unique {
+                let key = (name.to_string(), id, 1);
+                let Some(entry) = self.cache.get_mut(&key) else {
+                    continue;
+                };
+                let slot = i64::from(slot);
+                *entry = Arc::new(Weight {
+                    values: bank.slice_axis(0, slot, slot + 1)?,
+                    dense_bf16: None,
+                    scales: None,
+                    biases: None,
+                    group: 0,
+                    bits: 0,
+                    mode: String::new(),
+                });
+            }
+        }
         bank.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
     }
 
@@ -1275,14 +1324,10 @@ impl Store {
         lookup: bool,
         prepared: Option<Option<super::packed_cache::VerifiedChunk>>,
     ) -> Result<Arc<Weight>> {
-        self.read_impl_with(
-            name,
-            start,
-            rows,
-            lookup,
-            prepared,
-            super::memory::check_growth_headroom,
-        )
+        let mapped = self.plan.mapped;
+        self.read_impl_with(name, start, rows, lookup, prepared, || {
+            super::memory::check_growth_headroom(mapped)
+        })
     }
 
     fn read_impl_with(
@@ -2226,6 +2271,95 @@ mod cache_tests {
         }
     }
 
+    /// A lookup window leaves one Metal buffer behind, not one per row: every
+    /// row it touched becomes a view of the window's bank, a later window
+    /// re-homes the rows it hits, and the LRU bound holds in those bytes.
+    #[test]
+    fn decoded_rows_share_their_windows_buffer_and_stay_under_the_lru_bound() {
+        let cleanup = Cleanup::new();
+        let dir = cleanup.0.clone();
+        let (path, _) = rows_gguf(&dir);
+        let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let name = "token_embd.weight";
+        let row_bytes = 32 * 2;
+        let key = |id: usize| (name.to_string(), id, 1);
+        let cached = |store: &Store, id: usize| store.cache[&key(id)].values.clone();
+        let window = store.lookup_rows(name, &[5, 1, 6, 1, 2]).unwrap();
+        MxArray::eval_arrays(&[&window]).unwrap();
+        let views: Vec<_> = [5usize, 1, 6, 2]
+            .iter()
+            .map(|&id| cached(&store, id))
+            .collect();
+        MxArray::eval_arrays(&views.iter().collect::<Vec<_>>()).unwrap();
+        let base = views[0].storage_ptr() as usize;
+        assert_ne!(base, 0);
+        for (slot, (view, id)) in views.iter().zip([5usize, 1, 6, 2]).enumerate() {
+            assert_eq!(
+                view.storage_ptr() as usize,
+                base + slot * row_bytes,
+                "row {id} is slot {slot} of the window's bank"
+            );
+            let expected = oracle.read(name, id, 1).unwrap().dense().unwrap();
+            assert_eq!(
+                &*view.astype(DType::Float32).unwrap().to_float32().unwrap(),
+                &*expected
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+            );
+        }
+        let next = store.lookup_rows(name, &[1, 7]).unwrap();
+        MxArray::eval_arrays(&[&next]).unwrap();
+        let moved = cached(&store, 1);
+        let fresh = cached(&store, 7);
+        MxArray::eval_arrays(&[&moved, &fresh]).unwrap();
+        assert_eq!(
+            moved.storage_ptr() as usize + row_bytes,
+            fresh.storage_ptr() as usize,
+            "a hit moves into the window that touched it"
+        );
+        assert_ne!(moved.storage_ptr() as usize, base + row_bytes);
+        assert_eq!(store.cache_bytes, 5 * row_bytes as u64);
+
+        // Four rows fit beside the staging reserve; a window of eight evicts
+        // in LRU order and the counters say so.
+        store.cache_limit = MAX_READ_BYTES * 3 + 4 * row_bytes as u64;
+        let evicted_before = store.lookup.evicted_rows();
+        let wide = store.lookup_rows(name, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        MxArray::eval_arrays(&[&wide]).unwrap();
+        assert!(
+            store.cache_bytes <= 5 * row_bytes as u64,
+            "LRU bound: {} bytes cached",
+            store.cache_bytes
+        );
+        let evicted = store.lookup.evicted_rows() - evicted_before;
+        assert!(evicted >= 3, "{evicted} rows evicted");
+        assert_eq!(
+            store.lookup.evicted_row_bytes(),
+            store.lookup.evicted_rows() * row_bytes as u64
+        );
+        assert!(
+            [6, 7].iter().all(|&id| store.cache.contains_key(&key(id)))
+                && [0, 1].iter().all(|&id| !store.cache.contains_key(&key(id))),
+            "the oldest rows go first"
+        );
+        let expected = oracle.read(name, 7, 1).unwrap().dense().unwrap();
+        assert_eq!(
+            &*cached(&store, 7)
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap(),
+            &*expected
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+        );
+    }
+
     /// A reader's failed read is consumed with its request and never
     /// returned: the import reads the row itself, so the file as it is now
     /// decides, and nothing for the key stays behind.
@@ -2598,7 +2732,7 @@ mod mapped_tests {
             store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
             store.plan.policy = "auto".into();
             store
-                .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, _, _| {
+                .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
                     plan.budget = 1 << 30;
                     plan.mapped = true;
                     plan.resident = false;
@@ -2722,9 +2856,11 @@ mod mapped_tests {
         let before = store.cache_bytes;
         store.plan.policy = "auto".into();
         store
-            .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, dense, aux| {
-                // The fixture holds routed experts only.
-                assert_eq!((dense, aux), (0, 0));
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, dense, aux, pool, pack| {
+                // The fixture holds routed experts only; the gate sees
+                // the pool it was given and the pack's section bytes.
+                assert_eq!((dense, aux, pool), (0, 0, 1 << 30));
+                assert_eq!(pack, expected_bytes);
                 plan.budget = 1 << 30;
                 plan.mapped = true;
                 plan.resident = false;
@@ -2874,7 +3010,7 @@ mod mapped_tests {
         );
         store.plan.policy = "auto".into();
         store
-            .select_mapped_residency_with(EXPERTS, Some(1 << 40), &mut |plan, _, _| {
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
                 plan.resident = false;
@@ -2887,12 +3023,130 @@ mod mapped_tests {
         other.prepare_mapped_pack_at(&dir).unwrap();
         other.plan.policy = "auto".into();
         other
-            .select_mapped_residency_with(EXPERTS + 1, Some(1 << 40), &mut |_, _, _| {
+            .select_mapped_residency_with(EXPERTS + 1, 0, &mut |_, _, _, _, _| {
                 panic!("an incomplete pack must not be admitted")
             })
             .unwrap();
         assert!(!other.plan.mapped);
         assert_eq!(other.plan.mapped_bytes, 0);
         assert!(other.mapped_experts.is_empty());
+    }
+
+    /// The live-memory gate says no: the store stays on slots, maps nothing,
+    /// keeps its slot budget and reports the refusal with the gate's budget.
+    #[test]
+    fn a_refused_gate_keeps_the_slot_path_and_reports_the_bank_budget() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store.plan.policy = "auto".into();
+        let budget_before = store.plan.budget;
+        let limit_before = store.cache_limit;
+        let mut seen_pack = 0;
+        store
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, _, _, _, pack| {
+                seen_pack = pack;
+                plan.mapped_bank_budget = pack - 1;
+                plan.live_non_reclaimable = 40 << 30;
+                plan.budget = 1;
+                plan.mapped = true;
+                Err(err("mapped banks need more than the host leaves"))
+            })
+            .unwrap();
+        assert!(seen_pack > 0);
+        assert!(!store.plan.mapped);
+        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(
+            (store.plan.budget, store.cache_limit),
+            (budget_before, limit_before)
+        );
+        assert_eq!(store.plan.mapped_bank_budget, seen_pack - 1);
+        assert_eq!(store.plan.live_non_reclaimable, 40 << 30);
+        assert_eq!(
+            store.live.fallback(),
+            Some(Fallback::LoadGate {
+                pack: seen_pack,
+                budget: seen_pack - 1
+            })
+        );
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
+        assert!(store.slots.is_empty(), "slots are built by the first turn");
+    }
+
+    /// A mapped store whose turn tripped the wire finishes that turn mapped
+    /// and starts the next one on slots: banks unmapped, the slot budget
+    /// taken from the live host, slots built on demand, the reason
+    /// published.
+    #[test]
+    fn a_tripped_mapped_store_runs_its_next_turn_on_slots() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store.plan.policy = "auto".into();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped && store.live.mapped.load(Ordering::Acquire));
+        let mapped = store.plan.mapped_bytes;
+        assert!(store.begin_turn().unwrap().is_none(), "nothing tripped yet");
+        let ids = [4u32, 0, 2];
+        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mapped_bank = Arc::as_ptr(&banks[0]);
+        store.trip(Fallback::SsdReads {
+            read: 2 * mapped + 1,
+            mapped,
+        });
+        // The turn that tripped keeps its mapped banks.
+        assert!(store.plan.mapped);
+        let (same, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_eq!(Arc::as_ptr(&same[0]), mapped_bank);
+        assert!(store.live.fallback().is_none());
+
+        let why = store
+            .begin_turn()
+            .unwrap()
+            .expect("the next turn applies the fallback");
+        assert_eq!(
+            why,
+            Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped
+            }
+        );
+        assert!(!store.plan.mapped);
+        assert_eq!(store.plan.mapped_bytes, 0);
+        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert!(store.cache_limit >= store.cache_bytes + MAX_READ_BYTES * 3);
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
+        assert!(!store.live.mapped.load(Ordering::Acquire));
+        assert_eq!(store.live.fallback(), Some(why));
+        assert!(
+            !store
+                .wire_mapped_banks_at(std::time::Instant::now(), true, 3)
+                .unwrap(),
+            "a slot store never touches banks"
+        );
+        let (slots, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
+        assert_eq!(capacity, EXPERTS);
+        assert_eq!(local.len(), ids.len());
+        assert!(store.slot_bytes > 0 && store.slots.contains_key(&0));
+        assert!(store.begin_turn().unwrap().is_none(), "applied once");
     }
 }

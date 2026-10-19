@@ -25,12 +25,89 @@ pub(super) struct Plan {
     /// Bytes of pack sections backing live arrays; MLX counts them in
     /// `active_memory`, so budgets subtract them.
     pub mapped_bytes: u64,
+    /// Bytes of mapped banks the host could hold beside everything that
+    /// stays anonymous when the residency was chosen (`mapped_gate`).
+    pub mapped_bank_budget: u64,
+    /// `HostMemory::non_reclaimable` when the residency was chosen.
+    pub live_non_reclaimable: u64,
 }
 
 /// Bytes of auxiliary (MTP/vision) inventory the mapped budget keeps room for.
 const MAPPED_AUXILIARY_CAP: u64 = 8 << 30;
 /// LRU rows, paired banks and import staging under the mapped budget.
 const MAPPED_LRU_BYTES: u64 = 2 << 30;
+/// Room the mapped decision keeps between its need and physical RAM for
+/// what other processes allocate during a pass.
+pub(super) const MAPPED_MARGIN: u64 = 6 << 30;
+/// Free plus file cache a mapped turn must leave before it stops growing
+/// anonymous memory. The wired pack sits in neither, so the slot path's
+/// reserve (an eighth of RAM) cannot hold during a mapped turn: at 88 GiB
+/// available a 6k turn wired 89.5 GiB and left 8.8 GiB, where llama.cpp runs
+/// the same model. The load gate and the tripwire own the posture; this
+/// floor only refuses at the kernel's critical level.
+const MAPPED_TURN_FLOOR: u64 = 2 << 30;
+
+/// One `host_statistics64` read, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HostMemory {
+    pub physical: u64,
+    pub free: u64,
+    /// Pageable file-backed pages: clean cache the kernel drops on demand
+    /// (a resident mapped pack is in here between turns, wired pages are
+    /// not).
+    pub file: u64,
+    /// Pageable anonymous pages of every process, active or not.
+    pub anonymous: u64,
+    pub purgeable: u64,
+    pub wired: u64,
+    pub compressor: u64,
+}
+
+impl HostMemory {
+    /// Free plus clean file cache: what the kernel hands out without
+    /// touching another process's data.
+    pub fn available(&self) -> u64 {
+        self.free.saturating_add(self.file)
+    }
+
+    /// Memory a turn cannot take from the host: wired, the compressor pool
+    /// and other processes' anonymous pages (purgeable ones excepted). The
+    /// kernel evicts clean file pages before it compresses those, a mapped
+    /// pack between two bank bindings included: beside 20-40 GiB of them a
+    /// 6k turn re-read 1.06-2.3 TB and decoded at 0.06-0.4 tokens/s.
+    pub fn non_reclaimable(&self) -> u64 {
+        self.wired
+            .saturating_add(self.compressor)
+            .saturating_add(self.anonymous.saturating_sub(self.purgeable))
+    }
+}
+
+/// The residency decision as a byte budget for mapped banks. Today every
+/// routed bank maps or none does; a per-layer split can read the same
+/// budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct MappedGate {
+    pub bank_budget: u64,
+    pub non_reclaimable: u64,
+    pub anonymous_need: u64,
+}
+
+/// Mapped banks fit when physical RAM minus the margin, the host's live
+/// non-reclaimable memory and what this process keeps anonymous beside the
+/// pack (dense banks, bounded auxiliary inventory, LRU room, the KV pool)
+/// covers them.
+pub(super) fn mapped_gate(host: &HostMemory, anonymous_need: u64, margin: u64) -> MappedGate {
+    let non_reclaimable = host.non_reclaimable();
+    MappedGate {
+        bank_budget: host
+            .physical
+            .saturating_sub(margin)
+            .saturating_sub(non_reclaimable)
+            .saturating_sub(anonymous_need),
+        non_reclaimable,
+        anonymous_need,
+    }
+}
 
 pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
     let policy = match std::env::var_os("MLX_QWEN4_RESIDENCY") {
@@ -104,25 +181,21 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
         mapped_pack_files: 0,
         mapped: false,
         mapped_bytes: 0,
+        mapped_bank_budget: 0,
+        live_non_reclaimable: 0,
     })
 }
 
-/// `auto` maps the pack when every routed tensor is in it and the hot set
-/// leaves a quarter of RAM; an explicit weight budget, `stream`, `full` and
-/// `MLX_QWEN4_MAPPED_PACK=0` keep the slot path.
+/// `auto` considers the pack when every routed tensor is in it; an explicit
+/// weight budget, `stream`, `full` and `MLX_QWEN4_MAPPED_PACK=0` keep the
+/// slot path. Whether the banks fit is `mapped_plan`'s live decision.
 pub(super) fn mapped_residency_selected(
     policy: &str,
     explicit_budget: bool,
-    hot_bytes: u64,
-    physical: Option<u64>,
     pack_complete: bool,
     disabled: bool,
 ) -> bool {
-    policy == "auto"
-        && !explicit_budget
-        && !disabled
-        && pack_complete
-        && physical.is_some_and(|physical| hot_bytes <= physical.saturating_mul(3) / 4)
+    policy == "auto" && !explicit_budget && !disabled && pack_complete
 }
 
 pub(super) fn mapped_pack_disabled() -> bool {
@@ -145,30 +218,82 @@ pub(super) fn mapped_desired(dense_bytes: u64, auxiliary_bytes: u64) -> u64 {
 }
 
 /// Replace the slot budget by one that admits only what stays anonymous in
-/// mapped mode. The routed experts are clean page cache the OS may evict.
-pub(super) fn mapped_plan(plan: &mut Plan, dense_bytes: u64, auxiliary_bytes: u64) -> Result<()> {
+/// mapped mode, when the live host holds the pack beside it. The routed
+/// experts are clean page cache the OS may evict between turns; during a
+/// pass the driver wires every bank, so the whole pack must fit at once.
+/// `pool_bytes` is the paged KV pool, allocated before this decision.
+pub(super) fn mapped_plan(
+    plan: &mut Plan,
+    dense_bytes: u64,
+    auxiliary_bytes: u64,
+    pool_bytes: u64,
+    pack_bytes: u64,
+) -> Result<()> {
     let desired = mapped_desired(dense_bytes, auxiliary_bytes);
+    let anonymous_need = desired.saturating_add(pool_bytes);
     // A bootstrap snapshot exists only on the live macOS host; fixtures and
-    // other platforms take the desired budget without admission.
-    let budget = match plan.physical_bytes {
-        Some(physical) => {
-            let available = available_memory()?;
-            plan.available_bytes = Some(available);
-            automatic_budget(desired, available, physical)
+    // other platforms take the desired budget without a gate.
+    let gate = match plan.physical_bytes {
+        Some(_) => {
+            let host = host_memory()?;
+            plan.available_bytes = Some(host.available());
+            plan.physical_bytes = Some(host.physical);
+            mapped_gate(&host, anonymous_need, MAPPED_MARGIN)
         }
-        None => desired,
+        None => MappedGate {
+            bank_budget: pack_bytes,
+            non_reclaimable: 0,
+            anonymous_need,
+        },
     };
-    if budget == 0 {
-        return Err(Error::from_reason(
-            "Qwen4 mapped residency has no whole GiB for dense banks after system/working reserves",
-        ));
+    plan.mapped_bank_budget = gate.bank_budget;
+    plan.live_non_reclaimable = gate.non_reclaimable;
+    if gate.bank_budget < pack_bytes {
+        return Err(Error::from_reason(format!(
+            "mapped banks need {:.1} GiB, the host leaves {:.1} GiB beside {:.1} GiB live memory, {:.1} GiB anonymous need and a {:.0} GiB margin",
+            pack_bytes as f64 / (1u64 << 30) as f64,
+            gate.bank_budget as f64 / (1u64 << 30) as f64,
+            gate.non_reclaimable as f64 / (1u64 << 30) as f64,
+            anonymous_need as f64 / (1u64 << 30) as f64,
+            MAPPED_MARGIN as f64 / (1u64 << 30) as f64,
+        )));
     }
-    if plan.physical_bytes.is_some() {
-        admit(budget)?;
-    }
-    plan.budget = budget;
+    plan.budget = desired;
     plan.resident = false;
     plan.mapped = true;
+    Ok(())
+}
+
+/// The slot budget for a process that leaves mapped mode after a tripwire:
+/// the bootstrap rule over the live host, partial residency only. The
+/// process's own banks are already wired and so already outside
+/// `available`; the budget only has to cover what the store holds now.
+pub(super) fn slot_fallback_plan(plan: &mut Plan, held_bytes: u64) -> Result<()> {
+    let desired = plan
+        .hot_bytes
+        .checked_add((2 << 30) - 1)
+        .map(|n| (n >> 30) << 30)
+        .ok_or_else(|| Error::from_reason("Qwen4 hot-weight size overflow"))?;
+    let budget = match plan.physical_bytes {
+        Some(_) => {
+            let host = host_memory()?;
+            plan.available_bytes = Some(host.available());
+            automatic_budget(desired, host.available(), host.physical)
+        }
+        None => desired.min(super::weights::CACHE_BYTES),
+    };
+    plan.budget = budget.max(
+        held_bytes
+            .saturating_add(super::weights::MAX_READ_BYTES * 3)
+            .saturating_add((1 << 30) - 1)
+            >> 30
+            << 30,
+    );
+    plan.resident = false;
+    plan.mapped = false;
+    plan.mapped_bytes = 0;
+    plan.mapped_bank_budget = 0;
+    plan.partial_expert_slots = 0;
     Ok(())
 }
 
@@ -264,8 +389,14 @@ pub(super) fn maintain_freelist(physical: Option<u64>) {
     }
 }
 
-pub(super) fn check_growth_headroom() -> Result<()> {
-    if available_memory()? < system_reserve(physical_memory()?) {
+pub(super) fn check_growth_headroom(mapped: bool) -> Result<()> {
+    let host = host_memory()?;
+    let floor = if mapped {
+        MAPPED_TURN_FLOOR
+    } else {
+        system_reserve(host.physical)
+    };
+    if host.available() < floor {
         return Err(Error::from_reason(
             "Qwen4 stopped weight growth to preserve system headroom",
         ));
@@ -308,60 +439,9 @@ fn fits_with_headroom(bytes: u64, available: u64, reserve: u64) -> bool {
         .is_some_and(|need| need <= available)
 }
 
-/// Read `kern.memorystatus_vm_pressure_level`: levels below 2 are normal.
-#[cfg(target_os = "macos")]
-fn read_pressure_level() -> Result<i32> {
-    let mut pressure = 0i32;
-    let mut size = std::mem::size_of_val(&pressure);
-    if unsafe {
-        libc::sysctlbyname(
-            c"kern.memorystatus_vm_pressure_level".as_ptr(),
-            (&mut pressure as *mut i32).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(Error::from_reason(
-            "Cannot read macOS memory pressure for Qwen4 bootstrap",
-        ));
-    }
-    Ok(pressure)
-}
-
-/// Wait out a transient pressure spike before failing a load. The ignore
-/// opt-out is checked before the first read so it bypasses the gate entirely,
-/// including a sysctl failure. Injection points keep the timing testable.
-#[cfg(any(target_os = "macos", test))]
-fn wait_for_pressure(
-    mut read: impl FnMut() -> Result<i32>,
-    ignore_flag: impl Fn() -> bool,
-    mut sleep: impl FnMut(std::time::Duration),
-) -> Result<()> {
-    if ignore_flag() {
-        return Ok(());
-    }
-    let mut retries = 0;
-    loop {
-        match read() {
-            Ok(level) if level < 2 => return Ok(()),
-            _ if retries < 12 => {
-                retries += 1;
-                sleep(std::time::Duration::from_millis(250));
-            }
-            _ => {
-                return Err(Error::from_reason(
-                    "Qwen4 bootstrap requires normal, readable macOS memory pressure",
-                ));
-            }
-        }
-    }
-}
-
 /// Re-check the SSD read safety limit after freeing the allocator freelist.
-/// A freelist spike is transient; real pressure still refuses after the same
-/// bounded re-poll the bootstrap pressure gate uses.
+/// A freelist spike is transient; real pressure still refuses after a
+/// bounded re-poll.
 pub(super) fn check_active_memory_budget(
     cache_limit: u64,
     mut active: impl FnMut() -> f64,
@@ -383,8 +463,12 @@ pub(super) fn check_active_memory_budget(
     ))
 }
 
-#[cfg(target_os = "macos")]
 fn available_memory() -> Result<u64> {
+    Ok(host_memory()?.available())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn host_memory() -> Result<HostMemory> {
     unsafe extern "C" {
         fn mach_host_self() -> libc::mach_port_t;
         static mach_task_self_: libc::mach_port_t;
@@ -393,11 +477,6 @@ fn available_memory() -> Result<u64> {
             name: libc::mach_port_t,
         ) -> libc::kern_return_t;
     }
-    wait_for_pressure(
-        read_pressure_level,
-        || runtime_flags::is_one(c"MLX_QWEN4_IGNORE_MEMORY_PRESSURE"),
-        std::thread::sleep,
-    )?;
     let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
     let mut count = libc::HOST_VM_INFO64_COUNT;
     let host = unsafe { mach_host_self() };
@@ -419,16 +498,46 @@ fn available_memory() -> Result<u64> {
         ));
     }
     let stats = unsafe { stats.assume_init() };
-    // Exclude anonymous inactive memory and the compressor: growing the model
-    // cache must not assume that the OS can compress/swap the user's apps.
-    Ok((u64::from(stats.free_count) + u64::from(stats.external_page_count)) * page_size as u64)
+    let page = page_size as u64;
+    Ok(HostMemory {
+        physical: physical_memory()?,
+        free: u64::from(stats.free_count) * page,
+        file: u64::from(stats.external_page_count) * page,
+        anonymous: u64::from(stats.internal_page_count) * page,
+        purgeable: u64::from(stats.purgeable_count) * page,
+        wired: u64::from(stats.wire_count) * page,
+        compressor: u64::from(stats.compressor_page_count) * page,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn available_memory() -> Result<u64> {
+pub(super) fn host_memory() -> Result<HostMemory> {
     Err(Error::from_reason(
         "Qwen4 larger-cache admission is currently available only on macOS",
     ))
+}
+
+/// Bytes this process has read from disk since it started
+/// (`proc_pid_rusage`, the counter the mapped pack's page-ins land in).
+#[cfg(target_os = "macos")]
+pub(super) fn process_disk_reads() -> u64 {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+    unsafe { info.assume_init() }.ri_diskio_bytesread
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn process_disk_reads() -> u64 {
+    0
 }
 
 #[cfg(test)]
@@ -475,66 +584,86 @@ mod tests {
     }
 
     #[test]
-    fn mapped_residency_needs_auto_a_complete_pack_and_a_quarter_of_ram_free() {
-        let physical = Some(128u64 << 30);
-        let hot = 78u64 << 30;
-        assert!(mapped_residency_selected(
-            "auto", false, hot, physical, true, false
-        ));
+    fn mapped_residency_needs_auto_and_a_complete_pack() {
+        assert!(mapped_residency_selected("auto", false, true, false));
         // MLX_QWEN4_WEIGHT_CACHE_GIB pins an anonymous budget: slots.
-        assert!(!mapped_residency_selected(
-            "auto", true, hot, physical, true, false
-        ));
-        assert!(!mapped_residency_selected(
-            "stream", false, hot, physical, true, false
-        ));
-        assert!(!mapped_residency_selected(
-            "full", false, hot, physical, true, false
-        ));
+        assert!(!mapped_residency_selected("auto", true, true, false));
+        assert!(!mapped_residency_selected("stream", false, true, false));
+        assert!(!mapped_residency_selected("full", false, true, false));
         // MLX_QWEN4_MAPPED_PACK=0 is the slot A/B arm.
-        assert!(!mapped_residency_selected(
-            "auto", false, hot, physical, true, true
-        ));
-        assert!(!mapped_residency_selected(
-            "auto", false, hot, physical, false, false
-        ));
-        assert!(!mapped_residency_selected(
-            "auto", false, hot, None, true, false
-        ));
-        assert!(mapped_residency_selected(
-            "auto",
-            false,
-            96 << 30,
-            physical,
-            true,
-            false
-        ));
-        assert!(!mapped_residency_selected(
-            "auto",
-            false,
-            (96 << 30) + 1,
-            physical,
-            true,
-            false
-        ));
-        assert!(!mapped_residency_selected(
-            "auto",
-            false,
-            hot,
-            Some(96 << 30),
-            true,
-            false
-        ));
+        assert!(!mapped_residency_selected("auto", false, true, true));
+        assert!(!mapped_residency_selected("auto", false, false, false));
     }
 
+    fn gib(n: f64) -> u64 {
+        (n * (1u64 << 30) as f64) as u64
+    }
+
+    /// The desktop of 2026-10-19 15:47 (vm_stat): the same free memory with
+    /// a 40 GiB anonymous hog beside it must send the pack to slots, and
+    /// free memory alone must not admit it.
     #[test]
-    fn mapped_budget_holds_dense_banks_bounded_auxiliary_and_lru_room() {
-        let gib = |n: f64| (n * (1u64 << 30) as f64) as u64;
-        assert_eq!(mapped_desired(gib(3.8), 0), 6 << 30);
-        assert_eq!(mapped_desired(gib(3.8), gib(4.7)), 11 << 30);
-        assert_eq!(mapped_desired(gib(3.8), 20 << 30), 14 << 30);
-        assert_eq!(mapped_desired(0, 0), 2 << 30);
-        let mut plan = Plan {
+    fn mapped_gate_reads_live_memory_not_free() {
+        let pack = gib(73.15);
+        let need = gib(13.0);
+        let quiet = HostMemory {
+            physical: 128 << 30,
+            free: gib(77.3),
+            file: gib(10.0),
+            anonymous: gib(20.1),
+            purgeable: gib(0.7),
+            wired: gib(13.2),
+            compressor: gib(7.5),
+        };
+        let gate = mapped_gate(&quiet, need, 0);
+        assert_eq!(
+            gate.non_reclaimable,
+            gib(13.2) + gib(7.5) + gib(20.1) - gib(0.7)
+        );
+        assert_eq!(
+            gate.bank_budget,
+            (128u64 << 30) - gate.non_reclaimable - need
+        );
+        assert!(gate.bank_budget >= pack, "the quiet desktop holds the pack");
+        assert!(
+            mapped_gate(&quiet, need, MAPPED_MARGIN).bank_budget < pack,
+            "with the margin this desktop is 2 GiB short"
+        );
+        // A touching 40 GiB hog: the kernel compressed and swapped idle apps
+        // for it, so free barely moved while anonymous grew.
+        let hog = HostMemory {
+            free: gib(70.0),
+            anonymous: gib(20.1) + gib(40.0),
+            compressor: gib(9.0),
+            ..quiet
+        };
+        assert!(
+            mapped_gate(&hog, need, 0).bank_budget < pack,
+            "live anonymous memory decides, not free"
+        );
+        assert!(mapped_gate(&hog, need, 0).bank_budget < gate.bank_budget - gib(39.0));
+        // M3's 20 GiB hog (det-hog-1: 1.06 TB of re-reads) is refused too.
+        let hog20 = HostMemory {
+            anonymous: gib(20.1) + gib(20.0),
+            ..quiet
+        };
+        assert!(mapped_gate(&hog20, need, 0).bank_budget < pack);
+        // Purgeable pages are reclaimable; wired and compressed are not.
+        let purgeable = HostMemory {
+            purgeable: gib(30.0),
+            ..hog20
+        };
+        assert!(mapped_gate(&purgeable, need, 0).bank_budget >= pack);
+        let wired = HostMemory {
+            wired: gib(13.2) + gib(20.0),
+            ..quiet
+        };
+        assert!(mapped_gate(&wired, need, 0).bank_budget < pack);
+        assert_eq!(mapped_gate(&quiet, u64::MAX, 0).bank_budget, 0);
+    }
+
+    fn plan_without_snapshot() -> Plan {
+        Plan {
             budget: 73 << 30,
             hot_bytes: 83_631_869_440,
             resident: true,
@@ -547,12 +676,43 @@ mod tests {
             mapped_pack_files: 144,
             mapped: false,
             mapped_bytes: 0,
-        };
+            mapped_bank_budget: 0,
+            live_non_reclaimable: 0,
+        }
+    }
+
+    #[test]
+    fn mapped_budget_holds_dense_banks_bounded_auxiliary_and_lru_room() {
+        assert_eq!(mapped_desired(gib(3.8), 0), 6 << 30);
+        assert_eq!(mapped_desired(gib(3.8), gib(4.7)), 11 << 30);
+        assert_eq!(mapped_desired(gib(3.8), 20 << 30), 14 << 30);
+        assert_eq!(mapped_desired(0, 0), 2 << 30);
+        let mut plan = plan_without_snapshot();
         // No live snapshot (fixtures, other platforms): the desired budget is
-        // taken as is and nothing is admitted against the host.
-        mapped_plan(&mut plan, gib(3.8), 0).unwrap();
+        // taken as is and the bank budget is the pack.
+        mapped_plan(&mut plan, gib(3.8), 0, 1 << 30, gib(73.15)).unwrap();
         assert!(plan.mapped && !plan.resident);
         assert_eq!(plan.budget, 6 << 30);
+        assert_eq!(plan.mapped_bank_budget, gib(73.15));
+    }
+
+    #[test]
+    fn slot_fallback_plan_covers_what_the_store_holds() {
+        let mut plan = plan_without_snapshot();
+        plan.mapped = true;
+        plan.mapped_bytes = gib(73.15);
+        plan.mapped_bank_budget = gib(74.0);
+        slot_fallback_plan(&mut plan, gib(11.4)).unwrap();
+        assert!(!plan.mapped && !plan.resident);
+        assert_eq!(plan.mapped_bytes, 0);
+        assert_eq!(plan.mapped_bank_budget, 0);
+        assert_eq!(
+            plan.budget,
+            super::super::weights::CACHE_BYTES.max(12 << 30)
+        );
+        plan.budget = 0;
+        slot_fallback_plan(&mut plan, 0).unwrap();
+        assert_eq!(plan.budget, super::super::weights::CACHE_BYTES);
     }
 
     #[test]
@@ -570,6 +730,8 @@ mod tests {
             mapped_pack_files: 0,
             mapped: false,
             mapped_bytes: 0,
+            mapped_bank_budget: 0,
+            live_non_reclaimable: 0,
         };
         let mut plan = original.clone();
         refresh_from_snapshot(&mut plan, 94 << 30, 128 << 30).unwrap();
@@ -586,58 +748,6 @@ mod tests {
         refresh_from_snapshot(&mut full, 112 << 30, 128 << 30).unwrap();
         assert!(full.resident);
         assert!(refresh_from_snapshot(&mut plan, 19 << 30, 128 << 30).is_err());
-    }
-
-    #[test]
-    fn pressure_gate_waits_out_a_transient_spike() {
-        use std::sync::{Arc, Mutex};
-        let levels = Arc::new(Mutex::new(vec![2, 1].into_iter()));
-        let sleeps = Arc::new(Mutex::new(Vec::new()));
-        let read = {
-            let levels = Arc::clone(&levels);
-            move || {
-                levels
-                    .lock()
-                    .unwrap()
-                    .next()
-                    .ok_or_else(|| Error::from_reason("unexpected extra read"))
-            }
-        };
-        let sleep = {
-            let sleeps = Arc::clone(&sleeps);
-            move |d| sleeps.lock().unwrap().push(d)
-        };
-        super::wait_for_pressure(read, || false, sleep).unwrap();
-        assert_eq!(
-            *sleeps.lock().unwrap(),
-            vec![std::time::Duration::from_millis(250)]
-        );
-    }
-
-    #[test]
-    fn pressure_gate_gives_up_after_bounded_retries() {
-        let mut sleeps = 0;
-        let err = super::wait_for_pressure(|| Ok(3), || false, |_| sleeps += 1).unwrap_err();
-        assert_eq!(sleeps, 12);
-        assert!(
-            err.reason
-                .contains("requires normal, readable macOS memory pressure")
-        );
-    }
-
-    #[test]
-    fn pressure_gate_ignore_bypasses_unreadable_sysctl() {
-        let mut reads = 0;
-        super::wait_for_pressure(
-            || {
-                reads += 1;
-                Err(Error::from_reason("sysctl unavailable"))
-            },
-            || true,
-            |_| panic!("ignore must not wait"),
-        )
-        .unwrap();
-        assert_eq!(reads, 0);
     }
 
     #[test]

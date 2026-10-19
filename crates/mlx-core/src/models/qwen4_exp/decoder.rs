@@ -1721,12 +1721,15 @@ impl Decoder {
     pub fn step(&mut self, token: u32) -> Result<MxArray> {
         let _flags = runtime_flags::scope();
         self.rotary_tables.get_mut().clear();
+        let started = std::time::Instant::now();
         let result = self.forward_with_device_routes(token, true);
         self.rotary_tables.get_mut().clear();
         // A read failure or cancellation can happen after earlier layers have
         // advanced. Discard the entire prefix instead of reusing partial state.
         if result.is_err() {
             self.reset();
+        } else {
+            self.weights.observe_pass(1, started.elapsed());
         }
         result
     }
@@ -1828,10 +1831,13 @@ impl Decoder {
             self.weights.check_forward_headroom()?;
         }
         self.rotary_tables.get_mut().clear();
+        let started = std::time::Instant::now();
         let result = self.prefill_with_device_routes(tokens, embeddings, project_logits);
         self.rotary_tables.get_mut().clear();
         if result.is_err() {
             self.reset();
+        } else {
+            self.weights.observe_pass(tokens.len(), started.elapsed());
         }
         result
     }

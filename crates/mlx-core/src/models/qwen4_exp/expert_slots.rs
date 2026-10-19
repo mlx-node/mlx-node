@@ -137,10 +137,12 @@ impl Store {
     }
 
     /// Map every routed expert of every layer from the pack when `auto`
-    /// residency selects it (memory::mapped_residency_selected), replacing
-    /// the slot budget by one for dense banks and auxiliary rows only. Any
-    /// failure leaves the slot path in charge.
-    pub(in super::super) fn select_mapped_residency(&mut self) -> Result<()> {
+    /// residency selects it (memory::mapped_residency_selected) and the live
+    /// host holds the pack beside what stays anonymous (memory::mapped_plan),
+    /// replacing the slot budget by one for dense banks and auxiliary rows
+    /// only. Any failure leaves the slot path in charge. `pool_bytes` is the
+    /// paged KV pool created before this decision.
+    pub(in super::super) fn select_mapped_residency(&mut self, pool_bytes: u64) -> Result<()> {
         let Some(experts) = self
             .metadata
             .get("qwen4exp.expert_count")
@@ -148,10 +150,9 @@ impl Store {
         else {
             return Ok(());
         };
-        let physical = self.plan.physical_bytes;
         self.select_mapped_residency_with(
             experts as usize,
-            physical,
+            pool_bytes,
             &mut super::super::memory::mapped_plan,
         )
     }
@@ -159,8 +160,8 @@ impl Store {
     pub(super) fn select_mapped_residency_with(
         &mut self,
         experts: usize,
-        physical: Option<u64>,
-        plan: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64) -> Result<()>,
+        pool_bytes: u64,
+        plan: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64, u64, u64) -> Result<()>,
     ) -> Result<()> {
         if !self.gguf
             || experts == 0
@@ -194,11 +195,28 @@ impl Store {
         if !super::super::memory::mapped_residency_selected(
             &self.plan.policy,
             super::super::memory::explicit_weight_budget(),
-            self.plan.hot_bytes,
-            physical,
             complete,
             super::super::memory::mapped_pack_disabled(),
         ) {
+            return Ok(());
+        }
+        let pack_bytes: u64 = layers
+            .iter()
+            .flat_map(|&layer| names(layer))
+            .filter_map(|name| pack.file(&name))
+            .flat_map(|file| file.header.sections.iter().map(|s| s.length))
+            .sum();
+        let dense = self.fixed_projection_bytes()?;
+        let auxiliary = self.auxiliary_bytes()?;
+        let mut candidate = self.plan.clone();
+        if let Err(e) = plan(&mut candidate, dense, auxiliary, pool_bytes, pack_bytes) {
+            self.plan.mapped_bank_budget = candidate.mapped_bank_budget;
+            self.plan.live_non_reclaimable = candidate.live_non_reclaimable;
+            tracing::warn!("qwen4 residency: slot path, {e}");
+            self.live.set_fallback(Fallback::LoadGate {
+                pack: pack_bytes,
+                budget: candidate.mapped_bank_budget,
+            });
             return Ok(());
         }
         let mut mapped = HashMap::with_capacity(layers.len());
@@ -220,12 +238,7 @@ impl Store {
                 }
             }
         }
-        let dense = self.fixed_projection_bytes()?;
-        let auxiliary = self.auxiliary_bytes()?;
-        if let Err(e) = plan(&mut self.plan, dense, auxiliary) {
-            tracing::warn!("qwen4 mapped residency not admitted, using slots: {e}");
-            return Ok(());
-        }
+        self.plan = candidate;
         let files = (0..=layers.last().copied().unwrap_or(0))
             .map(|layer| mapped.get(&layer).map(|experts| experts.maps.clone()))
             .collect();
@@ -243,11 +256,94 @@ impl Store {
         self.plan.mapped_bytes = bytes;
         self.plan.partial_expert_slots = experts;
         self.mapped_experts = mapped;
+        self.live.store(&self.plan);
         tracing::info!(
-            "qwen4 mapped residency: {} layers x {experts} experts, {:.1} GiB mapped, {:.1} GiB budget for dense banks and rows",
+            "qwen4 mapped residency: {} layers x {experts} experts, {:.1} GiB mapped within a {:.1} GiB bank budget ({:.1} GiB live host memory), {:.1} GiB budget for dense banks and rows",
             layers.len(),
             bytes as f64 / (1u64 << 30) as f64,
+            self.plan.mapped_bank_budget as f64 / (1u64 << 30) as f64,
+            self.plan.live_non_reclaimable as f64 / (1u64 << 30) as f64,
             self.cache_limit as f64 / (1u64 << 30) as f64
+        );
+        Ok(())
+    }
+
+    /// Publish the residency the load settled on.
+    pub(in super::super) fn publish_live(&self) {
+        self.live.store(&self.plan);
+    }
+
+    /// A turn starts: a tripped mapped process moves to the slot path first,
+    /// then the turn's SSD count begins. Returns the fallback applied.
+    pub(in super::super) fn begin_turn(&mut self) -> Result<Option<Fallback>> {
+        let applied = match self.tripwire.take() {
+            Some(why) if self.plan.mapped => {
+                self.leave_mapped(&why)?;
+                Some(why)
+            }
+            _ => None,
+        };
+        self.tripwire
+            .begin_turn(super::super::memory::process_disk_reads());
+        Ok(applied)
+    }
+
+    /// One main-network pass over `rows` rows took `elapsed`.
+    pub(in super::super) fn observe_pass(&mut self, rows: usize, elapsed: Duration) {
+        if !self.plan.mapped {
+            return;
+        }
+        let reads = super::super::memory::process_disk_reads();
+        if let Some(why) = self
+            .tripwire
+            .observe(rows, elapsed, reads, self.plan.mapped_bytes)
+        {
+            tracing::warn!(
+                "qwen4 residency: mapped turn thrashes ({why}); the next turn runs on slots"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn trip(&mut self, why: Fallback) {
+        self.tripwire.begin_turn(0);
+        let mapped = self.plan.mapped_bytes;
+        match why {
+            Fallback::SsdReads { read, .. } => {
+                self.tripwire.observe(1, Duration::ZERO, read, mapped);
+            }
+            other => panic!("test trips through SSD reads only, not {other}"),
+        }
+    }
+
+    /// Drop the mapped banks and run the slot path from here on: the slot
+    /// budget from the live host, banks built lazily by `expert_slots`, the
+    /// dense banks and rows already held kept.
+    fn leave_mapped(&mut self, why: &Fallback) -> Result<()> {
+        let mut plan = self.plan.clone();
+        super::super::memory::slot_fallback_plan(&mut plan, self.cache_bytes)?;
+        let experts = self.mapped_experts.values().next().map(|m| m.experts);
+        self.mapped_experts.clear();
+        self.prefetch = None;
+        self.prefetch_pass = false;
+        self.mapped_pass_start = None;
+        self.slot_capacity = None;
+        self.plan = plan;
+        self.cache_limit = self.plan.budget;
+        if let (Some(experts), Some(top)) = (
+            experts,
+            self.metadata
+                .get("qwen4exp.expert_used_count")
+                .and_then(GgufMetaValue::as_u64),
+        ) {
+            self.plan.partial_expert_slots = self.expert_slot_capacity(experts, top as usize)?;
+        }
+        self.live.set_fallback(why.clone());
+        self.live.store(&self.plan);
+        tracing::warn!(
+            "qwen4 residency: mapped -> slots ({why}); {:.1} GiB slot budget, {} slots",
+            self.cache_limit as f64 / (1u64 << 30) as f64,
+            self.plan.partial_expert_slots
         );
         Ok(())
     }
