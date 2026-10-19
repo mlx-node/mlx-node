@@ -252,7 +252,16 @@ impl Decoder {
             // Rows whose complete blocks fit the budget select all of them
             // (the rest are -1), so the kernel is causal for those rows.
             let (selected, query_ends) = self.qsa_select(i, cache, &projections.iq, base, t)?;
-            math::qsa_attention(&q, &keys, &values, &selected, &query_ends, scale, ratio)?
+            math::qsa_attention(
+                &q,
+                &keys,
+                &values,
+                &selected,
+                &query_ends,
+                scale,
+                ratio,
+                math::QsaKernel::ByCapability,
+            )?
         } else {
             crate::array::scaled_dot_product_attention_causal(&q, &keys, &values, scale)?
         };

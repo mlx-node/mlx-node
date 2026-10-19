@@ -1819,9 +1819,35 @@ pub(super) fn qsa_select(
     Ok((selected, query_ends))
 }
 
-/// mlx-vlm's indexed QSA kernel. `selected` is `[1, t, topk]` sorted block ids
+/// Which indexed QSA kernel runs a window. Both write the same bits; the
+/// paired kernel reads each K/V row once for two heads of the kv group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QsaKernel {
+    /// The paired kernel when its pipeline holds the 1024-thread threadgroup
+    /// on this GPU, the single-head kernel otherwise.
+    ByCapability,
+    #[cfg(test)]
+    SingleHead,
+    #[cfg(test)]
+    PairedHeads,
+}
+
+impl QsaKernel {
+    fn heads_per_group(self) -> i32 {
+        match self {
+            Self::ByCapability => 0,
+            #[cfg(test)]
+            Self::SingleHead => 1,
+            #[cfg(test)]
+            Self::PairedHeads => 2,
+        }
+    }
+}
+
+/// mlx-vlm's indexed QSA kernel. `selected` is `[b, t, topk]` sorted block ids
 /// with -1 for unused picks; each row also attends its incomplete block up to
-/// `query_ends` (`[1, t]`, exclusive).
+/// `query_ends` (`[b, t]`, exclusive).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn qsa_attention(
     q: &MxArray,
     keys: &MxArray,
@@ -1830,6 +1856,7 @@ pub(super) fn qsa_attention(
     query_ends: &MxArray,
     scale: f64,
     block_size: usize,
+    kernel: QsaKernel,
 ) -> Result<MxArray> {
     let mut out = std::ptr::null_mut();
     let ok = unsafe {
@@ -1841,6 +1868,7 @@ pub(super) fn qsa_attention(
             query_ends.as_raw_ptr(),
             scale as f32,
             block_size as i32,
+            kernel.heads_per_group(),
             &mut out,
         )
     };
@@ -1848,6 +1876,31 @@ pub(super) fn qsa_attention(
         return Err(Error::from_reason("Qwen4 sparse attention kernel failed"));
     }
     MxArray::from_handle(out, "Qwen4 sparse attention")
+}
+
+/// `maxTotalThreadsPerThreadgroup` of `kernel`'s pipeline (`SingleHead` or
+/// `PairedHeads`) for these arrays on this GPU; 0 when it cannot be built.
+#[cfg(test)]
+pub(super) fn qsa_pipeline_threads(
+    q: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    selected: &MxArray,
+    query_ends: &MxArray,
+    block_size: usize,
+    kernel: QsaKernel,
+) -> i32 {
+    unsafe {
+        mlx_sys::mlx_qwen4_qsa_attention_pipeline_threads(
+            q.as_raw_ptr(),
+            keys.as_raw_ptr(),
+            values.as_raw_ptr(),
+            selected.as_raw_ptr(),
+            query_ends.as_raw_ptr(),
+            block_size as i32,
+            kernel.heads_per_group(),
+        )
+    }
 }
 
 pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
