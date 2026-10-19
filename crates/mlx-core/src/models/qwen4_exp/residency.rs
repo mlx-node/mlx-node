@@ -3,6 +3,7 @@
 //! vision/MTP remain demand loaded. All source reads stay bounded.
 use super::*;
 use crate::models::qwen4_exp::runtime_flags;
+use std::sync::atomic::Ordering;
 
 pub(super) fn is_auxiliary(name: &str) -> bool {
     ["mtp.", "visual.", "vision_tower.", "v.", "mm.", "nextn."]
@@ -370,9 +371,10 @@ impl Store {
         self.protected.clear();
         self.protected_bytes = 0;
         self.bank_bytes = 0;
+        self.mtp_banks_declined = false;
         self.cache_bytes = 0;
         self.growth_bytes = 0;
-        self.plan.resident_bank_bytes = 0;
+        self.plan.resident_bank_bytes.store(0, Ordering::Relaxed);
         self.plan.resident_expert_layers = 0;
         self.plan.partial_expert_slots = 0;
         crate::array::memory::synchronize_and_clear_cache();
@@ -511,7 +513,9 @@ impl Store {
         let bytes = bank.bytes()?;
         self.bank_bytes += bytes;
         self.cache_bytes += bytes;
-        self.plan.resident_bank_bytes = self.bank_bytes;
+        self.plan
+            .resident_bank_bytes
+            .store(self.bank_bytes, Ordering::Relaxed);
         self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
         self.banks.insert(name, Arc::new(bank));
         Ok(())
@@ -568,18 +572,33 @@ impl Store {
 
     /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
     /// so a draft step gathers them on the device. Runs once, on the first MTP
-    /// owner; the whole aux tensor streams through 64 MiB row chunks.
+    /// owner; the whole aux tensor streams through 64 MiB row chunks. Both
+    /// banks or none: nothing is installed or charged until both evaluated,
+    /// and a cache that cannot stage them keeps the row-reader draft path.
     pub(in super::super) fn prepare_mtp_expert_banks(&mut self) -> Result<u64> {
-        if MTP_EXPERT_BANKS
-            .iter()
-            .any(|name| !self.tensors.contains_key(*name))
+        self.prepare_mtp_expert_banks_with(&mut super::super::memory::admit)
+    }
+
+    pub(super) fn prepare_mtp_expert_banks_with(
+        &mut self,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+    ) -> Result<u64> {
+        if self.mtp_banks_declined
+            || MTP_EXPERT_BANKS
+                .iter()
+                .any(|name| !self.tensors.contains_key(*name))
         {
             return Ok(0);
         }
+        if MTP_EXPERT_BANKS
+            .iter()
+            .all(|name| self.banks.contains_key(*name))
+        {
+            return self.mtp_bank_bytes();
+        }
+        let mut specs = Vec::with_capacity(MTP_EXPERT_BANKS.len());
+        let (mut total, mut peak) = (0u64, 0u64);
         for name in MTP_EXPERT_BANKS {
-            if self.banks.contains_key(name) {
-                continue;
-            }
             let d = self.descriptor(name)?.clone();
             let (rows, width) = (d.rows()?, d.width()?);
             // MLX affine quantization needs K % 32 == 0; a narrower expert
@@ -589,18 +608,53 @@ impl Store {
                 .saturating_mul(width as u64)
                 .saturating_mul(if quantized { 9 } else { 16 })
                 / 8;
+            // Imported chunks and the concatenated bank coexist while the
+            // earlier banks are already held.
+            peak = peak.max(total.saturating_add(bytes.saturating_mul(2)));
+            total = total.saturating_add(bytes);
+            specs.push((name, d, rows, width, quantized, bytes));
+        }
+        let pinned = self.protected_bytes + self.bank_bytes + self.slot_bytes;
+        let room = self.cache_limit.saturating_sub(pinned);
+        if total > self.auxiliary_cache_allowance()?
+            || peak.saturating_add(MAX_READ_BYTES * 3) > room
+        {
+            self.mtp_banks_declined = true;
+            return Ok(0);
+        }
+        let built = match self.build_mtp_expert_banks(&specs, admit) {
+            Ok(built) => built,
+            Err(error) => {
+                self.mtp_banks_declined = true;
+                return Err(error);
+            }
+        };
+        for (name, bank) in built {
+            self.install_bank(name.into(), bank)?;
+        }
+        super::super::memory::maintain_freelist(self.plan.physical_bytes);
+        self.mtp_bank_bytes()
+    }
+
+    fn build_mtp_expert_banks(
+        &mut self,
+        specs: &[(&'static str, Tensor, usize, usize, bool, u64)],
+        admit: &mut impl FnMut(u64) -> Result<()>,
+    ) -> Result<Vec<(&'static str, Weight)>> {
+        let mut built = Vec::with_capacity(specs.len());
+        let mut held = 0u64;
+        for (name, d, rows, width, quantized, bytes) in specs {
+            let (rows, width, bytes) = (*rows, *width, *bytes);
             self.evict_to(
                 self.cache_limit
-                    .saturating_sub(bytes.saturating_mul(2) + MAX_READ_BYTES * 3),
+                    .saturating_sub(held + bytes.saturating_mul(2) + MAX_READ_BYTES * 3),
             )?;
-            super::super::memory::admit(
-                bytes.saturating_mul(2) + super::super::memory::WORKING_BYTES,
-            )?;
+            admit(bytes.saturating_mul(2) + super::super::memory::WORKING_BYTES)?;
             let chunk = (MAX_READ_BYTES as usize / (width * 4)).clamp(1, rows);
             let mut chunks = Vec::with_capacity(rows.div_ceil(chunk));
             for start in (0..rows).step_by(chunk) {
-                let values = d.import_safe_rows(start, (rows - start).min(chunk))?;
-                let weight = if quantized {
+                let values = d.import_rows(start, (rows - start).min(chunk))?.values;
+                let weight = if *quantized {
                     Weight::quantize_q8(&values)?
                 } else {
                     Weight {
@@ -635,10 +689,10 @@ impl Store {
             .collect();
             MxArray::eval_arrays_with_context(&arrays, "Qwen4 MTP expert bank")?;
             drop(chunks);
-            self.install_bank(name.into(), bank)?;
-            super::super::memory::maintain_freelist(self.plan.physical_bytes);
+            held += bank.bytes()?;
+            built.push((*name, bank));
         }
-        self.mtp_bank_bytes()
+        Ok(built)
     }
 }
 
@@ -1143,7 +1197,10 @@ mod tests {
                         .all(|name| is_fixed_projection(name, &store.tensors[name]))
                 );
                 assert_eq!(store.cache_bytes, store.bank_bytes);
-                assert_eq!(store.plan.resident_bank_bytes, store.bank_bytes);
+                assert_eq!(
+                    store.plan.resident_bank_bytes.load(Ordering::Relaxed),
+                    store.bank_bytes
+                );
                 assert!(store.bank_bytes < store.plan.hot_bytes);
                 assert!(
                     store.cache.is_empty()
@@ -1152,6 +1209,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mtp_banks_decline_when_the_cache_cannot_stage_both() {
+        // 3 x MAX_READ_BYTES lets the first bank's eviction target saturate
+        // to zero and pass; the second bank's cannot once the first is pinned.
+        let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+        s.cache_limit = MAX_READ_BYTES * 3;
+        let before = s.cache_bytes;
+        assert_eq!(s.prepare_mtp_expert_banks().unwrap(), 0);
+        assert_eq!(s.mtp_bank_bytes().unwrap(), 0);
+        assert!(MTP_EXPERT_BANKS.iter().all(|n| !s.banks.contains_key(*n)));
+        assert_eq!(s.cache_bytes, before);
+        assert_eq!(s.bank_bytes, 0);
+        assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), 0);
+        assert!(s.mtp_banks_declined, "a declined build must not retry");
+        s.cache_limit = CACHE_BYTES;
+        assert_eq!(s.prepare_mtp_expert_banks().unwrap(), 0);
+        s.mtp_banks_declined = false;
+        let bytes = s.prepare_mtp_expert_banks().unwrap();
+        assert!(bytes > 0);
+        assert_eq!(s.cache_bytes, before + bytes);
+    }
+
+    #[test]
+    fn failed_second_mtp_bank_leaves_no_partial_bank() {
+        let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+        let before = (s.cache_bytes, s.bank_bytes);
+        let mut admissions = 0;
+        let error = s
+            .prepare_mtp_expert_banks_with(&mut |_| {
+                admissions += 1;
+                if admissions == 2 {
+                    Err(err("simulated headroom loss before the second bank"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(error.reason.contains("second bank"), "{error}");
+        assert_eq!(admissions, 2);
+        assert!(MTP_EXPERT_BANKS.iter().all(|n| !s.banks.contains_key(*n)));
+        assert_eq!((s.cache_bytes, s.bank_bytes), before);
+        assert_eq!(s.mtp_bank_bytes().unwrap(), 0);
+        assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), 0);
+        assert!(s.mtp_banks_declined);
+        assert_eq!(s.prepare_mtp_expert_banks().unwrap(), 0);
+        s.mtp_banks_declined = false;
+        let bytes = s.prepare_mtp_expert_banks_with(&mut |_| Ok(())).unwrap();
+        assert!(bytes > 0);
+        assert!(MTP_EXPERT_BANKS.iter().all(|n| s.banks.contains_key(*n)));
+        assert_eq!(s.bank_bytes, before.1 + bytes);
+        assert_eq!(
+            s.plan.resident_bank_bytes.load(Ordering::Relaxed),
+            s.bank_bytes
+        );
     }
 
     #[test]
@@ -1183,7 +1296,7 @@ mod tests {
             assert!(!s.plan.resident);
             assert_eq!(s.bank_bytes, bytes);
             assert_eq!(s.cache_bytes, bytes);
-            assert_eq!(s.plan.resident_bank_bytes, bytes);
+            assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), bytes);
             assert!(s.cache.is_empty());
             assert_eq!(s.banks.len(), names.len());
             assert!(

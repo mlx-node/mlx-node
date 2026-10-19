@@ -133,51 +133,6 @@ impl Tensor {
         }
         Ok((self.offset + self.row_bytes()? * start as u64, bytes))
     }
-    /// Decode a row range of a safetensors tensor into an array without the LRU.
-    pub(super) fn import_safe_rows(&self, start: usize, rows: usize) -> Result<MxArray> {
-        let Encoding::Safe(dtype) = &self.encoding else {
-            return Err(err("Safetensors row import on a GGUF tensor"));
-        };
-        let (offset, bytes) = self.range(start, rows)?;
-        let shape = [rows as i64, self.width()? as i64];
-        let mut f = File::open(&self.path).map_err(err)?;
-        f.seek(SeekFrom::Start(offset)).map_err(err)?;
-        let mut buf = vec![0; bytes as usize];
-        f.read_exact(&mut buf).map_err(err)?;
-        let values = match dtype.as_str() {
-            "BF16" | "F16" => {
-                let v: Vec<u16> = buf
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                    .collect();
-                if dtype == "BF16" {
-                    MxArray::from_bfloat16(&v, &shape)?
-                } else {
-                    MxArray::from_float16(&v, &shape)?
-                }
-            }
-            "F32" => MxArray::from_float32(
-                &buf.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b))
-                    .collect::<Vec<_>>(),
-                &shape,
-            )?,
-            "I64" => MxArray::from_int64(
-                &buf.as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|b| i64::from_le_bytes(*b))
-                    .collect::<Vec<_>>(),
-                &shape,
-            )?,
-            _ => unreachable!(),
-        };
-        Ok(values)
-    }
     fn packed_key(&self, name: &str, start: usize, rows: usize) -> Result<Option<String>> {
         let (offset, bytes) = self.range(start, rows)?;
         Ok(match self.encoding {
@@ -507,6 +462,7 @@ pub struct Store {
     pub(super) plan: super::memory::Plan,
     banks: HashMap<String, Arc<Weight>>,
     bank_bytes: u64,
+    mtp_banks_declined: bool,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
     mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
@@ -621,7 +577,7 @@ impl Store {
                 policy: "stream".into(),
                 available_bytes: None,
                 physical_bytes: None,
-                resident_bank_bytes: 0,
+                resident_bank_bytes: Default::default(),
                 resident_expert_layers: 0,
                 partial_expert_slots: 0,
                 mapped_pack_files: 0,
@@ -632,6 +588,7 @@ impl Store {
             },
             banks: HashMap::new(),
             bank_bytes: 0,
+            mtp_banks_declined: false,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
             mapped_experts: HashMap::new(),
@@ -965,6 +922,15 @@ impl Store {
     #[cfg(test)]
     pub(super) fn lru_holds(&self, name: &str) -> bool {
         self.cache.keys().any(|(n, _, _)| n == name)
+    }
+    #[cfg(test)]
+    pub(super) fn cached_bytes(&self) -> u64 {
+        self.cache_bytes
+    }
+    #[cfg(test)]
+    pub(super) fn set_cache_limit(&mut self, bytes: u64) {
+        self.cache_limit = bytes;
+        self.plan.budget = bytes;
     }
     pub fn descriptor(&self, name: &str) -> Result<&Tensor> {
         self.tensors

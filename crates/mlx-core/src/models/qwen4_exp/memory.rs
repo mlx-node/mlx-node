@@ -2,6 +2,8 @@
 //! applications, recurrent state, page pools and transient work.
 use crate::models::qwen4_exp::runtime_flags;
 use napi::{Error, Result};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 pub(super) const FREE_CACHE_BYTES: u64 = 512 << 20;
 pub(super) const WORKING_BYTES: u64 = 4 << 30;
@@ -14,7 +16,10 @@ pub(super) struct Plan {
     pub policy: String,
     pub available_bytes: Option<u64>,
     pub physical_bytes: Option<u64>,
-    pub resident_bank_bytes: u64,
+    /// Shared with the model handle's clone: banks installed on the model
+    /// thread after load (the MTP expert banks) publish their bytes here so
+    /// `residencyInfo` reports what is actually pinned.
+    pub resident_bank_bytes: Arc<AtomicU64>,
     pub resident_expert_layers: usize,
     pub partial_expert_slots: usize,
     /// Routed expert tensors served from the mapped pack (0 = chunk reader).
@@ -198,7 +203,7 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
         policy,
         available_bytes: snapshot.map(|s| s.0),
         physical_bytes: snapshot.map(|s| s.1),
-        resident_bank_bytes: 0,
+        resident_bank_bytes: Arc::default(),
         resident_expert_layers: 0,
         partial_expert_slots: 0,
         mapped_pack_files: 0,
@@ -799,7 +804,7 @@ mod tests {
             policy: "auto".into(),
             available_bytes: None,
             physical_bytes: None,
-            resident_bank_bytes: 0,
+            resident_bank_bytes: Arc::default(),
             resident_expert_layers: 0,
             partial_expert_slots: 442,
             mapped_pack_files: 144,
@@ -1168,7 +1173,7 @@ mod tests {
             policy: "auto".into(),
             available_bytes: Some(99 << 30),
             physical_bytes: Some(128 << 30),
-            resident_bank_bytes: 0,
+            resident_bank_bytes: Arc::default(),
             resident_expert_layers: 0,
             partial_expert_slots: 0,
             mapped_pack_files: 0,
