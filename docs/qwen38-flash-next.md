@@ -71,11 +71,16 @@ wires every bank, so a mapped turn cannot keep the slot path's free/file
 reserve; it stops growing anonymous memory only below 2 GiB of free plus file
 cache. A mapped turn that reads more than twice the pack from SSD, or runs
 eight consecutive passes over ten times the running median of their kind
-(the streak starts over with every turn, whose first pass is the bank
-re-wire), finishes as it is and the next turn runs on the slot path: banks
-and read-ahead released first, then the slot budget read from the live host
-once wired memory has settled; the reason, the bytes or the step count
-are reported. Turns run without a wired-limit context (it does not pin
+(the streak and the SSD count start over when a turn opens on an idle model,
+whose first pass is the bank re-wire; turns admitted while others run join
+the window in progress), finishes as it is and the next turn to open runs on
+the slot path, every turn still open with it (residency is one per model):
+banks and read-ahead released first, then the slot budget read from the live
+host once wired memory has fallen and held for a second of fresh samples
+(`host_statistics64` repeats its last answer between its few fresh reads per
+second; such copies are skipped), at most 3 s; the prefill window is derived
+from the slot allowance again; the reason, the bytes or the step count are
+reported. Turns run without a wired-limit context (it does not pin
 file-backed buffers and only delays their release), the mid-turn staging
 admission is gone with the staging, the SSD safety limit subtracts the mapped
 bytes MLX counts in `active_memory`, and a lookup window's decoded rows share
@@ -168,7 +173,6 @@ before erroring.
 | `MLX_QWEN4_MAPPED_PACK=0`    | Keep the slot path although the mapped pack is complete (A/B arm).      |
 | `MLX_QWEN4_PREFETCH_LAYERS`  | Layers of the mapped pack read ahead of the one computing when a pass starts over a pack that is not fully resident (default 3; `0` disables read-ahead and a stale pass always touches every bank). |
 | `MLX_QWEN4_PREFETCH_AT_LOAD=1` | Ask the kernel for the whole mapped pack as the model loads (opt-in; moves the first prompt's SSD time into the load). |
-| `MLX_QWEN4_PREFILL_CHUNK`    | Power of two from 1–1024, constrained by the working-memory allowance.  |
 | `MLX_QWEN4_BATCHED_QSA=0`    | Run prompt windows past the indexer budget one token at a time instead of the batched sparse-attention kernel. |
 | `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |

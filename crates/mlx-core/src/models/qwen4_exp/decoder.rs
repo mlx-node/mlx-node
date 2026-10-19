@@ -134,7 +134,7 @@ impl Decoder {
 
     pub fn new(config: Config, weights: Store) -> Result<Self> {
         // Validate the checkpoint topology before the first tensor payload read.
-        let prefill_chunk_size = super::memory::prefill_window(&config, &weights.plan)?;
+        let prefill_chunk_size = super::memory::prefill_window(&config, &weights.plan);
         let d = Self {
             prefill_chunk_size,
             window_carry: true,

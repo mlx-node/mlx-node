@@ -92,6 +92,9 @@ pub struct Live {
     pub partial_expert_slots: AtomicU64,
     pub mapped_bank_budget: AtomicU64,
     pub live_non_reclaimable: AtomicU64,
+    /// The prefill window the current plan admits (recomputed when a mapped
+    /// process moves to slots).
+    pub prefill_chunk_tokens: AtomicU64,
     pub fallback: Mutex<Option<Fallback>>,
 }
 
@@ -121,7 +124,8 @@ impl Live {
 
 /// Thrash symptoms of a mapped turn whose pack no longer fits beside the
 /// host's live memory. The turn that shows them finishes as it is; the next
-/// turn runs on slots.
+/// turn to open moves the store, and every turn still open with it, to
+/// slots.
 #[derive(Default)]
 pub(super) struct Tripwire {
     /// `process_disk_reads()` when the current turn started.
@@ -144,6 +148,16 @@ impl Tripwire {
     #[cfg(test)]
     pub fn tripped(&self) -> Option<&Fallback> {
         self.tripped.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn turn_start_reads(&self) -> u64 {
+        self.turn_start_reads
+    }
+
+    #[cfg(test)]
+    pub fn slow_streak(&self) -> u32 {
+        self.slow_streak
     }
 
     pub fn take(&mut self) -> Option<Fallback> {

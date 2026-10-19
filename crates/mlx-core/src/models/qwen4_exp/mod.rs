@@ -51,32 +51,40 @@ struct Inner {
     media_prefill: Option<media::Prepared>,
     _pool_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     cache_limit_guard: crate::cache_limit::CacheLimitGuard,
-    /// A cancel flag is installed; the next installation after it is
-    /// cleared starts a new turn.
-    turn_open: bool,
+    /// Scheduled turns admitted and not yet finished; the first to open
+    /// after the set emptied starts a tripwire window, every open adds its
+    /// turn to the one in progress.
+    open_turns: std::collections::HashSet<u32>,
+    /// A whole turn of the exclusive lane is open (its cancel flag is
+    /// installed); it is one window of its own.
+    exclusive_turn: bool,
 }
 
 impl Inner {
-    /// The first installed cancel flag after a cleared one opens a turn: a
-    /// tripped mapped process moves to the slot path here, before any pass.
-    fn begin_turn(&mut self) {
-        let applied = match self.decoder.weights.begin_turn() {
-            Ok(applied) => applied,
-            Err(error) => {
-                tracing::warn!("qwen4 residency: slot fallback not applied: {error}");
-                return;
-            }
+    /// A turn opens. A tripped mapped process moves to the slot path here,
+    /// before any pass of the turn; the first turn of a window also starts
+    /// the window's SSD count and slow streak. The prefill window follows
+    /// the plan in force.
+    fn open_turn(&mut self, first: bool) {
+        let applied = if first {
+            self.decoder.weights.begin_turn()
+        } else {
+            self.decoder.weights.apply_fallback()
         };
-        if applied.is_some() {
-            self.cache_limit_guard =
-                crate::cache_limit::coordinator().register(self.decoder.weights.cache_budget());
-            match memory::prefill_window(&self.decoder.config, &self.decoder.weights.plan) {
-                Ok(window) => self.decoder.prefill_chunk_size = window,
-                Err(error) => {
-                    tracing::warn!("qwen4 residency: prefill window kept after fallback: {error}")
-                }
+        match applied {
+            Ok(Some(_)) => {
+                self.cache_limit_guard =
+                    crate::cache_limit::coordinator().register(self.decoder.weights.cache_budget());
             }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("qwen4 residency: slot fallback not applied: {error}"),
         }
+        self.decoder.prefill_chunk_size =
+            memory::prefill_window(&self.decoder.config, &self.decoder.weights.plan);
+        self.decoder.weights.live.prefill_chunk_tokens.store(
+            self.decoder.prefill_chunk_size as u64,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 struct Step<'a>(&'a mut Inner);
@@ -296,14 +304,16 @@ impl ChatBackend for Inner {
             Some(usize::MAX)
         }
     }
+    /// The exclusive lane installs its flag once per whole turn and clears
+    /// it after; the scheduler installs one per admission and prefill slice
+    /// of turns it has already opened (`scheduled_turn_opened`), so those
+    /// never start a window here.
     fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
-        match (flag.is_some(), self.turn_open) {
-            (true, false) => {
-                self.turn_open = true;
-                self.begin_turn();
-            }
-            (false, _) => self.turn_open = false,
-            (true, true) => {}
+        if flag.is_none() {
+            self.exclusive_turn = false;
+        } else if self.open_turns.is_empty() && !self.exclusive_turn {
+            self.exclusive_turn = true;
+            self.open_turn(true);
         }
         self.decoder.cancelled = flag;
     }
@@ -420,7 +430,6 @@ pub struct Qwen4ExpModel {
     residency: memory::Plan,
     live: Arc<tripwire::Live>,
     lookup: Arc<weights::LookupStats>,
-    prefill_chunk_size: usize,
     supports_images: bool,
 }
 #[napi]
@@ -486,9 +495,11 @@ impl Qwen4ExpModel {
                 drop(cache_limit_guard);
                 cache_limit_guard =
                     crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
-                decoder.prefill_chunk_size =
-                    memory::prefill_window(&config, &decoder.weights.plan)?;
-                let prefill_chunk_size = decoder.prefill_chunk_size;
+                decoder.prefill_chunk_size = memory::prefill_window(&config, &decoder.weights.plan);
+                decoder.weights.live.prefill_chunk_tokens.store(
+                    decoder.prefill_chunk_size as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
                 let residency = decoder.weights.plan.clone();
                 let live = Arc::clone(&decoder.weights.live);
                 let lookup = Arc::clone(&decoder.weights.lookup);
@@ -506,7 +517,8 @@ impl Qwen4ExpModel {
                     media_prefill: None,
                     _pool_guard: pool_guard,
                     cache_limit_guard,
-                    turn_open: false,
+                    open_turns: std::collections::HashSet::new(),
+                    exclusive_turn: false,
                 };
                 Ok((
                     crate::engine::hybrid_scheduler::HybridSchedulerState::new(inner)?,
@@ -518,7 +530,6 @@ impl Qwen4ExpModel {
                         residency,
                         live,
                         lookup,
-                        prefill_chunk_size,
                         supports_images,
                     ),
                 ))
@@ -533,7 +544,6 @@ impl Qwen4ExpModel {
             residency,
             live,
             lookup,
-            prefill_chunk_size,
             supports_images,
         ) = match ready.await {
             Ok(Ok(init)) => init,
@@ -567,7 +577,6 @@ impl Qwen4ExpModel {
             residency,
             live,
             lookup,
-            prefill_chunk_size,
             supports_images,
         })
     }
@@ -604,7 +613,7 @@ impl Qwen4ExpModel {
             weight_budget_bytes: live.weight_budget.load(Ordering::Acquire) as f64,
             hot_weight_bytes: self.residency.hot_bytes as f64,
             full_hot_residency: self.residency.resident,
-            prefill_chunk_tokens: self.prefill_chunk_size as u32,
+            prefill_chunk_tokens: live.prefill_chunk_tokens.load(Ordering::Acquire) as u32,
             available_memory_bytes: self.residency.available_bytes.map(|n| n as f64),
             physical_memory_bytes: self.residency.physical_bytes.map(|n| n as f64),
             resident_bank_bytes: self.residency.resident_bank_bytes as f64,

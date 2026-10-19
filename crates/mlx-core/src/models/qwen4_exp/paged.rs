@@ -392,6 +392,15 @@ impl HybridSchedulerBackend for Inner {
     fn scheduler_capacity(&self) -> usize {
         4
     }
+    fn scheduled_turn_opened(&mut self, seq: SeqId) {
+        let first = self.open_turns.is_empty() && !self.exclusive_turn;
+        if self.open_turns.insert(seq) {
+            self.open_turn(first);
+        }
+    }
+    fn scheduled_turn_closed(&mut self, seq: SeqId) {
+        self.open_turns.remove(&seq);
+    }
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         self.decoder.prefill_slice_size() as u32
     }

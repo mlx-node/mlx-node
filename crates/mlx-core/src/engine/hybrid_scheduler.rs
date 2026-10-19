@@ -111,6 +111,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduler_wired_bytes(&self) -> Option<usize> {
         None
     }
+    /// `seq_id` was admitted; called before the turn's cancel flag, wired
+    /// context and prefill slices are read, so a backend that changes its
+    /// residency per turn does it here. Every opened turn is closed once, on
+    /// whichever path finishes or rejects it.
+    fn scheduled_turn_opened(&mut self, _seq_id: SeqId) {}
+    fn scheduled_turn_closed(&mut self, _seq_id: SeqId) {}
 
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter>;
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter>;
@@ -2344,6 +2350,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             &admitted.params.cache_owner_id,
             admitted.params.cache_root_owner_id.as_deref(),
         );
+        self.inner.scheduled_turn_opened(seq_id);
         self.inner
             .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
         let owner_history = self
@@ -2365,6 +2372,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.abort_paged_turn();
                 self.inner.release_scheduled_recurrent_for(seq_id);
                 self.inner.release_scheduled_speculation(seq_id);
+                self.inner.scheduled_turn_closed(seq_id);
                 self.inner.set_turn_cancel_flag(None);
                 self.owner_states.remove(&owner_id);
                 self.owner_sequences.remove(&owner_id);
@@ -2383,6 +2391,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.inner.abort_paged_turn();
             self.inner.release_scheduled_recurrent_for(seq_id);
             self.inner.release_scheduled_speculation(seq_id);
+            self.inner.scheduled_turn_closed(seq_id);
             self.inner.set_turn_cancel_flag(None);
             self.owner_states.remove(&owner_id);
             self.owner_sequences.remove(&owner_id);
@@ -2491,6 +2500,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.abort_paged_turn();
                 self.inner.release_scheduled_recurrent_for(seq_id);
                 self.inner.release_scheduled_speculation(seq_id);
+                self.inner.scheduled_turn_closed(seq_id);
                 self.inner.set_turn_cancel_flag(None);
                 self.owner_states.remove(&failed_owner_id);
                 self.owner_sequences.remove(&failed_owner_id);
@@ -2822,6 +2832,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     fn finish_completed(&mut self, mut turn: TurnState<ScheduledTurn<B::PrefixState>>) {
+        // Every arm below ends the turn, the error returns included.
+        self.inner.scheduled_turn_closed(turn.seq_id);
         let Some(cancelled) = turn.cancelled.take() else {
             let owner_id = turn.payload.owner_id.clone();
             self.inner.abort_paged_turn();

@@ -61,6 +61,11 @@ pub(super) struct HostMemory {
     pub purgeable: u64,
     pub wired: u64,
     pub compressor: u64,
+    /// Page faults since boot. `host_statistics64` answers only a few
+    /// fresh reads per second per host and hands every other caller its
+    /// previous answer; a sample equal to the last one in every field is
+    /// that copy, not a quiet host (faults never stand still for 250 ms).
+    pub faults: u64,
 }
 
 impl HostMemory {
@@ -270,6 +275,10 @@ pub(super) fn mapped_plan(
 const UNWIRE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 const UNWIRE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 const UNWIRE_STEP: u64 = 256 << 20;
+/// Fresh samples without a fall, one second of polls, before the release
+/// counts as finished: the driver lets the banks go in steps, and one flat
+/// sample between two steps would make the budget of that plateau permanent.
+const UNWIRE_FLAT_SAMPLES: u32 = 4;
 
 /// The slot budget for a process that leaves mapped mode after a tripwire:
 /// the bootstrap rule over the live host, partial residency only. Called
@@ -312,25 +321,36 @@ pub(super) fn slot_fallback_plan_with(
     plan.partial_expert_slots = 0;
 }
 
-/// Sample the host until wired memory has fallen and stopped falling, or
-/// `UNWIRE_SETTLE` has passed; the last sample is the one to size from.
+/// Sample the host until wired memory has fallen and then held for
+/// `UNWIRE_FLAT_SAMPLES` fresh samples, or `UNWIRE_SETTLE` has passed; the
+/// last fresh sample is the one to size from. A sample equal to the previous
+/// one is the kernel's cached answer (`HostMemory::faults`): it neither
+/// counts as flat nor ends the loop.
 fn settled_host(
     host: &mut dyn FnMut() -> Result<HostMemory>,
     sleep: &mut dyn FnMut(std::time::Duration),
 ) -> Result<HostMemory> {
     let mut last = host()?;
     let mut fell = false;
+    let mut flat = 0;
     let mut waited = std::time::Duration::ZERO;
     while waited < UNWIRE_SETTLE {
         sleep(UNWIRE_POLL);
         waited += UNWIRE_POLL;
         let next = host()?;
-        let falling = last.wired.saturating_sub(next.wired) > UNWIRE_STEP;
+        if next == last {
+            continue;
+        }
+        if last.wired.saturating_sub(next.wired) > UNWIRE_STEP {
+            fell = true;
+            flat = 0;
+        } else if fell {
+            flat += 1;
+        }
         last = next;
-        if fell && !falling {
+        if flat >= UNWIRE_FLAT_SAMPLES {
             break;
         }
-        fell |= falling;
     }
     Ok(last)
 }
@@ -545,6 +565,7 @@ pub(super) fn host_memory() -> Result<HostMemory> {
         purgeable: u64::from(stats.purgeable_count) * page,
         wired: u64::from(stats.wire_count) * page,
         compressor: u64::from(stats.compressor_page_count) * page,
+        faults: stats.faults,
     })
 }
 
@@ -652,6 +673,7 @@ mod tests {
             purgeable: gib(0.7),
             wired: gib(13.2),
             compressor: gib(7.5),
+            faults: 0,
         };
         let gate = mapped_gate(&quiet, need, 0);
         assert_eq!(
@@ -769,21 +791,35 @@ mod tests {
             purgeable: 0,
             wired: gib(23.31),
             compressor: gib(10.0),
+            faults: 1,
         };
         let unwiring = HostMemory {
             free: gib(0.2),
             file: gib(47.2),
             wired: gib(19.0),
+            faults: 2,
             ..still_wired
         };
         let settled = HostMemory {
             free: gib(0.3),
             file: gib(50.6),
             wired: gib(16.7),
+            faults: 3,
             ..still_wired
         };
-        let mut samples =
-            std::collections::VecDeque::from([still_wired, unwiring, settled, settled]);
+        let flat = |n: u64| HostMemory {
+            faults: settled.faults + n,
+            ..settled
+        };
+        let mut samples = std::collections::VecDeque::from([
+            still_wired,
+            unwiring,
+            settled,
+            flat(1),
+            flat(2),
+            flat(3),
+            flat(4),
+        ]);
         let mut slept = Vec::new();
         let mut plan = plan_without_snapshot();
         plan.physical_bytes = Some(128 << 30);
@@ -805,7 +841,11 @@ mod tests {
             automatic_budget(gib(84.0), still_wired.available(), 128 << 30) < plan.budget,
             "the wired sample would have undersized the slots"
         );
-        assert_eq!(slept, vec![UNWIRE_POLL; 3], "one poll past the last fall");
+        assert_eq!(
+            slept,
+            vec![UNWIRE_POLL; 2 + UNWIRE_FLAT_SAMPLES as usize],
+            "one second of flat fresh samples past the last fall"
+        );
         assert_eq!(samples.len(), 0);
         assert!(!plan.mapped);
 
@@ -843,6 +883,95 @@ mod tests {
         );
         assert!(!plan.mapped);
         assert_eq!(plan.budget, 12 << 30);
+    }
+
+    fn release(wired: f64, file: f64, faults: u64) -> HostMemory {
+        HostMemory {
+            physical: 128 << 30,
+            free: 1 << 30,
+            file: gib(file),
+            anonymous: 30 << 30,
+            purgeable: 0,
+            wired: gib(wired),
+            compressor: 10 << 30,
+            faults,
+        }
+    }
+
+    /// The driver lets the banks go in steps. One flat sample between two
+    /// steps (50 -> 45 -> 45 -> 16 GiB wired) is not the end of the release:
+    /// the budget comes from the 16 GiB host, not the 45 GiB plateau.
+    #[test]
+    fn slot_fallback_waits_out_a_release_plateau() {
+        let plateau = release(45.0, 25.0, 3);
+        let done = release(16.0, 54.0, 8);
+        let mut samples = std::collections::VecDeque::from([
+            release(50.0, 20.0, 1),
+            release(45.0, 25.0, 2),
+            plateau,
+            release(16.0, 54.0, 4),
+            release(16.0, 54.0, 5),
+            release(16.0, 54.0, 6),
+            release(16.0, 54.0, 7),
+            done,
+        ]);
+        let mut polls = 0usize;
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            0,
+            &mut || Ok(samples.pop_front().expect("more samples than polls")),
+            &mut |_| polls += 1,
+        );
+        assert_eq!(samples.len(), 0);
+        assert_eq!(polls, 7);
+        assert_eq!(plan.available_bytes, Some(done.available()));
+        assert_eq!(plan.budget, gib(35.0));
+        assert_eq!(
+            automatic_budget(gib(84.0), plateau.available(), 128 << 30),
+            gib(6.0),
+            "stopping at the plateau would have left 6 GiB of slots for good"
+        );
+    }
+
+    /// `host_statistics64` answers a few fresh reads per second and repeats
+    /// its last answer otherwise; a run of those copies right after the first
+    /// fall is skipped, not taken as a settled host.
+    #[test]
+    fn slot_fallback_skips_the_kernels_cached_samples() {
+        let first_fall = release(45.0, 25.0, 2);
+        let done = release(16.0, 54.0, 7);
+        let mut samples = std::collections::VecDeque::from([
+            release(50.0, 20.0, 1),
+            first_fall,
+            first_fall,
+            first_fall,
+            first_fall,
+            first_fall,
+            release(16.0, 54.0, 3),
+            release(16.0, 54.0, 4),
+            release(16.0, 54.0, 5),
+            release(16.0, 54.0, 6),
+            done,
+        ]);
+        let mut polls = 0usize;
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            0,
+            &mut || Ok(samples.pop_front().expect("more samples than polls")),
+            &mut |_| polls += 1,
+        );
+        assert_eq!(samples.len(), 0);
+        assert_eq!(polls, 10);
+        assert_eq!(plan.available_bytes, Some(done.available()));
+        assert_eq!(plan.budget, gib(35.0));
     }
 
     #[test]
@@ -955,7 +1084,10 @@ pub(super) fn prefill_scratch(c: &super::config::Config, tokens: usize) -> u64 {
     per_token.saturating_mul(t).saturating_add(window.max(qsa))
 }
 
-pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> Result<usize> {
+/// The prefill window the current plan's scratch allowance admits; computed
+/// again whenever the plan changes (a mapped process that moved to slots
+/// has a smaller allowance than the one its load admitted).
+pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> usize {
     let live = match (plan.available_bytes, plan.physical_bytes) {
         (Some(a), Some(p)) => a.saturating_sub(plan.budget + system_reserve(p) + (2 << 30)),
         _ => plan.budget / 16,
@@ -970,22 +1102,7 @@ pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> Result<u
     while window > 1 && prefill_scratch(c, window) > allowance {
         window /= 2;
     }
-    if let Some(value) = std::env::var_os("MLX_QWEN4_PREFILL_CHUNK") {
-        let requested = value
-            .to_str()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| n.is_power_of_two() && *n <= super::MAX_PREFILL_CHUNK)
-            .ok_or_else(|| {
-                Error::from_reason("MLX_QWEN4_PREFILL_CHUNK must be a power of two from 1 to 1024")
-            })?;
-        if requested > window {
-            return Err(Error::from_reason(format!(
-                "Qwen4 prefill window {requested} exceeds bootstrap scratch allowance; admitted {window}"
-            )));
-        }
-        window = requested;
-    }
-    Ok(window)
+    window
 }
 
 /// Runtime tuning may shorten the bootstrap-admitted window, never grow it.

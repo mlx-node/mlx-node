@@ -1808,7 +1808,8 @@ fn tiny_inner() -> Inner {
         media_prefill: None,
         _pool_guard: None,
         cache_limit_guard: crate::cache_limit::coordinator().register(1 << 20),
-        turn_open: false,
+        open_turns: Default::default(),
+        exclusive_turn: false,
     }
 }
 
@@ -1996,6 +1997,185 @@ fn scheduled_owner_switch_does_not_inherit_another_requests_cancellation() {
     assert_eq!(inner.decoder.history, [3, 9, 7]);
     inner.activate_paged_seq(2).unwrap();
     assert!(inner.decoder.check_cancelled().is_err());
+}
+
+/// Scheduled turns overlap on one model, and residency and the tripwire
+/// window are per model: the first turn to open on an idle model starts the
+/// window (disk baseline, slow streak), later admissions join it, a finish
+/// beside an open turn keeps it, and the first admission after the set
+/// empties starts a new one. The exclusive lane's flag pair is one window.
+///
+/// MUTATION (M-M5R2-1a): `scheduled_turn_opened` passes `first = true` for
+/// every admission; the second admission re-baselines and the SENTINEL
+/// assertions fail.
+#[test]
+fn scheduled_turns_share_one_tripwire_window_until_the_last_one_closes() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::time::Duration;
+    const SENTINEL: u64 = u64::MAX - 1;
+    let mut inner = tiny_inner();
+    let poison = |inner: &mut Inner| {
+        let wire = inner.decoder.weights.tripwire_mut();
+        wire.begin_turn(SENTINEL);
+        for _ in 0..8 {
+            wire.observe(1, Duration::from_millis(25), SENTINEL, 0);
+        }
+        for _ in 0..3 {
+            wire.observe(1, Duration::from_millis(2_400), SENTINEL, 0);
+        }
+        assert_eq!((wire.turn_start_reads(), wire.slow_streak()), (SENTINEL, 3));
+    };
+    let window = |inner: &mut Inner| {
+        let wire = inner.decoder.weights.tripwire_mut();
+        (wire.turn_start_reads(), wire.slow_streak())
+    };
+    poison(&mut inner);
+    inner.scheduled_turn_opened(1);
+    let (base, streak) = window(&mut inner);
+    assert_ne!(base, SENTINEL, "the first admission starts a window");
+    assert_eq!(streak, 0);
+    poison(&mut inner);
+    inner.scheduled_turn_opened(2);
+    assert_eq!(
+        window(&mut inner),
+        (SENTINEL, 3),
+        "a second admission joins the window"
+    );
+    inner.scheduled_turn_closed(1);
+    assert_eq!(
+        window(&mut inner),
+        (SENTINEL, 3),
+        "a finish beside an open turn keeps the window"
+    );
+    inner.scheduled_turn_closed(2);
+    assert!(inner.open_turns.is_empty());
+    assert_eq!(window(&mut inner), (SENTINEL, 3), "a close never baselines");
+    inner.scheduled_turn_opened(3);
+    assert_ne!(
+        window(&mut inner).0,
+        SENTINEL,
+        "the set emptied: a new window"
+    );
+    assert_eq!(window(&mut inner).1, 0);
+    inner.scheduled_turn_closed(3);
+    poison(&mut inner);
+    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
+    assert_ne!(
+        window(&mut inner).0,
+        SENTINEL,
+        "an exclusive turn is a window"
+    );
+    poison(&mut inner);
+    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
+    assert_eq!(
+        window(&mut inner),
+        (SENTINEL, 3),
+        "a flag re-installed inside the turn is the same window"
+    );
+    inner.set_turn_cancel_flag(None);
+    assert_eq!(window(&mut inner), (SENTINEL, 3));
+    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
+    assert_ne!(window(&mut inner).0, SENTINEL, "the next exclusive turn");
+    inner.set_turn_cancel_flag(None);
+}
+
+/// Two owned turns admitted back to back overlap on the scheduler: both are
+/// open at once, and the set is empty once both finished, so the close runs
+/// on the normal finish path.
+///
+/// MUTATION (M-M5R2-1c): drop `scheduled_turn_closed` from the top of
+/// `finish_completed`; the set still holds both turns at the end.
+#[test]
+fn scheduled_turns_open_at_admission_and_close_when_they_finish() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    use crate::engine::model_command::ModelCommand;
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut replies = Vec::new();
+    for owner in ["a", "b"] {
+        let config = crate::engine::types::ChatConfig {
+            max_new_tokens: Some(8),
+            temperature: Some(0.0),
+            cache_owner_id: Some(owner.to_string()),
+            ..Default::default()
+        };
+        let messages = vec![
+            serde_json::from_value(serde_json::json!({"role": "user", "content": "a"})).unwrap(),
+        ];
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .send(ModelCommand::from_chat(ChatCmd::SessionStart {
+                    messages,
+                    config,
+                    reply,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                }))
+                .is_ok()
+        );
+        replies.push(rx);
+    }
+    let mut most_open = 0;
+    let mut done = 0;
+    for _ in 0..2048 {
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        most_open = most_open.max(state.inner.open_turns.len());
+        for rx in &mut replies {
+            if let Ok(result) = rx.try_recv() {
+                result.unwrap();
+                done += 1;
+            }
+        }
+        if done == 2 {
+            break;
+        }
+    }
+    assert_eq!(done, 2, "both turns finished");
+    assert_eq!(most_open, 2, "the second admission joined the first turn");
+    assert!(state.inner.open_turns.is_empty());
+    assert!(!state.inner.exclusive_turn);
+}
+
+/// The prefill window follows the plan in force: a fallback shrinks the slot
+/// allowance (budget / 16) below what the load admitted, and the next turn to
+/// open prefills with the window that allowance admits, not the load's.
+///
+/// MUTATION (M-M5R2-3): `open_turn` keeps `decoder.prefill_chunk_size`;
+/// the window stays at the load's value.
+#[test]
+fn a_turn_opens_with_the_prefill_window_of_the_plan_in_force() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::sync::atomic::Ordering;
+    let mut inner = tiny_inner();
+    let config = Arc::clone(&inner.decoder.config);
+    let admitted = inner.decoder.prefill_chunk_size;
+    assert_eq!(
+        admitted,
+        memory::prefill_window(&config, &inner.decoder.weights.plan)
+    );
+    assert!(admitted >= 4);
+    let mut plan = inner.decoder.weights.plan.clone();
+    plan.mapped = false;
+    plan.available_bytes = None;
+    plan.physical_bytes = None;
+    plan.budget = 16 * memory::prefill_scratch(&config, admitted / 4);
+    let narrow = memory::prefill_window(&config, &plan);
+    assert_eq!(narrow, admitted / 4);
+    inner.decoder.weights.plan = plan;
+    inner.scheduled_turn_opened(1);
+    assert_eq!(inner.decoder.prefill_chunk_size, narrow);
+    assert_eq!(
+        inner
+            .decoder
+            .weights
+            .live
+            .prefill_chunk_tokens
+            .load(Ordering::Acquire),
+        narrow as u64
+    );
+    inner.scheduled_turn_closed(1);
 }
 
 #[test]
@@ -3293,7 +3473,7 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
     plan.budget = 32 << 30;
     plan.available_bytes = Some(64 << 30);
     plan.physical_bytes = Some(128 << 30);
-    let small = memory::prefill_window(&config, &plan).unwrap();
+    let small = memory::prefill_window(&config, &plan);
     config.hidden_size = 8192;
     config.hc_count = 4;
     config.moe_intermediate_size = 4096;
@@ -3301,17 +3481,17 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
     config.head_dim = 256;
     config.num_experts_per_tok = 10;
     config.indexer_budget = 2048;
-    let large = memory::prefill_window(&config, &plan).unwrap();
+    let large = memory::prefill_window(&config, &plan);
     assert!(large < small);
     let old_ple = config.ple_conv_kernel_size;
     config.ple_conv_kernel_size = 64;
     assert!(
-        memory::prefill_window(&config, &plan).unwrap() < large,
+        memory::prefill_window(&config, &plan) < large,
         "A dominant PLE stage must reduce the admitted window"
     );
     config.ple_conv_kernel_size = old_ple;
     plan.available_bytes = Some((51 << 30) + (128 << 20));
-    assert!(memory::prefill_window(&config, &plan).unwrap() < large);
+    assert!(memory::prefill_window(&config, &plan) < large);
 }
 
 #[test]

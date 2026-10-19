@@ -273,19 +273,27 @@ impl Store {
         self.live.store(&self.plan);
     }
 
-    /// A turn starts: a tripped mapped process moves to the slot path first,
-    /// then the turn's SSD count begins. Returns the fallback applied.
+    /// The first turn of a measurement window opens: a tripped mapped
+    /// process moves to the slot path first, then the window's SSD count
+    /// and slow streak begin. Returns the fallback applied.
     pub(in super::super) fn begin_turn(&mut self) -> Result<Option<Fallback>> {
-        let applied = match self.tripwire.take() {
-            Some(why) if self.plan.mapped => {
-                self.leave_mapped(&why)?;
-                Some(why)
-            }
-            _ => None,
-        };
+        let applied = self.apply_fallback()?;
         self.tripwire
             .begin_turn(super::super::memory::process_disk_reads());
         Ok(applied)
+    }
+
+    /// A turn opens beside turns already open: residency is one per store,
+    /// so a trip moves every open turn to slots here; the window they
+    /// share keeps its baseline. Returns the fallback applied.
+    pub(in super::super) fn apply_fallback(&mut self) -> Result<Option<Fallback>> {
+        match self.tripwire.take() {
+            Some(why) if self.plan.mapped => {
+                self.leave_mapped(&why)?;
+                Ok(Some(why))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// One main-network pass over `rows` rows took `elapsed`.
@@ -299,9 +307,14 @@ impl Store {
             .observe(rows, elapsed, reads, self.plan.mapped_bytes)
         {
             tracing::warn!(
-                "qwen4 residency: mapped turn thrashes ({why}); the next turn runs on slots"
+                "qwen4 residency: mapped turn thrashes ({why}); the next turn to open runs on slots"
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn tripwire_mut(&mut self) -> &mut super::super::tripwire::Tripwire {
+        &mut self.tripwire
     }
 
     #[cfg(test)]

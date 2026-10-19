@@ -2867,6 +2867,26 @@ mod mapped_tests {
     #[test]
     fn mapped_banks_are_rewired_after_a_gap_and_not_within_a_pass() {
         use std::time::{Duration, Instant};
+        const CHILD: &str = "MLX_QWEN4_REWIRE_CHILD";
+        const NAME: &str = "models::qwen4_exp::weights::mapped_tests::mapped_banks_are_rewired_after_a_gap_and_not_within_a_pass";
+        if std::env::var_os(CHILD).is_none() {
+            // The wired limit is process-wide: while a sibling test's
+            // scheduled turn holds one, the driver wires this test's
+            // mmap-backed banks and the freshly built pack is never cold. A
+            // child process holds none.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let temp = Temp::new();
         let gguf = temp.0.join("experts.gguf");
         write_fixture(&gguf);
@@ -3294,6 +3314,69 @@ mod mapped_tests {
         assert!(store.begin_turn().unwrap().is_none(), "applied once");
     }
 
+    /// A turn admitted while another is open applies a trip without starting
+    /// a window: the store leaves mapped mode (every open turn runs on slots
+    /// from its next pass) and the SSD baseline of the window in progress
+    /// stays.
+    ///
+    /// MUTATION (M-M5R2-1b): `apply_fallback` returns `Ok(None)` without
+    /// leaving; the store stays mapped.
+    #[test]
+    fn an_admission_beside_an_open_turn_applies_the_trip_and_keeps_the_window() {
+        const SENTINEL: u64 = u64::MAX - 1;
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store.plan.policy = "auto".into();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.begin_turn().unwrap().is_none());
+        let mapped = store.plan.mapped_bytes;
+        let ids = [4u32, 0, 2];
+        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mapped_bank = Arc::as_ptr(&banks[0]);
+        store.trip(Fallback::SsdReads {
+            read: 2 * mapped + 1,
+            mapped,
+        });
+        store.tripwire_mut().begin_turn(SENTINEL);
+        let why = store
+            .apply_fallback()
+            .unwrap()
+            .expect("the admission applies the trip");
+        assert_eq!(
+            why,
+            Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped
+            }
+        );
+        assert!(!store.plan.mapped && store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert_eq!(store.plan.mapped_bytes, 0);
+        assert_eq!(
+            store.tripwire_mut().turn_start_reads(),
+            SENTINEL,
+            "the window in progress keeps its baseline"
+        );
+        assert_eq!(store.live.fallback(), Some(why));
+        let (slots, _, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
+        assert_eq!(capacity, EXPERTS);
+        assert!(store.apply_fallback().unwrap().is_none(), "applied once");
+    }
+
     /// The slot budget is sized after the banks are released: the host is
     /// read with the store's maps already dropped, from the sample after
     /// wired memory settles, and that budget is the one the store keeps.
@@ -3331,13 +3414,22 @@ mod mapped_tests {
             purgeable: 0,
             wired: 50 << 30,
             compressor: 10 << 30,
+            faults: 1,
         };
-        let released = HostMemory {
+        let released = |faults: u64| HostMemory {
             file: 54 << 30,
             wired: 16 << 30,
+            faults,
             ..wired
         };
-        let mut samples = std::collections::VecDeque::from([wired, released, released]);
+        let mut samples = std::collections::VecDeque::from([
+            wired,
+            released(2),
+            released(3),
+            released(4),
+            released(5),
+            released(6),
+        ]);
         let mut seen = Vec::new();
         let mut slept = 0;
         let why = Fallback::SsdReads {
@@ -3354,14 +3446,14 @@ mod mapped_tests {
                 &mut |_| slept += 1,
             )
             .unwrap();
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 6);
         assert!(
             seen.iter().all(|&n| n < holders),
             "sampled while the store still held its banks: {seen:?} of {holders}"
         );
-        assert_eq!(slept, 2);
+        assert_eq!(slept, 5);
         assert!(!store.plan.mapped && store.mapped_experts.is_empty() && store.prefetch.is_none());
-        assert_eq!(store.plan.available_bytes, Some(released.available()));
+        assert_eq!(store.plan.available_bytes, Some(released(6).available()));
         assert_eq!(store.plan.budget, 35 << 30, "sized from the released host");
         assert_eq!(store.cache_limit, store.plan.budget);
         assert_eq!(store.live.fallback(), Some(why));
