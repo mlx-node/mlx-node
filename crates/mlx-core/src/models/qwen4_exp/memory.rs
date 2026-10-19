@@ -264,22 +264,38 @@ pub(super) fn mapped_plan(
     Ok(())
 }
 
+/// The driver unwires a released bank 1.2-3.2 s after the turn that bound
+/// it. A fallback budget taken before that counts the pack against the
+/// slots for the life of the process (88 slots where ~27 GiB was there).
+const UNWIRE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+const UNWIRE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+const UNWIRE_STEP: u64 = 256 << 20;
+
 /// The slot budget for a process that leaves mapped mode after a tripwire:
-/// the bootstrap rule over the live host, partial residency only. The
-/// process's own banks are already wired and so already outside
-/// `available`; the budget only has to cover what the store holds now.
-pub(super) fn slot_fallback_plan(plan: &mut Plan, held_bytes: u64) -> Result<()> {
-    let desired = plan
-        .hot_bytes
-        .checked_add((2 << 30) - 1)
-        .map(|n| (n >> 30) << 30)
-        .ok_or_else(|| Error::from_reason("Qwen4 hot-weight size overflow"))?;
+/// the bootstrap rule over the live host, partial residency only. Called
+/// with the banks already released; the budget has to cover what the store
+/// still holds. A host that cannot be read leaves the held bytes as the
+/// budget, so the store is never left between the two paths.
+pub(super) fn slot_fallback_plan_with(
+    plan: &mut Plan,
+    held_bytes: u64,
+    host: &mut dyn FnMut() -> Result<HostMemory>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) {
+    let desired = plan.hot_bytes.saturating_add((2 << 30) - 1) >> 30 << 30;
     let budget = match plan.physical_bytes {
-        Some(_) => {
-            let host = host_memory()?;
-            plan.available_bytes = Some(host.available());
-            automatic_budget(desired, host.available(), host.physical)
-        }
+        Some(_) => match settled_host(host, sleep) {
+            Ok(host) => {
+                plan.available_bytes = Some(host.available());
+                automatic_budget(desired, host.available(), host.physical)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "qwen4 residency: host memory unreadable after leaving mapped mode ({error}); slots sized from the held bytes"
+                );
+                0
+            }
+        },
         None => desired.min(super::weights::CACHE_BYTES),
     };
     plan.budget = budget.max(
@@ -294,7 +310,29 @@ pub(super) fn slot_fallback_plan(plan: &mut Plan, held_bytes: u64) -> Result<()>
     plan.mapped_bytes = 0;
     plan.mapped_bank_budget = 0;
     plan.partial_expert_slots = 0;
-    Ok(())
+}
+
+/// Sample the host until wired memory has fallen and stopped falling, or
+/// `UNWIRE_SETTLE` has passed; the last sample is the one to size from.
+fn settled_host(
+    host: &mut dyn FnMut() -> Result<HostMemory>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Result<HostMemory> {
+    let mut last = host()?;
+    let mut fell = false;
+    let mut waited = std::time::Duration::ZERO;
+    while waited < UNWIRE_SETTLE {
+        sleep(UNWIRE_POLL);
+        waited += UNWIRE_POLL;
+        let next = host()?;
+        let falling = last.wired.saturating_sub(next.wired) > UNWIRE_STEP;
+        last = next;
+        if fell && !falling {
+            break;
+        }
+        fell |= falling;
+    }
+    Ok(last)
 }
 
 fn automatic_budget(desired: u64, available: u64, physical: u64) -> u64 {
@@ -702,7 +740,9 @@ mod tests {
         plan.mapped = true;
         plan.mapped_bytes = gib(73.15);
         plan.mapped_bank_budget = gib(74.0);
-        slot_fallback_plan(&mut plan, gib(11.4)).unwrap();
+        let mut unread =
+            || -> Result<HostMemory> { panic!("a plan without a snapshot reads no host") };
+        slot_fallback_plan_with(&mut plan, gib(11.4), &mut unread, &mut |_| {});
         assert!(!plan.mapped && !plan.resident);
         assert_eq!(plan.mapped_bytes, 0);
         assert_eq!(plan.mapped_bank_budget, 0);
@@ -711,8 +751,98 @@ mod tests {
             super::super::weights::CACHE_BYTES.max(12 << 30)
         );
         plan.budget = 0;
-        slot_fallback_plan(&mut plan, 0).unwrap();
+        slot_fallback_plan_with(&mut plan, 0, &mut unread, &mut |_| {});
         assert_eq!(plan.budget, super::super::weights::CACHE_BYTES);
+    }
+
+    /// Request 1 of M5-hog40-during-1 started 13 ms after request 0 ended,
+    /// while 23 GiB of the pack were still wired: the budget read 20 GiB
+    /// where the unwired host gave 27-29. The plan sizes from the sample
+    /// after wired has fallen and settled, not from the first one.
+    #[test]
+    fn slot_fallback_sizes_from_the_host_after_the_banks_unwire() {
+        let still_wired = HostMemory {
+            physical: 128 << 30,
+            free: gib(0.13),
+            file: gib(43.69),
+            anonymous: gib(30.0),
+            purgeable: 0,
+            wired: gib(23.31),
+            compressor: gib(10.0),
+        };
+        let unwiring = HostMemory {
+            free: gib(0.2),
+            file: gib(47.2),
+            wired: gib(19.0),
+            ..still_wired
+        };
+        let settled = HostMemory {
+            free: gib(0.3),
+            file: gib(50.6),
+            wired: gib(16.7),
+            ..still_wired
+        };
+        let mut samples =
+            std::collections::VecDeque::from([still_wired, unwiring, settled, settled]);
+        let mut slept = Vec::new();
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            gib(5.0),
+            &mut || Ok(samples.pop_front().expect("more samples than polls")),
+            &mut |d| slept.push(d),
+        );
+        assert_eq!(plan.available_bytes, Some(settled.available()));
+        assert_eq!(
+            plan.budget,
+            automatic_budget(gib(84.0), settled.available(), 128 << 30)
+        );
+        assert_eq!(plan.budget, gib(30.0));
+        assert!(
+            automatic_budget(gib(84.0), still_wired.available(), 128 << 30) < plan.budget,
+            "the wired sample would have undersized the slots"
+        );
+        assert_eq!(slept, vec![UNWIRE_POLL; 3], "one poll past the last fall");
+        assert_eq!(samples.len(), 0);
+        assert!(!plan.mapped);
+
+        // A host that never falls is polled for the settle window, no longer.
+        let mut polls = 0usize;
+        let mut slept = std::time::Duration::ZERO;
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        slot_fallback_plan_with(
+            &mut plan,
+            0,
+            &mut || {
+                polls += 1;
+                Ok(settled)
+            },
+            &mut |d| slept += d,
+        );
+        assert_eq!(slept, UNWIRE_SETTLE);
+        assert_eq!(
+            polls,
+            1 + (UNWIRE_SETTLE.as_millis() / UNWIRE_POLL.as_millis()) as usize
+        );
+        assert_eq!(plan.budget, gib(30.0));
+
+        // An unreadable host sizes from the held bytes and still leaves mapped mode.
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            gib(11.4),
+            &mut || Err(Error::from_reason("no host statistics")),
+            &mut |_| panic!("no poll without a first sample"),
+        );
+        assert!(!plan.mapped);
+        assert_eq!(plan.budget, 12 << 30);
     }
 
     #[test]

@@ -45,7 +45,8 @@ pub struct LookupStats {
     pub prefetched: AtomicU64,
     /// Imports the model thread read itself or waited for after requesting.
     pub late: AtomicU64,
-    /// Decoded rows the LRU bound evicted, and their bytes.
+    /// Decoded rows the LRU bound evicted, and the bytes those evictions
+    /// released: a window's shared buffer goes with its last row.
     pub evicted_rows: AtomicU64,
     pub evicted_row_bytes: AtomicU64,
 }
@@ -532,15 +533,26 @@ impl Weight {
         .into_iter()
         .flatten()
         {
-            bytes += a.size()?
-                * match a.dtype()? {
-                    DType::Uint8 | DType::Int8 => 1,
-                    DType::Float16 | DType::BFloat16 => 2,
-                    _ => 4,
-                };
+            bytes += array_bytes(a)?;
         }
         Ok(bytes)
     }
+}
+
+fn array_bytes(a: &MxArray) -> Result<u64> {
+    Ok(a.size()?
+        * match a.dtype()? {
+            DType::Uint8 | DType::Int8 => 1,
+            DType::Float16 | DType::BFloat16 => 2,
+            _ => 4,
+        })
+}
+
+/// One lookup window's Metal buffer, shared by the rows it imported. It is
+/// released with its last row view, so it is charged whole until then.
+struct WindowBank {
+    bytes: u64,
+    views: usize,
 }
 
 pub struct Store {
@@ -592,6 +604,9 @@ pub struct Store {
     pub lookup: Arc<LookupStats>,
     pub live: Arc<Live>,
     tripwire: Tripwire,
+    window_banks: HashMap<u64, WindowBank>,
+    row_bank: HashMap<(String, usize, usize), u64>,
+    next_window_bank: u64,
 }
 
 #[derive(Deserialize)]
@@ -706,6 +721,9 @@ impl Store {
             lookup: Arc::default(),
             live: Arc::default(),
             tripwire: Tripwire::default(),
+            window_banks: HashMap::new(),
+            row_bank: HashMap::new(),
+            next_window_bank: 0,
         };
         if s.gguf {
             s.index_gguf(path)?;
@@ -750,18 +768,46 @@ impl Store {
                 continue;
             }
             self.recency.remove(&old);
-            if let Some(w) = self.cache.remove(&old) {
-                let bytes = w.bytes()?;
-                self.cache_bytes -= bytes;
+            if let Some((_, freed)) = self.uncache(&old)? {
+                self.cache_bytes -= freed;
                 if old.2 == 1 {
                     LookupStats::count(&self.lookup.evicted_rows);
                     self.lookup
                         .evicted_row_bytes
-                        .fetch_add(bytes, Ordering::Relaxed);
+                        .fetch_add(freed, Ordering::Relaxed);
                 }
             }
         }
         Ok(())
+    }
+    /// Drop a cache entry and return it with the bytes its removal released:
+    /// a row view of a window's buffer releases that buffer's bytes with the
+    /// last view and nothing before, every other entry its own bytes.
+    pub(super) fn uncache(
+        &mut self,
+        key: &(String, usize, usize),
+    ) -> Result<Option<(Arc<Weight>, u64)>> {
+        let Some(w) = self.cache.remove(key) else {
+            return Ok(None);
+        };
+        let freed = match self.row_bank.remove(key) {
+            Some(id) => {
+                let bank = self
+                    .window_banks
+                    .get_mut(&id)
+                    .ok_or_else(|| err("Qwen4 decoded row names a released window buffer"))?;
+                bank.views -= 1;
+                if bank.views == 0 {
+                    let bytes = bank.bytes;
+                    self.window_banks.remove(&id);
+                    bytes
+                } else {
+                    0
+                }
+            }
+            None => w.bytes()?,
+        };
+        Ok(Some((w, freed)))
     }
     fn insert(&mut self, name: String, mut t: Tensor) -> Result<()> {
         let elements = t
@@ -1184,46 +1230,59 @@ impl Store {
         let mut unique = HashMap::new();
         let mut rows = Vec::new();
         let mut order = Vec::with_capacity(ids.len());
+        let mut imported = Vec::new();
+        let banked = self.banks.contains_key(name);
         for &id in ids {
             let slot = if let Some(&slot) = unique.get(&id) {
                 slot
             } else {
                 LookupStats::count(&self.lookup.lookups);
-                if !self.banks.contains_key(name)
-                    && !self.cache.contains_key(&(name.to_string(), id, 1))
-                {
+                let miss = !banked && !self.cache.contains_key(&(name.to_string(), id, 1));
+                if miss {
                     LookupStats::count(&self.lookup.misses);
                 }
                 let row = self.read_impl(name, id, 1, true, None)?.dense_pending()?;
-                let slot = rows.len() as i32;
+                let slot = rows.len();
                 rows.push(row);
+                if miss {
+                    imported.push((id, slot));
+                }
                 unique.insert(id, slot);
                 slot
             };
-            order.push(slot);
+            order.push(slot as i32);
         }
         if let [row] = rows.as_slice()
             && order.len() == 1
         {
             return Ok(row.clone());
         }
-        let bank = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
-        // Every row the window touched is re-homed as a view of the window's
-        // bank: one Metal buffer per window instead of one per row. Each
-        // buffer is a Metal resource and MLX aborts at ~499k of them; a fresh
-        // 10k-token prompt makes 165k rows, so the third such prompt in one
-        // process died. A row an older window holds is copied into this bank
-        // by the concatenation anyway, and the old bank is released once its
-        // untouched rows age out.
-        if !self.banks.contains_key(name) {
-            for (&id, &slot) in &unique {
-                let key = (name.to_string(), id, 1);
-                let Some(entry) = self.cache.get_mut(&key) else {
-                    continue;
-                };
-                let slot = i64::from(slot);
+        // The rows this window imported and still holds share one Metal
+        // buffer: each buffer is a Metal resource and MLX aborts at ~499k of
+        // them, which one buffer per row reached on the third fresh
+        // 10k-token prompt. Rows the LRU already held keep their buffer, so
+        // no buffer carries a slot nothing points to, and a window's buffer
+        // is charged whole until its last row view is evicted.
+        imported.retain(|&(id, _)| self.cache.contains_key(&(name.to_string(), id, 1)));
+        if imported.len() > 1 {
+            let fresh = MxArray::concatenate_many(
+                imported.iter().map(|&(_, slot)| &rows[slot]).collect(),
+                Some(0),
+            )?;
+            let bytes = array_bytes(&fresh)?;
+            let id = self.next_window_bank;
+            self.next_window_bank += 1;
+            let mut rehomed = 0;
+            for (i, &(row, slot)) in imported.iter().enumerate() {
+                let key = (name.to_string(), row, 1);
+                let view = fresh.slice_axis(0, i as i64, i as i64 + 1)?;
+                let entry = self
+                    .cache
+                    .get_mut(&key)
+                    .ok_or_else(|| err("Qwen4 decoded row left the LRU inside its window"))?;
+                rehomed += entry.bytes()?;
                 *entry = Arc::new(Weight {
-                    values: bank.slice_axis(0, slot, slot + 1)?,
+                    values: view.clone(),
                     dense_bf16: None,
                     scales: None,
                     biases: None,
@@ -1231,9 +1290,24 @@ impl Store {
                     bits: 0,
                     mode: String::new(),
                 });
+                self.row_bank.insert(key, id);
+                rows[slot] = view;
+            }
+            self.window_banks.insert(
+                id,
+                WindowBank {
+                    bytes,
+                    views: imported.len(),
+                },
+            );
+            self.cache_bytes = self.cache_bytes - rehomed + bytes;
+            self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
+            if imported.len() == rows.len() {
+                return fresh.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0);
             }
         }
-        bank.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
+        let window = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
+        window.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
     }
 
     /// Start reading rows `(tensor, row)` on the reader threads; rows the
@@ -2271,9 +2345,10 @@ mod cache_tests {
         }
     }
 
-    /// A lookup window leaves one Metal buffer behind, not one per row: every
-    /// row it touched becomes a view of the window's bank, a later window
-    /// re-homes the rows it hits, and the LRU bound holds in those bytes.
+    /// A lookup window leaves one Metal buffer behind for the rows it
+    /// imported; rows it hit stay where they are; the LRU charges a window's
+    /// buffer whole until its last row view is evicted and reports the
+    /// bytes it released, so the charge is the memory that is allocated.
     #[test]
     fn decoded_rows_share_their_windows_buffer_and_stay_under_the_lru_bound() {
         let cleanup = Cleanup::new();
@@ -2282,9 +2357,31 @@ mod cache_tests {
         let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
         let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
         let name = "token_embd.weight";
-        let row_bytes = 32 * 2;
+        let rb: usize = 32 * 2;
         let key = |id: usize| (name.to_string(), id, 1);
         let cached = |store: &Store, id: usize| store.cache[&key(id)].values.clone();
+        let f32s = |a: &MxArray| a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let same_bits = |store: &Store, oracle: &mut Store, id: usize| {
+            let expected = oracle.read(name, id, 1).unwrap().dense().unwrap();
+            assert_eq!(&*f32s(&cached(store, id)), &*f32s(&expected), "row {id}");
+        };
+        // What is allocated: every live window buffer whole, plus every row
+        // that has its own buffer.
+        let allocated = |store: &Store| -> u64 {
+            store.window_banks.values().map(|b| b.bytes).sum::<u64>()
+                + store
+                    .cache
+                    .iter()
+                    .filter(|(k, _)| !store.row_bank.contains_key(*k))
+                    .map(|(_, w)| w.bytes().unwrap())
+                    .sum::<u64>()
+        };
+        let held =
+            |store: &Store, ids: &[usize]| ids.iter().all(|&id| store.cache.contains_key(&key(id)));
+        let gone = |store: &Store, ids: &[usize]| {
+            ids.iter().all(|&id| !store.cache.contains_key(&key(id)))
+        };
+
         let window = store.lookup_rows(name, &[5, 1, 6, 1, 2]).unwrap();
         MxArray::eval_arrays(&[&window]).unwrap();
         let views: Vec<_> = [5usize, 1, 6, 2]
@@ -2297,67 +2394,114 @@ mod cache_tests {
         for (slot, (view, id)) in views.iter().zip([5usize, 1, 6, 2]).enumerate() {
             assert_eq!(
                 view.storage_ptr() as usize,
-                base + slot * row_bytes,
-                "row {id} is slot {slot} of the window's bank"
+                base + slot * rb,
+                "row {id} is slot {slot} of the window's buffer"
             );
-            let expected = oracle.read(name, id, 1).unwrap().dense().unwrap();
-            assert_eq!(
-                &*view.astype(DType::Float32).unwrap().to_float32().unwrap(),
-                &*expected
-                    .astype(DType::Float32)
-                    .unwrap()
-                    .to_float32()
-                    .unwrap()
-            );
+            same_bits(&store, &mut oracle, id);
         }
+        assert_eq!(store.cache_bytes, 4 * rb as u64);
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.window_banks.len(), 1);
+
+        // A hit stays in its buffer; a window's single miss keeps its own.
         let next = store.lookup_rows(name, &[1, 7]).unwrap();
         MxArray::eval_arrays(&[&next]).unwrap();
-        let moved = cached(&store, 1);
-        let fresh = cached(&store, 7);
-        MxArray::eval_arrays(&[&moved, &fresh]).unwrap();
+        let (kept, own) = (cached(&store, 1), cached(&store, 7));
+        MxArray::eval_arrays(&[&kept, &own]).unwrap();
         assert_eq!(
-            moved.storage_ptr() as usize + row_bytes,
-            fresh.storage_ptr() as usize,
-            "a hit moves into the window that touched it"
+            kept.storage_ptr() as usize,
+            base + rb,
+            "a hit is not copied"
         );
-        assert_ne!(moved.storage_ptr() as usize, base + row_bytes);
-        assert_eq!(store.cache_bytes, 5 * row_bytes as u64);
+        assert!(!store.row_bank.contains_key(&key(7)));
+        assert_eq!(store.cache_bytes, 5 * rb as u64);
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(
+            &*f32s(&next),
+            &*f32s(&MxArray::concatenate_many(vec![&kept, &own], Some(0)).unwrap())
+        );
+
+        // Two misses around a hit: a second buffer holds the two.
+        let third = store.lookup_rows(name, &[3, 1, 4]).unwrap();
+        MxArray::eval_arrays(&[&third]).unwrap();
+        let (a, b) = (cached(&store, 3), cached(&store, 4));
+        MxArray::eval_arrays(&[&a, &b]).unwrap();
+        assert_eq!(a.storage_ptr() as usize + rb, b.storage_ptr() as usize);
+        assert_eq!(cached(&store, 1).storage_ptr() as usize, base + rb);
+        assert_eq!(store.cache_bytes, 7 * rb as u64);
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.window_banks.len(), 2);
+        for id in [3, 1, 4] {
+            same_bits(&store, &mut oracle, id);
+        }
+
+        // LRU order is 5, 6, 2, 7, 3, 1, 4. Evicting rows of a buffer that
+        // still has a view releases nothing; the last view releases it all,
+        // and the counters say what was released.
+        store.evict_to(7 * rb as u64 - 1).unwrap();
+        assert!(gone(&store, &[5, 6, 2, 7]) && held(&store, &[3, 1, 4]));
+        assert_eq!(
+            store.cache_bytes,
+            6 * rb as u64,
+            "the first buffer is charged whole for its one live row"
+        );
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(
+            (
+                store.lookup.evicted_rows(),
+                store.lookup.evicted_row_bytes()
+            ),
+            (4, rb as u64)
+        );
+        assert_eq!(cached(&store, 1).storage_ptr() as usize, base + rb);
+        same_bits(&store, &mut oracle, 1);
+        store.evict_to(5 * rb as u64).unwrap();
+        assert!(gone(&store, &[3, 1]) && held(&store, &[4]));
+        assert_eq!(
+            store.cache_bytes,
+            2 * rb as u64,
+            "the first buffer went with row 1"
+        );
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.lookup.evicted_row_bytes(), 5 * rb as u64);
+        same_bits(&store, &mut oracle, 4);
+        store.evict_to(0).unwrap();
+        assert_eq!(store.cache_bytes, 0);
+        assert!(
+            store.cache.is_empty() && store.window_banks.is_empty() && store.row_bank.is_empty()
+        );
+        assert_eq!(
+            (
+                store.lookup.evicted_rows(),
+                store.lookup.evicted_row_bytes()
+            ),
+            (7, 7 * rb as u64)
+        );
 
         // Four rows fit beside the staging reserve; a window of eight evicts
-        // in LRU order and the counters say so.
-        store.cache_limit = MAX_READ_BYTES * 3 + 4 * row_bytes as u64;
-        let evicted_before = store.lookup.evicted_rows();
+        // in LRU order while it imports and folds the rows that survived.
+        store.cache_limit = MAX_READ_BYTES * 3 + 4 * rb as u64;
         let wide = store.lookup_rows(name, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
         MxArray::eval_arrays(&[&wide]).unwrap();
-        assert!(
-            store.cache_bytes <= 5 * row_bytes as u64,
-            "LRU bound: {} bytes cached",
-            store.cache_bytes
-        );
-        let evicted = store.lookup.evicted_rows() - evicted_before;
-        assert!(evicted >= 3, "{evicted} rows evicted");
+        assert_eq!(store.cache_bytes, 5 * rb as u64, "LRU bound");
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.window_banks.len(), 1);
+        assert!(gone(&store, &[0, 1, 2]) && held(&store, &[3, 4, 5, 6, 7]));
         assert_eq!(
-            store.lookup.evicted_row_bytes(),
-            store.lookup.evicted_rows() * row_bytes as u64
+            (
+                store.lookup.evicted_rows(),
+                store.lookup.evicted_row_bytes()
+            ),
+            (10, 10 * rb as u64)
         );
-        assert!(
-            [6, 7].iter().all(|&id| store.cache.contains_key(&key(id)))
-                && [0, 1].iter().all(|&id| !store.cache.contains_key(&key(id))),
-            "the oldest rows go first"
-        );
-        let expected = oracle.read(name, 7, 1).unwrap().dense().unwrap();
+        let expected: Vec<_> = (0..8)
+            .map(|id| oracle.read(name, id, 1).unwrap().dense().unwrap())
+            .collect();
         assert_eq!(
-            &*cached(&store, 7)
-                .astype(DType::Float32)
-                .unwrap()
-                .to_float32()
-                .unwrap(),
-            &*expected
-                .astype(DType::Float32)
-                .unwrap()
-                .to_float32()
-                .unwrap()
+            &*f32s(&wide),
+            &*f32s(&MxArray::concatenate_many(expected.iter().collect(), Some(0)).unwrap())
         );
+        same_bits(&store, &mut oracle, 7);
     }
 
     /// A reader's failed read is consumed with its request and never
@@ -3148,5 +3292,86 @@ mod mapped_tests {
         assert_eq!(local.len(), ids.len());
         assert!(store.slot_bytes > 0 && store.slots.contains_key(&0));
         assert!(store.begin_turn().unwrap().is_none(), "applied once");
+    }
+
+    /// The slot budget is sized after the banks are released: the host is
+    /// read with the store's maps already dropped, from the sample after
+    /// wired memory settles, and that budget is the one the store keeps.
+    #[test]
+    fn leaving_mapped_mode_releases_the_banks_before_sizing_the_slots() {
+        use super::super::memory::HostMemory;
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store.plan.policy = "auto".into();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        store.plan.physical_bytes = Some(128 << 30);
+        store.plan.hot_bytes = 83 << 30;
+        let map = Arc::clone(&store.mapped_experts[&0].maps[0]);
+        let holders = Arc::strong_count(&map);
+        assert!(holders >= 2, "the store holds the mapping: {holders}");
+        let wired = HostMemory {
+            physical: 128 << 30,
+            free: 1 << 30,
+            file: 20 << 30,
+            anonymous: 30 << 30,
+            purgeable: 0,
+            wired: 50 << 30,
+            compressor: 10 << 30,
+        };
+        let released = HostMemory {
+            file: 54 << 30,
+            wired: 16 << 30,
+            ..wired
+        };
+        let mut samples = std::collections::VecDeque::from([wired, released, released]);
+        let mut seen = Vec::new();
+        let mut slept = 0;
+        let why = Fallback::SsdReads {
+            read: 3 << 30,
+            mapped: 1 << 30,
+        };
+        store
+            .leave_mapped_with(
+                &why,
+                &mut || {
+                    seen.push(Arc::strong_count(&map));
+                    Ok(samples.pop_front().expect("more samples than polls"))
+                },
+                &mut |_| slept += 1,
+            )
+            .unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|&n| n < holders),
+            "sampled while the store still held its banks: {seen:?} of {holders}"
+        );
+        assert_eq!(slept, 2);
+        assert!(!store.plan.mapped && store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.plan.available_bytes, Some(released.available()));
+        assert_eq!(store.plan.budget, 35 << 30, "sized from the released host");
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert_eq!(store.live.fallback(), Some(why));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&map) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pack mapping outlived the fallback"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }

@@ -394,7 +394,8 @@ pub struct Qwen4ExpResidencyInfo {
     /// model thread read or waited for after requesting them.
     pub prefetched_rows: f64,
     pub late_rows: f64,
-    /// Decoded rows the LRU bound evicted since load, and their bytes.
+    /// Decoded rows the LRU bound evicted since load, and the bytes those
+    /// evictions released (a window's shared buffer goes with its last row).
     pub decoded_row_evictions: f64,
     pub decoded_row_evicted_bytes: f64,
 }

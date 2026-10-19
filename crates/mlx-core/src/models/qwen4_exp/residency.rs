@@ -372,6 +372,8 @@ impl Store {
         self.banks.clear();
         self.paired_banks.clear();
         self.cache.clear();
+        self.window_banks.clear();
+        self.row_bank.clear();
         self.order.clear();
         self.recency.clear();
         self.protected.clear();
@@ -497,8 +499,8 @@ impl Store {
                 .cloned()
                 .collect();
             for key in keys {
-                if let Some(w) = self.cache.remove(&key) {
-                    self.cache_bytes -= w.bytes()?;
+                if let Some((w, freed)) = self.uncache(&key)? {
+                    self.cache_bytes -= freed;
                     if self.protected.remove(&key) {
                         self.protected_bytes -= w.bytes()?;
                     }

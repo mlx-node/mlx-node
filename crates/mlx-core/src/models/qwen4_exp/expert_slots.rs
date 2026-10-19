@@ -19,7 +19,7 @@ const MAPPED_WIRE_GAP: Duration = Duration::from_millis(900);
 /// or overwritten and no reader lease is needed.
 pub(super) struct MappedExperts {
     banks: [Arc<Weight>; 3],
-    maps: [Arc<crate::array::Mmap>; 3],
+    pub(super) maps: [Arc<crate::array::Mmap>; 3],
     experts: usize,
 }
 
@@ -320,14 +320,31 @@ impl Store {
     /// budget from the live host, banks built lazily by `expert_slots`, the
     /// dense banks and rows already held kept.
     fn leave_mapped(&mut self, why: &Fallback) -> Result<()> {
-        let mut plan = self.plan.clone();
-        super::super::memory::slot_fallback_plan(&mut plan, self.cache_bytes)?;
+        self.leave_mapped_with(
+            why,
+            &mut super::super::memory::host_memory,
+            &mut std::thread::sleep,
+        )
+    }
+
+    /// The banks go first: their pages stay wired until the driver lets go
+    /// of them, and a budget read while they are counts the pack against
+    /// the slots for the life of the process.
+    pub(super) fn leave_mapped_with(
+        &mut self,
+        why: &Fallback,
+        host: &mut dyn FnMut() -> Result<super::super::memory::HostMemory>,
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Result<()> {
         let experts = self.mapped_experts.values().next().map(|m| m.experts);
-        self.mapped_experts.clear();
         self.prefetch = None;
+        self.mapped_experts.clear();
         self.prefetch_pass = false;
         self.mapped_pass_start = None;
         self.slot_capacity = None;
+        crate::array::memory::synchronize();
+        let mut plan = self.plan.clone();
+        super::super::memory::slot_fallback_plan_with(&mut plan, self.cache_bytes, host, sleep);
         self.plan = plan;
         self.cache_limit = self.plan.budget;
         if let (Some(experts), Some(top)) = (
@@ -672,10 +689,9 @@ impl Store {
                             expert as usize * slots.rows[part],
                             slots.rows[part],
                         );
-                        if let Some(w) = self.cache.remove(&key) {
-                            let bytes = w.bytes()?;
-                            self.slot_upload_bytes += bytes;
-                            self.cache_bytes -= bytes;
+                        if let Some((w, freed)) = self.uncache(&key)? {
+                            self.slot_upload_bytes += w.bytes()?;
+                            self.cache_bytes -= freed;
                             self.recency.remove(&key);
                         }
                     }
@@ -1063,12 +1079,22 @@ mod tests {
             let reduced = large.sum(Some(&[0]), Some(false)).unwrap();
             store.finish_expert_slots(0, &large).unwrap();
             MxArray::eval_arrays(&[&large]).unwrap();
-            assert!(crate::array::memory::get_active_memory() - before >= 4. * 1024. * 1024.);
+            assert!(unsafe { mlx_sys::mlx_array_is_available(large.as_raw_ptr()) });
             store.complete_expert_window(0, &reduced).unwrap();
             reduced
         };
-        crate::array::memory::synchronize();
-        let retained = crate::array::memory::get_active_memory() - before;
+        // Sibling tests allocate and free on the same process-wide counter
+        // (a residency test holds fixture banks for seconds); what this
+        // window retained is what is still there once they are done.
+        let mut retained = f64::MAX;
+        for _ in 0..1000 {
+            crate::array::memory::synchronize();
+            retained = crate::array::memory::get_active_memory() - before;
+            if retained < 256. * 1024. {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
             retained < 256. * 1024.,
             "completed window retained {retained} bytes"

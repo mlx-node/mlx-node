@@ -5514,7 +5514,10 @@ export interface Qwen4ExpResidencyInfo {
    */
   prefetchedRows: number;
   lateRows: number;
-  /** Decoded rows the LRU bound evicted since load, and their bytes. */
+  /**
+   * Decoded rows the LRU bound evicted since load, and the bytes those
+   * evictions released (a window's shared buffer goes with its last row).
+   */
   decodedRowEvictions: number;
   decodedRowEvictedBytes: number;
 }

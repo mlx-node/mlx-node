@@ -132,8 +132,13 @@ pub(super) struct Tripwire {
 }
 
 impl Tripwire {
+    /// A turn starts after an idle gap, so its first main pass is the bank
+    /// re-wire: one legitimately slow pass. A streak carried across turns
+    /// would add those up over short answers (one judged pass each) and
+    /// send a healthy session to slots for good.
     pub fn begin_turn(&mut self, reads_now: u64) {
         self.turn_start_reads = reads_now;
+        self.slow_streak = 0;
     }
 
     #[cfg(test)]
@@ -233,6 +238,50 @@ mod tests {
         );
         assert_eq!(wire.take(), tripped);
         assert!(wire.tripped().is_none());
+    }
+
+    /// Short turns: a prefill window of a new length (untrained) then the
+    /// re-wire step, and the turn ends. Sixteen of them in a row, each
+    /// reading the pack once, are cold starts, not a thrash.
+    #[test]
+    fn short_cold_turns_with_one_rewire_each_never_trip() {
+        let mapped = 73u64 << 30;
+        let mut wire = Tripwire::default();
+        wire.begin_turn(0);
+        for _ in 0..MIN_SAMPLES {
+            assert!(wire.observe(1, 25 * MS, 0, mapped).is_none());
+        }
+        let mut reads = 0u64;
+        for turn in 0..2 * SLOW_STREAK {
+            wire.begin_turn(reads);
+            reads += mapped;
+            let rows = 1000 + 37 * turn as usize;
+            assert!(wire.observe(rows, 900 * MS, reads, mapped).is_none());
+            assert!(
+                wire.observe(1, 1_400 * MS, reads, mapped).is_none(),
+                "turn {turn}: the re-wire step is not a streak"
+            );
+        }
+        assert!(wire.tripped().is_none());
+        // Two slow stretches short of a streak, one per turn, do not add up.
+        for _ in 0..2 {
+            wire.begin_turn(reads);
+            assert!(wire.observe(1, 1_400 * MS, reads, mapped).is_none());
+            for _ in 0..SLOW_STREAK - 2 {
+                assert!(wire.observe(1, 300 * MS, reads, mapped).is_none());
+            }
+        }
+        assert!(wire.tripped().is_none());
+        // Within one turn the streak still trips.
+        wire.begin_turn(reads);
+        for _ in 0..SLOW_STREAK - 1 {
+            assert!(wire.observe(1, 2_400 * MS, reads, mapped).is_none());
+        }
+        assert_eq!(
+            wire.observe(1, 2_400 * MS, reads, mapped)
+                .map(Fallback::slow_steps),
+            Some(Some(SLOW_STREAK))
+        );
     }
 
     #[test]

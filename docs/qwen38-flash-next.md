@@ -70,16 +70,19 @@ and the reason for a slot choice (`fallbackReason`). During a pass the driver
 wires every bank, so a mapped turn cannot keep the slot path's free/file
 reserve; it stops growing anonymous memory only below 2 GiB of free plus file
 cache. A mapped turn that reads more than twice the pack from SSD, or runs
-eight consecutive passes over ten times the running median of their kind,
-finishes as it is and the next turn runs on the slot path (banks unmapped,
-slot budget from the live host); the reason, the bytes or the step count
+eight consecutive passes over ten times the running median of their kind
+(the streak starts over with every turn, whose first pass is the bank
+re-wire), finishes as it is and the next turn runs on the slot path: banks
+and read-ahead released first, then the slot budget read from the live host
+once wired memory has settled; the reason, the bytes or the step count
 are reported. Turns run without a wired-limit context (it does not pin
 file-backed buffers and only delays their release), the mid-turn staging
 admission is gone with the staging, the SSD safety limit subtracts the mapped
 bytes MLX counts in `active_memory`, and a lookup window's decoded rows share
 one Metal buffer (one per row made a fresh 10k-token prompt cost 165k Metal
-resources and the third one abort at MLX's ~499k resource limit; the LRU
-evicts them by bytes and reports `decodedRowEvictions`). Greedy output no
+resources and the third one abort at MLX's ~499k resource limit; rows a window
+hits stay in their buffer, a buffer is charged whole until its last row is
+evicted, and the LRU reports `decodedRowEvictions`). Greedy output no
 longer depends on the free memory at load. The driver wires whole banks, not the experts a token
 routes to, and unwires a bank about a second after its last use; a pass that
 starts later than that after the previous one would otherwise re-wire the
