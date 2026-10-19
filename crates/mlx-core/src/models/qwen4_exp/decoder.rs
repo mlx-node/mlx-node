@@ -82,6 +82,19 @@ impl LayerCache {
         };
         Ok(self.index_keys.insert(keys))
     }
+    /// (K/V rows, indexer blocks, indexer tail rows).
+    #[cfg(test)]
+    pub(super) fn history_shape(&self) -> (usize, usize, usize) {
+        let rows = self
+            .keys
+            .as_ref()
+            .map_or(0, |keys| keys.shape_at(2).unwrap() as usize);
+        (
+            rows,
+            self.index_block_count().unwrap(),
+            self.index_tail.len(),
+        )
+    }
     pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
         self.conv
             .iter()
@@ -1916,73 +1929,6 @@ impl Decoder {
             c.ngram_size,
         )?;
         value.add(&convolved)
-    }
-    /// Run the released one-layer MTP head against its own QSA state. Scope,
-    /// position and the target page adapter are restored on every error path.
-    pub fn draft_step(
-        &mut self,
-        hidden: &MxArray,
-        token: u32,
-        position: usize,
-        cache: &mut LayerCache,
-        project: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
-        let _flags = runtime_flags::scope();
-        let embedding = self.embed_token(token)?;
-        let target_pages = self.paged.take();
-        self.scope = "mtp.".into();
-        self.position_override = Some(position);
-        let result: Result<(MxArray, MxArray)> = (|| {
-            let c = self.config.clone();
-            let e = self.norm(
-                &embedding,
-                "pre_fc_norm_embedding.weight",
-                "",
-                c.hidden_size,
-                true,
-            )?;
-            let e = self.linear(&e, "fc_embedding.weight", "")?;
-            let h = self
-                .norm(
-                    hidden,
-                    "pre_fc_norm_hidden.weight",
-                    "",
-                    c.hidden_size * c.hc_count,
-                    true,
-                )?
-                .reshape(&[1, 1, c.hc_count as i64, c.hidden_size as i64])?;
-            let h = self.linear(&h, "fc_hidden.weight", "")?;
-            let mut x =
-                h.add(&e.expand_dims(2)?)?
-                    .reshape(&[1, 1, (c.hc_count * c.hidden_size) as i64])?;
-            let (input, inject) = self.hyper(&x, "layers.0.attn_hyper_connection", "", true)?;
-            let attn = self.attention(&input, 0, cache)?;
-            let inject = inject.ok_or_else(|| {
-                Error::from_reason("Qwen4 MTP attention is missing its injection gate")
-            })?;
-            x = Self::inject(&x, &attn, &inject)?;
-            let (input, inject) = self.hyper(&x, "layers.0.mlp_hyper_connection", "", true)?;
-            let mlp = self.moe(&input, 0)?;
-            let inject = inject
-                .ok_or_else(|| Error::from_reason("Qwen4 MTP MLP is missing its injection gate"))?;
-            x = Self::inject(&x, &mlp, &inject)?;
-            MxArray::eval_arrays_with_context(&[&x], "qwen4::decoder::x")?;
-            let (mixed, _) = self.hyper(&x, "hyper_connection_mixer", "", false)?;
-            Ok((x, mixed))
-        })();
-        self.scope.clear();
-        self.position_override = None;
-        self.paged = target_pages;
-        let (hidden, mixed) = result?;
-        let logits = if project {
-            Some(self.linear(&mixed, "lm_head.weight", "output.weight")?)
-        } else {
-            None
-        };
-        if let Some(logits) = &logits {
-            MxArray::eval_arrays_with_context(&[logits], "qwen4::decoder::logits")?;
-        }
-        Ok((hidden, logits))
     }
     pub fn step(&mut self, token: u32) -> Result<MxArray> {
         let _flags = runtime_flags::scope();

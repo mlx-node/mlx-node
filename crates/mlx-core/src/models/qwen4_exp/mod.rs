@@ -223,7 +223,7 @@ impl ChatBackend for Inner {
         let mut config = config.clone();
         crate::engine::params::apply_generation_defaults(&mut config, &self.defaults);
         let mut params = crate::engine::params::extract_chat_params(&config);
-        params.mtp_depth = params.mtp_depth.min(3);
+        params.mtp_depth = config.mtp_depth.map_or(2, |_| params.mtp_depth.min(3));
         // The shared measured verification policy models greedy acceptance.
         // Stochastic requests retain fixed-depth, distribution-correct MTP.
         if !crate::sampling::is_greedy_temperature(
