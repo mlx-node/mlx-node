@@ -234,11 +234,12 @@ pub(super) fn explicit_weight_budget() -> bool {
     std::env::var_os("MLX_QWEN4_WEIGHT_CACHE_GIB").is_some()
 }
 
-/// Whole GiB the mapped budget asks for: dense banks and LRU room. Routed
-/// experts are not in it; neither is auxiliary inventory, whose rows stream
-/// through the LRU room (measured: a mapped process with the MTP checkpoint
-/// attached and MTP off holds 7.8-8.3 GiB in all, where an 8 GiB auxiliary
-/// term modeled 13 GiB and refused the desktop the pack ran on).
+/// Whole GiB the mapped budget asks for: dense banks (plus the Q8 draft
+/// banks while the MTP head is attached) and LRU room. Routed experts are
+/// not in it; neither is the rest of the auxiliary inventory, whose rows
+/// stream through the LRU room (measured: a mapped process with the MTP
+/// checkpoint attached and MTP off holds 7.8-8.3 GiB in all, where an 8 GiB
+/// auxiliary term modeled 13 GiB and refused the desktop the pack ran on).
 pub(super) fn mapped_desired(dense_bytes: u64) -> u64 {
     dense_bytes
         .saturating_add(MAPPED_LRU_BYTES)

@@ -133,7 +133,10 @@ impl Store {
             .try_fold(0u64, |bytes, (_, tensor)| {
                 tensor.runtime_bytes().map(|n| bytes.saturating_add(n))
             })?;
-        Ok(auxiliary.min(self.cache_limit / 8).max(MAX_READ_BYTES * 6))
+        Ok(auxiliary
+            .min(self.cache_limit / 8)
+            .max(MAX_READ_BYTES * 6)
+            .max(self.draft_bank_budget))
     }
 
     /// Map every routed expert of every layer from the pack when `auto`
@@ -207,8 +210,16 @@ impl Store {
             .flat_map(|file| file.header.sections.iter().map(|s| s.length))
             .sum();
         let dense = self.fixed_projection_bytes()?;
+        // The Q8 draft banks are anonymous MLX memory built on the first MTP
+        // owner: a mapped host must hold them beside the dense banks.
+        let draft_bank = self.mtp_bank_estimate()?;
         let mut candidate = self.plan.clone();
-        if let Err(e) = plan(&mut candidate, dense, pool_bytes, pack_bytes) {
+        if let Err(e) = plan(
+            &mut candidate,
+            dense.saturating_add(draft_bank),
+            pool_bytes,
+            pack_bytes,
+        ) {
             self.plan.mapped_bank_budget = candidate.mapped_bank_budget;
             self.plan.live_non_reclaimable = candidate.live_non_reclaimable;
             tracing::warn!("qwen4 residency: slot path, {e}");
@@ -251,18 +262,20 @@ impl Store {
             Err(e) => tracing::warn!("qwen4 mapped pack read-ahead unavailable: {e}"),
         }
         self.cache_limit = self.plan.budget;
+        self.draft_bank_budget = draft_bank;
         self.slot_capacity = Some(experts);
         self.plan.mapped_bytes = bytes;
         self.plan.partial_expert_slots = experts;
         self.mapped_experts = mapped;
         self.live.store(&self.plan);
         tracing::info!(
-            "qwen4 mapped residency: {} layers x {experts} experts, {:.1} GiB mapped within a {:.1} GiB bank budget ({:.1} GiB live host memory), {:.1} GiB budget for dense banks and rows",
+            "qwen4 mapped residency: {} layers x {experts} experts, {:.1} GiB mapped within a {:.1} GiB bank budget ({:.1} GiB live host memory), {:.1} GiB budget for dense banks, rows and {:.2} GiB of draft banks",
             layers.len(),
             bytes as f64 / (1u64 << 30) as f64,
             self.plan.mapped_bank_budget as f64 / (1u64 << 30) as f64,
             self.plan.live_non_reclaimable as f64 / (1u64 << 30) as f64,
-            self.cache_limit as f64 / (1u64 << 30) as f64
+            self.cache_limit as f64 / (1u64 << 30) as f64,
+            draft_bank as f64 / (1u64 << 30) as f64
         );
         Ok(())
     }
@@ -377,6 +390,7 @@ impl Store {
         let experts = self.mapped_experts.values().next().map(|m| m.experts);
         self.prefetch = None;
         self.mapped_experts.clear();
+        self.draft_bank_budget = 0;
         self.prefetch_pass = false;
         self.mapped_pass_start = None;
         self.slot_capacity = None;

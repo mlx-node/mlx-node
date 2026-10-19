@@ -570,6 +570,42 @@ impl Store {
             .try_fold(0u64, |n, w| Ok(n + w.bytes()?))
     }
 
+    /// The MTP head's routed-expert banks as they would be built: name,
+    /// descriptor, rows, width, quantized, bytes. Empty without the head.
+    fn mtp_bank_specs(&self) -> Result<Vec<(&'static str, Tensor, usize, usize, bool, u64)>> {
+        if MTP_EXPERT_BANKS
+            .iter()
+            .any(|name| !self.tensors.contains_key(*name))
+        {
+            return Ok(Vec::new());
+        }
+        MTP_EXPERT_BANKS
+            .iter()
+            .map(|&name| {
+                let d = self.descriptor(name)?.clone();
+                let (rows, width) = (d.rows()?, d.width()?);
+                // MLX affine quantization needs K % 32 == 0; a narrower expert
+                // (fixtures) stays a dense gather bank.
+                let quantized = width % 32 == 0;
+                let bytes = (rows as u64)
+                    .saturating_mul(width as u64)
+                    .saturating_mul(if quantized { 9 } else { 16 })
+                    / 8;
+                Ok((name, d, rows, width, quantized, bytes))
+            })
+            .collect()
+    }
+
+    /// Anonymous bytes the draft banks take once built: what a mapped plan
+    /// charges beside the dense banks while the MTP head is attached, so the
+    /// live-memory gate and the bank admission see the same number.
+    pub(in super::super) fn mtp_bank_estimate(&self) -> Result<u64> {
+        Ok(self
+            .mtp_bank_specs()?
+            .iter()
+            .fold(0u64, |n, spec| n.saturating_add(spec.5)))
+    }
+
     /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
     /// so a draft step gathers them on the device. Runs once, on the first MTP
     /// owner; the whole aux tensor streams through 64 MiB row chunks. Both
@@ -583,11 +619,11 @@ impl Store {
         &mut self,
         admit: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<u64> {
-        if self.mtp_banks_declined
-            || MTP_EXPERT_BANKS
-                .iter()
-                .any(|name| !self.tensors.contains_key(*name))
-        {
+        if self.mtp_banks_declined {
+            return Ok(0);
+        }
+        let specs = self.mtp_bank_specs()?;
+        if specs.is_empty() {
             return Ok(0);
         }
         if MTP_EXPERT_BANKS
@@ -596,23 +632,12 @@ impl Store {
         {
             return self.mtp_bank_bytes();
         }
-        let mut specs = Vec::with_capacity(MTP_EXPERT_BANKS.len());
         let (mut total, mut peak) = (0u64, 0u64);
-        for name in MTP_EXPERT_BANKS {
-            let d = self.descriptor(name)?.clone();
-            let (rows, width) = (d.rows()?, d.width()?);
-            // MLX affine quantization needs K % 32 == 0; a narrower expert
-            // (fixtures) stays a dense gather bank.
-            let quantized = width % 32 == 0;
-            let bytes = (rows as u64)
-                .saturating_mul(width as u64)
-                .saturating_mul(if quantized { 9 } else { 16 })
-                / 8;
+        for (.., bytes) in &specs {
             // Imported chunks and the concatenated bank coexist while the
             // earlier banks are already held.
             peak = peak.max(total.saturating_add(bytes.saturating_mul(2)));
-            total = total.saturating_add(bytes);
-            specs.push((name, d, rows, width, quantized, bytes));
+            total = total.saturating_add(*bytes);
         }
         let pinned = self.protected_bytes + self.bank_bytes + self.slot_bytes;
         let room = self.cache_limit.saturating_sub(pinned);

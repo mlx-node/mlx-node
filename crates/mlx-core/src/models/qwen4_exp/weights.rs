@@ -463,6 +463,9 @@ pub struct Store {
     banks: HashMap<String, Arc<Weight>>,
     bank_bytes: u64,
     mtp_banks_declined: bool,
+    /// Draft-bank bytes the mapped plan budgeted beside the dense banks; the
+    /// bank admission honours them, the slot path leaves them at zero.
+    draft_bank_budget: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
     mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
@@ -589,6 +592,7 @@ impl Store {
             banks: HashMap::new(),
             bank_bytes: 0,
             mtp_banks_declined: false,
+            draft_bank_budget: 0,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
             mapped_experts: HashMap::new(),
@@ -3155,6 +3159,72 @@ mod mapped_tests {
             "read-ahead off: a stale pass touches a cold pack"
         );
         assert!(!cold.prefetch_pass);
+    }
+
+    /// With the MTP head attached, the mapped plan's anonymous need carries
+    /// the Q8 draft banks beside the dense banks, the allowance admits that
+    /// bank once the plan is mapped, and leaving the mapped path drops it.
+    /// MUTATION (M-INT2-bank): pass `dense` alone to the gate -> the gate sees
+    /// the dense bytes without the bank and the first assertion fails.
+    #[test]
+    fn mapped_plan_charges_the_draft_bank_while_the_mtp_head_is_attached() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let aux =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/bf16/paged");
+        store
+            .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
+            .unwrap();
+        let bank = store.mtp_bank_estimate().unwrap();
+        assert!(bank > 0, "the fixture head has routed experts");
+        let dense = store.fixed_projection_bytes().unwrap();
+        let dir = temp.0.join("mapped");
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        store.plan.policy = "auto".into();
+        let mut charged = None;
+        store
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, need, _, _| {
+                charged = Some(need);
+                plan.budget = super::super::memory::mapped_desired(need);
+                plan.mapped = true;
+                plan.resident = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        assert_eq!(
+            charged,
+            Some(dense + bank),
+            "the gate's anonymous need carries the draft bank"
+        );
+        assert!(
+            store.auxiliary_cache_allowance().unwrap() >= bank,
+            "the mapped budget admits the bank it charged"
+        );
+        let slot_rule = store
+            .tensors
+            .iter()
+            .filter(|(name, _)| super::residency::is_auxiliary(name))
+            .map(|(_, t)| t.runtime_bytes().unwrap())
+            .sum::<u64>()
+            .min(store.cache_limit / 8)
+            .max(MAX_READ_BYTES * 6);
+        store
+            .leave_mapped_with(
+                &Fallback::LoadGate { pack: 0, budget: 0 },
+                &mut super::super::memory::host_memory,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!store.plan.mapped);
+        assert_eq!(
+            store.auxiliary_cache_allowance().unwrap(),
+            slot_rule,
+            "the slot path keeps its own allowance rule"
+        );
     }
 
     /// Mapped mode on the fixture pack: identity routing, capacity == experts,
