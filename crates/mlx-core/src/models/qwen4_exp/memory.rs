@@ -1301,9 +1301,28 @@ pub(super) fn draft_kv_bytes_per_token(c: &super::config::Config) -> u64 {
 }
 
 /// Verify snapshots of up to four accepted frontiers plus the draft K/V of
-/// `tokens`.
+/// `tokens`: what an owner holds once every token is in its draft cache.
 pub(super) fn draft_state_bytes(c: &super::config::Config, tokens: u64) -> u64 {
     4 * row_state_bytes(c) + tokens * draft_kv_bytes_per_token(c)
+}
+
+/// One BF16 target hidden row (`hc_count x hidden_size`) an MTP owner keeps
+/// until the next first draft pass writes it into the draft cache.
+pub(super) fn draft_hidden_row_bytes(c: &super::config::Config) -> u64 {
+    (c.hc_count * c.hidden_size * 2) as u64
+}
+
+/// What an MTP owner holds now: draft K/V for the rows in its cache, the
+/// hidden rows still waiting (trusted rows and the seed), and the verify
+/// snapshots while it is inside an MTP turn. A waiting row has no K/V yet.
+pub(super) fn draft_owner_bytes(
+    c: &super::config::Config,
+    cached_rows: u64,
+    hidden_rows: u64,
+    tracking: bool,
+) -> u64 {
+    let snapshots = if tracking { 4 * row_state_bytes(c) } else { 0 };
+    snapshots + cached_rows * draft_kv_bytes_per_token(c) + hidden_rows * draft_hidden_row_bytes(c)
 }
 
 /// What the working allowance leaves for scheduled rows and draft state once
@@ -1371,9 +1390,10 @@ fn runtime_slices_cannot_exceed_bootstrap_admission() {
 /// two 32k MTP owners then fit and the `2 * mtp_32k > budget` assertion fails.
 /// MUTATION: drop the four verify snapshots from `draft_state_bytes`; the 16k
 /// pair then fits and the `2 * row + 2 * draft_16k > budget` assertion fails.
-#[test]
-fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
-    let c = super::config::Config::parse(&serde_json::json!({
+/// The released Flash Next geometry (Qwen3.8 Flash Next).
+#[cfg(test)]
+fn flash_next_config() -> super::config::Config {
+    super::config::Config::parse(&serde_json::json!({
         "model_type": "qwen4_exp_text",
         "hidden_size": 2560,
         "num_hidden_layers": 48,
@@ -1408,7 +1428,12 @@ fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
         "split_ngram_parts": 128,
         "eos_token_id": 248044
     }))
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
+    let c = flash_next_config();
     assert_eq!(c.effective_context_limit(), 32_768);
     assert_eq!(row_state_bytes(&c), 169_967_616);
     assert_eq!(draft_kv_bytes_per_token(&c), 4096);
@@ -1450,5 +1475,51 @@ fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
         2 * row + 2 * draft_16k > budget,
         "two 16k MTP owners ({} B) must not both pass admission against the {budget} B budget",
         2 * row + 2 * draft_16k
+    );
+}
+
+/// Two Flash Next owners parked right after a 1024-row prefill slice, with
+/// 1023 trusted rows and the seed waiting and nothing drafted: each keeps
+/// 1024 BF16 hidden rows of 20,480 B beside its recurrent row and no draft
+/// K/V. A budget sized to the draft-K/V figure those rows used to be charged
+/// at admits a third owner only after reclaim.
+/// MUTATION (M-INT2-rows): charge waiting rows as draft K/V in
+/// `draft_owner_bytes`; `held` falls to the K/V figure, the third owner fits
+/// and the AfterReclaim assertion fails.
+#[test]
+fn flash_next_parked_owners_charge_their_waiting_hidden_rows() {
+    use crate::engine::hybrid_scheduler::{
+        ScheduledStateCapacity, ScheduledStateFit, scheduled_state_fit,
+    };
+    let c = flash_next_config();
+    assert_eq!(draft_hidden_row_bytes(&c), 20_480);
+    let row = row_state_bytes(&c);
+    let parked = draft_owner_bytes(&c, 0, 1024, false);
+    assert_eq!(parked, 1024 * 20_480);
+    let kv_figure = 1024 * draft_kv_bytes_per_token(&c);
+    assert!(parked > kv_figure);
+    assert_eq!(
+        draft_owner_bytes(&c, 7, 1, true),
+        4 * row + 7 * 4096 + 20_480,
+        "cached rows pay K/V, the seed pays its hidden row, a tracked owner its snapshots"
+    );
+    let candidate = row + draft_state_bytes(&c, 256);
+    let budget = 2 * (row + kv_figure) + candidate;
+    let held = 2 * (row + parked);
+    assert_eq!(
+        scheduled_state_fit(Some(ScheduledStateCapacity { budget, held }), 0, candidate),
+        ScheduledStateFit::AfterReclaim,
+        "the retained hidden rows overcommit a budget sized to their K/V figure"
+    );
+    assert_eq!(
+        scheduled_state_fit(
+            Some(ScheduledStateCapacity {
+                budget,
+                held: 2 * (row + kv_figure),
+            }),
+            0,
+            candidate
+        ),
+        ScheduledStateFit::Fits
     );
 }

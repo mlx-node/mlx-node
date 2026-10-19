@@ -69,7 +69,7 @@ pub(crate) struct ScheduledStateCapacity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScheduledStateFit {
+pub(crate) enum ScheduledStateFit {
     Fits,
     AfterReclaim,
     Never,
@@ -78,7 +78,7 @@ enum ScheduledStateFit {
 /// `outstanding_bytes` is what queued and running turns reserved but their
 /// sequences do not hold yet; it counts like held state. A candidate above
 /// the whole budget must error, never defer: no reclaim can make room for it.
-fn scheduled_state_fit(
+pub(crate) fn scheduled_state_fit(
     capacity: Option<ScheduledStateCapacity>,
     outstanding_bytes: u64,
     candidate_bytes: u64,

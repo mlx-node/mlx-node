@@ -355,19 +355,96 @@ fn scheduled_state_accounting_counts_rows_and_tracked_drafts() {
         )
         .unwrap();
     let frontier = prompt.len() as u64;
-    assert_eq!(held(&inner), row + memory::draft_state_bytes(&c, frontier));
+    // Nothing is cached yet: the trusted rows and the seed wait as hidden rows.
+    assert_eq!(inner.mtp.draft_rows(1), Some((0, prompt.len() - 1)));
+    let tracked = memory::draft_owner_bytes(&c, 0, frontier, true);
+    let parked = memory::draft_owner_bytes(&c, 0, frontier, false);
+    assert_eq!(held(&inner), row + tracked);
     assert_eq!(
         inner.scheduled_state_candidate_bytes(1, 100, true),
         memory::draft_state_bytes(&c, 100 - frontier)
     );
     inner.release_scheduled_speculation(1);
-    assert_eq!(held(&inner), row + frontier * kv);
+    assert_eq!(held(&inner), row + parked);
     inner.park_active_scheduled_recurrent().unwrap();
-    assert_eq!(held(&inner), row + frontier * kv);
+    assert_eq!(held(&inner), row + parked);
     inner.activate_paged_seq(2).unwrap();
-    assert_eq!(held(&inner), 2 * row + frontier * kv);
+    assert_eq!(held(&inner), 2 * row + parked);
     inner.release_scheduled_recurrent_for(1);
     assert_eq!(held(&inner), row);
+}
+
+/// Two MTP owners whose turns end right after a prefill that left width-1
+/// trusted rows waiting (nothing proposed): the parked owners keep those BF16
+/// hidden rows and the seed, nothing is flushed at parking, and the held
+/// state charges the rows at their hidden size with no draft K/V for them,
+/// so a third owner is admitted against what the rows really hold.
+/// MUTATION (M-INT2-rows): charge waiting rows as draft K/V in
+/// `draft_owner_bytes`; the held assertions fail.
+#[test]
+fn parked_mtp_owners_charge_their_waiting_hidden_rows() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledStateCapacity, ScheduledStateFit, scheduled_state_fit,
+    };
+    let mut inner = tiny_inner();
+    let c = inner.decoder.config.clone();
+    let width = 8usize;
+    inner.decoder.prefill_window_pin = Some(width);
+    inner.decoder.prefill_chunk_size = width;
+    let row = memory::row_state_bytes(&c);
+    let hidden = memory::draft_hidden_row_bytes(&c);
+    assert!(hidden > 0);
+    let held = |inner: &Inner| inner.scheduled_state_capacity().unwrap().held;
+    let prompt: Vec<u32> = (0..width as u32).map(|i| (i * 5 + 3) % 60).collect();
+    for seq in [1u32, 2] {
+        inner.activate_paged_seq(seq).unwrap();
+        inner.begin_mtp(seq, 0).unwrap();
+        let prefix = inner
+            .prime_prefix_state(&prompt, false, 32, &[], 0)
+            .unwrap();
+        inner
+            .paged_prefill(
+                &prompt,
+                &prefix,
+                Stream::default(crate::stream::DeviceType::Gpu),
+            )
+            .unwrap();
+        assert_eq!(
+            inner.mtp.draft_rows(seq),
+            Some((0, width - 1)),
+            "width - 1 trusted rows wait beside the seed; the draft cache is empty"
+        );
+        inner.release_scheduled_speculation(seq);
+        assert_eq!(
+            inner.mtp.draft_rows(seq),
+            Some((0, width - 1)),
+            "parking flushes nothing"
+        );
+        inner.park_active_scheduled_recurrent().unwrap();
+    }
+    let parked = width as u64 * hidden;
+    assert_eq!(
+        parked,
+        memory::draft_owner_bytes(&c, 0, width as u64, false)
+    );
+    assert_eq!(held(&inner), 2 * (row + parked));
+    let candidate = inner.scheduled_state_candidate_bytes(3, width as u32, true);
+    let capacity = |budget: u64| {
+        Some(ScheduledStateCapacity {
+            budget,
+            held: held(&inner),
+        })
+    };
+    assert_eq!(
+        scheduled_state_fit(capacity(2 * (row + parked) + candidate), 0, candidate),
+        ScheduledStateFit::Fits
+    );
+    assert_eq!(
+        scheduled_state_fit(capacity(2 * (row + parked) + candidate - 1), 0, candidate),
+        ScheduledStateFit::AfterReclaim,
+        "one byte under what the parked rows hold must wait for reclaim"
+    );
 }
 
 /// Two MTP owners queued in one drive pass, before any scheduler step. The

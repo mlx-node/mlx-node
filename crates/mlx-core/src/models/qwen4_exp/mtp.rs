@@ -53,13 +53,13 @@ impl State {
     pub fn owner_frontier(&self, seq: u32) -> Option<usize> {
         self.owners.get(&seq).map(|owner| owner.frontier)
     }
-    /// Draft K/V an owner holds, plus its verify snapshots inside an MTP turn.
+    /// What an owner holds: draft K/V for its cached rows, the hidden rows
+    /// waiting for the next first draft pass (trusted rows and the seed),
+    /// plus its verify snapshots inside an MTP turn.
     fn owner_bytes(c: &super::config::Config, owner: &Owner) -> u64 {
-        if owner.tracking {
-            super::memory::draft_state_bytes(c, owner.frontier as u64)
-        } else {
-            owner.frontier as u64 * super::memory::draft_kv_bytes_per_token(c)
-        }
+        let hidden_rows = owner.rows.len() as u64 + u64::from(owner.hidden.is_some());
+        let cached_rows = (owner.frontier as u64).saturating_sub(hidden_rows);
+        super::memory::draft_owner_bytes(c, cached_rows, hidden_rows, owner.tracking)
     }
     pub fn held_bytes(&self, c: &super::config::Config) -> u64 {
         self.owners
