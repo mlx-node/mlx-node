@@ -1424,17 +1424,9 @@ impl Decoder {
         self.ple_window(x, &[token], i, cache)
     }
 
-    fn ple_window(
-        &mut self,
-        x: &MxArray,
-        tokens: &[u32],
-        i: usize,
-        cache: &mut LayerCache,
-    ) -> Result<MxArray> {
-        let c = self.config.clone();
-        let t = tokens.len() as i64;
+    /// `[multipliers, head sizes, head offsets]` of PLE layer `i`.
+    fn ple_constants(&self, i: usize) -> Result<[Vec<u64>; 3]> {
         let p = format!("layers.{i}.ple");
-        let g = format!("blk.{i}");
         let constants = |name: &str| -> Result<Vec<u64>> {
             if self.gguf() {
                 super::gguf::integers(&self.weights.metadata, &format!("qwen4exp.ple.{name}"))
@@ -1449,9 +1441,17 @@ impl Decoder {
                 ))
             }
         };
-        let multipliers = constants("layer_multipliers")?;
-        let sizes = constants("head_vocab_sizes")?;
-        let offsets = constants("head_offsets")?;
+        Ok([
+            constants("layer_multipliers")?,
+            constants("head_vocab_sizes")?,
+            constants("head_offsets")?,
+        ])
+    }
+
+    /// Hash ids of `tokens` continuing the current history, in gather order.
+    fn ple_hash_ids(&self, i: usize, tokens: &[u32]) -> Result<Vec<u64>> {
+        let c = &self.config;
+        let [multipliers, sizes, offsets] = self.ple_constants(i)?;
         let mut previous =
             self.history[self.history.len().saturating_sub(c.ngram_size - 1)..].to_vec();
         let mut ids = Vec::new();
@@ -1469,34 +1469,80 @@ impl Decoder {
             )?);
             previous.push(token);
         }
+        Ok(ids)
+    }
 
-        let emb = if self.gguf() {
-            self.weights.lookup_rows(
-                "per_layer_token_embd.weight",
-                &ids.iter().map(|&id| id as usize).collect::<Vec<_>>(),
-            )?
-        } else {
-            let mut groups: std::collections::BTreeMap<String, (Vec<usize>, Vec<usize>)> =
-                Default::default();
-            for (position, id) in ids.iter().enumerate() {
-                let mut local = *id as usize;
-                let mut found = false;
-                for shard in 0..c.split_ngram_parts {
-                    let key = format!("{p}.ple_embedding.ngram_embedding.shard_{shard}.weight");
-                    let count = self.weights.descriptor(&key)?.rows()?;
-                    if local < count {
-                        let (rows, positions) = groups.entry(key).or_default();
-                        rows.push(local);
-                        positions.push(position);
-                        found = true;
-                        break;
+    /// The table row behind each hash id: the one GGUF table, or the
+    /// safetensors shard that holds it.
+    fn ple_row_keys(&self, i: usize, ids: &[u64]) -> Result<Vec<(String, usize)>> {
+        if self.gguf() {
+            return Ok(ids
+                .iter()
+                .map(|&id| ("per_layer_token_embd.weight".to_string(), id as usize))
+                .collect());
+        }
+        let p = format!("layers.{i}.ple");
+        let shards = (0..self.config.split_ngram_parts)
+            .map(|shard| {
+                let key = format!("{p}.ple_embedding.ngram_embedding.shard_{shard}.weight");
+                let count = self.weights.descriptor(&key)?.rows()?;
+                Ok((key, count))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|&id| {
+                let mut local = id as usize;
+                for (key, count) in &shards {
+                    if local < *count {
+                        return Ok((key.clone(), local));
                     }
                     local -= count;
                 }
-                if !found {
-                    return Err(Error::from_reason("PLE row outside checkpoint vocabulary"));
-                }
-            }
+                Err(Error::from_reason("PLE row outside checkpoint vocabulary"))
+            })
+            .collect()
+    }
+
+    /// Hand the reader threads the PLE rows `tokens` will need at their PLE
+    /// layer, before the layers ahead of it are encoded. The embedding row
+    /// is needed at once, so the model thread reads it itself.
+    fn prefetch_ple_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        let mut keys = Vec::new();
+        let c = self.config.clone();
+        for &layer in &c.ple_layer_ids {
+            let Some(i) = layer.checked_sub(1) else {
+                continue;
+            };
+            let ids = self.ple_hash_ids(i, tokens)?;
+            keys.extend(self.ple_row_keys(i, &ids)?);
+        }
+        self.weights.prefetch_rows(&keys)
+    }
+
+    fn ple_window(
+        &mut self,
+        x: &MxArray,
+        tokens: &[u32],
+        i: usize,
+        cache: &mut LayerCache,
+    ) -> Result<MxArray> {
+        let c = self.config.clone();
+        let t = tokens.len() as i64;
+        let p = format!("layers.{i}.ple");
+        let g = format!("blk.{i}");
+        let ids = self.ple_hash_ids(i, tokens)?;
+        let mut groups: std::collections::BTreeMap<String, (Vec<usize>, Vec<usize>)> =
+            Default::default();
+        for (position, (name, row)) in self.ple_row_keys(i, &ids)?.into_iter().enumerate() {
+            let (rows, positions) = groups.entry(name).or_default();
+            rows.push(row);
+            positions.push(position);
+        }
+        let emb = if groups.len() == 1
+            && let Some((name, (rows, _))) = groups.pop_first()
+        {
+            self.weights.lookup_rows(&name, &rows)?
+        } else {
             let mut rows = vec![None; ids.len()];
             for (name, (indices, positions)) in groups {
                 let bank = self.weights.lookup_rows(&name, &indices)?;
@@ -1573,27 +1619,13 @@ impl Decoder {
             &format!("{p}.conv1d.weight"),
             &format!("{g}.ple_conv1d.weight"),
         )?;
-        let convolved = if (tokens.len() > 8 && self.async_device_prefill())
-            || (self.deferred_state_submission()
-                && runtime_flags::is_one(c"MLX_QWEN4_DECODE_ASYNC_PLE"))
-        {
-            math::conv_window_with_completion(
-                &normalized,
-                &weight,
-                &mut cache.ple_conv,
-                c.ple_conv_kernel_size,
-                c.ngram_size,
-                true,
-            )?
-        } else {
-            math::conv_window(
-                &normalized,
-                &weight,
-                &mut cache.ple_conv,
-                c.ple_conv_kernel_size,
-                c.ngram_size,
-            )?
-        };
+        let convolved = math::conv_window(
+            &normalized,
+            &weight,
+            &mut cache.ple_conv,
+            c.ple_conv_kernel_size,
+            c.ngram_size,
+        )?;
         value.add(&convolved)
     }
     /// Run the released one-layer MTP head against its own QSA state. Scope,
@@ -1750,11 +1782,12 @@ impl Decoder {
         self.inject_for_mlp(&x, &branch, &gate, i, normalize)
     }
 
+    /// The token's embedding row as a lazy array: an LRU hit or an import
+    /// the consuming layer submits, never a drain at the token start.
     pub fn embed_token(&mut self, token: u32) -> Result<MxArray> {
         let key = self.key("embed_tokens.weight", "token_embd.weight");
         self.weights
-            .read(&key, token as usize, 1)?
-            .dense()?
+            .lookup_rows(&key, &[token as usize])?
             .reshape(&[1, 1, self.config.hidden_size as i64])
     }
 
@@ -1836,6 +1869,7 @@ impl Decoder {
             }
             adapter.record_tokens(tokens).map_err(Error::from_reason)?;
         }
+        self.prefetch_ple_rows(tokens)?;
         let batched = self.batch_prefill && tokens.len() > 1 && self.verification.is_none();
         let carry =
             batched && self.window_carry && !runtime_flags::is_zero(c"MLX_QWEN4_WINDOW_CARRY");
@@ -2063,12 +2097,8 @@ impl Decoder {
                 "qwen4_exp token/context outside configured limits",
             ));
         }
-        let key = self.key("embed_tokens.weight", "token_embd.weight");
-        let row = self
-            .weights
-            .read(&key, token as usize, 1)?
-            .dense()?
-            .reshape(&[1, 1, self.config.hidden_size as i64])?;
+        self.prefetch_ple_rows(&[token])?;
+        let row = self.embed_token(token)?;
         let mut x = MxArray::tile(&row, &[1, 1, self.config.hc_count as i32])?;
         let mut normed = None;
         for i in 0..self.config.num_hidden_layers {

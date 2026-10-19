@@ -5480,6 +5480,20 @@ export interface Qwen4ExpResidencyInfo {
    * Metal driver wires while a command buffer binds them).
    */
   mappedBytes: number;
+  /**
+   * Token/PLE rows asked of the decoded-row LRU since load, and the ones
+   * it had to import.
+   */
+  decodedRowLookups: number;
+  decodedRowMisses: number;
+  /** Share of decoded-row lookups served without an import. */
+  decodedRowHitRate: number;
+  /**
+   * Imported rows whose bytes a reader thread had ready, and those the
+   * model thread read or waited for after requesting them.
+   */
+  prefetchedRows: number;
+  lateRows: number;
 }
 
 /** Result of text recognition. */

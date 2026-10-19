@@ -100,9 +100,14 @@ instead of 50. The 75% gate does not see that memory;
 Otherwise, if the hot text network fits, it is prepared once in resident
 quantized banks; else fixed projections are retained within a quarter of the
 budget and routed experts use stable slots sized from the remaining budget and
-tensor geometry. Sparse token/PLE rows stay on SSD. Only selected cold experts
-are read. Every source read and its F32-equivalent size are capped at 64 MiB;
-bank preparation accounts for both imported chunks and their destination.
+tensor geometry. Sparse token/PLE rows stay on SSD: the 17 rows a token needs
+(its embedding and 16 hashed PLE rows) are requested from four reader threads
+as soon as the token is known, `pread` from descriptors kept open, and imported
+lazily into the layer that consumes them, so the model thread neither opens
+files nor drains the GPU at the token start; decoded rows are kept in the
+weight LRU. Only selected cold experts are read. Every source read and its
+F32-equivalent size are capped at 64 MiB; bank preparation accounts for both
+imported chunks and their destination.
 
 The optional prepared SSD cache stores losslessly imported matrix chunks, so
 later RAM evictions or restarts do not repeat the import. It excludes sparse
@@ -180,7 +185,11 @@ open or building pack does.
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
 expert-slot capacity (the expert count in mapped mode), the number of tensors
 served from the mapped pack (`mappedPackFiles`), whether experts are mapped in
-place (`mapped`, with `mappedBytes`), and prefill window. These are runtime budgets; they do
+place (`mapped`, with `mappedBytes`), the prefill window, and the live
+decoded-row counters (`decodedRowLookups`, `decodedRowMisses`,
+`decodedRowHitRate`, plus `prefetchedRows` / `lateRows`: imported rows the
+reader threads had ready versus rows the model thread read or waited for).
+The budgets are runtime budgets; they do
 not include every allocation made by macOS or other applications. The runtime
 currently requires macOS Metal for paged inference. NAX kernels are selected
 only for supported hardware and shapes; other shapes retain the native fallback.

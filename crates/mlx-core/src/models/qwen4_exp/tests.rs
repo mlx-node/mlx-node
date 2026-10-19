@@ -5040,7 +5040,7 @@ fn fused_injection_norm_preserves_stream_values_and_group_reduction() {
 }
 
 #[test]
-fn deferred_ple_history_matches_completed_windows_and_continuation() {
+fn ple_window_history_stays_lazy_and_matches_the_singleton_convolution() {
     use crate::array::DType;
     for dtype in [DType::Float32, DType::BFloat16] {
         let weight = MxArray::arange(0., 64., None, Some(DType::Float32))
@@ -5051,7 +5051,7 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
             .unwrap()
             .reshape(&[16, 4])
             .unwrap();
-        let (mut deferred, mut completed) = (None, None);
+        let (mut window, mut singleton) = (None, None);
         let mut pending = Vec::new();
         for rows in [1i64, 17, 1, 1, 33, 9, 1, 11, 1] {
             let x = MxArray::arange(0., (rows * 16) as f64, None, Some(DType::Float32))
@@ -5064,25 +5064,33 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
                 .unwrap()
                 .astype(dtype)
                 .unwrap();
-            let actual =
-                math::conv_window_with_completion(&x, &weight, &mut deferred, 4, 3, true).unwrap();
-            // Value parity alone missed the singleton's unconditional wait.
-            // Inspect readiness before the control or any output is evaluated.
+            let actual = math::conv_window(&x, &weight, &mut window, 4, 3).unwrap();
+            // Value parity alone would miss an eager wait. Inspect readiness
+            // before the reference or any output is evaluated.
             assert!(
-                !unsafe {
-                    mlx_sys::mlx_array_is_available(deferred.as_ref().unwrap().as_raw_ptr())
-                },
-                "deferred PLE history was eagerly completed for {rows} rows"
+                !unsafe { mlx_sys::mlx_array_is_available(window.as_ref().unwrap().as_raw_ptr()) },
+                "PLE history was eagerly completed for {rows} rows"
             );
-            let expected = math::conv_window(&x, &weight, &mut completed, 4, 3).unwrap();
+            let expected = (0..rows)
+                .map(|t| {
+                    math::conv(
+                        &x.slice_axis(1, t, t + 1).unwrap(),
+                        &weight,
+                        &mut singleton,
+                        4,
+                        3,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
             assert!(unsafe {
-                mlx_sys::mlx_array_is_available(completed.as_ref().unwrap().as_raw_ptr())
+                mlx_sys::mlx_array_is_available(singleton.as_ref().unwrap().as_raw_ptr())
             });
             pending.push((
                 actual,
-                expected,
-                deferred.clone().unwrap(),
-                completed.clone().unwrap(),
+                MxArray::concatenate_many(expected.iter().collect(), Some(1)).unwrap(),
+                window.clone().unwrap(),
+                singleton.clone().unwrap(),
             ));
         }
         for (actual, expected, tail, wanted_tail) in pending {
@@ -5096,6 +5104,72 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
             );
         }
     }
+}
+
+/// PLE rows requested of the reader threads at the token start against the
+/// same decoder reading them on its own thread: identical logits over a
+/// decode run, and every PLE row the prefetching decoder imported came from
+/// a request (a wrong hash id leaves rows unconsumed, a wrong row changes
+/// the logits).
+#[test]
+fn prefetched_ple_rows_match_this_thread_reads_and_are_consumed() {
+    let path = fixture().join("bf16/model.gguf");
+    let open = |readers: bool| {
+        let mut store = weights::Store::open_fixture(&path, None).unwrap();
+        store.row_readers = readers;
+        let config = gguf::config(&store).unwrap();
+        decoder::Decoder::new(config, store).unwrap()
+    };
+    let tokens: Vec<u32> = (0..24)
+        .map(|i| ((i * 11 + i / 3) % 61 + 2) as u32)
+        .collect();
+    let (mut direct, mut fetched) = (open(false), open(true));
+    // Distinct PLE rows the run imports: the hash ids of every token over
+    // the growing history, each row once (the fixture LRU never evicts).
+    let c = fetched.config.clone();
+    let constants = |name: &str| {
+        gguf::integers(&fetched.weights.metadata, &format!("qwen4exp.ple.{name}")).unwrap()
+    };
+    let (multipliers, sizes, offsets) = (
+        constants("layer_multipliers"),
+        constants("head_vocab_sizes"),
+        constants("head_offsets"),
+    );
+    let mut ple_rows = std::collections::HashSet::new();
+    for (i, &token) in tokens.iter().enumerate() {
+        ple_rows.extend(
+            math::hash_ids(
+                token,
+                &tokens[..i],
+                c.eos_token_id,
+                c.ngram_size,
+                c.heads_per_ngram,
+                &multipliers,
+                &sizes,
+                &offsets,
+            )
+            .unwrap(),
+        );
+    }
+    for &token in &tokens {
+        let want = direct.step(token).unwrap().to_float32().unwrap();
+        let got = fetched.step(token).unwrap().to_float32().unwrap();
+        assert_eq!(&*got, &*want, "token {token}");
+    }
+    let stats = &fetched.weights.lookup;
+    assert_eq!(
+        (
+            direct.weights.lookup.prefetched(),
+            direct.weights.lookup.late()
+        ),
+        (0, 0)
+    );
+    assert!(ple_rows.len() > 8 && (ple_rows.len() as u64) < stats.misses());
+    assert_eq!(
+        stats.prefetched() + stats.late(),
+        ple_rows.len() as u64,
+        "every imported PLE row must have been requested ahead"
+    );
 }
 
 /// The batched QSA window (selection + indexed kernel) against the per-token
