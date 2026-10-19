@@ -10,6 +10,9 @@
 #include <string_view>
 #ifdef MLX_NODE_METAL_ENABLED
 #include "metal/common/quantized.h"
+#include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/jit/includes.h"
+#include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 #endif
 
@@ -460,68 +463,184 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
   }
 }
 
+} // extern "C"
+
+namespace {
 // mlx-vlm's indexed sparse attention (qsa_kernel.py). `selected` rows are
 // sorted block ids with -1 for unused picks; each row also attends its
 // incomplete block up to `query_ends`. Q_LEN and the key length are runtime
 // shapes so chunk length and context never select a new Metal library.
+//
+// The threadgroup is 32 SIMD groups of 32 lanes: lane j owns dims 8j..8j+7
+// and SIMD group g walks keys g, g + 32, ...; a pipeline that cannot hold it
+// cannot run the kernel.
+constexpr int kQsaThreads = 1024;
+constexpr int kQsaSimdWidth = 32;
+
+bool qsa_inputs_valid(const array &q, const array &k, const array &v,
+                      const array &sel, const array &ends, int block_size) {
+  // One SIMD group per incomplete-block token, 32 per threadgroup.
+  return block_size > 0 && block_size <= 33 && q.ndim() == 4 &&
+         k.ndim() == 4 && k.shape() == v.shape() &&
+         (q.dtype() == mlx::core::bfloat16 ||
+          q.dtype() == mlx::core::float16) &&
+         k.dtype() == q.dtype() && v.dtype() == q.dtype() &&
+         k.shape(0) == q.shape(0) && k.shape(3) == q.shape(3) &&
+         q.shape(3) % 32 == 0 && k.shape(1) > 0 &&
+         q.shape(1) % k.shape(1) == 0 && sel.ndim() == 3 &&
+         sel.dtype() == mlx::core::int32 && sel.shape(0) == q.shape(0) &&
+         sel.shape(1) == q.shape(2) && sel.shape(2) > 0 && ends.ndim() == 2 &&
+         ends.dtype() == mlx::core::int32 && ends.shape(0) == q.shape(0) &&
+         ends.shape(1) == q.shape(2);
+}
+
+array qsa_kernel_output(const array &q, const array &k, const array &v,
+                        const array &sel, const array &ends, float scale,
+                        int block_size, int heads_per_group) {
+  const int heads = q.shape(1), kv_heads = k.shape(1), topk = sel.shape(2);
+  const int gqa = heads / kv_heads;
+  const int head_groups = (gqa + heads_per_group - 1) / heads_per_group;
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "qwen4_qsa_attention",
+      {"queries", "keys", "values", "block_indices", "query_ends", "scale"},
+      {"out"},
+#include "metal/qwen4/qsa_attention.metal.inc"
+  );
+  return kernel(
+      {q, k, v, sel, ends, array(scale, mlx::core::float32)}, {q.shape()},
+      {q.dtype()},
+      {kQsaThreads, int(q.shape(0)) * kv_heads * head_groups * int(q.shape(2)),
+       1},
+      {kQsaThreads, 1, 1},
+      {{"T", q.dtype()},
+       {"D_SIZE", int(q.shape(3))},
+       {"NUM_Q_HEADS", heads},
+       {"NUM_KV_HEADS", kv_heads},
+       {"GQA_FACTOR", gqa},
+       {"BLOCK_SIZE", block_size},
+       {"TOPK_BLOCKS", topk},
+       {"SELECTED_LENGTH", topk * block_size},
+       {"HEADS", heads_per_group}},
+      std::nullopt, false,
+      mlx::core::default_stream(mlx::core::Device::gpu))[0];
+}
+
+#ifdef MLX_NODE_METAL_ENABLED
+// maxTotalThreadsPerThreadgroup of the exact pipeline CustomKernel::eval_gpu
+// runs for `output` (same library key, so the compile is shared), built
+// without evaluating anything; 0 when it cannot be built or its SIMD width
+// is not 32. The key covers dtype, head dim, every template constant and the
+// input address spaces, so one probe serves every later call of a geometry.
+int qsa_pipeline_threads(const array &output) {
+  static std::mutex mutex;
+  static std::unordered_map<std::string, int> cache;
+  if (!output.has_primitive())
+    return 0;
+  auto *custom =
+      dynamic_cast<mlx::core::fast::CustomKernel *>(&output.primitive());
+  if (!custom)
+    return 0;
+  const std::string &key = custom->library_name();
+  std::lock_guard<std::mutex> lock(mutex);
+  if (auto found = cache.find(key); found != cache.end())
+    return found->second;
+  int threads = 0;
+  try {
+    const auto state = custom->state();
+    const auto &name = std::get<0>(state);
+    const auto &source = std::get<1>(state);
+    auto &device = mlx::core::metal::device(custom->stream().device);
+    auto *library = device.get_library(
+        key, mlx::core::CompileOptions(std::get<10>(state)),
+        [&source] { return mlx::core::metal::utils() + source; });
+    auto *pipeline = device.get_kernel(name, library);
+    if (pipeline->threadExecutionWidth() == kQsaSimdWidth &&
+        pipeline->staticThreadgroupMemoryLength() <=
+            device.mtl_device()->maxThreadgroupMemoryLength())
+      threads = int(pipeline->maxTotalThreadsPerThreadgroup());
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 sparse attention: pipeline " << key << ": "
+              << e.what() << std::endl;
+  }
+  if (threads < kQsaThreads)
+    std::cerr << "Qwen4 sparse attention: pipeline " << key << " holds "
+              << threads << " threads per threadgroup, needs " << kQsaThreads
+              << std::endl;
+  cache.emplace(key, threads);
+  return threads;
+}
+#else
+int qsa_pipeline_threads(const array &) { return 0; }
+#endif
+} // namespace
+
+extern "C" {
+
+// `heads_per_group` 0 runs the paired kernel when its pipeline holds the
+// threadgroup and the single-head kernel otherwise; both write the same bits.
+// 1 or 2 insists on that kernel. False when the arrays do not fit the kernel
+// or no pipeline can run it.
 bool mlx_qwen4_qsa_attention(mlx_array *queries, mlx_array *keys,
                              mlx_array *values, mlx_array *selected,
                              mlx_array *query_ends, float scale,
-                             int block_size, mlx_array **out) {
+                             int block_size, int heads_per_group,
+                             mlx_array **out) {
   try {
-    // One SIMD group per incomplete-block token, 32 per threadgroup.
     if (!queries || !keys || !values || !selected || !query_ends || !out ||
-        block_size <= 0 || block_size > 33 || !std::isfinite(scale))
+        !std::isfinite(scale) || heads_per_group < 0 || heads_per_group > 2)
       return false;
     auto q = *reinterpret_cast<array *>(queries),
          k = *reinterpret_cast<array *>(keys),
          v = *reinterpret_cast<array *>(values);
     auto sel = *reinterpret_cast<array *>(selected),
          ends = *reinterpret_cast<array *>(query_ends);
-    if (q.ndim() != 4 || k.ndim() != 4 || k.shape() != v.shape() ||
-        (q.dtype() != mlx::core::bfloat16 && q.dtype() != mlx::core::float16) ||
-        k.dtype() != q.dtype() || v.dtype() != q.dtype() ||
-        k.shape(0) != q.shape(0) || k.shape(3) != q.shape(3) ||
-        q.shape(3) % 32 || k.shape(1) <= 0 || q.shape(1) % k.shape(1) ||
-        sel.ndim() != 3 || sel.dtype() != mlx::core::int32 ||
-        sel.shape(0) != q.shape(0) || sel.shape(1) != q.shape(2) ||
-        sel.shape(2) <= 0 || ends.ndim() != 2 ||
-        ends.dtype() != mlx::core::int32 || ends.shape(0) != q.shape(0) ||
-        ends.shape(1) != q.shape(2))
+    if (!qsa_inputs_valid(q, k, v, sel, ends, block_size))
       return false;
-    const int heads = q.shape(1), kv_heads = k.shape(1), topk = sel.shape(2);
-    const int gqa = heads / kv_heads;
     // Two heads share each K/V row read. Three or more spill the per-head
     // fp32 accumulators at 1024 threads per threadgroup and run slower
     // (M5 Max, D 256: 1.72 ms for 2 heads vs 2.0 / 2.75 / 3.4 ms for 1 / 3 / 4).
-    constexpr int kHeadsPerGroup = 2;
-    const int head_groups = (gqa + kHeadsPerGroup - 1) / kHeadsPerGroup;
-    static auto kernel = mlx::core::fast::metal_kernel(
-        "qwen4_qsa_attention",
-        {"queries", "keys", "values", "block_indices", "query_ends", "scale"},
-        {"out"},
-#include "metal/qwen4/qsa_attention.metal.inc"
-    );
-    auto result = kernel(
-        {q, k, v, sel, ends, array(scale, mlx::core::float32)}, {q.shape()},
-        {q.dtype()},
-        {1024, int(q.shape(0)) * kv_heads * head_groups * int(q.shape(2)), 1},
-        {1024, 1, 1},
-        {{"T", q.dtype()},
-         {"D_SIZE", int(q.shape(3))},
-         {"NUM_Q_HEADS", heads},
-         {"NUM_KV_HEADS", kv_heads},
-         {"GQA_FACTOR", gqa},
-         {"BLOCK_SIZE", block_size},
-         {"TOPK_BLOCKS", topk},
-         {"SELECTED_LENGTH", topk * block_size},
-         {"HEADS", kHeadsPerGroup}},
-        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
-    *out = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
-    return true;
+    const int gqa = int(q.shape(1) / k.shape(1));
+    const int first = heads_per_group ? heads_per_group : std::min(2, gqa);
+    const int last = heads_per_group ? heads_per_group : 1;
+    for (int heads = first; heads >= last; --heads) {
+      auto result =
+          qsa_kernel_output(q, k, v, sel, ends, scale, block_size, heads);
+      if (qsa_pipeline_threads(result) >= kQsaThreads) {
+        *out = reinterpret_cast<mlx_array *>(new array(std::move(result)));
+        return true;
+      }
+    }
+    std::cerr << "Qwen4 sparse attention: no pipeline holds " << kQsaThreads
+              << " threads per threadgroup" << std::endl;
+    return false;
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 sparse attention: " << e.what() << std::endl;
     return false;
+  }
+}
+
+// maxTotalThreadsPerThreadgroup of the single-head (1) or paired (2) kernel's
+// pipeline for these arrays; 0 when it cannot be built.
+int mlx_qwen4_qsa_attention_pipeline_threads(
+    mlx_array *queries, mlx_array *keys, mlx_array *values,
+    mlx_array *selected, mlx_array *query_ends, int block_size,
+    int heads_per_group) {
+  try {
+    if (!queries || !keys || !values || !selected || !query_ends ||
+        heads_per_group < 1 || heads_per_group > 2)
+      return 0;
+    auto q = *reinterpret_cast<array *>(queries),
+         k = *reinterpret_cast<array *>(keys),
+         v = *reinterpret_cast<array *>(values);
+    auto sel = *reinterpret_cast<array *>(selected),
+         ends = *reinterpret_cast<array *>(query_ends);
+    if (!qsa_inputs_valid(q, k, v, sel, ends, block_size))
+      return 0;
+    return qsa_pipeline_threads(qsa_kernel_output(q, k, v, sel, ends, 1.0f,
+                                                  block_size, heads_per_group));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 sparse attention: " << e.what() << std::endl;
+    return 0;
   }
 }
 

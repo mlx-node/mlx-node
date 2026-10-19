@@ -2712,8 +2712,18 @@ unsafe extern "C" {
         query_ends: *mut mlx_array,
         scale: f32,
         block_size: i32,
+        heads_per_group: i32,
         out: *mut *mut mlx_array,
     ) -> bool;
+    pub fn mlx_qwen4_qsa_attention_pipeline_threads(
+        queries: *mut mlx_array,
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        selected: *mut mlx_array,
+        query_ends: *mut mlx_array,
+        block_size: i32,
+        heads_per_group: i32,
+    ) -> i32;
 }
 
 unsafe extern "C" {

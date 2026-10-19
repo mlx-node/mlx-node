@@ -6279,7 +6279,7 @@ pub(super) fn bf16_ulp_histogram(a: &[f32], b: &[f32]) -> ([usize; 5], u32) {
     (hist, max)
 }
 
-/// The tiled kernel against SDPA with a boolean mask built from the same
+/// The kernel against SDPA with a boolean mask built from the same
 /// picks (mlx-vlm's `build_mask`): selected blocks below each row's end, plus
 /// its incomplete tail block. -1 picks contribute nothing. Includes the
 /// released checkpoint's geometry (24/2 heads, D 256, ratio 4, top-k 512) and
@@ -6354,8 +6354,17 @@ fn qsa_kernel_matches_masked_sdpa() {
             let scale = (dim as f64).powf(-0.5);
             let want =
                 crate::array::scaled_dot_product_attention(&q, &k, &v, scale, Some(&mask)).unwrap();
-            let got =
-                math::qsa_attention(&q, &k, &v, &selected, &query_ends, scale, ratio).unwrap();
+            let got = math::qsa_attention(
+                &q,
+                &k,
+                &v,
+                &selected,
+                &query_ends,
+                scale,
+                ratio,
+                math::QsaKernel::ByCapability,
+            )
+            .unwrap();
             assert_eq!(
                 got.shape().unwrap().as_ref(),
                 want.shape().unwrap().as_ref(),
@@ -6379,11 +6388,168 @@ fn qsa_kernel_matches_masked_sdpa() {
     let ends = MxArray::from_int32(&[67], &[1, 1]).unwrap();
     for (block, ok) in [(33, true), (34, false)] {
         assert_eq!(
-            math::qsa_attention(&q, &k, &v, &selected, &ends, 0.2, block).is_ok(),
+            math::qsa_attention(
+                &q,
+                &k,
+                &v,
+                &selected,
+                &ends,
+                0.2,
+                block,
+                math::QsaKernel::ByCapability
+            )
+            .is_ok(),
             ok,
             "block_size={block}"
         );
     }
+}
+
+/// The paired kernel against the single-head kernel it replaces, raw output
+/// bits over every batch, head, query row and dim: GQA factors 1, 3, 5 and 12
+/// (odd factors leave the last head unpaired), batches above 1, -1 picks,
+/// exact and incomplete tail blocks, query ends below the key length, D 256
+/// and D 64, block sizes 4, 8 and 33. The capability pick must match both.
+#[test]
+fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
+    use crate::array::DType;
+    use math::QsaKernel;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let values = |shape: &[i64], seed: usize, dtype: DType| {
+        let n = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(
+            &(0..n)
+                .map(|i| (((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0) * 0.8)
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .unwrap()
+        .astype(dtype)
+        .unwrap()
+    };
+    let bits = |a: &MxArray| {
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let mut paired_cases = 0;
+    for (heads, kv_heads, dim, length, t, topk, block, batch) in [
+        (2i64, 2i64, 64i64, 70usize, 9usize, 3usize, 4usize, 2i64),
+        (6, 2, 256, 300, 11, 6, 4, 2),
+        (5, 1, 64, 130, 7, 4, 8, 2),
+        (10, 2, 64, 200, 10, 2, 33, 2),
+        (24, 2, 256, 4144, 48, 512, 4, 1),
+        (24, 2, 256, 600, 16, 512, 4, 2),
+    ] {
+        for dtype in [DType::BFloat16, DType::Float16] {
+            let label = format!(
+                "{dtype:?} heads={heads}/{kv_heads} dim={dim} length={length} t={t} topk={topk} block={block} batch={batch}"
+            );
+            let rows = batch as usize * t;
+            let q = values(&[batch, heads, t as i64, dim], 1, dtype);
+            let k = values(&[batch, kv_heads, length as i64, dim], 2, dtype);
+            let v = values(&[batch, kv_heads, length as i64, dim], 3, dtype);
+            // Per row: a query end (the key length, one below it, an exact
+            // block multiple, half a block past one, inside the first block,
+            // anywhere) and sorted picks among its complete blocks, -1 first;
+            // sparse rows drop up to two picks so -1 appears there too.
+            let mut ends = Vec::with_capacity(rows);
+            let mut picks = Vec::with_capacity(rows * topk);
+            let (mut exact_tails, mut partial_tails, mut below_length, mut unused) = (0, 0, 0, 0);
+            for row in 0..rows {
+                let end = match row % 6 {
+                    0 => length,
+                    1 => length - 1,
+                    2 => ((row * 7 + 3) % (length / block) + 1) * block,
+                    3 => ((row * 11) % length / block * block + block / 2 + 1).min(length),
+                    4 => row % block + 1,
+                    _ => (row * 13 + 5) % length + 1,
+                };
+                let complete = end / block;
+                let keep = complete.min(topk - row % 3);
+                let stride = complete.checked_div(keep).unwrap_or(1).max(1);
+                let mut chosen: Vec<i32> = (0..keep)
+                    .map(|i| ((row + i * stride) % complete) as i32)
+                    .collect();
+                chosen.sort_unstable();
+                chosen.dedup();
+                if end % block == 0 {
+                    exact_tails += 1;
+                } else {
+                    partial_tails += 1;
+                }
+                if end < length {
+                    below_length += 1;
+                }
+                unused += topk - chosen.len();
+                ends.push(end as i32);
+                picks.extend(std::iter::repeat_n(-1, topk - chosen.len()));
+                picks.extend(chosen);
+            }
+            assert!(
+                exact_tails > 0 && partial_tails > 0 && below_length > 0 && unused > 0,
+                "{label}: exact tails {exact_tails} partial {partial_tails} below length {below_length} unused picks {unused}"
+            );
+            let selected = MxArray::from_int32(&picks, &[batch, t as i64, topk as i64]).unwrap();
+            let query_ends = MxArray::from_int32(&ends, &[batch, t as i64]).unwrap();
+            let scale = (dim as f64).powf(-0.5);
+            let run = |kernel: QsaKernel| {
+                math::qsa_attention(&q, &k, &v, &selected, &query_ends, scale, block, kernel)
+                    .unwrap()
+            };
+            let threads = |kernel: QsaKernel| {
+                math::qsa_pipeline_threads(&q, &k, &v, &selected, &query_ends, block, kernel)
+            };
+            let single_threads = threads(QsaKernel::SingleHead);
+            let paired_threads = threads(QsaKernel::PairedHeads);
+            eprintln!(
+                "{label}: maxTotalThreadsPerThreadgroup single-head {single_threads} paired {paired_threads}"
+            );
+            assert!(
+                single_threads >= 1024,
+                "{label}: the single-head pipeline holds {single_threads} threads"
+            );
+            assert!(
+                paired_threads > 0,
+                "{label}: the paired pipeline did not build"
+            );
+            let want = bits(&run(QsaKernel::SingleHead));
+            assert!(
+                want.iter().any(|&b| f32::from_bits(b) != 0.0),
+                "{label}: all-zero output"
+            );
+            let compare = |name: &str, got: &MxArray| {
+                let got = bits(got);
+                assert_eq!(got.len(), want.len(), "{label}: {name}");
+                let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+                if differing > 0 {
+                    let first = want.iter().zip(&got).position(|(a, b)| a != b).unwrap();
+                    let per_batch = (heads * t as i64 * dim) as usize;
+                    let per_head = (t as i64 * dim) as usize;
+                    panic!(
+                        "{label}: {name} differs from the single-head kernel in {differing} of {} outputs; first at batch {} head {} row {} dim {}: {} vs {}",
+                        want.len(),
+                        first / per_batch,
+                        first % per_batch / per_head,
+                        first % per_head / dim as usize,
+                        first % dim as usize,
+                        f32::from_bits(want[first]),
+                        f32::from_bits(got[first])
+                    );
+                }
+            };
+            compare("the capability pick", &run(QsaKernel::ByCapability));
+            if paired_threads >= 1024 {
+                compare("the paired kernel", &run(QsaKernel::PairedHeads));
+                paired_cases += 1;
+            }
+        }
+    }
+    eprintln!("paired kernel compared bit for bit on {paired_cases} geometry/dtype cases");
 }
 
 /// The per-token path partitions a row as long as its own block count; the
