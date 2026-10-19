@@ -72,7 +72,9 @@ reserve; it stops growing anonymous memory only below 2 GiB of free plus file
 cache. A mapped turn that reads more than twice the pack from SSD, or runs
 eight consecutive passes over ten times the running median of their kind
 (a row count with no median yet — the decode steps of a process's first turn
-— is judged against the fastest pass of 256 rows or more seen so far; the
+— is judged against the fastest pass of 256 rows or more seen so far, and
+such a pass counts only with a quarter GiB of SSD reads behind it: slower
+without reads is GPU contention, recorded as the row count's own pace; the
 streak and the SSD count start over when a turn opens on an idle model, whose
 first pass is the bank re-wire; turns admitted while others run join the
 window in progress), leaves the mapped path between that pass and its next

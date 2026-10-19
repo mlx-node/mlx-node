@@ -23,10 +23,18 @@ const MIN_SAMPLES: usize = 8;
 /// A row count with fewer samples is judged against the fastest pass over
 /// more rows seen so far, when that pass had at least this many rows: a
 /// prefill window costs about 0.8 ms per row where a decode step costs 25-40
-/// ms per row, so a smaller window would call healthy decode steps slow,
-/// while a 256-row window (>= 200 ms) leaves a healthy step 5-8x headroom
-/// and a thrashing one (2.4-10 s) none.
+/// ms per row, so a smaller window would call healthy decode steps slow. A
+/// 256-row window (>= 200 ms) leaves a healthy 1-row step 5-8x headroom but
+/// a 2-4 row verify or batched step (60-160 ms) only 1.3-3x, which GPU
+/// contention eats, so a pass judged against the seed is a symptom only with
+/// `SEED_PASS_READ` of SSD reads behind it.
 const SEED_MIN_ROWS: usize = 256;
+/// SSD bytes a seed-judged slow pass must have read to count toward a
+/// streak: a mapped step refaults about 1 GiB while the host evicts the pack
+/// (115 GiB over 109 decode steps measured) and nothing once the prompt's
+/// windows have cached it, so a slow pass without reads is contention and
+/// becomes the row count's own pace.
+const SEED_PASS_READ: u64 = 256 << 20;
 /// `Live::fallback_token_index` while no request has left the mapped path
 /// mid-turn.
 pub const NO_TOKEN_INDEX: u64 = u64::MAX;
@@ -41,7 +49,8 @@ pub enum Fallback {
     SsdReads { read: u64, mapped: u64 },
     /// `steps` consecutive passes of `rows` rows took `step` against a
     /// `median` of their kind (the fastest larger pass while the row count
-    /// has fewer than `MIN_SAMPLES` samples).
+    /// has fewer than `MIN_SAMPLES` samples, each pass then with SSD reads
+    /// behind it).
     SlowSteps {
         rows: usize,
         step: Duration,
@@ -161,6 +170,8 @@ impl Live {
 pub(super) struct Tripwire {
     /// `process_disk_reads()` when the current turn started.
     turn_start_reads: u64,
+    /// `process_disk_reads()` after the last pass observed.
+    last_reads: u64,
     passes: HashMap<usize, VecDeque<Duration>>,
     slow_streak: u32,
     tripped: Option<Fallback>,
@@ -173,6 +184,7 @@ impl Tripwire {
     /// send a healthy session to slots for good.
     pub fn begin_turn(&mut self, reads_now: u64) {
         self.turn_start_reads = reads_now;
+        self.last_reads = reads_now;
         self.slow_streak = 0;
     }
 
@@ -234,6 +246,8 @@ impl Tripwire {
         if self.tripped.is_some() {
             return None;
         }
+        let pass_read = reads_now.saturating_sub(self.last_reads);
+        self.last_reads = reads_now;
         let read = reads_now.saturating_sub(self.turn_start_reads);
         if mapped_bytes > 0 && read > mapped_bytes.saturating_mul(SSD_FACTOR) {
             self.tripped = Some(Fallback::SsdReads {
@@ -248,7 +262,7 @@ impl Tripwire {
             } else {
                 median
             };
-            if elapsed > limit {
+            if elapsed > limit && (own || pass_read >= SEED_PASS_READ) {
                 self.slow_streak += 1;
                 if self.slow_streak >= SLOW_STREAK {
                     self.tripped = Some(Fallback::SlowSteps {
@@ -377,8 +391,9 @@ mod tests {
 
     /// The first turn of a process: a cold 6k prompt (six 1024-row windows,
     /// the first reading the pack) and then decode steps with no history of
-    /// their own. A thrash that starts here (2.4 s steps) trips against the
-    /// fastest window; the re-wire step and healthy steps do not.
+    /// their own. A thrash that starts here (2.4 s steps, the pack refaulting
+    /// behind them) trips against the fastest window; the re-wire step and
+    /// healthy steps do not.
     ///
     /// MUTATION (M-M6-seed): `reference` returns `None` for a row count with
     /// fewer than `MIN_SAMPLES` samples; the thrash runs on.
@@ -396,11 +411,14 @@ mod tests {
             assert!(wire.observe(1, 25 * MS, mapped, mapped).is_none());
         }
         assert_eq!(wire.slow_streak(), 0);
+        let mut reads = mapped;
         for _ in 0..SLOW_STREAK - 1 {
-            assert!(wire.observe(1, 2_400 * MS, mapped, mapped).is_none());
+            reads += 1 << 30;
+            assert!(wire.observe(1, 2_400 * MS, reads, mapped).is_none());
         }
+        reads += 1 << 30;
         assert_eq!(
-            wire.observe(1, 2_400 * MS, mapped, mapped).cloned(),
+            wire.observe(1, 2_400 * MS, reads, mapped).cloned(),
             Some(Fallback::SlowSteps {
                 rows: 1,
                 step: 2_400 * MS,
@@ -421,6 +439,70 @@ mod tests {
         }
         assert_eq!(healthy.reference(1), Some((30 * MS, true)));
         assert!(healthy.tripped().is_none());
+    }
+
+    /// One 256-row window at 200 ms seeds the 4-row verify passes, which
+    /// then run at 250 ms under GPU contention without a byte read from
+    /// SSD: not a symptom. They build their own median within `MIN_SAMPLES`
+    /// passes and are judged by it from then on; the same passes with the
+    /// pack refaulting behind them trip, and one pass under the read floor
+    /// breaks their streak.
+    ///
+    /// MUTATION (M-M6F2-reads): a seed-judged slow pass counts without
+    /// `SEED_PASS_READ` of reads; the contended passes trip at pass eight.
+    /// MUTATION (M-M6F2-record): a seed-judged slow pass without reads is
+    /// not recorded; the row count never owns its median.
+    #[test]
+    fn contended_passes_judged_against_the_seed_learn_their_own_pace() {
+        let mapped = 73u64 << 30;
+        let mut wire = Tripwire::default();
+        wire.begin_turn(mapped);
+        assert!(wire.observe(256, 200 * MS, mapped, mapped).is_none());
+        assert_eq!(wire.reference(4), Some((200 * MS, false)));
+        for pass in 1..=MIN_SAMPLES {
+            assert!(
+                wire.observe(4, 250 * MS, mapped, mapped).is_none(),
+                "pass {pass}"
+            );
+            assert_eq!(wire.slow_streak(), 0, "pass {pass}");
+        }
+        assert_eq!(wire.reference(4), Some((250 * MS, true)));
+        for _ in 0..2 * SLOW_STREAK {
+            assert!(wire.observe(4, 250 * MS, mapped, mapped).is_none());
+        }
+        assert!(wire.tripped().is_none());
+
+        let mut thrash = Tripwire::default();
+        thrash.begin_turn(mapped);
+        assert!(thrash.observe(256, 200 * MS, mapped, mapped).is_none());
+        let mut reads = mapped;
+        for _ in 0..SLOW_STREAK - 1 {
+            reads += SEED_PASS_READ;
+            assert!(thrash.observe(4, 250 * MS, reads, mapped).is_none());
+        }
+        reads += SEED_PASS_READ;
+        assert_eq!(
+            thrash.observe(4, 250 * MS, reads, mapped).cloned(),
+            Some(Fallback::SlowSteps {
+                rows: 4,
+                step: 250 * MS,
+                median: 200 * MS,
+                steps: SLOW_STREAK,
+            })
+        );
+
+        let mut broken = Tripwire::default();
+        broken.begin_turn(mapped);
+        assert!(broken.observe(256, 200 * MS, mapped, mapped).is_none());
+        let mut reads = mapped;
+        for _ in 0..SLOW_STREAK - 1 {
+            reads += SEED_PASS_READ;
+            assert!(broken.observe(4, 250 * MS, reads, mapped).is_none());
+        }
+        assert_eq!(broken.slow_streak(), SLOW_STREAK - 1);
+        reads += SEED_PASS_READ - 1;
+        assert!(broken.observe(4, 250 * MS, reads, mapped).is_none());
+        assert_eq!(broken.slow_streak(), 0);
     }
 
     /// A prompt shorter than `SEED_MIN_ROWS` seeds nothing: its per-row cost
