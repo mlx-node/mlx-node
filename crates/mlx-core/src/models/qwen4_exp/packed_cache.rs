@@ -1521,4 +1521,56 @@ mod tests {
         assert!(fresh.exists());
         assert!(foreign.exists());
     }
+
+    fn fixture_gguf() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/model.gguf")
+    }
+
+    #[test]
+    #[ignore = "helper process for fixture_loads_cannot_sweep_an_external_cache"]
+    fn fixture_open_child() {
+        super::super::weights::Store::open_fixture(&fixture_gguf(), None).unwrap();
+    }
+
+    /// HOME is overridden only in a child: other tests read it unlocked.
+    #[test]
+    fn fixture_loads_cannot_sweep_an_external_cache() {
+        let temp = Temp::new();
+        let home = temp.0.join("home");
+        let parent = home.join(if cfg!(target_os = "macos") {
+            "Library/Caches/mlx-node/qwen4-packed"
+        } else {
+            ".cache/mlx-node/qwen4-packed"
+        });
+        fs::create_dir_all(&parent).unwrap();
+        let stub: [(&str, &[u8]); 1] = [(".manifest", b"path=/gone\nfile=x.gguf\n")];
+        let retired = chunk_fixture(&parent, &"a".repeat(64), &stub, true);
+        let orphan = mapped_fixture(&parent, 'b', 100, true);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("models::qwen4_exp::packed_cache::tests::fixture_open_child")
+            .arg("--ignored")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "fixture child did not run: {stdout}{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            retired.exists(),
+            "a fixture load swept the user's retired chunk dir"
+        );
+        assert!(
+            orphan.exists(),
+            "a fixture load swept the user's orphaned mapped pack"
+        );
+        let _ = PackedCache::new_at(&parent, BTreeSet::from([fixture_gguf()])).unwrap();
+        assert!(
+            !retired.exists() && !orphan.exists(),
+            "both dirs must be sweep-eligible or the checks above prove nothing"
+        );
+    }
 }

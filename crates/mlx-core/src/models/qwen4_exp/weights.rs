@@ -522,7 +522,8 @@ impl Store {
     /// payload reads still pass the ordinary live admission checks.
     #[cfg(test)]
     pub(in super::super) fn open_fixture(path: &Path, root: Option<&Path>) -> Result<Self> {
-        let mut store = Self::open_metadata(path, root)?;
+        let root = root.map_or_else(Self::fixture_pack_root, Path::to_path_buf);
+        let mut store = Self::open_metadata(path, Some(&root))?;
         store.fixture = true;
         // Logical ceiling includes the importer staging allowance; the
         // synthetic tensors allocate only their actual payload sizes.
@@ -530,6 +531,14 @@ impl Store {
         store.plan.budget = store.cache_limit;
         store.plan.hot_bytes = store.hot_bytes()?;
         Ok(store)
+    }
+
+    /// `open_metadata`'s `None` resolves the user's real pack cache, whose
+    /// sweep deletes idle packs of other builds and processes; a unit test
+    /// must never reach it. The root is never created.
+    #[cfg(test)]
+    fn fixture_pack_root() -> PathBuf {
+        std::env::temp_dir().join(format!("mlx-qwen4-fixture-packs-{}", uuid::Uuid::new_v4()))
     }
 
     /// Auxiliary source checkpoints contribute only descriptors, so their

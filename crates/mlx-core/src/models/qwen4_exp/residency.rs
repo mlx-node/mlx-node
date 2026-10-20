@@ -1164,7 +1164,11 @@ mod tests {
             // Reproduce the actual cache state after a singleton projection.
             // Short verification windows must use the two original N=48
             // matmuls even though the joined N=96 bank is already cached.
-            let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
+            let mut store = Store::open_metadata(
+                &fixture().join("model.gguf"),
+                Some(&Store::fixture_pack_root()),
+            )
+            .unwrap();
             let first = "blk.0.ssm_alpha.weight";
             let second = "blk.0.ssm_beta.weight";
             for (name, start) in [(first, 0), (second, 48)] {
@@ -1212,7 +1216,11 @@ mod tests {
 
     #[test]
     fn failed_bank_load_releases_banks_before_the_retry() {
-        let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
+        let mut store = Store::open_metadata(
+            &fixture().join("model.gguf"),
+            Some(&Store::fixture_pack_root()),
+        )
+        .unwrap();
         {
             store.plan.hot_bytes = store.hot_bytes().unwrap();
             let mut refused = false;
@@ -1513,7 +1521,7 @@ mod tests {
     #[test]
     fn partial_projection_banks_use_actual_sizes_and_preserve_expert_lru() {
         for path in [fixture(), fixture().join("model.gguf")] {
-            let mut s = Store::open_metadata(&path, None).unwrap();
+            let mut s = Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             let bytes: u64 = s
                 .tensors
                 .iter()
@@ -1546,7 +1554,8 @@ mod tests {
                     .all(|n| is_fixed_projection(n, &s.tensors[n]))
             );
             let loaded = (s.bytes_read, s.packed_bytes_read);
-            let mut control = Store::open_metadata(&path, None).unwrap();
+            let mut control =
+                Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in names {
                 let rows = s.descriptor(&name).unwrap().rows().unwrap();
                 for start in [0, rows - 1] {
@@ -1586,7 +1595,7 @@ mod tests {
     #[test]
     fn projection_banks_preserve_rows_and_leave_lookup_and_auxiliary_weights_cold() {
         for path in [fixture(), fixture().join("bf16/paged/model.gguf")] {
-            let mut s = Store::open_metadata(&path, None).unwrap();
+            let mut s = Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             assert_eq!(s.bytes_read, 0);
             s.prepare_fixture_hot().unwrap();
             assert_eq!(s.cache_bytes, s.bank_bytes);
@@ -1599,7 +1608,8 @@ mod tests {
             );
             assert!(!s.banks.is_empty());
             let reads = (s.bytes_read, s.packed_hits, s.packed_bytes_read);
-            let mut reference = Store::open_metadata(&path, None).unwrap();
+            let mut reference =
+                Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in s.banks.keys().cloned().collect::<Vec<_>>() {
                 let rows = s.descriptor(&name).unwrap().rows().unwrap();
                 for start in [0, rows - 1] {
