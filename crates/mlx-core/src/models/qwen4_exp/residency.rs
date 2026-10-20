@@ -492,9 +492,16 @@ const MTP_EXPERT_BANKS: [&str; 2] = [
     "mtp.layers.0.mlp.experts.down_proj",
 ];
 
+/// A draft bank as the admission builds it: name, descriptor, rows, width,
+/// Q8 side dtype (none for a dense gather bank), bytes.
+pub(super) type MtpBankSpec = (&'static str, Tensor, usize, usize, Option<DType>, u64);
+
 impl Weight {
-    fn quantize_q8(values: &MxArray) -> Result<Self> {
-        // f16 scales: the affine expert GEMV accepts only the GGUF import dtype.
+    fn quantize_q8(values: &MxArray, sides: DType) -> Result<Self> {
+        // Quantize at f16, the GGUF import dtype the affine expert GEMV
+        // reads. f32 `sides` hold those same values for a bank it refuses:
+        // MLX gather_qmm promotes bf16 x with f16 sides to f32 and would cast
+        // the whole bank on every call; an astype to its own dtype is a no-op.
         let source = values.astype(DType::Float16)?;
         let (mut codes, mut scales, mut biases) = (
             std::ptr::null_mut(),
@@ -515,11 +522,14 @@ impl Weight {
         if !ok {
             return Err(err("Qwen4 MTP expert bank quantization failed"));
         }
+        let values = MxArray::from_handle(codes, "Qwen4 MTP bank codes")?;
+        let scales = MxArray::from_handle(scales, "Qwen4 MTP bank scales")?;
+        let biases = MxArray::from_handle(biases, "Qwen4 MTP bank biases")?;
         Ok(Self {
-            values: MxArray::from_handle(codes, "Qwen4 MTP bank codes")?,
+            values,
             dense_bf16: None,
-            scales: Some(MxArray::from_handle(scales, "Qwen4 MTP bank scales")?),
-            biases: Some(MxArray::from_handle(biases, "Qwen4 MTP bank biases")?),
+            scales: Some(scales.astype(sides)?),
+            biases: Some(biases.astype(sides)?),
             group: 32,
             bits: 8,
             mode: "affine".into(),
@@ -535,9 +545,9 @@ impl Store {
             .try_fold(0u64, |n, w| Ok(n + w.bytes()?))
     }
 
-    /// The MTP head's routed-expert banks as they would be built: name,
-    /// descriptor, rows, width, quantized, bytes. Empty without the head.
-    fn mtp_bank_specs(&self) -> Result<Vec<(&'static str, Tensor, usize, usize, bool, u64)>> {
+    /// The MTP head's routed-expert banks in one layout. `wide` gives a bank
+    /// the affine expert GEMV refuses f32 sides. Empty without the head.
+    fn mtp_bank_specs(&self, wide: bool) -> Result<Vec<MtpBankSpec>> {
         if MTP_EXPERT_BANKS
             .iter()
             .any(|name| !self.tensors.contains_key(*name))
@@ -551,24 +561,50 @@ impl Store {
                 let (rows, width) = (d.rows()?, d.width()?);
                 // MLX affine quantization needs K % 32 == 0; a narrower expert
                 // (fixtures) stays a dense gather bank.
-                let quantized = width % 32 == 0;
+                let f32_sides = wide && !Weight::affine_gemv_takes(width);
+                let sides = (width % 32 == 0).then_some(if f32_sides {
+                    DType::Float32
+                } else {
+                    DType::Float16
+                });
+                // Eighths of a byte per weight: a code byte, and a scale and
+                // a bias per 32 weights.
+                let eighths = match sides {
+                    None => 16,
+                    Some(DType::Float32) => 10,
+                    Some(_) => 9,
+                };
                 let bytes = (rows as u64)
                     .saturating_mul(width as u64)
-                    .saturating_mul(if quantized { 9 } else { 16 })
+                    .saturating_mul(eighths)
                     / 8;
-                Ok((name, d, rows, width, quantized, bytes))
+                Ok((name, d, rows, width, sides, bytes))
             })
             .collect()
     }
 
+    /// What the draft banks may take: the mapped plan's charge for them, or
+    /// the slot path's auxiliary allowance.
+    fn mtp_bank_allowance(&self) -> Result<u64> {
+        if self.draft_bank_budget > 0 {
+            Ok(self.draft_bank_budget)
+        } else {
+            self.auxiliary_cache_allowance()
+        }
+    }
+
     /// Anonymous bytes the draft banks take once built: what a mapped plan
     /// charges beside the dense banks while the MTP head is attached, so the
-    /// live-memory gate and the bank admission see the same number.
+    /// live-memory gate and the bank admission see the same number. The f32
+    /// sides only when the allowance holds them, as in the admission.
     pub(in super::super) fn mtp_bank_estimate(&self) -> Result<u64> {
-        Ok(self
-            .mtp_bank_specs()?
-            .iter()
-            .fold(0u64, |n, spec| n.saturating_add(spec.5)))
+        let total = |specs: Vec<MtpBankSpec>| specs.iter().fold(0u64, |n, s| n.saturating_add(s.5));
+        let wide = total(self.mtp_bank_specs(true)?);
+        if wide <= self.mtp_bank_allowance()? {
+            Ok(wide)
+        } else {
+            Ok(total(self.mtp_bank_specs(false)?))
+        }
     }
 
     /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
@@ -587,8 +623,7 @@ impl Store {
         if self.mtp_banks_declined {
             return Ok(0);
         }
-        let specs = self.mtp_bank_specs()?;
-        if specs.is_empty() {
+        if self.mtp_bank_specs(false)?.is_empty() {
             return Ok(0);
         }
         if MTP_EXPERT_BANKS
@@ -597,11 +632,18 @@ impl Store {
         {
             return self.mtp_bank_bytes();
         }
-        if !self.mtp_banks_fit()? {
+        let Some(specs) = self.mtp_bank_admission()? else {
             self.mtp_banks_declined = true;
             return Ok(0);
+        };
+        let mut built = self.build_mtp_expert_banks(&specs, admit);
+        // The f32 sides need more live headroom than the f16 layout, which
+        // the store admits whenever it admits them.
+        if built.is_err() && specs.iter().any(|spec| spec.4 == Some(DType::Float32)) {
+            let narrow = self.mtp_bank_specs(false)?;
+            built = self.build_mtp_expert_banks(&narrow, admit);
         }
-        let built = match self.build_mtp_expert_banks(&specs, admit) {
+        let built = match built {
             Ok(built) => built,
             Err(error) => {
                 self.mtp_banks_declined = true;
@@ -615,34 +657,45 @@ impl Store {
         self.mtp_bank_bytes()
     }
 
-    pub(super) fn mtp_banks_fit(&self) -> Result<bool> {
-        let (mut total, mut peak) = (0u64, 0u64);
-        for (.., bytes) in &self.mtp_bank_specs()? {
-            // Imported chunks and the concatenated bank coexist while the
-            // earlier banks are already held.
-            peak = peak.max(total.saturating_add(bytes.saturating_mul(2)));
-            total = total.saturating_add(*bytes);
-        }
+    /// The layout the draft banks are built in now: the f32 sides when they
+    /// fit, else the f16 ones, else none.
+    pub(super) fn mtp_bank_admission(&self) -> Result<Option<Vec<MtpBankSpec>>> {
+        let allowance = self.mtp_bank_allowance()?;
         let pinned = self.protected_bytes + self.bank_bytes + self.slot_bytes;
         let room = self.cache_limit.saturating_sub(pinned);
-        // The slot banks a cached capacity has yet to build stay pinned beside
-        // the draft banks, and the last one still needs its staging.
-        let planned = (self.protected_bytes + self.bank_bytes + self.planned_slot_bytes()?)
-            .saturating_add(total)
-            .saturating_add(MAX_READ_BYTES * 3);
-        Ok(total <= self.auxiliary_cache_allowance()?
-            && peak.saturating_add(MAX_READ_BYTES * 3) <= room
-            && planned <= self.cache_limit)
+        let planned_slots = self.planned_slot_bytes()?;
+        for wide in [true, false] {
+            let specs = self.mtp_bank_specs(wide)?;
+            let (mut total, mut peak) = (0u64, 0u64);
+            for (.., bytes) in &specs {
+                // Imported chunks and the concatenated bank coexist while the
+                // earlier banks are already held.
+                peak = peak.max(total.saturating_add(bytes.saturating_mul(2)));
+                total = total.saturating_add(*bytes);
+            }
+            // The slot banks a cached capacity has yet to build stay pinned
+            // beside the draft banks, and the last one still needs its staging.
+            let planned = (self.protected_bytes + self.bank_bytes + planned_slots)
+                .saturating_add(total)
+                .saturating_add(MAX_READ_BYTES * 3);
+            if total <= allowance
+                && peak.saturating_add(MAX_READ_BYTES * 3) <= room
+                && planned <= self.cache_limit
+            {
+                return Ok(Some(specs));
+            }
+        }
+        Ok(None)
     }
 
     fn build_mtp_expert_banks(
         &mut self,
-        specs: &[(&'static str, Tensor, usize, usize, bool, u64)],
+        specs: &[MtpBankSpec],
         admit: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<Vec<(&'static str, Weight)>> {
         let mut built = Vec::with_capacity(specs.len());
         let mut held = 0u64;
-        for (name, d, rows, width, quantized, bytes) in specs {
+        for (name, d, rows, width, sides, bytes) in specs {
             let (rows, width, bytes) = (*rows, *width, *bytes);
             self.evict_to(
                 self.cache_limit
@@ -653,8 +706,8 @@ impl Store {
             let mut chunks = Vec::with_capacity(rows.div_ceil(chunk));
             for start in (0..rows).step_by(chunk) {
                 let values = d.import_rows(start, (rows - start).min(chunk))?.values;
-                let weight = if *quantized {
-                    Weight::quantize_q8(&values)?
+                let weight = if let Some(sides) = sides {
+                    Weight::quantize_q8(&values, *sides)?
                 } else {
                     Weight {
                         values,
@@ -821,6 +874,12 @@ impl Store {
 }
 
 impl Weight {
+    /// The input widths the affine expert GEMV takes: the generic fast path
+    /// uses a different accumulation for K%512=0.
+    fn affine_gemv_takes(k: usize) -> bool {
+        !k.is_multiple_of(512)
+    }
+
     pub(in super::super) fn expert_rows(
         &self,
         x: &MxArray,
@@ -834,8 +893,9 @@ impl Weight {
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
             && scales.dtype().ok() == Some(DType::Float16)
             && ids.size()? <= 80
-            // The generic fast path uses a different accumulation for K%512=0.
-            && x.shape()?.last().is_some_and(|k| k % 512 != 0)
+            && x.shape()?
+                .last()
+                .is_some_and(|&k| Self::affine_gemv_takes(k as usize))
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             let out = unsafe {
@@ -1256,6 +1316,198 @@ mod tests {
             s.plan.resident_bank_bytes.load(Ordering::Relaxed),
             s.bank_bytes
         );
+    }
+
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const MTP_TEST_EXPERTS: usize = 4;
+
+    /// The MTP head's routed-expert banks at their real expert shapes (four
+    /// experts, BF16 in a temporary file), with each bank's source rows.
+    fn real_shape_mtp_experts() -> (Vec<(String, Tensor)>, Vec<MxArray>, Cleanup) {
+        let dir = std::env::temp_dir().join(format!("qwen4-mtp-sides-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cleanup = Cleanup(dir.clone());
+        let path = dir.join("experts.bin");
+        let banks = [
+            (MTP_EXPERT_BANKS[0], 1280, 2560),
+            (MTP_EXPERT_BANKS[1], 2560, 640),
+        ];
+        let (mut payload, mut tensors, mut sources) = (Vec::new(), Vec::new(), Vec::new());
+        for (k, (name, n, width)) in banks.into_iter().enumerate() {
+            let rows = MTP_TEST_EXPERTS * n;
+            let bits: Vec<u16> = (0..rows * width)
+                .map(|i| {
+                    let hash = (i as u32 ^ k as u32).wrapping_mul(2654435761) >> 8;
+                    let row = 0.05 + (i / width % 7) as f32 * 0.04;
+                    let v = (hash as f32 / (1u32 << 24) as f32 - 0.5) * row;
+                    (v.to_bits() >> 16) as u16
+                })
+                .collect();
+            tensors.push((
+                name.into(),
+                Tensor {
+                    path: path.clone(),
+                    shape: vec![MTP_TEST_EXPERTS, n, width],
+                    offset: payload.len() as u64,
+                    bytes: bits.len() as u64 * 2,
+                    encoding: Encoding::Safe("BF16".into()),
+                },
+            ));
+            payload.extend(bits.iter().flat_map(|b| b.to_le_bytes()));
+            sources.push(MxArray::from_bfloat16(&bits, &[rows as i64, width as i64]).unwrap());
+        }
+        std::fs::write(&path, &payload).unwrap();
+        (tensors, sources, cleanup)
+    }
+
+    /// The draft gate_up bank at its real expert shape (1280 x 2560, a K the
+    /// affine expert GEMV refuses) is built with f32 sides once, and its
+    /// gather keeps the bits of the f16-sided bank it replaces; the down bank
+    /// keeps f16 sides for the GEMV, and the estimate is the built bytes.
+    /// MUTATIONS: M-M1-f16 (`quantize_q8` keeps f16 sides) -> the gate_up
+    /// dtype assertion; M-M1-estimate (9/8 bytes for f32 sides) -> the bytes;
+    /// M-M1-bits (`quantize_q8` quantizes at the side dtype) -> `rows=10`.
+    #[test]
+    fn mtp_gate_up_bank_holds_f32_sides_with_the_f16_gather_bits() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let (experts, sources, _cleanup) = real_shape_mtp_experts();
+        let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+        s.tensors.extend(experts);
+        let estimate = s.mtp_bank_estimate().unwrap();
+        let installed = s.prepare_mtp_expert_banks_with(&mut |_| Ok(())).unwrap();
+        let sides = |name: &str| {
+            let bank = s.resident_bank(name).unwrap();
+            [&bank.scales, &bank.biases].map(|a| a.as_ref().unwrap().dtype().unwrap())
+        };
+        assert_eq!(
+            sides(MTP_EXPERT_BANKS[0]),
+            [DType::Float32; 2],
+            "the gather casts f16 gate_up sides on every draft"
+        );
+        assert_eq!(
+            sides(MTP_EXPERT_BANKS[1]),
+            [DType::Float16; 2],
+            "the affine expert GEMV reads f16 down sides"
+        );
+        assert_eq!(installed, s.mtp_bank_bytes().unwrap());
+        assert_eq!(
+            installed,
+            (MTP_TEST_EXPERTS * 1280 * 2560 * 10 / 8 + MTP_TEST_EXPERTS * 2560 * 640 * 9 / 8)
+                as u64
+        );
+        assert_eq!(estimate, installed, "the estimate charges the built banks");
+        let gate_up = s.resident_bank(MTP_EXPERT_BANKS[0]).unwrap();
+        let before = Weight::quantize_q8(&sources[0], DType::Float16).unwrap();
+        for rows in [10usize, 40, 120] {
+            let ids = MxArray::from_uint32(
+                &(0..rows)
+                    .map(|i| ((i * 7 + i / 3) % MTP_TEST_EXPERTS) as u32)
+                    .collect::<Vec<_>>(),
+                &[rows as i64],
+            )
+            .unwrap();
+            let x = MxArray::from_float32(
+                &(0..rows * 2560)
+                    .map(|i| (i as f32 * 0.013).cos())
+                    .collect::<Vec<_>>(),
+                &[rows as i64, 1, 2560],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let bits = |bank: &Weight| {
+                bank.expert_rows(&x, &ids, MTP_TEST_EXPERTS, false)
+                    .unwrap()
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            let want = bits(&before);
+            assert!(want.iter().any(|&b| b != 0), "rows={rows}");
+            assert_eq!(bits(&gate_up), want, "rows={rows}");
+        }
+    }
+
+    /// The f32 sides need more live headroom than the f16 layout: a refused
+    /// f32 build builds the f16 one once instead of declining the draft banks,
+    /// and declines them only when that is refused too.
+    /// MUTATIONS: M-M1-live (no f16 retry) -> "the f32 gate_up staging";
+    /// M-M1-live-any (the retry for any layout) ->
+    /// `failed_second_mtp_bank_leaves_no_partial_bank`.
+    #[test]
+    fn refused_f32_draft_banks_fall_back_to_the_f16_layout() {
+        let (experts, _, _cleanup) = real_shape_mtp_experts();
+        let bytes = |n: usize, width: usize, eighths: usize| {
+            (MTP_TEST_EXPERTS * n * width * eighths / 8) as u64
+        };
+        let (wide, narrow, down) = (
+            bytes(1280, 2560, 10),
+            bytes(1280, 2560, 9),
+            bytes(2560, 640, 9),
+        );
+        let [wide_up, narrow_up, down_up] =
+            [wide, narrow, down].map(|bank| 2 * bank + super::super::super::memory::WORKING_BYTES);
+        let cases: [(&str, &[usize], &[u64], bool); 3] = [
+            (
+                "the f32 gate_up staging",
+                &[0],
+                &[wide_up, narrow_up, down_up],
+                true,
+            ),
+            (
+                "the down staging beside the f32 gate_up bank",
+                &[1],
+                &[wide_up, down_up, narrow_up, down_up],
+                true,
+            ),
+            (
+                "both gate_up stagings",
+                &[0, 1],
+                &[wide_up, narrow_up],
+                false,
+            ),
+        ];
+        for (why, refused, want, built) in cases {
+            let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+            s.tensors.extend(experts.iter().cloned());
+            assert_eq!(s.mtp_bank_estimate().unwrap(), wide + down, "{why}");
+            let mut seen = Vec::new();
+            let result = s.prepare_mtp_expert_banks_with(&mut |bytes| {
+                seen.push(bytes);
+                if refused.contains(&(seen.len() - 1)) {
+                    Err(err("simulated headroom loss"))
+                } else {
+                    Ok(())
+                }
+            });
+            if built {
+                assert_eq!(result.ok(), Some(narrow + down), "{why}");
+                let bank = s.resident_bank(MTP_EXPERT_BANKS[0]).unwrap();
+                assert_eq!(
+                    [&bank.scales, &bank.biases].map(|a| a.as_ref().unwrap().dtype().unwrap()),
+                    [DType::Float16; 2],
+                    "{why}"
+                );
+                assert!(!s.mtp_banks_declined, "{why}");
+            } else {
+                assert!(result.is_err(), "{why}");
+                assert!(s.mtp_banks_declined, "{why}");
+                assert_eq!(s.mtp_bank_bytes().unwrap(), 0, "{why}");
+            }
+            assert_eq!(seen, want, "{why}");
+        }
     }
 
     #[test]

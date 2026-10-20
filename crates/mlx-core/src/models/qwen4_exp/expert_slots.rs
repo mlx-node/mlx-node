@@ -1365,17 +1365,22 @@ mod tests {
         Some((store, layers))
     }
 
-    /// The draft banks as the admission installs them, never evaluated.
+    /// The draft banks in the layout the admission takes, never evaluated.
     fn install_draft_banks(store: &mut Store) -> u64 {
-        for (name, rows, width) in DRAFT_HEADS {
+        let specs = store
+            .mtp_bank_admission()
+            .unwrap()
+            .expect("the admission takes the draft banks");
+        for (name, _, rows, width, sides, _) in specs {
+            let (rows, width, sides) = (rows as i64, width as i64, sides.unwrap());
             let lazy = |columns: i64, dtype| MxArray::zeros(&[rows, columns], Some(dtype)).unwrap();
             store.banks.insert(
                 name.into(),
                 Arc::new(Weight {
                     values: lazy(width / 4, DType::Uint32),
                     dense_bf16: None,
-                    scales: Some(lazy(width / 32, DType::Float16)),
-                    biases: Some(lazy(width / 32, DType::Float16)),
+                    scales: Some(lazy(width / 32, sides)),
+                    biases: Some(lazy(width / 32, sides)),
                     group: 32,
                     bits: 8,
                     mode: "affine".into(),
@@ -1412,8 +1417,9 @@ mod tests {
         let routed: u64 = layers.iter().sum();
         assert_eq!(routed, 78_538_342_400);
         let fixed = FIXED_BANK_BYTES;
+        store.cache_limit = 36 << 30;
         let draft = store.mtp_bank_estimate().unwrap();
-        assert_eq!(draft, 2_831_155_200);
+        assert_eq!(draft, 3_040_870_400, "the f32-sided gate_up bank");
         let slots = |store: &mut Store, gib: u64| {
             store.cache_limit = gib << 30;
             store.slot_capacity = None;
@@ -1468,7 +1474,7 @@ mod tests {
                 store.mtp_banks_declined = false;
                 store.cache_limit = limit;
                 let capacity = store.expert_slot_capacity(512, 10).unwrap();
-                let fits = store.mtp_banks_fit().unwrap();
+                let fits = store.mtp_bank_admission().unwrap().is_some();
                 if fits {
                     install_draft_banks(&mut store);
                 }
@@ -1521,7 +1527,7 @@ mod tests {
         let budgets = [21u64, 22, 23, 24, 26, 30];
         assert_eq!(
             budgets.map(|gib| slots(&mut store, gib)),
-            [94, 98, 105, 112, 125, 149],
+            [94, 98, 104, 111, 125, 149],
             "MTP head attached"
         );
         store.mtp_banks_declined = true;
@@ -1558,7 +1564,7 @@ mod tests {
             store.mtp_banks_declined = false;
             build_slot_banks(&mut store, &layers[..built], capacity).unwrap();
             assert!(
-                !store.mtp_banks_fit().unwrap(),
+                store.mtp_bank_admission().unwrap().is_none(),
                 "{built} layers built: the draft banks fit beside {capacity} slots"
             );
             let admitted = store
@@ -1583,7 +1589,71 @@ mod tests {
         store.slot_bytes = 0;
         store.slot_capacity = Some(85);
         store.mtp_banks_declined = false;
-        assert!(store.mtp_banks_fit().unwrap(), "85 slots leave the staging");
+        assert!(
+            store.mtp_bank_admission().unwrap().is_some(),
+            "85 slots leave the staging"
+        );
+        assert_eq!(store.bytes_read, 0);
+    }
+
+    /// The gate_up draft bank takes f32 sides (+0.2 GiB) only where they fit
+    /// and keeps the f16 layout otherwise, never declining a bank the f16
+    /// build would take: below a 22.66 GiB slot allowance, beside a mapped
+    /// plan that charged the f16 layout, or with only the f16 staging left.
+    /// The reserve never holds less than the build.
+    /// MUTATIONS: M-M1-narrow (only the f32 layout) -> 22 GiB; M-M1-mapped
+    /// (the slot allowance beside a mapped charge) -> the f16 charge;
+    /// M-M1-room (no f16 retry) -> the f16 staging.
+    #[test]
+    fn draft_banks_take_f32_sides_only_where_they_fit() {
+        let Some((mut store, _)) = draft_bank_store(None) else {
+            return;
+        };
+        const F16_BANKS: u64 = 2_831_155_200;
+        const F32_GATE_UP: u64 = 3_040_870_400;
+        let layout = |store: &Store| {
+            store.mtp_bank_admission().unwrap().map(|specs| {
+                let bytes: u64 = specs.iter().map(|spec| spec.5).sum();
+                (
+                    bytes,
+                    specs.iter().map(|spec| spec.4.unwrap()).collect::<Vec<_>>(),
+                )
+            })
+        };
+        let f16 = Some((F16_BANKS, vec![DType::Float16; 2]));
+        let f32 = Some((F32_GATE_UP, vec![DType::Float32, DType::Float16]));
+        store.bank_bytes = FIXED_BANK_BYTES;
+        store.cache_bytes = FIXED_BANK_BYTES;
+        // cache_limit / 8 holds the f32 layout from 22.66 GiB.
+        for (sixteenths, want, built) in [
+            (22 * 16, F16_BANKS, &f16),
+            (22 * 16 + 10, F16_BANKS, &f16),
+            (22 * 16 + 11, F32_GATE_UP, &f32),
+            (23 * 16, F32_GATE_UP, &f32),
+        ] {
+            store.cache_limit = sixteenths << 26;
+            let gib = sixteenths as f64 / 16.;
+            assert_eq!(store.mtp_bank_estimate().unwrap(), want, "{gib} GiB");
+            assert_eq!(&layout(&store), built, "{gib} GiB");
+        }
+        store.cache_limit = 40 << 30;
+        for (charged, built) in [(F16_BANKS, &f16), (F32_GATE_UP, &f32)] {
+            store.draft_bank_budget = charged;
+            let why = format!("a mapped plan charged {charged}");
+            assert_eq!(store.mtp_bank_estimate().unwrap(), charged, "{why}");
+            assert_eq!(&layout(&store), built, "{why}");
+        }
+        store.draft_bank_budget = 0;
+        // Pinned slot banks leave two copies of the f16 gate_up bank and the
+        // staging reads: the reserve holds the f32 build, the admission
+        // takes the f16 one.
+        store.cache_limit = 30 << 30;
+        store.slot_bytes =
+            store.cache_limit - FIXED_BANK_BYTES - 2 * 1_887_436_800 - MAX_READ_BYTES * 3;
+        assert_eq!(store.mtp_bank_estimate().unwrap(), F32_GATE_UP);
+        assert_eq!(layout(&store), f16, "the f16 staging");
+        store.slot_bytes += 1;
+        assert_eq!(layout(&store), None);
         assert_eq!(store.bytes_read, 0);
     }
     /// The same fallback on the released checkpoint: a mapped load with the
@@ -1637,8 +1707,8 @@ mod tests {
         );
         let draft = decoder.weights.prepare_mtp_expert_banks().unwrap();
         assert_eq!(
-            draft, 2_831_155_200,
-            "the mapped plan admits the draft banks"
+            draft, 3_040_870_400,
+            "the mapped plan admits the draft banks with f32 gate_up sides"
         );
         let turn = |decoder: &mut Decoder| -> Result<Vec<u32>> {
             decoder.reset();
