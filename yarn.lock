@@ -1045,7 +1045,7 @@ __metadata:
     class-variance-authority: "npm:^0.7.1"
     clsx: "npm:^2.1.1"
     drizzle-orm: "npm:1.0.0-rc.5-ab785fc"
-    happy-dom: "npm:21.0.3"
+    happy-dom: "npm:21.0.4"
     lucide-react: "npm:^1.38.0"
     react: "npm:^19.2.8"
     react-dom: "npm:^19.2.8"
@@ -1075,7 +1075,7 @@ __metadata:
     "@napi-rs/image": "npm:1.15.0"
     "@types/node": "catalog:"
     app-builder-lib: "npm:26.15.3"
-    electron: "npm:44.9.1"
+    electron: "npm:44.9.2"
     electron-updater: "npm:6.8.9"
     vite-plus: "catalog:"
   languageName: unknown
@@ -5981,9 +5981,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"electron@npm:44.9.1":
-  version: 44.9.1
-  resolution: "electron@npm:44.9.1"
+"electron@npm:44.9.2":
+  version: 44.9.2
+  resolution: "electron@npm:44.9.2"
   dependencies:
     "@electron-internal/extract-zip": "npm:^1.0.1"
     "@electron/get": "npm:^5.0.0"
@@ -5991,7 +5991,7 @@ __metadata:
   bin:
     electron: cli.js
     install-electron: install.js
-  checksum: 10c0/a0c0ba1aef88a594613f04fcc2d378818395f369fcbb7b97ba3433309a9dbeec9068fa23b34d2f386c33630f9659aca3dd59e3cdfb21b2bd2c509295fd01be8b
+  checksum: 10c0/c289eccd5fbbaa26960d27c8a8d6be754fe28eb8c82572f2986f0f7c13a5264e06fc40d608bfaade6e0b12a1ee93088b1e47c6ada03f4f8d321ac0e1af224b27
   languageName: node
   linkType: hard
 
@@ -6573,9 +6573,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"happy-dom@npm:21.0.3":
-  version: 21.0.3
-  resolution: "happy-dom@npm:21.0.3"
+"happy-dom@npm:21.0.4":
+  version: 21.0.4
+  resolution: "happy-dom@npm:21.0.4"
   dependencies:
     "@types/node": "npm:>=20.0.0"
     "@types/whatwg-mimetype": "npm:^3.0.2"
@@ -6584,7 +6584,7 @@ __metadata:
     entities: "npm:^7.0.1"
     whatwg-mimetype: "npm:^3.0.0"
     ws: "npm:^8.21.0"
-  checksum: 10c0/1147cd9d22594d202058e042f7a0351f8ec83a6152df14d10e7935eda32fafd298077635770188a346f49ea98dc5f7a69fa1304db668dcb8d4368f1fd5fc3189
+  checksum: 10c0/9368af9739a5ba07776a116368d13d6b2690de81a6525096a1fec36e4cd1270b569151d021e2a56fb314fba73674572de562f1364090b01df6c68e9843b002e8
   languageName: node
   linkType: hard
 
