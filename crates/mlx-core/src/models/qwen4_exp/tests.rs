@@ -3944,6 +3944,70 @@ fn mtp_first_draft_pass_extends_only_the_trusted_history() {
 }
 
 #[test]
+fn draft_pass_submits_its_input_rows_before_the_head() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let rows = &oracle["rows"].as_array().unwrap()[..3];
+    let tokens: Vec<u32> = rows
+        .iter()
+        .map(|r| r["token"].as_u64().unwrap() as u32)
+        .collect();
+    let hidden: Vec<MxArray> = rows
+        .iter()
+        .map(|r| {
+            let values: Vec<f32> = r["input_hidden"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+            MxArray::from_float32(&values, &[1, 1, (c.hc_count * c.hidden_size) as i64])
+                .unwrap()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap()
+        })
+        .collect();
+    let mut decoder = decoder::Decoder::new(
+        c.clone(),
+        weights::Store::open_fixture(&path, None).unwrap(),
+    )
+    .unwrap();
+    let (next, logits, _) = decoder
+        .draft_step(&hidden, &tokens, 0, &mut decoder::LayerCache::default())
+        .unwrap();
+    MxArray::eval_arrays(&[&next, &logits]).unwrap();
+    let log = decoder.submit_log.take();
+    assert_eq!(
+        log.iter()
+            .filter(|c| *c == "qwen4::mtp::draft_input")
+            .count(),
+        1,
+        "{log:?}"
+    );
+    assert_eq!(
+        log[..2],
+        ["qwen4::mtp::draft_input", "qwen4::decoder::kv"],
+        "the input rows reach the GPU before the head's attention: {log:?}"
+    );
+    decoder
+        .draft_prefill(
+            &hidden[..2],
+            &tokens[..2],
+            0,
+            &mut decoder::LayerCache::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        decoder.submit_log.take(),
+        ["qwen4::mtp::draft_input"],
+        "a history window submits its input rows once"
+    );
+}
+
+#[test]
 fn mtp_accepted_rows_wait_for_the_next_first_draft_pass() {
     use crate::engine::backend::PagedBackend;
     use crate::engine::hybrid_scheduler::{

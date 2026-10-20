@@ -154,6 +154,8 @@ pub struct Decoder {
     /// Layers whose routes a pass read back to the host one at a time.
     #[cfg(test)]
     pub(super) route_readbacks: u64,
+    #[cfg(test)]
+    pub(super) submit_log: std::cell::RefCell<Vec<String>>,
     pub last_chunk_hidden: Vec<MxArray>,
     /// The weight budget this store registers with the process-wide cache
     /// limit; re-registered whenever the residency changes, between turns or
@@ -251,6 +253,8 @@ impl Decoder {
             device_route_cooldown: 0,
             #[cfg(test)]
             route_readbacks: 0,
+            #[cfg(test)]
+            submit_log: Default::default(),
             last_chunk_hidden: Vec::new(),
             cache_limit_guard: None,
             #[cfg(test)]
@@ -919,6 +923,8 @@ impl Decoder {
         Ok((Self::inject(x, branch, gate)?, None))
     }
     fn submit(&self, arrays: &[&MxArray], context: &str) -> Result<()> {
+        #[cfg(test)]
+        self.submit_log.borrow_mut().push(context.to_owned());
         if crate::engine::persistence::compiled_forward_backend_available() {
             MxArray::async_eval_arrays(arrays);
             Ok(())

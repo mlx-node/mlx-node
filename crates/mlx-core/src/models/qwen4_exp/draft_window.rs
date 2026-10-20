@@ -89,6 +89,9 @@ impl Decoder {
                 (c.hc_count * c.hidden_size) as i64,
             ])?;
             let (input, inject) = self.hyper(&x, "layers.0.attn_hyper_connection", "", head)?;
+            let mut started = vec![&input];
+            started.extend(inject.iter());
+            self.submit(&started, "qwen4::mtp::draft_input")?;
             let history = n - usize::from(head);
             let rows = |a: &MxArray, start: usize, end: usize| {
                 if start == 0 && end == n {
