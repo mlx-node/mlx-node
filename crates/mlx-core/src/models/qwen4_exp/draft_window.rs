@@ -52,6 +52,21 @@ impl Decoder {
                 "Qwen4 MTP history window exceeds admission",
             ));
         }
+        let rows = match (cache.draft_rows, &cache.keys) {
+            (Some(rows), _) => rows,
+            (None, None) => 0,
+            (None, Some(_)) => {
+                return Err(Error::from_reason(
+                    "Qwen4 MTP history is not a draft history",
+                ));
+            }
+        };
+        if rows != position {
+            return Err(Error::from_reason(
+                "Qwen4 MTP history does not end at the window start",
+            ));
+        }
+        cache.draft_rows = Some(rows);
         let mut embeddings = Vec::with_capacity(tokens.len());
         for &token in tokens {
             self.check_cancelled()?;
@@ -191,14 +206,7 @@ impl Decoder {
         cache.index_tail = (used..tail + count)
             .map(|r| raw.slice_axis(0, r as i64, r as i64 + 1))
             .collect::<Result<_>>()?;
-        cache.keys = Some(match &cache.keys {
-            Some(old) => MxArray::concatenate(old, &k, 2)?,
-            None => k,
-        });
-        cache.values = Some(match &cache.values {
-            Some(old) => MxArray::concatenate(old, &v, 2)?,
-            None => v,
-        });
+        cache.append_draft_kv(&k, &v)?;
         Ok(())
     }
 }

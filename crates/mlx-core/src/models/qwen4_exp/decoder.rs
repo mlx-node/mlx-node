@@ -55,12 +55,19 @@ impl AttentionProjections {
     }
 }
 
+const DRAFT_HISTORY_STEP: usize = 256;
+const DRAFT_HEAD_ROWS: usize = 3;
+
 #[derive(Clone, Default)]
 pub struct LayerCache {
     conv: Option<MxArray>,
     recurrent: Option<MxArray>,
     keys: Option<MxArray>,
     values: Option<MxArray>,
+    /// Draft history: the rows of `keys`/`values` this cache owns. Clones
+    /// share one buffer and write in place past their own rows, so no cache
+    /// may read past its own rows.
+    draft_rows: Option<usize>,
     index_tail: Vec<MxArray>,
     /// `[blocks, indexer_head_dim]`. Snapshots and replay share handles, so
     /// appending must build a new array, never write into this one.
@@ -81,13 +88,62 @@ impl LayerCache {
         };
         Ok(self.index_keys.insert(keys))
     }
+    /// Write draft K/V rows after this cache's rows. A buffer too small for
+    /// them is replaced in this cache only: other holders keep reading theirs.
+    pub(super) fn append_draft_kv(
+        &mut self,
+        k: &MxArray,
+        v: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let rows = self.draft_rows.unwrap_or(0);
+        let end = rows + k.shape_at(2)? as usize;
+        let capacity = match &self.keys {
+            Some(keys) => keys.shape_at(2)? as usize,
+            None => 0,
+        };
+        if end > capacity {
+            let target = (end + DRAFT_HEAD_ROWS).next_multiple_of(DRAFT_HISTORY_STEP);
+            let grow = |old: &Option<MxArray>, update: &MxArray| -> Result<MxArray> {
+                let shape = [
+                    update.shape_at(0)?,
+                    update.shape_at(1)?,
+                    (target - rows) as i64,
+                    update.shape_at(3)?,
+                ];
+                let fresh = MxArray::zeros(&shape, Some(update.dtype()?))?;
+                match old {
+                    Some(old) if rows > 0 => {
+                        MxArray::concatenate(&old.slice_axis(2, 0, rows as i64)?, &fresh, 2)
+                    }
+                    _ => Ok(fresh),
+                }
+            };
+            self.keys = Some(grow(&self.keys, k)?);
+            self.values = Some(grow(&self.values, v)?);
+        }
+        let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) else {
+            return Err(Error::from_reason(
+                "Qwen4 MTP draft history lost its buffer",
+            ));
+        };
+        keys.slice_assign_axis_inplace(2, rows as i64, end as i64, k)?;
+        values.slice_assign_axis_inplace(2, rows as i64, end as i64, v)?;
+        self.draft_rows = Some(end);
+        Ok((keys.clone(), values.clone()))
+    }
+    /// (rows, K buffer, V buffer) of a draft history.
+    #[cfg(test)]
+    pub(super) fn draft_kv(&self) -> Option<(usize, &MxArray, &MxArray)> {
+        Some((self.draft_rows?, self.keys.as_ref()?, self.values.as_ref()?))
+    }
     /// (K/V rows, indexer blocks, indexer tail rows).
     #[cfg(test)]
     pub(super) fn history_shape(&self) -> (usize, usize, usize) {
-        let rows = self
-            .keys
-            .as_ref()
-            .map_or(0, |keys| keys.shape_at(2).unwrap() as usize);
+        let rows = self.draft_rows.unwrap_or_else(|| {
+            self.keys
+                .as_ref()
+                .map_or(0, |keys| keys.shape_at(2).unwrap() as usize)
+        });
         (
             rows,
             self.index_block_count().unwrap(),
@@ -1205,13 +1261,18 @@ impl Decoder {
             .v
             .reshape(&[1, 1, kh, hd])?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = match &cache.keys {
-            Some(old) => MxArray::concatenate(old, &k, 2)?,
-            None => k,
-        };
-        let values = match &cache.values {
-            Some(old) => MxArray::concatenate(old, &v, 2)?,
-            None => v,
+        let (keys, values) = if cache.draft_rows.is_some() {
+            cache.append_draft_kv(&k, &v)?
+        } else {
+            let keys = match &cache.keys {
+                Some(old) => MxArray::concatenate(old, &k, 2)?,
+                None => k,
+            };
+            let values = match &cache.values {
+                Some(old) => MxArray::concatenate(old, &v, 2)?,
+                None => v,
+            };
+            (keys, values)
         };
         self.submit_state(&[&keys, &values], "qwen4::decoder::kv")?;
         cache.keys = Some(keys.clone());

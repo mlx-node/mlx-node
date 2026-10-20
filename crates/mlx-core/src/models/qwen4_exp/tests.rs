@@ -4007,6 +4007,133 @@ fn draft_pass_submits_its_input_rows_before_the_head() {
     );
 }
 
+/// `[1, 2, n, 8]` BF16 draft K/V rows (finite bit patterns), laid out like the
+/// transposed projections the draft path writes.
+fn draft_kv_rows(seed: &mut u64, n: usize) -> MxArray {
+    let bits: Vec<u16> = (0..n * 16)
+        .map(|_| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            (*seed >> 16) as u16 & 0xBFFF
+        })
+        .collect();
+    MxArray::from_bfloat16(&bits, &[1, n as i64, 2, 8])
+        .unwrap()
+        .transpose(Some(&[0, 2, 1, 3]))
+        .unwrap()
+}
+
+#[test]
+fn draft_history_buffer_matches_its_concatenated_rows() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let extend = |reference: Option<&(MxArray, MxArray)>, k: &MxArray, v: &MxArray| match reference
+    {
+        Some((rk, rv)) => (
+            MxArray::concatenate(rk, k, 2).unwrap(),
+            MxArray::concatenate(rv, v, 2).unwrap(),
+        ),
+        None => (k.clone(), v.clone()),
+    };
+    let mut owner = decoder::LayerCache::default();
+    let mut trusted: Option<(MxArray, MxArray)> = None;
+    let mut step = 0;
+    while trusted.as_ref().map_or(0, |r| r.0.shape_at(2).unwrap()) < 600 {
+        let n = 1 + step % 4;
+        let (k, v) = (draft_kv_rows(&mut seed, n), draft_kv_rows(&mut seed, n));
+        let mut cache = owner.clone();
+        cache.append_draft_kv(&k, &v).unwrap();
+        let extended = extend(trusted.as_ref(), &k, &v);
+        let mut heads = vec![(cache.clone(), extended.clone())];
+        for _ in 0..2 {
+            let (mut draft, reference) = heads.last().cloned().unwrap();
+            let (k, v) = (draft_kv_rows(&mut seed, 1), draft_kv_rows(&mut seed, 1));
+            draft.append_draft_kv(&k, &v).unwrap();
+            heads.push((draft, extend(Some(&reference), &k, &v)));
+        }
+        let mut holders = vec![(&cache, &extended)];
+        holders.extend(heads[1..].iter().map(|(c, r)| (c, r)));
+        if let Some(reference) = &trusted {
+            holders.push((&owner, reference));
+        }
+        for (holder, reference) in holders {
+            let (rows, keys, values) = holder.draft_kv().unwrap();
+            assert_eq!(rows as i64, reference.0.shape_at(2).unwrap(), "step {step}");
+            let random: Vec<i32> = (0..7)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % rows as u64) as i32
+                })
+                .collect();
+            let all: Vec<i32> = (0..rows as i32).collect();
+            for indices in [all, random] {
+                let indices = MxArray::from_int32(&indices, &[indices.len() as i64]).unwrap();
+                for (buffer, expected) in [(keys, &reference.0), (values, &reference.1)] {
+                    assert_eq!(
+                        buffer
+                            .take(&indices, 2)
+                            .unwrap()
+                            .to_uint16_native()
+                            .unwrap(),
+                        expected
+                            .take(&indices, 2)
+                            .unwrap()
+                            .to_uint16_native()
+                            .unwrap(),
+                        "step {step}: {rows} rows"
+                    );
+                }
+            }
+        }
+        owner = cache;
+        trusted = Some(extended);
+        step += 1;
+    }
+}
+
+#[test]
+fn draft_history_appends_in_place() {
+    let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    let storage = |cache: &decoder::LayerCache| {
+        let (_, keys, values) = cache.draft_kv().unwrap();
+        MxArray::eval_arrays(&[keys, values]).unwrap();
+        (keys.storage_ptr(), values.storage_ptr())
+    };
+    let mut owner = decoder::LayerCache::default();
+    let (k, v) = (draft_kv_rows(&mut seed, 1), draft_kv_rows(&mut seed, 1));
+    owner.append_draft_kv(&k, &v).unwrap();
+    let start = storage(&owner);
+    assert!(!start.0.is_null() && !start.1.is_null());
+    let mut holder = owner.clone();
+    for n in [3, 1, 1, 2, 1, 1, 4, 1] {
+        let mut next = holder.clone();
+        let (k, v) = (draft_kv_rows(&mut seed, n), draft_kv_rows(&mut seed, n));
+        next.append_draft_kv(&k, &v).unwrap();
+        holder = next;
+    }
+    assert_eq!(
+        storage(&holder),
+        start,
+        "appends that fit write the buffer in place"
+    );
+    assert_eq!(owner.draft_kv().unwrap().0, 1);
+    let mut grown = holder.clone();
+    let (k, v) = (draft_kv_rows(&mut seed, 256), draft_kv_rows(&mut seed, 256));
+    grown.append_draft_kv(&k, &v).unwrap();
+    let after = storage(&grown);
+    assert!(
+        after.0 != start.0 && after.1 != start.1,
+        "a growth moves the rows"
+    );
+    assert_eq!(
+        storage(&holder),
+        start,
+        "the other holders keep their buffer"
+    );
+}
+
 #[test]
 fn mtp_accepted_rows_wait_for_the_next_first_draft_pass() {
     use crate::engine::backend::PagedBackend;
